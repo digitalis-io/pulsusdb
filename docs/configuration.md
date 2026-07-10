@@ -27,7 +27,7 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process |
 
-The native protocol is used for bulk inserts and sample fetches; HTTP is used for DDL and `INSERT ... SELECT` maintenance statements.
+The hard requirements are columnar bulk-insert/fetch performance and reliable DDL + `INSERT ... SELECT` maintenance statements; which transport serves which statement class is an implementation detail settled by the M0 client benchmark (docs/decisions/0001). `CLICKHOUSE_PORT`/`CLICKHOUSE_HTTP_PORT` both remain configurable so either split works.
 
 ## 3. Schema & retention
 
