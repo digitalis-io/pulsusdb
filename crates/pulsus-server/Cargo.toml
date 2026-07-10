@@ -1,0 +1,13 @@
+[package]
+name = "pulsus-server"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pulsusdb"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+rust-version = "1.93"
+repository = "https://github.com/digitalis-io/pulsusdb"
+authors = ["PulsusDB contributors"]
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,2 @@
+# Placeholder for future per-lint thresholds. M0 clippy strictness is
+# enforced by CI's `-- -D warnings` invocation, not by config here.

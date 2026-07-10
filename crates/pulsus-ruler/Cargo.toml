@@ -1,0 +1,6 @@
+[package]
+name = "pulsus-ruler"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
