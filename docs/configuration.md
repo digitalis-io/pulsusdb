@@ -115,29 +115,68 @@ Tiers are populated **in real time by insert-triggered materialized views inside
 
 ## 9. YAML file
 
-Everything above maps 1:1 into YAML (env var wins on conflict):
+Everything above maps 1:1 into YAML (env var wins on conflict). This is the **complete** document schema — unknown keys are rejected; every key shown with its default:
 
 ```yaml
-mode: all
+# root scalars
+mode: all                        # all | writer | reader | init
 host: 0.0.0.0
 port: 3100
-clickhouse:
-  server: clickhouse
-  port: 9000
-  database: pulsus
-  auth: "default:"
-  proto: native
+log_level: info                  # error | warn | info | debug | trace
+auth_user: null                  # both set => basic auth; one-sided => startup error
+auth_password: null              # secret: never appears in redacted output
+compat_endpoints: false
+cors_origin: "*"
+query_timeout: 2m
+skip_ddl: false
 retention_days: 7
+storage_policy: null
+rotation_interval: 1h
+log_rollup_resolution: 5s
+cluster: null                    # ClickHouse cluster name; enables distributed DDL
+dist_suffix: _dist
+skip_unavailable_shards: false
+
+clickhouse:
+  server: localhost
+  port: 9000
+  http_port: 8123
+  database: pulsus
+  auth: "default:"               # user:password, split on first colon; password is secret
+  proto: native                  # native | http | https
+  tls_skip_verify: false
+  pool_size: 8
+
 writer:
   batch_bytes: 16MiB
   batch_ms: 200
+  insert_mode: sync              # sync | async
+  ingest_queue_bytes: 256MiB
+
 reader:
   cache_ttl: 60s
   cache_max_series: 50000
-downsampling: { ... }        # see §7
+  series_activity_bucket: 1h
+  cache_window: 24h
+  promql_max_samples: 50000000
+  promql_lookback: 5m
+  logql_scan_budget_bytes: 50GiB
+  traceql_max_candidates: 100000
+
+downsampling:
+  enabled: false
+  raw_retention: null            # overrides retention_days for metric_samples when set
+  tier_policy: exact             # exact | fast
+  tiers: []                      # see §7; name/table unique, resolution/min_step/retention
+                                 # strictly increasing, min_step >= resolution per tier
+
 ruler:
   enabled: false
+  poll_interval: 30s
+  max_result_bytes: 10MiB
 ```
+
+Durations accept `ms|s|m|h|d|w`; byte sizes accept binary units (`KiB/MiB/GiB/TiB`), decimal units (`KB/MB/GB/TB`), or a bare integer of bytes.
 
 ## 10. Quickstart (docker compose)
 
