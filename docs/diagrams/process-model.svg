@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="660" viewBox="0 0 1120 660" role="img" aria-labelledby="title desc">
+  <title id="title">PulsusDB process model</title>
+  <desc id="desc">Inputs enter the PulsusDB writer and reader subsystems. The writer inserts batches into ClickHouse. The reader queries ClickHouse. The ruler writes results back through the writer path. The schema controller manages ClickHouse DDL and retention.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #0f172a; stroke-width: 2; }
+      .section { fill: #eef6ff; stroke: #2563eb; stroke-width: 1.5; }
+      .section2 { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
+      .section3 { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.5; }
+      .section4 { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; }
+      .input { fill: #ffffff; stroke: #64748b; stroke-width: 1.2; }
+      .store { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; }
+      .title { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 600 14px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 12px Arial, sans-serif; fill: #334155; }
+      .tiny { font: 11px Arial, sans-serif; fill: #475569; }
+      .arrow { stroke: #334155; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 6 5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1120" height="660"/>
+
+  <text class="title" x="48" y="38">Inputs</text>
+  <rect class="input" x="40" y="64" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="87">OTel Collector</text>
+  <rect class="input" x="40" y="116" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="139">OTLP logs</text>
+  <rect class="input" x="40" y="168" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="191">OTLP metrics</text>
+  <rect class="input" x="40" y="220" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="243">OTLP traces</text>
+  <rect class="input" x="40" y="272" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="295">OTLP profiles</text>
+  <rect class="input" x="40" y="324" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="347">remote_write</text>
+  <rect class="input" x="40" y="376" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="399">compat receivers</text>
+
+  <rect class="input" x="40" y="458" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="481">LogQL</text>
+  <rect class="input" x="40" y="510" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="533">PromQL</text>
+  <rect class="input" x="40" y="562" width="190" height="36" rx="6"/>
+  <text class="small" x="58" y="585">TraceQL / profiles API</text>
+
+  <rect class="panel" x="300" y="44" width="470" height="570" rx="10"/>
+  <text class="title" x="324" y="76">pulsusdb process</text>
+  <text class="tiny" x="324" y="96">Mode selects mounted subsystems: all, writer, reader, init</text>
+
+  <rect class="section" x="325" y="122" width="420" height="128" rx="8"/>
+  <text class="label" x="348" y="150">writer</text>
+  <text class="small" x="348" y="177">protocol parsers</text>
+  <text class="small" x="348" y="199">fingerprinting</text>
+  <text class="small" x="348" y="221">columnar batching and insert scheduler</text>
+
+  <rect class="section2" x="325" y="280" width="420" height="128" rx="8"/>
+  <text class="label" x="348" y="308">reader</text>
+  <text class="small" x="348" y="335">parsers, planners, SQL generation</text>
+  <text class="small" x="348" y="357">fetch, exact evaluation, wire format</text>
+  <text class="small" x="348" y="379">label cache, tier router, live tail</text>
+
+  <rect class="section3" x="325" y="438" width="420" height="70" rx="8"/>
+  <text class="label" x="348" y="466">ruler</text>
+  <text class="small" x="348" y="490">rule storage, evaluation loop, write-back</text>
+
+  <rect class="section4" x="325" y="528" width="420" height="62" rx="8"/>
+  <text class="label" x="348" y="555">schema controller</text>
+  <text class="small" x="348" y="579">DDL, migrations, TTL rotation, tier/MV management</text>
+
+  <rect class="store" x="860" y="238" width="210" height="184" rx="12"/>
+  <ellipse cx="965" cy="238" rx="105" ry="26" fill="#cffafe" stroke="#0891b2" stroke-width="2"/>
+  <path d="M 860 238 v 158 c 0 14 47 26 105 26 s 105 -12 105 -26 V 238" fill="none" stroke="#0891b2" stroke-width="2"/>
+  <ellipse cx="965" cy="396" rx="105" ry="26" fill="none" stroke="#0891b2" stroke-width="2"/>
+  <text class="title" x="914" y="307">ClickHouse</text>
+  <text class="small" x="916" y="334">1..N shards</text>
+  <text class="tiny" x="900" y="360">MergeTree / Distributed</text>
+
+  <path class="arrow" d="M 230 82 C 250 82 270 134 323 150"/>
+  <path class="arrow" d="M 230 134 H 323"/>
+  <path class="arrow" d="M 230 186 C 252 186 275 176 323 176"/>
+  <path class="arrow" d="M 230 238 C 255 238 275 204 323 204"/>
+  <path class="arrow" d="M 230 290 C 252 290 277 224 323 224"/>
+  <path class="arrow" d="M 230 342 C 250 342 275 236 323 236"/>
+  <path class="arrow" d="M 230 394 C 250 394 275 248 323 248"/>
+
+  <path class="arrow" d="M 230 476 C 260 476 280 304 323 304"/>
+  <path class="arrow" d="M 230 528 C 260 528 280 336 323 336"/>
+  <path class="arrow" d="M 230 580 C 260 580 280 366 323 366"/>
+
+  <path class="arrow" d="M 745 186 C 810 186 820 258 858 270"/>
+  <text class="tiny" x="774" y="170">batched columnar inserts</text>
+  <path class="arrow" d="M 858 330 C 820 330 810 344 747 344"/>
+  <text class="tiny" x="776" y="366">queries and result streams</text>
+  <path class="arrow dashed" d="M 745 474 C 815 474 795 398 858 390"/>
+  <path class="arrow dashed" d="M 535 438 C 535 410 535 408 535 408"/>
+  <text class="tiny" x="775" y="452">write-back through writer path</text>
+  <path class="arrow dashed" d="M 745 560 C 825 560 823 425 858 408"/>
+  <text class="tiny" x="778" y="544">DDL and lifecycle management</text>
+</svg>

@@ -21,28 +21,7 @@ All durable state lives in ClickHouse. PulsusDB processes are stateless (the rea
 
 **API surfaces.** The primary ingestion path is the OpenTelemetry Collector: OTLP endpoints for logs, metrics, traces, and profiles are always on, alongside Prometheus remote write (the collector's alternative metrics exporter). Query APIs live under product-neutral paths (`/api/logs/v1`, `/api/traces/v1`, `/api/profiles/v1`, `/api/rules/v1`, and the standard Prometheus `/api/v1` for metrics). Third-party API surfaces — foreign push protocols and datasource-compatible query aliases — are mounted only when `PULSUS_COMPAT_ENDPOINTS=true`; they bind to the same handlers and add no semantics (see [api.md §8](api.md)).
 
-```
-                     ┌──────────────────────────────────────────┐
- OTel Collector ────▶│                                          │
-  OTLP logs ────────▶│  writer                                  │
-  OTLP metrics ─────▶│   protocol parsers → fingerprinting →    │──── batched
-  OTLP traces ──────▶│   columnar batching → insert scheduler   │     columnar
-  OTLP profiles ────▶│                                          │     inserts
- remote_write ──────▶│                                          │        │
- compat receivers ──▶│  (flag-gated)                            │        ▼
-                     ├──────────────────────────────────────────┤
- LogQL ─────────────▶│  reader                                  │   ┌─────────────┐
- PromQL ────────────▶│   parsers → planners → SQL generation →  │◀──│  ClickHouse │
- TraceQL ───────────▶│   fetch → exact evaluation → wire format │   │  (1..N      │
- profiles API ──────▶│   label cache · tier router · live tail  │   │   shards)   │
-                     ├──────────────────────────────────────────┤   └─────────────┘
-                     │  ruler: rule storage, evaluation loop,   │        ▲
-                     │  write-back through the writer path      │────────┘
-                     ├──────────────────────────────────────────┤
-                     │  schema controller: DDL, migrations,     │
-                     │  TTL rotation, tier/MV management        │
-                     └──────────────────────────────────────────┘
-```
+![PulsusDB process model](diagrams/process-model.svg)
 
 ### 1.1 Rust workspace layout
 
@@ -171,15 +150,7 @@ Retention is TTL-driven and applied by the schema controller at startup and on a
 
 ## 4. Ingestion pipeline (writer)
 
-```
-HTTP request
-  → decompress (gzip | snappy | zstd, by Content-Encoding)
-  → protocol parser (by route + Content-Type)          } zero-copy where possible
-  → normalize to (labels, fingerprint, rows)           } pulsus-model types
-  → append to per-table columnar buffers
-  → flush on size (PULSUS_BATCH_BYTES) or age (PULSUS_BATCH_MS)
-  → single columnar INSERT per table per flush
-```
+![Writer ingestion pipeline](diagrams/ingestion-pipeline.svg)
 
 - **Parsers** live in `pulsus-write::protocols`, one module per protocol. Primary: OTLP logs, OTLP metrics, OTLP traces, OTLP profiles, Prometheus remote write, pprof ingest. Compatibility (mounted only with `PULSUS_COMPAT_ENDPOINTS`): log push JSON/protobuf, Zipkin JSON, Influx line protocol, Datadog logs/metrics, Elastic bulk. Each parser is a pure function from request bytes to normalized rows — trivially unit-testable against captured fixtures.
 - **Batching** is per destination table, with sync (request completes after flush succeeds) and async (`202` after enqueue) modes selectable per request via `X-Pulsus-Async`. Buffers are bounded; backpressure returns `429` rather than growing unbounded.
