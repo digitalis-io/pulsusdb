@@ -29,7 +29,8 @@ All durable state lives in ClickHouse. PulsusDB processes are stateless (the rea
 pulsusdb/
 ├── Cargo.toml                 # workspace root
 ├── crates/
-│   ├── pulsus-server/         # binary: config load, mode dispatch, router assembly
+│   ├── pulsus-server/         # binary: CLI, mode dispatch, router assembly
+│   ├── pulsus-config/         # typed configuration: env/YAML load, validation, redaction
 │   ├── pulsus-model/          # labels, fingerprints, samples, series, time types
 │   ├── pulsus-clickhouse/     # client pool (native protocol), columnar insert buffers
 │   ├── pulsus-schema/         # DDL templates, migrations, TTL rotation, MV lifecycle

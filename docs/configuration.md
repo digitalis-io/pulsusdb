@@ -1,6 +1,6 @@
 # PulsusDB Configuration
 
-PulsusDB is configured by environment variables, optionally layered over a YAML file (`--config <path>`). Environment variables always win. Every option has a sane single-node default: `pulsusdb` with only `CLICKHOUSE_SERVER` set is a working deployment.
+PulsusDB is configured by environment variables, optionally layered over a YAML file (`--config <path>`). Precedence: CLI flags (`--config`, `--mode` — the only two flags) > environment variables > YAML > defaults; an environment variable set to the empty string counts as unset. Every option has a sane single-node default: `pulsusdb` with only `CLICKHOUSE_SERVER` set is a working deployment.
 
 ## 1. Core
 
