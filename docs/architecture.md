@@ -279,7 +279,7 @@ Query endpoints (`/api/profiles/v1/{merge,select_series,export,render,render-dif
 
 - **Golden semantics tests:** fingerprint vectors; the **vendored upstream PromQL test corpus** (21 `.test` scenario files from the pinned Prometheus release, replayed natively by a test driver that implements the `.test` format) — this is the PromQL compliance gate, run in CI on every engine change; LogQL/TraceQL parser snapshot tests.
 - **SQL plan snapshots:** every planner change shows its SQL diff in review.
-- **Integration:** docker-compose harness (ClickHouse + pulsusdb + OTel Collector) driving every signal through a real collector pipeline into PulsusDB and reading back through every query API; compat receivers exercised with captured fixtures; a clustered variant with 2 shards validates distributed DDL and shard-local pushdown.
+- **Integration:** compose-file harness (ClickHouse + pulsusdb + OTel Collector; runs under podman compose or docker compose) driving every signal through a real collector pipeline into PulsusDB and reading back through every query API; compat receivers exercised with captured fixtures; a clustered variant with 2 shards validates distributed DDL and shard-local pushdown.
 - **Differential testing:** the same remote-write stream fed to Prometheus and PulsusDB, with per-series per-timestamp value comparison across the function matrix (the accuracy gate for M2).
 
 ---

@@ -178,7 +178,7 @@ ruler:
 
 Durations accept `ms|s|m|h|d|w`; byte sizes accept binary units (`KiB/MiB/GiB/TiB`), decimal units (`KB/MB/GB/TB`), or a bare integer of bytes.
 
-## 10. Quickstart (docker compose)
+## 10. Quickstart (podman compose / docker compose)
 
 ```yaml
 services:
