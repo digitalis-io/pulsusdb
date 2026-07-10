@@ -1,6 +1,10 @@
 //! PulsusDB server binary (`pulsusdb`). See docs/architecture.md §1 — process
-//! model, config load, mode dispatch, and router assembly. M0 wires only
-//! --version/--help; mode dispatch (issue #2) and API mounting land later.
+//! model, config load, mode dispatch, and router assembly. M0 wires
+//! --version/--help and config load/validation (issue #2); mode dispatch
+//! and API mounting (issue #6) land later.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::Parser;
 
@@ -9,10 +13,31 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PULSUS_GIT_
 
 #[derive(Parser, Debug)]
 #[command(name = "pulsusdb", version = VERSION, about = "PulsusDB observability database")]
-struct Cli {}
+struct Cli {
+    /// Path to a YAML configuration file (docs/configuration.md §9).
+    #[arg(long)]
+    config: Option<PathBuf>,
 
-fn main() {
-    let _cli = Cli::parse(); // clap handles --version/--help and exits.
-    // M0 scaffold: no subsystems mounted yet.
-    println!("pulsusdb {VERSION} — scaffold build; no subsystems mounted (M0)");
+    /// Process role override, beating `PULSUS_MODE` (docs/configuration.md
+    /// §1). Not a clap `ValueEnum` — validated by `pulsus-config` so the
+    /// valid-values list lives in exactly one place.
+    #[arg(long)]
+    mode: Option<String>,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse(); // clap handles --version/--help and exits.
+
+    match pulsus_config::load(cli.config.as_deref(), cli.mode.as_deref()) {
+        Ok(_config) => {
+            // M0 scaffold: config loaded and validated, but no subsystems
+            // mounted yet (mode dispatch and router assembly are issue #6).
+            println!("pulsusdb {VERSION} — scaffold build; no subsystems mounted (M0)");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("pulsusdb: {err}");
+            ExitCode::FAILURE
+        }
+    }
 }

@@ -11,3 +11,6 @@ authors = ["PulsusDB contributors"]
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+thiserror = "2"
