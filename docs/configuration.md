@@ -51,7 +51,7 @@ Deployment topologies:
 
 1. **Single node** — one `pulsusdb` (mode `all`), one ClickHouse. No cluster vars.
 2. **Split tiers** — N × `PULSUS_MODE=writer` behind an ingest LB, M × `PULSUS_MODE=reader` behind a query LB, same ClickHouse.
-3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `pulsusdb -mode init` once (or an init container) to create replicated + distributed tables; writers/readers as in (2).
+3. **Sharded ClickHouse** — set `PULSUS_CLUSTER`; run `pulsusdb --mode init` once (or an init container) to create replicated + distributed tables; writers/readers as in (2).
 4. **Cross-cluster reads** — a reader pointed at a query-only ClickHouse cluster whose `_dist`-suffixed tables front the storage cluster; set `PULSUS_DIST_SUFFIX` accordingly.
 
 ## 5. Writer
