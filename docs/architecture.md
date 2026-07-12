@@ -51,7 +51,7 @@ pulsusdb/
 | ClickHouse client | **`clickhouse`** (HTTP + RowBinary) — chosen in M0 (spike: [ADR 0001](decisions/0001-clickhouse-client.md)). Bulk insert 0.86M rows/s (log) / 0.39M rows/s (metric), streaming fetch 0.25M rows/s at bounded RSS; round-trips `UInt64` fingerprints (>2^63) and `SimpleAggregateFunction`/`AggregateFunction` states correctly. `klickhouse` (native TCP) rejected on insert throughput (46–53% slower on both row shapes) despite passing every correctness/DDL gate. Fallback: `klickhouse`, already proven correct and DDL-capable in the spike; the wrapper's public API (`ChConnConfig`/`ChPool`/`ChClient`/`ChError`) is crate-agnostic so swapping is an internals-only change |
 | Protobuf | `prost` (remote write `prompb`, OTLP via `opentelemetry-proto` — incl. the profiles signal, `pprof`) |
 | Compression | `snap` (snappy for remote write/OTLP), `flate2` (gzip), `lz4_flex` |
-| Hashing | `xxhash-rust` (metric fingerprints), `cityhasher` (log/trace fingerprints — must equal ClickHouse `cityHash64`) |
+| Hashing | `xxhash-rust` (metric fingerprints); log/trace/profile fingerprints need a ClickHouse-compatible `cityHash64` (the 1.0.2 fork) — candidate crates are validated empirically against a live `SELECT cityHash64(...)` gate, with an in-crate vendored port as the fallback if none match |
 | PromQL parsing | `promql-parser` crate (faithful port of the upstream parser); LogQL and TraceQL parsers are written in-house (recursive descent) |
 | JSON | `serde_json` for control paths; `simd-json` / hand-rolled streaming encoders on hot paths |
 
@@ -68,7 +68,7 @@ Logs, metrics, traces, and profiles have different query shapes, so each gets it
 A *fingerprint* is a 64-bit hash identifying a unique label set (a stream/series).
 
 - **Metrics:** `xxhash64` over the label set serialized as `key \xff value \xff ...` with keys sorted and `__name__` excluded (the metric name is a first-class column). This keeps fingerprints stable across label reordering and lets the samples table stay string-free.
-- **Logs and traces:** `cityHash64` over the sorted label key/value hash pairs — chosen to be **bit-identical to ClickHouse's `cityHash64`**, so server-side materialized views and client-side writers compute the same fingerprint and either side can derive it.
+- **Logs, traces, profiles:** `cityHash64` over a single canonical buffer — each sorted label appended as `key ++ 0xFF ++ value ++ 0xFF` — using an implementation **bit-identical to ClickHouse's `cityHash64`** (ClickHouse's frozen CityHash 1.0.2 variant, not upstream CityHash 1.1). The writer is the sole fingerprint authority (the label-index MV only fans out the writer's fingerprint), but bit-identity keeps server-side derivation possible (`cityHash64(concat(...))` over the same buffer) and is enforced by a live cross-check test against `SELECT cityHash64(unhex(...))`.
 
 Fingerprint computation is centralized in `pulsus-model` and covered by golden-value tests; a fingerprint mismatch between writer and MV silently corrupts the label index, so these functions are frozen by test vectors.
 
