@@ -157,6 +157,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "ch_cityhash102"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1eb857418fd28c9e70581e1ec52450a3ad6564e1d83f1806450a5128dadbf927"
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1024,6 +1030,17 @@ version = "0.0.0"
 [[package]]
 name = "pulsus-model"
 version = "0.0.0"
+dependencies = [
+ "ch_cityhash102",
+ "clickhouse",
+ "futures",
+ "pulsus-clickhouse",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "xxhash-rust",
+]
 
 [[package]]
 name = "pulsus-promql"
@@ -1748,6 +1765,12 @@ dependencies = [
  "tokio",
  "tokio-rustls",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
 
 [[package]]
 name = "yoke"
