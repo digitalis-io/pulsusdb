@@ -35,3 +35,132 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Issue #5: every DDL block in docs/schemas.md must be rendered and
+  # executed against a fresh ClickHouse in CI. Single-node 24.8 leg (live
+  # migration/MV tests, the `--mode init` create-then-no-op acceptance
+  # criterion) plus a negative leg proving the < 24.8 version refusal.
+  # Uses the runner's own docker (task-manager resolution #3 on issue #5);
+  # local development uses podman against the same runtime-neutral fixtures.
+  schema-it:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start ClickHouse 24.8
+        run: |
+          docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
+            clickhouse/clickhouse-server:24.8
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:19123/ping && break
+            sleep 1
+          done
+
+      - name: Live schema tests (single-node, migrations + MVs + crash/retry)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_schema
+
+      - name: Build pulsusdb
+        run: cargo build -p pulsus-server --bin pulsusdb
+
+      - name: "--mode init: first run creates every table/MV"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "19123"
+          CLICKHOUSE_DB: pulsus
+        run: ./target/debug/pulsusdb --mode init
+
+      - name: "--mode init: second run is a no-op (acceptance criterion)"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "19123"
+          CLICKHOUSE_DB: pulsus
+        run: ./target/debug/pulsusdb --mode init
+
+      - name: Stop ClickHouse 24.8
+        if: always()
+        run: docker rm -f pulsus-ch-schema-it
+
+      - name: Start ClickHouse 24.3 (below the minimum supported version)
+        run: |
+          docker run -d --name pulsus-ch-schema-it-old -p 19124:8123 -p 19001:9000 \
+            clickhouse/clickhouse-server:24.3
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:19124/ping && break
+            sleep 1
+          done
+
+      - name: "--mode init refuses ClickHouse < 24.8 with a clear error"
+        env:
+          CLICKHOUSE_SERVER: localhost
+          CLICKHOUSE_HTTP_PORT: "19124"
+          CLICKHOUSE_DB: pulsus
+        run: |
+          set +e
+          output=$(./target/debug/pulsusdb --mode init 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected a nonzero exit refusing ClickHouse < 24.8, got 0"
+            exit 1
+          fi
+          if ! echo "$output" | grep -qi "24.8"; then
+            echo "::error::refusal message did not name the minimum supported version (24.8)"
+            exit 1
+          fi
+
+      - name: Stop ClickHouse 24.3
+        if: always()
+        run: docker rm -f pulsus-ch-schema-it-old
+
+  # Issue #5: the 2-shard + Keeper cluster variant — Replicated engines,
+  # `_dist` write/read-back, and the live sharding-identity assertion
+  # (docs/schemas.md §7). Fixture at ci/clickhouse-cluster/compose.yaml.
+  schema-it-cluster:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start the 2-shard cluster
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for i in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h2" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      - name: Live cluster tests (_dist write/read-back, sharding identity)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-schema --test live_cluster
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v

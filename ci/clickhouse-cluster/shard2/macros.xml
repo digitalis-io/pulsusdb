@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!--
+  See shard1/macros.xml for the full rationale. `interserver_http_host` is
+  this node's static `ipv4_address` (compose.yaml, 172.28.0.0/24) — the
+  shard-less bookkeeping/catalog replica set (issue #5 fix plan F2) makes
+  shard1 and shard2 two replicas of the same table, so this node needs it
+  too, not just shard1.
+-->
+<clickhouse>
+    <macros>
+        <shard>2</shard>
+        <replica>ch-shard2</replica>
+        <cluster>pulsus_test_cluster</cluster>
+    </macros>
+    <interserver_http_host>172.28.0.12</interserver_http_host>
+</clickhouse>

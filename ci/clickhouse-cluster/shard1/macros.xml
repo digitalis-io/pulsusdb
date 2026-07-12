@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!--
+  `{shard}`/`{replica}` — the ClickHouse server macros the schema
+  controller's zoo-path convention (docs/schemas.md §7,
+  `/clickhouse/tables/{shard}/<db>.<table>` + `{replica}`) leaves verbatim
+  for the server to resolve. `{replica}` values are cluster-unique
+  (docs/schemas.md §7), required by the shard-less `.../all/...` zoo path
+  the bookkeeping/catalog tables join (issue #5 fix plan F2) — that path
+  makes shard1 and shard2 two replicas of the *same* table, so part-fetch
+  replication traffic actually flows between them, not just within a shard.
+
+  `interserver_http_host` is set explicitly to this node's static
+  `ipv4_address` (compose.yaml, 172.28.0.0/24) — KISS directive on issue #5:
+  no DNS aliases anywhere in this fixture. Without it, ClickHouse defaults
+  to the container's raw hostname (its container ID) for that replication
+  traffic, which is unresolvable from the other shard's container and
+  silently breaks replication (`system.replication_queue.last_exception`:
+  `DNS_ERROR: Not found address of host: <container-id>`) even though
+  DDL/queries succeed.
+-->
+<clickhouse>
+    <macros>
+        <shard>1</shard>
+        <replica>ch-shard1</replica>
+        <cluster>pulsus_test_cluster</cluster>
+    </macros>
+    <interserver_http_host>172.28.0.11</interserver_http_host>
+</clickhouse>

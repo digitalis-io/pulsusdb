@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!--
+  The 2-shard, 1-replica-per-shard cluster the issue #5 CI leg and
+  tests/live_cluster.rs render against. `internal_replication = true`
+  because the underlying tables are `Replicated*` (docs/schemas.md §7): the
+  Distributed layer must write each block to one replica and let
+  replication fan it out, never duplicate via the Distributed layer itself.
+  Shared verbatim across both ClickHouse nodes so both see the identical
+  cluster topology.
+
+  Replica hosts are the fixture's static `ipv4_address`es (compose.yaml,
+  172.28.0.0/24) — KISS directive on issue #5: no DNS aliases, no
+  service-name resolution anywhere in this fixture.
+-->
+<clickhouse>
+    <remote_servers>
+        <pulsus_test_cluster>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.11</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.12</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </pulsus_test_cluster>
+    </remote_servers>
+</clickhouse>

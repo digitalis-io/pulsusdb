@@ -11,4 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
+pulsus-schema = { path = "../pulsus-schema" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
