@@ -57,6 +57,7 @@ jobs:
       - name: Start ClickHouse 24.8
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
+            -v $GITHUB_WORKSPACE/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
             clickhouse/clickhouse-server:24.8
           for i in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
@@ -93,6 +94,7 @@ jobs:
       - name: Start ClickHouse 24.3 (below the minimum supported version)
         run: |
           docker run -d --name pulsus-ch-schema-it-old -p 19124:8123 -p 19001:9000 \
+            -v $GITHUB_WORKSPACE/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
             clickhouse/clickhouse-server:24.3
           for i in $(seq 1 30); do
             curl -sf http://localhost:19124/ping && break
