@@ -538,7 +538,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, and each shard's stage-3 read is against its own streams |
 | `trace_spans`, `trace_attrs_idx` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections and trace assembly are shard-local |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
-| `rules`, catalogs, bookkeeping | (replicated to all shards, no Distributed writes) | tiny, read-everywhere |
+| `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 
 Fan-out analysis for the canonical operations:
 
