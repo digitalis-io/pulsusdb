@@ -257,11 +257,13 @@ Recording rules are evaluated on the poll interval; alerting rules are accepted 
 ## 7. Operational endpoints
 
 ```
-GET /ready        → 200 when ClickHouse reachable (+ label cache warm in reader mode); 503 otherwise
+GET /ready        → 200 when ClickHouse reachable (+ label cache warm in reader mode, from M2); 503 otherwise
 GET /metrics      → Prometheus exposition of PulsusDB internals
 GET /config       → effective configuration, secrets redacted
 GET /buildinfo    → {"version","revision","builtAt","rustc"}
 ```
+
+When basic auth is enabled, `/ready` and `/metrics` remain **unauthenticated** (liveness probes and metric scrapers must work without credentials); `/config`, `/buildinfo`, and every data-plane route require auth.
 
 ---
 
