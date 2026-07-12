@@ -7,7 +7,7 @@
 //! 2).
 
 use crate::error::ConfigError;
-use crate::model::Config;
+use crate::model::{ChProto, Config};
 use crate::units::{ByteSize, HumanDuration};
 
 fn value_err(field: &str, msg: &str, expected: &str) -> ConfigError {
@@ -62,6 +62,20 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 10: at least one ClickHouse connection per process.
     if cfg.clickhouse.pool_size < 1 {
         return Err(value_err("clickhouse.pool_size", "must be >= 1", ">= 1"));
+    }
+
+    // Rule 11: `native` is a reserved variant, not an accepted transport —
+    // the M0 spike selected the HTTP-only `clickhouse` crate
+    // (docs/decisions/0001-clickhouse-client.md, "ADR 0001"), which
+    // `pulsus-clickhouse::ChConnConfig::validate` also rejects with the
+    // same wording (issue #3 fix plan, finding 3).
+    if cfg.clickhouse.proto == ChProto::Native {
+        return Err(value_err(
+            "clickhouse.proto",
+            "native transport is not supported: the M0 client is HTTP-only \
+             (docs/decisions/0001-clickhouse-client.md, ADR 0001)",
+            "http | https",
+        ));
     }
 
     // Rule 12: one-sided basic auth is a hard startup error (fail closed).
@@ -254,6 +268,31 @@ mod tests {
         let mut cfg = Config::default();
         cfg.clickhouse.pool_size = 0;
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn native_clickhouse_proto_is_rejected_citing_adr_0001() {
+        let mut cfg = Config::default();
+        cfg.clickhouse.proto = ChProto::Native;
+        let err = validate(&cfg).expect_err("native must be rejected at startup");
+        match &err {
+            ConfigError::Value { field, msg, .. } => {
+                assert_eq!(field, "clickhouse.proto");
+                assert!(
+                    msg.contains("ADR 0001"),
+                    "error must cite ADR 0001, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_config_proto_is_http_and_passes_validation() {
+        // The default deployment (docs/configuration.md §2) must be
+        // startup-valid: `native` is rejected, but the default is `Http`.
+        assert_eq!(Config::default().clickhouse.proto, ChProto::Http);
+        assert!(validate(&Config::default()).is_ok());
     }
 
     #[test]

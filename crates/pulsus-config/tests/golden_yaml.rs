@@ -37,7 +37,7 @@ clickhouse:
   http_port: 8123
   database: pulsus
   auth: "default:"               # user:password, split on first colon; password is secret
-  proto: native                  # native | http | https
+  proto: http                     # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
   pool_size: 8
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "xtask"]
 
 [workspace.package]
 edition = "2024"
@@ -14,3 +14,15 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
+futures = "0.3"
+
+# Winner of the M0 ClickHouse client spike (docs/decisions/0001-clickhouse-client.md):
+# `clickhouse` (HTTP + RowBinary) — highest bulk insert throughput on both
+# documented row shapes, and its own HTTP transport handles DDL/MV/backfill
+# reliably, so a single crate suffices (no native-protocol client shipped).
+clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots", "futures03"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }

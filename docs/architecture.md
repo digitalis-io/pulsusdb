@@ -32,7 +32,7 @@ pulsusdb/
 │   ├── pulsus-server/         # binary: CLI, mode dispatch, router assembly
 │   ├── pulsus-config/         # typed configuration: env/YAML load, validation, redaction
 │   ├── pulsus-model/          # labels, fingerprints, samples, series, time types
-│   ├── pulsus-clickhouse/     # client pool (native protocol), columnar insert buffers
+│   ├── pulsus-clickhouse/     # client pool + columnar insert buffers (ADR 0001)
 │   ├── pulsus-schema/         # DDL templates, migrations, TTL rotation, MV lifecycle
 │   ├── pulsus-write/          # ingestion protocol parsers + insert services
 │   ├── pulsus-read/           # query HTTP APIs, response encoders, live tail
@@ -48,7 +48,7 @@ pulsusdb/
 | Concern | Choice |
 |---------|--------|
 | Async runtime / HTTP | `tokio`, `axum` (WebSocket via `axum::extract::ws`), `tower` middleware |
-| ClickHouse client | `clickhouse` (HTTP + RowBinary) vs `klickhouse` (native TCP) — benchmark both in M0; requirement is columnar block inserts and streaming reads |
+| ClickHouse client | **`clickhouse`** (HTTP + RowBinary) — chosen in M0 (spike: [ADR 0001](decisions/0001-clickhouse-client.md)). Bulk insert 0.86M rows/s (log) / 0.39M rows/s (metric), streaming fetch 0.25M rows/s at bounded RSS; round-trips `UInt64` fingerprints (>2^63) and `SimpleAggregateFunction`/`AggregateFunction` states correctly. `klickhouse` (native TCP) rejected on insert throughput (46–53% slower on both row shapes) despite passing every correctness/DDL gate. Fallback: `klickhouse`, already proven correct and DDL-capable in the spike; the wrapper's public API (`ChConnConfig`/`ChPool`/`ChClient`/`ChError`) is crate-agnostic so swapping is an internals-only change |
 | Protobuf | `prost` (remote write `prompb`, OTLP via `opentelemetry-proto` — incl. the profiles signal, `pprof`) |
 | Compression | `snap` (snappy for remote write/OTLP), `flate2` (gzip), `lz4_flex` |
 | Hashing | `xxhash-rust` (metric fingerprints), `cityhasher` (log/trace fingerprints — must equal ClickHouse `cityHash64`) |

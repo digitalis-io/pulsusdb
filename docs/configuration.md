@@ -20,10 +20,11 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLICKHOUSE_SERVER` | `localhost` | host |
-| `CLICKHOUSE_PORT` | `9000` | native protocol port (HTTP port derived or set via `CLICKHOUSE_HTTP_PORT`, default `8123`) |
+| `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)) |
+| `CLICKHOUSE_PORT` | `9000` | native-protocol port; reserved for the documented fallback client, unused by the current transport |
 | `CLICKHOUSE_DB` | `pulsus` | database (created by `init`/startup unless `PULSUS_SKIP_DDL=1`) |
+| `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001 |
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
-| `CLICKHOUSE_PROTO` | `native` | `native` \| `http` \| `https` (TLS to ClickHouse) |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process |
 
@@ -143,7 +144,7 @@ clickhouse:
   http_port: 8123
   database: pulsus
   auth: "default:"               # user:password, split on first colon; password is secret
-  proto: native                  # native | http | https
+  proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
   pool_size: 8
 

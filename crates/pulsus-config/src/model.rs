@@ -119,7 +119,7 @@ impl Default for ClickHouseConfig {
             http_port: 8_123,
             database: "pulsus".to_string(),
             auth: ChAuth::default(),
-            proto: ChProto::Native,
+            proto: ChProto::default(),
             tls_skip_verify: false,
             pool_size: 8,
         }
@@ -290,8 +290,8 @@ impl std::str::FromStr for LogLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChProto {
-    #[default]
     Native,
+    #[default]
     Http,
     Https,
 }

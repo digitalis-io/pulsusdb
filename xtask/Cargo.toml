@@ -1,0 +1,28 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# xtask is a benchmark/regression harness, not part of the shipping build
+# graph. It is the only crate in the workspace allowed to depend on both
+# ClickHouse client candidates at once (docs/decisions/0001-clickhouse-client.md).
+[dependencies]
+clap.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json = "1"
+anyhow = "1"
+rand = "0.8"
+
+clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots"] }
+klickhouse = { version = "0.15", features = ["tls"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+tokio-rustls = "0.26"
+hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+rustls-pemfile = "2"
