@@ -88,6 +88,12 @@ If a finding depends on the design docs, cite the specific document and section.
 
 You will be given GitHub issue context below.
 
+Brevity rules for your output — it is posted directly as an issue comment:
+- Never reproduce the rubric, the prompt, the issue body, or the code/config you were given. Cite `file:line` instead of pasting.
+- Code excerpts only when a finding is incomprehensible without one, and never more than 5 lines.
+- Each finding field is one line; evidence at most three.
+- In the checks sections, list only entries that have issues; if none, write the single line `- all ok`.
+
 Output EXACTLY in this format:
 
 VERDICT: PASS|FAIL
@@ -106,22 +112,12 @@ FINDINGS:
 - none
 
 RUST-SPECIFIC CHECKS:
-- ownership/borrowing: <issues or "ok">
-- async/concurrency: <issues or "ok">
-- error handling: <issues or "ok">
-- panic safety: <issues or "ok">
-- unsafe/soundness: <issues or "ok">
-- traits/types/api design: <issues or "ok">
+- <only entries with issues, from: ownership/borrowing, async/concurrency, error handling, panic safety, unsafe/soundness, traits/types/api design>
+- if none: - all ok
 
 PLATFORM-SPECIFIC CHECKS:
-- design-doc conformance: <issues or "ok">
-- schema/DDL correctness: <issues or "ok">
-- fingerprint/label invariants: <issues or "ok">
-- generated SQL / index engagement: <issues or "ok">
-- query-language semantics: <issues or "ok">
-- ingestion atomicity/backpressure: <issues or "ok">
-- wire-format compatibility: <issues or "ok">
-- configuration contract: <issues or "ok">
+- <only entries with issues, from: design-doc conformance, schema/DDL correctness, fingerprint/label invariants, generated SQL/index engagement, query-language semantics, ingestion atomicity/backpressure, wire-format compatibility, configuration contract>
+- if none: - all ok
 
 TEST GAPS:
 - <item>
