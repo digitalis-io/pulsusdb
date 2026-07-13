@@ -22,10 +22,10 @@ use crate::render::RenderCtx;
 /// shutdown should `handle.abort()` the returned handle from their own
 /// shutdown path.
 ///
-/// A failed tick is logged to stderr and does not stop the loop: TTL
-/// reapplication is best-effort background maintenance, and one transient
-/// ClickHouse error must not silently disable rotation until the next
-/// process restart.
+/// A failed tick is logged via `tracing::warn!` and does not stop the loop:
+/// TTL reapplication is best-effort background maintenance, and one
+/// transient ClickHouse error must not silently disable rotation until the
+/// next process restart.
 pub fn spawn_rotation(
     client: Arc<ChClient>,
     ctx: RenderCtx,
@@ -37,7 +37,7 @@ pub fn spawn_rotation(
         loop {
             interval.tick().await;
             if let Err(err) = apply_ttl(&client, &ctx).await {
-                eprintln!("pulsus-schema: rotation: failed to reapply TTL: {err}");
+                tracing::warn!("pulsus-schema: rotation: failed to reapply TTL: {err}");
             }
         }
     })

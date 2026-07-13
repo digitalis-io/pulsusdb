@@ -14,8 +14,21 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "signal"] }
 futures = "0.3"
+
+# HTTP server stack (issue #6): axum/tower/tower-http for the router and its
+# middleware layers, tracing/tracing-subscriber for structured logging driven
+# by `PULSUS_LOG_LEVEL`, and the `metrics` facade + Prometheus exporter (not
+# the bare `prometheus` crate) so every crate can emit via
+# `metrics::counter!`/`histogram!` without depending on the server's registry.
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace", "timeout", "validate-request"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
 
 # Winner of the M0 ClickHouse client spike (docs/decisions/0001-clickhouse-client.md):
 # `clickhouse` (HTTP + RowBinary) — highest bulk insert throughput on both

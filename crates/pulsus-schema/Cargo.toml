@@ -10,6 +10,7 @@ clickhouse.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "rt"] }
+tracing.workspace = true
 xxhash-rust.workspace = true
 serde.workspace = true
 futures.workspace = true

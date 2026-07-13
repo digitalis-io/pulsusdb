@@ -271,7 +271,7 @@ async fn list_tables_with_prefix(
 /// Pure "who to warn about" decision: given every `log_metrics_*` name in
 /// `system.tables` and the currently-resolved `keep` name, returns the ones
 /// of the same `kind` that are orphaned (present, not `keep`). Split out
-/// from the live `eprintln!` wrapper below so the selection logic is
+/// from the live `tracing::warn!` wrapper below so the selection logic is
 /// unit-tested without a live server.
 fn orphaned_rollup_siblings<'a>(
     siblings: &'a [String],
@@ -285,12 +285,12 @@ fn orphaned_rollup_siblings<'a>(
         .collect()
 }
 
-/// Warns (`eprintln!`; matches the crate's existing style — migrates to
-/// `tracing` when #6 lands the subscriber, per task-manager resolution on
-/// issue #5) about any `log_metrics_*` object of `kind` left behind by a
-/// prior `PULSUS_LOG_ROLLUP_RESOLUTION` value. Data objects are never
-/// auto-dropped (issue #5 fix plan F1) — this is purely an operator-visible
-/// heads-up so orphaned storage doesn't go unnoticed.
+/// Warns (`tracing::warn!`, migrated from `eprintln!` now that issue #6 has
+/// wired the subscriber, per task-manager resolution on issue #5) about any
+/// `log_metrics_*` object of `kind` left behind by a prior
+/// `PULSUS_LOG_ROLLUP_RESOLUTION` value. Data objects are never auto-dropped
+/// (issue #5 fix plan F1) — this is purely an operator-visible heads-up so
+/// orphaned storage doesn't go unnoticed.
 async fn warn_orphaned_rollup_siblings(
     client: &ChClient,
     ctx: &RenderCtx,
@@ -299,7 +299,7 @@ async fn warn_orphaned_rollup_siblings(
 ) -> Result<(), SchemaError> {
     let siblings = list_tables_with_prefix(client, ctx, "log_metrics_").await?;
     for sibling in orphaned_rollup_siblings(&siblings, keep, kind) {
-        eprintln!(
+        tracing::warn!(
             "pulsus-schema: orphaned {} {}.{sibling} left in place after a \
              PULSUS_LOG_ROLLUP_RESOLUTION change (current is {}.{keep}); data is retained, not \
              auto-dropped",
