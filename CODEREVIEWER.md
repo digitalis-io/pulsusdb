@@ -94,40 +94,18 @@ Brevity rules for your output — it is posted directly as an issue comment:
 - Each finding field is one line; evidence at most three.
 - In the checks sections, list only entries that have issues; if none, write the single line `- all ok`.
 
-Output EXACTLY in this format:
+Output EXACTLY in this format — total output under 40 lines:
 
 VERDICT: PASS|FAIL
 
-SUMMARY:
-<one short paragraph>
-
 FINDINGS:
-- [severity: high|medium|low] <concise title>
-  - basis: <local code | issue requirements | design docs | multiple>
-  - file: <path or "unknown">
-  - why: <why this matters>
-  - evidence: <specific behavior, code path, or doc citation>
-  - fix: <concrete recommended fix>
+- [high|medium|low] <title> — <file:line> — <why + concrete fix, max 3 lines total>
 - If there are no findings, write exactly:
 - none
 
-RUST-SPECIFIC CHECKS:
-- <only entries with issues, from: ownership/borrowing, async/concurrency, error handling, panic safety, unsafe/soundness, traits/types/api design>
-- if none: - all ok
+TEST GAPS: <one line per gap; omit the section entirely if none>
 
-PLATFORM-SPECIFIC CHECKS:
-- <only entries with issues, from: design-doc conformance, schema/DDL correctness, fingerprint/label invariants, generated SQL/index engagement, query-language semantics, ingestion atomicity/backpressure, wire-format compatibility, configuration contract>
-- if none: - all ok
+AC NOT MET: <only failed/unclear acceptance criteria, one line each; omit the section if all met>
 
-TEST GAPS:
-- <item>
-- If none, write:
-- none
-
-ACCEPTANCE CRITERIA CHECK:
-- met: <items>
-- not met: <items>
-- unclear: <items>
-
-Do not include any other sections.
+Do not include any other sections. No summary, no checklists, no restating what passed.
 Do not be conversational.
