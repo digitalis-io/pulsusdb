@@ -166,3 +166,60 @@ jobs:
       - name: Tear down the cluster
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v
+
+  # Issue #7: e2e harness skeleton. Both legs build the local `pulsusdb:e2e`
+  # image once via buildx (GHA layer cache, so the image build itself is
+  # fast on both legs) then hand the whole stack lifecycle — up, poll
+  # `/ready`, run scenarios, down — to `pulsus-e2e`, the same binary local
+  # development runs against Podman.
+  e2e-single:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build pulsusdb:e2e
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: pulsusdb:e2e
+          load: true
+          cache-from: type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+
+      - name: Run the single-node e2e harness
+        run: cargo run -p pulsus-e2e -- --variant single --engine docker
+
+  e2e-cluster:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build pulsusdb:e2e
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: pulsusdb:e2e
+          load: true
+          cache-from: type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+
+      - name: Run the 2-shard cluster e2e harness
+        run: cargo run -p pulsus-e2e -- --variant cluster --engine docker

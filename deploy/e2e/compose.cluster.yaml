@@ -1,0 +1,57 @@
+# e2e cluster overlay (issue #7) on top of issue #5's
+# `ci/clickhouse-cluster/compose.yaml` (2-shard ClickHouse + Keeper,
+# `pulsus_test_cluster`): adds `pulsusdb` (built from source, `PULSUS_CLUSTER`
+# set so its schema controller runs `ON CLUSTER` DDL) and an `otel-collector`,
+# neither of which the base fixture defines — no ClickHouse/Keeper
+# duplication. Both new services join the base fixture's fixed
+# `pulsus-schema-it` network with their own static `ipv4_address`
+# (172.28.0.0/24 — KISS directive on issue #5: no DNS aliases anywhere in
+# this fixture); only pulsusdb's `:3100` is published on the host, per the
+# architect plan's port-collision note (CH/Keeper stay internal here).
+#
+# `${PULSUS_E2E_ROOT}` is set by the harness (`e2e/src/engine.rs`) to the
+# repository root, so `build.context` and the collector config mount
+# resolve correctly regardless of which compose file in the `-f` list a
+# given runtime treats as the base for relative paths.
+#
+# Used by `cargo run -p pulsus-e2e -- --variant cluster`; driven directly:
+#   podman-compose -f ci/clickhouse-cluster/compose.yaml -f deploy/e2e/compose.cluster.yaml -p pulsus-e2e-cluster up -d
+#   # or: docker compose -f ci/clickhouse-cluster/compose.yaml -f deploy/e2e/compose.cluster.yaml -p pulsus-e2e-cluster up -d
+version: "3.8"
+
+services:
+  pulsusdb:
+    build:
+      context: ${PULSUS_E2E_ROOT}
+    image: pulsusdb:e2e
+    networks:
+      pulsus-schema-it:
+        ipv4_address: 172.28.0.20
+    environment:
+      CLICKHOUSE_SERVER: "172.28.0.11" # ch-shard1's static ipv4_address
+      PULSUS_CLUSTER: pulsus_test_cluster
+      PULSUS_RETENTION_DAYS: "7"
+    # Plain start-order form, not `condition: service_healthy` — the
+    # harness polls `/ready` itself rather than trusting compose's health
+    # condition, whose semantics (and, on older Podman, reliability) differ
+    # across implementations (architect plan edge case).
+    depends_on: [ ch-shard1, ch-shard2 ]
+    ports: [ "3100:3100" ]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3100/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    networks:
+      pulsus-schema-it:
+        ipv4_address: 172.28.0.21
+    # An e2e-only config whose exporter targets `pulsusdb`'s static
+    # ipv4_address (172.28.0.20) above, not a DNS hostname — the
+    # collector's outbound target must avoid inter-container DNS exactly
+    # like every other service on this network (review fix).
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/otel-config.cluster.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on: [ pulsusdb ]

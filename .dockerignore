@@ -1,0 +1,13 @@
+# Keeps the build context small and reproducible (not itself in the
+# architect plan's file list, but required for the Dockerfile's
+# `COPY . .` to be workable at all — `target/` alone is several GB).
+/target
+/e2e/target
+/xtask/target
+.git
+.github
+.agents
+.claude
+.codex
+docs
+plans

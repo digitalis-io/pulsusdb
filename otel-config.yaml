@@ -1,0 +1,17 @@
+# PulsusDB quickstart (docs/configuration.md §10) — the collector receives
+# OTLP from your applications and pushes everything to PulsusDB. Verbatim
+# mirror of the doc's YAML; mounted read-only by `docker-compose.yaml`.
+receivers:
+  otlp:
+    protocols: { grpc: {}, http: {} }
+
+exporters:
+  otlphttp:
+    endpoint: http://pulsusdb:3100
+
+service:
+  pipelines:
+    logs:    { receivers: [otlp], exporters: [otlphttp] }
+    metrics: { receivers: [otlp], exporters: [otlphttp] }
+    traces:  { receivers: [otlp], exporters: [otlphttp] }
+    # profiles pipeline requires a collector build with the experimental profiles signal

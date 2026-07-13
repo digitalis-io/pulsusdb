@@ -1,0 +1,73 @@
+# e2e single-node override (issue #7) on the root `docker-compose.yaml`
+# quickstart: builds `pulsusdb` from source (local `pulsusdb:e2e` tag)
+# instead of pulling the not-yet-published `ghcr.io` image, adds a `/ready`
+# healthcheck, and puts every service on a fixed-subnet network with a
+# static `ipv4_address` each (KISS directive, same convention as issue #5's
+# `ci/clickhouse-cluster/compose.yaml`) — `pulsusdb` reaches ClickHouse by
+# that static IP (`CLICKHOUSE_SERVER` below), not the base file's
+# `clickhouse` DNS hostname, so the stack does not depend on inter-container
+# DNS resolution working under every compose implementation.
+#
+# `${PULSUS_E2E_ROOT}` is set by the harness (`e2e/src/engine.rs`) to the
+# repository root, so `build.context` resolves correctly regardless of
+# which compose file in the `-f` list a given runtime treats as the base
+# for relative paths.
+#
+# Used by `cargo run -p pulsus-e2e -- --variant single`; driven directly:
+#   podman-compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -p pulsus-e2e-single up -d
+#   # or: docker compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -p pulsus-e2e-single up -d
+version: "3.8"
+
+networks:
+  pulsus-e2e-single:
+    name: pulsus-e2e-single
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+services:
+  clickhouse:
+    # The official image restricts the passwordless `default` user to
+    # `127.0.0.1`/`::1` whenever neither `CLICKHOUSE_USER` nor
+    # `CLICKHOUSE_PASSWORD` is set, which also blocks `pulsusdb`'s own
+    # container-to-container connection — same fixture, same fix issue #5
+    # already applies for the schema-it CI legs.
+    volumes:
+      - ${PULSUS_E2E_ROOT}/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.10
+
+  pulsusdb:
+    build:
+      context: ${PULSUS_E2E_ROOT}
+    image: pulsusdb:e2e
+    environment:
+      CLICKHOUSE_SERVER: "172.29.0.10" # the `clickhouse` service's static ipv4_address, not its DNS name
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.11
+    # Plain start-order form, replacing the base file's
+    # `condition: service_healthy` — the harness polls `/ready` itself
+    # rather than trusting compose's health condition, whose semantics
+    # (and, on older Podman, reliability) differ across implementations
+    # (architect plan edge case).
+    depends_on: [ clickhouse ]
+    ports: [ "3100:3100" ]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3100/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  otel-collector:
+    # Overrides the base file's `./otel-config.yaml` mount (whose exporter
+    # targets the `pulsusdb` DNS hostname) with an e2e-only config whose
+    # exporter targets `pulsusdb`'s static ipv4_address (172.29.0.11) below
+    # — the collector's outbound target must avoid inter-container DNS
+    # exactly like every other service on this network (review fix).
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/otel-config.single.yaml:/etc/otelcol-contrib/config.yaml:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.12

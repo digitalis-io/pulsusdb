@@ -1,0 +1,20 @@
+# e2e single-node otel-collector config (issue #7 review fix): identical to
+# the root `otel-config.yaml` except the exporter target is `pulsusdb`'s
+# static `ipv4_address` for this variant (deploy/e2e/compose.single.yaml,
+# 172.29.0.11), not its DNS hostname — the whole point of this overlay's
+# static-IP network is that no inter-container hostname resolution is
+# required, and that must hold for the collector's outbound target too.
+receivers:
+  otlp:
+    protocols: { grpc: {}, http: {} }
+
+exporters:
+  otlphttp:
+    endpoint: http://172.29.0.11:3100
+
+service:
+  pipelines:
+    logs:    { receivers: [otlp], exporters: [otlphttp] }
+    metrics: { receivers: [otlp], exporters: [otlphttp] }
+    traces:  { receivers: [otlp], exporters: [otlphttp] }
+    # profiles pipeline requires a collector build with the experimental profiles signal

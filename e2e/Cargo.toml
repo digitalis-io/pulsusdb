@@ -1,0 +1,24 @@
+[package]
+name = "pulsus-e2e"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Dedicated e2e-harness binary (issue #7 architect plan), top-level like
+# `xtask/` to signal tooling rather than the shipping build graph. Owns the
+# compose stack lifecycle (up -> poll `/ready` -> run scenarios -> down)
+# for the single-node and 2-shard cluster variants. Talks HTTP to
+# `pulsusdb` only — no ClickHouse client dependency, unlike `xtask` (which
+# is pinned to the dual-client benchmark role, docs/decisions/0001).
+[[bin]]
+name = "pulsus-e2e"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

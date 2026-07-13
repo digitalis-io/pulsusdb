@@ -1,0 +1,37 @@
+# PulsusDB quickstart (docs/configuration.md §10): ClickHouse + pulsusdb +
+# an OTel Collector, wired exactly as documented — a verbatim mirror of the
+# doc's YAML, kept unchanged by tests. The e2e harness (issue #7,
+# `cargo run -p pulsus-e2e`) never edits this file; its single-node variant
+# layers `deploy/e2e/compose.single.yaml` on top to build `pulsusdb` from
+# source instead of pulling the not-yet-published `ghcr.io` image.
+#
+# Bring up:
+#   podman-compose up -d
+#   # or: docker compose up -d
+version: "3.8"
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    volumes: [ clickhouse-data:/var/lib/clickhouse ]
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+
+  pulsusdb:
+    image: ghcr.io/pulsusdb/pulsusdb:latest
+    environment:
+      CLICKHOUSE_SERVER: clickhouse
+      PULSUS_RETENTION_DAYS: "7"
+    ports: [ "3100:3100" ]
+    depends_on:
+      clickhouse: { condition: service_healthy }
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes: [ ./otel-config.yaml:/etc/otelcol-contrib/config.yaml ]
+    ports: [ "4317:4317", "4318:4318" ]
+    depends_on: [ pulsusdb ]
+
+volumes:
+  clickhouse-data:
