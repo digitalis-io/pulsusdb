@@ -56,3 +56,31 @@ hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ch_cityhash102 = "0.1"
 serde_json = "1"
+
+# OTLP logs receiver (issue #8). `opentelemetry-proto` supplies
+# `prost`-generated OTLP message types with the transport/tonic runtime
+# disabled (`default-features = false`, `gen-tonic-messages` + `logs`
+# only) — no protoc in CI, no gRPC transport pulled in for what is a pure
+# protobuf-decode + axum handler. Exact-pinned so a future
+# `opentelemetry-proto` release cannot silently change wire-compatible
+# message shapes underfoot; revisit vendoring only if version churn
+# becomes a real problem (open question #1, resolved by task-manager).
+# `bytes` and `prost` are `opentelemetry-proto`'s own message/codec types
+# and this crate's own request-body buffer. `flate2`/`snap`/`zstd` back
+# the hand-rolled gzip/snappy/zstd decompressors in
+# `pulsus-write::ingest::decompress` — tower-http's compression layer
+# covers gzip only, not snappy.
+opentelemetry-proto = { version = "=0.32.0", default-features = false, features = [
+    "gen-tonic-messages",
+    "logs",
+] }
+prost = "0.14"
+bytes = "1"
+flate2 = "1"
+snap = "1"
+zstd = "0.13"
+# Plan amendment 3 (#8 code review): reads/caps the `/v1/logs` request body
+# inside the handler via `BodyExt::frame`, bypassing axum's `DefaultBodyLimit`
+# so the documented 64 MiB decompressed-size cap (not axum's 2 MiB default)
+# is the sole bound. Already resolved in `Cargo.lock` via axum's own tree.
+http-body-util = "0.1"

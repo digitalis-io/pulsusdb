@@ -15,7 +15,7 @@ pub use fingerprint::{
 };
 pub use labels::{LabelError, LabelSet};
 pub use sample::{LogSample, MetricSample, Series};
-pub use time::{Fingerprint, UnixMilli, UnixNano};
+pub use time::{Date, Fingerprint, UnixMilli, UnixNano};
 
 #[cfg(test)]
 mod tests {
