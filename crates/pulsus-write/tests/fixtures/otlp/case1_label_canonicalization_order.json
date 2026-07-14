@@ -1,0 +1,29 @@
+{
+  "resource_attributes": [
+    ["k8s.pod.name", "pod-9"],
+    ["service.name", "orders"],
+    ["deployment.environment", "prod"]
+  ],
+  "scope_name": "orders-scope",
+  "scope_version": "2.1.0",
+  "scope_attributes": [],
+  "time_unix_nano_offset_ns": -3600000000000,
+  "observed_time_unix_nano_offset_ns": null,
+  "severity_number": 9,
+  "body": "order placed",
+  "golden": {
+    "service": "orders",
+    "labels_json": "{\"deployment_environment\":\"prod\",\"k8s_pod_name\":\"pod-9\",\"otel_scope_name\":\"orders-scope\",\"otel_scope_version\":\"2.1.0\",\"service_name\":\"orders\"}",
+    "fingerprint": 11637247895724104092,
+    "body": "order placed",
+    "severity": 9,
+    "timestamp_source": "time_unix_nano",
+    "idx_pairs": [
+      ["deployment_environment", "prod"],
+      ["k8s_pod_name", "pod-9"],
+      ["otel_scope_name", "orders-scope"],
+      ["otel_scope_version", "2.1.0"],
+      ["service_name", "orders"]
+    ]
+  }
+}

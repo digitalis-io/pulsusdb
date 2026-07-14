@@ -26,3 +26,14 @@ tokio-rustls = "0.26"
 hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 rustls-pemfile = "2"
+
+# `bench logs-read` (issue #16): the M1 logs read-path benchmark harness
+# must run the product's own planner-generated SQL and product
+# fingerprinting/DDL, not hand-written benchmark SQL or a re-derived
+# schema — justifying xtask's dependency on these product crates alongside
+# the two ClickHouse client candidates above.
+pulsus-clickhouse = { path = "../crates/pulsus-clickhouse" }
+pulsus-model = { path = "../crates/pulsus-model" }
+pulsus-logql = { path = "../crates/pulsus-logql" }
+pulsus-read = { path = "../crates/pulsus-read" }
+pulsus-schema = { path = "../crates/pulsus-schema" }

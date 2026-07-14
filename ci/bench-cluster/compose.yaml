@@ -1,0 +1,164 @@
+# 4-shard / 1-replica-per-shard ClickHouse cluster + a single-node
+# clickhouse-keeper, for the issue #16 `xtask bench logs-read --dist`
+# fixture: per-shard `system.query_log` + `EXPLAIN PIPELINE` evidence for
+# the shard-locality claims (docs/schemas.md §7). Extends
+# ci/clickhouse-cluster/compose.yaml's 2-shard pattern to 4 shards — the
+# claim under test is shard-local fan-out under `fingerprint` sharding,
+# which needs more than 2 shards to be a meaningful signal (task-manager
+# resolution #1 on issue #16). Manual-dispatch-only (`.github/workflows/
+# ci.yml`'s `bench-cluster` job): the scale-invariant gates run per-PR on
+# single-node (`crates/pulsus-read/tests/query_log_gates.rs`); this leg is
+# evidence-gathering, not per-PR protection.
+#
+# Runtime-neutral: works with either `docker compose` or `podman-compose`
+# (podman's CLI is docker-compatible), matching
+# `xtask/docker/docker-compose.ch.yml` / `ci/clickhouse-cluster/
+# compose.yaml`'s existing convention. CI uses the runner's docker; local
+# runs use podman.
+#
+# Bring up:
+#   podman-compose -f ci/bench-cluster/compose.yaml up -d
+#   # or: docker compose -f ci/bench-cluster/compose.yaml up -d
+#
+# Tear down:
+#   podman-compose -f ci/bench-cluster/compose.yaml down -v
+#
+# Run the benchmark against it:
+#   cargo run -p xtask -- bench logs-read --dist \
+#       --http-url http://127.0.0.1:18123 --database pulsus_bench \
+#       --cluster pulsus_bench_cluster \
+#       --profile ci --out docs/benchmarks/data/logs-read-dist.json
+version: "3.8"
+
+# Fixed, user-defined subnet with a static `ipv4_address` per container
+# (KISS directive, carried forward from issue #5): every config file here
+# — `remote_servers`, Keeper's `<zookeeper>` block, `interserver_http_host`
+# — addresses the other nodes purely by these IPs. No DNS aliases, no
+# service-name resolution, anywhere in the fixture.
+networks:
+  pulsus-bench:
+    name: pulsus-bench-cluster
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+services:
+  keeper:
+    image: docker.io/clickhouse/clickhouse-keeper:24.8
+    container_name: pulsus-bench-keeper
+    networks:
+      pulsus-bench:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ./keeper/keeper_config.xml:/etc/clickhouse-keeper/keeper_config.xml:ro
+    ports:
+      - "19281:9181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ch-shard1:
+    image: docker.io/clickhouse/clickhouse-server:24.8
+    container_name: pulsus-bench-shard1
+    networks:
+      pulsus-bench:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      - keeper
+    volumes:
+      - ./config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
+      - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+      - ./shard1/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    ports:
+      - "18123:8123" # HTTP
+      - "19010:9000" # native
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  ch-shard2:
+    image: docker.io/clickhouse/clickhouse-server:24.8
+    container_name: pulsus-bench-shard2
+    networks:
+      pulsus-bench:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      - keeper
+    volumes:
+      - ./config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
+      - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+      - ./shard2/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    ports:
+      - "28123:8123"
+      - "29000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  ch-shard3:
+    image: docker.io/clickhouse/clickhouse-server:24.8
+    container_name: pulsus-bench-shard3
+    networks:
+      pulsus-bench:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      - keeper
+    volumes:
+      - ./config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
+      - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+      - ./shard3/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    ports:
+      - "38123:8123"
+      - "39000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  ch-shard4:
+    image: docker.io/clickhouse/clickhouse-server:24.8
+    container_name: pulsus-bench-shard4
+    networks:
+      pulsus-bench:
+        ipv4_address: 172.28.0.14
+    depends_on:
+      - keeper
+    volumes:
+      - ./config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml:ro
+      - ./config.d/remote_servers.xml:/etc/clickhouse-server/config.d/remote_servers.xml:ro
+      - ./users.d/network.xml:/etc/clickhouse-server/users.d/network.xml:ro
+      - ./shard4/macros.xml:/etc/clickhouse-server/config.d/macros.xml:ro
+    ports:
+      - "48123:8123"
+      - "49000:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144

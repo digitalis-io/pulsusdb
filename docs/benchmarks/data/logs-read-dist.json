@@ -1,0 +1,781 @@
+{
+  "profile": "Ci",
+  "seed": 42,
+  "dist": true,
+  "cluster": "pulsus_bench_cluster",
+  "dataset": {
+    "total_rows": 720000,
+    "services": 50,
+    "streams": 500,
+    "needle_rows": 1426,
+    "start_ns": 1784021436057699271,
+    "end_ns": 1784025036057699271,
+    "load_elapsed_ms": 5647,
+    "canonical_service": "svc-000",
+    "canonical_env": "prod",
+    "canonical_fingerprint": 9358662146628073629
+  },
+  "queries": [
+    {
+      "name": "label_scoped_stream_read_6h",
+      "sql": "SELECT fingerprint, timestamp_ns, body\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 554447573062157008, 9358662146628073629, 12001626415738664362)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\nORDER BY timestamp_ns DESC\nLIMIT 100",
+      "wall_ms_p50": 77.699486,
+      "wall_ms_p95": 117.44993600000001,
+      "wall_ms_p99": 117.44993600000001,
+      "returned_rows": 100,
+      "read_rows": 106749,
+      "read_bytes": 18660923,
+      "selected_marks": 5,
+      "total_marks": 102,
+      "memory_usage": 9725890,
+      "query_duration_ms": 45,
+      "explain_indexes": [
+        "Expression (Project names)",
+        "  Limit (preliminary LIMIT (without OFFSET))",
+        "    Sorting (Merge sorted streams after aggregation stage for ORDER BY)",
+        "      Union",
+        "        Sorting (Sorting for ORDER BY)",
+        "          Expression ((Before ORDER BY + Projection))",
+        "            Filter ((WHERE + Change column names to column identifiers))",
+        "              ReadFromMergeTree (pulsus_bench_dist2.log_samples)",
+        "              Indexes:",
+        "                MinMax",
+        "                  Keys: ",
+        "                    timestamp_ns",
+        "                  Condition: and((timestamp_ns in (-Inf, 1784025036057699271]), (timestamp_ns in [1784021436057699272, +Inf)))",
+        "                  Parts: 3/3",
+        "                  Granules: 23/23",
+        "                Partition",
+        "                  Condition: true",
+        "                  Parts: 3/3",
+        "                  Granules: 23/23",
+        "                PrimaryKey",
+        "                  Keys: ",
+        "                    service",
+        "                    fingerprint",
+        "                    timestamp_ns",
+        "                  Condition: and(and((timestamp_ns in (-Inf, 1784025036057699271]), and((timestamp_ns in [1784021436057699272, +Inf)), (fingerprint in 2-element set))), (service in ['svc-000', 'svc-000']))",
+        "                  Parts: 3/3",
+        "                  Granules: 3/23",
+        "        ReadFromRemote (Read from remote replica)"
+      ],
+      "stage_evidence": [
+        {
+          "stage": "resolution",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 2000,
+              "read_bytes": 51725,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 384,
+              "read_bytes": 9938,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 536,
+              "read_bytes": 13867,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 572,
+              "read_bytes": 14797,
+              "selected_marks": 1,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform × 16",
+            "    (Filter)",
+            "    FilterTransform × 16",
+            "      (Aggregating)",
+            "      Resize 1 → 16",
+            "        AggregatingTransform",
+            "          (Expression)",
+            "          ExpressionTransform",
+            "            (Expression)",
+            "            ExpressionTransform",
+            "              (ReadFromMergeTree)",
+            "              MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "hydration",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 357,
+              "read_bytes": 36214,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 96,
+              "read_bytes": 9746,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 134,
+              "read_bytes": 13599,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "expected-pruned",
+              "read_rows": 0,
+              "read_bytes": 0,
+              "selected_marks": 0,
+              "pruned_reason": "optimize_skip_unused_shards pruned shard 4: none of the 4 queried fingerprints map to it (fingerprint % total_weight=4 over slots [0, 0, 1, 2] resolves to owning shards {1, 2, 3} — shard 4 is not among them)"
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform",
+            "    (Expression)",
+            "    ExpressionTransform",
+            "      (ReadFromMergeTree)",
+            "      MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "samples",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 104392,
+              "read_bytes": 18572984,
+              "selected_marks": 3,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 20224,
+              "read_bytes": 3598907,
+              "selected_marks": 3,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 62704,
+              "read_bytes": 11154320,
+              "selected_marks": 8,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "expected-pruned",
+              "read_rows": 0,
+              "read_bytes": 0,
+              "selected_marks": 0,
+              "pruned_reason": "optimize_skip_unused_shards pruned shard 4: none of the 4 queried fingerprints map to it (fingerprint % total_weight=4 over slots [0, 0, 1, 2] resolves to owning shards {1, 2, 3} — shard 4 is not among them)"
+            }
+          ],
+          "explain_pipeline": [
+            "(Expression)",
+            "ExpressionTransform",
+            "  (Limit)",
+            "  Limit",
+            "    (Sorting)",
+            "    MergingSortedTransform 3 → 1",
+            "      (Union)",
+            "        (Sorting)",
+            "        MergingSortedTransform 3 → 1",
+            "          MergeSortingTransform × 3",
+            "            LimitsCheckingTransform × 3",
+            "              PartialSortingTransform × 3",
+            "                (Expression)",
+            "                ExpressionTransform × 3",
+            "                  (Filter)",
+            "                  FilterTransform × 3",
+            "                    (ReadFromMergeTree)",
+            "                    MergeTreeSelect(pool: ReadPool, algorithm: Thread) × 3 0 → 1",
+            "        (ReadFromRemote)"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "body_search_24h",
+      "sql": "SELECT fingerprint, timestamp_ns, body\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 146776743113873368, 554447573062157008, 4822384909159605784, 12001626415738664362, 17259846748231831022, 2922370082508368009, 16688373275999325849, 10540492116184247601, 9358662146628073629)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\n  AND hasToken(body, 'xtaskneedle7c91a') AND position(body, 'xtaskneedle7c91a') > 0\nORDER BY timestamp_ns DESC\nLIMIT 1000",
+      "wall_ms_p50": 69.298845,
+      "wall_ms_p95": 72.466842,
+      "wall_ms_p99": 72.466842,
+      "returned_rows": 26,
+      "read_rows": 65789,
+      "read_bytes": 10347327,
+      "selected_marks": 5,
+      "total_marks": 102,
+      "memory_usage": 9727522,
+      "query_duration_ms": 31,
+      "explain_indexes": [
+        "Expression (Project names)",
+        "  Limit (preliminary LIMIT (without OFFSET))",
+        "    Sorting (Merge sorted streams after aggregation stage for ORDER BY)",
+        "      Union",
+        "        Sorting (Sorting for ORDER BY)",
+        "          Expression ((Before ORDER BY + Projection))",
+        "            Filter ((WHERE + Change column names to column identifiers))",
+        "              ReadFromMergeTree (pulsus_bench_dist2.log_samples)",
+        "              Indexes:",
+        "                MinMax",
+        "                  Keys: ",
+        "                    timestamp_ns",
+        "                  Condition: and((timestamp_ns in (-Inf, 1784025036057699271]), (timestamp_ns in [1784021436057699272, +Inf)))",
+        "                  Parts: 3/3",
+        "                  Granules: 23/23",
+        "                Partition",
+        "                  Condition: true",
+        "                  Parts: 3/3",
+        "                  Granules: 23/23",
+        "                PrimaryKey",
+        "                  Keys: ",
+        "                    service",
+        "                    fingerprint",
+        "                    timestamp_ns",
+        "                  Condition: and(and((timestamp_ns in (-Inf, 1784025036057699271]), and((timestamp_ns in [1784021436057699272, +Inf)), (fingerprint in 4-element set))), (service in ['svc-000', 'svc-000']))",
+        "                  Parts: 3/3",
+        "                  Granules: 3/23",
+        "                Skip",
+        "                  Name: idx_body_tokens",
+        "                  Description: tokenbf_v1 GRANULARITY 1",
+        "                  Parts: 3/3",
+        "                  Granules: 3/3",
+        "                Skip",
+        "                  Name: idx_body_ngrams",
+        "                  Description: ngrambf_v1 GRANULARITY 1",
+        "                  Parts: 3/3",
+        "                  Granules: 3/3",
+        "        ReadFromRemote (Read from remote replica)"
+      ],
+      "stage_evidence": [
+        {
+          "stage": "resolution",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 2000,
+              "read_bytes": 47149,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 384,
+              "read_bytes": 9938,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 536,
+              "read_bytes": 13867,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 572,
+              "read_bytes": 10221,
+              "selected_marks": 1,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform × 16",
+            "    (Filter)",
+            "    FilterTransform × 16",
+            "      (Aggregating)",
+            "      Resize 1 → 16",
+            "        AggregatingTransform",
+            "          (Expression)",
+            "          ExpressionTransform",
+            "            (Expression)",
+            "            ExpressionTransform",
+            "              (ReadFromMergeTree)",
+            "              MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "hydration",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 357,
+              "read_bytes": 36214,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 96,
+              "read_bytes": 9746,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 134,
+              "read_bytes": 13599,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "expected-pruned",
+              "read_rows": 0,
+              "read_bytes": 0,
+              "selected_marks": 0,
+              "pruned_reason": "optimize_skip_unused_shards pruned shard 4: none of the 10 queried fingerprints map to it (fingerprint % total_weight=4 over slots [0, 0, 0, 0, 2, 2, 1, 1, 1, 1] resolves to owning shards {1, 2, 3} — shard 4 is not among them)"
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform",
+            "    (Expression)",
+            "    ExpressionTransform",
+            "      (ReadFromMergeTree)",
+            "      MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "samples",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 63432,
+              "read_bytes": 10263964,
+              "selected_marks": 3,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 20224,
+              "read_bytes": 3598907,
+              "selected_marks": 3,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 21744,
+              "read_bytes": 2845300,
+              "selected_marks": 3,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "expected-pruned",
+              "read_rows": 0,
+              "read_bytes": 0,
+              "selected_marks": 0,
+              "pruned_reason": "optimize_skip_unused_shards pruned shard 4: none of the 10 queried fingerprints map to it (fingerprint % total_weight=4 over slots [0, 0, 0, 0, 2, 2, 1, 1, 1, 1] resolves to owning shards {1, 2, 3} — shard 4 is not among them)"
+            }
+          ],
+          "explain_pipeline": [
+            "(Expression)",
+            "ExpressionTransform",
+            "  (Limit)",
+            "  Limit",
+            "    (Sorting)",
+            "    MergingSortedTransform 3 → 1",
+            "      (Union)",
+            "        (Sorting)",
+            "        MergingSortedTransform 3 → 1",
+            "          MergeSortingTransform × 3",
+            "            LimitsCheckingTransform × 3",
+            "              PartialSortingTransform × 3",
+            "                (Expression)",
+            "                ExpressionTransform × 3",
+            "                  (Filter)",
+            "                  FilterTransform × 3",
+            "                    (ReadFromMergeTree)",
+            "                    MergeTreeSelect(pool: ReadPool, algorithm: Thread) × 3 0 → 1",
+            "        (ReadFromRemote)"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "label_series_discovery_7d",
+      "sql": "SELECT DISTINCT key AS name\nFROM log_streams_idx_dist\nWHERE month = '2026-07-01'\nORDER BY name",
+      "wall_ms_p50": 10.502393,
+      "wall_ms_p95": 12.06947,
+      "wall_ms_p99": 12.06947,
+      "returned_rows": 4,
+      "read_rows": 2000,
+      "read_bytes": 6000,
+      "selected_marks": 1,
+      "total_marks": 8,
+      "memory_usage": 4217888,
+      "query_duration_ms": 9,
+      "explain_indexes": [
+        "Expression (Project names)",
+        "  Distinct (DISTINCT)",
+        "    Sorting (Merge sorted streams for ORDER BY, without aggregation)",
+        "      Union",
+        "        Sorting (Sorting for ORDER BY)",
+        "          Expression (Before ORDER BY)",
+        "            Distinct (Preliminary DISTINCT)",
+        "              Expression (Projection)",
+        "                Expression",
+        "                  ReadFromMergeTree (pulsus_bench_dist2.log_streams_idx)",
+        "                  Indexes:",
+        "                    MinMax",
+        "                      Keys: ",
+        "                        month",
+        "                      Condition: (month in [20635, 20635])",
+        "                      Parts: 1/1",
+        "                      Granules: 1/1",
+        "                    Partition",
+        "                      Keys: ",
+        "                        month",
+        "                      Condition: (month in [20635, 20635])",
+        "                      Parts: 1/1",
+        "                      Granules: 1/1",
+        "                    PrimaryKey",
+        "                      Condition: true",
+        "                      Parts: 1/1",
+        "                      Granules: 1/1",
+        "        ReadFromRemote (Read from remote replica)"
+      ],
+      "stage_evidence": [
+        {
+          "stage": "discovery",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 2000,
+              "read_bytes": 6000,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 384,
+              "read_bytes": 1152,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 536,
+              "read_bytes": 1608,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 572,
+              "read_bytes": 1716,
+              "selected_marks": 1,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Expression)",
+            "ExpressionTransform",
+            "  (Distinct)",
+            "  DistinctSortedStreamTransform",
+            "    (Sorting)",
+            "    MergingSortedTransform 4 → 1",
+            "      (Union)",
+            "        (Sorting)",
+            "          (Expression)",
+            "          ExpressionTransform",
+            "            (Distinct)",
+            "            DistinctSortedStreamTransform",
+            "              (Expression)",
+            "              ExpressionTransform",
+            "                (Expression)",
+            "                ExpressionTransform",
+            "                  (ReadFromMergeTree)",
+            "                  MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "        (ReadFromRemote)"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "count_rate_rollup_over_corpus_window",
+      "sql": "SELECT fingerprint, intDiv(bucket_ns, 300000000000) * 300000000000 AS step, sum(count) AS n\nFROM log_metrics_5s_dist\nWHERE fingerprint IN (16002800254334750096, 14097363341216462340, 10701353299022872180, 16902566540504759664, 18151876074155682148, 11496232871647329316, 13618951416785845072, 3746322647148879220, 3592155188536135720, 1390561603788219288, 11865623298642248584, 5295111596556533952, 10703577415056885392, 1589565608494129320, 2623993159438049908, 15385845674044946336, 6261228796775463848, 6449791652691167552, 1582936284602081368, 1016565573746421360, 8985252721275746968, 2722586465723932296, 8750642319108593368, 2775106109767313580, 11379790847015476876, 9776843257874028332, 17504070282608481244, 554447573062157008, 8716803265436251388, 11906549680584285844, 7259811714599202412, 11315032306747052292, 13023400393793981656, 2917044303343876080, 14157854858771330860, 3331886605756027440, 11923409814950234116, 13871571920066764940, 15255360015230646356, 16737591803173486796, 1424042268324995040, 7009727929065742448, 14021731515750763556, 9739962597424124268, 17042311635848282492, 1948468682914778048, 6653829004655485400, 13509154152989839085, 14154941142317715849, 14693804013832436937, 5968485127560655673, 8465380326540603209, 3126554609483317233, 5025792469884292017, 5245770716579241461, 6626391902152192485, 9196186250593016877, 14772621732971240701, 14054762118403311585, 16384887471067125425, 17644369145960120917, 16900708939037454905, 13559461865628762213, 9358662146628073629, 939894621025155181, 13415785601937608845, 13307860404347075505, 10970513529437672609, 3986818642062893297, 16632626147158058497, 6345841429704722477, 18195048435131161781, 16036747115466669645, 7223945904072516241, 17228778517457961429, 7832037697197091185, 4044277754775484485, 6351654229367818581, 12902958346986139793, 5078965426300704549, 8498225534159176037, 14424674001125182602, 12194899080415568018, 1864296683732190930, 13883049144770170502, 8360926537653275358, 17219383714623902966, 12001626415738664362, 6360138637921929842, 12360793120358770646, 1398931623403093130, 16380242397367864962, 16835293005851256810, 1827157589467215918, 8415619952776980302, 10866815470972457182, 18238665971583019222, 790728747257953810, 16626981497715260774, 6721233353094624730, 1828295658154686350, 5757231357319777194, 16394252792411836526, 1525598289840170586, 10211408134701082462, 14846328231688869558, 12881808690066896558, 8182360270501927570, 15179188484467209430, 16192195441524944258, 15744302264494725926, 11342165902810440738, 16478754568887541298, 12728526102349312870, 14950442998141502446, 1796916620623789326, 16190799175534303902, 1087452118373238462, 4739047119454181374, 9481550195112348286, 13748658418438860239, 9123390080914387103, 6882269175418745523, 688561535256636535, 12055724076423602127, 2405425637249717143, 15340610725294486155, 14490412927624199287, 8738148841179848203, 17835633541174797643, 6315042880242475231, 4585497286249286179, 8637063417529945655, 8099745845241196091, 7325437778231811995, 10575586600586332331, 13381625109066710727, 2489963994063372575, 12392748390909316831, 11887908658144599299, 18039494937721341487, 13499435556948038763, 39353606691336267, 16545965695966379515, 16949386267585254411, 1584744464739272659, 502649575786120423, 4556467966928870727, 16605699454624976847, 10865139837613082571, 13527365066507002347, 12239787774490070935, 15684404389135581427, 512872522852251831, 16266965199620692099, 887630574012558583, 13125682310593731939, 15772517414941607451, 15840671077865999799, 14250159529888274919, 2478035000199631935, 16170890765417414851, 12591107699615818439, 9942795418493840599, 12657850229401432175, 11611283278109069787, 15740998562240202499) AND bucket_ns > 1784021436057699271 AND bucket_ns <= 1784025036057699271\nGROUP BY fingerprint, step",
+      "wall_ms_p50": 84.760423,
+      "wall_ms_p95": 152.940716,
+      "wall_ms_p99": 152.940716,
+      "returned_rows": 2171,
+      "read_rows": 363136,
+      "read_bytes": 8757714,
+      "selected_marks": 15,
+      "total_marks": 62,
+      "memory_usage": 8523078,
+      "query_duration_ms": 44,
+      "explain_indexes": [
+        "Union",
+        "  Expression ((Project names + Projection))",
+        "    Aggregating",
+        "      Expression (Before GROUP BY)",
+        "        Expression",
+        "          ReadFromMergeTree (pulsus_bench_dist2.log_metrics_5s)",
+        "          Indexes:",
+        "            MinMax",
+        "              Keys: ",
+        "                bucket_ns",
+        "              Condition: and((bucket_ns in (-Inf, 1784025036057699271]), (bucket_ns in [1784021436057699272, +Inf)))",
+        "              Parts: 3/3",
+        "              Granules: 13/13",
+        "            Partition",
+        "              Condition: true",
+        "              Parts: 3/3",
+        "              Granules: 13/13",
+        "            PrimaryKey",
+        "              Keys: ",
+        "                fingerprint",
+        "                bucket_ns",
+        "              Condition: and((bucket_ns in (-Inf, 1784025036057699271]), and((bucket_ns in [1784021436057699272, +Inf)), (fingerprint in 47-element set)))",
+        "              Parts: 3/3",
+        "              Granules: 13/13",
+        "  ReadFromRemote (Read from remote replica)"
+      ],
+      "stage_evidence": [
+        {
+          "stage": "resolution",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 2000,
+              "read_bytes": 51725,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 384,
+              "read_bytes": 9938,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 536,
+              "read_bytes": 13867,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 572,
+              "read_bytes": 14797,
+              "selected_marks": 1,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform × 16",
+            "    (Filter)",
+            "    FilterTransform × 16",
+            "      (Aggregating)",
+            "      Resize 1 → 16",
+            "        AggregatingTransform",
+            "          (Expression)",
+            "          ExpressionTransform",
+            "            (Expression)",
+            "            ExpressionTransform",
+            "              (ReadFromMergeTree)",
+            "              MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "hydration",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 500,
+              "read_bytes": 50725,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 96,
+              "read_bytes": 9746,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 134,
+              "read_bytes": 13599,
+              "selected_marks": 1,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 143,
+              "read_bytes": 14511,
+              "selected_marks": 1,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform",
+            "    (Expression)",
+            "    ExpressionTransform",
+            "      (ReadFromMergeTree)",
+            "      MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        },
+        {
+          "stage": "rollup_range",
+          "shards": [
+            {
+              "shard_num": 1,
+              "hostname": "010b90f78555",
+              "role": "coordinator-local",
+              "read_rows": 360636,
+              "read_bytes": 8655264,
+              "selected_marks": 13,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 2,
+              "hostname": "f64ede4cf0e6",
+              "role": "remote",
+              "read_rows": 69246,
+              "read_bytes": 1661904,
+              "selected_marks": 10,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 3,
+              "hostname": "770e15dd78bc",
+              "role": "remote",
+              "read_rows": 96648,
+              "read_bytes": 2319552,
+              "selected_marks": 13,
+              "pruned_reason": null
+            },
+            {
+              "shard_num": 4,
+              "hostname": "790d8e87db91",
+              "role": "remote",
+              "read_rows": 103152,
+              "read_bytes": 2475648,
+              "selected_marks": 14,
+              "pruned_reason": null
+            }
+          ],
+          "explain_pipeline": [
+            "(Union)",
+            "  (Expression)",
+            "  ExpressionTransform × 16",
+            "    (Aggregating)",
+            "    Resize 3 → 16",
+            "      AggregatingTransform × 3",
+            "        StrictResize 3 → 3",
+            "          (Expression)",
+            "          ExpressionTransform × 3",
+            "            (Expression)",
+            "            ExpressionTransform × 3",
+            "              (ReadFromMergeTree)",
+            "              MergeTreeSelect(pool: ReadPool, algorithm: Thread) × 3 0 → 1",
+            "  (ReadFromRemote)"
+          ]
+        }
+      ]
+    }
+  ]
+}

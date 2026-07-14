@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+  The official clickhouse-server image's entrypoint restricts the `default`
+  user to `127.0.0.1`/`::1` whenever neither CLICKHOUSE_USER nor
+  CLICKHOUSE_PASSWORD is set (/etc/clickhouse-server/users.d/default-user.xml)
+  — a sane default for a single exposed node, but it also blocks the
+  Distributed engine's own shard-to-shard native-protocol connections
+  (docs/schemas.md §7: `_dist` writes/reads fan out over that same
+  `default` user). This test-only fixture has no secrets to protect, so it
+  widens `default`'s allowed networks back to the cluster's Docker/Podman
+  bridge instead of layering on per-node passwords. Identical to
+  ci/clickhouse-cluster/users.d/network.xml.
+-->
+<clickhouse>
+    <users>
+        <default>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </default>
+    </users>
+</clickhouse>

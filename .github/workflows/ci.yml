@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Issue #16: lets the manual-dispatch-only `bench-cluster` job (below) be
+  # triggered on demand — the scale-invariant gates already run per-PR on
+  # single-node (`schema-it`); the 4-shard leg is evidence-gathering, not
+  # per-PR protection (task-manager resolution #4 on issue #16).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -80,6 +85,25 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test explain_indexes
+
+      # Issue #16, docs/schemas.md §9's two-tier model, Tier 1: the
+      # scale-invariant system.query_log ratio gate for the logs read path
+      # (CI-scale corpus). Reuses this job's ClickHouse 24.8 container.
+      - name: LogQL query_log ratio gate (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test query_log_gates
+
+      # Issue #16 plan amendment: licenses the direct RowBinary bulk-load
+      # shortcut `xtask bench logs-read`'s dataset generator uses for the
+      # CI-scale/Tier-2 corpora, by proving it is byte-identical to the
+      # product OTLP ingest path against hand-derived golden fixtures.
+      - name: Ingest fidelity gate (product ingest vs. bulk RowBinary)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test ingest_fidelity
 
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
@@ -243,3 +267,70 @@ jobs:
 
       - name: Run the 2-shard cluster e2e harness
         run: cargo run -p pulsus-e2e -- --variant cluster --engine docker
+
+  # Issue #16, docs/schemas.md §9's two-tier model, Tier 1 distributed leg:
+  # captures per-shard system.query_log + EXPLAIN PIPELINE evidence for the
+  # logs-family shard-locality claims (docs/schemas.md §7,
+  # docs/architecture.md risks table) on the 4-shard fixture
+  # (ci/bench-cluster/compose.yaml, extends ci/clickhouse-cluster/'s
+  # 2-shard pattern). Manual-dispatch-only (task-manager resolution #4 on
+  # issue #16): the scale-invariant gates already run per-PR on single-node
+  # (schema-it, above); this leg is evidence-gathering, not per-PR
+  # protection — promote to a nightly `schedule` if/when regressions
+  # actually appear here.
+  bench-cluster:
+    if: github.event_name == 'workflow_dispatch'
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+
+      - name: Start the 4-shard bench cluster
+        run: docker compose -f ci/bench-cluster/compose.yaml up -d
+
+      - name: Wait for cluster health
+        run: |
+          for i in $(seq 1 60); do
+            h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard1 2>/dev/null || echo starting)
+            h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard2 2>/dev/null || echo starting)
+            h3=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard3 2>/dev/null || echo starting)
+            h4=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard4 2>/dev/null || echo starting)
+            hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-keeper 2>/dev/null || echo starting)
+            if [ "$h1" = healthy ] && [ "$h2" = healthy ] && [ "$h3" = healthy ] && [ "$h4" = healthy ] && [ "$hk" = healthy ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::cluster did not become healthy in time"
+          docker ps -a
+          exit 1
+
+      - name: Run the M1 logs read-path benchmark (--dist)
+        run: |
+          cargo run -p xtask -- bench logs-read --dist \
+            --http-url http://127.0.0.1:18123 --database pulsus_bench_dist \
+            --cluster pulsus_bench_cluster \
+            --profile ci --seed 42 --services 50 --streams 500 \
+            --lines-per-sec 200 --duration-secs 3600 --reps 5 \
+            --out docs/benchmarks/data/logs-read-dist.json \
+            --report-out /tmp/logs-read-dist.md
+
+      - name: Upload evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-read-dist-evidence
+          path: |
+            docs/benchmarks/data/logs-read-dist.json
+            /tmp/logs-read-dist.md
+
+      - name: Tear down the cluster
+        if: always()
+        run: docker compose -f ci/bench-cluster/compose.yaml down -v

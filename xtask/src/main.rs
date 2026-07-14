@@ -9,11 +9,13 @@
 //!     --scenario all --rows 1000000 --reps 5 --out /tmp/ch-bench.json
 //! ```
 
+mod bench;
 mod ch_bench;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
+use bench::BenchArgs;
 use ch_bench::{
     ChCandidate, KlCandidate, aggstate::AggstateReport, ddl::DdlReport, fetch::FetchReport,
     insert::InsertReport, pool::PoolReport, tls::TlsReport,
@@ -30,6 +32,9 @@ struct Cli {
 enum Command {
     /// Run the ClickHouse client comparative benchmark.
     ChBench(ChBenchArgs),
+    /// Run the M1 logs read-path benchmark (issue #16; `--scenario
+    /// logs-read` is the only implemented scenario).
+    Bench(BenchArgs),
 }
 
 #[derive(Parser)]
@@ -101,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ChBench(args) => run_ch_bench(args).await,
+        Command::Bench(args) => bench::run(args).await,
     }
 }
 

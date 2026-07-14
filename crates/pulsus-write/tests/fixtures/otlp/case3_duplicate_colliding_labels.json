@@ -1,0 +1,27 @@
+{
+  "resource_attributes": [
+    ["service.name", "from_dot"]
+  ],
+  "scope_name": "collide-scope",
+  "scope_version": "1.0.0",
+  "scope_attributes": [
+    ["service_name", "from_underscore"]
+  ],
+  "time_unix_nano_offset_ns": -3600000000000,
+  "observed_time_unix_nano_offset_ns": null,
+  "severity_number": 3,
+  "body": "duplicate key collision",
+  "golden": {
+    "service": "from_underscore",
+    "labels_json": "{\"otel_scope_name\":\"collide-scope\",\"otel_scope_version\":\"1.0.0\",\"service_name\":\"from_underscore\"}",
+    "fingerprint": 10316335162659606707,
+    "body": "duplicate key collision",
+    "severity": 3,
+    "timestamp_source": "time_unix_nano",
+    "idx_pairs": [
+      ["otel_scope_name", "collide-scope"],
+      ["otel_scope_version", "1.0.0"],
+      ["service_name", "from_underscore"]
+    ]
+  }
+}

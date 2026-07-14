@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  See ci/clickhouse-cluster/shard1/macros.xml for the full rationale
+  (`{shard}`/`{replica}` server macros, `interserver_http_host` pinned to
+  the fixture's own static IP). This is the issue #16 4-shard bench
+  fixture's shard 1, cluster name `pulsus_bench_cluster` (distinct from
+  the 2-shard `pulsus_test_cluster`, so the two fixtures' zoo paths never
+  collide if ever run against the same Keeper — they never are, but the
+  cluster name is the schema controller's zoo-path-adjacent identity all
+  the same).
+-->
+<clickhouse>
+    <macros>
+        <shard>1</shard>
+        <replica>ch-shard1</replica>
+        <cluster>pulsus_bench_cluster</cluster>
+    </macros>
+    <interserver_http_host>172.28.0.11</interserver_http_host>
+</clickhouse>

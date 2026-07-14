@@ -26,5 +26,9 @@ tracing.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+# Issue #16 `ingest_fidelity.rs`: brings up a real schema (`run_init`) to
+# assert both ingest paths against a live ClickHouse, test-only (same
+# pattern as `pulsus-read`'s `explain_indexes.rs`).
+pulsus-schema = { path = "../pulsus-schema" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }

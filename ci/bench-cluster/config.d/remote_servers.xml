@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<!--
+  The 4-shard, 1-replica-per-shard cluster the issue #16 `xtask bench
+  logs-read` dist-mode fixture renders against (evidence-gathering only,
+  not per-PR CI protection — see ci/bench-cluster/compose.yaml). Extends
+  ci/clickhouse-cluster/config.d/remote_servers.xml's 2-shard pattern
+  verbatim to 4 shards: `internal_replication = true` because the
+  underlying tables are `Replicated*` (docs/schemas.md §7), same rationale
+  as the 2-shard fixture. Shared verbatim across all four ClickHouse
+  nodes.
+
+  Replica hosts are the fixture's static `ipv4_address`es (compose.yaml,
+  172.28.0.0/24) — KISS directive (issue #5, carried forward to #16): no
+  DNS aliases, no service-name resolution anywhere in this fixture.
+-->
+<clickhouse>
+    <remote_servers>
+        <pulsus_bench_cluster>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.11</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.12</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.13</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+            <shard>
+                <internal_replication>true</internal_replication>
+                <replica>
+                    <host>172.28.0.14</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </pulsus_bench_cluster>
+    </remote_servers>
+</clickhouse>

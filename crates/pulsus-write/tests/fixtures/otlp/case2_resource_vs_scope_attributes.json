@@ -1,0 +1,30 @@
+{
+  "resource_attributes": [
+    ["service.name", "billing"],
+    ["region", "eu-west-1"]
+  ],
+  "scope_name": "billing-scope",
+  "scope_version": "1.0.0",
+  "scope_attributes": [
+    ["team", "payments"]
+  ],
+  "time_unix_nano_offset_ns": -3600000000000,
+  "observed_time_unix_nano_offset_ns": null,
+  "severity_number": 5,
+  "body": "invoice generated",
+  "golden": {
+    "service": "billing",
+    "labels_json": "{\"otel_scope_name\":\"billing-scope\",\"otel_scope_version\":\"1.0.0\",\"region\":\"eu-west-1\",\"service_name\":\"billing\",\"team\":\"payments\"}",
+    "fingerprint": 8597027553288625590,
+    "body": "invoice generated",
+    "severity": 5,
+    "timestamp_source": "time_unix_nano",
+    "idx_pairs": [
+      ["otel_scope_name", "billing-scope"],
+      ["otel_scope_version", "1.0.0"],
+      ["region", "eu-west-1"],
+      ["service_name", "billing"],
+      ["team", "payments"]
+    ]
+  }
+}

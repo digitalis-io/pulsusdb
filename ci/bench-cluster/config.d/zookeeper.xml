@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!--
+  Points every ClickHouse node at the shared clickhouse-keeper container
+  (Keeper speaks the ZooKeeper client protocol on 9181) — required for
+  `Replicated*` engines' coordination (docs/schemas.md §7), same as
+  ci/clickhouse-cluster/config.d/zookeeper.xml.
+
+  Addressed by the fixture's static `ipv4_address` (compose.yaml,
+  172.28.0.0/24) — KISS directive: no DNS aliases anywhere in this
+  fixture.
+-->
+<clickhouse>
+    <zookeeper>
+        <node>
+            <host>172.28.0.10</host>
+            <port>9181</port>
+        </node>
+    </zookeeper>
+</clickhouse>

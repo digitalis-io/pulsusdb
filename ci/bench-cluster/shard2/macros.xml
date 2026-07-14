@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<!-- See shard1/macros.xml for the full rationale. -->
+<clickhouse>
+    <macros>
+        <shard>2</shard>
+        <replica>ch-shard2</replica>
+        <cluster>pulsus_bench_cluster</cluster>
+    </macros>
+    <interserver_http_host>172.28.0.12</interserver_http_host>
+</clickhouse>

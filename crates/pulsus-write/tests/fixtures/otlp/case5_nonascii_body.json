@@ -1,0 +1,25 @@
+{
+  "resource_attributes": [
+    ["service.name", "notify-svc"]
+  ],
+  "scope_name": "notify-scope",
+  "scope_version": "0.9.0",
+  "scope_attributes": [],
+  "time_unix_nano_offset_ns": -3600000000000,
+  "observed_time_unix_nano_offset_ns": null,
+  "severity_number": 9,
+  "body": "café ✅ 日本語 — \"quoted\"\nnewline",
+  "golden": {
+    "service": "notify-svc",
+    "labels_json": "{\"otel_scope_name\":\"notify-scope\",\"otel_scope_version\":\"0.9.0\",\"service_name\":\"notify-svc\"}",
+    "fingerprint": 2449534802712869363,
+    "body": "café ✅ 日本語 — \"quoted\"\nnewline",
+    "severity": 9,
+    "timestamp_source": "time_unix_nano",
+    "idx_pairs": [
+      ["otel_scope_name", "notify-scope"],
+      ["otel_scope_version", "0.9.0"],
+      ["service_name", "notify-svc"]
+    ]
+  }
+}
