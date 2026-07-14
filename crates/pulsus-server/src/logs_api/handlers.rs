@@ -378,6 +378,7 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            label_cache: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

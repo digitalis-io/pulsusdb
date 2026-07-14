@@ -1701,10 +1701,13 @@ dependencies = [
  "pulsus-clickhouse",
  "pulsus-config",
  "pulsus-logql",
+ "pulsus-model",
  "pulsus-schema",
+ "regex",
  "serde",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

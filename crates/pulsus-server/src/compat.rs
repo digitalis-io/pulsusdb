@@ -60,6 +60,7 @@ mod tests {
             metric_writer: Arc::new(crate::ingest::MetricWriterSink::new(Arc::new(
                 std::sync::OnceLock::new(),
             ))),
+            label_cache: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

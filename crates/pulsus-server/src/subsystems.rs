@@ -76,6 +76,7 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
+            label_cache: Arc::new(OnceLock::new()),
         };
         let router = writer_router().with_state(state);
         let request = Request::builder()

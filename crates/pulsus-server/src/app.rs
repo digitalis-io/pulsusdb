@@ -3,12 +3,13 @@
 //! composition order is encoded — see its doc comment for the exact layer
 //! ordering.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::Router;
 use metrics_exporter_prometheus::PrometheusHandle;
 use pulsus_clickhouse::ChPool;
 use pulsus_config::Config;
+use pulsus_read::LabelCache;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
@@ -27,7 +28,12 @@ use crate::{compat, modes};
 /// constantly" shape via their own inner `OnceLock` (issue #15/#27
 /// architect plans): the `WriterSink`/`MetricWriterSink` themselves are
 /// constructed eagerly (cheap — each is just an empty slot handle), only
-/// the `LogWriter`/`MetricWriter` they wrap arrive later.
+/// the `LogWriter`/`MetricWriter` they wrap arrive later. `label_cache`
+/// (issue #30) is the same async-filled `OnceLock` shape directly (no
+/// trait-adapting sink wrapper needed — nothing implements a `LabelCache`
+/// trait the way `WriterSink` implements `LogSink`): `.get()` is `None`
+/// until the reconnect loop constructs it, and permanently `None` in
+/// writer-only mode (the loop never fills it there).
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pool: Arc<RwLock<Option<Arc<ChPool>>>>,
@@ -36,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) build: BuildInfo,
     pub(crate) writer: Arc<WriterSink>,
     pub(crate) metric_writer: Arc<MetricWriterSink>,
+    pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
 }
 
 /// `/buildinfo` payload (docs/api.md §7): `{"version","revision","builtAt","rustc"}`.
@@ -110,6 +117,7 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            label_cache: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

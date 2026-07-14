@@ -16,6 +16,10 @@ serde_norway = "0.9"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "net", "signal"] }
 futures = "0.3"
+# In-process label-cache matcher evaluation (issue #30): a bounded compiled-
+# regex cache backs `=~`/`!~` matchers, mirroring ClickHouse RE2's fully-
+# anchored `match()` semantics on the SQL fallback path.
+regex = "1"
 
 # HTTP server stack (issue #6): axum/tower/tower-http for the router and its
 # middleware layers, tracing/tracing-subscriber for structured logging driven

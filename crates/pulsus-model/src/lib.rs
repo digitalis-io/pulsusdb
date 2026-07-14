@@ -5,6 +5,7 @@
 mod canonical;
 mod fingerprint;
 mod labels;
+mod matcher;
 mod sample;
 mod time;
 
@@ -14,6 +15,7 @@ pub use fingerprint::{
     stream_fingerprint,
 };
 pub use labels::{LabelError, LabelSet};
+pub use matcher::{LabelMatcher, MatchOp};
 pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use time::{
     DEFAULT_ACTIVITY_BUCKET_MS, Date, Fingerprint, UnixMilli, UnixNano, floor_to_activity_bucket,

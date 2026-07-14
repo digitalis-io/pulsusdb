@@ -9,6 +9,10 @@ rust-version.workspace = true
 pulsus-logql = { path = "../pulsus-logql" }
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
+# `floor_to_activity_bucket`/`DEFAULT_ACTIVITY_BUCKET_MS` (the writer/reader
+# shared bucket-floor identity, issue #26 precedent) plus `LabelSet`/
+# `Fingerprint`/`LabelMatcher`/`MatchOp` for the issue #30 label cache.
+pulsus-model = { path = "../pulsus-model" }
 # The `clickhouse` crate's `#[derive(Row)]` macro expands to paths rooted at
 # `clickhouse::...` unqualified, so it must be a direct dependency of every
 # crate that derives it, not just reachable transitively through
@@ -18,6 +22,18 @@ clickhouse.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 futures.workspace = true
+# In-process matcher evaluation for the label cache's `Re`/`Nre` matchers
+# (issue #30), bounded by a compiled-regex cache.
+regex.workspace = true
+# The refresh loop (`spawn_refresh_loop`) and the resident snapshot slot
+# (`std::sync::RwLock<Arc<CacheSnapshot>>` plus the `tokio::task::JoinHandle`
+# the loop runs in) are the first async/task-spawning code in this crate
+# (issue #30) — promoted from a dev-only dependency to a real one.
+tokio = { workspace = true, features = ["time", "rt", "sync", "macros"] }
+# `refresh.rs`'s self-healing sweep loop logs a failed sweep rather than
+# clobbering the last good snapshot (architect plan) — the same
+# `tracing::warn!` convention every other crate in this workspace uses.
+tracing.workspace = true
 
 [dev-dependencies]
 pulsus-schema = { path = "../pulsus-schema" }

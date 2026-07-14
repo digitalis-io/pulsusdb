@@ -141,12 +141,27 @@ fn ready_transitions_from_503_to_200_and_ops_endpoints_respond() {
          connects (cold-start contract)"
     );
 
-    // No subsystem emits any `metrics::counter!`/`histogram!` yet in this
-    // M0 skeleton (issue #6 scope), so an empty body is the correct,
-    // expected scrape result — the contract under test is a clean 200, not
-    // body content.
-    let (status, _body) = http_get(port, "/metrics").expect("/metrics reachable");
+    // `/ready` just reached 200 under the default `Mode::All`, which
+    // implies the label cache is warm (issue #30) — its counters/gauges
+    // must already be present in this very scrape (`ops::metrics_handler`
+    // bridges them through the `metrics` facade on every request, not on a
+    // timer), proving the "cache hit/size/age metrics on `/metrics`" AC
+    // end to end against a real process.
+    let (status, body) = http_get(port, "/metrics").expect("/metrics reachable");
     assert_eq!(status, 200);
+    for metric in [
+        "pulsus_label_cache_series_count",
+        "pulsus_label_cache_age_ms",
+        "pulsus_label_cache_oversize",
+        "pulsus_label_cache_hits_total",
+        "pulsus_label_cache_misses_total",
+        "pulsus_label_cache_refreshes_total",
+    ] {
+        assert!(
+            body.contains(metric),
+            "missing {metric:?} in /metrics body: {body}"
+        );
+    }
 
     let (status, body) = http_get(port, "/config").expect("/config reachable");
     assert_eq!(status, 200);

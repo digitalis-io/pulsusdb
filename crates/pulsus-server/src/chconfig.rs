@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
-use pulsus_read::{EngineConfig, LogQlEngine};
+use pulsus_read::{EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_write::{MetricWriterTables, WriterTables};
 
@@ -150,6 +150,37 @@ pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> LogQlEngine {
     LogQlEngine::new(client, engine_config_from(config))
 }
 
+/// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
+/// plan): `metric_series` is `_dist`-aware exactly as
+/// [`metric_writer_tables_from`] derives it — cache reads and writer
+/// registrations must agree on which physical table they mean.
+/// `staleness_multiplier` is the documented constant
+/// ([`pulsus_read::DEFAULT_STALENESS_MULTIPLIER`], task-manager resolution
+/// #2 on issue #30), not yet promoted to a config field.
+pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    LabelCacheConfig {
+        db: config.clickhouse.database.clone(),
+        series_table: format!("metric_series{dist}"),
+        bucket_ms: config.reader.series_activity_bucket.0.as_millis() as i64,
+        window_ms: config.reader.cache_window.0.as_millis() as i64,
+        cache_max_series: config.reader.cache_max_series,
+        ttl: config.reader.cache_ttl.0,
+        staleness_multiplier: pulsus_read::DEFAULT_STALENESS_MULTIPLIER,
+    }
+}
+
+/// Builds a [`LabelCache`] over `pool`, mirroring [`logql_engine`]'s
+/// "shared pool, no second connection" contract.
+pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> LabelCache {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
+    LabelCache::new(client, label_cache_config_from(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +315,43 @@ mod tests {
             config.reader.logql_scan_budget_bytes.0
         );
         assert_eq!(engine_cfg.max_streams, pulsus_read::DEFAULT_MAX_STREAMS);
+    }
+
+    #[test]
+    fn label_cache_config_from_uses_the_base_series_table_when_unclustered() {
+        let config = Config::default();
+        let cfg = label_cache_config_from(&config);
+        assert_eq!(cfg.series_table, "metric_series");
+    }
+
+    #[test]
+    fn label_cache_config_from_uses_the_dist_series_table_when_clustered() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let cfg = label_cache_config_from(&config);
+        assert_eq!(cfg.series_table, "metric_series_dist");
+    }
+
+    #[test]
+    fn label_cache_config_from_maps_the_reader_settings() {
+        let config = Config::default();
+        let cfg = label_cache_config_from(&config);
+        assert_eq!(cfg.db, config.clickhouse.database);
+        assert_eq!(
+            cfg.bucket_ms,
+            config.reader.series_activity_bucket.0.as_millis() as i64
+        );
+        assert_eq!(
+            cfg.window_ms,
+            config.reader.cache_window.0.as_millis() as i64
+        );
+        assert_eq!(cfg.cache_max_series, config.reader.cache_max_series);
+        assert_eq!(cfg.ttl, config.reader.cache_ttl.0);
+        assert_eq!(
+            cfg.staleness_multiplier,
+            pulsus_read::DEFAULT_STALENESS_MULTIPLIER
+        );
     }
 }
