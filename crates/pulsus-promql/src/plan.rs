@@ -95,15 +95,19 @@ pub enum OverTimeFn {
 
 /// Aggregation operators. `Group` is **not** in features.md §3's
 /// aggregation list (only `sum/avg/min/max/count/topk/bottomk` are) — it
-/// is sanctioned *only* for the `count`/`group` "over label matchers
-/// alone" fast path ([`QueryPlan::cache_answerable`], architecture.md
-/// §5.1 / this issue's AC), which resolves from the cache in-window and
-/// through `metric_series` historically. [`plan_aggregate`] therefore
-/// restricts `Group` to a bare instant-vector-selector body (the same
-/// structural shape `cache_answerable` recognizes); `group()` over any
-/// computed sub-expression is `Unsupported` (code review round 1, finding
-/// 4 — architect adjudication AMEND). `Count` has no such restriction: it
-/// *is* in the §3 list and is fully general.
+/// is sanctioned *only* for `count`/`group` directly over a bare instant
+/// vector selector (code review round 1, finding 4 — architect
+/// adjudication AMEND). [`plan_aggregate`] therefore restricts `Group` to
+/// that structural shape; `group()` over any computed sub-expression is
+/// `Unsupported`. This shape used to double as exactly what
+/// `QueryPlan::cache_answerable` recognized for a now-removed
+/// zero-ClickHouse fast path (issue #33 architect adjudication: the label
+/// cache's activity-bucket granularity cannot reproduce PromQL's exact
+/// 5-minute staleness lookback, so `count`/`group` always fetch+evaluate
+/// now) — the scope restriction on `Group` itself is independent of that
+/// removed optimization and still stands on the features.md §3 grounds
+/// alone. `Count` has no such restriction: it *is* in the §3 list and is
+/// fully general.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggOp {
     Sum,
@@ -209,35 +213,6 @@ pub enum PlanExpr {
     Scalar(f64),
 }
 
-/// The structural predicate result for [`QueryPlan::cache_answerable`]:
-/// `count`/`group` directly over one instant `VectorSelector`, answerable
-/// from the label cache with zero ClickHouse queries when the eval window
-/// is inside the cache window (checked by the caller, `pulsus-read`'s
-/// `MetricsEngine` — this crate has no notion of a cache window).
-///
-/// **Necessary, not sufficient (issue #40 architect adjudication).** This
-/// predicate is purely structural — `AggOp::Count`/`Group` directly over a
-/// bare selector, no range, no offset — and says nothing about whether the
-/// *query* is instant or ranged over multiple steps. It is **not** valid
-/// for a range (`step_ms != 0`) query: the label cache resolves
-/// `fingerprint -> labels` at activity-*bucket* granularity
-/// (`DEFAULT_ACTIVITY_BUCKET_MS`, 1h), which cannot reproduce upstream's
-/// per-step 5-minute lookback (a series active only in the first 5 minutes
-/// of an hour-long bucket must NOT be counted at a step 45 minutes later,
-/// but the cache has no per-step resolution to see that). The caller
-/// (`pulsus-read`'s `MetricsEngine::query_inner`) is responsible for
-/// additionally gating on `self.params.step_ms == 0` before taking the
-/// cache-only path — this crate's `QueryPlan` has no way to enforce that
-/// itself, since [`QueryPlan::cache_answerable`] does not (and should not)
-/// know how the caller intends to use its answer.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CacheAnswerable {
-    pub op: AggOp,
-    pub metric_name: String,
-    pub matchers: Vec<LabelMatcher>,
-    pub grouping: Option<Grouping>,
-}
-
 /// A parsed query, planned against `params`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryPlan {
@@ -246,39 +221,23 @@ pub struct QueryPlan {
     pub params: PlanParams,
 }
 
-impl QueryPlan {
-    /// See [`CacheAnswerable`]'s doc — **necessary, not sufficient**: a
-    /// range (`step_ms != 0`) query must never take the cache-only path
-    /// even when this returns `Some`. Callers gate on `self.params.step_ms
-    /// == 0` themselves (`pulsus-read`'s `MetricsEngine::query_inner`).
-    pub fn cache_answerable(&self) -> Option<CacheAnswerable> {
-        let PlanExpr::Aggregate {
-            op,
-            expr,
-            param: None,
-            grouping,
-        } = &self.root
-        else {
-            return None;
-        };
-        if !matches!(op, AggOp::Count | AggOp::Group) {
-            return None;
-        }
-        let PlanExpr::Selector(id) = expr.as_ref() else {
-            return None;
-        };
-        let sel = self.selectors.get(*id)?;
-        if sel.range_ms.is_some() || sel.offset_ms != 0 {
-            return None;
-        }
-        Some(CacheAnswerable {
-            op: *op,
-            metric_name: sel.metric_name.clone(),
-            matchers: sel.matchers.clone(),
-            grouping: grouping.clone(),
-        })
-    }
-}
+// Issue #33 architect adjudication (superseding #31's ratified zero-
+// ClickHouse `count`/`group` AC and #40's instant-only narrowing of it):
+// `QueryPlan::cache_answerable`/`CacheAnswerable` — the structural
+// predicate that used to let `pulsus-read`'s `MetricsEngine` answer
+// `count`/`group` straight from the label cache — are deleted, not merely
+// left unused. The differential proved live that the cache's activity-
+// *bucket* granularity (1h) cannot distinguish "had a sample within the
+// 5-minute PromQL staleness lookback" from "active somewhere in an
+// up-to-24h-old 1-hour bucket" (`count(mem_usage_bytes{service="svc-0"})`:
+// this engine returned 69 including 12 series silent for over 5 minutes,
+// Prometheus correctly returned 57) — no eligibility/age check on the
+// cache itself can close that per-series granularity gap. A predicate that
+// can never be lookback-correct is a latent trap for a future caller, not
+// a dormant optimization worth keeping around; every `count`/`group` query
+// now always resolves -> fetches `metric_samples` -> evaluates, where the
+// evaluator applies the real 5-minute lookback per step
+// (`pulsus-read`'s `MetricsEngine::query_inner`).
 
 /// Planner state: accumulates flattened selectors while recursively
 /// walking the AST. Does not need `params` itself — `PlanParams` only
@@ -594,26 +553,25 @@ fn plan_aggregate(planner: &mut Planner, agg: &AggregateExpr) -> Result<PlanExpr
     if matches!(op, AggOp::Topk | AggOp::Bottomk) && param.is_none() {
         return Err(unsupported(format!("{} without a k parameter", agg.op)));
     }
-    // `group` is restricted to a bare **instant** vector-selector body —
-    // the same structural shape `cache_answerable` recognizes (code review
-    // round 1, finding 4: `group` is not in features.md §3's aggregation
-    // list, sanctioned only for the count/group-over-matchers-alone fast
-    // path). Checked on the **raw AST** (`agg.expr`), before planning, so
-    // every non-selector body (a range vector, a function call, an
-    // arithmetic expression, a paren-wrapped range vector...) gets the
-    // same named-construct error, rather than `plan_expr`'s generic
-    // `Expr::MatrixSelector` arm firing first with an unrelated message
-    // for the range-vector case specifically (code review round 2:
-    // `group(up[5m])` must name "group" in its `Unsupported` error, not
-    // just "range vector used outside ..."). `offset` stays permitted
-    // (round 2, the ratified historical-variant sanction): a
-    // `VectorSelector` with `offset` set is still `Expr::VectorSelector`
-    // structurally, so it passes this check unchanged —
-    // `group(up offset 5m)` is never `cache_answerable` (that predicate
-    // itself requires `offset_ms == 0`), so it always routes through the
-    // ordinary resolve+fetch path, which falls back to `metric_series`
-    // exactly like any other out-of-cache-window selector. Nested
-    // parentheses are unwrapped first (code review round 3 — a regression
+    // `group` is restricted to a bare **instant** vector-selector body
+    // (code review round 1, finding 4: `group` is not in features.md §3's
+    // aggregation list, sanctioned only over a bare selector — see
+    // `AggOp`'s own doc comment for the now-removed `cache_answerable` fast
+    // path this shape used to double for, issue #33). Checked on the
+    // **raw AST** (`agg.expr`), before planning, so every non-selector body
+    // (a range vector, a function call, an arithmetic expression, a
+    // paren-wrapped range vector...) gets the same named-construct error,
+    // rather than `plan_expr`'s generic `Expr::MatrixSelector` arm firing
+    // first with an unrelated message for the range-vector case
+    // specifically (code review round 2: `group(up[5m])` must name "group"
+    // in its `Unsupported` error, not just "range vector used outside
+    // ..."). `offset` stays permitted (round 2, the ratified
+    // historical-variant sanction): a `VectorSelector` with `offset` set is
+    // still `Expr::VectorSelector` structurally, so it passes this check
+    // unchanged and always routes through the ordinary resolve+fetch path,
+    // which falls back to `metric_series` exactly like any other
+    // out-of-cache-window selector. Nested parentheses are unwrapped first
+    // (code review round 3 — a regression
     // the round-2 fix introduced: `group((up))` was wrongly rejected,
     // since this check compared `agg.expr` directly against
     // `Expr::VectorSelector` without accounting for `plan_expr`'s own
@@ -1077,22 +1035,6 @@ mod tests {
         assert_eq!(upper_incl, 10_000_000 - 60_000);
     }
 
-    #[test]
-    fn cache_answerable_recognizes_count_over_a_bare_instant_selector() {
-        let expr = parse(r#"count by (job) (up)"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        let ca = p.cache_answerable().expect("should be cache-answerable");
-        assert_eq!(ca.op, AggOp::Count);
-        assert_eq!(ca.metric_name, "up");
-    }
-
-    #[test]
-    fn cache_answerable_recognizes_group() {
-        let expr = parse(r#"group(up)"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_some());
-    }
-
     // --- `group` restricted to a bare instant selector (code review
     // round 1, finding 4) ---
 
@@ -1110,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn group_by_over_a_bare_instant_selector_is_planned_and_cache_answerable() {
+    fn group_by_over_a_bare_instant_selector_is_planned() {
         let expr = parse(r#"group by (job) (up)"#).unwrap();
         let p = plan(&expr, params()).unwrap();
         assert!(matches!(
@@ -1120,7 +1062,6 @@ mod tests {
                 ..
             }
         ));
-        assert!(p.cache_answerable().is_some());
     }
 
     #[test]
@@ -1207,18 +1148,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn group_with_offset_is_never_cache_answerable() {
-        // `cache_answerable` itself requires `offset_ms == 0` — an
-        // offset selector always routes through the ordinary resolve+
-        // fetch path (which falls back to `metric_series` when the
-        // offset-shifted window is out of the cache's residency), never
-        // the zero-ClickHouse fast path.
-        let expr = parse("group(up offset 5m)").unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_none());
-    }
-
     // --- code review round 3: nested parens must not break the `group`
     // guard (a regression the round-2 fix introduced) ---
 
@@ -1249,7 +1178,6 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
-        assert!(p.cache_answerable().is_none());
     }
 
     #[test]
@@ -1289,33 +1217,5 @@ mod tests {
             PromqlError::Unsupported { construct } => assert!(construct.contains("group")),
             other => panic!("expected Unsupported, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn cache_answerable_is_none_for_sum() {
-        let expr = parse(r#"sum(up)"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_none());
-    }
-
-    #[test]
-    fn cache_answerable_is_none_when_the_selector_has_a_range() {
-        let expr = parse(r#"count(count_over_time(up[5m]))"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_none());
-    }
-
-    #[test]
-    fn cache_answerable_is_none_when_the_selector_has_an_offset() {
-        let expr = parse(r#"count(up offset 5m)"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_none());
-    }
-
-    #[test]
-    fn cache_answerable_is_none_for_nested_expressions() {
-        let expr = parse(r#"count(up * 2)"#).unwrap();
-        let p = plan(&expr, params()).unwrap();
-        assert!(p.cache_answerable().is_none());
     }
 }

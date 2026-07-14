@@ -4,13 +4,16 @@
 //! (direct `ChClient::insert_block`, not through `pulsus-write`), same
 //! `should_run`/`skip_unless_live!` gate, same per-test throwaway database.
 //!
-//! Covers the ACs that need real data + real ClickHouse execution: the
-//! zero-ClickHouse `count`/`group` cache-only fast path, the historical
-//! variant routing through `metric_series`, and the ratified fetch-
-//! concurrency contract (both selectors of a binop query issue their
-//! fetches before either completes). Pure, DB-free coverage (exact-
-//! semantics goldens, SQL-plan snapshots) lives in `pulsus-promql`'s own
-//! test suite and `src/metrics/{sample_sql,sql}.rs`.
+//! Covers the ACs that need real data + real ClickHouse execution:
+//! `count`/`group`'s lookback-correct fetch+evaluate path (issue #33
+//! architect adjudication removed the earlier zero-ClickHouse cache-only
+//! fast path — its bucket-granularity resolution could not reproduce
+//! PromQL's exact 5-minute staleness lookback), the historical variant
+//! routing through `metric_series`, and the ratified fetch-concurrency
+//! contract (both selectors of a binop query issue their fetches before
+//! either completes). Pure, DB-free coverage (exact-semantics goldens,
+//! SQL-plan snapshots) lives in `pulsus-promql`'s own test suite and
+//! `src/metrics/{sample_sql,sql}.rs`.
 //!
 //! To run these:
 //!
@@ -26,6 +29,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
+use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
     DataWindow, DiscoveryFilter, ExplainStage, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
@@ -157,22 +161,36 @@ fn engine_config(db: &str) -> MetricsConfig {
     }
 }
 
-/// AC: `count by (job) (up)` served from the cache with **zero** ClickHouse
-/// queries when in-window. Proven by construction, not by inspecting a
-/// query log: `metric_samples` is left completely empty for `up` — the
-/// cache-only path answers purely from `metric_series`-derived label-cache
-/// metadata (series *existence*, not sample *values*), so a correct,
-/// non-empty answer here is only possible if no sample query ever ran (an
-/// evaluator that fell through to the normal fetch path would find zero
-/// samples and return zero series, not the seeded count).
+/// **Issue #33 architect adjudication — WITHDRAWN AC, replaced.** The old
+/// version of this test proved `count by (job) (up)` was served from the
+/// label cache with **zero** ClickHouse sample queries — that AC (ratified
+/// on #31) is withdrawn: the differential proved live that the cache's
+/// activity-*bucket* granularity (1h) cannot distinguish "had a sample
+/// within the 5-minute PromQL staleness lookback" from "active somewhere
+/// in an up-to-24h-old 1-hour bucket"
+/// (`count(mem_usage_bytes{service="svc-0"})`: 69 counted vs. Prometheus's
+/// correct 57 — 12 series silent for >5m were wrongly still counted). The
+/// `cache_answerable()` fast path is deleted from the product
+/// (`pulsus-promql::plan::QueryPlan`) entirely, not merely narrowed
+/// further — every `count`/`group` query, instant or range, now always
+/// resolves -> fetches `metric_samples` -> evaluates, which is correct by
+/// construction (the evaluator applies the real 5-minute lookback per
+/// step, `pulsus-promql::eval::staleness`).
+///
+/// This replacement proves exactly the silent-series-must-be-excluded case
+/// the old cache-only path could not: two `job="api"` series, one live and
+/// one silent for far longer than the 5-minute lookback, must count as
+/// `1`, not `2` — and the explain trace must show `sample_fetch` (real
+/// ClickHouse I/O), never a `cache_only` stage (that stage name no longer
+/// exists anywhere in this engine).
 #[tokio::test]
-async fn count_by_job_up_is_served_from_the_cache_with_zero_clickhouse_sample_queries() {
+async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
     skip_unless_live!();
 
     let bootstrap = ChClient::new(test_config("default"))
         .await
         .expect("connect (bootstrap)");
-    let db = "pulsus_read_it_metrics_engine_cache_only";
+    let db = "pulsus_read_it_metrics_engine_count_lookback";
     init_db(&bootstrap, db).await;
     let client = ChClient::new(test_config(db))
         .await
@@ -188,7 +206,6 @@ async fn count_by_job_up_is_served_from_the_cache_with_zero_clickhouse_sample_qu
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
     let recent_bucket = (now / bucket) * bucket;
 
-    // metric_series rows only — metric_samples is left empty for "up".
     seed_series(
         &client,
         &[
@@ -213,6 +230,36 @@ async fn count_by_job_up_is_served_from_the_cache_with_zero_clickhouse_sample_qu
         ],
     )
     .await;
+    seed_samples(
+        &client,
+        &[
+            // fp1 (job=api): live, sampled at the query instant itself.
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                value: 1.0,
+            },
+            // fp2 (job=api): its last sample is well outside the 5-minute
+            // lookback — the same "active in the bucket, but not within
+            // lookback of this instant" case the removed cache-only path
+            // got wrong. Must be excluded from the count.
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket - (DEFAULT_LOOKBACK_MS + 60_000),
+                value: 1.0,
+            },
+            // fp3 (job=web): live.
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 3,
+                unix_milli: recent_bucket,
+                value: 1.0,
+            },
+        ],
+    )
+    .await;
 
     let cache = Arc::new(LabelCache::new(
         cache_client,
@@ -228,13 +275,25 @@ async fn count_by_job_up_is_served_from_the_cache_with_zero_clickhouse_sample_qu
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, explain) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query_explained");
+    stage(&explain, "sample_fetch");
+    assert!(
+        explain.stages.iter().all(|s| s.name != "cache_only"),
+        "the cache_only stage no longer exists: {:#?}",
+        explain.stages
+    );
     match result {
         QueryResult::Vector(mut v) => {
             v.sort_by(|a, b| a.labels.cmp(&b.labels));
             assert_eq!(v.len(), 2, "expected two job groups, got {v:?}");
             assert_eq!(v[0].labels, vec![("job".to_string(), "api".to_string())]);
-            assert_eq!(v[0].value, 2.0);
+            assert_eq!(
+                v[0].value, 1.0,
+                "fp2 is silent for longer than the lookback and must be excluded"
+            );
             assert_eq!(v[1].labels, vec![("job".to_string(), "web".to_string())]);
             assert_eq!(v[1].value, 1.0);
         }
@@ -394,8 +453,10 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
     .await;
 
     // 24h cache window: last week's row is well outside it, forcing the
-    // fallback path for both the cache_answerable attempt and the
-    // per-selector resolution that follows it.
+    // `SqlFallback` path for the per-selector resolution the ordinary
+    // fetch+evaluate path performs (issue #33: the cache-only fast path
+    // this comment used to also mention is removed — every count/group
+    // query, in-window or historical, now always resolves this way).
     let cache = Arc::new(LabelCache::new(
         cache_client,
         cache_config(db, 24 * 3_600_000),
@@ -428,14 +489,13 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
 }
 
 /// Code review round 2: `group(up offset 2d)` — `offset` stays permitted
-/// on `group`'s bare-instant-selector restriction, and (since `offset`
-/// makes the selector never `cache_answerable`, per
-/// `group_with_offset_is_never_cache_answerable` in `pulsus-promql`'s own
-/// unit tests) demonstrably routes through the ordinary resolve+fetch
-/// path, which falls back to `metric_series` here because the
-/// offset-shifted window lands outside the cache's 24h residency — even
-/// though the query's own `start_ms`/`end_ms` is "now" (inside the cache
-/// window), unlike the plain historical-window test above.
+/// on `group`'s bare-instant-selector restriction, and (every `count`/
+/// `group` query always resolves through the ordinary resolve+fetch path
+/// since issue #33's removal of the cache-only fast path) demonstrably
+/// falls back to `metric_series` here because the offset-shifted window
+/// lands outside the cache's 24h residency — even though the query's own
+/// `start_ms`/`end_ms` is "now" (inside the cache window), unlike the
+/// plain historical-window test above.
 #[tokio::test]
 async fn group_with_offset_routes_through_metric_series() {
     skip_unless_live!();
@@ -663,14 +723,19 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
     drop_database(&bootstrap, db).await;
 }
 
-/// Issue #40 routing assertions (guards the architect adjudication both
-/// directions on the *same* query/data): an **instant** `count by (...)
-/// (up)` still takes the zero-ClickHouse `cache_only` fast path and
-/// returns a `Vector` — the ratified #31 AC, which must not regress — while
-/// the identical selector as a **range** query takes the ordinary
-/// `sample_fetch` path and returns a `Matrix`.
+/// Issue #40 routing assertions — **updated for issue #33's removal of the
+/// cache-only fast path**: this used to guard that an *instant* `count
+/// by(...) (up)` took the zero-ClickHouse `cache_only` path while the
+/// identical selector as a *range* query took `sample_fetch`. That
+/// asymmetry is gone (the architect adjudication on #33 withdrew the
+/// ratified #31 zero-ClickHouse AC on differential evidence — see
+/// `count_by_job_up_is_lookback_correct_and_excludes_a_silent_series`'s own
+/// doc comment for the underlying bug): now both legs of the identical
+/// selector always take `sample_fetch`, and `cache_only` no longer exists
+/// as an explain stage name anywhere in this engine — this test guards
+/// exactly that routing symmetry.
 #[tokio::test]
-async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_range() {
+async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
     skip_unless_live!();
 
     let bootstrap = ChClient::new(test_config("default"))
@@ -695,14 +760,6 @@ async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_ran
     let t0 = recent_bucket;
     let t1 = t0 + step_ms;
 
-    // metric_series only — `metric_samples` is left empty, mirroring the
-    // zero-ClickHouse-sample-queries proof-by-construction the original
-    // cache-only test uses: the instant leg below can only produce a
-    // correct, non-empty answer if it truly never touches `metric_samples`.
-    // The range leg, in contrast, *needs* real samples (it must fall
-    // through to the fetch path) — seeded separately, after the instant
-    // assertion, so the instant leg's zero-ClickHouse-sample-queries proof
-    // stays airtight.
     seed_series(
         &client,
         &[SeedSeriesRow {
@@ -713,45 +770,6 @@ async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_ran
         }],
     )
     .await;
-
-    let cache = Arc::new(LabelCache::new(
-        cache_client,
-        cache_config(db, 24 * 3_600_000),
-    ));
-    cache.refresh().await.expect("refresh");
-    assert!(cache.is_warm());
-
-    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
-    let expr = parse("count by (service) (up)").expect("parse");
-
-    // --- instant leg: cache_only, Vector, zero sample queries ---
-    let instant_params = MetricQueryParams {
-        start_ms: t0,
-        end_ms: t0,
-        step_ms: 0,
-    };
-    let (instant_result, instant_explain) = engine
-        .query_explained(&expr, &instant_params)
-        .await
-        .expect("instant query_explained");
-    stage(&instant_explain, "cache_only");
-    assert!(
-        instant_explain
-            .stages
-            .iter()
-            .all(|s| s.name != "sample_fetch"),
-        "instant query must not take the sample_fetch path: {:#?}",
-        instant_explain.stages
-    );
-    match instant_result {
-        QueryResult::Vector(v) => {
-            assert_eq!(v.len(), 1);
-            assert_eq!(v[0].value, 1.0);
-        }
-        other => panic!("expected Vector for the instant leg, got {other:?}"),
-    }
-
-    // --- range leg: sample_fetch, Matrix ---
     seed_samples(
         &client,
         &[
@@ -770,6 +788,45 @@ async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_ran
         ],
     )
     .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let expr = parse("count by (service) (up)").expect("parse");
+
+    // --- instant leg: sample_fetch, Vector ---
+    let instant_params = MetricQueryParams {
+        start_ms: t0,
+        end_ms: t0,
+        step_ms: 0,
+    };
+    let (instant_result, instant_explain) = engine
+        .query_explained(&expr, &instant_params)
+        .await
+        .expect("instant query_explained");
+    stage(&instant_explain, "sample_fetch");
+    assert!(
+        instant_explain
+            .stages
+            .iter()
+            .all(|s| s.name != "cache_only"),
+        "the cache_only stage no longer exists: {:#?}",
+        instant_explain.stages
+    );
+    match instant_result {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].value, 1.0);
+        }
+        other => panic!("expected Vector for the instant leg, got {other:?}"),
+    }
+
+    // --- range leg: sample_fetch, Matrix ---
     let range_params = MetricQueryParams {
         start_ms: t0,
         end_ms: t1,
@@ -782,7 +839,7 @@ async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_ran
     stage(&range_explain, "sample_fetch");
     assert!(
         range_explain.stages.iter().all(|s| s.name != "cache_only"),
-        "range query must not take the cache_only path: {:#?}",
+        "the cache_only stage no longer exists: {:#?}",
         range_explain.stages
     );
     match range_result {
@@ -1107,9 +1164,10 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
         step_ms: 0,
     };
 
-    // Cache-hit chunk path: `sum(up)` is not `cache_answerable` (only
-    // count/group are), so it goes through the ordinary per-selector
-    // fetch, which resolves from the (warm, in-window) cache.
+    // Cache-hit chunk path: `sum(up)` goes through the ordinary
+    // per-selector fetch (every query does, since issue #33 removed the
+    // count/group cache-only fast path), which resolves from the (warm,
+    // in-window) cache.
     let expr = parse("sum(up)").expect("parse");
     let (_, explain) = engine
         .query_explained(&expr, &params)

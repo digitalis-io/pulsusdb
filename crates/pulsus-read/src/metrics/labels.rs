@@ -157,12 +157,16 @@ pub enum Resolution {
     SqlFallback { sql: String, reason: FallbackReason },
 }
 
-/// [`LabelCache::resolve_labelled`]'s result — like [`Resolution`], but the
-/// cache fast path carries each matched fingerprint's resolved
-/// [`LabelSet`], not just the bare fingerprint. Needed by issue #31's
-/// zero-ClickHouse `count`/`group` fast path (task-manager resolution #2
-/// on issue #31): that AC requires *labels* (to compute a
-/// `by`/`without` grouping key), not just fingerprints. On the SQL/
+/// [`LabelCache::resolve_labelled`]'s result — like [`Resolution`], but
+/// carries each matched fingerprint's resolved [`LabelSet`], not just the
+/// bare fingerprint. Originally added for issue #31's `count`/`group`
+/// cache-only fast path (task-manager resolution #2 on issue #31, since
+/// removed — issue #33 architect adjudication, bucket-granularity cache
+/// resolution cannot reproduce PromQL's exact 5-minute lookback), it is
+/// now the ordinary fetch path's own label-hydration mechanism
+/// (`pulsus-read`'s `MetricsEngine::query_inner`): every fetched selector
+/// needs each matched series' labels to build its final `(labels,
+/// samples)` pair for the evaluator, not just fingerprints. On the SQL/
 /// out-of-window path this returns the identical [`FallbackReason`] and
 /// sub-query [`Resolution::resolve`] would, so `count`/`group` historical
 /// variants route through `metric_series` exactly like any other query.
@@ -681,12 +685,13 @@ impl SeriesResolver for LabelCache {
 
 impl LabelCache {
     /// Issue #31's addition: like [`SeriesResolver::resolve`], but carries
-    /// each matched fingerprint's [`LabelSet`] — the zero-ClickHouse
-    /// `count`/`group` fast path needs labels (to compute a
-    /// `by`/`without` grouping key), not just fingerprints. Not part of
-    /// the [`SeriesResolver`] trait itself (that contract is #30's and
-    /// already depended on elsewhere with its narrower fingerprints-only
-    /// signature) — an inherent method alongside it instead.
+    /// each matched fingerprint's [`LabelSet`] — see [`LabelledResolution`]'s
+    /// own doc for why the ordinary fetch path needs this (not just the
+    /// now-removed cache-only fast path it was originally added for). Not
+    /// part of the [`SeriesResolver`] trait itself (that contract is #30's
+    /// and already depended on elsewhere with its narrower
+    /// fingerprints-only signature) — an inherent method alongside it
+    /// instead.
     pub fn resolve_labelled(
         &self,
         metric_name: &str,

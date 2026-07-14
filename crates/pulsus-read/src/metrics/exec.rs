@@ -40,7 +40,6 @@ use futures::StreamExt;
 use futures::future::join_all;
 use pulsus_clickhouse::{ChClient, ChRow, ChRowStream, QuerySettings};
 use pulsus_model::{Fingerprint, LabelSet};
-use pulsus_promql::eval::aggregation;
 use pulsus_promql::parser::Expr;
 use pulsus_promql::{
     DEFAULT_LOOKBACK_MS, FetchedSeries, InstantSample, Labels, PlanParams, QueryValue, RangeSeries,
@@ -204,72 +203,36 @@ impl MetricsEngine {
         let plan_params = p.plan_params();
         let plan = pulsus_promql::plan(expr, plan_params)?;
 
-        // The zero-ClickHouse `count`/`group` fast path (architect plan
-        // AC): only taken when the cache can answer it; any degradation
-        // (cold/stale/out-of-window/over-cardinality/regex-unsupported)
-        // falls through to the ordinary per-selector fetch+evaluate path
-        // below, which resolves the same selector through the identical
-        // `LabelCache`/`SqlFallback` machinery — so the "historical variant
-        // routes through metric_series" AC holds without special-casing.
+        // Issue #33 architect adjudication (superseding #31's ratified
+        // zero-ClickHouse `count`/`group` AC and #40's instant-only gate on
+        // it): the cache-only fast path this comment used to describe has
+        // been **removed**, not merely narrowed further. The label cache
+        // resolves series presence at activity-*bucket* granularity (1h,
+        // `DEFAULT_ACTIVITY_BUCKET_MS`), which cannot distinguish "had a
+        // sample within the 5-minute PromQL staleness lookback" from
+        // "active somewhere in an up-to-24h-old 1-hour bucket" — a
+        // structural granularity gap no eligibility/age check on the cache
+        // itself can close, proven live by the #33 differential
+        // (`count(mem_usage_bytes{service="svc-0"})`: this engine returned
+        // 69 including 12 series silent for over 5 minutes, Prometheus
+        // correctly returned 57). `count`/`group` are ordinary PromQL
+        // aggregation with exact lookback semantics
+        // (architecture.md §5.1: "100% of semantics in Rust,
+        // Prometheus-exact") — a value-matrix correctness concern, never
+        // eligible for an approximate answer — so every `count`/`group`
+        // query (instant and range alike) now always resolves → fetches
+        // `metric_samples` → evaluates, where the evaluator applies the
+        // real 5-minute lookback (`eval::staleness`) per step. One extra
+        // fetch versus the old fast path; correct by construction.
         //
-        // Issue #40: `cache_answerable()` is structural only (necessary,
-        // not sufficient — see its own doc) and says nothing about whether
-        // this is an instant or a range query. It must additionally be
-        // gated on `plan_params.step_ms == 0` here: the label cache
-        // resolves series presence at activity-*bucket* granularity (1h),
-        // which cannot reproduce upstream's per-step 5-minute lookback — a
-        // series active only in the first 5 minutes of an hour-long bucket
-        // must be excluded from a later step's count, but the cache has no
-        // per-step resolution to see that. A range `count`/`group` query
-        // therefore falls through to the ordinary fetch+evaluate path
-        // below, which resolves the exact same selector but evaluates
-        // per-step with the real 5-minute lookback (`eval::staleness`) and
-        // naturally returns a `Matrix` (one value per step) instead of a
-        // `Vector` — no envelope special-casing needed, the normal
-        // `evaluate()`/`value_to_query_result` path already does this.
-        if plan_params.step_ms == 0
-            && let Some(ca) = plan.cache_answerable()
-        {
-            let window = DataWindow {
-                start_ms: plan_params.start_ms,
-                end_ms: plan_params.end_ms,
-            };
-            match self
-                .resolver
-                .resolve_labelled(&ca.metric_name, &ca.matchers, window)
-            {
-                LabelledResolution::Series(pairs) => {
-                    if let Some(e) = explain.as_mut() {
-                        e.push(
-                            "cache_only",
-                            format!("label cache: {} matching series", pairs.len()),
-                            Some("zero ClickHouse queries".to_string()),
-                        );
-                    }
-                    let vector: Vec<InstantSample> = pairs
-                        .into_iter()
-                        .map(|(_, labels)| InstantSample {
-                            labels: to_promql_labels(&labels),
-                            // `ca.op` is always `count`/`group` here (the
-                            // only cache-answerable ops) — `aggregate`
-                            // unconditionally drops `metric_name` for both
-                            // (issue #37's aggregation-drops rule), so this
-                            // value is never observed in the result; set to
-                            // the matched metric for documentation/
-                            // consistency with the ordinary fetch path.
-                            metric_name: Some(ca.metric_name.clone()),
-                            t_ms: plan_params.start_ms,
-                            v: 1.0,
-                        })
-                        .collect();
-                    let out = aggregation::aggregate(ca.op, &vector, ca.grouping.as_ref(), None)?;
-                    return Ok(vector_to_query_result(out));
-                }
-                LabelledResolution::SqlFallback { .. } => {
-                    // Fall through to the ordinary path below.
-                }
-            }
-        }
+        // `QueryPlan::cache_answerable`/`CacheAnswerable` (the structural
+        // predicate this branch used to consult) are deleted from
+        // `pulsus-promql` entirely, not merely left unused — a predicate
+        // that can never be lookback-correct at bucket granularity is a
+        // latent trap for a future caller, not a dormant optimization
+        // worth keeping around. `resolve_labelled` itself is unaffected —
+        // the fetch path below (and issue #32's discovery endpoints) still
+        // use it for label hydration/resolution.
 
         // Phase 1 (sync, cheap): resolve every selector, build its fetch
         // plan (the actual `sample_fetch` SQL — a pure function of `(sel,
@@ -834,6 +797,7 @@ fn value_to_query_result(value: QueryValue) -> QueryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pulsus_promql::eval::aggregation;
 
     fn ls(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::from_verbatim(
