@@ -5,3 +5,4 @@
 
 pub mod otlp_logs;
 pub mod otlp_metrics;
+pub mod remote_write;

@@ -54,6 +54,24 @@ pub enum LogsIngestError {
     #[error("malformed ExportLogsServiceRequest protobuf: {0}")]
     Decode(#[from] prost::DecodeError),
 
+    /// A decoded message's repeated-field count exceeds a documented
+    /// structural bound (issue #28 code review hardening finding): a
+    /// decode-time DoS guard against a body that decodes successfully
+    /// (within the 64 MiB decompressed-size cap) but unpacks into a far
+    /// larger in-memory structure via many minimal-length repeated
+    /// submessages — e.g. millions of near-empty `TimeSeries`/`Label`
+    /// entries, each only a few wire bytes but tens of heap-adjacent bytes
+    /// once decoded. `field` names the exceeded repeated field, `limit`/
+    /// `actual` make the whole-request `400` actionable. Structural class
+    /// (same as [`Self::OversizeBody`]) — checked immediately after decode,
+    /// before any further per-element processing.
+    #[error("{field} count {actual} exceeds the documented limit of {limit}")]
+    OversizeMessage {
+        field: &'static str,
+        limit: usize,
+        actual: usize,
+    },
+
     /// A sync-mode ([`crate::ingest::LogSink::admit_flush`]) request's
     /// completion future resolved with an error the writer core did not
     /// classify further (e.g. the writer shut down mid-flush without
@@ -92,6 +110,19 @@ mod tests {
             limit: 64 * 1024 * 1024,
         };
         assert!(err.to_string().contains("67108864"));
+    }
+
+    #[test]
+    fn oversize_message_names_the_field_and_both_counts() {
+        let err = LogsIngestError::OversizeMessage {
+            field: "timeseries",
+            limit: 1_000_000,
+            actual: 1_000_001,
+        };
+        let message = err.to_string();
+        assert!(message.contains("timeseries"));
+        assert!(message.contains("1000000"));
+        assert!(message.contains("1000001"));
     }
 
     #[test]

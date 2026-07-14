@@ -1,15 +1,19 @@
-//! `POST /v1/logs` and `POST /v1/metrics` server wiring (issue #15/#27
-//! architect plans): [`WriterSink`]/[`MetricWriterSink`] adapt their
-//! async-filled writer slots (`serve::spawn_reconnect_loop` constructs the
-//! real [`LogWriter`]/[`MetricWriter`] once the ClickHouse pool is ready,
-//! *before* `pool_slot` — see that module's doc comment) to
-//! `pulsus-write`'s [`LogSink`]/[`MetricSink`] seams, and
-//! [`ingest_logs`]/[`ingest_metrics`] are the thin `State<AppState>`
-//! handlers that call straight into `pulsus_write::ingest`/
-//! `pulsus_write::ingest_metrics`'s state-agnostic cores (see those fns'
-//! doc comments for why the server cannot reuse
+//! `POST /v1/logs`, `POST /v1/metrics`, and `POST /api/v1/write` server
+//! wiring (issue #15/#27/#28 architect plans): [`WriterSink`]/
+//! [`MetricWriterSink`] adapt their async-filled writer slots
+//! (`serve::spawn_reconnect_loop` constructs the real [`LogWriter`]/
+//! [`MetricWriter`] once the ClickHouse pool is ready, *before* `pool_slot`
+//! — see that module's doc comment) to `pulsus-write`'s [`LogSink`]/
+//! [`MetricSink`] seams, and [`ingest_logs`]/[`ingest_metrics`]/
+//! [`ingest_remote_write`] are the thin `State<AppState>` handlers that
+//! call straight into `pulsus_write::ingest`/`pulsus_write::ingest_metrics`/
+//! `pulsus_write::ingest_remote_write`'s state-agnostic cores (see those
+//! fns' doc comments for why the server cannot reuse
 //! `pulsus_write::ingest::http::{logs,metrics}::<S>`'s generic-`State`
-//! mount points).
+//! mount points). [`ingest_remote_write`] (issue #28) reuses
+//! [`MetricWriterSink`] verbatim — the same `AppState.metric_writer` field
+//! #27 introduced — adding only its own route + handler, per the ratified
+//! "second issue rebases onto the first" ordering rule.
 
 use std::sync::{Arc, OnceLock};
 
@@ -107,6 +111,19 @@ pub(crate) async fn ingest_metrics(
     body: Body,
 ) -> Response {
     pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body).await
+}
+
+/// `POST /api/v1/write` (docs/api.md §1.2, issue #28): Prometheus remote-
+/// write. Pulls `AppState`'s `MetricWriterSink` — the same instance
+/// `ingest_metrics` uses — and hands straight into
+/// `pulsus_write::ingest_remote_write`'s reused core; no logic of its own
+/// beyond that seam.
+pub(crate) async fn ingest_remote_write(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_remote_write(state.metric_writer.as_ref(), headers, body).await
 }
 
 #[cfg(test)]
