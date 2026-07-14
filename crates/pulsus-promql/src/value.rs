@@ -108,17 +108,41 @@ impl SeriesData {
 }
 
 /// One instant-vector series: labels plus a single `(t_ms, value)`.
+///
+/// **`metric_name` (issue #37 fix):** `__name__` is deliberately carried
+/// *outside* [`Labels`] (which never contains it, see that type's own doc)
+/// rather than special-cased back into the label vector/grouping-key
+/// machinery every `Labels`-keyed `HashMap` in `eval/{aggregation,binop}.rs`
+/// already relies on. `Some(name)` iff this sample's value is the
+/// **verbatim value of an existing series** (a bare selector match, or a
+/// `topk`/`bottomk`/filter-mode-comparison pass-through of one); `None` iff
+/// the value was **computed** (an aggregation, a range/`_over_time`
+/// function, arithmetic, a `bool`-mode comparison, `histogram_quantile`) —
+/// this is Prometheus's own `dropMetricName` rule, verified per construct
+/// class against real captured `prom/prometheus:v3.13.0` responses; see
+/// `crates/pulsus-server/tests/fixtures/prom_api/PROVENANCE.md`'s
+/// "`__name__` keep/drop rule per construct class" table, and each
+/// `eval::eval_step` arm's own citation of it. Consumed by
+/// `pulsus-read::metrics::exec` to splice `__name__` back into the
+/// rendered label object exactly where `/api/v1/series` already does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstantSample {
     pub labels: Labels,
+    pub metric_name: Option<String>,
     pub t_ms: i64,
     pub v: f64,
 }
 
-/// One range-vector (matrix) series: labels plus its ascending points.
+/// One range-vector (matrix) series: labels plus its ascending points. See
+/// [`InstantSample::metric_name`]'s doc for the keep/drop contract — a
+/// range query's `metric_name` is constant across every step of the same
+/// series (an evaluated step's `PlanExpr` shape, and therefore its
+/// keep/drop verdict, never changes mid-query), so accumulating it once
+/// per series (not once per step) is correct.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangeSeries {
     pub labels: Labels,
+    pub metric_name: Option<String>,
     /// `(t_ms, value)`, ascending by `t_ms` — one point per evaluated step.
     pub points: Vec<(i64, f64)>,
 }

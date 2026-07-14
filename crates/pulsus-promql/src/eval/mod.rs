@@ -37,6 +37,12 @@ enum StepValue {
     Scalar(f64),
 }
 
+/// A range query's per-`Labels`-group accumulator: the group's
+/// `metric_name` (issue #37 — constant across every step of one series,
+/// see [`evaluate`]'s own comment) alongside its accumulated `(t_ms, v)`
+/// points.
+type RangeGroupAcc = (Option<String>, Vec<(i64, f64)>);
+
 /// Evaluates `plan` against `data` — pure, no I/O.
 pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, PromqlError> {
     let p = &plan.params;
@@ -49,7 +55,13 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
         );
     }
 
-    let mut vector_points: HashMap<Labels, Vec<(i64, f64)>> = HashMap::new();
+    // Issue #37 fix: `metric_name` is accumulated alongside `points`, keyed
+    // by the same `Labels` group — it is constant across every step of one
+    // series (the evaluated `PlanExpr` shape, and therefore its keep/drop
+    // verdict, never changes mid-query), so capturing it once per group
+    // (from whichever step first populates the group) is correct. See
+    // `InstantSample::metric_name`'s doc for the keep/drop contract itself.
+    let mut vector_points: HashMap<Labels, RangeGroupAcc> = HashMap::new();
     let mut scalar_points: Vec<(i64, f64)> = Vec::new();
     let mut saw_vector = false;
     let mut saw_scalar = false;
@@ -60,7 +72,42 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
             StepValue::Vector(v) => {
                 saw_vector = true;
                 for s in v {
-                    vector_points.entry(s.labels).or_default().push((t, s.v));
+                    let InstantSample {
+                        labels,
+                        metric_name,
+                        t_ms: _,
+                        v: value,
+                    } = s;
+                    // Defensive invariant (architect adjudication on issue
+                    // #37 code review, finding 2 — REJECT, guarded here):
+                    // every member of one `Labels` group must agree on
+                    // `metric_name` across every step. Two differently-
+                    // named series could only collapse into the same
+                    // `Labels` group via a set operation (`or`/`and`/
+                    // `unless`) merging distinct metrics' outputs, and
+                    // `plan::bin_op` never maps `T_LAND`/`T_LOR`/
+                    // `T_LUNLESS` — they are `PromqlError::Unsupported`
+                    // (`plan::tests::and_is_unsupported` et al.) — so no
+                    // reachable M2 plan can produce such a pair. Same-
+                    // `Labels` members are the same fingerprint anyway
+                    // (fingerprint hashes the full label set,
+                    // `Labels` = all labels minus `__name__`), so
+                    // collapsing them is correct by construction, not
+                    // merely assumed.
+                    match vector_points.entry(labels) {
+                        std::collections::hash_map::Entry::Occupied(mut e) => {
+                            debug_assert_eq!(
+                                e.get().0,
+                                metric_name,
+                                "issue #37 invariant: every step of one output series (same \
+                                 non-name Labels) must agree on metric_name"
+                            );
+                            e.get_mut().1.push((t, value));
+                        }
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert((metric_name, Vec::new())).1.push((t, value));
+                        }
+                    }
                 }
             }
             StepValue::Scalar(v) => {
@@ -74,13 +121,18 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
     if saw_scalar && !saw_vector {
         return Ok(QueryValue::Matrix(vec![RangeSeries {
             labels: Labels::default(),
+            metric_name: None,
             points: scalar_points,
         }]));
     }
 
     let mut out: Vec<RangeSeries> = vector_points
         .into_iter()
-        .map(|(labels, points)| RangeSeries { labels, points })
+        .map(|(labels, (metric_name, points))| RangeSeries {
+            labels,
+            metric_name,
+            points,
+        })
         .collect();
     out.sort_by(|a, b| a.labels.cmp(&b.labels));
     Ok(QueryValue::Matrix(out))
@@ -110,8 +162,37 @@ fn eval_step(
     match expr {
         PlanExpr::Scalar(v) => Ok(StepValue::Scalar(*v)),
 
+        // Issue #37: a bare selector returns the **verbatim value of an
+        // existing series** — Prometheus keeps `__name__` here (captured:
+        // `query.name_selector_keeps_get.json`; PROVENANCE.md's
+        // "`__name__` keep/drop rule" table).
+        //
+        // **Invariant this synthesizes `__name__` from `sel.metric_name`
+        // rather than a per-fetched-row metric name (architect
+        // adjudication on issue #37 code review, finding 1 — REJECT,
+        // guarded here):** every reachable `SelectorSpec` carries exactly
+        // one concrete metric name — `plan.rs::extract_name_and_matchers`
+        // rejects both a name-less selector (`{job="x"}`) and a
+        // `__name__` `Re`/`NotRe`/`NotEqual` matcher (`{__name__=~"a|b"}`)
+        // as `PromqlError::Unsupported` *before* any `QueryPlan`/
+        // `SelectorSpec` exists — so every series `data.get(*id)` returns
+        // was fetched under `PREWHERE metric_name = {sel.metric_name}`
+        // (the #30 resolver is metric-scoped the same way) and is
+        // provably that one metric. See
+        // `plan::tests::{a_selector_without_a_concrete_metric_name_is_unsupported,
+        // a_regex_name_matcher_is_unsupported,
+        // a_name_alternation_regex_matcher_is_unsupported}`.
+        // M6's multi-metric selectors (`{__name__=~"a|b"}`) will need a
+        // real per-row `metric_name` carried on `FetchedSeries` from the
+        // fetch layer — this `debug_assert!` exists so that work can't
+        // silently reuse this single-name synthesis by accident.
         PlanExpr::Selector(id) => {
             let sel = &selectors[*id];
+            debug_assert!(
+                !sel.metric_name.is_empty(),
+                "every SelectorSpec carries exactly one concrete, non-empty metric name — \
+                 plan.rs rejects nameless/regex-__name__ selectors before a QueryPlan exists"
+            );
             let eff_t = t_ms - sel.offset_ms;
             let mut out = Vec::new();
             for series in data.get(*id) {
@@ -119,6 +200,7 @@ fn eval_step(
                 {
                     out.push(InstantSample {
                         labels: series.labels.clone(),
+                        metric_name: Some(sel.metric_name.clone()),
                         t_ms,
                         v: sample.v,
                     });
@@ -127,6 +209,9 @@ fn eval_step(
             Ok(StepValue::Vector(out))
         }
 
+        // Issue #37: `rate`/`irate`/`increase`/`delta` **compute** a new
+        // value from the windowed samples — Prometheus drops `__name__`
+        // here (captured: `query.name_rate_drops_get.json`).
         PlanExpr::RangeFn { func, selector } => {
             let sel = &selectors[*selector];
             let eff_t = t_ms - sel.offset_ms;
@@ -142,6 +227,7 @@ fn eval_step(
                 {
                     out.push(InstantSample {
                         labels: series.labels.clone(),
+                        metric_name: None,
                         t_ms,
                         v,
                     });
@@ -150,6 +236,9 @@ fn eval_step(
             Ok(StepValue::Vector(out))
         }
 
+        // Issue #37: `*_over_time` also **computes** a new value —
+        // Prometheus drops `__name__` (interactively verified:
+        // `avg_over_time(up[1m])`, PROVENANCE.md's table).
         PlanExpr::OverTime { func, selector } => {
             let sel = &selectors[*selector];
             let eff_t = t_ms - sel.offset_ms;
@@ -163,6 +252,7 @@ fn eval_step(
                 if let Some(v) = functions::eval_over_time(*func, &windowed) {
                     out.push(InstantSample {
                         labels: series.labels.clone(),
+                        metric_name: None,
                         t_ms,
                         v,
                     });
@@ -171,6 +261,10 @@ fn eval_step(
             Ok(StepValue::Vector(out))
         }
 
+        // Issue #37: `histogram_quantile` **computes** a new value from
+        // the bucket series — Prometheus drops `__name__` (interactively
+        // verified: `histogram_quantile(0.5, x_bucket_histogram_bucket)`
+        // -> `"metric":{}`, PROVENANCE.md's table).
         PlanExpr::HistogramQuantile { quantile, expr } => {
             let StepValue::Scalar(q) = eval_step(quantile, selectors, data, t_ms, lookback_ms)?
             else {
@@ -213,6 +307,7 @@ fn eval_step(
                 let v = functions::histogram_quantile(q, buckets)?;
                 out.push(InstantSample {
                     labels: key,
+                    metric_name: None,
                     t_ms,
                     v,
                 });
@@ -497,5 +592,267 @@ mod tests {
             }
             other => panic!("expected Vector, got {other:?}"),
         }
+    }
+
+    // --- issue #37: `__name__` keep/drop rule per construct class ---
+    //
+    // Verified against real captured `prom/prometheus:v3.13.0` responses
+    // (`crates/pulsus-server/tests/fixtures/prom_api/PROVENANCE.md`'s
+    // "`__name__` keep/drop rule per construct class" table) — every case
+    // below cites the construct class that table pins.
+
+    fn instant_vector(v: QueryValue) -> Vec<InstantSample> {
+        match v {
+            QueryValue::Vector(v) => v,
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// Bare selector: KEEP (`query.name_selector_keeps_get.json`).
+    #[test]
+    fn bare_selector_keeps_metric_name() {
+        let expr = crate::parser::parse("up").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+    }
+
+    /// A selector's `metric_name` propagates into a range query's
+    /// `RangeSeries` too (constant across every step of the same series).
+    #[test]
+    fn bare_selector_range_query_keeps_metric_name() {
+        let expr = crate::parser::parse("up").unwrap();
+        let p = plan(&expr, params(0, 60_000, 60_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(1, &[("job", "a")], vec![s(0, 1.0), s(60_000, 2.0)])],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].metric_name.as_deref(), Some("up"));
+                assert_eq!(m[0].points.len(), 2);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// Aggregation: DROP (`query.name_aggregation_drops_get.json`).
+    #[test]
+    fn aggregation_drops_metric_name() {
+        let expr = crate::parser::parse("sum(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("job", "a")], vec![s(0, 1.0)]),
+                series(2, &[("job", "b")], vec![s(0, 2.0)]),
+            ],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// `rate`/`increase`/`delta`/`irate`: DROP
+    /// (`query.name_rate_drops_get.json`).
+    #[test]
+    fn rate_drops_metric_name() {
+        let expr = crate::parser::parse("rate(http_requests_total[1m])").unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1, 0.0), s(60_000, 60.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// `*_over_time`: DROP (interactively verified — see PROVENANCE.md).
+    #[test]
+    fn over_time_drops_metric_name() {
+        let expr = crate::parser::parse("avg_over_time(up[1m])").unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1, 1.0), s(60_000, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// `histogram_quantile`: DROP (interactively verified — see
+    /// PROVENANCE.md).
+    #[test]
+    fn histogram_quantile_drops_metric_name() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, x_bucket)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.5")], vec![s(0, 5.0)]),
+                series(2, &[("le", "+Inf")], vec![s(0, 5.0)]),
+            ],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// Vector-scalar arithmetic: DROP (interactively verified: `up * 2`).
+    #[test]
+    fn vector_scalar_arithmetic_drops_metric_name() {
+        let expr = crate::parser::parse("up * 2").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// Vector-scalar comparison, filter mode (no `bool`): KEEP
+    /// (interactively verified: `up > 0`).
+    #[test]
+    fn vector_scalar_filter_comparison_keeps_metric_name() {
+        let expr = crate::parser::parse("up > 0").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+    }
+
+    /// Vector-scalar comparison, `bool` mode: DROP (interactively
+    /// verified: `up > bool 0`).
+    #[test]
+    fn vector_scalar_bool_comparison_drops_metric_name() {
+        let expr = crate::parser::parse("up > bool 0").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// Vector-vector arithmetic: DROP (interactively verified:
+    /// `up + on(job) up`, i.e. `foo + on(job) bar` here).
+    #[test]
+    fn vector_vector_arithmetic_drops_metric_name() {
+        let expr = crate::parser::parse("foo + on(job) bar").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 2.0)])]);
+        data.insert(1, vec![series(2, &[("job", "a")], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// Vector-vector comparison, filter mode (no `bool`): KEEP the LHS's
+    /// `metric_name` (interactively verified: `up > (up - 1)`).
+    #[test]
+    fn vector_vector_filter_comparison_keeps_the_lhs_metric_name() {
+        let expr = crate::parser::parse("foo > bar").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 5.0)])]);
+        data.insert(1, vec![series(2, &[("job", "a")], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name.as_deref(), Some("foo"));
+    }
+
+    /// Vector-vector comparison, `bool` mode: DROP (interactively
+    /// verified: `up > bool up`).
+    #[test]
+    fn vector_vector_bool_comparison_drops_metric_name() {
+        let expr = crate::parser::parse("foo > bool bar").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 5.0)])]);
+        data.insert(1, vec![series(2, &[("job", "a")], vec![s(0, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// `topk`/`bottomk`: KEEP — they select existing series verbatim,
+    /// never compute a new value (interactively verified: `topk(1, up)`).
+    #[test]
+    fn topk_keeps_metric_name() {
+        let expr = crate::parser::parse("topk(1, up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("job", "a")], vec![s(0, 5.0)]),
+                series(2, &[("job", "b")], vec![s(0, 1.0)]),
+            ],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+    }
+
+    /// Issue #37 code-review finding 3: `on(...)` DROPS `__name__` (captured:
+    /// `query.name_comparison_on_drops_get.json`) — `Keep(job)` retains
+    /// only the `on`-listed labels, `__name__` not among them.
+    #[test]
+    fn vector_vector_filter_comparison_with_on_drops_metric_name() {
+        let expr = crate::parser::parse("foo == on(job) bar").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a"), ("instance", "1")],
+                vec![s(0, 5.0)],
+            )],
+        );
+        data.insert(
+            1,
+            vec![series(
+                2,
+                &[("job", "a"), ("instance", "2")],
+                vec![s(0, 5.0)],
+            )],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// Issue #37 code-review finding 3: `ignoring(...)` KEEPS `__name__`
+    /// (captured: `query.name_comparison_plain_keeps_get.json` covers the
+    /// no-modifier case; `Del(instance)` drops only the ignored label,
+    /// `__name__` survives).
+    #[test]
+    fn vector_vector_filter_comparison_with_ignoring_keeps_metric_name() {
+        let expr = crate::parser::parse("foo == ignoring(instance) bar").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a"), ("instance", "1")],
+                vec![s(0, 5.0)],
+            )],
+        );
+        data.insert(
+            1,
+            vec![series(
+                2,
+                &[("job", "a"), ("instance", "2")],
+                vec![s(0, 5.0)],
+            )],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name.as_deref(), Some("foo"));
     }
 }

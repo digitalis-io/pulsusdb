@@ -1180,6 +1180,404 @@ mod tests {
             assert_eq!(body_string(res).await, fixture);
         }
 
+        // --- issue #37: `__name__` keep/drop rule per construct class —
+        // captured on both `query` and `query_range` per the bug's AC.
+        // See PROVENANCE.md's "`__name__` keep/drop rule per construct
+        // class" table for the full, interactively-verified matrix; these
+        // three cover exactly the classes the bug named (selector/
+        // aggregation/rate). ---
+
+        #[tokio::test]
+        async fn query_name_selector_keeps_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_selector_keeps_get.json");
+            let res = query_response(up_vector(), None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_aggregation_drops_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_aggregation_drops_get.json");
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_rate_drops_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_rate_drops_get.json");
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("code".to_string(), "200".to_string()),
+                    ("job".to_string(), "api".to_string()),
+                    ("method".to_string(), "get".to_string()),
+                ],
+                value: 0.45,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_selector_keeps_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_selector_keeps_get.json"
+            );
+            let result = QueryResult::Matrix(vec![
+                MatrixSeries {
+                    labels: vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    points: vec![(REF_MS, 1.0)],
+                },
+                MatrixSeries {
+                    labels: vec![
+                        ("__name__".to_string(), "up".to_string()),
+                        ("instance".to_string(), "localhost:9101".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    points: vec![(REF_MS, 0.0)],
+                },
+            ]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_aggregation_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_aggregation_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![],
+                points: vec![(REF_MS, 1.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_rate_drops_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query_range.name_rate_drops_get.json");
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("code".to_string(), "200".to_string()),
+                    ("job".to_string(), "api".to_string()),
+                    ("method".to_string(), "get".to_string()),
+                ],
+                points: vec![(REF_MS, 0.45)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        // --- issue #37 code-review round: the AC-gap goldens (finding 4)
+        // — topk/bottomk/*_over_time/histogram_quantile/binop, both
+        // endpoints, byte-exact against the same pinned Prometheus
+        // digest. See PROVENANCE.md's keep/drop table. ---
+
+        #[tokio::test]
+        async fn query_name_topk_keeps_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_topk_keeps_get.json");
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_topk_keeps_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query_range.name_topk_keeps_get.json");
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                points: vec![(REF_MS, 1.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_bottomk_keeps_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_bottomk_keeps_get.json");
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9101".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                value: 0.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_bottomk_keeps_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_bottomk_keeps_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9101".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                points: vec![(REF_MS, 0.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_over_time_drops_matches_captured() {
+            let fixture =
+                include_str!("../../tests/fixtures/prom_api/query.name_over_time_drops_get.json");
+            let result = QueryResult::Vector(vec![
+                VectorSample {
+                    labels: vec![
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    value: 1.0,
+                },
+                VectorSample {
+                    labels: vec![
+                        ("instance".to_string(), "localhost:9101".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    value: 0.0,
+                },
+            ]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_over_time_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_over_time_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![
+                MatrixSeries {
+                    labels: vec![
+                        ("instance".to_string(), "localhost:9100".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    points: vec![(REF_MS, 1.0)],
+                },
+                MatrixSeries {
+                    labels: vec![
+                        ("instance".to_string(), "localhost:9101".to_string()),
+                        ("job".to_string(), "node".to_string()),
+                    ],
+                    points: vec![(REF_MS, 0.0)],
+                },
+            ]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_histogram_quantile_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_histogram_quantile_drops_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![],
+                value: 0.5,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_histogram_quantile_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_histogram_quantile_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![],
+                points: vec![(REF_MS, 0.5)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_binop_arithmetic_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_binop_arithmetic_drops_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                value: 2.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_binop_arithmetic_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_binop_arithmetic_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                points: vec![(REF_MS, 2.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_comparison_plain_keeps_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_comparison_plain_keeps_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_comparison_plain_keeps_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_comparison_plain_keeps_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                points: vec![(REF_MS, 1.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_comparison_on_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_comparison_on_drops_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![("job".to_string(), "node".to_string())],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_comparison_on_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_comparison_on_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![("job".to_string(), "node".to_string())],
+                points: vec![(REF_MS, 1.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_name_comparison_bool_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_comparison_bool_drops_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        #[tokio::test]
+        async fn query_range_name_comparison_bool_drops_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query_range.name_comparison_bool_drops_get.json"
+            );
+            let result = QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                points: vec![(REF_MS, 1.0)],
+            }]);
+            let res = query_response(result, None, 0);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        /// Issue #37 code-review round 3 [medium]: `on(__name__)` compares
+        /// the *actual* metric name, not an empty/always-equal key — same
+        /// name pairs and the result carries the real `__name__` (here,
+        /// `on(__name__)` lists only `__name__`, so the ordinary matching
+        /// key is empty and the sole output label is `__name__` itself).
+        #[tokio::test]
+        async fn query_name_on_dunder_name_same_name_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_on_dunder_name_same_name_matches_get.json"
+            );
+            let result = QueryResult::Vector(vec![VectorSample {
+                labels: vec![("__name__".to_string(), "up".to_string())],
+                value: 1.0,
+            }]);
+            let res = query_response(result, None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
+        /// Companion to the above: `on(__name__)` between two *different*
+        /// metric names (`up` vs. `up_alias`) must not pair at all, so the
+        /// result is an empty vector — never an empty-key false match.
+        #[tokio::test]
+        async fn query_name_on_dunder_name_different_names_empty_matches_captured() {
+            let fixture = include_str!(
+                "../../tests/fixtures/prom_api/query.name_on_dunder_name_different_names_empty_get.json"
+            );
+            let res = query_response(QueryResult::Vector(vec![]), None, REF_MS);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
         #[tokio::test]
         async fn labels_with_match_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/labels.with_match_get.json");

@@ -14,7 +14,7 @@ fixtures — see the caveat below).
 | Image | `prom/prometheus:v3.13.0` |
 | Image digest (pinned, `capture.sh` resolves by this, not the tag) | `sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8` |
 | Prometheus version (from the capture's own `status/buildinfo`) | `3.13.0`, revision `40af9c2cdc0eda00f3622e867a27f6359f7295f3` |
-| Capture date | 2026-07-14 (re-run same day for the code-review round-1 fixture additions below) |
+| Capture date | 2026-07-14 (re-run same day: code-review round-1 fixture additions, issue #37's first `__name__` construct-class goldens, issue #37's code-review round — topk/bottomk/over_time/histogram_quantile/binop goldens, then issue #37's code-review round 3 — `on(__name__)` goldens) |
 | Capture host | podman 3.4.4, rootless |
 
 ## Seed data
@@ -29,9 +29,44 @@ fixtures below are reproducible independent of wall-clock capture time:
 ```
 up{job="node",instance="localhost:9100"} 1 1435781451.000
 up{job="node",instance="localhost:9101"} 0 1435781451.000
+http_requests_total{job="api",method="get",code="200"} 1000 1435781391.000
 http_requests_total{job="api",method="get",code="200"} 1027 1435781451.000
 http_requests_total{job="api",method="post",code="500"} 3 1435781451.000
+x_histogram_bucket{le="0.1"} 1 1435781451.000
+x_histogram_bucket{le="0.5"} 5 1435781451.000
+x_histogram_bucket{le="1"} 10 1435781451.000
+x_histogram_bucket{le="+Inf"} 10 1435781451.000
+up_alias{instance="localhost:9100"} 1 1435781451.000
 ```
+
+Issue #37: `http_requests_total{method="get",code="200"}` carries a second,
+earlier sample (`1435781391`, `REF_TS - 60`) — the minimum needed for
+`rate()`/`increase()` to compute a real (non-empty, non-degenerate) result
+over a `[65s]` range ending at `REF_TS`. Deliberately the *only* series
+gaining a second sample, so every fixture keyed on `up`'s original
+single-sample shape (`query.vector_get.json`, `query_range.matrix_get.json`,
+`labels.*`, `series.*`, `label_values.*`) stays byte-identical to the #32
+capture — verified by diff before committing this re-capture.
+
+Issue #37 code-review round (finding 4, AC gap): `x_histogram_bucket` is a
+new metric family (a classic Prometheus histogram, `_bucket`-suffixed with
+an `le` label) added solely for the `histogram_quantile` golden below — it
+does not touch any existing series, so every prior fixture stays
+byte-identical. Every `topk`/`bottomk`/`*_over_time`/arithmetic-binop/
+comparison-binop golden reuses `up{instance="localhost:9100"}` (the single
+series with value `1` at `REF_TS`) on **both** sides of any binary
+expression — deliberately avoiding `up`'s other series
+(`instance="localhost:9101"`), which shares `job="node"` and would collide
+under `on(job)` matching (`matching_key` would reduce both `up` rows to the
+same key, `too_many_matches`) if matched unfiltered.
+
+Issue #37 code-review round 3 (finding: `on(__name__)` matched on an empty
+key rather than the real metric name — see `pulsus-promql/src/eval/
+binop.rs`'s `MatchKey`/`matching_key`): `up_alias` is a second, differently
+-named metric that shares `up{instance="localhost:9100"}`'s exact label
+set, added solely to let `on(__name__)` be captured against two *actually
+different* metric names. It does not touch any existing series or label
+set, so every prior fixture stays byte-identical.
 
 The container also runs its own default self-scrape (`job="prometheus"`,
 `2s` interval, deliberately fast for this one-shot capture rather than
@@ -79,6 +114,51 @@ real Prometheus `headStats` field in the first place (real `headStats` is
 `status/tsdb` now reads only `numSeries`/`seriesCountByMetricName` from
 the resident label-cache snapshot, no ClickHouse query at all. See
 docs/api.md §3.4.
+
+## `__name__` keep/drop rule per construct class (issue #37)
+
+Bug: `/api/v1/query`/`/api/v1/query_range` omitted `__name__` from
+un-aggregated selector results — verified against these captures to be
+**exactly** this rule, never approximated. Every row below is now a
+committed, byte-exact `query`/`query_range` golden pair (issue #37
+code-review round: the first pass's `topk`/`*_over_time`/
+`histogram_quantile`/binop rows were only interactively probed — an AC
+gap, since closed):
+
+| Construct class | `__name__` | Captured evidence |
+|---|---|---|
+| Bare selector (`up`) | **keep** | `query.name_selector_keeps_get.json`, `query_range.name_selector_keeps_get.json` |
+| Aggregation (`sum`/`avg`/`min`/`max`/`count`/`group`, by/without) | **drop** | `query.name_aggregation_drops_get.json`, `query_range.name_aggregation_drops_get.json` |
+| `topk` | **keep** (verbatim pass-through of the selected series) | `query.name_topk_keeps_get.json`, `query_range.name_topk_keeps_get.json` — `topk(1,up)` |
+| `bottomk` | **keep** (same as `topk`) | `query.name_bottomk_keeps_get.json`, `query_range.name_bottomk_keeps_get.json` — `bottomk(1,up)` |
+| Range function (`rate`/`irate`/`increase`/`delta`) | **drop** | `query.name_rate_drops_get.json`, `query_range.name_rate_drops_get.json` |
+| `*_over_time` (`avg_over_time` etc.) | **drop** | `query.name_over_time_drops_get.json`, `query_range.name_over_time_drops_get.json` — `avg_over_time(up[1m])` |
+| `histogram_quantile` | **drop** | `query.name_histogram_quantile_drops_get.json`, `query_range.name_histogram_quantile_drops_get.json` — `histogram_quantile(0.5,x_histogram_bucket)` |
+| Binary arithmetic (vector-scalar or vector-vector) | **drop** | `query.name_binop_arithmetic_drops_get.json`, `query_range.name_binop_arithmetic_drops_get.json` — `up{instance="localhost:9100"} + up{instance="localhost:9100"}` |
+| Binary comparison, filter mode, **no matching modifier** | **keep** | `query.name_comparison_plain_keeps_get.json`, `query_range.name_comparison_plain_keeps_get.json` — `up{instance="localhost:9100"} == up{instance="localhost:9100"}` |
+| Binary comparison, filter mode, **`on(...)`** | **drop** (unless `__name__` itself is `on`-listed) | `query.name_comparison_on_drops_get.json`, `query_range.name_comparison_on_drops_get.json` — `up{instance="localhost:9100"} == on(job) up{instance="localhost:9100"}` |
+| Binary comparison, filter mode, **`ignoring(...)`** | **keep** (unless `__name__` itself is `ignoring`-ed) | interactively verified (issue #37 first pass): `up == ignoring(instance) up` |
+| Binary comparison, `bool` mode | **drop** (value is transformed to `0`/`1`, any matching modifier) | `query.name_comparison_bool_drops_get.json`, `query_range.name_comparison_bool_drops_get.json` — `up{instance="localhost:9100"} == bool up{instance="localhost:9100"}` |
+| Binary comparison, filter mode, **`on(__name__)`**, same metric name | **keep**, with the real matched name (not an empty string) | `query.name_on_dunder_name_same_name_matches_get.json` — `up{instance="localhost:9100"} == on(__name__) up{instance="localhost:9100"}` |
+| Binary comparison, filter mode, **`on(__name__)`**, different metric names | no pairing at all — empty result (never a false match on an empty key) | `query.name_on_dunder_name_different_names_empty_get.json` — `up{instance="localhost:9100"} == on(__name__) up_alias{instance="localhost:9100"}` |
+
+The general shape of the rule: a construct that **selects or filters**
+existing series (a plain selector, `topk`/`bottomk`, a non-`bool`
+comparison) keeps `__name__`; a construct that **computes a new value**
+for the series (arithmetic, `bool` comparisons, aggregations, range/
+`_over_time` functions, `histogram_quantile`) drops it — matching real
+Prometheus's own `dropMetricName` convention (`promql/engine.go`).
+Filter-mode vector-vector comparisons are the one construct class with a
+**further** sub-rule: `__name__` is kept iff it survives the exact same
+`on`/`ignoring` label reduction the ordinary labels go through
+(`resultMetric` in `promql/engine.go`: `on(...)` -> `Keep(matching
+labels)`, so `__name__` drops unless explicitly `on`-listed; `ignoring
+(...)` -> `Del(ignored labels)`, so `__name__` survives unless explicitly
+`ignoring`-ed) — see `pulsus-promql/src/eval/binop.rs`'s `name_kept` fn,
+which every filter-mode comparison goes through.
+`pulsus-promql`'s implementation (`crates/pulsus-promql/src/eval/mod.rs`,
+`.../eval/binop.rs`) cites this table (and `name_kept`'s own upstream
+citation) at each relevant `PlanExpr`/comparison-mode arm.
 
 ## Determinism caveat
 

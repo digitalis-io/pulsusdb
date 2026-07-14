@@ -53,6 +53,26 @@ echo "==> pulling $IMAGE"
 podman pull "$IMAGE" >/dev/null
 
 echo "==> writing the seed OpenMetrics fixture (fixed timestamp $REF_TS)"
+# Issue #37: `http_requests_total{method="get",code="200"}` carries a
+# second, earlier sample (`REF_TS - 60`) — the minimum needed for
+# `rate()`/`increase()` to compute a real (non-empty) result over a
+# `[65s]` range ending at `REF_TS`. Samples for one series must be written
+# in ascending-timestamp order (promtool's OpenMetrics backfill importer
+# requirement) — deliberately the *only* series gaining a second sample,
+# so every already-committed fixture keyed on `up`'s single-sample shape
+# stays byte-identical (minimal blast radius).
+#
+# Issue #37 code-review round 3: `up_alias` is a second, differently-named
+# metric sharing `up`'s `instance="localhost:9100"` label, needed to
+# capture `on(__name__)` matching a different metric name (upstream must
+# NOT pair it) versus the same metric name (upstream must pair it).
+#
+# NOTE: this heredoc is unquoted (parameter expansion for REF_TS), so
+# every line inside it is literal OpenMetrics file content, not a shell
+# comment — a `#`-prefixed line here must be a valid OpenMetrics pragma
+# (`# HELP`/`# TYPE`/`# EOF`) and must never contain backticks/$() (those
+# get shell-expanded as command substitution before promtool ever sees
+# the file).
 cat >"$WORKDIR/seed.openmetrics" <<EOF
 # TYPE up gauge
 # HELP up 1 if the target is healthy
@@ -60,8 +80,18 @@ up{job="node",instance="localhost:9100"} 1 ${REF_TS}.000
 up{job="node",instance="localhost:9101"} 0 ${REF_TS}.000
 # TYPE http_requests_total counter
 # HELP http_requests_total total HTTP requests
+http_requests_total{job="api",method="get",code="200"} 1000 $((REF_TS - 60)).000
 http_requests_total{job="api",method="get",code="200"} 1027 ${REF_TS}.000
 http_requests_total{job="api",method="post",code="500"} 3 ${REF_TS}.000
+# TYPE x_histogram histogram
+# HELP x_histogram issue #37 code-review finding 4: histogram_quantile golden
+x_histogram_bucket{le="0.1"} 1 ${REF_TS}.000
+x_histogram_bucket{le="0.5"} 5 ${REF_TS}.000
+x_histogram_bucket{le="1"} 10 ${REF_TS}.000
+x_histogram_bucket{le="+Inf"} 10 ${REF_TS}.000
+# TYPE up_alias gauge
+# HELP up_alias a second metric name sharing up's instance label (issue #37 round 3)
+up_alias{instance="localhost:9100"} 1 ${REF_TS}.000
 # EOF
 EOF
 
@@ -147,10 +177,52 @@ capture_get "query.scalar_nan" "/api/v1/query?query=0%2F0"
 capture_get "query.scalar_pos_inf" "/api/v1/query?query=1%2F0"
 capture_get "query.scalar_neg_inf" "/api/v1/query?query=-1%2F0"
 
+# Issue #37: the `__name__` keep/drop rule per construct class — a bare
+# selector KEEPS `__name__`, an aggregation DROPS it, and a range function
+# (rate/increase/delta/irate) also DROPS it. Captured on both `query` and
+# `query_range` per the bug's AC.
+capture_get "query.name_selector_keeps_get" "/api/v1/query?query=up&time=${REF_TS}"
+capture_get "query.name_aggregation_drops_get" "/api/v1/query?query=sum(up)&time=${REF_TS}"
+capture_get "query.name_rate_drops_get" "/api/v1/query?query=rate(http_requests_total%5B65s%5D)&time=${REF_TS}"
+
+# Issue #37 code-review finding 4 (AC gap): `topk`/`bottomk` KEEP,
+# `*_over_time`/`histogram_quantile`/arithmetic-binop DROP, and
+# comparison-binop keeps/drops per the exact `on`/`ignoring`/`bool` rule
+# (finding 3) — every case below scoped to the single
+# `up{instance="localhost:9100"}` series (value `1` at `REF_TS`) so binop
+# matching never hits a duplicate-key collision against `up`'s other
+# (`instance="localhost:9101"`) series.
+capture_get "query.name_topk_keeps_get" "/api/v1/query?query=topk(1,up)&time=${REF_TS}"
+capture_get "query.name_bottomk_keeps_get" "/api/v1/query?query=bottomk(1,up)&time=${REF_TS}"
+capture_get "query.name_over_time_drops_get" "/api/v1/query?query=avg_over_time(up%5B1m%5D)&time=${REF_TS}"
+capture_get "query.name_histogram_quantile_drops_get" "/api/v1/query?query=histogram_quantile(0.5,x_histogram_bucket)&time=${REF_TS}"
+capture_get "query.name_binop_arithmetic_drops_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%2B%20up%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+capture_get "query.name_comparison_plain_keeps_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20up%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+capture_get "query.name_comparison_on_drops_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20on(job)%20up%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+capture_get "query.name_comparison_bool_drops_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20bool%20up%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+
+# Issue #37 code-review round 3 [medium]: `on(__name__)` must compare the
+# *actual* metric name, not an empty/always-equal key — same-name pairs
+# and produces a real, non-empty `__name__` in the result; different-name
+# does not pair, so the result is an empty vector (`"result":[]`).
+capture_get "query.name_on_dunder_name_same_name_matches_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20on(__name__)%20up%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+capture_get "query.name_on_dunder_name_different_names_empty_get" "/api/v1/query?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20on(__name__)%20up_alias%7Binstance%3D%22localhost%3A9100%22%7D&time=${REF_TS}"
+
 echo "==> capturing /api/v1/query_range"
 capture_get "query_range.matrix_get" "/api/v1/query_range?query=up&start=$((REF_TS - 60))&end=${REF_TS}&step=30"
 capture_post "query_range.matrix_post" "/api/v1/query_range" "query=up&start=$((REF_TS - 60))&end=${REF_TS}&step=30"
 capture_get_allow_error "query_range.error_bad_data_get" "/api/v1/query_range?query=up%7B&start=0&end=1&step=1"
+capture_get "query_range.name_selector_keeps_get" "/api/v1/query_range?query=up&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_aggregation_drops_get" "/api/v1/query_range?query=sum(up)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_rate_drops_get" "/api/v1/query_range?query=rate(http_requests_total%5B65s%5D)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_topk_keeps_get" "/api/v1/query_range?query=topk(1,up)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_bottomk_keeps_get" "/api/v1/query_range?query=bottomk(1,up)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_over_time_drops_get" "/api/v1/query_range?query=avg_over_time(up%5B1m%5D)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_histogram_quantile_drops_get" "/api/v1/query_range?query=histogram_quantile(0.5,x_histogram_bucket)&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_binop_arithmetic_drops_get" "/api/v1/query_range?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%2B%20up%7Binstance%3D%22localhost%3A9100%22%7D&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_comparison_plain_keeps_get" "/api/v1/query_range?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20up%7Binstance%3D%22localhost%3A9100%22%7D&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_comparison_on_drops_get" "/api/v1/query_range?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20on(job)%20up%7Binstance%3D%22localhost%3A9100%22%7D&start=${REF_TS}&end=${REF_TS}&step=30"
+capture_get "query_range.name_comparison_bool_drops_get" "/api/v1/query_range?query=up%7Binstance%3D%22localhost%3A9100%22%7D%20%3D%3D%20bool%20up%7Binstance%3D%22localhost%3A9100%22%7D&start=${REF_TS}&end=${REF_TS}&step=30"
 
 echo "==> capturing /api/v1/labels"
 capture_get "labels.with_match_get" "/api/v1/labels?match[]=up&start=$((REF_TS - 60))&end=$((REF_TS + 60))"

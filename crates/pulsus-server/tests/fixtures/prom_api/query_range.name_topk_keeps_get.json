@@ -1,0 +1,1 @@
+{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"up","instance":"localhost:9100","job":"node"},"values":[[1435781451,"1"]]}]}}

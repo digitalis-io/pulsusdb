@@ -1,0 +1,1 @@
+{"status":"success","data":{"resultType":"vector","result":[{"metric":{"instance":"localhost:9100","job":"node"},"value":[1435781451,"1"]},{"metric":{"instance":"localhost:9101","job":"node"},"value":[1435781451,"0"]}]}}

@@ -232,6 +232,14 @@ impl MetricsEngine {
                         .into_iter()
                         .map(|(_, labels)| InstantSample {
                             labels: to_promql_labels(&labels),
+                            // `ca.op` is always `count`/`group` here (the
+                            // only cache-answerable ops) — `aggregate`
+                            // unconditionally drops `metric_name` for both
+                            // (issue #37's aggregation-drops rule), so this
+                            // value is never observed in the result; set to
+                            // the matched metric for documentation/
+                            // consistency with the ordinary fetch path.
+                            metric_name: Some(ca.metric_name.clone()),
                             t_ms: plan_params.start_ms,
                             v: 1.0,
                         })
@@ -759,12 +767,31 @@ fn parse_json_string<I: Iterator<Item = char>>(
     }
 }
 
+/// Splices `metric_name` back in as a `__name__` entry (issue #37 fix) —
+/// exactly the pattern `MetricsEngine::series` already uses for `/series`'s
+/// discovery results (`series.push(("__name__".to_string(), metric_name))`),
+/// now applied at the query path's own label-assembly seam too, so
+/// `/api/v1/query`/`/api/v1/query_range` and `/api/v1/series` agree.
+/// `pulsus_promql::eval`'s per-construct-class keep/drop verdict
+/// (`InstantSample`/`RangeSeries::metric_name`, see that type's doc) is the
+/// single source of truth for *whether* this pushes anything; the ordering
+/// within the returned `Vec` does not matter — `prom_api::encode`'s
+/// `labels_object_json` renders through a `serde_json::Map` (a `BTreeMap`),
+/// which always re-sorts keys, `__name__` included.
+fn with_metric_name(labels: Labels, metric_name: Option<String>) -> Vec<(String, String)> {
+    let mut pairs = labels.0;
+    if let Some(name) = metric_name {
+        pairs.push(("__name__".to_string(), name));
+    }
+    pairs
+}
+
 fn vector_to_query_result(vector: Vec<InstantSample>) -> QueryResult {
     QueryResult::Vector(
         vector
             .into_iter()
             .map(|s| VectorSample {
-                labels: s.labels.0,
+                labels: with_metric_name(s.labels, s.metric_name),
                 value: s.v,
             })
             .collect(),
@@ -777,7 +804,7 @@ fn value_to_query_result(value: QueryValue) -> QueryResult {
         QueryValue::Matrix(m) => QueryResult::Matrix(
             m.into_iter()
                 .map(|s: RangeSeries| MatrixSeries {
-                    labels: s.labels.0,
+                    labels: with_metric_name(s.labels, s.metric_name),
                     points: s.points,
                 })
                 .collect(),
@@ -909,6 +936,7 @@ mod tests {
                 .iter()
                 .map(|s| InstantSample {
                     labels: s.labels.clone(),
+                    metric_name: None,
                     t_ms: 0,
                     v: s.samples[0].v,
                 })
@@ -1011,6 +1039,7 @@ mod tests {
     fn vector_to_query_result_carries_labels_and_values() {
         let vector = vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
+            metric_name: None,
             t_ms: 0,
             v: 3.0,
         }];
@@ -1019,6 +1048,49 @@ mod tests {
                 assert_eq!(v.len(), 1);
                 assert_eq!(v[0].value, 3.0);
                 assert_eq!(v[0].labels, vec![("job".to_string(), "api".to_string())]);
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// Issue #37 regression: a selector's `metric_name: Some(...)` must be
+    /// spliced back in as `__name__` — the root cause of the bug this test
+    /// pins against ever regressing.
+    #[test]
+    fn vector_to_query_result_splices_metric_name_as_dunder_name() {
+        let vector = vec![InstantSample {
+            labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
+            metric_name: Some("up".to_string()),
+            t_ms: 0,
+            v: 1.0,
+        }];
+        match vector_to_query_result(vector) {
+            QueryResult::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                assert!(
+                    v[0].labels
+                        .contains(&("__name__".to_string(), "up".to_string()))
+                );
+                assert!(
+                    v[0].labels
+                        .contains(&("job".to_string(), "api".to_string()))
+                );
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_to_query_result_omits_dunder_name_when_metric_name_is_none() {
+        let vector = vec![InstantSample {
+            labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
+            metric_name: None,
+            t_ms: 0,
+            v: 1.0,
+        }];
+        match vector_to_query_result(vector) {
+            QueryResult::Vector(v) => {
+                assert!(!v[0].labels.iter().any(|(k, _)| k == "__name__"));
             }
             other => panic!("expected Vector, got {other:?}"),
         }
@@ -1036,12 +1108,36 @@ mod tests {
     fn value_to_query_result_maps_matrix() {
         let matrix = vec![RangeSeries {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
+            metric_name: None,
             points: vec![(0, 1.0), (1000, 2.0)],
         }];
         match value_to_query_result(QueryValue::Matrix(matrix)) {
             QueryResult::Matrix(m) => {
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0].points, vec![(0, 1.0), (1000, 2.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// Issue #37 regression: a `RangeSeries`'s `metric_name: Some(...)`
+    /// (a plain selector's own range query, e.g. `up` over `[start,end]`)
+    /// must be spliced back in as `__name__`, matching the instant-vector
+    /// case above.
+    #[test]
+    fn value_to_query_result_matrix_splices_metric_name_as_dunder_name() {
+        let matrix = vec![RangeSeries {
+            labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
+            metric_name: Some("up".to_string()),
+            points: vec![(0, 1.0), (1000, 2.0)],
+        }];
+        match value_to_query_result(QueryValue::Matrix(matrix)) {
+            QueryResult::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert!(
+                    m[0].labels
+                        .contains(&("__name__".to_string(), "up".to_string()))
+                );
             }
             other => panic!("expected Matrix, got {other:?}"),
         }

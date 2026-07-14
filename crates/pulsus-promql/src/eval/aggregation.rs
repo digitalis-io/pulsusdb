@@ -81,8 +81,18 @@ fn aggregate_reduce(
                 AggOp::Group => 1.0,
                 AggOp::Topk | AggOp::Bottomk => unreachable!("handled by aggregate_topk"),
             };
+            // Issue #37: every `aggregate_reduce` op **computes** a new
+            // value (a sum/avg/min/max/count/group over a whole group) —
+            // Prometheus drops `__name__` here (captured:
+            // `query.name_aggregation_drops_get.json`). `aggregate_topk`
+            // (below) is the one aggregation op that does *not* go through
+            // this fn — it clones the original, matched `InstantSample`
+            // verbatim, so `metric_name` survives there unmodified (a
+            // `topk`/`bottomk` selects existing series, it never computes
+            // a value — captured/verified: `topk(1, up)` keeps `__name__`).
             InstantSample {
                 labels,
+                metric_name: None,
                 t_ms: acc.t_ms,
                 v,
             }
@@ -140,6 +150,7 @@ mod tests {
     fn sample(labels: &[(&str, &str)], v: f64) -> InstantSample {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
+            metric_name: Some("test_metric".to_string()),
             t_ms: 0,
             v,
         }
@@ -275,6 +286,42 @@ mod tests {
         let vector = vec![sample(&[("job", "a"), ("inst", "1")], 5.0)];
         let out = aggregate(AggOp::Topk, &vector, None, Some(1.0)).unwrap();
         assert_eq!(out[0].labels.get("inst"), Some("1"));
+    }
+
+    // --- issue #37: `__name__` keep/drop rule ---
+
+    #[test]
+    fn sum_drops_metric_name() {
+        let vector = vec![sample(&[("job", "a")], 1.0), sample(&[("job", "b")], 2.0)];
+        let out = aggregate(AggOp::Sum, &vector, None, None).unwrap();
+        assert_eq!(out[0].metric_name, None);
+    }
+
+    #[test]
+    fn avg_min_max_count_group_all_drop_metric_name() {
+        let vector = vec![sample(&[("job", "a")], 1.0)];
+        for op in [
+            AggOp::Avg,
+            AggOp::Min,
+            AggOp::Max,
+            AggOp::Count,
+            AggOp::Group,
+        ] {
+            let out = aggregate(op, &vector, None, None).unwrap();
+            assert_eq!(out[0].metric_name, None, "{op:?} must drop __name__");
+        }
+    }
+
+    /// `topk`/`bottomk` select existing series verbatim — they never
+    /// compute a new value, so `__name__` is kept (captured/verified:
+    /// `topk(1, up)`, see PROVENANCE.md).
+    #[test]
+    fn topk_and_bottomk_keep_metric_name() {
+        let vector = vec![sample(&[("s", "1")], 5.0), sample(&[("s", "2")], 1.0)];
+        let topk = aggregate(AggOp::Topk, &vector, None, Some(1.0)).unwrap();
+        assert_eq!(topk[0].metric_name.as_deref(), Some("test_metric"));
+        let bottomk = aggregate(AggOp::Bottomk, &vector, None, Some(1.0)).unwrap();
+        assert_eq!(bottomk[0].metric_name.as_deref(), Some("test_metric"));
     }
 
     #[test]

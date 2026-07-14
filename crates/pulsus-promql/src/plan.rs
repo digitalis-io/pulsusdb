@@ -773,6 +773,20 @@ mod tests {
         assert!(matches!(err, PromqlError::Unsupported { .. }));
     }
 
+    /// Issue #37 architect adjudication (code-review finding 1, REJECT —
+    /// guard test): the specific multi-metric-alternation shape the
+    /// finding named (`{__name__=~"foo|bar"}`) is rejected by `plan()`
+    /// exactly like the simpler `up.*` case above — pins the invariant
+    /// `eval::eval_step`'s `PlanExpr::Selector` arm's `debug_assert!`
+    /// documents: every reachable `SelectorSpec` carries exactly one
+    /// concrete metric name, never a multi-metric alternation.
+    #[test]
+    fn a_name_alternation_regex_matcher_is_unsupported() {
+        let expr = parse(r#"{__name__=~"foo|bar"}"#).unwrap();
+        let err = plan(&expr, params()).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
     // --- series_selector (issue #32 code-review round-1 fix) ---
 
     #[test]
