@@ -24,6 +24,11 @@ metrics-exporter-prometheus.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
 pulsus-logql = { path = "../pulsus-logql" }
+# `prom_api` (issue #32) parses PromQL directly (`pulsus_promql::parse`)
+# and reuses `pulsus_promql::plan`'s already-tested `__name__`-extraction
+# for `match[]` selectors — mirrors `pulsus-logql`'s own role on the log
+# query surface.
+pulsus-promql = { path = "../pulsus-promql" }
 pulsus-read = { path = "../pulsus-read" }
 pulsus-schema = { path = "../pulsus-schema" }
 pulsus-write = { path = "../pulsus-write" }
@@ -37,6 +42,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# `#[derive(clickhouse::Row)]` (via `pulsus_clickhouse::Row`) expands
+# referencing the `clickhouse` crate name directly, so `tests/
+# prom_api_live.rs`'s seed-row structs need it in scope even though
+# `pulsus-clickhouse` already re-exports the derive itself — same
+# dev-only precedent as `pulsus-read`'s own live tests
+# (`clickhouse.workspace = true` there too).
+clickhouse.workspace = true
 # `pulsus_model::UnixNano` in `ingest.rs`'s `WriterSink` unit tests only
 # (constructing a `LogRow` directly) — never referenced from production
 # code, so this stays dev-only rather than pulling `pulsus-model` into the

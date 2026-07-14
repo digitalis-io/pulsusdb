@@ -18,6 +18,7 @@ mod logs_api;
 mod middleware;
 mod modes;
 mod ops;
+mod prom_api;
 mod schema_init;
 mod serve;
 mod subsystems;

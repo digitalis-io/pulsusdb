@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
-use pulsus_read::{EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine};
+use pulsus_read::{
+    EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
+};
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_write::{MetricWriterTables, WriterTables};
 
@@ -181,6 +183,39 @@ pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> LabelCach
     LabelCache::new(client, label_cache_config_from(config))
 }
 
+/// Maps `Config` to [`pulsus_read::MetricsConfig`] (issue #32 architect
+/// plan): `metric_samples`/`metric_series` are `_dist`-aware exactly as
+/// [`metric_writer_tables_from`]/[`label_cache_config_from`] derive them;
+/// `metric_metadata` is **never** `_dist`-suffixed (docs/schemas.md §2.1: a
+/// global, unsharded catalog table), mirroring
+/// [`metric_writer_tables_from`]'s own carve-out for it.
+pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    MetricsConfig {
+        db: config.clickhouse.database.clone(),
+        samples_table: format!("metric_samples{dist}"),
+        series_table: format!("metric_series{dist}"),
+        metadata_table: "metric_metadata".to_string(),
+    }
+}
+
+/// Builds a [`MetricsEngine`] over `pool` and the already-constructed
+/// `label_cache` — the same `Arc<ChPool>`/`Arc<LabelCache>` `AppState`
+/// already holds, mirroring [`logql_engine`]'s "shared pool, no second
+/// connection" contract (issue #32).
+pub(crate) fn metrics_engine(
+    pool: Arc<ChPool>,
+    label_cache: Arc<LabelCache>,
+    config: &Config,
+) -> MetricsEngine {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
+    MetricsEngine::new(client, label_cache, metrics_config_from(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +367,30 @@ mod tests {
         };
         let cfg = label_cache_config_from(&config);
         assert_eq!(cfg.series_table, "metric_series_dist");
+    }
+
+    #[test]
+    fn metrics_config_from_uses_base_table_names_when_unclustered() {
+        let config = Config::default();
+        let cfg = metrics_config_from(&config);
+        assert_eq!(cfg.samples_table, "metric_samples");
+        assert_eq!(cfg.series_table, "metric_series");
+        assert_eq!(cfg.metadata_table, "metric_metadata");
+    }
+
+    #[test]
+    fn metrics_config_from_uses_dist_table_names_when_clustered_except_metadata() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let cfg = metrics_config_from(&config);
+        assert_eq!(cfg.samples_table, "metric_samples_dist");
+        assert_eq!(cfg.series_table, "metric_series_dist");
+        assert_eq!(
+            cfg.metadata_table, "metric_metadata",
+            "metric_metadata is a global catalog table and must never carry a _dist suffix"
+        );
     }
 
     #[test]

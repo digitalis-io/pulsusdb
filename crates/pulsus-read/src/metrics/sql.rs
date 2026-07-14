@@ -34,7 +34,7 @@
 use crate::logql::escape::{ch_regex_anchored, ch_string};
 use pulsus_model::floor_to_activity_bucket;
 
-use super::matcher::{DataWindow, LabelMatcher, MatchOp};
+use super::matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
 
 /// `intDiv({ms}, {bucket_ms}) * {bucket_ms}` — the literal bound
 /// docs/schemas.md §2.1 renders, computed via the shared
@@ -139,6 +139,69 @@ pub fn series_labels_by_fingerprint(series_table: &str, metric_name: &str, fps: 
         "SELECT fingerprint, labels\nFROM {series_table}\nWHERE metric_name = {}\n  AND fingerprint IN ({fp_list})\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
         ch_string(metric_name)
     )
+}
+
+/// Issue #32's discovery query: `fingerprint, metric_name, labels` for
+/// **all** series matching `filter`, bucket-floored to `window` — used by
+/// `MetricsEngine::{label_names,label_values,series}`, which apply their
+/// **own** window filtering here rather than trusting the label cache's
+/// wider (whole-`PULSUS_CACHE_WINDOW`) resident-superset fast path (#30
+/// handoff AC: the cache's bucket-granularity superset must not leak into a
+/// discovery response for a narrower request window). `filter.metric_name
+/// == None` renders no `metric_name` predicate at all — "every metric",
+/// Prometheus's own `/labels`/`/label/{name}/values` semantics when
+/// `match[]` is omitted (docs/api.md §3.3). Selects `metric_name` (unlike
+/// [`historical_resolution_query`]) because a metric-name-less filter's
+/// caller does not otherwise know which metric each returned row belongs
+/// to — needed to populate `__name__` per row.
+pub fn discovery_query(
+    series_table: &str,
+    filter: &DiscoveryFilter,
+    window: DataWindow,
+    bucket_ms: i64,
+) -> String {
+    let lower = floored_bound(window.start_ms, bucket_ms);
+    let upper = floored_bound(window.end_ms, bucket_ms);
+    let mut sql = format!("SELECT fingerprint, metric_name, labels\nFROM {series_table}\n");
+    match &filter.metric_name {
+        Some(name) => {
+            sql.push_str(&format!(
+                "WHERE metric_name = {}\n  AND unix_milli >= {lower} AND unix_milli <= {upper}",
+                ch_string(name)
+            ));
+        }
+        None => {
+            sql.push_str(&format!(
+                "WHERE unix_milli >= {lower} AND unix_milli <= {upper}"
+            ));
+        }
+    }
+    append_matchers(&mut sql, &filter.matchers);
+    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
+    sql
+}
+
+/// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
+/// `ReplacingMergeTree(updated_ns)` (docs/schemas.md §2.1) whose merges are
+/// asynchronous, so a plain `SELECT` can observe more than one row per
+/// `metric_name` — `argMax(_, updated_ns)` deterministically collapses to
+/// the latest-written value per column without waiting for a merge,
+/// grouped by the base family name (schemas.md §2.1's writer contract: a
+/// derived series' suffix is never stripped here — callers must already be
+/// querying by the base name). `metric` is an optional exact-name filter,
+/// `limit` an optional row cap.
+pub fn metadata_query(metadata_table: &str, metric: Option<&str>, limit: Option<usize>) -> String {
+    let mut sql = format!(
+        "SELECT metric_name, argMax(metric_type, updated_ns) AS metric_type, argMax(help, updated_ns) AS help, argMax(unit, updated_ns) AS unit\nFROM {metadata_table}"
+    );
+    if let Some(name) = metric {
+        sql.push_str(&format!("\nWHERE metric_name = {}", ch_string(name)));
+    }
+    sql.push_str("\nGROUP BY metric_name\nORDER BY metric_name");
+    if let Some(n) = limit {
+        sql.push_str(&format!("\nLIMIT {n}"));
+    }
+    sql
 }
 
 #[cfg(test)]
@@ -354,5 +417,81 @@ mod tests {
             }
             assert_ne!(c, '\'', "bare unescaped quote in {literal:?}");
         }
+    }
+
+    // --- discovery_query (issue #32) ---
+
+    #[test]
+    fn discovery_query_with_a_metric_name_filters_on_it() {
+        let filter = DiscoveryFilter {
+            metric_name: Some("up".to_string()),
+            matchers: vec![eq("job", "api")],
+        };
+        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        assert!(sql.contains("metric_name = 'up'"));
+        assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
+        assert!(sql.starts_with("SELECT fingerprint, metric_name, labels\nFROM metric_series"));
+        assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+    }
+
+    #[test]
+    fn discovery_query_without_a_metric_name_has_no_metric_name_predicate() {
+        let filter = DiscoveryFilter::default();
+        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        assert!(!sql.contains("metric_name ="));
+        assert!(sql.contains("unix_milli >= 0 AND unix_milli <= 3600000"));
+    }
+
+    #[test]
+    fn discovery_query_without_a_metric_name_still_applies_matchers() {
+        let filter = DiscoveryFilter {
+            metric_name: None,
+            matchers: vec![eq("job", "api")],
+        };
+        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        assert!(sql.contains("JSONExtractString(labels, 'job') = 'api'"));
+    }
+
+    #[test]
+    fn discovery_query_metric_name_injection_stays_inside_one_literal() {
+        let payload = "up'; DROP TABLE metric_series; --";
+        let filter = DiscoveryFilter {
+            metric_name: Some(payload.to_string()),
+            matchers: vec![],
+        };
+        let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
+        assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
+        assert_no_unescaped_quote(&ch_string(payload));
+    }
+
+    // --- metadata_query (issue #32) ---
+
+    #[test]
+    fn metadata_query_with_no_filter_or_limit_selects_every_row() {
+        let sql = metadata_query("metric_metadata", None, None);
+        assert!(sql.starts_with("SELECT metric_name, argMax(metric_type, updated_ns)"));
+        assert!(!sql.contains("WHERE"));
+        assert!(!sql.contains("LIMIT"));
+        assert!(sql.ends_with("GROUP BY metric_name\nORDER BY metric_name"));
+    }
+
+    #[test]
+    fn metadata_query_filters_on_the_given_metric_name() {
+        let sql = metadata_query("metric_metadata", Some("up"), None);
+        assert!(sql.contains("WHERE metric_name = 'up'"));
+    }
+
+    #[test]
+    fn metadata_query_applies_the_given_limit() {
+        let sql = metadata_query("metric_metadata", None, Some(10));
+        assert!(sql.ends_with("LIMIT 10"));
+    }
+
+    #[test]
+    fn metadata_query_metric_name_injection_stays_inside_one_literal() {
+        let payload = "up'; DROP TABLE metric_metadata; --";
+        let sql = metadata_query("metric_metadata", Some(payload), None);
+        assert!(sql.contains(&format!("WHERE metric_name = {}", ch_string(payload))));
+        assert_no_unescaped_quote(&ch_string(payload));
     }
 }

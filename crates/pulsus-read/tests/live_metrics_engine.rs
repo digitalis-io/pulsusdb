@@ -28,8 +28,8 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySetti
 use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
-    ExplainStage, LabelCache, LabelCacheConfig, MetricQueryParams, MetricsConfig, MetricsEngine,
-    PlanExplain, QueryResult,
+    DataWindow, DiscoveryFilter, ExplainStage, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
+    MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain, QueryResult,
 };
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -153,6 +153,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
         series_table: "metric_series".to_string(),
+        metadata_table: "metric_metadata".to_string(),
     }
 }
 
@@ -836,6 +837,538 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     );
     // Never the cache-hit path's plain explicit-list shape.
     assert!(!fetch_stage.sql.contains("IN (1"));
+
+    drop_database(&bootstrap, db).await;
+}
+
+// ---------------------------------------------------------------------
+// Discovery endpoints (issue #32: label_names/label_values/series/
+// metadata/tsdb_status) — the HTTP surface's data needs.
+// ---------------------------------------------------------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedMetadataRow {
+    metric_name: String,
+    metric_type: String,
+    help: String,
+    unit: String,
+    updated_ns: i64,
+}
+
+async fn seed_metadata(client: &ChClient, rows: &[SeedMetadataRow]) {
+    client
+        .insert_block("metric_metadata", rows)
+        .await
+        .expect("seed metric_metadata");
+}
+
+/// AC: `/series`/`/labels`/`/label/{name}/values` honor `start`/`end` with
+/// bucket-aware bounds and return `__name__` — and, load-bearing for the
+/// #30 handoff AC, a discovery query whose window is **narrower** than the
+/// resident label cache's own residency window must not leak series that
+/// are outside the discovery query's own window (proven here by seeding a
+/// second, cache-resident series bucketed well before the query window and
+/// asserting it is absent from every discovery result).
+#[tokio::test]
+async fn discovery_endpoints_honor_the_query_window_and_include_name() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_discovery";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+    // A cache-resident series bucketed 3 buckets before `recent_bucket` —
+    // inside the 24h cache residency window below, but outside the
+    // discovery query's own narrow [recent_bucket, recent_bucket] window.
+    let older_bucket = recent_bucket - 3 * bucket;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 2,
+                unix_milli: older_bucket,
+                labels: r#"{"job":"stale"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    // Both fingerprints are cache-resident (proving the leak-check below is
+    // meaningful: the cache's own superset genuinely contains the older,
+    // out-of-window series).
+    assert_eq!(cache.tsdb_snapshot().num_series, 2);
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let window = DataWindow {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+    };
+    let filters = vec![DiscoveryFilter {
+        metric_name: Some("up".to_string()),
+        matchers: vec![],
+    }];
+
+    let series = engine.series(&filters, window).await.expect("series");
+    assert_eq!(
+        series.len(),
+        1,
+        "the older, out-of-window series must not leak into /series: {series:?}"
+    );
+    assert!(series[0].contains(&("__name__".to_string(), "up".to_string())));
+    assert!(series[0].contains(&("job".to_string(), "api".to_string())));
+
+    let names = engine
+        .label_names(&filters, window)
+        .await
+        .expect("label_names");
+    assert!(names.contains(&"__name__".to_string()));
+    assert!(names.contains(&"job".to_string()));
+
+    let values = engine
+        .label_values("job", &filters, window)
+        .await
+        .expect("label_values");
+    assert_eq!(values, vec!["api".to_string()]);
+
+    let name_values = engine
+        .label_values("__name__", &filters, window)
+        .await
+        .expect("label_values(__name__)");
+    assert_eq!(name_values, vec!["up".to_string()]);
+
+    // Widening the window to cover both buckets recovers the older series
+    // too — proving the narrower result above was genuine window-filtering,
+    // not a bug that always drops it.
+    let wide_window = DataWindow {
+        start_ms: older_bucket,
+        end_ms: recent_bucket,
+    };
+    let wide_series = engine
+        .series(&filters, wide_window)
+        .await
+        .expect("series (wide window)");
+    assert_eq!(wide_series.len(), 2);
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// AC: an empty `match[]` (`filters == []`) for `/labels`/
+/// `/label/{name}/values` is Prometheus's own "no filter" contract —
+/// every series in the window, unfiltered.
+#[tokio::test]
+async fn label_names_with_no_filters_covers_every_metric_in_window() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_discovery_unfiltered";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "http_requests_total".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"status":"200"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let window = DataWindow {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+    };
+
+    let names = engine
+        .label_names(&[], window)
+        .await
+        .expect("label_names (unfiltered)");
+    assert!(names.contains(&"__name__".to_string()));
+    assert!(names.contains(&"job".to_string()));
+    assert!(names.contains(&"status".to_string()));
+
+    let metric_names = engine
+        .label_values("__name__", &[], window)
+        .await
+        .expect("label_values(__name__) (unfiltered)");
+    assert_eq!(
+        metric_names,
+        vec!["http_requests_total".to_string(), "up".to_string()]
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// A regex matcher (`=~`) narrows a discovery filter exactly like it
+/// narrows a query selector — proven against real ClickHouse `match()`.
+#[tokio::test]
+async fn series_applies_regex_matchers() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_discovery_regex";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "http_requests_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"status":"500"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "http_requests_total".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"status":"200"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let window = DataWindow {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+    };
+    let filters = vec![DiscoveryFilter {
+        metric_name: Some("http_requests_total".to_string()),
+        matchers: vec![LabelMatcher {
+            key: "status".to_string(),
+            op: MatchOp::Re,
+            value: "5..".to_string(),
+        }],
+    }];
+
+    let series = engine.series(&filters, window).await.expect("series");
+    assert_eq!(series.len(), 1);
+    assert!(series[0].contains(&("status".to_string(), "500".to_string())));
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Code-review round-1 fix (matcher-only `match[]`): a `DiscoveryFilter`
+/// with `metric_name: None` — the engine-level shape
+/// `pulsus_promql::series_selector` now produces for a bare-matcher
+/// `match[]` selector like `{job="api"}` — must resolve across **every**
+/// metric name, not just one, proven against real ClickHouse with two
+/// distinct metric families sharing the same `job` label.
+#[tokio::test]
+async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_discovery_matcher_only";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "http_requests_total".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api","code":"200"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 3,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let window = DataWindow {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+    };
+    let filters = vec![DiscoveryFilter {
+        metric_name: None,
+        matchers: vec![LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "api".to_string(),
+        }],
+    }];
+
+    let series = engine.series(&filters, window).await.expect("series");
+    let names: Vec<&str> = series
+        .iter()
+        .map(|pairs| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == "__name__")
+                .map(|(_, v)| v.as_str())
+                .expect("__name__ present")
+        })
+        .collect();
+    assert_eq!(
+        series.len(),
+        2,
+        "expected both up and http_requests_total: {series:?}"
+    );
+    assert!(names.contains(&"up"));
+    assert!(names.contains(&"http_requests_total"));
+    // The job="web" series must not match.
+    assert!(
+        !series
+            .iter()
+            .any(|pairs| pairs.contains(&("job".to_string(), "web".to_string())))
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// AC: `metadata` reads `metric_metadata`, collapsing the
+/// `ReplacingMergeTree`'s version column to the latest write.
+#[tokio::test]
+async fn metadata_collapses_to_the_latest_write() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_metadata";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    seed_metadata(
+        &client,
+        &[
+            SeedMetadataRow {
+                metric_name: "up".to_string(),
+                metric_type: "gauge".to_string(),
+                help: "old help".to_string(),
+                unit: "".to_string(),
+                updated_ns: 1_000,
+            },
+            SeedMetadataRow {
+                metric_name: "up".to_string(),
+                metric_type: "gauge".to_string(),
+                help: "1 if the target is healthy".to_string(),
+                unit: "".to_string(),
+                updated_ns: 2_000,
+            },
+            SeedMetadataRow {
+                metric_name: "http_requests_total".to_string(),
+                metric_type: "counter".to_string(),
+                help: "total requests".to_string(),
+                unit: "requests".to_string(),
+                updated_ns: 1_000,
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    let all = engine.metadata(None, None).await.expect("metadata (all)");
+    assert_eq!(all.len(), 2);
+    let up = all.iter().find(|m| m.name == "up").expect("up metadata");
+    assert_eq!(
+        up.help, "1 if the target is healthy",
+        "must collapse to the latest write"
+    );
+
+    let scoped = engine
+        .metadata(Some("http_requests_total"), None)
+        .await
+        .expect("metadata (scoped)");
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].metric_type, "counter");
+    assert_eq!(scoped[0].unit, "requests");
+
+    let limited = engine
+        .metadata(None, Some(1))
+        .await
+        .expect("metadata (limited)");
+    assert_eq!(limited.len(), 1);
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// AC: `status/tsdb` reports `numSeries`/top cardinality. Code-review
+/// round-1 fix: `numSamples` was dropped (never a real Prometheus
+/// `headStats` field, and serving it required a live ClickHouse `count()`
+/// over `metric_samples`, violating the zero-ClickHouse contract) — this
+/// test deliberately seeds **no** `metric_samples` rows at all, proving
+/// `tsdb_status` never touches that table.
+#[tokio::test]
+async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_tsdb_status";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    let status = engine.tsdb_status().await.expect("tsdb_status");
+    assert_eq!(status.num_series, 2);
+    assert_eq!(
+        status.series_count_by_metric_name,
+        vec![("up".to_string(), 2)]
+    );
 
     drop_database(&bootstrap, db).await;
 }

@@ -10,9 +10,10 @@ pub use logql::{
     StreamResult, TimeBounds, VectorSample,
 };
 pub use metrics::{
-    CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, FallbackReason, LabelCache,
-    LabelCacheConfig, LabelMatcher, LabelledResolution, MatchOp, MetricQueryParams, MetricsConfig,
-    MetricsEngine, Resolution, SeriesResolver, spawn_refresh_loop,
+    CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,
+    FallbackReason, LabelCache, LabelCacheConfig, LabelMatcher, LabelledResolution, MatchOp,
+    MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, Resolution, SeriesResolver,
+    TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus, spawn_refresh_loop,
 };
 
 #[cfg(test)]

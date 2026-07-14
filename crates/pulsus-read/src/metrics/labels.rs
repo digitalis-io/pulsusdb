@@ -611,6 +611,54 @@ impl LabelCache {
     }
 }
 
+/// The resident cache's own summary of itself: `numSeries` plus a
+/// bounded, sorted-descending top-N by per-metric series count (issue #32
+/// `status/tsdb`, task-manager resolution #2: "from the resident #30 cache
+/// snapshot, zero extra ClickHouse — freshness = cache TTL"). Deliberately
+/// never a full unbounded metric-name listing: a cardinality report is
+/// only ever useful as a bounded "top offenders" view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsdbCacheSnapshot {
+    pub num_series: u64,
+    /// Sorted descending by count, ties broken ascending by name, capped
+    /// at [`TSDB_TOP_METRIC_NAMES`].
+    pub series_count_by_metric_name: Vec<(String, u64)>,
+}
+
+/// The bound on `status/tsdb`'s `seriesCountByMetricName` (issue #32) — a
+/// documented constant, same "cap first, promote to a config knob only if a
+/// deployment needs it" precedent as [`REGEX_CACHE_CAPACITY`].
+pub const TSDB_TOP_METRIC_NAMES: usize = 10;
+
+/// [`LabelCache::tsdb_snapshot`]'s pure core, factored out the same way
+/// [`resolve_over`] is: testable against a hand-built [`CacheSnapshot`]
+/// with no `ChClient` at all.
+pub(crate) fn tsdb_snapshot_over(snapshot: &CacheSnapshot) -> TsdbCacheSnapshot {
+    let mut by_metric: Vec<(String, u64)> = snapshot
+        .by_metric
+        .iter()
+        .map(|(name, fps)| (name.clone(), fps.len() as u64))
+        .collect();
+    by_metric.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by_metric.truncate(TSDB_TOP_METRIC_NAMES);
+    TsdbCacheSnapshot {
+        num_series: snapshot.series_count() as u64,
+        series_count_by_metric_name: by_metric,
+    }
+}
+
+impl LabelCache {
+    /// Issue #32's `status/tsdb` accessor: a lock-free read of the current
+    /// snapshot (mirrors [`LabelCache::is_warm`]'s own discipline — never
+    /// held across an `.await`, and this method isn't even async). A cold
+    /// cache (`generation == 0`) yields an all-zero, empty summary rather
+    /// than a ClickHouse fallback query (task-manager resolution #2: "no
+    /// SQL variant for M2").
+    pub fn tsdb_snapshot(&self) -> TsdbCacheSnapshot {
+        tsdb_snapshot_over(&self.current_snapshot())
+    }
+}
+
 impl SeriesResolver for LabelCache {
     fn resolve(
         &self,
@@ -1247,5 +1295,71 @@ mod tests {
             }
             other => panic!("expected matching Fingerprints/Series, got {other:?}"),
         }
+    }
+
+    // --- tsdb_snapshot_over (issue #32) ---
+
+    #[test]
+    fn tsdb_snapshot_over_a_cold_cache_is_empty() {
+        let snap = tsdb_snapshot_over(&CacheSnapshot::default());
+        assert_eq!(snap.num_series, 0);
+        assert!(snap.series_count_by_metric_name.is_empty());
+    }
+
+    #[test]
+    fn tsdb_snapshot_over_counts_series_and_sorts_by_metric_descending() {
+        let snap = snapshot(
+            vec![
+                ("up", 1, &[]),
+                ("up", 2, &[]),
+                ("http_requests_total", 3, &[]),
+            ],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let summary = tsdb_snapshot_over(&snap);
+        assert_eq!(summary.num_series, 3);
+        assert_eq!(
+            summary.series_count_by_metric_name,
+            vec![
+                ("up".to_string(), 2),
+                ("http_requests_total".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn tsdb_snapshot_over_ties_break_ascending_by_name() {
+        let snap = snapshot(
+            vec![("zeta", 1, &[]), ("alpha", 2, &[])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let summary = tsdb_snapshot_over(&snap);
+        assert_eq!(
+            summary.series_count_by_metric_name,
+            vec![("alpha".to_string(), 1), ("zeta".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn tsdb_snapshot_over_caps_at_the_top_n_metric_names() {
+        const NAMES: [&str; TSDB_TOP_METRIC_NAMES + 5] = [
+            "m00", "m01", "m02", "m03", "m04", "m05", "m06", "m07", "m08", "m09", "m10", "m11",
+            "m12", "m13", "m14",
+        ];
+        let entries: Vec<SnapshotEntry<'_>> = NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, name)| -> SnapshotEntry<'_> { (name, i as Fingerprint, &[][..]) })
+            .collect();
+        let snap = snapshot(entries, 0, BASE_SWEEP_MS, 1);
+        let summary = tsdb_snapshot_over(&snap);
+        assert_eq!(
+            summary.series_count_by_metric_name.len(),
+            TSDB_TOP_METRIC_NAMES
+        );
     }
 }

@@ -302,6 +302,62 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
     })
 }
 
+/// Issue #32 code-review round-1 fix: a `match[]` discovery selector
+/// (`/series`, `/labels`, `/label/{name}/values`) is looser than a
+/// [`SelectorSpec`] — Prometheus's own `match[]` contract permits a
+/// **matcher-only** selector with no concrete metric name at all (e.g.
+/// `{job="api"}`), which [`extract_name_and_matchers`]/[`plan`] reject by
+/// design (the fetch/resolve path is always metric-scoped). This is the
+/// discovery-only counterpart: `expr` must be a bare [`Expr::VectorSelector`]
+/// (anything else — an aggregate, a binary expression, a function call —
+/// is not a `match[]` selector at all, `PromqlError::Unsupported`).
+///
+/// - A single `__name__` **`Equal`** matcher (or the bare-name syntax,
+///   `up{...}`) -> `Some(name)`, removed from the returned matchers.
+/// - No `__name__` matcher at all -> `None` (every matcher, including any
+///   ordinary label matchers, is retained) — the standard `{job="api"}`
+///   discovery case.
+/// - `__name__` matched via `Re`/`NotRe`/`NotEqual` ->
+///   `PromqlError::Unsupported` (a documented M2 limitation: `metric_name`
+///   is a physical column, not a `labels`-JSON key, so regex/negative
+///   metric-name discovery needs its own query shape — deferred to M6
+///   parity, matching the existing `extract_name_and_matchers` precedent
+///   for the query path).
+pub fn series_selector(expr: &Expr) -> Result<(Option<String>, Vec<LabelMatcher>), PromqlError> {
+    let Expr::VectorSelector(vs) = expr else {
+        return Err(unsupported(
+            "match[] selector must be a bare vector selector",
+        ));
+    };
+    if !vs.matchers.or_matchers.is_empty() {
+        return Err(unsupported(
+            "UTF-8-quoted label-name-or selector syntax (or_matchers)",
+        ));
+    }
+
+    let mut metric_name: Option<String> = vs.name.clone();
+    let mut matchers = Vec::with_capacity(vs.matchers.matchers.len());
+    for m in &vs.matchers.matchers {
+        if m.name == "__name__" {
+            match &m.op {
+                PLabelMatchOp::Equal if metric_name.is_none() => {
+                    metric_name = Some(m.value.clone());
+                }
+                PLabelMatchOp::Equal => {
+                    return Err(unsupported("selector with a metric name set twice"));
+                }
+                _ => {
+                    return Err(unsupported("__name__ regex/negative in match[]"));
+                }
+            }
+            continue;
+        }
+        matchers.push(convert_matcher(m)?);
+    }
+
+    Ok((metric_name, matchers))
+}
+
 fn unsupported(construct: impl Into<String>) -> PromqlError {
     PromqlError::Unsupported {
         construct: construct.into(),
@@ -714,6 +770,80 @@ mod tests {
     fn a_regex_name_matcher_is_unsupported() {
         let expr = parse(r#"{__name__=~"up.*"}"#).unwrap();
         let err = plan(&expr, params()).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    // --- series_selector (issue #32 code-review round-1 fix) ---
+
+    #[test]
+    fn series_selector_extracts_the_bare_metric_name() {
+        let expr = parse("up").unwrap();
+        let (name, matchers) = series_selector(&expr).unwrap();
+        assert_eq!(name, Some("up".to_string()));
+        assert!(matchers.is_empty());
+    }
+
+    #[test]
+    fn series_selector_extracts_the_explicit_name_matcher_form() {
+        let expr = parse(r#"{__name__="up",job="api"}"#).unwrap();
+        let (name, matchers) = series_selector(&expr).unwrap();
+        assert_eq!(name, Some("up".to_string()));
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0].key, "job");
+    }
+
+    #[test]
+    fn series_selector_permits_a_matcher_only_selector_with_no_metric_name() {
+        let expr = parse(r#"{job="api"}"#).unwrap();
+        let (name, matchers) = series_selector(&expr).unwrap();
+        assert_eq!(name, None);
+        assert_eq!(
+            matchers,
+            vec![LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Eq,
+                value: "api".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn series_selector_retains_matchers_alongside_a_named_metric() {
+        let expr = parse(r#"up{job="api",env=~"prod.*"}"#).unwrap();
+        let (name, matchers) = series_selector(&expr).unwrap();
+        assert_eq!(name, Some("up".to_string()));
+        assert_eq!(matchers.len(), 2);
+    }
+
+    #[test]
+    fn series_selector_rejects_a_regex_name_matcher() {
+        let expr = parse(r#"{__name__=~"up.*"}"#).unwrap();
+        let err = series_selector(&expr).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn series_selector_rejects_a_negative_name_matcher() {
+        // A bare `__name__!=...` matcher is not itself a valid selector
+        // (the upstream parser requires at least one non-negated
+        // matcher) — pairs it with an ordinary matcher so parsing
+        // succeeds and `series_selector`'s own rejection is exercised.
+        let expr = parse(r#"{__name__!="up",job="api"}"#).unwrap();
+        let err = series_selector(&expr).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn series_selector_rejects_a_not_regex_name_matcher() {
+        let expr = parse(r#"{__name__!~"up.*",job="api"}"#).unwrap();
+        let err = series_selector(&expr).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn series_selector_rejects_a_non_selector_expression() {
+        let expr = parse("sum(up)").unwrap();
+        let err = series_selector(&expr).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
     }
 

@@ -1,0 +1,1 @@
+{"status":"success","data":{"startTime":"2026-07-14T17:52:16.629459106Z","CWD":"/prometheus","hostname":"18bc463cdf44","serverTime":"2026-07-14T17:52:25.86354864Z","reloadConfigSuccess":true,"lastConfigTime":"2026-07-14T17:52:16Z","corruptionCount":0,"goroutineCount":30,"GOMAXPROCS":16,"GOMEMLIMIT":15096029184,"GOGC":"75","GODEBUG":"","storageRetention":"15d"}}

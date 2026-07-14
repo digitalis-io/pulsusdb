@@ -61,6 +61,7 @@ mod tests {
                 std::sync::OnceLock::new(),
             ))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            started_at: std::time::SystemTime::now(),
         }
     }
 

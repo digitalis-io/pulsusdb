@@ -123,6 +123,7 @@ pub async fn run(config: Config) -> ExitCode {
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
+        started_at: std::time::SystemTime::now(),
     };
 
     let router = match app::build_router(state, &config) {

@@ -33,7 +33,11 @@ use crate::{compat, modes};
 /// trait-adapting sink wrapper needed — nothing implements a `LabelCache`
 /// trait the way `WriterSink` implements `LogSink`): `.get()` is `None`
 /// until the reconnect loop constructs it, and permanently `None` in
-/// writer-only mode (the loop never fills it there).
+/// writer-only mode (the loop never fills it there). `started_at` (issue #32)
+/// is set exactly once, at process startup, before the router is even
+/// built — unlike `pool`/`writer`/`label_cache` it needs no
+/// `RwLock`/`OnceLock` indirection, since its value is known and fixed
+/// from the very first instant `AppState` exists.
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pool: Arc<RwLock<Option<Arc<ChPool>>>>,
@@ -43,6 +47,7 @@ pub(crate) struct AppState {
     pub(crate) writer: Arc<WriterSink>,
     pub(crate) metric_writer: Arc<MetricWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
+    pub(crate) started_at: std::time::SystemTime,
 }
 
 /// `/buildinfo` payload (docs/api.md §7): `{"version","revision","builtAt","rustc"}`.
@@ -118,6 +123,7 @@ mod tests {
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            started_at: std::time::SystemTime::now(),
         }
     }
 

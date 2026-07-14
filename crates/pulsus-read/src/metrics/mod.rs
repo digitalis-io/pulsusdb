@@ -64,12 +64,12 @@ pub mod sample_sql;
 pub mod sql;
 pub mod stats;
 
-pub use exec::{MetricQueryParams, MetricsConfig, MetricsEngine};
+pub use exec::{MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus};
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
-    LabelledResolution, Resolution, SeriesResolver,
+    LabelledResolution, Resolution, SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
 };
-pub use matcher::{DataWindow, LabelMatcher, MatchOp};
+pub use matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
 pub use refresh::spawn_refresh_loop;
 pub use rows::SeriesRow;
 pub use sample_rows::SampleRow;

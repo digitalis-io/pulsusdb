@@ -48,7 +48,7 @@ use pulsus_promql::{
 };
 
 use super::labels::LabelledResolution;
-use super::matcher::DataWindow;
+use super::matcher::{DataWindow, DiscoveryFilter};
 use super::sample_rows::SampleRow;
 use super::sample_sql;
 use crate::logql::error::ReadError;
@@ -67,8 +67,16 @@ pub struct MetricsConfig {
     /// `metric_samples`.
     pub samples_table: String,
     /// `metric_series` — needed for the `SqlFallback` path's label
-    /// hydration query ([`super::sql::series_labels_by_fingerprint`]).
+    /// hydration query ([`super::sql::series_labels_by_fingerprint`]) and
+    /// (issue #32) the discovery endpoints' own `metric_series`-backed
+    /// query ([`super::sql::discovery_query`]).
     pub series_table: String,
+    /// `metric_metadata` — issue #32's `/api/v1/metadata`
+    /// ([`super::sql::metadata_query`]). **Never** `_dist`-suffixed
+    /// (docs/schemas.md §2.1: it is a global, unsharded catalog table) —
+    /// callers deriving table names from `Config` must not apply the same
+    /// `_dist` rule they use for `samples_table`/`series_table`.
+    pub metadata_table: String,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -83,6 +91,47 @@ pub struct MetricsConfig {
 struct HydratedLabelsRow {
     fingerprint: u64,
     labels: String,
+}
+
+/// [`MetricsEngine::metadata`]'s `metric_metadata` result row
+/// ([`super::sql::metadata_query`]'s `argMax`-collapsed columns).
+#[derive(
+    Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
+)]
+struct MetricMetaRow {
+    metric_name: String,
+    metric_type: String,
+    help: String,
+    unit: String,
+}
+
+/// One `metric_metadata` row (issue #32): `name` is always the **base
+/// family name** (docs/schemas.md §2.1's writer contract) — a derived
+/// series' `_bucket`/`_sum`/`_count` suffix is never stripped by this type
+/// or by [`MetricsEngine::metadata`]; callers must already be querying by
+/// the base name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricMeta {
+    pub name: String,
+    pub metric_type: String,
+    pub help: String,
+    pub unit: String,
+}
+
+/// `GET /api/v1/status/tsdb`'s payload (issue #32; code-review round-1
+/// fix): `num_series`/`series_count_by_metric_name` reflect the resident
+/// label-cache snapshot (freshness = cache TTL, docs/api.md §3.4) — **zero
+/// ClickHouse**, per task-manager resolution #2. A `num_samples` field
+/// previously queried `count() FROM metric_samples` live, violating that
+/// contract; it is also not a real Prometheus `headStats` field (real
+/// `headStats` is `numSeries`/`numLabelPairs`/`chunkCount`/`minTime`/
+/// `maxTime`) and cannot be served from the cache (which holds
+/// `fingerprint -> labels`, no sample counts) — removed rather than kept
+/// as a live-query exception.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TsdbStatus {
+    pub num_series: u64,
+    pub series_count_by_metric_name: Vec<(String, u64)>,
 }
 
 /// A metrics query's time span. Instant = `start_ms == end_ms`,
@@ -357,6 +406,166 @@ impl MetricsEngine {
             out.push(row.map_err(ReadError::Clickhouse)?);
         }
         Ok(out)
+    }
+
+    /// Discovery resolution shared by [`MetricsEngine::label_names`],
+    /// [`MetricsEngine::label_values`], and [`MetricsEngine::series`]
+    /// (issue #32). **Always** resolves via [`super::sql::discovery_query`]
+    /// — the metric_series-backed SQL path with bucket-floored bounds for
+    /// the caller's *exact* window — never the label cache's in-process
+    /// fast path ([`LabelledResolution`]/[`super::labels::Resolution`]).
+    /// The cache's resident snapshot spans the whole `PULSUS_CACHE_WINDOW`
+    /// (e.g. 24h) and does not track each series' own bucketed activity
+    /// time, so reusing the cache-hit branch here would leak that wider
+    /// residency window into a narrower discovery response (#30 handoff
+    /// AC: "the cache's bucket-granularity superset must not leak into
+    /// /series results"). `filters` empty is Prometheus's own "no
+    /// `match[]`" contract (docs/api.md §3.3) — every series in the
+    /// window, unfiltered; each element otherwise applies its own
+    /// window-bound, bucket-floored `metric_series` query, concurrently
+    /// (`join_all`, mirroring `query_inner`'s fetch-concurrency contract),
+    /// unioned and deduplicated by `(metric_name, fingerprint)` (a
+    /// fingerprint is shared across metric names — see
+    /// `super::refresh::run_sweep`'s own comment on the same invariant).
+    async fn discovery_series(
+        &self,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<(String, LabelSet)>, ReadError> {
+        let bucket_ms = self.resolver.config.bucket_ms;
+        let effective: Vec<DiscoveryFilter> = if filters.is_empty() {
+            vec![DiscoveryFilter::default()]
+        } else {
+            filters.to_vec()
+        };
+        let fetches = effective.iter().map(|filter| {
+            let sql =
+                super::sql::discovery_query(&self.config.series_table, filter, window, bucket_ms);
+            self.fetch_rows::<super::rows::SeriesRow>(sql)
+        });
+        let results: Vec<Result<Vec<super::rows::SeriesRow>, ReadError>> = join_all(fetches).await;
+        let mut seen: std::collections::HashSet<(String, Fingerprint)> =
+            std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for rows in results {
+            for row in rows? {
+                if seen.insert((row.metric_name.clone(), row.fingerprint)) {
+                    out.push((row.metric_name, parse_canonical_labels(&row.labels)));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// `GET|POST /api/v1/labels` (issue #32): the union of label keys over
+    /// every series [`DiscoveryFilter`] matches, plus `__name__` always
+    /// (docs/api.md §3.3) — even when the resolved series set is empty, an
+    /// absent `metric_name` from every filter, or a metric whose series
+    /// carry no labels at all: Prometheus's `/labels` always advertises
+    /// `__name__` as a known label name.
+    pub async fn label_names(
+        &self,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<String>, ReadError> {
+        let series = self.discovery_series(filters, window).await?;
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        names.insert("__name__".to_string());
+        for (_, labels) in &series {
+            for (k, _) in labels.iter() {
+                names.insert(k.to_string());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
+    /// `GET /api/v1/label/{name}/values` (issue #32): distinct values of
+    /// `name` across every series [`DiscoveryFilter`] matches.
+    /// `name == "__name__"` returns the distinct metric names themselves
+    /// (docs/api.md §3.3).
+    pub async fn label_values(
+        &self,
+        name: &str,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<String>, ReadError> {
+        let series = self.discovery_series(filters, window).await?;
+        let mut values: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if name == "__name__" {
+            for (metric_name, _) in &series {
+                values.insert(metric_name.clone());
+            }
+        } else {
+            for (_, labels) in &series {
+                if let Some(v) = labels.get(name) {
+                    values.insert(v.to_string());
+                }
+            }
+        }
+        Ok(values.into_iter().collect())
+    }
+
+    /// `GET|POST /api/v1/series` (issue #32): every matching series' full
+    /// label set, each with `__name__=<metric_name>` spliced in (docs/api.md
+    /// §3.3), sorted deterministically. `filters` must be non-empty —
+    /// enforced by the caller (`pulsus-server`'s param parsing, `match[]`
+    /// required), not re-validated here.
+    pub async fn series(
+        &self,
+        filters: &[DiscoveryFilter],
+        window: DataWindow,
+    ) -> Result<Vec<Vec<(String, String)>>, ReadError> {
+        let series = self.discovery_series(filters, window).await?;
+        let mut out: Vec<Vec<(String, String)>> = series
+            .into_iter()
+            .map(|(metric_name, labels)| {
+                let mut pairs: Vec<(String, String)> = labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                pairs.push(("__name__".to_string(), metric_name));
+                pairs.sort();
+                pairs
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// `GET /api/v1/metadata` (issue #32): `metric_metadata` rows, already
+    /// keyed by the base family name (docs/schemas.md §2.1's writer
+    /// contract — never stripped/derived here).
+    pub async fn metadata(
+        &self,
+        metric: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<MetricMeta>, ReadError> {
+        let sql = super::sql::metadata_query(&self.config.metadata_table, metric, limit);
+        let rows: Vec<MetricMetaRow> = self.fetch_rows(sql).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MetricMeta {
+                name: r.metric_name,
+                metric_type: r.metric_type,
+                help: r.help,
+                unit: r.unit,
+            })
+            .collect())
+    }
+
+    /// `GET /api/v1/status/tsdb` (issue #32; code-review round-1 fix):
+    /// `numSeries`/`seriesCountByMetricName` from the resident label-cache
+    /// snapshot — **zero ClickHouse**, task-manager resolution #2,
+    /// freshness = cache age. `async` only for call-site parity with
+    /// every other `MetricsEngine` method; this never actually awaits
+    /// anything.
+    pub async fn tsdb_status(&self) -> Result<TsdbStatus, ReadError> {
+        let cache_snapshot = self.resolver.tsdb_snapshot();
+        Ok(TsdbStatus {
+            num_series: cache_snapshot.num_series,
+            series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
+        })
     }
 }
 

@@ -180,8 +180,22 @@ GET /api/v1/status/buildinfo     → version, revision, build metadata
 GET /api/v1/status/config        → effective config (redacted), Prometheus envelope
 GET /api/v1/status/flags         → static-equivalent flag map
 GET /api/v1/status/runtimeinfo   → process start time, storage retention
-GET /api/v1/status/tsdb          → numSeries, numSamples, top metrics/labels by cardinality
+GET /api/v1/status/tsdb          → numSeries, top metrics by cardinality
 ```
+
+`status/tsdb` is served entirely from the resident reader label cache (zero ClickHouse), fresh to within `PULSUS_CACHE_TTL`; it reports `numSeries` and `seriesCountByMetricName` (top cardinality). `numSamples` is **omitted** — it is not a Prometheus `headStats` field and cannot be served without a live sample scan, which the zero-ClickHouse contract forbids.
+
+#### Errors (§3.1-3.4)
+
+`{"status":"error","errorType":"...","error":"..."}` — exactly these three fields, **no `position` field** (unlike the log API's §2.3 envelope): a PromQL parse error's position is embedded verbatim inside the `error` message string, Prometheus-style, never split out.
+
+| Cause | HTTP | `errorType` |
+|-------|------|-------------|
+| Malformed params, malformed PromQL (parser position **in the message**), 11,000-point cap exceeded | `400` | `bad_data` |
+| Out-of-subset construct / binary-op matching failure / histogram-bucket error | `422` | `execution` |
+| ClickHouse read timed out | `503` | `timeout` |
+| Pool or label cache not yet ready, ClickHouse unreachable | `503` | `unavailable` |
+| Unclassified internal failure | `500` | `internal` |
 
 ---
 

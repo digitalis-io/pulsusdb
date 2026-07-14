@@ -193,6 +193,7 @@ mod tests {
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            started_at: std::time::SystemTime::now(),
         }
     }
 
@@ -257,6 +258,7 @@ mod tests {
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            started_at: std::time::SystemTime::now(),
         };
         let res = config_handler(State(state)).await.into_response();
         assert_eq!(res.status(), StatusCode::OK);

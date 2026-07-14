@@ -1,0 +1,1 @@
+{"status":"success","data":{"go_goroutines":[{"type":"gauge","unit":"","help":"Number of goroutines that currently exist."}]}}

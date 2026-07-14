@@ -28,6 +28,23 @@ pub struct DataWindow {
     pub end_ms: i64,
 }
 
+/// One `match[]` selector for the discovery endpoints (issue #32:
+/// `/labels`, `/label/{name}/values`, `/series`) — deliberately looser than
+/// [`pulsus_promql::SelectorSpec`]: `metric_name` is optional so a caller
+/// can express "every series, unfiltered" (Prometheus's own `/labels`/
+/// `/label/{name}/values` contract when `match[]` is omitted entirely,
+/// docs/api.md §3.3) as the single filter `DiscoveryFilter { metric_name:
+/// None, matchers: vec![] }`. `/series` requires at least one selector
+/// (enforced by the caller, `pulsus-server`'s param parsing) with a
+/// concrete metric name (the #31 planner's own structural contract — a
+/// nameless/regex-`__name__` PromQL selector is `PromqlError::Unsupported`
+/// before it ever reaches this type).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiscoveryFilter {
+    pub metric_name: Option<String>,
+    pub matchers: Vec<LabelMatcher>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
