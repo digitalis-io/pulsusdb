@@ -244,6 +244,101 @@ async fn count_by_job_up_is_served_from_the_cache_with_zero_clickhouse_sample_qu
     drop_database(&bootstrap, db).await;
 }
 
+/// Issue #37 regression, end to end against real ClickHouse: a bare
+/// selector's `/api/v1/query`-equivalent (`engine.query(&expr, ...)`) must
+/// carry `__name__` — the label-set propagation seam
+/// (`pulsus_promql::eval` -> `pulsus_read::metrics::exec::exec.rs`'s
+/// `with_metric_name`) exercised through the full fetch+evaluate path,
+/// not just the cache-only fast path the test above covers (which is an
+/// aggregation, `count by (job)`, and correctly has *no* `__name__`).
+#[tokio::test]
+async fn bare_selector_query_keeps_metric_name_end_to_end() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_name_keeps";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            labels: r#"{"job":"api"}"#.to_string(),
+        }],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    // Bare selector: keeps __name__.
+    let expr = parse("up").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+    match engine.query(&expr, &params).await.expect("query") {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert!(
+                v[0].labels
+                    .contains(&("__name__".to_string(), "up".to_string())),
+                "bare selector must keep __name__: {:?}",
+                v[0].labels
+            );
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+
+    // Aggregation over the same data: drops __name__.
+    let expr = parse("sum(up)").expect("parse");
+    match engine.query(&expr, &params).await.expect("query") {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert!(
+                !v[0].labels.iter().any(|(k, _)| k == "__name__"),
+                "aggregation must drop __name__: {:?}",
+                v[0].labels
+            );
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
 /// AC: the historical variant of `count by (job) (up)` — a window outside
 /// the cache's residency — demonstrably routes through `metric_series`
 /// (not the cache-only fast path, and not a false empty). Real sample data
