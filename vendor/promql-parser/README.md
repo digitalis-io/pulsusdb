@@ -1,0 +1,91 @@
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/GreptimeTeam/promql-parser/blob/main/LICENSE)
+[![Build Status](https://github.com/greptimeteam/promql-parser/actions/workflows/ci.yml/badge.svg)](https://github.com/GreptimeTeam/promql-parser/blob/main/.github/workflows/ci.yml)
+[![Version](https://img.shields.io/crates/v/promql-parser?label=promql-parser)](https://crates.io/crates/promql-parser)
+[![codecov](https://codecov.io/gh/GreptimeTeam/promql-parser/branch/main/graph/badge.svg?token=4GEPVMJYNG)](https://app.codecov.io/gh/GreptimeTeam/promql-parser/tree/main)
+
+
+# PromQL Lexer and Parser
+
+The goal of this project is to build a PromQL lexer and parser capable of
+parsing PromQL that conforms with [Prometheus Query][querying-prometheus].
+
+## Example
+
+To parse a simple instant vector selector expression:
+
+``` rust
+use promql_parser::parser;
+
+let promql = r#"
+    http_requests_total{
+        environment=~"staging|testing|development",
+        method!="GET"
+    } offset 5m
+"#;
+
+match parser::parse(promql) {
+    Ok(expr) => {
+        println!("Prettify:\n{}\n", expr.prettify());
+        println!("AST:\n{expr:?}");
+    }
+    Err(info) => println!("Err: {info:?}"),
+}
+```
+
+or you can directly run examples under this repo:
+
+``` shell
+cargo run --example parser
+```
+
+This outputs:
+
+```rust
+Prettify:
+http_requests_total{environment=~"staging|testing|development",method!="GET"} offset 5m
+
+AST:
+VectorSelector(VectorSelector { name: Some("http_requests_total"), matchers: Matchers { matchers: [Matcher { op: Re(staging|testing|development), name: "environment", value: "staging|testing|development" }, Matcher { op: NotEqual, name: "method", value: "GET" }] }, offset: Some(Pos(300s)), at: None })
+```
+
+## PromQL compliance
+
+This crate declares compatible with [prometheus v3.8][prom-v3.8], which is
+released at 2025-11-28. Any revision on PromQL after this commit is not guaranteed.
+
+## Community Extensions
+
+There are a number of community projects that extend promql-parser or
+provide integrations with other systems.
+
+### Language Bindings
+
+- [py-promql-parser](https://github.com/messense/py-promql-parser) Python.
+- [lua-promql-parser](https://github.com/mtrbpr/lua-promql-parser) Lua.
+
+## Known Uses
+
+Here are some of the projects known to use promql-parser:
+
+- [GreptimeDB](https://github.com/GreptimeTeam/greptimedb) Open Source & Cloud Native Distributed Time Series Database
+- [OpenObserve](https://github.com/openobserve/openobserve) High performance, petabyte scale Elasticsearch/Splunk/Datadog alternative for (logs, metrics, traces, RUM, Error tracking, Session replay)
+
+If your project is using promql-parser, feel free to make a PR to add it to this list.
+
+## Contributing
+
+Contributions are highly encouraged!
+
+Pull requests that add support for or fix a bug in a feature in the PromQL will
+likely be accepted after review.
+
+## Licensing
+
+All code in this repository is licensed under the [Apache License 2.0](LICENSE).
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+licensed as above, without any additional terms or conditions.
+
+[prom-v3.8]: https://github.com/prometheus/prometheus/tree/v3.8.0/promql/parser
+[querying-prometheus]: https://prometheus.io/docs/prometheus/latest/querying/basics/

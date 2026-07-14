@@ -95,10 +95,24 @@ http-body-util = "0.1"
 # table): every number in ADR 0002 (corpus pass rate, divergence buckets,
 # round-trip results) was measured against exactly this version, and a bump
 # invalidates the spike's evidence until re-run (docs/architecture.md §5.1's
-# "re-vendor on reference bump" rule). Dev-dependency only in
-# `pulsus-promql` for this spike; #31 promotes it to a real dependency.
+# "re-vendor on reference bump" rule). Promoted from dev-dependency to a
+# real `pulsus-promql` dependency by issue #31 — the `[patch.crates-io]`
+# entry below redirects this version requirement to the vendored, patched
+# copy (docs/decisions/0003-promql-parser-vendor-patch.md), so every
+# `promql_parser::...` import path is unchanged.
 promql-parser = "=0.10.0"
 # `sha2` backs the corpus integrity check in `upstream_parser_corpus.rs`
 # (recomputes the vendored corpus's SHA-256 and asserts it against
 # `manifest.json` before running any case).
 sha2 = "0.10"
+
+# ADR 0003 (patch-and-vendor `promql-parser`, superseding ADR 0002's default
+# port-fallback): 5 leaf-level fixes (reserved-keyword lexing, backtick
+# raw-string escapes, a duration-literal overflow bound, two `Display`
+# bugs — see vendor/promql-parser/PATCHES.md) applied to an otherwise
+# unmodified `promql-parser 0.10.0`, redirected here so every
+# `promql_parser::...` import path and the #29 corpus/golden gate are
+# unchanged. Re-vendor rule: on any `promql-parser`/Prometheus reference
+# bump, re-run the #29 corpus + golden gate before accepting the bump.
+[patch.crates-io]
+promql-parser = { path = "vendor/promql-parser" }

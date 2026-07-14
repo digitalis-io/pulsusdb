@@ -91,12 +91,16 @@ pub struct MatrixSeries {
 }
 
 /// The engine's raw result — #13 encodes this into the query-API JSON
-/// envelope (out of scope here per the architect plan).
+/// envelope (out of scope here per the architect plan). `Scalar` is issue
+/// #31's addition (`pulsus_promql::QueryValue::Scalar` — a bare-number
+/// PromQL expression, e.g. `1 + 1`, evaluated with no series involved);
+/// LogQL never produces it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
     Streams(Vec<StreamResult>),
     Vector(Vec<VectorSample>),
     Matrix(Vec<MatrixSeries>),
+    Scalar(f64),
 }
 
 pub struct LogQlEngine {
@@ -740,7 +744,12 @@ impl LogQlEngine {
 /// the canonical SQL text `plan`/`sql` generate — and what `PlanExplain`
 /// surfaces to callers — is unaffected, so `tests/sql_snapshots.rs`'s
 /// byte-exact assertions stay meaningful.
-fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
+///
+/// `pub(crate)`: issue #31's `metrics::exec::MetricsEngine` reuses this
+/// same fix at its own execution boundary (its `SqlFallback` sub-query's
+/// anchored `match(...)` regex predicates carry the identical `^(?:...)$`
+/// literal-`?` shape), rather than duplicating the doubling logic.
+pub(crate) fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
     if sql.contains('?') {
         Cow::Owned(sql.replace('?', "??"))
     } else {

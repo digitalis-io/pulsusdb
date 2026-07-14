@@ -157,6 +157,23 @@ pub enum Resolution {
     SqlFallback { sql: String, reason: FallbackReason },
 }
 
+/// [`LabelCache::resolve_labelled`]'s result — like [`Resolution`], but the
+/// cache fast path carries each matched fingerprint's resolved
+/// [`LabelSet`], not just the bare fingerprint. Needed by issue #31's
+/// zero-ClickHouse `count`/`group` fast path (task-manager resolution #2
+/// on issue #31): that AC requires *labels* (to compute a
+/// `by`/`without` grouping key), not just fingerprints. On the SQL/
+/// out-of-window path this returns the identical [`FallbackReason`] and
+/// sub-query [`Resolution::resolve`] would, so `count`/`group` historical
+/// variants route through `metric_series` exactly like any other query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LabelledResolution {
+    /// Sorted by fingerprint, fully answered from the current snapshot.
+    Series(Vec<(Fingerprint, LabelSet)>),
+    /// Identical contract to [`Resolution::SqlFallback`].
+    SqlFallback { sql: String, reason: FallbackReason },
+}
+
 /// Pure over the current snapshot. Implemented by [`LabelCache`]; a
 /// separate trait (rather than an inherent method) so issue #31 can depend
 /// on the contract without depending on the concrete refresh/ClickHouse
@@ -252,6 +269,26 @@ fn matches(
     Ok(true)
 }
 
+/// Renders the fallback sub-query and pairs it with `reason` — shared by
+/// both [`resolve_over`] (wraps into [`Resolution::SqlFallback`]) and
+/// [`resolve_labelled_over`] (wraps into
+/// [`LabelledResolution::SqlFallback`]), so the two resolution paths can
+/// never disagree on *which* sub-query a given fallback reason renders.
+fn sql_fallback_sql(
+    config: &LabelCacheConfig,
+    metric_name: &str,
+    window: DataWindow,
+    matchers: &[LabelMatcher],
+) -> String {
+    super::sql::historical_series_subquery(
+        &config.series_table,
+        metric_name,
+        window,
+        config.bucket_ms,
+        matchers,
+    )
+}
+
 fn sql_fallback(
     config: &LabelCacheConfig,
     metric_name: &str,
@@ -259,14 +296,23 @@ fn sql_fallback(
     matchers: &[LabelMatcher],
     reason: FallbackReason,
 ) -> Resolution {
-    let sql = super::sql::historical_series_subquery(
-        &config.series_table,
-        metric_name,
-        window,
-        config.bucket_ms,
-        matchers,
-    );
-    Resolution::SqlFallback { sql, reason }
+    Resolution::SqlFallback {
+        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        reason,
+    }
+}
+
+fn labelled_sql_fallback(
+    config: &LabelCacheConfig,
+    metric_name: &str,
+    window: DataWindow,
+    matchers: &[LabelMatcher],
+    reason: FallbackReason,
+) -> LabelledResolution {
+    LabelledResolution::SqlFallback {
+        sql: sql_fallback_sql(config, metric_name, window, matchers),
+        reason,
+    }
 }
 
 /// The pure resolution algorithm: `resolve`'s whole contract, factored out
@@ -387,6 +433,111 @@ pub(crate) fn resolve_over(
     Resolution::Fingerprints(matched)
 }
 
+/// [`LabelCache::resolve_labelled`]'s pure core — issue #31's addition,
+/// mirroring [`resolve_over`]'s every gate (cold/out-of-window/stale/
+/// regex-unsupported/over-cardinality) exactly, but collecting each
+/// matched fingerprint's [`LabelSet`] alongside it rather than discarding
+/// it. Kept as a near-duplicate of [`resolve_over`] rather than having one
+/// call the other: [`resolve_over`]'s `Resolution::Fingerprints` is a
+/// stable public contract already depended on by other call sites/tests,
+/// and re-deriving labels from fingerprints after the fact would mean a
+/// second (possibly-swapped) snapshot read — reading the snapshot once and
+/// walking it once for both fingerprint and label output avoids that
+/// race entirely.
+pub(crate) fn resolve_labelled_over(
+    snapshot: &CacheSnapshot,
+    regex_cache: &RegexCache,
+    metrics: &CacheMetrics,
+    config: &LabelCacheConfig,
+    metric_name: &str,
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+) -> LabelledResolution {
+    if snapshot.generation == 0 {
+        metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
+        return labelled_sql_fallback(
+            config,
+            metric_name,
+            window,
+            matchers,
+            FallbackReason::ColdCache,
+        );
+    }
+
+    if window.start_ms < snapshot.covered_from_ms {
+        metrics
+            .miss_out_of_window_total
+            .fetch_add(1, Ordering::Relaxed);
+        return labelled_sql_fallback(
+            config,
+            metric_name,
+            window,
+            matchers,
+            FallbackReason::OutOfWindow,
+        );
+    }
+
+    let staleness_threshold_ms =
+        config.ttl.as_millis() as i64 * i64::from(config.staleness_multiplier);
+    let recency_edge_ms = snapshot
+        .sweep_time_ms
+        .saturating_add(staleness_threshold_ms);
+    if window.end_ms > recency_edge_ms {
+        let age_ms = window.end_ms.saturating_sub(snapshot.sweep_time_ms).max(0) as u64;
+        metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
+        return labelled_sql_fallback(
+            config,
+            metric_name,
+            window,
+            matchers,
+            FallbackReason::StaleCache { age_ms },
+        );
+    }
+
+    let Some(candidates) = snapshot.by_metric.get(metric_name) else {
+        metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+        return LabelledResolution::Series(Vec::new());
+    };
+
+    let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
+    for &fp in candidates {
+        let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
+            continue;
+        };
+        match matches(regex_cache, labels, matchers) {
+            Ok(true) => matched.push((fp, labels.clone())),
+            Ok(false) => {}
+            Err(reason) => {
+                metrics
+                    .miss_regex_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return labelled_sql_fallback(config, metric_name, window, matchers, reason);
+            }
+        }
+    }
+
+    if matched.len() as u64 > config.cache_max_series {
+        metrics
+            .miss_over_cardinality_total
+            .fetch_add(1, Ordering::Relaxed);
+        let matched_count = matched.len();
+        return labelled_sql_fallback(
+            config,
+            metric_name,
+            window,
+            matchers,
+            FallbackReason::OverCardinality {
+                matched: matched_count,
+                cap: config.cache_max_series,
+            },
+        );
+    }
+
+    matched.sort_unstable_by_key(|(fp, _)| *fp);
+    metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+    LabelledResolution::Series(matched)
+}
+
 /// The resident label cache: owns the snapshot slot, config, the compiled-
 /// regex cache, the `ChClient` the refresh sweep queries through, and the
 /// metrics atomics. Fields are `pub(crate)` — visible to [`super::refresh`]
@@ -469,6 +620,33 @@ impl SeriesResolver for LabelCache {
     ) -> Resolution {
         let snapshot = self.current_snapshot();
         resolve_over(
+            &snapshot,
+            &self.regex_cache,
+            &self.metrics,
+            &self.config,
+            metric_name,
+            matchers,
+            window,
+        )
+    }
+}
+
+impl LabelCache {
+    /// Issue #31's addition: like [`SeriesResolver::resolve`], but carries
+    /// each matched fingerprint's [`LabelSet`] — the zero-ClickHouse
+    /// `count`/`group` fast path needs labels (to compute a
+    /// `by`/`without` grouping key), not just fingerprints. Not part of
+    /// the [`SeriesResolver`] trait itself (that contract is #30's and
+    /// already depended on elsewhere with its narrower fingerprints-only
+    /// signature) — an inherent method alongside it instead.
+    pub fn resolve_labelled(
+        &self,
+        metric_name: &str,
+        matchers: &[LabelMatcher],
+        window: DataWindow,
+    ) -> LabelledResolution {
+        let snapshot = self.current_snapshot();
+        resolve_labelled_over(
             &snapshot,
             &self.regex_cache,
             &self.metrics,
@@ -917,5 +1095,157 @@ mod tests {
     fn regex_cache_rejects_an_uncompilable_pattern() {
         let cache = RegexCache::new(4);
         assert_eq!(cache.is_match("(unclosed", "x"), None);
+    }
+
+    // --- resolve_labelled (issue #31) ---
+
+    fn resolve_labelled(
+        snap: &CacheSnapshot,
+        cfg: &LabelCacheConfig,
+        metric_name: &str,
+        matchers: &[LabelMatcher],
+        w: DataWindow,
+    ) -> LabelledResolution {
+        let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
+        let metrics = CacheMetrics::default();
+        resolve_labelled_over(snap, &regex_cache, &metrics, cfg, metric_name, matchers, w)
+    }
+
+    #[test]
+    fn resolve_labelled_returns_fingerprints_paired_with_their_labels() {
+        let snap = snapshot(
+            vec![("up", 20, &[("job", "api")]), ("up", 10, &[("job", "web")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        match resolve_labelled(&snap, &config(), "up", &[], window(0, 1_000)) {
+            LabelledResolution::Series(series) => {
+                assert_eq!(series.len(), 2);
+                // Sorted by fingerprint (10, 20).
+                assert_eq!(series[0].0, 10);
+                assert_eq!(series[0].1.get("job"), Some("web"));
+                assert_eq!(series[1].0, 20);
+                assert_eq!(series[1].1.get("job"), Some("api"));
+            }
+            other => panic!("expected Series, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_applies_matchers_identically_to_resolve() {
+        let snap = snapshot(
+            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "web")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "api".to_string(),
+        };
+        match resolve_labelled(&snap, &config(), "up", &[m], window(0, 1_000)) {
+            LabelledResolution::Series(series) => {
+                assert_eq!(series, vec![(1, labels(&[("job", "api")]))]);
+            }
+            other => panic!("expected Series, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_of_a_cold_cache_falls_back_with_the_same_reason_as_resolve() {
+        let snap = CacheSnapshot::default();
+        match resolve_labelled(&snap, &config(), "up", &[], window(0, 1_000)) {
+            LabelledResolution::SqlFallback { reason, .. } => {
+                assert_eq!(reason, FallbackReason::ColdCache)
+            }
+            other => panic!("expected SqlFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_out_of_window_falls_back_to_the_same_sql_metric_series_routes_through() {
+        let snap = snapshot(vec![("up", 1, &[("job", "api")])], 10_000, BASE_SWEEP_MS, 1);
+        match resolve_labelled(&snap, &config(), "up", &[], window(0, 20_000)) {
+            LabelledResolution::SqlFallback { reason, sql } => {
+                assert_eq!(reason, FallbackReason::OutOfWindow);
+                assert!(sql.contains("metric_series"));
+            }
+            other => panic!("expected SqlFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_an_unknown_metric_name_is_an_empty_series_not_a_fallback() {
+        let snap = snapshot(vec![], 0, BASE_SWEEP_MS, 1);
+        match resolve_labelled(&snap, &config(), "unknown_metric", &[], window(0, 1_000)) {
+            LabelledResolution::Series(series) => assert!(series.is_empty()),
+            other => panic!("expected empty Series, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_over_cardinality_falls_back_to_sql() {
+        let mut cfg = config();
+        cfg.cache_max_series = 1;
+        let snap = snapshot(
+            vec![("up", 1, &[("job", "api")]), ("up", 2, &[("job", "api")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "api".to_string(),
+        };
+        match resolve_labelled(&snap, &cfg, "up", &[m], window(0, 1_000)) {
+            LabelledResolution::SqlFallback { reason, .. } => {
+                assert_eq!(
+                    reason,
+                    FallbackReason::OverCardinality { matched: 2, cap: 1 }
+                );
+            }
+            other => panic!("expected SqlFallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_labelled_matches_resolve_on_which_fingerprints_hit() {
+        // Differential-style sanity check: the two paths' matcher
+        // evaluation must never diverge on the *set* of matched
+        // fingerprints, only on whether labels are carried alongside.
+        let snap = snapshot(
+            vec![
+                ("http_requests_total", 30, &[("status", "500")]),
+                ("http_requests_total", 10, &[("status", "503")]),
+                ("http_requests_total", 20, &[("status", "200")]),
+            ],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let m = LabelMatcher {
+            key: "status".to_string(),
+            op: MatchOp::Re,
+            value: "5..".to_string(),
+        };
+        let cfg = config();
+        let plain = resolve(
+            &snap,
+            &cfg,
+            "http_requests_total",
+            std::slice::from_ref(&m),
+            window(0, 1_000),
+        );
+        let labelled = resolve_labelled(&snap, &cfg, "http_requests_total", &[m], window(0, 1_000));
+        match (plain, labelled) {
+            (Resolution::Fingerprints(fps), LabelledResolution::Series(series)) => {
+                let labelled_fps: Vec<Fingerprint> = series.iter().map(|(fp, _)| *fp).collect();
+                assert_eq!(fps, labelled_fps);
+            }
+            other => panic!("expected matching Fingerprints/Series, got {other:?}"),
+        }
     }
 }

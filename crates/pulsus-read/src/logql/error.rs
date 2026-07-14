@@ -60,7 +60,11 @@ impl fmt::Display for TooBroadReason {
     }
 }
 
-/// Errors from planning or executing a LogQL query.
+/// Errors from planning or executing a LogQL **or PromQL** query — despite
+/// living in the `logql` module (this crate's original, pre-#31 error
+/// type), `ReadError` is shared crate-wide; issue #31's
+/// `metrics::exec::MetricsEngine` reuses it rather than minting a second
+/// top-level error type, via the `Promql` variant below.
 #[derive(Debug, Error)]
 pub enum ReadError {
     /// Surfaced by callers (e.g. #13) that parse a raw query string before
@@ -68,6 +72,16 @@ pub enum ReadError {
     /// parse, so this variant is never constructed inside `pulsus-read`.
     #[error("logql parse error: {0}")]
     Parse(#[from] LogQlError),
+
+    /// Issue #31: any `pulsus_promql::plan`/`evaluate` failure — parse,
+    /// unsupported-construct, bad vector matching, or a
+    /// `histogram_quantile` bucket error. The inner `PromqlError`'s own
+    /// `Display` (in particular `PromqlError::Parse`, which carries the
+    /// vendored parser's upstream error text verbatim) is preserved
+    /// unmodified inside this variant's message — only this outer "promql:
+    /// " prefix is added.
+    #[error("promql: {0}")]
+    Promql(#[from] pulsus_promql::PromqlError),
 
     /// The selector has no positive (`=`/`=~`) matcher — Loki's
     /// "match-everything" rejection (task-manager resolution #2: the coarse
@@ -165,5 +179,22 @@ mod tests {
     #[test]
     fn invalid_step_message_names_the_zero_step_rule() {
         assert!(ReadError::InvalidStep.to_string().contains("step_ns"));
+    }
+
+    #[test]
+    fn promql_display_wraps_the_inner_error_verbatim() {
+        let inner = pulsus_promql::PromqlError::Unsupported {
+            construct: "the @ modifier".to_string(),
+        };
+        let err = ReadError::Promql(inner);
+        assert!(err.to_string().starts_with("promql: "));
+        assert!(err.to_string().contains("the @ modifier"));
+    }
+
+    #[test]
+    fn promql_parse_error_text_survives_unmodified_inside_read_error() {
+        let inner = pulsus_promql::PromqlError::Parse("unexpected character: 'x'".to_string());
+        let err = ReadError::from(inner);
+        assert_eq!(err.to_string(), "promql: unexpected character: 'x'");
     }
 }

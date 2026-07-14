@@ -118,6 +118,29 @@ pub fn historical_resolution_query(
     sql
 }
 
+/// Issue #31's label-hydration query: `fingerprint -> labels` for an
+/// already-**resolved, concrete** fingerprint list (mirrors `logql::exec`'s
+/// stage-2 hydration precedent). Used only on the `SqlFallback` sample-
+/// fetch path ([`super::sample_sql::sample_fetch_subquery`]) — the sample
+/// fetch's own nested `fingerprint IN ( <subquery> )` already narrows to
+/// exactly the fingerprints that returned samples in-window, so this
+/// hydrates *only those*, not the fallback's full (possibly much larger)
+/// matcher-matched set. No `window`/`matchers`/bucket-floor predicates
+/// here — the fingerprint list is already the answer; this is a pure
+/// `fingerprint -> labels` lookup, filtered only by `metric_name` (the
+/// schema's metric-scoping invariant) and the explicit `IN (...)` list.
+pub fn series_labels_by_fingerprint(series_table: &str, metric_name: &str, fps: &[u64]) -> String {
+    let fp_list = fps
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT fingerprint, labels\nFROM {series_table}\nWHERE metric_name = {}\n  AND fingerprint IN ({fp_list})\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint",
+        ch_string(metric_name)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +192,22 @@ mod tests {
         let sql = historical_resolution_query("metric_series", "up", window(), 3_600_000, &[]);
         assert!(sql.starts_with("SELECT fingerprint, labels\nFROM metric_series"));
         assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+    }
+
+    #[test]
+    fn series_labels_by_fingerprint_renders_an_explicit_fingerprint_list() {
+        let sql = series_labels_by_fingerprint("metric_series", "up", &[101, 205, 990]);
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, labels\nFROM metric_series\nWHERE metric_name = 'up'\n  AND fingerprint IN (101, 205, 990)\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
+        );
+    }
+
+    #[test]
+    fn series_labels_by_fingerprint_has_no_window_or_matcher_predicates() {
+        let sql = series_labels_by_fingerprint("metric_series", "up", &[1]);
+        assert!(!sql.contains("unix_milli >="));
+        assert!(!sql.contains("JSONExtractString"));
     }
 
     #[test]

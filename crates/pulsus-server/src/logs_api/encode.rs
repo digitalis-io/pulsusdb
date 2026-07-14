@@ -341,6 +341,24 @@ pub(crate) fn query_response(
                 suffix,
             ))
         }
+        // Issue #31: `pulsus_promql::QueryValue::Scalar` (a bare-number
+        // PromQL expression, e.g. `1 + 1`) — docs/api.md §2.1's documented
+        // `"resultType":"scalar"` shape. No streaming needed (a single
+        // value, unlike the O(series) result arrays above); `pulsus-server`
+        // does not yet wire `MetricsEngine` into a route (that is #32), so
+        // this arm is unreachable from any request today, but keeps
+        // `QueryResult` matches exhaustive and correct for when it lands.
+        QueryResult::Scalar(v) => {
+            let body = explain_suffix(
+                format!(
+                    "{{\"status\":\"success\",\"data\":{{\"resultType\":\"scalar\",\"result\":[{},{}]}}",
+                    format_unix_seconds(at_ns),
+                    format_value_json(v)
+                ),
+                explain.as_ref(),
+            );
+            json_response(Body::from(format!("{body}}}")))
+        }
     }
 }
 

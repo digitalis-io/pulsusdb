@@ -1,6 +1,6 @@
 # ADR 0002: `promql-parser` validation spike (M2 PromQL parser)
 
-Status: **Accepted — port fallback triggered** (2026-07-14)
+Status: **Superseded by [0003](0003-promql-parser-vendor-patch.md)** (2026-07-14) — the port-fallback trigger below fired mechanically on volume (12 patchable inputs > the ≤5 bar), but ADR 0003 found the gap concentrated in 5 leaf-level root causes touching zero grammar productions and ratified patch-and-vendor over a from-scratch port. This ADR's measurements (corpus pass rate, divergence buckets, round-trip results) stand as the evidence trail; its *decision* (port) does not.
 Issue: [#29](https://github.com/digitalis-io/pulsusdb/issues/29)
 
 ## Context

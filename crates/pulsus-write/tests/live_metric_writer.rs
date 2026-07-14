@@ -333,3 +333,117 @@ async fn metric_series_same_bucket_samples_register_exactly_one_row() {
 
     drop_database(&bootstrap, db).await;
 }
+
+/// Belt-and-suspenders guard test (issue #31 code review round 1, finding
+/// 2 — architect adjudication REJECT with a guard test required): a
+/// fingerprint's `metric_series.labels` cannot change across rows by
+/// construction — `metric_fingerprint` is `hash(canonical label set)`
+/// (docs/schemas.md §2.1) and the writer renders `labels` as deterministic
+/// canonical JSON (sorted keys, issue #4/#26 canonicalization), so a label
+/// change *is* a different fingerprint, never a new row for the same one.
+/// This is what makes issue #31's `series_labels_by_fingerprint` (a plain
+/// `DESC LIMIT 1 BY` hydration with no window bound) safe: whichever row
+/// it picks for a fingerprint carries the same `labels` any other row for
+/// that fingerprint would. Proven here against the real product write
+/// path (`MetricWriter`, not a direct `insert_block`): two samples for the
+/// same series in two *different* activity buckets (so two distinct
+/// `metric_series` rows are registered — same fingerprint, different
+/// `unix_milli`) must carry byte-identical `labels` text.
+#[tokio::test]
+async fn metric_series_rows_for_the_same_fingerprint_carry_byte_identical_labels() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_write_it_metric_series_label_immutability";
+    drop_database(&bootstrap, db).await;
+
+    let params = RenderCtx {
+        db: db.to_string(),
+        cluster: None,
+        dist_suffix: "_dist".to_string(),
+        storage_policy: None,
+        retention_days: 7,
+        log_rollup: Duration::from_secs(5),
+    };
+    run_init(&bootstrap, &params).await.expect("run_init");
+
+    let client = Arc::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (target db)"),
+    );
+    let writer = MetricWriter::new_with_tables(
+        client.clone(),
+        &WriterConfig::default(),
+        DEFAULT_ACTIVITY_BUCKET_MS,
+        MetricWriterTables::metrics_default(),
+    );
+
+    let (labels, _) = LabelSet::from_normalized([("job".to_string(), "checkout".to_string())]);
+    let metric_name: Arc<str> = Arc::from("http_requests_total");
+    let series = SeriesRef {
+        metric_name: metric_name.clone(),
+        fingerprint: 4242,
+        labels,
+    };
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let batch = ParsedMetrics {
+        samples: vec![
+            MetricPoint {
+                metric_name: metric_name.clone(),
+                fingerprint: 4242,
+                unix_milli: 0,
+                value: 1.0,
+            },
+            MetricPoint {
+                metric_name: metric_name.clone(),
+                fingerprint: 4242,
+                unix_milli: bucket * 5, // a distinct activity bucket
+                value: 2.0,
+            },
+        ],
+        series: vec![series],
+        ..Default::default()
+    };
+
+    let wait = writer.admit_flush(batch).expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("flush settles")
+        .expect("flush succeeds");
+
+    writer.shutdown(Duration::from_secs(5)).await;
+
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct LabelsRow {
+        unix_milli: i64,
+        labels: String,
+    }
+    let sql = format!(
+        "SELECT unix_milli, labels FROM {db}.metric_series \
+         WHERE metric_name = '{metric_name}' AND fingerprint = 4242 ORDER BY unix_milli"
+    );
+    let mut stream = client
+        .query_stream::<LabelsRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query metric_series");
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next().await {
+        rows.push(row.expect("decode LabelsRow"));
+    }
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "two distinct activity buckets must register two metric_series rows"
+    );
+    assert_eq!(
+        rows[0].labels, rows[1].labels,
+        "the same fingerprint's labels must be byte-identical across every metric_series row \
+         (labels are immutable by construction — a change would be a different fingerprint)"
+    );
+
+    drop_database(&bootstrap, db).await;
+}

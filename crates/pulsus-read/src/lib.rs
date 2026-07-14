@@ -11,7 +11,8 @@ pub use logql::{
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, FallbackReason, LabelCache,
-    LabelCacheConfig, LabelMatcher, MatchOp, Resolution, SeriesResolver, spawn_refresh_loop,
+    LabelCacheConfig, LabelMatcher, LabelledResolution, MatchOp, MetricQueryParams, MetricsConfig,
+    MetricsEngine, Resolution, SeriesResolver, spawn_refresh_loop,
 };
 
 #[cfg(test)]

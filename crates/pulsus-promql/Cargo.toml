@@ -5,12 +5,22 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[dev-dependencies]
-# Issue #29 spike: validates `promql-parser` against the upstream Prometheus
-# parser test corpus + an M2-subset AST golden matrix before #31 promotes it
-# to a real `[dependencies]` entry. See docs/decisions/0002-promql-parser-
-# selection.md.
+[dependencies]
+# Promoted from [dev-dependencies] by issue #31 (was the #29 spike-only
+# dependency, docs/decisions/0002-promql-parser-selection.md) — now the
+# real parser this crate's `parser`/`plan` modules build on. Redirected to
+# the vendored, patched copy via the workspace root's [patch.crates-io]
+# (docs/decisions/0003-promql-parser-vendor-patch.md).
 promql-parser.workspace = true
+# `STALE_NAN_BITS`, `Fingerprint`, `LabelSet`, `LabelMatcher`/`MatchOp` — the
+# matcher type lives here (not `pulsus-read`) specifically so both
+# `pulsus-promql` and `pulsus-read` can depend on it without a cycle
+# (`pulsus-model -> pulsus-promql -> pulsus-read`, issue #31 plan
+# amendment §1).
+pulsus-model = { path = "../pulsus-model" }
+thiserror.workspace = true
+
+[dev-dependencies]
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

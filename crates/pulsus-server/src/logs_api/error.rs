@@ -118,6 +118,18 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
                 None,
             ),
         },
+        // Issue #31: every `pulsus_promql::PromqlError` variant (parse,
+        // unsupported construct, bad vector matching, histogram_quantile
+        // bucket error) is a client-caused failure — mapped uniformly to
+        // 400 `bad_data`, no position (unlike `LogQlError`'s span-tracked
+        // parser, `PromqlError::Parse` carries only the vendored parser's
+        // message text). `pulsus-server` does not yet wire `MetricsEngine`
+        // into a route (that is #32), so this arm is unreachable from any
+        // request today; #32 may split it into a finer-grained mapping
+        // (e.g. `Unsupported` -> a distinct `errorType`) if the PromQL API
+        // surface needs one — this keeps `ReadError` matches exhaustive
+        // and correct in the meantime.
+        ReadError::Promql(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
     }
 }
 

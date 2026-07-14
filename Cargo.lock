@@ -1590,8 +1590,6 @@ dependencies = [
 [[package]]
 name = "promql-parser"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e8c90c956be4237a93be6f2298302b56974ef862ab11e0f98869d1f27c69f88"
 dependencies = [
  "cfgrammar",
  "chrono",
@@ -1687,9 +1685,11 @@ name = "pulsus-promql"
 version = "0.0.0"
 dependencies = [
  "promql-parser",
+ "pulsus-model",
  "serde",
  "serde_json",
  "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1702,6 +1702,7 @@ dependencies = [
  "pulsus-config",
  "pulsus-logql",
  "pulsus-model",
+ "pulsus-promql",
  "pulsus-schema",
  "regex",
  "serde",

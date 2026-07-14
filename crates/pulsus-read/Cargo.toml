@@ -13,6 +13,12 @@ pulsus-config = { path = "../pulsus-config" }
 # shared bucket-floor identity, issue #26 precedent) plus `LabelSet`/
 # `Fingerprint`/`LabelMatcher`/`MatchOp` for the issue #30 label cache.
 pulsus-model = { path = "../pulsus-model" }
+# The pure planner/evaluator (issue #31): `pulsus-read::metrics::exec`
+# orchestrates `pulsus_promql::plan` -> resolve/fetch -> `pulsus_promql
+# ::evaluate`, the only crate in the workspace that calls into both this
+# and `pulsus-model` at once (`pulsus-model -> pulsus-promql ->
+# pulsus-read`, acyclic — issue #31 plan amendment §1).
+pulsus-promql = { path = "../pulsus-promql" }
 # The `clickhouse` crate's `#[derive(Row)]` macro expands to paths rooted at
 # `clickhouse::...` unqualified, so it must be a direct dependency of every
 # crate that derives it, not just reachable transitively through
