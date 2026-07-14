@@ -8,9 +8,13 @@ pub mod writer;
 
 pub use error::LogsIngestError;
 pub use ingest::http::ingest;
+pub use ingest::metrics::{MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef};
 pub use ingest::{Backpressure, FlushWait, LogSink};
 pub use protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow, decode, parse};
-pub use writer::{LogWriter, WriteError, WriterTables};
+pub use writer::{
+    LogWriter, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, MetricWriter,
+    MetricWriterTables, WriteError, WriterTables,
+};
 
 #[cfg(test)]
 mod tests {

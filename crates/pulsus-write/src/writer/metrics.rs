@@ -11,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::writer::spool::SpoolCounters;
+
 /// Per-table counters (one instance each for `log_samples`/`log_streams`).
 #[derive(Debug, Default)]
 pub struct TableMetrics {
@@ -102,6 +104,16 @@ pub struct WriterMetricsSnapshot {
     pub rejected_total: u64,
 }
 
+impl SpoolCounters for WriterMetrics {
+    fn spool_poison_total(&self) -> &AtomicU64 {
+        &self.spool_poison_total
+    }
+
+    fn spool_uncertain_total(&self) -> &AtomicU64 {
+        &self.spool_uncertain_total
+    }
+}
+
 impl WriterMetrics {
     pub fn snapshot(&self, queue_bytes: u64) -> WriterMetricsSnapshot {
         WriterMetricsSnapshot {
@@ -114,6 +126,81 @@ impl WriterMetrics {
             stream_registrations_total: self.stream_registrations_total.load(Ordering::Relaxed),
             lru_hits_total: self.lru_hits_total.load(Ordering::Relaxed),
             lru_misses_total: self.lru_misses_total.load(Ordering::Relaxed),
+            collisions_total: self.collisions_total.load(Ordering::Relaxed),
+            rejected_total: self.rejected_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`WriterMetrics`]'s three-table counterpart for
+/// [`crate::writer::MetricWriter`] (issue #26 architect plan): the same
+/// shape, generalized from two tables (`samples`/`streams`) to three
+/// (`samples`/`series`/`metadata`), plus metrics-specific counters
+/// (`series_registrations_total`, `series_lru_hits/misses_total`,
+/// `metadata_upserts_total`) replacing `WriterMetrics`'s log-specific
+/// `stream_registrations_total`/`lru_hits/misses_total`. Reuses
+/// `TableMetrics`/`TableMetricsSnapshot` unchanged — the per-table counters
+/// mean the same thing regardless of family.
+#[derive(Debug, Default)]
+pub struct MetricWriterMetrics {
+    pub samples: Arc<TableMetrics>,
+    pub series: Arc<TableMetrics>,
+    pub metadata: Arc<TableMetrics>,
+    pub backpressure_total: AtomicU64,
+    pub spool_poison_total: AtomicU64,
+    pub spool_uncertain_total: AtomicU64,
+    pub series_registrations_total: AtomicU64,
+    pub series_lru_hits_total: AtomicU64,
+    pub series_lru_misses_total: AtomicU64,
+    pub metadata_upserts_total: AtomicU64,
+    pub collisions_total: AtomicU64,
+    pub rejected_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetricWriterMetricsSnapshot {
+    pub samples: TableMetricsSnapshot,
+    pub series: TableMetricsSnapshot,
+    pub metadata: TableMetricsSnapshot,
+    /// The live `queued_bytes` gauge — passed in by the caller
+    /// ([`crate::writer::MetricWriter::metrics`]), which owns the
+    /// authoritative `AtomicU64` (not duplicated here).
+    pub queue_bytes: u64,
+    pub backpressure_total: u64,
+    pub spool_poison_total: u64,
+    pub spool_uncertain_total: u64,
+    pub series_registrations_total: u64,
+    pub series_lru_hits_total: u64,
+    pub series_lru_misses_total: u64,
+    pub metadata_upserts_total: u64,
+    pub collisions_total: u64,
+    pub rejected_total: u64,
+}
+
+impl SpoolCounters for MetricWriterMetrics {
+    fn spool_poison_total(&self) -> &AtomicU64 {
+        &self.spool_poison_total
+    }
+
+    fn spool_uncertain_total(&self) -> &AtomicU64 {
+        &self.spool_uncertain_total
+    }
+}
+
+impl MetricWriterMetrics {
+    pub fn snapshot(&self, queue_bytes: u64) -> MetricWriterMetricsSnapshot {
+        MetricWriterMetricsSnapshot {
+            samples: self.samples.snapshot(),
+            series: self.series.snapshot(),
+            metadata: self.metadata.snapshot(),
+            queue_bytes,
+            backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
+            spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),
+            spool_uncertain_total: self.spool_uncertain_total.load(Ordering::Relaxed),
+            series_registrations_total: self.series_registrations_total.load(Ordering::Relaxed),
+            series_lru_hits_total: self.series_lru_hits_total.load(Ordering::Relaxed),
+            series_lru_misses_total: self.series_lru_misses_total.load(Ordering::Relaxed),
+            metadata_upserts_total: self.metadata_upserts_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
         }
@@ -155,5 +242,34 @@ mod tests {
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.spool_poison_total, 1);
         assert_eq!(snap.spool_uncertain_total, 3);
+    }
+
+    #[test]
+    fn metric_writer_metrics_snapshot_carries_the_passed_in_queue_bytes() {
+        let metrics = MetricWriterMetrics::default();
+        let snap = metrics.snapshot(4096);
+        assert_eq!(snap.queue_bytes, 4096);
+    }
+
+    #[test]
+    fn metric_writer_metrics_snapshot_reflects_series_and_metadata_counters() {
+        let metrics = MetricWriterMetrics::default();
+        metrics
+            .series_registrations_total
+            .fetch_add(2, Ordering::Relaxed);
+        metrics
+            .series_lru_hits_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .series_lru_misses_total
+            .fetch_add(2, Ordering::Relaxed);
+        metrics
+            .metadata_upserts_total
+            .fetch_add(3, Ordering::Relaxed);
+        let snap = metrics.snapshot(0);
+        assert_eq!(snap.series_registrations_total, 2);
+        assert_eq!(snap.series_lru_hits_total, 1);
+        assert_eq!(snap.series_lru_misses_total, 2);
+        assert_eq!(snap.metadata_upserts_total, 3);
     }
 }

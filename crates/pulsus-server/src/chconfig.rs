@@ -13,7 +13,7 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
 use pulsus_read::{EngineConfig, LogQlEngine};
 use pulsus_schema::{RenderCtx, SchemaParams};
-use pulsus_write::WriterTables;
+use pulsus_write::{MetricWriterTables, WriterTables};
 
 /// Maps `Config` to the connection settings any part of this binary dials
 /// ClickHouse with, targeting the configured `clickhouse.database`. Callers
@@ -116,6 +116,28 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
     WriterTables {
         samples: Arc::from(format!("log_samples{dist}")),
         streams: Arc::from(format!("log_streams{dist}")),
+    }
+}
+
+/// Maps `Config` to [`pulsus_write::MetricWriterTables`] (issue #26
+/// architect plan), deriving `_dist` names the *same way*
+/// [`writer_tables_from`] does for `metric_samples`/`metric_series` — a
+/// configured `cluster` writes through the `_dist` wrapper tables, an
+/// unclustered deployment writes the base tables directly. `metadata`
+/// NEVER carries a `_dist` suffix: `metric_metadata` is a global catalog
+/// table (docs/schemas.md §2.1/§7, catalog id 3, `family: None`), not
+/// sharded, so there is no `_dist` wrapper for it to reconcile in the
+/// first place.
+pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    MetricWriterTables {
+        samples: Arc::from(format!("metric_samples{dist}")),
+        series: Arc::from(format!("metric_series{dist}")),
+        metadata: Arc::from("metric_metadata"),
     }
 }
 
@@ -223,6 +245,30 @@ mod tests {
         let tables = writer_tables_from(&config);
         assert_eq!(&*tables.samples, "log_samples_dist");
         assert_eq!(&*tables.streams, "log_streams_dist");
+    }
+
+    #[test]
+    fn metric_writer_tables_from_uses_base_table_names_when_unclustered() {
+        let config = Config::default();
+        let tables = metric_writer_tables_from(&config);
+        assert_eq!(&*tables.samples, "metric_samples");
+        assert_eq!(&*tables.series, "metric_series");
+        assert_eq!(&*tables.metadata, "metric_metadata");
+    }
+
+    #[test]
+    fn metric_writer_tables_from_uses_dist_table_names_when_clustered_except_metadata() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let tables = metric_writer_tables_from(&config);
+        assert_eq!(&*tables.samples, "metric_samples_dist");
+        assert_eq!(&*tables.series, "metric_series_dist");
+        assert_eq!(
+            &*tables.metadata, "metric_metadata",
+            "metric_metadata is a global catalog table and must never carry a _dist suffix"
+        );
     }
 
     #[test]

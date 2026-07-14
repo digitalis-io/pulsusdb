@@ -20,7 +20,7 @@ use crate::writer::buffer::{Generation, TableBuffer};
 use crate::writer::config::WriterRuntime;
 use crate::writer::error::WriteError;
 use crate::writer::metrics::TableMetrics;
-use crate::writer::spool::{SpoolKind, SpoolWriter};
+use crate::writer::spool::{SpoolEncode, SpoolKind, SpoolWriter};
 
 /// Real-vs-mock seam over a columnar block insert (architect plan): the
 /// production impl ([`ChBlockInserter`]) wraps
@@ -130,7 +130,7 @@ pub(crate) fn spawn<R>(
     mut shutdown_rx: watch::Receiver<Option<Instant>>,
 ) -> tokio::task::JoinHandle<()>
 where
-    R: ChRow + Send + Sync + 'static,
+    R: ChRow + SpoolEncode + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(ctx.runtime.batch_age);
@@ -167,7 +167,7 @@ where
 /// bounded by the drain deadline.
 async fn flush_once<R>(ctx: &TableContext<R>, shutdown_rx: watch::Receiver<Option<Instant>>)
 where
-    R: ChRow + Send + Sync,
+    R: ChRow + SpoolEncode + Send + Sync,
 {
     let Some(generation) = ctx.buffer.swap_out() else {
         return;
@@ -185,7 +185,7 @@ where
 /// start.
 async fn drain<R>(ctx: &TableContext<R>, shutdown_rx: watch::Receiver<Option<Instant>>)
 where
-    R: ChRow + Send + Sync,
+    R: ChRow + SpoolEncode + Send + Sync,
 {
     loop {
         let Some(generation) = ctx.buffer.swap_out() else {
@@ -219,7 +219,7 @@ async fn settle_generation<R>(
     generation: Generation<R>,
     mut shutdown_rx: watch::Receiver<Option<Instant>>,
 ) where
-    R: ChRow + Send + Sync,
+    R: ChRow + SpoolEncode + Send + Sync,
 {
     let started = Instant::now();
     ctx.table_metrics.inflight.fetch_add(1, Ordering::Relaxed);
@@ -344,7 +344,7 @@ async fn finish_generation<R>(
     outcome: FlushOutcome,
     started: Instant,
 ) where
-    R: ChRow + Send + Sync,
+    R: ChRow + SpoolEncode + Send + Sync,
 {
     match outcome {
         FlushOutcome::Ok => {

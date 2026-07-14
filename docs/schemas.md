@@ -72,7 +72,7 @@ PARTITION BY toYYYYMM(fromUnixTimestamp64Milli(unix_milli))
 ORDER BY (metric_name, fingerprint, unix_milli);
 ```
 
-- Written once per series per **activity bucket** (`PULSUS_SERIES_ACTIVITY_BUCKET`, default `1h`): the writer floors `unix_milli` to the bucket and skips known `(fingerprint, bucket)` pairs via an in-process LRU. Natural duplicates collapse at read time with `LIMIT 1 BY metric_name, fingerprint` — **no `ReplacingMergeTree`, no `FINAL`**.
+- Written once per series per **activity bucket** (`PULSUS_SERIES_ACTIVITY_BUCKET`, default `1h`): the writer floors `unix_milli` to the bucket and skips known `(metric_name, fingerprint, bucket)` triples via an in-process LRU — **metric-name-scoped**, not `(fingerprint, bucket)` alone: `metric_fingerprint` (§2.1's fingerprint function) excludes `__name__`, so two differently-named metrics sharing the same label set share a fingerprint, and a name-less key would let one metric's registration false-hit-suppress the other's `metric_series` row. Natural duplicates collapse at read time with `LIMIT 1 BY metric_name, fingerprint` — **no `ReplacingMergeTree`, no `FINAL`**.
 - **Size the activity bucket to cardinality.** Rows/month ≈ active series × (30d ÷ bucket). At 5M continuously active series, hourly buckets produce ~3.6B metadata rows/month; a `1d` bucket produces ~150M — the recommended setting at multi-million-series scale. Coarser buckets are always *logically safe*: the bucket-floored read bounds (§2.1 lookup SQL, rendered from the same config constant the writer uses) can over-include series adjacent to the query window — they match no samples — but can never miss one. They are not computationally free, though: a 10-minute historical query against a `1d` bucket drags that whole day's series for the metric through label matching. Bucket size is therefore part of the label-resolution benchmark below, not just a storage knob.
 
 #### Label resolution at scale — the strategy ladder
@@ -120,12 +120,13 @@ CREATE TABLE metric_metadata (
     metric_name  LowCardinality(String),
     metric_type  LowCardinality(String),   -- counter | gauge | histogram | summary
     help         String,
-    unit         String
-) ENGINE = ReplacingMergeTree
+    unit         String,
+    updated_ns   Int64
+) ENGINE = ReplacingMergeTree(updated_ns)
 ORDER BY metric_name;
 ```
 
-`metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known.
+`metric_type` also drives the planner: counter functions on rollup tiers are only legal because the type is known. **`updated_ns` is the `ReplacingMergeTree` version column** (issue #26 fix, mirroring `log_streams`' `ReplacingMergeTree(updated_ns)`): every non-key column here (`metric_type`/`help`/`unit`) sits outside `ORDER BY metric_name`, so without a version column a merge's latest-wins outcome would be nondeterministic — unacceptable given `metric_type` drives planner correctness. The writer emits a new row (receiver-injected `now_ns`) only when the incoming `(metric_type, help, unit)` tuple differs from the last value it durably emitted for that `metric_name` (a bounded last-value cache, success-only promoted on a confirmed flush) — idempotent on repeats, and a type change that later reverts (A→B→A) re-emits on the second A rather than being suppressed by a static once-only registration.
 
 ### 2.2 Downsampling tiers
 

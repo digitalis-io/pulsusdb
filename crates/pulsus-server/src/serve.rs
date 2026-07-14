@@ -19,7 +19,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pulsus_clickhouse::{ChClient, ChError, ChPool};
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_schema::SchemaError;
-use pulsus_write::LogWriter;
+use pulsus_write::{LogWriter, MetricWriter};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -29,7 +29,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    bootstrap_conn_config_from, conn_config_from, schema_params_from, writer_tables_from,
+    bootstrap_conn_config_from, conn_config_from, metric_writer_tables_from, schema_params_from,
+    writer_tables_from,
 };
 use crate::ingest::WriterSink;
 
@@ -81,6 +82,12 @@ pub async fn run(config: Config) -> ExitCode {
     // `/ready`=200 implies the ingest route is live too (issue #15
     // architect plan).
     let writer_slot: Arc<OnceLock<Arc<LogWriter>>> = Arc::new(OnceLock::new());
+    // `MetricWriter`'s lifecycle-parity counterpart (issue #26 architect
+    // plan): constructed + shutdown-drained alongside `LogWriter`, but
+    // deliberately NOT wired into `AppState` or any route yet — the
+    // `MetricSink` adapter and `/v1/metrics`/`/api/v1/write` mount land in
+    // #27/#28. Its flush tasks simply idle (never admitted to) until then.
+    let metric_writer_slot: Arc<OnceLock<Arc<MetricWriter>>> = Arc::new(OnceLock::new());
     // The reconnect loop is a one-shot bootstrap (see its own doc comment):
     // it runs exactly once per process and, on success, spawns at most one
     // rotation task — handed back over this oneshot channel so `run` can
@@ -90,6 +97,7 @@ pub async fn run(config: Config) -> ExitCode {
     let reconnect_handle = spawn_reconnect_loop(
         Arc::clone(&pool_slot),
         Arc::clone(&writer_slot),
+        Arc::clone(&metric_writer_slot),
         Arc::clone(&config),
         rotation_tx,
     );
@@ -137,6 +145,11 @@ pub async fn run(config: Config) -> ExitCode {
     // process never mounted the writer (`writer_slot` stays empty).
     if let Some(writer) = writer_slot.get() {
         writer.shutdown(WRITER_DRAIN_DEADLINE).await;
+    }
+    // Same drain, same deadline, for `MetricWriter` (issue #26) — a no-op
+    // when this process never mounted the writer subsystem.
+    if let Some(metric_writer) = metric_writer_slot.get() {
+        metric_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
     shutdown_background_tasks(reconnect_handle, rotation_rx).await;
@@ -209,6 +222,7 @@ enum StartupError {
 fn spawn_reconnect_loop(
     pool_slot: Arc<RwLock<Option<Arc<ChPool>>>>,
     writer_slot: Arc<OnceLock<Arc<LogWriter>>>,
+    metric_writer_slot: Arc<OnceLock<Arc<MetricWriter>>>,
     config: Arc<Config>,
     rotation_tx: oneshot::Sender<JoinHandle<()>>,
 ) -> JoinHandle<()> {
@@ -219,7 +233,7 @@ fn spawn_reconnect_loop(
                 Ok(pool) => {
                     tracing::info!("clickhouse schema ready; pool established");
                     let pool = Arc::new(pool);
-                    // Construct and store the writer *before* the pool
+                    // Construct and store the writer(s) *before* the pool
                     // (issue #15 architect plan): `/ready`=200 (which gates
                     // on `pool_slot`) must imply the ingest route is live
                     // too, not just that the reader's pool exists.
@@ -229,7 +243,7 @@ fn spawn_reconnect_loop(
                             config.query_timeout.0,
                         ));
                         let writer = Arc::new(LogWriter::new_with_tables(
-                            client,
+                            client.clone(),
                             &config.writer,
                             writer_tables_from(&config),
                         ));
@@ -239,6 +253,19 @@ fn spawn_reconnect_loop(
                         // can therefore never already be set, so a `set`
                         // failure is unreachable.
                         let _ = writer_slot.set(writer);
+
+                        // `MetricWriter` (issue #26 architect plan): same
+                        // client, same lifecycle gate — shares one
+                        // ClickHouse connection pool with `LogWriter`
+                        // rather than opening a second one.
+                        let bucket_ms = config.reader.series_activity_bucket.0.as_millis() as i64;
+                        let metric_writer = Arc::new(MetricWriter::new_with_tables(
+                            client,
+                            &config.writer,
+                            bucket_ms,
+                            metric_writer_tables_from(&config),
+                        ));
+                        let _ = metric_writer_slot.set(metric_writer);
                     }
                     *pool_slot.write().await = Some(pool);
                     if rotation_enabled(&config) {
@@ -474,6 +501,7 @@ mod tests {
         let (rotation_tx, _rotation_rx) = oneshot::channel();
         let handle = spawn_reconnect_loop(
             Arc::new(RwLock::new(None)),
+            Arc::new(OnceLock::new()),
             Arc::new(OnceLock::new()),
             Arc::new(cfg),
             rotation_tx,

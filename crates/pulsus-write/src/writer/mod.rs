@@ -34,6 +34,7 @@
 mod buffer;
 mod config;
 mod error;
+mod metric;
 mod metrics;
 mod registration;
 mod rows;
@@ -52,9 +53,13 @@ use tracing::warn;
 
 pub use config::WriterRuntime;
 pub use error::WriteError;
-pub use metrics::{TableMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot};
-pub use registration::StreamLru;
-pub use rows::{LogSampleRow, LogStreamRow};
+pub use metric::{MetricWriter, MetricWriterTables};
+pub use metrics::{
+    MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, WriterMetrics,
+    WriterMetricsSnapshot,
+};
+pub use registration::{MetadataCache, SeriesLru, StreamLru};
+pub use rows::{LogSampleRow, LogStreamRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow};
 pub use table::{BlockInserter, ChBlockInserter};
 
 use crate::error::LogsIngestError;
@@ -275,7 +280,7 @@ impl LogWriter {
             let mut lru = self.shared.lru.lock().expect("stream lru mutex poisoned");
             for stream in &batch.streams {
                 let key = (stream.fingerprint, stream.month.days_since_epoch());
-                if lru.contains(key) {
+                if lru.contains(&key) {
                     self.shared
                         .metrics
                         .lru_hits_total

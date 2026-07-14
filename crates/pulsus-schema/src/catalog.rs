@@ -136,8 +136,9 @@ pub const MIGRATIONS: &[Migration] = &[
                  metric_name  LowCardinality(String),\n\
                  metric_type  LowCardinality(String),\n\
                  help         String,\n\
-                 unit         String\n\
-             ) ENGINE = ReplacingMergeTree\n\
+                 unit         String,\n\
+                 updated_ns   Int64\n\
+             ) ENGINE = ReplacingMergeTree(updated_ns)\n\
              ORDER BY metric_name;",
         ),
         scope: MigrationScope::Checksum,

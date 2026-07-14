@@ -338,6 +338,7 @@ struct MetricMetadataRow {
     metric_type: String,
     help: String,
     unit: String,
+    updated_ns: i64,
 }
 
 /// Reads `table` `FINAL` (bookkeeping/catalog tables are `ReplacingMergeTree`

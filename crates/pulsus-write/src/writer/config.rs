@@ -27,8 +27,17 @@ const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 
 /// Hand-rolled `StreamLru` capacity (task-manager resolution, issue #9:
 /// "documented constants now"; promote to a `PULSUS_*` var if a deployment
-/// needs to tune it). 1,000,000 `(fingerprint, month)` entries.
+/// needs to tune it). 1,000,000 `(fingerprint, month)` entries. Also reused
+/// as-is for `MetricWriter`'s `SeriesLru` (issue #26 architect plan: "reuse
+/// existing `LRU_CAPACITY` for the series LRU").
 const LRU_CAPACITY: usize = 1_000_000;
+
+/// Hand-rolled `MetadataCache` capacity (issue #26 architect plan): 1,000,000
+/// distinct `metric_name` entries, each holding one last-emitted `(type,
+/// help, unit)` descriptor — a documented constant for now, promote to a
+/// `PULSUS_*` var if a deployment needs to tune it, same precedent as
+/// [`LRU_CAPACITY`].
+const METADATA_LRU_CAPACITY: usize = 1_000_000;
 
 /// Spool root, relative to the process working directory (task-manager
 /// resolution, issue #9 — mirrors issue #8's `MAX_DECOMPRESSED_BYTES`
@@ -56,6 +65,9 @@ pub struct WriterRuntime {
     pub retry_base_delay: Duration,
     pub retry_max_delay: Duration,
     pub lru_capacity: usize,
+    /// [`MetricWriter`](crate::writer::MetricWriter)'s `MetadataCache`
+    /// capacity — unused by [`crate::writer::LogWriter`].
+    pub metadata_lru_capacity: usize,
     pub spool_dir: PathBuf,
 }
 
@@ -69,6 +81,7 @@ impl WriterRuntime {
             retry_base_delay: RETRY_BASE_DELAY,
             retry_max_delay: RETRY_MAX_DELAY,
             lru_capacity: LRU_CAPACITY,
+            metadata_lru_capacity: METADATA_LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
         }
     }

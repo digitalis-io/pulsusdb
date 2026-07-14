@@ -118,6 +118,15 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     positive_u64("writer.batch_ms", cfg.writer.batch_ms)?;
     positive_bytes("writer.ingest_queue_bytes", cfg.writer.ingest_queue_bytes)?;
     positive_u64("reader.cache_max_series", cfg.reader.cache_max_series)?;
+    // The `metric_series` activity-bucket floor (docs/schemas.md §2.1) is a
+    // divisor in `pulsus_model::floor_to_activity_bucket` — a zero bucket
+    // would panic that function's `debug_assert!` (or divide by zero in a
+    // release build), so it is validated at startup like every other
+    // positive-value config guard, issue #26 open question #4.
+    positive_duration(
+        "reader.series_activity_bucket",
+        cfg.reader.series_activity_bucket,
+    )?;
     positive_u64("reader.promql_max_samples", cfg.reader.promql_max_samples)?;
     positive_bytes(
         "reader.logql_scan_budget_bytes",
@@ -358,6 +367,13 @@ mod tests {
     fn zero_writer_batch_bytes_is_rejected() {
         let mut cfg = Config::default();
         cfg.writer.batch_bytes = ByteSize(0);
+        assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn zero_series_activity_bucket_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.reader.series_activity_bucket = HumanDuration(std::time::Duration::ZERO);
         assert!(validate(&cfg).is_err());
     }
 

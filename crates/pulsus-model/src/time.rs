@@ -21,6 +21,39 @@ pub struct UnixNano(pub i64);
 /// with zero conversion overhead at the insert/query boundary.
 pub type Fingerprint = u64;
 
+/// The default `metric_series` activity-bucket width in milliseconds
+/// (docs/schemas.md §2.1, `PULSUS_SERIES_ACTIVITY_BUCKET`,
+/// `pulsus_config::ReaderConfig::series_activity_bucket`'s documented
+/// default, `1h`). Duplicated here as an `i64` constant — not derived from
+/// `pulsus-config` (this crate does not depend on it) — so both the writer
+/// (issue #26, bucket-floors `metric_series.unix_milli` at registration) and
+/// the reader (issue #30, renders the same floor into its historical-bound
+/// SQL) can pin their default against one source without a cross-crate
+/// dependency cycle; `pulsus-config`'s own default is cross-checked against
+/// this constant in `pulsus-write`'s test suite.
+pub const DEFAULT_ACTIVITY_BUCKET_MS: i64 = 3_600_000;
+
+/// Floors `unix_milli` to the nearest (lower-or-equal) multiple of
+/// `bucket_ms` — the `metric_series` activity-bucket floor (docs/schemas.md
+/// §2.1). **Truncating (toward-zero) division**, matching ClickHouse's
+/// `intDiv` bit-for-bit — deliberately NOT [`i64::div_euclid`] (floor
+/// division), which diverges from `intDiv` for negative `unix_milli` (e.g.
+/// `intDiv(-1, 3_600_000) * 3_600_000 == 0`, whereas floor division would
+/// give `-3_600_000`). This is the single frozen definition both the
+/// writer's registration gate (issue #26) and the reader's rendered
+/// historical-bound SQL (`intDiv({data_start}, {bucket_ms}) * {bucket_ms}`,
+/// issue #30) must call, so the AC's cross-crate identity holds by
+/// construction rather than by convention.
+///
+/// `bucket_ms` must be `>= 1` (config-validated by
+/// `pulsus_config::validate`, mirroring its other positive-value guards);
+/// violated only by a programming error, never by untrusted input, hence a
+/// `debug_assert!` rather than a `Result`.
+pub fn floor_to_activity_bucket(unix_milli: i64, bucket_ms: i64) -> i64 {
+    debug_assert!(bucket_ms >= 1, "bucket_ms must be >= 1");
+    (unix_milli / bucket_ms) * bucket_ms
+}
+
 /// Nanoseconds per day, used to floor a [`UnixNano`]-scale timestamp down to
 /// a whole day before civil-calendar conversion.
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
@@ -207,5 +240,53 @@ mod tests {
         assert_eq!(far_future.days_since_epoch(), u16::MAX);
         let far_past = Date::start_of_month_utc(i64::MIN);
         assert_eq!(far_past.days_since_epoch(), 0);
+    }
+
+    #[test]
+    fn default_activity_bucket_ms_is_one_hour() {
+        assert_eq!(DEFAULT_ACTIVITY_BUCKET_MS, 3_600_000);
+    }
+
+    #[test]
+    fn floor_to_activity_bucket_floors_a_mid_bucket_timestamp_down() {
+        assert_eq!(floor_to_activity_bucket(3_600_001, 3_600_000), 3_600_000);
+        assert_eq!(floor_to_activity_bucket(7_199_999, 3_600_000), 3_600_000);
+    }
+
+    #[test]
+    fn floor_to_activity_bucket_of_an_exact_bucket_boundary_is_a_no_op() {
+        assert_eq!(floor_to_activity_bucket(3_600_000, 3_600_000), 3_600_000);
+        assert_eq!(floor_to_activity_bucket(0, 3_600_000), 0);
+    }
+
+    /// Golden test (architect plan amendment 3, closing a review test gap):
+    /// truncating (toward-zero) division must match ClickHouse's `intDiv`
+    /// for negative inputs — `div_euclid` (floor division) would give a
+    /// different, wrong answer here. `intDiv(-1, 3_600_000) * 3_600_000 ==
+    /// 0`, not `-3_600_000`.
+    #[test]
+    fn floor_to_activity_bucket_negative_timestamp_matches_clickhouse_intdiv_truncation() {
+        assert_eq!(floor_to_activity_bucket(-1, 3_600_000), 0);
+        assert_ne!(
+            floor_to_activity_bucket(-1, 3_600_000),
+            (-1i64).div_euclid(3_600_000) * 3_600_000,
+            "truncating division must diverge from floor division here"
+        );
+
+        // A negative timestamp whose magnitude exceeds one bucket:
+        // intDiv(-3_600_001, 3_600_000) == -1 (truncated toward zero), so
+        // the floored result is -3_600_000, not the floor-division answer
+        // of -7_200_000.
+        assert_eq!(floor_to_activity_bucket(-3_600_001, 3_600_000), -3_600_000);
+        assert_eq!(
+            (-3_600_001i64).div_euclid(3_600_000) * 3_600_000,
+            -7_200_000,
+            "sanity check on the diverging floor-division answer"
+        );
+    }
+
+    #[test]
+    fn floor_to_activity_bucket_a_negative_exact_multiple_is_unchanged() {
+        assert_eq!(floor_to_activity_bucket(-3_600_000, 3_600_000), -3_600_000);
     }
 }
