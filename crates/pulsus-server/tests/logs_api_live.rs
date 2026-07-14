@@ -19,8 +19,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command};
+use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use flate2::read::GzDecoder;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
 use pulsus_read::logql::sql::{self, MetricSource, TimeWindow};
 
@@ -48,15 +50,30 @@ struct HttpResponse {
     body: String,
 }
 
-/// Issues one raw HTTP/1.1 request over loopback. `body` is form-urlencoded
-/// content when `Some` (POST); `None` sends no body (GET).
-fn http_request(
+/// Raw-bytes response variant of [`HttpResponse`] (issue #24): `body` is the
+/// dechunked, and — when the response carries `Content-Encoding: gzip` —
+/// gzip-decoded, exact bytes. Needed for the gzip live coverage below,
+/// where the whole point is comparing decompressed bytes directly against
+/// an identity-encoding response's bytes, never through a lossy UTF-8
+/// rendering of either side (a real gzip stream is not valid UTF-8, so
+/// [`http_request`]'s `String` body cannot represent it before decoding).
+struct HttpResponseBytes {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// Issues one raw HTTP/1.1 request over loopback and returns the response
+/// with its exact body bytes (see [`HttpResponseBytes`]). `body` is
+/// form-urlencoded content when `Some` (POST); `None` sends no body (GET).
+/// [`http_request`] is a thin, lossy-`String` wrapper around this.
+fn http_request_bytes(
     port: u16,
     method: &str,
     path: &str,
     extra_headers: &[(&str, &str)],
     body: Option<&str>,
-) -> Option<HttpResponse> {
+) -> Option<HttpResponseBytes> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
@@ -102,7 +119,7 @@ fn http_request(
     // `encode.rs` streams the body without a `Content-Length`, so every
     // `/api/logs/v1` response is `Transfer-Encoding: chunked` — dechunk it
     // before handing back `body` so callers never see chunk-size framing.
-    let body_bytes = if headers
+    let dechunked = if headers
         .get("transfer-encoding")
         .is_some_and(|v| v == "chunked")
     {
@@ -110,12 +127,44 @@ fn http_request(
     } else {
         raw_body.to_vec()
     };
-    let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-    Some(HttpResponse {
+    // Gzip-decode when the server negotiated it (`Accept-Encoding: gzip` in
+    // `extra_headers`) — issue #24's fix point: this used to panic the
+    // request task instead of ever reaching a well-formed gzip response.
+    let body = if headers.get("content-encoding").is_some_and(|v| v == "gzip") {
+        let mut decoded = Vec::new();
+        GzDecoder::new(&dechunked[..])
+            .read_to_end(&mut decoded)
+            .ok()?;
+        decoded
+    } else {
+        dechunked
+    };
+
+    Some(HttpResponseBytes {
         status,
         headers,
         body,
+    })
+}
+
+/// Issues one raw HTTP/1.1 request over loopback. `body` is form-urlencoded
+/// content when `Some` (POST); `None` sends no body (GET). None of this
+/// suite's pre-existing callers send `Accept-Encoding`, so they never
+/// receive a gzip body and this lossy `String` rendering is unaffected by
+/// issue #24's gzip coverage (which uses [`http_request_bytes`] instead).
+fn http_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Option<HttpResponse> {
+    let res = http_request_bytes(port, method, path, extra_headers, body)?;
+    Some(HttpResponse {
+        status: res.status,
+        headers: res.headers,
+        body: String::from_utf8_lossy(&res.body).into_owned(),
     })
 }
 
@@ -1100,6 +1149,155 @@ async fn loki_compat_aliases_are_byte_identical_to_native() {
         Some(true),
         "alias explain payload missing non-empty stages"
     );
+}
+
+/// Gzip live coverage (issue #24): `Unfold` panicked when re-polled after
+/// EOF, which `tower_http::compression::CompressionLayer`'s gzip encoder
+/// does — aborting the request task on every real `Accept-Encoding: gzip`
+/// request (Grafana's Loki client always sends one). This drives every
+/// endpoint on both surfaces (native + `/loki` alias, flag on) with
+/// `Accept-Encoding: gzip`, asserting each is reachable, 200, actually
+/// gzip-encoded, and gzip-decodes byte-identical to the same request with
+/// no `Accept-Encoding` — proof through the real compression layer and the
+/// real server process, not just `encode.rs`'s in-process
+/// `CompressionLayer` unit coverage. Then fires a concurrent burst of gzip
+/// requests across all ten route entries (five endpoints x two surfaces):
+/// the panic this issue fixes aborted the whole request task, so
+/// overlapping in-flight requests is the sharpest end-to-end proof the
+/// server process itself never crashes or drops a sibling request.
+#[tokio::test]
+async fn gzip_accept_encoding_is_byte_identical_and_never_panics_across_all_endpoints_and_surfaces()
+{
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_gzip";
+    let port = 31_117;
+    let (_guard, _client, base_ns) = setup_env(db, port, &[("PULSUS_COMPAT_ENDPOINTS", "1")]).await;
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let start_s = start.to_string();
+    let end_s = end.to_string();
+    let base_ns_s = base_ns.to_string();
+
+    // One (method, route, params) per `/api/logs/v1` endpoint (docs/api.md
+    // §2) — mirrored across both surfaces' prefixes below.
+    type Endpoint<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+    let endpoints: Vec<Endpoint> = vec![
+        (
+            "GET",
+            "query_range",
+            vec![
+                ("query", r#"{service_name="checkout"}"#),
+                ("start", start_s.as_str()),
+                ("end", end_s.as_str()),
+            ],
+        ),
+        (
+            "GET",
+            "query",
+            vec![
+                ("query", r#"count_over_time({service_name="checkout"}[1h])"#),
+                ("time", base_ns_s.as_str()),
+            ],
+        ),
+        (
+            "GET",
+            "labels",
+            vec![("start", start_s.as_str()), ("end", end_s.as_str())],
+        ),
+        (
+            "GET",
+            "label/env/values",
+            vec![("start", start_s.as_str()), ("end", end_s.as_str())],
+        ),
+        (
+            "GET",
+            "series",
+            vec![
+                ("match[]", r#"{service_name="checkout"}"#),
+                ("start", start_s.as_str()),
+                ("end", end_s.as_str()),
+            ],
+        ),
+    ];
+
+    for prefix in ["/api/logs/v1", "/loki/api/v1"] {
+        for ep in &endpoints {
+            let method = ep.0;
+            let route = ep.1;
+            let params = &ep.2;
+            let path = q(&format!("{prefix}/{route}"), params);
+
+            let identity = http_request_bytes(port, method, &path, &[], None)
+                .unwrap_or_else(|| panic!("{prefix}/{route}: identity request reachable"));
+            assert_eq!(identity.status, 200, "{prefix}/{route}: identity status");
+
+            let gzip = http_request_bytes(
+                port,
+                method,
+                &path,
+                &[("Accept-Encoding", "gzip")],
+                None,
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "{prefix}/{route}: gzip request reachable (issue #24 regression: must not \
+                     panic the request task)"
+                )
+            });
+            assert_eq!(gzip.status, 200, "{prefix}/{route}: gzip status");
+            assert_eq!(
+                gzip.headers.get("content-encoding").map(String::as_str),
+                Some("gzip"),
+                "{prefix}/{route}: must actually be gzip-encoded for this assertion to be \
+                 meaningful"
+            );
+            assert_eq!(
+                gzip.body, identity.body,
+                "{prefix}/{route}: gzip-decoded body must be byte-identical to identity"
+            );
+        }
+    }
+
+    // Concurrent burst across all ten route entries (both surfaces): each
+    // thread issues its own gzip request over its own TCP connection, and a
+    // `Barrier` lines every thread up so requests actually overlap
+    // in-flight on the server instead of serializing incidentally.
+    let mut requests: Vec<(String, String)> = Vec::new();
+    for prefix in ["/api/logs/v1", "/loki/api/v1"] {
+        for ep in &endpoints {
+            requests.push((ep.0.to_string(), q(&format!("{prefix}/{}", ep.1), &ep.2)));
+        }
+    }
+    let barrier = Arc::new(Barrier::new(requests.len()));
+    let handles: Vec<_> = requests
+        .into_iter()
+        .map(|(method, path)| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                http_request_bytes(port, &method, &path, &[("Accept-Encoding", "gzip")], None)
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let res = handle
+            .join()
+            .expect("request thread must not panic")
+            .expect(
+                "concurrent gzip request must be reachable and complete without panicking the \
+             request task",
+            );
+        assert_eq!(res.status, 200, "concurrent gzip request must succeed");
+        assert_eq!(
+            res.headers.get("content-encoding").map(String::as_str),
+            Some("gzip")
+        );
+    }
 }
 
 fn read_rss_kb(pid: u32) -> Option<u64> {

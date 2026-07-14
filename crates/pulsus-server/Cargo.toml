@@ -37,3 +37,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
+# gzip-decodes `CompressionLayer` response bodies in the poll-after-end
+# regression coverage for issue #24 — dev-only, never a runtime dependency
+# (the server itself only ever *encodes* gzip, via tower-http).
+flate2.workspace = true

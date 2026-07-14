@@ -1482,6 +1482,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "flate2",
  "futures",
  "metrics",
  "metrics-exporter-prometheus",

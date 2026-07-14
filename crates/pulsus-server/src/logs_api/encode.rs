@@ -12,6 +12,18 @@
 //! `poll_next` calls (the encoder-memory AC amendment 1 exists to satisfy;
 //! see this module's tests for the chunk-boundedness proof).
 //!
+//! **Poll-after-end (issue #24):** the raw `unfold` stream is `.fuse()`d
+//! before it is handed to `Body::from_stream`. `Unfold`'s documented
+//! invariant is that it must never be polled again once it has returned
+//! `Poll::Ready(None)` — it panics otherwise. Under identity encoding,
+//! axum/hyper never poll a body again after `None`, so the bug lay
+//! dormant; `tower_http::compression::CompressionLayer`'s gzip encoder
+//! polls the wrapped body once more past its final `None` to observe
+//! EOF/flush, which re-polled the bare `Unfold` and panicked the request
+//! task on every gzip-negotiated request. `Fuse` makes the extra poll a
+//! safe no-op (`Poll::Ready(None)` forever) without buffering or changing
+//! any frame this encoder yields.
+//!
 //! **Ordering (edge case #1):** the engine's results arrive in
 //! `HashMap`-iteration order (unstable). Every response shape here sorts
 //! its items by label set (streams: `(labels_json, fingerprint)`; matrix/
@@ -21,6 +33,7 @@
 use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
@@ -32,6 +45,12 @@ use pulsus_read::{
 /// materialized, O(limit)-bounded domain data) is moved into the stream's
 /// state and lives for the whole drain — only the *current* item's
 /// `render()` output is additional, temporary encoder memory.
+///
+/// The `unfold` stream is `.fuse()`d before reaching `Body::from_stream`
+/// (issue #24): `Fuse` adds no buffering, it only turns a poll after the
+/// stream's first `None` into another safe `None` instead of a panic —
+/// load-bearing for `tower_http::compression::CompressionLayer`'s gzip
+/// encoder, which polls once past EOF.
 fn stream_array<T, R>(prefix: Vec<u8>, items: Vec<T>, render: R, suffix: Vec<u8>) -> Body
 where
     T: Send + 'static,
@@ -91,7 +110,7 @@ where
         }
     });
 
-    Body::from_stream(stream)
+    Body::from_stream(stream.fuse())
 }
 
 fn json_response(body: Body) -> Response {
@@ -361,9 +380,16 @@ pub(crate) fn json_array_response(items: Vec<String>, explain: Option<PlanExplai
 mod tests {
     use super::*;
 
+    use std::io::Read;
+
+    use axum::Router;
     use axum::body::to_bytes;
-    use futures::StreamExt;
+    use axum::http::Request;
+    use axum::routing::get;
+    use flate2::read::GzDecoder;
     use pulsus_read::RoutingDecision;
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
 
     async fn body_string(res: Response) -> String {
         let bytes = to_bytes(res.into_body(), usize::MAX).await.expect("body");
@@ -647,5 +673,162 @@ mod tests {
             max_chunk_len < 64 * 1024,
             "max_chunk_len = {max_chunk_len} (aggregate would be ~{total_len})"
         );
+    }
+
+    /// Poll-after-end regression (issue #24): `futures::stream::Unfold`'s
+    /// documented contract is that it must never be polled again once it
+    /// has returned `Poll::Ready(None)` — it `panic!`s otherwise. This is
+    /// exactly what `tower_http::compression::CompressionLayer`'s gzip
+    /// encoder does (it polls the wrapped body once more past EOF), which
+    /// used to abort the request task on every gzip-negotiated request.
+    /// Drives the body's data stream to completion, then polls it once
+    /// more, and asserts a second, safe `None` — the minimal reproduction
+    /// of the defect, with no compression dependency needed. Fails (panics
+    /// at `unfold.rs:108`) on `Body::from_stream(stream)` without `.fuse()`.
+    #[tokio::test]
+    async fn stream_array_body_yields_none_instead_of_panicking_when_polled_after_completion() {
+        let result = QueryResult::Streams(vec![stream(
+            1,
+            r#"{"service_name":"checkout"}"#,
+            vec![(100, "hello")],
+        )]);
+        let res = query_response(result, None, 0);
+        let mut body_stream = res.into_body().into_data_stream();
+
+        while body_stream.next().await.is_some() {}
+
+        assert!(
+            body_stream.next().await.is_none(),
+            "polling the body stream once more after completion must yield None, not panic"
+        );
+    }
+
+    /// Runs `build` (a response-shape constructor) through a real
+    /// `CompressionLayer`-wrapped router twice — once with no
+    /// `Accept-Encoding` (identity) and once with `Accept-Encoding: gzip`
+    /// — and asserts the gzip-decoded body is byte-identical to the
+    /// identity body. Exercises the actual layer that triggers the
+    /// poll-after-end panic (a synthetic `unfold`/`.fuse()` test cannot
+    /// prove the *real* compression encoder is satisfied).
+    async fn assert_gzip_response_is_byte_identical_to_identity(build: fn() -> Response) {
+        let router = Router::new()
+            .route("/x", get(move || async move { build() }))
+            .layer(CompressionLayer::new());
+
+        let identity_request = Request::builder().uri("/x").body(Body::empty()).unwrap();
+        let identity_response = router
+            .clone()
+            .oneshot(identity_request)
+            .await
+            .expect("identity request must not panic the request task");
+        let identity_body = to_bytes(identity_response.into_body(), usize::MAX)
+            .await
+            .expect("identity body");
+
+        let gzip_request = Request::builder()
+            .uri("/x")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Body::empty())
+            .unwrap();
+        let gzip_response = router
+            .oneshot(gzip_request)
+            .await
+            .expect("gzip request must not panic the request task (issue #24 regression)");
+        assert_eq!(
+            gzip_response
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "response must actually be gzip-encoded for this assertion to be meaningful"
+        );
+        let gzip_body = to_bytes(gzip_response.into_body(), usize::MAX)
+            .await
+            .expect("gzip body");
+
+        let mut decoder = GzDecoder::new(&gzip_body[..]);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .expect("gzip body must decode as a valid gzip stream");
+
+        assert_eq!(
+            decoded, identity_body,
+            "gzip-decoded body must be byte-identical to the identity-encoding body"
+        );
+    }
+
+    #[tokio::test]
+    async fn gzip_streams_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            let result = QueryResult::Streams(vec![
+                stream(
+                    1,
+                    r#"{"env":"prod","service_name":"checkout"}"#,
+                    vec![(100, "hello"), (200, "world")],
+                ),
+                stream(
+                    2,
+                    r#"{"env":"staging","service_name":"checkout"}"#,
+                    vec![(150, "another line")],
+                ),
+            ]);
+            query_response(result, None, 0)
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_empty_streams_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            query_response(QueryResult::Streams(vec![]), None, 0)
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_matrix_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            let series = MatrixSeries {
+                labels: vec![("service_name".to_string(), "checkout".to_string())],
+                points: vec![(0, 1.0), (1_000_000_000, 2.5)],
+            };
+            query_response(QueryResult::Matrix(vec![series]), None, 0)
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_vector_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            let sample = VectorSample {
+                labels: vec![("service_name".to_string(), "checkout".to_string())],
+                value: 42.0,
+            };
+            query_response(QueryResult::Vector(vec![sample]), None, 5_500_000_000)
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_string_array_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            string_array_response(vec!["env".to_string(), "service_name".to_string()], None)
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_series_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            json_array_response(
+                vec![
+                    r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+                    r#"{"env":"staging","service_name":"checkout"}"#.to_string(),
+                ],
+                None,
+            )
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
 }
