@@ -55,6 +55,10 @@ async fn main() -> ExitCode {
         engine,
         keep: cli.keep,
         base_url: "http://127.0.0.1:3100".to_string(),
+        // Both compose variants publish the collector's OTLP/HTTP receiver
+        // on this same host port (issue #15 architect plan) — see
+        // `deploy/e2e/compose.{single,cluster}.yaml`.
+        collector_url: "http://127.0.0.1:4318".to_string(),
     };
 
     match harness::run(opts).await {

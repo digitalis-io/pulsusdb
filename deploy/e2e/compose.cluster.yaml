@@ -55,3 +55,7 @@ services:
     volumes:
       - ${PULSUS_E2E_ROOT}/deploy/e2e/otel-config.cluster.yaml:/etc/otelcol-contrib/config.yaml:ro
     depends_on: [ pulsusdb ]
+    # Published so the harness can push OTLP/HTTP JSON fixtures straight
+    # into the collector's `otlp` receiver (issue #15), same rationale as
+    # `compose.single.yaml`'s identical port mapping.
+    ports: [ "4318:4318" ]

@@ -54,6 +54,9 @@ mod tests {
                 .build_recorder()
                 .handle(),
             build: crate::app::BuildInfo::from_build_env(),
+            writer: Arc::new(crate::ingest::WriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
         }
     }
 

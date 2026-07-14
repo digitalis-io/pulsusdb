@@ -157,6 +157,7 @@ Retention is TTL-driven and applied by the schema controller at startup and on a
 - **Batching** is per destination table, with sync (request completes after flush succeeds) and async (`202` after enqueue) modes selectable per request via `X-Pulsus-Async`. Buffers are bounded; backpressure returns `429` rather than growing unbounded.
 - **Series/stream registration** is write-through: new fingerprints (checked against a fast in-process LRU) emit rows to the series/streams tables; known fingerprints skip that insert entirely.
 - **Errors are per-batch atomic**: a failed insert retries with exponential backoff and jitter; poison batches (schema mismatch) are dumped to a local spool file and skipped, with a counter exposed on `/metrics`.
+- **Cluster-mode writes go through the `_dist` wrapper** (§7): the writer never freelances shard placement (schemas.md §7). Their cross-shard delivery is **eventually consistent even for sync-mode writes** — a sync-mode `FlushWait` confirms the `_dist` `INSERT` *returned*, not that ClickHouse's Distributed engine has forwarded every row to its owning shard. Strengthening this (`insert_distributed_sync=1` or an equivalent client-side-computed direct-to-shard write) is deferred to the **M7 operations epic**.
 
 ---
 
@@ -279,7 +280,7 @@ Query endpoints (`/api/profiles/v1/{merge,select_series,export,render,render-dif
 
 - **Golden semantics tests:** fingerprint vectors; the **vendored upstream PromQL test corpus** (21 `.test` scenario files from the pinned Prometheus release, replayed natively by a test driver that implements the `.test` format) — this is the PromQL compliance gate, run in CI on every engine change; LogQL/TraceQL parser snapshot tests.
 - **SQL plan snapshots:** every planner change shows its SQL diff in review.
-- **Integration:** compose-file harness (ClickHouse + pulsusdb + OTel Collector; runs under podman compose or docker compose) driving every signal through a real collector pipeline into PulsusDB and reading back through every query API; compat receivers exercised with captured fixtures; a clustered variant with 2 shards validates distributed DDL and shard-local pushdown.
+- **Integration:** compose-file harness (ClickHouse + pulsusdb + OTel Collector; runs under podman compose or docker compose) driving every signal through a real collector pipeline into PulsusDB and reading back through every query API; compat receivers exercised with captured fixtures; a clustered variant with 2 shards validates distributed DDL and shard-local pushdown. Consequence of the `_dist` eventual-consistency model above: the collector-to-query e2e scenarios assert via **poll-until-visible** (bounded deadline, no fixed sleeps) rather than assuming a write is cross-shard-visible the instant its HTTP response returns.
 - **Differential testing:** the same remote-write stream fed to Prometheus and PulsusDB, with per-series per-timestamp value comparison across the function matrix (the accuracy gate for M2).
 
 ---

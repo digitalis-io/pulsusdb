@@ -65,6 +65,33 @@ use table::{ShutdownSignal, TableContext};
 const SAMPLES_TABLE: &str = "log_samples";
 const STREAMS_TABLE: &str = "log_streams";
 
+/// The two target table names a [`LogWriter`] inserts into (issue #15
+/// architect plan, Design A): cluster-mode deployments write through the
+/// `_dist` Distributed wrappers, mirroring the reader's own
+/// `chconfig::engine_config_from` `_dist` derivation — schemas.md §7's
+/// mandate is that "all inserts go through the `_dist` wrappers … the
+/// writer never freelances shard placement". `Arc<str>` (not
+/// `&'static str`): the cluster-suffixed name is computed once at server
+/// startup from `Config`, not known at compile time.
+#[derive(Debug, Clone)]
+pub struct WriterTables {
+    pub samples: Arc<str>,
+    pub streams: Arc<str>,
+}
+
+impl WriterTables {
+    /// Unclustered defaults: the bare local table names, matching this
+    /// module's pre-issue-#15 hardcoded behavior exactly — every existing
+    /// caller (`new`/`with_inserters`) delegates here so single-node
+    /// behavior and every pre-existing test are unchanged.
+    pub fn logs_default() -> Self {
+        WriterTables {
+            samples: Arc::from(SAMPLES_TABLE),
+            streams: Arc::from(STREAMS_TABLE),
+        }
+    }
+}
+
 struct Shared {
     samples: Arc<buffer::TableBuffer<LogSampleRow>>,
     streams: Arc<buffer::TableBuffer<LogStreamRow>>,
@@ -88,19 +115,50 @@ pub struct LogWriter {
 
 impl LogWriter {
     /// Production constructor: batches and flushes through a real
-    /// ClickHouse connection.
+    /// ClickHouse connection, against the unclustered default table names
+    /// ([`WriterTables::logs_default`]). Delegates to
+    /// [`Self::new_with_tables`] — zero behavior change from before issue
+    /// #15.
     pub fn new(client: Arc<ChClient>, cfg: &WriterConfig) -> Self {
+        Self::new_with_tables(client, cfg, WriterTables::logs_default())
+    }
+
+    /// [`Self::new`], but against `tables` (issue #15 architect plan,
+    /// Design A) — the server's cluster-aware constructor for `_dist`
+    /// table names.
+    pub fn new_with_tables(
+        client: Arc<ChClient>,
+        cfg: &WriterConfig,
+        tables: WriterTables,
+    ) -> Self {
         let inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
-        Self::with_inserters(inserter.clone(), inserter, cfg)
+        Self::with_inserters_with_tables(inserter.clone(), inserter, cfg, tables)
     }
 
     /// Test/mock constructor: any [`BlockInserter`] pair — e.g. a
     /// scriptable mock that can fail/hang on demand (architect plan: "no
-    /// real ClickHouse in unit tests").
+    /// real ClickHouse in unit tests") — against the unclustered default
+    /// table names. Delegates to [`Self::with_inserters_with_tables`].
     pub fn with_inserters(
         samples_inserter: Arc<dyn BlockInserter<LogSampleRow>>,
         streams_inserter: Arc<dyn BlockInserter<LogStreamRow>>,
         cfg: &WriterConfig,
+    ) -> Self {
+        Self::with_inserters_with_tables(
+            samples_inserter,
+            streams_inserter,
+            cfg,
+            WriterTables::logs_default(),
+        )
+    }
+
+    /// [`Self::with_inserters`], but against `tables` (issue #15 architect
+    /// plan, Design A).
+    pub fn with_inserters_with_tables(
+        samples_inserter: Arc<dyn BlockInserter<LogSampleRow>>,
+        streams_inserter: Arc<dyn BlockInserter<LogStreamRow>>,
+        cfg: &WriterConfig,
+        tables: WriterTables,
     ) -> Self {
         let runtime = Arc::new(WriterRuntime::from_config(cfg));
         let metrics = Arc::new(WriterMetrics::default());
@@ -130,7 +188,7 @@ impl LogWriter {
             });
 
         let samples_ctx = TableContext {
-            table: SAMPLES_TABLE,
+            table: tables.samples,
             buffer: samples.clone(),
             notify: samples_notify.clone(),
             inserter: samples_inserter,
@@ -141,7 +199,7 @@ impl LogWriter {
             on_flush_success: None,
         };
         let streams_ctx = TableContext {
-            table: STREAMS_TABLE,
+            table: tables.streams,
             buffer: streams.clone(),
             notify: streams_notify.clone(),
             inserter: streams_inserter,

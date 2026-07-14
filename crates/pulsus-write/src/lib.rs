@@ -7,9 +7,10 @@ pub mod protocols;
 pub mod writer;
 
 pub use error::LogsIngestError;
+pub use ingest::http::ingest;
 pub use ingest::{Backpressure, FlushWait, LogSink};
 pub use protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow, decode, parse};
-pub use writer::{LogWriter, WriteError};
+pub use writer::{LogWriter, WriteError, WriterTables};
 
 #[cfg(test)]
 mod tests {

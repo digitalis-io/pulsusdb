@@ -366,6 +366,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::app::BuildInfo;
+    use crate::ingest::WriterSink;
 
     fn test_state() -> AppState {
         AppState {
@@ -375,6 +376,7 @@ mod tests {
                 .build_recorder()
                 .handle(),
             build: BuildInfo::from_build_env(),
+            writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
         }
     }
 

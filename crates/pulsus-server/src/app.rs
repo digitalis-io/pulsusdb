@@ -12,6 +12,7 @@ use pulsus_config::Config;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
+use crate::ingest::WriterSink;
 use crate::middleware;
 use crate::ops;
 use crate::serve::ServeError;
@@ -22,13 +23,17 @@ use crate::{compat, modes};
 /// once by the background reconnect loop (`serve::spawn_reconnect_loop`) —
 /// `tokio::sync::RwLock` because `/ready` reads it on every probe while it
 /// is written at most once per process lifetime (reads vastly dominate
-/// writes).
+/// writes). `writer` mirrors the same "async-filled, read constantly"
+/// shape via its own inner `OnceLock` (issue #15 architect plan): the
+/// `WriterSink` itself is constructed eagerly (cheap — it is just an empty
+/// slot handle), only the `LogWriter` it wraps arrives later.
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pool: Arc<RwLock<Option<Arc<ChPool>>>>,
     pub(crate) config: Arc<Config>,
     pub(crate) metrics: PrometheusHandle,
     pub(crate) build: BuildInfo,
+    pub(crate) writer: Arc<WriterSink>,
 }
 
 /// `/buildinfo` payload (docs/api.md §7): `{"version","revision","builtAt","rustc"}`.
@@ -101,6 +106,7 @@ mod tests {
                 .build_recorder()
                 .handle(),
             build: BuildInfo::from_build_env(),
+            writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
         }
     }
 

@@ -13,6 +13,7 @@ use pulsus_config::Mode;
 mod app;
 mod chconfig;
 mod compat;
+mod ingest;
 mod logs_api;
 mod middleware;
 mod modes;

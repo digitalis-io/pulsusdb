@@ -13,6 +13,7 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
 use pulsus_read::{EngineConfig, LogQlEngine};
 use pulsus_schema::{RenderCtx, SchemaParams};
+use pulsus_write::WriterTables;
 
 /// Maps `Config` to the connection settings any part of this binary dials
 /// ClickHouse with, targeting the configured `clickhouse.database`. Callers
@@ -94,6 +95,27 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         rollup_res_ns: config.log_rollup_resolution.0.as_nanos() as u64,
         scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
         max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
+    }
+}
+
+/// Maps `Config` to [`pulsus_write::WriterTables`] (issue #15 architect
+/// plan, Design A): the writer becomes `_dist`-aware, deriving table names
+/// the *same way* [`engine_config_from`] does — a configured `cluster`
+/// writes through the `_dist` wrapper tables, an unclustered deployment
+/// writes the base tables directly. schemas.md §7: "all inserts go
+/// through the `_dist` wrappers … the writer never freelances shard
+/// placement" — this function is that mandate's one enforcement point on
+/// the write path, mirroring `engine_config_from`'s enforcement on the
+/// read path.
+pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    WriterTables {
+        samples: Arc::from(format!("log_samples{dist}")),
+        streams: Arc::from(format!("log_streams{dist}")),
     }
 }
 
@@ -182,6 +204,25 @@ mod tests {
         assert_eq!(engine_cfg.streams, "log_streams_dist");
         assert_eq!(engine_cfg.samples, "log_samples_dist");
         assert_eq!(engine_cfg.rollup_table, "log_metrics_5s_dist");
+    }
+
+    #[test]
+    fn writer_tables_from_uses_base_table_names_when_unclustered() {
+        let config = Config::default();
+        let tables = writer_tables_from(&config);
+        assert_eq!(&*tables.samples, "log_samples");
+        assert_eq!(&*tables.streams, "log_streams");
+    }
+
+    #[test]
+    fn writer_tables_from_uses_dist_table_names_when_clustered() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let tables = writer_tables_from(&config);
+        assert_eq!(&*tables.samples, "log_samples_dist");
+        assert_eq!(&*tables.streams, "log_streams_dist");
     }
 
     #[test]

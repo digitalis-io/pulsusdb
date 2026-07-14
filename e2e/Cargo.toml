@@ -19,6 +19,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap.workspace = true
+# `RoundtripFixture`/`RoundtripStream`/`RoundtripLine` (issue #15,
+# `scenarios.rs`) deserialize `test/fixtures/logs/roundtrip.json` — no
+# other fixture in this crate has needed a typed shape until now
+# (`ops/buildinfo.fields.json` is a bare `Vec<String>`, read via
+# `serde_json` alone).
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

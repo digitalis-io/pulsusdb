@@ -1,0 +1,60 @@
+{
+  "streams": [
+    {
+      "service": "checkout",
+      "scope_name": "checkout-scope",
+      "scope_version": "1.0.0",
+      "resource_attrs": {
+        "env": "prod",
+        "k8s.pod.name": "checkout-7f9c"
+      },
+      "scope_attrs": {},
+      "lines": [
+        { "ts_offset_ns": -4000000000, "body": "checkout: order placed" },
+        { "ts_offset_ns": -3000000000, "body": "{\"lvl\":\"info\",\"msg\":\"café ☕\"}" },
+        { "ts_offset_ns": -2000000000, "body": "checkout: payment captured" },
+        { "ts_offset_ns": -1000000000, "body": "checkout: order fulfilled" }
+      ]
+    },
+    {
+      "service": "payments",
+      "scope_name": "payments-scope",
+      "scope_version": "2.1.0",
+      "resource_attrs": {
+        "env": "staging"
+      },
+      "scope_attrs": {
+        "team": "payments-team"
+      },
+      "lines": [
+        { "ts_offset_ns": -3000000000, "body": "payments: charge authorized" },
+        { "ts_offset_ns": -2000000000, "body": "payments: charge captured" }
+      ]
+    },
+    {
+      "service": "inventory",
+      "resource_attrs": {
+        "env": "prod"
+      },
+      "scope_attrs": {},
+      "lines": [
+        { "ts_offset_ns": -2000000000, "body": "inventory: stock reserved" },
+        { "ts_offset_ns": -1000000000, "body": "inventory: stock released" }
+      ]
+    },
+    {
+      "service": "billing",
+      "scope_name": "billing-scope",
+      "scope_version": "0.9.0",
+      "resource_attrs": {
+        "env": "resource-env"
+      },
+      "scope_attrs": {
+        "env": "scope-env"
+      },
+      "lines": [
+        { "ts_offset_ns": -1000000000, "body": "billing: collision case exercised" }
+      ]
+    }
+  ]
+}

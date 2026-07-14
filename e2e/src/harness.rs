@@ -2,10 +2,9 @@
 //! until it's live, run every scenario registered for the variant, and
 //! tear down (via `ComposeGuard`, so teardown also fires on panic or an
 //! early scenario failure). On any readiness-timeout or scenario failure,
-//! dumps `pulsusdb` + `otel-collector` logs before returning the error.
-//! Collector export 404s are expected and ignored here (no ingest API in
-//! M0 — the skeleton asserts only ops endpoints).
+//! dumps diagnostic service logs before returning the error.
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,12 +25,32 @@ const READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// Service names dumped on failure — present under these exact names in
 /// both variants' overlays.
 const DIAGNOSTIC_SERVICES: &[&str] = &["pulsusdb", "otel-collector"];
+/// Extra services dumped on the cluster leg only (issue #15): the 2-shard
+/// ClickHouse containers `ci/clickhouse-cluster/compose.yaml` defines,
+/// absent from the single-node variant.
+const CLUSTER_DIAGNOSTIC_SERVICES: &[&str] = &["ch-shard1", "ch-shard2"];
+
+/// Every service to dump logs for on a failed run of `variant` —
+/// [`DIAGNOSTIC_SERVICES`] plus, on the cluster leg,
+/// [`CLUSTER_DIAGNOSTIC_SERVICES`].
+fn diagnostic_services(variant: Variant) -> Vec<&'static str> {
+    let mut services = DIAGNOSTIC_SERVICES.to_vec();
+    if variant == Variant::Cluster {
+        services.extend_from_slice(CLUSTER_DIAGNOSTIC_SERVICES);
+    }
+    services
+}
 
 pub struct RunOptions {
     pub variant: Variant,
     pub engine: EngineKind,
     pub keep: bool,
     pub base_url: String,
+    /// The collector's published OTLP/HTTP base URL (issue #15 architect
+    /// plan) — both compose variants publish the same host port
+    /// (`deploy/e2e/compose.{single,cluster}.yaml`, `:4318`), so this is a
+    /// fixed value like `base_url`, not derived per-variant.
+    pub collector_url: String,
 }
 
 /// The `-f` file list + project name for one variant (architect plan:
@@ -85,15 +104,17 @@ pub async fn run(opts: RunOptions) -> Result<()> {
 
     println!("pulsus-e2e: polling {}/ready", opts.base_url);
     if let Err(err) = wait_ready(&http, &opts.base_url, READY_POLL_TIMEOUT).await {
-        dump_logs(&compose);
+        dump_logs(&compose, opts.variant);
         return Err(err);
     }
 
     let ctx = Ctx {
         http,
         base_url: opts.base_url.clone(),
+        collector_url: opts.collector_url.clone(),
         variant: opts.variant,
         fixtures_dir: workspace_root().join("test/fixtures"),
+        compose: compose.clone(),
     };
 
     let scenarios: Vec<_> = SCENARIOS
@@ -107,7 +128,7 @@ pub async fn run(opts: RunOptions) -> Result<()> {
     for scenario in scenarios {
         println!("pulsus-e2e: running scenario {:?}", scenario.name);
         if let Err(err) = (scenario.run)(&ctx).await {
-            dump_logs(&compose);
+            dump_logs(&compose, opts.variant);
             return Err(err.context(format!("scenario {:?} failed", scenario.name)));
         }
     }
@@ -150,10 +171,49 @@ pub async fn wait_ready(http: &reqwest::Client, base_url: &str, timeout: Duratio
     }
 }
 
-fn dump_logs(compose: &Compose) {
-    for service in DIAGNOSTIC_SERVICES {
+fn dump_logs(compose: &Compose, variant: Variant) {
+    for service in diagnostic_services(variant) {
         eprintln!("=== logs: {service} ===");
         eprintln!("{}", compose.logs(service));
+    }
+}
+
+/// Polls `attempt` every `interval` until it returns `Ok(Some(value))` or
+/// `timeout` elapses, returning `value` — the collector-to-query e2e's
+/// **poll-until-visible** primitive (issue #15 architect plan): cluster-
+/// mode `_dist` writes are eventually consistent even in sync mode
+/// (docs/architecture.md's writer section), so scenarios asserting
+/// ingested data is queryable poll for it rather than assuming immediate
+/// visibility. `Ok(None)` ("not visible yet") and `Err` (a transient
+/// request failure) are both treated as "not yet" and retried — only the
+/// final, post-deadline attempt's error (if any) is surfaced, so a
+/// scenario failure reports the *last* observed state, not the first.
+/// Mirrors [`wait_ready`]'s bounded-poll shape, generalized over the
+/// condition being polled for.
+pub async fn poll_until<F, Fut, T>(
+    timeout: Duration,
+    interval: Duration,
+    mut attempt: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let outcome = attempt().await;
+        let now = tokio::time::Instant::now();
+        match outcome {
+            Ok(Some(value)) => return Ok(value),
+            Ok(None) if now >= deadline => {
+                bail!("condition not met within {timeout:?}");
+            }
+            Err(err) if now >= deadline => {
+                return Err(err.context(format!("condition not met within {timeout:?}")));
+            }
+            Ok(None) | Err(_) => {}
+        }
+        tokio::time::sleep(interval.min(deadline - now)).await;
     }
 }
 

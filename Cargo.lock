@@ -1411,6 +1411,7 @@ dependencies = [
  "anyhow",
  "clap",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -1489,8 +1490,10 @@ dependencies = [
  "pulsus-clickhouse",
  "pulsus-config",
  "pulsus-logql",
+ "pulsus-model",
  "pulsus-read",
  "pulsus-schema",
+ "pulsus-write",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

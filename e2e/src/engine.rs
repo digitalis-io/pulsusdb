@@ -130,6 +130,20 @@ impl Compose {
         }
     }
 
+    /// `compose exec -T <service> <args...>` — stdout only, trimmed
+    /// (issue #15 architect plan: the cluster leg's shard-local sanity
+    /// check runs `clickhouse-client` inside each shard container, rather
+    /// than publishing each shard's `:8123` — task-manager-approved,
+    /// "no extra published ports"). `-T` disables pseudo-TTY allocation,
+    /// load-bearing under a non-interactive CI runner (both Docker and
+    /// Podman compose accept it identically).
+    pub fn exec(&self, service: &str, args: &[&str]) -> Result<String> {
+        let mut full = vec!["exec", "-T", service];
+        full.extend_from_slice(args);
+        let output = self.run(&full)?;
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     fn run(&self, args: &[&str]) -> Result<Output> {
         let mut argv = self.engine.compose_argv0();
         for f in &self.files {

@@ -3,10 +3,18 @@
 //! render the OTLP response. A thin layer over the pure parser — no
 //! batching, no ClickHouse writes (architect plan, "out of scope").
 //!
-//! Not mounted into `pulsus-server`'s router by this issue (#8): that
-//! wiring needs a concrete `LogSink` (issue #9's writer core), which does
-//! not exist yet. Callers construct their own
-//! `axum::routing::post(logs::<S>)` route once a sink is available.
+//! [`ingest`] is the state-agnostic core (issue #15 architect plan):
+//! `&dyn LogSink` rather than a generic `State<Arc<S>>` extractor, because
+//! `pulsus-server`'s concrete sink (`WriterSink`, wrapping the
+//! async-filled writer slot) cannot implement `FromRef<AppState>` through
+//! an `Arc` — `Arc` is not `#[fundamental]`, so `Arc<WriterSink>:
+//! FromRef<AppState>` is an orphan-rule violation from this crate's side.
+//! A `&dyn LogSink` core sidesteps the state-type gymnastics entirely: the
+//! server's own thin `axum::extract::State<AppState>` handler pulls its
+//! sink out of `AppState` and calls straight into [`ingest`]. [`logs`]
+//! (this crate's own generic-`State` mount point, used by its own tests
+//! and any caller with a concrete, `FromRef`-able sink type) is now a
+//! one-line delegate to it.
 
 use std::sync::Arc;
 
@@ -51,9 +59,9 @@ struct Status {
     message: String,
 }
 
-/// `POST /v1/logs`: decompress, decode, parse, admit, respond. `S` is the
-/// concrete [`LogSink`] the caller mounts this handler with via
-/// `axum::routing::post(logs::<S>).with_state(Arc::new(sink))`.
+/// `POST /v1/logs`: decompress, decode, parse, admit, respond — the
+/// state-agnostic core every mount point (this crate's own [`logs`],
+/// `pulsus-server`'s `ingest_logs`) delegates to.
 ///
 /// Extracts `Body` rather than `Bytes` (plan amendment 3, code review
 /// finding): the `Bytes` extractor engages axum's `DefaultBodyLimit` (2 MiB
@@ -62,10 +70,7 @@ struct Status {
 /// size cap and its `OversizeBody -> 400/code=3` OTLP error mapping.
 /// `Body` bypasses `DefaultBodyLimit` entirely, so [`read_capped_body`]
 /// becomes the sole bound — no `DefaultBodyLimit::disable()` layer needed.
-pub async fn logs<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Body) -> Response
-where
-    S: LogSink + 'static,
-{
+pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -96,6 +101,19 @@ where
         },
         Err(Backpressure) => backpressure_response(),
     }
+}
+
+/// This crate's own generic-`State` mount point: `S` is the concrete
+/// [`LogSink`] the caller mounts this handler with via
+/// `axum::routing::post(logs::<S>).with_state(Arc::new(sink))`. A one-line
+/// delegate to [`ingest`] — see this module's doc comment for why
+/// `pulsus-server` cannot reuse this generic form and mounts [`ingest`]
+/// directly instead.
+pub async fn logs<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Body) -> Response
+where
+    S: LogSink + 'static,
+{
+    ingest(sink.as_ref(), headers, body).await
 }
 
 /// `true` when `X-Pulsus-Async: 1` selects async-mode admission.
@@ -352,6 +370,40 @@ mod tests {
         let res = post_body(router(sink.clone()), valid_request_body(), &[]).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// Request `Content-Type` handling (code review follow-up, issue #15):
+    /// this handler decodes every request body as protobuf unconditionally
+    /// — it keys decompression off `Content-Encoding` only ([`content_encoding`]),
+    /// never inspects the request's `Content-Type` at all. An explicit
+    /// `content-type: application/x-protobuf` header (what a real OTLP/HTTP
+    /// exporter — including the collector's `otlphttp` re-export after
+    /// translating an operator's OTLP/JSON push — actually sends) must
+    /// therefore admit identically to no header being present at all, which
+    /// this pins byte-for-byte. The JSON-in/protobuf-out half of "protobuf
+    /// accepted, JSON via collector translation" is exercised end-to-end by
+    /// `pulsus-e2e`'s `logs_roundtrip` scenario, which pushes OTLP/JSON into
+    /// a real collector and asserts the protobuf re-export this handler
+    /// receives round-trips correctly.
+    #[tokio::test]
+    async fn an_explicit_protobuf_content_type_header_admits_identically_to_no_header() {
+        let body = valid_request_body();
+
+        let sink_with_header = MockSink::new(Outcome::Admit);
+        let with_header = post_body(
+            router(sink_with_header.clone()),
+            body.clone(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+
+        let sink_without_header = MockSink::new(Outcome::Admit);
+        let without_header = post_body(router(sink_without_header.clone()), body, &[]).await;
+
+        assert_eq!(with_header.status(), StatusCode::OK);
+        assert_eq!(with_header.status(), without_header.status());
+        assert_eq!(sink_with_header.admitted.lock().unwrap().len(), 1);
+        assert_eq!(sink_without_header.admitted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

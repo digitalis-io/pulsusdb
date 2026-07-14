@@ -4,13 +4,15 @@
 //! signature so `modes.rs` never has to change when the real handlers land.
 
 use axum::Router;
+use axum::routing::post;
 
 use crate::app::AppState;
 
 /// Ingestion APIs (OTLP, Prometheus remote write, native profile ingest).
-/// Empty until pulsus-write lands its handlers.
+/// `POST /v1/logs` is wired (issue #15, docs/api.md §1.1); the remaining
+/// signals' ingest routes are still empty until their own issues land.
 pub(crate) fn writer_router() -> Router<AppState> {
-    Router::new()
+    Router::new().route("/v1/logs", post(crate::ingest::ingest_logs))
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).

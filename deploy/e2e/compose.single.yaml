@@ -75,6 +75,12 @@ services:
     networks:
       pulsus-e2e-single:
         ipv4_address: 172.29.0.12
+    # Published so the harness (`e2e/src/scenarios.rs`'s `logs_roundtrip`)
+    # can push OTLP/HTTP JSON fixtures straight into the collector's `otlp`
+    # receiver (issue #15) — the same static-IP-only-inside-the-network
+    # discipline this file's other services follow does not apply to the
+    # harness process itself, which runs on the host.
+    ports: [ "4318:4318" ]
 
   # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
   # surface (issue #14, task-manager-approved option A): proves alias

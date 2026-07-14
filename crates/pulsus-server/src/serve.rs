@@ -12,13 +12,14 @@
 
 use std::future::Future;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use pulsus_clickhouse::{ChClient, ChError, ChPool};
-use pulsus_config::{Config, LogLevel};
+use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_schema::SchemaError;
+use pulsus_write::LogWriter;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -27,7 +28,10 @@ use tokio::task::JoinHandle;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
-use crate::chconfig::{bootstrap_conn_config_from, conn_config_from, schema_params_from};
+use crate::chconfig::{
+    bootstrap_conn_config_from, conn_config_from, schema_params_from, writer_tables_from,
+};
+use crate::ingest::WriterSink;
 
 /// Startup-time failures specific to the HTTP server layer (config-load and
 /// schema-controller failures are handled separately, in `main.rs` /
@@ -43,35 +47,59 @@ pub(crate) enum ServeError {
     },
 }
 
+/// The bound on [`LogWriter::shutdown`]'s drain, run between graceful HTTP
+/// shutdown and background-task/pool teardown (issue #15 architect plan).
+/// A documented constant for now, not a `PULSUS_*` var (task-manager
+/// resolution: promote to config only when a deployment needs to tune it —
+/// the same precedent `writer::config::WriterRuntime`'s own documented
+/// constants set).
+const WRITER_DRAIN_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Runs one serving process (`all`/`writer`/`reader`) to completion: init
 /// tracing, install the metrics recorder, spawn the reconnect loop (which
 /// also starts the recurring TTL-rotation task once the schema is ready),
 /// build the router, and serve with graceful shutdown. Shutdown ordering
 /// (architect plan amendment, extended to rotation by the issue #6 review
-/// fix): graceful stop (accept loop drains) → abort the reconnect task,
-/// then join it → abort the rotation task (if one was ever started), then
-/// join it → only then does `pool_slot` (and the `ChPool` it may hold) drop,
-/// so pool teardown never races an in-flight `connect`/`ping`/rotation tick.
+/// fix, and to the writer by issue #15): graceful stop (accept loop drains
+/// in-flight requests — including a sync-ingest request's held-open
+/// `FlushWait`) → drain the writer (`LogWriter::shutdown`, bounded by
+/// [`WRITER_DRAIN_DEADLINE`]) → abort the reconnect task, then join it →
+/// abort the rotation task (if one was ever started), then join it → only
+/// then does `pool_slot` (and the `ChPool` it may hold) drop, so pool
+/// teardown never races an in-flight `connect`/`ping`/rotation tick *or* a
+/// still-draining writer flush.
 pub async fn run(config: Config) -> ExitCode {
     init_tracing(config.log_level);
 
     let metrics = install_metrics_recorder();
     let config = Arc::new(config);
     let pool_slot: Arc<RwLock<Option<Arc<ChPool>>>> = Arc::new(RwLock::new(None));
+    // Async-filled at most once by the reconnect loop, same shape as
+    // `pool_slot` but a `OnceLock` (no readers before the first write ever
+    // race a write — `WriterSink::admit`/`admit_flush` just see `None` and
+    // return `Backpressure`, no lock needed) — set *before* `pool_slot` so
+    // `/ready`=200 implies the ingest route is live too (issue #15
+    // architect plan).
+    let writer_slot: Arc<OnceLock<Arc<LogWriter>>> = Arc::new(OnceLock::new());
     // The reconnect loop is a one-shot bootstrap (see its own doc comment):
     // it runs exactly once per process and, on success, spawns at most one
     // rotation task — handed back over this oneshot channel so `run` can
     // abort it at shutdown too. No duplication/leak risk follows from that
     // single-spawn invariant.
     let (rotation_tx, rotation_rx) = oneshot::channel();
-    let reconnect_handle =
-        spawn_reconnect_loop(Arc::clone(&pool_slot), Arc::clone(&config), rotation_tx);
+    let reconnect_handle = spawn_reconnect_loop(
+        Arc::clone(&pool_slot),
+        Arc::clone(&writer_slot),
+        Arc::clone(&config),
+        rotation_tx,
+    );
 
     let state = AppState {
         pool: Arc::clone(&pool_slot),
         config: Arc::clone(&config),
         metrics,
         build: BuildInfo::from_build_env(),
+        writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
     };
 
     let router = match app::build_router(state, &config) {
@@ -100,6 +128,15 @@ pub async fn run(config: Config) -> ExitCode {
         .await
     {
         tracing::error!(error = %err, "server exited with an error");
+    }
+
+    // Drain any still-buffered/in-flight writer generations (async-mode
+    // admits that never had a request-scoped `FlushWait` to hold graceful
+    // shutdown open for) before the reconnect/rotation tasks stop and
+    // `pool_slot` drops (issue #15 architect plan). A no-op when this
+    // process never mounted the writer (`writer_slot` stays empty).
+    if let Some(writer) = writer_slot.get() {
+        writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
     shutdown_background_tasks(reconnect_handle, rotation_rx).await;
@@ -171,6 +208,7 @@ enum StartupError {
 /// loop's first successful pass lands.
 fn spawn_reconnect_loop(
     pool_slot: Arc<RwLock<Option<Arc<ChPool>>>>,
+    writer_slot: Arc<OnceLock<Arc<LogWriter>>>,
     config: Arc<Config>,
     rotation_tx: oneshot::Sender<JoinHandle<()>>,
 ) -> JoinHandle<()> {
@@ -180,7 +218,29 @@ fn spawn_reconnect_loop(
             match ensure_schema_then_connect(&config).await {
                 Ok(pool) => {
                     tracing::info!("clickhouse schema ready; pool established");
-                    *pool_slot.write().await = Some(Arc::new(pool));
+                    let pool = Arc::new(pool);
+                    // Construct and store the writer *before* the pool
+                    // (issue #15 architect plan): `/ready`=200 (which gates
+                    // on `pool_slot`) must imply the ingest route is live
+                    // too, not just that the reader's pool exists.
+                    if writer_enabled(&config) {
+                        let client = Arc::new(ChClient::from_shared_pool(
+                            Arc::clone(&pool),
+                            config.query_timeout.0,
+                        ));
+                        let writer = Arc::new(LogWriter::new_with_tables(
+                            client,
+                            &config.writer,
+                            writer_tables_from(&config),
+                        ));
+                        // `spawn_reconnect_loop` is a one-shot bootstrap
+                        // that `return`s on this, its first successful
+                        // pass (see this fn's own doc comment) — the slot
+                        // can therefore never already be set, so a `set`
+                        // failure is unreachable.
+                        let _ = writer_slot.set(writer);
+                    }
+                    *pool_slot.write().await = Some(pool);
                     if rotation_enabled(&config) {
                         let handle = spawn_rotation_task(Arc::clone(&config));
                         // The receiver may already be gone (e.g. `run` is
@@ -213,6 +273,15 @@ fn spawn_reconnect_loop(
 /// touching the network.
 fn rotation_enabled(config: &Config) -> bool {
     !config.skip_ddl
+}
+
+/// Whether this process mounts the writer subsystem (`docs/architecture.md
+/// §1`'s mode table: `all`/`writer` mount ingestion APIs, `reader` does
+/// not) — the reconnect loop's gate on constructing a `LogWriter` at all
+/// (issue #15 architect plan). Pure so the gate is unit-tested without
+/// touching the network, mirroring [`rotation_enabled`]'s idiom.
+fn writer_enabled(cfg: &Config) -> bool {
+    matches!(cfg.mode, Mode::All | Mode::Writer)
 }
 
 /// Spawns the recurring TTL-rotation task in a self-healing shape (issue #6
@@ -403,7 +472,12 @@ mod tests {
         cfg.clickhouse.http_port = 1; // nothing listens here
         cfg.clickhouse.pool_size = 1;
         let (rotation_tx, _rotation_rx) = oneshot::channel();
-        let handle = spawn_reconnect_loop(Arc::new(RwLock::new(None)), Arc::new(cfg), rotation_tx);
+        let handle = spawn_reconnect_loop(
+            Arc::new(RwLock::new(None)),
+            Arc::new(OnceLock::new()),
+            Arc::new(cfg),
+            rotation_tx,
+        );
         assert!(!handle.is_finished());
         handle.abort();
         let result = handle.await;
@@ -416,6 +490,26 @@ mod tests {
         assert!(rotation_enabled(&cfg));
         cfg.skip_ddl = true;
         assert!(!rotation_enabled(&cfg));
+    }
+
+    #[test]
+    fn writer_enabled_follows_the_mode_table() {
+        use pulsus_config::Mode;
+
+        for mode in [Mode::All, Mode::Writer] {
+            let cfg = Config {
+                mode,
+                ..Config::default()
+            };
+            assert!(writer_enabled(&cfg), "{mode:?} must mount the writer");
+        }
+        for mode in [Mode::Reader, Mode::Init] {
+            let cfg = Config {
+                mode,
+                ..Config::default()
+            };
+            assert!(!writer_enabled(&cfg), "{mode:?} must not mount the writer");
+        }
     }
 
     /// Load-bearing regression test for the round-3 review finding: a

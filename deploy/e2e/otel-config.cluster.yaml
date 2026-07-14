@@ -4,6 +4,9 @@
 # 172.28.0.20), not its DNS hostname — the whole point of this overlay's
 # static-IP network is that no inter-container hostname resolution is
 # required, and that must hold for the collector's outbound target too.
+#
+# logs-only pipeline (issue #15 architect plan) — see
+# otel-config.single.yaml's identical note.
 receivers:
   otlp:
     protocols: { grpc: {}, http: {} }
@@ -14,7 +17,5 @@ exporters:
 
 service:
   pipelines:
-    logs:    { receivers: [otlp], exporters: [otlphttp] }
-    metrics: { receivers: [otlp], exporters: [otlphttp] }
-    traces:  { receivers: [otlp], exporters: [otlphttp] }
-    # profiles pipeline requires a collector build with the experimental profiles signal
+    logs: { receivers: [otlp], exporters: [otlphttp] }
+    # metrics/traces/profiles pipelines land with their own milestones (M2/M4/M5)

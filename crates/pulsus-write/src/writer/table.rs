@@ -103,7 +103,12 @@ pub(crate) type FlushSuccessHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
 /// Per-table wiring the flush task closes over.
 pub(crate) struct TableContext<R> {
-    pub table: &'static str,
+    /// The target ClickHouse table name to insert into — `Arc<str>` (not
+    /// `&'static str`): in cluster mode this is a `_dist`-suffixed name
+    /// computed once at server startup from `Config`
+    /// ([`crate::writer::WriterTables`], issue #15 architect plan), not
+    /// known at compile time.
+    pub table: Arc<str>,
     pub buffer: Arc<TableBuffer<R>>,
     pub notify: Arc<Notify>,
     pub inserter: Arc<dyn BlockInserter<R>>,
@@ -299,7 +304,7 @@ where
     let mut attempt = 0u32;
     let mut rng = XorShift64::seeded();
     loop {
-        match ctx.inserter.insert(ctx.table, rows).await {
+        match ctx.inserter.insert(&ctx.table, rows).await {
             Ok(()) => return FlushOutcome::Ok,
             Err(ChError::InsertUncertain(msg)) => return FlushOutcome::Uncertain(msg),
             Err(e) if e.is_retryable() && attempt < ctx.runtime.retry_max_attempts => {
@@ -314,7 +319,7 @@ where
                     &mut rng,
                 );
                 warn!(
-                    table = ctx.table,
+                    table = %ctx.table,
                     attempt,
                     delay_ms = delay.as_millis() as u64,
                     error = %e,
@@ -358,11 +363,11 @@ async fn finish_generation<R>(
         FlushOutcome::Uncertain(msg) => {
             if let Err(spool_err) = ctx
                 .spool
-                .write(SpoolKind::Uncertain, ctx.table, &generation.rows, &msg)
+                .write(SpoolKind::Uncertain, &ctx.table, &generation.rows, &msg)
                 .await
             {
                 error!(
-                    table = ctx.table,
+                    table = %ctx.table,
                     error = %spool_err,
                     "failed to spool an insert-uncertain batch to disk"
                 );
@@ -374,11 +379,11 @@ async fn finish_generation<R>(
         FlushOutcome::Poisoned(msg) => {
             if let Err(spool_err) = ctx
                 .spool
-                .write(SpoolKind::Poison, ctx.table, &generation.rows, &msg)
+                .write(SpoolKind::Poison, &ctx.table, &generation.rows, &msg)
                 .await
             {
                 error!(
-                    table = ctx.table,
+                    table = %ctx.table,
                     error = %spool_err,
                     "failed to spool a poison batch to disk"
                 );
