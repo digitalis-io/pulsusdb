@@ -5,7 +5,7 @@
 //! re-derived.
 
 use crate::error::PromqlError;
-use crate::math::KahanSum;
+use crate::math::{KahanSum, kahan_inc};
 use crate::plan::{OverTimeFn, RangeFn};
 use crate::value::Sample;
 
@@ -46,6 +46,15 @@ pub fn eval_range_fn(
 /// only the last two samples, no extrapolation. A drop between them is
 /// treated as a counter reset (the result is simply the last value, not
 /// `last - previous`).
+///
+/// Issue #39 audit: re-verified operation-for-operation against
+/// `promql/functions.go` (v3.13.0, lines 829-834, 836-840, 874-880) —
+/// `sampledInterval := ss[1].T - ss[0].T` (a single `i64` subtraction,
+/// matching `interval_ms` here), the reset-vs-diff branch (`ss[1].F -
+/// ss[0].F`, matching `last.v - prev.v`), and a single final division
+/// `resultSample.F /= float64(sampledInterval) / 1000` (matching `result /=
+/// interval_ms as f64 / 1000.0`) — already bit-exact, unlike
+/// `eval_extrapolated` below; no change needed here.
 fn eval_irate(samples: &[Sample]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
@@ -65,11 +74,17 @@ fn eval_irate(samples: &[Sample]) -> Option<f64> {
     Some(result)
 }
 
-/// `rate`/`increase`/`delta` — Prometheus's `extrapolatedRate`, ported
-/// verbatim (counter-reset correction when `is_counter`, then
-/// 1.1x-average-interval edge extrapolation, then divide by `range_ms`
-/// when `is_rate`). Requires at least 2 samples in the window (the
-/// extrapolation heuristic needs at least one interval to average).
+/// `rate`/`increase`/`delta` — Prometheus's `extrapolatedRate`
+/// (`promql/functions.go`, v3.13.0, lines 471-591), ported
+/// operation-for-operation, not just formula-for-formula (issue #39: a
+/// prior version of this port computed the right *values* via a
+/// differently-*ordered* sequence of floating-point operations, which
+/// silently produced 1-2 ULP-divergent results from real Prometheus on
+/// real inputs — see the two numbered notes below for the two spots that
+/// actually mattered).
+///
+/// Requires at least 2 samples in the window (the extrapolation heuristic
+/// needs at least one interval to average).
 fn eval_extrapolated(
     samples: &[Sample],
     range_ms: i64,
@@ -83,8 +98,17 @@ fn eval_extrapolated(
     }
     let first = samples[0];
     let last = samples[samples.len() - 1];
+    // Line 510: `resultFloat = samples.Floats[numSamplesMinusOne].F -
+    // samples.Floats[0].F` (last - first).
     let mut result_value = last.v - first.v;
 
+    // Lines 519-524: counter-reset correction. Go's loop walks
+    // `samples.Floats[1:]` (never comparing the very first sample against
+    // anything), pairing each element with its immediate predecessor.
+    // Starting `last_value` at `0.0` and looping over every sample
+    // (including the first) is equivalent for a counter — the first
+    // comparison (`first.v < 0.0`) can never fire for a genuine
+    // non-negative counter reading — without needing a second slice index.
     if is_counter {
         let mut last_value = 0.0_f64;
         for s in samples {
@@ -95,42 +119,89 @@ fn eval_extrapolated(
         }
     }
 
+    // Lines 531-535.
     let mut duration_to_start = (first.t_ms - range_start_ms) as f64 / 1000.0;
-    let duration_to_end = (range_end_ms - last.t_ms) as f64 / 1000.0;
+    let mut duration_to_end = (range_end_ms - last.t_ms) as f64 / 1000.0;
     let sampled_interval = (last.t_ms - first.t_ms) as f64 / 1000.0;
     let average_duration_between_samples = sampled_interval / (samples.len() - 1) as f64;
+    let extrapolation_threshold = average_duration_between_samples * 1.1;
 
-    if is_counter && result_value > 0.0 && first.v >= 0.0 {
-        let duration_to_zero = sampled_interval * (first.v / result_value);
+    // issue #39 note 1 — ORDER matters here, not just the two formulas in
+    // isolation: upstream clamps `durationToStart` to the threshold FIRST
+    // (lines 550-552), and only *then* (lines 553-574) applies the
+    // counter-cannot-go-negative zero-point override, comparing
+    // `durationToZero` against the *already-clamped* `duration_to_start` —
+    // never the raw value. Computing the zero-point override against the
+    // raw `duration_to_start` (as a prior version of this port did) and
+    // applying the threshold clamp as a separate, later decision is a
+    // different sequence of comparisons, which can select a different
+    // final `duration_to_start` (not merely round differently).
+    if duration_to_start >= extrapolation_threshold {
+        duration_to_start = average_duration_between_samples / 2.0;
+    }
+    if is_counter {
+        // Lines 560-573: `durationToZero := durationToStart` is the
+        // fallback when the zero-crossing isn't computable — mirrored
+        // here by pre-seeding `duration_to_zero` with the (already
+        // threshold-clamped) `duration_to_start` so the final `if
+        // duration_to_zero < duration_to_start` comparison is a genuine
+        // no-op in that case, exactly as upstream's is.
+        let mut duration_to_zero = duration_to_start;
+        if result_value > 0.0 && first.v >= 0.0 {
+            duration_to_zero = sampled_interval * (first.v / result_value);
+        }
         if duration_to_zero < duration_to_start {
             duration_to_start = duration_to_zero;
         }
     }
-
-    let extrapolation_threshold = average_duration_between_samples * 1.1;
-    let mut extrapolate_to_interval = sampled_interval;
-
-    if duration_to_start < extrapolation_threshold {
-        extrapolate_to_interval += duration_to_start;
-    } else {
-        extrapolate_to_interval += average_duration_between_samples / 2.0;
+    // Lines 576-578: `duration_to_end`'s own threshold clamp — independent
+    // of the counter zero-point logic above, which only ever touches
+    // `duration_to_start`.
+    if duration_to_end >= extrapolation_threshold {
+        duration_to_end = average_duration_between_samples / 2.0;
     }
-    if duration_to_end < extrapolation_threshold {
-        extrapolate_to_interval += duration_to_end;
-    } else {
-        extrapolate_to_interval += average_duration_between_samples / 2.0;
-    }
-    result_value *= extrapolate_to_interval / sampled_interval;
+
+    // issue #39 note 2 — the actual root cause of the observed ULP
+    // divergence: lines 580-585 fully reduce `factor` (including the `/
+    // ms.Range.Seconds()` division when `is_rate`) into ONE value, THEN
+    // multiply `resultFloat` by it exactly once. `(a * b) / c` and `a *
+    // (b / c)` round differently in IEEE 754 even though they're
+    // mathematically equal — a prior version of this port did
+    // `result_value *= (extrapolate_to_interval / sampled_interval)`
+    // followed by a *separate* `result_value /= range_seconds`, which is
+    // the `(a*b)/c` shape upstream never performs.
+    let mut factor = (sampled_interval + duration_to_start + duration_to_end) / sampled_interval;
     if is_rate {
-        result_value /= range_ms as f64 / 1000.0;
+        factor /= range_ms as f64 / 1000.0;
     }
+    result_value *= factor;
     Some(result_value)
 }
 
-/// `avg/min/max/sum/count_over_time`. `sum`/`avg` use [`KahanSum`],
-/// matching Prometheus's own compensated-summation `*_over_time`
-/// implementation. `None` for an empty window (series absent at this
-/// step) — never a wrong `0`/`NaN` standing in for absence.
+/// `avg/min/max/sum/count_over_time`. `None` for an empty window (series
+/// absent at this step) — never a wrong `0`/`NaN` standing in for absence.
+///
+/// `sum_over_time` uses [`KahanSum`] (upstream `funcSumOverTime`,
+/// `promql/functions.go` v3.13.0: `sum, c := 0., 0.; for _, f := range
+/// s.Floats { sum, c = kahansum.Inc(f.F, sum, c) }; return sum + c` — seeds
+/// at `0.0` and Kahan-adds *every* sample, exactly what [`KahanSum::new`]
+/// + [`KahanSum::add`]-per-sample + [`KahanSum::value`] does).
+///
+/// `avg_over_time` (issue #39 audit finding) is **not** `sum_over_time /
+/// count` — upstream's `funcAvgOverTime` uses a materially different
+/// accumulation (see that function's own doc comment below) that this
+/// port now replicates operation-for-operation instead of reusing
+/// [`KahanSum`] the same way `sum_over_time` does.
+///
+/// `min`/`max`/`count_over_time` (issue #39 audit) carry no ULP risk at
+/// all — upstream's `compareOverTime` (`funcMinOverTime`/
+/// `funcMaxOverTime`) does nothing but direct `>`/`<` value comparisons
+/// (no arithmetic, so no rounding to diverge on) and `funcCountOverTime`
+/// is a plain length; both already match here bit-for-bit by construction.
+/// (Their `NaN`-vs-leading-value tie-breaking rule does differ subtly from
+/// this port's `f64::max`/`f64::min` fold — out of scope for #39, which is
+/// specifically about floating-point *accumulation order*, not `NaN`
+/// handling; flagged as a distinct follow-up.)
 pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
     if samples.is_empty() {
         return None;
@@ -144,13 +215,7 @@ pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
             }
             Some(k.value())
         }
-        OverTimeFn::Avg => {
-            let mut k = KahanSum::new();
-            for s in samples {
-                k.add(s.v);
-            }
-            Some(k.value() / samples.len() as f64)
-        }
+        OverTimeFn::Avg => Some(eval_avg_over_time(samples)),
         OverTimeFn::Min => Some(samples.iter().map(|s| s.v).fold(f64::INFINITY, f64::min)),
         OverTimeFn::Max => Some(
             samples
@@ -158,6 +223,63 @@ pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
                 .map(|s| s.v)
                 .fold(f64::NEG_INFINITY, f64::max),
         ),
+    }
+}
+
+/// `avg_over_time` — upstream's `funcAvgOverTime` float path
+/// (`promql/functions.go` v3.13.0, lines 1267-1297), ported
+/// operation-for-operation (issue #39 audit finding: this is *not*
+/// `sum_over_time(...) / count(...)`, and the original port here computed
+/// it that way — a genuinely different accumulation, not just a
+/// differently-rounded path to the same formula):
+///
+/// - `sum` is **seeded with the first sample's raw value directly** — no
+///   Kahan compensation is applied to it — and only the *second* sample
+///   onward is folded in via [`kahan_inc`]. Contrast `sum_over_time`
+///   (above), which seeds at `0.0` and Kahan-adds *every* sample including
+///   the first.
+/// - The final combination is `sum/count + kahanC/count` — **two**
+///   separate divisions, then added — never `(sum + kahanC) / count`.
+/// - If the running sum ever overflows to `±Inf`, upstream falls back to
+///   an *incremental mean* recurrence (`mean`/`kahanC` updated per-sample
+///   via `q := (count-1)/count`) for the remainder of the series. Ported
+///   here too for full fidelity even though no fixture/corpus value in
+///   this codebase currently reaches it (avg_over_time's inputs are all
+///   well within `f64` range) — this function must not go quietly wrong
+///   the day one does.
+fn eval_avg_over_time(samples: &[Sample]) -> f64 {
+    debug_assert!(!samples.is_empty(), "caller already checked non-empty");
+    let mut sum = samples[0].v;
+    let mut mean = 0.0_f64;
+    let mut kahan_c = 0.0_f64;
+    let mut incremental_mean = false;
+    let mut count = 1.0_f64;
+
+    for (i, s) in samples[1..].iter().enumerate() {
+        count = (i + 2) as f64;
+        if !incremental_mean {
+            let (new_sum, new_c) = kahan_inc(s.v, sum, kahan_c);
+            if !new_sum.is_infinite() {
+                sum = new_sum;
+                kahan_c = new_c;
+                continue;
+            }
+            // Switch to the incremental-mean recurrence, seeded from the
+            // (pre-overflow) running sum's own mean so far.
+            incremental_mean = true;
+            mean = sum / (count - 1.0);
+            kahan_c /= count - 1.0;
+        }
+        let q = (count - 1.0) / count;
+        let (new_mean, new_c) = kahan_inc(s.v / count, q * mean, q * kahan_c);
+        mean = new_mean;
+        kahan_c = new_c;
+    }
+
+    if incremental_mean {
+        mean + kahan_c
+    } else {
+        sum / count + kahan_c / count
     }
 }
 
@@ -365,6 +487,69 @@ mod tests {
         assert_eq!(eval_range_fn(RangeFn::Rate, &[], 60_000, 0, 60_000), None);
     }
 
+    /// Issue #39 hand-derived golden: the exact #33 differential-harness
+    /// repro (`target/e2e-artifacts/metrics-diff/single/mismatch-
+    /// 1784061239969673907.json`, not committed — gitignored under
+    /// `target/`), reconstructed from the corpus generator's own
+    /// deterministic algorithm (`e2e/src/corpus.rs`'s `splitmix64`/`mix`/
+    /// `counter_increment`, `seed=424242` from
+    /// `test/fixtures/metrics/differential.json`, `service_idx=1`
+    /// ("svc-1"), `instance_idx=0` ("inst-000"), no counter reset on this
+    /// particular series — `flat=68`, `68 % COUNTER_RESET_MODULUS(5) ==
+    /// 3`) — not re-derived from first principles, so this test's raw
+    /// sample values are independently verifiable against that generator.
+    ///
+    /// Query: `rate(requests_total{...}[2m])`, instant time
+    /// `1784061189208` ms (the corpus's own last sample). Real Prometheus
+    /// v3.13.0 (same pinned image `#32`'s goldens use) reported
+    /// `134.55238095238093` for this exact input; this engine reported
+    /// `134.55238095238096` (bit `...1b` vs. `...1a` in the low mantissa
+    /// byte) before the `eval_extrapolated` operation-order fix above.
+    /// Asserts the exact bit pattern (`to_bits`), not an epsilon — an
+    /// epsilon comparison would have silently passed on the very bug this
+    /// golden exists to catch.
+    #[test]
+    fn issue_39_rate_extrapolation_matches_prometheus_bit_exactly() {
+        // 8 raw `requests_total` samples inside the `(range_start,
+        // range_end]` window (step 15s, samples at ts_idx 32..=39 of the
+        // corpus's 40; every value below matches `counter_value(seed=
+        // 424242, service_idx=1, instance_idx=0, ts_idx)` computed
+        // independently in Python against the corpus module's own
+        // algorithm during this fix's investigation).
+        let samples = vec![
+            s(1_784_061_084_208, 66_846.0),
+            s(1_784_061_099_208, 68_855.0),
+            s(1_784_061_114_208, 70_858.0),
+            s(1_784_061_129_208, 72_866.0),
+            s(1_784_061_144_208, 74_905.0),
+            s(1_784_061_159_208, 76_939.0),
+            s(1_784_061_174_208, 78_951.0),
+            s(1_784_061_189_208, 80_974.0),
+        ];
+        let range_ms = 120_000; // `[2m]`
+        let range_end_ms = 1_784_061_189_208; // the corpus's last sample ts.
+        let range_start_ms = range_end_ms - range_ms;
+
+        let v = eval_range_fn(
+            RangeFn::Rate,
+            &samples,
+            range_ms,
+            range_start_ms,
+            range_end_ms,
+        )
+        .expect("8 samples in window");
+
+        let expected = 134.552_380_952_380_93_f64;
+        assert_eq!(
+            v.to_bits(),
+            expected.to_bits(),
+            "got {v:?} (bits {:x}), want {expected:?} (bits {:x}) — real Prometheus's own \
+             reported value for this exact input",
+            v.to_bits(),
+            expected.to_bits()
+        );
+    }
+
     // --- irate ---
 
     #[test]
@@ -395,6 +580,69 @@ mod tests {
     fn avg_over_time_divides_by_the_sample_count() {
         let samples = vec![s(0, 2.0), s(60_000, 4.0)];
         assert_eq!(eval_over_time(OverTimeFn::Avg, &samples), Some(3.0));
+    }
+
+    /// Issue #39 audit finding: `avg_over_time` is genuinely a different
+    /// accumulation from `sum_over_time(...) / count(...)`, not just a
+    /// differently-rounded path to the same formula — pinned here with a
+    /// case where the two approaches provably diverge at the last bit
+    /// (found by randomized search against a Python replica of both
+    /// algorithms during this fix's investigation, then hand-verified).
+    /// Bit-exact (`to_bits`), not an epsilon comparison, for the same
+    /// reason as the rate-family golden above.
+    #[test]
+    fn avg_over_time_matches_upstreams_accumulation_not_sum_over_time_divided_by_count() {
+        let values = [
+            577_446.702_271,
+            -812_280.826_452,
+            -943_305.046_956,
+            671_530.207_84,
+            -134_465.864_19,
+            524_560.164_916,
+            -995_787.893_298,
+        ];
+        let samples: Vec<Sample> = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 60_000, v))
+            .collect();
+
+        let avg = eval_over_time(OverTimeFn::Avg, &samples).unwrap();
+
+        let mut k = KahanSum::new();
+        for v in values {
+            k.add(v);
+        }
+        let naive_sum_then_divide = k.value() / values.len() as f64;
+
+        assert_ne!(
+            avg.to_bits(),
+            naive_sum_then_divide.to_bits(),
+            "this input was specifically chosen because the two accumulations diverge — if \
+             they now match, either the input no longer exercises the difference or \
+             avg_over_time regressed to the naive shape"
+        );
+        let expected: f64 = -158_900.365_124_142_85;
+        assert_eq!(avg.to_bits(), expected.to_bits(), "got {avg:?}");
+    }
+
+    /// Issue #39: `avg_over_time`'s upstream incremental-mean overflow
+    /// fallback must produce a finite, sane result rather than `NaN`/`Inf`
+    /// garbage once the running sum overflows `f64::MAX`.
+    #[test]
+    fn avg_over_time_falls_back_to_incremental_mean_on_overflow() {
+        let samples = vec![
+            s(0, f64::MAX),
+            s(60_000, f64::MAX),
+            s(120_000, 1.0),
+            s(180_000, 2.0),
+        ];
+        let avg = eval_over_time(OverTimeFn::Avg, &samples).unwrap();
+        assert!(avg.is_finite(), "got {avg:?}");
+        // Roughly `f64::MAX / 2` (the two `f64::MAX` terms dominate) —
+        // sanity, not bit-exact (this path exists to avoid NaN/Inf, not to
+        // be pinned to a captured Prometheus value).
+        assert!(avg > 1e307, "got {avg:?}");
     }
 
     #[test]
