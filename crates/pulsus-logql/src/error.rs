@@ -73,6 +73,25 @@ pub enum LogQlError {
     TrailingInput { span: Span },
 }
 
+impl LogQlError {
+    /// The byte-offset span every variant carries — surfaced by #13's
+    /// `400 bad_data` query-error envelope as `position` (docs/api.md
+    /// "Errors": "400 for malformed queries with parser position where
+    /// available").
+    pub fn span(&self) -> Span {
+        match self {
+            LogQlError::UnexpectedToken { span, .. }
+            | LogQlError::UnexpectedEof { span, .. }
+            | LogQlError::NotYetSupported { span, .. }
+            | LogQlError::InvalidDuration { span, .. }
+            | LogQlError::UnterminatedString { span }
+            | LogQlError::EmptySelector { span }
+            | LogQlError::RecursionLimitExceeded { span }
+            | LogQlError::TrailingInput { span } => *span,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +168,36 @@ mod tests {
     fn trailing_input_message_names_the_offset() {
         let err = LogQlError::TrailingInput { span: span() };
         assert!(err.to_string().contains("byte 3"));
+    }
+
+    #[test]
+    fn span_returns_the_carried_span_for_every_variant() {
+        let cases = [
+            LogQlError::UnexpectedToken {
+                found: "x".to_string(),
+                expected: "y".to_string(),
+                span: span(),
+            },
+            LogQlError::UnexpectedEof {
+                expected: "y".to_string(),
+                span: span(),
+            },
+            LogQlError::NotYetSupported {
+                construct: "json".to_string(),
+                span: span(),
+            },
+            LogQlError::InvalidDuration {
+                raw: "5x".to_string(),
+                reason: "bad".to_string(),
+                span: span(),
+            },
+            LogQlError::UnterminatedString { span: span() },
+            LogQlError::EmptySelector { span: span() },
+            LogQlError::RecursionLimitExceeded { span: span() },
+            LogQlError::TrailingInput { span: span() },
+        ];
+        for case in cases {
+            assert_eq!(case.span(), span());
+        }
     }
 }

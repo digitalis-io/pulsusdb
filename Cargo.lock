@@ -1479,11 +1479,16 @@ name = "pulsus-server"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "bytes",
+ "chrono",
  "clap",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "pulsus-clickhouse",
  "pulsus-config",
+ "pulsus-logql",
+ "pulsus-read",
  "pulsus-schema",
  "serde",
  "serde_json",

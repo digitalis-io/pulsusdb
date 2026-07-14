@@ -30,6 +30,7 @@ pub use ast::{
 };
 pub use error::LogQlError;
 pub use parser::{parse, parse_selector};
+pub use token::Span;
 
 #[cfg(test)]
 mod tests {

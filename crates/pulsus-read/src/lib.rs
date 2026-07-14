@@ -4,8 +4,9 @@
 pub mod logql;
 
 pub use logql::{
-    Direction, EngineConfig, LogQlEngine, PlanCtx, PlanExplain, QueryParams, QueryResult,
-    QuerySpec, ReadError, RouteChoice, RoutingDecision,
+    DEFAULT_MAX_STREAMS, Direction, EngineConfig, ExplainStage, LogQlEngine, MatrixSeries, PlanCtx,
+    PlanExplain, QueryParams, QueryResult, QuerySpec, ReadError, RouteChoice, RoutingDecision,
+    StreamResult, TimeBounds, VectorSample,
 };
 
 #[cfg(test)]

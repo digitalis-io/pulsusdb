@@ -33,6 +33,19 @@ pub struct SampleRow {
     pub body: String,
 }
 
+/// Labels discovery (`log_streams_idx`): one distinct label key.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LabelNameRow {
+    pub name: String,
+}
+
+/// Label-values discovery (`log_streams_idx`): one distinct value of the
+/// requested key.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LabelValueRow {
+    pub value: String,
+}
+
 /// A selectivity probe result (`count()` over one matcher's index prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct ProbeRow {
@@ -68,6 +81,22 @@ mod tests {
         let a = StreamRow { fingerprint: 1 };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn label_name_row_derives_are_usable() {
+        let a = LabelNameRow {
+            name: "env".to_string(),
+        };
+        assert_eq!(a.clone(), a);
+    }
+
+    #[test]
+    fn label_value_row_derives_are_usable() {
+        let a = LabelValueRow {
+            value: "prod".to_string(),
+        };
+        assert_eq!(a.clone(), a);
     }
 
     #[test]

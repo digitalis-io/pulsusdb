@@ -7,8 +7,11 @@
 //! fix) — derives its connection settings and schema parameters from these
 //! functions.
 
-use pulsus_clickhouse::{ChConnConfig, ChProto};
+use std::sync::Arc;
+
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
+use pulsus_read::{EngineConfig, LogQlEngine};
 use pulsus_schema::{RenderCtx, SchemaParams};
 
 /// Maps `Config` to the connection settings any part of this binary dials
@@ -66,6 +69,43 @@ pub(crate) fn schema_params_from(config: &Config) -> SchemaParams {
     }
 }
 
+/// Maps `Config` to [`pulsus_read::LogQlEngine`]'s table-name/budget
+/// context (issue #13 architect plan: `EngineConfig` construction, deferred
+/// from #12, lands here alongside the other `Config → *` mappings).
+/// Cluster-aware table-name resolution mirrors `pulsus-schema`'s own
+/// `_dist`-suffix rule (`controller.rs`): a configured `cluster` reads
+/// through the `_dist` wrapper tables, an unclustered deployment reads the
+/// base tables directly.
+pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    EngineConfig {
+        db: config.clickhouse.database.clone(),
+        streams_idx: format!("log_streams_idx{dist}"),
+        streams: format!("log_streams{dist}"),
+        samples: format!("log_samples{dist}"),
+        rollup_table: format!(
+            "log_metrics_{}{dist}",
+            pulsus_schema::rollup_suffix(config.log_rollup_resolution.0)
+        ),
+        rollup_res_ns: config.log_rollup_resolution.0.as_nanos() as u64,
+        scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
+        max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
+    }
+}
+
+/// Builds a [`LogQlEngine`] over `pool` — the same `Arc<ChPool>` `AppState`
+/// already holds (`ChClient::from_shared_pool`, issue #13 resolved open
+/// question #1), so a `/api/logs/v1` request never opens a second
+/// connection pool.
+pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> LogQlEngine {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
+    LogQlEngine::new(client, engine_config_from(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +159,43 @@ mod tests {
         let params = schema_params_from(&config);
         assert_eq!(params.db, "pulsus");
         assert_eq!(params.cluster.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn engine_config_from_uses_base_table_names_when_unclustered() {
+        let config = Config::default();
+        let engine_cfg = engine_config_from(&config);
+        assert_eq!(engine_cfg.streams_idx, "log_streams_idx");
+        assert_eq!(engine_cfg.streams, "log_streams");
+        assert_eq!(engine_cfg.samples, "log_samples");
+        assert_eq!(engine_cfg.rollup_table, "log_metrics_5s");
+    }
+
+    #[test]
+    fn engine_config_from_uses_dist_table_names_when_clustered() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let engine_cfg = engine_config_from(&config);
+        assert_eq!(engine_cfg.streams_idx, "log_streams_idx_dist");
+        assert_eq!(engine_cfg.streams, "log_streams_dist");
+        assert_eq!(engine_cfg.samples, "log_samples_dist");
+        assert_eq!(engine_cfg.rollup_table, "log_metrics_5s_dist");
+    }
+
+    #[test]
+    fn engine_config_from_maps_the_rollup_resolution_and_scan_budget() {
+        let config = Config::default();
+        let engine_cfg = engine_config_from(&config);
+        assert_eq!(
+            engine_cfg.rollup_res_ns,
+            config.log_rollup_resolution.0.as_nanos() as u64
+        );
+        assert_eq!(
+            engine_cfg.scan_budget_bytes,
+            config.reader.logql_scan_budget_bytes.0
+        );
+        assert_eq!(engine_cfg.max_streams, pulsus_read::DEFAULT_MAX_STREAMS);
     }
 }

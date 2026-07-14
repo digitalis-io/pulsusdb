@@ -11,11 +11,20 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+bytes.workspace = true
+# RFC3339 timestamp parsing for `/api/logs/v1`'s `start`/`end`/`time` params
+# (issue #13 architect plan interfaces: "else RFC3339 (chrono) ⇒ ns"); no
+# other timestamp math in this binary needs it (elsewhere "now" is read via
+# `std::time::SystemTime`, matching the rest of the workspace).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap.workspace = true
+futures.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
+pulsus-logql = { path = "../pulsus-logql" }
+pulsus-read = { path = "../pulsus-read" }
 pulsus-schema = { path = "../pulsus-schema" }
 serde.workspace = true
 serde_json.workspace = true

@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,7 +39,7 @@ const MAX_IDEMPOTENT_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 pub struct ChClient {
-    pool: ChPool,
+    pool: Arc<ChPool>,
     default_timeout: Duration,
 }
 
@@ -60,9 +61,21 @@ impl ChClient {
         let default_timeout = cfg.query_timeout;
         let pool = ChPool::connect(cfg).await?;
         Ok(Self {
-            pool,
+            pool: Arc::new(pool),
             default_timeout,
         })
+    }
+
+    /// Builds a `ChClient` over an already-connected, shared `ChPool`
+    /// (issue #13's read-API wiring): `AppState` holds exactly one
+    /// `Arc<ChPool>`, and every per-request `LogQlEngine` borrows it via a
+    /// cheap `Arc::clone` rather than opening a second connection pool
+    /// (issue #13 architect plan, resolved open question #1).
+    pub fn from_shared_pool(pool: Arc<ChPool>, query_timeout: Duration) -> Self {
+        Self {
+            pool,
+            default_timeout: query_timeout,
+        }
     }
 
     /// Columnar block insert into `table`.

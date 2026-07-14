@@ -14,9 +14,11 @@ pub(crate) fn writer_router() -> Router<AppState> {
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).
-/// Empty until pulsus-read lands its handlers.
+/// `/api/logs/v1` is wired (issue #13); the remaining product surfaces
+/// (`/api/v1` PromQL, `/api/traces/v1`, `/api/profiles/v1`) are still empty
+/// until their own issues land.
 pub(crate) fn reader_router() -> Router<AppState> {
-    Router::new()
+    crate::logs_api::router()
 }
 
 /// Rules API (`/api/rules/v1`). Empty until pulsus-ruler lands its handlers.

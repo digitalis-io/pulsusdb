@@ -19,7 +19,7 @@ pub use controller::{
     SchemaParams, apply_ttl, check_version, guard_skip_ddl_in_init, reconcile, run_init,
 };
 pub use error::SchemaError;
-pub use render::{Family, RenderCtx};
+pub use render::{Family, RenderCtx, rollup_suffix};
 pub use rotation::spawn_rotation;
 
 #[cfg(test)]

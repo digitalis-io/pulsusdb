@@ -73,6 +73,18 @@ pub struct PlanCtx<'a> {
     pub max_streams: usize,
 }
 
+/// A `[start_ns, end_ns]` time window for label/series discovery reads
+/// (#13's `labels`/`label/{name}/values`/`series` endpoints supply this
+/// from parsed `start`/`end` query params). Deliberately distinct from
+/// [`QueryParams`]/[`QuerySpec`]: discovery reads never bucket or evaluate
+/// a range aggregation, they only bound which `log_streams_idx` months
+/// ([`super::plan::months_overlapping`]) to scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeBounds {
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
+
 /// Hard structural cap on the number of fingerprints stage 1 may resolve
 /// before hydration/sample reads (task-manager resolution #1 on issue #11):
 /// a documented constant, not a config field, same precedent as #8's
@@ -98,6 +110,16 @@ mod tests {
             QuerySpec::Instant { at_ns } => assert_eq!(at_ns, 100),
             QuerySpec::Range { .. } => panic!("expected Instant"),
         }
+    }
+
+    #[test]
+    fn time_bounds_carries_start_and_end_verbatim() {
+        let b = TimeBounds {
+            start_ns: 10,
+            end_ns: 20,
+        };
+        assert_eq!(b.start_ns, 10);
+        assert_eq!(b.end_ns, 20);
     }
 
     #[test]

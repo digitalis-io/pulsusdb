@@ -46,11 +46,7 @@ pub fn stage1(
     positive_branches: &[String],
     negative_branches: &[String],
 ) -> String {
-    let month_clause = if months.len() == 1 {
-        format!("month = {}", months[0])
-    } else {
-        format!("month IN ({})", months.join(", "))
-    };
+    let month_clause = month_clause(months);
 
     let mut where_branches: Vec<&str> = positive_branches.iter().map(String::as_str).collect();
     where_branches.extend(negative_branches.iter().map(String::as_str));
@@ -79,14 +75,44 @@ pub fn stage1(
 /// are point ranges and skip probes entirely (architect plan: "Selectivity
 /// probes").
 pub fn probe(streams_idx_table: &str, months: &[String], key_literal: &str) -> String {
-    let month_clause = if months.len() == 1 {
-        format!("month = {}", months[0])
-    } else {
-        format!("month IN ({})", months.join(", "))
-    };
+    let month_clause = month_clause(months);
     format!(
         "SELECT count() AS n\nFROM {streams_idx_table}\nWHERE {month_clause} AND key = {key_literal}"
     )
+}
+
+/// Labels discovery (#13 `GET|POST /api/logs/v1/labels`): every distinct
+/// `log_streams_idx` key within `months`, ascending. Budget-capped like
+/// every other index scan in this module (`LogQlEngine::budget_settings`).
+pub fn label_names(streams_idx_table: &str, months: &[String]) -> String {
+    format!(
+        "SELECT DISTINCT key AS name\nFROM {streams_idx_table}\nWHERE {}\nORDER BY name",
+        month_clause(months)
+    )
+}
+
+/// Label-values discovery (#13 `GET /api/logs/v1/label/{{name}}/values`):
+/// every distinct value of one key within `months`, ascending.
+/// `key_literal` is a pre-escaped ClickHouse string literal (see
+/// [`super::escape::ch_string`]). **M1 scope:** returns the key's full
+/// distinct-value set; `query=`-selector narrowing is deferred to M6
+/// parity (docs/api.md §2.3).
+pub fn label_values(streams_idx_table: &str, months: &[String], key_literal: &str) -> String {
+    format!(
+        "SELECT DISTINCT val AS value\nFROM {streams_idx_table}\nWHERE {} AND key = {key_literal}\nORDER BY value",
+        month_clause(months)
+    )
+}
+
+/// The `month = '...'` / `month IN (...)` clause shared by every stage-1-
+/// style `log_streams_idx` scan in this module (`months` is at least one
+/// pre-rendered `'YYYY-MM-01'` date literal).
+fn month_clause(months: &[String]) -> String {
+    if months.len() == 1 {
+        format!("month = {}", months[0])
+    } else {
+        format!("month IN ({})", months.join(", "))
+    }
 }
 
 /// Stage 2 — hydration (docs/schemas.md §3.2 line 307), byte-exact to the
@@ -245,6 +271,31 @@ mod tests {
         assert_eq!(
             stage2("log_streams", &[18374, 99120]),
             "SELECT fingerprint, service, labels FROM log_streams WHERE fingerprint IN (18374, 99120)"
+        );
+    }
+
+    #[test]
+    fn label_names_renders_a_distinct_key_scan_for_one_month() {
+        assert_eq!(
+            label_names("log_streams_idx", &["'2026-07-01'".to_string()]),
+            "SELECT DISTINCT key AS name\nFROM log_streams_idx\nWHERE month = '2026-07-01'\nORDER BY name"
+        );
+    }
+
+    #[test]
+    fn label_names_renders_a_month_in_list_for_a_boundary_spanning_window() {
+        let sql = label_names(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
+        );
+        assert!(sql.contains("WHERE month IN ('2026-07-01', '2026-08-01')"));
+    }
+
+    #[test]
+    fn label_values_renders_a_distinct_value_scan_scoped_to_one_key() {
+        assert_eq!(
+            label_values("log_streams_idx", &["'2026-07-01'".to_string()], "'env'"),
+            "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\nORDER BY value"
         );
     }
 

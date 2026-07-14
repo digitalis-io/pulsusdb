@@ -16,9 +16,12 @@ use pulsus_logql::{Expr, Grouping, GroupingKind, VectorAggOp};
 
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
-use super::params::{PlanCtx, QueryParams};
+use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
 use super::plan::{self, MetricPlan, Plan, StreamsPlan};
-use super::rows::{MetricBucketRow, MetricInstantRow, SampleRow, StreamMetaRow, StreamRow};
+use super::rows::{
+    LabelNameRow, LabelValueRow, MetricBucketRow, MetricInstantRow, SampleRow, StreamMetaRow,
+    StreamRow,
+};
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
 /// `max_bytes_to_read` overflow this crate sets from
@@ -109,9 +112,220 @@ impl LogQlEngine {
     pub async fn query(&self, expr: &Expr, params: &QueryParams) -> Result<QueryResult, ReadError> {
         let ctx = self.config.plan_ctx();
         match plan::plan(expr, params, &ctx)? {
-            Plan::Streams(sp) => self.run_streams(&sp).await.map(QueryResult::Streams),
-            Plan::Metric(mp) => self.run_metric(&mp).await,
+            Plan::Streams(sp) => self
+                .run_streams_inner(&sp, None)
+                .await
+                .map(QueryResult::Streams),
+            Plan::Metric(mp) => self.run_metric_inner(&mp, None).await,
         }
+    }
+
+    /// One execution that also captures the plan trace (#13's
+    /// `X-Pulsus-Explain`) — `run_streams_inner`/`run_metric_inner` push
+    /// every stage's SQL into `explain` in the same single pass that
+    /// executes it, so this incurs **zero** extra ClickHouse reads versus
+    /// [`LogQlEngine::query`] (architect plan amendment §3, resolving the
+    /// round-1 review finding that a naive `query()` + `explain()` pairing
+    /// would double-execute and could observe different data).
+    pub async fn query_explained(
+        &self,
+        expr: &Expr,
+        params: &QueryParams,
+    ) -> Result<(QueryResult, PlanExplain), ReadError> {
+        let ctx = self.config.plan_ctx();
+        match plan::plan(expr, params, &ctx)? {
+            Plan::Streams(sp) => {
+                let mut explain = PlanExplain::new("streams");
+                let result = self.run_streams_inner(&sp, Some(&mut explain)).await?;
+                Ok((QueryResult::Streams(result), explain))
+            }
+            Plan::Metric(mp) => {
+                let result_type = if mp.step_ns.is_none() {
+                    "vector"
+                } else {
+                    "matrix"
+                };
+                let mut explain = PlanExplain::new(result_type);
+                let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
+                Ok((result, explain))
+            }
+        }
+    }
+
+    /// Labels discovery (#13 `GET|POST /api/logs/v1/labels`): distinct
+    /// `log_streams_idx` keys within `b`'s months. Budget-capped like
+    /// every other index scan in this module.
+    pub async fn label_names(&self, b: TimeBounds) -> Result<Vec<String>, ReadError> {
+        self.label_names_inner(b, None).await
+    }
+
+    /// [`LogQlEngine::label_names`] plus its `X-Pulsus-Explain` trace, in
+    /// the same single pass (no second scan).
+    pub async fn label_names_explained(
+        &self,
+        b: TimeBounds,
+    ) -> Result<(Vec<String>, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("labels");
+        let names = self.label_names_inner(b, Some(&mut explain)).await?;
+        Ok((names, explain))
+    }
+
+    async fn label_names_inner(
+        &self,
+        b: TimeBounds,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<String>, ReadError> {
+        let months = plan::months_overlapping(b.start_ns, b.end_ns);
+        let sql = super::sql::label_names(&self.config.streams_idx, &months);
+        if let Some(e) = explain.as_mut() {
+            e.push("label_names", sql.clone(), None);
+        }
+        let mut names = Vec::new();
+        let mut stream = self
+            .query_stream::<LabelNameRow>(&sql, &self.budget_settings())
+            .await
+            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            names.push(row.name);
+        }
+        Ok(names)
+    }
+
+    /// Label-values discovery (#13 `GET /api/logs/v1/label/{name}/values`):
+    /// distinct values of `name` within `b`'s months. **M1 scope:** returns
+    /// the key's full distinct-value set; `query=`-selector narrowing is
+    /// deferred to M6 parity (docs/api.md §2.3).
+    pub async fn label_values(&self, name: &str, b: TimeBounds) -> Result<Vec<String>, ReadError> {
+        self.label_values_inner(name, b, None).await
+    }
+
+    /// [`LogQlEngine::label_values`] plus its `X-Pulsus-Explain` trace, in
+    /// the same single pass (no second scan).
+    pub async fn label_values_explained(
+        &self,
+        name: &str,
+        b: TimeBounds,
+    ) -> Result<(Vec<String>, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("label_values");
+        let values = self.label_values_inner(name, b, Some(&mut explain)).await?;
+        Ok((values, explain))
+    }
+
+    async fn label_values_inner(
+        &self,
+        name: &str,
+        b: TimeBounds,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<String>, ReadError> {
+        let months = plan::months_overlapping(b.start_ns, b.end_ns);
+        let key_literal = super::escape::ch_string(name);
+        let sql = super::sql::label_values(&self.config.streams_idx, &months, &key_literal);
+        if let Some(e) = explain.as_mut() {
+            e.push("label_values", sql.clone(), None);
+        }
+        let mut values = Vec::new();
+        let mut stream = self
+            .query_stream::<LabelValueRow>(&sql, &self.budget_settings())
+            .await
+            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            values.push(row.value);
+        }
+        Ok(values)
+    }
+
+    /// Series discovery (#13 `GET|POST /api/logs/v1/series`): the union of
+    /// every `selectors` stream resolution, hydrated into distinct
+    /// canonical-labels JSON strings (already sorted-key JSON, per
+    /// `docs/schemas.md` §3.1 — spliced verbatim into #13's response, never
+    /// re-parsed/re-encoded here). `selectors` are expected to be bare
+    /// stream selectors (`Expr::Log` with an empty pipeline, as #13 builds
+    /// from `match[]`); a metric expression is planned all the same (both
+    /// `Plan` variants carry `stage1_sql`/`streams_table`) since stage 1
+    /// resolution does not depend on the pipeline/aggregation.
+    pub async fn series(
+        &self,
+        selectors: &[Expr],
+        b: TimeBounds,
+    ) -> Result<Vec<String>, ReadError> {
+        self.series_inner(selectors, b, None).await
+    }
+
+    /// [`LogQlEngine::series`] plus its `X-Pulsus-Explain` trace, in the
+    /// same single pass (no second scan).
+    pub async fn series_explained(
+        &self,
+        selectors: &[Expr],
+        b: TimeBounds,
+    ) -> Result<(Vec<String>, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("series");
+        let result = self.series_inner(selectors, b, Some(&mut explain)).await?;
+        Ok((result, explain))
+    }
+
+    async fn series_inner(
+        &self,
+        selectors: &[Expr],
+        b: TimeBounds,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<String>, ReadError> {
+        let ctx = self.config.plan_ctx();
+        // `series` never buckets or filters samples — it only needs stage
+        // 1's month-bounded fingerprint resolution — so `limit`/
+        // `direction`/`step_ns` are unused placeholders (a nonzero
+        // `step_ns` sidesteps `plan::metric_plan`'s zero-step guard on the
+        // off chance a caller ever hands this a metric expression).
+        let qp = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: b.start_ns,
+                end_ns: b.end_ns,
+                step_ns: 1_000_000_000,
+            },
+            limit: 1,
+            direction: Direction::Backward,
+        };
+        let mut fingerprints: Vec<u64> = Vec::new();
+        let mut streams_table = self.config.streams.clone();
+        for expr in selectors {
+            let (stage1_sql, table) = match plan::plan(expr, &qp, &ctx)? {
+                Plan::Streams(sp) => (sp.stage1_sql, sp.streams_table),
+                Plan::Metric(mp) => (mp.stage1_sql, mp.streams_table),
+            };
+            if let Some(e) = explain.as_mut() {
+                e.push("stage1_stream_resolution", stage1_sql.clone(), None);
+            }
+            let fps = self.resolve_fingerprints(&stage1_sql).await?;
+            fingerprints.extend(fps);
+            streams_table = table;
+        }
+        fingerprints.sort_unstable();
+        fingerprints.dedup();
+        // Each selector's own `resolve_fingerprints` call already caps that
+        // *individual* selector at `max_streams` (`check_stream_cap` inside
+        // it), but says nothing about the deduped union across selectors —
+        // N disjoint `match[]` values can each stay under the cap
+        // individually while their union blows well past it, building an
+        // oversized stage-2 `fingerprint IN (...)` hydration query (round-1
+        // code review finding 1). Re-check the cap on the union before
+        // proceeding.
+        check_stream_cap(fingerprints.len(), self.config.max_streams)?;
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "stage2_hydration",
+                super::sql::stage2(&streams_table, &fingerprints),
+                None,
+            );
+        }
+        let meta = self.hydrate(&streams_table, &fingerprints).await?;
+        let mut labels: Vec<String> = meta.into_values().map(|m| m.labels).collect();
+        labels.sort();
+        labels.dedup();
+        Ok(labels)
     }
 
     pub async fn explain(
@@ -191,10 +405,35 @@ impl LogQlEngine {
             .set("read_overflow_mode", "throw")
     }
 
-    async fn run_streams(&self, sp: &StreamsPlan) -> Result<Vec<StreamResult>, ReadError> {
+    /// Executes a [`StreamsPlan`] end to end. When `explain` is `Some`,
+    /// every stage's already-computed SQL is pushed into it in the same
+    /// single pass that executes it — no second run (architect plan
+    /// amendment §3; see [`LogQlEngine::query_explained`]).
+    async fn run_streams_inner(
+        &self,
+        sp: &StreamsPlan,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<StreamResult>, ReadError> {
+        if let Some(e) = explain.as_mut() {
+            e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+            for probe in &sp.probes {
+                e.push(
+                    "selectivity_probe",
+                    probe.sql.clone(),
+                    Some(format!("key = {}", probe.key)),
+                );
+            }
+        }
         let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
         if fingerprints.is_empty() {
             return Ok(Vec::new());
+        }
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "stage2_hydration",
+                super::sql::stage2(&sp.streams_table, &fingerprints),
+                None,
+            );
         }
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
@@ -211,6 +450,9 @@ impl LogQlEngine {
             sp.direction,
             sp.limit,
         );
+        if let Some(e) = explain.as_mut() {
+            e.push("stage3_samples", sql.clone(), None);
+        }
 
         let mut by_fp: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
         let mut stream = self
@@ -238,7 +480,24 @@ impl LogQlEngine {
             .collect())
     }
 
-    async fn run_metric(&self, mp: &MetricPlan) -> Result<QueryResult, ReadError> {
+    /// Executes a [`MetricPlan`] end to end. Same single-pass explain
+    /// contract as [`LogQlEngine::run_streams_inner`].
+    async fn run_metric_inner(
+        &self,
+        mp: &MetricPlan,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        if let Some(e) = explain.as_mut() {
+            e.set_routing(mp.routing.clone());
+            e.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
+            for probe in &mp.probes {
+                e.push(
+                    "selectivity_probe",
+                    probe.sql.clone(),
+                    Some(format!("key = {}", probe.key)),
+                );
+            }
+        }
         let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         let is_instant = mp.step_ns.is_none();
         if fingerprints.is_empty() {
@@ -247,6 +506,13 @@ impl LogQlEngine {
             } else {
                 QueryResult::Matrix(Vec::new())
             });
+        }
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "stage2_hydration",
+                super::sql::stage2(&mp.streams_table, &fingerprints),
+                None,
+            );
         }
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
         // Rollup table has no `service` column (`ORDER BY (fingerprint,
@@ -275,6 +541,9 @@ impl LogQlEngine {
                 },
                 &mp.extra_predicates,
             );
+            if let Some(e) = explain.as_mut() {
+                e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+            }
             let mut stream = self
                 .query_stream::<MetricInstantRow>(&sql, &self.budget_settings())
                 .await
@@ -316,6 +585,9 @@ impl LogQlEngine {
                 step_ns,
                 &mp.extra_predicates,
             );
+            if let Some(e) = explain.as_mut() {
+                e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+            }
             let mut stream = self
                 .query_stream::<MetricBucketRow>(&sql, &self.budget_settings())
                 .await

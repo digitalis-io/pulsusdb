@@ -65,31 +65,57 @@ Direct pprof ingestion for SDKs/agents that don't route through the collector. F
 
 ## 2. Logs query API
 
-### 2.1 `GET /api/logs/v1/query_range`
+M1 ships the five core endpoints below (§2.1-2.3); `/tail` (§2.4) and
+`/stats` (§2.5) ship M6, and the drilldown endpoints (§2.6) ship M7.
+
+### 2.1 `GET|POST /api/logs/v1/query_range`
 
 | Param | Type | Notes |
 |-------|------|-------|
 | `query` | LogQL | required |
-| `start`, `end` | ns / RFC3339 | default: last hour |
-| `step` | duration | metric queries only |
-| `limit` | int | max entries per stream direction (default 100) |
+| `start`, `end` | ns / RFC3339 | default: `end = now`, `start = end - 1h` |
+| `step` | duration \| int (seconds) | metric queries only; derived `clamp((end-start)/250, >=1s)` when omitted |
+| `limit` | int | max **total** entries returned across the response, ordered by `direction` (newest-first for `backward`); global, not per-stream (default 100, hard cap 5000 — values above the cap are rejected with `400`) |
 | `direction` | `forward`\|`backward` | default `backward` |
 
-Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":[...],"stats":{...}}}` — log selector queries return `streams` (values as `[<ts_ns>, <line>]`), metric queries return `matrix`.
+`POST` accepts the same param names as an `application/x-www-form-urlencoded` body (large queries/long ranges can exceed URL length limits; mainstream Loki-datasource clients POST this endpoint).
 
-### 2.2 `GET /api/logs/v1/query`
+`limit` bounds the total number of log entries in the response (global), consistent with the reference log-API semantic; it is not applied per stream.
 
-Instant evaluation at `time` (ns). Returns `vector` or `streams`.
+Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":[...],"stats":{...}}}` — log selector queries return `streams`, metric queries return `matrix`. Streams are sorted by label set for a deterministic response.
+
+- **streams**: `result: [{"stream":{k:v,...},"values":[["<ts_ns>", "<line>"],...]}, ...]`. `ts_ns` is a **string** (nanosecond precision overflows JS's safe-integer range). `stats: {"streams":N,"entries":N,"bytes":N}` (`bytes` = decoded line bytes).
+- **matrix**: `result: [{"metric":{k:v,...},"values":[[<unix_seconds>, "<value>"],...]}, ...]`. Timestamps are Prometheus-style unix-seconds numbers (millisecond resolution — exact for every M1 step, which is always `>= 1s`); `value` is a quoted string (`"NaN"`/`"+Inf"`/`"-Inf"` as applicable, matching §3.1's convention). `stats: {"series":N}`.
+- With `X-Pulsus-Explain: 1`, `data.explain = {"result_type","routing":{"chosen":"rollup"|"raw","reason":"..."}|null,"stages":[{"name","sql","note"|null},...]}` is added alongside `data.stats`.
+
+### 2.2 `GET|POST /api/logs/v1/query`
+
+Instant evaluation at `time` (ns / RFC3339, default now). Returns `vector` (`result: [{"metric":{...},"value":[<unix_seconds>, "<value>"]}, ...]`) or `streams`, plus `stats`/`explain` per §2.1's shapes. `POST` accepts the same param names as an `application/x-www-form-urlencoded` body (same rationale as `query_range`).
 
 ### 2.3 Labels & series
 
 ```
 GET|POST /api/logs/v1/labels                 ?start=&end=
-GET      /api/logs/v1/label/{name}/values    ?start=&end=&query=
+GET      /api/logs/v1/label/{name}/values    ?start=&end=
 GET|POST /api/logs/v1/series                 ?match[]=<selector>&start=&end=
 ```
 
-Responses: `{"status":"success","data":[...]}`; series returns an array of label maps.
+`start`/`end` default the same way as §2.1 (`end = now`, `start = end - 1h`). POST accepts the same params as an `application/x-www-form-urlencoded` body (`match[]` repeated for `/series`); `/label/{name}/values` is `GET`-only. `match[]` selectors are bare LogQL stream selectors (e.g. `{service_name="checkout"}`); at least one is required.
+
+Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values` return an array of strings, `series` returns an array of label maps (sorted for a deterministic response). With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape, `routing` always `null`) is added as a **top-level sibling of `data`** (not nested under it — these responses' `data` is an array, not an object).
+
+**`label/{name}/values` M1 scope:** returns every distinct value of `name` within `[start, end]`; `query=`-selector narrowing (restricting to values seen only on streams matching a selector) is deferred to M6 parity.
+
+#### Errors (§2.1-2.3)
+
+`{"status":"error","errorType":"...","error":"...","position":<byte offset>?}` — `position` is present only for LogQL parse errors.
+
+| Cause | HTTP | `errorType` |
+|-------|------|-------------|
+| Malformed params, malformed LogQL, empty/contradictory matchers, invalid `step` | `400` | `bad_data` |
+| Query rejected as too broad (scan-budget or stream-count cap exceeded) | `422` | `query_too_broad` |
+| ClickHouse read timed out | `504` | `timeout` |
+| Unclassified ClickHouse/internal failure | `500` | `internal` |
 
 ### 2.4 `GET /api/logs/v1/tail` (WebSocket)
 
