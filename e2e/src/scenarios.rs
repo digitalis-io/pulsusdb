@@ -181,6 +181,16 @@ struct RoundtripLine {
 const ROUNDTRIP_FIXTURE: &str = "logs/roundtrip.json";
 const ROUNDTRIP_POLL_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUNDTRIP_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Collector readiness poll bounds (CI regression fix, issue #15: same
+/// class of bug as `grafana_loki_compat`'s missing readiness wait — this
+/// scenario runs right after `pulsus /ready` (gated by the harness), but
+/// nothing waited for the **collector**'s own OTLP/HTTP receiver to start
+/// listening, so a slow-starting collector on a loaded CI runner hit
+/// "connection reset by peer" on the very first `POST /v1/logs`). Matches
+/// [`GRAFANA_READY_POLL_TIMEOUT`]'s magnitude (90s) — the same
+/// poll-until discipline the harness uses everywhere else.
+const COLLECTOR_READY_POLL_TIMEOUT: Duration = Duration::from_secs(90);
+const COLLECTOR_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// The query window every assertion below brackets `base_ns` with — wide
 /// enough that none of the fixture's `ts_offset_ns` values (all small,
 /// recent offsets) can fall outside it.
@@ -214,13 +224,22 @@ async fn logs_roundtrip(ctx: &Ctx) -> Result<()> {
     let marker = run_marker(base_ns);
 
     let payload = build_otlp_export_request(&fixture, base_ns, &marker);
-    let res = ctx
-        .http
-        .post(format!("{}/v1/logs", ctx.collector_url))
-        .json(&payload)
-        .send()
-        .await
-        .context("POST otlp/v1/logs to the collector failed")?;
+    // Poll-until-listening (CI regression fix, issue #15): retries on
+    // transport-level failures only (connection refused/reset — the
+    // collector's OTLP/HTTP receiver isn't listening yet), stopping the
+    // instant *any* HTTP response comes back, success or not. Safe to
+    // resend the identical payload on a transport failure: a connection
+    // that was never established processed zero bytes server-side, so
+    // this can never double-ingest. `res.status()` is still checked below
+    // exactly as before — reaching the collector at all doesn't imply the
+    // export itself succeeded.
+    let res = poll_until(
+        COLLECTOR_READY_POLL_TIMEOUT,
+        COLLECTOR_READY_POLL_INTERVAL,
+        || post_otlp_logs(ctx, &payload),
+    )
+    .await
+    .context("collector otlp/v1/logs endpoint never accepted a connection")?;
     if !res.status().is_success() {
         bail!("collector otlp/v1/logs export returned {}", res.status());
     }
@@ -270,6 +289,34 @@ fn now_unix_nanos() -> Result<i64> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock is before the Unix epoch")?;
     i64::try_from(dur.as_nanos()).context("current time does not fit in i64 nanoseconds")
+}
+
+/// One `POST {collector_url}/v1/logs` attempt (CI regression fix, issue
+/// #15): `Ok(Some(response))` once the request reaches the collector at
+/// all (any HTTP response, success or not — the caller still checks
+/// `response.status()`), `Ok(None)` on a transport-level failure (the
+/// collector's OTLP/HTTP receiver isn't listening yet) — the [`poll_until`]
+/// condition [`logs_roundtrip`] polls on. Neither `deploy/e2e/otel-config
+/// .single.yaml` nor `.cluster.yaml` wires the `health_check` extension
+/// (checked: no `extensions:`/`service.extensions` block in either), so
+/// there is no cheaper dedicated readiness endpoint to poll instead — the
+/// real OTLP endpoint is the correct, only signal available.
+async fn post_otlp_logs(
+    ctx: &Ctx,
+    payload: &serde_json::Value,
+) -> Result<Option<reqwest::Response>> {
+    // `?` (not `.ok()`-and-discard): `poll_until` tolerates an `Err` return
+    // exactly like `Ok(None)` (retried until the deadline), but surfaces
+    // the underlying `reqwest::Error` in the final failure's context if
+    // the collector never comes up — preserves the transport-failure
+    // detail rather than collapsing it to a generic timeout message.
+    let res = ctx
+        .http
+        .post(format!("{}/v1/logs", ctx.collector_url))
+        .json(payload)
+        .send()
+        .await?;
+    Ok(Some(res))
 }
 
 fn otlp_key_value(key: &str, value: &str) -> serde_json::Value {
