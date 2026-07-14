@@ -11,11 +11,25 @@
 # The build stage is split via cargo-chef into a `planner` stage that
 # computes a dependency-only recipe from the workspace manifests, and a
 # `build` stage that first `cargo chef cook`s just that recipe — a layer
-# keyed only on Cargo.toml/Cargo.lock/rust-toolchain.toml, so it is skipped
-# whenever a commit only touches application source — before copying in the
-# full source and building the release binary. Combined with the buildx
-# `type=gha` layer cache used in CI, this means dependency compilation is
-# cached across commits instead of being redone on every image build.
+# keyed only on Cargo.toml/Cargo.lock/rust-toolchain.toml/vendor/ (see
+# below), so it is skipped whenever a commit only touches application
+# source — before copying in the full source and building the release
+# binary. Combined with the buildx `type=gha` layer cache used in CI, this
+# means dependency compilation is cached across commits instead of being
+# redone on every image build.
+#
+# `vendor/promql-parser` (issue #31, docs/decisions/0003) is a
+# `[patch.crates-io]` **path** dependency the root `Cargo.toml` redirects
+# `promql-parser` to — both stages that make Cargo actually resolve the
+# workspace's dependency graph (`planner`'s `cargo chef prepare` and
+# `build`'s `cargo chef cook`) need it present in the build context at
+# that point, not merely by the time the full `COPY . .` runs. `planner`
+# already gets it for free (its single `COPY . .` runs before `prepare`);
+# `build` needs its own explicit `COPY vendor vendor` before `cook`, since
+# that stage otherwise only has `recipe.json` + `rust-toolchain.toml` at
+# that point (a prior version of this file omitted it, breaking `cook`
+# with "failed to load source for dependency promql-parser / No such file
+# or directory" — CI run 29350618115).
 #
 # Build:
 #   podman build -t pulsusdb:e2e .
@@ -24,6 +38,10 @@
 FROM docker.io/library/rust:1.93-bookworm AS planner
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
+# Copies the whole build context — including vendor/promql-parser, not
+# excluded by .dockerignore — so `cargo chef prepare` below can already
+# resolve the `[patch.crates-io]` path dependency; unlike the `build`
+# stage's narrower copies, no separate `COPY vendor vendor` is needed here.
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -38,6 +56,16 @@ COPY --from=planner /src/recipe.json recipe.json
 # final build silently used different rustc versions and every dependency
 # fingerprint (and thus the whole point of this cache layer) was invalidated.
 COPY rust-toolchain.toml rust-toolchain.toml
+# vendor/promql-parser must be present before `cook` for the same reason
+# rust-toolchain.toml must: `cook` reconstructs the workspace's
+# Cargo.toml/Cargo.lock from `recipe.json` and actually invokes Cargo to
+# resolve + build the dependency graph, which includes resolving the
+# `[patch.crates-io]` path redirect to this directory. This is its own
+# cache layer, correctly keyed only on vendor/'s own contents: it — and
+# `cook` after it — only re-run when the vendored patch itself changes,
+# not on every application-source-only commit (the same cache-correctness
+# property rust-toolchain.toml's copy already has).
+COPY vendor vendor
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p pulsus-server --bin pulsusdb
