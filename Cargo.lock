@@ -1491,16 +1491,22 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "bytes",
+ "clickhouse",
  "flate2",
+ "futures",
  "http-body-util",
  "opentelemetry-proto",
  "prost",
+ "pulsus-clickhouse",
+ "pulsus-config",
  "pulsus-model",
+ "serde",
  "serde_json",
  "snap",
  "thiserror 2.0.18",
  "tokio",
  "tower",
+ "tracing",
  "zstd",
 ]
 
