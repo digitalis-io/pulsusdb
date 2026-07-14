@@ -86,6 +86,17 @@ pub enum ReadError {
     #[error("query too broad: {0}")]
     QueryTooBroad(TooBroadReason),
 
+    /// A `Range` metric query's `step_ns` was zero. `0.is_multiple_of(_)`
+    /// is trivially `true`, which would otherwise let the routing decision
+    /// pick rollup and render `intDiv(bucket_ns, 0)` — undefined in
+    /// ClickHouse; the raw fallback's own `intDiv(timestamp_ns, 0)`
+    /// bucketing is equally invalid. Rejected in [`super::plan::plan`]
+    /// before either SQL builder is reached — defense in depth ahead of
+    /// whatever request-level `step > 0` validation #13 adds (task-manager
+    /// resolution #4 on issue #12).
+    #[error("range query step_ns must be greater than zero")]
+    InvalidStep,
+
     /// An unclassified/passthrough ClickHouse error (network, decode,
     /// server exception not mapped to [`ReadError::QueryTooBroad`]).
     #[error("clickhouse: {0}")]
@@ -149,5 +160,10 @@ mod tests {
                 .to_string()
                 .contains("contradictory")
         );
+    }
+
+    #[test]
+    fn invalid_step_message_names_the_zero_step_rule() {
+        assert!(ReadError::InvalidStep.to_string().contains("step_ns"));
     }
 }

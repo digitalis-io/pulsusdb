@@ -310,6 +310,36 @@ fn stage2_is_byte_exact_to_schemas_md_3_2() {
 // Metric queries — range aggregation ops, rollup routing, vector aggs.
 // ---------------------------------------------------------------------
 
+/// Review-requested test gap (architect plan review, issue #12): a
+/// zero-step `Range` query must be rejected at the planner, before either
+/// the rollup or raw SQL builder is ever reached. `0.is_multiple_of(_)` is
+/// trivially `true`, so without this guard the routing decision would pick
+/// rollup and render `intDiv(bucket_ns, 0)` — undefined in ClickHouse.
+#[test]
+fn a_zero_step_range_query_is_rejected_before_any_sql_is_generated() {
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: START_NS,
+            end_ns: END_NS,
+            step_ns: 0,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let expr = parse(r#"rate({env="prod"}[5m])"#).expect("parse");
+    let err = plan(&expr, &params, &ctx()).unwrap_err();
+    assert!(matches!(err, pulsus_read::logql::ReadError::InvalidStep));
+}
+
+/// The reason [`RoutingDecision`] names whenever `STEP_NS` (60s, a multiple
+/// of the 5s fixture resolution) routes to rollup — shared by every
+/// positive-eligibility case below (rate/count_over_time/bytes_rate/
+/// bytes_over_time all share the same step/resolution shape, differing
+/// only in `agg_expr`/`rate_window_ns`).
+fn expected_rollup_reason() -> String {
+    "rollup: step 60000000000 ns divisible by resolution 5000000000 ns".to_string()
+}
+
 #[test]
 fn rate_is_rollup_served_and_sums_count() {
     let mp = metric_plan(
@@ -321,6 +351,8 @@ fn rate_is_rollup_served_and_sums_count() {
     assert_eq!(mp.bucket_col, "bucket_ns");
     assert_eq!(mp.agg_expr, "sum(count)");
     assert_eq!(mp.rate_window_ns, Some(STEP_NS));
+    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Rollup);
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 #[test]
@@ -332,6 +364,7 @@ fn count_over_time_is_rollup_served_with_no_rate_division() {
     assert!(mp.rollup);
     assert_eq!(mp.agg_expr, "sum(count)");
     assert_eq!(mp.rate_window_ns, None);
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 #[test]
@@ -340,8 +373,13 @@ fn bytes_rate_sums_bytes_and_divides_by_the_window() {
         r#"bytes_rate({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
+    // bytes_* ops are rollup-eligible too: `log_metrics_5s` carries a
+    // `bytes SimpleAggregateFunction(sum, UInt64)` column (schemas.md
+    // §3.1), so there is no bytes-specific eligibility carve-out.
+    assert!(mp.rollup);
     assert_eq!(mp.agg_expr, "sum(bytes)");
     assert_eq!(mp.rate_window_ns, Some(STEP_NS));
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 #[test]
@@ -350,8 +388,10 @@ fn bytes_over_time_sums_bytes_with_no_rate_division() {
         r#"bytes_over_time({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
+    assert!(mp.rollup);
     assert_eq!(mp.agg_expr, "sum(bytes)");
     assert_eq!(mp.rate_window_ns, None);
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 /// Renders `mp`'s metric SQL the way `LogQlEngine` would once fingerprints
@@ -397,6 +437,8 @@ fn a_line_filter_forces_the_raw_fallback_even_for_count_over_time() {
     assert_eq!(mp.bucket_col, "timestamp_ns");
     assert_eq!(mp.agg_expr, "count()");
     assert_eq!(mp.extra_predicates.len(), 1);
+    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
+    assert_eq!(mp.routing.reason, "raw: line filter present");
 
     let sql = metric_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
     assert!(
@@ -413,6 +455,7 @@ fn bytes_raw_fallback_sums_the_body_length() {
     );
     assert!(!mp.rollup);
     assert_eq!(mp.agg_expr, "sum(length(body))");
+    assert_eq!(mp.routing.reason, "raw: line filter present");
 
     let sql = metric_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
     assert!(
@@ -435,6 +478,11 @@ fn a_step_not_dividing_the_rollup_resolution_forces_the_raw_fallback() {
     let mp = metric_plan(r#"rate({env="prod"}[5m])"#, &params);
     assert!(!mp.rollup);
     assert_eq!(mp.table, "log_samples");
+    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
+    assert_eq!(
+        mp.routing.reason,
+        "raw: step 3000000000 ns not a multiple of resolution 5000000000 ns"
+    );
 
     let sql = metric_sql(
         &mp,
@@ -532,6 +580,13 @@ fn instant_metric_spec_has_no_step_and_a_range_derived_window() {
     // 5m range window: start = at - 5m.
     assert_eq!(mp.start_ns, END_NS - 300_000_000_000);
     assert_eq!(mp.rate_window_ns, Some(300_000_000_000));
+    // Issue #12 behaviour change from #11: an instant window has no step to
+    // test against the rollup resolution, so it always routes raw (an
+    // unaligned `[at-range, at]` window would silently diverge from raw at
+    // bucket edges — task-manager resolution #1).
+    assert!(!mp.rollup);
+    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
+    assert_eq!(mp.routing.reason, "raw: instant query");
 }
 
 #[test]
@@ -557,6 +612,13 @@ fn vector_agg_sum_by_captures_the_grouping_labels() {
     let grouping = grouping.as_ref().expect("by grouping");
     assert_eq!(grouping.kind, pulsus_logql::GroupingKind::By);
     assert_eq!(grouping.labels, vec!["service_name".to_string()]);
+    // `unwrap_vector_aggs` strips the `sum by (...)` wrapper before the
+    // routing decision is made, so a vector-agg-wrapped range agg routes
+    // identically to the bare `rate(...)` it wraps (the wrapper is
+    // finished in Rust over the routed result, never part of the SQL
+    // eligibility shape).
+    assert!(mp.rollup);
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 #[test]

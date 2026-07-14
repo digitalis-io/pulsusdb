@@ -46,7 +46,7 @@ pub use error::{ReadError, TooBroadReason};
 pub use exec::{EngineConfig, LogQlEngine, MatrixSeries, QueryResult, StreamResult, VectorSample};
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec};
-pub use plan::{MetricPlan, Plan, ProbePlan, StreamsPlan, plan};
+pub use plan::{MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, plan};
 
 #[cfg(test)]
 mod tests {

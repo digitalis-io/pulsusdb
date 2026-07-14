@@ -5,7 +5,7 @@ pub mod logql;
 
 pub use logql::{
     Direction, EngineConfig, LogQlEngine, PlanCtx, PlanExplain, QueryParams, QueryResult,
-    QuerySpec, ReadError,
+    QuerySpec, ReadError, RouteChoice, RoutingDecision,
 };
 
 #[cfg(test)]

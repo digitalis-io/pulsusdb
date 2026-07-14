@@ -47,6 +47,27 @@ pub struct StreamsPlan {
     pub probes: Vec<ProbePlan>,
 }
 
+/// Which physical table a metric read was routed to. See
+/// [`RoutingDecision`] for the accompanying (deterministic, plan-derived)
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteChoice {
+    Rollup,
+    Raw,
+}
+
+/// The rollup-vs-raw routing decision for one metric query, computed once
+/// in [`metric_plan`] and carried on both [`MetricPlan`] (for [`super::exec`]
+/// to act on) and [`super::explain::PlanExplain`] (for #13's
+/// `X-Pulsus-Explain` header to name). `reason` is entirely plan-derived —
+/// an enum tag plus numeric nanosecond values, never user-controlled
+/// data — so it is safe to surface verbatim in a response header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutingDecision {
+    pub chosen: RouteChoice,
+    pub reason: String,
+}
+
 /// The static part of a metric query plan. `table`/`bucket_col`/`agg_expr`
 /// encode the rollup-vs-raw routing decision (docs/schemas.md §3.2);
 /// `rate_window_ns` is `Some` only for `rate`/`bytes_rate` (the divisor
@@ -59,6 +80,11 @@ pub struct MetricPlan {
     pub bucket_col: &'static str,
     pub agg_expr: &'static str,
     pub rollup: bool,
+    /// The single routing decision `rollup` is derived from
+    /// (`rollup == matches!(routing.chosen, RouteChoice::Rollup)`); kept
+    /// alongside the plain bool so callers that only need the SQL shape
+    /// (`exec.rs`) don't have to match on the enum.
+    pub routing: RoutingDecision,
     /// Line-filter pushdown for the raw fallback (the rollup table has no
     /// `body` column — a metric query with a line filter can never be
     /// rollup-served, see [`metric_plan`]).
@@ -146,6 +172,18 @@ fn metric_plan(
     p: &QueryParams,
     ctx: &PlanCtx<'_>,
 ) -> Result<MetricPlan, ReadError> {
+    // `0.is_multiple_of(_)` is trivially `true`, which would otherwise let
+    // a zero step reach the routing decision below and pick rollup, then
+    // render `intDiv(bucket_ns, 0)` — undefined in ClickHouse. The raw
+    // fallback's own `intDiv(timestamp_ns, 0)` bucketing is equally
+    // invalid, so this is checked before *any* routing choice is made,
+    // making `intDiv(_, 0)` structurally unreachable regardless of what
+    // request-level validation #13 later adds (task-manager resolution #4
+    // on issue #12: "defense in depth, one cheap branch").
+    if let QuerySpec::Range { step_ns: 0, .. } = p.spec {
+        return Err(ReadError::InvalidStep);
+    }
+
     let (base, vector_aggs) = unwrap_vector_aggs(metric_expr);
     let MetricExpr::Range { op, range, .. } = base else {
         // `unwrap_vector_aggs` strips every `Vector` layer, so the base is
@@ -183,13 +221,59 @@ fn metric_plan(
     // reads "never touch samples for count-only rollup shapes" — that
     // guarantee only holds when there is nothing left for `log_samples` to
     // filter).
-    let rollup_eligible = extra_predicates.is_empty()
-        && match p.spec {
-            QuerySpec::Instant { .. } => true,
-            QuerySpec::Range { step_ns, .. } => {
-                ctx.rollup_res_ns > 0 && step_ns.is_multiple_of(ctx.rollup_res_ns)
+    //
+    // This routing decision assumes every `RangeAggOp` reaching here is
+    // count-only (M1's four: `Rate`/`CountOverTime`/`BytesRate`/
+    // `BytesOverTime`, `ast.rs`) — a future non-count op (M6) must gate
+    // eligibility on `op` too, not just line-filter/step shape. Likewise,
+    // "pipeline-created label dependencies" (a pipeline stage that derives
+    // a label the query then groups/filters on) are structurally
+    // impossible in M1: the only pipeline stage this crate parses is
+    // `LineFilter` (`Stage`, `ast.rs`), which never produces a label. Both
+    // are guard comments only — nothing to gate on yet.
+    // `Instant` is matched *first*, ahead of the line-filter/resolution
+    // checks below: an instant window ([at - range, at]) has no step to
+    // test against the resolution regardless of what else is true about
+    // the query, so its reason must always be exactly "raw: instant query"
+    // — never shadowed by an unrelated raw-fallback reason an instant query
+    // also happens to satisfy (code review fix, issue #12: an instant query
+    // that also carries a line filter, or runs with `rollup_res_ns == 0`,
+    // must still report "raw: instant query", not "raw: line filter
+    // present"/"raw: rollup resolution not configured"). schemas.md §3.2
+    // ties eligibility strictly to "the query step is a multiple of the
+    // resolution", and an unaligned window would silently diverge from raw
+    // at bucket edges (task-manager resolution #1 on issue #12).
+    let routing = match p.spec {
+        QuerySpec::Instant { .. } => RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: instant query".to_string(),
+        },
+        QuerySpec::Range { step_ns, .. } if !extra_predicates.is_empty() => RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: line filter present".to_string(),
+        },
+        QuerySpec::Range { .. } if ctx.rollup_res_ns == 0 => RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: "raw: rollup resolution not configured".to_string(),
+        },
+        QuerySpec::Range { step_ns, .. } if step_ns.is_multiple_of(ctx.rollup_res_ns) => {
+            RoutingDecision {
+                chosen: RouteChoice::Rollup,
+                reason: format!(
+                    "rollup: step {step_ns} ns divisible by resolution {} ns",
+                    ctx.rollup_res_ns
+                ),
             }
-        };
+        }
+        QuerySpec::Range { step_ns, .. } => RoutingDecision {
+            chosen: RouteChoice::Raw,
+            reason: format!(
+                "raw: step {step_ns} ns not a multiple of resolution {} ns",
+                ctx.rollup_res_ns
+            ),
+        },
+    };
+    let rollup_eligible = matches!(routing.chosen, RouteChoice::Rollup);
 
     let is_bytes = matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime);
     let is_rate = matches!(op, RangeAggOp::Rate | RangeAggOp::BytesRate);
@@ -219,6 +303,7 @@ fn metric_plan(
         bucket_col,
         agg_expr,
         rollup: rollup_eligible,
+        routing,
         extra_predicates,
         start_ns,
         end_ns,
@@ -522,12 +607,185 @@ pub(crate) fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use pulsus_logql::parse_selector;
+    use pulsus_logql::{parse, parse_selector};
 
     use super::*;
 
     fn selector(src: &str) -> StreamSelector {
         parse_selector(src).expect("parse selector")
+    }
+
+    fn test_ctx() -> PlanCtx<'static> {
+        PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1024,
+            max_streams: 100_000,
+        }
+    }
+
+    fn metric_mp(query: &str, spec: QuerySpec) -> Result<MetricPlan, ReadError> {
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let expr = parse(query).expect("parse");
+        match plan(&expr, &params, &test_ctx())? {
+            Plan::Metric(mp) => Ok(mp),
+            Plan::Streams(_) => panic!("expected a Metric plan"),
+        }
+    }
+
+    /// Test-gap flagged by the architect-plan review: a zero-step `Range`
+    /// query must be rejected before it ever reaches the routing decision
+    /// — `0.is_multiple_of(_)` is trivially `true`, so without this guard
+    /// it would silently route to rollup and render `intDiv(_, 0)`.
+    #[test]
+    fn a_zero_step_range_query_is_rejected_as_an_invalid_step() {
+        let err = metric_mp(
+            r#"rate({env="prod"}[5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000,
+                step_ns: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReadError::InvalidStep));
+    }
+
+    #[test]
+    fn a_step_dividing_the_resolution_routes_to_rollup_with_a_named_reason() {
+        let mp = metric_mp(
+            r#"rate({env="prod"}[5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.routing.chosen, RouteChoice::Rollup);
+        assert!(mp.rollup);
+        assert_eq!(
+            mp.routing.reason,
+            "rollup: step 60000000000 ns divisible by resolution 5000000000 ns"
+        );
+    }
+
+    #[test]
+    fn a_step_not_dividing_the_resolution_routes_to_raw_with_a_named_reason() {
+        let mp = metric_mp(
+            r#"rate({env="prod"}[5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 3_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert!(!mp.rollup);
+        assert_eq!(
+            mp.routing.reason,
+            "raw: step 3000000000 ns not a multiple of resolution 5000000000 ns"
+        );
+    }
+
+    #[test]
+    fn a_line_filter_routes_to_raw_with_a_named_reason_even_on_an_eligible_step() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"} |= "err" [5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert_eq!(mp.routing.reason, "raw: line filter present");
+    }
+
+    #[test]
+    fn an_instant_query_routes_to_raw_with_a_named_reason() {
+        let mp = metric_mp(
+            r#"rate({env="prod"}[5m])"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert!(!mp.rollup);
+        assert_eq!(mp.routing.reason, "raw: instant query");
+    }
+
+    #[test]
+    fn an_unconfigured_rollup_resolution_routes_to_raw_with_a_named_reason() {
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let mut ctx = test_ctx();
+        ctx.rollup_res_ns = 0;
+        let expr = parse(r#"rate({env="prod"}[5m])"#).expect("parse");
+        let mp = match plan(&expr, &params, &ctx).unwrap() {
+            Plan::Metric(mp) => mp,
+            Plan::Streams(_) => panic!("expected a Metric plan"),
+        };
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert_eq!(mp.routing.reason, "raw: rollup resolution not configured");
+    }
+
+    /// Precedence lock (code review fix, issue #12): `Instant` must win
+    /// over every other raw-fallback reason an instant query also happens
+    /// to satisfy — a line filter here would otherwise (wrongly) report
+    /// "raw: line filter present" instead of "raw: instant query".
+    #[test]
+    fn an_instant_query_with_a_line_filter_still_reports_the_instant_reason() {
+        let mp = metric_mp(
+            r#"rate({env="prod"} |= "err" [5m])"#,
+            QuerySpec::Instant {
+                at_ns: 1_000_000_000,
+            },
+        )
+        .unwrap();
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert_eq!(mp.routing.reason, "raw: instant query");
+    }
+
+    /// Precedence lock (code review fix, issue #12): an unconfigured
+    /// rollup resolution must not shadow the "raw: instant query" reason
+    /// either.
+    #[test]
+    fn an_instant_query_with_an_unconfigured_rollup_resolution_still_reports_the_instant_reason() {
+        let params = QueryParams {
+            spec: QuerySpec::Instant {
+                at_ns: 1_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let mut ctx = test_ctx();
+        ctx.rollup_res_ns = 0;
+        let expr = parse(r#"rate({env="prod"}[5m])"#).expect("parse");
+        let mp = match plan(&expr, &params, &ctx).unwrap() {
+            Plan::Metric(mp) => mp,
+            Plan::Streams(_) => panic!("expected a Metric plan"),
+        };
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert_eq!(mp.routing.reason, "raw: instant query");
     }
 
     #[test]

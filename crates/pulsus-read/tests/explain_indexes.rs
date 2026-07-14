@@ -680,10 +680,16 @@ fn expected_metric_rollup_usage() -> Vec<String> {
     ])
 }
 
+/// Renamed from `metric_rollup_instant_read_uses_the_fingerprint_bucket_primary_key`
+/// (issue #12 behaviour change from #11): an instant metric query has no
+/// step to test against the rollup resolution (an unaligned `[at-range,
+/// at]` window would silently diverge from raw at bucket edges —
+/// task-manager resolution #1 on issue #12), so it now always routes raw.
 #[tokio::test]
-async fn metric_rollup_instant_read_uses_the_fingerprint_bucket_primary_key() {
+async fn metric_instant_read_routes_to_raw_and_uses_the_service_fingerprint_timestamp_primary_key()
+{
     skip_unless_live!();
-    let db = "pulsus_read_it_metric_rollup_instant";
+    let db = "pulsus_read_it_metric_instant_raw";
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -693,16 +699,20 @@ async fn metric_rollup_instant_read_uses_the_fingerprint_bucket_primary_key() {
         direction: Direction::Backward,
     };
     let mp = metric_plan(r#"rate({env="prod"}[5m])"#, &params, db);
-    assert!(mp.rollup);
+    assert!(!mp.rollup);
+    assert_eq!(
+        mp.routing.reason, "raw: instant query",
+        "instant queries must name the routing reason"
+    );
     assert!(mp.step_ns.is_none());
-    let table = format!("{db}.log_metrics_5s");
+    let table = format!("{db}.log_samples");
     let sql = sql::metric_instant(
         sql::MetricSource {
             table: &table,
             bucket_col: mp.bucket_col,
             agg_expr: mp.agg_expr,
         },
-        &[],
+        &["'checkout'".to_string()],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
@@ -712,7 +722,30 @@ async fn metric_rollup_instant_read_uses_the_fingerprint_bucket_primary_key() {
     );
 
     let usage = explain(&client, &sql).await;
-    assert_eq!(usage, expected_metric_rollup_usage());
+    assert_eq!(usage, expected_metric_instant_raw_usage());
+}
+
+/// The `(service, fingerprint, timestamp_ns)` primary key on `log_samples`
+/// — the same key condition [`expected_stage3_line_filter_usage`] asserts
+/// (a `body` predicate never factors into `PrimaryKey`'s `Condition:`, only
+/// into whether the `Skip` blocks are listed at all), minus the two `Skip`
+/// entries: an instant metric read carries no line filter, so it never
+/// references `body` and neither skip index is ever considered.
+fn expected_metric_instant_raw_usage() -> Vec<String> {
+    v(&[
+        "MinMax",
+        "Keys:",
+        "timestamp_ns",
+        "Condition: and((timestamp_ns in (-Inf, #]), (timestamp_ns in [#, +Inf)))",
+        "Partition",
+        "Condition: true",
+        "PrimaryKey",
+        "Keys:",
+        "service",
+        "fingerprint",
+        "timestamp_ns",
+        "Condition: and(and((timestamp_ns in (-Inf, #]), and((timestamp_ns in [#, +Inf)), (fingerprint in #-element set))), (service in ['checkout', 'checkout']))",
+    ])
 }
 
 #[tokio::test]

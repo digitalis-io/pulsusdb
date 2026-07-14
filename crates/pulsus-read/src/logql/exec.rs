@@ -394,6 +394,7 @@ impl LogQlEngine {
             "matrix"
         };
         let mut explain = PlanExplain::new(result_type);
+        explain.set_routing(mp.routing.clone());
         explain.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
         for probe in &mp.probes {
             explain.push(
@@ -412,11 +413,6 @@ impl LogQlEngine {
             None,
         );
         let meta = self.hydrate(&mp.streams_table, &fingerprints).await?;
-        let note = if mp.rollup {
-            Some("rollup-served".to_string())
-        } else {
-            Some("raw fallback".to_string())
-        };
         let services = if mp.rollup {
             Vec::new()
         } else {
@@ -450,7 +446,7 @@ impl LogQlEngine {
                 &mp.extra_predicates,
             ),
         };
-        explain.push("metric_read", metric_sql, note);
+        explain.push("metric_read", metric_sql, Some(mp.routing.reason.clone()));
         Ok(explain)
     }
 }

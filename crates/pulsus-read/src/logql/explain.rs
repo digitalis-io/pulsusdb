@@ -5,6 +5,8 @@
 //! trace can only be assembled during execution, not at pure-plan time —
 //! see `plan.rs`'s module docs).
 
+use super::plan::RoutingDecision;
+
 /// One executed (or about-to-execute) stage's SQL, named for the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplainStage {
@@ -20,6 +22,10 @@ pub struct PlanExplain {
     /// type this plan produces.
     pub result_type: &'static str,
     pub stages: Vec<ExplainStage>,
+    /// The rollup-vs-raw routing decision, `Some` only for metric plans
+    /// ([`super::plan::MetricPlan`]) — a streams (log-selector) plan never
+    /// routes between tables, so it leaves this `None`.
+    pub routing: Option<RoutingDecision>,
 }
 
 impl PlanExplain {
@@ -27,6 +33,7 @@ impl PlanExplain {
         Self {
             result_type,
             stages: Vec::new(),
+            routing: None,
         }
     }
 
@@ -37,10 +44,15 @@ impl PlanExplain {
             note,
         });
     }
+
+    pub fn set_routing(&mut self, decision: RoutingDecision) {
+        self.routing = Some(decision);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::plan::RouteChoice;
     use super::*;
 
     #[test]
@@ -51,5 +63,23 @@ mod tests {
         assert_eq!(explain.stages.len(), 2);
         assert_eq!(explain.stages[0].name, "stage1");
         assert_eq!(explain.stages[1].note.as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn a_new_explain_has_no_routing_decision_yet() {
+        let explain = PlanExplain::new("matrix");
+        assert!(explain.routing.is_none());
+    }
+
+    #[test]
+    fn set_routing_records_the_decision() {
+        let mut explain = PlanExplain::new("matrix");
+        explain.set_routing(RoutingDecision {
+            chosen: RouteChoice::Rollup,
+            reason: "rollup: step 60000000000 ns divisible by resolution 5000000000 ns".to_string(),
+        });
+        let routing = explain.routing.expect("routing set");
+        assert_eq!(routing.chosen, RouteChoice::Rollup);
+        assert!(routing.reason.starts_with("rollup:"));
     }
 }
