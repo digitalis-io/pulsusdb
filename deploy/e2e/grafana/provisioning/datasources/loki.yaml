@@ -1,0 +1,19 @@
+# Provisions Grafana's Loki datasource against pulsusdb's M1 compat
+# surface (issue #14, docs/api.md §8.1) for the single-node e2e stack
+# (deploy/e2e/compose.single.yaml). `url` uses pulsusdb's static
+# ipv4_address (172.29.0.11), not its DNS hostname — same KISS
+# static-IP/no-DNS convention every other e2e fixture follows, so this
+# works identically under old Podman's per-container network attachment
+# (see `e2e/src/engine.rs`'s `--in-pod=false` note). A fixed `uid` lets the
+# `grafana_loki_compat` scenario (`e2e/src/scenarios.rs`) reference the
+# datasource without querying Grafana's API to discover it first.
+apiVersion: 1
+
+datasources:
+  - name: PulsusDB (Loki compat)
+    uid: pulsus-loki
+    type: loki
+    access: proxy
+    url: http://172.29.0.11:3100
+    isDefault: true
+    editable: false

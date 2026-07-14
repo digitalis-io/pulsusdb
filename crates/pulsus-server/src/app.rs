@@ -208,4 +208,153 @@ mod tests {
             );
         }
     }
+
+    /// The `/loki/api/v1/*` M1 compat surface (issue #14, docs/api.md
+    /// §8.1) through the full `build_router` composition — not just
+    /// `compat::apply_aliases` in isolation. Mirrors the ops auth matrix's
+    /// style: one router build, several status assertions. No auth
+    /// configured here (`Config::default()`), so this exercises only the
+    /// flag/mode gating; auth-enabled behaviour is covered separately by
+    /// `loki_compat_aliases_401_at_the_perimeter_then_404_like_any_unmounted_path_once_authenticated`.
+    #[tokio::test]
+    async fn loki_compat_aliases_are_gated_on_the_flag_and_the_reader_subsystem() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use pulsus_config::Mode;
+        use tower::ServiceExt;
+
+        async fn status(router: &Router, method: Method, path: &str) -> StatusCode {
+            let request = Request::builder()
+                .uri(path)
+                .method(method)
+                .body(Body::empty())
+                .unwrap();
+            router.clone().oneshot(request).await.unwrap().status()
+        }
+
+        // Default config: `compat_endpoints=false` -> the alias surface is
+        // entirely absent, same as any other unmounted path.
+        let default_cfg = Config::default();
+        let default_router =
+            build_router(test_state(), &default_cfg).expect("router builds (flag off)");
+        assert_eq!(
+            status(&default_router, Method::GET, "/loki/api/v1/labels").await,
+            StatusCode::NOT_FOUND
+        );
+
+        // `compat_endpoints=true`, default `Mode::All` (Reader mounted):
+        // the alias is present — reachable, so *not* 404 (503, no pool in
+        // `test_state`) — and its method matrix matches native exactly
+        // (`label/{name}/values` is GET-only, so POST there is 405).
+        let enabled_cfg = Config {
+            compat_endpoints: true,
+            ..Config::default()
+        };
+        let enabled_router =
+            build_router(test_state(), &enabled_cfg).expect("router builds (flag on, all mode)");
+        assert_ne!(
+            status(&enabled_router, Method::GET, "/loki/api/v1/labels").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(
+                &enabled_router,
+                Method::POST,
+                "/loki/api/v1/label/env/values"
+            )
+            .await,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        // `compat_endpoints=true` but `Mode::Writer` (Reader not mounted):
+        // the mode invariant — the alias must 404 exactly where native
+        // `/api/logs/v1/labels` does in writer-only mode.
+        let writer_only_cfg = Config {
+            compat_endpoints: true,
+            mode: Mode::Writer,
+            ..Config::default()
+        };
+        let writer_only_router = build_router(test_state(), &writer_only_cfg)
+            .expect("router builds (flag on, writer-only mode)");
+        assert_eq!(
+            status(&writer_only_router, Method::GET, "/loki/api/v1/labels").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// Architect adjudication on issue #14's code review (auth-vs-404
+    /// finding: REJECTED as a defect, test-gap accepted — no production
+    /// change). With auth configured, the alias surface is **not**
+    /// special-cased: a flag-off (or writer-only-mode) `/loki/*` path is
+    /// byte-identical, at every layer, to a native-unmounted path and to a
+    /// totally bogus path — 401 to an unauthenticated caller (the perimeter
+    /// deliberately never leaks which paths exist before authenticating),
+    /// 404 to an authenticated one (once past the perimeter, unmounted is
+    /// unmounted). Mirrors `ops_auth_matrix_exempts_ready_and_metrics_but_gates_config_and_buildinfo`'s
+    /// idiom — `build_router` is the only place the auth layer composes,
+    /// so `compat::apply_aliases` alone (this module's other loki test,
+    /// and `compat.rs`'s own tests) cannot exercise this.
+    #[tokio::test]
+    async fn loki_compat_aliases_401_at_the_perimeter_then_404_like_any_unmounted_path_once_authenticated()
+     {
+        use axum::body::Body;
+        use axum::http::Request;
+        use pulsus_config::{Mode, Secret};
+        use tower::ServiceExt;
+
+        async fn status(router: &Router, path: &str, auth: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder().uri(path).method("GET");
+            if let Some(value) = auth {
+                builder = builder.header(axum::http::header::AUTHORIZATION, value);
+            }
+            let request = builder.body(Body::empty()).unwrap();
+            router.clone().oneshot(request).await.unwrap().status()
+        }
+
+        let valid = format!("Basic {}", middleware::base64_encode(b"alice:hunter2"));
+        let auth_creds = |extra: Config| Config {
+            auth_user: Some("alice".to_string()),
+            auth_password: Some(Secret::new("hunter2")),
+            ..extra
+        };
+
+        // Auth enabled + valid creds + flag off -> 404, exactly like the
+        // native-unmounted `/api/logs/v1/nope` and a totally bogus path.
+        let flag_off_cfg = auth_creds(Config {
+            compat_endpoints: false,
+            ..Config::default()
+        });
+        let flag_off_router =
+            build_router(test_state(), &flag_off_cfg).expect("router builds (auth on, flag off)");
+        assert_eq!(
+            status(&flag_off_router, "/loki/api/v1/query", Some(&valid)).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Auth enabled + valid creds + flag on but `Mode::Writer` -> 404
+        // (the mode invariant holds under auth too).
+        let writer_only_cfg = auth_creds(Config {
+            compat_endpoints: true,
+            mode: Mode::Writer,
+            ..Config::default()
+        });
+        let writer_only_router = build_router(test_state(), &writer_only_cfg)
+            .expect("router builds (auth on, flag on, writer-only mode)");
+        assert_eq!(
+            status(&writer_only_router, "/loki/api/v1/query", Some(&valid)).await,
+            StatusCode::NOT_FOUND
+        );
+
+        // Perimeter parity: with no credentials at all, a flag-off alias
+        // and a totally bogus path are indistinguishable — both 401. An
+        // unauthenticated caller learns nothing about which paths exist.
+        assert_eq!(
+            status(&flag_off_router, "/loki/api/v1/query", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&flag_off_router, "/totally-bogus", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

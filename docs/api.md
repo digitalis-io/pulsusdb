@@ -299,6 +299,10 @@ Disabled by default. When enabled, PulsusDB additionally mounts third-party API 
 
 ### 8.1 Query aliases
 
+The M1 log-query aliases (`/loki/api/v1/{query_range,query,labels,label/*/values,series}`) are pure route bindings onto the native `/api/logs/v1` handlers — responses are byte-identical to native, including `X-Pulsus-Explain` passthrough. They mount iff `PULSUS_COMPAT_ENDPOINTS=true` **and** the Reader subsystem is mounted (docs/architecture.md §1's mode table); they 404 exactly where native does (e.g. writer-only mode never mounts either surface). Gating is decided once at router-build time, not per request.
+
+When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated request regardless of path existence; authenticated requests to an unmounted alias (flag off, or non-Reader mode) return 404, indistinguishable from any nonexistent route.
+
 | Compatibility path | Native equivalent | Ships with |
 |--------------------|-------------------|------------|
 | `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |

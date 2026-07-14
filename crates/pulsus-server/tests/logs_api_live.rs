@@ -167,18 +167,24 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Spawns `pulsusdb` bound to `port`, targeting a fresh `db` — the server
-/// itself runs the schema reconcile (same startup path `live_server.rs`
-/// proves). Blocks until `/ready` is `200` (60s deadline).
-fn spawn_ready_server(port: u16, db: &str) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+/// Spawns `pulsusdb` bound to `port`, targeting a fresh `db`, with any
+/// `extra_env` set on top of the baseline (issue #14: `spawn_ready_server`
+/// below is just this with no extras; the compat-alias live tests pass
+/// `[("PULSUS_COMPAT_ENDPOINTS", "1")]`) — the server itself runs the
+/// schema reconcile (same startup path `live_server.rs` proves). Blocks
+/// until `/ready` is `200` (60s deadline).
+fn spawn_ready_server_env(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    command
         .env("PULSUS_HOST", "127.0.0.1")
         .env("PULSUS_PORT", port.to_string())
         .env("CLICKHOUSE_SERVER", ch_host())
         .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
-        .env("CLICKHOUSE_DB", db)
-        .spawn()
-        .expect("spawn pulsusdb");
+        .env("CLICKHOUSE_DB", db);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn pulsusdb");
     let guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -191,6 +197,12 @@ fn spawn_ready_server(port: u16, db: &str) -> ChildGuard {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("/ready never reached 200 within 60s");
+}
+
+/// Baseline spawn — `PULSUS_COMPAT_ENDPOINTS` unset, i.e. `false`
+/// (`Config::default()`).
+fn spawn_ready_server(port: u16, db: &str) -> ChildGuard {
+    spawn_ready_server_env(port, db, &[])
 }
 
 fn data_client_config(db: &str) -> ChConnConfig {
@@ -282,7 +294,13 @@ async fn seed(client: &ChClient, db: &str, base_ns: i64) {
 }
 
 async fn setup(db: &str, port: u16) -> (ChildGuard, ChClient, i64) {
-    let guard = spawn_ready_server(port, db);
+    setup_env(db, port, &[]).await
+}
+
+/// `setup`, but spawning through [`spawn_ready_server_env`] so callers can
+/// pass extra environment (issue #14: `PULSUS_COMPAT_ENDPOINTS=1`).
+async fn setup_env(db: &str, port: u16, extra_env: &[(&str, &str)]) -> (ChildGuard, ChClient, i64) {
+    let guard = spawn_ready_server_env(port, db, extra_env);
     let client = ChClient::new(data_client_config(db))
         .await
         .expect("connect data client");
@@ -939,6 +957,148 @@ async fn query_range_memory_scales_with_the_limit_not_the_seeded_stream_count() 
         delta_kb < 50_000,
         "RSS grew by {delta_kb}KiB across one limit=100 request over 5,000 seeded streams \
          — suspiciously large for an O(limit) read path"
+    );
+}
+
+/// Compat-alias live test (issue #14): with `PULSUS_COMPAT_ENDPOINTS`
+/// unset (default `false`), every `/loki/api/v1/*` alias path is a plain
+/// 404 — the routes are simply absent, same as any other unmounted path
+/// (no per-request flag check, gating is router-build-time only).
+#[tokio::test]
+async fn loki_compat_aliases_404_when_the_flag_is_off() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_compat_off";
+    let port = 31_115;
+    let _guard = spawn_ready_server(port, db);
+
+    for path in [
+        "/loki/api/v1/query_range",
+        "/loki/api/v1/query",
+        "/loki/api/v1/labels",
+        "/loki/api/v1/label/env/values",
+        "/loki/api/v1/series",
+    ] {
+        let res = http_get(port, path).expect("loki alias reachable (though 404)");
+        assert_eq!(
+            res.status, 404,
+            "{path} must 404 when PULSUS_COMPAT_ENDPOINTS is off"
+        );
+    }
+}
+
+/// Compat-alias live test (issue #14): with the flag on, every
+/// `/loki/api/v1/*` alias returns a byte-identical response to its native
+/// `/api/logs/v1/*` counterpart for the same request — the two surfaces
+/// share one handler fn per route (`logs_api::mount_log_query_routes`), so
+/// this is an end-to-end proof, not just a router-shape assertion. Every
+/// request below pins explicit `start`/`end`/`time` (never the `now`
+/// defaults), so two separately-issued requests cannot diverge on a
+/// wall-clock default (architect plan edge case).
+#[tokio::test]
+async fn loki_compat_aliases_are_byte_identical_to_native() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_compat_identical";
+    let port = 31_116;
+    let (_guard, _client, base_ns) = setup_env(db, port, &[("PULSUS_COMPAT_ENDPOINTS", "1")]).await;
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    // Pre-rendered once so every `params` array below borrows genuine
+    // `&str`s (not `&String`s built inline, which the array literal
+    // would otherwise infer as its element type).
+    let start_s = start.to_string();
+    let end_s = end.to_string();
+    let base_ns_s = base_ns.to_string();
+
+    let assert_identical = |label: &str, native: HttpResponse, alias: HttpResponse| {
+        assert_eq!(alias.status, native.status, "{label}: status diverged");
+        assert_eq!(
+            alias.body, native.body,
+            "{label}: body diverged from native"
+        );
+    };
+
+    // query_range
+    let params = [
+        ("query", r#"{service_name="checkout"}"#),
+        ("start", start_s.as_str()),
+        ("end", end_s.as_str()),
+    ];
+    let native =
+        http_get(port, &q("/api/logs/v1/query_range", &params)).expect("native query_range");
+    let alias = http_get(port, &q("/loki/api/v1/query_range", &params)).expect("alias query_range");
+    assert_identical("query_range", native, alias);
+
+    // query (instant)
+    let params = [
+        ("query", r#"count_over_time({service_name="checkout"}[1h])"#),
+        ("time", base_ns_s.as_str()),
+    ];
+    let native = http_get(port, &q("/api/logs/v1/query", &params)).expect("native query");
+    let alias = http_get(port, &q("/loki/api/v1/query", &params)).expect("alias query");
+    assert_identical("query", native, alias);
+
+    // labels
+    let params = [("start", start_s.as_str()), ("end", end_s.as_str())];
+    let native = http_get(port, &q("/api/logs/v1/labels", &params)).expect("native labels");
+    let alias = http_get(port, &q("/loki/api/v1/labels", &params)).expect("alias labels");
+    assert_identical("labels", native, alias);
+
+    // label/{name}/values
+    let params = [("start", start_s.as_str()), ("end", end_s.as_str())];
+    let native =
+        http_get(port, &q("/api/logs/v1/label/env/values", &params)).expect("native label values");
+    let alias =
+        http_get(port, &q("/loki/api/v1/label/env/values", &params)).expect("alias label values");
+    assert_identical("label/{name}/values", native, alias);
+
+    // series
+    let params = [
+        ("match[]", r#"{service_name="checkout"}"#),
+        ("start", start_s.as_str()),
+        ("end", end_s.as_str()),
+    ];
+    let native = http_get(port, &q("/api/logs/v1/series", &params)).expect("native series");
+    let alias = http_get(port, &q("/loki/api/v1/series", &params)).expect("alias series");
+    assert_identical("series", native, alias);
+
+    // `X-Pulsus-Explain: 1` passthrough (query_range) — proves header
+    // handling, not just the body encoder, is identical between surfaces.
+    let params = [
+        ("query", r#"{service_name="checkout"}"#),
+        ("start", start_s.as_str()),
+        ("end", end_s.as_str()),
+    ];
+    let native = http_request(
+        port,
+        "GET",
+        &q("/api/logs/v1/query_range", &params),
+        &[("X-Pulsus-Explain", "1")],
+        None,
+    )
+    .expect("native query_range (explain)");
+    let alias = http_request(
+        port,
+        "GET",
+        &q("/loki/api/v1/query_range", &params),
+        &[("X-Pulsus-Explain", "1")],
+        None,
+    )
+    .expect("alias query_range (explain)");
+    let alias_explain_stages = json(&alias)["data"]["explain"]["stages"]
+        .as_array()
+        .map(|a| !a.is_empty());
+    assert_identical("query_range (X-Pulsus-Explain)", native, alias);
+    assert_eq!(
+        alias_explain_stages,
+        Some(true),
+        "alias explain payload missing non-empty stages"
     );
 }
 

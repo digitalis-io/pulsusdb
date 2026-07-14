@@ -61,6 +61,14 @@ pub const SCENARIOS: &[Scenario] = &[
         variants: &[Variant::Single, Variant::Cluster],
         run: |ctx| Box::pin(buildinfo_roundtrip(ctx)),
     },
+    Scenario {
+        name: "grafana_loki_compat",
+        // Single-variant only (architect plan): the `grafana` service and
+        // its Loki-datasource provisioning ship only in
+        // `deploy/e2e/compose.single.yaml`.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(grafana_loki_compat(ctx)),
+    },
 ];
 
 /// `GET /ready` is already gated on by the harness's own polling
@@ -109,6 +117,80 @@ async fn buildinfo_roundtrip(ctx: &Ctx) -> Result<()> {
         if !present {
             bail!("GET /buildinfo missing or empty field {field:?} in {body}");
         }
+    }
+    Ok(())
+}
+
+/// Grafana's own published base URL for this stack (deploy/e2e/
+/// compose.single.yaml's `grafana` service, `ports: ["3000:3000"]`) —
+/// distinct from `ctx.base_url` (pulsusdb's `:3100`), so this scenario
+/// builds its own client/URL rather than using `Ctx::url`.
+const GRAFANA_BASE_URL: &str = "http://127.0.0.1:3000";
+
+/// M1 log-query compat alias check via a real Loki datasource (issue #14,
+/// docs/api.md §8.1; task-manager-approved option A on the architect
+/// plan's open question). Drives Grafana's datasource proxy
+/// (`POST /api/ds/query`) with an M1 `query_range` against the
+/// `pulsus-loki` datasource provisioned in
+/// `deploy/e2e/grafana/provisioning/datasources/loki.yaml`, which points
+/// at pulsusdb's `/loki/api/v1/*` compat surface
+/// (`PULSUS_COMPAT_ENDPOINTS=true` in the single-variant compose overlay).
+/// Asserts a well-formed Loki envelope with no query error — proving alias
+/// routing and Loki-datasource wire compatibility end to end.
+///
+/// Empty results are permitted and expected here: M1 ships no ingest
+/// receiver (`writer_router()` is still empty, docs/api.md §8.2 is M6), so
+/// nothing seeds data through the running HTTP-only stack. Byte-identical
+/// behaviour against *real* data is already proven at the `pulsus-server`
+/// live layer (`crates/pulsus-server/tests/logs_api_live.rs`) via direct
+/// `ChClient` seeding. **Issue #15's collector-to-query e2e upgrades this
+/// same scenario to assert non-empty frames** once the ingest path is
+/// wired through the running stack.
+async fn grafana_loki_compat(_ctx: &Ctx) -> Result<()> {
+    let http = reqwest::Client::new();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis();
+    let from_ms = now_ms.saturating_sub(3_600_000);
+
+    let request_body = serde_json::json!({
+        "queries": [{
+            "refId": "A",
+            "datasource": { "type": "loki", "uid": "pulsus-loki" },
+            "expr": r#"{service_name="checkout"}"#,
+            "queryType": "range",
+            "maxLines": 100,
+        }],
+        "from": from_ms.to_string(),
+        "to": now_ms.to_string(),
+    });
+
+    let res = http
+        .post(format!("{GRAFANA_BASE_URL}/api/ds/query"))
+        .json(&request_body)
+        .send()
+        .await
+        .context("POST /api/ds/query failed")?;
+    if !res.status().is_success() {
+        bail!("POST /api/ds/query returned {}", res.status());
+    }
+    let payload: serde_json::Value = res
+        .json()
+        .await
+        .context("POST /api/ds/query body was not JSON")?;
+
+    let result_a = payload
+        .get("results")
+        .and_then(|results| results.get("A"))
+        .with_context(|| format!("no results.A in ds/query response: {payload}"))?;
+
+    if let Some(error) = result_a.get("error") {
+        bail!("Loki query_range through the compat alias errored: {error}");
+    }
+    if !result_a.get("frames").is_some_and(|f| f.is_array()) {
+        bail!("results.A missing a frames array in ds/query response: {result_a}");
     }
     Ok(())
 }

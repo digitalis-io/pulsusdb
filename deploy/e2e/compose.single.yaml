@@ -44,6 +44,10 @@ services:
     image: pulsusdb:e2e
     environment:
       CLICKHOUSE_SERVER: "172.29.0.10" # the `clickhouse` service's static ipv4_address, not its DNS name
+      # M1 log-query compat aliases (issue #14, docs/api.md §8.1) — on for
+      # this variant so the `grafana` service below can exercise the
+      # `/loki/api/v1/*` surface through a real Loki datasource.
+      PULSUS_COMPAT_ENDPOINTS: "true"
     networks:
       pulsus-e2e-single:
         ipv4_address: 172.29.0.11
@@ -71,3 +75,23 @@ services:
     networks:
       pulsus-e2e-single:
         ipv4_address: 172.29.0.12
+
+  # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
+  # surface (issue #14, task-manager-approved option A): proves alias
+  # routing + Loki-datasource compatibility end to end via
+  # `e2e/src/scenarios.rs`'s `grafana_loki_compat` scenario. Anonymous
+  # Editor access — no login flow needed for the scenario's HTTP client to
+  # drive `/api/ds/query`. Single-variant only (not part of the cluster
+  # overlay).
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Editor"
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/grafana/provisioning:/etc/grafana/provisioning:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.13
+    depends_on: [ pulsusdb ]
+    ports: [ "3000:3000" ]
