@@ -4,3 +4,21 @@ version = "0.0.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+pulsus-logql = { path = "../pulsus-logql" }
+pulsus-clickhouse = { path = "../pulsus-clickhouse" }
+pulsus-config = { path = "../pulsus-config" }
+# The `clickhouse` crate's `#[derive(Row)]` macro expands to paths rooted at
+# `clickhouse::...` unqualified, so it must be a direct dependency of every
+# crate that derives it, not just reachable transitively through
+# `pulsus-clickhouse` (same pattern as `pulsus-schema`/`pulsus-write`'s
+# Cargo.toml).
+clickhouse.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+pulsus-schema = { path = "../pulsus-schema" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -1444,6 +1444,17 @@ version = "0.0.0"
 [[package]]
 name = "pulsus-read"
 version = "0.0.0"
+dependencies = [
+ "clickhouse",
+ "futures",
+ "pulsus-clickhouse",
+ "pulsus-config",
+ "pulsus-logql",
+ "pulsus-schema",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
 
 [[package]]
 name = "pulsus-ruler"
