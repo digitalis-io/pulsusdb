@@ -1,0 +1,22 @@
+VectorSelector(
+    VectorSelector {
+        name: None,
+        matchers: Matchers {
+            matchers: [
+                Matcher {
+                    op: NotEqual,
+                    name: "__name__",
+                    value: "foo",
+                },
+                Matcher {
+                    op: Equal,
+                    name: "job",
+                    value: "test",
+                },
+            ],
+            or_matchers: [],
+        },
+        offset: None,
+        at: None,
+    },
+)

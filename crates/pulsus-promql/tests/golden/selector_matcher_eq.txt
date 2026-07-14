@@ -1,0 +1,19 @@
+VectorSelector(
+    VectorSelector {
+        name: Some(
+            "foo",
+        ),
+        matchers: Matchers {
+            matchers: [
+                Matcher {
+                    op: Equal,
+                    name: "env",
+                    value: "prod",
+                },
+            ],
+            or_matchers: [],
+        },
+        offset: None,
+        at: None,
+    },
+)

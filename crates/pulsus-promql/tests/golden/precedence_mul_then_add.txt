@@ -1,0 +1,55 @@
+Binary(
+    BinaryExpr {
+        op: TokenType(
+            24,
+        ),
+        lhs: Binary(
+            BinaryExpr {
+                op: TokenType(
+                    36,
+                ),
+                lhs: VectorSelector(
+                    VectorSelector {
+                        name: Some(
+                            "a",
+                        ),
+                        matchers: Matchers {
+                            matchers: [],
+                            or_matchers: [],
+                        },
+                        offset: None,
+                        at: None,
+                    },
+                ),
+                rhs: VectorSelector(
+                    VectorSelector {
+                        name: Some(
+                            "b",
+                        ),
+                        matchers: Matchers {
+                            matchers: [],
+                            or_matchers: [],
+                        },
+                        offset: None,
+                        at: None,
+                    },
+                ),
+                modifier: None,
+            },
+        ),
+        rhs: VectorSelector(
+            VectorSelector {
+                name: Some(
+                    "c",
+                ),
+                matchers: Matchers {
+                    matchers: [],
+                    or_matchers: [],
+                },
+                offset: None,
+                at: None,
+            },
+        ),
+        modifier: None,
+    },
+)

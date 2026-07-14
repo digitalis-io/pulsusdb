@@ -1,0 +1,7 @@
+{
+  "case_count": 349,
+  "prometheus_sha": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+  "prometheus_tag": "v3.13.0",
+  "promql_parser_version": "0.10.0",
+  "sha256": "911ff24d4e270e3e193b151849915bd68d092b90bacd4b8e92faceaf5353bac0"
+}

@@ -84,3 +84,16 @@ zstd = "0.13"
 # so the documented 64 MiB decompressed-size cap (not axum's 2 MiB default)
 # is the sole bound. Already resolved in `Cargo.lock` via axum's own tree.
 http-body-util = "0.1"
+
+# M2 promql-parser validation spike (issue #29, docs/decisions/0002-promql-
+# parser-selection.md). Exact-pinned (not a `"0.10"` range like most of this
+# table): every number in ADR 0002 (corpus pass rate, divergence buckets,
+# round-trip results) was measured against exactly this version, and a bump
+# invalidates the spike's evidence until re-run (docs/architecture.md §5.1's
+# "re-vendor on reference bump" rule). Dev-dependency only in
+# `pulsus-promql` for this spike; #31 promotes it to a real dependency.
+promql-parser = "=0.10.0"
+# `sha2` backs the corpus integrity check in `upstream_parser_corpus.rs`
+# (recomputes the vendored corpus's SHA-256 and asserts it against
+# `manifest.json` before running any case).
+sha2 = "0.10"

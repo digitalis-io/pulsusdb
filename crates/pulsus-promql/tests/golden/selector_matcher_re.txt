@@ -1,0 +1,23 @@
+VectorSelector(
+    VectorSelector {
+        name: Some(
+            "foo",
+        ),
+        matchers: Matchers {
+            matchers: [
+                Matcher {
+                    op: Re(
+                        Regex(
+                            "^(?:prod|staging)$",
+                        ),
+                    ),
+                    name: "env",
+                    value: "prod|staging",
+                },
+            ],
+            or_matchers: [],
+        },
+        offset: None,
+        at: None,
+    },
+)

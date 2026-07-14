@@ -1,0 +1,33 @@
+Call(
+    Call {
+        func: Function {
+            name: "avg_over_time",
+            arg_types: [
+                Matrix,
+            ],
+            variadic: 0,
+            return_type: Vector,
+            experimental: false,
+        },
+        args: FunctionArgs {
+            args: [
+                MatrixSelector(
+                    MatrixSelector {
+                        vs: VectorSelector {
+                            name: Some(
+                                "foo",
+                            ),
+                            matchers: Matchers {
+                                matchers: [],
+                                or_matchers: [],
+                            },
+                            offset: None,
+                            at: None,
+                        },
+                        range: 300s,
+                    },
+                ),
+            ],
+        },
+    },
+)

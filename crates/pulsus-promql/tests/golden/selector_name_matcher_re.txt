@@ -1,0 +1,21 @@
+VectorSelector(
+    VectorSelector {
+        name: None,
+        matchers: Matchers {
+            matchers: [
+                Matcher {
+                    op: Re(
+                        Regex(
+                            "^(?:foo|bar)$",
+                        ),
+                    ),
+                    name: "__name__",
+                    value: "foo|bar",
+                },
+            ],
+            or_matchers: [],
+        },
+        offset: None,
+        at: None,
+    },
+)

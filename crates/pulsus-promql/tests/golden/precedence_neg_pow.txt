@@ -1,0 +1,38 @@
+Unary(
+    UnaryExpr {
+        expr: Binary(
+            BinaryExpr {
+                op: TokenType(
+                    39,
+                ),
+                lhs: VectorSelector(
+                    VectorSelector {
+                        name: Some(
+                            "a",
+                        ),
+                        matchers: Matchers {
+                            matchers: [],
+                            or_matchers: [],
+                        },
+                        offset: None,
+                        at: None,
+                    },
+                ),
+                rhs: VectorSelector(
+                    VectorSelector {
+                        name: Some(
+                            "b",
+                        ),
+                        matchers: Matchers {
+                            matchers: [],
+                            or_matchers: [],
+                        },
+                        offset: None,
+                        at: None,
+                    },
+                ),
+                modifier: None,
+            },
+        ),
+    },
+)

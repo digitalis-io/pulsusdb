@@ -1,0 +1,30 @@
+Aggregate(
+    AggregateExpr {
+        op: TokenType(
+            47,
+        ),
+        expr: VectorSelector(
+            VectorSelector {
+                name: Some(
+                    "foo",
+                ),
+                matchers: Matchers {
+                    matchers: [],
+                    or_matchers: [],
+                },
+                offset: None,
+                at: None,
+            },
+        ),
+        param: None,
+        modifier: Some(
+            Exclude(
+                Labels {
+                    labels: [
+                        "env",
+                    ],
+                },
+            ),
+        ),
+    },
+)

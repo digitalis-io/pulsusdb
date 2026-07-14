@@ -1,0 +1,26 @@
+Binary(
+    BinaryExpr {
+        op: TokenType(
+            29,
+        ),
+        lhs: VectorSelector(
+            VectorSelector {
+                name: Some(
+                    "foo",
+                ),
+                matchers: Matchers {
+                    matchers: [],
+                    or_matchers: [],
+                },
+                offset: None,
+                at: None,
+            },
+        ),
+        rhs: NumberLiteral(
+            NumberLiteral {
+                val: 2.0,
+            },
+        ),
+        modifier: None,
+    },
+)

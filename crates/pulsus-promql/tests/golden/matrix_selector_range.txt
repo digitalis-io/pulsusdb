@@ -1,0 +1,16 @@
+MatrixSelector(
+    MatrixSelector {
+        vs: VectorSelector {
+            name: Some(
+                "foo",
+            ),
+            matchers: Matchers {
+                matchers: [],
+                or_matchers: [],
+            },
+            offset: None,
+            at: None,
+        },
+        range: 300s,
+    },
+)
