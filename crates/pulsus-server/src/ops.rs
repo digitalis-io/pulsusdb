@@ -113,7 +113,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::app::BuildInfo;
-    use crate::ingest::WriterSink;
+    use crate::ingest::{MetricWriterSink, WriterSink};
     use pulsus_config::Config;
 
     fn test_state() -> AppState {
@@ -125,6 +125,7 @@ mod tests {
                 .handle(),
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
         }
     }
 
@@ -177,6 +178,7 @@ mod tests {
                 .handle(),
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
         };
         let res = config_handler(State(state)).await.into_response();
         assert_eq!(res.status(), StatusCode::OK);

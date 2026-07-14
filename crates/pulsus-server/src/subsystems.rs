@@ -9,10 +9,13 @@ use axum::routing::post;
 use crate::app::AppState;
 
 /// Ingestion APIs (OTLP, Prometheus remote write, native profile ingest).
-/// `POST /v1/logs` is wired (issue #15, docs/api.md §1.1); the remaining
-/// signals' ingest routes are still empty until their own issues land.
+/// `POST /v1/logs` (issue #15) and `POST /v1/metrics` (issue #27,
+/// docs/api.md §1.1) are wired; the remaining signals' ingest routes are
+/// still empty until their own issues land.
 pub(crate) fn writer_router() -> Router<AppState> {
-    Router::new().route("/v1/logs", post(crate::ingest::ingest_logs))
+    Router::new()
+        .route("/v1/logs", post(crate::ingest::ingest_logs))
+        .route("/v1/metrics", post(crate::ingest::ingest_metrics))
 }
 
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).

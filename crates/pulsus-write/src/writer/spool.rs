@@ -226,6 +226,8 @@ fn now_unix_nanos() -> i128 {
 mod tests {
     use serde::Serialize;
 
+    use pulsus_model::STALE_NAN_BITS;
+
     use super::*;
     use crate::writer::metrics::WriterMetrics;
     use crate::writer::rows::MetricSampleRow;
@@ -322,7 +324,6 @@ mod tests {
     /// collapsed to `null`.
     #[tokio::test]
     async fn stale_nan_metric_sample_round_trips_its_exact_bits_through_the_spool_file() {
-        const STALE_NAN_BITS: u64 = 0x7FF0_0000_0000_0002;
         let dir = tempdir();
         let metrics = Arc::new(WriterMetrics::default());
         let spool = SpoolWriter::new(dir.clone(), metrics);

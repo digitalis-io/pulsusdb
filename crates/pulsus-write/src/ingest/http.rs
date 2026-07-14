@@ -1,20 +1,29 @@
-//! The `POST /v1/logs` axum handler (docs/api.md §1.1): decompress ->
-//! prost-decode -> `otlp_logs::parse` -> hand rows to a [`LogSink`] ->
-//! render the OTLP response. A thin layer over the pure parser — no
+//! The `POST /v1/logs` and `POST /v1/metrics` axum handlers (docs/api.md
+//! §1.1): decompress -> prost-decode -> `otlp_logs::parse`/
+//! `otlp_metrics::parse` -> hand rows to a [`LogSink`]/[`MetricSink`] ->
+//! render the OTLP response. A thin layer over the pure parsers — no
 //! batching, no ClickHouse writes (architect plan, "out of scope").
+//! [`ingest_metrics`]/[`metrics`] (issue #27) reuse every piece of
+//! [`ingest`]/[`logs`]'s (issue #8/#15) machinery below — capped body
+//! reads, decompression, `google.rpc.Status` error rendering,
+//! classification, and the sync/async admission branch — the only
+//! metrics-specific additions are [`decode_metrics_request`] and
+//! [`export_metrics_response`].
 //!
-//! [`ingest`] is the state-agnostic core (issue #15 architect plan):
-//! `&dyn LogSink` rather than a generic `State<Arc<S>>` extractor, because
-//! `pulsus-server`'s concrete sink (`WriterSink`, wrapping the
-//! async-filled writer slot) cannot implement `FromRef<AppState>` through
-//! an `Arc` — `Arc` is not `#[fundamental]`, so `Arc<WriterSink>:
-//! FromRef<AppState>` is an orphan-rule violation from this crate's side.
-//! A `&dyn LogSink` core sidesteps the state-type gymnastics entirely: the
-//! server's own thin `axum::extract::State<AppState>` handler pulls its
-//! sink out of `AppState` and calls straight into [`ingest`]. [`logs`]
-//! (this crate's own generic-`State` mount point, used by its own tests
-//! and any caller with a concrete, `FromRef`-able sink type) is now a
-//! one-line delegate to it.
+//! [`ingest`]/[`ingest_metrics`] are the state-agnostic cores (issue #15
+//! architect plan): `&dyn LogSink`/`&dyn MetricSink` rather than a generic
+//! `State<Arc<S>>` extractor, because `pulsus-server`'s concrete sinks
+//! (`WriterSink`/`MetricWriterSink`, each wrapping an async-filled writer
+//! slot) cannot implement `FromRef<AppState>` through an `Arc` — `Arc` is
+//! not `#[fundamental]`, so `Arc<WriterSink>: FromRef<AppState>` is an
+//! orphan-rule violation from this crate's side. A `&dyn LogSink`/
+//! `&dyn MetricSink` core sidesteps the state-type gymnastics entirely:
+//! the server's own thin `axum::extract::State<AppState>` handler pulls
+//! its sink out of `AppState` and calls straight into [`ingest`]/
+//! [`ingest_metrics`]. [`logs`]/[`metrics`] (this crate's own
+//! generic-`State` mount points, used by its own tests and any caller
+//! with a concrete, `FromRef`-able sink type) are now one-line delegates
+//! to them.
 
 use std::sync::Arc;
 
@@ -28,11 +37,15 @@ use prost::Message;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
 
 use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
+use crate::ingest::metrics::MetricSink;
 use crate::ingest::{Backpressure, LogSink};
-use crate::protocols::otlp_logs;
+use crate::protocols::{otlp_logs, otlp_metrics};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
 /// selects async-mode (enqueue, `202`); absent or any other value selects
@@ -116,6 +129,53 @@ where
     ingest(sink.as_ref(), headers, body).await
 }
 
+/// `POST /v1/metrics` (issue #27): the metrics analog of [`ingest`] —
+/// identical decompress/decode/parse/admit/respond shape, reusing every
+/// shared helper below verbatim. See this module's doc comment for why
+/// `pulsus-server` mounts this `&dyn MetricSink` core directly rather than
+/// [`metrics`]'s generic-`State` form.
+pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Body) -> Response {
+    let now_ns = now_unix_nanos();
+
+    let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return error_response(err),
+    };
+
+    let request = match decode_metrics_request(&headers, &body) {
+        Ok(request) => request,
+        Err(err) => return error_response(err),
+    };
+
+    let parsed = otlp_metrics::parse(&request, now_ns);
+    let rejected = parsed.rejected;
+    let rejected_message = parsed.rejected_message.clone();
+
+    if is_async(&headers) {
+        return match sink.admit(parsed) {
+            Ok(()) => export_metrics_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Err(Backpressure) => backpressure_response(),
+        };
+    }
+
+    match sink.admit_flush(parsed) {
+        Ok(wait) => match wait.await {
+            Ok(()) => export_metrics_response(StatusCode::OK, rejected, rejected_message),
+            Err(err) => error_response(err),
+        },
+        Err(Backpressure) => backpressure_response(),
+    }
+}
+
+/// This crate's own generic-`State` mount point for [`ingest_metrics`] —
+/// mirrors [`logs`] exactly.
+pub async fn metrics<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Body) -> Response
+where
+    S: MetricSink + 'static,
+{
+    ingest_metrics(sink.as_ref(), headers, body).await
+}
+
 /// `true` when `X-Pulsus-Async: 1` selects async-mode admission.
 fn is_async(headers: &HeaderMap) -> bool {
     headers
@@ -167,6 +227,18 @@ fn decode_request(
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
     otlp_logs::decode(&decompressed)
+}
+
+/// Reads `Content-Encoding` (defaulting to `identity` when absent or
+/// empty), decompresses, and prost-decodes the request body — the
+/// metrics analog of [`decode_request`].
+fn decode_metrics_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<ExportMetricsServiceRequest, LogsIngestError> {
+    let encoding = content_encoding(headers)?;
+    let decompressed = decompress::decompress(encoding, body)?;
+    otlp_metrics::decode(&decompressed)
 }
 
 fn content_encoding(headers: &HeaderMap) -> Result<Encoding, LogsIngestError> {
@@ -253,6 +325,23 @@ fn export_response(
         error_message: rejected_message.unwrap_or_default(),
     });
     let body = ExportLogsServiceResponse { partial_success }.encode_to_vec();
+    protobuf_response(status, body)
+}
+
+/// Success/accepted response body for `/v1/metrics` — the metrics analog
+/// of [`export_response`], carrying `partial_success.rejected_data_points`
+/// (the OTLP metrics partial-success field name) instead of
+/// `rejected_log_records`.
+fn export_metrics_response(
+    status: StatusCode,
+    rejected: u64,
+    rejected_message: Option<String>,
+) -> Response {
+    let partial_success = (rejected > 0).then(|| ExportMetricsPartialSuccess {
+        rejected_data_points: i64::try_from(rejected).unwrap_or(i64::MAX),
+        error_message: rejected_message.unwrap_or_default(),
+    });
+    let body = ExportMetricsServiceResponse { partial_success }.encode_to_vec();
     protobuf_response(status, body)
 }
 
@@ -596,5 +685,217 @@ mod tests {
             .await
             .unwrap();
         Status::decode(bytes.as_ref()).unwrap()
+    }
+
+    // -- `/v1/metrics` (issue #27) ---------------------------------------
+    // Mirrors the `/v1/logs` test suite above exactly — same shared
+    // helpers (`read_capped_body`, `content_encoding`, `classify`,
+    // `error_response`, `backpressure_response`, `protobuf_response`),
+    // only the sink/request/response types differ.
+
+    use crate::ingest::metrics::ParsedMetrics;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+    };
+
+    struct MockMetricSink {
+        outcome: Outcome,
+        admitted: Mutex<Vec<ParsedMetrics>>,
+    }
+
+    impl MockMetricSink {
+        fn new(outcome: Outcome) -> Arc<MockMetricSink> {
+            Arc::new(MockMetricSink {
+                outcome,
+                admitted: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl MetricSink for MockMetricSink {
+        fn admit(&self, batch: ParsedMetrics) -> Result<(), Backpressure> {
+            self.admitted.lock().unwrap().push(batch);
+            match self.outcome {
+                Outcome::Admit | Outcome::FlushFails => Ok(()),
+                Outcome::Backpressure => Err(Backpressure),
+            }
+        }
+
+        fn admit_flush(&self, batch: ParsedMetrics) -> Result<FlushWait, Backpressure> {
+            self.admitted.lock().unwrap().push(batch);
+            match self.outcome {
+                Outcome::Admit => Ok(FlushWait::new(async { Ok(()) })),
+                Outcome::FlushFails => Ok(FlushWait::new(async {
+                    Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
+                })),
+                Outcome::Backpressure => Err(Backpressure),
+            }
+        }
+    }
+
+    fn metrics_router(sink: Arc<MockMetricSink>) -> Router {
+        Router::new()
+            .route("/v1/metrics", post(metrics::<MockMetricSink>))
+            .with_state(sink)
+    }
+
+    /// [`post_body`]'s `/v1/metrics` counterpart — that helper hardcodes
+    /// `/v1/logs`, so this suite posts to its own path rather than
+    /// generalizing a shared helper only two call sites would use
+    /// differently.
+    async fn post_metrics_body(
+        router: Router,
+        body: Vec<u8>,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/metrics");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Body::from(body)).unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    fn valid_metrics_request_body() -> Vec<u8> {
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "up".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                opentelemetry_proto::tonic::metrics::v1::NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 1_700_000_000_000_000_000,
+                                    exemplars: vec![],
+                                    flags: 0,
+                                    value: Some(number_data_point::Value::AsDouble(1.0)),
+                                },
+                            ],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        req.encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn metrics_sync_mode_admits_via_admit_flush_and_returns_200() {
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(
+            metrics_router(sink.clone()),
+            valid_metrics_request_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_async_mode_admits_via_admit_and_returns_202() {
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(
+            metrics_router(sink.clone()),
+            valid_metrics_request_body(),
+            &[("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_malformed_body_returns_400_with_status_code_3() {
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(
+            metrics_router(sink),
+            b"not a protobuf message".to_vec(),
+            &[],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+    }
+
+    #[tokio::test]
+    async fn metrics_sink_backpressure_returns_429_with_status_code_8() {
+        let sink = MockMetricSink::new(Outcome::Backpressure);
+        let res = post_metrics_body(metrics_router(sink), valid_metrics_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 8);
+    }
+
+    #[tokio::test]
+    async fn metrics_flush_failure_returns_500_with_status_code_13() {
+        let sink = MockMetricSink::new(Outcome::FlushFails);
+        let res = post_metrics_body(metrics_router(sink), valid_metrics_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 13);
+    }
+
+    #[tokio::test]
+    async fn metrics_success_response_reports_partial_success_when_points_were_rejected() {
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "up".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                // Zero timestamp: rejected (partial success).
+                                opentelemetry_proto::tonic::metrics::v1::NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 0,
+                                    exemplars: vec![],
+                                    flags: 0,
+                                    value: Some(number_data_point::Value::AsDouble(1.0)),
+                                },
+                                opentelemetry_proto::tonic::metrics::v1::NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: 1_700_000_000_000_000_000,
+                                    exemplars: vec![],
+                                    flags: 0,
+                                    value: Some(number_data_point::Value::AsDouble(2.0)),
+                                },
+                            ],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(metrics_router(sink), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response = ExportMetricsServiceResponse::decode(bytes.as_ref()).unwrap();
+        let partial = response.partial_success.expect("partial success is set");
+        assert_eq!(partial.rejected_data_points, 1);
+        assert!(!partial.error_message.is_empty());
     }
 }

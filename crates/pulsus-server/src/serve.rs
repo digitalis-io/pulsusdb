@@ -32,7 +32,7 @@ use crate::chconfig::{
     bootstrap_conn_config_from, conn_config_from, metric_writer_tables_from, schema_params_from,
     writer_tables_from,
 };
-use crate::ingest::WriterSink;
+use crate::ingest::{MetricWriterSink, WriterSink};
 
 /// Startup-time failures specific to the HTTP server layer (config-load and
 /// schema-controller failures are handled separately, in `main.rs` /
@@ -83,10 +83,11 @@ pub async fn run(config: Config) -> ExitCode {
     // architect plan).
     let writer_slot: Arc<OnceLock<Arc<LogWriter>>> = Arc::new(OnceLock::new());
     // `MetricWriter`'s lifecycle-parity counterpart (issue #26 architect
-    // plan): constructed + shutdown-drained alongside `LogWriter`, but
-    // deliberately NOT wired into `AppState` or any route yet — the
-    // `MetricSink` adapter and `/v1/metrics`/`/api/v1/write` mount land in
-    // #27/#28. Its flush tasks simply idle (never admitted to) until then.
+    // plan): constructed + shutdown-drained alongside `LogWriter`. Wired
+    // into `AppState` (via `MetricWriterSink`) and `/v1/metrics` below
+    // (issue #27); `/api/v1/write` (Prometheus remote write) still lands
+    // in #28. Its flush tasks simply idle (never admitted to) until this
+    // slot is filled by the reconnect loop.
     let metric_writer_slot: Arc<OnceLock<Arc<MetricWriter>>> = Arc::new(OnceLock::new());
     // The reconnect loop is a one-shot bootstrap (see its own doc comment):
     // it runs exactly once per process and, on success, spawns at most one
@@ -108,6 +109,7 @@ pub async fn run(config: Config) -> ExitCode {
         metrics,
         build: BuildInfo::from_build_env(),
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
+        metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
     };
 
     let router = match app::build_router(state, &config) {

@@ -4,3 +4,4 @@
 //! captured fixtures.
 
 pub mod otlp_logs;
+pub mod otlp_metrics;

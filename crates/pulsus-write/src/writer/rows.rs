@@ -352,7 +352,7 @@ impl SpoolEncode for MetricMetadataRow {
 mod tests {
     use std::sync::Arc;
 
-    use pulsus_model::{Date, LabelSet, UnixNano};
+    use pulsus_model::{Date, LabelSet, STALE_NAN_BITS, UnixNano};
 
     use super::*;
 
@@ -518,7 +518,6 @@ mod tests {
     /// pattern silently corrupted to a *different* NaN payload).
     #[test]
     fn metric_sample_row_preserves_the_stale_nan_bit_pattern_exactly() {
-        const STALE_NAN_BITS: u64 = 0x7FF0_0000_0000_0002;
         let point = MetricPoint {
             metric_name: Arc::from("up"),
             fingerprint: 1,
@@ -541,7 +540,6 @@ mod tests {
     /// convenience masking the hazard).
     #[test]
     fn metric_sample_row_spool_encoding_preserves_a_stale_nan_via_value_bits_as_a_string() {
-        const STALE_NAN_BITS: u64 = 0x7FF0_0000_0000_0002;
         let row = MetricSampleRow {
             metric_name: "up".to_string(),
             fingerprint: 1,

@@ -14,7 +14,7 @@ pub use fingerprint::{
     stream_fingerprint,
 };
 pub use labels::{LabelError, LabelSet};
-pub use sample::{LogSample, MetricSample, Series};
+pub use sample::{LogSample, MetricSample, STALE_NAN_BITS, Series};
 pub use time::{
     DEFAULT_ACTIVITY_BUCKET_MS, Date, Fingerprint, UnixMilli, UnixNano, floor_to_activity_bucket,
 };

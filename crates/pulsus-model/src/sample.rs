@@ -6,6 +6,18 @@
 use crate::labels::LabelSet;
 use crate::time::{Fingerprint, UnixMilli, UnixNano};
 
+/// Prometheus stale-NaN bit pattern, emitted for a data point flagged
+/// "no recorded value" (OTLP `DataPointFlags::NoRecordedValueMask`) or a
+/// Prometheus remote-write staleness marker — matches the OpenTelemetry
+/// collector's `prometheusremotewrite` exporter and Prometheus's own
+/// `staleness.go`. Lives here (not in `pulsus-write`) because both the
+/// OTLP metrics receiver (issue #27) and Prometheus remote write (issue
+/// #28) need the identical constant; a value stored as this exact bit
+/// pattern must survive every hop verbatim (`.to_bits()`, never
+/// `is_nan()` — NaN != NaN, and a bare "is it NaN" check would not catch
+/// a bit pattern silently corrupted to a *different* NaN payload).
+pub const STALE_NAN_BITS: u64 = 0x7FF0_0000_0000_0002;
+
 /// One metric data point: `(fingerprint, timestamp_ms, value)`. No string
 /// data on this hot path — a fingerprint's labels are resolved separately
 /// via [`Series`] (docs/architecture.md §2).
@@ -69,5 +81,11 @@ mod tests {
             labels: labels.clone(),
         };
         assert_eq!(series.labels, labels);
+    }
+
+    #[test]
+    fn stale_nan_bits_constant_is_a_quiet_nan_pattern() {
+        assert!(f64::from_bits(STALE_NAN_BITS).is_nan());
+        assert_eq!(STALE_NAN_BITS, 0x7FF0_0000_0000_0002);
     }
 }

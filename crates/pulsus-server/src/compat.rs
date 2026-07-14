@@ -57,6 +57,9 @@ mod tests {
             writer: Arc::new(crate::ingest::WriterSink::new(Arc::new(
                 std::sync::OnceLock::new(),
             ))),
+            metric_writer: Arc::new(crate::ingest::MetricWriterSink::new(Arc::new(
+                std::sync::OnceLock::new(),
+            ))),
         }
     }
 

@@ -57,22 +57,23 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ch_cityhash102 = "0.1"
 serde_json = "1"
 
-# OTLP logs receiver (issue #8). `opentelemetry-proto` supplies
-# `prost`-generated OTLP message types with the transport/tonic runtime
-# disabled (`default-features = false`, `gen-tonic-messages` + `logs`
-# only) — no protoc in CI, no gRPC transport pulled in for what is a pure
-# protobuf-decode + axum handler. Exact-pinned so a future
-# `opentelemetry-proto` release cannot silently change wire-compatible
-# message shapes underfoot; revisit vendoring only if version churn
-# becomes a real problem (open question #1, resolved by task-manager).
-# `bytes` and `prost` are `opentelemetry-proto`'s own message/codec types
-# and this crate's own request-body buffer. `flate2`/`snap`/`zstd` back
-# the hand-rolled gzip/snappy/zstd decompressors in
-# `pulsus-write::ingest::decompress` — tower-http's compression layer
-# covers gzip only, not snappy.
+# OTLP logs (issue #8) and metrics (issue #27) receivers. `opentelemetry-proto`
+# supplies `prost`-generated OTLP message types with the transport/tonic
+# runtime disabled (`default-features = false`, `gen-tonic-messages` +
+# `logs` + `metrics` only) — no protoc in CI, no gRPC transport pulled in
+# for what is a pure protobuf-decode + axum handler. Exact-pinned so a
+# future `opentelemetry-proto` release cannot silently change wire-
+# compatible message shapes underfoot; revisit vendoring only if version
+# churn becomes a real problem (open question #1, resolved by
+# task-manager). `bytes` and `prost` are `opentelemetry-proto`'s own
+# message/codec types and this crate's own request-body buffer.
+# `flate2`/`snap`/`zstd` back the hand-rolled gzip/snappy/zstd
+# decompressors in `pulsus-write::ingest::decompress` — tower-http's
+# compression layer covers gzip only, not snappy.
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = [
     "gen-tonic-messages",
     "logs",
+    "metrics",
 ] }
 prost = "0.14"
 bytes = "1"
