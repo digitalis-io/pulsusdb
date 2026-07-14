@@ -211,7 +211,25 @@ impl MetricsEngine {
         // below, which resolves the same selector through the identical
         // `LabelCache`/`SqlFallback` machinery — so the "historical variant
         // routes through metric_series" AC holds without special-casing.
-        if let Some(ca) = plan.cache_answerable() {
+        //
+        // Issue #40: `cache_answerable()` is structural only (necessary,
+        // not sufficient — see its own doc) and says nothing about whether
+        // this is an instant or a range query. It must additionally be
+        // gated on `plan_params.step_ms == 0` here: the label cache
+        // resolves series presence at activity-*bucket* granularity (1h),
+        // which cannot reproduce upstream's per-step 5-minute lookback — a
+        // series active only in the first 5 minutes of an hour-long bucket
+        // must be excluded from a later step's count, but the cache has no
+        // per-step resolution to see that. A range `count`/`group` query
+        // therefore falls through to the ordinary fetch+evaluate path
+        // below, which resolves the exact same selector but evaluates
+        // per-step with the real 5-minute lookback (`eval::staleness`) and
+        // naturally returns a `Matrix` (one value per step) instead of a
+        // `Vector` — no envelope special-casing needed, the normal
+        // `evaluate()`/`value_to_query_result` path already does this.
+        if plan_params.step_ms == 0
+            && let Some(ca) = plan.cache_answerable()
+        {
             let window = DataWindow {
                 start_ms: plan_params.start_ms,
                 end_ms: plan_params.end_ms,

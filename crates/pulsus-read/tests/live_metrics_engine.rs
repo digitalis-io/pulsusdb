@@ -520,6 +520,282 @@ async fn group_with_offset_routes_through_metric_series() {
     drop_database(&bootstrap, db).await;
 }
 
+/// Issue #40 regression (the #33 differential repro): `count by (service)
+/// (up)` over `/api/v1/query_range`-equivalent (`step_ms != 0`) must
+/// return a `Matrix` (one value per step), never a `Vector` — the
+/// cache-only fast path (correct only for instant queries, per the
+/// architect adjudication on #40) must not be taken here, so this must
+/// come back through the ordinary fetch+evaluate path, which naturally
+/// produces a per-step envelope with no special-casing.
+#[tokio::test]
+async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_range_count_matrix";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+    let step_ms = 60_000;
+    // 3 steps, both series present at every one of them — this test proves
+    // the envelope shape and per-step values are correct in the steady
+    // -state case; the non-constant-count (mid-window series start) case is
+    // covered at the evaluator level in `pulsus-promql`
+    // (`a_range_count_with_a_mid_window_series_start_has_non_constant_per_step_counts`),
+    // where the exact 5-minute-lookback boundary can be pinned without a
+    // live ClickHouse round trip.
+    let t0 = recent_bucket;
+    let t1 = t0 + step_ms;
+    let t2 = t0 + 2 * step_ms;
+
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 10,
+                unix_milli: recent_bucket,
+                labels: r#"{"service":"a"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 11,
+                unix_milli: recent_bucket,
+                labels: r#"{"service":"b"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 10,
+                unix_milli: t0,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 10,
+                unix_milli: t1,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 10,
+                unix_milli: t2,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 11,
+                unix_milli: t0,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 11,
+                unix_milli: t1,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 11,
+                unix_milli: t2,
+                value: 1.0,
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let expr = parse("count by (service) (up)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: t0,
+        end_ms: t2,
+        step_ms,
+    };
+    let result = engine.query(&expr, &params).await.expect("query");
+    match result {
+        QueryResult::Matrix(mut m) => {
+            // `by (service)` splits into one group per distinct `service`
+            // value — `a` and `b` each have exactly one series, so each
+            // group's per-step count is a constant `1.0`.
+            m.sort_by(|a, b| a.labels.cmp(&b.labels));
+            assert_eq!(m.len(), 2, "expected two service groups, got {m:?}");
+            assert_eq!(m[0].labels, vec![("service".to_string(), "a".to_string())]);
+            assert_eq!(
+                m[0].points,
+                vec![(t0, 1.0), (t1, 1.0), (t2, 1.0)],
+                "series `a` present at every step -> a constant per-step count of 1"
+            );
+            assert_eq!(m[1].labels, vec![("service".to_string(), "b".to_string())]);
+            assert_eq!(
+                m[1].points,
+                vec![(t0, 1.0), (t1, 1.0), (t2, 1.0)],
+                "series `b` present at every step -> a constant per-step count of 1"
+            );
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #40 routing assertions (guards the architect adjudication both
+/// directions on the *same* query/data): an **instant** `count by (...)
+/// (up)` still takes the zero-ClickHouse `cache_only` fast path and
+/// returns a `Vector` — the ratified #31 AC, which must not regress — while
+/// the identical selector as a **range** query takes the ordinary
+/// `sample_fetch` path and returns a `Matrix`.
+#[tokio::test]
+async fn count_by_service_routes_cache_only_for_instant_and_sample_fetch_for_range() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_range_count_routing";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+    let step_ms = 60_000;
+    let t0 = recent_bucket;
+    let t1 = t0 + step_ms;
+
+    // metric_series only — `metric_samples` is left empty, mirroring the
+    // zero-ClickHouse-sample-queries proof-by-construction the original
+    // cache-only test uses: the instant leg below can only produce a
+    // correct, non-empty answer if it truly never touches `metric_samples`.
+    // The range leg, in contrast, *needs* real samples (it must fall
+    // through to the fetch path) — seeded separately, after the instant
+    // assertion, so the instant leg's zero-ClickHouse-sample-queries proof
+    // stays airtight.
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "up".to_string(),
+            fingerprint: 20,
+            unix_milli: recent_bucket,
+            labels: r#"{"service":"a"}"#.to_string(),
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let expr = parse("count by (service) (up)").expect("parse");
+
+    // --- instant leg: cache_only, Vector, zero sample queries ---
+    let instant_params = MetricQueryParams {
+        start_ms: t0,
+        end_ms: t0,
+        step_ms: 0,
+    };
+    let (instant_result, instant_explain) = engine
+        .query_explained(&expr, &instant_params)
+        .await
+        .expect("instant query_explained");
+    stage(&instant_explain, "cache_only");
+    assert!(
+        instant_explain
+            .stages
+            .iter()
+            .all(|s| s.name != "sample_fetch"),
+        "instant query must not take the sample_fetch path: {:#?}",
+        instant_explain.stages
+    );
+    match instant_result {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].value, 1.0);
+        }
+        other => panic!("expected Vector for the instant leg, got {other:?}"),
+    }
+
+    // --- range leg: sample_fetch, Matrix ---
+    seed_samples(
+        &client,
+        &[
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 20,
+                unix_milli: t0,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "up".to_string(),
+                fingerprint: 20,
+                unix_milli: t1,
+                value: 1.0,
+            },
+        ],
+    )
+    .await;
+    let range_params = MetricQueryParams {
+        start_ms: t0,
+        end_ms: t1,
+        step_ms,
+    };
+    let (range_result, range_explain) = engine
+        .query_explained(&expr, &range_params)
+        .await
+        .expect("range query_explained");
+    stage(&range_explain, "sample_fetch");
+    assert!(
+        range_explain.stages.iter().all(|s| s.name != "cache_only"),
+        "range query must not take the cache_only path: {:#?}",
+        range_explain.stages
+    );
+    match range_result {
+        QueryResult::Matrix(m) => {
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0].points, vec![(t0, 1.0), (t1, 1.0)]);
+        }
+        other => panic!("expected Matrix for the range leg, got {other:?}"),
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
 /// Ratified concurrency contract (issue #31 plan amendment §2): every
 /// selector's fetch is issued before any of them completes. Proven by an
 /// A/B timing comparison that cancels out everything *except* fetch

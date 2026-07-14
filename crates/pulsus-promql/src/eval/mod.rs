@@ -574,6 +574,53 @@ mod tests {
         }
     }
 
+    /// Issue #40 (architect adjudication's semantics guard): a range
+    /// `count(...)` must evaluate **per step** with the real 5-minute
+    /// staleness lookback — a series that starts mid-window changes the
+    /// count from that step onward, never a constant repeated across every
+    /// step. This is exactly the case the label-cache-only fast path
+    /// cannot see (the cache only knows "active somewhere in an hour-long
+    /// bucket", not "had a sample within 5 minutes of *this* step"), which
+    /// is why #40 gates that fast path to instant queries only
+    /// (`pulsus-read`'s `MetricsEngine::query_inner`) and routes every
+    /// range `count`/`group` through this ordinary per-step evaluate path
+    /// instead.
+    #[test]
+    fn a_range_count_with_a_mid_window_series_start_has_non_constant_per_step_counts() {
+        let expr = crate::parser::parse("count(up)").unwrap();
+        // 3 steps, spaced exactly one lookback (5m) apart: t=0, t=300_000,
+        // t=600_000.
+        let p = plan(&expr, params(0, 600_000, 300_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                // Series A: present at every step.
+                series(
+                    1,
+                    &[("job", "a")],
+                    vec![s(0, 1.0), s(300_000, 1.0), s(600_000, 1.0)],
+                ),
+                // Series B: first sample lands mid-window (t=300_000) — at
+                // t=0 its lookback window `(-300_000, 0]` has no sample of
+                // B in it, so it is correctly absent from that step alone.
+                series(2, &[("job", "b")], vec![s(300_000, 1.0), s(600_000, 1.0)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "count(...) with no grouping is one series");
+                assert_eq!(
+                    m[0].points,
+                    vec![(0, 1.0), (300_000, 2.0), (600_000, 2.0)],
+                    "count must be 1 before series B starts and 2 from its first sample onward \
+                     — never a constant 2 repeated across every step"
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
     #[test]
     fn offset_shifts_the_effective_lookup_time() {
         let expr = crate::parser::parse("up offset 1m").unwrap();

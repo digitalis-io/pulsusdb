@@ -214,6 +214,22 @@ pub enum PlanExpr {
 /// from the label cache with zero ClickHouse queries when the eval window
 /// is inside the cache window (checked by the caller, `pulsus-read`'s
 /// `MetricsEngine` — this crate has no notion of a cache window).
+///
+/// **Necessary, not sufficient (issue #40 architect adjudication).** This
+/// predicate is purely structural — `AggOp::Count`/`Group` directly over a
+/// bare selector, no range, no offset — and says nothing about whether the
+/// *query* is instant or ranged over multiple steps. It is **not** valid
+/// for a range (`step_ms != 0`) query: the label cache resolves
+/// `fingerprint -> labels` at activity-*bucket* granularity
+/// (`DEFAULT_ACTIVITY_BUCKET_MS`, 1h), which cannot reproduce upstream's
+/// per-step 5-minute lookback (a series active only in the first 5 minutes
+/// of an hour-long bucket must NOT be counted at a step 45 minutes later,
+/// but the cache has no per-step resolution to see that). The caller
+/// (`pulsus-read`'s `MetricsEngine::query_inner`) is responsible for
+/// additionally gating on `self.params.step_ms == 0` before taking the
+/// cache-only path — this crate's `QueryPlan` has no way to enforce that
+/// itself, since [`QueryPlan::cache_answerable`] does not (and should not)
+/// know how the caller intends to use its answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheAnswerable {
     pub op: AggOp,
@@ -231,7 +247,10 @@ pub struct QueryPlan {
 }
 
 impl QueryPlan {
-    /// See [`CacheAnswerable`]'s doc.
+    /// See [`CacheAnswerable`]'s doc — **necessary, not sufficient**: a
+    /// range (`step_ms != 0`) query must never take the cache-only path
+    /// even when this returns `Some`. Callers gate on `self.params.step_ms
+    /// == 0` themselves (`pulsus-read`'s `MetricsEngine::query_inner`).
     pub fn cache_answerable(&self) -> Option<CacheAnswerable> {
         let PlanExpr::Aggregate {
             op,
