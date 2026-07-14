@@ -948,6 +948,20 @@ fn shard_local_log_samples_count(compose: &Compose, shard_service: &str) -> Resu
 /// distinct from `ctx.base_url` (pulsusdb's `:3100`), so this scenario
 /// builds its own client/URL rather than using `Ctx::url`.
 const GRAFANA_BASE_URL: &str = "http://127.0.0.1:3000";
+/// Grafana readiness poll bounds (CI regression fix: the harness's own
+/// `/ready` poll — `harness::READY_POLL_TIMEOUT`/`READY_POLL_INTERVAL` —
+/// only covers `pulsusdb`; nothing previously waited for the separate
+/// `grafana` container to finish booting before this scenario's first
+/// `/api/ds/query` call, so a slow-starting Grafana on a loaded CI runner
+/// hit "connection reset" a few seconds after `compose up`). Matches
+/// `harness::READY_POLL_TIMEOUT`'s magnitude (90s) — consistent with the
+/// rest of the harness's poll-until discipline.
+const GRAFANA_READY_POLL_TIMEOUT: Duration = Duration::from_secs(90);
+const GRAFANA_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// The provisioned Loki datasource's fixed `uid`
+/// (`deploy/e2e/grafana/provisioning/datasources/loki.yaml`) — shared
+/// between the readiness probe below and the query request body.
+const GRAFANA_LOKI_DATASOURCE_UID: &str = "pulsus-loki";
 
 /// M1 log-query compat alias check via a real Loki datasource (issue #14,
 /// docs/api.md §8.1; task-manager-approved option A on the architect
@@ -966,8 +980,21 @@ const GRAFANA_BASE_URL: &str = "http://127.0.0.1:3000";
 /// the time this runs — the selector below (`{service_name="checkout"}`)
 /// is chosen to match it, so a well-formed *but empty* envelope is now a
 /// failure, not the expected M0/M1-pre-ingest state.
+///
+/// **Grafana readiness (CI regression fix, issue #15):** unlike
+/// `pulsusdb` (gated by `harness::wait_ready` before any scenario runs),
+/// nothing previously waited for the separate `grafana` container to
+/// finish booting — a slow-starting Grafana on a loaded CI runner hit
+/// "connection reset by peer" seconds after `compose up`, since this was
+/// the very first request this scenario (or any scenario) ever sent it.
+/// [`wait_for_grafana_ready`] polls `/api/health` (process up) and then
+/// the specific `pulsus-loki` datasource's own endpoint (config
+/// provisioning applied — Grafana provisions datasources asynchronously
+/// after `/api/health` already reports healthy) before the first
+/// `/api/ds/query` call below.
 async fn grafana_loki_compat(_ctx: &Ctx) -> Result<()> {
     let http = reqwest::Client::new();
+    wait_for_grafana_ready(&http).await?;
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -978,7 +1005,7 @@ async fn grafana_loki_compat(_ctx: &Ctx) -> Result<()> {
     let request_body = serde_json::json!({
         "queries": [{
             "refId": "A",
-            "datasource": { "type": "loki", "uid": "pulsus-loki" },
+            "datasource": { "type": "loki", "uid": GRAFANA_LOKI_DATASOURCE_UID },
             "expr": r#"{service_name="checkout"}"#,
             "queryType": "range",
             "maxLines": 100,
@@ -1022,6 +1049,48 @@ async fn grafana_loki_compat(_ctx: &Ctx) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Poll-until-visible for Grafana itself (CI regression fix, issue #15):
+/// first `/api/health` (the process is up and answering HTTP at all),
+/// then the specific `pulsus-loki` datasource's own endpoint (config
+/// provisioning has applied — this can lag `/api/health` by a beat, since
+/// Grafana provisions datasources from disk during startup rather than
+/// before opening its listener). Both stages tolerate connection errors
+/// (`Ok(None)` on any request failure, not just a non-2xx status) — a
+/// listener that is not yet accepting connections must retry exactly like
+/// a non-2xx response, not abort the poll early.
+async fn wait_for_grafana_ready(http: &reqwest::Client) -> Result<()> {
+    poll_until(
+        GRAFANA_READY_POLL_TIMEOUT,
+        GRAFANA_READY_POLL_INTERVAL,
+        || grafana_get_ok(http, "/api/health"),
+    )
+    .await
+    .context("grafana /api/health never returned 200")?;
+
+    let datasource_path = format!("/api/datasources/uid/{GRAFANA_LOKI_DATASOURCE_UID}");
+    poll_until(
+        GRAFANA_READY_POLL_TIMEOUT,
+        GRAFANA_READY_POLL_INTERVAL,
+        || grafana_get_ok(http, &datasource_path),
+    )
+    .await
+    .context("grafana's pulsus-loki datasource was never provisioned")?;
+
+    Ok(())
+}
+
+/// One `GET {GRAFANA_BASE_URL}{path}` attempt: `Ok(Some(()))` on any 2xx,
+/// `Ok(None)` otherwise (including connection failures — see
+/// [`wait_for_grafana_ready`]'s doc comment) — the [`poll_until`]
+/// condition both of its stages share.
+async fn grafana_get_ok(http: &reqwest::Client, path: &str) -> Result<Option<()>> {
+    let outcome = http.get(format!("{GRAFANA_BASE_URL}{path}")).send().await;
+    Ok(match outcome {
+        Ok(res) if res.status().is_success() => Some(()),
+        _ => None,
+    })
 }
 
 fn load_fixture_fields(path: &Path) -> Result<Vec<String>> {

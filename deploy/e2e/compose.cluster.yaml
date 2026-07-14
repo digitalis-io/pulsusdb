@@ -17,7 +17,13 @@
 # Used by `cargo run -p pulsus-e2e -- --variant cluster`; driven directly:
 #   podman-compose -f ci/clickhouse-cluster/compose.yaml -f deploy/e2e/compose.cluster.yaml -p pulsus-e2e-cluster up -d
 #   # or: docker compose -f ci/clickhouse-cluster/compose.yaml -f deploy/e2e/compose.cluster.yaml -p pulsus-e2e-cluster up -d
-version: "3.8"
+#
+# No top-level `version:` key — Compose Specification, not the legacy
+# versioned schema (both Docker and Podman Compose warn "the attribute
+# `version` is obsolete" when it's present; this was pure CI log noise).
+# NOTE: `ci/clickhouse-cluster/compose.yaml` (the other `-f` file above,
+# owned by issue #5) still carries one — out of this fix's scope, left for
+# a follow-up.
 
 services:
   pulsusdb:

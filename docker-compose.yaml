@@ -8,7 +8,11 @@
 # Bring up:
 #   podman-compose up -d
 #   # or: docker compose up -d
-version: "3.8"
+#
+# No top-level `version:` key (Compose Specification, not the legacy
+# versioned schema — matches docs/configuration.md §10's canonical YAML
+# verbatim, and modern Docker/Podman Compose both warn "the attribute
+# `version` is obsolete" when it's present).
 
 services:
   clickhouse:

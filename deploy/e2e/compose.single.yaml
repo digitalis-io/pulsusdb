@@ -16,7 +16,10 @@
 # Used by `cargo run -p pulsus-e2e -- --variant single`; driven directly:
 #   podman-compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -p pulsus-e2e-single up -d
 #   # or: docker compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -p pulsus-e2e-single up -d
-version: "3.8"
+#
+# No top-level `version:` key — Compose Specification, not the legacy
+# versioned schema (both Docker and Podman Compose warn "the attribute
+# `version` is obsolete" when it's present; this was pure CI log noise).
 
 networks:
   pulsus-e2e-single:
