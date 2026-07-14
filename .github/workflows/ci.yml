@@ -105,6 +105,75 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test ingest_fidelity
 
+      # Live API/engine suites — every env-gated suite runs here; new issues
+      # must wire theirs in. Each test self-isolates via its own throwaway
+      # database (`DROP DATABASE IF EXISTS` + a unique `pulsus_*_it_*` name)
+      # or, for live_cityhash/live_intdiv/live_clickhouse, read-only queries
+      # against the bare image's pre-created `default` database — none of
+      # them touch the `pulsus` database `--mode init` uses below.
+      - name: Live ClickHouse client suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-clickhouse --test live_clickhouse
+
+      - name: Live cityHash64 fixture cross-check
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-model --test live_cityhash
+
+      - name: Live intDiv activity-bucket cross-check
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-model --test live_intdiv
+
+      - name: Live metrics cache suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_cache
+
+      - name: Live metrics engine suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test live_metrics_engine
+
+      - name: Rollup differential suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test rollup_differential
+
+      - name: Series stream cap suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test series_stream_cap
+
+      - name: Live metric writer suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_metric_writer
+
+      # Spawns the real `pulsusdb` binary against this job's ClickHouse
+      # container (fixed loopback ports 31100-31117, distinct from any
+      # other port this job uses) to drive it over HTTP end-to-end.
+      - name: Live server smoke test (/ready, /metrics, /config, /buildinfo)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test live_server
+
+      - name: Live logs API suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test logs_api_live
+
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
 
