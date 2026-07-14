@@ -31,4 +31,3 @@ xtask/docker/certs/
 # directory, per `writer::config::WriterRuntime`'s documented constant.
 /spool/
 crates/pulsus-write/spool/
-CODEREVIEWER.md
