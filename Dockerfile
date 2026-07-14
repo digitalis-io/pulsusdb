@@ -8,12 +8,37 @@
 # no image is published to a registry from here (out of scope — tracked
 # separately for the M7 release job).
 #
+# The build stage is split via cargo-chef into a `planner` stage that
+# computes a dependency-only recipe from the workspace manifests, and a
+# `build` stage that first `cargo chef cook`s just that recipe — a layer
+# keyed only on Cargo.toml/Cargo.lock/rust-toolchain.toml, so it is skipped
+# whenever a commit only touches application source — before copying in the
+# full source and building the release binary. Combined with the buildx
+# `type=gha` layer cache used in CI, this means dependency compilation is
+# cached across commits instead of being redone on every image build.
+#
 # Build:
 #   podman build -t pulsusdb:e2e .
 #   # or: docker build -t pulsusdb:e2e .
 
-FROM docker.io/library/rust:1.93-bookworm AS build
+FROM docker.io/library/rust:1.93-bookworm AS planner
+RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM docker.io/library/rust:1.93-bookworm AS build
+RUN cargo install cargo-chef --locked --version 0.1.77
+WORKDIR /src
+COPY --from=planner /src/recipe.json recipe.json
+# rust-toolchain.toml pins an exact patch (1.93.0) that the `rust:1.93-bookworm`
+# tag does not always match byte-for-byte (it tracks the latest 1.93.x patch).
+# Copying it in before `cook` makes cook build the dependency graph with the
+# same rustc used by the final `cargo build` below; without it, cook and the
+# final build silently used different rustc versions and every dependency
+# fingerprint (and thus the whole point of this cache layer) was invalidated.
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p pulsus-server --bin pulsusdb
 
