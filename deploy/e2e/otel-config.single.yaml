@@ -9,9 +9,19 @@
 # metrics/traces ingest routes yet (M2/M4), so those pipelines would 404
 # against it on every export attempt and spam the collector's own log —
 # trimmed until the milestones that add them land.
+#
+# Explicit `0.0.0.0` binds (CI regression fix, issue #15): modern
+# `otel-collector-contrib` defaults the `otlp` receiver's `grpc`/`http`
+# endpoints to `localhost:4317`/`localhost:4318` *inside the container*
+# when no `endpoint` is given — reachable from another container sharing
+# its network namespace, but not through a published Docker/Podman port
+# (which connects to the container's external interface, not loopback).
+# The harness's `logs_roundtrip` scenario pushes fixtures through exactly
+# that published port (`deploy/e2e/compose.single.yaml`'s `4318:4318`),
+# so the bind must be explicit.
 receivers:
   otlp:
-    protocols: { grpc: {}, http: {} }
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
 exporters:
   otlphttp:

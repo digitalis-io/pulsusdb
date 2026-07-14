@@ -7,9 +7,15 @@
 #
 # logs-only pipeline (issue #15 architect plan) — see
 # otel-config.single.yaml's identical note.
+#
+# Explicit `0.0.0.0` binds (CI regression fix, issue #15) — see
+# otel-config.single.yaml's identical note: modern `otel-collector-contrib`
+# otherwise defaults the `otlp` receiver to `localhost`-only endpoints
+# inside the container, unreachable through the published port
+# (`deploy/e2e/compose.cluster.yaml`'s `4318:4318`) the harness uses.
 receivers:
   otlp:
-    protocols: { grpc: {}, http: {} }
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
 exporters:
   otlphttp:

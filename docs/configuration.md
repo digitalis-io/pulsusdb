@@ -214,7 +214,7 @@ volumes:
 ```yaml
 receivers:
   otlp:
-    protocols: { grpc: {}, http: {} }
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
 exporters:
   otlphttp:

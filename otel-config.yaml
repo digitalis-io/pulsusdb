@@ -1,9 +1,17 @@
 # PulsusDB quickstart (docs/configuration.md §10) — the collector receives
 # OTLP from your applications and pushes everything to PulsusDB. Verbatim
 # mirror of the doc's YAML; mounted read-only by `docker-compose.yaml`.
+#
+# Explicit `0.0.0.0` binds (CI regression fix, issue #15): modern
+# `otel-collector-contrib` defaults the `otlp` receiver's `grpc`/`http`
+# endpoints to `localhost`-only inside the container when no `endpoint` is
+# given — unreachable through `docker-compose.yaml`'s published
+# `4317:4317`/`4318:4318` ports (a published port reaches the container's
+# external interface, not its loopback), so a caller pushing OTLP from the
+# host per this doc's own quickstart would hit a refused/reset connection.
 receivers:
   otlp:
-    protocols: { grpc: {}, http: {} }
+    protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
 
 exporters:
   otlphttp:
