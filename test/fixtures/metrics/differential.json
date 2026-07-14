@@ -1,0 +1,70 @@
+{
+  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan).",
+  "seed": 424242,
+  "step_ms": 15000,
+  "sample_count": 40,
+  "histogram_bounds": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0],
+  "ci": {
+    "services": 5,
+    "gauge_instances": 23,
+    "gauge_slots": 3,
+    "counter_instances": 68,
+    "histogram_instances": 6
+  },
+  "full": {
+    "services": 5,
+    "gauge_instances": 225,
+    "gauge_slots": 3,
+    "counter_instances": 680,
+    "histogram_instances": 58
+  },
+  "query_matrix": [
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service!=\"svc-3\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=~\"svc-(1|2)\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",instance!~\"inst-0.*\"}", "modes": ["instant", "range"] },
+
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} offset 1m", "modes": ["instant", "range"] },
+
+    { "expr": "rate(requests_total{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"] },
+    { "expr": "irate(requests_total{run_id=\"{R}\"}[1m])", "modes": ["instant", "range"] },
+    { "expr": "increase(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "delta(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+
+    { "expr": "avg_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "min_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "sum_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "count_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+
+    { "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
+    { "expr": "avg without(instance)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "min by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "max by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "count by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "topk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"] },
+    { "expr": "bottomk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"] },
+
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * 2", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} > bool 5e8", "modes": ["instant", "range"] },
+    {
+      "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])) + on(service) sum by(service)(rate(requests_total{run_id=\"{R}\"}[5m]))",
+      "modes": ["instant", "range"]
+    },
+    {
+      "_comment": "matching-drop case (architect plan §6, substituting this corpus's own `slot` dimension for the plan's illustrative `method` label — the corpus has no `method` label; deviation noted in the issue #33 implementation notes): left selects every instance at slot-0 for svc-1, right pins a single instance at slot-1 — `ignoring(slot)` matches on (service,instance), so every left-side series without a slot-1 counterpart at the *same* instance is silently dropped from the output, leaving exactly one result series.",
+      "expr": "mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\",slot=\"slot-0\"} + ignoring(slot) mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\",slot=\"slot-1\",instance=\"inst-000\"}",
+      "modes": ["instant", "range"]
+    },
+
+    {
+      "expr": "histogram_quantile(0.9, sum by(le)(rate(request_duration_seconds_bucket{run_id=\"{R}\"}[5m])))",
+      "modes": ["instant", "range"]
+    },
+    {
+      "expr": "histogram_quantile(0.5, rate(request_duration_seconds_bucket{run_id=\"{R}\",service=\"svc-3\"}[5m]))",
+      "modes": ["instant", "range"]
+    }
+  ]
+}

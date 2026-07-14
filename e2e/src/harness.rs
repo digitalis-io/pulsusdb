@@ -23,8 +23,11 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Service names dumped on failure — present under these exact names in
-/// both variants' overlays.
-const DIAGNOSTIC_SERVICES: &[&str] = &["pulsusdb", "otel-collector"];
+/// both variants' overlays. `prometheus` (issue #33): the reference
+/// backend the `metrics_differential` scenario diffs against — present
+/// under this name in both `deploy/e2e/compose.{single,cluster}.yaml`, so
+/// a failed differential run dumps its logs alongside `pulsusdb`'s own.
+const DIAGNOSTIC_SERVICES: &[&str] = &["pulsusdb", "otel-collector", "prometheus"];
 /// Extra services dumped on the cluster leg only (issue #15): the 2-shard
 /// ClickHouse containers `ci/clickhouse-cluster/compose.yaml` defines,
 /// absent from the single-node variant.
@@ -51,6 +54,13 @@ pub struct RunOptions {
     /// (`deploy/e2e/compose.{single,cluster}.yaml`, `:4318`), so this is a
     /// fixed value like `base_url`, not derived per-variant.
     pub collector_url: String,
+    /// The reference Prometheus's published base URL (issue #33 architect
+    /// plan, task-manager resolution #4: "threaded through
+    /// `RunOptions`/`Ctx`, mirrors `collector_url`") — both compose
+    /// variants publish the same host port
+    /// (`deploy/e2e/compose.{single,cluster}.yaml`, `:9090`), so this is
+    /// fixed like `collector_url`, not derived per-variant.
+    pub prometheus_url: String,
 }
 
 /// The `-f` file list + project name for one variant (architect plan:
@@ -112,6 +122,7 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         http,
         base_url: opts.base_url.clone(),
         collector_url: opts.collector_url.clone(),
+        prometheus_url: opts.prometheus_url.clone(),
         variant: opts.variant,
         fixtures_dir: workspace_root().join("test/fixtures"),
         compose: compose.clone(),

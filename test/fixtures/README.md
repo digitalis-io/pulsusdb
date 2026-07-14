@@ -32,3 +32,12 @@ scenario registered for `<v>` automatically.
   never a fixed past date, so the fixture stays inside
   `PULSUS_RETENTION_DAYS` and the query window brackets it regardless of
   when the suite runs.
+- `metrics/differential.json` — the M2 differential-accuracy corpus/query-
+  matrix fixture (issue #33, `e2e/src/corpus.rs` + `e2e/src/metrics.rs`'s
+  `metrics_differential` scenario): a `seed`/`step_ms`/`sample_count`/
+  `histogram_bounds` shared by both tiers, per-family series counts for
+  the `ci` (~1k series, gates every PR) and `full` (~10k series, the
+  docs/features.md §7 acceptance criterion) tiers, and the pinned
+  `query_matrix` (`{R}` substituted with the run's `run_id` at execution
+  time) every entry runs in `instant` and/or `range` mode against both
+  PulsusDB and a reference Prometheus.

@@ -5,10 +5,10 @@
 # static-IP network is that no inter-container hostname resolution is
 # required, and that must hold for the collector's outbound target too.
 #
-# logs-only pipeline (issue #15 architect plan): `pulsusdb` mounts no
-# metrics/traces ingest routes yet (M2/M4), so those pipelines would 404
-# against it on every export attempt and spam the collector's own log —
-# trimmed until the milestones that add them land.
+# logs + metrics pipelines (issue #15/#33): `pulsusdb` mounts no traces/
+# profiles ingest routes yet (M4/M5), so those pipelines would 404 against
+# it on every export attempt and spam the collector's own log — trimmed
+# until the milestones that add them land.
 #
 # Explicit `0.0.0.0` binds (CI regression fix, issue #15): modern
 # `otel-collector-contrib` defaults the `otlp` receiver's `grpc`/`http`
@@ -16,9 +16,10 @@
 # when no `endpoint` is given — reachable from another container sharing
 # its network namespace, but not through a published Docker/Podman port
 # (which connects to the container's external interface, not loopback).
-# The harness's `logs_roundtrip` scenario pushes fixtures through exactly
-# that published port (`deploy/e2e/compose.single.yaml`'s `4318:4318`),
-# so the bind must be explicit.
+# The harness's `logs_roundtrip`/`metrics_differential` scenarios push
+# fixtures through exactly that published port
+# (`deploy/e2e/compose.single.yaml`'s `4318:4318`), so the bind must be
+# explicit.
 receivers:
   otlp:
     protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
@@ -26,8 +27,25 @@ receivers:
 exporters:
   otlphttp:
     endpoint: http://172.29.0.11:3100
+  # The M2 differential-accuracy scenario's whole validity (issue #33
+  # architect plan) rests on both exporters below being **identical**
+  # except for their `endpoint` — a single OTLP→PRW conversion fanning out
+  # to two independently-queued/retried `prometheusremotewrite` exporters,
+  # never OTLP-to-one + PRW-to-the-other (which would risk labeling/suffix/
+  # temporality skew and invalidate the differential). `add_metric_suffixes:
+  # false` keeps metric names identical on both sides (no collector-side
+  # unit-suffix rewriting); identifying labels travel as OTLP datapoint
+  # attributes (`e2e/src/corpus.rs`), not resource attributes, so no
+  # `resource_to_telemetry_conversion` setting is needed either.
+  prometheusremotewrite/pulsus:
+    endpoint: http://172.29.0.11:3100/api/v1/write
+    add_metric_suffixes: false
+  prometheusremotewrite/prom:
+    endpoint: http://172.29.0.14:9090/api/v1/write
+    add_metric_suffixes: false
 
 service:
   pipelines:
     logs: { receivers: [otlp], exporters: [otlphttp] }
-    # metrics/traces/profiles pipelines land with their own milestones (M2/M4/M5)
+    metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus, prometheusremotewrite/prom] }
+    # traces/profiles pipelines land with their own milestones (M4/M5)

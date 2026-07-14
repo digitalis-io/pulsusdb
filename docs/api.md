@@ -173,6 +173,8 @@ GET|POST /api/v1/query_exemplars           (empty-success stub in v1)
 
 `__name__` is always present in labels responses. Metadata is sourced from `metric_metadata` (populated from remote-write metadata and OTLP).
 
+For a historical window (outside the resident label cache's `PULSUS_CACHE_WINDOW`), `/series`, `/labels`, and `/label/{name}/values` resolve from `metric_series` with bucket-floored bounds (docs/schemas.md §2.1) — their result is the **bucket-granularity active set**, a documented, bounded superset of Prometheus's exact-sample-window set (never a subset — over-inclusion is bounded by the activity-bucket size, and it is never a false empty).
+
 ### 3.4 Status
 
 ```

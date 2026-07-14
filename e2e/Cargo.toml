@@ -28,3 +28,12 @@ serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# issue #33: the StaleNaN micro-case builds a raw `prompb.WriteRequest`
+# directly (bypassing the collector, by design — see `metrics.rs`'s doc
+# comment) and pushes it snappy-compressed to both `/api/v1/write`
+# endpoints, mirroring `pulsus-write::protocols::remote_write`'s own
+# hand-rolled prompb structs/wire encoding (no protoc/build-dep, matching
+# that module's own rationale) — new to this crate, flagged in the issue
+# #33 implementation notes.
+prost.workspace = true
+snap.workspace = true

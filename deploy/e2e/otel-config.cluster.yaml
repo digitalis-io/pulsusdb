@@ -5,8 +5,8 @@
 # static-IP network is that no inter-container hostname resolution is
 # required, and that must hold for the collector's outbound target too.
 #
-# logs-only pipeline (issue #15 architect plan) — see
-# otel-config.single.yaml's identical note.
+# logs + metrics pipelines (issue #15/#33) — see
+# otel-config.single.yaml's identical notes on both.
 #
 # Explicit `0.0.0.0` binds (CI regression fix, issue #15) — see
 # otel-config.single.yaml's identical note: modern `otel-collector-contrib`
@@ -20,8 +20,17 @@ receivers:
 exporters:
   otlphttp:
     endpoint: http://172.28.0.20:3100
+  # Identical to `otel-config.single.yaml`'s pair except for `endpoint` —
+  # see that file's doc comment for why this identity is load-bearing.
+  prometheusremotewrite/pulsus:
+    endpoint: http://172.28.0.20:3100/api/v1/write
+    add_metric_suffixes: false
+  prometheusremotewrite/prom:
+    endpoint: http://172.28.0.22:9090/api/v1/write
+    add_metric_suffixes: false
 
 service:
   pipelines:
     logs: { receivers: [otlp], exporters: [otlphttp] }
-    # metrics/traces/profiles pipelines land with their own milestones (M2/M4/M5)
+    metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus, prometheusremotewrite/prom] }
+    # traces/profiles pipelines land with their own milestones (M4/M5)

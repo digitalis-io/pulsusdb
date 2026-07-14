@@ -9,6 +9,16 @@ on:
   # single-node (`schema-it`); the 4-shard leg is evidence-gathering, not
   # per-PR protection (task-manager resolution #4 on issue #16).
   workflow_dispatch:
+  # Issue #33 amendment: keeps the literal docs/features.md §7 "10k
+  # series" acceptance criterion continuously validated after #33's own
+  # closure evidence (a green `e2e-metrics-full` run, both variants) —
+  # per-PR CI continues to gate at the `ci` (~1k series) tier inside
+  # `e2e-single`/`e2e-cluster` below; correctness is scale-invariant, so
+  # the nightly/dispatch-only full tier is evidence-gathering, not per-PR
+  # protection (same "PR gate vs. nightly reference profile" split as
+  # issue #16's `bench-cluster`).
+  schedule:
+    - cron: "17 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -288,7 +298,10 @@ jobs:
   # image once via buildx (GHA layer cache, so the image build itself is
   # fast on both legs) then hand the whole stack lifecycle — up, poll
   # `/ready`, run scenarios, down — to `pulsus-e2e`, the same binary local
-  # development runs against Podman.
+  # development runs against Podman. Since issue #33, this also gates the
+  # M2 differential-accuracy scenario at its `ci` (~1k series) tier
+  # (`PULSUS_E2E_METRICS_SCALE` defaults to `ci` — `e2e/src/metrics.rs`);
+  # the ~10k `full` tier is `e2e-metrics-full` below.
   e2e-single:
     needs: ci
     runs-on: ubuntu-latest
@@ -318,6 +331,19 @@ jobs:
       - name: Run the single-node e2e harness
         run: cargo run -p pulsus-e2e -- --variant single --engine docker
 
+      # Issue #33: the metrics-differential scenario dumps a minimal repro
+      # (query, mode, window, both raw responses) to
+      # `target/e2e-artifacts/metrics-diff/<variant>/` on any mismatch —
+      # never an allowlist (docs/features.md §7 AC). Uploaded only on
+      # failure so a green run carries no extra CI artifact weight.
+      - name: Upload metrics-differential mismatch artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-single-metrics-diff-artifacts
+          path: target/e2e-artifacts/**
+          if-no-files-found: ignore
+
   e2e-cluster:
     needs: ci
     runs-on: ubuntu-latest
@@ -346,6 +372,62 @@ jobs:
 
       - name: Run the 2-shard cluster e2e harness
         run: cargo run -p pulsus-e2e -- --variant cluster --engine docker
+
+      - name: Upload metrics-differential mismatch artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-cluster-metrics-diff-artifacts
+          path: target/e2e-artifacts/**
+          if-no-files-found: ignore
+
+  # Issue #33: the literal docs/features.md §7 "10k series" acceptance
+  # criterion — a green run of both variants at the `full` tier is #33's
+  # own closure evidence, then continuously re-validated nightly/on
+  # dispatch (the `ci` tier above gates every PR; correctness is
+  # scale-invariant, so this leg is evidence-gathering, not per-PR
+  # protection — same split as issue #16's `bench-cluster`).
+  e2e-metrics-full:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    needs: ci
+    strategy:
+      matrix:
+        variant: [single, cluster]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build pulsusdb:e2e
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: pulsusdb:e2e
+          load: true
+          cache-from: type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-e2e
+
+      - name: Run the ${{ matrix.variant }} e2e harness (full 10k-series differential tier)
+        env:
+          PULSUS_E2E_METRICS_SCALE: full
+        run: cargo run -p pulsus-e2e -- --variant ${{ matrix.variant }} --engine docker
+
+      - name: Upload metrics-differential evidence/mismatch artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-metrics-full-${{ matrix.variant }}-artifacts
+          path: target/e2e-artifacts/**
+          if-no-files-found: ignore
 
   # Issue #16, docs/schemas.md §9's two-tier model, Tier 1 distributed leg:
   # captures per-shard system.query_log + EXPLAIN PIPELINE evidence for the

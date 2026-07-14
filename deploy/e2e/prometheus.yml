@@ -1,0 +1,27 @@
+# Reference Prometheus config for the M2 differential-accuracy e2e
+# scenario (issue #33 architect plan, `e2e/src/metrics.rs`'s
+# `metrics_differential`): this Prometheus never scrapes anything of its
+# own — it exists solely as the collector's second `prometheusremotewrite`
+# exporter target, receiving the exact same OTLP-derived corpus PulsusDB
+# does (`deploy/e2e/otel-config.{single,cluster}.yaml`), so the two can be
+# queried side by side and diffed.
+#
+# Image: `prom/prometheus:v3.13.0` — the same tag `#32`'s golden fixtures
+# were captured from (`crates/pulsus-server/tests/fixtures/prom_api/
+# PROVENANCE.md`, digest `sha256:0e698e35e50d1ddc2d11a4a55b089fe62eb71358a5c204dfafd21bdf8ffe04b8`
+# at capture time). Not digest-pinned here: this scenario compares live
+# against whatever image the tag currently resolves to (that comparison
+# *is* the differential — it never depends on #32's captured bytes), so a
+# tag-mutation drift from #32's capture-time digest is expected/benign,
+# not a correctness risk for this scenario.
+#
+# No alerting/rules — out of scope (architect plan: "No alerting/rules").
+# `--web.enable-remote-write-receiver` (set in each compose variant's
+# `command:`, not here) is what makes `POST /api/v1/write` accept the
+# collector's export; `--query.lookback-delta` is left at its default (5m,
+# matching PulsusDB's own `pulsus_promql::plan::DEFAULT_LOOKBACK_MS` —
+# `docs/architecture.md §9`'s differential-testing bullet).
+global:
+  scrape_interval: 15s
+
+scrape_configs: []

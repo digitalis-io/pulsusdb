@@ -37,6 +37,9 @@ pub struct Ctx {
     pub http: reqwest::Client,
     pub base_url: String,
     pub collector_url: String,
+    /// The reference Prometheus's published base URL (issue #33 architect
+    /// plan) — `crate::metrics::metrics_differential`'s oracle backend.
+    pub prometheus_url: String,
     pub variant: Variant,
     pub fixtures_dir: PathBuf,
     pub compose: Compose,
@@ -90,6 +93,17 @@ pub const SCENARIOS: &[Scenario] = &[
         // `deploy/e2e/compose.single.yaml`.
         variants: &[Variant::Single],
         run: |ctx| Box::pin(grafana_loki_compat(ctx)),
+    },
+    Scenario {
+        name: "metrics_differential",
+        // Both variants (issue #33 architect plan): the cluster leg's
+        // `poll_until`-based completeness pre-check absorbs `_dist`
+        // eventual-consistency lag the same way `logs_roundtrip` does —
+        // no separate cluster-only assertions needed. Registered after
+        // `logs_roundtrip`/`grafana_loki_compat`: independent data via its
+        // own `run_id`, so ordering relative to them is immaterial.
+        variants: &[Variant::Single, Variant::Cluster],
+        run: |ctx| Box::pin(crate::metrics::metrics_differential(ctx)),
     },
 ];
 

@@ -65,3 +65,19 @@ services:
     # into the collector's `otlp` receiver (issue #15), same rationale as
     # `compose.single.yaml`'s identical port mapping.
     ports: [ "4318:4318" ]
+
+  # The M2 differential-accuracy scenario's reference backend (issue #33
+  # architect plan) — same role/rationale as `compose.single.yaml`'s
+  # `prometheus` service, on this variant's `pulsus-schema-it` subnet
+  # instead.
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      pulsus-schema-it:
+        ipv4_address: 172.28.0.22
+    ports: [ "9090:9090" ]

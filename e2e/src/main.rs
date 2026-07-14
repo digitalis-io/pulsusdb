@@ -8,8 +8,10 @@
 //! cargo run -p pulsus-e2e -- --variant cluster --engine podman --keep
 //! ```
 
+mod corpus;
 mod engine;
 mod harness;
+mod metrics;
 mod scenarios;
 
 use std::process::ExitCode;
@@ -59,6 +61,10 @@ async fn main() -> ExitCode {
         // on this same host port (issue #15 architect plan) — see
         // `deploy/e2e/compose.{single,cluster}.yaml`.
         collector_url: "http://127.0.0.1:4318".to_string(),
+        // Both compose variants publish the reference Prometheus on this
+        // same host port too (issue #33 architect plan) — see
+        // `deploy/e2e/compose.{single,cluster}.yaml`.
+        prometheus_url: "http://127.0.0.1:9090".to_string(),
     };
 
     match harness::run(opts).await {

@@ -85,6 +85,32 @@ services:
     # harness process itself, which runs on the host.
     ports: [ "4318:4318" ]
 
+  # The M2 differential-accuracy scenario's reference backend (issue #33
+  # architect plan, `e2e/src/metrics.rs`'s `metrics_differential`): the
+  # collector's second `prometheusremotewrite` exporter target
+  # (`otel-config.single.yaml`) receives the same OTLP-derived corpus
+  # PulsusDB does, so the two can be diffed. Same image `#32`'s golden
+  # fixtures are captured from — pin/digest kept in sync with that issue's
+  # own image reference. `--web.enable-remote-write-receiver` is what
+  # makes `POST /api/v1/write` accept the collector's export (KISS: no
+  # TLS, static IP, no DNS — same convention as every other service on
+  # this network).
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.14
+    # Published so the harness's completeness/query-matrix HTTP client
+    # (running on the host, like every other Ctx.http call) can drive
+    # `/api/v1/*` directly against it — same rationale as `pulsusdb`'s own
+    # `:3100` publish above.
+    ports: [ "9090:9090" ]
+
   # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
   # surface (issue #14, task-manager-approved option A): proves alias
   # routing + Loki-datasource compatibility end to end via
