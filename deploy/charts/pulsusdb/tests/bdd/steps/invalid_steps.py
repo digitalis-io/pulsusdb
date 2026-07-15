@@ -17,7 +17,9 @@ from pytest_bdd import scenarios, then  # noqa: E402
 
 from conftest import HelmRelease, run  # noqa: E402
 
-import common_steps  # noqa: F401,E402  (supplies the generic "I helm install pulsusdb with ..." When step)
+# The `Given`/`When` steps this scenario uses (cluster readiness, the
+# generic 'I helm install pulsusdb with "{extra}"') are shared and live in
+# `conftest.py` — no import needed, see its docstring for why.
 
 scenarios("../features/helm_install_invalid.feature")
 

@@ -1,4 +1,6 @@
-"""Binds `helm_uninstall.feature` — AC #8, PVC-retention behaviour."""
+"""Binds `helm_uninstall.feature` — AC #8, PVC-retention behaviour. The
+`Given` steps this scenario uses are shared and live in `conftest.py`
+(no import needed — see its docstring for why)."""
 
 from __future__ import annotations
 
@@ -11,8 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pytest_bdd import scenarios, then, when  # noqa: E402
 
 from conftest import HelmRelease, run  # noqa: E402
-
-import common_steps  # noqa: F401,E402
 
 scenarios("../features/helm_uninstall.feature")
 

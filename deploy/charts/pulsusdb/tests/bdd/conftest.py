@@ -4,6 +4,23 @@ locally-built `pulsusdb` image `kind load`ed into it (never pulled — no
 image is published yet, M7), a `kubernetes.client` handle, and a
 per-scenario `helm install` -> yield -> `helm uninstall` lifecycle.
 
+**Shared Given/When/Then step definitions also live in this file**
+(first real CI run, issue #38: every scenario failed with
+`pytest_bdd.exceptions.StepDefinitionNotFoundError` for steps that were
+defined in a sibling `steps/common_steps.py` module and merely
+`import`ed — plain-Python-side-effect — by each `steps/*.py` module that
+needed them). pytest-bdd resolves step definitions from pytest's plugin
+registry, which is scoped per test module; a step decorated with
+`@given`/`@when`/`@then` in one module is only visible to `scenarios()`
+calls in *that same* module unless it is registered somewhere pytest
+shares across every test module automatically — which is exactly what
+`conftest.py` is for (unlike a plain sibling module, importing it is not
+even required: pytest auto-discovers every `conftest.py` up the directory
+tree for every test module it collects). `pytest --collect-only` cannot
+catch this class of bug — step binding is a runtime concern, collection
+only proves the `.feature` files parse and `scenarios()` calls resolve a
+file path.
+
 Run (from the repo root, `deploy/charts/pulsusdb/tests/bdd/`'s own
 `requirements.txt` installed):
 
@@ -18,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import time
 import urllib.error
@@ -31,6 +49,7 @@ import pytest
 import yaml
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from pytest_bdd import given, parsers, then, when
 
 BDD_DIR = Path(__file__).resolve().parent
 CHART_DIR = BDD_DIR.parents[1]
@@ -340,3 +359,105 @@ def wait_for_condition(predicate, *, timeout: int = DEFAULT_TIMEOUT, interval: f
         time.sleep(interval)
     detail = f" (last error: {last_err})" if last_err else ""
     raise TimeoutError(f"timed out waiting for: {description}{detail}")
+
+
+def _pods_ready(k8s_core_v1, namespace: str, label_selector: str | None = None) -> bool:
+    pods = k8s_core_v1.list_namespaced_pod(namespace, label_selector=label_selector or "").items
+    if not pods:
+        return False
+    for pod in pods:
+        # Helm test-hook Pods (annotated helm.sh/hook: test) are excluded —
+        # they are not part of the release's steady-state workload and are
+        # only run on-demand via `helm test`.
+        if (pod.metadata.annotations or {}).get("helm.sh/hook") == "test":
+            continue
+        conditions = {c.type: c.status for c in (pod.status.conditions or [])}
+        if conditions.get("Ready") != "True":
+            return False
+    return True
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def port_forward(namespace: str, service: str, local_port: int, remote_port: int):
+    """Starts `kubectl port-forward` as a background process; caller is
+    responsible for terminating it. Returns the `Popen` handle. A plain
+    helper function (not a pytest-bdd step), so — unlike the steps below —
+    it still needs an explicit `from conftest import port_forward` in any
+    module that calls it; conftest.py's automatic cross-module visibility
+    is a pytest/pytest-bdd fixture-and-step-registry mechanism, not a
+    general Python import shortcut."""
+    proc = subprocess.Popen(
+        [
+            "kubectl", "port-forward",
+            "-n", namespace,
+            f"svc/{service}",
+            f"{local_port}:{remote_port}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # kubectl port-forward has no readiness signal on stdout we can trust
+    # portably; poll the local port instead of a fixed sleep.
+    wait_for_condition(
+        lambda: _port_open(local_port),
+        timeout=30,
+        description=f"port-forward {service}:{remote_port} -> localhost:{local_port}",
+    )
+    return proc
+
+
+# === Shared Given/When/Then step definitions ===
+# Moved here from the former `steps/common_steps.py` (first real CI run,
+# issue #38 — see this module's docstring for the full root-cause
+# explanation). Every `steps/*.py` module's `scenarios(...)` call can use
+# these without any import at all.
+
+
+@given("a Kind cluster with the locally-built pulsusdb image loaded", target_fixture="cluster_ready")
+def _cluster_ready(kind_cluster, pulsusdb_image):
+    return pulsusdb_image
+
+
+@when(parsers.parse("I helm install pulsusdb with default values"))
+def _install_default(helm_release: HelmRelease):
+    result = helm_release.install()
+    assert result.returncode == 0, result.stderr
+
+
+@given("a running pulsusdb release installed with default values", target_fixture="running_release")
+def _running_release(helm_release: HelmRelease, k8s_core_v1):
+    result = helm_release.install()
+    assert result.returncode == 0, result.stderr
+    wait_for_condition(
+        lambda: _pods_ready(k8s_core_v1, helm_release.namespace),
+        timeout=DEFAULT_TIMEOUT,
+        description=f"initial install Ready in namespace {helm_release.namespace}",
+    )
+    return helm_release
+
+
+@when(parsers.parse('I helm install pulsusdb with "{extra}"'))
+def _install_with_extra(helm_release: HelmRelease, extra: str):
+    args = extra.split()
+    result = helm_release.install(*args)
+    helm_release.last_result = result  # type: ignore[attr-defined]
+
+
+@then(parsers.parse("every pod in the release reaches Ready within the timeout budget"))
+def _pods_reach_ready(helm_release: HelmRelease, k8s_core_v1):
+    wait_for_condition(
+        lambda: _pods_ready(k8s_core_v1, helm_release.namespace),
+        timeout=DEFAULT_TIMEOUT,
+        description=f"all pods Ready in namespace {helm_release.namespace}",
+    )
+
+
+@then("the bundled helm test hook exits successfully")
+def _helm_test_passes(helm_release: HelmRelease):
+    result = helm_release.test()
+    assert result.returncode == 0, f"helm test failed:\n{result.stdout}\n{result.stderr}"

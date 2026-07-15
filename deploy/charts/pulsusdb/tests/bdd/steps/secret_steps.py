@@ -18,9 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pytest_bdd import scenarios, then  # noqa: E402
 
-from conftest import HelmRelease, http_get, run  # noqa: E402
-
-import common_steps  # noqa: F401,E402
+from conftest import HelmRelease, http_get, port_forward, run  # noqa: E402
 
 scenarios("../features/helm_clickhouse_secret.feature")
 
@@ -74,7 +72,7 @@ def _api_config_redacts_password(helm_release: HelmRelease, k8s_core_v1):
     secret = k8s_core_v1.read_namespaced_secret(f"{helm_release.name}-clickhouse", helm_release.namespace)
     password = base64.b64decode(secret.data["password"]).decode("utf-8")
 
-    proc = common_steps.port_forward(helm_release.namespace, helm_release.name, 13101, 3100)
+    proc = port_forward(helm_release.namespace, helm_release.name, 13101, 3100)
     try:
         resp = http_get("http://127.0.0.1:13101/config", timeout=10)
         assert resp.status_code == 200, f"/config returned {resp.status_code}: {resp.text}"

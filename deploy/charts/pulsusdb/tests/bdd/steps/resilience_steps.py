@@ -22,7 +22,9 @@ from pytest_bdd import scenarios, then, when  # noqa: E402
 
 from conftest import DEFAULT_TIMEOUT, HelmRelease, run, wait_for_condition  # noqa: E402
 
-import common_steps  # noqa: F401,E402
+# The `Given`/`And` steps this scenario uses (cluster readiness, default
+# install) are shared and live in `conftest.py` — no import needed, see
+# its docstring for why.
 
 scenarios("../features/helm_clickhouse_resilience.feature")
 

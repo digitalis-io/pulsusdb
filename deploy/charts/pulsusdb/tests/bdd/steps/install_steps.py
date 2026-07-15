@@ -1,7 +1,13 @@
 """Binds `helm_install_single.feature`, `helm_install_cluster.feature`, and
 `helm_split_mode.feature` and implements their scenario-specific steps.
-`common_steps` supplies the shared Given/When/Then steps every scenario
-here also uses (cluster readiness, default install, pods-Ready, helm test).
+The shared Given/When/Then steps every scenario here also uses (cluster
+readiness, default install, pods-Ready, helm test) live in `conftest.py`
+now, not a sibling module — pytest-bdd resolves step definitions per test
+module, and merely `import`ing a sibling module for its decorator
+side-effects does not register those steps for *this* module's
+`scenarios()` calls (first real CI run, issue #38 — see conftest.py's
+docstring for the full root-cause explanation). No import needed for
+them here at all.
 """
 
 from __future__ import annotations
@@ -16,9 +22,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/bdd/steps/ (si
 
 from pytest_bdd import scenarios, then  # noqa: E402
 
-from conftest import DEFAULT_TIMEOUT, HelmRelease, http_get, http_post_json, wait_for_condition  # noqa: E402
-
-import common_steps  # noqa: F401,E402  (registers shared steps, incl. "I helm install pulsusdb with ...")
+from conftest import (  # noqa: E402
+    DEFAULT_TIMEOUT,
+    HelmRelease,
+    http_get,
+    http_post_json,
+    port_forward,
+    wait_for_condition,
+)
 
 scenarios("../features/helm_install_single.feature")
 scenarios("../features/helm_install_cluster.feature")
@@ -57,8 +68,8 @@ def _ingest_query_roundtrip(helm_release: HelmRelease):
     collector_svc = f"{helm_release.name}-otel-collector"
     pulsusdb_svc = helm_release.name
 
-    collector_proc = common_steps.port_forward(helm_release.namespace, collector_svc, 14318, 4318)
-    query_proc = common_steps.port_forward(helm_release.namespace, pulsusdb_svc, 13100, 3100)
+    collector_proc = port_forward(helm_release.namespace, collector_svc, 14318, 4318)
+    query_proc = port_forward(helm_release.namespace, pulsusdb_svc, 13100, 3100)
     try:
         body = {
             "resourceLogs": [
