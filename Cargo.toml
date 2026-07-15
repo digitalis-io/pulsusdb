@@ -74,12 +74,17 @@ serde_json = "1"
 # crate's own request-body buffer. `flate2`/`snap`/`zstd` back the
 # hand-rolled gzip/snappy/zstd decompressors in
 # `pulsus-write::ingest::decompress` — tower-http's compression layer
-# covers gzip only, not snappy.
+# covers gzip only, not snappy. `with-serde` (issue #55) adds OTLP-canonical
+# protojson `Serialize`/`Deserialize` impls (hex trace/span IDs, camelCase,
+# u64-as-string) for the trace-fetch API's JSON encoder — a purely additive
+# feature (pulls `serde`/`const-hex`/`base64`), no wire-codec change to the
+# `prost` protobuf path.
 opentelemetry-proto = { version = "=0.32.0", default-features = false, features = [
     "gen-tonic-messages",
     "logs",
     "metrics",
     "trace",
+    "with-serde",
 ] }
 # `TraceSpanRow.payload` (issue #54): a binary protobuf blob stored in a
 # ClickHouse `String` column — `#[serde(with = "serde_bytes")]` routes the

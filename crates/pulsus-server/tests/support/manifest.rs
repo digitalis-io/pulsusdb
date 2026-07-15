@@ -88,6 +88,17 @@ pub enum Surface {
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`).
     PromApi,
+    /// `/api/traces/v1/trace/{traceId}[/json]` (issue #55) — success is an
+    /// OTLP `TracesData` body (JSON or protobuf by `Accept`); errors are
+    /// always the JSON envelope (`{"status","errorType","error"}`, no
+    /// `position`). Against the conformance suite's empty databases the
+    /// "success" of a well-formed request is the mounted-but-absent `404
+    /// not_found` envelope — which doubles as the mounting oracle (an
+    /// unmounted path returns axum's *empty* 404 instead). Asserted by the
+    /// dedicated `assert_traces_fetch_route` (the generic matrix's
+    /// sibling-404 suffix trick would mutate the trailing `{traceId}` param
+    /// into a 400, not an unrouted 404).
+    TracesFetch,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -635,6 +646,33 @@ const OTLP_TRACES_INGEST_CASES: &[CaseClass] = &[
     },
 ];
 
+/// The valid-but-absent 32-hex trace id every `{traceId}` placeholder
+/// resolves to (issue #55 verification finding: the old 8-char `abcd1234`
+/// placeholder is invalid under the 16-or-32-hex rule and would 400 on the
+/// now-mounted route instead of exercising the absent-trace 404). No test
+/// database ever ingests this id; the malformed case below mutates it back
+/// out of the resolved path.
+pub const ABSENT_TRACE_ID: &str = "feedfacefeedfacefeedfacefeedface";
+
+/// Mutates the resolved `{traceId}` into a same-length non-hex id — still
+/// one path segment, so it routes to the same handler and must be rejected
+/// as `400 bad_data` (not the absent-trace 404).
+fn traces_malformed_hex(req: &mut Req) {
+    req.path = req
+        .path
+        .replace(ABSENT_TRACE_ID, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+}
+
+const TRACE_FETCH_CASES: &[CaseClass] = &[CaseClass {
+    name: "malformed_hex",
+    build: traces_malformed_hex,
+    expect_status: 400,
+    expect: ExpectedError::Json {
+        error_type: "bad_data",
+        has_position: false,
+    },
+}];
+
 fn rw_bad_snappy(req: &mut Req) {
     req.body = b"\xFF\xFF\xFF not snappy".to_vec();
 }
@@ -1022,6 +1060,33 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
+    // -- Traces fetch (ReaderMode, issue #55) -----------------------------
+    // `success_status` is 404: against this suite's empty databases a
+    // well-formed absent-id fetch's documented outcome is the
+    // mounted-but-absent `not_found` JSON envelope (`Surface::TracesFetch`'s
+    // doc comment — it doubles as the mounting oracle).
+    RouteSpec {
+        path: "/api/traces/v1/trace/{traceId}",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetch,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
+    RouteSpec {
+        path: "/api/traces/v1/trace/{traceId}/json",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetch,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
     // notes): every M4-M8 §4-§8 row is out of scope for a guard whose only
@@ -1112,17 +1177,6 @@ static MANIFEST: &[RouteSpec] = &[
         surface: Surface::LogsQuery,
         gate: Gate::ReaderMode,
         status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
-        path: "/api/traces/v1/trace/{traceId}",
-        methods: &[Method::Get],
-        surface: Surface::PromApi,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M4" },
         doc_ref: DocRef::Skip,
         success_status: 0,
         base_query: "",
@@ -1244,7 +1298,7 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",
         function: "reader_router",
-        body: "crate::logs_api::router().merge(crate::prom_api::router())",
+        body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",

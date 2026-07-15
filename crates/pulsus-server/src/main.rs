@@ -22,6 +22,7 @@ mod prom_api;
 mod schema_init;
 mod serve;
 mod subsystems;
+mod traces_api;
 
 /// Long version string: build version + build git SHA (issue #23:
 /// `PULSUS_VERSION` is `build.rs`'s `PULSUS_BUILD_VERSION`-overridable

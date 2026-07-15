@@ -13,6 +13,7 @@ use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
 use pulsus_config::Config;
 use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
+    TraceEngine, TraceReadConfig,
 };
 use pulsus_schema::{RenderCtx, SchemaParams};
 use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
@@ -236,6 +237,29 @@ pub(crate) fn metrics_engine(
     MetricsEngine::new(client, label_cache, metrics_config_from(config))
 }
 
+/// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issue #55):
+/// `trace_spans` is `_dist`-aware exactly as every other read/write table
+/// mapping in this module — a configured `cluster` reads through the
+/// `trace_spans_dist` wrapper ([`trace_writer_tables_from`]'s write-side
+/// twin), an unclustered deployment reads the base table directly.
+pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    TraceReadConfig {
+        spans_table: format!("trace_spans{dist}"),
+    }
+}
+
+/// Builds a [`TraceEngine`] over `pool`, mirroring [`logql_engine`]'s
+/// "shared pool, no second connection" contract.
+pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> TraceEngine {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
+    TraceEngine::new(client, trace_read_config_from(config))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +454,23 @@ mod tests {
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+    }
+
+    #[test]
+    fn trace_read_config_from_uses_the_base_spans_table_when_unclustered() {
+        let config = Config::default();
+        let cfg = trace_read_config_from(&config);
+        assert_eq!(cfg.spans_table, "trace_spans");
+    }
+
+    #[test]
+    fn trace_read_config_from_uses_the_dist_spans_table_when_clustered() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let cfg = trace_read_config_from(&config);
+        assert_eq!(cfg.spans_table, "trace_spans_dist");
     }
 
     #[test]

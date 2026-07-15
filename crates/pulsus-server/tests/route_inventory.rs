@@ -1320,6 +1320,7 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::Ingest => spec.gate == Gate::WriterMode,
             Surface::LogsQuery => matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader),
             Surface::PromApi => spec.gate == Gate::ReaderMode,
+            Surface::TracesFetch => spec.gate == Gate::ReaderMode,
         };
         assert!(
             ok,

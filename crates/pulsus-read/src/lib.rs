@@ -3,6 +3,7 @@
 
 pub mod logql;
 pub mod metrics;
+pub mod traces;
 
 pub use logql::{
     DEFAULT_MAX_STREAMS, Direction, EngineConfig, ExplainStage, LogQlEngine, MatrixSeries, PlanCtx,
@@ -15,6 +16,7 @@ pub use metrics::{
     MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, Resolution, SeriesResolver,
     TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus, spawn_refresh_loop,
 };
+pub use traces::{StoredSpan, TraceEngine, TraceReadConfig};
 
 #[cfg(test)]
 mod tests {

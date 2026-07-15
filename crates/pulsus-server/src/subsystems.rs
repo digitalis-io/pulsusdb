@@ -27,10 +27,13 @@ pub(crate) fn writer_router() -> Router<AppState> {
 /// Query APIs (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`).
 /// `/api/logs/v1` is wired (issue #13); `/api/v1` (the standard Prometheus
 /// HTTP API — PulsusDB's *native* metrics surface, issue #32) is wired
-/// too; the remaining product surfaces (`/api/traces/v1`,
-/// `/api/profiles/v1`) are still empty until their own issues land.
+/// too; `/api/traces/v1`'s trace-by-ID fetch is wired (issue #55, search/
+/// tags/metrics land with their own M4 issues); `/api/profiles/v1` is
+/// still empty until its own issues land.
 pub(crate) fn reader_router() -> Router<AppState> {
-    crate::logs_api::router().merge(crate::prom_api::router())
+    crate::logs_api::router()
+        .merge(crate::prom_api::router())
+        .merge(crate::traces_api::router())
 }
 
 /// Rules API (`/api/rules/v1`). Empty until pulsus-ruler lands its handlers.

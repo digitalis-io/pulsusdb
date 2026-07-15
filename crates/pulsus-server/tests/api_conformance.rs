@@ -403,8 +403,12 @@ struct Status {
 /// value — content-agnostic (no seeded data assumed), just enough to make
 /// the path syntactically dispatchable.
 fn resolve_path(path: &str) -> String {
+    // `{traceId}` must resolve to a *valid, absent* 32-hex id (issue #55
+    // verification finding: the old 8-char `abcd1234` placeholder is
+    // invalid under the 16-or-32-hex rule and would 400 on the mounted
+    // route instead of exercising the absent-trace 404 oracle).
     path.replace("{name}", "env")
-        .replace("{traceId}", "abcd1234")
+        .replace("{traceId}", manifest::ABSENT_TRACE_ID)
         .replace("{kind}", "logs")
 }
 
@@ -534,6 +538,23 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                     "{ctx}: data must be a JSON object, got {data}"
                 );
             }
+        }
+        (Surface::TracesFetch, _) => {
+            // Against this suite's empty databases the documented outcome
+            // of a well-formed fetch is the mounted-but-absent `404
+            // not_found` JSON envelope — the mounting oracle
+            // (`Surface::TracesFetch`'s doc comment): an unmounted path
+            // would return axum's *empty* 404 instead, so this arm fails
+            // on a silently un-mounted route. Errors on this surface are
+            // always JSON, never protobuf.
+            assert_case_envelope(
+                res,
+                &ExpectedError::Json {
+                    error_type: "not_found",
+                    has_position: false,
+                },
+                ctx,
+            );
         }
         (Surface::Ingest, _) => {
             unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
@@ -724,6 +745,89 @@ fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
 
     let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
     let sibling = format!("{}-conformance-nonexistent", resolve_path(spec.path));
+    let res = get(port, &sibling, &ctx);
+    assert_404_empty(&res, &ctx);
+
+    for case in spec.cases {
+        run_case(port, spec, case, spawn);
+    }
+}
+
+/// The dedicated trace-fetch matrix (issue #55; `Surface::TracesFetch` is
+/// special-cased at the dispatch site exactly as `Surface::Ingest` is):
+/// the generic [`assert_full_route_matrix`] is incompatible with a
+/// trailing-`{param}` route — its sibling-404 check appends a suffix to
+/// the resolved path, which here merely *mutates the param* and hits the
+/// same route as a 400, not axum's empty 404. The sibling here is proven
+/// by appending an extra `/segment` instead, making the path genuinely
+/// unrouted. Cells (plan v2/v3): absent 32-hex → 404 `not_found` JSON
+/// envelope; 16-hex short id → 404 (accepted, not 400); protobuf /
+/// x-protobuf `Accept` on absent → still the 404 JSON envelope (errors
+/// never switch to protobuf; for the `/json` route this also proves the
+/// suffix ignores `Accept`); `POST` → 405 `Allow: GET,HEAD`; extra-segment
+/// sibling → empty 404; plus the manifest's `CaseClass`es (malformed hex →
+/// 400).
+fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    let absent_404 = ExpectedError::Json {
+        error_type: "not_found",
+        has_position: false,
+    };
+    let path = resolve_path(spec.path);
+
+    for &method in spec.methods {
+        let ctx = format!(
+            "[{spawn}] {} {} case=documented-method-absent-404",
+            method.as_str(),
+            spec.path
+        );
+        let req = manifest::Req::new(method.as_str(), path.clone());
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status,
+            spec.success_status,
+            "{ctx}: status (body: {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_success_envelope(spec, &res, &ctx);
+    }
+
+    // A 16-hex short id is *accepted* (left-padded to 32) and absent — 404
+    // with the envelope, never a 400.
+    let ctx = format!("[{spawn}] GET {} case=short-16-hex-absent-404", spec.path);
+    let short_path = path.replace(manifest::ABSENT_TRACE_ID, "feedfacefeedface");
+    let res = get(port, &short_path, &ctx);
+    assert_eq!(
+        res.status,
+        404,
+        "{ctx}: a 16-hex id must be accepted and resolve to absent, got {} (body: {:?})",
+        res.status,
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_case_envelope(&res, &absent_404, &ctx);
+
+    // Errors never switch representation: a protobuf-flavoured `Accept`
+    // (both the canonical name and the x- request-side alias) still gets
+    // the 404 JSON envelope. On the `/json` route this doubles as the
+    // "/json ignores Accept" error-path cell.
+    for accept in ["application/protobuf", "application/x-protobuf"] {
+        let ctx = format!(
+            "[{spawn}] GET {} case=absent-404-stays-json accept={accept}",
+            spec.path
+        );
+        let mut req = manifest::Req::new("GET", path.clone());
+        req.headers.push(("accept", accept.to_string()));
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(res.status, 404, "{ctx}: status");
+        assert_case_envelope(&res, &absent_404, &ctx);
+    }
+
+    let ctx = format!("[{spawn}] POST {} case=undocumented-method-405", spec.path);
+    let post = manifest::Req::new("POST", path.clone());
+    let res = raw_request(port, &post).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_405_with_allow(&res, &ctx, spec.methods);
+
+    let ctx = format!("[{spawn}] GET {} case=extra-segment-sibling-404", spec.path);
+    let sibling = format!("{path}/conformance-nonexistent");
     let res = get(port, &sibling, &ctx);
     assert_404_empty(&res, &ctx);
 
@@ -1045,6 +1149,9 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
         }
         match spec.surface {
             Surface::Ingest => assert_ingest_route(port, spec, "spawn=all,auth=off,compat=on"),
+            Surface::TracesFetch => {
+                assert_traces_fetch_route(port, spec, "spawn=all,auth=off,compat=on")
+            }
             _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
         }
     }

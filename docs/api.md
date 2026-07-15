@@ -212,6 +212,20 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 
 `traceId` is hex (16 or 32 chars, left-padded). `404` with an error envelope when absent.
 
+**Content negotiation.** The default representation is OTLP-canonical JSON (protojson: hex trace/span ids, camelCase fields, 64-bit integers as strings) with `Content-Type: application/json`; no `Accept` header means JSON. `Accept: application/protobuf` (or its request-side alias `application/x-protobuf`) selects the protobuf `TracesData` encoding, returned as `Content-Type: application/protobuf` — deliberately asymmetric with OTLP *ingest*, which uses `application/x-protobuf` per the OTLP/HTTP spec; the query response follows the Tempo/Grafana client convention instead, and never emits `x-protobuf`. Quality values are honored per RFC 9110 (`;q=` weights, exact `type/subtype` > `type/*` > `*/*` specificity, `q=0` excludes; an equal-quality tie resolves to JSON). An `Accept` header under which neither served representation is acceptable (e.g. `text/plain`, or every matching range at `q=0`) is rejected with `406 not_acceptable`. The `/json` suffix forces JSON unconditionally — it never consults `Accept` and never returns `406`.
+
+**Response shape.** One `TracesData` assembling every stored span of the trace; at-least-once ingest duplicates are deduplicated by span id at read time. Spans are returned in a canonical order — ascending `(startTimeUnixNano, spanId)` — so responses are byte-deterministic regardless of storage read order.
+
+**Errors** are always the JSON envelope (`{"status":"error","errorType":...,"error":...}`), regardless of `Accept`:
+
+| Cause | HTTP | `errorType` |
+|-------|------|-------------|
+| Malformed `traceId` (not 16/32 hex chars) | `400` | `bad_data` |
+| Trace absent | `404` | `not_found` |
+| No acceptable representation under `Accept` | `406` | `not_acceptable` |
+| ClickHouse read timed out | `504` | `timeout` |
+| Unclassified ClickHouse/internal failure (incl. undecodable or unsupported stored payloads) | `500` | `internal` |
+
 ### 4.2 `GET /api/traces/v1/search`
 
 | Param | Notes |

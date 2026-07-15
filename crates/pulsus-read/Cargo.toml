@@ -27,6 +27,12 @@ pulsus-promql = { path = "../pulsus-promql" }
 clickhouse.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+# `StoredSpanRow.payload` (issue #55): the stored span payload is a binary
+# blob in a ClickHouse `String` column — `#[serde(with = "serde_bytes")]`
+# routes the `Vec<u8>` through RowBinary's length-prefixed byte-string
+# encoding instead of serde's default `Array(UInt8)` sequence encoding
+# (same pattern as `pulsus-write`'s `TraceSpanRow.payload`).
+serde_bytes.workspace = true
 futures.workspace = true
 # In-process matcher evaluation for the label cache's `Re`/`Nre` matchers
 # (issue #30), bounded by a compiled-regex cache.
