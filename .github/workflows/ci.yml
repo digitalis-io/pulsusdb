@@ -126,6 +126,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test ingest_fidelity
 
+      # Issue #54 AC5: the OTLP traces round-trip — POST /v1/traces ->
+      # TraceWriter (sync) -> exact count()s on both writer-written trace
+      # tables, plus a live payload/FixedString wire-encoding read-back.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Traces ingest round-trip (exact counts)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test trace_ingest_roundtrip
+
       # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
       # step — reproducibility + a committed CI-scale evidence artifact
       # only (task-manager resolution #2: no asserted `system.query_log`

@@ -1,14 +1,17 @@
-//! The `POST /v1/logs`, `POST /v1/metrics`, and `POST /api/v1/write` axum
-//! handlers (docs/api.md §1.1-1.2): decompress -> prost-decode ->
-//! `otlp_logs::parse`/`otlp_metrics::parse`/`remote_write::parse` -> hand
-//! rows to a [`LogSink`]/[`MetricSink`] -> render the response. A thin
+//! The `POST /v1/logs`, `POST /v1/metrics`, `POST /v1/traces`, and
+//! `POST /api/v1/write` axum handlers (docs/api.md §1.1-1.2): decompress ->
+//! prost-decode -> `otlp_logs::parse`/`otlp_metrics::parse`/
+//! `otlp_traces::parse`/`remote_write::parse` -> hand rows to a
+//! [`LogSink`]/[`MetricSink`]/[`TraceSink`] -> render the response. A thin
 //! layer over the pure parsers — no batching, no ClickHouse writes
 //! (architect plan, "out of scope"). [`ingest_metrics`]/[`metrics`] (issue
-//! #27) reuse every piece of [`ingest`]/[`logs`]'s (issue #8/#15) machinery
-//! below — capped body reads, decompression, `google.rpc.Status` error
-//! rendering, classification, and the sync/async admission branch — the
-//! only metrics-specific additions are [`decode_metrics_request`] and
-//! [`export_metrics_response`]. [`ingest_remote_write`] (issue #28) reuses
+//! #27) and [`ingest_traces`]/[`traces`] (issue #54) reuse every piece of
+//! [`ingest`]/[`logs`]'s (issue #8/#15) machinery below — capped body
+//! reads, decompression, `google.rpc.Status` error rendering,
+//! classification, and the sync/async admission branch — the only
+//! signal-specific additions are [`decode_metrics_request`]/
+//! [`decode_traces_request`] and [`export_metrics_response`]/
+//! [`export_traces_response`]. [`ingest_remote_write`] (issue #28) reuses
 //! the same capped-body-read/classification/sync-async-admission shape but
 //! renders remote-write-shaped responses instead (empty `204`/`202`,
 //! plain-text errors — see its own doc comment for why it cannot reuse
@@ -46,12 +49,16 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsPartialSuccess, ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 
 use crate::error::LogsIngestError;
 use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
+use crate::ingest::traces::TraceSink;
 use crate::ingest::{Backpressure, LogSink};
-use crate::protocols::{otlp_logs, otlp_metrics, remote_write};
+use crate::protocols::{otlp_logs, otlp_metrics, otlp_traces, remote_write};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
 /// selects async-mode (enqueue, `202`); absent or any other value selects
@@ -182,6 +189,60 @@ where
     ingest_metrics(sink.as_ref(), headers, body).await
 }
 
+/// `POST /v1/traces` (issue #54): the traces analog of [`ingest`] —
+/// identical decompress/decode/parse/admit/respond shape, reusing every
+/// shared helper below verbatim. See this module's doc comment for why
+/// `pulsus-server` mounts this `&dyn TraceSink` core directly rather than
+/// [`traces`]'s generic-`State` form.
+pub async fn ingest_traces(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
+    let now_ns = now_unix_nanos();
+
+    let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
+        Ok(body) => body,
+        Err(err) => return error_response(err),
+    };
+
+    let request = match decode_traces_request(&headers, &body) {
+        Ok(request) => request,
+        Err(err) => return error_response(err),
+    };
+
+    // Fallible, unlike the logs/metrics parses: the traces parser's
+    // expansion budget (`otlp_traces::MAX_EXPANDED_BYTES`, a structural
+    // whole-request bound) surfaces here as the same 400/`code = 3`
+    // classification a decode failure gets.
+    let parsed = match otlp_traces::parse(&request, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return error_response(err),
+    };
+    let rejected = parsed.rejected;
+    let rejected_message = parsed.rejected_message.clone();
+
+    if is_async(&headers) {
+        return match sink.admit(parsed) {
+            Ok(()) => export_traces_response(StatusCode::ACCEPTED, rejected, rejected_message),
+            Err(Backpressure) => backpressure_response(),
+        };
+    }
+
+    match sink.admit_flush(parsed) {
+        Ok(wait) => match wait.await {
+            Ok(()) => export_traces_response(StatusCode::OK, rejected, rejected_message),
+            Err(err) => error_response(err),
+        },
+        Err(Backpressure) => backpressure_response(),
+    }
+}
+
+/// This crate's own generic-`State` mount point for [`ingest_traces`] —
+/// mirrors [`logs`]/[`metrics`] exactly.
+pub async fn traces<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Body) -> Response
+where
+    S: TraceSink + 'static,
+{
+    ingest_traces(sink.as_ref(), headers, body).await
+}
+
 /// `POST /api/v1/write` (issue #28, docs/api.md §1.2): Prometheus
 /// remote-write's `prompb.WriteRequest`. Structurally the same decompress/
 /// decode/parse/admit/respond shape as [`ingest`]/[`ingest_metrics`], with
@@ -301,6 +362,18 @@ fn decode_metrics_request(
     otlp_metrics::decode(&decompressed)
 }
 
+/// Reads `Content-Encoding` (defaulting to `identity` when absent or
+/// empty), decompresses, and prost-decodes the request body — the traces
+/// analog of [`decode_request`].
+fn decode_traces_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<ExportTraceServiceRequest, LogsIngestError> {
+    let encoding = content_encoding(headers)?;
+    let decompressed = decompress::decompress(encoding, body)?;
+    otlp_traces::decode(&decompressed)
+}
+
 /// Decompresses (always block-snappy — see [`ingest_remote_write`]'s doc
 /// comment for why `Content-Encoding` is never consulted) and prost-decodes
 /// the request body.
@@ -411,6 +484,22 @@ fn export_metrics_response(
         error_message: rejected_message.unwrap_or_default(),
     });
     let body = ExportMetricsServiceResponse { partial_success }.encode_to_vec();
+    protobuf_response(status, body)
+}
+
+/// Success/accepted response body for `/v1/traces` — the traces analog of
+/// [`export_response`], carrying `partial_success.rejected_spans` (the
+/// OTLP traces partial-success field name).
+fn export_traces_response(
+    status: StatusCode,
+    rejected: u64,
+    rejected_message: Option<String>,
+) -> Response {
+    let partial_success = (rejected > 0).then(|| ExportTracePartialSuccess {
+        rejected_spans: i64::try_from(rejected).unwrap_or(i64::MAX),
+        error_message: rejected_message.unwrap_or_default(),
+    });
+    let body = ExportTraceServiceResponse { partial_success }.encode_to_vec();
     protobuf_response(status, body)
 }
 
@@ -1002,6 +1091,268 @@ mod tests {
         let response = ExportMetricsServiceResponse::decode(bytes.as_ref()).unwrap();
         let partial = response.partial_success.expect("partial success is set");
         assert_eq!(partial.rejected_data_points, 1);
+        assert!(!partial.error_message.is_empty());
+    }
+
+    // -- `/v1/traces` (issue #54) ------------------------------------------
+    // Mirrors the `/v1/logs`/`/v1/metrics` suites above exactly — same
+    // shared helpers, only the sink/request/response types differ.
+
+    use crate::ingest::traces::{ParsedTraces, TraceSink};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+    struct MockTraceSink {
+        outcome: Outcome,
+        admitted: Mutex<Vec<ParsedTraces>>,
+    }
+
+    impl MockTraceSink {
+        fn new(outcome: Outcome) -> Arc<MockTraceSink> {
+            Arc::new(MockTraceSink {
+                outcome,
+                admitted: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl TraceSink for MockTraceSink {
+        fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
+            self.admitted.lock().unwrap().push(batch);
+            match self.outcome {
+                Outcome::Admit | Outcome::FlushFails => Ok(()),
+                Outcome::Backpressure => Err(Backpressure),
+            }
+        }
+
+        fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
+            self.admitted.lock().unwrap().push(batch);
+            match self.outcome {
+                Outcome::Admit => Ok(FlushWait::new(async { Ok(()) })),
+                Outcome::FlushFails => Ok(FlushWait::new(async {
+                    Err(LogsIngestError::FlushFailed("writer shut down".to_string()))
+                })),
+                Outcome::Backpressure => Err(Backpressure),
+            }
+        }
+    }
+
+    fn traces_router(sink: Arc<MockTraceSink>) -> Router {
+        Router::new()
+            .route("/v1/traces", post(traces::<MockTraceSink>))
+            .with_state(sink)
+    }
+
+    /// [`post_body`]'s `/v1/traces` counterpart (same rationale as
+    /// [`post_metrics_body`]'s).
+    async fn post_traces_body(router: Router, body: Vec<u8>, headers: &[(&str, &str)]) -> Response {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/traces");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Body::from(body)).unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    fn trace_span(trace_id: Vec<u8>, span_id: Vec<u8>) -> Span {
+        Span {
+            trace_id,
+            span_id,
+            name: "op-a".to_string(),
+            start_time_unix_nano: 1_700_000_000_000_000_000,
+            end_time_unix_nano: 1_700_000_001_000_000_000,
+            ..Default::default()
+        }
+    }
+
+    fn traces_request(spans: Vec<Span>) -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: None,
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans,
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        }
+    }
+
+    fn valid_traces_request_body() -> Vec<u8> {
+        traces_request(vec![trace_span(vec![1; 16], vec![2; 8])]).encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn traces_sync_mode_admits_via_admit_flush_and_returns_200() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(
+            traces_router(sink.clone()),
+            valid_traces_request_body(),
+            &[],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn traces_async_header_value_zero_stays_sync() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(
+            traces_router(sink.clone()),
+            valid_traces_request_body(),
+            &[("x-pulsus-async", "0")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn traces_async_mode_admits_via_admit_and_returns_202() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(
+            traces_router(sink.clone()),
+            valid_traces_request_body(),
+            &[("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn traces_malformed_body_returns_400_with_status_code_3() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res =
+            post_traces_body(traces_router(sink), b"not a protobuf message".to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+    }
+
+    #[tokio::test]
+    async fn traces_unsupported_content_encoding_returns_400_with_status_code_3() {
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(
+            traces_router(sink),
+            valid_traces_request_body(),
+            &[("content-encoding", "br")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+    }
+
+    /// Issue #54 code-review [high] fix, at the route level: a body well
+    /// inside the 64 MiB cap whose resource × span fan-out exceeds
+    /// `otlp_traces::MAX_EXPANDED_BYTES` is a whole-request 400/code 3
+    /// (the structural-oversize class), and the sink is never admitted to.
+    #[tokio::test]
+    async fn traces_expansion_budget_overflow_returns_400_with_status_code_3() {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let big_value = "v".repeat(1024 * 1024); // 1 MiB resource attr value
+        let resource = Resource {
+            attributes: vec![KeyValue {
+                key: "big.attr".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(big_value)),
+                }),
+                key_strindex: 0,
+            }],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        };
+        let span_count = crate::protocols::otlp_traces::MAX_EXPANDED_BYTES / (1024 * 1024) + 2;
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(resource),
+                scope_spans: vec![ScopeSpans {
+                    scope: None,
+                    spans: (0..span_count)
+                        .map(|_| trace_span(vec![1; 16], vec![2; 8]))
+                        .collect(),
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(traces_router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(
+            sink.admitted.lock().unwrap().is_empty(),
+            "an over-budget request must never reach the sink (no partial write)"
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_body_over_the_64_mib_cap_returns_400_with_status_code_3() {
+        let body = vec![0u8; decompress::MAX_DECOMPRESSED_BYTES + 1024];
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(traces_router(sink), body, &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+    }
+
+    #[tokio::test]
+    async fn traces_sink_backpressure_returns_429_with_status_code_8() {
+        let sink = MockTraceSink::new(Outcome::Backpressure);
+        let res = post_traces_body(traces_router(sink), valid_traces_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 8);
+    }
+
+    #[tokio::test]
+    async fn traces_async_mode_sink_backpressure_also_returns_429_with_status_code_8() {
+        let sink = MockTraceSink::new(Outcome::Backpressure);
+        let res = post_traces_body(
+            traces_router(sink),
+            valid_traces_request_body(),
+            &[("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 8);
+    }
+
+    #[tokio::test]
+    async fn traces_flush_failure_returns_500_with_status_code_13() {
+        let sink = MockTraceSink::new(Outcome::FlushFails);
+        let res = post_traces_body(traces_router(sink), valid_traces_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 13);
+    }
+
+    #[tokio::test]
+    async fn traces_success_response_reports_partial_success_when_spans_were_rejected() {
+        // One bad span (15-byte trace_id) alongside one valid span.
+        let req = traces_request(vec![
+            trace_span(vec![1; 15], vec![2; 8]),
+            trace_span(vec![1; 16], vec![2; 8]),
+        ]);
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(traces_router(sink), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response = ExportTraceServiceResponse::decode(bytes.as_ref()).unwrap();
+        let partial = response.partial_success.expect("partial success is set");
+        assert_eq!(partial.rejected_spans, 1);
         assert!(!partial.error_message.is_empty());
     }
 

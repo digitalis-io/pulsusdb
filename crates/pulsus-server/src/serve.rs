@@ -20,7 +20,7 @@ use pulsus_clickhouse::{ChClient, ChError, ChPool};
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_read::LabelCache;
 use pulsus_schema::SchemaError;
-use pulsus_write::{LogWriter, MetricWriter};
+use pulsus_write::{LogWriter, MetricWriter, TraceWriter};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -31,9 +31,9 @@ use tracing_subscriber::EnvFilter;
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
     bootstrap_conn_config_from, build_label_cache, conn_config_from, metric_writer_tables_from,
-    schema_params_from, writer_tables_from,
+    schema_params_from, trace_writer_tables_from, writer_tables_from,
 };
-use crate::ingest::{MetricWriterSink, WriterSink};
+use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
 /// Startup-time failures specific to the HTTP server layer (config-load and
 /// schema-controller failures are handled separately, in `main.rs` /
@@ -90,6 +90,10 @@ pub async fn run(config: Config) -> ExitCode {
     // in #28. Its flush tasks simply idle (never admitted to) until this
     // slot is filled by the reconnect loop.
     let metric_writer_slot: Arc<OnceLock<Arc<MetricWriter>>> = Arc::new(OnceLock::new());
+    // `TraceWriter`'s slot (issue #54): same lifecycle as the other two
+    // writer slots — constructed by the reconnect loop in writer-enabled
+    // modes, drained alongside them at shutdown.
+    let trace_writer_slot: Arc<OnceLock<Arc<TraceWriter>>> = Arc::new(OnceLock::new());
     // The label cache's async-filled slot (issue #30 architect plan): same
     // shape as `writer_slot`/`metric_writer_slot`, constructed by the
     // reconnect loop only in reader-enabled modes (see `reader_enabled`).
@@ -107,8 +111,11 @@ pub async fn run(config: Config) -> ExitCode {
     let (label_cache_refresh_tx, label_cache_refresh_rx) = oneshot::channel();
     let reconnect_handle = spawn_reconnect_loop(
         Arc::clone(&pool_slot),
-        Arc::clone(&writer_slot),
-        Arc::clone(&metric_writer_slot),
+        WriterSlots {
+            log: Arc::clone(&writer_slot),
+            metric: Arc::clone(&metric_writer_slot),
+            trace: Arc::clone(&trace_writer_slot),
+        },
         Arc::clone(&label_cache_slot),
         Arc::clone(&config),
         rotation_tx,
@@ -122,6 +129,7 @@ pub async fn run(config: Config) -> ExitCode {
         build: BuildInfo::from_build_env(),
         writer: Arc::new(WriterSink::new(Arc::clone(&writer_slot))),
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
+        trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
         started_at: std::time::SystemTime::now(),
     };
@@ -166,6 +174,10 @@ pub async fn run(config: Config) -> ExitCode {
     // when this process never mounted the writer subsystem.
     if let Some(metric_writer) = metric_writer_slot.get() {
         metric_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
+    }
+    // And for `TraceWriter` (issue #54), same contract.
+    if let Some(trace_writer) = trace_writer_slot.get() {
+        trace_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
     shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx).await;
@@ -223,6 +235,17 @@ enum StartupError {
     Pool(ChError),
 }
 
+/// The per-signal writer slots the reconnect loop fills (all three
+/// together, before `pool_slot` — see [`spawn_reconnect_loop`]) in
+/// writer-enabled modes. A bundling struct rather than three loose
+/// parameters: the slots share one lifecycle and always travel together
+/// (and clippy's `too_many_arguments` agrees).
+struct WriterSlots {
+    log: Arc<OnceLock<Arc<LogWriter>>>,
+    metric: Arc<OnceLock<Arc<MetricWriter>>>,
+    trace: Arc<OnceLock<Arc<TraceWriter>>>,
+}
+
 /// Background task: repeatedly ensures the schema exists (unless
 /// `PULSUS_SKIP_DDL`) and then connects the serving `ChPool`, retrying the
 /// whole sequence with capped exponential backoff until it succeeds, then
@@ -244,8 +267,7 @@ enum StartupError {
 /// loop's first successful pass lands.
 fn spawn_reconnect_loop(
     pool_slot: Arc<RwLock<Option<Arc<ChPool>>>>,
-    writer_slot: Arc<OnceLock<Arc<LogWriter>>>,
-    metric_writer_slot: Arc<OnceLock<Arc<MetricWriter>>>,
+    writer_slots: WriterSlots,
     label_cache_slot: Arc<OnceLock<Arc<LabelCache>>>,
     config: Arc<Config>,
     rotation_tx: oneshot::Sender<JoinHandle<()>>,
@@ -277,7 +299,7 @@ fn spawn_reconnect_loop(
                         // pass (see this fn's own doc comment) — the slot
                         // can therefore never already be set, so a `set`
                         // failure is unreachable.
-                        let _ = writer_slot.set(writer);
+                        let _ = writer_slots.log.set(writer);
 
                         // `MetricWriter` (issue #26 architect plan): same
                         // client, same lifecycle gate — shares one
@@ -285,12 +307,21 @@ fn spawn_reconnect_loop(
                         // rather than opening a second one.
                         let bucket_ms = config.reader.series_activity_bucket.0.as_millis() as i64;
                         let metric_writer = Arc::new(MetricWriter::new_with_tables(
-                            client,
+                            client.clone(),
                             &config.writer,
                             bucket_ms,
                             metric_writer_tables_from(&config),
                         ));
-                        let _ = metric_writer_slot.set(metric_writer);
+                        let _ = writer_slots.metric.set(metric_writer);
+
+                        // `TraceWriter` (issue #54): same shared client,
+                        // same lifecycle gate as the other two writers.
+                        let trace_writer = Arc::new(TraceWriter::new_with_tables(
+                            client,
+                            &config.writer,
+                            trace_writer_tables_from(&config),
+                        ));
+                        let _ = writer_slots.trace.set(trace_writer);
                     }
                     // The label cache (issue #30 architect plan; code-review
                     // round-1 fix): built and stored *before* `pool_slot` is
@@ -561,8 +592,11 @@ mod tests {
         let (label_cache_refresh_tx, _label_cache_refresh_rx) = oneshot::channel();
         let handle = spawn_reconnect_loop(
             Arc::new(RwLock::new(None)),
-            Arc::new(OnceLock::new()),
-            Arc::new(OnceLock::new()),
+            WriterSlots {
+                log: Arc::new(OnceLock::new()),
+                metric: Arc::new(OnceLock::new()),
+                trace: Arc::new(OnceLock::new()),
+            },
             Arc::new(OnceLock::new()),
             Arc::new(cfg),
             rotation_tx,

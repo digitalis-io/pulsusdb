@@ -89,6 +89,19 @@ impl Date {
         Date(month_start_day.clamp(0, i64::from(u16::MAX)) as u16)
     }
 
+    /// The UTC start-of-day containing `timestamp_ns` — the per-**day**
+    /// floor `trace_attrs_idx.date` needs (docs/schemas.md §4.1:
+    /// `PARTITION BY date` is daily, unlike `log_streams.month`'s monthly
+    /// [`Date::start_of_month_utc`] floor; issue #54 task-manager
+    /// adjudication #1). Same saturation contract as
+    /// [`Date::start_of_month_utc`]: a day count outside the `u16` range
+    /// clamps to the nearest in-range end rather than panicking on
+    /// pathological/malicious input.
+    pub fn start_of_day_utc(timestamp_ns: i64) -> Date {
+        let day = timestamp_ns.div_euclid(NANOS_PER_DAY);
+        Date(day.clamp(0, i64::from(u16::MAX)) as u16)
+    }
+
     /// Days since the Unix epoch — the exact value ClickHouse's `Date`
     /// column stores on the wire.
     pub fn days_since_epoch(&self) -> u16 {
@@ -240,6 +253,58 @@ mod tests {
         assert_eq!(far_future.days_since_epoch(), u16::MAX);
         let far_past = Date::start_of_month_utc(i64::MIN);
         assert_eq!(far_past.days_since_epoch(), 0);
+    }
+
+    #[test]
+    fn start_of_day_utc_floors_a_mid_day_timestamp_to_that_day() {
+        // 2024-03-15T12:34:56Z — same instant `start_of_month_utc`'s
+        // mid-month test uses, so the two floors are directly comparable.
+        let ts_ns = 1_710_505_996_123_456_789;
+        let day = Date::start_of_day_utc(ts_ns);
+        assert_eq!(
+            civil_from_days(i64::from(day.days_since_epoch())),
+            (2024, 3, 15)
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_two_timestamps_in_the_same_day_yield_equal_dates() {
+        // 2024-03-15T00:00:00Z and 2024-03-15T23:59:59.999999999Z.
+        let start = Date::start_of_day_utc(1_710_460_800_000_000_000);
+        let end = Date::start_of_day_utc(1_710_547_199_999_999_999);
+        assert_eq!(start, end);
+    }
+
+    #[test]
+    fn start_of_day_utc_across_a_day_boundary_differs() {
+        // 2024-03-15T23:59:59Z vs 2024-03-16T00:00:00Z.
+        let before = Date::start_of_day_utc(1_710_547_199_000_000_000);
+        let after = Date::start_of_day_utc(1_710_547_200_000_000_000);
+        assert_ne!(before, after);
+        assert_eq!(
+            after.days_since_epoch(),
+            before.days_since_epoch() + 1,
+            "consecutive days differ by exactly one epoch-day"
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_of_the_epoch_instant_is_day_zero() {
+        assert_eq!(Date::start_of_day_utc(0).days_since_epoch(), 0);
+    }
+
+    #[test]
+    fn start_of_day_utc_saturates_instead_of_panicking_on_out_of_range_timestamps() {
+        assert_eq!(
+            Date::start_of_day_utc(i64::MAX).days_since_epoch(),
+            u16::MAX
+        );
+        assert_eq!(Date::start_of_day_utc(i64::MIN).days_since_epoch(), 0);
+        // Pre-epoch but in the representable i64 range: clamps to day 0.
+        assert_eq!(
+            Date::start_of_day_utc(-(NANOS_PER_DAY * 200)).days_since_epoch(),
+            0
+        );
     }
 
     #[test]

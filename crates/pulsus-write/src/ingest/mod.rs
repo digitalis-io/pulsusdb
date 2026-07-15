@@ -7,6 +7,7 @@
 pub mod decompress;
 pub mod http;
 pub mod metrics;
+pub mod traces;
 
 use std::fmt;
 use std::future::Future;

@@ -15,7 +15,7 @@ use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
 };
 use pulsus_schema::{RenderCtx, SchemaParams};
-use pulsus_write::{MetricWriterTables, WriterTables};
+use pulsus_write::{MetricWriterTables, TraceWriterTables, WriterTables};
 
 /// Maps `Config` to the connection settings any part of this binary dials
 /// ClickHouse with, targeting the configured `clickhouse.database`. Callers
@@ -140,6 +140,26 @@ pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
         samples: Arc::from(format!("metric_samples{dist}")),
         series: Arc::from(format!("metric_series{dist}")),
         metadata: Arc::from("metric_metadata"),
+    }
+}
+
+/// Maps `Config` to [`pulsus_write::TraceWriterTables`] (issue #54),
+/// deriving `_dist` names the *same way* [`writer_tables_from`]/
+/// [`metric_writer_tables_from`] do — a configured `cluster` writes both
+/// per-shard trace tables through their `_dist` wrappers (`Family::Traces`,
+/// `cityHash64(trace_id)` sharding, docs/schemas.md §7), an unclustered
+/// deployment writes the base tables directly. `trace_tag_catalog` is
+/// deliberately absent: it is MV-populated (issue #53), never
+/// writer-written, so there is no table name for the writer to resolve.
+pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
+    let dist = if config.cluster.is_some() {
+        config.dist_suffix.as_str()
+    } else {
+        ""
+    };
+    TraceWriterTables {
+        spans: Arc::from(format!("trace_spans{dist}")),
+        attrs: Arc::from(format!("trace_attrs_idx{dist}")),
     }
 }
 
@@ -335,6 +355,25 @@ mod tests {
             &*tables.metadata, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+    }
+
+    #[test]
+    fn trace_writer_tables_from_uses_base_table_names_when_unclustered() {
+        let config = Config::default();
+        let tables = trace_writer_tables_from(&config);
+        assert_eq!(&*tables.spans, "trace_spans");
+        assert_eq!(&*tables.attrs, "trace_attrs_idx");
+    }
+
+    #[test]
+    fn trace_writer_tables_from_uses_dist_table_names_when_clustered() {
+        let config = Config {
+            cluster: Some("prod".to_string()),
+            ..Config::default()
+        };
+        let tables = trace_writer_tables_from(&config);
+        assert_eq!(&*tables.spans, "trace_spans_dist");
+        assert_eq!(&*tables.attrs, "trace_attrs_idx_dist");
     }
 
     #[test]

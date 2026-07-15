@@ -9,6 +9,7 @@ use pulsus_model::LabelSet;
 use serde::{Deserialize, Serialize};
 
 use crate::ingest::metrics::{MetricMetadata, MetricPoint, SeriesRef};
+use crate::ingest::traces::{AttrRecord, SpanRecord};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::spool::SpoolEncode;
 
@@ -348,6 +349,180 @@ impl SpoolEncode for MetricMetadataRow {
     }
 }
 
+/// One `trace_spans` row (docs/schemas.md §4.1, issue #54). `[u8; N]` ↔
+/// `FixedString(N)` (serde arrays serialize as N raw bytes on the RowBinary
+/// wire — no length prefix); `payload` is a **binary** protobuf blob stored
+/// in a `String` column, routed through `serde_bytes` so it serializes as a
+/// length-prefixed byte string (`serialize_bytes`) rather than serde's
+/// default `Vec<u8>`-as-sequence encoding, which would target
+/// `Array(UInt8)` and fail the insert. Field names/order match the DDL
+/// column list.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct TraceSpanRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub name: String,
+    pub service: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+    pub status_code: i8,
+    pub kind: i8,
+    /// Always `1` (= OTLP protobuf, docs/schemas.md §4.1's `payload_type`
+    /// legend) for rows produced by the OTLP receiver; `2` (Zipkin JSON) is
+    /// a compat-receiver value (M6+).
+    pub payload_type: i8,
+    #[serde(with = "serde_bytes")]
+    pub payload: Vec<u8>,
+}
+
+impl From<&SpanRecord> for TraceSpanRow {
+    fn from(record: &SpanRecord) -> Self {
+        TraceSpanRow {
+            trace_id: record.trace_id,
+            span_id: record.span_id,
+            parent_id: record.parent_id,
+            name: record.name.clone(),
+            service: record.service.clone(),
+            timestamp_ns: record.timestamp_ns,
+            duration_ns: record.duration_ns,
+            status_code: record.status_code,
+            kind: record.kind,
+            payload_type: 1,
+            payload: record.payload.clone(),
+        }
+    }
+}
+
+impl TraceSpanRow {
+    /// See [`LogSampleRow::est_bytes`]'s doc comment for the estimate's
+    /// intent and limits.
+    pub fn est_bytes(&self) -> u64 {
+        Self::estimate(&self.name, &self.service, self.payload.len())
+    }
+
+    /// Estimates a `SpanRecord`'s footprint *before* it is materialized
+    /// into a `TraceSpanRow` (reserve-before-materialize, the established
+    /// `est_source_bytes` pattern) — identical accounting to
+    /// [`Self::est_bytes`], read straight off the source record.
+    pub fn est_source_bytes(record: &SpanRecord) -> u64 {
+        Self::estimate(&record.name, &record.service, record.payload.len())
+    }
+
+    fn estimate(name: &str, service: &str, payload_len: usize) -> u64 {
+        (name.len() + service.len() + payload_len
+            + 16 /* trace_id */ + 8 /* span_id */ + 8 /* parent_id */
+            + 8 /* timestamp_ns */ + 8 /* duration_ns */
+            + 1 /* status_code */ + 1 /* kind */ + 1/* payload_type */) as u64
+    }
+}
+
+impl SpoolEncode for TraceSpanRow {
+    /// The spool is a human audit artifact, never an insert replay source
+    /// (`pulsus-clickhouse`'s "never auto-retried" contract): IDs render as
+    /// lowercase hex, and the binary `payload` renders as its byte length
+    /// only (`payload_len`) — a multi-KiB protobuf blob as a JSON int array
+    /// would bloat the file without helping a human audit it.
+    fn to_spool_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "trace_id": hex_lower(&self.trace_id),
+            "span_id": hex_lower(&self.span_id),
+            "parent_id": hex_lower(&self.parent_id),
+            "name": self.name,
+            "service": self.service,
+            "timestamp_ns": self.timestamp_ns,
+            "duration_ns": self.duration_ns,
+            "status_code": self.status_code,
+            "kind": self.kind,
+            "payload_type": self.payload_type,
+            "payload_len": self.payload.len(),
+        })
+    }
+}
+
+/// One `trace_attrs_idx` row (docs/schemas.md §4.1, issue #54 as amended:
+/// the `scope` discriminator sits between `val` and `val_num`, matching the
+/// DDL column order). `date` is the span's UTC **day** since the epoch
+/// (`Date::start_of_day_utc` — daily partitions), carried as the bare `u16`
+/// ClickHouse `Date` wire value, same convention as `LogStreamRow::month`.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct TraceAttrRow {
+    pub date: u16,
+    pub key: String,
+    pub val: String,
+    pub scope: String,
+    pub val_num: Option<f64>,
+    pub timestamp_ns: i64,
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub duration_ns: i64,
+}
+
+impl From<&AttrRecord> for TraceAttrRow {
+    fn from(record: &AttrRecord) -> Self {
+        TraceAttrRow {
+            date: record.date,
+            key: record.key.clone(),
+            val: record.val.clone(),
+            scope: record.scope.clone(),
+            val_num: record.val_num,
+            timestamp_ns: record.timestamp_ns,
+            trace_id: record.trace_id,
+            span_id: record.span_id,
+            duration_ns: record.duration_ns,
+        }
+    }
+}
+
+impl TraceAttrRow {
+    /// See [`LogSampleRow::est_bytes`]'s doc comment for the estimate's
+    /// intent and limits.
+    pub fn est_bytes(&self) -> u64 {
+        Self::estimate(&self.key, &self.val, &self.scope)
+    }
+
+    /// Estimates an `AttrRecord`'s footprint *before* it is materialized
+    /// into a `TraceAttrRow` (reserve-before-materialize).
+    pub fn est_source_bytes(record: &AttrRecord) -> u64 {
+        Self::estimate(&record.key, &record.val, &record.scope)
+    }
+
+    fn estimate(key: &str, val: &str, scope: &str) -> u64 {
+        (key.len() + val.len() + scope.len()
+            + 2 /* date */ + 9 /* val_num (tag + f64) */ + 8 /* timestamp_ns */
+            + 16 /* trace_id */ + 8 /* span_id */ + 8/* duration_ns */) as u64
+    }
+}
+
+impl SpoolEncode for TraceAttrRow {
+    /// IDs as lowercase hex (same audit rationale as [`TraceSpanRow`]'s
+    /// impl); `val_num` is finite-or-`None` by construction
+    /// (`otlp_traces::parse` filters non-finite parses), so a plain
+    /// `serde_json` number is exact — no `value_bits` hazard.
+    fn to_spool_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "date": self.date,
+            "key": self.key,
+            "val": self.val,
+            "scope": self.scope,
+            "val_num": self.val_num,
+            "timestamp_ns": self.timestamp_ns,
+            "trace_id": hex_lower(&self.trace_id),
+            "span_id": hex_lower(&self.span_id),
+            "duration_ns": self.duration_ns,
+        })
+    }
+}
+
+/// Lowercase hex rendering for the trace rows' spool audit encoding.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -655,6 +830,122 @@ mod tests {
         assert_eq!(
             MetricMetadataRow::est_source_bytes(&meta),
             mapped.est_bytes()
+        );
+    }
+
+    fn span_record() -> SpanRecord {
+        SpanRecord {
+            trace_id: [0xAB; 16],
+            span_id: [0x01; 8],
+            parent_id: [0; 8],
+            name: "op-a".to_string(),
+            service: "checkout".to_string(),
+            timestamp_ns: 1_700_000_000_000_000_000,
+            duration_ns: 1_000_000_000,
+            status_code: 2,
+            kind: 3,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }
+    }
+
+    fn attr_record() -> AttrRecord {
+        AttrRecord {
+            date: 19_675,
+            key: "http.status_code".to_string(),
+            scope: "span".to_string(),
+            val: "500".to_string(),
+            val_num: Some(500.0),
+            timestamp_ns: 1_700_000_000_000_000_000,
+            trace_id: [0xAB; 16],
+            span_id: [0x01; 8],
+            duration_ns: 1_000_000_000,
+        }
+    }
+
+    #[test]
+    fn trace_span_row_from_span_record_copies_every_field_and_pins_payload_type() {
+        let mapped = TraceSpanRow::from(&span_record());
+        assert_eq!(mapped.trace_id, [0xAB; 16]);
+        assert_eq!(mapped.span_id, [0x01; 8]);
+        assert_eq!(mapped.parent_id, [0; 8]);
+        assert_eq!(mapped.name, "op-a");
+        assert_eq!(mapped.service, "checkout");
+        assert_eq!(mapped.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(mapped.duration_ns, 1_000_000_000);
+        assert_eq!(mapped.status_code, 2);
+        assert_eq!(mapped.kind, 3);
+        assert_eq!(mapped.payload_type, 1, "OTLP protobuf payload type");
+        assert_eq!(mapped.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn trace_span_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
+        let record = span_record();
+        let mapped = TraceSpanRow::from(&record);
+        assert_eq!(TraceSpanRow::est_source_bytes(&record), mapped.est_bytes());
+    }
+
+    /// Pins `TraceSpanRow`'s spool audit-file SHAPE: IDs as lowercase hex,
+    /// the binary payload as its byte length only (`payload_len`) — the
+    /// spool is a human audit artifact, never an insert replay source.
+    #[test]
+    fn trace_span_row_spool_encoding_renders_hex_ids_and_payload_len_only() {
+        let spooled = TraceSpanRow::from(&span_record()).to_spool_value();
+        assert_eq!(
+            spooled,
+            serde_json::json!({
+                "trace_id": "abababababababababababababababab",
+                "span_id": "0101010101010101",
+                "parent_id": "0000000000000000",
+                "name": "op-a",
+                "service": "checkout",
+                "timestamp_ns": 1_700_000_000_000_000_000i64,
+                "duration_ns": 1_000_000_000,
+                "status_code": 2,
+                "kind": 3,
+                "payload_type": 1,
+                "payload_len": 4,
+            })
+        );
+    }
+
+    #[test]
+    fn trace_attr_row_from_attr_record_copies_every_field() {
+        let mapped = TraceAttrRow::from(&attr_record());
+        assert_eq!(mapped.date, 19_675);
+        assert_eq!(mapped.key, "http.status_code");
+        assert_eq!(mapped.val, "500");
+        assert_eq!(mapped.scope, "span");
+        assert_eq!(mapped.val_num, Some(500.0));
+        assert_eq!(mapped.timestamp_ns, 1_700_000_000_000_000_000);
+        assert_eq!(mapped.trace_id, [0xAB; 16]);
+        assert_eq!(mapped.span_id, [0x01; 8]);
+        assert_eq!(mapped.duration_ns, 1_000_000_000);
+    }
+
+    #[test]
+    fn trace_attr_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
+        let record = attr_record();
+        let mapped = TraceAttrRow::from(&record);
+        assert_eq!(TraceAttrRow::est_source_bytes(&record), mapped.est_bytes());
+    }
+
+    #[test]
+    fn trace_attr_row_spool_encoding_renders_hex_ids_and_plain_val_num() {
+        let spooled = TraceAttrRow::from(&attr_record()).to_spool_value();
+        assert_eq!(
+            spooled,
+            serde_json::json!({
+                "date": 19_675,
+                "key": "http.status_code",
+                "val": "500",
+                "scope": "span",
+                "val_num": 500.0,
+                "timestamp_ns": 1_700_000_000_000_000_000i64,
+                "trace_id": "abababababababababababababababab",
+                "span_id": "0101010101010101",
+                "duration_ns": 1_000_000_000,
+            })
         );
     }
 }

@@ -40,6 +40,7 @@ mod registration;
 mod rows;
 mod spool;
 mod table;
+mod trace;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,12 +56,16 @@ pub use config::WriterRuntime;
 pub use error::WriteError;
 pub use metric::{MetricWriter, MetricWriterTables};
 pub use metrics::{
-    MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, WriterMetrics,
-    WriterMetricsSnapshot,
+    MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, TraceWriterMetrics,
+    TraceWriterMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot,
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
-pub use rows::{LogSampleRow, LogStreamRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow};
+pub use rows::{
+    LogSampleRow, LogStreamRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow,
+    TraceSpanRow,
+};
 pub use table::{BlockInserter, ChBlockInserter};
+pub use trace::{TraceWriter, TraceWriterTables};
 
 use crate::error::LogsIngestError;
 use crate::ingest::{Backpressure, FlushWait, LogSink};

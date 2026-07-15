@@ -18,6 +18,7 @@ pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
 pulsus-model = { path = "../pulsus-model" }
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 snap.workspace = true
 thiserror.workspace = true

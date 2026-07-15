@@ -207,6 +207,60 @@ impl MetricWriterMetrics {
     }
 }
 
+/// [`WriterMetrics`]'s two-table counterpart for
+/// [`crate::writer::TraceWriter`] (issue #54): `spans`/`attrs` per-table
+/// counters plus the shared backpressure/spool/rejected atomics. No
+/// registration-cache counters (traces have no LRU/metadata caches —
+/// `trace_tag_catalog` is MV-populated) and no `collisions_total`
+/// (`ParsedTraces` has no label sets, so nothing collides).
+#[derive(Debug, Default)]
+pub struct TraceWriterMetrics {
+    pub spans: Arc<TableMetrics>,
+    pub attrs: Arc<TableMetrics>,
+    pub backpressure_total: AtomicU64,
+    pub spool_poison_total: AtomicU64,
+    pub spool_uncertain_total: AtomicU64,
+    pub rejected_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceWriterMetricsSnapshot {
+    pub spans: TableMetricsSnapshot,
+    pub attrs: TableMetricsSnapshot,
+    /// The live `queued_bytes` gauge — passed in by the caller
+    /// ([`crate::writer::TraceWriter::metrics`]), which owns the
+    /// authoritative `AtomicU64` (not duplicated here).
+    pub queue_bytes: u64,
+    pub backpressure_total: u64,
+    pub spool_poison_total: u64,
+    pub spool_uncertain_total: u64,
+    pub rejected_total: u64,
+}
+
+impl SpoolCounters for TraceWriterMetrics {
+    fn spool_poison_total(&self) -> &AtomicU64 {
+        &self.spool_poison_total
+    }
+
+    fn spool_uncertain_total(&self) -> &AtomicU64 {
+        &self.spool_uncertain_total
+    }
+}
+
+impl TraceWriterMetrics {
+    pub fn snapshot(&self, queue_bytes: u64) -> TraceWriterMetricsSnapshot {
+        TraceWriterMetricsSnapshot {
+            spans: self.spans.snapshot(),
+            attrs: self.attrs.snapshot(),
+            queue_bytes,
+            backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
+            spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),
+            spool_uncertain_total: self.spool_uncertain_total.load(Ordering::Relaxed),
+            rejected_total: self.rejected_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +303,17 @@ mod tests {
         let metrics = MetricWriterMetrics::default();
         let snap = metrics.snapshot(4096);
         assert_eq!(snap.queue_bytes, 4096);
+    }
+
+    #[test]
+    fn trace_writer_metrics_snapshot_reflects_queue_bytes_and_counters() {
+        let metrics = TraceWriterMetrics::default();
+        metrics.backpressure_total.fetch_add(2, Ordering::Relaxed);
+        metrics.rejected_total.fetch_add(5, Ordering::Relaxed);
+        let snap = metrics.snapshot(4096);
+        assert_eq!(snap.queue_bytes, 4096);
+        assert_eq!(snap.backpressure_total, 2);
+        assert_eq!(snap.rejected_total, 5);
     }
 
     #[test]

@@ -76,9 +76,11 @@ pub enum Surface {
     /// `/config`, `/buildinfo` — authed (when configured), never gated by
     /// mode.
     OpsAuthed,
-    /// `/v1/logs`, `/v1/metrics` (OTLP protobuf), `/api/v1/write`
-    /// (remote-write) — three distinct envelope shapes; `api_conformance.rs`
-    /// dispatches on the concrete path, not just this variant.
+    /// `/v1/logs`, `/v1/metrics`, `/v1/traces` (OTLP protobuf),
+    /// `/api/v1/write` (remote-write) — two structurally distinct envelope
+    /// families (three OTLP `Export*ServiceResponse` types + remote-write's
+    /// empty-body shape); `api_conformance.rs` dispatches on the concrete
+    /// path, not just this variant.
     Ingest,
     /// `/api/logs/v1/*` and its `/loki/api/v1/*` alias — LogQL JSON query
     /// envelope (`{"status","errorType","error","position"?}`).
@@ -197,7 +199,7 @@ pub enum ExpectedError {
         has_position: bool,
     },
     /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
-    /// protobuf error body (OTLP `/v1/logs`, `/v1/metrics`).
+    /// protobuf error body (OTLP `/v1/logs`, `/v1/metrics`, `/v1/traces`).
     Otlp { code: i32 },
     /// `/api/v1/write`'s plain-text error body (`text/plain; charset=utf-8`,
     /// non-empty).
@@ -550,6 +552,89 @@ const OTLP_INGEST_CASES: &[CaseClass] = &[
     },
 ];
 
+/// A valid-protobuf `/v1/traces` body, ~1 MiB on the wire, whose resource ×
+/// span fan-out estimates past `otlp_traces::MAX_EXPANDED_BYTES` (each
+/// span's stored payload re-carries the whole 1 MiB resource) — the
+/// parser's expansion budget must reject it wholesale as the structural
+/// 400/code-3 class (issue #54 code-review [high] fix). Traces-specific by
+/// construction, hence in [`OTLP_TRACES_INGEST_CASES`] only.
+fn otlp_traces_expansion_budget_body(req: &mut Req) {
+    use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use prost::Message;
+
+    let resource = Resource {
+        attributes: vec![KeyValue {
+            key: "big.attr".to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::StringValue("v".repeat(1024 * 1024))),
+            }),
+            key_strindex: 0,
+        }],
+        dropped_attributes_count: 0,
+        entity_refs: vec![],
+    };
+    let span_count = pulsus_write::protocols::otlp_traces::MAX_EXPANDED_BYTES / (1024 * 1024) + 2;
+    let body = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(resource),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: (0..span_count)
+                    .map(|_| Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![2; 8],
+                        name: "conformance-fan-out".to_string(),
+                        start_time_unix_nano: 1_700_000_000_000_000_000,
+                        end_time_unix_nano: 1_700_000_001_000_000_000,
+                        ..Default::default()
+                    })
+                    .collect(),
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    req.content_type = Some("application/x-protobuf");
+    req.body = body.encode_to_vec();
+}
+
+/// [`OTLP_INGEST_CASES`] ⊕ the traces-only expansion-budget cell (a
+/// `const`-slice concat is not expressible on stable, so the three shared
+/// entries are repeated verbatim). Only `/v1/traces` references this list —
+/// the logs/metrics parsers have no expansion budget (their outputs are
+/// ~1:1 with wire records; see issue #54's implementation notes for the
+/// metrics-path follow-up).
+const OTLP_TRACES_INGEST_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_body",
+        build: otlp_malformed_body,
+        expect_status: 400,
+        expect: ExpectedError::Otlp { code: 3 },
+    },
+    CaseClass {
+        name: "unsupported_content_encoding",
+        build: otlp_wrong_content_encoding,
+        expect_status: 400,
+        expect: ExpectedError::Otlp { code: 3 },
+    },
+    CaseClass {
+        name: "undecodable_body_correct_content_type",
+        build: otlp_undecodable_with_correct_content_type,
+        expect_status: 400,
+        expect: ExpectedError::Otlp { code: 3 },
+    },
+    CaseClass {
+        name: "expansion_budget_exceeded",
+        build: otlp_traces_expansion_budget_body,
+        expect_status: 400,
+        expect: ExpectedError::Otlp { code: 3 },
+    },
+];
+
 fn rw_bad_snappy(req: &mut Req) {
     req.body = b"\xFF\xFF\xFF not snappy".to_vec();
 }
@@ -657,6 +742,17 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "",
         cases: OTLP_INGEST_CASES,
+    },
+    RouteSpec {
+        path: "/v1/traces",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::WriterMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: OTLP_TRACES_INGEST_CASES,
     },
     RouteSpec {
         path: "/api/v1/write",
@@ -933,17 +1029,6 @@ static MANIFEST: &[RouteSpec] = &[
     // the endpoint inventory's own documentation value and are excluded
     // from both the drift guard (never `Mounted`) and the docs-gap check
     // (`DocRef::Skip`).
-    RouteSpec {
-        path: "/v1/traces",
-        methods: &[Method::Post],
-        surface: Surface::Ingest,
-        gate: Gate::WriterMode,
-        status: RouteStatus::Planned { milestone: "M4" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
     RouteSpec {
         path: "/v1development/profiles",
         methods: &[Method::Post],

@@ -294,20 +294,22 @@ async fn seed_spans_corpus(client: &ChClient, db: &str, base_ns: i64) {
 }
 
 /// Seeds [`CORPUS_ROWS`] `trace_attrs_idx` rows as ONE dense
-/// `(key='http.status_code', val='500')` group with timestamps spread
-/// evenly across `[base_ns, base_ns + CORPUS_SPAN_NS)` — so that single
-/// `(key, val)` prefix spans many granules and pruning under a narrower
-/// time window is attributable to the timestamp predicate alone (issue #53
-/// plan v2 delta 3).
+/// `(key='http.status_code', val='500', scope='span')` group with
+/// timestamps spread evenly across `[base_ns, base_ns + CORPUS_SPAN_NS)` —
+/// so that single `(key, val, scope)` prefix spans many granules and
+/// pruning under a narrower time window is attributable to the timestamp
+/// predicate alone (issue #53 plan v2 delta 3, scope column added by issue
+/// #54's amended migration 17).
 async fn seed_attrs_corpus(client: &ChClient, db: &str, base_ns: i64) {
     let step_ns = CORPUS_SPAN_NS / i64::try_from(CORPUS_ROWS).expect("fits i64");
     let sql = format!(
         "INSERT INTO {db}.trace_attrs_idx \
-             (date, key, val, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+             (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
          SELECT \
              toDate(fromUnixTimestamp64Nano({base_ns} + number * {step_ns})), \
              'http.status_code', \
              '500', \
+             'span', \
              500, \
              {base_ns} + number * {step_ns}, \
              toFixedString(hex(cityHash64(number)), 16), \
@@ -390,21 +392,26 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
         2
     );
 
-    // Four attr rows, three distinct (key, val) pairs — the MV must land
-    // the deduplicated set in trace_tag_catalog (read FINAL: ReplacingMergeTree).
+    // Five attr rows, four distinct (scope, key, val) triples — the MV
+    // must land the deduplicated scoped set in trace_tag_catalog (read
+    // FINAL: ReplacingMergeTree). 'deployment.environment'/'prod' exists
+    // at BOTH scopes (issue #54's dual-scope case): the catalog must keep
+    // both rows, separated only by scope.
     client
         .execute(
             &format!(
                 "INSERT INTO {db}.trace_attrs_idx \
-                     (date, key, val, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                     (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
                  VALUES \
-                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '500', 500, {ts}, \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '500', 'span', 500, {ts}, \
                       '0123456789abcdef', 'span0001', 1000000), \
-                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '500', 500, {ts}, \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '500', 'span', 500, {ts}, \
                       'fedcba9876543210', 'span0002', 2000000), \
-                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '404', 404, {ts}, \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.status_code', '404', 'span', 404, {ts}, \
                       '0123456789abcdef', 'span0001', 1000000), \
-                     (toDate(fromUnixTimestamp64Nano({ts})), 'http.method', 'GET', NULL, {ts}, \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'deployment.environment', 'prod', 'resource', NULL, {ts}, \
+                      '0123456789abcdef', 'span0001', 1000000), \
+                     (toDate(fromUnixTimestamp64Nano({ts})), 'deployment.environment', 'prod', 'span', NULL, {ts}, \
                       '0123456789abcdef', 'span0001', 1000000)"
             ),
             &QuerySettings::new(),
@@ -418,17 +425,20 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
             &format!("SELECT count() AS n FROM {db}.trace_attrs_idx")
         )
         .await,
-        4
+        5
     );
 
     #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
     struct TagRow {
+        scope: String,
         key: String,
         val: String,
     }
     let mut stream = client
         .query_stream::<TagRow>(
-            &format!("SELECT key, val FROM {db}.trace_tag_catalog FINAL ORDER BY key, val"),
+            &format!(
+                "SELECT scope, key, val FROM {db}.trace_tag_catalog FINAL ORDER BY scope, key, val"
+            ),
             &QuerySettings::new(),
         )
         .await
@@ -438,19 +448,22 @@ async fn run_init_creates_trace_tables_and_mv_and_round_trips_via_the_catalog_mv
         tags.push(row.expect("decode tag row"));
     }
     let expected: Vec<TagRow> = [
-        ("http.method", "GET"),
-        ("http.status_code", "404"),
-        ("http.status_code", "500"),
+        ("resource", "deployment.environment", "prod"),
+        ("span", "deployment.environment", "prod"),
+        ("span", "http.status_code", "404"),
+        ("span", "http.status_code", "500"),
     ]
     .into_iter()
-    .map(|(key, val)| TagRow {
+    .map(|(scope, key, val)| TagRow {
+        scope: scope.to_string(),
         key: key.to_string(),
         val: val.to_string(),
     })
     .collect();
     assert_eq!(
         tags, expected,
-        "the MV must populate trace_tag_catalog with the deduplicated (key, val) set"
+        "the MV must populate trace_tag_catalog with the deduplicated (scope, key, val) set — \
+         the dual-scope pair stays two rows, separated only by scope"
     );
 }
 
@@ -515,11 +528,13 @@ async fn stage1_intrinsics_query_selects_the_service_time_projection() {
     );
 }
 
-/// AC3b (issue #53 plan v2 delta 3): within ONE dense `(key, val)` prefix
-/// spanning many granules, the identical Stage-2 attr query over a narrow
-/// (1h) time window must read strictly fewer granules — and rows — than the
-/// full-range run, proving the `(key, val, timestamp_ns, ...)` primary key
-/// time-prunes *within* the key prefix (not merely via key/val selectivity).
+/// AC3b (issue #53 plan v2 delta 3, re-proven under issue #54's amended
+/// scoped DDL): within ONE dense `(key, val, scope)` prefix spanning many
+/// granules, the identical Stage-2 attr query (now scoped, docs/schemas.md
+/// §4.2) over a narrow (1h) time window must read strictly fewer granules —
+/// and rows — than the full-range run, proving the `(key, val, scope,
+/// timestamp_ns, ...)` primary key time-prunes *within* the scoped key
+/// prefix (not merely via key/val selectivity).
 #[tokio::test]
 async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
     skip_unless_live!();
@@ -536,7 +551,7 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
     let stage2 = |from_ns: i64| {
         format!(
             "SELECT trace_id, span_id FROM {db}.trace_attrs_idx \
-             WHERE key = 'http.status_code' AND val = '500' \
+             WHERE key = 'http.status_code' AND val = '500' AND scope = 'span' \
                AND timestamp_ns > {from_ns} AND timestamp_ns <= {end_ns}"
         )
     };
@@ -545,8 +560,8 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
 
     let full_plan = explain_indexes(&client, &full_sql).await;
     let narrow_plan = explain_indexes(&client, &narrow_sql).await;
-    assert_primary_key_keys(&full_plan, &["key", "val", "timestamp_ns"]);
-    assert_primary_key_keys(&narrow_plan, &["key", "val", "timestamp_ns"]);
+    assert_primary_key_keys(&full_plan, &["key", "val", "scope", "timestamp_ns"]);
+    assert_primary_key_keys(&narrow_plan, &["key", "val", "scope", "timestamp_ns"]);
 
     let (full_selected, full_total) = last_granules(&full_plan);
     let (narrow_selected, narrow_total) = last_granules(&narrow_plan);
@@ -565,17 +580,26 @@ async fn narrow_time_window_prunes_granules_within_a_fixed_key_val_prefix() {
         full_plan.join("\n")
     );
 
-    // Execution-side corroboration: strictly fewer rows read too.
+    // Execution-side corroboration: strictly fewer rows read too. NOT a
+    // bare `count()` wrap (issue #54 re-prove finding): on 24.8 a filtered
+    // count whose predicate is fully primary-key-analyzable is answered
+    // from index metadata for every fully-matched granule range, so
+    // `read_rows` collapses to the *boundary* parts only — the full-range
+    // run reads just the first (partial) day partition and the narrow run
+    // the last, and which is larger depends on the time of day the corpus
+    // was seeded (a latent flake). `uniqExact(span_id)` forces every
+    // matched row to actually be read, so `read_rows` reflects real
+    // scanning on both legs.
     let pid = std::process::id();
     let (_, full_read_rows) = run_and_capture_query_log(
         &client,
-        &format!("SELECT count() AS n FROM ({full_sql})"),
+        &format!("SELECT uniqExact(span_id) AS n FROM ({full_sql})"),
         &format!("pulsus-it-traces-attr-full-{pid}"),
     )
     .await;
     let (_, narrow_read_rows) = run_and_capture_query_log(
         &client,
-        &format!("SELECT count() AS n FROM ({narrow_sql})"),
+        &format!("SELECT uniqExact(span_id) AS n FROM ({narrow_sql})"),
         &format!("pulsus-it-traces-attr-narrow-{pid}"),
     )
     .await;

@@ -1458,7 +1458,11 @@ version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
 dependencies = [
+ "futures-core",
+ "futures-sink",
  "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1482,7 +1486,9 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "opentelemetry",
+ "percent-encoding",
  "portable-atomic",
+ "rand 0.9.5",
  "thiserror 2.0.18",
 ]
 
@@ -1786,6 +1792,7 @@ dependencies = [
  "pulsus-model",
  "pulsus-schema",
  "serde",
+ "serde_bytes",
  "serde_json",
  "snap",
  "thiserror 2.0.18",
@@ -2212,6 +2219,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

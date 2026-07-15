@@ -68,7 +68,8 @@ Logs, metrics, traces, and profiles have different query shapes, so each gets it
 A *fingerprint* is a 64-bit hash identifying a unique label set (a stream/series).
 
 - **Metrics:** `xxhash64` over the label set serialized as `key \xff value \xff ...` with keys sorted and `__name__` excluded (the metric name is a first-class column). This keeps fingerprints stable across label reordering and lets the samples table stay string-free.
-- **Logs, traces, profiles:** `cityHash64` over a single canonical buffer — each sorted label appended as `key ++ 0xFF ++ value ++ 0xFF` — using an implementation **bit-identical to ClickHouse's `cityHash64`** (ClickHouse's frozen CityHash 1.0.2 variant, not upstream CityHash 1.1). The writer is the sole fingerprint authority (the label-index MV only fans out the writer's fingerprint), but bit-identity keeps server-side derivation possible (`cityHash64(concat(...))` over the same buffer) and is enforced by a live cross-check test against `SELECT cityHash64(unhex(...))`.
+- **Logs and profiles:** `cityHash64` over a single canonical buffer — each sorted label appended as `key ++ 0xFF ++ value ++ 0xFF` — using an implementation **bit-identical to ClickHouse's `cityHash64`** (ClickHouse's frozen CityHash 1.0.2 variant, not upstream CityHash 1.1). The writer is the sole fingerprint authority (the label-index MV only fans out the writer's fingerprint), but bit-identity keeps server-side derivation possible (`cityHash64(concat(...))` over the same buffer) and is enforced by a live cross-check test against `SELECT cityHash64(unhex(...))`.
+- **Traces carry no label fingerprint** (this supersedes earlier revisions of this section, which listed traces alongside logs/profiles — ratified with the M4 schema, issue #53/#54): a span's identity is `(trace_id, span_id)`, the attribute index keys on `(key, val, scope, timestamp_ns, trace_id, span_id)`, and distribution shards by `cityHash64(trace_id)` — a server-side expression over a physical column, never a writer-generated label-set fingerprint.
 
 Fingerprint computation is centralized in `pulsus-model` and covered by golden-value tests; a fingerprint mismatch between writer and MV silently corrupts the label index, so these functions are frozen by test vectors.
 
@@ -77,7 +78,7 @@ Fingerprint computation is centralized in `pulsus-model` and covered by golden-v
 Label keys are part of the user-visible query surface *and* the fingerprint input, so their normalization is fixed before any code exists:
 
 - **Logs and metrics:** attribute keys are normalized to Prometheus-style names at ingest — characters outside `[a-zA-Z0-9_]` become `_` (OTel `service.name` → label `service_name`, `k8s.pod.name` → `k8s_pod_name`). This matches how the wider ecosystem (collectors, exporters, dashboards) already flattens OTel attributes, and it happens **before** fingerprinting, so a series has exactly one identity regardless of transport.
-- **Traces:** span and resource attribute keys are stored **verbatim** in the attribute index — TraceQL addresses them by their OTel names (`span.http.status_code`, `resource.service.name`).
+- **Traces:** span and resource attribute keys are stored **verbatim** in the attribute index — TraceQL addresses them by their OTel names (`span.http.status_code`, `resource.service.name`). The index carries a `scope` discriminator (`'resource'` vs `'span'`) alongside each verbatim `(key, val)` pair, so `resource.foo` and `span.foo` remain separable even when the same key appears at both scopes.
 - **The promoted physical column is named `service` on the tables whose read paths are service-led — logs, traces, and profiles** — populated from `service.name` (resource) at ingest. It is an internal projection: users see the `service_name` label (logs/profiles) or `resource.service.name` (TraceQL); the planner maps both to the column. **Metrics deliberately have no `service` column**: the hot table stays `(metric_name, fingerprint, unix_milli, value)`, reads are metric-name + fingerprint driven, and service exists there only as the normalized `service_name` label.
 - Golden tests pin the whole chain: `{service_name="checkout"}`, `resource.service.name = "checkout"`, and the physical `service` column must resolve to the same data.
 
@@ -91,7 +92,7 @@ v1 is **single-tenant**. One per-request escape hatch exists for routing: `X-Pul
 
 **The authoritative DDL, per-table rationale, generated-SQL read paths, and latency targets live in [schemas.md](schemas.md).** This section summarizes the decisions; where the two documents differ, schemas.md wins.
 
-All DDL is owned by `pulsus-schema` as templated SQL (parameters: database, cluster clause, engine family, storage policy). Migrations are append-only and idempotent; a `schema_migrations` bookkeeping table records applied statements. When `PULSUS_CLUSTER` is set, `MergeTree` families swap to `ReplicatedMergeTree` equivalents and `*_dist` Distributed tables are created. Raw sample/span tables partition **daily** (short TTL, whole-part drops); series/index/tier tables partition **monthly**.
+All DDL is owned by `pulsus-schema` as templated SQL (parameters: database, cluster clause, engine family, storage policy). Migrations are idempotent, and append-only from the first tagged release onward — in-place amendment of an already-listed migration was permitted only pre-release (the trace-index scope amendment, issue #54, was the last such window; see schemas.md §6); a `schema_migrations` bookkeeping table records applied statements. When `PULSUS_CLUSTER` is set, `MergeTree` families swap to `ReplicatedMergeTree` equivalents and `*_dist` Distributed tables are created. Raw sample/span tables partition **daily** (short TTL, whole-part drops); series/index/tier tables partition **monthly**.
 
 ### 3.1 Metrics
 
@@ -125,12 +126,12 @@ Decisions and their reasons:
 
 ### 3.3 Traces
 
-Span payload table (`trace_spans`, ordered `(trace_id, timestamp_ns)` with a `service_time` projection), attribute index (`trace_attrs_idx`, ordered `(key, val, timestamp_ns, trace_id, span_id)` with a typed `val_num` column for numeric comparisons), and a bounded `trace_tag_catalog` for tag APIs (full DDL and read-path SQL in [schemas.md §4](schemas.md)).
+Span payload table (`trace_spans`, ordered `(trace_id, timestamp_ns)` with a `service_time` projection), attribute index (`trace_attrs_idx`, ordered `(key, val, scope, timestamp_ns, trace_id, span_id)` with a typed `val_num` column for numeric comparisons and a `scope` discriminator), and a bounded, scope-aware `trace_tag_catalog` for tag APIs (full DDL and read-path SQL in [schemas.md §4](schemas.md)).
 
 Decisions and their reasons:
 
 - **Both access patterns served by one table.** Primary ordering `(trace_id, timestamp_ns)` makes trace-by-ID fetch a point read; the `service_time` **projection** gives service + time-range searches their own physically sorted copy, so "recent traces for service X" never scans by trace ID. Projections cost write amplification; that trade is accepted because trace search is the human-facing slow path.
-- **`timestamp_ns` before `trace_id` in the attribute index ordering** so that TraceQL searches — which are always time-bounded — prune index granules by time within a `(key, val)` prefix.
+- **`timestamp_ns` before `trace_id` in the attribute index ordering** so that TraceQL searches — which are always time-bounded — prune index granules by time within a `(key, val)` (or scoped `(key, val, scope)`) prefix.
 - **Candidate-set discipline.** TraceQL planning caps intermediate trace-ID candidate sets (spill to a bounded top-K by recency) rather than joining unbounded sets against the payload table.
 
 ### 3.4 Profiles

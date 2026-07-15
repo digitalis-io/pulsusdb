@@ -430,7 +430,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use crate::app::BuildInfo;
-    use crate::ingest::{MetricWriterSink, WriterSink};
+    use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
     fn test_state() -> AppState {
         AppState {
@@ -442,6 +442,7 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
         }

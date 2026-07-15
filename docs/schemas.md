@@ -375,6 +375,7 @@ CREATE TABLE trace_attrs_idx (
     date          Date,
     key           LowCardinality(String),
     val           String,
+    scope         LowCardinality(String),        -- 'resource' | 'span'
     val_num       Nullable(Float64),             -- populated when val parses numeric
     timestamp_ns  Int64,
     trace_id      FixedString(16),
@@ -382,19 +383,21 @@ CREATE TABLE trace_attrs_idx (
     duration_ns   Int64
 ) ENGINE = ReplacingMergeTree
 PARTITION BY date
-ORDER BY (key, val, timestamp_ns, trace_id, span_id)
+ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)
 TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
 SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE trace_tag_catalog (
-    key  LowCardinality(String),
-    val  String
+    scope  LowCardinality(String),
+    key    LowCardinality(String),
+    val    String
 ) ENGINE = ReplacingMergeTree
-ORDER BY (key, val);
--- populated by MV over trace_attrs_idx; bounded per key by the writer
+ORDER BY (scope, key, val);
+-- populated by MV over trace_attrs_idx (SELECT scope, key, val); bounded per key by the writer
 ```
 
-- **`timestamp_ns` third in the index key**: TraceQL searches are always time-bounded, so within each `(key, val)` prefix the time predicate prunes granules — a 3h search over a busy attribute reads 3h of index, not 7 days (compare finding #5's index, which ordered trace/span IDs before time).
+- **`scope` discriminates the attribute's origin** (`'resource'` vs `'span'`), so identical verbatim `(key, val)` pairs at different scopes stay separable — scoped TraceQL (`resource.foo` vs `span.foo`) would otherwise be incorrect. It sits **after** `(key, val)` in the ordering key: the proven `(key, val)` prefix pruning is preserved, a scoped query fixes `scope` by equality for near-free post-prefix time pruning, and an unscoped legacy tag search still prunes on the bare `(key, val)` prefix. Scope attributes are **not** indexed (M4 TraceQL exposes only `resource.`/`span.` selectors); they remain fully preserved in the span payload. `trace_tag_catalog` carries `scope` too — Tempo's `/api/v2/search/tags` (T6) is scope-aware.
+- **`timestamp_ns` after the `(key, val, scope)` prefix**: TraceQL searches are always time-bounded, so within each `(key, val)` (or `(key, val, scope)`) prefix the time predicate prunes granules — a 3h search over a busy attribute reads 3h of index, not 7 days (compare finding #5's index, which ordered trace/span IDs before time).
 - **`val_num`** gives numeric comparisons (`span.http.status_code >= 500`) a typed column. Scope this honestly: `val_num` is not in the primary key, so a range predicate scans *all values of that key* in the time range and filters — acceptable for low-cardinality numeric attributes (status codes, retry counts), **not** a general strategy for high-cardinality numerics (sizes, user-defined measurements). Duration, status, kind, name, and service are physical span columns precisely so the common numeric intrinsics never rely on this index. If benchmarks show real workloads need fast range predicates on high-cardinality numeric attributes, the design adds a dedicated numeric index ordered `(key, timestamp_ns, val_num, ...)` — benchmark-gated, not speculative.
 - Tag APIs read only `trace_tag_catalog` — discovery never scans span payloads.
 
@@ -420,13 +423,14 @@ WHERE timestamp_ns > {now - 3h} AND timestamp_ns <= {now}
   AND duration_ns > 2000000000
 ```
 
-Stage 2 — attribute conditions on the index, time-pruned within the key prefix:
+Stage 2 — attribute conditions on the index, time-pruned within the key prefix (the `span.` selector pins `scope = 'span'`; an unscoped `.attr` selector omits the scope predicate and still prunes on the `(key, val)` prefix alone):
 
 ```sql
 SELECT trace_id, span_id
 FROM trace_attrs_idx
 WHERE date >= today() - 1
   AND key = 'http.status_code' AND val_num >= 500
+  AND scope = 'span'
   AND timestamp_ns > {now - 3h} AND timestamp_ns <= {now}
 ```
 
@@ -530,6 +534,8 @@ CREATE TABLE mv_checksums (
 ) ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY mv_name;
 ```
+
+**Migration amendment policy:** the migration catalog (`pulsus-schema`'s `catalog.rs`, recorded per-id in `schema_migrations`) is append-only from the first tagged release onward. In-place amendment of an already-listed migration was permitted only pre-release (no tagged release, no persistent deployments, CI databases created fresh per run); the trace-index scope amendment (issue #54) was the last such amendment window. A local database created before a pre-release amendment must be dropped and re-reconciled — the per-id checksum drift guard refuses to touch the stale tables.
 
 ---
 

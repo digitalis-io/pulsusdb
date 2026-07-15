@@ -12,6 +12,16 @@
 //! wrappers, per the architect plan. M0 covers only the logs + metrics
 //! families (docs/schemas.md §2.1, §3.1, §6); traces/profiles/rules and the
 //! metric tiers are out of scope (issue #5).
+//!
+//! **Amendment policy:** migrations are append-only from the first tagged
+//! release onward. In-place amendment of an already-listed migration was
+//! permitted only pre-release (no tagged release, no persistent
+//! deployments, CI databases created fresh per run), and issue #54's scope
+//! amendment of migrations 17/18 + `trace_tag_catalog_mv` was the last such
+//! amendment window (task-manager ruling on #54). Developers with a local
+//! schema created before that amendment must drop and re-reconcile it —
+//! the checksum drift guard ([`MigrationScope::Checksum`]) correctly
+//! refuses to touch the stale tables.
 
 use crate::render::Family;
 
@@ -351,6 +361,7 @@ pub const MIGRATIONS: &[Migration] = &[
                  date          Date,\n\
                  key           LowCardinality(String),\n\
                  val           String,\n\
+                 scope         LowCardinality(String),\n\
                  val_num       Nullable(Float64),\n\
                  timestamp_ns  Int64,\n\
                  trace_id      FixedString(16),\n\
@@ -358,7 +369,7 @@ pub const MIGRATIONS: &[Migration] = &[
                  duration_ns   Int64\n\
              ) ENGINE = ReplacingMergeTree\n\
              PARTITION BY date\n\
-             ORDER BY (key, val, timestamp_ns, trace_id, span_id)\n\
+             ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)\n\
              TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
              SETTINGS ttl_only_drop_parts = 1;",
         ),
@@ -375,10 +386,11 @@ pub const MIGRATIONS: &[Migration] = &[
         family: None,
         ddl: Ddl::Static(
             "CREATE TABLE IF NOT EXISTS {{db}}.trace_tag_catalog{{on_cluster}} (\n\
-                 key  LowCardinality(String),\n\
-                 val  String\n\
+                 scope  LowCardinality(String),\n\
+                 key    LowCardinality(String),\n\
+                 val    String\n\
              ) ENGINE = ReplacingMergeTree\n\
-             ORDER BY (key, val);",
+             ORDER BY (scope, key, val);",
         ),
         scope: MigrationScope::Checksum,
         replication: Replication::Global,
@@ -427,13 +439,13 @@ pub const MVS: &[MvDef] = &[
                GROUP BY fingerprint, bucket_ns;",
     },
     // Fires per shard in cluster mode; every shard writes the same Global
-    // replica set and `ReplacingMergeTree(key, val)` + duplicate-tolerant
-    // reads absorb the redundancy (docs/schemas.md §8) — the established
-    // catalog pattern (`metric_metadata`).
+    // replica set and `ReplacingMergeTree(scope, key, val)` +
+    // duplicate-tolerant reads absorb the redundancy (docs/schemas.md §8) —
+    // the established catalog pattern (`metric_metadata`).
     MvDef {
         name: "trace_tag_catalog_mv",
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog AS\n\
-               SELECT key, val\n\
+               SELECT scope, key, val\n\
                FROM {{db}}.trace_attrs_idx;",
     },
 ];
@@ -567,17 +579,23 @@ mod tests {
         assert!(static_tmpl(16).contains("INTERVAL {{retention_days}} DAY DELETE"));
     }
 
-    /// AC1b (issue #53, plan v2 delta 1): trace_attrs_idx carries the
+    /// AC1b (issue #53, plan v2 delta 1) as amended in place by issue #54
+    /// (scope discriminator, last pre-release amendment window — see the
+    /// module doc's amendment policy): trace_attrs_idx carries the
     /// adjudicated retention lifecycle — the same tokenized delete-TTL as
-    /// trace_spans — plus the §4.1 typed-numeric column and index key.
+    /// trace_spans — plus the §4.1 typed-numeric column, the `scope`
+    /// discriminator, and the scoped index key with `scope` AFTER `val`
+    /// (preserves the proven `(key, val)` prefix pruning; scoped TraceQL
+    /// fixes `scope` for near-free post-prefix time pruning).
     #[test]
-    fn trace_attrs_idx_ddl_carries_val_num_order_and_tokenized_ttl() {
+    fn trace_attrs_idx_ddl_carries_scope_val_num_order_and_tokenized_ttl() {
         let ddl = rendered_static(17);
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_attrs_idx"));
+        assert!(ddl.contains("scope         LowCardinality(String)"));
         assert!(ddl.contains("val_num       Nullable(Float64)"));
         assert!(ddl.contains("ENGINE = ReplacingMergeTree"));
         assert!(ddl.contains("PARTITION BY date"));
-        assert!(ddl.contains("ORDER BY (key, val, timestamp_ns, trace_id, span_id)"));
+        assert!(ddl.contains("ORDER BY (key, val, scope, timestamp_ns, trace_id, span_id)"));
         assert!(ddl.contains(
             "TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE"
         ));
@@ -585,14 +603,17 @@ mod tests {
         assert!(static_tmpl(17).contains("INTERVAL {{retention_days}} DAY DELETE"));
     }
 
-    /// AC1b (issue #53): trace_tag_catalog is a bounded catalog — deduped
-    /// `(key, val)`, no TTL, no `_dist` wrapper (Replication::Global).
+    /// AC1b (issue #53) as amended in place by issue #54: trace_tag_catalog
+    /// is a bounded catalog — deduped `(scope, key, val)` (scope-aware for
+    /// T6's Tempo `/api/v2/search/tags`), no TTL, no `_dist` wrapper
+    /// (Replication::Global).
     #[test]
     fn trace_tag_catalog_ddl_is_a_bounded_replacing_catalog() {
         let ddl = rendered_static(18);
         assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_tag_catalog"));
+        assert!(ddl.contains("scope  LowCardinality(String)"));
         assert!(ddl.contains("ENGINE = ReplacingMergeTree"));
-        assert!(ddl.contains("ORDER BY (key, val);"));
+        assert!(ddl.contains("ORDER BY (scope, key, val);"));
         assert!(!ddl.contains("TTL"));
         let m = MIGRATIONS.iter().find(|m| m.id == 18).expect("id 18");
         assert_eq!(m.replication, Replication::Global);
@@ -603,6 +624,19 @@ mod tests {
                 .any(|m| m.name == "trace_tag_catalog" && matches!(m.ddl, Ddl::Dist)),
             "trace_tag_catalog must not have a _dist wrapper"
         );
+    }
+
+    /// Issue #54 (scope amendment): the tag-catalog MV forwards the `scope`
+    /// discriminator — a scope-less MV would land every row with the
+    /// column's empty-string default, silently collapsing the catalog's
+    /// scope dimension.
+    #[test]
+    fn trace_tag_catalog_mv_selects_scope_key_val() {
+        let mv = MVS
+            .iter()
+            .find(|mv| mv.name == "trace_tag_catalog_mv")
+            .expect("trace_tag_catalog_mv present");
+        assert!(mv.tmpl.contains("SELECT scope, key, val"));
     }
 
     /// Issue #53: the `_dist` wrappers for both per-shard trace tables carry

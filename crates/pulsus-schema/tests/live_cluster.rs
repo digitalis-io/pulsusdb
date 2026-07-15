@@ -365,6 +365,7 @@ struct MetricMetadataRow {
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 struct TraceTagRow {
+    scope: String,
     key: String,
     val: String,
 }
@@ -535,8 +536,8 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     shard1
         .execute(
             &format!(
-                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog (key, val) \
-                 VALUES ('http.status_code', '500')"
+                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog (scope, key, val) \
+                 VALUES ('span', 'http.status_code', '500')"
             ),
             &QuerySettings::new(),
             Idempotency::NonIdempotent,
@@ -549,14 +550,14 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
                 &shard1,
                 TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
-                "key, val",
+                "scope, key, val",
             )
             .await,
             bookkeeping_rows::<TraceTagRow>(
                 &shard2,
                 TEST_DB_BOOKKEEPING,
                 "trace_tag_catalog",
-                "key, val",
+                "scope, key, val",
             )
             .await,
         )

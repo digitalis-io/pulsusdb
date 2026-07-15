@@ -13,7 +13,7 @@ use pulsus_read::LabelCache;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::ingest::{MetricWriterSink, WriterSink};
+use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 use crate::middleware;
 use crate::ops;
 use crate::serve::ServeError;
@@ -24,11 +24,12 @@ use crate::{compat, modes};
 /// once by the background reconnect loop (`serve::spawn_reconnect_loop`) —
 /// `tokio::sync::RwLock` because `/ready` reads it on every probe while it
 /// is written at most once per process lifetime (reads vastly dominate
-/// writes). `writer`/`metric_writer` mirror the same "async-filled, read
-/// constantly" shape via their own inner `OnceLock` (issue #15/#27
-/// architect plans): the `WriterSink`/`MetricWriterSink` themselves are
-/// constructed eagerly (cheap — each is just an empty slot handle), only
-/// the `LogWriter`/`MetricWriter` they wrap arrive later. `label_cache`
+/// writes). `writer`/`metric_writer`/`trace_writer` mirror the same
+/// "async-filled, read constantly" shape via their own inner `OnceLock`
+/// (issue #15/#27/#54 architect plans): the `WriterSink`/
+/// `MetricWriterSink`/`TraceWriterSink` themselves are constructed eagerly
+/// (cheap — each is just an empty slot handle), only the `LogWriter`/
+/// `MetricWriter`/`TraceWriter` they wrap arrive later. `label_cache`
 /// (issue #30) is the same async-filled `OnceLock` shape directly (no
 /// trait-adapting sink wrapper needed — nothing implements a `LabelCache`
 /// trait the way `WriterSink` implements `LogSink`): `.get()` is `None`
@@ -46,6 +47,7 @@ pub(crate) struct AppState {
     pub(crate) build: BuildInfo,
     pub(crate) writer: Arc<WriterSink>,
     pub(crate) metric_writer: Arc<MetricWriterSink>,
+    pub(crate) trace_writer: Arc<TraceWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
     pub(crate) started_at: std::time::SystemTime,
 }
@@ -126,6 +128,7 @@ mod tests {
             build: BuildInfo::from_build_env(),
             writer: Arc::new(WriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
+            trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
         }

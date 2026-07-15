@@ -69,12 +69,16 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
 use opentelemetry_proto::tonic::common::v1::AnyValue;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
 };
+use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use manifest::{
     CaseClass, ExpectedError, Gate, Method, RouteSpec, RouteStatus, Surface, route_manifest,
@@ -328,6 +332,29 @@ fn valid_otlp_metrics_body() -> Vec<u8> {
                         }],
                     })),
                 }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    req.encode_to_vec()
+}
+
+fn valid_otlp_traces_body() -> Vec<u8> {
+    let span = Span {
+        trace_id: vec![1; 16],
+        span_id: vec![2; 8],
+        name: "conformance-span".to_string(),
+        start_time_unix_nano: 1_700_000_000_000_000_000,
+        end_time_unix_nano: 1_700_000_001_000_000_000,
+        ..Default::default()
+    };
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![span],
                 schema_url: String::new(),
             }],
             schema_url: String::new(),
@@ -748,6 +775,10 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
         ExportLogsServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
             panic!("{ctx}: success body must decode as ExportLogsServiceResponse: {e}")
         });
+    } else if spec.path == "/v1/traces" {
+        ExportTraceServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
+            panic!("{ctx}: success body must decode as ExportTraceServiceResponse: {e}")
+        });
     } else {
         ExportMetricsServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
             panic!("{ctx}: success body must decode as ExportMetricsServiceResponse: {e}")
@@ -769,6 +800,7 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
         match path {
             "/v1/logs" => valid_otlp_logs_body(),
             "/v1/metrics" => valid_otlp_metrics_body(),
+            "/v1/traces" => valid_otlp_traces_body(),
             "/api/v1/write" => valid_remote_write_body(),
             other => panic!("no valid-body builder registered for ingest route {other}"),
         }
@@ -1069,6 +1101,7 @@ async fn all_mode_auth_on_perimeter() {
             r.body = match spec.path {
                 "/v1/logs" => valid_otlp_logs_body(),
                 "/v1/metrics" => valid_otlp_metrics_body(),
+                "/v1/traces" => valid_otlp_traces_body(),
                 "/api/v1/write" => valid_remote_write_body(),
                 other => panic!("no valid-body builder for {other}"),
             };
@@ -1252,6 +1285,7 @@ async fn reader_only_mode_writer_routes_404() {
                 req.body = match spec.path {
                     "/v1/logs" => valid_otlp_logs_body(),
                     "/v1/metrics" => valid_otlp_metrics_body(),
+                    "/v1/traces" => valid_otlp_traces_body(),
                     "/api/v1/write" => valid_remote_write_body(),
                     other => panic!("no valid-body builder for {other}"),
                 };

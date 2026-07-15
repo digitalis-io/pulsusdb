@@ -1,19 +1,22 @@
-//! `POST /v1/logs`, `POST /v1/metrics`, and `POST /api/v1/write` server
-//! wiring (issue #15/#27/#28 architect plans): [`WriterSink`]/
-//! [`MetricWriterSink`] adapt their async-filled writer slots
-//! (`serve::spawn_reconnect_loop` constructs the real [`LogWriter`]/
-//! [`MetricWriter`] once the ClickHouse pool is ready, *before* `pool_slot`
-//! — see that module's doc comment) to `pulsus-write`'s [`LogSink`]/
-//! [`MetricSink`] seams, and [`ingest_logs`]/[`ingest_metrics`]/
-//! [`ingest_remote_write`] are the thin `State<AppState>` handlers that
-//! call straight into `pulsus_write::ingest`/`pulsus_write::ingest_metrics`/
-//! `pulsus_write::ingest_remote_write`'s state-agnostic cores (see those
-//! fns' doc comments for why the server cannot reuse
-//! `pulsus_write::ingest::http::{logs,metrics}::<S>`'s generic-`State`
-//! mount points). [`ingest_remote_write`] (issue #28) reuses
-//! [`MetricWriterSink`] verbatim — the same `AppState.metric_writer` field
-//! #27 introduced — adding only its own route + handler, per the ratified
-//! "second issue rebases onto the first" ordering rule.
+//! `POST /v1/logs`, `POST /v1/metrics`, `POST /v1/traces`, and
+//! `POST /api/v1/write` server wiring (issue #15/#27/#28/#54 architect
+//! plans): [`WriterSink`]/[`MetricWriterSink`]/[`TraceWriterSink`] adapt
+//! their async-filled writer slots (`serve::spawn_reconnect_loop`
+//! constructs the real [`LogWriter`]/[`MetricWriter`]/[`TraceWriter`] once
+//! the ClickHouse pool is ready, *before* `pool_slot` — see that module's
+//! doc comment) to `pulsus-write`'s [`LogSink`]/[`MetricSink`]/
+//! [`TraceSink`] seams, and [`ingest_logs`]/[`ingest_metrics`]/
+//! [`ingest_traces`]/[`ingest_remote_write`] are the thin
+//! `State<AppState>` handlers that call straight into
+//! `pulsus_write::ingest`/`pulsus_write::ingest_metrics`/
+//! `pulsus_write::ingest_traces`/`pulsus_write::ingest_remote_write`'s
+//! state-agnostic cores (see those fns' doc comments for why the server
+//! cannot reuse `pulsus_write::ingest::http::{logs,metrics,traces}::<S>`'s
+//! generic-`State` mount points). [`ingest_remote_write`] (issue #28)
+//! reuses [`MetricWriterSink`] verbatim — the same
+//! `AppState.metric_writer` field #27 introduced — adding only its own
+//! route + handler, per the ratified "second issue rebases onto the first"
+//! ordering rule.
 
 use std::sync::{Arc, OnceLock};
 
@@ -24,7 +27,7 @@ use axum::response::Response;
 
 use pulsus_write::{
     Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
-    ParsedMetrics,
+    ParsedMetrics, ParsedTraces, TraceSink, TraceWriter,
 };
 
 use crate::app::AppState;
@@ -90,6 +93,35 @@ impl MetricSink for MetricWriterSink {
     }
 }
 
+/// [`WriterSink`]'s traces counterpart (issue #54): adapts
+/// `Arc<OnceLock<Arc<TraceWriter>>>` to [`TraceSink`], same "backpressure
+/// while empty" contract.
+pub(crate) struct TraceWriterSink {
+    slot: Arc<OnceLock<Arc<TraceWriter>>>,
+}
+
+impl TraceWriterSink {
+    pub(crate) fn new(slot: Arc<OnceLock<Arc<TraceWriter>>>) -> Self {
+        TraceWriterSink { slot }
+    }
+}
+
+impl TraceSink for TraceWriterSink {
+    fn admit(&self, batch: ParsedTraces) -> Result<(), Backpressure> {
+        match self.slot.get() {
+            Some(writer) => writer.admit(batch),
+            None => Err(Backpressure),
+        }
+    }
+
+    fn admit_flush(&self, batch: ParsedTraces) -> Result<FlushWait, Backpressure> {
+        match self.slot.get() {
+            Some(writer) => writer.admit_flush(batch),
+            None => Err(Backpressure),
+        }
+    }
+}
+
 /// `POST /v1/logs` (docs/api.md §1.1): pulls `AppState`'s `WriterSink` and
 /// hands straight into `pulsus_write::ingest`'s reused #8 core — no logic
 /// of its own beyond that seam.
@@ -111,6 +143,18 @@ pub(crate) async fn ingest_metrics(
     body: Body,
 ) -> Response {
     pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body).await
+}
+
+/// `POST /v1/traces` (docs/api.md §1.1, issue #54): pulls `AppState`'s
+/// `TraceWriterSink` and hands straight into
+/// `pulsus_write::ingest_traces`'s reused core — no logic of its own
+/// beyond that seam.
+pub(crate) async fn ingest_traces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_traces(state.trace_writer.as_ref(), headers, body).await
 }
 
 /// `POST /api/v1/write` (docs/api.md §1.2, issue #28): Prometheus remote-
@@ -180,5 +224,35 @@ mod tests {
     fn metric_admit_flush_is_backpressure_while_the_slot_is_empty() {
         let sink = MetricWriterSink::new(Arc::new(OnceLock::new()));
         assert!(sink.admit_flush(metrics_batch()).is_err());
+    }
+
+    fn traces_batch() -> ParsedTraces {
+        ParsedTraces {
+            spans: vec![pulsus_write::SpanRecord {
+                trace_id: [1; 16],
+                span_id: [2; 8],
+                parent_id: [0; 8],
+                name: "op-a".to_string(),
+                service: "svc".to_string(),
+                timestamp_ns: 1,
+                duration_ns: 1,
+                status_code: 0,
+                kind: 0,
+                payload: vec![1],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trace_admit_is_backpressure_while_the_slot_is_empty() {
+        let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
+        assert_eq!(sink.admit(traces_batch()), Err(Backpressure));
+    }
+
+    #[test]
+    fn trace_admit_flush_is_backpressure_while_the_slot_is_empty() {
+        let sink = TraceWriterSink::new(Arc::new(OnceLock::new()));
+        assert!(sink.admit_flush(traces_batch()).is_err());
     }
 }
