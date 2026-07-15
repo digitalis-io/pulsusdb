@@ -140,6 +140,31 @@ jobs:
             docs/benchmarks/data/metrics-labels-ci.json
             /tmp/metrics-labels-ci.md
 
+      # Issue #35: the late-label-hydration `--profile ci` smoke step —
+      # reproducibility + a committed CI-scale evidence artifact only (same
+      # posture as #34's M2 step above: no asserted `system.query_log`
+      # ratio gate here). `--profile ci` hard-codes the fixed
+      # `[1_000, 10_000]` breadth set and rejects any `--breadths`
+      # override, so this step never silently runs the 50,000-breadth
+      # verdict-evaluation shape in CI (that is `--profile full`,
+      # manual-only — see docs/benchmarks/m1-logs-late-hydration.md's
+      # reproduction section). Reuses this job's ClickHouse 24.8 container.
+      - name: M1 late-hydration benchmark (--profile ci smoke)
+        run: |
+          cargo run -p xtask -- bench logs-hydration \
+            --http-url http://127.0.0.1:19123 --database pulsus_bench_hydration_ci \
+            --profile ci --seed 42 \
+            --out docs/benchmarks/data/logs-hydration-ci.json \
+            --report-out /tmp/logs-hydration-ci.md
+
+      - name: Upload M1 late-hydration evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-hydration-ci-evidence
+          path: |
+            docs/benchmarks/data/logs-hydration-ci.json
+            /tmp/logs-hydration-ci.md
+
       # Live API/engine suites — every env-gated suite runs here; new issues
       # must wire theirs in. Each test self-isolates via its own throwaway
       # database (`DROP DATABASE IF EXISTS` + a unique `pulsus_*_it_*` name)

@@ -390,6 +390,10 @@ mod tests {
             corpus_window_hours: 24,
             cache_max_series: 10_000_000,
             matcher_reps: 10,
+            breadths: None,
+            rss_probe: false,
+            rss_variant: None,
+            rss_breadth: None,
         }
     }
 

@@ -10,6 +10,26 @@
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, Idempotency, QuerySettings, Row};
 
+/// Applies `query_id` and, when present, `log_comment` to `base` — the
+/// single place every scenario's per-stage settings route `log_comment`
+/// run-tagging through (issue #35 architect plan: "benefits every
+/// scenario"), so `SETTINGS log_comment` A/B correlation via
+/// `system.query_log` never has a second, divergent implementation.
+/// `log_comment` is applied as an HTTP request setting via
+/// [`QuerySettings::set`] — never inlined into SQL text (same injection
+/// posture as every other setting this crate applies).
+pub(crate) fn tagged_settings(
+    base: QuerySettings,
+    query_id: &str,
+    log_comment: Option<&str>,
+) -> QuerySettings {
+    let settings = base.set("query_id", query_id);
+    match log_comment {
+        Some(comment) => settings.set("log_comment", comment),
+        None => settings,
+    }
+}
+
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
 pub(crate) struct QueryLogTotals {
     pub(crate) read_rows: u64,

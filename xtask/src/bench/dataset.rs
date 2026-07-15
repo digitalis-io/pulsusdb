@@ -383,6 +383,311 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
     })
 }
 
+// --- `logs-hydration` (issue #35) broad-selector corpus ---
+//
+// A **separate, additive** corpus generator — not a `DatasetSpec`/
+// `DatasetSummary` widening (deviation from the architect plan's v1/v2
+// `broad_tiers` field sketch, recorded in the issue #35 implementation
+// notes): each breadth gets its own freshly-dropped-and-reinitialized
+// database (mirroring `metrics_labels::run`'s per-`bucket_ms` reset), so
+// [`HYDRATION_SERVICE`] never needs a breadth suffix and the R6 "identical
+// fingerprints across all breadths" property (v4 architect plan) falls out
+// structurally: the same `(service, env, region, stream_ordinal)`
+// construction for ordinals `0..RESULT_STREAMS` yields byte-identical
+// `LabelSet`s, hence byte-identical fingerprints/labels, at every breadth —
+// rather than requiring a second selector branch to reunite a
+// breadth-varying service name with a breadth-invariant result set. This
+// keeps [`DatasetSpec`]/[`DatasetSummary`] (and therefore every committed
+// `logs-read-*.json`/`metrics-labels-*.json` byte-shape) completely
+// untouched.
+
+/// The fixed, result-bearing stream count every breadth carries — equal to
+/// the `logs-hydration` scenario's LIMIT (architect plan R6), so `ORDER BY
+/// timestamp_ns DESC LIMIT 100` always returns exactly these streams'
+/// single sample each, regardless of breadth.
+pub const HYDRATION_RESULT_STREAMS: u32 = 100;
+/// The single service every breadth's streams (both result-bearing and
+/// filler) share — architect plan edge case 6, "single-service broad shape
+/// is the deliberate isolation": `PREWHERE service = 'svc-broad'` is always
+/// a singleton, so the entire eager-vs-late delta is the `labels` column.
+pub const HYDRATION_SERVICE: &str = "svc-broad";
+/// The fixed one-hour corpus window every breadth uses, split evenly
+/// between the result/filler timestamp bands (see [`load_broad_tier`]'s
+/// doc comment) — exported so the RSS-probe child (which only knows
+/// `--rss-breadth`, not the parent's frozen `ref_ns`) can re-derive
+/// `start_ns` from a freshly-queried `end_ns` without re-deriving this
+/// constant independently.
+pub const HYDRATION_WINDOW_NS: i64 = 3_600 * 1_000_000_000;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BroadDatasetSpec {
+    pub seed: u64,
+    /// Total streams the selector resolves (`>= HYDRATION_RESULT_STREAMS`).
+    pub breadth: u32,
+    /// The one frozen reference instant every breadth pass in this
+    /// scenario invocation shares (captured once by `logs_hydration::run`,
+    /// never re-read per breadth) — this is what makes the
+    /// `HYDRATION_RESULT_STREAMS` result set's samples byte-identical
+    /// across breadths (same seed, same construction, same anchor).
+    pub ref_ns: i64,
+    pub dist: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BroadDatasetSummary {
+    pub breadth: u32,
+    pub service: String,
+    pub result_streams: u32,
+    pub filler_streams: u32,
+    /// The `HYDRATION_RESULT_STREAMS` fixed fingerprints, in stream-ordinal
+    /// order (`0..HYDRATION_RESULT_STREAMS`) — identical across breadths.
+    pub result_fingerprints: Vec<u64>,
+    pub start_ns: i64,
+    pub end_ns: i64,
+    /// The result/filler timestamp-band boundary (architect plan R6):
+    /// result-bearing samples fall in `(t_split_ns, end_ns]`, filler
+    /// samples in `(start_ns, t_split_ns]`.
+    pub t_split_ns: i64,
+    pub load_elapsed_ms: u64,
+}
+
+/// One broad-tier stream's construction — mirrors [`Stream`]/[`build_streams`]
+/// (same `LabelSet::from_normalized`/`stream_fingerprint` primitives, same
+/// `env`/`region` assignment shape) but scoped to [`HYDRATION_SERVICE`]
+/// alone (a single service, not a round-robin over `spec.services`) and
+/// keyed by a stream ordinal that is **breadth-independent** for the fixed
+/// result-bearing set — see the module-level doc comment above.
+fn build_broad_streams(breadth: u32) -> Vec<Stream> {
+    (0..breadth)
+        .map(|i| {
+            let env = ENVS[(i as usize) % ENVS.len()].to_string();
+            let region = REGIONS[(i as usize / ENVS.len()) % REGIONS.len()];
+            let (labels, _collisions) = LabelSet::from_normalized([
+                ("service.name".to_string(), HYDRATION_SERVICE.to_string()),
+                ("env".to_string(), env.clone()),
+                ("region".to_string(), region.to_string()),
+                ("stream_ordinal".to_string(), i.to_string()),
+            ]);
+            let fingerprint = stream_fingerprint(&labels);
+            Stream {
+                service: HYDRATION_SERVICE.to_string(),
+                env,
+                fingerprint,
+                labels_json: labels.to_canonical_json(),
+            }
+        })
+        .collect()
+}
+
+/// Per-stream, non-overlapping time **slots** for the two R6 timestamp
+/// bands (code review finding, issue #35: the previous `frac`-plus-jitter
+/// formula's last slot could push `jitter_ns` past the slot's own
+/// boundary — the top result stream's timestamp could exceed `end_ns`
+/// entirely, and the top filler's could cross `t_split_ns` into the result
+/// band, both of which corrupt the fixed 100-stream result set at some
+/// breadths but not others). Every stream gets its own disjoint
+/// `[slot_start, slot_start + slot_width)` range within its band; the
+/// jitter term is reduced modulo the slot's own width before being added,
+/// so it can **never** leave that slot — and disjoint slots make every
+/// timestamp in the corpus globally unique (F5) without relying on jitter
+/// entropy alone. [`Self::result_timestamp_ns`] sizes its slots off
+/// [`HYDRATION_RESULT_STREAMS`] (the constant, never a `breadth`-derived
+/// count — `load_broad_tier` asserts `breadth >= HYDRATION_RESULT_STREAMS`,
+/// so the runtime `result_streams` count always equals it), so the result
+/// band's slot layout — hence every result-bearing stream's timestamp — is
+/// *structurally* breadth-independent, not just incidentally so; a pure,
+/// no-I/O type so this property is unit-testable without a live database.
+#[derive(Debug, Clone, Copy)]
+struct BroadTimestampBands {
+    start_ns: i64,
+    t_split_ns: i64,
+    end_ns: i64,
+    result_slot_width: i64,
+    filler_slot_width: i64,
+}
+
+impl BroadTimestampBands {
+    fn new(start_ns: i64, t_split_ns: i64, end_ns: i64, filler_streams: u32) -> Self {
+        let half_ns = end_ns - t_split_ns;
+        let result_slot_width = (half_ns / i64::from(HYDRATION_RESULT_STREAMS)).max(1);
+        let filler_slot_width = if filler_streams > 0 {
+            ((half_ns - 1) / i64::from(filler_streams)).max(1)
+        } else {
+            1
+        };
+        BroadTimestampBands {
+            start_ns,
+            t_split_ns,
+            end_ns,
+            result_slot_width,
+            filler_slot_width,
+        }
+    }
+
+    /// Result-bearing stream `i`'s (`0..HYDRATION_RESULT_STREAMS`) timestamp
+    /// — always strictly within `(t_split_ns, end_ns]`, and (since neither
+    /// the inputs nor `HYDRATION_RESULT_STREAMS` depend on breadth)
+    /// bit-identical for the same `(seed, i)` at every breadth.
+    fn result_timestamp_ns(&self, seed: u64, i: u32) -> i64 {
+        let jitter_ns = splitmix64(seed ^ u64::from(i)) as i64;
+        let slot_start = self.t_split_ns + 1 + i64::from(i) * self.result_slot_width;
+        let offset = jitter_ns.rem_euclid(self.result_slot_width);
+        (slot_start + offset).clamp(self.t_split_ns + 1, self.end_ns)
+    }
+
+    /// Filler stream `j` (`0..filler_streams`)'s timestamp — always
+    /// strictly within `(start_ns, t_split_ns)`.
+    fn filler_timestamp_ns(&self, seed: u64, j: u32) -> i64 {
+        // Filler stream ordinals share the result band's `0..breadth`
+        // ordinal space (`i = HYDRATION_RESULT_STREAMS + j` in
+        // `load_broad_tier`'s loop) — reusing that same absolute `i` as the
+        // jitter key here would collide with a result stream's own jitter
+        // input whenever `j` happens to equal some result `i`; offsetting
+        // by `HYDRATION_RESULT_STREAMS` keeps every jitter key distinct.
+        let jitter_ns = splitmix64(seed ^ u64::from(HYDRATION_RESULT_STREAMS + j)) as i64;
+        let slot_start = self.start_ns + 1 + i64::from(j) * self.filler_slot_width;
+        let offset = jitter_ns.rem_euclid(self.filler_slot_width);
+        (slot_start + offset).clamp(self.start_ns + 1, self.t_split_ns - 1)
+    }
+}
+
+/// Loads one breadth's `logs-hydration` corpus into the database `client`
+/// is bound to (already freshly schema-initialized by the caller — every
+/// breadth gets its own reset database, see the module-level doc comment):
+/// [`HYDRATION_RESULT_STREAMS`] result-bearing streams, each carrying
+/// exactly one sample in the newest timestamp band `(t_split_ns, end_ns]`,
+/// plus `breadth - HYDRATION_RESULT_STREAMS` filler streams, each carrying
+/// exactly one sample in the older band `(start_ns, t_split_ns]`. One
+/// sample per stream (not the baseline generator's many-samples-per-stream
+/// shape) keeps `ORDER BY timestamp_ns DESC LIMIT HYDRATION_RESULT_STREAMS`
+/// an exact, unambiguous split between the two bands — the result
+/// fingerprint set is always exactly the `HYDRATION_RESULT_STREAMS`
+/// streams, never a partial mix (architect plan R6). Timestamps are drawn
+/// from a per-row jitter keyed on `(spec.seed, i)` so every row's
+/// `timestamp_ns` is globally unique (F5) even before the gate's total-order
+/// tiebreak is applied.
+pub async fn load_broad_tier(
+    client: &ChClient,
+    spec: &BroadDatasetSpec,
+) -> anyhow::Result<BroadDatasetSummary> {
+    anyhow::ensure!(
+        spec.breadth >= HYDRATION_RESULT_STREAMS,
+        "--breadths: {} is below the fixed result-set size ({HYDRATION_RESULT_STREAMS}) — every \
+         breadth must be able to carry the full result-bearing set",
+        spec.breadth
+    );
+
+    let streams_table = if spec.dist {
+        "log_streams_dist"
+    } else {
+        "log_streams"
+    };
+    let streams_idx_table = if spec.dist {
+        "log_streams_idx_dist"
+    } else {
+        "log_streams_idx"
+    };
+    let samples_table = if spec.dist {
+        "log_samples_dist"
+    } else {
+        "log_samples"
+    };
+
+    let start_instant = Instant::now();
+    let streams = build_broad_streams(spec.breadth);
+
+    let end_ns = spec.ref_ns;
+    // A one-hour window, split evenly: the newest half carries the
+    // result-bearing streams' samples, the oldest half the filler streams'
+    // — see this function's doc comment.
+    let start_ns = end_ns - HYDRATION_WINDOW_NS;
+    let t_split_ns = start_ns + HYDRATION_WINDOW_NS / 2;
+    let month = Date::start_of_month_utc(end_ns).days_since_epoch();
+
+    let stream_rows: Vec<SeedStreamRow> = streams
+        .iter()
+        .map(|s| SeedStreamRow {
+            month,
+            fingerprint: s.fingerprint,
+            service: s.service.clone(),
+            labels: s.labels_json.clone(),
+            updated_ns: end_ns,
+        })
+        .collect();
+    for chunk in stream_rows.chunks(INSERT_BATCH_ROWS) {
+        client.insert_block(streams_table, chunk).await?;
+    }
+
+    if spec.dist {
+        poll_count_until_visible(
+            client,
+            &format!("SELECT count() AS n FROM {streams_table}"),
+            streams.len() as u64,
+            streams_table,
+        )
+        .await?;
+        poll_count_until_visible(
+            client,
+            &format!("SELECT count() AS n FROM {streams_idx_table}"),
+            streams.len() as u64 * LABELS_PER_STREAM,
+            streams_idx_table,
+        )
+        .await?;
+    }
+
+    let result_streams = HYDRATION_RESULT_STREAMS.min(spec.breadth);
+    let filler_streams = spec.breadth - result_streams;
+    let bands = BroadTimestampBands::new(start_ns, t_split_ns, end_ns, filler_streams);
+
+    let mut batch: Vec<SeedSampleRow> = Vec::with_capacity(streams.len());
+    for (i, stream) in streams.iter().enumerate() {
+        let i = i as u32;
+        let is_result = i < result_streams;
+        let timestamp_ns = if is_result {
+            bands.result_timestamp_ns(spec.seed, i)
+        } else {
+            bands.filler_timestamp_ns(spec.seed, i - result_streams)
+        };
+        batch.push(SeedSampleRow {
+            service: stream.service.clone(),
+            fingerprint: stream.fingerprint,
+            timestamp_ns,
+            severity: ((i % 24) + 1) as i8,
+            body: gen_body(u64::from(i), &stream.service, false),
+        });
+    }
+    for chunk in batch.chunks(INSERT_BATCH_ROWS) {
+        client.insert_block(samples_table, chunk).await?;
+    }
+
+    if spec.dist {
+        poll_count_until_visible(
+            client,
+            &format!("SELECT count() AS n FROM {samples_table}"),
+            streams.len() as u64,
+            samples_table,
+        )
+        .await?;
+    }
+
+    let result_fingerprints = streams[..result_streams as usize]
+        .iter()
+        .map(|s| s.fingerprint)
+        .collect();
+
+    Ok(BroadDatasetSummary {
+        breadth: spec.breadth,
+        service: HYDRATION_SERVICE.to_string(),
+        result_streams,
+        filler_streams,
+        result_fingerprints,
+        start_ns,
+        end_ns,
+        t_split_ns,
+        load_elapsed_ms: start_instant.elapsed().as_millis() as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +755,129 @@ mod tests {
     fn gen_body_carries_the_needle_only_when_asked() {
         assert!(gen_body(1, "svc", true).contains(NEEDLE));
         assert!(!gen_body(1, "svc", false).contains(NEEDLE));
+    }
+
+    #[test]
+    fn build_broad_streams_all_share_the_single_hydration_service() {
+        let streams = build_broad_streams(50);
+        assert!(streams.iter().all(|s| s.service == HYDRATION_SERVICE));
+    }
+
+    #[test]
+    fn build_broad_streams_fingerprints_are_distinct() {
+        let streams = build_broad_streams(200);
+        let mut fps: Vec<u64> = streams.iter().map(|s| s.fingerprint).collect();
+        fps.sort_unstable();
+        fps.dedup();
+        assert_eq!(fps.len(), 200);
+    }
+
+    /// The architect plan's R6 corpus property: the first
+    /// `HYDRATION_RESULT_STREAMS` streams' construction does not depend on
+    /// `breadth` at all, so their fingerprints are byte-identical whichever
+    /// breadth they were generated for.
+    #[test]
+    fn build_broad_streams_result_set_fingerprints_are_identical_across_breadths() {
+        let small = build_broad_streams(HYDRATION_RESULT_STREAMS);
+        let large = build_broad_streams(HYDRATION_RESULT_STREAMS * 500);
+        for i in 0..HYDRATION_RESULT_STREAMS as usize {
+            assert_eq!(
+                small[i].fingerprint, large[i].fingerprint,
+                "stream ordinal {i} diverged across breadths"
+            );
+            assert_eq!(small[i].labels_json, large[i].labels_json);
+        }
+    }
+
+    /// A representative window, matching `load_broad_tier`'s own
+    /// construction (`start_ns`/`t_split_ns`/`end_ns` derived from
+    /// `HYDRATION_WINDOW_NS`).
+    fn test_bands(filler_streams: u32) -> (i64, i64, i64, BroadTimestampBands) {
+        let end_ns = 1_800_000_000_000_000_000i64;
+        let start_ns = end_ns - HYDRATION_WINDOW_NS;
+        let t_split_ns = start_ns + HYDRATION_WINDOW_NS / 2;
+        let bands = BroadTimestampBands::new(start_ns, t_split_ns, end_ns, filler_streams);
+        (start_ns, t_split_ns, end_ns, bands)
+    }
+
+    /// Code review finding (issue #35, [high]): every result-bearing
+    /// stream's timestamp must land strictly within `(t_split_ns, end_ns]`
+    /// — no jitter may cross either boundary — at every breadth this
+    /// scenario sweeps, including the extremes.
+    #[test]
+    fn result_timestamps_never_cross_the_band_boundary_at_any_breadth() {
+        for breadth in [HYDRATION_RESULT_STREAMS, 1_000, 10_000, 50_000, 100_000] {
+            let filler_streams = breadth - HYDRATION_RESULT_STREAMS;
+            let (_, t_split_ns, end_ns, bands) = test_bands(filler_streams);
+            for i in 0..HYDRATION_RESULT_STREAMS {
+                let ts = bands.result_timestamp_ns(42, i);
+                assert!(
+                    ts > t_split_ns && ts <= end_ns,
+                    "breadth={breadth} i={i}: timestamp {ts} escaped (t_split_ns={t_split_ns}, \
+                     end_ns={end_ns}]"
+                );
+            }
+        }
+    }
+
+    /// Code review finding companion: every filler stream's timestamp must
+    /// land strictly below `t_split_ns` (and above `start_ns`) at every
+    /// breadth, including the largest filler count this scenario sweeps.
+    #[test]
+    fn filler_timestamps_never_cross_the_band_boundary_at_any_breadth() {
+        for breadth in [HYDRATION_RESULT_STREAMS + 1, 1_000, 10_000, 50_000] {
+            let filler_streams = breadth - HYDRATION_RESULT_STREAMS;
+            let (start_ns, t_split_ns, _, bands) = test_bands(filler_streams);
+            for j in 0..filler_streams {
+                let ts = bands.filler_timestamp_ns(42, j);
+                assert!(
+                    ts > start_ns && ts < t_split_ns,
+                    "breadth={breadth} j={j}: timestamp {ts} escaped (start_ns={start_ns}, \
+                     t_split_ns={t_split_ns})"
+                );
+            }
+        }
+    }
+
+    /// The R6 property the whole corpus design depends on: the fixed
+    /// result-bearing set's timestamps (not just its fingerprints/labels —
+    /// see `build_broad_streams_result_set_fingerprints_are_identical_across_breadths`)
+    /// are bit-identical across breadths, since `BroadTimestampBands` sizes
+    /// its result slots off the constant `HYDRATION_RESULT_STREAMS`, never
+    /// off a breadth-derived count.
+    #[test]
+    fn result_timestamps_are_bit_identical_across_breadths() {
+        let (_, _, _, small_bands) = test_bands(1_000 - HYDRATION_RESULT_STREAMS);
+        let (_, _, _, large_bands) = test_bands(50_000 - HYDRATION_RESULT_STREAMS);
+        for i in 0..HYDRATION_RESULT_STREAMS {
+            assert_eq!(
+                small_bands.result_timestamp_ns(42, i),
+                large_bands.result_timestamp_ns(42, i),
+                "result stream {i}'s timestamp diverged across breadths"
+            );
+        }
+    }
+
+    /// Every timestamp in one breadth pass — result and filler alike — is
+    /// globally unique (F5): disjoint per-stream slots guarantee this by
+    /// construction, not by jitter-entropy luck.
+    #[test]
+    fn every_timestamp_in_one_breadth_pass_is_globally_unique() {
+        let breadth = 10_000u32;
+        let filler_streams = breadth - HYDRATION_RESULT_STREAMS;
+        let (_, _, _, bands) = test_bands(filler_streams);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..HYDRATION_RESULT_STREAMS {
+            assert!(
+                seen.insert(bands.result_timestamp_ns(7, i)),
+                "duplicate result timestamp"
+            );
+        }
+        for j in 0..filler_streams {
+            assert!(
+                seen.insert(bands.filler_timestamp_ns(7, j)),
+                "duplicate filler timestamp"
+            );
+        }
     }
 }

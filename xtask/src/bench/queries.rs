@@ -69,7 +69,9 @@ use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 use super::dataset::DatasetSummary;
-use super::query_log::{QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log};
+use super::query_log::{
+    QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log, tagged_settings,
+};
 
 /// One shard's evidence for a `--dist` run (empty in single-node mode) —
 /// **every** shard in the cluster gets an entry per stage, whether it
@@ -846,21 +848,38 @@ impl Tables {
     }
 }
 
+/// `SETTINGS log_comment` run-tag every query in this scenario carries
+/// (issue #35 architect plan) — a fixed constant rather than a
+/// threaded-through parameter, since every [`reader_settings`] call site in
+/// this file is already scoped to the single `logs-read` scenario (`bench
+/// metrics-labels`/`bench logs-hydration` tag their own settings via their
+/// own modules' calls into [`super::query_log::tagged_settings`]). Purely
+/// additive: `log_comment` is an HTTP request setting, never inlined SQL,
+/// and does not touch `read_rows`/`read_bytes`/`SelectedMarks`, so
+/// `query_log_gates.rs` and the committed `logs-read-ci.json`/
+/// `logs-read-dist.json` numbers are unchanged — it only makes this
+/// scenario's `system.query_log` rows independently greppable/correlatable
+/// by `log_comment` alongside `query_id`.
+const LOG_COMMENT: &str = "pulsus-bench:logs-read";
+
 /// Settings applied to every timed query: the clustered-reader block
 /// (docs/schemas.md §7) in `--dist` mode, plain otherwise, plus the
-/// per-query `query_id` tag every stage carries. `skip_unavailable_shards
-/// = false` (unlike the product's own configurable
-/// `PULSUS_SKIP_UNAVAILABLE_SHARDS` default) — this harness exists to
-/// *capture evidence*, and a verification/benchmark run should fail
-/// loudly on genuine shard unavailability rather than silently tolerate
-/// it and record evidence for a degraded read as if it were normal.
+/// per-query `query_id` tag every stage carries and the scenario-wide
+/// [`LOG_COMMENT`] tag (routed through the shared
+/// [`super::query_log::tagged_settings`] so every scenario's `log_comment`
+/// application lives in one place). `skip_unavailable_shards = false`
+/// (unlike the product's own configurable `PULSUS_SKIP_UNAVAILABLE_SHARDS`
+/// default) — this harness exists to *capture evidence*, and a
+/// verification/benchmark run should fail loudly on genuine shard
+/// unavailability rather than silently tolerate it and record evidence for
+/// a degraded read as if it were normal.
 fn reader_settings(dist: bool, query_id: &str) -> QuerySettings {
     let base = if dist {
         QuerySettings::clustered_reader(false)
     } else {
         QuerySettings::new()
     };
-    base.set("query_id", query_id)
+    tagged_settings(base, query_id, Some(LOG_COMMENT))
 }
 
 async fn resolve_fingerprints(
@@ -1527,7 +1546,7 @@ async fn run_metric_shape(
 /// months_overlapping` (`pub(crate)` there, not reachable from this
 /// crate): same Howard Hinnant civil-calendar algorithm `pulsus_model::
 /// Date` is built on.
-fn month_literals(start_ns: i64, end_ns: i64) -> Vec<String> {
+pub(crate) fn month_literals(start_ns: i64, end_ns: i64) -> Vec<String> {
     const NANOS_PER_DAY: i64 = 86_400_000_000_000;
     let day_of = |ns: i64| ns.div_euclid(NANOS_PER_DAY);
     let ymd = |days: i64| {

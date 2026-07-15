@@ -33,6 +33,7 @@
 //! plan: recorded numbers are warm, after an explicit warmup pass).
 
 pub mod dataset;
+pub mod logs_hydration;
 pub mod metrics_labels;
 pub mod queries;
 mod query_log;
@@ -119,6 +120,32 @@ pub struct BenchArgs {
     /// call, per selector/cardinality (`metrics-labels` only, path 1).
     #[arg(long, default_value_t = 1_000)]
     pub matcher_reps: usize,
+
+    // --- `logs-hydration` scenario only (issue #35); all defaulted so
+    // `logs-read`/`metrics-labels` are unaffected. ---
+    /// Selector breadths (streams-per-service), comma-separated
+    /// (`logs-hydration` only). **`--profile ci` hard-codes
+    /// [`logs_hydration::CI_BREADTHS`] and rejects any override**; only
+    /// `--profile full` accepts this override, defaulting to
+    /// [`logs_hydration::FULL_BREADTHS`] when unset — same posture as
+    /// `--metric-cardinalities`.
+    #[arg(long)]
+    pub breadths: Option<String>,
+    /// Hidden internal mode (architect plan v3/v5): runs exactly one
+    /// `(--rss-variant, --rss-breadth)` query against an already-loaded
+    /// database, self-reports `/proc/self/status` RSS over a parent-signalled
+    /// window, then exits — never set by a human directly, only spawned by
+    /// the parent `logs-hydration` process as a fresh child per RSS
+    /// repetition.
+    #[arg(long, default_value_t = false, hide = true)]
+    pub rss_probe: bool,
+    /// `"eager"` | `"late_idx"` | `"late_proj"` — required when
+    /// `--rss-probe`.
+    #[arg(long, hide = true)]
+    pub rss_variant: Option<String>,
+    /// The breadth to probe — required when `--rss-probe`.
+    #[arg(long, hide = true)]
+    pub rss_breadth: Option<u32>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,14 +154,17 @@ pub enum Profile {
     Full,
 }
 
-/// Dispatches on `args.scenario` — `"logs-read"` (issue #16) or
-/// `"metrics-labels"` (issue #34); any other value is a hard error.
+/// Dispatches on `args.scenario` — `"logs-read"` (issue #16),
+/// `"metrics-labels"` (issue #34), or `"logs-hydration"` (issue #35); any
+/// other value is a hard error.
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     match args.scenario.as_str() {
         "logs-read" => run_logs_read(args).await,
         "metrics-labels" => metrics_labels::run(args).await,
+        "logs-hydration" => logs_hydration::run(args).await,
         other => anyhow::bail!(
-            "unknown bench scenario {other:?} (expected \"logs-read\" or \"metrics-labels\")"
+            "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", or \
+             \"logs-hydration\")"
         ),
     }
 }
