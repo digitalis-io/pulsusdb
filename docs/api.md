@@ -301,7 +301,7 @@ Recording rules are evaluated on the poll interval; alerting rules are accepted 
 ```
 GET /ready        → 200 when ClickHouse reachable (+ label cache warm in reader mode, from M2); 503 otherwise
 GET /metrics      → Prometheus exposition of PulsusDB internals
-GET /config       → effective configuration, secrets redacted
+GET /config       → effective configuration, secrets redacted (rendered as YAML text, served as `text/plain; charset=utf-8` — not a YAML media type)
 GET /buildinfo    → {"version","revision","builtAt","rustc"}
 ```
 

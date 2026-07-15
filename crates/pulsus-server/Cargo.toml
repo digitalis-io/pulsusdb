@@ -59,3 +59,12 @@ tower = { workspace = true, features = ["util"] }
 # regression coverage for issue #24 — dev-only, never a runtime dependency
 # (the server itself only ever *encodes* gzip, via tower-http).
 flate2.workspace = true
+# Issue #36: `tests/api_conformance.rs` builds/decodes the OTLP
+# `Export{Logs,Metrics}ServiceResponse` and hand-rolled `google.rpc.Status`
+# protobuf bodies, and snappy-compresses `prompb.WriteRequest` bodies for
+# `/api/v1/write` — the same three crates `pulsus-write` already uses for
+# the real handlers, dev-only here since `pulsus-server` never encodes/
+# decodes protobuf itself (it calls straight into `pulsus_write::ingest*`).
+opentelemetry-proto.workspace = true
+prost.workspace = true
+snap.workspace = true

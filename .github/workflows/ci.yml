@@ -244,6 +244,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test prom_api_live
 
+      # Issue #36: the live exhaustive API conformance matrix — every
+      # mounted route x case-class over loopback HTTP against five
+      # `pulsusdb` spawns (mode/auth/compat permutations), reusing this
+      # job's ClickHouse 24.8 container. The hermetic drift-guard/docs-gap
+      # half (`route_inventory`) needs no step here — it runs under the
+      # `ci` job's plain `cargo test --workspace` above.
+      - name: API conformance matrix
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test api_conformance
+
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
 

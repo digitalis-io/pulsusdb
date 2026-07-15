@@ -1,0 +1,1383 @@
+//! Issue #36: the live exhaustive API conformance matrix. Expands
+//! `support::manifest::route_manifest()` (every `Mounted` `RouteSpec`) ×
+//! case-classes into HTTP requests against five real `pulsusdb` spawns —
+//! one per mode/auth/compat permutation the plan pins (v2 finding 3) —
+//! over loopback (bare `TcpStream` HTTP/1.1, the same idiom
+//! `live_server.rs`/`prom_api_live.rs`/`logs_api_live.rs` already use — no
+//! new HTTP-client dependency).
+//!
+//! **No seeded data.** Every assertion here is status/envelope/headers-only
+//! (architect plan: "no PromQL/LogQL correctness assertions — conformance
+//! asserts status/envelope/headers only"), and every read handler this
+//! matrix drives returns a well-formed `200` with an empty result set
+//! against a freshly-`--mode init`-reconciled, empty database — `/ready`
+//! reaching `200` already implies the pool (and, in reader-enabled modes,
+//! the label cache **and** the writer/metric-writer slots — `serve.rs`
+//! constructs the writer(s) *before* publishing the pool slot) are live,
+//! so no cache-warm poll or ClickHouse seed is needed anywhere below.
+//!
+//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, same podman/docker harness as
+//! the other live suites:
+//!
+//! ```text
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
+//!     clickhouse/clickhouse-server:24.8
+//! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test api_conformance
+//! podman rm -f pulsus-ch-test
+//! ```
+//!
+//! Runtime budget: 6 process spawns (each dominated by ClickHouse schema
+//! reconcile, a handful of seconds) plus a few hundred cheap loopback
+//! requests (the sixth spawn also seeds two tiny rows directly) — comfortably
+//! inside the single-digit-minute budget the architect plan documents.
+//! Ports 31120-31125, distinct from every other live suite's fixed ports
+//! (31100-31117).
+//!
+//! **`query_too_broad` (422) live coverage** (code-review round-1 finding):
+//! `TooBroadReason` has two independent triggers (`logql/error.rs`) —
+//! `StreamCap` (`DEFAULT_MAX_STREAMS = 100_000`, hard-coded, **no** config
+//! knob exists to lower it — `PULSUS_LOGQL_MAX_STREAMS` is a doc-comment
+//! aspiration in `pulsus-read`, never wired into `pulsus-config`/`env.rs`)
+//! and `ScanBudgetBytes` (`reader.logql_scan_budget_bytes`, **is**
+//! configurable via `PULSUS_LOGQL_SCAN_BUDGET_BYTES`, default 50 GiB). The
+//! sixth spawn below sets that budget to `1` byte and seeds two minimal
+//! rows — any real read exceeds 1 byte, tripping ClickHouse's `code 307
+//! TOO_MANY_BYTES` -> `ReadError::QueryTooBroad(ScanBudgetBytes)` -> the
+//! same documented `422 query_too_broad` taxonomy row `StreamCap` would
+//! have produced (this matrix asserts status/envelope only, never internal
+//! correctness — either `TooBroadReason` variant proves the same live
+//! contract). The `StreamCap` trigger specifically stays unit-level-only
+//! (`logql/exec.rs::exceeding_the_stream_cap_maps_to_stream_cap_not_scan_budget_bytes`),
+//! since it has no config knob to reach cheaply.
+
+#[path = "support/manifest.rs"]
+mod manifest;
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use flate2::read::GzDecoder;
+use prost::Message;
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
+
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+};
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+};
+use opentelemetry_proto::tonic::common::v1::AnyValue;
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::metrics::v1::{
+    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric, number_data_point,
+};
+
+use manifest::{
+    CaseClass, ExpectedError, Gate, Method, RouteSpec, RouteStatus, Surface, route_manifest,
+};
+
+fn should_run() -> bool {
+    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+}
+
+fn ch_host() -> String {
+    std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string())
+}
+
+fn ch_http_port() -> String {
+    std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string())
+}
+
+fn ch_http_port_num() -> u16 {
+    ch_http_port()
+        .parse()
+        .expect("PULSUS_TEST_CH_HTTP_PORT is a valid u16")
+}
+
+// ---------------------------------------------------------------------
+// Bare-`TcpStream` HTTP/1.1 helper (extends `logs_api_live.rs`'s own
+// idiom to arbitrary methods/headers/raw bodies + gzip request/response).
+// ---------------------------------------------------------------------
+
+struct RawResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl RawResponse {
+    fn content_type(&self) -> Option<&str> {
+        self.headers.get("content-type").map(String::as_str)
+    }
+
+    /// `ctx` is the caller's full matrix-cell identifier (round-10
+    /// finding: a malformed-envelope failure must name the exact cell,
+    /// not just say "invalid JSON body").
+    fn json(&self, ctx: &str) -> serde_json::Value {
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|e| panic!("{ctx}: invalid JSON body: {e}\nbody: {:?}", self.body))
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = find_subslice(raw, b"\r\n") else {
+            break;
+        };
+        let size_str = String::from_utf8_lossy(&raw[..line_end]);
+        let Ok(size) = usize::from_str_radix(size_str.trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let data_start = line_end + 2;
+        let data_end = data_start + size;
+        if data_end > raw.len() {
+            break;
+        }
+        out.extend_from_slice(&raw[data_start..data_end]);
+        raw = &raw[(data_end + 2).min(raw.len())..];
+    }
+    out
+}
+
+/// Issues one raw HTTP/1.1 request over loopback for `req` (`manifest::Req`
+/// — method/path/query/headers/content-type/body already fully built by
+/// the caller/`CaseClass::build`) and returns the exact response bytes,
+/// dechunked and gzip-decoded when the server negotiated it.
+fn raw_request(port: u16, req: &manifest::Req) -> Option<RawResponse> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+
+    let target = if req.query.is_empty() {
+        req.path.clone()
+    } else {
+        format!("{}?{}", req.path, req.query)
+    };
+    let mut head = format!(
+        "{} {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n",
+        req.method
+    );
+    if let Some(ct) = req.content_type {
+        head.push_str(&format!("Content-Type: {ct}\r\n"));
+    }
+    for (name, value) in &req.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!("Content-Length: {}\r\n\r\n", req.body.len()));
+
+    stream.write_all(head.as_bytes()).ok()?;
+    stream.write_all(&req.body).ok()?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+
+    let split_at = find_subslice(&buf, b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(&buf[..split_at]).into_owned();
+    let raw_body = &buf[split_at + 4..];
+
+    let mut lines = head.lines();
+    let status = lines
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    let headers: HashMap<String, String> = lines
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+
+    let dechunked = if headers
+        .get("transfer-encoding")
+        .is_some_and(|v| v == "chunked")
+    {
+        dechunk(raw_body)
+    } else {
+        raw_body.to_vec()
+    };
+
+    let body = if headers.get("content-encoding").is_some_and(|v| v == "gzip") {
+        let mut decoded = Vec::new();
+        GzDecoder::new(&dechunked[..])
+            .read_to_end(&mut decoded)
+            .ok()?;
+        decoded
+    } else {
+        dechunked
+    };
+
+    Some(RawResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// `ctx` is the caller's full matrix-cell identifier (round-11 finding: a
+/// transport failure — connection refused, read timeout — must name the
+/// exact cell, not just the path).
+fn get(port: u16, path: &str, ctx: &str) -> RawResponse {
+    raw_request(port, &manifest::Req::new("GET", path.to_string()))
+        .unwrap_or_else(|| panic!("{ctx}: request must be reachable (transport failure)"))
+}
+
+// ---------------------------------------------------------------------
+// Process lifecycle
+// ---------------------------------------------------------------------
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    command
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("CLICKHOUSE_SERVER", ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", ch_http_port())
+        .env("CLICKHOUSE_DB", db);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn pulsusdb");
+    let guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if get_maybe(port, "/ready").is_some_and(|r| r.status == 200) {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("/ready never reached 200 within 60s (port {port}, db {db})");
+}
+
+fn get_maybe(port: u16, path: &str) -> Option<RawResponse> {
+    raw_request(port, &manifest::Req::new("GET", path.to_string()))
+}
+
+// ---------------------------------------------------------------------
+// Ingest body builders (mirror `pulsus-write/src/ingest/http.rs`'s own
+// test fixtures — no lib-exported "valid request" helper exists there, so
+// this crate builds its own minimal ones from the public OTLP/
+// `pulsus_write::WriteRequest` types).
+// ---------------------------------------------------------------------
+
+fn valid_otlp_logs_body() -> Vec<u8> {
+    let record = LogRecord {
+        time_unix_nano: 1_700_000_000_000_000_000,
+        body: Some(AnyValue {
+            value: Some(Value::StringValue("conformance".to_string())),
+        }),
+        ..Default::default()
+    };
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    req.encode_to_vec()
+}
+
+fn valid_otlp_metrics_body() -> Vec<u8> {
+    let req = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: "conformance_metric".to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: vec![],
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![],
+                            start_time_unix_nano: 0,
+                            time_unix_nano: 1_700_000_000_000_000_000,
+                            exemplars: vec![],
+                            flags: 0,
+                            value: Some(number_data_point::Value::AsDouble(1.0)),
+                        }],
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    req.encode_to_vec()
+}
+
+fn valid_remote_write_body() -> Vec<u8> {
+    use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![Label {
+                name: "__name__".to_string(),
+                value: "conformance_up".to_string(),
+            }],
+            samples: vec![Sample {
+                value: 1.0,
+                timestamp: 1_700_000_000_000,
+            }],
+        }],
+        metadata: vec![],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress a valid WriteRequest")
+}
+
+/// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
+/// protobuf (mirrors `pulsus-write/src/ingest/http.rs`'s private `Status`
+/// type — not exported, so this test binary defines its own decode-only
+/// copy of the exact same wire shape).
+#[derive(Clone, PartialEq, ::prost::Message)]
+struct Status {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+// ---------------------------------------------------------------------
+// Path resolution + generic request construction
+// ---------------------------------------------------------------------
+
+/// Resolves an axum route template's `{param}` placeholders to a concrete
+/// value — content-agnostic (no seeded data assumed), just enough to make
+/// the path syntactically dispatchable.
+fn resolve_path(path: &str) -> String {
+    path.replace("{name}", "env")
+        .replace("{traceId}", "abcd1234")
+        .replace("{kind}", "logs")
+}
+
+fn undocumented_method(spec: &RouteSpec) -> &'static str {
+    // No `RouteSpec` in the manifest documents `DELETE` — a safe universal
+    // choice for the "one undocumented method -> 405" case-class.
+    debug_assert!(!spec.methods.contains(&Method::Delete));
+    "DELETE"
+}
+
+/// Builds the "valid" request for `spec`'s success-status assertion:
+/// `GET` with `base_query` as the query string, `POST` with `base_query`
+/// as an `application/x-www-form-urlencoded` body — `Surface::Ingest`
+/// routes are never routed through this (see `assert_ingest_family`).
+fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
+    assert_ne!(
+        spec.surface,
+        Surface::Ingest,
+        "ingest routes build their own bodies"
+    );
+    let mut req = manifest::Req::new(method.as_str(), resolve_path(spec.path));
+    match method {
+        Method::Get => req.query = spec.base_query.to_string(),
+        Method::Post => {
+            req.content_type = Some("application/x-www-form-urlencoded");
+            req.body = spec.base_query.as_bytes().to_vec();
+        }
+        _ => panic!("unexpected documented method {method:?} on {}", spec.path),
+    }
+    req
+}
+
+/// The concrete JSON type each query endpoint's success `data` field
+/// carries (docs/api.md §2/§3's own response shapes): `query`/`query_range`
+/// wrap an object (`{"resultType","result",...}`), the discovery routes
+/// return bare arrays, `/metadata` and every `/status/*` route return
+/// objects. Round-7 finding (medium): `data: null` (or the wrong JSON
+/// type) must fail the cell, not merely "data key present".
+fn expected_data_is_array(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    matches!(last, "labels" | "values" | "series" | "query_exemplars")
+}
+
+fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
+    match (spec.surface, spec.path) {
+        (Surface::OpsPublic, "/metrics") => {
+            // Content-type is unconditional (`ops::metrics_handler` sets it
+            // regardless of what `state.metrics.render()` produces); body
+            // *content* is not asserted here beyond that — writer-only mode
+            // never bridges the label cache's counters in (nothing else is
+            // recorded either yet), so an empty body is a genuine, correct
+            // `/metrics` response in that mode, not an envelope defect.
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; version=0.0.4"),
+                "{ctx}: /metrics content-type"
+            );
+        }
+        (Surface::OpsPublic, _) => {
+            // "/ready": a 200 is a bare `StatusCode::OK.into_response()`
+            // (`ops.rs`) — empty body, no Content-Type (round-7 finding:
+            // explicit body/header assertion, not status-only).
+            assert_eq!(res.status, 200, "{ctx}: /ready status");
+            assert!(
+                res.body.is_empty(),
+                "{ctx}: a 200 /ready body must be empty, got {:?}",
+                String::from_utf8_lossy(&res.body)
+            );
+            assert!(
+                res.content_type().is_none(),
+                "{ctx}: a 200 /ready must carry no Content-Type header, got {:?}",
+                res.content_type()
+            );
+        }
+        (Surface::OpsAuthed, "/config") => {
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; charset=utf-8"),
+                "{ctx}: /config content-type (docs/api.md correction: not YAML media type)"
+            );
+            assert!(
+                !res.body.is_empty(),
+                "{ctx}: /config body must be non-empty"
+            );
+        }
+        (Surface::OpsAuthed, _) => {
+            // "/buildinfo": every documented field must be a populated
+            // (non-null, non-empty) string (round-7 finding: presence
+            // alone accepted `null`).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: /buildinfo content-type"
+            );
+            let json = res.json(ctx);
+            for field in ["version", "revision", "builtAt", "rustc"] {
+                assert!(
+                    json.get(field)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty()),
+                    "{ctx}: {field:?} must be a non-empty string, body {json}"
+                );
+            }
+        }
+        (Surface::LogsQuery, _) | (Surface::PromApi, _) => {
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: query envelope content-type"
+            );
+            let json = res.json(ctx);
+            assert_eq!(json["status"], "success", "{ctx}: envelope status field");
+            let data = json
+                .get("data")
+                .unwrap_or_else(|| panic!("{ctx}: envelope must carry data, body {json}"));
+            // Round-7 finding (medium): `data` must be the endpoint's
+            // actual documented JSON type — `null` (or a mismatched type)
+            // fails the cell.
+            if expected_data_is_array(spec.path) {
+                assert!(
+                    data.is_array(),
+                    "{ctx}: data must be a JSON array, got {data}"
+                );
+            } else {
+                assert!(
+                    data.is_object(),
+                    "{ctx}: data must be a JSON object, got {data}"
+                );
+            }
+        }
+        (Surface::Ingest, _) => {
+            unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
+        }
+    }
+}
+
+fn assert_case_envelope(res: &RawResponse, expect: &ExpectedError, ctx: &str) {
+    match expect {
+        ExpectedError::Json {
+            error_type,
+            has_position,
+        } => {
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: expected a JSON error envelope, content-type was {:?}",
+                res.content_type()
+            );
+            let json = res.json(ctx);
+            assert_eq!(json["status"], "error", "{ctx}");
+            assert_eq!(json["errorType"], *error_type, "{ctx}: body {json}");
+            assert!(
+                json.get("error")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty()),
+                "{ctx}: `error` message must be a non-empty string, body {json}"
+            );
+            assert_eq!(
+                json.get("position").is_some(),
+                *has_position,
+                "{ctx}: `position` field presence, body {json}"
+            );
+        }
+        ExpectedError::Otlp { code } => {
+            assert_eq!(
+                res.content_type(),
+                Some("application/x-protobuf"),
+                "{ctx}: OTLP error content-type"
+            );
+            let status = Status::decode(res.body.as_slice())
+                .unwrap_or_else(|e| panic!("{ctx}: invalid google.rpc.Status protobuf: {e}"));
+            assert_eq!(status.code, *code, "{ctx}: google.rpc.Status.code");
+            assert!(
+                !status.message.is_empty(),
+                "{ctx}: message must be non-empty"
+            );
+        }
+        ExpectedError::PlainText => {
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; charset=utf-8"),
+                "{ctx}: remote-write error content-type"
+            );
+            assert!(
+                !res.body.is_empty(),
+                "{ctx}: plain-text error body must be non-empty"
+            );
+        }
+    }
+}
+
+/// Review round-1 finding (high): every 404 cell pins axum's actual
+/// not-found response shape — empty body, no `Content-Type` — not just the
+/// status code (verified empirically: `curl` against a real spawn shows
+/// `content-length: 0` and no `content-type` header on every unmatched
+/// path). Round-2 finding (medium): the `Content-Type` *absence* is now
+/// asserted explicitly, not just implied by the body being empty.
+fn assert_404_empty(res: &RawResponse, ctx: &str) {
+    assert_eq!(res.status, 404, "{ctx}: status");
+    assert!(
+        res.body.is_empty(),
+        "{ctx}: axum's not-found body must be empty, got {:?}",
+        res.body
+    );
+    assert!(
+        res.content_type().is_none(),
+        "{ctx}: a 404 response must carry no Content-Type header, got {:?}",
+        res.content_type()
+    );
+}
+
+/// Axum's `MethodRouter` `Allow` header value for a route mounted on
+/// exactly `methods` — verified empirically (`GET,HEAD` for a GET-only
+/// route, `GET,HEAD,POST` for GET+POST, bare `POST` for POST-only; `HEAD`
+/// is always synthesized alongside `GET`, never alongside any other
+/// method). Every `RouteSpec.methods` in this manifest is one of exactly
+/// those three shapes.
+fn expected_allow(methods: &[Method]) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if methods.contains(&Method::Get) {
+        parts.push("GET");
+        parts.push("HEAD");
+    }
+    for m in [Method::Post, Method::Put, Method::Delete, Method::Patch] {
+        if methods.contains(&m) {
+            parts.push(m.as_str());
+        }
+    }
+    parts.join(",")
+}
+
+/// Review round-1 finding (high): every 405 cell pins the `Allow` header
+/// axum's `MethodRouter` sets, plus the same empty-body shape as 404.
+/// Round-2 finding (medium): pins the *exact* expected method set derived
+/// from the manifest (`expected_allow`), not just "non-empty", and asserts
+/// `Content-Type` absence too (verified empirically alongside the other
+/// two).
+fn assert_405_with_allow(res: &RawResponse, ctx: &str, methods: &[Method]) {
+    assert_eq!(res.status, 405, "{ctx}: status");
+    assert!(
+        res.body.is_empty(),
+        "{ctx}: a 405 body must be empty, got {:?}",
+        res.body
+    );
+    assert!(
+        res.content_type().is_none(),
+        "{ctx}: a 405 response must carry no Content-Type header, got {:?}",
+        res.content_type()
+    );
+    let expected = expected_allow(methods);
+    assert_eq!(
+        res.headers.get("allow").map(String::as_str),
+        Some(expected.as_str()),
+        "{ctx}: Allow header must name exactly the documented methods"
+    );
+}
+
+/// Review round-1 finding (high): the auth perimeter's failure envelope —
+/// pinned exactly (`middleware::BasicAuth::validate`'s own response:
+/// `Body::from("unauthorized")`, `WWW-Authenticate: Basic`, no
+/// `Content-Type`), not just the `401` status. Round-2 finding (medium):
+/// the `Content-Type` absence is now asserted explicitly too.
+fn assert_401_unauthorized(res: &RawResponse, ctx: &str) {
+    assert_eq!(res.status, 401, "{ctx}: status");
+    assert_eq!(
+        res.headers.get("www-authenticate").map(String::as_str),
+        Some("Basic"),
+        "{ctx}: WWW-Authenticate header"
+    );
+    assert!(
+        res.content_type().is_none(),
+        "{ctx}: a 401 response must carry no Content-Type header, got {:?}",
+        res.content_type()
+    );
+    assert_eq!(
+        res.body,
+        b"unauthorized",
+        "{ctx}: unauthenticated body must be the exact pinned text, got {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+}
+
+/// Method conformance + routing + invalid-param cases + success envelope
+/// for one `Surface::{OpsPublic,OpsAuthed,LogsQuery,PromApi}` `RouteSpec`
+/// (every documented method reaches the exact documented success status;
+/// one undocumented method is `405`; a sibling nonexistent path is `404`;
+/// every `CaseClass` in `spec.cases` reaches its exact `(status, envelope)`).
+/// `spawn` names the server permutation (AC/round-9 finding: every cell
+/// failure names the exact `[spawn] METHOD path case=...` cell).
+fn assert_full_route_matrix(port: u16, spec: &RouteSpec, spawn: &str) {
+    for &method in spec.methods {
+        let ctx = format!(
+            "[{spawn}] {} {} case=documented-method-success",
+            method.as_str(),
+            spec.path
+        );
+        let req = valid_request(spec, method);
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status,
+            spec.success_status,
+            "{ctx}: status (body: {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        assert_success_envelope(spec, &res, &ctx);
+    }
+
+    let ctx = format!(
+        "[{spawn}] {} {} case=undocumented-method-405",
+        undocumented_method(spec),
+        spec.path
+    );
+    let undocumented = manifest::Req::new(undocumented_method(spec), resolve_path(spec.path));
+    let res =
+        raw_request(port, &undocumented).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_405_with_allow(&res, &ctx, spec.methods);
+
+    let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
+    let sibling = format!("{}-conformance-nonexistent", resolve_path(spec.path));
+    let res = get(port, &sibling, &ctx);
+    assert_404_empty(&res, &ctx);
+
+    for case in spec.cases {
+        run_case(port, spec, case, spawn);
+    }
+}
+
+fn run_case(port: u16, spec: &RouteSpec, case: &CaseClass, spawn: &str) {
+    let mut req = manifest::Req::new(spec.methods[0].as_str(), resolve_path(spec.path));
+    (case.build)(&mut req);
+    let ctx = format!("[{spawn}] {} {} case={}", req.method, spec.path, case.name);
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        case.expect_status,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_case_envelope(&res, &case.expect, &ctx);
+}
+
+/// The success-outcome envelope for one of the three `Surface::Ingest`
+/// routes (v3/v4 per-outcome split: remote-write's empty-body/no-
+/// `Content-Type` success shape is structurally distinct from OTLP's
+/// `Export*ServiceResponse` protobuf) — shared by [`assert_ingest_route`]'s
+/// full async-header matrix and [`all_mode_auth_on_perimeter`]'s
+/// valid-credentials cell. `ctx` is the caller's full cell identifier
+/// (round-9 finding: failures name the exact cell, including header/
+/// credential variant, not just the path).
+fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
+    if spec.path == "/api/v1/write" {
+        assert!(
+            res.content_type().is_none(),
+            "{ctx}: a 204/202 remote-write success must carry no Content-Type header"
+        );
+        assert!(
+            res.body.is_empty(),
+            "{ctx}: a 204/202 remote-write success must have an empty body"
+        );
+        return;
+    }
+    assert_eq!(
+        res.content_type(),
+        Some("application/x-protobuf"),
+        "{ctx}: OTLP success content-type"
+    );
+    if spec.path == "/v1/logs" {
+        ExportLogsServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
+            panic!("{ctx}: success body must decode as ExportLogsServiceResponse: {e}")
+        });
+    } else {
+        ExportMetricsServiceResponse::decode(res.body.as_slice()).unwrap_or_else(|e| {
+            panic!("{ctx}: success body must decode as ExportMetricsServiceResponse: {e}")
+        });
+    }
+}
+
+/// The three `Surface::Ingest` routes' full matrix: `X-Pulsus-Async` ∈
+/// {absent, `0`, `1`} against the documented exact sync/async status per
+/// route (plan v2 finding 2, restored/pinned), the per-outcome envelope
+/// split (plan v3/v4: OTLP success = `Export*ServiceResponse` protobuf,
+/// OTLP error = `google.rpc.Status` protobuf; remote-write success = empty
+/// body with **no** `Content-Type` header, remote-write error =
+/// `text/plain; charset=utf-8`), a sibling-404, an undocumented-method-405,
+/// and every `CaseClass` in the manifest.
+fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    let is_remote_write = spec.path == "/api/v1/write";
+    let body_for = |path: &str| -> Vec<u8> {
+        match path {
+            "/v1/logs" => valid_otlp_logs_body(),
+            "/v1/metrics" => valid_otlp_metrics_body(),
+            "/api/v1/write" => valid_remote_write_body(),
+            other => panic!("no valid-body builder registered for ingest route {other}"),
+        }
+    };
+
+    let async_cases: &[(Option<&str>, u16)] = if is_remote_write {
+        &[(None, 204), (Some("0"), 204), (Some("1"), 202)]
+    } else {
+        &[(None, 200), (Some("0"), 200), (Some("1"), 202)]
+    };
+    for (header, expect_status) in async_cases {
+        let ctx = format!(
+            "[{spawn}] POST {} case=success x-pulsus-async={}",
+            spec.path,
+            header.unwrap_or("<absent>")
+        );
+        let mut req = manifest::Req::new("POST", spec.path);
+        if let Some(v) = header {
+            req.headers.push(("x-pulsus-async", v.to_string()));
+        }
+        // Review round-1 finding (medium): send the documented request
+        // headers (docs/api.md §1.1-1.2) on the success path, not just an
+        // unlabeled body — `Content-Type: application/x-protobuf` for OTLP,
+        // plus `Content-Encoding: snappy` for remote-write.
+        req.content_type = Some("application/x-protobuf");
+        if is_remote_write {
+            req.headers.push(("content-encoding", "snappy".to_string()));
+        }
+        req.body = body_for(spec.path);
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(res.status, *expect_status, "{ctx}: status");
+        assert_ingest_success_envelope(spec, &res, &ctx);
+    }
+
+    // Case-class 6's "wrong Content-Type" cell, OTLP-only (review round-2
+    // finding): `ingest/http.rs` never inspects `Content-Type` at all (it
+    // decodes every body as protobuf unconditionally — its own doc comment,
+    // and `an_explicit_protobuf_content_type_header_admits_identically_to_no_header`'s
+    // unit coverage). A **valid**, decodable protobuf body labeled
+    // `Content-Type: application/json` therefore still succeeds — pinning
+    // that reality directly here (not as a `CaseClass`, which has no way
+    // to know which signal-specific valid body — logs vs metrics — to
+    // build) rather than asserting a `400` that would never actually
+    // happen.
+    if !is_remote_write {
+        let ctx = format!(
+            "[{spawn}] POST {} case=wrong-content-type-valid-body-pinned-success",
+            spec.path
+        );
+        let mut req = manifest::Req::new("POST", spec.path);
+        req.content_type = Some("application/json");
+        req.body = body_for(spec.path);
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status, spec.success_status,
+            "{ctx}: Content-Type is not enforced — a valid protobuf body must still succeed \
+             regardless of the (wrong) Content-Type header"
+        );
+        assert_ingest_success_envelope(spec, &res, &ctx);
+    }
+
+    let ctx = format!(
+        "[{spawn}] {} {} case=undocumented-method-405",
+        undocumented_method(spec),
+        spec.path
+    );
+    let undocumented = manifest::Req::new(undocumented_method(spec), spec.path.to_string());
+    let res =
+        raw_request(port, &undocumented).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_405_with_allow(&res, &ctx, spec.methods);
+
+    let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
+    let sibling = format!("{}-conformance-nonexistent", spec.path);
+    let res = get(port, &sibling, &ctx);
+    assert_404_empty(&res, &ctx);
+
+    for case in spec.cases {
+        run_case(port, spec, case, spawn);
+    }
+}
+
+/// `Accept-Encoding: identity` vs `gzip` byte-identity (edge case 4): the
+/// global `CompressionLayer` must never alter decoded bytes. Run against a
+/// representative subset (one JSON ops route, `/metrics`, one
+/// `LogsQuery` route, one `PromApi` route) — every mounted route's body is
+/// encoded through the exact same global layer, so this is not a per-route
+/// property; the plan calls for "at least one JSON and one `/metrics`
+/// body".
+fn assert_gzip_identity(port: u16, path: &str, query: &str, spawn: &str) {
+    // Round-10 finding (medium): the full `[spawn] METHOD path case
+    // variant` cell identifier, per leg.
+    let ctx_id = format!("[{spawn}] GET {path} case=gzip-identity leg=identity");
+    let ctx_gz = format!("[{spawn}] GET {path} case=gzip-identity leg=gzip");
+    let mut req = manifest::Req::new("GET", path.to_string());
+    req.query = query.to_string();
+    // Round-8 finding (medium): the identity leg requests `identity`
+    // explicitly and asserts no Content-Encoding came back — an
+    // always-gzip server (unsolicited compression) now fails this leg
+    // rather than being transparently decoded and passing.
+    req.headers
+        .push(("accept-encoding", "identity".to_string()));
+    let identity = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_id}: must be reachable"));
+    assert!(
+        !identity.headers.contains_key("content-encoding"),
+        "{ctx_id}: must carry no Content-Encoding header, got {:?}",
+        identity.headers.get("content-encoding")
+    );
+    req.headers.pop();
+    req.headers.push(("accept-encoding", "gzip".to_string()));
+    let gz = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_gz}: must be reachable"));
+    assert_eq!(
+        gz.headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "{ctx_gz}: must actually negotiate gzip for this assertion to be meaningful"
+    );
+    // Round-7 finding (medium): status + Content-Type equality, not just
+    // body identity — gzip negotiation must never change either.
+    assert_eq!(identity.status, 200, "{ctx_id}: status");
+    assert_eq!(
+        gz.status, identity.status,
+        "{ctx_gz}: status must equal the identity leg's"
+    );
+    assert_eq!(
+        gz.content_type(),
+        identity.content_type(),
+        "{ctx_gz}: Content-Type must equal the identity leg's"
+    );
+    assert_eq!(
+        gz.body, identity.body,
+        "{ctx_gz}: gzip-decoded body must be byte-identical to the identity response"
+    );
+}
+
+/// `/metrics`'s own gzip-identity leg: unlike every other route this
+/// matrix drives, `ops::metrics_handler` bridges the label cache's *live*
+/// counters/gauges into the response on every single scrape (`ops.rs`'s
+/// own doc comment) — `pulsus_label_cache_age_ms`'s value (and, per the
+/// underlying exporter's label-set registration order, the ordering of
+/// the labelled `pulsus_label_cache_misses_total{reason=...}` series)
+/// genuinely differ between two back-to-back requests, by design, not by
+/// a gzip-layer defect. Normalizes both bodies the same way
+/// (`explain_indexes.rs`'s established "collapse the volatile part before
+/// comparing" idiom, applied to whole lines here rather than digits) so
+/// this still proves gzip decode fidelity — corruption in the compression
+/// layer would show up as a genuine content mismatch even after
+/// normalizing away the one known-live gauge and the label-order
+/// nondeterminism.
+fn assert_gzip_identity_metrics(port: u16, spawn: &str) {
+    fn normalize(body: &[u8]) -> Vec<String> {
+        let mut lines: Vec<String> = String::from_utf8_lossy(body)
+            .lines()
+            .filter(|line| !line.contains("pulsus_label_cache_age_ms"))
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    // Round-10 finding (medium): full cell identifiers, per leg.
+    let ctx_id = format!("[{spawn}] GET /metrics case=gzip-identity leg=identity");
+    let ctx_gz = format!("[{spawn}] GET /metrics case=gzip-identity leg=gzip");
+    let mut req = manifest::Req::new("GET", "/metrics".to_string());
+    // Round-8 finding (medium): explicit `identity` + Content-Encoding
+    // absence, same as `assert_gzip_identity`.
+    req.headers
+        .push(("accept-encoding", "identity".to_string()));
+    let identity = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_id}: must be reachable"));
+    assert!(
+        !identity.headers.contains_key("content-encoding"),
+        "{ctx_id}: must carry no Content-Encoding header, got {:?}",
+        identity.headers.get("content-encoding")
+    );
+    req.headers.pop();
+    req.headers.push(("accept-encoding", "gzip".to_string()));
+    let gz = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx_gz}: must be reachable"));
+    assert_eq!(
+        gz.headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "{ctx_gz}: must actually negotiate gzip for this assertion to be meaningful"
+    );
+    // Round-7 finding (medium): status + Content-Type equality too.
+    assert_eq!(identity.status, 200, "{ctx_id}: status");
+    assert_eq!(
+        gz.status, identity.status,
+        "{ctx_gz}: status must equal the identity leg's"
+    );
+    assert_eq!(
+        gz.content_type(),
+        identity.content_type(),
+        "{ctx_gz}: Content-Type must equal the identity leg's"
+    );
+    assert_eq!(
+        normalize(&gz.body),
+        normalize(&identity.body),
+        "{ctx_gz}: gzip-decoded body must match the identity response once the one known-live \
+         gauge line and label-set ordering are normalized away"
+    );
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        let n =
+            (u32::from(b0) << 16) | (u32::from(b1.unwrap_or(0)) << 8) | u32::from(b2.unwrap_or(0));
+        out.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
+        out.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if b1.is_some() {
+            CHARS[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if b2.is_some() {
+            CHARS[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Spawn 1: mode=all, auth off, compat on — the full mounted surface.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_mode_auth_off_compat_on_full_matrix() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_120;
+    let db = "pulsus_api_conformance_it_full";
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "true")]);
+
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted {
+            continue;
+        }
+        match spec.surface {
+            Surface::Ingest => assert_ingest_route(port, spec, "spawn=all,auth=off,compat=on"),
+            _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
+        }
+    }
+
+    let spawn = "spawn=all,auth=off,compat=on";
+    assert_gzip_identity(port, "/buildinfo", "", spawn);
+    assert_gzip_identity(
+        port,
+        "/api/logs/v1/query_range",
+        "query=%7Bservice_name%3D%22checkout%22%7D",
+        spawn,
+    );
+    assert_gzip_identity(port, "/api/v1/query", "query=up", spawn);
+    assert_gzip_identity_metrics(port, spawn);
+}
+
+// ---------------------------------------------------------------------
+// Spawn 2: mode=all, auth on — the 401 perimeter.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_mode_auth_on_perimeter() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_121;
+    let db = "pulsus_api_conformance_it_auth";
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_COMPAT_ENDPOINTS", "true"),
+            ("PULSUS_AUTH_USER", "alice"),
+            ("PULSUS_AUTH_PASSWORD", "hunter2"),
+        ],
+    );
+
+    let valid = format!("Basic {}", base64_encode(b"alice:hunter2"));
+    let invalid = format!("Basic {}", base64_encode(b"alice:wrong"));
+
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted {
+            continue;
+        }
+        let method = spec.methods[0];
+        let is_ingest = spec.surface == Surface::Ingest;
+        let mut req = if is_ingest {
+            let mut r = manifest::Req::new("POST", spec.path);
+            r.content_type = Some("application/x-protobuf");
+            if spec.path == "/api/v1/write" {
+                r.headers.push(("content-encoding", "snappy".to_string()));
+            }
+            r.body = match spec.path {
+                "/v1/logs" => valid_otlp_logs_body(),
+                "/v1/metrics" => valid_otlp_metrics_body(),
+                "/api/v1/write" => valid_remote_write_body(),
+                other => panic!("no valid-body builder for {other}"),
+            };
+            r
+        } else {
+            valid_request(spec, method)
+        };
+
+        // No credentials: `/ready`/`/metrics` (OpsPublic) never gate on
+        // auth (exact documented success status, not just "not 401");
+        // every other mounted route (including data-plane routes that are
+        // otherwise unreachable under other spawns) is exactly `401` with
+        // the pinned auth-failure envelope — the perimeter never leaks
+        // path existence.
+        let spawn = "spawn=all,auth=on,compat=on";
+        let ctx = format!(
+            "[{spawn}] {} {} case=auth creds=none",
+            req.method, spec.path
+        );
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        if spec.surface == Surface::OpsPublic {
+            assert_eq!(
+                res.status, spec.success_status,
+                "{ctx}: ops-public must never require auth"
+            );
+            assert_success_envelope(spec, &res, &ctx);
+            continue;
+        }
+        assert_401_unauthorized(&res, &ctx);
+
+        let ctx = format!(
+            "[{spawn}] {} {} case=auth creds=wrong",
+            req.method, spec.path
+        );
+        req.headers.push(("authorization", invalid.clone()));
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_401_unauthorized(&res, &ctx);
+
+        let ctx = format!(
+            "[{spawn}] {} {} case=auth creds=valid",
+            req.method, spec.path
+        );
+        req.headers.pop();
+        req.headers.push(("authorization", valid.clone()));
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status,
+            spec.success_status,
+            "{ctx}: valid credentials must reach the exact documented success status (body: {:?})",
+            String::from_utf8_lossy(&res.body)
+        );
+        if is_ingest {
+            assert_ingest_success_envelope(spec, &res, &ctx);
+        } else {
+            assert_success_envelope(spec, &res, &ctx);
+        }
+    }
+
+    // Perimeter uniformity (edge case 2): an unauthenticated request to a
+    // totally nonexistent path is indistinguishable from one to a real
+    // (but not-yet-authenticated) path — both carry the exact same `401`
+    // envelope, never a path-existence oracle via 404-before-401.
+    let ctx = "[spawn=all,auth=on,compat=on] GET /totally-bogus-conformance-path case=auth \
+               creds=none (perimeter uniformity)";
+    let res = get(port, "/totally-bogus-conformance-path", ctx);
+    assert_401_unauthorized(&res, ctx);
+}
+
+// ---------------------------------------------------------------------
+// Spawn 3: mode=all, compat off — `/loki/*` 404s.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn all_mode_compat_off_alias_404() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_122;
+    let db = "pulsus_api_conformance_it_compat_off";
+    let _guard = spawn_ready(port, db, &[]); // PULSUS_COMPAT_ENDPOINTS unset => false.
+
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted || spec.gate != Gate::CompatAndReader {
+            continue;
+        }
+        let ctx = format!(
+            "[spawn=all,auth=off,compat=off] GET {} case=compat-flag-off-404",
+            spec.path
+        );
+        let res = get(port, &resolve_path(spec.path), &ctx);
+        assert_404_empty(&res, &ctx);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Spawn 4: mode=writer, compat flag ON — every ReaderMode/CompatAndReader
+// route still 404s (pins that the compat flag alone never mounts aliases
+// without Reader mode); ops + ingest stay live.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writer_only_mode_reader_routes_404() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_123;
+    let db = "pulsus_api_conformance_it_writer_only";
+    // Review round-3 finding (medium): `PULSUS_COMPAT_ENDPOINTS=true` here
+    // too, not just mode=writer — pins the actual gating interaction
+    // (verified by reading `compat.rs::apply_aliases`: it checks
+    // `modes::mounted(cfg).contains(&Subsystem::Reader)` unconditionally,
+    // *in addition to* the flag, so the alias never mounts writer-side
+    // regardless of the flag) rather than only ever exercising the
+    // flag-off case, which would miss a regression that mounted aliases
+    // whenever the flag is true, independent of mode.
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_MODE", "writer"),
+            ("PULSUS_COMPAT_ENDPOINTS", "true"),
+        ],
+    );
+
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted {
+            continue;
+        }
+        let spawn = "spawn=writer-only,compat=on";
+        match spec.gate {
+            Gate::ReaderMode | Gate::CompatAndReader => {
+                let ctx = format!("[{spawn}] GET {} case=out-of-mode-404", spec.path);
+                let res = get(port, &resolve_path(spec.path), &ctx);
+                assert_404_empty(&res, &ctx);
+            }
+            Gate::Always => {
+                let ctx = format!("[{spawn}] GET {} case=ops-stays-live", spec.path);
+                let res = get(port, &resolve_path(spec.path), &ctx);
+                assert_eq!(
+                    res.status, spec.success_status,
+                    "{ctx}: ops routes must stay live at their exact documented status in \
+                     writer-only mode"
+                );
+                assert_success_envelope(spec, &res, &ctx);
+            }
+            Gate::WriterMode => assert_ingest_route(port, spec, spawn),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Spawn 5: mode=reader — every WriterMode (ingest) route 404s; ops +
+// reader routes stay live.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reader_only_mode_writer_routes_404() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_124;
+    let db = "pulsus_api_conformance_it_reader_only";
+    let _guard = spawn_ready(port, db, &[("PULSUS_MODE", "reader")]);
+
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted {
+            continue;
+        }
+        let spawn = "spawn=reader-only";
+        match spec.gate {
+            Gate::WriterMode => {
+                let ctx = format!("[{spawn}] POST {} case=out-of-mode-404", spec.path);
+                let mut req = manifest::Req::new("POST", spec.path);
+                req.content_type = Some("application/x-protobuf");
+                if spec.path == "/api/v1/write" {
+                    req.headers.push(("content-encoding", "snappy".to_string()));
+                }
+                req.body = match spec.path {
+                    "/v1/logs" => valid_otlp_logs_body(),
+                    "/v1/metrics" => valid_otlp_metrics_body(),
+                    "/api/v1/write" => valid_remote_write_body(),
+                    other => panic!("no valid-body builder for {other}"),
+                };
+                let res =
+                    raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+                assert_404_empty(&res, &ctx);
+            }
+            Gate::Always => {
+                let ctx = format!("[{spawn}] GET {} case=ops-stays-live", spec.path);
+                let res = get(port, &resolve_path(spec.path), &ctx);
+                assert_eq!(
+                    res.status, spec.success_status,
+                    "{ctx}: ops routes must stay live at their exact documented status in \
+                     reader-only mode"
+                );
+                assert_success_envelope(spec, &res, &ctx);
+            }
+            // `CompatAndReader` needs `PULSUS_COMPAT_ENDPOINTS=true` too
+            // (unset here, matches `Config::default()`) — covered by
+            // `all_mode_compat_off_alias_404`'s flag-only isolation and
+            // `writer_only_mode_reader_routes_404`'s mode-only isolation;
+            // skip here to avoid asserting two conflated preconditions in
+            // one spawn.
+            Gate::CompatAndReader => {}
+            Gate::ReaderMode => {
+                let method = spec.methods[0];
+                let ctx = format!(
+                    "[{spawn}] {} {} case=in-mode-success",
+                    method.as_str(),
+                    spec.path
+                );
+                let req = valid_request(spec, method);
+                let res =
+                    raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+                assert_eq!(
+                    res.status, spec.success_status,
+                    "{ctx}: must reach its documented success status in reader-only mode"
+                );
+                assert_success_envelope(spec, &res, &ctx);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Spawn 6: PULSUS_LOGQL_SCAN_BUDGET_BYTES=1 — the live `422
+// query_too_broad` case (code-review round-1 finding: `scan_budget_bytes`
+// *is* configurable, unlike the hard-coded `DEFAULT_MAX_STREAMS` — see
+// this module's doc comment for the full rationale).
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logql_scan_budget_query_too_broad_live_case() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_125;
+    let db = "pulsus_api_conformance_it_query_too_broad";
+    let _guard = spawn_ready(port, db, &[("PULSUS_LOGQL_SCAN_BUDGET_BYTES", "1")]);
+
+    // Minimal seed (one stream, one sample — mirrors `logs_api_live.rs`'s
+    // own direct-`ChClient`-insert idiom, trimmed to the smallest amount
+    // that still exercises a real ClickHouse read): any actual row read
+    // exceeds the 1-byte budget above.
+    let client = ChClient::new(ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port_num(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 4,
+        query_timeout: Duration::from_secs(20),
+        ..ChConnConfig::default()
+    })
+    .await
+    .expect("connect data client");
+
+    let now_ns = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("now fits in i64 nanoseconds");
+
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({now_ns}))), 1, \
+                 'checkout', '{{\"service_name\":\"checkout\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES ('checkout', 1, {now_ns}, 0, 'hello')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_samples");
+
+    let res = get(
+        port,
+        "/api/logs/v1/query_range?query=%7Bservice_name%3D%22checkout%22%7D",
+        "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422",
+    );
+    assert_eq!(
+        res.status,
+        422,
+        "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_case_envelope(
+        &res,
+        &ExpectedError::Json {
+            error_type: "query_too_broad",
+            has_position: false,
+        },
+        "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422",
+    );
+}
