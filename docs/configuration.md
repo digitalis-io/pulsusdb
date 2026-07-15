@@ -77,7 +77,8 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_PROMQL_MAX_SAMPLES` | `50000000` | evaluation sample budget per query |
 | `PULSUS_PROMQL_LOOKBACK` | `5m` | staleness/lookback delta |
 | `PULSUS_LOGQL_SCAN_BUDGET_BYTES` | `50GiB` | per-query scan cap; exceeding returns "query too broad" |
-| `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | candidate trace cap before top-K-by-recency truncation |
+| `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
+| `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
 
 ## 7. Downsampling (M3)
 

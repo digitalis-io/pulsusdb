@@ -1,21 +1,32 @@
-//! Trace read path (issue #55): the docs/schemas.md §4.2 trace-by-ID
-//! point read. Deliberately **OTLP-agnostic** (task-manager adjudication
-//! on issue #55, open question 1): this module speaks SQL and streamed
-//! rows only — no `prost`/`opentelemetry-proto` dependency enters this
-//! crate. Decoding the stored per-span payloads, de-duplicating
-//! at-least-once replays, and assembling the OTLP `TracesData` response
-//! all live server-side (`pulsus-server/src/traces_api/assemble.rs`),
-//! mirroring the logs layering (`pulsus-read` returns rows,
-//! `logs_api/encode.rs` shapes them).
+//! Trace read path: the docs/schemas.md §4.2 trace-by-ID point read
+//! (issue #55) and the two-phase TraceQL search (issue #57). Deliberately
+//! **OTLP-agnostic** (task-manager adjudication on issue #55, open
+//! question 1): this module speaks SQL and streamed rows only — no
+//! `prost`/`opentelemetry-proto` dependency enters this crate. Decoding
+//! stored per-span payloads and shaping API responses live server-side
+//! (`pulsus-server/src/traces_api`), mirroring the logs layering.
 //!
-//! **Module layout** mirrors [`crate::logql`]'s plan/execute split at
-//! point-read scale: [`sql`] (the pure, snapshot-tested SQL builder),
-//! [`rows`] (`ChClient` result-row shapes), and [`exec`] (`TraceEngine`,
+//! **Module layout** mirrors [`crate::logql`]'s plan/execute split:
+//! [`filter`] (the shared span-filter compiler — T7's metrics endpoints
+//! consume it too), [`search_plan`] (pure `Query → SearchPlan`),
+//! [`search_sql`] (the pure, byte-frozen SQL builders), [`search_eval`]
+//! (the pure Phase-2 exact evaluator), [`sql`]/[`rows`] (point-read
+//! builder + `ChClient` result-row shapes), and [`exec`] (`TraceEngine`,
 //! the only module here that talks to ClickHouse).
 
 pub mod exec;
+pub mod filter;
 pub mod rows;
+pub mod search_eval;
+pub mod search_plan;
+pub mod search_sql;
 pub mod sql;
 
-pub use exec::{TraceEngine, TraceReadConfig};
+pub use exec::{
+    BATCH_TRACES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE, RootSummary, SearchOutput,
+    TraceEngine, TraceReadConfig, TraceSearchResult,
+};
+pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
 pub use rows::{StoredSpan, StoredSpanRow};
+pub use search_eval::SpanSummary;
+pub use search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};

@@ -1,8 +1,9 @@
 //! `/api/traces/v1`'s error envelope: `{"status":"error","errorType",
-//! "error"}` (docs/api.md §4.1), and the status-code mapping table pinned
-//! by the issue #55 plan (v2's error table + v3's `406 not_acceptable`).
-//! Mirrors `logs_api/error.rs`'s structure; no `position` field — there is
-//! no query language to report a byte offset into on this surface.
+//! "error","position"?}` (docs/api.md §4.1/§4.2), and the status-code
+//! mapping table pinned by the issue #55 plan (v2's error table + v3's
+//! `406 not_acceptable`) plus issue #57's search rows. Mirrors
+//! `logs_api/error.rs`'s structure; `position` (a byte offset) appears
+//! only on TraceQL parse errors — the fetch surface never carries it.
 //!
 //! Errors are **always** this JSON envelope, never protobuf, regardless of
 //! the request's `Accept` header (docs/api.md §4.1) — the mounted-but-
@@ -16,24 +17,38 @@ use serde::Serialize;
 
 use pulsus_clickhouse::ChError;
 use pulsus_read::logql::ReadError;
+use pulsus_traceql::TraceQlError;
 
 use super::assemble::AssembleError;
-use super::params::TraceIdError;
+use super::legacy::LegacyError;
+use super::params::{SearchParamError, TraceIdError};
 
-/// Every failure mode a `/api/traces/v1/trace/{traceId}` handler can
-/// return, converted to the documented error envelope by [`IntoResponse`]:
+/// Every failure mode a `/api/traces/v1` handler can return, converted
+/// to the documented error envelope by [`IntoResponse`]:
 ///
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
-/// | `Param` | 400 | `bad_data` |
+/// | `Param` / `SearchParam` / `Plan` | 400 | `bad_data` |
+/// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
+/// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
 /// | `NotFound` | 404 | `not_found` |
 /// | `NotAcceptable` | 406 | `not_acceptable` |
+/// | `Read(QueryTooBroad)` | 422 | `query_too_broad` |
 /// | `PoolUnavailable` | 503 | `unavailable` |
 /// | `Read(Clickhouse(Timeout))` | 504 | `timeout` |
 /// | `Read(_)` / `Assemble(_)` | 500 | `internal` |
 #[derive(Debug)]
 pub(crate) enum ApiError {
     Param(TraceIdError),
+    /// Search request-parameter failures (issue #57).
+    SearchParam(SearchParamError),
+    /// Legacy `tags` logfmt failures (issue #57).
+    Legacy(LegacyError),
+    /// TraceQL parse failure — `400 bad_data` with a `position` byte
+    /// offset, matching the LogQL parse-error envelope.
+    Query(TraceQlError),
+    /// Search planning failure (unsupported field / type mismatch).
+    Plan(pulsus_read::TracePlanError),
     /// The trace has no stored spans (an empty §4.2 fetch).
     NotFound,
     /// RFC 9110: no served representation is acceptable under the
@@ -50,6 +65,18 @@ pub(crate) enum ApiError {
 impl From<TraceIdError> for ApiError {
     fn from(e: TraceIdError) -> Self {
         ApiError::Param(e)
+    }
+}
+
+impl From<SearchParamError> for ApiError {
+    fn from(e: SearchParamError) -> Self {
+        ApiError::SearchParam(e)
+    }
+}
+
+impl From<LegacyError> for ApiError {
+    fn from(e: LegacyError) -> Self {
+        ApiError::Legacy(e)
     }
 }
 
@@ -71,16 +98,36 @@ struct ErrorEnvelope {
     #[serde(rename = "errorType")]
     error_type: &'static str,
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    position: Option<usize>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, error_type, message) = match &self {
-            ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
+        let (status, error_type, message, position) = match &self {
+            ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            ApiError::SearchParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            // Strict logfmt errors carry a byte offset into the decoded
+            // `tags` value (code review round 1 — documented in
+            // docs/api.md §4.2 alongside the TraceQL parse offset).
+            ApiError::Legacy(e) => (
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                e.to_string(),
+                Some(e.pos()),
+            ),
+            ApiError::Query(e) => (
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                e.to_string(),
+                Some(e.span().start),
+            ),
+            ApiError::Plan(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::NotFound => (
                 StatusCode::NOT_FOUND,
                 "not_found",
                 "trace not found".to_string(),
+                None,
             ),
             ApiError::NotAcceptable => (
                 StatusCode::NOT_ACCEPTABLE,
@@ -88,24 +135,43 @@ impl IntoResponse for ApiError {
                 "no acceptable representation: this endpoint serves application/json and \
                  application/protobuf"
                     .to_string(),
+                None,
             ),
             ApiError::Read(e) => match e {
+                ReadError::QueryTooBroad(_) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "query_too_broad",
+                    e.to_string(),
+                    None,
+                ),
                 ReadError::Clickhouse(ChError::Timeout(_)) => {
-                    (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string())
+                    (StatusCode::GATEWAY_TIMEOUT, "timeout", e.to_string(), None)
                 }
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    e.to_string(),
+                    None,
+                ),
             },
-            ApiError::Assemble(e) => (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+            ApiError::Assemble(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                e.to_string(),
+                None,
+            ),
             ApiError::PoolUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
                 "clickhouse pool not yet established".to_string(),
+                None,
             ),
         };
         let body = ErrorEnvelope {
             status: "error",
             error_type,
             error: message,
+            position,
         };
         (status, Json(body)).into_response()
     }
@@ -186,5 +252,48 @@ mod tests {
         let (status, json) = envelope(ApiError::PoolUnavailable).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn a_traceql_parse_error_maps_to_400_bad_data_with_a_position() {
+        let err = pulsus_traceql::parse("{ ").expect_err("must fail");
+        let (status, json) = envelope(ApiError::Query(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json["position"].is_u64(), "body {json}");
+    }
+
+    #[tokio::test]
+    async fn query_too_broad_maps_to_422_query_too_broad() {
+        let err = ApiError::Read(ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::TraceScanBudgetRows { budget_rows: 42 },
+        ));
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+        assert!(json.get("position").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_logfmt_error_maps_to_400_bad_data_with_its_tags_offset() {
+        let err = ApiError::Legacy(LegacyError::UnquotedEquals {
+            key: "a".to_string(),
+            pos: 3,
+        });
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(json["position"], 3, "body {json}");
+    }
+
+    #[tokio::test]
+    async fn a_plan_error_maps_to_400_bad_data_without_a_position() {
+        let err = ApiError::Plan(pulsus_read::TracePlanError::TypeMismatch(
+            "status supports only = and !=".to_string(),
+        ));
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json.get("position").is_none());
     }
 }

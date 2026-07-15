@@ -24,10 +24,14 @@ use super::rows::{
 };
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
-/// `max_bytes_to_read` overflow this crate sets from
+/// `max_bytes_to_read` overflow this module sets from
 /// `reader.logql_scan_budget_bytes`. Deliberately the *only* server code
-/// mapped to [`ReadError::QueryTooBroad`]: `max_rows_to_read` is never set,
-/// so code 158 (`TOO_MANY_ROWS`) can never masquerade as the byte budget
+/// [`map_read_error`] maps to [`ReadError::QueryTooBroad`]:
+/// `max_rows_to_read` is never set on **LogQL** read paths (the traces
+/// scan budget sets it deliberately on its generator queries, where code
+/// 158 maps to `TooBroadReason::TraceScanBudgetRows` via
+/// `traces::exec`'s own mapper — issue #57), so on the LogQL path code
+/// 158 (`TOO_MANY_ROWS`) can never masquerade as the byte budget
 /// (architect plan amendment §4).
 const CODE_TOO_MANY_BYTES: i32 = 307;
 
@@ -745,10 +749,11 @@ impl LogQlEngine {
 /// surfaces to callers — is unaffected, so `tests/sql_snapshots.rs`'s
 /// byte-exact assertions stay meaningful.
 ///
-/// `pub(crate)`: issue #31's `metrics::exec::MetricsEngine` reuses this
-/// same fix at its own execution boundary (its `SqlFallback` sub-query's
-/// anchored `match(...)` regex predicates carry the identical `^(?:...)$`
-/// literal-`?` shape), rather than duplicating the doubling logic.
+/// `pub(crate)`: issue #31's `metrics::exec::MetricsEngine` and issue
+/// #57's `traces::exec::TraceEngine` reuse this same fix at their own
+/// execution boundaries (their anchored `match(...)` regex predicates
+/// carry the identical `^(?:...)$` literal-`?` shape), rather than
+/// duplicating the doubling logic.
 pub(crate) fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
     if sql.contains('?') {
         Cow::Owned(sql.replace('?', "??"))
@@ -760,9 +765,11 @@ pub(crate) fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
 /// Maps a ClickHouse error to [`ReadError`], translating the byte-budget
 /// overflow code to a structured [`TooBroadReason::ScanBudgetBytes`] and
 /// leaving every other server code (including 158 `TOO_MANY_ROWS`, which
-/// this crate never triggers because `max_rows_to_read` is never set) as a
-/// generic [`ReadError::Clickhouse`] passthrough — never reinterpreted as a
-/// timeout or vice versa.
+/// the LogQL path never triggers because it never sets `max_rows_to_read`
+/// — the traces search path sets that budget deliberately and maps 158 in
+/// its **own** mapper, `traces::exec::map_trace_read_error`, issue #57) as
+/// a generic [`ReadError::Clickhouse`] passthrough — never reinterpreted
+/// as a timeout or vice versa.
 fn map_read_error(e: ChError, budget_bytes: u64) -> ReadError {
     if let ChError::Server { code, .. } = &e
         && *code == CODE_TOO_MANY_BYTES
@@ -778,7 +785,10 @@ fn map_read_error(e: ChError, budget_bytes: u64) -> ReadError {
 /// The Rust-side structural stream cap (task-manager resolution #1 on
 /// issue #11): a `count` past `cap` is [`TooBroadReason::StreamCap`], a
 /// distinct "too broad" family from the ClickHouse byte budget — never a
-/// ClickHouse row limit, since `max_rows_to_read` is never set.
+/// ClickHouse row limit, since `max_rows_to_read` is never set on LogQL
+/// read paths (the traces scan budget sets it deliberately on its
+/// generator queries — issue #57); on the LogQL path code 158 cannot
+/// masquerade as `StreamCap`.
 fn check_stream_cap(count: usize, cap: usize) -> Result<(), ReadError> {
     if count > cap {
         Err(ReadError::QueryTooBroad(TooBroadReason::StreamCap {

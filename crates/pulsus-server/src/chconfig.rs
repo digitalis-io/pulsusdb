@@ -237,11 +237,14 @@ pub(crate) fn metrics_engine(
     MetricsEngine::new(client, label_cache, metrics_config_from(config))
 }
 
-/// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issue #55):
-/// `trace_spans` is `_dist`-aware exactly as every other read/write table
-/// mapping in this module — a configured `cluster` reads through the
-/// `trace_spans_dist` wrapper ([`trace_writer_tables_from`]'s write-side
-/// twin), an unclustered deployment reads the base table directly.
+/// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issues #55/#57):
+/// both trace tables are `_dist`-aware exactly as every other read/write
+/// table mapping in this module — a configured `cluster` reads through
+/// the `_dist` wrappers ([`trace_writer_tables_from`]'s write-side twin)
+/// and flips `distributed` so the search engine injects the
+/// docs/schemas.md §7 clustered-reader settings; an unclustered
+/// deployment reads the base tables directly. Search budgets/caps map
+/// from `reader.traceql_max_candidates` / `reader.traceql_scan_budget_rows`.
 pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
     let dist = if config.cluster.is_some() {
         config.dist_suffix.as_str()
@@ -250,6 +253,11 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
     };
     TraceReadConfig {
         spans_table: format!("trace_spans{dist}"),
+        attrs_table: format!("trace_attrs_idx{dist}"),
+        max_candidates: config.reader.traceql_max_candidates,
+        scan_budget_rows: config.reader.traceql_scan_budget_rows,
+        distributed: config.cluster.is_some(),
+        skip_unavailable_shards: config.skip_unavailable_shards,
     }
 }
 
@@ -457,20 +465,33 @@ mod tests {
     }
 
     #[test]
-    fn trace_read_config_from_uses_the_base_spans_table_when_unclustered() {
+    fn trace_read_config_from_uses_the_base_tables_when_unclustered() {
         let config = Config::default();
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.spans_table, "trace_spans");
+        assert_eq!(cfg.attrs_table, "trace_attrs_idx");
+        assert!(!cfg.distributed);
     }
 
     #[test]
-    fn trace_read_config_from_uses_the_dist_spans_table_when_clustered() {
+    fn trace_read_config_from_uses_the_dist_tables_and_flag_when_clustered() {
         let config = Config {
             cluster: Some("prod".to_string()),
             ..Config::default()
         };
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.spans_table, "trace_spans_dist");
+        assert_eq!(cfg.attrs_table, "trace_attrs_idx_dist");
+        assert!(cfg.distributed);
+    }
+
+    #[test]
+    fn trace_read_config_from_maps_the_search_budgets() {
+        let config = Config::default();
+        let cfg = trace_read_config_from(&config);
+        assert_eq!(cfg.max_candidates, config.reader.traceql_max_candidates);
+        assert_eq!(cfg.scan_budget_rows, config.reader.traceql_scan_budget_rows);
+        assert_eq!(cfg.skip_unavailable_shards, config.skip_unavailable_shards);
     }
 
     #[test]

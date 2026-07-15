@@ -19,6 +19,11 @@ pulsus-model = { path = "../pulsus-model" }
 # and `pulsus-model` at once (`pulsus-model -> pulsus-promql ->
 # pulsus-read`, acyclic — issue #31 plan amendment §1).
 pulsus-promql = { path = "../pulsus-promql" }
+# The TraceQL AST (issue #57): `traces::search_plan`/`traces::filter` lower
+# `pulsus_traceql::Query` into the two-phase search plan — mirrors
+# `pulsus-logql`'s role on the logs read path (parsing itself stays
+# server-side; this crate consumes the AST only).
+pulsus-traceql = { path = "../pulsus-traceql" }
 # The `clickhouse` crate's `#[derive(Row)]` macro expands to paths rooted at
 # `clickhouse::...` unqualified, so it must be a direct dependency of every
 # crate that derives it, not just reachable transitively through

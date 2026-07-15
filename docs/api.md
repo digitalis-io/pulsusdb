@@ -231,13 +231,32 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 | Param | Notes |
 |-------|-------|
 | `q` | TraceQL query (preferred) |
-| `tags`, `minDuration`, `maxDuration` | legacy search params, compiled to TraceQL internally |
-| `start`, `end` | unix seconds |
-| `limit`, `spss` | result and spans-per-spanset caps |
+| `tags`, `minDuration`, `maxDuration` | legacy search params, compiled to TraceQL internally (below) |
+| `start`, `end` | unix seconds; **both required**, `end > start` |
+| `limit`, `spss` | result cap (default 20) and spans-per-spanset cap (default 3); positive integers |
+
+**`q` vs legacy params:** mutually exclusive — supplying `q` together with any of `tags`/`minDuration`/`maxDuration` is a `400 bad_data`, never silent precedence. Supplying neither is a valid time-range-only search (`{}`).
+
+**Legacy compilation:** `tags` is logfmt — space-separated `key=value` pairs; a value may be double-quoted to contain spaces/`=`, and inside quotes `\"` and `\\` are the only escapes. Each pair compiles to an **unscoped** `.key="value"` conjunct; `minDuration`/`maxDuration` compile to `duration >= <lit>` / `duration <= <lit>`; all conjuncts join with `&&` in one `{ … }` and the result goes through the ordinary TraceQL parser (one validation path). The grammar is enforced strictly: a bare key with no `=`, an empty key, an unterminated quote, an `=` or `"` inside an **unquoted** value (quote the value instead), a quoted value not followed by whitespace/end-of-input, or any escape other than `\"`/`\\` is a `400 bad_data` carrying `position` — the byte offset into the decoded `tags` value.
 
 **Duration literals** (in `q`, e.g. `duration > 2s`): an **unsigned** decimal number (integer or fraction — `2`, `1.5`, `.5`) **immediately** followed by exactly **one** unit from `{ns, us, µs, ms, s, m, h}`. No sign; no compound literals (`1h30m` is rejected). A fractional literal is valid only if it resolves to an exact whole number of nanoseconds (`0.5s` = 500000000ns is valid; `0.1ns` is a positioned parse error) — no rounding, no truncation.
 
-Response: `{"traces":[{"traceID","rootServiceName","rootTraceName","startTimeUnixNano","durationMs","spanSets":[...]}],"metrics":{...}}`.
+**Regex operators** (`=~`/`!~`) are full-value anchored (`^(?:…)$`), matching the label-matcher convention across PulsusDB's query languages. `!=`/`!~` on an attribute match spans **lacking the key entirely** as well as spans whose value differs.
+
+Response: `{"traces":[...],"metrics":{"partial":<bool>,"limit":<n>,"returned":<n>}}`. Each trace carries `traceID`, `rootServiceName`, `rootTraceName`, `startTimeUnixNano` (string nanoseconds; root metadata comes from the **whole** trace, so a root that predates `start` is still reported correctly), `durationMs` (the root span's duration), and `spanSets`: one entry of `{"matched":<total matched spans>,"spans":[...]}` where each span summary carries `spanID`, `name`, `startTimeUnixNano`, `durationMs`, plus an `attributes` list (`{"key","value":{"stringValue"}}`) for `select()`-projected fields.
+
+**Ordering contract:** `traces[]` is ordered by the max timestamp of each trace's exactly-matched spans, **descending**, with `trace_id` ascending as the tiebreak — deterministic under timestamp ties.
+
+**Partial results:** the response returns at most `limit` traces (the top-K under the ordering contract above). Candidate generation and consumption are capped **separately** from `limit`, both at `PULSUS_TRACEQL_MAX_CANDIDATES`: each candidate generator is a top-K-by-recency read of that depth, and the merged candidate stream is evaluated up to that many candidates — so the engine may evaluate up to `PULSUS_TRACEQL_MAX_CANDIDATES` candidates even for a small `limit` (stopping earlier only when no unseen candidate can still enter the top `limit`). `metrics.partial` is `true` whenever any internal bound engaged before natural exhaustion — a candidate generator hit its `PULSUS_TRACEQL_MAX_CANDIDATES` depth, the candidate consumption ceiling was reached with candidates still unconsumed, or a single trace exceeded the 10,000 hydrated-spans-per-trace cap (that trace is evaluated on its truncated span set, never silently reported complete). `metrics.limit` echoes the request's `limit`; `metrics.returned` is the returned trace count.
+
+**Errors** use the §4.1 JSON envelope; a TraceQL parse error carries `position` (byte offset into `q`), and a `tags` logfmt error carries `position` (byte offset into the decoded `tags` value):
+
+| Cause | HTTP | `errorType` |
+|-------|------|-------------|
+| Malformed `q` / params / `tags` logfmt / `q`+legacy conflict / unsupported operator-type combination | `400` | `bad_data` |
+| Scan or memory budget exceeded (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS` rows read, read/result byte ceilings, or the engine's 256 MiB retention budget) — too broad to bound, never silently slow or quietly incomplete | `422` | `query_too_broad` |
+| ClickHouse read timed out | `504` | `timeout` |
+| Unclassified failure | `500` | `internal` |
 
 ### 4.3 Tags
 

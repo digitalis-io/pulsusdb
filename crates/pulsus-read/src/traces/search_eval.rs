@@ -1,0 +1,1137 @@
+//! Phase-2 exact evaluation (issue #57 plan v3-v7; docs/schemas.md §4.2)
+//! — pure, no I/O, unit-tested without a database. Given one hydrated
+//! candidate batch (spans deduped by `span_id`) plus its attribute
+//! membership / value reads, evaluates the **full** query exactly:
+//!
+//! - the boolean `FieldExpr` tree per span (physical leaves on hydrated
+//!   columns; attribute leaves by membership — the ratified negation
+//!   rule: `!=`/`!~` matches a span iff **no** index row for that span
+//!   satisfies the positive predicate, so absent-key spans match);
+//! - cross-spanset algebra with matched-span membership preserved
+//!   (`{A} && {B}` keeps traces matching both, spanset = union of the
+//!   operands' matched spans; `||` unions — trace-level, task-manager
+//!   adjudication 1);
+//! - the pipeline (`count`/`sum`/`avg`/`min`/`max` aggregate filters over
+//!   the matched spans, then `select()` response projection).
+//!
+//! Emits **response summaries only** (plan v6 delta 2): the engine's
+//! result heap never holds hydrated spans or payloads.
+//!
+//! ## Allocation-charge audit (code review round 3)
+//!
+//! Invariant: **no retained or intermediate collection exists
+//! uncharged** — every allocation site in this module and its charge:
+//!
+//! | Allocation site | Charge (always BEFORE the allocation) |
+//! |---|---|
+//! | per-filter matched set (`eval_filter`) | [`charged_set`] pre-charges `spans.len() × SET_ENTRY_BYTES`; released when empty/merged/after summaries |
+//! | `&&`/`||` union set (`union_sets`) | [`charged_set`] pre-charge; both operand sets released after the merge |
+//! | aggregate `Vec<f64>` buffers + sorted `&HydratedSpan` ref list | the per-trace `transients` envelope (`matched × (ref + f64 + overhead)`), released after summaries |
+//! | `TraceMatch` slot + summaries buffer | base charge (`size_of + overhead + take × size_of::<SpanSummary>`) before `Vec::with_capacity(take)` |
+//! | summary name + attributes buffer (full capacity, incl. unused) | `build_summary`'s envelope charge before any clone |
+//! | each attribute `(display, value)` clone | per-pair string-length charge immediately before the clone |
+//! | scalar renders (`duration`/`status`/`kind`, ≤ ~20 B) | stated residual: transiently rendered to learn the length, charged before entering the buffer |
+//! | `out: Vec<TraceMatch>` slots | covered by each match's `size_of::<TraceMatch>` base charge + overhead envelope (growth doubling) |
+//!
+//! The engine-side (exec.rs) sites are audited in that module's doc;
+//! BOTH tables are enforced mechanically by `tests/traces_alloc_audit.rs`
+//! (round 4). A failed charge is atomic (no phantom `used`), and a
+//! mid-batch breach returns the 422 class with the partial output
+//! dropped (error-path release semantics: see `ByteBudget`'s type docs).
+
+use std::collections::{HashMap, HashSet};
+
+use pulsus_traceql::{AggregateOp, ComparisonOp, FieldExpr, SpansetExpr};
+
+use super::exec::ByteBudget;
+use super::search_plan::{
+    AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, SearchPlan,
+    SelectField,
+};
+use crate::logql::error::ReadError;
+
+/// One hydrated span (physical summary columns only — never payloads).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydratedSpan {
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub service: String,
+    pub name: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+    pub status_code: i8,
+    pub kind: i8,
+}
+
+/// One candidate trace's hydrated batch slice.
+#[derive(Debug, Clone)]
+pub struct TraceSpans {
+    pub trace_id: [u8; 16],
+    pub spans: Vec<HydratedSpan>,
+}
+
+/// A `(trace_id, span_id)` pair — the identity every attribute read is
+/// keyed on.
+pub type SpanKey = ([u8; 16], [u8; 8]);
+
+/// The batch's attribute reads, index-aligned with the plan's
+/// `probes` / `agg_fields` / `select_attrs`.
+#[derive(Debug, Default)]
+pub struct BatchAttrs {
+    pub membership: Vec<HashSet<SpanKey>>,
+    pub agg_values: Vec<HashMap<SpanKey, f64>>,
+    pub select_values: Vec<HashMap<SpanKey, String>>,
+}
+
+/// One matched span's response summary (docs/api.md §4.2 `spanSets`
+/// entry): summary fields plus the `select()`-projected attributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanSummary {
+    pub span_id: [u8; 8],
+    pub name: String,
+    pub start_ns: i64,
+    pub duration_ns: i64,
+    /// `select()`-projected `(display, rendered value)` pairs, in the
+    /// query's select order.
+    pub attributes: Vec<(String, String)>,
+}
+
+impl SpanSummary {
+    /// The summary's heap payload beyond its own `size_of` slot in the
+    /// parent `TraceMatch::spans` buffer (which the parent accounts):
+    /// overhead envelope + name bytes + the attributes buffer at its
+    /// **actual capacity** (code review round 2: unused preallocated
+    /// capacity is retained memory too) + the attribute string bytes.
+    /// [`evaluate_batch`] charges exactly these amounts BEFORE each
+    /// allocation, so a heap-evict release of
+    /// [`TraceMatch::retained_bytes`] returns precisely what was charged.
+    pub(crate) fn heap_payload_bytes(&self) -> usize {
+        super::exec::RETAINED_ENTRY_OVERHEAD
+            + self.name.len()
+            + self.attributes.capacity() * std::mem::size_of::<(String, String)>()
+            + self
+                .attributes
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+    }
+}
+
+/// One exactly-matched trace, ready for the engine's result heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceMatch {
+    pub trace_id: [u8; 16],
+    /// The public sort key: max `timestamp_ns` over the trace's
+    /// exactly-matched spans (docs/api.md §4.2 ordering contract).
+    pub sort_key: i64,
+    /// Total matched spans (pre-`spss` cap) — the response's `matched`.
+    pub matched: u32,
+    /// `spss`-capped summaries, ascending `(start_ns, span_id)`.
+    pub spans: Vec<SpanSummary>,
+}
+
+impl TraceMatch {
+    /// Capacity-based retained cost — byte-for-byte equal to what
+    /// [`evaluate_batch`] charged while building this match (asserted by
+    /// the `charges_equal_retained_bytes_exactly` unit test), so the
+    /// engine's heap-evict release keeps the budget exact.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<TraceMatch>()
+            + super::exec::RETAINED_ENTRY_OVERHEAD
+            + self.spans.capacity() * std::mem::size_of::<SpanSummary>()
+            + self
+                .spans
+                .iter()
+                .map(SpanSummary::heap_payload_bytes)
+                .sum::<usize>()
+    }
+}
+
+fn cmp_i64(op: ComparisonOp, lhs: i64, rhs: i64) -> bool {
+    match op {
+        ComparisonOp::Eq => lhs == rhs,
+        ComparisonOp::Neq => lhs != rhs,
+        ComparisonOp::Gt => lhs > rhs,
+        ComparisonOp::Gte => lhs >= rhs,
+        ComparisonOp::Lt => lhs < rhs,
+        ComparisonOp::Lte => lhs <= rhs,
+        ComparisonOp::Re | ComparisonOp::Nre => false,
+    }
+}
+
+fn cmp_f64(op: ComparisonOp, lhs: f64, rhs: f64) -> bool {
+    match op {
+        ComparisonOp::Eq => lhs == rhs,
+        ComparisonOp::Neq => lhs != rhs,
+        ComparisonOp::Gt => lhs > rhs,
+        ComparisonOp::Gte => lhs >= rhs,
+        ComparisonOp::Lt => lhs < rhs,
+        ComparisonOp::Lte => lhs <= rhs,
+        ComparisonOp::Re | ComparisonOp::Nre => false,
+    }
+}
+
+fn eval_physical(p: &PhysicalEval, span: &HydratedSpan) -> bool {
+    match p {
+        PhysicalEval::Name { op, value } => op.matches(value, &span.name),
+        PhysicalEval::Service { op, value } => op.matches(value, &span.service),
+        PhysicalEval::Duration { op, nanos } => cmp_i64(*op, span.duration_ns, *nanos),
+        PhysicalEval::Status { op, code } => cmp_i64(*op, span.status_code as i64, *code as i64),
+        PhysicalEval::Kind { op, code } => cmp_i64(*op, span.kind as i64, *code as i64),
+    }
+}
+
+/// Evaluates one filter's boolean tree for one span. Deliberately never
+/// short-circuits: `leaf_idx` must advance through every comparison so
+/// the pre-order leaf registry stays aligned with the AST walk.
+fn eval_expr(
+    expr: &FieldExpr,
+    filter: &PlannedFilter,
+    leaf_idx: &mut usize,
+    trace_id: [u8; 16],
+    span: &HydratedSpan,
+    attrs: &BatchAttrs,
+) -> bool {
+    match expr {
+        FieldExpr::Comparison { .. } => {
+            let leaf = &filter.leaves[*leaf_idx];
+            *leaf_idx += 1;
+            match leaf {
+                PlannedLeafEval::Physical(p) => eval_physical(p, span),
+                PlannedLeafEval::Attr { probe_idx, negated } => {
+                    let member = attrs.membership[*probe_idx].contains(&(trace_id, span.span_id));
+                    member != *negated
+                }
+            }
+        }
+        FieldExpr::Binary { op, lhs, rhs } => {
+            let l = eval_expr(lhs, filter, leaf_idx, trace_id, span, attrs);
+            let r = eval_expr(rhs, filter, leaf_idx, trace_id, span, attrs);
+            match op {
+                pulsus_traceql::BoolOp::And => l && r,
+                pulsus_traceql::BoolOp::Or => l || r,
+            }
+        }
+    }
+}
+
+/// A matched-span-id set whose storage is charged against the request
+/// budget for as long as it lives (code review round 3: spanset
+/// intermediates are memory too). The charge is the set's **upper-bound
+/// capacity** (every id comes from this trace's spans, so
+/// `trace.spans.len()` bounds every set in the tree), paid BEFORE the
+/// allocation; [`release_set`] returns it when the set is dropped or
+/// merged away. `ByteBudget` is `&mut`-threaded, so release is explicit
+/// on every exit path rather than `Drop`-based.
+struct ChargedSet {
+    set: HashSet<[u8; 8]>,
+    charge: usize,
+}
+
+/// Per-entry cost of a charged span-id set (id + the container-overhead
+/// envelope).
+const SET_ENTRY_BYTES: usize =
+    std::mem::size_of::<[u8; 8]>() + super::exec::RETAINED_ENTRY_OVERHEAD;
+
+/// Charge-before-allocate constructor for a span-id set of up to
+/// `capacity` entries.
+fn charged_set(capacity: usize, budget: &mut ByteBudget) -> Result<ChargedSet, ReadError> {
+    let charge = capacity * SET_ENTRY_BYTES;
+    budget.charge(charge)?;
+    Ok(ChargedSet {
+        set: HashSet::with_capacity(capacity),
+        charge,
+    })
+}
+
+fn release_set(set: ChargedSet, budget: &mut ByteBudget) {
+    budget.release(set.charge);
+}
+
+/// Evaluates one `{...}` filter over a trace → its matched span-id set
+/// (`None` when nothing matches — the spanset produces no result for
+/// this trace). The set is charged before allocation and released here
+/// when empty.
+fn eval_filter(
+    body: Option<&FieldExpr>,
+    filter: &PlannedFilter,
+    trace: &TraceSpans,
+    attrs: &BatchAttrs,
+    budget: &mut ByteBudget,
+) -> Result<Option<ChargedSet>, ReadError> {
+    let mut matched = charged_set(trace.spans.len(), budget)?;
+    for span in &trace.spans {
+        let is_match = match body {
+            None => true,
+            Some(expr) => {
+                let mut leaf_idx = 0;
+                eval_expr(expr, filter, &mut leaf_idx, trace.trace_id, span, attrs)
+            }
+        };
+        if is_match {
+            matched.set.insert(span.span_id);
+        }
+    }
+    if matched.set.is_empty() {
+        release_set(matched, budget);
+        Ok(None)
+    } else {
+        Ok(Some(matched))
+    }
+}
+
+/// Evaluates the spanset expression tree for one trace, preserving
+/// matched-span membership through the cross-spanset algebra. Every set
+/// in the tree — per-filter results AND the `&&`/`||` union sets — is
+/// budget-charged before allocation; operand sets are released the
+/// moment they are merged away, and a mid-evaluation breach propagates
+/// the 422 error class (already-made charges die with the failing
+/// request's budget — no cross-request state exists).
+fn eval_spanset(
+    expr: &SpansetExpr,
+    plan: &SearchPlan,
+    filter_idx: &mut usize,
+    trace: &TraceSpans,
+    attrs: &BatchAttrs,
+    budget: &mut ByteBudget,
+) -> Result<Option<ChargedSet>, ReadError> {
+    match expr {
+        SpansetExpr::Filter(f) => {
+            let filter = &plan.filters[*filter_idx];
+            *filter_idx += 1;
+            eval_filter(f.body.as_ref(), filter, trace, attrs, budget)
+        }
+        SpansetExpr::Binary { op, lhs, rhs } => {
+            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, budget)?;
+            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, budget)?;
+            match op {
+                // Trace-level intersection: the trace qualifies iff both
+                // operands matched within it; its spanset is the union of
+                // their matched spans (adjudication 1).
+                pulsus_traceql::BoolOp::And => match (l, r) {
+                    (Some(a), Some(b)) => Ok(Some(union_sets(a, b, trace, budget)?)),
+                    (Some(a), None) => {
+                        release_set(a, budget);
+                        Ok(None)
+                    }
+                    (None, Some(b)) => {
+                        release_set(b, budget);
+                        Ok(None)
+                    }
+                    (None, None) => Ok(None),
+                },
+                pulsus_traceql::BoolOp::Or => match (l, r) {
+                    (Some(a), Some(b)) => Ok(Some(union_sets(a, b, trace, budget)?)),
+                    (Some(a), None) => Ok(Some(a)),
+                    (None, Some(b)) => Ok(Some(b)),
+                    (None, None) => Ok(None),
+                },
+            }
+        }
+    }
+}
+
+/// Merges two charged operand sets into a freshly charged union set —
+/// the union is charged BEFORE it is allocated (three sets are briefly
+/// live and all three are counted), then both operands are released.
+fn union_sets(
+    a: ChargedSet,
+    b: ChargedSet,
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedSet, ReadError> {
+    let mut union = charged_set(trace.spans.len(), budget)?;
+    union.set.extend(a.set.iter().copied());
+    union.set.extend(b.set.iter().copied());
+    release_set(a, budget);
+    release_set(b, budget);
+    Ok(union)
+}
+
+fn aggregate_value(
+    agg: &super::search_plan::PlannedAggregate,
+    trace: &TraceSpans,
+    matched: &HashSet<[u8; 8]>,
+    attrs: &BatchAttrs,
+) -> Option<f64> {
+    let values: Vec<f64> = match &agg.source {
+        AggSource::Count => return Some(matched.len() as f64),
+        AggSource::DurationNs => trace
+            .spans
+            .iter()
+            .filter(|s| matched.contains(&s.span_id))
+            .map(|s| s.duration_ns as f64)
+            .collect(),
+        AggSource::Attr { field_idx } => trace
+            .spans
+            .iter()
+            .filter(|s| matched.contains(&s.span_id))
+            .filter_map(|s| {
+                attrs.agg_values[*field_idx]
+                    .get(&(trace.trace_id, s.span_id))
+                    .copied()
+            })
+            .collect(),
+    };
+    if values.is_empty() {
+        return None;
+    }
+    Some(match agg.op {
+        AggregateOp::Count => values.len() as f64,
+        AggregateOp::Sum => values.iter().sum(),
+        AggregateOp::Avg => values.iter().sum::<f64>() / values.len() as f64,
+        AggregateOp::Min => values.iter().copied().fold(f64::INFINITY, f64::min),
+        AggregateOp::Max => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+/// Renders a stored status code back to its TraceQL keyword (the same
+/// closed set `filter::compile_leaf` lowers — OTEL wire codes).
+fn status_keyword(code: i8) -> &'static str {
+    match code {
+        1 => "ok",
+        2 => "error",
+        _ => "unset",
+    }
+}
+
+/// Renders a stored kind code back to its TraceQL keyword.
+fn kind_keyword(code: i8) -> &'static str {
+    match code {
+        1 => "internal",
+        2 => "server",
+        3 => "client",
+        4 => "producer",
+        5 => "consumer",
+        _ => "unspecified",
+    }
+}
+
+/// Test-only clone observer (code review round 4): counts every
+/// selected-attribute value clone actually performed. `record()` sits
+/// immediately between the value's budget charge and its clone in
+/// [`build_summary`], so "zero recorded clones on a breach path" is an
+/// observable proof that the charge preceded — and prevented — the
+/// clone, not an inference from counter arithmetic. Thread-local: the
+/// test harness runs tests concurrently.
+#[cfg(test)]
+pub(crate) mod clone_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static VALUE_CLONES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn reset() {
+        VALUE_CLONES.with(|c| c.set(0));
+    }
+
+    pub(crate) fn count() -> usize {
+        VALUE_CLONES.with(|c| c.get())
+    }
+
+    pub(crate) fn record() {
+        VALUE_CLONES.with(|c| c.set(c.get() + 1));
+    }
+}
+
+/// Builds one span summary, charging the budget **before every retained
+/// allocation** (code review round 2): the summary's overhead + name
+/// bytes + the attributes buffer at full capacity are charged before
+/// anything is cloned, and each attribute's display/value string bytes
+/// are charged before that pair is cloned into the buffer. The one
+/// stated residual: scalar renders (`duration`/`status`/`kind` — ≤ ~20
+/// bytes by construction) are transiently allocated to learn their
+/// length, then charged before entering the buffer; unbounded strings
+/// (name/service/attr values) are never cloned before their charge.
+fn build_summary(
+    plan: &SearchPlan,
+    trace_id: [u8; 16],
+    span: &HydratedSpan,
+    attrs: &BatchAttrs,
+    budget: &mut ByteBudget,
+) -> Result<SpanSummary, ReadError> {
+    let attr_capacity = plan.select_fields.len();
+    budget.charge(
+        super::exec::RETAINED_ENTRY_OVERHEAD
+            + span.name.len()
+            + attr_capacity * std::mem::size_of::<(String, String)>(),
+    )?;
+    let mut attributes = Vec::with_capacity(attr_capacity);
+    for field in &plan.select_fields {
+        match field {
+            SelectField::Physical { display, column } => match column {
+                PhysicalSelect::Name => {
+                    budget.charge(display.len() + span.name.len())?;
+                    attributes.push((display.clone(), span.name.clone()));
+                }
+                PhysicalSelect::Service => {
+                    budget.charge(display.len() + span.service.len())?;
+                    attributes.push((display.clone(), span.service.clone()));
+                }
+                PhysicalSelect::DurationNs | PhysicalSelect::Status | PhysicalSelect::Kind => {
+                    let value = match column {
+                        PhysicalSelect::DurationNs => span.duration_ns.to_string(),
+                        PhysicalSelect::Status => status_keyword(span.status_code).to_string(),
+                        _ => kind_keyword(span.kind).to_string(),
+                    };
+                    budget.charge(display.len() + value.len())?;
+                    attributes.push((display.clone(), value));
+                }
+            },
+            SelectField::Attr { display, field_idx } => {
+                if let Some(value) = attrs.select_values[*field_idx].get(&(trace_id, span.span_id))
+                {
+                    budget.charge(display.len() + value.len())?;
+                    // The probe sits between the charge and the clone: a
+                    // refused charge returns above and this line — and
+                    // therefore the clone below — never executes (the
+                    // round-4 observable ordering proof).
+                    #[cfg(test)]
+                    clone_probe::record();
+                    attributes.push((display.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    Ok(SpanSummary {
+        span_id: span.span_id,
+        name: span.name.clone(),
+        start_ns: span.timestamp_ns,
+        duration_ns: span.duration_ns,
+        attributes,
+    })
+}
+
+/// Evaluates one hydrated batch → the exactly-matched traces, each as a
+/// response summary. Batch inputs are discarded by the caller afterwards
+/// (only these summaries survive into the result heap).
+///
+/// **Budget contract (code review round 2 — the chosen shape is
+/// charge-before-allocate):** every retained/returned byte — the
+/// `TraceMatch` base, the summaries buffer at capacity, each summary's
+/// name/attribute strings — is charged against `budget` BEFORE it is
+/// allocated (`build_summary`); per-trace evaluation intermediates (the
+/// matched-id set + aggregate value buffers) are charged while live and
+/// released when the trace's summaries are done. A breach mid-batch
+/// returns the 422 error class immediately — the partially built output
+/// is dropped (the request is failing; its counter dies with it) and no
+/// returned `Vec` ever contains uncharged bytes.
+pub(crate) fn evaluate_batch(
+    plan: &SearchPlan,
+    traces: &[TraceSpans],
+    attrs: &BatchAttrs,
+    budget: &mut ByteBudget,
+) -> Result<Vec<TraceMatch>, ReadError> {
+    let mut out = Vec::new();
+    'traces: for trace in traces {
+        let mut filter_idx = 0;
+        let Some(matched) =
+            eval_spanset(&plan.spanset, plan, &mut filter_idx, trace, attrs, budget)?
+        else {
+            continue;
+        };
+        // Post-match transients (per-aggregate `Vec<f64>` buffers + the
+        // sorted `&HydratedSpan` ref list below): charged while live
+        // (round-2: intermediates are memory too), released once this
+        // trace's summaries are built. The matched set itself is already
+        // charged (`ChargedSet`).
+        let transients = matched.set.len()
+            * (std::mem::size_of::<&HydratedSpan>()
+                + std::mem::size_of::<f64>()
+                + super::exec::RETAINED_ENTRY_OVERHEAD);
+        if let Err(e) = budget.charge(transients) {
+            release_set(matched, budget);
+            return Err(e);
+        }
+        for agg in &plan.aggregates {
+            let pass = match aggregate_value(agg, trace, &matched.set, attrs) {
+                Some(value) => cmp_f64(agg.cmp, value, agg.threshold),
+                None => false,
+            };
+            if !pass {
+                budget.release(transients);
+                release_set(matched, budget);
+                continue 'traces;
+            }
+        }
+        // `select()` never changes which traces match — response shaping
+        // only (plan v2).
+        let mut matched_spans: Vec<&HydratedSpan> = trace
+            .spans
+            .iter()
+            .filter(|s| matched.set.contains(&s.span_id))
+            .collect();
+        matched_spans.sort_by(|a, b| (a.timestamp_ns, a.span_id).cmp(&(b.timestamp_ns, b.span_id)));
+        let sort_key = matched_spans
+            .iter()
+            .map(|s| s.timestamp_ns)
+            .max()
+            .unwrap_or(i64::MIN);
+        let take = matched_spans.len().min(plan.spss as usize);
+        // Charge the match base + the summaries buffer (at its exact
+        // capacity) BEFORE allocating it.
+        budget.charge(
+            std::mem::size_of::<TraceMatch>()
+                + super::exec::RETAINED_ENTRY_OVERHEAD
+                + take * std::mem::size_of::<SpanSummary>(),
+        )?;
+        let mut summaries = Vec::with_capacity(take);
+        for span in matched_spans.iter().take(take) {
+            summaries.push(build_summary(plan, trace.trace_id, span, attrs, budget)?);
+        }
+        let matched_total = matched_spans.len() as u32;
+        drop(matched_spans);
+        budget.release(transients);
+        release_set(matched, budget);
+        out.push(TraceMatch {
+            trace_id: trace.trace_id,
+            sort_key,
+            matched: matched_total,
+            spans: summaries,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use pulsus_traceql::parse;
+
+    use super::super::filter::SpanFilterCtx;
+    use super::super::search_plan::{SearchCtx, SearchParams, plan_search};
+    use super::*;
+
+    fn plan(q: &str) -> SearchPlan {
+        plan_search(
+            &parse(q).expect("parse"),
+            &SearchParams {
+                start_ns: 0,
+                end_ns: 1_000_000,
+                limit: 20,
+                spss: 3,
+            },
+            &SearchCtx {
+                filter: SpanFilterCtx {
+                    spans_table: "trace_spans",
+                    attrs_table: "trace_attrs_idx",
+                },
+                max_candidates: 100,
+                distributed: false,
+            },
+        )
+        .expect("plan")
+    }
+
+    fn tid(n: u8) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[15] = n;
+        id
+    }
+
+    fn sid(n: u8) -> [u8; 8] {
+        let mut id = [0u8; 8];
+        id[7] = n;
+        id
+    }
+
+    fn span(n: u8, service: &str, name: &str, ts: i64, dur: i64) -> HydratedSpan {
+        HydratedSpan {
+            span_id: sid(n),
+            parent_id: [0u8; 8],
+            service: service.to_string(),
+            name: name.to_string(),
+            timestamp_ns: ts,
+            duration_ns: dur,
+            status_code: 0,
+            kind: 1,
+        }
+    }
+
+    /// Runs the evaluator under a large test budget — round-2 review:
+    /// there is deliberately NO uncharged evaluation path, so the pure
+    /// semantic tests fund one instead of bypassing the accounting.
+    fn eval(plan: &SearchPlan, traces: &[TraceSpans], attrs: &BatchAttrs) -> Vec<TraceMatch> {
+        evaluate_batch(plan, traces, attrs, &mut ByteBudget::new(usize::MAX))
+            .expect("within the test budget")
+    }
+
+    fn membership(plan: &SearchPlan, entries: &[(usize, [u8; 16], [u8; 8])]) -> BatchAttrs {
+        let mut attrs = BatchAttrs {
+            membership: vec![HashSet::new(); plan.probes.len()],
+            agg_values: vec![HashMap::new(); plan.agg_fields.len()],
+            select_values: vec![HashMap::new(); plan.select_attrs.len()],
+        };
+        for (probe_idx, trace_id, span_id) in entries {
+            attrs.membership[*probe_idx].insert((*trace_id, *span_id));
+        }
+        attrs
+    }
+
+    #[test]
+    fn mixed_table_or_is_a_real_disjunction_not_an_intersection() {
+        // { duration > 2s || span.foo = "x" } — span 1 matches only by
+        // duration, span 2 only by attr, span 3 by neither.
+        let p = plan(r#"{ duration > 2s || span.foo = "x" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "svc", "slow", 10, 3_000_000_000),
+                span(2, "svc", "attr", 20, 1),
+                span(3, "svc", "none", 30, 1),
+            ],
+        };
+        let attrs = membership(&p, &[(0, tid(1), sid(2))]);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched, 2);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1), sid(2)]);
+    }
+
+    #[test]
+    fn negation_matches_absent_and_different_but_not_equal() {
+        // Ratified rule: `!=` matches spans lacking the key and spans
+        // with a different value; a span whose index rows satisfy the
+        // positive predicate does not match.
+        let p = plan(r#"{ .env != "prod" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "svc", "absent", 10, 1),
+                span(2, "svc", "equal", 20, 1),
+                span(3, "svc", "different", 30, 1),
+            ],
+        };
+        // The probe is the positive `env = 'prod'`: span 2 has it; span 3
+        // has env=staging (so no row satisfies the positive predicate —
+        // not in the membership set); span 1 has no env at all.
+        let attrs = membership(&p, &[(0, tid(1), sid(2))]);
+        let matches = eval(&p, &[trace], &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1), sid(3)]);
+    }
+
+    #[test]
+    fn dual_scope_membership_satisfies_an_unscoped_negation_correctly() {
+        // A span carrying env=prod at EITHER scope is excluded by
+        // `{ .env != "prod" }` — the unscoped probe unions both scopes,
+        // so one membership entry suffices to reject the span.
+        let p = plan(r#"{ .env != "prod" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "svc", "resource-scoped", 10, 1)],
+        };
+        let attrs = membership(&p, &[(0, tid(1), sid(1))]);
+        assert!(eval(&p, &[trace], &attrs).is_empty());
+    }
+
+    #[test]
+    fn cross_spanset_and_requires_both_operands_and_unions_membership() {
+        let p = plan(r#"{ span.a = "1" } && { span.b = "2" }"#);
+        let both = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+        };
+        let only_a = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, "s", "a", 10, 1)],
+        };
+        let attrs = membership(
+            &p,
+            &[
+                (0, tid(1), sid(1)),
+                (1, tid(1), sid(2)),
+                (0, tid(2), sid(1)),
+            ],
+        );
+        let matches = eval(&p, &[both, only_a], &attrs);
+        assert_eq!(matches.len(), 1, "only the trace matching both operands");
+        assert_eq!(matches[0].trace_id, tid(1));
+        assert_eq!(matches[0].matched, 2, "spanset is the union of operands");
+    }
+
+    #[test]
+    fn cross_spanset_or_is_a_union_of_traces() {
+        let p = plan(r#"{ span.a = "1" } || { span.b = "2" }"#);
+        let only_a = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1)],
+        };
+        let only_b = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, "s", "b", 10, 1)],
+        };
+        let attrs = membership(&p, &[(0, tid(1), sid(1)), (1, tid(2), sid(1))]);
+        let matches = eval(&p, &[only_a, only_b], &attrs);
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn count_aggregate_filters_traces_by_matched_span_count() {
+        let p = plan(r#"{ name = "hot" } | count() > 1"#);
+        let two = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "hot", 10, 1), span(2, "s", "hot", 20, 1)],
+        };
+        let one = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, "s", "hot", 10, 1)],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[two, one], &attrs);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trace_id, tid(1));
+    }
+
+    #[test]
+    fn span_id_dedup_upstream_means_count_is_not_inflated_by_replays() {
+        // The engine dedups by span_id before evaluation; this pins the
+        // evaluator's own set semantics — the same span id counted once.
+        let p = plan(r#"{ name = "hot" } | count() >= 2"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "hot", 10, 1)],
+        };
+        let attrs = membership(&p, &[]);
+        assert!(eval(&p, &[trace], &attrs).is_empty());
+    }
+
+    #[test]
+    fn avg_duration_aggregate_compares_in_nanoseconds() {
+        let p = plan(r#"{ name = "x" } | avg(duration) > 100ms"#);
+        let slow = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 200_000_000)],
+        };
+        let fast = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, "s", "x", 10, 50_000_000)],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[slow, fast], &attrs);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trace_id, tid(1));
+    }
+
+    #[test]
+    fn attr_aggregate_reads_val_num_for_exactly_the_matched_spans() {
+        let p = plan(r#"{ name = "x" } | avg(span.retries) > 1"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1), span(2, "s", "y", 20, 1)],
+        };
+        let mut attrs = membership(&p, &[]);
+        attrs.agg_values[0].insert((tid(1), sid(1)), 3.0);
+        // span 2 has retries=0 but does NOT match the filter — it must
+        // not drag the average down.
+        attrs.agg_values[0].insert((tid(1), sid(2)), 0.0);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn a_trace_with_no_aggregatable_values_is_rejected_not_defaulted() {
+        let p = plan(r#"{ name = "x" } | avg(span.retries) > 0"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        let attrs = membership(&p, &[]);
+        assert!(eval(&p, &[trace], &attrs).is_empty());
+    }
+
+    #[test]
+    fn select_projects_physical_and_attr_values_into_summaries() {
+        let p = plan(r#"{ name = "x" } | select(resource.service.name, span.foo)"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "checkout", "x", 10, 1)],
+        };
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "bar".to_string());
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(
+            matches[0].spans[0].attributes,
+            vec![
+                ("resource.service.name".to_string(), "checkout".to_string()),
+                ("span.foo".to_string(), "bar".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn spss_caps_summaries_but_matched_reports_the_full_count() {
+        let p = plan(r#"{ name = "x" }"#); // spss = 3 from the fixture
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: (1..=5).map(|n| span(n, "s", "x", n as i64, 1)).collect(),
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matches[0].matched, 5);
+        assert_eq!(matches[0].spans.len(), 3);
+        assert_eq!(matches[0].spans[0].span_id, sid(1), "ascending start_ns");
+    }
+
+    #[test]
+    fn sort_key_is_the_max_matched_timestamp_not_the_max_span_timestamp() {
+        let p = plan(r#"{ name = "x" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1), span(2, "s", "other", 99, 1)],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matches[0].sort_key, 10);
+    }
+
+    #[test]
+    fn match_all_spanset_matches_every_span() {
+        let p = plan("{}");
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matches[0].matched, 2);
+    }
+
+    #[test]
+    fn repeated_key_conjunction_uses_independent_probes() {
+        // { span.a = "1" && span.a = "2" } — satisfiable only by a span
+        // whose key has BOTH values indexed (arrays render as one value,
+        // so ordinarily empty — the semantics must still be per-probe).
+        let p = plan(r#"{ span.a = "1" && span.a = "2" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        let attrs = membership(&p, &[(0, tid(1), sid(1))]); // only "1"
+        assert!(eval(&p, std::slice::from_ref(&trace), &attrs).is_empty());
+        let attrs = membership(&p, &[(0, tid(1), sid(1)), (1, tid(1), sid(1))]);
+        assert_eq!(eval(&p, &[trace], &attrs).len(), 1);
+    }
+
+    // -- round-2 accounting: charge-before-allocate ----------------------
+
+    /// The exact-equality invariant the heap-evict release depends on:
+    /// after a batch, the budget holds byte-for-byte the sum of the
+    /// returned matches' `retained_bytes` (intermediates released, every
+    /// retained byte charged — no formula drift between the charging
+    /// path and the cost model).
+    #[test]
+    fn charges_equal_retained_bytes_exactly() {
+        let p = plan(r#"{ name = "x" } | select(resource.service.name, span.foo)"#);
+        let traces = vec![
+            TraceSpans {
+                trace_id: tid(1),
+                spans: vec![
+                    span(1, "checkout", "x", 10, 1),
+                    span(2, "checkout", "x", 20, 1),
+                ],
+            },
+            TraceSpans {
+                trace_id: tid(2),
+                spans: vec![span(1, "billing", "x", 30, 1)],
+            },
+        ];
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "bar-value".to_string());
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &traces, &attrs, &mut budget).expect("in budget");
+        assert_eq!(matches.len(), 2);
+        let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
+        assert_eq!(
+            budget.used(),
+            retained,
+            "the budget must hold exactly the returned matches' retained bytes"
+        );
+    }
+
+    /// Round-2 finding: unused preallocated `select()` capacity is
+    /// retained memory — it is charged and counted even when no attribute
+    /// value materializes (attributes len 0, capacity 1 here).
+    #[test]
+    fn unused_select_capacity_is_charged_and_counted() {
+        let p = plan(r#"{ name = "x" } | select(span.foo)"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        let attrs = membership(&p, &[]); // no foo value anywhere
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &[trace], &attrs, &mut budget).expect("in budget");
+        let summary = &matches[0].spans[0];
+        assert!(summary.attributes.is_empty());
+        assert_eq!(
+            summary.attributes.capacity(),
+            1,
+            "with_capacity(select_fields)"
+        );
+        assert!(
+            summary.heap_payload_bytes()
+                >= std::mem::size_of::<(String, String)>()
+                    + super::super::exec::RETAINED_ENTRY_OVERHEAD,
+            "the empty-but-allocated attributes buffer is still costed"
+        );
+        assert_eq!(
+            budget.used(),
+            matches
+                .iter()
+                .map(TraceMatch::retained_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    /// Round-4 STRICT ordering proof: the clone probe (recorded at the
+    /// exact clone site, after the charge) observably shows whether a
+    /// selected-value clone ever happened. Two breach points are
+    /// exercised: a budget one byte short of the full cost fails at the
+    /// LAST charge — the value charge itself, everything before it
+    /// succeeded — and a near-zero budget fails at the first fixed
+    /// pre-charge. In BOTH cases zero clones are recorded; the success
+    /// probe records exactly one. This proves order, it does not infer
+    /// it from counter arithmetic.
+    #[test]
+    fn over_budget_selected_string_errors_before_cloning_into_the_output() {
+        let p = plan(r#"{ name = "x" } | select(span.foo)"#);
+        let big = "v".repeat(100_000);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "x", 10, 1)],
+        };
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), big.clone());
+
+        // Success probe: full cost measured; exactly ONE value clone.
+        clone_probe::reset();
+        let mut probe = ByteBudget::new(usize::MAX);
+        let built =
+            evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut probe).expect("fits");
+        assert_eq!(clone_probe::count(), 1, "the allowed path clones once");
+        let full_cost = probe.used();
+        assert_eq!(full_cost, built[0].retained_bytes());
+
+        // Breach at the FINAL charge — the value charge (deterministic:
+        // charges are a fixed sequence and the value charge is last).
+        // The charge fails, so the clone site is never reached.
+        clone_probe::reset();
+        let mut budget = ByteBudget::new(full_cost - 1);
+        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
+            .expect_err("one byte short must fail at the value charge");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(crate::logql::TooBroadReason::ScanBudgetBytes { .. })
+            ),
+            "breach propagates the 422 error class, got {err:?}"
+        );
+        assert_eq!(
+            clone_probe::count(),
+            0,
+            "the 100 KB value was NEVER cloned on the breach path — the charge \
+             observably precedes the clone"
+        );
+
+        // Breach at the first fixed pre-charge: still zero clones.
+        clone_probe::reset();
+        let mut tiny = ByteBudget::new(16);
+        evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut tiny)
+            .expect_err("a near-zero budget fails before anything is built");
+        assert_eq!(clone_probe::count(), 0);
+    }
+
+    // -- round-3 accounting: spanset intermediates -----------------------
+
+    /// The cross-spanset intermediates (per-filter sets) are charged
+    /// BEFORE allocation: a budget below one filter-set's upper bound
+    /// breaches during intermediate evaluation even though the final
+    /// result would have been EMPTY (`&&` with a non-matching rhs) — no
+    /// uncharged 2,000-entry set ever exists.
+    #[test]
+    fn spanset_intermediates_breach_even_when_the_final_result_is_empty() {
+        let p = plan(r#"{ name = "m" } && { name = "nomatch" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: (0..2_000)
+                .map(|n| span((n % 250) as u8, "s", "m", n as i64, 1))
+                .collect(),
+        };
+        let attrs = membership(&p, &[]);
+        // One filter set's upper-bound pre-charge is spans × entry cost;
+        // allow half of it.
+        let mut budget = ByteBudget::new(1_000 * SET_ENTRY_BYTES);
+        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
+            .expect_err("the first filter's set pre-charge must breach");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(crate::logql::TooBroadReason::ScanBudgetBytes { .. })
+            ),
+            "got {err:?}"
+        );
+        // And with room the query completes to its (empty) result with
+        // every intermediate released.
+        let mut roomy = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &[trace], &attrs, &mut roomy).expect("in budget");
+        assert!(matches.is_empty());
+        assert_eq!(roomy.used(), 0, "all intermediate sets were released");
+    }
+
+    /// The `||` union set is charged before it is built — a budget that
+    /// fits both operand sets but not the third (union) set breaches at
+    /// the union pre-charge; with room, the peak is three live sets and
+    /// everything not retained is released.
+    #[test]
+    fn cross_spanset_union_charges_the_third_set_before_building_it() {
+        let p = plan(r#"{ name = "m" } || { name = "m2" }"#);
+        let spans: Vec<HydratedSpan> = (0..1_000)
+            .map(|n| {
+                span(
+                    (n % 250) as u8,
+                    "s",
+                    if n % 2 == 0 { "m" } else { "m2" },
+                    n as i64,
+                    1,
+                )
+            })
+            .collect();
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans,
+        };
+        let attrs = membership(&p, &[]);
+        // Every set (filter results AND the union) pre-charges the
+        // 1,000-span upper bound; 2.5 sets of room means the union's
+        // pre-charge is the one that breaches.
+        let mut budget = ByteBudget::new(2_500 * SET_ENTRY_BYTES);
+        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
+            .expect_err("the union set's pre-charge must breach");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(crate::logql::TooBroadReason::ScanBudgetBytes { .. })
+            ),
+            "got {err:?}"
+        );
+        // No release assertions on the error path — round-4 adjudication:
+        // the request-scoped budget is dropped whole on error (see
+        // `ByteBudget`'s type docs); error-path releases are not required
+        // for soundness.
+        // With room: completes, and the budget holds exactly the
+        // returned matches (all sets released after the merge).
+        let mut roomy = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &[trace], &attrs, &mut roomy).expect("in budget");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            roomy.used(),
+            matches
+                .iter()
+                .map(TraceMatch::retained_bytes)
+                .sum::<usize>(),
+            "operand and union intermediates were all released"
+        );
+    }
+}

@@ -37,3 +37,7 @@ pulsus-model = { path = "../crates/pulsus-model" }
 pulsus-logql = { path = "../crates/pulsus-logql" }
 pulsus-read = { path = "../crates/pulsus-read" }
 pulsus-schema = { path = "../crates/pulsus-schema" }
+# `bench traces-read` (issue #57 AC4) plans its evidence stages through
+# the product TraceQL planner (`pulsus_read::traces::plan_search`), which
+# consumes the parsed AST.
+pulsus-traceql = { path = "../crates/pulsus-traceql" }

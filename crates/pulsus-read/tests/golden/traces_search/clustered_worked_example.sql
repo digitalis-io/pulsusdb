@@ -1,0 +1,32 @@
+-- case: clustered_worked_example
+-- q: { resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }
+
+== phase1 generator[0] ==
+SELECT trace_id, max(timestamp_ns) AS bound_ts
+FROM trace_spans_dist
+PREWHERE service = 'checkout'
+WHERE timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+GROUP BY trace_id
+ORDER BY bound_ts DESC, trace_id ASC
+LIMIT 100001
+
+== phase2 hydration (sample batch) ==
+SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns, status_code, kind
+FROM trace_spans_dist
+WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC
+LIMIT 10001 BY trace_id
+
+== phase2 membership[0] ==
+SELECT DISTINCT trace_id, span_id
+FROM trace_attrs_idx_dist
+WHERE date >= toDate('2023-11-14') AND date <= toDate('2023-11-15')
+  AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')
+  AND timestamp_ns > 1700000000000000000 AND timestamp_ns <= 1700010800000000000
+  AND trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'), unhex('101112131415161718191a1b1c1d1e1f'))
+
+== root hydration (sample winners) ==
+SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns
+FROM trace_spans_dist
+WHERE trace_id IN (unhex('000102030405060708090a0b0c0d0e0f'))

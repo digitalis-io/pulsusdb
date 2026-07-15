@@ -394,6 +394,18 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
 
+      # Issue #57 AC4: per-stage per-shard shard-locality verdicts for the
+      # two-phase TraceQL search + trace-by-ID, against a client-computed
+      # cityHash64(trace_id) % total_weight roster (hard errors on any
+      # fan-out violation). Recorded evidence: docs/benchmarks/
+      # m4-traces-read-path.md + data/traces-read-cluster-ci.json.
+      - name: Traces read-path fan-out evidence (bench traces-read)
+        run: |
+          cargo run -p xtask -- bench traces-read \
+            --http-url http://127.0.0.1:18123 \
+            --database pulsus_traces_bench_ci \
+            --cluster pulsus_test_cluster
+
       - name: Tear down the cluster
         if: always()
         run: docker compose -f ci/clickhouse-cluster/compose.yaml down -v

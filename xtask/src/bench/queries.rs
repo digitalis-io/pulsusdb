@@ -270,13 +270,28 @@ impl ClusterTopology {
     /// non-negative-integer sharding-key expression (our bare
     /// `fingerprint` column, docs/schemas.md §7 — no hash wrapper):
     /// `slots[value % total_weight]`.
-    fn shard_for_fingerprint(&self, fingerprint: u64) -> u32 {
+    pub(crate) fn shard_for_fingerprint(&self, fingerprint: u64) -> u32 {
         let slot = (fingerprint % self.total_weight) as usize;
         self.slots[slot]
     }
 
-    fn all_shards(&self) -> std::collections::BTreeSet<u32> {
+    pub(crate) fn all_shards(&self) -> std::collections::BTreeSet<u32> {
         self.shards.clone()
+    }
+
+    /// The cumulative-weight modulus of the sharding-slot map — exposed
+    /// for `traces-read`'s `cityHash64(trace_id) % total_weight` pruning
+    /// derivation strings (issue #57 AC4; same slot model, hash-valued
+    /// key).
+    pub(crate) fn total_weight(&self) -> u64 {
+        self.total_weight
+    }
+
+    /// Resolves a `system.query_log` row's hostname to its shard_num —
+    /// exposed for `traces-read`'s per-shard evidence attribution
+    /// (issue #57 AC4).
+    pub(crate) fn shard_of_hostname(&self, hostname: &str) -> Option<u32> {
+        self.hostname_to_shard.get(hostname).copied()
     }
 }
 
@@ -333,7 +348,7 @@ fn build_shard_maps(
 
 /// Loads [`ClusterTopology`] for `cluster` — called once per `--dist` run,
 /// not per stage (the topology does not change mid-run).
-async fn load_cluster_topology(
+pub(crate) async fn load_cluster_topology(
     client: &ChClient,
     cluster: &str,
 ) -> anyhow::Result<ClusterTopology> {

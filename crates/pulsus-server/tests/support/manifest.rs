@@ -99,6 +99,14 @@ pub enum Surface {
     /// sibling-404 suffix trick would mutate the trailing `{traceId}` param
     /// into a 400, not an unrouted 404).
     TracesFetch,
+    /// `GET /api/traces/v1/search` (issue #57) — success is the
+    /// documented docs/api.md §4.2 envelope
+    /// (`{"traces":[...],"metrics":{"partial","limit","returned"}}`), not
+    /// the `{"status","data"}` query envelope; against this suite's empty
+    /// databases a well-formed request returns the empty envelope 200,
+    /// which doubles as the mounting oracle. Errors are the JSON envelope
+    /// with `position` present exactly on TraceQL parse errors.
+    TracesSearch,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -673,6 +681,99 @@ const TRACE_FETCH_CASES: &[CaseClass] = &[CaseClass {
     },
 }];
 
+// -- traces search (issue #57, docs/api.md §4.2) -----------------------
+
+/// The base query every search case mutates from: match-all `q={}` over
+/// a fixed 1h window (both required params present).
+pub const TRACES_SEARCH_BASE_QUERY: &str = "q=%7B%7D&start=1700000000&end=1700003600";
+
+fn traces_search_malformed_q(req: &mut Req) {
+    // "{" — unterminated spanset: a positioned TraceQL parse error.
+    req.query = "q=%7B&start=1700000000&end=1700003600".to_string();
+}
+
+fn traces_search_bad_start(req: &mut Req) {
+    req.query = "q=%7B%7D&start=notanumber&end=1700003600".to_string();
+}
+
+fn traces_search_bad_limit(req: &mut Req) {
+    req.query = format!("{TRACES_SEARCH_BASE_QUERY}&limit=abc");
+}
+
+fn traces_search_bad_spss(req: &mut Req) {
+    req.query = format!("{TRACES_SEARCH_BASE_QUERY}&spss=abc");
+}
+
+fn traces_search_malformed_tags(req: &mut Req) {
+    // A bare key with no `=` violates the documented logfmt grammar.
+    req.query = "tags=barekey&start=1700000000&end=1700003600".to_string();
+}
+
+fn traces_search_q_plus_legacy(req: &mut Req) {
+    // `q` and the legacy params are mutually exclusive — explicit 400,
+    // never silent precedence (task-manager ratification on plan v2).
+    req.query = format!("{TRACES_SEARCH_BASE_QUERY}&tags=a%3Db");
+}
+
+const TRACES_SEARCH_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_q",
+        build: traces_search_malformed_q,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "bad_start",
+        build: traces_search_bad_start,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "bad_limit",
+        build: traces_search_bad_limit,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "bad_spss",
+        build: traces_search_bad_spss,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "malformed_tags_logfmt",
+        build: traces_search_malformed_tags,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            // Strict logfmt errors carry a byte offset into the decoded
+            // `tags` value (code review round 1).
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "q_plus_legacy_conflict",
+        build: traces_search_q_plus_legacy,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
 fn rw_bad_snappy(req: &mut Req) {
     req.body = b"\xFF\xFF\xFF not snappy".to_vec();
 }
@@ -1087,6 +1188,22 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: TRACE_FETCH_CASES,
     },
+    // -- Traces search (ReaderMode, issue #57) ---------------------------
+    // `success_status` is 200: against this suite's empty databases a
+    // well-formed match-all search returns the documented empty envelope
+    // (`{"traces":[],"metrics":{...}}`) — the mounting oracle
+    // (`Surface::TracesSearch`'s doc comment).
+    RouteSpec {
+        path: "/api/traces/v1/search",
+        methods: &[Method::Get],
+        surface: Surface::TracesSearch,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_SEARCH_BASE_QUERY,
+        cases: TRACES_SEARCH_CASES,
+    },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
     // notes): every M4-M8 §4-§8 row is out of scope for a guard whose only
@@ -1177,17 +1294,6 @@ static MANIFEST: &[RouteSpec] = &[
         surface: Surface::LogsQuery,
         gate: Gate::ReaderMode,
         status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
-        path: "/api/traces/v1/search",
-        methods: &[Method::Get],
-        surface: Surface::PromApi,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M4" },
         doc_ref: DocRef::Skip,
         success_status: 0,
         base_query: "",

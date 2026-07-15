@@ -1,0 +1,192 @@
+{
+  "cluster": "pulsus_test_cluster",
+  "database": "pulsus_traces_bench_ci",
+  "traces": 4000,
+  "checkout_traces": 80,
+  "total_weight": 2,
+  "search_wall_ms": 64.25323800000001,
+  "search_returned": 20,
+  "search_partial": false,
+  "stages": [
+    {
+      "stage": "trace_by_id",
+      "sql": "SELECT trace_id, span_id, parent_id, payload_type, payload\nFROM trace_spans_dist\nWHERE trace_id = unhex('00000000000000000000000000000ea6')",
+      "wall_ms": 4.014954,
+      "returned_rows": 1,
+      "expected_shards": [
+        1
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 1994,
+          "read_bytes": 69830,
+          "selected_marks": 1,
+          "memory_usage": 4196358,
+          "query_duration_ms": 2
+        },
+        {
+          "shard_num": 2,
+          "role": "expected-pruned",
+          "read_rows": 0,
+          "read_bytes": 0,
+          "selected_marks": 0,
+          "memory_usage": 0,
+          "query_duration_ms": 0,
+          "pruned_reason": "optimize_skip_unused_shards pruned shard 2: none of the queried trace ids map to it (cityHash64(00000000000000000000000000000ea6) = 4034476134512471790, % 2 = 0 -> shard 1)"
+        }
+      ]
+    },
+    {
+      "stage": "phase1_generator_service",
+      "sql": "SELECT trace_id, max(timestamp_ns) AS bound_ts\nFROM trace_spans_dist\nPREWHERE service = 'checkout'\nWHERE timestamp_ns > 1784145617170476910 AND timestamp_ns <= 1784152817170476910\nGROUP BY trace_id\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT 100001",
+      "wall_ms": 14.16142,
+      "returned_rows": 79,
+      "expected_shards": [
+        1,
+        2
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 4000,
+          "read_bytes": 100016,
+          "selected_marks": 1,
+          "memory_usage": 4535055,
+          "query_duration_ms": 12
+        },
+        {
+          "shard_num": 2,
+          "role": "remote",
+          "read_rows": 2006,
+          "read_bytes": 50158,
+          "selected_marks": 1,
+          "memory_usage": 73136,
+          "query_duration_ms": 6
+        }
+      ]
+    },
+    {
+      "stage": "phase1_generator_attr",
+      "sql": "SELECT trace_id, max(timestamp_ns) AS bound_ts\nFROM trace_attrs_idx_dist\nWHERE date >= toDate('2026-07-15') AND date <= toDate('2026-07-15')\n  AND timestamp_ns > 1784145617170476910 AND timestamp_ns <= 1784152817170476910\n  AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')\nGROUP BY trace_id\nORDER BY bound_ts DESC, trace_id ASC\nLIMIT 100001",
+      "wall_ms": 13.929574,
+      "returned_rows": 79,
+      "expected_shards": [
+        1,
+        2
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 4000,
+          "read_bytes": 148016,
+          "selected_marks": 1,
+          "memory_usage": 4568616,
+          "query_duration_ms": 12
+        },
+        {
+          "shard_num": 2,
+          "role": "remote",
+          "read_rows": 2006,
+          "read_bytes": 74230,
+          "selected_marks": 1,
+          "memory_usage": 74168,
+          "query_duration_ms": 4
+        }
+      ]
+    },
+    {
+      "stage": "phase2_hydration",
+      "sql": "SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns, status_code, kind\nFROM trace_spans_dist\nWHERE trace_id IN (unhex('00000000000000000000000000000ea6'), unhex('00000000000000000000000000000f0a'), unhex('00000000000000000000000000000f3c'), unhex('00000000000000000000000000000f6e'))\n  AND timestamp_ns > 1784145617170476910 AND timestamp_ns <= 1784152817170476910\nORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\nLIMIT 10001 BY trace_id",
+      "wall_ms": 10.700965,
+      "returned_rows": 4,
+      "expected_shards": [
+        1,
+        2
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 4000,
+          "read_bytes": 172818,
+          "selected_marks": 1,
+          "memory_usage": 6615298,
+          "query_duration_ms": 8
+        },
+        {
+          "shard_num": 2,
+          "role": "remote",
+          "read_rows": 2006,
+          "read_bytes": 86694,
+          "selected_marks": 1,
+          "memory_usage": 15184,
+          "query_duration_ms": 3
+        }
+      ]
+    },
+    {
+      "stage": "phase2_membership",
+      "sql": "SELECT DISTINCT trace_id, span_id\nFROM trace_attrs_idx_dist\nWHERE date >= toDate('2026-07-15') AND date <= toDate('2026-07-15')\n  AND (key = 'http.status_code' AND val_num >= 500 AND scope = 'span')\n  AND timestamp_ns > 1784145617170476910 AND timestamp_ns <= 1784152817170476910\n  AND trace_id IN (unhex('00000000000000000000000000000ea6'), unhex('00000000000000000000000000000f0a'), unhex('00000000000000000000000000000f3c'), unhex('00000000000000000000000000000f6e'))",
+      "wall_ms": 10.491083999999999,
+      "returned_rows": 4,
+      "expected_shards": [
+        1,
+        2
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 4000,
+          "read_bytes": 180032,
+          "selected_marks": 1,
+          "memory_usage": 5266135,
+          "query_duration_ms": 8
+        },
+        {
+          "shard_num": 2,
+          "role": "remote",
+          "read_rows": 2006,
+          "read_bytes": 90286,
+          "selected_marks": 1,
+          "memory_usage": 23630,
+          "query_duration_ms": 2
+        }
+      ]
+    },
+    {
+      "stage": "root_hydration",
+      "sql": "SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns\nFROM trace_spans_dist\nWHERE trace_id IN (unhex('00000000000000000000000000000ea6'))",
+      "wall_ms": 7.326456,
+      "returned_rows": 1,
+      "expected_shards": [
+        1
+      ],
+      "shards": [
+        {
+          "shard_num": 1,
+          "role": "coordinator-local",
+          "read_rows": 1994,
+          "read_bytes": 83788,
+          "selected_marks": 1,
+          "memory_usage": 4190175,
+          "query_duration_ms": 4
+        },
+        {
+          "shard_num": 2,
+          "role": "expected-pruned",
+          "read_rows": 0,
+          "read_bytes": 0,
+          "selected_marks": 0,
+          "memory_usage": 0,
+          "query_duration_ms": 0,
+          "pruned_reason": "optimize_skip_unused_shards pruned shard 2: none of the queried trace ids map to it (cityHash64(00000000000000000000000000000ea6) = 4034476134512471790, % 2 = 0 -> shard 1)"
+        }
+      ]
+    }
+  ]
+}

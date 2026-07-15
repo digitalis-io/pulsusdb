@@ -244,6 +244,11 @@ async fn point_read_is_a_primary_index_read_with_pruned_granules() {
         .expect("connect engine client"),
         TraceReadConfig {
             spans_table: "trace_spans".to_string(),
+            attrs_table: "trace_attrs_idx".to_string(),
+            max_candidates: 100_000,
+            scan_budget_rows: 50_000_000,
+            distributed: false,
+            skip_unavailable_shards: false,
         },
     );
     let spans = engine.fetch_by_id(&hex32).await.expect("fetch_by_id");

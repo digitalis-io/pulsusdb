@@ -17,24 +17,45 @@ use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
 use thiserror::Error;
 
-/// Why a query was rejected as too broad. Two structurally separate
-/// reasons, never conflated (architect plan amendment §4):
+/// Why a query was rejected as too broad. Three structurally separate
+/// reasons, never conflated (architect plan amendment §4; issue #57 adds
+/// the traces row budget): two byte/row *server-budget* families
+/// ([`TooBroadReason::ScanBudgetBytes`], [`TooBroadReason::TraceScanBudgetRows`])
+/// plus the Rust-side structural [`TooBroadReason::StreamCap`]. The row
+/// budget is set only on the traces search path — the LogQL path still
+/// never sets `max_rows_to_read`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooBroadReason {
-    /// The ClickHouse `max_bytes_to_read` setting (set from
-    /// `reader.logql_scan_budget_bytes`) was exceeded — server code 307
-    /// (`TOO_MANY_BYTES`). `estimate` is the pre-flight selectivity-probe
-    /// estimate when one was computed (best-effort early-abort only; the
-    /// ClickHouse setting is the authoritative backstop).
+    /// A ClickHouse-side or engine-side **byte** budget was exceeded. On
+    /// the LogQL path this is the `max_bytes_to_read` setting (set from
+    /// `reader.logql_scan_budget_bytes`) — server code 307
+    /// (`TOO_MANY_BYTES`). On the traces search path (issue #57) the same
+    /// reason carries every byte-budget breach: the per-query
+    /// `max_bytes_to_read`/`max_result_bytes` throw settings (codes 307 /
+    /// 396) and the engine's request-scoped retention counter
+    /// (`traces::exec::HYDRATION_BYTE_BUDGET`). `estimate` is the
+    /// pre-flight selectivity-probe estimate when one was computed
+    /// (best-effort early-abort only; the budget itself is the
+    /// authoritative backstop).
     ScanBudgetBytes {
         budget_bytes: u64,
         estimate: Option<u64>,
     },
     /// Stage 1 resolved more fingerprints than [`crate::logql::params::DEFAULT_MAX_STREAMS`]
     /// (or a caller-supplied cap) — a Rust-side structural limit, never a
-    /// ClickHouse row cap (`max_rows_to_read` is deliberately never set,
-    /// so ClickHouse code 158 `TOO_MANY_ROWS` can never masquerade as this).
+    /// ClickHouse row cap. `max_rows_to_read` is never set on **LogQL**
+    /// read paths (the traces scan budget sets it deliberately on its
+    /// generator queries, where code 158 maps to
+    /// [`TooBroadReason::TraceScanBudgetRows`]), so on the LogQL path
+    /// ClickHouse code 158 `TOO_MANY_ROWS` can never masquerade as this.
     StreamCap { count: usize, cap: usize },
+    /// The traces search scan budget (`reader.traceql_scan_budget_rows`,
+    /// applied as `max_rows_to_read` + `read_overflow_mode='throw'` to
+    /// every candidate-generator/hydration query — issue #57 plan v4
+    /// delta 2) was exceeded — server code 158 (`TOO_MANY_ROWS`). Set
+    /// **only** by `traces::exec`'s own error mapper; LogQL's
+    /// `map_read_error` never produces it.
+    TraceScanBudgetRows { budget_rows: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -55,6 +76,9 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "resolved {count} streams, exceeding the {cap}-stream cap"
                 )
+            }
+            TooBroadReason::TraceScanBudgetRows { budget_rows } => {
+                write!(f, "trace scan budget of {budget_rows} rows exceeded")
             }
         }
     }

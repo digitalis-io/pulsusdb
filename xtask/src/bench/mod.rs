@@ -13,6 +13,12 @@
 //!   benchmarks the docs/schemas.md §2.1 strategy ladder's three paths
 //!   (cache matcher, SQL fallback, prototype `metric_series_idx`) on a
 //!   deterministic `metric_series` corpus. See [`metrics_labels`].
+//! - `traces-read` (issue #57 AC4) — the M4 traces read-path
+//!   shard-locality evidence harness on the 2-shard
+//!   `ci/clickhouse-cluster` fixture: per-stage per-shard
+//!   `system.query_log` evidence for the two-phase TraceQL search +
+//!   trace-by-ID, verdicted (hard errors) against a client-computed
+//!   `cityHash64(trace_id) % total_weight` roster. See [`traces_read`].
 //!
 //! Example:
 //! ```text
@@ -38,6 +44,7 @@ pub mod metrics_labels;
 pub mod queries;
 mod query_log;
 pub mod report;
+pub mod traces_read;
 
 use std::time::Duration;
 
@@ -155,16 +162,17 @@ pub enum Profile {
 }
 
 /// Dispatches on `args.scenario` — `"logs-read"` (issue #16),
-/// `"metrics-labels"` (issue #34), or `"logs-hydration"` (issue #35); any
-/// other value is a hard error.
+/// `"metrics-labels"` (issue #34), `"logs-hydration"` (issue #35), or
+/// `"traces-read"` (issue #57); any other value is a hard error.
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
     match args.scenario.as_str() {
         "logs-read" => run_logs_read(args).await,
         "metrics-labels" => metrics_labels::run(args).await,
         "logs-hydration" => logs_hydration::run(args).await,
+        "traces-read" => traces_read::run(args).await,
         other => anyhow::bail!(
-            "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", or \
-             \"logs-hydration\")"
+            "unknown bench scenario {other:?} (expected \"logs-read\", \"metrics-labels\", \
+             \"logs-hydration\", or \"traces-read\")"
         ),
     }
 }

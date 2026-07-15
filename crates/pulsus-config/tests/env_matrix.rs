@@ -212,6 +212,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_max_candidates == 77,
     },
     Row {
+        var: "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
+        value: "12345",
+        check: |c| c.reader.traceql_scan_budget_rows == 12_345,
+    },
+    Row {
         var: "PULSUS_TIER_POLICY",
         value: "fast",
         check: |c| c.downsampling.tier_policy == TierPolicy::Fast,
@@ -246,8 +251,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        41,
-        "docs/configuration.md §§1-8 document exactly 41 variables"
+        42,
+        "docs/configuration.md §§1-8 document exactly 42 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

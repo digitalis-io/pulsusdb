@@ -159,6 +159,7 @@ pub struct ReaderConfig {
     pub promql_lookback: HumanDuration,
     pub logql_scan_budget_bytes: ByteSize,
     pub traceql_max_candidates: u64,
+    pub traceql_scan_budget_rows: u64,
 }
 
 impl Default for ReaderConfig {
@@ -172,6 +173,7 @@ impl Default for ReaderConfig {
             promql_lookback: HumanDuration(Duration::from_secs(300)),
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             traceql_max_candidates: 100_000,
+            traceql_scan_budget_rows: 50_000_000,
         }
     }
 }

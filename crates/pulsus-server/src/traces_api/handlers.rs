@@ -24,7 +24,8 @@ use super::params;
 /// pattern: clone the `Option` out from behind the lock, drop the guard
 /// before doing anything else) and builds a `TraceEngine` over it —
 /// `503 unavailable` before the pool is established, matching `/ready`.
-async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError> {
+/// `pub(super)`: `search.rs` shares the same engine acquisition.
+pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()

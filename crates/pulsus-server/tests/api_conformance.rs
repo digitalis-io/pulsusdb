@@ -556,6 +556,30 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 ctx,
             );
         }
+        (Surface::TracesSearch, _) => {
+            // Issue #57: success is the documented docs/api.md §4.2
+            // envelope, not the `{"status","data"}` query envelope.
+            // Against this suite's empty databases the well-formed
+            // match-all search returns the empty envelope — the mounting
+            // oracle (an unmounted path would 404 instead of 200).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: search envelope content-type"
+            );
+            let json = res.json(ctx);
+            assert_eq!(
+                json["traces"],
+                serde_json::json!([]),
+                "{ctx}: empty DB must return an empty traces array, body {json}"
+            );
+            assert_eq!(json["metrics"]["partial"], false, "{ctx}: body {json}");
+            assert_eq!(json["metrics"]["returned"], 0, "{ctx}: body {json}");
+            assert!(
+                json["metrics"]["limit"].is_u64(),
+                "{ctx}: metrics.limit must be an integer, body {json}"
+            );
+        }
         (Surface::Ingest, _) => {
             unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
         }

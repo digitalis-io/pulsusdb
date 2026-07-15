@@ -30,6 +30,10 @@ pulsus-logql = { path = "../pulsus-logql" }
 # query surface.
 pulsus-promql = { path = "../pulsus-promql" }
 pulsus-read = { path = "../pulsus-read" }
+# `traces_api/search.rs` (issue #57) parses TraceQL (`pulsus_traceql::parse`)
+# and hands the AST to `pulsus-read`'s search planner — mirrors
+# `pulsus-logql`'s role on the log query surface.
+pulsus-traceql = { path = "../pulsus-traceql" }
 pulsus-schema = { path = "../pulsus-schema" }
 pulsus-write = { path = "../pulsus-write" }
 # `traces_api` (issue #55) decodes the stored per-span payloads as OTLP

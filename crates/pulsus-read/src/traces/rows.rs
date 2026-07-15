@@ -26,6 +26,71 @@ pub struct StoredSpanRow {
     pub payload: Vec<u8>,
 }
 
+/// One Phase-1 candidate-generator row (issue #57): a trace id plus its
+/// `bound_ts` — the newest leaf-matching span's timestamp, the upper
+/// bound on the trace's final public sort key that licenses the engine's
+/// threshold termination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct CandidateRow {
+    pub trace_id: [u8; 16],
+    pub bound_ts: i64,
+}
+
+/// One Phase-2 batch-hydration row — the physical summary columns only
+/// (never `payload`; `pulsus-read` stays OTLP-agnostic). Field order
+/// matches `search_sql::hydration_sql`'s SELECT list exactly (RowBinary
+/// is positional).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct HydrationRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub service: String,
+    pub name: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+    pub status_code: i8,
+    pub kind: i8,
+}
+
+/// One attribute-membership row (`search_sql::membership_sql`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MembershipRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+}
+
+/// One numeric attribute value row (`search_sql::attr_values_sql` with
+/// `numeric = true`; `val_num` is `Nullable(Float64)` — `isNotNull` is in
+/// the predicate but `any()` keeps the column Nullable).
+#[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
+pub struct NumValueRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub v: Option<f64>,
+}
+
+/// One string attribute value row (`search_sql::attr_values_sql` with
+/// `numeric = false`).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct StrValueRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub v: String,
+}
+
+/// One winners' root-hydration row (`search_sql::root_sql`).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct RootRow {
+    pub trace_id: [u8; 16],
+    pub span_id: [u8; 8],
+    pub parent_id: [u8; 8],
+    pub service: String,
+    pub name: String,
+    pub timestamp_ns: i64,
+    pub duration_ns: i64,
+}
+
 /// What [`super::exec::TraceEngine::fetch_by_id`] hands to callers: the
 /// assembly-relevant subset of [`StoredSpanRow`], keeping this crate's
 /// public trace-read surface free of the read-alignment-only columns.
