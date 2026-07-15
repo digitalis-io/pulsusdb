@@ -64,6 +64,8 @@ Deployment topologies:
 | `PULSUS_INSERT_MODE` | `sync` | `sync` \| `async` default when `X-Pulsus-Async` absent |
 | `PULSUS_INGEST_QUEUE_BYTES` | `256MiB` | total buffered bytes before `429` backpressure |
 
+A batch that exhausts its insert retry budget is spooled to `./spool/{poison,uncertain}/<table>/` (relative to the process's working directory — a documented constant, not yet a `PULSUS_*` variable). In the published container image (§10), the working directory is `/var/lib/pulsusdb`, owned by the non-root `pulsus` user, so this resolves to `/var/lib/pulsusdb/spool/`; mount a volume over that path if spooled batches need to survive a container restart.
+
 ## 6. Reader
 
 | Variable | Default | Description |
@@ -191,7 +193,7 @@ services:
       interval: 5s
 
   pulsusdb:
-    image: ghcr.io/pulsusdb/pulsusdb:latest
+    image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
       CLICKHOUSE_SERVER: clickhouse
       PULSUS_RETENTION_DAYS: "7"

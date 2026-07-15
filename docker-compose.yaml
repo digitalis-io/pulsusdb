@@ -23,7 +23,7 @@ services:
       interval: 5s
 
   pulsusdb:
-    image: ghcr.io/pulsusdb/pulsusdb:latest
+    image: ghcr.io/digitalis-io/pulsusdb:latest
     environment:
       CLICKHOUSE_SERVER: clickhouse
       PULSUS_RETENTION_DAYS: "7"

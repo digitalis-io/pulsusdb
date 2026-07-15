@@ -58,6 +58,7 @@ Design documents live in [`docs/`](docs/) and are written before the code:
 | `docs/features.md` | Full feature list and compatibility matrix |
 | `docs/api.md` | Every ingestion and query endpoint, with parameters and wire formats |
 | `docs/configuration.md` | Environment variables, deployment modes, ClickHouse setup |
+| `docs/releasing.md` | Cutting a release: GHCR image publishing procedure and tag policy |
 
 Development is tracked through GitHub issues; each issue maps to a scoped unit of work from these documents.
 

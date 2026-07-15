@@ -2,17 +2,44 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    // Short git SHA for --version; falls back to "unknown" outside a git checkout.
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
+    // Revision: `PULSUS_BUILD_REVISION` (issue #23 release workflow, stamped
+    // verbatim from the full `github.sha` build-arg — do not shorten it,
+    // the release smoke test exact-matches it against the image's
+    // `org.opencontainers.image.revision` label) beats the local
+    // `git rev-parse` short SHA, which in turn falls back to "unknown"
+    // outside a git checkout (e.g. a source tarball, or the release
+    // image's `.dockerignore`-excluded `.git`).
+    let sha = std::env::var("PULSUS_BUILD_REVISION")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short=12", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=PULSUS_GIT_SHA={sha}");
+    println!("cargo:rerun-if-env-changed=PULSUS_BUILD_REVISION");
+
+    // Version: `PULSUS_BUILD_VERSION` (the release workflow's `github.ref_name`
+    // tag, e.g. `v1.2.3`, with the leading `v` stripped) beats the crate's
+    // own `Cargo.toml` literal, which stays `0.0.0` for local/dev builds —
+    // the build-arg override is the single source of truth for a released
+    // image's version, not `Cargo.toml` (architect plan: do not bump the
+    // crate version to match tags).
+    let version = std::env::var("PULSUS_BUILD_VERSION")
+        .ok()
+        .map(|s| s.trim().trim_start_matches('v').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into()));
+    println!("cargo:rustc-env=PULSUS_VERSION={version}");
+    println!("cargo:rerun-if-env-changed=PULSUS_BUILD_VERSION");
 
     // `/buildinfo` (docs/api.md §7) needs a build timestamp and the
     // compiler version alongside the git SHA above; both are recomputed

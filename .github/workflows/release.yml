@@ -1,0 +1,114 @@
+name: Release
+
+# Tag-triggered only (issue #23): a push of a `vX.Y.Z[-pre]` tag builds the
+# repo `Dockerfile` (issue #7) and publishes it to GHCR. No `edge`/`main`
+# image on every push — that is explicitly out of scope for this issue
+# (docs/releasing.md notes it as a possible follow-up).
+on:
+  push:
+    tags: ["v*"]
+
+# Least-privilege: `packages: write` is the only extra permission this job
+# needs to push to GHCR via the ambient `GITHUB_TOKEN` (no PAT). `contents:
+# read` is enough to check out the tag.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag/label derivation. `flavor: latest=auto` + `type=semver` is what
+      # gives us the prerelease-suppression contract this workflow relies
+      # on: metadata-action@v5's documented `type=semver` behaviour is that
+      # a prerelease ref (e.g. `v2.0.8-beta.67`) emits *only* the exact
+      # `{{version}}` tag — `{{major}}.{{minor}}`/`{{major}}` and `latest`
+      # are all withheld — while a stable ref emits all three (architect
+      # plan amendment, issue #23). This is pinned to metadata-action@v5;
+      # bumping that major requires re-verifying this suppression behaviour
+      # against its changelog before trusting it again.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/digitalis-io/pulsusdb
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      # 1) Build + load (single-platform makes `load: true` possible) and
+      #    smoke-test *before* anything is pushed — a failing smoke test
+      #    must never leave a broken tag on GHCR.
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PULSUS_BUILD_VERSION=${{ github.ref_name }}
+            PULSUS_BUILD_REVISION=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=pulsusdb-release
+            type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-release
+
+      - name: Smoke test (version+revision stamp, non-root, spool writable)
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/digitalis-io/pulsusdb:${{ steps.meta.outputs.version }}
+          OUT=$(docker run --rm "$IMG" --version)
+          echo "$OUT"
+          # clap prints: "pulsusdb <VERSION> (<REVISION>)". PULSUS_BUILD_REVISION
+          # is stamped verbatim (full 40-char github.sha, not --short) so this
+          # matches the org.opencontainers.image.revision label byte-for-byte.
+          EXPECT="${{ steps.meta.outputs.version }} (${{ github.sha }})"
+          echo "$OUT" | grep -qF "$EXPECT" \
+            || { echo "::error::version/revision stamp mismatch; want '$EXPECT'"; exit 1; }
+          docker run --rm "$IMG" --help >/dev/null
+          test "$(docker run --rm --entrypoint id "$IMG" -u)" != "0"
+          # Review fix (issue #23): the writer's insert-failure spool
+          # (`./spool/{poison,uncertain}/<table>/`, docs/configuration.md
+          # §5) is created lazily under the process's working directory —
+          # prove the non-root `pulsus` user can actually create and write
+          # it under the image's `/var/lib/pulsusdb` WORKDIR, since a
+          # silent write failure there would only surface as a swallowed
+          # spool error under a real insert failure, not a startup crash.
+          docker run --rm --entrypoint sh "$IMG" -c \
+            'mkdir -p ./spool/uncertain/probe && echo ok > ./spool/uncertain/probe/f && cat ./spool/uncertain/probe/f' \
+            | grep -qF ok \
+            || { echo "::error::pulsus (uid 10001) cannot write the spool dir under WORKDIR"; exit 1; }
+
+      # 2) Push only after the smoke test above passed. Cache is warm from
+      #    step 1, so this rebuild is near-instant.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PULSUS_BUILD_VERSION=${{ github.ref_name }}
+            PULSUS_BUILD_REVISION=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=pulsusdb-release
+            type=gha,scope=pulsusdb-e2e
+          cache-to: type=gha,mode=max,scope=pulsusdb-release

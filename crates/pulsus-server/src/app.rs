@@ -61,11 +61,15 @@ pub(crate) struct BuildInfo {
 }
 
 impl BuildInfo {
-    /// Reads the four build-time constants embedded by `build.rs`
-    /// (`CARGO_PKG_VERSION` plus the three `PULSUS_*` build-script env vars).
+    /// Reads the four build-time constants embedded by `build.rs`: the four
+    /// `PULSUS_*` build-script env vars. `version`/`revision` default to
+    /// `CARGO_PKG_VERSION`/the local git SHA for dev builds, but are
+    /// overridden by the release workflow's `PULSUS_BUILD_VERSION`/
+    /// `PULSUS_BUILD_REVISION` build-args (issue #23) so a published
+    /// image's `/buildinfo` matches its tag and `github.sha` exactly.
     pub(crate) fn from_build_env() -> Self {
         BuildInfo {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: env!("PULSUS_VERSION").to_string(),
             revision: env!("PULSUS_GIT_SHA").to_string(),
             built_at: env!("PULSUS_BUILT_AT").to_string(),
             rustc: env!("PULSUS_RUSTC").to_string(),

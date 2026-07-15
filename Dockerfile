@@ -4,9 +4,11 @@
 # too (slim variant) — same libc as the build stage, so there is no
 # host/container glibc mismatch, and the shipped image is far smaller than
 # the full toolchain image. Produces the local `pulsusdb:e2e` tag that
-# `deploy/e2e/compose.single.yaml` / `compose.cluster.yaml` build against;
-# no image is published to a registry from here (out of scope — tracked
-# separately for the M7 release job).
+# `deploy/e2e/compose.single.yaml` / `compose.cluster.yaml` build against.
+# `.github/workflows/release.yml` (issue #23) builds this same file with
+# `PULSUS_BUILD_VERSION`/`PULSUS_BUILD_REVISION` build-args set and pushes
+# it to `ghcr.io/digitalis-io/pulsusdb` on tagged releases — see
+# docs/releasing.md for the procedure.
 #
 # The build stage is split via cargo-chef into a `planner` stage that
 # computes a dependency-only recipe from the workspace manifests, and a
@@ -68,6 +70,16 @@ COPY rust-toolchain.toml rust-toolchain.toml
 COPY vendor vendor
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
+# Release version/revision stamp (issue #23): deliberately placed *after*
+# `cook` so these build-args do not bust the dependency-cook cache layer
+# above (shared with CI's `pulsusdb-e2e` scope) — only this final
+# workspace-crate compile re-runs per release. Empty defaults keep the
+# local/dev `pulsusdb:e2e` build path unaffected: `build.rs`'s own
+# `git rev-parse`/`CARGO_PKG_VERSION` fallbacks fire whenever these are unset.
+ARG PULSUS_BUILD_VERSION=""
+ARG PULSUS_BUILD_REVISION=""
+ENV PULSUS_BUILD_VERSION=${PULSUS_BUILD_VERSION}
+ENV PULSUS_BUILD_REVISION=${PULSUS_BUILD_REVISION}
 RUN cargo build --release -p pulsus-server --bin pulsusdb
 
 FROM docker.io/library/debian:bookworm-slim AS runtime
@@ -78,7 +90,29 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Non-root runtime user (issue #23 AC: "runs as non-root"). Fixed numeric
+# uid/gid (not just a name) so the id is stable across rebuilds and matches
+# whatever the release smoke test / any k8s `runAsUser` pins. `pulsusdb`
+# binds an unprivileged port (3100); it normally writes nothing to disk, but
+# `pulsus-write`'s `WriterRuntime::spool_dir` (crates/pulsus-write/src/
+# writer/config.rs) is `./spool`, resolved against the process's *working
+# directory* — on insert failure it creates `./spool/{poison,uncertain}/`
+# on first use. Without an explicit `WORKDIR`, that resolves to `/`, which
+# `pulsus` (uid 10001) cannot write to (review fix, issue #23: an insert
+# failure under the published image would silently fail to spool). Give it
+# an owned, writable working directory instead — `./spool` then resolves to
+# `/var/lib/pulsusdb/spool` (documented in docs/configuration.md §5 and
+# docs/releasing.md for anyone who wants to mount a persistent volume over
+# it).
+RUN groupadd --system --gid 10001 pulsus \
+ && useradd  --system --uid 10001 --gid pulsus \
+             --home-dir /nonexistent --shell /usr/sbin/nologin pulsus \
+ && mkdir -p /var/lib/pulsusdb \
+ && chown 10001:10001 /var/lib/pulsusdb
+WORKDIR /var/lib/pulsusdb
+
 COPY --from=build /src/target/release/pulsusdb /usr/local/bin/pulsusdb
 
 EXPOSE 3100
+USER pulsus
 ENTRYPOINT ["/usr/local/bin/pulsusdb"]

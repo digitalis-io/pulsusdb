@@ -23,8 +23,11 @@ mod schema_init;
 mod serve;
 mod subsystems;
 
-/// Long version string: crate version + build git SHA.
-const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PULSUS_GIT_SHA"), ")");
+/// Long version string: build version + build git SHA (issue #23:
+/// `PULSUS_VERSION` is `build.rs`'s `PULSUS_BUILD_VERSION`-overridable
+/// stamp — `CARGO_PKG_VERSION` for local/dev builds, the release tag for a
+/// published image — so `--version` and `/status/buildinfo` agree).
+const VERSION: &str = concat!(env!("PULSUS_VERSION"), " (", env!("PULSUS_GIT_SHA"), ")");
 
 #[derive(Parser, Debug)]
 #[command(name = "pulsusdb", version = VERSION, about = "PulsusDB observability database")]
