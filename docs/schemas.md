@@ -382,7 +382,9 @@ CREATE TABLE trace_attrs_idx (
     duration_ns   Int64
 ) ENGINE = ReplacingMergeTree
 PARTITION BY date
-ORDER BY (key, val, timestamp_ns, trace_id, span_id);
+ORDER BY (key, val, timestamp_ns, trace_id, span_id)
+TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1;
 
 CREATE TABLE trace_tag_catalog (
     key  LowCardinality(String),

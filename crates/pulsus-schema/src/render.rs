@@ -43,6 +43,7 @@ pub struct RenderCtx {
 pub enum Family {
     Metrics,
     Logs,
+    Traces,
 }
 
 impl Family {
@@ -53,6 +54,7 @@ impl Family {
         match self {
             Family::Metrics => "cityHash64(metric_name, fingerprint)",
             Family::Logs => "fingerprint",
+            Family::Traces => "cityHash64(trace_id)",
         }
     }
 }
@@ -474,11 +476,20 @@ mod tests {
     }
 
     #[test]
+    fn dist_ddl_template_uses_the_traces_family_sharding_expr() {
+        let tmpl = dist_ddl_template("trace_spans", Family::Traces);
+        let out = render(&tmpl, "trace_spans", &ctx(), false);
+        assert!(out.contains("pulsus.trace_spans_dist"));
+        assert!(out.contains("Distributed('', pulsus, trace_spans, cityHash64(trace_id))"));
+    }
+
+    #[test]
     fn family_sharding_expressions_are_distinct_and_stable() {
         assert_eq!(
             Family::Metrics.sharding_expr(),
             "cityHash64(metric_name, fingerprint)"
         );
         assert_eq!(Family::Logs.sharding_expr(), "fingerprint");
+        assert_eq!(Family::Traces.sharding_expr(), "cityHash64(trace_id)");
     }
 }

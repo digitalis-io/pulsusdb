@@ -311,6 +311,94 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::ConfigName,
         replication: Replication::PerShard,
     },
+    // --- traces family (docs/schemas.md §4.1, issue #53) ---
+    Migration {
+        id: 16,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_spans{{on_cluster}} (\n\
+                 trace_id      FixedString(16),\n\
+                 span_id       FixedString(8),\n\
+                 parent_id     FixedString(8),\n\
+                 name          LowCardinality(String),\n\
+                 service       LowCardinality(String),\n\
+                 timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 duration_ns   Int64  CODEC(T64, ZSTD(1)),\n\
+                 status_code   Int8,\n\
+                 kind          Int8,\n\
+                 payload_type  Int8,\n\
+                 payload       String CODEC(ZSTD(3)),\n\
+                 INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4,\n\
+                 PROJECTION service_time (\n\
+                     SELECT * ORDER BY (service, timestamp_ns)\n\
+                 )\n\
+             ) ENGINE = MergeTree\n\
+             PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns))\n\
+             ORDER BY (trace_id, timestamp_ns)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 17,
+        name: "trace_attrs_idx",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_attrs_idx{{on_cluster}} (\n\
+                 date          Date,\n\
+                 key           LowCardinality(String),\n\
+                 val           String,\n\
+                 val_num       Nullable(Float64),\n\
+                 timestamp_ns  Int64,\n\
+                 trace_id      FixedString(16),\n\
+                 span_id       FixedString(8),\n\
+                 duration_ns   Int64\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             PARTITION BY date\n\
+             ORDER BY (key, val, timestamp_ns, trace_id, span_id)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // Catalog table: one cluster-wide replica set, no `_dist` wrapper —
+    // tag-API reads serve from the local replica without fan-out
+    // (docs/schemas.md §7, task-manager adjudication on issue #53; mirrors
+    // `metric_metadata`).
+    Migration {
+        id: 18,
+        name: "trace_tag_catalog",
+        family: None,
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_tag_catalog{{on_cluster}} (\n\
+                 key  LowCardinality(String),\n\
+                 val  String\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             ORDER BY (key, val);",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::Global,
+    },
+    Migration {
+        id: 19,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 20,
+        name: "trace_attrs_idx",
+        family: Some(Family::Traces),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -338,11 +426,52 @@ pub const MVS: &[MvDef] = &[
                FROM {{db}}.log_samples\n\
                GROUP BY fingerprint, bucket_ns;",
     },
+    // Fires per shard in cluster mode; every shard writes the same Global
+    // replica set and `ReplacingMergeTree(key, val)` + duplicate-tolerant
+    // reads absorb the redundancy (docs/schemas.md §8) — the established
+    // catalog pattern (`metric_metadata`).
+    MvDef {
+        name: "trace_tag_catalog_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog AS\n\
+               SELECT key, val\n\
+               FROM {{db}}.trace_attrs_idx;",
+    },
 ];
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::render::{self, RenderCtx};
+
+    fn ctx() -> RenderCtx {
+        RenderCtx {
+            db: "pulsus".to_string(),
+            cluster: None,
+            dist_suffix: "_dist".to_string(),
+            storage_policy: None,
+            retention_days: 7,
+            log_rollup: Duration::from_secs(5),
+        }
+    }
+
+    /// Migration `id`'s `Ddl::Static` template, unrendered.
+    fn static_tmpl(id: u32) -> &'static str {
+        let m = MIGRATIONS
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("no migration with id {id}"));
+        let Ddl::Static(tmpl) = m.ddl else {
+            panic!("migration {id} is not Ddl::Static");
+        };
+        tmpl
+    }
+
+    /// Renders migration `id`'s `Ddl::Static` template in single-node mode.
+    fn rendered_static(id: u32) -> String {
+        render::render(static_tmpl(id), "", &ctx(), false)
+    }
 
     #[test]
     fn migration_ids_are_unique_and_ascending() {
@@ -384,10 +513,18 @@ mod tests {
     }
 
     #[test]
-    fn mvs_are_non_empty_and_named() {
-        assert_eq!(MVS.len(), 2);
+    fn mvs_are_exactly_the_expected_set() {
+        let names: Vec<&str> = MVS.iter().map(|mv| mv.name).collect();
+        assert_eq!(
+            names,
+            [
+                "log_streams_idx_mv",
+                "log_metrics_{{log_rollup_suffix}}_mv",
+                "trace_tag_catalog_mv",
+            ],
+            "MVS must contain exactly the catalog's materialized views"
+        );
         for mv in MVS {
-            assert!(!mv.name.is_empty());
             assert!(mv.tmpl.contains("CREATE MATERIALIZED VIEW"));
         }
     }
@@ -410,12 +547,84 @@ mod tests {
         }
     }
 
-    /// Issue #5 fix plan F2: only the three catalog/bookkeeping tables join
-    /// the shard-less, cluster-wide replica set.
+    /// AC1b (issue #53): trace_spans transcribes docs/schemas.md §4.1 —
+    /// dual physical order (projection), duration skip index, tokenized
+    /// delete-TTL, part-level TTL drops.
+    #[test]
+    fn trace_spans_ddl_carries_projection_index_and_tokenized_ttl() {
+        let ddl = rendered_static(16);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_spans"));
+        assert!(ddl.contains("PROJECTION service_time"));
+        assert!(ddl.contains("SELECT * ORDER BY (service, timestamp_ns)"));
+        assert!(ddl.contains("INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4"));
+        assert!(ddl.contains("ORDER BY (trace_id, timestamp_ns)"));
+        assert!(ddl.contains(
+            "TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE"
+        ));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1;"));
+        // Tokenized, not a hard-coded literal: retention stays mutable
+        // operational config, excluded from migration identity.
+        assert!(static_tmpl(16).contains("INTERVAL {{retention_days}} DAY DELETE"));
+    }
+
+    /// AC1b (issue #53, plan v2 delta 1): trace_attrs_idx carries the
+    /// adjudicated retention lifecycle — the same tokenized delete-TTL as
+    /// trace_spans — plus the §4.1 typed-numeric column and index key.
+    #[test]
+    fn trace_attrs_idx_ddl_carries_val_num_order_and_tokenized_ttl() {
+        let ddl = rendered_static(17);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_attrs_idx"));
+        assert!(ddl.contains("val_num       Nullable(Float64)"));
+        assert!(ddl.contains("ENGINE = ReplacingMergeTree"));
+        assert!(ddl.contains("PARTITION BY date"));
+        assert!(ddl.contains("ORDER BY (key, val, timestamp_ns, trace_id, span_id)"));
+        assert!(ddl.contains(
+            "TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE"
+        ));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1;"));
+        assert!(static_tmpl(17).contains("INTERVAL {{retention_days}} DAY DELETE"));
+    }
+
+    /// AC1b (issue #53): trace_tag_catalog is a bounded catalog — deduped
+    /// `(key, val)`, no TTL, no `_dist` wrapper (Replication::Global).
+    #[test]
+    fn trace_tag_catalog_ddl_is_a_bounded_replacing_catalog() {
+        let ddl = rendered_static(18);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_tag_catalog"));
+        assert!(ddl.contains("ENGINE = ReplacingMergeTree"));
+        assert!(ddl.contains("ORDER BY (key, val);"));
+        assert!(!ddl.contains("TTL"));
+        let m = MIGRATIONS.iter().find(|m| m.id == 18).expect("id 18");
+        assert_eq!(m.replication, Replication::Global);
+        assert!(m.family.is_none(), "catalog tables carry no family");
+        assert!(
+            !MIGRATIONS
+                .iter()
+                .any(|m| m.name == "trace_tag_catalog" && matches!(m.ddl, Ddl::Dist)),
+            "trace_tag_catalog must not have a _dist wrapper"
+        );
+    }
+
+    /// Issue #53: the `_dist` wrappers for both per-shard trace tables carry
+    /// the Traces family (and therefore render `cityHash64(trace_id)` via
+    /// `dist_ddl_template` — the render-side test proves the expression).
+    #[test]
+    fn trace_dist_migrations_carry_the_traces_family() {
+        for (id, name) in [(19, "trace_spans"), (20, "trace_attrs_idx")] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
+            assert_eq!(m.name, name);
+            assert!(matches!(m.ddl, Ddl::Dist));
+            assert_eq!(m.family, Some(Family::Traces));
+        }
+    }
+
+    /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping
+    /// tables — `schema_migrations`, `mv_checksums`, `metric_metadata`, and
+    /// `trace_tag_catalog` — join the shard-less, cluster-wide replica set.
     #[test]
     fn only_catalog_and_bookkeeping_migrations_are_globally_replicated() {
         for m in MIGRATIONS {
-            let expected = matches!(m.id, 1..=3);
+            let expected = matches!(m.id, 1..=3 | 18);
             assert_eq!(
                 m.replication == Replication::Global,
                 expected,

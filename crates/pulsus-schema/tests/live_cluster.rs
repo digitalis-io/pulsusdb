@@ -213,6 +213,8 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("log_streams_idx_dist", Family::Logs),
         ("log_samples_dist", Family::Logs),
         ("log_metrics_5s_dist", Family::Logs),
+        ("trace_spans_dist", Family::Traces),
+        ("trace_attrs_idx_dist", Family::Traces),
     ];
     for (table, family) in dist_tables {
         assert!(
@@ -256,6 +258,26 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
     for t in logs_dist {
         let ddl = create_table_query(&shard1, TEST_DB_DIST, t).await;
         assert!(ddl.contains(Family::Logs.sharding_expr()));
+    }
+
+    let traces_dist = ["trace_spans_dist", "trace_attrs_idx_dist"];
+    for t in traces_dist {
+        let ddl = create_table_query(&shard1, TEST_DB_DIST, t).await;
+        assert!(ddl.contains(Family::Traces.sharding_expr()));
+    }
+
+    // trace_tag_catalog is a Global catalog table (issue #53 adjudication):
+    // present on every shard, but never wrapped in a `_dist` table — tag
+    // reads serve from the local replica without fan-out.
+    for names in [&names1, &names2] {
+        assert!(
+            names.contains(&"trace_tag_catalog".to_string()),
+            "trace_tag_catalog must exist on every shard: {names:?}"
+        );
+        assert!(
+            !names.contains(&"trace_tag_catalog_dist".to_string()),
+            "trace_tag_catalog must NOT have a _dist wrapper: {names:?}"
+        );
     }
 
     // Write/read-back through `_dist`: insert into `log_samples_dist` via a
@@ -339,6 +361,12 @@ struct MetricMetadataRow {
     help: String,
     unit: String,
     updated_ns: i64,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct TraceTagRow {
+    key: String,
+    val: String,
 }
 
 /// Reads `table` `FINAL` (bookkeeping/catalog tables are `ReplacingMergeTree`
@@ -496,5 +524,50 @@ async fn bookkeeping_and_catalog_tables_are_identical_on_every_shard() {
     assert_eq!(
         metadata1, metadata2,
         "metric_metadata rows must be identical on every shard"
+    );
+
+    // trace_tag_catalog (issue #53): the traces tag catalog joins the same
+    // shard-less Global replica set — a row written while connected to
+    // shard1 must read back identically from shard2 directly (no `_dist`
+    // wrapper exists for it). Unlike metric_metadata (legitimately empty in
+    // this test), a row is written explicitly so the assertion proves live
+    // replication, not just two empty tables agreeing.
+    shard1
+        .execute(
+            &format!(
+                "INSERT INTO {TEST_DB_BOOKKEEPING}.trace_tag_catalog (key, val) \
+                 VALUES ('http.status_code', '500')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert trace_tag_catalog row via shard1");
+    let (tags1, tags2) = poll_until_matching(|| async {
+        (
+            bookkeeping_rows::<TraceTagRow>(
+                &shard1,
+                TEST_DB_BOOKKEEPING,
+                "trace_tag_catalog",
+                "key, val",
+            )
+            .await,
+            bookkeeping_rows::<TraceTagRow>(
+                &shard2,
+                TEST_DB_BOOKKEEPING,
+                "trace_tag_catalog",
+                "key, val",
+            )
+            .await,
+        )
+    })
+    .await;
+    assert!(
+        !tags1.is_empty(),
+        "trace_tag_catalog must have the inserted row"
+    );
+    assert_eq!(
+        tags1, tags2,
+        "trace_tag_catalog rows must be identical on every shard"
     );
 }

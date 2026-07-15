@@ -383,8 +383,11 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
     }
 }
 
-/// Applies the current `{{retention_days}}`-derived TTL to both raw sample
-/// tables (docs/schemas.md §2.1/§3.1). `ALTER TABLE ... MODIFY TTL` is
+/// Applies the current `{{retention_days}}`-derived TTL to every retained
+/// table (docs/schemas.md §2.1/§3.1/§4.1): the raw metric/log sample tables
+/// plus both trace tables (`trace_attrs_idx` is time-scoped derived data —
+/// task-manager adjudication on issue #53; `trace_tag_catalog` is a bounded
+/// catalog and carries no TTL). `ALTER TABLE ... MODIFY TTL` is
 /// naturally idempotent (re-applying the same expression is a no-op), so
 /// this is safe both from `run_init` (applied once) and
 /// [`crate::rotation::spawn_rotation`] (applied on every tick, so a changed
@@ -405,6 +408,12 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
         "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY TTL \
          toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
         "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+        "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY TTL \
+         toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
+        "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+        "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY TTL \
+         toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
+        "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
     ];
     for stmt in stmts {
         let rendered = render::substitute_tokens(stmt, ctx);
