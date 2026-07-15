@@ -1,0 +1,8 @@
+InvalidDuration {
+    raw: "99999999999999999999s",
+    reason: "duration overflows u64 nanoseconds",
+    span: Span {
+        start: 13,
+        end: 34,
+    },
+}

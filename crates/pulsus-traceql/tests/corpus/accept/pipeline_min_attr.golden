@@ -1,0 +1,22 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: None,
+        },
+    ),
+    pipeline: [
+        Aggregate {
+            op: Min,
+            field: Some(
+                Attribute {
+                    scope: Unscoped,
+                    key: "retries",
+                },
+            ),
+            cmp: Lt,
+            value: Number(
+                "2",
+            ),
+        },
+    ],
+}

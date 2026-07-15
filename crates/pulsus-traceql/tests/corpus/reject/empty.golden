@@ -1,0 +1,7 @@
+UnexpectedEof {
+    expected: "a spanset filter ('{') or '('",
+    span: Span {
+        start: 0,
+        end: 0,
+    },
+}

@@ -1,0 +1,38 @@
+Query {
+    spanset: Binary {
+        op: Or,
+        lhs: Filter(
+            SpansetFilter {
+                body: Some(
+                    Comparison {
+                        field: Intrinsic(
+                            Status,
+                        ),
+                        op: Eq,
+                        value: Status(
+                            Error,
+                        ),
+                    },
+                ),
+            },
+        ),
+        rhs: Filter(
+            SpansetFilter {
+                body: Some(
+                    Comparison {
+                        field: Intrinsic(
+                            Duration,
+                        ),
+                        op: Gt,
+                        value: Duration(
+                            Duration(
+                                1000000000,
+                            ),
+                        ),
+                    },
+                ),
+            },
+        ),
+    },
+    pipeline: [],
+}

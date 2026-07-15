@@ -1,0 +1,1 @@
+{ resource.service.name = "checkout" } | avg(duration) > 100ms

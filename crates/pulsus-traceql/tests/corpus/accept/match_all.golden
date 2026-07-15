@@ -1,0 +1,8 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: None,
+        },
+    ),
+    pipeline: [],
+}

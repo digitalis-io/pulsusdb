@@ -1,0 +1,46 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: And,
+                    lhs: Binary {
+                        op: And,
+                        lhs: Comparison {
+                            field: Attribute {
+                                scope: Resource,
+                                key: "service.name",
+                            },
+                            op: Eq,
+                            value: String(
+                                "checkout",
+                            ),
+                        },
+                        rhs: Comparison {
+                            field: Attribute {
+                                scope: Span,
+                                key: "http.status_code",
+                            },
+                            op: Gte,
+                            value: Number(
+                                "500",
+                            ),
+                        },
+                    },
+                    rhs: Comparison {
+                        field: Intrinsic(
+                            Duration,
+                        ),
+                        op: Gt,
+                        value: Duration(
+                            Duration(
+                                2000000000,
+                            ),
+                        ),
+                    },
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

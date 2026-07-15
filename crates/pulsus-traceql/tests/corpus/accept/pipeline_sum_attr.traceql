@@ -1,0 +1,1 @@
+{} | sum(span.bytes) >= 1000

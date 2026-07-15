@@ -1,0 +1,32 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: Or,
+                    lhs: Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                        op: Eq,
+                        value: Number(
+                            "1",
+                        ),
+                    },
+                    rhs: Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "b",
+                        },
+                        op: Eq,
+                        value: Number(
+                            "2",
+                        ),
+                    },
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

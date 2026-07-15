@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "number \"100\"",
+    expected: "a duration with a unit (e.g. 2s, 100ms)",
+    span: Span {
+        start: 13,
+        end: 16,
+    },
+}

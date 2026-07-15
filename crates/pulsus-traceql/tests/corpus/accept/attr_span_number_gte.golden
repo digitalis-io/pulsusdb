@@ -1,0 +1,19 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Span,
+                        key: "http.status_code",
+                    },
+                    op: Gte,
+                    value: Number(
+                        "500",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

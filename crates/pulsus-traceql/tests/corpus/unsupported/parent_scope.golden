@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "parent scope",
+    span: Span {
+        start: 2,
+        end: 8,
+    },
+}

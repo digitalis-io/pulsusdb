@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "identifier \"parent\"",
+    expected: "an intrinsic (name, duration, status, kind) or a scoped attribute (span., resource., or the unscoped . form)",
+    span: Span {
+        start: 2,
+        end: 8,
+    },
+}

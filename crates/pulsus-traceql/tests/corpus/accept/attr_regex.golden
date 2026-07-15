@@ -1,0 +1,19 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Span,
+                        key: "http.url",
+                    },
+                    op: Re,
+                    value: String(
+                        "/api/.*",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

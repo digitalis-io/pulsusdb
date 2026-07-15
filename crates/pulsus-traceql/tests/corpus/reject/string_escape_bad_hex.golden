@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "'Z' in a hex escape (expected 2 hex digits)",
+    expected: "a valid escape (\\a, \\b, \\f, \\n, \\r, \\t, \\v, \\\\, \\\", \\xHH, \\NNN octal, \\uXXXX, or \\UXXXXXXXX)",
+    span: Span {
+        start: 10,
+        end: 12,
+    },
+}

@@ -1,0 +1,18 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        Kind,
+                    ),
+                    op: Neq,
+                    value: Kind(
+                        Producer,
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

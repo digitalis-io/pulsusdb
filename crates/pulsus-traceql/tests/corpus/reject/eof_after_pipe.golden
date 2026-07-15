@@ -1,0 +1,7 @@
+UnexpectedEof {
+    expected: "a pipeline stage (count, sum, avg, min, max, or select)",
+    span: Span {
+        start: 12,
+        end: 12,
+    },
+}

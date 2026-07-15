@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "identifier \"name\"",
+    expected: "an aggregatable field (duration or an attribute)",
+    span: Span {
+        start: 9,
+        end: 13,
+    },
+}

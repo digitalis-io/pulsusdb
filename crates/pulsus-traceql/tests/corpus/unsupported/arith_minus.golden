@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "arithmetic operator '-'",
+    span: Span {
+        start: 9,
+        end: 10,
+    },
+}

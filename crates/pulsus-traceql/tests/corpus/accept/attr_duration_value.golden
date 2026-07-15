@@ -1,0 +1,21 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Span,
+                        key: "client.timeout",
+                    },
+                    op: Eq,
+                    value: Duration(
+                        Duration(
+                            5000000000,
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

@@ -238,7 +238,7 @@ Live tail (`/api/logs/v1/tail`) is a WebSocket loop polling the tail of `log_sam
 
 In-house parser → planner → SQL generator over `trace_attrs_idx` + `trace_spans`:
 
-- Span-attribute conditions become index reads intersected per span (same `GROUP BY ... HAVING` shape as LogQL matchers); intrinsics (`duration`, `status`, `name`, service) filter directly on indexed columns.
+- Span-attribute conditions become index reads intersected per span (same `GROUP BY ... HAVING` shape as LogQL matchers); intrinsics (`duration`, `status`, `name`, `kind`) filter directly on indexed columns. `service` is not a TraceQL intrinsic — it is the `resource.service.name` attribute, which the planner maps to the physical `service` column.
 - The planner produces a bounded candidate set of `(trace_id, span_id)` and hydrates from `trace_spans` — by primary key for ID fetches, via the `service_time` projection for service-scoped searches.
 - **TraceQL metrics** (`/api/traces/v1/metrics/query_range`, `/api/traces/v1/metrics/query`) compile the same span filters into `GROUP BY toStartOfInterval(...)` aggregations evaluated fully in ClickHouse.
 

@@ -1,0 +1,35 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        Status,
+                    ),
+                    op: Eq,
+                    value: Status(
+                        Error,
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Select {
+            fields: [
+                Attribute {
+                    scope: Span,
+                    key: "http.status_code",
+                },
+                Attribute {
+                    scope: Unscoped,
+                    key: "foo",
+                },
+                Attribute {
+                    scope: Resource,
+                    key: "service.name",
+                },
+            ],
+        },
+    ],
+}

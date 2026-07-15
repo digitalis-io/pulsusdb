@@ -1,0 +1,22 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: None,
+        },
+    ),
+    pipeline: [
+        Aggregate {
+            op: Sum,
+            field: Some(
+                Attribute {
+                    scope: Span,
+                    key: "bytes",
+                },
+            ),
+            cmp: Gte,
+            value: Number(
+                "1000",
+            ),
+        },
+    ],
+}

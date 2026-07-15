@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "Unicode escape value 0xD800",
+    expected: "a valid Unicode scalar value (not a surrogate, at most 0x10FFFF)",
+    span: Span {
+        start: 10,
+        end: 16,
+    },
+}

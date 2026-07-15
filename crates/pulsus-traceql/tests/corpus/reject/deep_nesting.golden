@@ -1,0 +1,6 @@
+RecursionLimitExceeded {
+    span: Span {
+        start: 66,
+        end: 67,
+    },
+}

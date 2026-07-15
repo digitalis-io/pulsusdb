@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "byte escape value 0xFF",
+    expected: "a byte escape at or below 0x7F (non-ASCII bytes are not representable as UTF-8 text; use \\uXXXX)",
+    span: Span {
+        start: 10,
+        end: 14,
+    },
+}

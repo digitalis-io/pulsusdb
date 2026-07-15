@@ -1,0 +1,6 @@
+UnterminatedString {
+    span: Span {
+        start: 9,
+        end: 15,
+    },
+}

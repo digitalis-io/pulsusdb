@@ -1,0 +1,27 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        Status,
+                    ),
+                    op: Eq,
+                    value: Status(
+                        Error,
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Aggregate {
+            op: Count,
+            field: None,
+            cmp: Gt,
+            value: Number(
+                "3",
+            ),
+        },
+    ],
+}

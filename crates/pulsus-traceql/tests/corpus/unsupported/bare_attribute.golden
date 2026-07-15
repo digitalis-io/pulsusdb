@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "bare attribute expression",
+    span: Span {
+        start: 2,
+        end: 6,
+    },
+}

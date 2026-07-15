@@ -235,6 +235,8 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 | `start`, `end` | unix seconds |
 | `limit`, `spss` | result and spans-per-spanset caps |
 
+**Duration literals** (in `q`, e.g. `duration > 2s`): an **unsigned** decimal number (integer or fraction — `2`, `1.5`, `.5`) **immediately** followed by exactly **one** unit from `{ns, us, µs, ms, s, m, h}`. No sign; no compound literals (`1h30m` is rejected). A fractional literal is valid only if it resolves to an exact whole number of nanoseconds (`0.5s` = 500000000ns is valid; `0.1ns` is a positioned parse error) — no rounding, no truncation.
+
 Response: `{"traces":[{"traceID","rootServiceName","rootTraceName","startTimeUnixNano","durationMs","spanSets":[...]}],"metrics":{...}}`.
 
 ### 4.3 Tags

@@ -1,0 +1,8 @@
+InvalidDuration {
+    raw: "1w",
+    reason: "unit \"w\" is not supported; allowed units are ns, us, µs, ms, s, m, h",
+    span: Span {
+        start: 13,
+        end: 15,
+    },
+}

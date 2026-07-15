@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "'+'",
+    expected: "a duration literal (e.g. 2s, 100ms)",
+    span: Span {
+        start: 13,
+        end: 14,
+    },
+}

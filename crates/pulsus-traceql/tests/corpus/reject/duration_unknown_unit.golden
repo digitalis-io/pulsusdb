@@ -1,0 +1,8 @@
+InvalidDuration {
+    raw: "5x",
+    reason: "unknown unit \"x\"; allowed units are ns, us, µs, ms, s, m, h",
+    span: Span {
+        start: 13,
+        end: 15,
+    },
+}

@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "identifier \"duration\"",
+    expected: "')' (count() takes no argument)",
+    span: Span {
+        start: 11,
+        end: 19,
+    },
+}

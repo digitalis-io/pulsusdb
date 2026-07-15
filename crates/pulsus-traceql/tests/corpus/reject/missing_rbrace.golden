@@ -1,0 +1,7 @@
+UnexpectedEof {
+    expected: "'}'",
+    span: Span {
+        start: 8,
+        end: 8,
+    },
+}

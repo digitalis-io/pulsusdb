@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "duration \"30m\"",
+    expected: "'}'",
+    span: Span {
+        start: 15,
+        end: 18,
+    },
+}

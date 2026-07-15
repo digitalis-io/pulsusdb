@@ -1,0 +1,1 @@
+{} | min(.retries) < 2

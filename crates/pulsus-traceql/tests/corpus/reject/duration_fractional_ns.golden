@@ -1,0 +1,7 @@
+FractionalNanoseconds {
+    raw: "0.1ns",
+    span: Span {
+        start: 13,
+        end: 18,
+    },
+}

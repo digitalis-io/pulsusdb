@@ -1,0 +1,1 @@
+{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }

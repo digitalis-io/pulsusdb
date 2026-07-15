@@ -1,0 +1,19 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Resource,
+                        key: "service.name",
+                    },
+                    op: Eq,
+                    value: String(
+                        "checkout",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

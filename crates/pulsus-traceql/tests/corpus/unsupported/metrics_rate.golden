@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "metrics function 'rate'",
+    span: Span {
+        start: 5,
+        end: 9,
+    },
+}

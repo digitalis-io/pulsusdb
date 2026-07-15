@@ -1,0 +1,1 @@
+{ status = error } || { duration > 1s }

@@ -1,0 +1,23 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: None,
+        },
+    ),
+    pipeline: [
+        Aggregate {
+            op: Max,
+            field: Some(
+                Intrinsic(
+                    Duration,
+                ),
+            ),
+            cmp: Lte,
+            value: Duration(
+                Duration(
+                    5000000000,
+                ),
+            ),
+        },
+    ],
+}

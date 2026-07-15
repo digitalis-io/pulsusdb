@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "')'",
+    expected: "a field (select() requires at least one field)",
+    span: Span {
+        start: 12,
+        end: 13,
+    },
+}

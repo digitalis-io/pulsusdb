@@ -1,0 +1,19 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Resource,
+                        key: "deployment.environment",
+                    },
+                    op: Nre,
+                    value: String(
+                        "dev|test",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}
