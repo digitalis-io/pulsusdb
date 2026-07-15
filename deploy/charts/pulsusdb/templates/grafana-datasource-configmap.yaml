@@ -1,0 +1,30 @@
+{{/*
+Parity with `deploy/e2e/grafana/provisioning/datasources/loki.yaml`. Off
+by default (`grafana.datasourceProvisioning.enabled`): the datasource only
+works when `pulsusdb.config.compat_endpoints=true` (docs/configuration.md
+§1, docs/api.md §8) — a default-on datasource would be broken by default,
+so this is opt-in and NOTES.txt/README call the coupling out. Labelled
+`grafana_datasource: "1"` — the standard label the Grafana community Helm
+chart's sidecar watches for, so this ConfigMap is consumable by that
+chart's provisioning sidecar without any extra wiring.
+*/}}
+{{- if .Values.grafana.datasourceProvisioning.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-grafana-datasource
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+    grafana_datasource: "1"
+data:
+  pulsusdb-loki.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: PulsusDB (Loki compat)
+        uid: {{ include "pulsusdb.fullname" . }}-loki
+        type: loki
+        access: proxy
+        url: http://{{ include "pulsusdb.queryServiceName" . }}:{{ .Values.service.port }}
+        isDefault: false
+        editable: false
+{{- end }}

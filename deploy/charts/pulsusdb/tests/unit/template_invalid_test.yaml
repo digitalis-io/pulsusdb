@@ -1,0 +1,104 @@
+suite: values.schema.json / template-time fail-guard negative cases (AC #4)
+release:
+  name: pulsusdb
+  namespace: default
+templates:
+  - deployment-all.yaml
+  - configmap.yaml
+  - secret.yaml
+tests:
+  - it: given an invalid topology enum value, when rendering, then values.schema.json rejects it before templating
+    set:
+      topology: bogus
+    asserts:
+      - failedTemplate:
+          errorPattern: "topology"
+
+  - it: given topology=cluster with clickhouse.shards=1, when rendering, then values.schema.json rejects it (>= 2 required)
+    set:
+      topology: cluster
+      clickhouse.shards: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: "shards"
+
+  - it: given an empty image.repository, when rendering, then values.schema.json rejects it
+    set:
+      image.repository: ""
+    asserts:
+      - failedTemplate:
+          errorPattern: "repository"
+
+  - it: given clickhouse.enabled=false with no pulsusdb.config.clickhouse.server, when rendering, then values.schema.json rejects it (external ClickHouse requires an explicit server)
+    set:
+      clickhouse.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "server"
+
+  - it: given clickhouse.enabled=false with a server set but no clickhouse.auth.existingSecret, when rendering, then the template-time fail guard rejects it (the chart never invents a password for a database it doesn't manage)
+    set:
+      clickhouse.enabled: false
+      pulsusdb.config.clickhouse.server: "external-clickhouse.example.com"
+    asserts:
+      # The `fail` guard lives in configmap.yaml but fires wherever it is
+      # first `include`d during rendering — deployment-all.yaml's
+      # checksum annotation (`pulsusdb.checksums`) reaches it before
+      # configmap.yaml is rendered as its own standalone document, so
+      # helm-unittest attributes the failure to deployment-all.yaml.
+      - failedTemplate:
+          errorPattern: "existingSecret"
+        template: deployment-all.yaml
+
+  - it: given persistence.size with no unit suffix, when rendering, then values.schema.json rejects it (AC #4's literal negative case)
+    set:
+      persistence.size: "10"
+    asserts:
+      - failedTemplate:
+          errorPattern: "size|pattern"
+
+  - it: given clickhouse.replicasPerShard=2, when rendering, then values.schema.json rejects it (restricted to 1 — documented follow-up, not implemented)
+    set:
+      topology: cluster
+      clickhouse.shards: 2
+      clickhouse.replicasPerShard: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicasPerShard"
+
+  - it: given a misspelled top-level key, when rendering, then values.schema.json rejects it (additionalProperties:false — code review round-2 finding #3)
+    set:
+      toplogy: single
+    asserts:
+      - failedTemplate:
+          errorPattern: "toplogy"
+
+  - it: given a misspelled pulsusdb.config key, when rendering, then values.schema.json rejects it (matches pulsus-config's own deny_unknown_fields exactly)
+    set:
+      pulsusdb.config.retentiondays: 7
+    asserts:
+      - failedTemplate:
+          errorPattern: "retentiondays"
+
+  - it: given an extraEnv entry with both value and valueFrom set, when rendering, then values.schema.json rejects it (mutually exclusive, code review round-2 finding #3)
+    set:
+      pulsusdb:
+        extraEnv:
+          - name: FOO
+            value: bar
+            valueFrom:
+              secretKeyRef:
+                name: s
+                key: k
+    asserts:
+      - failedTemplate:
+          errorPattern: "oneOf"
+
+  - it: given an extraEnv entry with neither value nor valueFrom set, when rendering, then values.schema.json rejects it
+    set:
+      pulsusdb:
+        extraEnv:
+          - name: FOO
+    asserts:
+      - failedTemplate:
+          errorPattern: "oneOf"

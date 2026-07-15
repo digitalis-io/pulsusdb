@@ -66,6 +66,18 @@ Development is tracked through GitHub issues; each issue maps to a scoped unit o
 
 PulsusDB is not yet runnable — the first milestone is a working ingest + query path for logs. Watch the repository or the issue tracker to follow progress.
 
+## Deploying with Helm
+
+A Helm chart is available under [`deploy/charts/pulsusdb`](deploy/charts/pulsusdb), published as an OCI artifact:
+
+```sh
+helm install my-pulsusdb oci://ghcr.io/digitalis-io/charts/pulsusdb --version <chart-version>
+```
+
+The default install is a self-contained single-node stack — bundled ClickHouse, one all-mode `pulsusdb` Deployment, and an OTel Collector — the Kubernetes equivalent of the docker-compose quickstart in [docs/configuration.md §10](docs/configuration.md). See the [chart README](deploy/charts/pulsusdb/README.md) for the full values reference, the two orthogonal topology axes (bundled-ClickHouse sharding vs. writer/reader process split), and the probe contract.
+
+**The `pulsusdb` application image is not published to a registry yet** (tracked separately) — real installs need `--set image.tag=<a locally built or future released tag>` until that lands.
+
 ## Contributing
 
 Contributions are welcome once the initial design documents land. Until then, feedback on the architecture and API documents via issues is the most useful way to help.

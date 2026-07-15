@@ -1,0 +1,166 @@
+{{/*
+One StatefulSet + headless Service per shard (`clickhouse.shards`,
+`values.schema.json` requires >= 2 when `topology=cluster`), distinct
+names `<fullname>-clickhouse-shard-0..N` (AC #3, suffix-after-truncate
+safe — code review round-1 finding #7). Each mounts the shared
+`remote_servers.xml`/`zookeeper.xml`/`interserver-credentials.xml`
+ConfigMap plus its own `macros.xml` ConfigMap
+(`clickhouse-cluster-configmap.yaml`).
+
+Liveness/readiness stay HTTP `/ping` — see
+`clickhouse-statefulset-single.yaml`'s doc comment for the full rationale
+(code review round-1 finding #5, REJECTED/pinned by the architect): the
+TCP-only probe contract governs pulsusdb pods only, not ClickHouse's own
+self-health.
+
+`users-d` (round-2 code-review [high] regression fix) — see
+`clickhouse-statefulset-single.yaml`'s doc comment: the entrypoint writes
+`/etc/clickhouse-server/users.d/default-user.xml` whenever
+`CLICKHOUSE_PASSWORD` is set (always, here), which crash-loops under
+`readOnlyRootFilesystem: true` without a writable volume mounted at
+exactly that path.
+*/}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
+{{- range $i := until (int .Values.clickhouse.shards) }}
+{{- $shardName := include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $shardName }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" $ "component" "clickhouse") | nindent 4 }}
+    pulsusdb.digitalis.io/shard: {{ $i | quote }}
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: {{ $.Values.pulsusdb.config.clickhouse.http_port }}
+    - name: native
+      port: {{ $.Values.pulsusdb.config.clickhouse.port }}
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" $ "component" "clickhouse") | nindent 4 }}
+    pulsusdb.digitalis.io/shard: {{ $i | quote }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $shardName }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" $ "component" "clickhouse") | nindent 4 }}
+    pulsusdb.digitalis.io/shard: {{ $i | quote }}
+spec:
+  serviceName: {{ $shardName }}
+  # `clickhouse.replicasPerShard` is restricted to 1 (values.schema.json +
+  # `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard` guard) — see that
+  # guard's doc comment for why true multi-replica-per-shard isn't
+  # supported yet.
+  replicas: {{ $.Values.clickhouse.replicasPerShard }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" $ "component" "clickhouse") | nindent 6 }}
+      pulsusdb.digitalis.io/shard: {{ $i | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" $ "component" "clickhouse") | nindent 8 }}
+        pulsusdb.digitalis.io/shard: {{ $i | quote }}
+      annotations:
+        {{- include "pulsusdb.clickhouseClusterChecksums" $ | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml $.Values.clickhouse.podSecurityContext | nindent 8 }}
+      containers:
+        - name: clickhouse
+          image: {{ $.Values.clickhouse.image }}
+          env:
+            - name: CLICKHOUSE_DB
+              value: {{ $.Values.pulsusdb.config.clickhouse.database }}
+            {{- if ne $.Values.clickhouse.auth.username "default" }}
+            - name: CLICKHOUSE_USER
+              value: {{ $.Values.clickhouse.auth.username }}
+            {{- end }}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulsusdb.clickhouseSecretName" $ }}
+                  key: {{ include "pulsusdb.clickhouseSecretKey" $ }}
+            # Code review round-1 [high] finding #1: shared inter-node
+            # secret for `remote_servers.xml`'s `<secret>` (distributed
+            # query authentication) and `interserver_http_credentials`
+            # (replication part-fetch authentication) — both XML files
+            # below pull this via `from_env`, never a literal value.
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulsusdb.clickhouseSecretName" $ }}
+                  key: {{ include "pulsusdb.clickhouseInterserverSecretKey" $ }}
+          ports:
+            - name: http
+              containerPort: {{ $.Values.pulsusdb.config.clickhouse.http_port }}
+            - name: native
+              containerPort: {{ $.Values.pulsusdb.config.clickhouse.port }}
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            {{- toYaml $.Values.clickhouse.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml $.Values.clickhouse.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/remote_servers.xml
+              subPath: remote_servers.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/zookeeper.xml
+              subPath: zookeeper.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/interserver-credentials.xml
+              subPath: interserver-credentials.xml
+            - name: macros
+              mountPath: /etc/clickhouse-server/config.d/macros.xml
+              subPath: macros.xml
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: {{ include "pulsusdb.fullname" $ }}-clickhouse-cluster-config
+        - name: macros
+          configMap:
+            name: {{ $shardName }}-macros
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+        {{- if not $.Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if $.Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $.Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $.Values.persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,28 @@
+{{/*
+Disabled skeleton only (issue #38 out of scope: functional HPA/VPA
+autoscaling is a follow-up, not implemented here). Targets the reader
+Deployment in split mode (the query tier is the usual autoscale target),
+the all-mode Deployment otherwise.
+*/}}
+{{- if .Values.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ if .Values.pulsusdb.split.enabled }}{{ include "pulsusdb.readerFullname" . }}{{ else }}{{ include "pulsusdb.fullname" . }}{{ end }}
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilizationPercentage }}
+{{- end }}

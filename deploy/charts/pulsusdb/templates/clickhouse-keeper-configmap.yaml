@@ -1,0 +1,41 @@
+{{/*
+Keeper's own config, split into its own file (not inlined into
+`clickhouse-keeper-statefulset.yaml`) specifically so that file's pod
+template can compute a `checksum/config` annotation from *this* file via
+`$.Template.BasePath` (code review round-1 finding #3) without a
+self-referential `include` (a template checksumming its own still-being-
+rendered output is an infinite loop, not just a bad idea).
+*/}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}-config
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+data:
+  keeper_config.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <listen_host>0.0.0.0</listen_host>
+        <keeper_server>
+            <tcp_port>9181</tcp_port>
+            <server_id>1</server_id>
+            <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+            <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+            <four_letter_word_white_list>ruok,mntr,conf</four_letter_word_white_list>
+            <coordination_settings>
+                <operation_timeout_ms>10000</operation_timeout_ms>
+                <session_timeout_ms>30000</session_timeout_ms>
+                <raft_logs_level>warning</raft_logs_level>
+            </coordination_settings>
+            <raft_configuration>
+                <server>
+                    <id>1</id>
+                    <hostname>{{ include "pulsusdb.clickhouseKeeperFullname" . }}-0.{{ include "pulsusdb.clickhouseKeeperFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local</hostname>
+                    <port>9234</port>
+                </server>
+            </raft_configuration>
+        </keeper_server>
+    </clickhouse>
+{{- end }}

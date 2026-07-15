@@ -1,0 +1,34 @@
+{{/*
+Renders `pulsusdb.config` as `config.yaml`, matching docs/configuration.md
+§9's schema exactly (non-secret keys only — `auth_password` and the
+ClickHouse password live in `templates/secret.yaml`, never here). Mounted
+read-only at `/etc/pulsusdb/config.yaml`; every serving Deployment passes
+`--config /etc/pulsusdb/config.yaml --mode <mode>` (`mode` is not a key in
+this document — it is a per-Deployment `--mode` flag, docs/configuration.md
+§9 note: root scalars only, `mode` defaults to `all` and is overridden per
+process by the CLI flag, which wins over the YAML file).
+*/}}
+{{- include "pulsusdb.validateClickhouseServer" . -}}
+{{- include "pulsusdb.validateClickhouseAuth" . -}}
+{{- include "pulsusdb.validateReplicasPerShard" . -}}
+{{- $cfg := deepCopy .Values.pulsusdb.config }}
+{{- $clusterName := "" }}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
+{{- $clusterName = .Values.clickhouse.clusterName }}
+{{- else if .Values.pulsusdb.config.cluster }}
+{{- $clusterName = .Values.pulsusdb.config.cluster }}
+{{- end }}
+{{- $_ := set $cfg "cluster" (ternary $clusterName nil (ne $clusterName "")) }}
+{{- $_ := set $cfg.clickhouse "server" (include "pulsusdb.clickhouseServer" . | trim) }}
+{{- if .Values.pulsusdb.auth.user }}
+{{- $_ := set $cfg "auth_user" .Values.pulsusdb.auth.user }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-config
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml $cfg | nindent 4 }}

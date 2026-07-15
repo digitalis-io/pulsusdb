@@ -1,0 +1,65 @@
+{{- if .Values.otelCollector.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.otelCollectorFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "otel-collector") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "otel-collector") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pulsusdb.otelCollectorFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "otel-collector") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "otel-collector") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" . "component" "otel-collector") | nindent 8 }}
+      annotations:
+        {{- include "pulsusdb.otelChecksums" $ | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.otelCollector.podSecurityContext | nindent 8 }}
+      containers:
+        - name: otel-collector
+          image: {{ .Values.otelCollector.image }}
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            {{- toYaml .Values.otelCollector.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.otelCollector.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib/config.yaml
+              subPath: config.yaml
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pulsusdb.otelCollectorFullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+{{- end }}

@@ -1,0 +1,42 @@
+# Helm chart for PulsusDB (issue #38 architect plan). Chart SemVer is
+# independent of the `pulsusdb` application SemVer (task-manager resolution
+# #4, issue #38): this chart is published on `helm-v*` tags to
+# `oci://ghcr.io/digitalis-io/charts/pulsusdb`, the application image on
+# plain `v*` tags to `ghcr.io/digitalis-io/pulsusdb` (.github/workflows/
+# release.yml, docs/releasing.md). `appVersion` below tracks the
+# **released image tag** this chart version was verified against (resolved
+# open question #3), not the `pulsus-server` crate's `0.0.0` dev-build
+# placeholder — bump it deliberately per release, `chart-publish` asserts
+# it matches `image.tag` when `image.tag` is set.
+apiVersion: v2
+name: pulsusdb
+description: >-
+  A lightweight, all-in-one observability database for logs, metrics,
+  traces, and profiles, backed by ClickHouse. This chart deploys PulsusDB
+  (single all-mode or split writer/reader), optionally a bundled
+  single-node or sharded ClickHouse, and an OpenTelemetry Collector for
+  OTLP + Prometheus remote-write ingestion.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.27.0-0"
+home: https://github.com/digitalis-io/pulsusdb
+sources:
+  - https://github.com/digitalis-io/pulsusdb
+keywords:
+  - observability
+  - logs
+  - metrics
+  - traces
+  - profiles
+  - clickhouse
+  - opentelemetry
+maintainers:
+  - name: Digitalis.io
+    url: https://digitalis.io
+annotations:
+  # OCI publish parity with .github/workflows/release.yml's image labels
+  # (issue #38 plan amendment §4) — carried through `helm package`'s
+  # Chart.yaml annotations into the pushed OCI artifact's manifest.
+  org.opencontainers.image.source: https://github.com/digitalis-io/pulsusdb
+  org.opencontainers.image.licenses: AGPL-3.0-only

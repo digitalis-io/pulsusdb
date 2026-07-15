@@ -1,0 +1,401 @@
+# Default values for the pulsusdb chart.
+#
+# `pulsusdb.config` maps 1:1 onto docs/configuration.md §9's YAML document
+# schema (issue #38 AC #14 / architect plan) — every key here that lands in
+# the rendered ConfigMap `config.yaml` is a real `pulsus-config` field, no
+# invented keys. Secrets (`auth_password`, the ClickHouse password half of
+# `CLICKHOUSE_AUTH`) are deliberately **not** represented in
+# `pulsusdb.config` — they are chart-only values under `pulsusdb.auth` /
+# `clickhouse.auth`, rendered into a Secret and injected as env vars, which
+# win over the YAML file per the documented precedence (docs/
+# configuration.md: "CLI flags > environment variables > YAML > defaults").
+
+# -- Container image for the pulsusdb binary.
+image:
+  # `ghcr.io/digitalis-io/pulsusdb` is not yet published (M7 release job,
+  # issue #38 Dependencies section) — this is a placeholder repository.
+  # Real installs must `--set image.tag=<released-tag>` until M7 lands;
+  # `chart-test-kind` CI overrides `image.repository`/`tag` to the locally
+  # built-and-`kind load`ed image and never pulls.
+  repository: ghcr.io/digitalis-io/pulsusdb
+  # Empty string => Chart.yaml's appVersion is used (standard Helm
+  # `{{ .Chart.AppVersion }}` fallback convention, `_helpers.tpl`).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- ClickHouse topology axis (orthogonal to `pulsusdb.split.enabled`
+# below): `single` renders one bundled ClickHouse StatefulSet; `cluster`
+# renders a sharded set (`clickhouse.shards` StatefulSets) + a Keeper
+# StatefulSet, mirroring `ci/clickhouse-cluster/`. Only meaningful when
+# `clickhouse.enabled=true` — ignored for external ClickHouse.
+topology: single
+
+pulsusdb:
+  # -- Process-split axis (orthogonal to `topology` above): false (default)
+  # renders one `--mode all` Deployment (schema controller + writer +
+  # reader in one process, docs/architecture.md §1); true renders separate
+  # `--mode writer` and `--mode reader` Deployments, independently scaled.
+  split:
+    enabled: false
+
+  # -- Replica count for the all-mode Deployment (`split.enabled=false`).
+  replicaCount: 1
+
+  writer:
+    replicaCount: 2
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+
+  reader:
+    replicaCount: 2
+    resources:
+      requests: { cpu: 250m, memory: 512Mi }
+      limits: { cpu: "2", memory: 2Gi }
+
+  # -- Resources for the all-mode Deployment (`split.enabled=false`).
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+
+  # -- 1:1 with docs/configuration.md §9's YAML schema (secrets excluded,
+  # see `pulsusdb.auth` / `clickhouse.auth` below) — deliberately snake_case
+  # to match that schema's field names exactly, so `templates/configmap.yaml`
+  # can render this whole subtree with a single `toYaml`, no key-renaming
+  # logic to get subtly wrong. `mode` is intentionally absent here: it is
+  # set per-Deployment-template from `--mode`, not user-configurable.
+  config:
+    host: 0.0.0.0
+    port: 3100
+    log_level: info
+    compat_endpoints: false
+    cors_origin: "*"
+    query_timeout: 2m
+    skip_ddl: false
+    retention_days: 7
+    storage_policy: null
+    rotation_interval: 1h
+    log_rollup_resolution: 5s
+    # -- ClickHouse cluster name (enables `ON CLUSTER` DDL, `Replicated*`
+    # engines, `_dist` tables). `null` here: auto-set to
+    # `clickhouse.clusterName` when `topology=cluster` and
+    # `clickhouse.enabled=true` (`_helpers.tpl`'s `pulsusdb.clusterName`);
+    # set explicitly for an external pre-clustered ClickHouse.
+    cluster: null
+    dist_suffix: _dist
+    skip_unavailable_shards: false
+
+    clickhouse:
+      # -- Left empty here: auto-set to the bundled ClickHouse's entry
+      # Service when `clickhouse.enabled=true` (`_helpers.tpl`'s
+      # `pulsusdb.clickhouseServer`); required non-empty when
+      # `clickhouse.enabled=false` (external ClickHouse, `values.schema.json`
+      # enforces this).
+      server: ""
+      port: 9000
+      http_port: 8123
+      database: pulsus
+      proto: http
+      tls_skip_verify: false
+      pool_size: 8
+
+    writer:
+      batch_bytes: 16MiB
+      batch_ms: 200
+      insert_mode: sync
+      ingest_queue_bytes: 256MiB
+
+    reader:
+      cache_ttl: 60s
+      cache_max_series: 50000
+      series_activity_bucket: 1h
+      cache_window: 24h
+      promql_max_samples: 50000000
+      promql_lookback: 5m
+      logql_scan_budget_bytes: 50GiB
+      traceql_max_candidates: 100000
+
+    downsampling:
+      enabled: false
+      raw_retention: null
+      tier_policy: exact
+      tiers: []
+
+    ruler:
+      enabled: false
+      poll_interval: 30s
+      max_result_bytes: 10MiB
+
+  # -- HTTP Basic auth (docs/configuration.md §1). `user` is non-secret and
+  # rendered into the ConfigMap; `password` is chart-managed: set it
+  # explicitly, or point `existingSecret` at a pre-created Secret carrying
+  # a `PULSUS_AUTH_PASSWORD` key. Both unset (default) => no auth (matches
+  # `pulsus-config`'s own "one-sided is a startup error" contract — do not
+  # set only `user`).
+  auth:
+    user: ""
+    password: ""
+    existingSecret: ""
+
+  # -- Escape hatch for any `PULSUS_*`/`CLICKHOUSE_*` env override the
+  # structured `config`/`auth` values above don't (yet) expose — a
+  # standard `[{name, value}, ...]` or `[{name, valueFrom}, ...]` list,
+  # appended after the chart's own env vars so it can override them.
+  extraEnv: []
+
+  # -- The writer's insert-failure spool volume, mounted at
+  # `/var/lib/pulsusdb` (the image's WORKDIR — `./spool` resolves under
+  # it). `emptyDir` by default; set `persistence.enabled: true` here
+  # (distinct from the ClickHouse `persistence` block below) with a
+  # `size`/`storageClass` for a PVC if spooled batches must survive a pod
+  # reschedule.
+  spool:
+    persistence:
+      enabled: false
+      size: 5Gi
+      storageClass: ""
+
+# -- Disabled-by-default operator-convenience `--mode init` Job (issue #38
+# plan round-2 amendment §1): NOT wired into install/upgrade. Every
+# serving pod already self-reconciles its own schema before it can serve
+# (`crates/pulsus-server/src/serve.rs`'s `ensure_schema_then_connect` runs
+# strictly before the pool is published; `/ready` is 503 until it
+# succeeds) and `run_init`/reconcile is idempotent, so N replicas each
+# self-reconciling is safe by contract — this Job exists only for
+# operators who want first-boot DDL serialized ahead of a very large
+# split/cluster fleet's first rollout. Normally unnecessary.
+initJob:
+  enabled: false
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  backoffLimit: 3
+
+clickhouse:
+  # -- false => external/production ClickHouse: point
+  # `pulsusdb.config.clickhouse.server` (+ `port`/`database`/...) at it and
+  # supply credentials via `pulsusdb.auth.clickhousePassword` or
+  # `clickhouse.auth.existingSecret`. The bundled StatefulSet(s) below are a
+  # CI/compose-fixture-parity convenience, not a hardened HA ClickHouse —
+  # see README.md's production guidance.
+  enabled: true
+  # -- Pinned to a full patch tag, not a floating `24.8` minor (code
+  # review round-1 [low] finding #12) — `24.8` can resolve to a different
+  # image over time as new patches land; digest-pinning is left to
+  # operators who want it (`--set clickhouse.image=...@sha256:...`).
+  # Re-verify this pin is still a published, non-EOL 24.8.x LTS patch
+  # before bumping the chart's own default.
+  image: docker.io/clickhouse/clickhouse-server:24.8.14
+  keeperImage: docker.io/clickhouse/clickhouse-keeper:24.8.14
+
+  # -- Number of shards when `topology=cluster` (`values.schema.json`
+  # requires >= 2). Ignored when `topology=single`.
+  shards: 1
+  # -- Replicas per shard. Restricted to `1` (`values.schema.json`
+  # `maximum: 1` + a `_helpers.tpl` `fail` guard) — true replication needs
+  # per-replica `macros.xml` identities and stable Keeper paths tied to
+  # StatefulSet ordinals, tracked as a documented follow-up, not
+  # implemented here.
+  replicasPerShard: 1
+  clusterName: pulsus_cluster
+
+  # -- Bundled ClickHouse is never passwordless (issue #38 plan amendment
+  # §4): a random password is generated on install (guarded by `lookup` so
+  # upgrades never rotate it) unless `existingSecret` is set, wired into
+  # both the bundled server's users config and `pulsusdb`'s
+  # `CLICKHOUSE_AUTH`.
+  auth:
+    username: default
+    # -- Pre-created Secret with a `password` key, instead of the
+    # chart-generated one. Takes priority over the generated Secret. Must
+    # also carry `existingSecretInterserverKey`'s key (cluster mode only)
+    # — this chart never invents a password for a database it doesn't
+    # manage, including the interserver-authentication secret.
+    existingSecret: ""
+    existingSecretPasswordKey: password
+    # -- Cluster mode only (code review round-1 [high] finding #1):
+    # shared secret value for `remote_servers.xml`'s `<secret>` element
+    # and `interserver_http_credentials`, sourced from the same Secret
+    # object as the password above — never a literal in the rendered XML.
+    existingSecretInterserverKey: interserver-secret
+
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "2", memory: 4Gi }
+
+  keeperResources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+  # -- Hardened per code review round-1 finding #9: the official images
+  # support running as their built-in non-root `clickhouse` user (uid/gid
+  # 101). `readOnlyRootFilesystem: true` is safe only because
+  # `/var/lib/clickhouse` (PVC/emptyDir), `/var/log/clickhouse-server`,
+  # and `/tmp` are all dedicated writable volumes the chart always mounts
+  # (same pairing discipline as pulsusdb's own spool volume). Not
+  # independently verified against a live cluster in this sandbox (no
+  # docker/kind available) — values-overridable if a real cluster run
+  # surfaces a permission issue.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+  # -- Keeper's own hardened context (separately values-overridable per
+  # workload, code review round-1 finding #9) — same non-root uid model as
+  # the `clickhouse/clickhouse-keeper` image ships.
+  keeperPodSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    runAsGroup: 101
+    fsGroup: 101
+    seccompProfile:
+      type: RuntimeDefault
+  keeperSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+persistence:
+  # -- ClickHouse data volumes only (pulsusdb itself is stateless except
+  # for its spool, see `securityContext`/`extraVolumes` below).
+  enabled: true
+  size: 20Gi
+  storageClass: ""
+  keeperSize: 5Gi
+
+otelCollector:
+  enabled: true
+  image: docker.io/otel/opentelemetry-collector-contrib:0.110.0
+  # -- Passthrough escape hatch (code review round-1 finding #11): when
+  # non-empty, rendered verbatim as the collector's whole config.yaml,
+  # replacing this chart's own release-aware default entirely (not
+  # deep-merged — the operator owns wiring the pulsusdb ingest endpoint
+  # correctly in that case). Not exhaustively schema-validated —
+  # `values.schema.json` only checks it is an object.
+  config: {}
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 512Mi }
+  # -- The official image runs as non-root (uid/gid 10001) by default;
+  # matched here explicitly rather than left to the image's own default,
+  # values-overridable per code review round-1 finding #9.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop: [ALL]
+
+grafana:
+  # -- Parity with `deploy/e2e/grafana/provisioning/datasources/loki.yaml`;
+  # off by default because the datasource only works when
+  # `pulsusdb.config.compatEndpoints=true` (docs/configuration.md §1,
+  # docs/api.md §8) — NOTES.txt/README call this coupling out.
+  datasourceProvisioning:
+    enabled: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+service:
+  type: ClusterIP
+  port: 3100
+
+# -- Non-root, matching the published image (Dockerfile uid/gid 10001,
+# WORKDIR `/var/lib/pulsusdb`).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- `readOnlyRootFilesystem: true` is safe only because the spool
+# (`/var/lib/pulsusdb/spool`, docs/configuration.md §5) is backed by a
+# dedicated writable volume the chart always mounts — see
+# `pulsusdb.spool` below, plus an `emptyDir` at `/tmp`.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+# -- Probe contract (issue #38 plan amendment §1 — do not deviate):
+# readiness is the ONLY probe that ever depends on ClickHouse/the reader
+# cache, and the ONLY probe that never restarts a pod (it only removes it
+# from Service endpoints). liveness and startupProbe are both plain TCP
+# `:3100` in every mode, so no ClickHouse outage or cold cache can ever
+# trigger a restart. The string `/ready` must appear in readinessProbe
+# only.
+livenessProbe:
+  tcpSocket:
+    port: 3100
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 3100
+  periodSeconds: 5
+  failureThreshold: 3
+startupProbe:
+  tcpSocket:
+    port: 3100
+  failureThreshold: 60
+  periodSeconds: 5
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: pulsusdb.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+hpa:
+  # -- Disabled skeleton only (issue #38 out of scope: functional
+  # autoscaling is a follow-up).
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# -- Additional pod-level annotations/labels for every workload this chart
+# renders (pulsusdb, ClickHouse, otel-collector).
+podAnnotations: {}
+podLabels: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

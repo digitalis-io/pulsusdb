@@ -1,0 +1,53 @@
+{{/*
+Rendered when `pulsusdb.split.enabled=true`: the horizontally-scaled
+ingest tier (`--mode writer`, docs/architecture.md §1 topology 2/3).
+*/}}
+{{- if .Values.pulsusdb.split.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pulsusdb.writerFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "writer") | nindent 4 }}
+spec:
+  replicas: {{ .Values.pulsusdb.writer.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "writer") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" . "component" "writer") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "pulsusdb.checksums" $ | nindent 8 }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pulsusdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - {{- include "pulsusdb.container" (dict "root" . "mode" "writer" "resources" .Values.pulsusdb.writer.resources) | nindent 10 }}
+      volumes:
+        {{- include "pulsusdb.volumes" . | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

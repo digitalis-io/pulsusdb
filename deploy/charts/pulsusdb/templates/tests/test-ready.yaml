@@ -1,0 +1,42 @@
+{{/*
+`helm test` hook Pod (issue #38 AC #5/#6's in-cluster behavioural
+assertion): curls `/ready` on every Service this release exposes and
+asserts `200` (docs/api.md §7). Uses the same non-root securityContext
+contract as the pulsusdb workloads themselves — no privilege needed to
+curl an HTTP endpoint.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "pulsusdb.componentFullname" (dict "root" . "suffix" "-test-ready") }}
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: test-ready
+      image: {{ include "pulsusdb.image" . }}
+      command: ["sh", "-c"]
+      args:
+        {{- if .Values.pulsusdb.split.enabled }}
+        - >-
+          wget --spider -q http://{{ include "pulsusdb.writerFullname" . }}:{{ .Values.service.port }}/ready &&
+          wget --spider -q http://{{ include "pulsusdb.readerFullname" . }}:{{ .Values.service.port }}/ready
+        {{- else }}
+        - >-
+          wget --spider -q http://{{ include "pulsusdb.fullname" . }}:{{ .Values.service.port }}/ready
+        {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

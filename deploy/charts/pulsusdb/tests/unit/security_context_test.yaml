@@ -1,0 +1,95 @@
+suite: securityContext + writable-spool-volume pairing (issue #38 review fix)
+release:
+  name: pulsusdb
+  namespace: default
+templates:
+  - deployment-all.yaml
+  - configmap.yaml
+  - secret.yaml
+  - clickhouse-statefulset-single.yaml
+  - clickhouse-secret.yaml
+tests:
+  - it: given default values, when rendering, then the pod runs as non-root uid/gid 10001
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 10001
+      - equal:
+          path: spec.template.spec.securityContext.runAsGroup
+          value: 10001
+
+  - it: given default values, when rendering, then the container filesystem is read-only
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation
+          value: false
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.capabilities.drop
+          value: ["ALL"]
+
+  - it: given readOnlyRootFilesystem is true, when rendering, then a writable spool volume is always mounted at /var/lib/pulsusdb (review fix — the mount and the flag must never be split apart)
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spool
+            mountPath: /var/lib/pulsusdb
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spool
+            emptyDir: {}
+
+  - it: given pulsusdb.spool.persistence.enabled=true, when rendering, then the spool volume is a PVC instead of emptyDir
+    templates:
+      - deployment-all.yaml
+    set:
+      pulsusdb.spool.persistence.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spool
+            persistentVolumeClaim:
+              claimName: pulsusdb-spool
+
+  - it: given default values, when rendering, then a writable /tmp volume is always mounted
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+
+  - it: given the bundled single-node ClickHouse's readOnlyRootFilesystem is true, when rendering, then a writable users.d volume is always mounted (round-2 code-review [high] regression fix — the official entrypoint writes default-user.xml there whenever CLICKHOUSE_PASSWORD is set, which this chart always sets; boot-verified against the pinned image with podman --read-only)
+    templates:
+      - clickhouse-statefulset-single.yaml
+    documentIndex: 1
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: users-d
+            mountPath: /etc/clickhouse-server/users.d
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: users-d
+            emptyDir: {}

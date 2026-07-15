@@ -1,0 +1,119 @@
+suite: probe matrix (issue #38 plan amendment §1 — the only restarting probe is liveness, and it never touches /ready)
+release:
+  name: pulsusdb
+  namespace: default
+templates:
+  - deployment-all.yaml
+  - deployment-writer.yaml
+  - deployment-reader.yaml
+  - init-job.yaml
+  - configmap.yaml
+  - secret.yaml
+  - service.yaml
+tests:
+  - it: given the all-mode Deployment, when rendering, then liveness is plain TCP :3100 (never HTTP, never /ready)
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.tcpSocket.port
+          value: 3100
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet
+
+  - it: given the all-mode Deployment, when rendering, then readiness is the only probe that references /ready
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /ready
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: 3100
+
+  - it: given the all-mode Deployment, when rendering, then startupProbe is plain TCP :3100 with a generous failureThreshold (never HTTP, never /ready — a /ready startup probe would restart-loop a fresh rollout during a ClickHouse outage)
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.tcpSocket.port
+          value: 3100
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe.httpGet
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.failureThreshold
+          value: 60
+
+  - it: given split-mode writer/reader Deployments, when rendering, then the same probe matrix applies identically to both
+    set:
+      pulsusdb.split.enabled: true
+    templates:
+      - deployment-writer.yaml
+      - deployment-reader.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.tcpSocket.port
+          value: 3100
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.path
+          value: /ready
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.tcpSocket.port
+          value: 3100
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe.httpGet
+
+  - it: given pulsusdb.config.port is changed, when rendering, then containerPort and every probe's port follow it — never the independently-defaulted service.port (code review round-1 finding #8)
+    set:
+      pulsusdb.config.port: 9999
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 9999
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.tcpSocket.port
+          value: 9999
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: 9999
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.tcpSocket.port
+          value: 9999
+
+  - it: given pulsusdb.config.port is changed, when rendering the Service, then targetPort stays name-based ("http") so it automatically tracks the container's actual port without needing its own numeric override
+    set:
+      pulsusdb.config.port: 9999
+    templates:
+      - deployment-all.yaml
+      - service.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].name
+          value: http
+        template: deployment-all.yaml
+      - equal:
+          path: spec.ports[0].targetPort
+          value: http
+        template: service.yaml
+      - equal:
+          path: spec.ports[0].port
+          value: 3100
+        template: service.yaml
+
+  - it: given the optional init Job, when rendering, then it has no probes at all (--mode init exits, it never serves HTTP)
+    set:
+      initJob.enabled: true
+    templates:
+      - init-job.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].livenessProbe
+      - notExists:
+          path: spec.template.spec.containers[0].readinessProbe
+      - notExists:
+          path: spec.template.spec.containers[0].startupProbe

@@ -1,0 +1,6 @@
+# pytest-bdd Kind-cluster behavioural suite (issue #38 plan round-2
+# amendment §3). Pinned per the task-manager-approved plan.
+pytest==8.3.*
+pytest-bdd==7.3.*
+kubernetes==31.*
+pyyaml==6.*

@@ -1,0 +1,102 @@
+suite: 63-char-safe component naming (code review round-1 finding #7)
+release:
+  # 53 chars — the maximum length `helm install`/`helm-unittest` itself
+  # accepts for a release name (Helm's own release-name regex caps it at
+  # 53) — this is deliberately as long a release name as Helm allows, to
+  # exercise the truncation path without needing `fullnameOverride`.
+  name: a-very-long-release-name-that-is-quite-long-abcdef
+  namespace: default
+set:
+  topology: cluster
+  clickhouse.shards: 3
+  pulsusdb.split.enabled: true
+templates:
+  - deployment-writer.yaml
+  - deployment-reader.yaml
+  - service.yaml
+  - clickhouse-shard-statefulset.yaml
+  - clickhouse-keeper-statefulset.yaml
+  - otel-collector-deployment.yaml
+  - configmap.yaml
+  - secret.yaml
+  - clickhouse-cluster-configmap.yaml
+  - clickhouse-keeper-configmap.yaml
+  - otel-collector-configmap.yaml
+tests:
+  - it: given a maximum-length release name, when rendering the writer/reader Services, then both names stay <= 63 chars and remain distinct
+    templates:
+      - service.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+        documentIndex: 0
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+        documentIndex: 1
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long-abcdef-pulsu-writer
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long-abcdef-pulsu-reader
+        documentIndex: 1
+
+  - it: given a maximum-length release name, when rendering 3 ClickHouse shards, then every shard StatefulSet name stays <= 63 chars and all 3 remain distinct
+    templates:
+      - clickhouse-shard-statefulset.yaml
+    asserts:
+      - hasDocuments:
+          count: 6 # Service + StatefulSet per shard
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+        documentIndex: 1
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+        documentIndex: 3
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+        documentIndex: 5
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-0
+        documentIndex: 1
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-1
+        documentIndex: 3
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long--clickhouse-shard-2
+        documentIndex: 5
+
+  - it: given a maximum-length release name, when rendering the Keeper StatefulSet, then its name stays <= 63 chars
+    templates:
+      - clickhouse-keeper-statefulset.yaml
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long-a-clickhouse-keeper
+
+  - it: given a maximum-length release name, when rendering the otel-collector Deployment, then its name stays <= 63 chars
+    templates:
+      - otel-collector-deployment.yaml
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: "^.{1,63}$"
+      - equal:
+          path: metadata.name
+          value: a-very-long-release-name-that-is-quite-long-abcd-otel-collector

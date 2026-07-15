@@ -1,0 +1,446 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "pulsusdb",
+  "description": "Values schema for the pulsusdb Helm chart (issue #38). Covers every documented value (code review round-1 finding #11) with additionalProperties:false on every fully-enumerated ('closed') object (code review round-2 finding #3) — genuinely open passthrough objects (otelCollector.config, *.annotations maps, podLabels/podAnnotations/nodeSelector, raw k8s securityContext/probe/affinity/toleration objects this chart never re-models) are deliberately left open, noted inline. Documented limitations: JSON Schema cannot express 'requests <= limits' quantity-ordering (round-2 amendment §2 — Kubernetes' own API-server admission already rejects requests > limits; a pytest-bdd scenario proves that behaviourally instead of re-implementing it here) nor 'clickhouse.replicasPerShard > 1' as anything richer than a numeric ceiling (the real rule — per-replica macros/Keeper-path identity is unimplemented — is enforced by `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard` `fail` guard at template time).",
+  "type": "object",
+  "required": ["image", "topology", "pulsusdb", "clickhouse"],
+  "additionalProperties": false,
+  "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A k8s LocalObjectReference — genuinely just {name}.",
+        "properties": { "name": { "type": "string" } }
+      }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "topology": {
+      "type": "string",
+      "enum": ["single", "cluster"],
+      "description": "The ClickHouse topology axis, orthogonal to pulsusdb.split.enabled."
+    },
+    "pulsusdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "split": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        },
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "writer": { "$ref": "#/definitions/workload" },
+        "reader": { "$ref": "#/definitions/workload" },
+        "resources": { "$ref": "#/definitions/resources" },
+        "config": { "$ref": "#/definitions/pulsusdbConfig" },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "user": { "type": "string" },
+            "password": { "type": "string" },
+            "existingSecret": { "type": "string" }
+          }
+        },
+        "extraEnv": {
+          "type": "array",
+          "description": "Standard Kubernetes env var list — appended after the chart's own env vars, so entries here can override them.",
+          "items": { "$ref": "#/definitions/envVar" }
+        },
+        "spool": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "persistence": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "size": { "$ref": "#/definitions/storageQuantity" },
+                "storageClass": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "initJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "backoffLimit": { "type": "integer", "minimum": 0 },
+        "resources": { "$ref": "#/definitions/resources" }
+      }
+    },
+    "clickhouse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "shards", "replicasPerShard"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "type": "string", "minLength": 1 },
+        "keeperImage": { "type": "string", "minLength": 1 },
+        "shards": { "type": "integer", "minimum": 1 },
+        "replicasPerShard": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1,
+          "description": "Restricted to 1 (documented follow-up: per-replica macros.xml/Keeper-path identity is unimplemented)."
+        },
+        "clusterName": { "type": "string", "minLength": 1 },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "username": { "type": "string", "minLength": 1 },
+            "existingSecret": { "type": "string" },
+            "existingSecretPasswordKey": { "type": "string", "minLength": 1 },
+            "existingSecretInterserverKey": { "type": "string", "minLength": 1 }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "keeperResources": { "$ref": "#/definitions/resources" },
+        "podSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough — deliberately not re-modeled field-by-field." },
+        "securityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough — deliberately not re-modeled field-by-field." },
+        "keeperPodSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough." },
+        "keeperSecurityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough." }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "size": { "$ref": "#/definitions/storageQuantity" },
+        "storageClass": { "type": "string" },
+        "keeperSize": { "$ref": "#/definitions/storageQuantity" }
+      }
+    },
+    "otelCollector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": { "type": "string", "minLength": 1 },
+        "config": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Passthrough OTel Collector config (code review round-1 finding #11): when non-empty, rendered verbatim, replacing the chart's own release-aware default entirely. Deliberately left OPEN (additionalProperties: true) — not exhaustively schema'd, validated only as 'is an object' here; the collector itself validates its own config shape at startup."
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "podSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough." },
+        "securityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough." }
+      }
+    },
+    "grafana": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "datasourceProvisioning": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "enabled": { "type": "boolean" } }
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object", "description": "Arbitrary annotation map — deliberately left open." }
+      }
+    },
+    "podSecurityContext": { "type": "object", "description": "Raw k8s PodSecurityContext passthrough — deliberately not re-modeled field-by-field." },
+    "securityContext": { "type": "object", "description": "Raw k8s SecurityContext passthrough — deliberately not re-modeled field-by-field." },
+    "livenessProbe": { "type": "object", "description": "Raw k8s Probe passthrough — port fields are always overridden from pulsusdb.config.port regardless of what's set here." },
+    "readinessProbe": { "type": "object", "description": "Raw k8s Probe passthrough." },
+    "startupProbe": { "type": "object", "description": "Raw k8s Probe passthrough." },
+    "ingress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "type": "object", "description": "Arbitrary annotation map — deliberately left open." },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "host": { "type": "string" },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": { "type": "string" },
+                    "pathType": { "type": "string", "enum": ["Prefix", "Exact", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "type": "array", "description": "Raw k8s IngressTLS list passthrough — deliberately not re-modeled." }
+      }
+    },
+    "hpa": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "podAnnotations": { "type": "object", "description": "Arbitrary annotation map — deliberately left open." },
+    "podLabels": { "type": "object", "description": "Arbitrary label map — deliberately left open." },
+    "nodeSelector": { "type": "object", "description": "Arbitrary label-selector map — deliberately left open." },
+    "tolerations": { "type": "array", "description": "Raw k8s Toleration list passthrough — deliberately not re-modeled." },
+    "affinity": { "type": "object", "description": "Raw k8s Affinity passthrough — deliberately not re-modeled (deeply nested upstream type)." }
+  },
+  "allOf": [
+    {
+      "$comment": "AC #4 negative case: topology=cluster requires clickhouse.shards >= 2 (owner-specified cross-field rule).",
+      "if": {
+        "properties": { "topology": { "const": "cluster" } },
+        "required": ["topology"]
+      },
+      "then": {
+        "properties": {
+          "clickhouse": {
+            "type": "object",
+            "properties": { "shards": { "type": "integer", "minimum": 2 } }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "AC #4 negative case: pulsusdb.config.clickhouse.server must be non-empty when clickhouse.enabled=false (external ClickHouse) — also enforced at template time by _helpers.tpl's pulsusdb.validateClickhouseServer fail guard, which produces the more actionable error message; this schema rule is the fast pre-templating rejection.",
+      "if": {
+        "properties": {
+          "clickhouse": {
+            "type": "object",
+            "properties": { "enabled": { "const": false } },
+            "required": ["enabled"]
+          }
+        },
+        "required": ["clickhouse"]
+      },
+      "then": {
+        "properties": {
+          "pulsusdb": {
+            "type": "object",
+            "properties": {
+              "config": {
+                "type": "object",
+                "properties": {
+                  "clickhouse": {
+                    "type": "object",
+                    "properties": { "server": { "type": "string", "minLength": 1 } },
+                    "required": ["server"]
+                  }
+                },
+                "required": ["clickhouse"]
+              }
+            },
+            "required": ["config"]
+          }
+        },
+        "required": ["pulsusdb"]
+      }
+    }
+  ],
+  "definitions": {
+    "quantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|m|k|M|G|T|P|E)?$",
+      "description": "A Kubernetes resource quantity (e.g. '20Gi', '500m', '2'). Bare unitless integers (e.g. \"10\") ARE accepted by this pattern for CPU/memory-style quantities per the Kubernetes quantity grammar, where a bare number is meaningful (whole cores, bytes); a value with no digits or an invalid suffix is rejected."
+    },
+    "storageQuantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)$",
+      "description": "A Kubernetes resource quantity with a REQUIRED binary/decimal unit suffix, used for persistence sizes only (AC #4's literal negative case: \"10\" with no unit is rejected — a bare byte count is essentially always a typo for a volume size, unlike cpu/memory where a bare number is meaningful)."
+    },
+    "humanDuration": {
+      "type": ["string", "null"],
+      "description": "pulsus-config's HumanDuration: ms|s|m|h|d|w suffixed (docs/configuration.md §9). Not pattern-validated here — pulsus-config itself rejects a malformed value at startup with an actionable error; this schema only constrains the type."
+    },
+    "byteSize": {
+      "type": ["string", "integer"],
+      "description": "pulsus-config's ByteSize: binary (KiB/MiB/GiB/TiB), decimal (KB/MB/GB/TB), or a bare integer of bytes (docs/configuration.md §9). Not pattern-validated here — see humanDuration's note."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Requests/limits shape only (the two resource keys this chart documents/tests — not full k8s ResourceList generality). JSON Schema cannot express 'requests <= limits' quantity ordering — see this file's top-level description.",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": { "$ref": "#/definitions/quantity" },
+            "memory": { "$ref": "#/definitions/quantity" }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cpu": { "$ref": "#/definitions/quantity" },
+            "memory": { "$ref": "#/definitions/quantity" }
+          }
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 0 },
+        "resources": { "$ref": "#/definitions/resources" }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "description": "code review round-2 finding #3: value/valueFrom are mutually exclusive (never both, and one of the two must be set) — mirrors Kubernetes' own EnvVar contract.",
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": { "type": "string" },
+        "valueFrom": { "type": "object", "description": "Raw k8s EnvVarSource passthrough — deliberately not re-modeled." }
+      },
+      "oneOf": [
+        { "required": ["value"], "not": { "required": ["valueFrom"] } },
+        { "required": ["valueFrom"], "not": { "required": ["value"] } }
+      ]
+    },
+    "pulsusdbConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "1:1 with docs/configuration.md §9's YAML schema (secrets excluded) — pulsus-config's own `Config` struct is `#[serde(deny_unknown_fields)]`, so additionalProperties:false here matches the product's real behaviour exactly, not just this chart's convention.",
+      "properties": {
+        "host": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "log_level": { "type": "string", "enum": ["error", "warn", "info", "debug", "trace"] },
+        "compat_endpoints": { "type": "boolean" },
+        "cors_origin": { "type": "string" },
+        "query_timeout": { "$ref": "#/definitions/humanDuration" },
+        "skip_ddl": { "type": "boolean" },
+        "retention_days": { "type": "integer", "minimum": 1 },
+        "storage_policy": { "type": ["string", "null"] },
+        "rotation_interval": { "$ref": "#/definitions/humanDuration" },
+        "log_rollup_resolution": { "$ref": "#/definitions/humanDuration" },
+        "cluster": { "type": ["string", "null"] },
+        "dist_suffix": { "type": "string" },
+        "skip_unavailable_shards": { "type": "boolean" },
+        "clickhouse": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "server": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "http_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "database": { "type": "string", "minLength": 1 },
+            "proto": { "type": "string", "enum": ["http", "https"] },
+            "tls_skip_verify": { "type": "boolean" },
+            "pool_size": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "writer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "batch_bytes": { "$ref": "#/definitions/byteSize" },
+            "batch_ms": { "type": "integer", "minimum": 1 },
+            "insert_mode": { "type": "string", "enum": ["sync", "async"] },
+            "ingest_queue_bytes": { "$ref": "#/definitions/byteSize" }
+          }
+        },
+        "reader": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "cache_ttl": { "$ref": "#/definitions/humanDuration" },
+            "cache_max_series": { "type": "integer", "minimum": 1 },
+            "series_activity_bucket": { "$ref": "#/definitions/humanDuration" },
+            "cache_window": { "$ref": "#/definitions/humanDuration" },
+            "promql_max_samples": { "type": "integer", "minimum": 1 },
+            "promql_lookback": { "$ref": "#/definitions/humanDuration" },
+            "logql_scan_budget_bytes": { "$ref": "#/definitions/byteSize" },
+            "traceql_max_candidates": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "downsampling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "raw_retention": { "$ref": "#/definitions/humanDuration" },
+            "tier_policy": { "type": "string", "enum": ["exact", "fast"] },
+            "tiers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "resolution", "table", "retention", "min_step"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 },
+                  "resolution": { "$ref": "#/definitions/humanDuration" },
+                  "table": { "type": "string", "minLength": 1 },
+                  "retention": { "$ref": "#/definitions/humanDuration" },
+                  "min_step": { "$ref": "#/definitions/humanDuration" }
+                }
+              }
+            }
+          }
+        },
+        "ruler": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "poll_interval": { "$ref": "#/definitions/humanDuration" },
+            "max_result_bytes": { "$ref": "#/definitions/byteSize" }
+          }
+        }
+      }
+    }
+  }
+}

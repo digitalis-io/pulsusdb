@@ -1,0 +1,40 @@
+{{/*
+Disabled-by-default operator-convenience Job (`initJob.enabled`, issue #38
+plan round-2 amendment §1 — read `values.yaml`'s `initJob` comment for the
+full rationale). NOT a Helm hook and NOT wired into install/upgrade
+ordering: every serving pod already self-reconciles its own schema before
+it can serve, so this Job is redundant on the default path. It exists only
+for operators who want `--mode init` DDL serialized once, ahead of a very
+large split/cluster fleet's first rollout, instead of letting every
+replica's first self-reconcile race (safely — `run_init`/reconcile is
+idempotent — but redundantly at scale).
+*/}}
+{{- if .Values.initJob.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "pulsusdb.componentFullname" (dict "root" . "suffix" "-init") }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "init") | nindent 4 }}
+spec:
+  backoffLimit: {{ .Values.initJob.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" . "component" "init") | nindent 8 }}
+      annotations:
+        {{- include "pulsusdb.checksums" $ | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "pulsusdb.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - {{- include "pulsusdb.container" (dict "root" . "mode" "init" "resources" .Values.initJob.resources) | nindent 10 }}
+      volumes:
+        {{- include "pulsusdb.volumes" . | nindent 8 }}
+{{- end }}

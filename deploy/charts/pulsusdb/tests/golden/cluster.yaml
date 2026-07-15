@@ -1,0 +1,1184 @@
+# Golden snapshot (issue #38) — `helm template` output for manifest-drift review.
+# Regenerate with:
+#   deploy/charts/pulsusdb/tests/golden/check.sh --update
+# `kind: Secret` documents are deliberately excluded — the bundled ClickHouse
+# password is randomly generated per-install (`clickhouse-secret.yaml`'s
+# `lookup`-guarded `randAlphaNum`), so a Secret's rendered content is never
+# stable across renders and would make this file permanently noisy.
+
+---
+# Source: pulsusdb/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: pulsusdb/templates/clickhouse-cluster-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-clickhouse-cluster-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+data:
+  remote_servers.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <remote_servers>
+            <pulsus_cluster>
+                <!-- Code review round-1 [high] finding #1: authenticates
+                     distributed-query traffic between cluster nodes.
+                     Sourced from the generated ClickHouse Secret via
+                     from_env — never a literal here. -->
+                <secret from_env="CLICKHOUSE_INTERSERVER_SECRET"/>
+                <shard>
+                    <internal_replication>true</internal_replication>
+                    <replica>
+                        <host>pulsusdb-clickhouse-shard-0.default.svc.cluster.local</host>
+                        <port>9000</port>
+                    </replica>
+                </shard>
+                <shard>
+                    <internal_replication>true</internal_replication>
+                    <replica>
+                        <host>pulsusdb-clickhouse-shard-1.default.svc.cluster.local</host>
+                        <port>9000</port>
+                    </replica>
+                </shard>
+                <shard>
+                    <internal_replication>true</internal_replication>
+                    <replica>
+                        <host>pulsusdb-clickhouse-shard-2.default.svc.cluster.local</host>
+                        <port>9000</port>
+                    </replica>
+                </shard>
+            </pulsus_cluster>
+        </remote_servers>
+    </clickhouse>
+  zookeeper.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <zookeeper>
+            <node>
+                <host>pulsusdb-clickhouse-keeper-0.pulsusdb-clickhouse-keeper.default.svc.cluster.local</host>
+                <port>9181</port>
+            </node>
+        </zookeeper>
+    </clickhouse>
+  interserver-credentials.xml: |
+    <?xml version="1.0"?>
+    <!--
+      Code review round-1 [high] finding #1: authenticates the
+      interserver-HTTP replication protocol (part-fetch traffic between
+      shards — docs/schemas.md §7's shard-less bookkeeping/catalog
+      replica set means this traffic is real, not theoretical, even at
+      replicasPerShard=1). The password is from_env, sourced from the
+      same generated Secret as remote_servers.xml's <secret> above
+      (`_helpers.tpl`'s pulsusdb.clickhouseInterserverSecretKey) — never a
+      literal. The username is not secret (interserver HTTP has no
+      notion of distinct users beyond this one shared credential).
+    -->
+    <clickhouse>
+        <interserver_http_credentials>
+            <user>interserver</user>
+            <password from_env="CLICKHOUSE_INTERSERVER_SECRET"/>
+        </interserver_http_credentials>
+    </clickhouse>
+---
+# Source: pulsusdb/templates/clickhouse-cluster-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-clickhouse-shard-0-macros
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+data:
+  macros.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <macros>
+            <shard>0</shard>
+            <replica>pulsusdb-clickhouse-shard-0</replica>
+            <cluster>pulsus_cluster</cluster>
+        </macros>
+        <interserver_http_host>pulsusdb-clickhouse-shard-0-0.pulsusdb-clickhouse-shard-0.default.svc.cluster.local</interserver_http_host>
+    </clickhouse>
+---
+# Source: pulsusdb/templates/clickhouse-cluster-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-clickhouse-shard-1-macros
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+data:
+  macros.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <macros>
+            <shard>1</shard>
+            <replica>pulsusdb-clickhouse-shard-1</replica>
+            <cluster>pulsus_cluster</cluster>
+        </macros>
+        <interserver_http_host>pulsusdb-clickhouse-shard-1-0.pulsusdb-clickhouse-shard-1.default.svc.cluster.local</interserver_http_host>
+    </clickhouse>
+---
+# Source: pulsusdb/templates/clickhouse-cluster-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-clickhouse-shard-2-macros
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+data:
+  macros.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <macros>
+            <shard>2</shard>
+            <replica>pulsusdb-clickhouse-shard-2</replica>
+            <cluster>pulsus_cluster</cluster>
+        </macros>
+        <interserver_http_host>pulsusdb-clickhouse-shard-2-0.pulsusdb-clickhouse-shard-2.default.svc.cluster.local</interserver_http_host>
+    </clickhouse>
+---
+# Source: pulsusdb/templates/clickhouse-keeper-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-clickhouse-keeper-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse-keeper
+data:
+  keeper_config.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <listen_host>0.0.0.0</listen_host>
+        <keeper_server>
+            <tcp_port>9181</tcp_port>
+            <server_id>1</server_id>
+            <log_storage_path>/var/lib/clickhouse-keeper/coordination/log</log_storage_path>
+            <snapshot_storage_path>/var/lib/clickhouse-keeper/coordination/snapshots</snapshot_storage_path>
+            <four_letter_word_white_list>ruok,mntr,conf</four_letter_word_white_list>
+            <coordination_settings>
+                <operation_timeout_ms>10000</operation_timeout_ms>
+                <session_timeout_ms>30000</session_timeout_ms>
+                <raft_logs_level>warning</raft_logs_level>
+            </coordination_settings>
+            <raft_configuration>
+                <server>
+                    <id>1</id>
+                    <hostname>pulsusdb-clickhouse-keeper-0.pulsusdb-clickhouse-keeper.default.svc.cluster.local</hostname>
+                    <port>9234</port>
+                </server>
+            </raft_configuration>
+        </keeper_server>
+    </clickhouse>
+---
+# Source: pulsusdb/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  config.yaml: |
+    clickhouse:
+      database: pulsus
+      http_port: 8123
+      pool_size: 8
+      port: 9000
+      proto: http
+      server: pulsusdb-clickhouse-shard-0
+      tls_skip_verify: false
+    cluster: pulsus_cluster
+    compat_endpoints: false
+    cors_origin: '*'
+    dist_suffix: _dist
+    downsampling:
+      enabled: false
+      raw_retention: null
+      tier_policy: exact
+      tiers: []
+    host: 0.0.0.0
+    log_level: info
+    log_rollup_resolution: 5s
+    port: 3100
+    query_timeout: 2m
+    reader:
+      cache_max_series: 50000
+      cache_ttl: 60s
+      cache_window: 24h
+      logql_scan_budget_bytes: 50GiB
+      promql_lookback: 5m
+      promql_max_samples: 50000000
+      series_activity_bucket: 1h
+      traceql_max_candidates: 100000
+    retention_days: 7
+    rotation_interval: 1h
+    ruler:
+      enabled: false
+      max_result_bytes: 10MiB
+      poll_interval: 30s
+    skip_ddl: false
+    skip_unavailable_shards: false
+    storage_policy: null
+    writer:
+      batch_bytes: 16MiB
+      batch_ms: 200
+      ingest_queue_bytes: 256MiB
+      insert_mode: sync
+---
+# Source: pulsusdb/templates/otel-collector-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-otel-collector-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
+
+    exporters:
+      otlphttp:
+        endpoint: http://pulsusdb:3100
+      prometheusremotewrite/pulsus:
+        endpoint: http://pulsusdb:3100/api/v1/write
+        add_metric_suffixes: false
+
+    service:
+      pipelines:
+        logs: { receivers: [otlp], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
+        # traces/profiles pipelines land with their own milestones (M4/M5)
+---
+# Source: pulsusdb/templates/clickhouse-keeper-statefulset.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-clickhouse-keeper
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse-keeper
+spec:
+  clusterIP: None
+  ports:
+    - name: client
+      port: 9181
+    - name: raft
+      port: 9234
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: clickhouse-keeper
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-clickhouse-shard-0
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "0"
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8123
+    - name: native
+      port: 9000
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "0"
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-clickhouse-shard-1
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "1"
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8123
+    - name: native
+      port: 9000
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "1"
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-clickhouse-shard-2
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "2"
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8123
+    - name: native
+      port: 9000
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "2"
+---
+# Source: pulsusdb/templates/otel-collector-deployment.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-otel-collector
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  type: ClusterIP
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: otel-collector
+---
+# Source: pulsusdb/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: all
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3100
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: all
+---
+# Source: pulsusdb/templates/deployment-all.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: all
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: all
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: all
+      annotations:
+        checksum/config: 4bd044677f373be143e77a678dcfb80b6244f50aa03f92594ec714e43f28ec3d
+        checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+    spec:
+      serviceAccountName: pulsusdb
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        -
+          name: pulsusdb
+          image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --mode
+            - all
+            - --config
+            - /etc/pulsusdb/config.yaml
+          ports:
+            - name: http
+              containerPort: 3100
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_AUTH_PASSWORD_ONLY
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            - name: CLICKHOUSE_AUTH
+              value: "default:$(CLICKHOUSE_AUTH_PASSWORD_ONLY)"
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            tcpSocket:
+              port: 3100
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ready
+              port: 3100
+            periodSeconds: 5
+          startupProbe:
+            failureThreshold: 60
+            periodSeconds: 5
+            tcpSocket:
+              port: 3100
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulsusdb
+              readOnly: true
+            - name: spool
+              mountPath: /var/lib/pulsusdb
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-config
+        - name: spool
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+# Source: pulsusdb/templates/otel-collector-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pulsusdb-otel-collector
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: otel-collector
+      annotations:
+        checksum/config: eb2a1d286e54b14e4b0e2463f635a86729947ceec6f70f180f80d1e1b91651b1
+    spec:
+      securityContext:
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: docker.io/otel/opentelemetry-collector-contrib:0.110.0
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib/config.yaml
+              subPath: config.yaml
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-otel-collector-config
+        - name: tmp
+          emptyDir: {}
+---
+# Source: pulsusdb/templates/clickhouse-keeper-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pulsusdb-clickhouse-keeper
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse-keeper
+spec:
+  serviceName: pulsusdb-clickhouse-keeper
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: clickhouse-keeper
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: clickhouse-keeper
+      annotations:
+        checksum/config: 9f46d89acadcc62189cd6b81883d3e750f1fe3e4b8bacf6906baae5a0716126b
+    spec:
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clickhouse-keeper
+          image: docker.io/clickhouse/clickhouse-keeper:24.8.14
+          env:
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: interserver-secret
+          ports:
+            - name: client
+              containerPort: 9181
+            - name: raft
+              containerPort: 9234
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/clickhouse-keeper/keeper_config.xml
+              subPath: keeper_config.xml
+            - name: data
+              mountPath: /var/lib/clickhouse-keeper
+            - name: tmp
+              mountPath: /tmp
+            - name: log
+              mountPath: /var/log/clickhouse-keeper
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-clickhouse-keeper-config
+        - name: tmp
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pulsusdb-clickhouse-shard-0
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "0"
+spec:
+  serviceName: pulsusdb-clickhouse-shard-0
+  # `clickhouse.replicasPerShard` is restricted to 1 (values.schema.json +
+  # `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard` guard) — see that
+  # guard's doc comment for why true multi-replica-per-shard isn't
+  # supported yet.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: clickhouse
+      pulsusdb.digitalis.io/shard: "0"
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: clickhouse
+        pulsusdb.digitalis.io/shard: "0"
+      annotations:
+        checksum/config: 78a6f1b01851c009a48382fd776f7d8577411906fa92d61f99e1196406f85914
+        checksum/secret: ec729a4d2f4ee1e04f118cd2d6341b3194f43564abe9ff20143d3d2a2305955f
+    spec:
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server:24.8.14
+          env:
+            - name: CLICKHOUSE_DB
+              value: pulsus
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            # Code review round-1 [high] finding #1: shared inter-node
+            # secret for `remote_servers.xml`'s `<secret>` (distributed
+            # query authentication) and `interserver_http_credentials`
+            # (replication part-fetch authentication) — both XML files
+            # below pull this via `from_env`, never a literal value.
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: interserver-secret
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/remote_servers.xml
+              subPath: remote_servers.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/zookeeper.xml
+              subPath: zookeeper.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/interserver-credentials.xml
+              subPath: interserver-credentials.xml
+            - name: macros
+              mountPath: /etc/clickhouse-server/config.d/macros.xml
+              subPath: macros.xml
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: pulsusdb-clickhouse-cluster-config
+        - name: macros
+          configMap:
+            name: pulsusdb-clickhouse-shard-0-macros
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pulsusdb-clickhouse-shard-1
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "1"
+spec:
+  serviceName: pulsusdb-clickhouse-shard-1
+  # `clickhouse.replicasPerShard` is restricted to 1 (values.schema.json +
+  # `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard` guard) — see that
+  # guard's doc comment for why true multi-replica-per-shard isn't
+  # supported yet.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: clickhouse
+      pulsusdb.digitalis.io/shard: "1"
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: clickhouse
+        pulsusdb.digitalis.io/shard: "1"
+      annotations:
+        checksum/config: 78a6f1b01851c009a48382fd776f7d8577411906fa92d61f99e1196406f85914
+        checksum/secret: ec729a4d2f4ee1e04f118cd2d6341b3194f43564abe9ff20143d3d2a2305955f
+    spec:
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server:24.8.14
+          env:
+            - name: CLICKHOUSE_DB
+              value: pulsus
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            # Code review round-1 [high] finding #1: shared inter-node
+            # secret for `remote_servers.xml`'s `<secret>` (distributed
+            # query authentication) and `interserver_http_credentials`
+            # (replication part-fetch authentication) — both XML files
+            # below pull this via `from_env`, never a literal value.
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: interserver-secret
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/remote_servers.xml
+              subPath: remote_servers.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/zookeeper.xml
+              subPath: zookeeper.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/interserver-credentials.xml
+              subPath: interserver-credentials.xml
+            - name: macros
+              mountPath: /etc/clickhouse-server/config.d/macros.xml
+              subPath: macros.xml
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: pulsusdb-clickhouse-cluster-config
+        - name: macros
+          configMap:
+            name: pulsusdb-clickhouse-shard-1-macros
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Source: pulsusdb/templates/clickhouse-shard-statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pulsusdb-clickhouse-shard-2
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+    pulsusdb.digitalis.io/shard: "2"
+spec:
+  serviceName: pulsusdb-clickhouse-shard-2
+  # `clickhouse.replicasPerShard` is restricted to 1 (values.schema.json +
+  # `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard` guard) — see that
+  # guard's doc comment for why true multi-replica-per-shard isn't
+  # supported yet.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: clickhouse
+      pulsusdb.digitalis.io/shard: "2"
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: clickhouse
+        pulsusdb.digitalis.io/shard: "2"
+      annotations:
+        checksum/config: 78a6f1b01851c009a48382fd776f7d8577411906fa92d61f99e1196406f85914
+        checksum/secret: ec729a4d2f4ee1e04f118cd2d6341b3194f43564abe9ff20143d3d2a2305955f
+    spec:
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server:24.8.14
+          env:
+            - name: CLICKHOUSE_DB
+              value: pulsus
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            # Code review round-1 [high] finding #1: shared inter-node
+            # secret for `remote_servers.xml`'s `<secret>` (distributed
+            # query authentication) and `interserver_http_credentials`
+            # (replication part-fetch authentication) — both XML files
+            # below pull this via `from_env`, never a literal value.
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: interserver-secret
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/remote_servers.xml
+              subPath: remote_servers.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/zookeeper.xml
+              subPath: zookeeper.xml
+            - name: cluster-config
+              mountPath: /etc/clickhouse-server/config.d/interserver-credentials.xml
+              subPath: interserver-credentials.xml
+            - name: macros
+              mountPath: /etc/clickhouse-server/config.d/macros.xml
+              subPath: macros.xml
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: cluster-config
+          configMap:
+            name: pulsusdb-clickhouse-cluster-config
+        - name: macros
+          configMap:
+            name: pulsusdb-clickhouse-shard-2-macros
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Source: pulsusdb/templates/tests/test-ready.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pulsusdb-test-ready
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    fsGroup: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: test-ready
+      image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+      command: ["sh", "-c"]
+      args:
+        - >-
+          wget --spider -q http://pulsusdb:3100/ready
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

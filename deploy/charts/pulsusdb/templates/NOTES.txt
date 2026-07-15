@@ -1,0 +1,71 @@
+PulsusDB ({{ .Chart.Name }} {{ .Chart.Version }}, app {{ .Chart.AppVersion }}) has been installed.
+
+{{- if .Values.pulsusdb.split.enabled }}
+
+Ingest Service (writer):
+  {{ include "pulsusdb.writerFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+Query Service (reader):
+  {{ include "pulsusdb.readerFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- else }}
+
+Service:
+  {{ include "pulsusdb.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+{{- end }}
+
+Check readiness (gates traffic; a pod stays running-but-unready during a
+ClickHouse outage or a cold reader cache, it is never restarted for
+that — see the chart README's probe contract):
+
+  kubectl -n {{ .Release.Namespace }} run curl-check --rm -it --restart=Never --image=curlimages/curl -- \
+    curl -sf http://{{ if .Values.pulsusdb.split.enabled }}{{ include "pulsusdb.readerFullname" . }}{{ else }}{{ include "pulsusdb.fullname" . }}{{ end }}:{{ .Values.service.port }}/ready
+
+Run the bundled `helm test` hook (curls /ready on every Service this
+release exposes):
+
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+{{- if .Values.otelCollector.enabled }}
+
+OTel Collector (OTLP ingest — send your application telemetry here):
+  {{ include "pulsusdb.otelCollectorFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:4317 (gRPC)
+  {{ include "pulsusdb.otelCollectorFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:4318 (HTTP)
+{{- end }}
+
+{{- if not .Values.pulsusdb.config.compat_endpoints }}
+
+NOTE: `pulsusdb.config.compat_endpoints` is false — third-party-compatible
+query aliases (e.g. the Loki datasource) are NOT mounted. The PulsusDB
+native API (`/api/logs/v1`, `/api/v1`, `/api/traces/v1`, `/api/profiles/v1`)
+is always available regardless.
+{{- end }}
+
+{{- if .Values.grafana.datasourceProvisioning.enabled }}
+{{- if not .Values.pulsusdb.config.compat_endpoints }}
+
+WARNING: `grafana.datasourceProvisioning.enabled=true` but
+`pulsusdb.config.compat_endpoints=false` — the provisioned Loki datasource
+will 404 on every query until `compat_endpoints` is also enabled.
+{{- end }}
+{{- end }}
+
+{{- if not .Values.clickhouse.enabled }}
+
+ClickHouse is external (`clickhouse.enabled=false`): make sure
+`pulsusdb.config.clickhouse.server` ({{ .Values.pulsusdb.config.clickhouse.server }}) is reachable
+from this namespace and `clickhouse.auth.existingSecret` carries valid
+credentials.
+{{- else }}
+
+Bundled ClickHouse ({{ .Values.topology }} topology) is a CI/compose-
+fixture-parity deployment, not a hardened production ClickHouse — for
+production, set `clickhouse.enabled=false` and point
+`pulsusdb.config.clickhouse.server` at your own cluster (see README.md).
+
+NOTE: if you rotate the bundled ClickHouse's generated password
+out-of-band (e.g. `kubectl edit secret {{ include "pulsusdb.clickhouseSecretName" . }}`),
+existing pods do NOT automatically restart — Helm's checksum-triggered
+rollout mechanism cannot see live Secret content, only the values that
+decide which Secret/keys are wired in (a documented Helm limitation, not
+a chart bug). Run `kubectl rollout restart` on every pulsusdb and
+ClickHouse workload in this release after an out-of-band rotation.
+{{- end }}

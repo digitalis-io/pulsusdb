@@ -1,0 +1,91 @@
+suite: default (topology=single, pulsusdb.split.enabled=false) render
+release:
+  name: pulsusdb
+  namespace: default
+templates:
+  - deployment-all.yaml
+  - deployment-writer.yaml
+  - deployment-reader.yaml
+  - service.yaml
+  - configmap.yaml
+  - secret.yaml
+  - clickhouse-statefulset-single.yaml
+  - clickhouse-secret.yaml
+tests:
+  - it: given default values, when rendering, then it produces exactly one all-mode Deployment
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: Deployment
+      - equal:
+          path: metadata.name
+          value: pulsusdb
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["--mode", "all", "--config", "/etc/pulsusdb/config.yaml"]
+      - equal:
+          path: spec.replicas
+          value: 1
+
+  - it: given default values, when rendering, then no writer/reader split Deployments are produced
+    templates:
+      - deployment-writer.yaml
+      - deployment-reader.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: given default values, when rendering, then exactly one shared Service is produced
+    templates:
+      - service.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: pulsusdb
+      - equal:
+          path: spec.ports[0].port
+          value: 3100
+
+  - it: given default values, when rendering the ConfigMap, then no secret substring ever appears in it
+    templates:
+      - configmap.yaml
+    set:
+      pulsusdb.auth.password: "super-secret-marker"
+    asserts:
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "super-secret-marker"
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: "auth_password"
+
+  - it: given default values, when rendering the ConfigMap, then clickhouse.server resolves to the bundled single-node entry Service
+    templates:
+      - configmap.yaml
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "server: pulsusdb-clickhouse\\b"
+
+  - it: given default values, when rendering, then the bundled ClickHouse is never passwordless
+    templates:
+      - clickhouse-statefulset-single.yaml
+    documentIndex: 1
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].env[?(@.name=="CLICKHOUSE_PASSWORD")].valueFrom.secretKeyRef.name
+          pattern: "pulsusdb-clickhouse"
+
+  - it: given no existingSecret, when rendering the bundled ClickHouse Secret, then it always carries a non-empty generated password
+    templates:
+      - clickhouse-secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isNotEmpty:
+          path: stringData.password

@@ -1,0 +1,58 @@
+{{/*
+One HTTP `:3100` Service — serves both the query API and OTLP-HTTP ingest
+on the same listener (docs/architecture.md §1: "One HTTP listener per
+process serves every mounted API"; the collector's `otlphttp`/
+`prometheusremotewrite` exporters target this same port, no separate gRPC
+4317 Service). Split mode gets independent `-writer` (ingest) and
+`-reader` (query) Services instead of one shared Service, matching the
+independently-scaled Deployments.
+*/}}
+{{- if .Values.pulsusdb.split.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.writerFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "writer") | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "writer") | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.readerFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 4 }}
+{{- else }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "all") | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "all") | nindent 4 }}
+{{- end }}

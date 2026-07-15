@@ -1,0 +1,40 @@
+{{/* Off-by-default PodDisruptionBudget(s), one per rendered pulsusdb workload. */}}
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- if .Values.pulsusdb.split.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.writerFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "writer") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "writer") | nindent 6 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.readerFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "reader") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "reader") | nindent 6 }}
+{{- else }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "all") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "all") | nindent 6 }}
+{{- end }}
+{{- end }}

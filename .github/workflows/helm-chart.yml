@@ -1,0 +1,143 @@
+# Helm chart lint/unit-test/behavioural-test CI (issue #38). Three jobs,
+# gated on PRs/pushes touching `deploy/charts/pulsusdb/**` (this file's own
+# path is included so a workflow change re-runs itself):
+#   - chart-lint:      `helm lint --strict` + `helm template` (both
+#                       topologies) + kubeconform schema validation +
+#                       golden-snapshot drift check. Cheap, no cluster.
+#   - chart-unittest:  helm-unittest render/schema specs
+#                       (tests/unit/*_test.yaml). Cheap, no cluster.
+#   - chart-test-kind: builds the local `pulsusdb` image, spins up a real
+#                       Kind cluster, and runs the pytest-bdd behavioural
+#                       suite (tests/bdd/) against it — both topologies,
+#                       split mode, upgrade/uninstall lifecycle, the
+#                       ClickHouse-outage/reconcile-retry resilience
+#                       scenarios, and the OCI package/push/pull round
+#                       trip. This is the literal `.feature`-file BDD
+#                       coverage the owner asked for (task-manager
+#                       resolution #1, issue #38) — see
+#                       deploy/charts/pulsusdb/tests/bdd/conftest.py.
+name: Helm Chart
+
+on:
+  pull_request:
+    paths:
+      - "deploy/charts/pulsusdb/**"
+      - ".github/workflows/helm-chart.yml"
+  push:
+    branches: [main]
+    paths:
+      - "deploy/charts/pulsusdb/**"
+      - ".github/workflows/helm-chart.yml"
+
+env:
+  HELM_VERSION: "v3.18.4"
+  KIND_VERSION: "v0.29.0"
+
+jobs:
+  chart-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: helm lint --strict
+        run: helm lint deploy/charts/pulsusdb --strict
+
+      - name: helm template (topology=single, default values)
+        run: helm template pulsusdb deploy/charts/pulsusdb > /tmp/render-single.yaml
+
+      - name: helm template (topology=cluster, clickhouse.shards=3)
+        run: |
+          helm template pulsusdb deploy/charts/pulsusdb \
+            --set topology=cluster --set clickhouse.shards=3 \
+            > /tmp/render-cluster.yaml
+
+      # AC #2/#3: no `kubectl apply --dry-run=server` validation errors —
+      # kubeconform validates every rendered object's schema the same way
+      # a real API server's structural admission would, without requiring
+      # a live cluster for this cheap per-PR job.
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+
+      - name: kubeconform (schema validation, both topologies)
+        run: |
+          kubeconform -summary -strict -kubernetes-version 1.29.0 /tmp/render-single.yaml
+          kubeconform -summary -strict -kubernetes-version 1.29.0 /tmp/render-cluster.yaml
+
+      - name: Golden snapshot drift check
+        run: bash deploy/charts/pulsusdb/tests/golden/check.sh
+
+  chart-unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install the helm-unittest plugin
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+
+      - name: "helm unittest (render/schema specs: AC #4's negative cases, probes, securityContext, env/secret passthrough)"
+        run: helm unittest -f 'tests/unit/*_test.yaml' deploy/charts/pulsusdb
+
+  chart-test-kind:
+    needs: [chart-lint, chart-unittest]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Install kind
+        run: |
+          curl -sSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install the pytest-bdd suite's pinned dependencies
+        run: pip install -r deploy/charts/pulsusdb/tests/bdd/requirements.txt
+
+      # `conftest.py`'s `kind_cluster`/`pulsusdb_image` fixtures own the
+      # whole lifecycle: create the Kind cluster, `docker build` the repo
+      # `Dockerfile`, `kind load docker-image` it (never a registry pull —
+      # no image is published yet, M7), then run every `.feature` scenario
+      # against it. `--tb=short` keeps a failing scenario's diagnostic
+      # readable without truncating the subprocess stdout/stderr this
+      # suite's `run()` helper embeds in its assertion messages.
+      #
+      # Diagnostics-before-teardown (code review round-1 finding #10) is
+      # owned by `conftest.py` itself, not this workflow: a failing
+      # scenario's `helm_release` fixture dumps its namespace's
+      # `kubectl get/describe/logs` into `target/bdd-diagnostics/<test>/`
+      # *before* deleting that namespace, and the session-scoped
+      # `kind_cluster` fixture runs `kind export logs` into
+      # `target/bdd-diagnostics/session/` *before* deleting the cluster
+      # (both ordered ahead of any cleanup, inside the same fixture
+      # teardown, not left to a separate always-runs-after workflow step
+      # that would find everything already gone).
+      - name: Run the pytest-bdd behavioural suite
+        run: pytest deploy/charts/pulsusdb/tests/bdd -v --tb=short
+
+      - name: Upload BDD diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chart-test-kind-diagnostics
+          path: target/bdd-diagnostics/**
+          if-no-files-found: ignore
+
+      - name: Tear down the Kind cluster (idempotent — conftest.py already deletes it on a clean run)
+        if: always()
+        run: kind delete cluster --name pulsusdb-bdd || true

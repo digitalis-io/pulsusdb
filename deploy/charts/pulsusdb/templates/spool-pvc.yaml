@@ -1,0 +1,24 @@
+{{/*
+Optional PVC backing the writer's insert-failure spool
+(`/var/lib/pulsusdb/spool`) across pod reschedules — `emptyDir` (the
+default, see `pulsusdb.volumes` in `_helpers.tpl`) is fine for most
+deployments since a spooled batch surviving a reschedule is a
+best-effort durability improvement, not a correctness requirement (the
+writer already retries before spooling at all).
+*/}}
+{{- if .Values.pulsusdb.spool.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-spool
+  labels:
+    {{- include "pulsusdb.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with .Values.pulsusdb.spool.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.pulsusdb.spool.persistence.size }}
+{{- end }}

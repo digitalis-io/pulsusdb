@@ -1,0 +1,47 @@
+{{/*
+Collector config templated from `deploy/e2e/otel-config.single.yaml`
+(issue #38 architect plan): logs -> `otlphttp` to pulsusdb's ingest
+Service, metrics -> `prometheusremotewrite` `:3100/api/v1/write`.
+Traces/profiles pipelines are omitted, same as that reference file — no
+ingest routes exist for them yet (M4/M5); wiring them would 404 on every
+export attempt.
+
+`otelCollector.config` (code review round-1 finding #11) is a passthrough
+escape hatch: when set, it is rendered **verbatim**, replacing this
+chart's own release-aware default entirely (the operator takes full
+responsibility for wiring the pulsusdb ingest endpoint correctly in that
+case) — not deep-merged, so there is no surprising partial-override
+behaviour to reason about. Left empty (`{}`, the default), the chart
+renders the computed default below, parameterized by this release's own
+Service names.
+*/}}
+{{- if .Values.otelCollector.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.otelCollectorFullname" . }}-config
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "otel-collector") | nindent 4 }}
+data:
+  config.yaml: |
+    {{- if .Values.otelCollector.config }}
+    {{- toYaml .Values.otelCollector.config | nindent 4 }}
+    {{- else }}
+    receivers:
+      otlp:
+        protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
+
+    exporters:
+      otlphttp:
+        endpoint: http://{{ include "pulsusdb.ingestServiceName" . }}:{{ .Values.service.port }}
+      prometheusremotewrite/pulsus:
+        endpoint: http://{{ include "pulsusdb.ingestServiceName" . }}:{{ .Values.service.port }}/api/v1/write
+        add_metric_suffixes: false
+
+    service:
+      pipelines:
+        logs: { receivers: [otlp], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
+        # traces/profiles pipelines land with their own milestones (M4/M5)
+    {{- end }}
+{{- end }}

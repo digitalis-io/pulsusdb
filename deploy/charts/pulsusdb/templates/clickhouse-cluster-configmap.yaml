@@ -1,0 +1,94 @@
+{{/*
+Cluster-mode ClickHouse config, mirroring `ci/clickhouse-cluster/config.d/`
+(issue #38 architect plan): `remote_servers.xml` enumerates all
+`clickhouse.shards` shards (AC #3's real fan-out contract — pulsusdb's own
+config carries one entry-point + `cluster:` name, never a shard list; see
+`_helpers.tpl`'s `pulsusdb.clickhouseServer` doc comment), `zookeeper.xml`
+points every shard at the bundled Keeper. One `macros.xml` per shard
+(`{shard}`/`{replica}`/`{cluster}` — docs/schemas.md §7's zoo-path
+convention) since `clickhouse.replicasPerShard` is restricted to `1`
+(`values.schema.json` + `_helpers.tpl`'s `pulsusdb.validateReplicasPerShard`
+guard), so each shard's identity is static, unlike a real multi-replica
+StatefulSet which would need per-ordinal macros via the Downward API.
+*/}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
+{{- include "pulsusdb.validateClickhouseAuth" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.fullname" . }}-clickhouse-cluster-config
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+data:
+  remote_servers.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <remote_servers>
+            <{{ .Values.clickhouse.clusterName }}>
+                <!-- Code review round-1 [high] finding #1: authenticates
+                     distributed-query traffic between cluster nodes.
+                     Sourced from the generated ClickHouse Secret via
+                     from_env — never a literal here. -->
+                <secret from_env="CLICKHOUSE_INTERSERVER_SECRET"/>
+                {{- range $i := until (int .Values.clickhouse.shards) }}
+                <shard>
+                    <internal_replication>true</internal_replication>
+                    <replica>
+                        <host>{{ include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}.{{ $.Release.Namespace }}.svc.cluster.local</host>
+                        <port>{{ $.Values.pulsusdb.config.clickhouse.port }}</port>
+                    </replica>
+                </shard>
+                {{- end }}
+            </{{ .Values.clickhouse.clusterName }}>
+        </remote_servers>
+    </clickhouse>
+  zookeeper.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <zookeeper>
+            <node>
+                <host>{{ include "pulsusdb.clickhouseKeeperFullname" . }}-0.{{ include "pulsusdb.clickhouseKeeperFullname" . }}.{{ .Release.Namespace }}.svc.cluster.local</host>
+                <port>9181</port>
+            </node>
+        </zookeeper>
+    </clickhouse>
+  interserver-credentials.xml: |
+    <?xml version="1.0"?>
+    <!--
+      Code review round-1 [high] finding #1: authenticates the
+      interserver-HTTP replication protocol (part-fetch traffic between
+      shards — docs/schemas.md §7's shard-less bookkeeping/catalog
+      replica set means this traffic is real, not theoretical, even at
+      replicasPerShard=1). The password is from_env, sourced from the
+      same generated Secret as remote_servers.xml's <secret> above
+      (`_helpers.tpl`'s pulsusdb.clickhouseInterserverSecretKey) — never a
+      literal. The username is not secret (interserver HTTP has no
+      notion of distinct users beyond this one shared credential).
+    -->
+    <clickhouse>
+        <interserver_http_credentials>
+            <user>interserver</user>
+            <password from_env="CLICKHOUSE_INTERSERVER_SECRET"/>
+        </interserver_http_credentials>
+    </clickhouse>
+{{- range $i := until (int .Values.clickhouse.shards) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}-macros
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" $ "component" "clickhouse") | nindent 4 }}
+data:
+  macros.xml: |
+    <?xml version="1.0"?>
+    <clickhouse>
+        <macros>
+            <shard>{{ $i }}</shard>
+            <replica>{{ include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}</replica>
+            <cluster>{{ $.Values.clickhouse.clusterName }}</cluster>
+        </macros>
+        <interserver_http_host>{{ include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}-0.{{ include "pulsusdb.clickhouseShardFullname" (dict "root" $ "shard" $i) }}.{{ $.Release.Namespace }}.svc.cluster.local</interserver_http_host>
+    </clickhouse>
+{{- end }}
+{{- end }}

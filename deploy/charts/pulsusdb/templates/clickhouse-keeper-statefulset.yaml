@@ -1,0 +1,132 @@
+{{/*
+Single-node clickhouse-keeper for cluster mode, mirroring
+`ci/clickhouse-cluster/keeper/keeper_config.xml` — one Raft voter is
+sufficient for the CI/compose-fixture-parity topology this chart bundles;
+a production Keeper quorum is out of scope (README.md documents
+`clickhouse.enabled=false` as the recommended production path). Config
+lives in `clickhouse-keeper-configmap.yaml`.
+
+Liveness/readiness stay exec-based (`ruok`) — same "dependency, not
+dependent" rationale as ClickHouse's own HTTP `/ping` (see
+`clickhouse-statefulset-single.yaml`'s doc comment, code review round-1
+finding #5, REJECTED/pinned by the architect): the TCP-only probe
+contract governs pulsusdb pods only.
+
+`CLICKHOUSE_INTERSERVER_SECRET` (round-2 code-review [low] finding #4):
+wired identically to the shard StatefulSets, per the round-3 spec's "one
+shared secret value per release, mounted into every shard + keeper" —
+Keeper's own Raft protocol has no `interserver_http_credentials`/`<secret>`
+concept to consume it today, but the env var is present for parity/
+forward-compatibility rather than being silently inconsistent with the
+shards.
+
+`log` (round-2 code-review [high] regression fix, found while boot-
+verifying this fix against the pinned image): the entrypoint's directory
+setup fails closed ("Necessary directory '/var/log/clickhouse-keeper'
+isn't accessible") under `readOnlyRootFilesystem: true` without a
+writable volume mounted at exactly that path — verified directly with
+`podman run --read-only` against the pinned `24.8.14` keeper image; same
+class of bug as the ClickHouse server's `users.d` fix above, different
+path.
+*/}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: client
+      port: 9181
+    - name: raft
+      port: 9234
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 4 }}
+spec:
+  serviceName: {{ include "pulsusdb.clickhouseKeeperFullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse-keeper") | nindent 8 }}
+      annotations:
+        {{- include "pulsusdb.clickhouseKeeperChecksums" $ | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.clickhouse.keeperPodSecurityContext | nindent 8 }}
+      containers:
+        - name: clickhouse-keeper
+          image: {{ .Values.clickhouse.keeperImage }}
+          env:
+            - name: CLICKHOUSE_INTERSERVER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulsusdb.clickhouseSecretName" . }}
+                  key: {{ include "pulsusdb.clickhouseInterserverSecretKey" . }}
+          ports:
+            - name: client
+              containerPort: 9181
+            - name: raft
+              containerPort: 9234
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "echo ruok | timeout 2 nc -w 2 127.0.0.1 9181 | grep -q imok"]
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.clickhouse.keeperResources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.clickhouse.keeperSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/clickhouse-keeper/keeper_config.xml
+              subPath: keeper_config.xml
+            - name: data
+              mountPath: /var/lib/clickhouse-keeper
+            - name: tmp
+              mountPath: /tmp
+            - name: log
+              mountPath: /var/log/clickhouse-keeper
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "pulsusdb.clickhouseKeeperFullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+        - name: log
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.keeperSize }}
+  {{- end }}
+{{- end }}

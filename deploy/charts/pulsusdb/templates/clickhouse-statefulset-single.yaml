@@ -1,0 +1,158 @@
+{{/*
+Bundled single-node ClickHouse (`topology=single`, `clickhouse.enabled=true`)
+— mirrors `deploy/e2e/compose.single.yaml`'s `clickhouse` service. A
+StatefulSet (not a Deployment) because ClickHouse itself is stateful,
+unlike pulsusdb. CI/compose-fixture parity, not a hardened production
+ClickHouse — README.md documents `clickhouse.enabled=false` as the
+recommended production path.
+
+Never passwordless (issue #38 plan amendment §4): setting `CLICKHOUSE_PASSWORD`
+below is what makes the official image's entrypoint both create/password
+the `default` (or `CLICKHOUSE_USER`) account **and** lift its
+127.0.0.1-only network restriction — no custom `users.d/network.xml`
+needed (unlike the CI-only fixture at `ci/clickhouse-cluster/users.d/
+network.xml`, which is a passwordless-default-user hack this chart does
+not ship).
+
+**Liveness/readiness stay HTTP `/ping`, deliberately NOT TCP** (code
+review round-1 [medium] finding #5 — REJECTED by the architect, pinned
+here so it is not re-flagged): the chart's TCP-only liveness/startupProbe
+contract (`values.yaml`'s probe block, `_helpers.tpl`'s `pulsusdb.container`)
+was negotiated specifically for **pulsusdb** pods, whose own `/ready`
+couples to an *external* ClickHouse — a ClickHouse hiccup must never
+restart a *pulsusdb* pod (the restart-storm risk the whole probe-contract
+negotiation was about). ClickHouse itself has no such external dependency
+to protect against here: its `/ping` is local self-health with zero
+cross-service coupling, and a genuinely wedged ClickHouse *should* be
+restarted — it is the dependency being protected, not a dependent that
+could restart-storm because of someone else's outage. HTTP `/ping`
+liveness+readiness is also the standard/official ClickHouse pattern. Do
+not "fix" this to TCP; the two contracts are deliberately different
+because the failure-coupling risk they each guard against is different.
+
+**`readOnlyRootFilesystem: true` + the `users.d` writable volume (round-2
+code-review [high] regression fix):** the official entrypoint
+(`/entrypoint.sh`'s `manage_clickhouse_user`) writes
+`/etc/clickhouse-server/users.d/default-user.xml` on every start whenever
+`CLICKHOUSE_PASSWORD` is set — which this chart always sets (never
+passwordless, above). Verified directly against the pinned
+`24.8.14` image's own entrypoint script (not assumed): every other path it
+creates/chowns (`DATA_DIR`, `TMP_DIR`, `USER_PATH`, `FORMAT_SCHEMA_PATH` —
+all under `/var/lib/clickhouse/`; `LOG_DIR`/`ERROR_LOG_DIR` under
+`/var/log/clickhouse-server/`) is already covered by the `data`/`log`
+volumes below; only `users.d` was missing, which crash-loops the
+container under a read-only root (`mkdir`/`cat >` failing on a read-only
+filesystem). Fixed with a dedicated `emptyDir` at exactly that path — the
+directory is empty in the base image (nothing baked-in to lose by
+mounting over it). Boot-proven: `podman run --read-only --tmpfs /tmp
+--tmpfs /var/lib/clickhouse --tmpfs /var/log/clickhouse-server --tmpfs
+/etc/clickhouse-server/users.d --user 101:101 -e
+CLICKHOUSE_PASSWORD=... clickhouse/clickhouse-server:24.8.14` reaches
+`/ping` 200 and accepts authenticated queries with the set password
+(rejects unauthenticated ones with 403) — verified locally against the
+pinned image before this fix was written up.
+*/}}
+{{- if and .Values.clickhouse.enabled (eq .Values.topology "single") }}
+{{- include "pulsusdb.validateClickhouseAuth" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pulsusdb.clickhouseFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: {{ .Values.pulsusdb.config.clickhouse.http_port }}
+    - name: native
+      port: {{ .Values.pulsusdb.config.clickhouse.port }}
+  selector:
+    {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "pulsusdb.clickhouseFullname" . }}
+  labels:
+    {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 4 }}
+spec:
+  serviceName: {{ include "pulsusdb.clickhouseFullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "pulsusdb.componentSelectorLabels" (dict "root" . "component" "clickhouse") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pulsusdb.componentLabels" (dict "root" . "component" "clickhouse") | nindent 8 }}
+      annotations:
+        {{- include "pulsusdb.clickhouseChecksums" $ | nindent 8 }}
+    spec:
+      securityContext:
+        {{- toYaml .Values.clickhouse.podSecurityContext | nindent 8 }}
+      containers:
+        - name: clickhouse
+          image: {{ .Values.clickhouse.image }}
+          env:
+            - name: CLICKHOUSE_DB
+              value: {{ .Values.pulsusdb.config.clickhouse.database }}
+            {{- if ne .Values.clickhouse.auth.username "default" }}
+            - name: CLICKHOUSE_USER
+              value: {{ .Values.clickhouse.auth.username }}
+            {{- end }}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "pulsusdb.clickhouseSecretName" . }}
+                  key: {{ include "pulsusdb.clickhouseSecretKey" . }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.pulsusdb.config.clickhouse.http_port }}
+            - name: native
+              containerPort: {{ .Values.pulsusdb.config.clickhouse.port }}
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.clickhouse.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.clickhouse.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+      {{- if not .Values.persistence.enabled }}
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
+{{- end }}

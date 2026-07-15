@@ -94,3 +94,65 @@ docker run --rm ghcr.io/digitalis-io/pulsusdb:1.2.3 --version
 `PULSUS_BUILD_VERSION`/`PULSUS_BUILD_REVISION` build-args the image was
 built with, so `--version`, `/status/buildinfo`, and the image's
 `org.opencontainers.image.version`/`.revision` labels always agree.
+
+## 6. Releasing the Helm chart
+
+The Helm chart under `deploy/charts/pulsusdb/` (issue #38) is versioned and
+released **independently** of the application image above — a different
+tag prefix, a different SemVer, a different workflow:
+
+```sh
+git tag helm-v0.2.0
+git push origin helm-v0.2.0
+```
+
+`helm-v*` tags (never plain `v*`, which is the application image trigger
+above) start `.github/workflows/helm-release.yml`, which:
+
+1. Reads `deploy/charts/pulsusdb/Chart.yaml`'s `name`/`version`/`appVersion`.
+2. Guards that `values.yaml`'s default `image.tag` (when non-empty) agrees
+   with `Chart.yaml`'s `appVersion` — `appVersion` is the **released
+   application image tag** this chart version was verified against, not
+   the `pulsus-server` crate's `0.0.0` dev-build placeholder (Cargo.toml
+   is not the version surface for this purpose).
+3. Fails, rather than silently overwriting, if this chart version already
+   exists at `oci://ghcr.io/digitalis-io/charts/pulsusdb` — the whole
+   workflow runs under a single global `concurrency: helm-publish` group
+   (no ref suffix) so two simultaneous tag pushes can never both pass this
+   check before either publishes.
+4. `helm package`s and `helm push`es to
+   `oci://ghcr.io/digitalis-io/charts/pulsusdb`, then `helm pull`s the
+   result back **by digest** (not by the mutable version tag) to verify
+   the round trip before the job is considered successful.
+
+Chart `version` must be bumped in `Chart.yaml` as part of the release PR —
+the workflow's already-exists guard is what enforces this is not
+forgotten, not a human process alone.
+
+**Not yet implemented: chart signing/provenance attestation** (keyless
+cosign). Deferred to a follow-up issue filed alongside #38's closure — it
+needs its own scoped OIDC-identity and consumer-side verification-policy
+decision to be worth doing; what ships today is integrity (digest-verified
+push/pull round trip), not authenticity/provenance.
+
+### One-time: make the GHCR chart package public, and protect `main`
+
+Same one-time manual step as §4 above, for the
+`ghcr.io/digitalis-io/charts/pulsusdb` OCI package specifically (the first
+`helm push` also creates it private by default) — set it Public and link
+it to this repository.
+
+**Also required (issue #38 AC #17), and equally something no workflow can
+do on its own:** a repo owner must enable branch protection on `main`
+requiring the `ci` workflow's checks **and** `chart-lint` /
+`chart-unittest` / **`chart-test-kind`** (`.github/workflows/helm-chart.yml`)
+to pass before merging. `chart-test-kind` in particular is not optional
+once this is set up: `.github/workflows/helm-release.yml`'s AC #11
+interpretation (§6 above) is that the tag-triggered publish workflow runs
+only `helm lint --strict` + `helm-unittest` inline and deliberately does
+**not** re-run the Kind behavioural suite — it relies on `chart-test-kind`
+having already gated the `main` commit a `helm-v*` tag is cut from. If
+`chart-test-kind` is not a required check, that reliance is false, and an
+untested chart could be published. A `GITHUB_TOKEN` cannot modify
+repository branch-protection settings, so this is a manual, one-time
+action in the repository's Settings → Branches page.

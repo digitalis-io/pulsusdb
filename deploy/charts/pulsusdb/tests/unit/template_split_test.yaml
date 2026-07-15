@@ -1,0 +1,84 @@
+suite: split-mode (pulsusdb.split.enabled=true) render
+release:
+  name: pulsusdb
+  namespace: default
+set:
+  pulsusdb.split.enabled: true
+templates:
+  - deployment-all.yaml
+  - deployment-writer.yaml
+  - deployment-reader.yaml
+  - service.yaml
+  - configmap.yaml
+  - secret.yaml
+tests:
+  - it: given split.enabled=true, when rendering, then no all-mode Deployment is produced
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: given split.enabled=true, when rendering, then a writer Deployment with --mode writer is produced
+    templates:
+      - deployment-writer.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: pulsusdb-writer
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["--mode", "writer", "--config", "/etc/pulsusdb/config.yaml"]
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: given split.enabled=true, when rendering, then a reader Deployment with --mode reader is produced
+    templates:
+      - deployment-reader.yaml
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: pulsusdb-reader
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value: ["--mode", "reader", "--config", "/etc/pulsusdb/config.yaml"]
+      - equal:
+          path: spec.replicas
+          value: 2
+
+  - it: given split.enabled=true, when rendering Services, then independent writer and reader Services are produced (not one shared Service)
+    templates:
+      - service.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.name
+          value: pulsusdb-writer
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: pulsusdb-reader
+        documentIndex: 1
+
+  - it: given split.enabled=true and independently-set resources, when rendering, then writer/reader resources are not conflated
+    set:
+      pulsusdb.writer.resources.requests.cpu: "111m"
+      pulsusdb.reader.resources.requests.cpu: "222m"
+    templates:
+      - deployment-writer.yaml
+      - deployment-reader.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "111m"
+        template: deployment-writer.yaml
+      - equal:
+          path: spec.template.spec.containers[0].resources.requests.cpu
+          value: "222m"
+        template: deployment-reader.yaml

@@ -1,0 +1,186 @@
+# Helm chart OCI publish (issue #38). Tag-triggered only, `helm-v*` — an
+# independent tag prefix and independent SemVer from the application image
+# release (`v*` -> .github/workflows/release.yml, docs/releasing.md):
+# chart versioning is decoupled from app releases (task-manager resolution
+# #4). Publishes `oci://ghcr.io/digitalis-io/charts/pulsusdb`.
+#
+# GLOBAL concurrency (task-manager final ruling #1, issue #38): the group
+# has NO ref suffix, so every `chart-publish` run across every tag push
+# serializes against every other one. Publishes are rare — global
+# serialization is free correctness here, and combined with the in-job
+# already-exists guard below, it closes the race the round-3 review found
+# in a ref-keyed (or chart-version-keyed) concurrency group: two tags
+# packaging the same chart version can no longer both pass preflight
+# concurrently, because they can no longer run concurrently at all.
+concurrency: helm-publish
+
+# AC #11 interpretation (code review round-1 finding, resolved by the
+# architect's round-3 code-review disposition item #6): this workflow runs
+# `helm lint --strict` + `helm-unittest` **inline**, as pre-publish gates —
+# fast, self-contained, no cluster needed, and a tag workflow has no way to
+# read a *different* workflow run's PR check results anyway. Kind is
+# deliberately **not** re-run here: `chart-test-kind`
+# (.github/workflows/helm-chart.yml) is a required branch-protection check
+# on `main` (docs/releasing.md), and a `helm-v*` tag is only ever cut from
+# an already-merged `main` commit — the behavioural gate is the merge
+# barrier, not something this tag-triggered job needs to repeat. See
+# docs/releasing.md's branch-protection owner action, which lists
+# `chart-test-kind` among the required checks for exactly this reason.
+on:
+  push:
+    tags: ["helm-v*"]
+
+# Least-privilege: `packages: write` is the only extra permission this job
+# needs to push to GHCR via the ambient `GITHUB_TOKEN` (no PAT). `contents:
+# read` is enough to check out the tag. Mirrors release.yml's permissions
+# block.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  HELM_VERSION: "v3.18.4"
+  CHART_DIR: deploy/charts/pulsusdb
+  OCI_REPO: oci://ghcr.io/digitalis-io/charts
+
+jobs:
+  chart-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # Pre-publish gates (code review round-1 disposition item #6) — fast,
+      # self-contained, no cluster. A failure here aborts the job before
+      # anything is packaged or pushed.
+      - name: helm lint --strict (pre-publish gate)
+        run: helm lint "$CHART_DIR" --strict
+
+      - name: Install the helm-unittest plugin
+        run: helm plugin install https://github.com/helm-unittest/helm-unittest
+
+      - name: helm unittest (pre-publish gate)
+        run: helm unittest -f 'tests/unit/*_test.yaml' "$CHART_DIR"
+
+      - id: chart
+        name: Read Chart.yaml name/version/appVersion
+        run: |
+          name=$(awk -F': *' '/^name:/{print $2; exit}' "$CHART_DIR/Chart.yaml")
+          version=$(awk -F': *' '/^version:/{print $2; exit}' "$CHART_DIR/Chart.yaml")
+          app_version=$(awk -F': *' '/^appVersion:/{print $2; exit}' "$CHART_DIR/Chart.yaml" | tr -d '"')
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+
+      # AC #13 (as resolved — task-manager open-question #3): appVersion is
+      # the released image tag this chart version was verified against,
+      # not the pulsus-server crate's 0.0.0 dev placeholder. `values.yaml`'s
+      # `image.tag: ""` already falls back to `.Chart.AppVersion` at render
+      # time (_helpers.tpl's `pulsusdb.image`), so the only way these two
+      # can diverge is an explicit non-empty `image.tag` default in
+      # values.yaml that no longer matches Chart.yaml's appVersion — fail
+      # the release rather than publish a chart whose documented default
+      # image tag silently disagrees with its own appVersion.
+      - name: appVersion / default image.tag consistency guard
+        run: |
+          set -euo pipefail
+          image_tag=$(awk '/^image:/{f=1} f && /tag:/{print $2; exit}' "$CHART_DIR/values.yaml" | tr -d '"')
+          app_version="${{ steps.chart.outputs.app_version }}"
+          if [ -n "$image_tag" ] && [ "$image_tag" != "$app_version" ]; then
+            echo "::error::values.yaml default image.tag ($image_tag) diverges from Chart.yaml appVersion ($app_version)"
+            exit 1
+          fi
+
+      # Code review round-1 [high] finding #4: authenticate *before* the
+      # existence preflight, not after — with an unauthenticated `helm
+      # pull`, a private/permission-denied response looked identical to
+      # "not found" and the guard below would have treated it as clear to
+      # publish (fail-open). Reordered so the preflight below only ever
+      # runs against an authenticated registry session.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # AC #12: fail (never silently overwrite) if this chart version
+      # already exists in the OCI repository. Combined with this
+      # workflow's GLOBAL concurrency group above, no two runs can ever
+      # race this preflight against each other.
+      #
+      # Fail-closed (code review round-1 finding #4): a *zero* exit status
+      # means the version was pulled successfully — it exists, abort. A
+      # *non-zero* exit status only means "proceed to publish" when the
+      # captured output unambiguously says the manifest/tag does not
+      # exist (`not found` / `manifest unknown` / `name unknown` — the
+      # standard OCI-distribution-spec error codes helm/oras surface for
+      # a genuinely missing artifact). Every other non-zero outcome —
+      # an auth failure, a network error, a 5xx, an empty or unparseable
+      # response — aborts the publish instead of assuming it is safe to
+      # proceed. No `|| true` anywhere in this step.
+      - name: "Already-exists preflight guard (AC #12)"
+        run: |
+          set +e
+          pull_output=$(helm pull "$OCI_REPO/${{ steps.chart.outputs.name }}" --version "${{ steps.chart.outputs.version }}" -d /tmp/preflight 2>&1)
+          status=$?
+          set -e
+          echo "$pull_output"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::pulsusdb-${{ steps.chart.outputs.version }} already exists at $OCI_REPO — bump Chart.yaml's version before releasing"
+            exit 1
+          fi
+          if echo "$pull_output" | grep -qiE 'not found|manifest unknown|name unknown|NAME_UNKNOWN|MANIFEST_UNKNOWN'; then
+            echo "Confirmed not-found for pulsusdb-${{ steps.chart.outputs.version }} — proceeding to publish."
+          else
+            echo "::error::already-exists preflight returned an ambiguous (non-confirmed-not-found) error — failing closed rather than risking an overwrite. See helm pull output above."
+            exit 1
+          fi
+
+      # Label/provenance parity with release.yml's image labels, minus
+      # signing (deferred to a follow-up filed at close — task-manager
+      # plan round-2 amendment §4: cosign/provenance needs its own scoped
+      # OIDC-identity + verification-policy decision to be worth doing).
+      - name: helm package (with source/revision/license annotations)
+        run: |
+          helm package "$CHART_DIR" \
+            --destination /tmp/chart-out \
+            --version "${{ steps.chart.outputs.version }}" \
+            --app-version "${{ steps.chart.outputs.app_version }}"
+
+      - id: push
+        name: helm push
+        run: |
+          set -euo pipefail
+          tgz="/tmp/chart-out/${{ steps.chart.outputs.name }}-${{ steps.chart.outputs.version }}.tgz"
+          out=$(helm push "$tgz" "$OCI_REPO" 2>&1 | tee /dev/stderr)
+          # `helm push`'s own stderr reports the pushed digest
+          # ("Pushed: ... Digest: sha256:...") — capture it so the
+          # verification step below can pull by digest, not by mutable
+          # tag, proving exactly what was pushed (round-2 amendment §4:
+          # "immutable-digest verification").
+          digest=$(echo "$out" | grep -oE 'sha256:[0-9a-f]{64}' | tail -n1)
+          if [ -z "$digest" ]; then
+            echo "::error::could not parse a digest out of helm push output"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # AC #11: helm pull smoke step verifies the round-trip, by digest
+      # (immutable — round-2 amendment §4), not by the mutable version tag.
+      - name: helm pull round-trip verification (by digest)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/verify
+          helm pull "$OCI_REPO/${{ steps.chart.outputs.name }}@${{ steps.push.outputs.digest }}" -d /tmp/verify
+          tar xzf /tmp/verify/*.tgz -C /tmp/verify
+          pulled_name=$(awk -F': *' '/^name:/{print $2; exit}' "/tmp/verify/${{ steps.chart.outputs.name }}/Chart.yaml")
+          pulled_version=$(awk -F': *' '/^version:/{print $2; exit}' "/tmp/verify/${{ steps.chart.outputs.name }}/Chart.yaml")
+          if [ "$pulled_name" != "${{ steps.chart.outputs.name }}" ] || [ "$pulled_version" != "${{ steps.chart.outputs.version }}" ]; then
+            echo "::error::round-trip mismatch: pulled name=$pulled_name version=$pulled_version, expected name=${{ steps.chart.outputs.name }} version=${{ steps.chart.outputs.version }}"
+            exit 1
+          fi
+          echo "Verified oci://ghcr.io/digitalis-io/charts/${{ steps.chart.outputs.name }}@${{ steps.push.outputs.digest }} round-trips to Chart.yaml name/version ${pulled_name}/${pulled_version}"

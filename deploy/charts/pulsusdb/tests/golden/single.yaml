@@ -1,0 +1,509 @@
+# Golden snapshot (issue #38) — `helm template` output for manifest-drift review.
+# Regenerate with:
+#   deploy/charts/pulsusdb/tests/golden/check.sh --update
+# `kind: Secret` documents are deliberately excluded — the bundled ClickHouse
+# password is randomly generated per-install (`clickhouse-secret.yaml`'s
+# `lookup`-guarded `randAlphaNum`), so a Secret's rendered content is never
+# stable across renders and would make this file permanently noisy.
+
+---
+# Source: pulsusdb/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: pulsusdb/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  config.yaml: |
+    clickhouse:
+      database: pulsus
+      http_port: 8123
+      pool_size: 8
+      port: 9000
+      proto: http
+      server: pulsusdb-clickhouse
+      tls_skip_verify: false
+    cluster: null
+    compat_endpoints: false
+    cors_origin: '*'
+    dist_suffix: _dist
+    downsampling:
+      enabled: false
+      raw_retention: null
+      tier_policy: exact
+      tiers: []
+    host: 0.0.0.0
+    log_level: info
+    log_rollup_resolution: 5s
+    port: 3100
+    query_timeout: 2m
+    reader:
+      cache_max_series: 50000
+      cache_ttl: 60s
+      cache_window: 24h
+      logql_scan_budget_bytes: 50GiB
+      promql_lookback: 5m
+      promql_max_samples: 50000000
+      series_activity_bucket: 1h
+      traceql_max_candidates: 100000
+    retention_days: 7
+    rotation_interval: 1h
+    ruler:
+      enabled: false
+      max_result_bytes: 10MiB
+      poll_interval: 30s
+    skip_ddl: false
+    skip_unavailable_shards: false
+    storage_policy: null
+    writer:
+      batch_bytes: 16MiB
+      batch_ms: 200
+      ingest_queue_bytes: 256MiB
+      insert_mode: sync
+---
+# Source: pulsusdb/templates/otel-collector-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pulsusdb-otel-collector-config
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols: { grpc: { endpoint: 0.0.0.0:4317 }, http: { endpoint: 0.0.0.0:4318 } }
+
+    exporters:
+      otlphttp:
+        endpoint: http://pulsusdb:3100
+      prometheusremotewrite/pulsus:
+        endpoint: http://pulsusdb:3100/api/v1/write
+        add_metric_suffixes: false
+
+    service:
+      pipelines:
+        logs: { receivers: [otlp], exporters: [otlphttp] }
+        metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus] }
+        # traces/profiles pipelines land with their own milestones (M4/M5)
+---
+# Source: pulsusdb/templates/clickhouse-statefulset-single.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-clickhouse
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8123
+    - name: native
+      port: 9000
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: clickhouse
+---
+# Source: pulsusdb/templates/otel-collector-deployment.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb-otel-collector
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  type: ClusterIP
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: otel-collector
+---
+# Source: pulsusdb/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: all
+spec:
+  type: ClusterIP
+  ports:
+    - port: 3100
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/component: all
+---
+# Source: pulsusdb/templates/deployment-all.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pulsusdb
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: all
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: all
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: all
+      annotations:
+        checksum/config: 74d397ebd3a0b8ebf8be502327e459323de11b294c37e86dd1d534b418f1267d
+        checksum/secret: 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b
+    spec:
+      serviceAccountName: pulsusdb
+      securityContext:
+        fsGroup: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        -
+          name: pulsusdb
+          image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --mode
+            - all
+            - --config
+            - /etc/pulsusdb/config.yaml
+          ports:
+            - name: http
+              containerPort: 3100
+              protocol: TCP
+          env:
+            - name: CLICKHOUSE_AUTH_PASSWORD_ONLY
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+            - name: CLICKHOUSE_AUTH
+              value: "default:$(CLICKHOUSE_AUTH_PASSWORD_ONLY)"
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            tcpSocket:
+              port: 3100
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /ready
+              port: 3100
+            periodSeconds: 5
+          startupProbe:
+            failureThreshold: 60
+            periodSeconds: 5
+            tcpSocket:
+              port: 3100
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/pulsusdb
+              readOnly: true
+            - name: spool
+              mountPath: /var/lib/pulsusdb
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-config
+        - name: spool
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+# Source: pulsusdb/templates/otel-collector-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pulsusdb-otel-collector
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: otel-collector
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: otel-collector
+      annotations:
+        checksum/config: eb2a1d286e54b14e4b0e2463f635a86729947ceec6f70f180f80d1e1b91651b1
+    spec:
+      securityContext:
+        runAsGroup: 10001
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          image: docker.io/otel/opentelemetry-collector-contrib:0.110.0
+          args: ["--config=/etc/otelcol-contrib/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol-contrib/config.yaml
+              subPath: config.yaml
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: pulsusdb-otel-collector-config
+        - name: tmp
+          emptyDir: {}
+---
+# Source: pulsusdb/templates/clickhouse-statefulset-single.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pulsusdb-clickhouse
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: clickhouse
+spec:
+  serviceName: pulsusdb-clickhouse
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pulsusdb
+      app.kubernetes.io/instance: pulsusdb
+      app.kubernetes.io/component: clickhouse
+  template:
+    metadata:
+      labels:
+        helm.sh/chart: pulsusdb-0.1.0
+        app.kubernetes.io/name: pulsusdb
+        app.kubernetes.io/instance: pulsusdb
+        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/managed-by: Helm
+        app.kubernetes.io/component: clickhouse
+      annotations:
+        checksum/secret: ec729a4d2f4ee1e04f118cd2d6341b3194f43564abe9ff20143d3d2a2305955f
+    spec:
+      securityContext:
+        fsGroup: 101
+        runAsGroup: 101
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: clickhouse
+          image: docker.io/clickhouse/clickhouse-server:24.8.14
+          env:
+            - name: CLICKHOUSE_DB
+              value: pulsus
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: pulsusdb-clickhouse
+                  key: password
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          livenessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: "2"
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/clickhouse
+            - name: log
+              mountPath: /var/log/clickhouse-server
+            - name: tmp
+              mountPath: /tmp
+            - name: users-d
+              mountPath: /etc/clickhouse-server/users.d
+      volumes:
+        - name: log
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: users-d
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+# Source: pulsusdb/templates/tests/test-ready.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pulsusdb-test-ready
+  labels:
+    helm.sh/chart: pulsusdb-0.1.0
+    app.kubernetes.io/name: pulsusdb
+    app.kubernetes.io/instance: pulsusdb
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    fsGroup: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: test-ready
+      image: ghcr.io/digitalis-io/pulsusdb:0.1.0
+      command: ["sh", "-c"]
+      args:
+        - >-
+          wget --spider -q http://pulsusdb:3100/ready
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+          - ALL
+        readOnlyRootFilesystem: true
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

@@ -31,3 +31,9 @@ xtask/docker/certs/
 # directory, per `writer::config::WriterRuntime`'s documented constant.
 /spool/
 crates/pulsus-write/spool/
+
+# Helm chart pytest-bdd suite (issue #38): kubeconfig for the session-scoped
+# Kind cluster fixture, plus normal Python bytecode caches.
+deploy/charts/pulsusdb/tests/bdd/.kubeconfig-*
+**/__pycache__/
+*.pyc
