@@ -59,10 +59,19 @@ jobs:
       # kubeconform validates every rendered object's schema the same way
       # a real API server's structural admission would, without requiring
       # a live cluster for this cheap per-PR job.
+      #
+      # `/usr/local/bin` is not reliably writable by the unprivileged
+      # `runner` user on GitHub-hosted ubuntu runners (first real CI run,
+      # issue #38: an unrelated sibling step's plain `chmod
+      # /usr/local/bin/kind` failed with "Operation not permitted") —
+      # `sudo` (passwordless on these runners) every write there, even
+      # though this particular extraction happened to succeed in that
+      # run; both steps write to the same root-owned directory and must
+      # be equally robust, not just the one that already broke.
       - name: Install kubeconform
         run: |
           curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
-            | tar xz -C /usr/local/bin kubeconform
+            | sudo tar xz -C /usr/local/bin kubeconform
 
       - name: kubeconform (schema validation, both topologies)
         run: |
@@ -97,10 +106,22 @@ jobs:
         with:
           version: ${{ env.HELM_VERSION }}
 
+      # KISS pick over `helm/kind-action@v1` (first real CI run, issue #38):
+      # `conftest.py`'s own `kind_cluster` fixture already owns the whole
+      # cluster lifecycle (`kind create cluster --name pulsusdb-bdd`,
+      # kubeconfig discovery, teardown) — swapping in a marketplace action
+      # that *also* creates its own (differently-named, by default)
+      # cluster would mean reconciling two cluster-naming/kubeconfig
+      # stories instead of one. Installing the `kind` binary is the only
+      # thing this workflow needs to add; `sudo install` (passwordless on
+      # GitHub-hosted ubuntu runners) fixes the actual failure — a plain
+      # `curl -o /usr/local/bin/kind && chmod +x` isn't reliably
+      # root-writable there ("Operation not permitted" on the first real
+      # run) — in one line, with no other step's behaviour changing.
       - name: Install kind
         run: |
-          curl -sSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
+          curl -sSLo /tmp/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
 
       - uses: actions/setup-python@v6
         with:
