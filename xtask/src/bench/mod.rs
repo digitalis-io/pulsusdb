@@ -1,12 +1,18 @@
-//! `cargo xtask bench logs-read` — the M1 logs read-path benchmark
-//! harness (issue #16). Generates a deterministic logs corpus (two
-//! profiles: `ci`, minutes-scale, wired into the `schema-it` CI job; and
-//! `full`, the parameterized 1 TB/7d/50-service/5k-stream Tier-2
-//! reference shape, manual-only), runs the product planner's own
-//! generated SQL for the three issue query shapes plus the §9-mandated
-//! label/series discovery shape, captures per-query `system.query_log`
-//! evidence and `EXPLAIN indexes = 1`, and emits JSON (+ optionally a
-//! markdown table body) evidence.
+//! `cargo xtask bench <scenario>` — the benchmark/evidence-harness
+//! subcommand. Two scenarios:
+//!
+//! - `logs-read` (issue #16) — the M1 logs read-path benchmark. Generates a
+//!   deterministic logs corpus (two profiles: `ci`, minutes-scale, wired
+//!   into the `schema-it` CI job; and `full`, the parameterized 1 TB/7d/
+//!   50-service/5k-stream Tier-2 reference shape, manual-only), runs the
+//!   product planner's own generated SQL for the three issue query shapes
+//!   plus the §9-mandated label/series discovery shape, captures per-query
+//!   `system.query_log` evidence and `EXPLAIN indexes = 1`, and emits JSON
+//!   (+ optionally a markdown table body) evidence.
+//! - `metrics-labels` (issue #34) — the M2 label-resolution benchmark:
+//!   benchmarks the docs/schemas.md §2.1 strategy ladder's three paths
+//!   (cache matcher, SQL fallback, prototype `metric_series_idx`) on a
+//!   deterministic `metric_series` corpus. See [`metrics_labels`].
 //!
 //! Example:
 //! ```text
@@ -27,7 +33,9 @@
 //! plan: recorded numbers are warm, after an explicit warmup pass).
 
 pub mod dataset;
+pub mod metrics_labels;
 pub mod queries;
+mod query_log;
 pub mod report;
 
 use std::time::Duration;
@@ -38,7 +46,7 @@ use pulsus_schema::{RenderCtx, run_init};
 
 #[derive(Parser, Debug, Clone)]
 pub struct BenchArgs {
-    /// Only `"logs-read"` is implemented (issue #16).
+    /// `"logs-read"` (issue #16) or `"metrics-labels"` (issue #34).
     #[arg(default_value = "logs-read")]
     pub scenario: String,
     #[arg(long, value_enum, default_value_t = Profile::Ci)]
@@ -80,21 +88,58 @@ pub struct BenchArgs {
     /// Also render a markdown evidence table to this path.
     #[arg(long)]
     pub report_out: Option<String>,
+
+    // --- `metrics-labels` scenario only (issue #34); all defaulted so
+    // `logs-read` is unaffected. ---
+    /// Per-metric series cardinalities, comma-separated (`metrics-labels`
+    /// only). **`--profile ci` hard-codes a fixed small set and rejects any
+    /// override** (never silently runs the 5M-series shape in CI); only
+    /// `--profile full` accepts this override, defaulting to
+    /// `10000,500000,5000000` when unset. See
+    /// [`metrics_labels::CI_CARDINALITIES`]/[`metrics_labels::FULL_CARDINALITIES`].
+    #[arg(long)]
+    pub metric_cardinalities: Option<String>,
+    /// Activity-bucket sizes to benchmark, comma-separated (`1h`/`1d`
+    /// tokens only, `metrics-labels` only).
+    #[arg(long, default_value = "1h,1d")]
+    pub activity_buckets: String,
+    /// The `metric_series` corpus window in hours (`metrics-labels` only) —
+    /// default matches `PULSUS_CACHE_WINDOW`'s own default (24h).
+    #[arg(long, default_value_t = 24)]
+    pub corpus_window_hours: u64,
+    /// `PULSUS_CACHE_MAX_SERIES` override for the benchmarked
+    /// [`pulsus_read::metrics::LabelCache`] (`metrics-labels` only) —
+    /// raised well above the product default so the in-process matcher
+    /// actually evaluates every benchmarked selector instead of degrading
+    /// to the SQL fallback before doing any work (architect plan edge case
+    /// 1).
+    #[arg(long, default_value_t = 10_000_000)]
+    pub cache_max_series: u64,
+    /// Timed repetitions of the pure in-process `SeriesResolver::resolve`
+    /// call, per selector/cardinality (`metrics-labels` only, path 1).
+    #[arg(long, default_value_t = 1_000)]
+    pub matcher_reps: usize,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Profile {
     Ci,
     Full,
 }
 
+/// Dispatches on `args.scenario` — `"logs-read"` (issue #16) or
+/// `"metrics-labels"` (issue #34); any other value is a hard error.
 pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        args.scenario == "logs-read",
-        "unknown bench scenario {:?} (only \"logs-read\" is implemented)",
-        args.scenario
-    );
+    match args.scenario.as_str() {
+        "logs-read" => run_logs_read(args).await,
+        "metrics-labels" => metrics_labels::run(args).await,
+        other => anyhow::bail!(
+            "unknown bench scenario {other:?} (expected \"logs-read\" or \"metrics-labels\")"
+        ),
+    }
+}
 
+async fn run_logs_read(args: BenchArgs) -> anyhow::Result<()> {
     let (server, http_port) = parse_http_url(&args.http_url)?;
     let admin_cfg = ChConnConfig {
         server,

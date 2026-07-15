@@ -115,6 +115,31 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test ingest_fidelity
 
+      # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
+      # step — reproducibility + a committed CI-scale evidence artifact
+      # only (task-manager resolution #2: no asserted `system.query_log`
+      # ratio gate here, a follow-up once the report shows which ratios are
+      # stable). `--profile ci` hard-codes a fixed, small cardinality set
+      # ([1_000, 10_000, 50_000]) and rejects any `--metric-cardinalities`
+      # override, so this step can never silently run the 5M-series
+      # design-target shape in CI. Reuses this job's ClickHouse 24.8
+      # container.
+      - name: M2 metrics-labels benchmark (--profile ci smoke)
+        run: |
+          cargo run -p xtask -- bench metrics-labels \
+            --http-url http://127.0.0.1:19123 --database pulsus_bench_metrics_ci \
+            --profile ci --seed 42 --reps 3 --matcher-reps 200 \
+            --out docs/benchmarks/data/metrics-labels-ci.json \
+            --report-out /tmp/metrics-labels-ci.md
+
+      - name: Upload M2 metrics-labels evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-labels-ci-evidence
+          path: |
+            docs/benchmarks/data/metrics-labels-ci.json
+            /tmp/metrics-labels-ci.md
+
       # Live API/engine suites — every env-gated suite runs here; new issues
       # must wire theirs in. Each test self-isolates via its own throwaway
       # database (`DROP DATABASE IF EXISTS` + a unique `pulsus_*_it_*` name)

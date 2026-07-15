@@ -64,11 +64,12 @@
 use std::time::Instant;
 
 use futures::StreamExt;
-use pulsus_clickhouse::{ChClient, ChRow, Idempotency, QuerySettings, Row};
+use pulsus_clickhouse::{ChClient, ChRow, QuerySettings, Row};
 use pulsus_read::logql::sql::{self, TimeWindow};
 use pulsus_read::logql::{Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 use super::dataset::DatasetSummary;
+use super::query_log::{QueryLogTotals, flush_logs, flush_logs_before_shard_read, read_query_log};
 
 /// One shard's evidence for a `--dist` run (empty in single-node mode) —
 /// **every** shard in the cluster gets an entry per stage, whether it
@@ -140,25 +141,6 @@ fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
     sorted_ms[idx.min(sorted_ms.len() - 1)]
 }
 
-#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
-struct QueryLogTotals {
-    read_rows: u64,
-    read_bytes: u64,
-    selected_marks: u64,
-    memory_usage: u64,
-    query_duration_ms: u64,
-}
-
-impl std::ops::AddAssign for QueryLogTotals {
-    fn add_assign(&mut self, other: Self) {
-        self.read_rows += other.read_rows;
-        self.read_bytes += other.read_bytes;
-        self.selected_marks += other.selected_marks;
-        self.memory_usage = self.memory_usage.max(other.memory_usage);
-        self.query_duration_ms += other.query_duration_ms;
-    }
-}
-
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct FingerprintRow {
     fingerprint: u64,
@@ -196,55 +178,6 @@ struct MetricRow {
 struct LabelNameRow {
     #[allow(dead_code)]
     name: String,
-}
-
-/// Flushes `system.query_log` on the connected node only. `cluster`
-/// distinguishes this from [`flush_logs_before_shard_read`]: every shard's
-/// `QueryFinish` row for a distributed sub-query lands in *that shard's
-/// own* local `system.query_log`, which only its own periodic flush
-/// interval (or its own `FLUSH LOGS`) makes queryable — flushing the
-/// initiator alone leaves the other shards' rows invisible to
-/// `read_shard_evidence`'s `clusterAllReplicas` read.
-async fn flush_logs(client: &ChClient) -> anyhow::Result<()> {
-    client
-        .execute(
-            "SYSTEM FLUSH LOGS",
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await?;
-    Ok(())
-}
-
-/// Flushes `system.query_log` cluster-wide (`ON CLUSTER`) before a
-/// `--dist` shard-evidence read — see [`flush_logs`]'s doc comment for
-/// why a local-only flush is not enough once `read_shard_evidence` needs
-/// every shard's own rows.
-async fn flush_logs_before_shard_read(client: &ChClient, cluster: &str) -> anyhow::Result<()> {
-    client
-        .execute(
-            &format!("SYSTEM FLUSH LOGS ON CLUSTER {cluster}"),
-            &QuerySettings::new(),
-            Idempotency::Idempotent,
-        )
-        .await?;
-    Ok(())
-}
-
-async fn read_query_log(client: &ChClient, query_id: &str) -> anyhow::Result<QueryLogTotals> {
-    let sql = format!(
-        "SELECT read_rows, read_bytes, ProfileEvents['SelectedMarks'] AS selected_marks, \
-         memory_usage, query_duration_ms FROM system.query_log \
-         WHERE query_id = '{query_id}' AND type = 'QueryFinish' \
-         ORDER BY event_time_microseconds DESC LIMIT 1"
-    );
-    let mut stream = client
-        .query_stream::<QueryLogTotals>(&sql, &QuerySettings::new())
-        .await?;
-    match stream.next().await {
-        Some(row) => Ok(row?),
-        None => Ok(QueryLogTotals::default()),
-    }
 }
 
 /// One shard's raw `system.query_log` row for a stage, before it is
