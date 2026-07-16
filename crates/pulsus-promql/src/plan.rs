@@ -642,6 +642,20 @@ fn plan_binary(planner: &mut Planner, bin: &BinaryExpr) -> Result<PlanExpr, Prom
                     ));
                 }
             }
+            // Issue #81: the vendored parser accepts the experimental
+            // `fill`/`fill_left`/`fill_right` binary-operator modifiers
+            // (`BinModifier::fill_values`), but the M2 evaluator has no
+            // unmatched-side filling — dropping the modifier here would
+            // silently return wrong (unfilled) results, the worst failure
+            // class for a query engine. Reject by name until M6-07
+            // implements the real semantics and removes this. Zero cost
+            // for non-fill queries: a single `is_some()` check on the
+            // already-parsed modifier struct.
+            if m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some() {
+                return Err(unsupported(
+                    "fill/fill_left/fill_right (binary-operator fill modifier)",
+                ));
+            }
             let matching = match &m.matching {
                 None => Matching::default_ignoring_none(),
                 Some(LabelModifier::Include(ls)) => Matching {
@@ -984,6 +998,45 @@ mod tests {
         let expr = parse("foo and bar").unwrap();
         let err = plan(&expr, params()).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    /// Issue #81: every fill-modifier spelling (`fill`, `fill_left`,
+    /// `fill_right`, and both one-sided forms combined) must fail with a
+    /// *named* `Unsupported` — before this reject, `plan_binary` silently
+    /// dropped `BinModifier::fill_values` and returned wrong (unfilled)
+    /// results. M6-07 implements the real semantics and removes the
+    /// reject.
+    #[test]
+    fn every_fill_modifier_spelling_is_a_named_unsupported() {
+        for query in [
+            "foo + fill(0) bar",
+            "foo + fill_left(0) bar",
+            "foo + fill_right(0) bar",
+            "foo + fill_left(5) fill_right(7) bar",
+            "foo == bool fill(30) bar",
+            "foo + on(job) fill(0) bar",
+        ] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert!(
+                    construct.contains("fill"),
+                    "{query}: error must name the fill construct, got {construct:?}"
+                ),
+                other => panic!("{query}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #81 guard for the non-fill side: a modifier *without* fill
+    /// values (plain `on(...)`) keeps planning exactly as before — the
+    /// reject is a single `is_some()` check on the already-parsed
+    /// modifier, never a new cost or behavior change for non-fill
+    /// queries.
+    #[test]
+    fn a_modifier_without_fill_values_still_plans() {
+        let expr = parse("foo * on(job) bar").unwrap();
+        assert!(plan(&expr, params()).is_ok());
     }
 
     #[test]

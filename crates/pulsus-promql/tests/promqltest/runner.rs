@@ -90,6 +90,12 @@ fn walk(expr: &Expr, c: &mut Constructs) {
                 if m.matching.is_some() {
                     c.features.insert("vector-matching-on-ignoring".to_string());
                 }
+                // Issue #81: the experimental fill/fill_left/fill_right
+                // binary-operator modifiers — scheduled(M6-07); the
+                // planner rejects them by name until then.
+                if m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some() {
+                    c.features.insert("binop-fill-modifier".to_string());
+                }
             }
             walk(&bin.lhs, c);
             walk(&bin.rhs, c);

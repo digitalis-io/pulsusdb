@@ -723,6 +723,12 @@
       "probe": "m atan2 m"
     },
     {
+      "name": "binop-fill-modifier",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m + fill(0) m"
+    },
+    {
       "name": "at-modifier",
       "status": "scheduled",
       "issue": "M6-08",

@@ -574,8 +574,13 @@ fn every_implemented_witness_exists_outside_all_buckets_and_passes() {
 /// The committed closed language-feature set (plan v2 Δ4, amended by the
 /// #64 adjudication on flag 7: `type-and-unit-labels` — the PROM-39
 /// metadata-label semantics — is tracked as a 14th feature, scheduled
-/// into M6-08 as evaluate-and-decide) — asserted against the manifest by
-/// exact identity, both directions.
+/// into M6-08 as evaluate-and-decide; amended again by #81:
+/// `binop-fill-modifier` — the experimental fill/fill_left/fill_right
+/// binary-operator modifiers the planner now rejects by name — is
+/// tracked as a 15th feature, scheduled into M6-07, replacing its 33
+/// eval-divergence ledger entries with manifest-classified
+/// expected-fails) — asserted against the manifest by exact identity,
+/// both directions.
 const CLOSED_LANGUAGE_FEATURES: &[&str] = &[
     "set-op-and",
     "set-op-or",
@@ -584,6 +589,7 @@ const CLOSED_LANGUAGE_FEATURES: &[&str] = &[
     "group_left",
     "group_right",
     "atan2",
+    "binop-fill-modifier",
     "at-modifier",
     "subquery",
     "duration-expression",
