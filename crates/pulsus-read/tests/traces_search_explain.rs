@@ -70,6 +70,14 @@ fn test_ctx(db: &str) -> SchemaParams {
 const DB: &str = "pulsus_traces_search_it";
 /// ≥100k time-spread spans (issue #53 fixture floor).
 const CORPUS_SPANS: u64 = 120_000;
+/// The default MergeTree index granularity: reads are quantized to
+/// whole granules of this many rows, so every `read_rows` bound below
+/// must budget in granule multiples, never in exact matched-row counts
+/// (issue #60 CI flake: a `CORPUS_SPANS / 5` = 24,000 bound sat below
+/// the 3-granule mark of 24,576 — a part/merge layout that selected one
+/// granule more than the local layout breached it with the projection
+/// working perfectly).
+const GRANULE_ROWS: u64 = 8_192;
 /// The whole corpus spans 47h ending "now".
 const WINDOW_NS: i64 = 47 * 3_600 * 1_000_000_000;
 /// `checkout` frequency: 1-in-50 spans (2% ≤ the 5% ceiling).
@@ -429,11 +437,30 @@ async fn two_phase_search_explain_and_budget_gates() {
         "query_log.projections must name service_time, got {:?}",
         row.projections
     );
+    // Granule evidence (the honest pruning unit, #53 pattern): the
+    // EXPLAIN above must select a small subset of the projection's
+    // granules — the layout-robust form of "touches a small fraction".
+    let (proj_sel, proj_total) = primary_key_granules(&raw);
     assert!(
-        row.read_rows < CORPUS_SPANS / 5,
+        proj_sel > 0 && proj_sel * 2 <= proj_total,
+        "the service_time projection read must select at most half the granules \
+         ({proj_sel}/{proj_total}):\n{raw}"
+    );
+    // Row bound with granule headroom — do NOT re-tighten (issue #60 CI
+    // flake, run 29469732884): the true match is ~2,400 checkout rows
+    // (CORPUS_SPANS / CHECKOUT_EVERY), but reads quantize to 8,192-row
+    // granules PER PART, so the measured `read_rows` is a small number
+    // of granules whose count varies with the part/merge layout (CI
+    // observed 26,233 ≈ 3.2 granules where local layouts read under
+    // 24,576). CORPUS_SPANS / 3 = 40,000 ≈ 5 granules: several granules
+    // of headroom above the observed quantization boundary, still 3×
+    // below the 120k full scan this gate exists to catch.
+    assert!(
+        row.read_rows < CORPUS_SPANS / 3,
         "the projection read must touch a small fraction of the corpus \
-         (read {} of {CORPUS_SPANS})",
-        row.read_rows
+         (read {} of {CORPUS_SPANS}; bound {} ≈ 5 granules of {GRANULE_ROWS} rows)",
+        row.read_rows,
+        CORPUS_SPANS / 3
     );
 
     // ---- AC2 gate 2 (issue #53 AC3b): time pruning isolated within one
@@ -626,9 +653,21 @@ async fn two_phase_search_explain_and_budget_gates() {
          way — a read-bounded common-value generator needs a different (plan-\
          amended) SQL shape, not a test assertion"
     );
+    // Granule-aware slop — do NOT re-tighten (same quantization
+    // arithmetic as gate 1): the true prefix is exactly CORPUS_SPANS
+    // attr rows, but each covering part rounds its contiguous
+    // (key, val) range up to whole granules on both ends (≤ ~2 granules
+    // per part), and the attr table's three seeded keys across up to
+    // three date partitions can leave the prefix spread over several
+    // parts depending on merge timing — up to ~6 padding granules
+    // (49,152 rows) in the worst layout, which the previous
+    // CORPUS_SPANS / 4 (30,000 ≈ 3.6 granules) slop could not absorb.
+    // 8 granules (65,536) of headroom still sits far below the 3-key
+    // full-table scan (3 × CORPUS_SPANS = 360k) this gate exists to
+    // catch.
     assert!(
-        limited.read_rows <= CORPUS_SPANS + CORPUS_SPANS / 4,
-        "the read stays confined to the (key, val) prefix (+granule slop), never \
+        limited.read_rows <= CORPUS_SPANS + 8 * GRANULE_ROWS,
+        "the read stays confined to the (key, val) prefix (+8-granule slop), never \
          the whole 3-key attr table (read {} of {} attr rows)",
         limited.read_rows,
         3 * CORPUS_SPANS

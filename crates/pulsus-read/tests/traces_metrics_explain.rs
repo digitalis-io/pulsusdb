@@ -72,6 +72,11 @@ fn test_ctx(db: &str) -> SchemaParams {
 const DB: &str = "pulsus_traces_metrics_expl_it";
 /// ≥100k time-spread spans (issue #53 fixture floor).
 const CORPUS_SPANS: u64 = 120_000;
+/// The default MergeTree index granularity: reads quantize to whole
+/// granules of this many rows per part, so `read_rows` bounds must
+/// budget in granule multiples (issue #60 CI flake on the sibling
+/// `traces_search_explain` suite — see the gate-1 comment below).
+const GRANULE_ROWS: u64 = 8_192;
 /// The whole corpus spans 47h ending "now".
 const WINDOW_NS: i64 = 47 * 3_600 * 1_000_000_000;
 /// `checkout` frequency: 1-in-50 spans (2% ≤ the 5% ceiling).
@@ -372,11 +377,26 @@ async fn metrics_explain_and_budget_gates() {
     // key-only-scan honesty note), so the spans side must contribute only
     // the projection's small service prefix on top — without the
     // projection the spans side alone would add another full CORPUS_SPANS.
+    //
+    // Granule-aware bound — do NOT re-tighten (issue #60 CI flake, run
+    // 29469732884, on the sibling search suite's identical projection
+    // shape): both reads quantize to 8,192-row granules per part. The
+    // attr key prefix is CORPUS_SPANS rows plus up to ~6 padding
+    // granules across the layout's parts; the spans-side projection
+    // prefix is ~2,400 matched rows that CI layouts have realized as
+    // ~26k read rows (3-4 granules/parts' worth). The old
+    // CORPUS_SPANS / 4 (30,000) slop left only ~4k of headroom on that
+    // observed CI layout. CORPUS_SPANS / 2 (60,000 ≈ 7.3 granules)
+    // absorbs both quantization terms while an unprojected spans-side
+    // full scan (another whole CORPUS_SPANS → ≥ 240k total) still fails
+    // this gate by a wide margin.
     assert!(
-        row.read_rows < CORPUS_SPANS + CORPUS_SPANS / 4,
+        row.read_rows < CORPUS_SPANS + CORPUS_SPANS / 2,
         "the spans side must be served by the service_time projection's prefix, not a \
-         full scan (read {} total; attr key prefix alone is ~{CORPUS_SPANS})",
-        row.read_rows
+         full scan (read {} total; attr key prefix alone is ~{CORPUS_SPANS}, bound adds \
+         {} ≈ 7 granules of {GRANULE_ROWS} rows of quantization headroom)",
+        row.read_rows,
+        CORPUS_SPANS / 2
     );
 
     // ---- AC3 gate 2: the attr semi-join subquery prunes on the
