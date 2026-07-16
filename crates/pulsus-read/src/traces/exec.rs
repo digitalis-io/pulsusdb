@@ -68,7 +68,7 @@ use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
 use super::rows::{
     CandidateRow, HydrationRow, MembershipRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow,
-    StrValueRow,
+    StrValueRow, TagNameRow, TagValueRow,
 };
 use super::search_eval::{self, BatchAttrs, HydratedSpan, SpanSummary, TraceMatch, TraceSpans};
 use super::search_plan::{SearchCtx, SearchPlan};
@@ -84,6 +84,19 @@ pub const BATCH_TRACES: usize = 32;
 /// truncates that trace's evaluation set and marks the response partial
 /// (a truncated trace is never silently reported complete).
 pub const MAX_SPANS_PER_TRACE: usize = 10_000;
+
+/// Response cap for the §4.3 tag-names read (`GET /api/traces/v1/tags`,
+/// issue #58) — a documented constant (docs/api.md §4.3; promoted to
+/// config only on evidence). The generated SQL carries
+/// `LIMIT TAG_NAMES_MAX + 1`: the extra row is the truncation probe (the
+/// search path's `gen_cap + 1` convention) — the engine returns at most
+/// `TAG_NAMES_MAX` rows plus a non-silent `truncated` flag.
+pub const TAG_NAMES_MAX: usize = 10_000;
+
+/// Response cap for the §4.3 tag-values read
+/// (`GET /api/traces/v1/tag/{tag}/values`) — same probe convention as
+/// [`TAG_NAMES_MAX`].
+pub const TAG_VALUES_MAX: usize = 1_000;
 
 /// Layer 2 — the single request-scoped retention budget: every byte the
 /// search accumulates (merge tuples, in-flight batch rows, membership
@@ -142,6 +155,14 @@ pub struct TraceReadConfig {
     /// `trace_attrs_idx{_dist}` — the attribute index the search
     /// generators/membership reads target.
     pub attrs_table: String,
+    /// `trace_tag_catalog` — the Global tag catalog the §4.3 discovery
+    /// reads (issue #58) target. NEVER `_dist`-suffixed: migration 18 is
+    /// `Replication::Global, family: None` (no `_dist` wrapper exists to
+    /// name), so every catalog read is a local-replica primary-key-prefix
+    /// scan with no coordinator fan-out (docs/schemas.md §4.1/§7 —
+    /// `chconfig::trace_read_config_from` sets it unconditionally, the
+    /// `metric_metadata` carve-out pattern).
+    pub catalog_table: String,
     /// `reader.traceql_max_candidates` — per-generator top-K depth and
     /// the merged consumption ceiling.
     pub max_candidates: u64,
@@ -187,6 +208,25 @@ pub struct SearchOutput {
     pub partial: bool,
     pub returned: u32,
     pub limit: u32,
+}
+
+/// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct
+/// `(scope, key)` pairs in the catalog's own `(scope, key)` order, at
+/// most [`TAG_NAMES_MAX`] of them; `truncated` is the non-silent cap
+/// indicator — `true` iff the `LIMIT cap + 1` probe row appeared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagNames {
+    pub names: Vec<(String, String)>,
+    pub truncated: bool,
+}
+
+/// [`TraceEngine::list_tag_values`]'s output (issue #58): distinct
+/// values for one key, ordered ascending, at most [`TAG_VALUES_MAX`];
+/// `truncated` as in [`TagNames`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagValues {
+    pub values: Vec<String>,
+    pub truncated: bool,
 }
 
 /// The Layer-2 retention counter: one per request, charged on every
@@ -369,6 +409,73 @@ impl TraceEngine {
             spans.push(StoredSpan::from(row));
         }
         Ok(spans)
+    }
+
+    /// Streams the §4.3 tag-names read (issue #58): distinct
+    /// `(scope, key)` pairs from the Global tag catalog — only ever
+    /// `config.catalog_table` (`trace_tag_catalog`, never `_dist`, never
+    /// a span/attr table: discovery never scans payloads, epic #19 AC1).
+    /// `scope` is escaped HERE (`ch_string`) before it reaches the pure
+    /// builder — the engine is the catalog reads' injection boundary.
+    /// Bounded by the SQL `LIMIT` cap + 1 probe: at most
+    /// [`TAG_NAMES_MAX`] rows return, and the probe row (row cap + 1)
+    /// flips `truncated` instead of shipping a silent subset.
+    pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
+        let scope_literal = scope.map(crate::logql::escape::ch_string);
+        let sql = super::tags_sql::tag_names_sql(
+            &self.config.catalog_table,
+            scope_literal.as_deref(),
+            TAG_NAMES_MAX + 1,
+        );
+        let mut names = Vec::new();
+        // Scoped stream (module convention): the pooled-connection lease
+        // drops at return, after full consumption — the stream is always
+        // drained (≤ cap + 1 rows by the SQL LIMIT).
+        let mut stream = self
+            .client
+            .query_stream::<TagNameRow>(&sql, &QuerySettings::new())
+            .await
+            .map_err(ReadError::Clickhouse)?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(ReadError::Clickhouse)?;
+            names.push((row.scope, row.key));
+        }
+        let truncated = names.len() > TAG_NAMES_MAX;
+        names.truncate(TAG_NAMES_MAX);
+        Ok(TagNames { names, truncated })
+    }
+
+    /// Streams the §4.3 tag-values read (issue #58): distinct values for
+    /// one key, optionally scope-confined — same catalog-only,
+    /// escape-at-the-engine, `LIMIT` cap + 1 probe contract as
+    /// [`Self::list_tag_names`], capped at [`TAG_VALUES_MAX`].
+    pub async fn list_tag_values(
+        &self,
+        key: &str,
+        scope: Option<&str>,
+    ) -> Result<TagValues, ReadError> {
+        let key_literal = crate::logql::escape::ch_string(key);
+        let scope_literal = scope.map(crate::logql::escape::ch_string);
+        let sql = super::tags_sql::tag_values_sql(
+            &self.config.catalog_table,
+            &key_literal,
+            scope_literal.as_deref(),
+            TAG_VALUES_MAX + 1,
+        );
+        let mut values = Vec::new();
+        // Scoped stream: same lease/drain contract as list_tag_names.
+        let mut stream = self
+            .client
+            .query_stream::<TagValueRow>(&sql, &QuerySettings::new())
+            .await
+            .map_err(ReadError::Clickhouse)?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(ReadError::Clickhouse)?;
+            values.push(row.val);
+        }
+        let truncated = values.len() > TAG_VALUES_MAX;
+        values.truncate(TAG_VALUES_MAX);
+        Ok(TagValues { values, truncated })
     }
 
     /// Executes a [`SearchPlan`] end to end (module doc for the model).
@@ -959,6 +1066,7 @@ mod tests {
         let config = TraceReadConfig {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
+            catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             distributed: false,
@@ -974,6 +1082,7 @@ mod tests {
         TraceReadConfig {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
+            catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
             distributed: false,

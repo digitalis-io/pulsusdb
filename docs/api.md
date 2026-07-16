@@ -265,7 +265,25 @@ GET /api/traces/v1/tags                   ?scope=&start=&end=      (scoped respo
 GET /api/traces/v1/tag/{tag}/values       ?q=&start=&end=          (typed values)
 ```
 
-Served from `trace_tag_catalog` (bounded, deduplicated) — never by scanning span payloads.
+Served exclusively from `trace_tag_catalog` (bounded, deduplicated) — never by scanning span payloads or the attribute index.
+
+| Param | Notes |
+|-------|-------|
+| `scope` | `resource` or `span`; omitted = both scopes. Anything else (incl. `intrinsic`/`none`) is a `400 bad_data`, never silently widened |
+| `{tag}` | `resource.<key>` / `span.<key>` scope the lookup; a leading-`.` or bare key is unscoped (values from both scopes) |
+| `start`, `end` | accepted for client compatibility and **ignored**: the catalog has no timestamp column, so tag discovery is time-less. Catalog entries can therefore **outlive** the 7-day span retention (the source `trace_attrs_idx` is TTL'd; `trace_tag_catalog` has no TTL) |
+| `q` | accepted and **ignored** (best-effort narrowing, Tempo semantics): when `q` cannot be evaluated against the catalog, results may be a **superset** of what a narrowing query would return |
+
+Response shapes (native; the §8.1 Tempo aliases are projections of these):
+
+```json
+{"scopes":[{"name":"resource","tags":["env","service.name"]},{"name":"span","tags":["http.status_code"]}],"truncated":false}
+{"tagValues":[{"type":"string","value":"checkout"},{"type":"int","value":"500"}],"truncated":false}
+```
+
+Tag names are ordered `(scope, key)` ascending; values are ordered ascending. Responses are capped at **10 000** tag names / **1 000** values per request (documented constants `TAG_NAMES_MAX`/`TAG_VALUES_MAX`); a capped response sets the top-level `"truncated": true` — never an indistinguishable silent subset.
+
+**Typed values are best-effort inference** from the stored string (the catalog stores values type-lessly): exact `true`/`false` → `bool`; a valid §4.2 duration literal (by the normative parser — `.5s` yes, `0.1ns`/`1h30m`/`1d` no) → `duration`; optional-sign integers → `int`; `f64`-parseable → `float`; else `string`. Known limit: a numeric- or duration-*looking* string attribute infers as numeric/duration.
 
 ### 4.4 TraceQL metrics
 

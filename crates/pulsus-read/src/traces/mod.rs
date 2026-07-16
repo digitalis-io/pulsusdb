@@ -10,9 +10,10 @@
 //! [`filter`] (the shared span-filter compiler — T7's metrics endpoints
 //! consume it too), [`search_plan`] (pure `Query → SearchPlan`),
 //! [`search_sql`] (the pure, byte-frozen SQL builders), [`search_eval`]
-//! (the pure Phase-2 exact evaluator), [`sql`]/[`rows`] (point-read
-//! builder + `ChClient` result-row shapes), and [`exec`] (`TraceEngine`,
-//! the only module here that talks to ClickHouse).
+//! (the pure Phase-2 exact evaluator), [`tags_sql`] (the pure §4.3
+//! tag-discovery builders — catalog-only, issue #58), [`sql`]/[`rows`]
+//! (point-read builder + `ChClient` result-row shapes), and [`exec`]
+//! (`TraceEngine`, the only module here that talks to ClickHouse).
 
 pub mod exec;
 pub mod filter;
@@ -21,12 +22,14 @@ pub mod search_eval;
 pub mod search_plan;
 pub mod search_sql;
 pub mod sql;
+pub mod tags_sql;
 
 pub use exec::{
     BATCH_TRACES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE, RootSummary, SearchOutput,
-    TraceEngine, TraceReadConfig, TraceSearchResult,
+    TAG_NAMES_MAX, TAG_VALUES_MAX, TagNames, TagValues, TraceEngine, TraceReadConfig,
+    TraceSearchResult,
 };
 pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
-pub use rows::{StoredSpan, StoredSpanRow};
+pub use rows::{StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
 pub use search_eval::SpanSummary;
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};

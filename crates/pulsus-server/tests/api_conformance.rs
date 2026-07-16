@@ -409,6 +409,7 @@ fn resolve_path(path: &str) -> String {
     // route instead of exercising the absent-trace 404 oracle).
     path.replace("{name}", "env")
         .replace("{traceId}", manifest::ABSENT_TRACE_ID)
+        .replace("{tag}", "service.name")
         .replace("{kind}", "logs")
 }
 
@@ -578,6 +579,38 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             assert!(
                 json["metrics"]["limit"].is_u64(),
                 "{ctx}: metrics.limit must be an integer, body {json}"
+            );
+        }
+        (Surface::TracesTags, path) => {
+            // Issue #58: success is the documented docs/api.md §4.3
+            // native envelope. Against this suite's empty databases both
+            // routes return the empty envelope 200 — the mounting oracle
+            // (an unmounted path would 404 instead). For the values
+            // route this cell runs with the manifest's NON-TRIVIAL
+            // `base_query` `q=` — proving accept-and-ignore (a 400 here
+            // is the adjudicated-away rejection behavior).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: tags envelope content-type"
+            );
+            let json = res.json(ctx);
+            if path.ends_with("/values") {
+                assert_eq!(
+                    json["tagValues"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty tagValues array, body {json}"
+                );
+            } else {
+                assert_eq!(
+                    json["scopes"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty scopes array, body {json}"
+                );
+            }
+            assert_eq!(
+                json["truncated"], false,
+                "{ctx}: an empty result set is never truncated, body {json}"
             );
         }
         (Surface::Ingest, _) => {

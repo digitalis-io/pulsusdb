@@ -286,6 +286,53 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test traces_api_live
 
+      # Issue #57 AC2/AC6 (Tier-1, scale-invariant): EXPLAIN/query_log
+      # gates for the two-phase TraceQL search generators (projection
+      # selection, attr-index prefix + time pruning, top-K Limit, the
+      # bounded-transfer LIMIT differential) plus the live budget trips
+      # (scan-budget 422, Layer-2 retention 422, span-overflow partial).
+      # Wired here by issue #58 — the step was omitted when #57 landed.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: TraceQL search EXPLAIN + budget gates (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_search_explain
+
+      # Issue #57 AC3/AC5: spawns the real `pulsusdb` binary and drives
+      # `GET /api/traces/v1/search` end-to-end — exact trace-ID sets for
+      # the pre-committed q= cases, legacy-params equivalence, ordering/
+      # tiebreak, cap/partial contract, scan-budget 422. Ports
+      # 31131-31133. Wired here by issue #58 — the step was omitted when
+      # #57 landed. Reuses this job's ClickHouse 24.8 container.
+      - name: Live traces search suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test traces_search_live
+
+      # Issue #58 AC9 (Tier-1, scale-invariant): the tag-discovery index
+      # gates on the exact tags_sql shapes — strict (scope)/(scope, key)
+      # primary-key-prefix pruning for the scoped shapes (two-shape
+      # query_log comparison), the two unscoped degraded paths recorded.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Tag catalog EXPLAIN gate (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_tags_explain
+
+      # Issue #58 AC8: spawns the real `pulsusdb` binary and drives the
+      # §4.3 tags/tag-values surface end-to-end — deduped scoped names,
+      # typed value inference, q= superset semantics, the truncation
+      # contract, and the zero-payload query_log proof (catalog-only
+      # reads). Port 31134. Reuses this job's ClickHouse 24.8 container.
+      - name: Live traces tags suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-server --test traces_tags_live
+
       # Issue #36: the live exhaustive API conformance matrix — every
       # mounted route x case-class over loopback HTTP against five
       # `pulsusdb` spawns (mode/auth/compat permutations), reusing this

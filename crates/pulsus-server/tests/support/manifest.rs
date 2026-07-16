@@ -107,6 +107,19 @@ pub enum Surface {
     /// which doubles as the mounting oracle. Errors are the JSON envelope
     /// with `position` present exactly on TraceQL parse errors.
     TracesSearch,
+    /// `GET /api/traces/v1/tags` and `/api/traces/v1/tag/{tag}/values`
+    /// (issue #58, docs/api.md §4.3) — success is the documented native
+    /// envelope (`{"scopes":[...],"truncated":...}` /
+    /// `{"tagValues":[...],"truncated":...}`); against this suite's empty
+    /// databases a well-formed request returns the empty envelope 200 —
+    /// the mounting oracle. The values route's `base_query` carries a
+    /// NON-TRIVIAL `q=` on purpose: `q` is adjudicated accept-and-ignore
+    /// (superset semantics), so the cell proves a 200, never a 400.
+    /// Unlike `TracesFetch`, the middle `{tag}` param with a trailing
+    /// static `/values` is compatible with the generic matrix (the
+    /// sibling-404 suffix yields a genuinely unrouted path). Errors are
+    /// the JSON envelope, never with `position`.
+    TracesTags,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -774,6 +787,48 @@ const TRACES_SEARCH_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- traces tags (issue #58, docs/api.md §4.3) --------------------------
+
+/// The non-trivial `q=` the values route's `base_query` carries —
+/// `{span.x="y"}`, URL-encoded. Accept-and-ignore (adjudication 1 on
+/// issue #58): the cell asserts a 200 empty envelope, proving `q` never
+/// 400s; the seeded superset-equivalence assertion lives in
+/// `traces_tags_live.rs`.
+pub const TRACES_TAG_VALUES_BASE_QUERY: &str = "q=%7Bspan.x%3D%22y%22%7D";
+
+fn traces_tags_bogus_scope(req: &mut Req) {
+    // `scope` ∈ {resource, span, absent}; anything else is an explicit
+    // 400, never silently widened to "all scopes" (adjudication 4).
+    req.query = "scope=bogus".to_string();
+}
+
+const TRACES_TAGS_CASES: &[CaseClass] = &[CaseClass {
+    name: "unsupported_scope",
+    build: traces_tags_bogus_scope,
+    expect_status: 400,
+    expect: ExpectedError::Json {
+        error_type: "bad_data",
+        has_position: false,
+    },
+}];
+
+fn traces_tag_values_empty_key(req: &mut Req) {
+    // `resource.` — a scope prefix with an empty key: still one path
+    // segment, routes to the same handler, rejected as 400.
+    req.path = req.path.replace("service.name", "resource.");
+    req.query.clear();
+}
+
+const TRACES_TAG_VALUES_CASES: &[CaseClass] = &[CaseClass {
+    name: "empty_key",
+    build: traces_tag_values_empty_key,
+    expect_status: 400,
+    expect: ExpectedError::Json {
+        error_type: "bad_data",
+        has_position: false,
+    },
+}];
+
 fn rw_bad_snappy(req: &mut Req) {
     req.body = b"\xFF\xFF\xFF not snappy".to_vec();
 }
@@ -1203,6 +1258,32 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: TRACES_SEARCH_BASE_QUERY,
         cases: TRACES_SEARCH_CASES,
+    },
+    // -- Traces tags (ReaderMode, issue #58) ------------------------------
+    // `success_status` is 200: against this suite's empty databases both
+    // discovery routes return the documented empty envelope — the
+    // mounting oracle (`Surface::TracesTags`'s doc comment).
+    RouteSpec {
+        path: "/api/traces/v1/tags",
+        methods: &[Method::Get],
+        surface: Surface::TracesTags,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: TRACES_TAGS_CASES,
+    },
+    RouteSpec {
+        path: "/api/traces/v1/tag/{tag}/values",
+        methods: &[Method::Get],
+        surface: Surface::TracesTags,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_TAG_VALUES_BASE_QUERY,
+        cases: TRACES_TAG_VALUES_CASES,
     },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation

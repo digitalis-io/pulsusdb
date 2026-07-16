@@ -335,6 +335,7 @@ fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
+        catalog_table: "trace_tag_catalog".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
         distributed: false,

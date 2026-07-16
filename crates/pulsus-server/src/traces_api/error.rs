@@ -21,14 +21,14 @@ use pulsus_traceql::TraceQlError;
 
 use super::assemble::AssembleError;
 use super::legacy::LegacyError;
-use super::params::{SearchParamError, TraceIdError};
+use super::params::{SearchParamError, TagPathError, TagsParamError, TraceIdError};
 
 /// Every failure mode a `/api/traces/v1` handler can return, converted
 /// to the documented error envelope by [`IntoResponse`]:
 ///
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
-/// | `Param` / `SearchParam` / `Plan` | 400 | `bad_data` |
+/// | `Param` / `SearchParam` / `TagsParam` / `TagPath` / `Plan` | 400 | `bad_data` |
 /// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
 /// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
 /// | `NotFound` | 404 | `not_found` |
@@ -42,6 +42,10 @@ pub(crate) enum ApiError {
     Param(TraceIdError),
     /// Search request-parameter failures (issue #57).
     SearchParam(SearchParamError),
+    /// `/tags` request-parameter failures (issue #58, no `position`).
+    TagsParam(TagsParamError),
+    /// `{tag}` path-parameter failures (issue #58, no `position`).
+    TagPath(TagPathError),
     /// Legacy `tags` logfmt failures (issue #57).
     Legacy(LegacyError),
     /// TraceQL parse failure — `400 bad_data` with a `position` byte
@@ -80,6 +84,18 @@ impl From<LegacyError> for ApiError {
     }
 }
 
+impl From<TagsParamError> for ApiError {
+    fn from(e: TagsParamError) -> Self {
+        ApiError::TagsParam(e)
+    }
+}
+
+impl From<TagPathError> for ApiError {
+    fn from(e: TagPathError) -> Self {
+        ApiError::TagPath(e)
+    }
+}
+
 impl From<ReadError> for ApiError {
     fn from(e: ReadError) -> Self {
         ApiError::Read(e)
@@ -107,6 +123,8 @@ impl IntoResponse for ApiError {
         let (status, error_type, message, position) = match &self {
             ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::SearchParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            ApiError::TagsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            ApiError::TagPath(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             // Strict logfmt errors carry a byte offset into the decoded
             // `tags` value (code review round 1 — documented in
             // docs/api.md §4.2 alongside the TraceQL parse offset).
@@ -197,6 +215,29 @@ mod tests {
         let (status, json) = envelope(err).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["status"], "error");
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json.get("position").is_none());
+    }
+
+    #[tokio::test]
+    async fn tags_param_error_maps_to_400_bad_data_without_a_position() {
+        let err = ApiError::TagsParam(TagsParamError::UnsupportedScope("bogus".to_string()));
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json.get("position").is_none());
+        assert!(
+            json["error"].as_str().is_some_and(|m| m.contains("bogus")),
+            "message must name the rejected scope, got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_path_error_maps_to_400_bad_data_without_a_position() {
+        let err = ApiError::TagPath(TagPathError::EmptyKey);
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
         assert!(json.get("position").is_none());
     }

@@ -710,6 +710,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
         TraceReadConfig {
             spans_table: "trace_spans_dist".to_string(),
             attrs_table: "trace_attrs_idx_dist".to_string(),
+            // Never `_dist`: the tag catalog is a Global table with no
+            // wrapper (unused by this bench's search-only path anyway).
+            catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             distributed: true,

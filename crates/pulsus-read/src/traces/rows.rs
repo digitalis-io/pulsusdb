@@ -91,6 +91,21 @@ pub struct RootRow {
     pub duration_ns: i64,
 }
 
+/// One `trace_tag_catalog` row of the §4.3 tag-names read
+/// (`tags_sql::tag_names_sql` — `SELECT DISTINCT scope, key`, issue #58).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TagNameRow {
+    pub scope: String,
+    pub key: String,
+}
+
+/// One `trace_tag_catalog` row of the §4.3 tag-values read
+/// (`tags_sql::tag_values_sql` — `SELECT DISTINCT val`, issue #58).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TagValueRow {
+    pub val: String,
+}
+
 /// What [`super::exec::TraceEngine::fetch_by_id`] hands to callers: the
 /// assembly-relevant subset of [`StoredSpanRow`], keeping this crate's
 /// public trace-read surface free of the read-alignment-only columns.

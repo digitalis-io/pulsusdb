@@ -53,6 +53,25 @@ pub fn tokenize_for_corpus_gate(input: &str) -> Result<Vec<Token>, TraceQlError>
     lexer::tokenize(input)
 }
 
+/// Whether `raw` is a valid TraceQL duration literal under the normative
+/// in-house grammar (docs/api.md §4.2) — the module-doc rules verbatim,
+/// including the exact-whole-nanoseconds requirement (`.5s` is valid,
+/// `0.1ns` is not). This is the SINGLE SOURCE OF TRUTH for "is this
+/// string a duration" outside the parser (issue #58 task-manager
+/// amendment): consumers such as the tag-value type inference delegate
+/// here rather than re-implementing the grammar, so no second
+/// implementation exists to drift.
+pub fn is_duration_literal(raw: &str) -> bool {
+    duration::parse_duration(
+        raw,
+        Span {
+            start: 0,
+            end: raw.len(),
+        },
+    )
+    .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +89,19 @@ mod tests {
             SpansetExpr::Filter(SpansetFilter { body: None })
         );
         assert!(query.pipeline.is_empty());
+    }
+
+    #[test]
+    fn is_duration_literal_agrees_with_the_normative_parser() {
+        // Accepts: the grammar's own accept vectors, incl. the leading-dot
+        // fraction (issue #58 round-2 review).
+        for raw in ["2s", "100ms", "1.5s", "500µs", ".5s", "0.5s", "1h", "5m"] {
+            assert!(is_duration_literal(raw), "{raw:?} must be a duration");
+        }
+        // Rejects: compound literals, unsupported units, inexact
+        // fractional nanoseconds, missing units, signs.
+        for raw in ["1h30m", "1d", "0.1ns", "5", "-1s", "", ".s", "5x"] {
+            assert!(!is_duration_literal(raw), "{raw:?} must not be a duration");
+        }
     }
 }

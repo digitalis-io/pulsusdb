@@ -148,6 +148,71 @@ fn parse_count(
         })
 }
 
+/// Errors from parsing the `/api/traces/v1/tags` query parameters —
+/// mapped to `400 bad_data` by `error::ApiError` (issue #58).
+#[derive(Debug, Error)]
+pub(crate) enum TagsParamError {
+    #[error(
+        "unsupported scope {0:?}: expected \"resource\" or \"span\" (or omit the parameter \
+         for both scopes)"
+    )]
+    UnsupportedScope(String),
+}
+
+/// Errors from parsing the `{tag}` path parameter of
+/// `/api/traces/v1/tag/{tag}/values` — mapped to `400 bad_data`.
+#[derive(Debug, Error)]
+pub(crate) enum TagPathError {
+    #[error("invalid tag: the attribute key must be non-empty")]
+    EmptyKey,
+}
+
+/// The parsed `/api/traces/v1/tags` request: only `scope` filters.
+/// `start`/`end` are accepted for client compatibility and IGNORED —
+/// `trace_tag_catalog` has no timestamp column, so tag discovery is
+/// time-less by contract (docs/api.md §4.3, issue #58 frozen-schema
+/// resolution); any other parameter is likewise ignored.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TagsParams {
+    pub scope: Option<String>,
+}
+
+/// Parses the `/api/traces/v1/tags` query string (docs/api.md §4.3):
+/// `scope` ∈ {`resource`, `span`, absent} — anything else (including
+/// `intrinsic`/`none` and the empty string) is an explicit `400`, never
+/// silently widened to "all scopes" (task-manager adjudication 4 on
+/// issue #58).
+pub(crate) fn parse_tags_params(raw: &str) -> Result<TagsParams, TagsParamError> {
+    let pairs = parse_pairs(raw);
+    let scope = match get(&pairs, "scope") {
+        None => None,
+        Some(s @ ("resource" | "span")) => Some(s.to_string()),
+        Some(other) => return Err(TagsParamError::UnsupportedScope(other.to_string())),
+    };
+    Ok(TagsParams { scope })
+}
+
+/// Splits the `{tag}` path parameter into `(scope, key)` (docs/api.md
+/// §4.3): a `resource.`/`span.` prefix scopes the lookup; a leading `.`
+/// or a bare key is unscoped (both scopes). The remainder after the
+/// prefix is the verbatim attribute key (`resource.service.name` →
+/// scope `resource`, key `service.name`); an empty remainder is a `400`.
+pub(crate) fn parse_tag_path(raw_tag: &str) -> Result<(Option<String>, String), TagPathError> {
+    let (scope, key) = if let Some(key) = raw_tag.strip_prefix("resource.") {
+        (Some("resource".to_string()), key)
+    } else if let Some(key) = raw_tag.strip_prefix("span.") {
+        (Some("span".to_string()), key)
+    } else if let Some(key) = raw_tag.strip_prefix('.') {
+        (None, key)
+    } else {
+        (None, raw_tag)
+    };
+    if key.is_empty() {
+        return Err(TagPathError::EmptyKey);
+    }
+    Ok((scope, key.to_string()))
+}
+
 /// Splits a query string into ordered, percent-decoded `(key, value)`
 /// pairs — the same per-surface pair core as `logs_api`/`prom_api`.
 pub(crate) fn parse_pairs(raw: &str) -> Vec<(String, String)> {
@@ -363,5 +428,76 @@ mod tests {
         let p = parse_search_params("start=1&end=2").unwrap();
         assert_eq!(p.q, None);
         assert_eq!(p.tags, None);
+    }
+
+    // -- tags params (issue #58) -------------------------------------------
+
+    #[test]
+    fn tags_scope_resource_and_span_parse() {
+        assert_eq!(
+            parse_tags_params("scope=resource")
+                .unwrap()
+                .scope
+                .as_deref(),
+            Some("resource")
+        );
+        assert_eq!(
+            parse_tags_params("scope=span").unwrap().scope.as_deref(),
+            Some("span")
+        );
+    }
+
+    #[test]
+    fn tags_absent_scope_means_both_scopes() {
+        assert_eq!(parse_tags_params("").unwrap().scope, None);
+    }
+
+    #[test]
+    fn tags_start_end_are_accepted_and_ignored_not_errors() {
+        // The catalog is time-less: the bounds parse away without effect
+        // (docs/api.md §4.3).
+        let p = parse_tags_params("scope=span&start=100&end=200").unwrap();
+        assert_eq!(p.scope.as_deref(), Some("span"));
+    }
+
+    #[test]
+    fn tags_unknown_scope_is_rejected_never_widened() {
+        for raw in ["scope=bogus", "scope=intrinsic", "scope=none", "scope="] {
+            assert!(
+                matches!(
+                    parse_tags_params(raw),
+                    Err(TagsParamError::UnsupportedScope(_))
+                ),
+                "{raw} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn tag_path_prefixes_resolve_to_scopes() {
+        assert_eq!(
+            parse_tag_path("resource.service.name").unwrap(),
+            (Some("resource".to_string()), "service.name".to_string())
+        );
+        assert_eq!(
+            parse_tag_path("span.x").unwrap(),
+            (Some("span".to_string()), "x".to_string())
+        );
+    }
+
+    #[test]
+    fn tag_path_leading_dot_and_bare_keys_are_unscoped() {
+        assert_eq!(parse_tag_path(".x").unwrap(), (None, "x".to_string()));
+        assert_eq!(parse_tag_path("x").unwrap(), (None, "x".to_string()));
+    }
+
+    #[test]
+    fn tag_path_empty_keys_are_rejected() {
+        for raw in ["", ".", "resource.", "span."] {
+            assert!(
+                matches!(parse_tag_path(raw), Err(TagPathError::EmptyKey)),
+                "{raw:?} must be rejected"
+            );
+        }
     }
 }
