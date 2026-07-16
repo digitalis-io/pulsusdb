@@ -1,0 +1,202 @@
+# Issue #70 (M6-07) proof corpus — witness cases for the set operators
+# (`and`/`or`/`unless`), `group_left`/`group_right` many-to-one matching
+# with include-label copying, `atan2`, and the one-to-one fill modifiers.
+# function-coverage.json points the six non-fill language-feature
+# witnesses at exact query texts below (`binop-fill-modifier`'s witness is
+# the executed `upstream/fill-modifier.test`); the coverage drift test
+# replays this file and requires each to pass.
+#
+# These features' sole vendored upstream home (`upstream/operators.test`)
+# stays skip-manifested behind its `expect` (M6-08) and
+# `load_with_nhcb`/native-histogram (#22) directives — so this
+# hand-derived file is the executable Tier-1 anchor, per the #65/#66
+# precedent confirmed in the #70 adjudication. Semantics are ported from
+# Prometheus v3.13.0 `promql/engine.go` @ 40af9c2 (`VectorAnd`/`VectorOr`/
+# `VectorUnless`, `VectorBinop`, `resultMetric`); the fill cases mirror
+# the byte-frozen `upstream/fill-modifier.test`, which executes fully
+# green as of M6-07.
+#
+# Pinned semantics this file exercises end-to-end:
+#   - set ops: membership on the matching signature (default drops
+#     __name__ — two different metrics with equal labels intersect;
+#     on(__name__) separates them); survivors copied VERBATIM (full
+#     labels, __name__, value); `or` = lhs then rhs-not-in-lhs;
+#   - atan2: arithmetic-class elementwise atan2(l, r), __name__ dropped;
+#   - group_left/group_right: output = the many side's full labels
+#     (name-dropped iff arithmetic or bool; a FILTER comparison keeps the
+#     many-side name) + include labels copied from the one side;
+#     group_left(__name__) copies the one side's name; the three verbatim
+#     duplicate-match errors;
+#   - one-to-one fill: a missing side is substituted by its fill value —
+#     a filled (synthetic) lhs yields the match-group identity with no
+#     __name__, while a real lhs passes through whole.
+
+load 1m
+	foo{job="api", instance="0"} 10x10
+	foo{job="api", instance="1"} 20x10
+	foo{job="app", instance="2"} 30x10
+	foo2{job="api", instance="0"} 55x10
+	bar{job="api", instance="0"} 100x10
+	bar{job="canary", instance="9"} 900x10
+
+# and: intersection on the full-label signature; the survivor keeps its
+# labels, name, and value verbatim.
+eval instant at 5m foo and bar
+	foo{job="api", instance="0"} 10
+
+# and on(job): signature narrows to the listed labels.
+eval instant at 5m foo and on(job) bar
+	foo{job="api", instance="0"} 10
+	foo{job="api", instance="1"} 20
+
+# The default signature drops __name__: two different metrics with equal
+# labels intersect.
+eval instant at 5m foo2 and foo
+	foo2{job="api", instance="0"} 55
+
+# on(__name__) puts the real metric name in the signature: different
+# names no longer intersect.
+eval instant at 5m foo2 and on(__name__) foo
+
+# or: every lhs element, then each rhs element whose signature is absent
+# from the lhs.
+eval instant at 5m foo or bar
+	foo{job="api", instance="0"} 10
+	foo{job="api", instance="1"} 20
+	foo{job="app", instance="2"} 30
+	bar{job="canary", instance="9"} 900
+
+# unless: the lhs elements whose signature is absent from the rhs.
+eval instant at 5m foo unless bar
+	foo{job="api", instance="1"} 20
+	foo{job="app", instance="2"} 30
+
+# unless ignoring(instance): signature = remaining labels (job).
+eval instant at 5m foo unless ignoring(instance) bar
+	foo{job="app", instance="2"} 30
+
+# Set ops are per-step in range queries too.
+eval range from 0 to 5m step 1m foo and bar
+	foo{job="api", instance="0"} 10 10 10 10 10 10
+
+# atan2: arithmetic-class — elementwise atan2(l, r), matched like any
+# arithmetic vector-vector op, __name__ dropped.
+eval instant at 5m foo atan2 bar
+	{job="api", instance="0"} 0.09966865249116202
+
+# atan2 with a scalar operand flows through the vector-scalar arm.
+eval instant at 5m foo{job="app"} atan2 2
+	{job="app", instance="2"} 1.5042281630190728
+
+clear
+
+# ---------- group_left / group_right (many-to-one, one-to-many) ----------
+
+load 1m
+	requests{method="GET", status="200"} 100x10
+	requests{method="POST", status="200"} 200x10
+	requests{method="GET", status="500"} 10x10
+	limits{status="200", owner="team-a"} 1000x10
+	limits{status="500", owner="team-b"} 50x10
+	limits{status="404", owner="team-c"} 500x10
+	limits_dup{status="200", zone="a"} 1x10
+	limits_dup{status="200", zone="b"} 2x10
+	onemeta{status="200", method="ALL"} 7x10
+
+# group_left arithmetic: output = the many side's full labels, __name__
+# dropped; the unmatched one-side series (status=404) contributes nothing.
+eval instant at 5m requests / on(status) group_left limits
+	{method="GET", status="200"} 0.1
+	{method="POST", status="200"} 0.2
+	{method="GET", status="500"} 0.2
+
+# group_left(owner): the include label is copied from the one side.
+eval instant at 5m requests * on(status) group_left(owner) limits
+	{method="GET", status="200", owner="team-a"} 100000
+	{method="POST", status="200", owner="team-a"} 200000
+	{method="GET", status="500", owner="team-b"} 500
+
+# A FILTER comparison keeps the many-side __name__ (plan v2 D2).
+eval instant at 5m requests < on(status) group_left limits
+	requests{method="GET", status="200"} 100
+	requests{method="POST", status="200"} 200
+	requests{method="GET", status="500"} 10
+
+# bool drops the name; the include copy still applies (after the drop).
+eval instant at 5m requests < bool on(status) group_left(owner) limits
+	{method="GET", status="200", owner="team-a"} 1
+	{method="POST", status="200", owner="team-a"} 1
+	{method="GET", status="500", owner="team-b"} 1
+
+# group_right: the operand-swapped mirror — the many side is the RHS, the
+# include label comes from the LHS (the one side).
+eval instant at 5m limits * on(status) group_right(owner) requests
+	{method="GET", status="200", owner="team-a"} 100000
+	{method="POST", status="200", owner="team-a"} 200000
+	{method="GET", status="500", owner="team-b"} 500
+
+# bool + group_right (the D2 mirror): limits > requests per match group.
+eval instant at 5m limits > bool on(status) group_right(owner) requests
+	{method="GET", status="200", owner="team-a"} 1
+	{method="POST", status="200", owner="team-a"} 1
+	{method="GET", status="500", owner="team-b"} 1
+
+# group_left(__name__) copies the one side's metric name onto the output.
+eval instant at 5m requests * on(status) group_left(__name__) limits
+	limits{method="GET", status="200"} 100000
+	limits{method="POST", status="200"} 200000
+	limits{method="GET", status="500"} 500
+
+# One-to-one with two lhs matches for one signature: many-to-one must be
+# explicit.
+eval_fail instant at 5m requests * on(status) limits
+	expected_fail_message multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)
+
+# A duplicate signature on the one side is many-to-many — verbatim
+# upstream error, "right hand-side" under group_left.
+eval_fail instant at 5m requests * on(status) group_left limits_dup
+	expected_fail_message found duplicate series for the match group {status="200"} on the right hand-side of the operation
+
+# ... and "left hand-side" under group_right (the one side is the LHS).
+eval_fail instant at 5m limits_dup * on(status) group_right requests
+	expected_fail_message on the left hand-side of the operation
+
+# Duplicate output identity across the many side: the include copy
+# collapses method=GET/POST onto one output labelset.
+eval_fail instant at 5m requests * on(status) group_left(method) onemeta
+	expected_fail_message multiple matches for labels: grouping labels must ensure unique matches
+
+clear
+
+# ---------- one-to-one fill (experimental; the runner plans with the
+# promql-experimental-functions gate on, like upstream promqltest) ----------
+
+load 1m
+	lv{l="a"} 10x10
+	lv{l="b"} 20x10
+	rv{l="a"} 100x10
+	rv{l="c"} 300x10
+
+# fill(0): both sides fill — every match group emits.
+eval instant at 5m lv + fill(0) rv
+	{l="a"} 110
+	{l="b"} 20
+	{l="c"} 300
+
+# fill_left(5): only a missing lhs fills — output exists where rv does.
+eval instant at 5m lv + fill_left(5) rv
+	{l="a"} 110
+	{l="c"} 305
+
+# fill_right(7): only a missing rhs fills — output exists where lv does.
+eval instant at 5m lv + fill_right(7) rv
+	{l="a"} 110
+	{l="b"} 27
+
+# Filter-mode comparison with fill pins the name asymmetry: a real lhs
+# passes through verbatim (name kept); a filled lhs is the match-group
+# identity with no name, and the kept value is the fill value.
+eval instant at 5m lv != fill(10) rv
+	lv{l="a"} 10
+	lv{l="b"} 20
+	{l="c"} 10

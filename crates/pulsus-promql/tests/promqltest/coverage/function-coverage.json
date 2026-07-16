@@ -900,21 +900,30 @@
   "language_features": [
     {
       "name": "set-op-and",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m and m"
+      "status": "implemented",
+      "probe": "m and m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "foo and bar"
+      }
     },
     {
       "name": "set-op-or",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m or m"
+      "status": "implemented",
+      "probe": "m or m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "foo or bar"
+      }
     },
     {
       "name": "set-op-unless",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m unless m"
+      "status": "implemented",
+      "probe": "m unless m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "foo unless bar"
+      }
     },
     {
       "name": "vector-matching-on-ignoring",
@@ -927,27 +936,39 @@
     },
     {
       "name": "group_left",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m * on(l) group_left m"
+      "status": "implemented",
+      "probe": "m * on(l) group_left m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "requests / on(status) group_left limits"
+      }
     },
     {
       "name": "group_right",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m * on(l) group_right m"
+      "status": "implemented",
+      "probe": "m * on(l) group_right m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "limits * on(status) group_right(owner) requests"
+      }
     },
     {
       "name": "atan2",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m atan2 m"
+      "status": "implemented",
+      "probe": "m atan2 m",
+      "witness": {
+        "file": "proof/m6_07_operator_matrix.test",
+        "query": "foo atan2 bar"
+      }
     },
     {
       "name": "binop-fill-modifier",
-      "status": "scheduled",
-      "issue": "M6-07",
-      "probe": "m + fill(0) m"
+      "status": "implemented",
+      "probe": "m + fill(0) m",
+      "witness": {
+        "file": "upstream/fill-modifier.test",
+        "query": "left_vector + fill(0) right_vector"
+      }
     },
     {
       "name": "at-modifier",

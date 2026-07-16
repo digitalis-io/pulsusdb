@@ -266,10 +266,11 @@ pub struct Grouping {
     pub labels: Vec<String>,
 }
 
-/// Binary arithmetic/comparison operators. Set operators (`and`/`or`/
-/// `unless`) and `atan2` are out of the M2 proof subset (never
-/// constructed here — [`plan_binary`] rejects them as
-/// [`PromqlError::Unsupported`]).
+/// Binary arithmetic/comparison operators. `Atan2` (issue #70, M6-07) is
+/// arithmetic-class — upstream `changesMetricSchema` (`promql/engine.go`
+/// v3.13 @ 40af9c2) lists `ATAN2` alongside the six arithmetic operators,
+/// so it drops `__name__` and never filters. Set operators (`and`/`or`/
+/// `unless`) are not `BinOp`s at all — they plan to [`PlanExpr::SetOp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -278,6 +279,7 @@ pub enum BinOp {
     Div,
     Mod,
     Pow,
+    Atan2,
     Eq,
     Ne,
     Lt,
@@ -293,6 +295,44 @@ impl BinOp {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         )
     }
+}
+
+/// Set operators (issue #70, M6-07): verbatim-passthrough set membership
+/// on the [`Matching`] signature — never a computed value, never a label
+/// reduction, never a `__name__` drop (upstream `VectorAnd`/`VectorOr`/
+/// `VectorUnless` copy the surviving element unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    And,
+    Or,
+    Unless,
+}
+
+/// Vector-matching cardinality for [`PlanExpr::Binary`] (issue #70,
+/// M6-07). `Left`/`Right` carry the `group_left(...)`/`group_right(...)`
+/// include labels — additional labels copied to the output **from the
+/// "one" side** (deleted when absent there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Group {
+    OneToOne,
+    Left(Vec<String>),
+    Right(Vec<String>),
+}
+
+/// The experimental `fill`/`fill_left`/`fill_right` binary-operator
+/// modifier values (issue #70, M6-07; upstream feature-flagged behind
+/// `EnableBinopFillModifiers`, mirrored here behind
+/// [`PlanParams::experimental_functions`]): a missing operand for a match
+/// group is substituted by its side's fill value; `None` = no filling for
+/// that side (`fill(v)` sets both). `lhs`/`rhs` are **source-text operand
+/// sides**, but the evaluator applies them positionally AFTER its
+/// `group_right` operand swap (upstream-exact) — so under `group_right`,
+/// `fill_left` effectively fills the source-RHS/many side (pinned by
+/// `fill-modifier.test`'s `group_right fill_left(1)` case).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FillValues {
+    pub lhs: Option<f64>,
+    pub rhs: Option<f64>,
 }
 
 /// Vector-vector matching mode. The default (no `on`/`ignoring` clause)
@@ -426,6 +466,25 @@ pub enum PlanExpr {
         lhs: Box<PlanExpr>,
         rhs: Box<PlanExpr>,
         bool_modifier: bool,
+        matching: Matching,
+        /// Issue #70 (M6-07): one-to-one (the M2 default) or the
+        /// `group_left`/`group_right` many-to-one cardinality with its
+        /// include labels.
+        group: Group,
+        /// Issue #70 (M6-07): the experimental fill modifier values —
+        /// always [`FillValues::default`] (no filling) unless
+        /// [`PlanParams::experimental_functions`] is set.
+        fill: FillValues,
+    },
+    /// Issue #70 (M6-07): `and`/`or`/`unless` — set membership on the
+    /// matching signature, both operands instant vectors (the vendored
+    /// parser rejects a scalar operand at parse time). No `bool`, no
+    /// `group_*`, no `fill` (all parser- or plan-rejected per upstream
+    /// parse.go).
+    SetOp {
+        op: SetOp,
+        lhs: Box<PlanExpr>,
+        rhs: Box<PlanExpr>,
         matching: Matching,
     },
     /// Issue #65 (M6-02): an elementwise math/trig function over a vector
@@ -1364,6 +1423,7 @@ fn bin_op(op: token::TokenType) -> Option<BinOp> {
         id if id == token::T_DIV => Some(BinOp::Div),
         id if id == token::T_MOD => Some(BinOp::Mod),
         id if id == token::T_POW => Some(BinOp::Pow),
+        id if id == token::T_ATAN2 => Some(BinOp::Atan2),
         id if id == token::T_EQLC => Some(BinOp::Eq),
         id if id == token::T_NEQ => Some(BinOp::Ne),
         id if id == token::T_LSS => Some(BinOp::Lt),
@@ -1374,48 +1434,161 @@ fn bin_op(op: token::TokenType) -> Option<BinOp> {
     }
 }
 
+fn set_op_token(op: token::TokenType) -> Option<SetOp> {
+    match op.id() {
+        id if id == token::T_LAND => Some(SetOp::And),
+        id if id == token::T_LOR => Some(SetOp::Or),
+        id if id == token::T_LUNLESS => Some(SetOp::Unless),
+        _ => None,
+    }
+}
+
+/// Converts the vendored modifier's `on`/`ignoring` clause into
+/// [`Matching`] (shared by the arithmetic/comparison and set-op paths).
+fn matching_of(matching: Option<&LabelModifier>) -> Matching {
+    match matching {
+        None => Matching::default_ignoring_none(),
+        Some(LabelModifier::Include(ls)) => Matching {
+            on: true,
+            labels: ls.labels.clone(),
+        },
+        Some(LabelModifier::Exclude(ls)) => Matching {
+            on: false,
+            labels: ls.labels.clone(),
+        },
+    }
+}
+
+/// The named experimental rejection for every `fill`/`fill_left`/
+/// `fill_right` spelling with the flag off (issue #70 fill-gating delta:
+/// the #81 blanket reject reworded to the experimental-rejection form —
+/// upstream gates the fill grammar behind `EnableBinopFillModifiers`,
+/// mirrored on [`PlanParams::experimental_functions`]).
+fn fill_requires_experimental() -> PromqlError {
+    unsupported(
+        "experimental fill/fill_left/fill_right (binary-operator fill modifier) (requires \
+         promql-experimental-functions)",
+    )
+}
+
+/// Issue #70 (M6-07): `and`/`or`/`unless`. The vendored parser's
+/// `check_ast_for_binary_expr` already guarantees both operands are
+/// vector-typed ("set operator ... not allowed in binary scalar
+/// expression"), rejects `group_left`/`group_right` ("no grouping allowed
+/// for ... operation") and `bool` (comparison-only) — only the fill
+/// modifier is unchecked there, so it is rejected here exactly like
+/// upstream parse.go @ 40af9c2 ("filling in missing series not allowed
+/// for set operators"), behind the experimental gate first so the
+/// flag-off path stays the uniform named rejection.
+fn plan_set_op(
+    planner: &mut Planner,
+    bin: &BinaryExpr,
+    op: SetOp,
+) -> Result<PlanExpr, PromqlError> {
+    if let Some(m) = &bin.modifier
+        && (m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some())
+    {
+        if !planner.experimental {
+            return Err(fill_requires_experimental());
+        }
+        return Err(PromqlError::BadMatching {
+            detail: "filling in missing series not allowed for set operators".to_string(),
+        });
+    }
+    let matching = matching_of(bin.modifier.as_ref().and_then(|m| m.matching.as_ref()));
+    let lhs = plan_expr(planner, &bin.lhs)?;
+    let rhs = plan_expr(planner, &bin.rhs)?;
+    Ok(PlanExpr::SetOp {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+        matching,
+    })
+}
+
 fn plan_binary(planner: &mut Planner, bin: &BinaryExpr) -> Result<PlanExpr, PromqlError> {
+    if let Some(op) = set_op_token(bin.op) {
+        return plan_set_op(planner, bin, op);
+    }
     let Some(op) = bin_op(bin.op) else {
         return Err(unsupported(format!("binary operator {}", bin.op)));
     };
 
-    let (bool_modifier, matching) = match &bin.modifier {
-        None => (false, Matching::default_ignoring_none()),
+    // Upstream's scalar-operand guard is *typed*, not runtime: parse.go
+    // (@ 40af9c2, the checkAST BinaryExpr arm) inspects the operands'
+    // static value types — mirrored here via the vendored AST's own
+    // `value_type()`.
+    let scalar_operand = bin.lhs.value_type() == crate::parser::ValueType::Scalar
+        || bin.rhs.value_type() == crate::parser::ValueType::Scalar;
+
+    let (bool_modifier, matching, group, fill) = match &bin.modifier {
+        None => (
+            false,
+            Matching::default_ignoring_none(),
+            Group::OneToOne,
+            FillValues::default(),
+        ),
         Some(m) => {
-            match &m.card {
-                VectorMatchCardinality::OneToOne | VectorMatchCardinality::ManyToMany => {}
-                VectorMatchCardinality::ManyToOne(_) | VectorMatchCardinality::OneToMany(_) => {
-                    return Err(unsupported(
-                        "group_left/group_right (many-to-one vector matching)",
-                    ));
-                }
-            }
-            // Issue #81: the vendored parser accepts the experimental
-            // `fill`/`fill_left`/`fill_right` binary-operator modifiers
-            // (`BinModifier::fill_values`), but the M2 evaluator has no
-            // unmatched-side filling — dropping the modifier here would
-            // silently return wrong (unfilled) results, the worst failure
-            // class for a query engine. Reject by name until M6-07
-            // implements the real semantics and removes this. Zero cost
-            // for non-fill queries: a single `is_some()` check on the
-            // already-parsed modifier struct.
-            if m.fill_values.lhs.is_some() || m.fill_values.rhs.is_some() {
-                return Err(unsupported(
-                    "fill/fill_left/fill_right (binary-operator fill modifier)",
-                ));
-            }
-            let matching = match &m.matching {
-                None => Matching::default_ignoring_none(),
-                Some(LabelModifier::Include(ls)) => Matching {
-                    on: true,
-                    labels: ls.labels.clone(),
-                },
-                Some(LabelModifier::Exclude(ls)) => Matching {
-                    on: false,
-                    labels: ls.labels.clone(),
-                },
+            let fill = FillValues {
+                lhs: m.fill_values.lhs,
+                rhs: m.fill_values.rhs,
             };
-            (m.return_bool, matching)
+            let fill_present = fill.lhs.is_some() || fill.rhs.is_some();
+            // Issue #70 (M6-07), superseding #81's blanket reject: real
+            // fill semantics exist now, but only behind the experimental
+            // flag (upstream's own `EnableBinopFillModifiers` posture).
+            if fill_present && !planner.experimental {
+                return Err(fill_requires_experimental());
+            }
+            if scalar_operand {
+                // parse.go:807-814 exactly (issue #70 plan v2 D4, as
+                // amended by the round-2 adjudication): with a scalar
+                // operand, error ONLY on a non-empty `on`/`ignoring`
+                // label list or a fill value — then discard the whole
+                // matching modifier (`group_left`/`group_right` with
+                // empty matching is SILENTLY discarded, like upstream's
+                // `n.VectorMatching = nil`). `bool` survives the discard
+                // (it lives outside upstream's VectorMatching). The
+                // non-empty-labels arm is defense-in-depth: the vendored
+                // parser already rejects it at parse time ("vector
+                // matching only allowed between vectors").
+                let labels_nonempty = bin
+                    .modifier
+                    .as_ref()
+                    .and_then(|m| m.matching.as_ref())
+                    .is_some_and(|lm| !lm.labels().labels.is_empty());
+                if labels_nonempty {
+                    return Err(PromqlError::BadMatching {
+                        detail: "vector matching only allowed between instant vectors".to_string(),
+                    });
+                }
+                if fill_present {
+                    return Err(PromqlError::BadMatching {
+                        detail: "filling in missing series only allowed between instant vectors"
+                            .to_string(),
+                    });
+                }
+                (
+                    m.return_bool,
+                    Matching::default_ignoring_none(),
+                    Group::OneToOne,
+                    FillValues::default(),
+                )
+            } else {
+                let group = match &m.card {
+                    // `ManyToMany` is set-operator-only (the vendored
+                    // parser only ever assigns it in the set-op arm, which
+                    // routes to `plan_set_op` above) — unreachable here
+                    // through `parse()`, folded into the one-to-one arm
+                    // rather than left as a panic path.
+                    VectorMatchCardinality::OneToOne | VectorMatchCardinality::ManyToMany => {
+                        Group::OneToOne
+                    }
+                    VectorMatchCardinality::ManyToOne(ls) => Group::Left(ls.labels.clone()),
+                    VectorMatchCardinality::OneToMany(ls) => Group::Right(ls.labels.clone()),
+                };
+                (m.return_bool, matching_of(m.matching.as_ref()), group, fill)
+            }
         }
     };
 
@@ -1427,6 +1600,8 @@ fn plan_binary(planner: &mut Planner, bin: &BinaryExpr) -> Result<PlanExpr, Prom
         rhs: Box::new(rhs),
         bool_modifier,
         matching,
+        group,
+        fill,
     })
 }
 
@@ -1742,28 +1917,105 @@ mod tests {
         }
     }
 
+    // --- issue #70 (M6-07): group_left/group_right, set ops, atan2,
+    // fill modifiers ---
+
     #[test]
-    fn group_left_is_unsupported() {
-        let expr = parse("foo * on(job) group_left(x) bar").unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    fn plans_group_left_with_include_labels() {
+        let expr = parse("foo * on(job) group_left(x, y) bar").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary { group, .. } => {
+                assert_eq!(group, &Group::Left(vec!["x".to_string(), "y".to_string()]));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
     }
 
     #[test]
-    fn and_is_unsupported() {
-        let expr = parse("foo and bar").unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    fn plans_group_right_with_include_labels() {
+        let expr = parse("foo * on(job) group_right(x) bar").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary { group, .. } => {
+                assert_eq!(group, &Group::Right(vec!["x".to_string()]));
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
     }
 
-    /// Issue #81: every fill-modifier spelling (`fill`, `fill_left`,
-    /// `fill_right`, and both one-sided forms combined) must fail with a
-    /// *named* `Unsupported` — before this reject, `plan_binary` silently
-    /// dropped `BinModifier::fill_values` and returned wrong (unfilled)
-    /// results. M6-07 implements the real semantics and removes the
-    /// reject.
     #[test]
-    fn every_fill_modifier_spelling_is_a_named_unsupported() {
+    fn plans_atan2_as_an_arithmetic_class_binop() {
+        let expr = parse("foo atan2 bar").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary { op, .. } => {
+                assert_eq!(*op, BinOp::Atan2);
+                assert!(!op.is_comparison(), "atan2 is arithmetic-class");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plans_set_operators_with_their_matching() {
+        for (query, want_op) in [
+            ("foo and bar", SetOp::And),
+            ("foo or bar", SetOp::Or),
+            ("foo unless bar", SetOp::Unless),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::SetOp { op, matching, .. } => {
+                    assert_eq!(*op, want_op, "{query}");
+                    assert!(!matching.on, "{query}: default matching is ignoring()");
+                    assert!(matching.labels.is_empty(), "{query}");
+                }
+                other => panic!("{query}: expected SetOp, got {other:?}"),
+            }
+        }
+        let expr = parse("foo and on(job) bar").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::SetOp { matching, .. } => {
+                assert!(matching.on);
+                assert_eq!(matching.labels, vec!["job".to_string()]);
+            }
+            other => panic!("expected SetOp, got {other:?}"),
+        }
+    }
+
+    /// Perf Tier-1 gate (issue #70 plan; standing query-performance
+    /// mandate): every binary form flattens to exactly its operands'
+    /// selectors — two concurrent fetches, never an N×M cross-product
+    /// fetch, no extra round trip. Set ops, matching, include-copy, and
+    /// fill are all pure post-fetch hashing.
+    #[test]
+    fn binary_forms_flatten_to_exactly_two_selectors() {
+        for (query, p) in [
+            ("foo and bar", params()),
+            ("foo * on(job) group_left(x) bar", params()),
+            ("foo + on(l) fill(0) bar", params_experimental()),
+        ] {
+            let expr = parse(query).unwrap();
+            let planned = plan(&expr, p).unwrap();
+            assert_eq!(
+                planned.selectors.len(),
+                2,
+                "{query}: exactly one SelectorSpec per operand"
+            );
+        }
+    }
+
+    /// Issue #70 fill-gating delta (plan v2 D3): with the experimental
+    /// flag OFF, every fill spelling is the named experimental rejection
+    /// — the #81 blanket reject reworded to the `max_of`/`sort_by_label`
+    /// gate form. This unit test IS the flag-off gate: the corpus runner
+    /// always plans with the flag on (`runner.rs::params_for`), so
+    /// flag-off behavior can only be pinned here.
+    #[test]
+    fn every_fill_modifier_spelling_is_gated_behind_experimental_functions() {
         for query in [
             "foo + fill(0) bar",
             "foo + fill_left(0) bar",
@@ -1771,24 +2023,194 @@ mod tests {
             "foo + fill_left(5) fill_right(7) bar",
             "foo == bool fill(30) bar",
             "foo + on(job) fill(0) bar",
+            "foo and fill(0) bar",
         ] {
             let expr = parse(query).unwrap();
             let err = plan(&expr, params()).unwrap_err();
             match err {
                 PromqlError::Unsupported { construct } => assert!(
-                    construct.contains("fill"),
-                    "{query}: error must name the fill construct, got {construct:?}"
+                    construct.contains("fill")
+                        && construct.contains("experimental")
+                        && construct.contains("promql-experimental-functions"),
+                    "{query}: error must name the fill construct and the gate, got {construct:?}"
                 ),
                 other => panic!("{query}: expected Unsupported, got {other:?}"),
             }
         }
     }
 
-    /// Issue #81 guard for the non-fill side: a modifier *without* fill
-    /// values (plain `on(...)`) keeps planning exactly as before — the
-    /// reject is a single `is_some()` check on the already-parsed
-    /// modifier, never a new cost or behavior change for non-fill
-    /// queries.
+    /// Flag ON: every fill spelling plans, carrying the parsed per-side
+    /// values (`fill(v)` sets both sides; `fill_left`/`fill_right` one).
+    #[test]
+    fn fill_modifiers_plan_with_the_experimental_flag() {
+        for (query, want) in [
+            (
+                "foo + fill(0) bar",
+                FillValues {
+                    lhs: Some(0.0),
+                    rhs: Some(0.0),
+                },
+            ),
+            (
+                "foo + fill_left(5) bar",
+                FillValues {
+                    lhs: Some(5.0),
+                    rhs: None,
+                },
+            ),
+            (
+                "foo + fill_right(7) bar",
+                FillValues {
+                    lhs: None,
+                    rhs: Some(7.0),
+                },
+            ),
+            (
+                "foo + fill_left(5) fill_right(7) bar",
+                FillValues {
+                    lhs: Some(5.0),
+                    rhs: Some(7.0),
+                },
+            ),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params_experimental()).unwrap();
+            match &p.root {
+                PlanExpr::Binary { fill, .. } => assert_eq!(fill, &want, "{query}"),
+                other => panic!("{query}: expected Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// Upstream parse.go @ 40af9c2: "filling in missing series not
+    /// allowed for set operators" — the vendored parser does not check
+    /// fill on set ops, so the planner does (flag-on; flag-off is the
+    /// uniform experimental rejection above).
+    #[test]
+    fn fill_on_a_set_operator_is_bad_matching_with_the_flag_on() {
+        let expr = parse("foo and fill(0) bar").unwrap();
+        let err = plan(&expr, params_experimental()).unwrap_err();
+        match err {
+            PromqlError::BadMatching { detail } => assert!(
+                detail.contains("filling in missing series not allowed for set operators"),
+                "got {detail:?}"
+            ),
+            other => panic!("expected BadMatching, got {other:?}"),
+        }
+    }
+
+    // --- issue #70 plan v2 D4 (as amended): the scalar-operand guard is
+    // parse.go:807-814 exactly — with a scalar operand, error ONLY on a
+    // non-empty on/ignoring label list or a fill value; empty `on()`/
+    // `ignoring()` and `group_left`/`group_right` are silently discarded.
+
+    #[test]
+    fn empty_on_with_a_scalar_operand_plans_with_the_matching_discarded() {
+        let expr = parse("foo + on() 5").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary {
+                matching, group, ..
+            } => {
+                assert!(!matching.on, "matching is cleared to the default");
+                assert!(matching.labels.is_empty());
+                assert_eq!(group, &Group::OneToOne);
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// The round-2 adjudication's golden pin, at the nearest
+    /// grammar-reachable spelling: `group_left`/`group_right` with a
+    /// scalar operand and *empty* matching is accepted-with-discard —
+    /// the group modifier simply has no effect (upstream clears
+    /// `VectorMatching` after the label/fill checks). The adjudication's
+    /// literal `foo + group_left(x) 5` cannot parse in ANY PromQL
+    /// grammar — upstream's `group_modifiers` production only admits
+    /// `group_left`/`group_right` *after* an `on`/`ignoring` clause, and
+    /// the vendored parser mirrors that ("unexpected <group_left>",
+    /// pinned below) — so the `on()`-prefixed spellings here are the
+    /// exact upstream-reachable forms of the same semantics.
+    #[test]
+    fn group_left_with_a_scalar_operand_and_empty_matching_is_silently_discarded() {
+        for query in [
+            "foo + on() group_left(x) 5",
+            "foo + on() group_right(x) 5",
+            "foo + on() group_left 5",
+            "foo + ignoring() group_right(x) 5",
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::Binary {
+                    matching, group, ..
+                } => {
+                    assert_eq!(group, &Group::OneToOne, "{query}: group discarded");
+                    assert!(matching.labels.is_empty(), "{query}: matching cleared");
+                }
+                other => panic!("{query}: expected Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// The grammar-level companion to the discard pin above: a bare
+    /// `group_left` with no preceding `on`/`ignoring` clause is a parse
+    /// error in the upstream grammar and the vendored parser alike.
+    #[test]
+    fn group_left_without_on_or_ignoring_is_a_parse_error() {
+        let err = parse("foo + group_left(x) 5").unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)), "got {err:?}");
+    }
+
+    /// `bool` lives outside upstream's `VectorMatching` — it survives the
+    /// scalar-operand discard.
+    #[test]
+    fn bool_survives_the_scalar_operand_matching_discard() {
+        let expr = parse("foo > bool on() 5").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary { bool_modifier, .. } => assert!(bool_modifier),
+            other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// A NON-empty matching label list with a scalar operand errors — the
+    /// vendored parser already rejects it at parse time ("vector matching
+    /// only allowed between vectors"), pinned here so the plan-level
+    /// defense-in-depth arm stays honest about which layer fires.
+    #[test]
+    fn nonempty_on_with_a_scalar_operand_is_a_parse_error() {
+        let err = parse("foo + on(job) 5").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vector matching only allowed between vectors"),
+            "got {err}"
+        );
+    }
+
+    /// A fill value with a scalar operand errors at plan time (the
+    /// vendored parser has no fill check): upstream parse.go's "filling
+    /// in missing series only allowed between instant vectors".
+    #[test]
+    fn fill_with_a_scalar_operand_is_bad_matching_with_the_flag_on() {
+        for query in ["foo + fill(0) 5", "5 + fill_left(1) foo"] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, params_experimental()).unwrap_err();
+            match err {
+                PromqlError::BadMatching { detail } => assert!(
+                    detail
+                        .contains("filling in missing series only allowed between instant vectors"),
+                    "{query}: got {detail:?}"
+                ),
+                other => panic!("{query}: expected BadMatching, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #81 guard for the non-fill side (kept through #70): a
+    /// modifier *without* fill values (plain `on(...)`) keeps planning
+    /// exactly as before — never a new cost or behavior change for
+    /// non-fill queries.
     #[test]
     fn a_modifier_without_fill_values_still_plans() {
         let expr = parse("foo * on(job) bar").unwrap();

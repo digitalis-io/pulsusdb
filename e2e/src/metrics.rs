@@ -1849,14 +1849,26 @@ mod tests {
     /// --enable-feature=promql-experimental-functions and would error
     /// one-sidedly; their selection is additionally hash/order-dependent
     /// — see the coverage manifest rationale). Those are proven Tier-1 by
-    /// the proof corpus + unit tests, per the #69 adjudication.
+    /// the proof corpus + unit tests, per the #69 adjudication. Resized
+    /// 132 -> 146 by issue #70 (M6-07): 7 new entries x 2 modes for the
+    /// set operators (with and without on/ignoring — verbatim
+    /// passthrough, bit-exact-eligible) and group_left/group_right with
+    /// an include label (IEEE basic-op values over an order-independent
+    /// `max by` one side) — `atan2` is deliberately excluded from this
+    /// bit-exact matrix (Go-vs-Rust libm ULP, the #65-recorded
+    /// discipline; proven by the corpus at its 1e-6 epsilon) and the
+    /// experimental fill modifiers cannot appear at all (the e2e
+    /// Prometheus runs without
+    /// --enable-feature=promql-experimental-functions and would error
+    /// one-sidedly; proven by the fully-green upstream fill-modifier
+    /// corpus file instead, per the #70 adjudication).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_thirty_two_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_forty_six_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 132,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 132 — update \
+            rows, 146,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 146 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

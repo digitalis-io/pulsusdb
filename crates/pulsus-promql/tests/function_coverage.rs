@@ -533,7 +533,20 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
         .collect();
     assert_eq!(
         implemented_features,
-        BTreeSet::from(["vector-matching-on-ignoring"])
+        BTreeSet::from([
+            "vector-matching-on-ignoring",
+            // M6-07 (issue #70): the binary-operator matrix completion —
+            // set ops, group_left/group_right, atan2, and the
+            // experimental fill modifiers (planner-gated behind
+            // promql-experimental-functions).
+            "set-op-and",
+            "set-op-or",
+            "set-op-unless",
+            "group_left",
+            "group_right",
+            "atan2",
+            "binop-fill-modifier",
+        ])
     );
 }
 

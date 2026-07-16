@@ -24,17 +24,21 @@ pub enum PromqlError {
 
     /// An out-of-subset function, operator, or modifier — named exactly so
     /// the caller never has to guess what silently failed (architect plan:
-    /// "no silent wrong answer"). Covers everything outside the M2 proof
-    /// subset: the `@` modifier, subqueries, `group_left`/`group_right`,
-    /// duration-expression arithmetic, native-histogram arithmetic, and
-    /// every function outside the M2 list.
+    /// "no silent wrong answer"). Covers everything outside the
+    /// implemented subset: the `@` modifier, subqueries,
+    /// duration-expression arithmetic, native-histogram arithmetic,
+    /// gated experimental constructs with the flag off, and every
+    /// unimplemented function.
     #[error("not yet supported: {construct}")]
     Unsupported { construct: String },
 
-    /// A binary expression's vector matching is invalid or unsupported —
-    /// e.g. a many-to-one match without `group_left`/`group_right` (which
-    /// are themselves out of the M2 subset, so any many-to-one match is
-    /// rejected here, never silently mismatched).
+    /// A binary expression's vector matching is invalid — the upstream
+    /// duplicate-match errors (a many-to-one match without
+    /// `group_left`/`group_right`, a duplicate "one"-side signature, a
+    /// non-unique many-to-one output identity — issue #70 carries the
+    /// verbatim upstream v3.13 message in `detail`) and the
+    /// modifier-misuse rejections ported from upstream parse.go (fill
+    /// with a scalar operand or a set operator).
     #[error("binary operator matching error: {detail}")]
     BadMatching { detail: String },
 

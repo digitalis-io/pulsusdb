@@ -8,6 +8,7 @@ use crate::error::PromqlError;
 pub use promql_parser::label::{
     MatchOp as PLabelMatchOp, Matcher as PMatcher, Matchers as PMatchers,
 };
+pub use promql_parser::parser::value::ValueType;
 pub use promql_parser::parser::{
     AggregateExpr, AtModifier, BinModifier, BinaryExpr, Call, Expr, LabelModifier, MatrixSelector,
     NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr,

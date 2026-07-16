@@ -107,6 +107,14 @@
 
     { "expr": "group by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
     { "expr": "group without(instance)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
-    { "expr": "count_values(\"v\", mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] }
+    { "expr": "count_values(\"v\", mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} and ignoring(slot) requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} or requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} unless requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "requests_total{run_id=\"{R}\"} unless on(instance, run_id) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} / on(service, run_id) group_left max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * on(service, run_id) group_left(team) label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
+    { "expr": "label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\") * on(service, run_id) group_right(team) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] }
   ]
 }

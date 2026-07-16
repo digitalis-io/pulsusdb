@@ -22,6 +22,7 @@ pub mod datetime;
 pub mod elementwise;
 pub mod functions;
 pub mod labels;
+mod quote;
 pub mod staleness;
 
 use std::collections::HashMap;
@@ -815,22 +816,74 @@ fn eval_step(
             rhs,
             bool_modifier,
             matching,
+            group,
+            fill,
+        } => {
+            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms)?;
+            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms)?;
+            // The planner's typed scalar-operand guard (issue #70,
+            // parse.go:807-814) discards `group`/`fill` whenever either
+            // operand is scalar-typed, so the scalar arms below can never
+            // see them — asserted, not silently ignored.
+            match (l, r) {
+                (StepValue::Scalar(l), StepValue::Scalar(r)) => {
+                    debug_assert!(
+                        *group == crate::plan::Group::OneToOne && *fill == Default::default(),
+                        "plan_binary discards group/fill for scalar operands"
+                    );
+                    Ok(StepValue::Scalar(binop::scalar_scalar(*op, l, r)))
+                }
+                (StepValue::Vector(v), StepValue::Scalar(s)) => {
+                    debug_assert!(
+                        *group == crate::plan::Group::OneToOne && *fill == Default::default(),
+                        "plan_binary discards group/fill for scalar operands"
+                    );
+                    Ok(StepValue::Vector(binop::vector_scalar(
+                        *op,
+                        *bool_modifier,
+                        &v,
+                        s,
+                        false,
+                    )))
+                }
+                (StepValue::Scalar(s), StepValue::Vector(v)) => {
+                    debug_assert!(
+                        *group == crate::plan::Group::OneToOne && *fill == Default::default(),
+                        "plan_binary discards group/fill for scalar operands"
+                    );
+                    Ok(StepValue::Vector(binop::vector_scalar(
+                        *op,
+                        *bool_modifier,
+                        &v,
+                        s,
+                        true,
+                    )))
+                }
+                (StepValue::Vector(l), StepValue::Vector(r)) => Ok(StepValue::Vector(
+                    binop::vector_vector(*op, *bool_modifier, matching, group, fill, &l, &r)?,
+                )),
+            }
+        }
+
+        // Issue #70 (M6-07): `and`/`or`/`unless` — both operands are
+        // vector-typed by the vendored parser's own check ("set operator
+        // ... not allowed in binary scalar expression"), so the non-vector
+        // arm is defense-in-depth, never reachable through `parse()`.
+        PlanExpr::SetOp {
+            op,
+            lhs,
+            rhs,
+            matching,
         } => {
             let l = eval_step(lhs, selectors, data, t_ms, lookback_ms)?;
             let r = eval_step(rhs, selectors, data, t_ms, lookback_ms)?;
             match (l, r) {
-                (StepValue::Scalar(l), StepValue::Scalar(r)) => {
-                    Ok(StepValue::Scalar(binop::scalar_scalar(*op, l, r)))
+                (StepValue::Vector(l), StepValue::Vector(r)) => {
+                    Ok(StepValue::Vector(binop::set_op(*op, matching, &l, &r)))
                 }
-                (StepValue::Vector(v), StepValue::Scalar(s)) => Ok(StepValue::Vector(
-                    binop::vector_scalar(*op, *bool_modifier, &v, s, false),
-                )),
-                (StepValue::Scalar(s), StepValue::Vector(v)) => Ok(StepValue::Vector(
-                    binop::vector_scalar(*op, *bool_modifier, &v, s, true),
-                )),
-                (StepValue::Vector(l), StepValue::Vector(r)) => Ok(StepValue::Vector(
-                    binop::vector_vector(*op, *bool_modifier, matching, &l, &r)?,
-                )),
+                _ => Err(PromqlError::Unsupported {
+                    construct: "set operator over a scalar operand".to_string(),
+                }),
             }
         }
     }
