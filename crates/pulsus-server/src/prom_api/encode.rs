@@ -326,14 +326,26 @@ fn render_vector_item(s: &VectorSample, at_ms: i64) -> Vec<u8> {
 /// evaluation time (`/query`'s `time` param) — only read for
 /// [`QueryResult::Vector`]/[`QueryResult::Scalar`] (never produced by a
 /// range query); `query_range` callers may pass any placeholder.
+///
+/// `ordered` (issue #68, M6-05 — task-manager-adjudicated shape): `true`
+/// skips the vector arm's deterministic label re-sort so the evaluator's
+/// own order survives on the wire — set ONLY for a sort-rooted
+/// (`pulsus_promql::expr_is_sort_root`) **instant** query by
+/// `handlers::run_query`; every other query (and every matrix result,
+/// which has no upstream ordering contract here) keeps the label-sorted
+/// output the M2 determinism discipline pinned. Without this, `sort()`/
+/// `sort_desc()` would be inert at the API.
 pub(crate) fn query_response(
     result: QueryResult,
     explain: Option<PlanExplain>,
     at_ms: i64,
+    ordered: bool,
 ) -> Response {
     match result {
         QueryResult::Vector(mut items) => {
-            items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            if !ordered {
+                items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            }
             let prefix =
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":["
                     .to_vec();
@@ -718,7 +730,7 @@ mod tests {
             labels: vec![("job".to_string(), "api".to_string())],
             value: 42.0,
         };
-        let res = query_response(QueryResult::Vector(vec![sample]), None, 5_500);
+        let res = query_response(QueryResult::Vector(vec![sample]), None, 5_500, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -732,7 +744,7 @@ mod tests {
             labels: vec![("job".to_string(), "api".to_string())],
             points: vec![(0, 1.0), (1_000, 2.5)],
         };
-        let res = query_response(QueryResult::Matrix(vec![series]), None, 0);
+        let res = query_response(QueryResult::Matrix(vec![series]), None, 0, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -742,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn scalar_envelope_is_byte_exact() {
-        let res = query_response(QueryResult::Scalar(2.0), None, 1_000);
+        let res = query_response(QueryResult::Scalar(2.0), None, 1_000, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -757,7 +769,7 @@ mod tests {
     async fn scalar_envelope_nests_explain_under_data_byte_exact() {
         let mut explain = PlanExplain::new("scalar");
         explain.push("literal", "SELECT 2", None);
-        let res = query_response(QueryResult::Scalar(2.0), Some(explain), 1_000);
+        let res = query_response(QueryResult::Scalar(2.0), Some(explain), 1_000, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -769,7 +781,7 @@ mod tests {
     async fn scalar_envelope_with_explain_has_no_top_level_explain_field() {
         let mut explain = PlanExplain::new("scalar");
         explain.push("literal", "SELECT 2", None);
-        let res = query_response(QueryResult::Scalar(2.0), Some(explain), 1_000);
+        let res = query_response(QueryResult::Scalar(2.0), Some(explain), 1_000, false);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
@@ -791,18 +803,74 @@ mod tests {
                 value: 2.0,
             },
         ]);
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let body = body_string(res).await;
         let alpha_pos = body.find("alpha").expect("alpha present");
         let zeta_pos = body.find("zeta").expect("zeta present");
         assert!(alpha_pos < zeta_pos);
     }
 
+    /// Issue #68 (M6-05) gate, direction 1: `ordered: true` (a
+    /// sort-rooted instant query) preserves the evaluator's value order
+    /// on the wire — the label re-sort must NOT run (it would put
+    /// `alpha` first and make `sort()` inert at the API).
+    #[tokio::test]
+    async fn ordered_vector_envelope_preserves_evaluator_order_on_the_wire() {
+        let result = QueryResult::Vector(vec![
+            VectorSample {
+                labels: vec![("job".to_string(), "zeta".to_string())],
+                value: 1.0,
+            },
+            VectorSample {
+                labels: vec![("job".to_string(), "alpha".to_string())],
+                value: 2.0,
+            },
+        ]);
+        let res = query_response(result, None, 0, true);
+        let body = body_string(res).await;
+        let alpha_pos = body.find("alpha").expect("alpha present");
+        let zeta_pos = body.find("zeta").expect("zeta present");
+        assert!(
+            zeta_pos < alpha_pos,
+            "ordered=true must keep the evaluator's order (zeta first): {body}"
+        );
+    }
+
+    /// Issue #68 (M6-05) gate, direction 2: `ordered` never disturbs a
+    /// matrix result — range queries keep the deterministic label sort
+    /// regardless (upstream's own "sort is ineffective for range
+    /// queries").
+    #[tokio::test]
+    async fn ordered_flag_does_not_affect_matrix_label_sorting() {
+        let make = || {
+            QueryResult::Matrix(vec![
+                MatrixSeries {
+                    labels: vec![("job".to_string(), "zeta".to_string())],
+                    points: vec![(0, 1.0)],
+                },
+                MatrixSeries {
+                    labels: vec![("job".to_string(), "alpha".to_string())],
+                    points: vec![(0, 2.0)],
+                },
+            ])
+        };
+        for ordered in [false, true] {
+            let res = query_response(make(), None, 0, ordered);
+            let body = body_string(res).await;
+            let alpha_pos = body.find("alpha").expect("alpha present");
+            let zeta_pos = body.find("zeta").expect("zeta present");
+            assert!(
+                alpha_pos < zeta_pos,
+                "matrix stays label-sorted with ordered={ordered}: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn query_response_carries_explain_with_exactness() {
         let mut explain = PlanExplain::new("vector");
         explain.push("sample_fetch", "SELECT 1", None);
-        let res = query_response(QueryResult::Vector(vec![]), Some(explain), 0);
+        let res = query_response(QueryResult::Vector(vec![]), Some(explain), 0, false);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["explain"]["result_type"], "vector");
@@ -812,7 +880,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_vector_result_still_renders_a_well_formed_envelope() {
-        let res = query_response(QueryResult::Vector(vec![]), None, 0);
+        let res = query_response(QueryResult::Vector(vec![]), None, 0, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -970,7 +1038,7 @@ mod tests {
             labels: vec![("job".to_string(), "api".to_string())],
             value: 1.0,
         }]);
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let mut body_stream = res.into_body().into_data_stream();
 
         while body_stream.next().await.is_some() {}
@@ -999,7 +1067,7 @@ mod tests {
             })
             .collect();
 
-        let res = query_response(QueryResult::Matrix(items), None, 0);
+        let res = query_response(QueryResult::Matrix(items), None, 0, false);
         let mut stream = res.into_body().into_data_stream();
 
         let mut chunk_count = 0usize;
@@ -1075,7 +1143,7 @@ mod tests {
                 labels: vec![("job".to_string(), "api".to_string())],
                 value: 42.0,
             };
-            query_response(QueryResult::Vector(vec![sample]), None, 5_500)
+            query_response(QueryResult::Vector(vec![sample]), None, 5_500, false)
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
@@ -1151,7 +1219,7 @@ mod tests {
         #[tokio::test]
         async fn query_vector_matches_the_captured_prometheus_response() {
             let fixture = include_str!("../../tests/fixtures/prom_api/query.vector_get.json");
-            let res = query_response(up_vector(), None, REF_MS);
+            let res = query_response(up_vector(), None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1176,7 +1244,7 @@ mod tests {
                     points: vec![(REF_MS, 0.0)],
                 },
             ]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1191,7 +1259,7 @@ mod tests {
         async fn query_name_selector_keeps_matches_captured() {
             let fixture =
                 include_str!("../../tests/fixtures/prom_api/query.name_selector_keeps_get.json");
-            let res = query_response(up_vector(), None, REF_MS);
+            let res = query_response(up_vector(), None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1203,7 +1271,7 @@ mod tests {
                 labels: vec![],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1219,7 +1287,7 @@ mod tests {
                 ],
                 value: 0.45,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1246,7 +1314,7 @@ mod tests {
                     points: vec![(REF_MS, 0.0)],
                 },
             ]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1259,7 +1327,7 @@ mod tests {
                 labels: vec![],
                 points: vec![(REF_MS, 1.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1275,7 +1343,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 0.45)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1296,7 +1364,7 @@ mod tests {
                 ],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1312,7 +1380,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 1.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1328,7 +1396,7 @@ mod tests {
                 ],
                 value: 0.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1345,7 +1413,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 0.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1369,7 +1437,7 @@ mod tests {
                     value: 0.0,
                 },
             ]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1394,7 +1462,7 @@ mod tests {
                     points: vec![(REF_MS, 0.0)],
                 },
             ]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1407,7 +1475,7 @@ mod tests {
                 labels: vec![],
                 value: 0.5,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1420,7 +1488,7 @@ mod tests {
                 labels: vec![],
                 points: vec![(REF_MS, 0.5)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1436,7 +1504,7 @@ mod tests {
                 ],
                 value: 2.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1452,7 +1520,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 2.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1469,7 +1537,7 @@ mod tests {
                 ],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1486,7 +1554,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 1.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1499,7 +1567,7 @@ mod tests {
                 labels: vec![("job".to_string(), "node".to_string())],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1512,7 +1580,7 @@ mod tests {
                 labels: vec![("job".to_string(), "node".to_string())],
                 points: vec![(REF_MS, 1.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1528,7 +1596,7 @@ mod tests {
                 ],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1544,7 +1612,7 @@ mod tests {
                 ],
                 points: vec![(REF_MS, 1.0)],
             }]);
-            let res = query_response(result, None, 0);
+            let res = query_response(result, None, 0, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1562,7 +1630,7 @@ mod tests {
                 labels: vec![("__name__".to_string(), "up".to_string())],
                 value: 1.0,
             }]);
-            let res = query_response(result, None, REF_MS);
+            let res = query_response(result, None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1574,7 +1642,7 @@ mod tests {
             let fixture = include_str!(
                 "../../tests/fixtures/prom_api/query.name_on_dunder_name_different_names_empty_get.json"
             );
-            let res = query_response(QueryResult::Vector(vec![]), None, REF_MS);
+            let res = query_response(QueryResult::Vector(vec![]), None, REF_MS, false);
             assert_eq!(body_string(res).await, fixture);
         }
 
@@ -1632,7 +1700,7 @@ mod tests {
                 async fn $test_name() {
                     let fixture = include_str!(concat!("../../tests/fixtures/prom_api/", $fixture));
                     let at_ms = golden_scalar_at_ms(fixture);
-                    let res = query_response(QueryResult::Scalar($value), None, at_ms);
+                    let res = query_response(QueryResult::Scalar($value), None, at_ms, false);
                     assert_eq!(body_string(res).await, fixture);
                 }
             };

@@ -340,6 +340,53 @@ pub enum PlanExpr {
     AbsentOverTime {
         selector: SelectorId,
     },
+    /// Issue #68 (M6-05): `absent(v)` — the instant-vector counterpart of
+    /// [`PlanExpr::AbsentOverTime`]. When the (paren-stripped) argument is
+    /// a bare vector selector, `selector` carries its id so the evaluator
+    /// can synthesize labels from the matchers (the shared
+    /// `createLabelsForAbsentFunction` walk); any computed argument plans
+    /// normally with `selector: None` (empty synthetic label set).
+    Absent {
+        arg: Box<PlanExpr>,
+        selector: Option<SelectorId>,
+    },
+    /// Issue #68 (M6-05): `sort(v)`/`sort_desc(v)` — a pure pass-through
+    /// reorder (value order, NaN last in both directions). Ordering is
+    /// observable for instant queries only.
+    Sort {
+        descending: bool,
+        arg: Box<PlanExpr>,
+    },
+    /// Issue #68 (M6-05, experimental): `sort_by_label(v, names…)`/
+    /// `sort_by_label_desc(v, names…)` — natural (numeric-aware) label
+    /// collation in argument order, full-label-set tie-break.
+    SortByLabel {
+        descending: bool,
+        labels: Vec<String>,
+        arg: Box<PlanExpr>,
+    },
+    /// Issue #68 (M6-05): `label_replace(v, dst, replacement, src,
+    /// regex)`. `regex` is validated at plan time (compiled with
+    /// upstream's exact `^(?s:…)$` dot-all anchoring) and recompiled per
+    /// evaluation step; `dst` name validity is checked at plan time too
+    /// (both mirror upstream funcLabelReplace's before-the-loop checks,
+    /// so they error even over an empty selection).
+    LabelReplace {
+        arg: Box<PlanExpr>,
+        dst: String,
+        replacement: String,
+        src: String,
+        regex: String,
+    },
+    /// Issue #68 (M6-05): `label_join(v, dst, separator, src…)`. `dst`
+    /// and every `src` name are validated at plan time (upstream
+    /// funcLabelJoin's own order).
+    LabelJoin {
+        arg: Box<PlanExpr>,
+        dst: String,
+        separator: String,
+        src_labels: Vec<String>,
+    },
     HistogramQuantile {
         quantile: Box<PlanExpr>,
         expr: Box<PlanExpr>,
@@ -1009,7 +1056,162 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         return Ok(PlanExpr::VectorOf { arg: Box::new(arg) });
     }
 
+    // Issue #68 (M6-05): sort family. Pure pass-through reorders — no
+    // string arguments for the value-sorting pair; the experimental
+    // `sort_by_label*` pair takes 0+ label-name string literals (registry
+    // variadic `-1`: `sort_by_label(m)` with no names is valid upstream —
+    // the full-label-set fallback alone orders it).
+    if let Some(descending) = match name {
+        "sort" => Some(false),
+        "sort_desc" => Some(true),
+        _ => None,
+    } {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported(format!("{name}() with != 1 argument")));
+        };
+        let arg = plan_expr(planner, arg)?;
+        return Ok(PlanExpr::Sort {
+            descending,
+            arg: Box::new(arg),
+        });
+    }
+    if let Some(descending) = match name {
+        "sort_by_label" => Some(false),
+        "sort_by_label_desc" => Some(true),
+        _ => None,
+    } {
+        if !planner.experimental {
+            return Err(unsupported(format!(
+                "experimental function {name}() (requires promql-experimental-functions)"
+            )));
+        }
+        let Some((vector_arg, label_args)) = args.split_first() else {
+            return Err(unsupported(format!("{name}() with no arguments")));
+        };
+        let arg = plan_expr(planner, vector_arg)?;
+        let labels = label_args
+            .iter()
+            .map(|a| plan_string_arg(name, a))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PlanExpr::SortByLabel {
+            descending,
+            labels,
+            arg: Box::new(arg),
+        });
+    }
+
+    // Issue #68 (M6-05): `label_replace`/`label_join`. String arguments
+    // are pulled directly from the (paren-stripped) AST — never via
+    // `plan_expr`, which rejects `Expr::StringLiteral` outright — and the
+    // regex/label-name validity checks run at plan time, mirroring
+    // upstream's before-the-loop checks (they error even over an empty
+    // selection).
+    if name == "label_replace" {
+        let [vector_arg, dst_arg, replacement_arg, src_arg, regex_arg] = args.as_slice() else {
+            return Err(unsupported("label_replace() with != 5 arguments"));
+        };
+        let arg = plan_expr(planner, vector_arg)?;
+        let dst = plan_string_arg(name, dst_arg)?;
+        let replacement = plan_string_arg(name, replacement_arg)?;
+        let src = plan_string_arg(name, src_arg)?;
+        let regex = plan_string_arg(name, regex_arg)?;
+        // Plan v2 Δ1: upstream's exact `^(?s:regex)$` dot-all anchoring —
+        // the same construction the eval arm recompiles per step.
+        crate::eval::labels::compile_label_replace_regex(&regex)?;
+        if !crate::eval::labels::is_valid_label_name(&dst) {
+            return Err(PromqlError::LabelSet {
+                detail: format!("invalid destination label name in label_replace(): {dst}"),
+            });
+        }
+        return Ok(PlanExpr::LabelReplace {
+            arg: Box::new(arg),
+            dst,
+            replacement,
+            src,
+            regex,
+        });
+    }
+    if name == "label_join" {
+        // Registry arity: vector, dst, separator, then 0+ src labels
+        // (variadic `-1` — `label_join(m, "dst", ", ")` is valid and
+        // joins to `""`, deleting dst).
+        if args.len() < 3 {
+            return Err(unsupported("label_join() with < 3 arguments"));
+        }
+        let arg = plan_expr(planner, &args[0])?;
+        let dst = plan_string_arg(name, &args[1])?;
+        let separator = plan_string_arg(name, &args[2])?;
+        let mut src_labels = Vec::with_capacity(args.len() - 3);
+        for a in &args[3..] {
+            src_labels.push(plan_string_arg(name, a)?);
+        }
+        if !crate::eval::labels::is_valid_label_name(&dst) {
+            return Err(PromqlError::LabelSet {
+                detail: format!("invalid destination label name in label_join(): {dst}"),
+            });
+        }
+        for src in &src_labels {
+            if !crate::eval::labels::is_valid_label_name(src) {
+                return Err(PromqlError::LabelSet {
+                    detail: format!("invalid source label name in label_join(): {src}"),
+                });
+            }
+        }
+        return Ok(PlanExpr::LabelJoin {
+            arg: Box::new(arg),
+            dst,
+            separator,
+            src_labels,
+        });
+    }
+
+    // Issue #68 (M6-05): `absent(v)`. A bare (paren-stripped) vector-
+    // selector argument records its selector id so the evaluator can
+    // synthesize labels from the matchers (the `timestamp()` special-case
+    // shape); every computed argument plans normally with no selector
+    // (empty synthetic label set).
+    if name == "absent" {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported("absent() with != 1 argument"));
+        };
+        return Ok(match unwrap_parens(arg) {
+            Expr::VectorSelector(vs) => {
+                let planned = plan_vector_selector(planner, vs)?;
+                let PlanExpr::Selector(id) = planned else {
+                    // `plan_vector_selector` only ever builds a Selector —
+                    // kept total (a descriptive error, never a panic).
+                    return Err(unsupported(
+                        "absent() over an unexpected selector plan shape",
+                    ));
+                };
+                PlanExpr::Absent {
+                    arg: Box::new(PlanExpr::Selector(id)),
+                    selector: Some(id),
+                }
+            }
+            other => PlanExpr::Absent {
+                arg: Box::new(plan_expr(planner, other)?),
+                selector: None,
+            },
+        });
+    }
+
     Err(unsupported(format!("function {name}()")))
+}
+
+/// Extracts a string-literal argument for the label/sort functions
+/// (issue #68): parentheses are stripped first — the vendored
+/// `label_replace((((testmetric))), (("dst")), …)` case requires it —
+/// then the literal's value is taken **directly from the AST**
+/// (`plan_expr` rejects `Expr::StringLiteral` outright, so string
+/// arguments never route through it).
+fn plan_string_arg(func: &str, expr: &Expr) -> Result<String, PromqlError> {
+    match unwrap_parens(expr) {
+        Expr::StringLiteral(s) => Ok(s.val.clone()),
+        _ => Err(unsupported(format!(
+            "{func}() with a non-string-literal string argument"
+        ))),
+    }
 }
 
 fn agg_op(op: token::TokenType) -> Option<AggOp> {
@@ -1557,13 +1759,16 @@ mod tests {
 
     #[test]
     fn a_function_outside_the_implemented_list_is_unsupported() {
-        // `sort` is scheduled for M6-05 — a stand-in for "any function the
-        // planner does not yet map" (issue #65 moved the previous stand-in,
-        // `abs`, into the implemented set).
-        let expr = parse("sort(up)").unwrap();
+        // `histogram_count` is scheduled for the native-histogram issue
+        // (#22) — a stand-in for "any function the planner does not yet
+        // map" (issue #65 moved the previous stand-in, `abs`, into the
+        // implemented set; issue #68 moved its successor, `sort`).
+        let expr = parse("histogram_count(up)").unwrap();
         let err = plan(&expr, params()).unwrap_err();
         match err {
-            PromqlError::Unsupported { construct } => assert!(construct.contains("sort")),
+            PromqlError::Unsupported { construct } => {
+                assert!(construct.contains("histogram_count"));
+            }
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
@@ -2297,6 +2502,172 @@ mod tests {
         for query in ["time()", "month()", "vector(1)", "vector(time())"] {
             let p = plan(&parse(query).unwrap(), params()).unwrap();
             assert!(p.selectors.is_empty(), "{query} must emit no selector");
+        }
+    }
+
+    // --- issue #68 (M6-05): label, sort & absence functions ---
+
+    /// Perf Tier-1 gate (AC6; standing query-performance mandate): every
+    /// M6-05 function is pure post-fetch — the wrapped expression's
+    /// selector set (the input the fetch SQL — and therefore the
+    /// `X-Pulsus-Explain` `sample_fetch` stage — is generated from) is
+    /// byte-identical to the bare expression's, mirroring the
+    /// #65/#66/#67 gates above.
+    #[test]
+    fn m6_05_label_sort_absence_fns_keep_the_selector_set_byte_identical() {
+        let bare = plan(
+            &parse(r#"mem_usage_bytes{service="svc-1"}"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        for query in [
+            r#"sort(mem_usage_bytes{service="svc-1"})"#,
+            r#"sort_desc(mem_usage_bytes{service="svc-1"})"#,
+            r#"sort_by_label(mem_usage_bytes{service="svc-1"}, "service")"#,
+            r#"sort_by_label_desc(mem_usage_bytes{service="svc-1"}, "service")"#,
+            r#"label_replace(mem_usage_bytes{service="svc-1"}, "dst", "$1", "service", "(.*)")"#,
+            r#"label_join(mem_usage_bytes{service="svc-1"}, "dst", "-", "service")"#,
+            r#"absent(mem_usage_bytes{service="svc-1"})"#,
+        ] {
+            let wrapped = plan(&parse(query).unwrap(), params_experimental()).unwrap();
+            assert_eq!(wrapped.selectors, bare.selectors, "{query}");
+        }
+    }
+
+    /// `sort_by_label`/`sort_by_label_desc` are registry-experimental —
+    /// rejected by name unless the gate is on (the `max_of`/`first_over_
+    /// time` pattern), including the zero-label-argument form the
+    /// coverage auto-probe uses.
+    #[test]
+    fn sort_by_label_is_gated_behind_experimental_functions() {
+        for query in [
+            r#"sort_by_label(up, "job")"#,
+            r#"sort_by_label_desc(up, "job")"#,
+            "sort_by_label(up)",
+        ] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, params()).unwrap_err();
+            assert!(matches!(err, PromqlError::Unsupported { .. }), "{query}");
+            let p = plan(&expr, params_experimental()).unwrap();
+            match &p.root {
+                PlanExpr::SortByLabel { .. } => {}
+                other => panic!("{query}: expected SortByLabel, got {other:?}"),
+            }
+        }
+    }
+
+    /// String arguments are pulled from the paren-stripped AST — the
+    /// vendored `label_replace((((testmetric))), (("dst")), …)` shape.
+    #[test]
+    fn label_replace_accepts_paren_wrapped_string_arguments() {
+        let expr = parse(
+            r#"label_replace((((testmetric))), (("dst")), (("value-$1")), (("src")), (("re")))"#,
+        )
+        .unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::LabelReplace {
+                dst,
+                replacement,
+                src,
+                regex,
+                ..
+            } => {
+                assert_eq!(dst, "dst");
+                assert_eq!(replacement, "value-$1");
+                assert_eq!(src, "src");
+                assert_eq!(regex, "re");
+            }
+            other => panic!("expected LabelReplace, got {other:?}"),
+        }
+    }
+
+    /// A non-string expression in a string position (and a short
+    /// `label_join` argument list) never reaches the planner at all — the
+    /// vendored parser's own type/arity check rejects it first
+    /// (`plan_string_arg`'s `Unsupported` branch is defense-in-depth for
+    /// a hand-built AST, kept total rather than relied upon).
+    #[test]
+    fn label_fns_non_string_or_short_argument_lists_are_parse_errors() {
+        for query in [
+            r#"label_replace(up, up, "r", "s", ".*")"#,
+            r#"label_join(up, "d", 1)"#,
+            r#"sort_by_label(up, up)"#,
+            r#"label_join(up, "dst")"#,
+        ] {
+            let err = parse(query).unwrap_err();
+            assert!(matches!(err, PromqlError::Parse(_)), "{query}: {err:?}");
+        }
+    }
+
+    /// Plan-time validation (mirroring upstream's before-the-loop checks,
+    /// so these error even over an empty selection): invalid regex under
+    /// the `^(?s:…)$` anchor, and invalid (empty) destination/source
+    /// label names, each with the exact upstream message.
+    #[test]
+    fn label_fns_plan_time_validation_errors_carry_the_upstream_messages() {
+        for (query, want) in [
+            (
+                r#"label_replace(up, "dst", "v", "src", "(.*")"#,
+                "invalid regular expression in label_replace(): (.*",
+            ),
+            (
+                r#"label_replace(up, "", "v", "src", "(.*)")"#,
+                "invalid destination label name in label_replace(): ",
+            ),
+            (
+                r#"label_join(up, "", ",", "src")"#,
+                "invalid destination label name in label_join(): ",
+            ),
+            (
+                r#"label_join(up, "dst", ",", "")"#,
+                "invalid source label name in label_join(): ",
+            ),
+        ] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, params()).unwrap_err();
+            assert!(matches!(err, PromqlError::LabelSet { .. }), "{query}");
+            assert_eq!(err.to_string(), want, "{query}");
+        }
+    }
+
+    /// A valid `(?s:…)`-anchored regex plans fine — the dot-all wrapper
+    /// itself must not break compilation of ordinary patterns (including
+    /// an already-flagged one).
+    #[test]
+    fn label_replace_accepts_ordinary_and_flagged_regexes_at_plan_time() {
+        for query in [
+            r#"label_replace(up, "dst", "$1", "src", "source-value-(.*)")"#,
+            r#"label_replace(up, "dst", "${x}", "src", "(?P<x>.*)")"#,
+            r#"label_replace(up, "dst", "$1", "src", "(?i)(A.B)")"#,
+        ] {
+            let expr = parse(query).unwrap();
+            assert!(plan(&expr, params()).is_ok(), "{query}");
+        }
+    }
+
+    /// `absent` over a bare (paren-stripped) selector records the
+    /// selector id for label synthesis; any computed argument records
+    /// `None`.
+    #[test]
+    fn absent_records_the_bare_selector_and_only_the_bare_selector() {
+        for query in ["absent(up)", "absent(((up)))", r#"absent(up{job="x"})"#] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::Absent {
+                    selector: Some(id), ..
+                } => assert_eq!(*id, 0, "{query}"),
+                other => panic!("{query}: expected Absent with a selector, got {other:?}"),
+            }
+        }
+        for query in ["absent(sum(up))", "absent(up + up)", "absent(rate(up[5m]))"] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::Absent { selector: None, .. } => {}
+                other => panic!("{query}: expected Absent without a selector, got {other:?}"),
+            }
         }
     }
 }

@@ -227,12 +227,23 @@ async fn run_query(
     explain: bool,
     at_ms: i64,
 ) -> Result<Response, ApiError> {
+    // Issue #68 (M6-05): a sort-rooted INSTANT query's wire order is the
+    // evaluator's own (that ordering is the function's whole point);
+    // everything else — every non-sort query, and every range query
+    // (upstream's own "sort is ineffective for range queries") — keeps
+    // the encoder's deterministic label sort.
+    let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
     if explain {
         let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
-        Ok(encode::query_response(result, Some(plan_explain), at_ms))
+        Ok(encode::query_response(
+            result,
+            Some(plan_explain),
+            at_ms,
+            ordered,
+        ))
     } else {
         let result = engine.query(expr, query_params).await?;
-        Ok(encode::query_response(result, None, at_ms))
+        Ok(encode::query_response(result, None, at_ms, ordered))
     }
 }
 

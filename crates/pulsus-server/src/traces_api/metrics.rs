@@ -88,7 +88,11 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         MetricsForm::Range => (engine.metrics_range(&plan).await?, 0),
         MetricsForm::Instant => (engine.metrics_instant(&plan).await?, plan.snapped_end_ms()),
     };
-    Ok(crate::prom_api::encode::query_response(result, None, at_ms))
+    // `ordered: false` — TraceQL metrics have no sort-rooted form; the
+    // encoder's deterministic label sort stays in force (issue #68).
+    Ok(crate::prom_api::encode::query_response(
+        result, None, at_ms, false,
+    ))
 }
 
 #[cfg(test)]

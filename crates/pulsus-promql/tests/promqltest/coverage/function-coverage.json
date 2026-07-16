@@ -13,8 +13,11 @@
     {
       "name": "absent",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "absent(nonexistent{job=\"testjob\", instance=\"testinstance\", method=~\".x\"})"
+      }
     },
     {
       "name": "absent_over_time",
@@ -347,7 +350,7 @@
       "name": "info",
       "experimental": true,
       "status": "scheduled",
-      "issue": "M6-05"
+      "issue": "M6-05b"
     },
     {
       "name": "irate",
@@ -361,14 +364,20 @@
     {
       "name": "label_join",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "label_join(testmetric, \"dst\", \"-\", \"src\", \"src1\", \"src2\")"
+      }
     },
     {
       "name": "label_replace",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "label_replace(testmetric, \"dst\", \"destination-value-$1\", \"src\", \"source-value-(.*)\")"
+      }
     },
     {
       "name": "last_over_time",
@@ -586,26 +595,38 @@
     {
       "name": "sort",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "sort(http_requests)"
+      }
     },
     {
       "name": "sort_by_label",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "sort_by_label(cpu_time_total, \"cpu\")"
+      }
     },
     {
       "name": "sort_by_label_desc",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "sort_by_label_desc(http_requests, \"instance\")"
+      }
     },
     {
       "name": "sort_desc",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-05"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05_label_sort_absence.test",
+        "query": "sort_desc(http_requests)"
+      }
     },
     {
       "name": "sqrt",

@@ -1829,14 +1829,21 @@ mod tests {
     /// bit-exact matrix, and the experimental functions cannot appear at
     /// all (the e2e Prometheus runs without
     /// --enable-feature=promql-experimental-functions and would error
-    /// one-sidedly).
+    /// one-sidedly). Resized 120 -> 126 by issue #68 (M6-05): 3 new
+    /// entries x 2 modes for label_replace/label_join/absent
+    /// (pass-through values, bit-exact-eligible; value+labelset only —
+    /// the harness's set comparison cannot see ordering, so sort/
+    /// sort_desc rows would prove nothing and the experimental
+    /// sort_by_label pair cannot appear at all, both per the #68
+    /// adjudication — ordering is proven Tier-1 by the proof corpus's
+    /// eval_ordered cases plus the encode-level wire-order test).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_twenty_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_twenty_six_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 120,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 120 — update \
+            rows, 126,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 126 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

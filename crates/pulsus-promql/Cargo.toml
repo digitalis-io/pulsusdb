@@ -18,14 +18,16 @@ promql-parser.workspace = true
 # (`pulsus-model -> pulsus-promql -> pulsus-read`, issue #31 plan
 # amendment §1).
 pulsus-model = { path = "../pulsus-model" }
+# Promoted from [dev-dependencies] by issue #68 (M6-05): `label_replace`
+# needs upstream's exact `^(?s:regex)$` dot-all anchored matching +
+# `$1`/`${name}` capture expansion in the evaluator itself (previously the
+# promqltest driver's synthetic store was the only consumer, applying
+# `MatchOp::Re`/`Nre` with Prometheus's full anchoring when selecting
+# loaded series).
+regex.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# `regex` is test-only: the promqltest driver's synthetic store must apply
-# `MatchOp::Re`/`Nre` with Prometheus's full anchoring (`^(?:pat)$`) when
-# selecting loaded series — a mismatch would mis-select series and fake a
-# corpus divergence (issue #64 plan, edge cases).
-regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

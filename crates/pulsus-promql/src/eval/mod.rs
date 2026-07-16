@@ -21,13 +21,12 @@ pub mod binop;
 pub mod datetime;
 pub mod elementwise;
 pub mod functions;
+pub mod labels;
 pub mod staleness;
 
 use std::collections::HashMap;
 
 use pulsus_model::STALE_NAN_BITS;
-
-use pulsus_model::MatchOp;
 
 use crate::error::PromqlError;
 use crate::plan::{MathFn, OverTimeFn, PlanExpr, QueryPlan, ScalarFn, SelectorSpec};
@@ -41,11 +40,10 @@ enum StepValue {
     Scalar(f64),
 }
 
-/// A range query's per-`Labels`-group accumulator: the group's
-/// `metric_name` (issue #37 — constant across every step of one series,
-/// see [`evaluate`]'s own comment) alongside its accumulated `(t_ms, v)`
-/// points.
-type RangeGroupAcc = (Option<String>, Vec<(i64, f64)>);
+/// The FULL upstream series identity (plan v3 Δ5): the kept metric name
+/// (`None` for name-dropping constructs) alongside the non-name label
+/// set — upstream hashes the complete label set, `__name__` included.
+type SeriesIdentity = (Option<String>, Labels);
 
 /// Evaluates `plan` against `data` — pure, no I/O.
 pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, PromqlError> {
@@ -59,13 +57,26 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
         );
     }
 
-    // Issue #37 fix: `metric_name` is accumulated alongside `points`, keyed
-    // by the same `Labels` group — it is constant across every step of one
-    // series (the evaluated `PlanExpr` shape, and therefore its keep/drop
-    // verdict, never changes mid-query), so capturing it once per group
-    // (from whichever step first populates the group) is correct. See
-    // `InstantSample::metric_name`'s doc for the keep/drop contract itself.
-    let mut vector_points: HashMap<Labels, RangeGroupAcc> = HashMap::new();
+    // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
+    // range accumulator keys on the FULL upstream series identity
+    // `(metric_name, Labels)` — upstream hashes the complete label set,
+    // `__name__` included. The old key relied on "every member of one
+    // `Labels` group agrees on `metric_name`", which M6-05's
+    // `label_replace`/`label_join` `__name__` rewrites break (a nested
+    // `label_replace` can produce two metric names sharing one non-name
+    // label set — the `Labels`-only key silently merged them; see
+    // `a_labels_only_range_key_would_collapse_distinct_metric_names`).
+    // Cross-name merges cannot happen now because the key separates them;
+    // every step of one `(metric_name, Labels)` group agrees on the name
+    // by construction, so no per-entry assertion is needed. Existing
+    // query classes are outcome-unchanged: name-dropping classes map to
+    // `(None, Labels)` (a bijection with the old key) and name-keeping
+    // classes carry one concrete name per selector (the plan invariant),
+    // so the pair partitions identically. Rewritten series with the same
+    // full identity at disjoint step times still merge into one output
+    // series (they never coexist at a step; the per-step duplicate check
+    // in `eval::labels` errors when they do overlap).
+    let mut vector_points: HashMap<SeriesIdentity, Vec<(i64, f64)>> = HashMap::new();
     let mut scalar_points: Vec<(i64, f64)> = Vec::new();
     let mut saw_vector = false;
     let mut saw_scalar = false;
@@ -82,36 +93,10 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
                         t_ms: _,
                         v: value,
                     } = s;
-                    // Defensive invariant (architect adjudication on issue
-                    // #37 code review, finding 2 — REJECT, guarded here):
-                    // every member of one `Labels` group must agree on
-                    // `metric_name` across every step. Two differently-
-                    // named series could only collapse into the same
-                    // `Labels` group via a set operation (`or`/`and`/
-                    // `unless`) merging distinct metrics' outputs, and
-                    // `plan::bin_op` never maps `T_LAND`/`T_LOR`/
-                    // `T_LUNLESS` — they are `PromqlError::Unsupported`
-                    // (`plan::tests::and_is_unsupported` et al.) — so no
-                    // reachable M2 plan can produce such a pair. Same-
-                    // `Labels` members are the same fingerprint anyway
-                    // (fingerprint hashes the full label set,
-                    // `Labels` = all labels minus `__name__`), so
-                    // collapsing them is correct by construction, not
-                    // merely assumed.
-                    match vector_points.entry(labels) {
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            debug_assert_eq!(
-                                e.get().0,
-                                metric_name,
-                                "issue #37 invariant: every step of one output series (same \
-                                 non-name Labels) must agree on metric_name"
-                            );
-                            e.get_mut().1.push((t, value));
-                        }
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert((metric_name, Vec::new())).1.push((t, value));
-                        }
-                    }
+                    vector_points
+                        .entry((metric_name, labels))
+                        .or_default()
+                        .push((t, value));
                 }
             }
             StepValue::Scalar(v) => {
@@ -132,13 +117,17 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
 
     let mut out: Vec<RangeSeries> = vector_points
         .into_iter()
-        .map(|(labels, (metric_name, points))| RangeSeries {
+        .map(|((metric_name, labels), points)| RangeSeries {
             labels,
             metric_name,
             points,
         })
         .collect();
-    out.sort_by(|a, b| a.labels.cmp(&b.labels));
+    // `(labels, metric_name)` tie-break (plan v3 Δ5): the wire order is
+    // the encoder's own matrix label-sort either way — this only pins
+    // internal determinism when two full identities share their non-name
+    // labels.
+    out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
     Ok(QueryValue::Matrix(out))
 }
 
@@ -338,30 +327,13 @@ fn eval_step(
         // series (value `1`) iff **no** matched series has a sample in the
         // step's window (a selector matching zero series included);
         // otherwise an empty vector. The synthetic labels port upstream
-        // `createLabelsForAbsentFunction` (v3.13.0) exactly, including its
-        // `has`/delete rule (#67 review round-1 Δ3): walking the matchers
-        // in source order, a first-seen **equality** matcher sets its
-        // label; *any* other matcher targeting that name (a second
-        // equality, or any regex/negation) **deletes** it — so
-        // `m{a="1",a="2"}` and `m{a="1",a=~"x"}` both drop `a`, while
-        // order matters exactly as upstream (`m{a=~"x",a="1"}` KEEPS
-        // `a="1"`). The order-sensitivity is a `labels.Builder`-over-
-        // EmptyLabels artifact, traced at the pinned SHA (40af9c2,
-        // `labels_common.go::{Set,Del}` + both `Builder.Labels()`
-        // variants) for #67 code review finding 1: `Del` removes the name
-        // from the builder's `add` list *at the time it runs* and appends
-        // it to `del`, but `del` only masks the **base** label set —
-        // which is empty here — while `Labels()` appends everything left
-        // in `add` unconditionally; `Set` never consults `del`. So
-        // regex-then-equality survives (Del was a no-op on an empty
-        // `add`; the later Set lands) and equality-then-regex is removed
-        // (Del strips the earlier Set from `add`). Confirmed empirically
-        // against prom/prometheus:v3.13.0:
-        // `absent_over_time(nonexistent{a=~"x",a="1"}[5m])` -> `{a="1"}`,
-        // `absent_over_time(nonexistent{a="1",a=~"x"}[5m])` -> `{}`.
-        // `__name__` is never emitted (upstream skips MetricName
-        // matchers; `sel.matchers` already excludes it by the planner's
-        // metric-scoping rule).
+        // `createLabelsForAbsentFunction` (v3.13.0) exactly — see
+        // [`labels::labels_for_absent`] (issue #68 factored the shared
+        // matcher-walk out; the full upstream `labels.Builder` provenance
+        // trace and the live-verified order-sensitivity live on that
+        // helper's doc). `__name__` is never emitted (upstream skips
+        // MetricName matchers; `sel.matchers` already excludes it by the
+        // planner's metric-scoping rule).
         PlanExpr::AbsentOverTime { selector } => {
             let sel = &selectors[*selector];
             let eff_t = t_ms - sel.offset_ms;
@@ -376,22 +348,120 @@ fn eval_step(
             if present {
                 return Ok(StepValue::Vector(Vec::new()));
             }
-            let mut synthesized: Vec<(String, String)> = Vec::new();
-            let mut has: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for m in &sel.matchers {
-                if m.op == MatchOp::Eq && !has.contains(m.key.as_str()) {
-                    synthesized.push((m.key.clone(), m.value.clone()));
-                    has.insert(&m.key);
-                } else {
-                    synthesized.retain(|(k, _)| k != &m.key);
-                }
-            }
             Ok(StepValue::Vector(vec![InstantSample {
-                labels: Labels::new(synthesized),
+                labels: labels::labels_for_absent(&sel.matchers),
                 metric_name: None,
                 t_ms,
                 v: 1.0,
             }]))
+        }
+
+        // Issue #68 (M6-05): `absent(v)` — one synthetic series (value
+        // `1`) iff the evaluated instant vector is empty at the step;
+        // otherwise an empty vector. A bare (paren-stripped) vector-
+        // selector argument synthesizes labels from its matchers via the
+        // exact `absent_over_time` walk ([`labels::labels_for_absent`] —
+        // vendored functions.test:1700-1712); any computed argument
+        // (`sum(...)`, `a+b`, `rate(...)`, a filter comparison) yields
+        // the empty label set (:1735-1750). `__name__` is never emitted.
+        PlanExpr::Absent { arg, selector } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "absent() over a scalar expression".to_string(),
+                });
+            };
+            if !v.is_empty() {
+                return Ok(StepValue::Vector(Vec::new()));
+            }
+            let labels = match selector {
+                Some(id) => labels::labels_for_absent(&selectors[*id].matchers),
+                None => Labels::default(),
+            };
+            Ok(StepValue::Vector(vec![InstantSample {
+                labels,
+                metric_name: None,
+                t_ms,
+                v: 1.0,
+            }]))
+        }
+
+        // Issue #68 (M6-05): `sort(v)`/`sort_desc(v)` — pass-through of
+        // existing series (KEEP `__name__`), reordered by value with NaN
+        // last in BOTH directions (functions.test:703,715). Ordering is
+        // observable only for an instant query (the range accumulator
+        // above collapses per-step order by construction — upstream's
+        // own "sort is ineffective for range queries"); the server
+        // encoder preserves this order on the wire for sort-rooted
+        // instant queries (`expr_is_sort_root`).
+        PlanExpr::Sort { descending, arg } => {
+            let StepValue::Vector(mut v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "sort()/sort_desc() over a scalar expression".to_string(),
+                });
+            };
+            labels::sort_vector(&mut v, *descending);
+            Ok(StepValue::Vector(v))
+        }
+
+        // Issue #68 (M6-05, experimental): `sort_by_label(_desc)(v, …)` —
+        // pass-through reordered by natural (numeric-aware) label
+        // collation in argument order, full-virtual-labelset tie-break
+        // (functions.test:755-871; plan v2 Δ2).
+        PlanExpr::SortByLabel {
+            descending,
+            labels: names,
+            arg,
+        } => {
+            let StepValue::Vector(mut v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "sort_by_label()/sort_by_label_desc() over a scalar expression"
+                        .to_string(),
+                });
+            };
+            labels::sort_by_label_vector(&mut v, names, *descending);
+            Ok(StepValue::Vector(v))
+        }
+
+        // Issue #68 (M6-05): `label_replace`/`label_join` — joint
+        // `(metric_name, Labels)` rewrites (KEEP `__name__` unless the
+        // rewrite itself targets it), with per-step duplicate-identity
+        // detection (functions.test:477-527/:562-591).
+        PlanExpr::LabelReplace {
+            arg,
+            dst,
+            replacement,
+            src,
+            regex,
+        } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "label_replace() over a scalar expression".to_string(),
+                });
+            };
+            Ok(StepValue::Vector(labels::label_replace_vector(
+                v,
+                dst,
+                replacement,
+                src,
+                regex,
+            )?))
+        }
+        PlanExpr::LabelJoin {
+            arg,
+            dst,
+            separator,
+            src_labels,
+        } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "label_join() over a scalar expression".to_string(),
+                });
+            };
+            Ok(StepValue::Vector(labels::label_join_vector(
+                v, dst, separator, src_labels,
+            )?))
         }
 
         // Issue #37: `histogram_quantile` **computes** a new value from
@@ -1817,5 +1887,288 @@ mod tests {
         let v = instant_vector(evaluate(&p, &data).unwrap());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].metric_name.as_deref(), Some("foo"));
+    }
+
+    // --- issue #68 (M6-05): label, sort & absence functions ---
+
+    /// `sort`/`sort_desc` are pass-throughs of existing series — KEEP
+    /// `__name__`, reorder by value with NaN last in BOTH directions
+    /// (functions.test:703,715), end-to-end through `evaluate`.
+    #[test]
+    fn sort_and_sort_desc_keep_metric_name_and_put_nan_last_both_directions() {
+        for (query, want) in [
+            ("sort(up)", vec!["c", "b", "a"]),
+            ("sort_desc(up)", vec!["b", "c", "a"]),
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(
+                0,
+                vec![
+                    series(1, &[("i", "a")], vec![s(0, f64::NAN)]),
+                    series(2, &[("i", "b")], vec![s(0, 3.0)]),
+                    series(3, &[("i", "c")], vec![s(0, 1.0)]),
+                ],
+            );
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            let order: Vec<&str> = v.iter().map(|s| s.labels.get("i").unwrap()).collect();
+            assert_eq!(order, want, "{query}");
+            assert!(
+                v.iter().all(|s| s.metric_name.as_deref() == Some("up")),
+                "{query}: sort passes existing series through — __name__ kept"
+            );
+        }
+    }
+
+    /// `label_replace`/`label_join` keep the (possibly rewritten) joint
+    /// `(metric_name, Labels)` identity end-to-end.
+    #[test]
+    fn label_replace_rewrites_labels_and_keeps_metric_name_end_to_end() {
+        let expr =
+            crate::parser::parse(r#"label_replace(up, "dst", "value-$1", "src", "source-(.*)")"#)
+                .unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("src", "source-10")], vec![s(0, 1.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].labels.get("dst"), Some("value-10"));
+        assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+    }
+
+    /// AC5: `absent()` and `absent_over_time()` share the exact
+    /// `labels_for_absent` synthesis (`eval::labels` — both arms call the
+    /// one helper): for every matcher shape the two functions synthesize
+    /// identical labels over an absent selection.
+    #[test]
+    fn absent_and_absent_over_time_share_the_label_synthesis() {
+        for matchers in [
+            r#"{job="testjob", instance="testinstance", method=~".x"}"#,
+            r#"{a="1",a="2",instance="127.0.0.1"}"#,
+            r#"{a=~"x",a="1"}"#,
+            "",
+        ] {
+            let instant = crate::parser::parse(&format!("absent(nonexistent{matchers})")).unwrap();
+            let over_time =
+                crate::parser::parse(&format!("absent_over_time(nonexistent{matchers}[1m])"))
+                    .unwrap();
+            let p_i = plan(&instant, params(0, 0, 0)).unwrap();
+            let p_o = plan(&over_time, params(0, 0, 0)).unwrap();
+            let v_i = instant_vector(evaluate(&p_i, &SeriesData::new()).unwrap());
+            let v_o = instant_vector(evaluate(&p_o, &SeriesData::new()).unwrap());
+            assert_eq!(v_i.len(), 1, "{matchers}");
+            assert_eq!(v_o.len(), 1, "{matchers}");
+            assert_eq!(v_i[0].labels, v_o[0].labels, "{matchers}");
+            assert_eq!(v_i[0].metric_name, None, "{matchers}");
+            assert_eq!(v_i[0].v, 1.0, "{matchers}");
+        }
+    }
+
+    /// `absent()` over a present selection (or a non-empty computed
+    /// vector) is empty; a computed argument synthesizes the EMPTY label
+    /// set when absent (functions.test:1725-1750).
+    #[test]
+    fn absent_is_empty_when_present_and_empty_labeled_for_computed_arguments() {
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]);
+        for query in ["absent(up)", "absent(sum(up))"] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert!(v.is_empty(), "{query}: present -> empty, got {v:?}");
+        }
+        for query in [
+            r#"absent(sum(nonexistent{job="testjob"}))"#,
+            "absent(nonexistent > 1)",
+            "absent(a + b)",
+            "absent(rate(nonexistent[5m]))",
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+            assert_eq!(v.len(), 1, "{query}");
+            assert!(v[0].labels.is_empty(), "{query}: computed arg -> {{}}");
+            assert_eq!(v[0].v, 1.0, "{query}");
+        }
+    }
+
+    /// The Δ5(c) contamination regression golden, reachable today: a
+    /// nested `label_replace` first writes `__name__` from a
+    /// distinguishing label, then drops that label — two metric names
+    /// sharing one non-name label set. The full-identity range
+    /// accumulator must keep them as TWO separate output series with
+    /// their own point sequences, at overlapping and at disjoint step
+    /// times (AC12(iii)).
+    #[test]
+    fn range_query_keeps_distinct_metric_names_with_equal_non_name_labels_separate() {
+        let query = r#"label_replace(label_replace(m, "__name__", "$1", "kind", "(.*)"), "kind", "", "kind", ".*")"#;
+        let expr = crate::parser::parse(query).unwrap();
+        let p = plan(&expr, params(0, 600_000, 300_000)).unwrap();
+        // Overlapping: both series present at every step.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(
+                    1,
+                    &[("kind", "foo"), ("shared", "x")],
+                    vec![s(0, 1.0), s(300_000, 2.0), s(600_000, 3.0)],
+                ),
+                series(
+                    2,
+                    &[("kind", "bar"), ("shared", "x")],
+                    vec![s(0, 4.0), s(300_000, 5.0), s(600_000, 6.0)],
+                ),
+            ],
+        );
+        let QueryValue::Matrix(m) = evaluate(&p, &data).unwrap() else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 2, "two full identities, never merged: {m:?}");
+        let by_name = |name: &str| {
+            m.iter()
+                .find(|s| s.metric_name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing series {name}: {m:?}"))
+        };
+        assert_eq!(
+            by_name("foo").points,
+            vec![(0, 1.0), (300_000, 2.0), (600_000, 3.0)]
+        );
+        assert_eq!(
+            by_name("bar").points,
+            vec![(0, 4.0), (300_000, 5.0), (600_000, 6.0)]
+        );
+        assert!(m.iter().all(|s| s.labels.get("shared") == Some("x")));
+        // Disjoint: the two series never coexist at a step — still two
+        // separate series (same full-identity key, different names).
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("kind", "foo"), ("shared", "x")], vec![s(0, 1.0)]),
+                series(
+                    2,
+                    &[("kind", "bar"), ("shared", "x")],
+                    vec![s(600_000, 6.0)],
+                ),
+            ],
+        );
+        let QueryValue::Matrix(m) = evaluate(&p, &data).unwrap() else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(
+            m.len(),
+            2,
+            "disjoint steps must not merge across names: {m:?}"
+        );
+    }
+
+    /// Trip-proof for the Δ5 rekey (plan v3: "locking in that the fix is
+    /// load-bearing, not decorative"): the SAME per-step vectors run
+    /// through a replica of the pre-fix `Labels`-only accumulator (its
+    /// `debug_assert_eq!` included) panic in debug builds — and silently
+    /// merge two metric names into one group in release builds — exactly
+    /// the contamination the `(Option<metric_name>, Labels)` key removes.
+    #[test]
+    fn a_labels_only_range_key_would_collapse_distinct_metric_names() {
+        let query = r#"label_replace(label_replace(m, "__name__", "$1", "kind", "(.*)"), "kind", "", "kind", ".*")"#;
+        let expr = crate::parser::parse(query).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("kind", "foo"), ("shared", "x")], vec![s(0, 1.0)]),
+                series(2, &[("kind", "bar"), ("shared", "x")], vec![s(0, 4.0)]),
+            ],
+        );
+        // The pre-fix accumulator, verbatim in shape: keyed by `Labels`
+        // alone, `metric_name` captured from whichever step first
+        // populates the group, guarded by the old debug_assert.
+        type PreFixGroupAcc = (Option<String>, Vec<(i64, f64)>);
+        let replica = || {
+            let mut acc: HashMap<Labels, PreFixGroupAcc> = HashMap::new();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            for sample in v {
+                match acc.entry(sample.labels) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        debug_assert_eq!(
+                            e.get().0,
+                            sample.metric_name,
+                            "issue #37 invariant: every step of one output series (same \
+                             non-name Labels) must agree on metric_name"
+                        );
+                        e.get_mut().1.push((sample.t_ms, sample.v));
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((sample.metric_name, Vec::new()))
+                            .1
+                            .push((sample.t_ms, sample.v));
+                    }
+                }
+            }
+            acc
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(replica));
+        if cfg!(debug_assertions) {
+            assert!(
+                outcome.is_err(),
+                "the pre-fix Labels-only key must trip its debug_assert on this input"
+            );
+        } else {
+            let acc = outcome.expect("no debug_assert in release");
+            assert_eq!(
+                acc.len(),
+                1,
+                "release-mode pre-fix key silently merges two metric names into one group"
+            );
+        }
+    }
+
+    /// AC12(i)/(ii) over the full identity: same `(metric_name, Labels)`
+    /// at disjoint timestamps merges into ONE output series; the same
+    /// identity coexisting at a shared step errors with the upstream
+    /// duplicate-labelset message.
+    #[test]
+    fn range_rewrites_merge_disjoint_identities_and_error_on_overlap() {
+        let query = r#"label_replace(m, "kind", "", "kind", ".*")"#;
+        let expr = crate::parser::parse(query).unwrap();
+        let p = plan(&expr, params(0, 600_000, 300_000)).unwrap();
+        // Disjoint: series one only at t=0, series two only at t=600s.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("kind", "one"), ("shared", "x")], vec![s(0, 7.0)]),
+                series(
+                    2,
+                    &[("kind", "two"), ("shared", "x")],
+                    vec![s(600_000, 9.0)],
+                ),
+            ],
+        );
+        let QueryValue::Matrix(m) = evaluate(&p, &data).unwrap() else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1, "disjoint same-identity rewrites merge: {m:?}");
+        assert_eq!(m[0].points, vec![(0, 7.0), (600_000, 9.0)]);
+        assert_eq!(m[0].metric_name.as_deref(), Some("m"));
+        // Overlap: both present at t=0 — the per-step duplicate check
+        // fails the whole query.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("kind", "one"), ("shared", "x")], vec![s(0, 1.0)]),
+                series(2, &[("kind", "two"), ("shared", "x")], vec![s(0, 2.0)]),
+            ],
+        );
+        let err = evaluate(&p, &data).unwrap_err();
+        assert!(matches!(err, PromqlError::LabelSet { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset"
+        );
     }
 }

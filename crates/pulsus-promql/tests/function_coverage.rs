@@ -387,10 +387,10 @@ fn probe_classification_matches_every_manifest_status() {
 
 /// Pins today's `implemented` surface exactly: the M2 set, issue #65's
 /// (M6-02) 30 elementwise math/trig + scalar functions, issue #66's
-/// (M6-03) 12 time/date + scalar/vector functions, and issue #67's
-/// (M6-04) 18 range-vector functions. Every later M6 issue flips entries
-/// here deliberately — this test makes the flip explicit, never
-/// incidental.
+/// (M6-03) 12 time/date + scalar/vector functions, issue #67's (M6-04)
+/// 18 range-vector functions, and issue #68's (M6-05) 7 label/sort/
+/// absence functions. Every later M6 issue flips entries here
+/// deliberately — this test makes the flip explicit, never incidental.
 #[test]
 fn implemented_set_is_exactly_the_m2_surface_today() {
     let manifest = CoverageManifest::load();
@@ -482,6 +482,16 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "ts_of_last_over_time",
             "ts_of_max_over_time",
             "ts_of_min_over_time",
+            // M6-05 (issue #68): label, sort & absence, non-experimental.
+            "absent",
+            "label_join",
+            "label_replace",
+            "sort",
+            "sort_desc",
+            // M6-05: experimental (planner-gated behind
+            // promql-experimental-functions).
+            "sort_by_label",
+            "sort_by_label_desc",
         ])
     );
     let implemented_ops: BTreeSet<&str> = manifest

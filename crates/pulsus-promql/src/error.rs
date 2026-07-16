@@ -44,6 +44,20 @@ pub enum PromqlError {
     #[error("histogram_quantile error: {detail}")]
     HistogramBucket { detail: String },
 
+    /// A label-rewrite/sort function's label-set contract is violated —
+    /// issue #68 (M6-05): `label_replace`'s invalid regex or destination
+    /// label name, `label_join`'s invalid destination/source label name,
+    /// or a rewrite producing duplicate `(metric_name, labels)` output
+    /// identities. `detail` carries the exact upstream v3.13 message
+    /// (`promql/functions.go`: `invalid regular expression in
+    /// label_replace(): …`, `invalid destination label name in …(): …`,
+    /// `invalid source label name in label_join(): …`, `vector cannot
+    /// contain metrics with the same labelset`) verbatim — the vendored
+    /// `functions.test` asserts these as message substrings, so `Display`
+    /// is the raw detail with no added prefix.
+    #[error("{detail}")]
+    LabelSet { detail: String },
+
     /// A function parameter is outside its valid domain — issue #67
     /// (M6-04, on the `HistogramBucket` precedent per the task-manager
     /// adjudication): `double_exponential_smoothing`'s smoothing/trend
@@ -88,6 +102,20 @@ mod tests {
             detail: "no +Inf bucket found".to_string(),
         };
         assert!(err.to_string().contains("+Inf"));
+    }
+
+    /// Issue #68 (M6-05): the vendored `functions.test` asserts these
+    /// messages as substrings of the query error — `Display` must be the
+    /// raw upstream text with no added prefix.
+    #[test]
+    fn label_set_display_is_the_raw_detail_with_no_prefix() {
+        let err = PromqlError::LabelSet {
+            detail: "vector cannot contain metrics with the same labelset".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset"
+        );
     }
 
     #[test]

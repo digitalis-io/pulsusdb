@@ -1,0 +1,530 @@
+# Issue #68 (M6-05) proof corpus — witness cases for the seven post-fetch
+# label/sort/absence functions (function-coverage.json points each entry's
+# `witness` at the exact query texts below; the coverage drift test
+# replays this file and requires each to pass). Every case transcribes the
+# byte-frozen vendored `upstream/functions.test` inputs/outputs (cited by
+# line per case) into the driver's executed grammar — that vendored file
+# itself stays skip-manifested behind the deferred `expect` directive
+# (activates in M6-08) and native-histogram sample syntax (#22), so these
+# hand-derived cases are the executable Tier-1 anchor; when M6-08 lands
+# `expect ordered`, the vendored originals begin running and retroactively
+# confirm this file.
+#
+# Pinned semantics this file exercises end-to-end:
+#   - label_replace: full-string `^(?s:regex)$` anchored match (no
+#     sub-string match), $1/multi-capture/named-group expansion,
+#     non-existent src reads "", matched-but-empty src still relabels,
+#     no-match passes through, empty expansion DELETES the label,
+#     paren-wrapped arguments, __name__ readable and writable; invalid
+#     regex / invalid dst name / duplicate output labelsets are query
+#     errors with the exact upstream messages;
+#   - label_join: in-order concat (missing src = ""), empty result
+#     deletes dst, zero src labels allowed, creates dst, duplicate
+#     labelsets error; invalid dst/src names error;
+#   - sort/sort_desc: value order asc/desc, NaN LAST in both directions,
+#     __name__ kept (pass-through);
+#   - sort_by_label(_desc) (experimental — the driver plans with the gate
+#     on, like upstream promqltest): NATURAL numeric-aware collation per
+#     named label in argument order, full-virtual-labelset tie-break with
+#     __name__ at its lexical key position, desc reverses the whole
+#     comparator;
+#   - absent: bare-selector matcher walk (the shared
+#     createLabelsForAbsentFunction port) vs {} for computed arguments;
+#     present -> empty;
+#   - range identity (plan v3 Δ4/Δ5): per-step rewrites with the same
+#     full (metric_name, labels) identity merge across disjoint steps,
+#     error on an overlapping step, and distinct metric names with equal
+#     non-name labels stay separate series.
+#
+# The embedded-newline dot-all case (Δ1) and the byte-level error-path
+# goldens are inexpressible in this grammar — they live in
+# `src/eval/labels.rs`'s unit tests.
+
+# --- label_replace -------------------------------------------------------
+# Fixture: functions.test:472-474.
+
+load 5m
+	testmetric{src="source-value-10",dst="original-destination-value"} 0
+	testmetric{src="source-value-20",dst="original-destination-value"} 1
+
+# label_replace does a full-string match and replace (functions.test:477).
+eval instant at 0m label_replace(testmetric, "dst", "destination-value-$1", "src", "source-value-(.*)")
+	testmetric{src="source-value-10",dst="destination-value-10"} 0
+	testmetric{src="source-value-20",dst="destination-value-20"} 1
+
+# label_replace does not do a sub-string match (functions.test:482).
+eval instant at 0m label_replace(testmetric, "dst", "destination-value-$1", "src", "value-(.*)")
+	testmetric{src="source-value-10",dst="original-destination-value"} 0
+	testmetric{src="source-value-20",dst="original-destination-value"} 1
+
+# label_replace works with multiple capture groups (functions.test:487).
+eval instant at 0m label_replace(testmetric, "dst", "$1-value-$2", "src", "(.*)-value-(.*)")
+	testmetric{src="source-value-10",dst="source-value-10"} 0
+	testmetric{src="source-value-20",dst="source-value-20"} 1
+
+# Named-group ${name} expansion parity (plan v2 Δ4; same fixture, Go
+# Expand's ${name} form).
+eval instant at 0m label_replace(testmetric, "dst", "${x}", "src", "(?P<x>.*)")
+	testmetric{src="source-value-10",dst="source-value-10"} 0
+	testmetric{src="source-value-20",dst="source-value-20"} 1
+
+# label_replace does not overwrite the destination label if the source
+# label does not exist (functions.test:493).
+eval instant at 0m label_replace(testmetric, "dst", "value-$1", "nonexistent-src", "source-value-(.*)")
+	testmetric{src="source-value-10",dst="original-destination-value"} 0
+	testmetric{src="source-value-20",dst="original-destination-value"} 1
+
+# label_replace overwrites the destination label if the source label is
+# empty, but matched (functions.test:499).
+eval instant at 0m label_replace(testmetric, "dst", "value-$1", "nonexistent-src", "(.*)")
+	testmetric{src="source-value-10",dst="value-"} 0
+	testmetric{src="source-value-20",dst="value-"} 1
+
+# label_replace does not overwrite the destination label if the source
+# label is not matched (functions.test:505).
+eval instant at 0m label_replace(testmetric, "dst", "value-$1", "src", "non-matching-regex")
+	testmetric{src="source-value-10",dst="original-destination-value"} 0
+	testmetric{src="source-value-20",dst="original-destination-value"} 1
+
+# Paren-wrapped arguments (functions.test:509).
+eval instant at 0m label_replace((((testmetric))), (("dst")), (("value-$1")), (("src")), (("non-matching-regex")))
+	testmetric{src="source-value-10",dst="original-destination-value"} 0
+	testmetric{src="source-value-20",dst="original-destination-value"} 1
+
+# label_replace drops labels that are set to empty values
+# (functions.test:514).
+eval instant at 0m label_replace(testmetric, "dst", "", "dst", ".*")
+	testmetric{src="source-value-10"} 0
+	testmetric{src="source-value-20"} 1
+
+# label_replace fails when the regex is invalid (functions.test:519; the
+# upstream message text is ours to pin — the vendored case is a bare
+# `expect fail`).
+eval_fail instant at 0m label_replace(testmetric, "dst", "value-$1", "src", "(.*")
+	expected_fail_message invalid regular expression in label_replace(): (.*
+	expected_fail_regexp ^invalid regular expression in label_replace\(\):
+
+# label_replace fails when the destination label name is invalid
+# (functions.test:523 uses the invalid byte "\xff", inexpressible in a
+# Rust String — the empty name is the representable invalid case under
+# v3.13's UTF-8 validation scheme).
+eval_fail instant at 0m label_replace(testmetric, "", "", "src", "(.*)")
+	expected_fail_message invalid destination label name in label_replace():
+
+# label_replace fails when there would be duplicated identical output
+# label sets (functions.test:527).
+eval_fail instant at 0m label_replace(testmetric, "src", "", "", "")
+	expected_fail_message vector cannot contain metrics with the same labelset
+
+clear
+
+# --- label_join ----------------------------------------------------------
+# Fixture: functions.test:553-558.
+
+load 5m
+	testmetric{src="a",src1="b",src2="c",dst="original-destination-value"} 0
+	testmetric{src="d",src1="e",src2="f",dst="original-destination-value"} 1
+	dup{label="a", this="a"} 1.0
+	dup{label="b", this="a"} 1.0
+
+# label_join joins all src values in order (functions.test:562).
+eval instant at 0m label_join(testmetric, "dst", "-", "src", "src1", "src2")
+	testmetric{src="a",src1="b",src2="c",dst="a-b-c"} 0
+	testmetric{src="d",src1="e",src2="f",dst="d-e-f"} 1
+
+# label_join treats non existent src labels as empty strings
+# (functions.test:567).
+eval instant at 0m label_join(testmetric, "dst", "-", "src", "src3", "src1")
+	testmetric{src="a",src1="b",src2="c",dst="a--b"} 0
+	testmetric{src="d",src1="e",src2="f",dst="d--e"} 1
+
+# label_join overwrites the destination label even if the resulting dst
+# label is empty string — i.e. deletes it (functions.test:572).
+eval instant at 0m label_join(testmetric, "dst", "", "emptysrc", "emptysrc1", "emptysrc2")
+	testmetric{src="a",src1="b",src2="c"} 0
+	testmetric{src="d",src1="e",src2="f"} 1
+
+# Zero src labels joins to "" and deletes dst (functions.test:577).
+eval instant at 0m label_join(testmetric, "dst", ", ")
+	testmetric{src="a",src1="b",src2="c"} 0
+	testmetric{src="d",src1="e",src2="f"} 1
+
+# Duplicate output labelsets fail (functions.test:591).
+eval_fail instant at 0m label_join(dup, "label", "", "this")
+	expected_fail_message vector cannot contain metrics with the same labelset
+
+# Invalid destination / source label names fail (plan v2 Δ4; the empty
+# name is the representable invalid case — see the label_replace note).
+eval_fail instant at 0m label_join(testmetric, "", ", ", "src")
+	expected_fail_message invalid destination label name in label_join():
+
+eval_fail instant at 0m label_join(testmetric, "dst", ", ", "")
+	expected_fail_message invalid source label name in label_join():
+
+clear
+
+# label_join creates dst if not present (functions.test:583-587).
+load 5m
+	testmetric1{src="foo",src1="bar",src2="foobar"} 0
+	testmetric1{src="fizz",src1="buzz",src2="fizzbuzz"} 1
+
+eval instant at 0m label_join(testmetric1, "dst", ", ", "src", "src1", "src2")
+	testmetric1{src="foo",src1="bar",src2="foobar",dst="foo, bar, foobar"} 0
+	testmetric1{src="fizz",src1="buzz",src2="fizzbuzz",dst="fizz, buzz, fizzbuzz"} 1
+
+clear
+
+# --- sort / sort_desc ----------------------------------------------------
+# Fixture: functions.test:691-700, minus its native-histogram series
+# (#22; upstream excludes it from the float ordering anyway). Value order
+# with NaN LAST in BOTH directions (functions.test:702-712 and :714-724 —
+# the NaN series is the final row of each vendored expectation).
+
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+	http_requests{job="api-server", instance="1", group="production"}	0+20x10
+	http_requests{job="api-server", instance="0", group="canary"}		0+30x10
+	http_requests{job="api-server", instance="1", group="canary"}		0+40x10
+	http_requests{job="api-server", instance="2", group="canary"}		NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN
+	http_requests{job="app-server", instance="0", group="production"}	0+50x10
+	http_requests{job="app-server", instance="1", group="production"}	0+60x10
+	http_requests{job="app-server", instance="0", group="canary"}		0+70x10
+	http_requests{job="app-server", instance="1", group="canary"}		0+80x10
+
+eval_ordered instant at 50m sort(http_requests)
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+
+eval_ordered instant at 50m sort_desc(http_requests)
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+
+# A range sort is a correct no-op — the per-step order collapses into the
+# label-keyed matrix by construction (upstream: "sort is ineffective for
+# range queries").
+eval range from 45m to 50m step 5m sort(http_requests{job="app-server", group="canary"})
+	http_requests{group="canary", instance="0", job="app-server"} 630 700
+	http_requests{group="canary", instance="1", job="app-server"} 720 800
+
+clear
+
+# --- sort_by_label / sort_by_label_desc (experimental) --------------------
+# Fixture: functions.test:729-753 (all-float — no exclusions needed).
+
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+	http_requests{job="api-server", instance="1", group="production"}	0+20x10
+	http_requests{job="api-server", instance="0", group="canary"}		0+30x10
+	http_requests{job="api-server", instance="1", group="canary"}		0+40x10
+	http_requests{job="api-server", instance="2", group="canary"}		NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN NaN
+	http_requests{job="app-server", instance="0", group="production"}	0+50x10
+	http_requests{job="app-server", instance="1", group="production"}	0+60x10
+	http_requests{job="app-server", instance="0", group="canary"}		0+70x10
+	http_requests{job="app-server", instance="1", group="canary"}		0+80x10
+	http_requests{job="api-server", instance="2", group="production"}	0+10x10
+	cpu_time_total{job="cpu", cpu="0"} 0+10x10
+	cpu_time_total{job="cpu", cpu="1"} 0+10x10
+	cpu_time_total{job="cpu", cpu="2"} 0+10x10
+	cpu_time_total{job="cpu", cpu="3"} 0+10x10
+	cpu_time_total{job="cpu", cpu="10"} 0+10x10
+	cpu_time_total{job="cpu", cpu="11"} 0+10x10
+	cpu_time_total{job="cpu", cpu="12"} 0+10x10
+	cpu_time_total{job="cpu", cpu="20"} 0+10x10
+	cpu_time_total{job="cpu", cpu="21"} 0+10x10
+	cpu_time_total{job="cpu", cpu="100"} 0+10x10
+	node_uname_info{job="node_exporter", instance="4m600", release="1.2.3"} 0+10x10
+	node_uname_info{job="node_exporter", instance="4m5", release="1.11.3"} 0+10x10
+	node_uname_info{job="node_exporter", instance="4m1000", release="1.111.3"} 0+10x10
+
+# One named label; ties fall back to the full label set
+# (functions.test:755).
+eval_ordered instant at 50m sort_by_label(http_requests, "instance")
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+	http_requests{group="production", instance="2", job="api-server"} 100
+
+# Multiple named labels, argument order (functions.test:792).
+eval_ordered instant at 50m sort_by_label(http_requests, "group", "instance", "job")
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="production", instance="2", job="api-server"} 100
+
+# Argument order matters (functions.test:804).
+eval_ordered instant at 50m sort_by_label(http_requests, "job", "instance", "group")
+	http_requests{group="canary", instance="0", job="api-server"} 300
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+	http_requests{group="production", instance="2", job="api-server"} 100
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="production", instance="1", job="app-server"} 600
+
+# desc reverses the WHOLE comparator, tie-break included
+# (functions.test:816).
+eval_ordered instant at 50m sort_by_label_desc(http_requests, "instance")
+	http_requests{group="production", instance="2", job="api-server"} 100
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="0", job="api-server"} 300
+
+# (functions.test:840).
+eval_ordered instant at 50m sort_by_label_desc(http_requests, "instance", "group", "job")
+	http_requests{group="production", instance="2", job="api-server"} 100
+	http_requests{group="canary", instance="2", job="api-server"} NaN
+	http_requests{group="production", instance="1", job="app-server"} 600
+	http_requests{group="production", instance="1", job="api-server"} 200
+	http_requests{group="canary", instance="1", job="app-server"} 800
+	http_requests{group="canary", instance="1", job="api-server"} 400
+	http_requests{group="production", instance="0", job="app-server"} 500
+	http_requests{group="production", instance="0", job="api-server"} 100
+	http_requests{group="canary", instance="0", job="app-server"} 700
+	http_requests{group="canary", instance="0", job="api-server"} 300
+
+# NATURAL numeric-aware collation, not lexicographic — the three vendored
+# discriminators (a lexicographic shortcut passes every http_requests
+# case above but fails all three of these).
+# cpu: 0,1,2,3,10,11,12,20,21,100 (functions.test:852).
+eval_ordered instant at 50m sort_by_label(cpu_time_total, "cpu")
+	cpu_time_total{job="cpu", cpu="0"} 100
+	cpu_time_total{job="cpu", cpu="1"} 100
+	cpu_time_total{job="cpu", cpu="2"} 100
+	cpu_time_total{job="cpu", cpu="3"} 100
+	cpu_time_total{job="cpu", cpu="10"} 100
+	cpu_time_total{job="cpu", cpu="11"} 100
+	cpu_time_total{job="cpu", cpu="12"} 100
+	cpu_time_total{job="cpu", cpu="20"} 100
+	cpu_time_total{job="cpu", cpu="21"} 100
+	cpu_time_total{job="cpu", cpu="100"} 100
+
+# instance: 4m5, 4m600, 4m1000 (functions.test:865).
+eval_ordered instant at 50m sort_by_label(node_uname_info, "instance")
+	node_uname_info{job="node_exporter", instance="4m5", release="1.11.3"} 100
+	node_uname_info{job="node_exporter", instance="4m600", release="1.2.3"} 100
+	node_uname_info{job="node_exporter", instance="4m1000", release="1.111.3"} 100
+
+# release: 1.2.3, 1.11.3, 1.111.3 (functions.test:871).
+eval_ordered instant at 50m sort_by_label(node_uname_info, "release")
+	node_uname_info{job="node_exporter", instance="4m600", release="1.2.3"} 100
+	node_uname_info{job="node_exporter", instance="4m5", release="1.11.3"} 100
+	node_uname_info{job="node_exporter", instance="4m1000", release="1.111.3"} 100
+
+clear
+
+# Natural-sort edge vectors (plan v2 Δ2, hand-derived to the ported
+# comparator): leading zeros resolve deterministically by the byte-order
+# fallback ("01" before "1"), mixed alpha-numeric tokens compare
+# chunkwise (a10b2 before a10b10), digits sort before alpha.
+
+load 5m
+	natsort_edge{v="01", id="lz"}	0+10x10
+	natsort_edge{v="1", id="one"}	0+10x10
+	natsort_edge{v="a10b2", id="m2"}	0+10x10
+	natsort_edge{v="a10b10", id="m10"}	0+10x10
+	natsort_edge{v="x", id="alpha"}	0+10x10
+
+eval_ordered instant at 50m sort_by_label(natsort_edge, "v")
+	natsort_edge{id="lz", v="01"} 100
+	natsort_edge{id="one", v="1"} 100
+	natsort_edge{id="m2", v="a10b2"} 100
+	natsort_edge{id="m10", v="a10b10"} 100
+	natsort_edge{id="alpha", v="x"} 100
+
+eval_ordered instant at 50m sort_by_label_desc(natsort_edge, "v")
+	natsort_edge{id="alpha", v="x"} 100
+	natsort_edge{id="m10", v="a10b10"} 100
+	natsort_edge{id="m2", v="a10b2"} 100
+	natsort_edge{id="one", v="1"} 100
+	natsort_edge{id="lz", v="01"} 100
+
+clear
+
+# Cross-metric full-label ties (plan v2 Δ2): two series identical on the
+# named label, differing only in __name__ — the fallback compares the
+# VIRTUAL full label set with __name__ at its lexical key position. The
+# multi-name vector is built with a __name__-writing label_replace (a
+# multi-name selector is still planner-unsupported).
+
+load 5m
+	tie{kind="bbb", x="1"}	0+10x10
+	tie{kind="aaa", x="1"}	0+20x10
+	tie_pos{__aa="z", kind="aaa", x="1"}	0+10x10
+	tie_pos{__aa="a", kind="zzz", x="1"}	0+20x10
+
+eval_ordered instant at 50m sort_by_label(label_replace(tie, "__name__", "$1", "kind", "(.*)"), "x")
+	aaa{kind="aaa", x="1"} 200
+	bbb{kind="bbb", x="1"} 100
+
+eval_ordered instant at 50m sort_by_label_desc(label_replace(tie, "__name__", "$1", "kind", "(.*)"), "x")
+	bbb{kind="bbb", x="1"} 100
+	aaa{kind="aaa", x="1"} 200
+
+# __name__ sits at its LEXICAL position, not unconditionally first: the
+# __aa label sorts before __name__, so its value ('a' < 'z') decides the
+# tie against the opposing metric-name order.
+eval_ordered instant at 50m sort_by_label(label_replace(tie_pos, "__name__", "$1", "kind", "(.*)"), "x")
+	zzz{__aa="a", kind="zzz", x="1"} 200
+	aaa{__aa="z", kind="aaa", x="1"} 100
+
+eval_ordered instant at 50m sort_by_label_desc(label_replace(tie_pos, "__name__", "$1", "kind", "(.*)"), "x")
+	aaa{__aa="z", kind="aaa", x="1"} 100
+	zzz{__aa="a", kind="zzz", x="1"} 200
+
+clear
+
+# --- __name__ as label_replace src/dst ------------------------------------
+# (Adjudicated on #68: __name__ is readable and writable; upstream exempts
+# label_replace/label_join from dropMetricName.)
+
+load 5m
+	rw_names{kind="foo", shared="x"}	1 2 3
+	rw_names{kind="bar", shared="x"}	4 5 6
+
+# Write __name__ from a capture.
+eval instant at 0m label_replace(rw_names, "__name__", "$1", "kind", "(.*)")
+	foo{kind="foo", shared="x"} 1
+	bar{kind="bar", shared="x"} 4
+
+# Read __name__ as src.
+eval instant at 0m label_replace(rw_names, "copied", "$1", "__name__", "(.*)")
+	rw_names{kind="foo", shared="x", copied="rw_names"} 1
+	rw_names{kind="bar", shared="x", copied="rw_names"} 4
+
+# An empty expansion into __name__ deletes the metric name.
+eval instant at 0m label_replace(rw_names, "__name__", "", "kind", ".*")
+	{kind="foo", shared="x"} 1
+	{kind="bar", shared="x"} 4
+
+# --- range identity semantics (plan v3 Δ4/Δ5, AC12) ------------------------
+# Steps land at 0m/5m/10m; the 5m-step lookback window is left-open, so a
+# sample at exactly t-5m is excluded — the gap rows below make the two
+# source series step-disjoint.
+
+load 5m
+	rw{kind="one", shared="x"}	7 _ _
+	rw{kind="two", shared="x"}	_ _ 9
+	rw_overlap{kind="one", shared="x"}	1 1 1
+	rw_overlap{kind="two", shared="x"}	2 2 2
+	rw_names_disjoint{kind="foo", shared="x"}	1 _ _
+	rw_names_disjoint{kind="bar", shared="x"}	_ _ 6
+
+# (i) Same full identity at DISJOINT step times -> one merged series.
+eval range from 0 to 10m step 5m label_replace(rw, "kind", "", "kind", ".*")
+	rw{shared="x"} 7 _ 9
+
+# (ii) Same full identity at an OVERLAPPING step -> the whole query fails
+# with the upstream duplicate-labelset message.
+eval_fail range from 0 to 10m step 5m label_replace(rw_overlap, "kind", "", "kind", ".*")
+	expected_fail_message vector cannot contain metrics with the same labelset
+
+# (iii) Equal non-name labels under DIFFERENT metric names -> two separate
+# series, at overlapping steps...
+eval range from 0 to 10m step 5m label_replace(label_replace(rw_names, "__name__", "$1", "kind", "(.*)"), "kind", "", "kind", ".*")
+	foo{shared="x"} 1 2 3
+	bar{shared="x"} 4 5 6
+
+# ...and at disjoint steps (never merged, never a false collision).
+eval range from 0 to 10m step 5m label_replace(label_replace(rw_names_disjoint, "__name__", "$1", "kind", "(.*)"), "kind", "", "kind", ".*")
+	foo{shared="x"} 1 _ _
+	bar{shared="x"} _ _ 6
+
+clear
+
+# --- absent --------------------------------------------------------------
+# Bare-selector label synthesis: the shared createLabelsForAbsentFunction
+# walk (functions.test:1700-1712).
+
+eval instant at 50m absent(nonexistent)
+	{} 1
+
+eval instant at 50m absent(nonexistent{job="testjob", instance="testinstance", method=~".x"})
+	{instance="testinstance", job="testjob"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job="testjob2",foo="bar"})
+	{foo="bar"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job="testjob2",job="three",foo="bar"})
+	{foo="bar"} 1
+
+eval instant at 50m absent(nonexistent{job="testjob",job=~"testjob2",foo="bar"})
+	{foo="bar"} 1
+
+# Parentheses strip before the bare-selector special case (the upstream
+# unwrapParenExpr walk — the label_replace paren case's sibling).
+eval instant at 50m absent(((nonexistent{job="testjob"})))
+	{job="testjob"} 1
+
+# Computed arguments synthesize the EMPTY label set
+# (functions.test:1735-1750; `a and b` stays planner-unsupported until
+# M6-07's set operations).
+eval instant at 50m absent(sum(nonexistent{job="testjob", instance="testinstance"}))
+	{} 1
+
+eval instant at 50m absent(max(nonexistent))
+	{} 1
+
+eval instant at 50m absent(nonexistent > 1)
+	{} 1
+
+eval instant at 50m absent(a + b)
+	{} 1
+
+eval instant at 50m absent(rate(nonexistent[5m]))
+	{} 1
+
+clear
+
+# Don't return anything when there's something there
+# (functions.test:1719-1727, minus the native-histogram rows).
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+
+eval instant at 50m absent(http_requests)
+
+eval instant at 50m absent(sum(http_requests))
+
+clear
+
+# A range query evaluates absence per step: the only sample (t=0) is
+# visible at step 0 and outside the left-open lookback window from 5m on.
+load 5m
+	sparse{job="x"}	1
+
+eval range from 0 to 10m step 5m absent(sparse{job="x"})
+	{job="x"} _ 1 1

@@ -93,7 +93,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter}` | 422 | `execution` |
+/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
@@ -104,10 +104,15 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // `double_exponential_smoothing` factor) maps like
         // `HistogramBucket`: a well-formed query whose evaluation is
         // rejected — 422 `execution`, the adjudicated precedent.
+        // `LabelSet` (issue #68: label_replace/label_join invalid
+        // regex/label-name and duplicate-output-labelset errors) maps the
+        // same way — a well-formed query whose evaluation is rejected,
+        // exactly upstream's 422 `execution` for these.
         PromqlError::Unsupported { .. }
         | PromqlError::BadMatching { .. }
         | PromqlError::HistogramBucket { .. }
-        | PromqlError::InvalidParameter { .. } => {
+        | PromqlError::InvalidParameter { .. }
+        | PromqlError::LabelSet { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
     }
@@ -239,6 +244,23 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("invalid smoothing factor")
+        );
+    }
+
+    #[tokio::test]
+    async fn promql_label_set_error_maps_to_422_execution_with_the_raw_message() {
+        // Issue #68: label_replace/label_join validation and
+        // duplicate-labelset errors — the message is the upstream text
+        // verbatim (asserted by substring in the vendored corpus).
+        let err = PromqlError::LabelSet {
+            detail: "vector cannot contain metrics with the same labelset".to_string(),
+        };
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "vector cannot contain metrics with the same labelset"
         );
     }
 

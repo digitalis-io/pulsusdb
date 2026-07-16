@@ -99,6 +99,10 @@
     { "expr": "changes(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
     { "expr": "last_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
     { "expr": "present_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "absent_over_time(nonexistent_metric{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] }
+    { "expr": "absent_over_time(nonexistent_metric{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+
+    { "expr": "label_replace(mem_usage_bytes{run_id=\"{R}\"}, \"rewritten\", \"$1-copy\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
+    { "expr": "label_join(mem_usage_bytes{run_id=\"{R}\"}, \"joined\", \"-\", \"service\", \"instance\")", "modes": ["instant", "range"] },
+    { "expr": "absent(nonexistent_metric{run_id=\"{R}\"})", "modes": ["instant", "range"] }
   ]
 }
