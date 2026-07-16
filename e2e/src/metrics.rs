@@ -819,6 +819,29 @@ fn extract_series(
                 out.entry(key).or_insert_with(BTreeMap::new).insert(ts, val);
             }
         }
+        // Issue #66 (M6-03): scalar-typed instant queries (`time()`,
+        // `scalar(...)`). The wire shape is a bare `[ts, "value"]` pair
+        // in `data.result` (docs/api.md §3.1 — identical on both stores),
+        // not an array of series. Stored under a synthetic label key so a
+        // scalar on one store can never silently compare equal to an
+        // empty-labelset vector on the other — a resultType disagreement
+        // must surface as a series-set diff, not a false pass. Values and
+        // the timestamp go through the exact same bit-exact-except-NaN /
+        // `parse_ts_exact` discipline as every vector sample (both stores
+        // evaluate at the identical pinned eval time, so the pair must
+        // match exactly).
+        (Mode::Instant, "scalar") => {
+            if result.len() != 2 {
+                bail!("scalar result must be a [ts, value] pair: {body}");
+            }
+            let key = vec![("__result_type__".to_string(), "scalar".to_string())];
+            out.insert(key, BTreeMap::from([(next_ts()?, parse_val(&result[1])?)]));
+        }
+        // Range mode needs no scalar arm: both stores wrap a scalar-typed
+        // expression's range result into an ordinary matrix with one
+        // empty-labelset series (Prometheus's engine does this natively;
+        // PulsusDB's evaluator returns `QueryValue::Matrix` for every
+        // range query), so the `(Range, "matrix")` arm below covers it.
         (Mode::Range, "matrix") => {
             for item in result {
                 let key = label_key(&item["metric"]);
@@ -1515,6 +1538,72 @@ mod tests {
 
         let matrix = r#"{"data":{"result":[{"metric":{},"values":[[1000,"1"],[1000.5,"2"]]}]}}"#;
         assert_eq!(extract_raw_timestamps(matrix), vec!["1000", "1000.5"]);
+    }
+
+    /// Issue #66 (M6-03): scalar-typed instant responses (`time()`,
+    /// `scalar(...)`) — the `[ts, "value"]` pair parses through the same
+    /// byte-exact timestamp path and lands under the synthetic
+    /// `__result_type__=scalar` key.
+    #[test]
+    fn extract_series_parses_an_instant_scalar_result() {
+        let raw = r#"{"status":"success","data":{"resultType":"scalar","result":[1435781451.781,"55.5"]}}"#;
+        let body: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let timestamps = extract_raw_timestamps(raw);
+        assert_eq!(timestamps, vec!["1435781451.781"]);
+        let series = extract_series(&body, &timestamps, Mode::Instant).unwrap();
+        assert_eq!(series.len(), 1);
+        let key = vec![("__result_type__".to_string(), "scalar".to_string())];
+        assert_eq!(series[&key], BTreeMap::from([(1_435_781_451_781, 55.5)]));
+    }
+
+    /// A scalar result on one store and an empty-labelset vector on the
+    /// other must diff as a series-set mismatch — never a false pass
+    /// (the synthetic key's whole purpose).
+    #[test]
+    fn a_scalar_and_an_empty_labelset_vector_never_compare_equal() {
+        let scalar_raw =
+            r#"{"status":"success","data":{"resultType":"scalar","result":[1000,"42"]}}"#;
+        let vector_raw = r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1000,"42"]}]}}"#;
+        let scalar_body: serde_json::Value = serde_json::from_str(scalar_raw).unwrap();
+        let vector_body: serde_json::Value = serde_json::from_str(vector_raw).unwrap();
+        let a = extract_series(
+            &scalar_body,
+            &extract_raw_timestamps(scalar_raw),
+            Mode::Instant,
+        )
+        .unwrap();
+        let b = extract_series(
+            &vector_body,
+            &extract_raw_timestamps(vector_raw),
+            Mode::Instant,
+        )
+        .unwrap();
+        let detail = diff_series_maps(&a, &b).expect("scalar vs vector must diff");
+        assert!(detail.contains("series set differs"), "{detail}");
+    }
+
+    /// A malformed scalar pair (wrong arity) is a shape error, not a
+    /// silent partial parse.
+    #[test]
+    fn extract_series_rejects_a_malformed_scalar_pair() {
+        let raw = r#"{"status":"success","data":{"resultType":"scalar","result":[1000]}}"#;
+        let body: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let err = extract_series(&body, &extract_raw_timestamps(raw), Mode::Instant)
+            .expect_err("a one-element scalar result must be rejected");
+        assert!(err.to_string().contains("[ts, value] pair"), "{err:#}");
+    }
+
+    /// Range mode never accepts a bare scalar resultType — both stores
+    /// wrap scalar-typed range results into a matrix (asserted live by
+    /// the `time()`/`scalar(...)` range rows), so a scalar here is a
+    /// contract violation that must fail loudly.
+    #[test]
+    fn extract_series_still_rejects_scalar_in_range_mode() {
+        let raw = r#"{"status":"success","data":{"resultType":"scalar","result":[1000,"42"]}}"#;
+        let body: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let err = extract_series(&body, &extract_raw_timestamps(raw), Mode::Range)
+            .expect_err("scalar in range mode must be rejected");
+        assert!(err.to_string().contains("unexpected resultType"), "{err:#}");
     }
 
     /// A label value containing a literal `[` followed by a digit must
