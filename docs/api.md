@@ -381,14 +381,25 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 | `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
 | `/loki/api/v1/tail`, `/loki/api/v1/index/stats` | `/api/logs/v1/{tail,stats}` | M6 |
 | `/loki/api/v1/index/volume`, `/detected_labels`, `/detected_fields`, `/patterns` | `/api/logs/v1/{volume,detected_labels,detected_fields,patterns}` | M7 |
-| `/api/traces/{traceId}[/json]`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}` | M4 |
-| `/api/search`, `/api/search/tags`, `/api/search/tag/{tag}/values`, `/api/v2/search/*`, `/api/echo` | `/api/traces/v1/search`, `/api/traces/v1/tags`, `/api/traces/v1/tag/*` | M4 |
-| `/api/metrics/query_range`, `/api/metrics/query` (+ `/tempo/` prefixes) | `/api/traces/v1/metrics/*` | M4 |
+| `/api/traces/{traceId}`, `/api/traces/{traceId}/json`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}`, `/api/traces/v1/trace/{traceId}/json` | M4 |
+| `/api/search` | `/api/traces/v1/search` | M4 |
+| `/api/search/tags`, `/api/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (Tempo v1 flat projection) | M4 |
+| `/api/v2/search/tags`, `/api/v2/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (native shape minus `truncated`) | M4 |
+| `/api/echo` | — (constant `echo` body) | M4 |
+| `/api/metrics/query_range`, `/api/metrics/query`, `/tempo/api/metrics/query_range`, `/tempo/api/metrics/query` | `/api/traces/v1/metrics/query_range`, `/api/traces/v1/metrics/query` | M4 |
 | `POST /querier.v1.QuerierService/{ProfileTypes,LabelNames,LabelValues,Series,SelectMergeStacktraces,SelectSeries,SelectMergeProfile,GetProfileStats,AnalyzeQuery}`, `POST /settings.v1.SettingsService/Get` (Connect-protocol, protobuf) | `/api/profiles/v1/*` | M5 |
 | `/pyroscope/render`, `/pyroscope/render-diff` | `/api/profiles/v1/render{,-diff}` | M5 |
 | `/loki/api/v1/rules[...]`, `/api/prom/rules[...]`, `/prometheus/api/v1/rules` | `/api/rules/v1/*` | M7 |
 
 Routing note: the alias `GET /api/traces/{traceId}` coexists with native `/api/traces/v1/...`; the literal `v1` segment is matched first.
+
+**M4 Tempo query aliases (all `GET`).** The trace-by-ID, search, and TraceQL-metrics aliases are pure route bindings onto the native handlers — responses are byte-identical to native, including §4.1's `Accept` negotiation on trace-by-ID (the `/json` alias binds the forcing handler and never negotiates). Deltas and reshapings:
+
+- **Metrics envelope:** the `/api/metrics/*` aliases serve the native Prometheus matrix/vector envelope (§4.4), not Tempo's own metrics wire format — a documented, deliberate delta.
+- **v1 flat tags:** `/api/search/tags` and `/api/search/tag/{tag}/values` serve Tempo's legacy v1 flat shapes — `{"tagNames":[...]}` (distinct keys, catalog order, deduplicated across scopes) and `{"tagValues":["a","b"]}` (bare strings). A server-side projection of the native scoped/typed §4.3 result: scope, value types, and `truncated` are dropped.
+- **v2 tags:** `/api/v2/search/tags` and `/api/v2/search/tag/{tag}/values` serve the native scoped/typed shapes minus the PulsusDB-only top-level `truncated` field (Tempo's v2 wire shape has no equivalent — alias consumers lose the truncation signal; use the native routes to observe it).
+- **Intrinsic scope:** not synthesized — `scope=intrinsic` is a `400 bad_data` on native and alias alike (§4.3), a delta from Tempo, which reports a static `intrinsic` scope. If intrinsic autocomplete proves load-bearing for real Grafana usage, the fix is adding intrinsic scope to the **native** v2 tags endpoint in a follow-up (the alias stays a pure projection of native) — never alias-side synthesis.
+- **`/api/echo`:** `200` with the constant body `echo`.
 
 ### 8.2 Ingest receivers (M6)
 

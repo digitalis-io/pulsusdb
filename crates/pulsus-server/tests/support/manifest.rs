@@ -133,6 +133,31 @@ pub enum Surface {
     /// sibling-404 suffix yields a genuinely unrouted path). Errors are
     /// the JSON envelope, never with `position`.
     TracesTags,
+    /// The T9 v2 Tempo tag-discovery aliases `/api/v2/search/tags` and
+    /// `/api/v2/search/tag/{tag}/values` (issue #61, docs/api.md §8.1) —
+    /// reshaping, not pure bindings: the native §4.3 scoped/typed shapes
+    /// MINUS the PulsusDB-only top-level `truncated` field (Tempo's v2
+    /// wire has no equivalent). Against this suite's empty databases a
+    /// well-formed request returns the empty envelope 200
+    /// (`{"scopes":[]}` / `{"tagValues":[]}`) with NO `truncated` key —
+    /// the mounting oracle. Errors are native-identical (shared param
+    /// parsing), never with `position`. The seeded non-empty wire-shape
+    /// proof lives in `traces_tags_live.rs`.
+    TracesTagsV2,
+    /// The T9 v1 Tempo tag-discovery aliases `/api/search/tags` and
+    /// `/api/search/tag/{tag}/values` (issue #61, docs/api.md §8.1) —
+    /// Tempo's legacy flat shapes: `{"tagNames":[<bare strings>]}` /
+    /// `{"tagValues":[<bare strings>]}` (scope, value types, and
+    /// `truncated` all projected away server-side). Empty-DB mounting
+    /// oracle: the flat empty envelope 200, with neither a `scopes` nor
+    /// a `truncated` key. Errors native-identical, never with
+    /// `position`. Seeded proof in `traces_tags_live.rs`.
+    TracesTagsV1,
+    /// `GET /api/echo` (issue #61) — Tempo's constant liveness echo:
+    /// `200` with the exact body `echo` (`text/plain; charset=utf-8`,
+    /// axum's `&'static str` response), no I/O, no pool. The body text
+    /// is the mounting oracle; the route has no error cases.
+    Echo,
 }
 
 /// Mode/flag gating (issue #36 plan v2 finding 3): mirrors
@@ -1413,6 +1438,159 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: TRACES_METRICS_BASE_QUERY,
         cases: TRACES_METRICS_CASES,
     },
+    // -- Tempo compat aliases (CompatAndReader, issue #61) ----------------
+    // 13 routes, all GET, all mounted iff `PULSUS_COMPAT_ENDPOINTS=true`
+    // AND Reader is mounted (the M1 Loki precedent). Eight are pure route
+    // bindings onto the native traces handlers — reusing the native
+    // surface, `success_status`, `base_query`, and exact `CaseClass` list
+    // (the #36 alias pattern: an alias wired to the wrong handler fails
+    // this matrix, not just a byte-identity smoke test); byte-identity on
+    // seeded data is proven in `traces_api_live.rs`. Four reshape to
+    // Tempo's v1 flat / v2 (no `truncated`) tag shapes (own surfaces);
+    // `/api/echo` is a constant.
+    RouteSpec {
+        path: "/api/traces/{traceId}",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetch,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
+    RouteSpec {
+        path: "/api/traces/{traceId}/json",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetch,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
+    RouteSpec {
+        path: "/tempo/api/traces/{traceId}",
+        methods: &[Method::Get],
+        surface: Surface::TracesFetch,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 404,
+        base_query: "",
+        cases: TRACE_FETCH_CASES,
+    },
+    RouteSpec {
+        path: "/api/search",
+        methods: &[Method::Get],
+        surface: Surface::TracesSearch,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_SEARCH_BASE_QUERY,
+        cases: TRACES_SEARCH_CASES,
+    },
+    RouteSpec {
+        path: "/api/v2/search/tags",
+        methods: &[Method::Get],
+        surface: Surface::TracesTagsV2,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: TRACES_TAGS_CASES,
+    },
+    RouteSpec {
+        path: "/api/v2/search/tag/{tag}/values",
+        methods: &[Method::Get],
+        surface: Surface::TracesTagsV2,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_TAG_VALUES_BASE_QUERY,
+        cases: TRACES_TAG_VALUES_CASES,
+    },
+    RouteSpec {
+        path: "/api/search/tags",
+        methods: &[Method::Get],
+        surface: Surface::TracesTagsV1,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: TRACES_TAGS_CASES,
+    },
+    RouteSpec {
+        path: "/api/search/tag/{tag}/values",
+        methods: &[Method::Get],
+        surface: Surface::TracesTagsV1,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_TAG_VALUES_BASE_QUERY,
+        cases: TRACES_TAG_VALUES_CASES,
+    },
+    RouteSpec {
+        path: "/api/echo",
+        methods: &[Method::Get],
+        surface: Surface::Echo,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/metrics/query_range",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
+    },
+    RouteSpec {
+        path: "/api/metrics/query",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
+    },
+    RouteSpec {
+        path: "/tempo/api/metrics/query_range",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
+    },
+    RouteSpec {
+        path: "/tempo/api/metrics/query",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
+    },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation
     // notes): every M4-M8 §4-§8 row is out of scope for a guard whose only
@@ -1608,7 +1786,9 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router());} router",
+        // Re-pinned for issue #61 (T9): the Tempo trace-alias merge joins
+        // the Loki one inside the same Reader-mounted block.
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",

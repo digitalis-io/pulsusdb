@@ -23,7 +23,15 @@
 //!   matched by the byte-frozen SELECT lists, independent of the FROM
 //!   table — must count EXACTLY the requests this test made and read
 //!   only `trace_tag_catalog`, and zero Selects in the run (any SQL
-//!   text) may touch `trace_spans`/`trace_attrs_idx`.
+//!   text) may touch `trace_spans`/`trace_attrs_idx`;
+//! - the issue #61 (T9) seeded wire-shape proof for the four RESHAPING
+//!   Tempo tag aliases, over real HTTP against this non-trivial catalog
+//!   (the spawn sets `PULSUS_COMPAT_ENDPOINTS=true`): v1 flat bare-string
+//!   `tagNames`/`tagValues`, v2 typed `{"type","value"}` objects, and
+//!   the `truncated` field ABSENT from every alias body while PRESENT
+//!   (and, on the over-cap key, `true`) on the native twin. The alias
+//!   requests ride the same exact-count zero-payload proof: they issue
+//!   the identical catalog SELECTs, so `discovered` counts them too.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
@@ -34,7 +42,7 @@
 //! ```
 //!
 //! Port 31134 — distinct from every other live suite's fixed ports
-//! (31100-31133).
+//! (31100-31133 and `traces_api_live.rs`'s 31135).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -224,7 +232,11 @@ fn spawn_ready(port: u16, db: &str) -> ChildGuard {
             "CLICKHOUSE_HTTP_PORT",
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
-        .env("CLICKHOUSE_DB", db);
+        .env("CLICKHOUSE_DB", db)
+        // Issue #61 (T9): mount the Tempo compat aliases — the reshaping
+        // wire-shape assertions below need them; native behavior is
+        // unaffected (router-build-time merging only).
+        .env("PULSUS_COMPAT_ENDPOINTS", "true");
     let guard = ChildGuard(cmd.spawn().expect("spawn pulsusdb"));
 
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -631,6 +643,148 @@ async fn tag_discovery_against_real_clickhouse() {
     assert_eq!(
         vals, expected,
         "{ctx}: the ordered, deduplicated ascending prefix"
+    );
+
+    // -- Issue #61 (T9): the four RESHAPING Tempo aliases against this
+    // non-trivial catalog — exact reference wire shapes over real HTTP.
+    // Runs BEFORE the names-bulk seed (the small fixture keeps the
+    // expected sets exact); every alias request goes through `get_json`,
+    // so the exact-count zero-payload proof below covers the aliases too
+    // (they issue the identical catalog SELECTs).
+
+    // Route 5, `/api/v2/search/tags`: the native scoped shape with the
+    // `truncated` key ABSENT while the native twin carries it.
+    let ctx = "alias v2 tags (scoped, no truncated)";
+    let native = get_json(port, NAMES_URL, ctx, &mut discovered);
+    let alias = get_json(port, "/api/v2/search/tags", ctx, &mut discovered);
+    assert_eq!(
+        alias["scopes"], native["scopes"],
+        "{ctx}: the v2 alias serves the native scoped shape, body {alias}"
+    );
+    assert!(
+        !scopes_of(&alias, ctx).is_empty(),
+        "{ctx}: seeded proof must be non-empty, body {alias}"
+    );
+    assert!(
+        native.get("truncated").is_some(),
+        "{ctx}: the native twin carries truncated, body {native}"
+    );
+    assert!(
+        alias.get("truncated").is_none(),
+        "{ctx}: the alias must drop truncated, body {alias}"
+    );
+
+    // Route 6, `/api/v2/search/tag/{tag}/values`: typed {"type","value"}
+    // OBJECTS (not v1's bare strings), no `truncated`.
+    let ctx = "alias v2 typed values";
+    let alias = get_json(
+        port,
+        "/api/v2/search/tag/span.http.status_code/values",
+        ctx,
+        &mut discovered,
+    );
+    assert_eq!(
+        values_of(&alias, ctx),
+        vec![
+            ("int".to_string(), "200".to_string()),
+            ("int".to_string(), "500".to_string()),
+        ],
+        "{ctx}: typed value objects, body {alias}"
+    );
+    assert!(
+        alias["tagValues"][0].is_object(),
+        "{ctx}: v2 entries are objects, never bare strings, body {alias}"
+    );
+    assert!(
+        alias.get("truncated").is_none(),
+        "{ctx}: the alias must drop truncated, body {alias}"
+    );
+    // The truncated-drop is observable, not vacuous: on the over-cap key
+    // the native flag is TRUE, and the alias still has no key at all.
+    let ctx = "alias v2 values truncated-drop (over-cap key)";
+    let native = get_json(port, &values_url("span.bulk.id"), ctx, &mut discovered);
+    assert_eq!(native["truncated"], true, "{ctx}: body flag");
+    let alias = get_json(
+        port,
+        "/api/v2/search/tag/span.bulk.id/values",
+        ctx,
+        &mut discovered,
+    );
+    assert_eq!(
+        alias["tagValues"], native["tagValues"],
+        "{ctx}: same capped typed set as native"
+    );
+    assert!(
+        alias.get("truncated").is_none(),
+        "{ctx}: truncated dropped even when the native flag is true, body keys {:?}",
+        alias.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
+
+    // Route 11, `/api/search/tags`: Tempo v1 FLAT `{"tagNames":[...]}` —
+    // distinct keys in catalog (scope, key) order; no scopes, no
+    // truncated.
+    let ctx = "alias v1 flat tagNames";
+    let alias = get_json(port, "/api/search/tags", ctx, &mut discovered);
+    assert_eq!(
+        alias["tagNames"],
+        serde_json::json!([
+            "env",
+            "service.name",
+            "bulk.id",
+            "cache.hit",
+            "http.status_code",
+            "latency.bucket",
+        ]),
+        "{ctx}: flat bare-string names in catalog order, body {alias}"
+    );
+    assert!(
+        alias.get("scopes").is_none() && alias.get("truncated").is_none(),
+        "{ctx}: the flat shape has neither scopes nor truncated, body {alias}"
+    );
+
+    // Route 12, `/api/search/tag/{tag}/values`: v1 flat bare STRINGS —
+    // the object-vs-string distinction from route 6 on the same seeded
+    // data.
+    let ctx = "alias v1 flat tagValues";
+    let alias = get_json(
+        port,
+        "/api/search/tag/resource.service.name/values",
+        ctx,
+        &mut discovered,
+    );
+    assert_eq!(
+        alias["tagValues"],
+        serde_json::json!(["checkout", "payments"]),
+        "{ctx}: flat bare-string values, body {alias}"
+    );
+    assert!(
+        alias["tagValues"][0].is_string(),
+        "{ctx}: v1 entries are bare strings, never typed objects, body {alias}"
+    );
+    assert!(
+        alias.get("truncated").is_none(),
+        "{ctx}: no truncated key, body {alias}"
+    );
+    // Over-cap flat twin: exactly the cap, all bare strings, still no
+    // truncated key (native is true).
+    let ctx = "alias v1 flat over-cap";
+    let alias = get_json(
+        port,
+        "/api/search/tag/span.bulk.id/values",
+        ctx,
+        &mut discovered,
+    );
+    let flat_vals = alias["tagValues"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{ctx}: tagValues must be an array, body {alias}"));
+    assert_eq!(flat_vals.len(), TAG_VALUES_MAX, "{ctx}: exactly the cap");
+    assert!(
+        flat_vals.iter().all(serde_json::Value::is_string),
+        "{ctx}: every capped entry is a bare string"
+    );
+    assert!(
+        alias.get("truncated").is_none(),
+        "{ctx}: truncated dropped even on the capped set"
     );
 
     // -- The TAG_NAMES_MAX twin of the values cap: seed past 10,000

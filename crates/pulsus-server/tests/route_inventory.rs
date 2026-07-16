@@ -1320,10 +1320,18 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::Ingest => spec.gate == Gate::WriterMode,
             Surface::LogsQuery => matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader),
             Surface::PromApi => spec.gate == Gate::ReaderMode,
-            Surface::TracesFetch
-            | Surface::TracesSearch
-            | Surface::TracesMetrics
-            | Surface::TracesTags => spec.gate == Gate::ReaderMode,
+            // The native traces routes are ReaderMode; their issue #61
+            // pure-binding aliases reuse the same surfaces under
+            // CompatAndReader (the LogsQuery precedent).
+            Surface::TracesFetch | Surface::TracesSearch | Surface::TracesMetrics => {
+                matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
+            }
+            // Only the native tag-discovery routes use TracesTags — the
+            // aliases are reshaping surfaces, compat-gated by definition.
+            Surface::TracesTags => spec.gate == Gate::ReaderMode,
+            Surface::TracesTagsV1 | Surface::TracesTagsV2 | Surface::Echo => {
+                spec.gate == Gate::CompatAndReader
+            }
         };
         assert!(
             ok,

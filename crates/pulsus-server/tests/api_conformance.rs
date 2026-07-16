@@ -655,6 +655,85 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 "{ctx}: an empty result set is never truncated, body {json}"
             );
         }
+        (Surface::TracesTagsV2, path) => {
+            // Issue #61: the v2 aliases are the native §4.3 shapes MINUS
+            // the PulsusDB-only `truncated` field (Tempo v2 wire-shape
+            // conformance). Empty-DB empty envelope 200 is the mounting
+            // oracle; the `truncated` ABSENCE is the reshaping oracle (a
+            // pure binding onto the native handler would carry it). The
+            // seeded non-empty shape proof lives in `traces_tags_live.rs`.
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: v2 tags alias envelope content-type"
+            );
+            let json = res.json(ctx);
+            if path.ends_with("/values") {
+                assert_eq!(
+                    json["tagValues"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty tagValues array, body {json}"
+                );
+            } else {
+                assert_eq!(
+                    json["scopes"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty scopes array, body {json}"
+                );
+            }
+            assert!(
+                json.get("truncated").is_none(),
+                "{ctx}: the v2 alias must drop the native `truncated` field, body {json}"
+            );
+        }
+        (Surface::TracesTagsV1, path) => {
+            // Issue #61: Tempo's legacy v1 FLAT shapes — bare-string
+            // arrays, no scopes, no types, no `truncated`. Empty-DB flat
+            // empty envelope 200 is the mounting oracle. Seeded
+            // non-empty flat-vs-typed proof in `traces_tags_live.rs`.
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: v1 tags alias envelope content-type"
+            );
+            let json = res.json(ctx);
+            if path.ends_with("/values") {
+                assert_eq!(
+                    json["tagValues"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty flat tagValues array, body {json}"
+                );
+            } else {
+                assert_eq!(
+                    json["tagNames"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty flat tagNames array, body {json}"
+                );
+                assert!(
+                    json.get("scopes").is_none(),
+                    "{ctx}: the v1 flat shape has no scopes key, body {json}"
+                );
+            }
+            assert!(
+                json.get("truncated").is_none(),
+                "{ctx}: the v1 flat shape has no truncated key, body {json}"
+            );
+        }
+        (Surface::Echo, _) => {
+            // Issue #61: the constant Tempo echo — exact body, exact
+            // content-type (axum's `&'static str` response).
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; charset=utf-8"),
+                "{ctx}: echo content-type"
+            );
+            assert_eq!(
+                res.body,
+                b"echo",
+                "{ctx}: echo body must be the exact constant, got {:?}",
+                String::from_utf8_lossy(&res.body)
+            );
+        }
         (Surface::Ingest, _) => {
             unreachable!("{ctx}: ingest routes assert via assert_ingest_family")
         }

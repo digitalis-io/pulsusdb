@@ -24,11 +24,15 @@
 //! through the shared `prom_api::encode` Prometheus matrix/vector
 //! envelope.
 //!
-//! Out of scope here (see the #19 decomposition): the Tempo compat
-//! aliases (`/api/traces/{traceId}[/json]`, `/api/metrics/*`, T9 — pure
-//! route bindings onto these same handlers, docs/api.md §8.1).
+//! The §8.1 Tempo compat aliases (issue #61, T9) ship here too:
+//! [`compat_router`] binds the eight pure aliases onto these same
+//! handlers and the reshaping/constant ones onto `compat.rs`;
+//! `crate::compat::apply_aliases` decides *whether* it gets merged
+//! (`PULSUS_COMPAT_ENDPOINTS` + Reader-mode gating — the M1 Loki
+//! precedent, see `logs_api/mod.rs`).
 
 mod assemble;
+mod compat;
 mod error;
 mod handlers;
 mod legacy;
@@ -66,6 +70,46 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/traces/v1/metrics/query", get(metrics::metrics_query))
 }
 
+/// The Tempo-compat alias surface (docs/api.md §8.1, issue #61) — 13
+/// `GET` routes, all literal paths (so the #36 drift guard extracts them
+/// directly; no mount helper, no pinning needed). Eight are pure route
+/// bindings onto the native handlers (byte-identical responses by
+/// construction — same fn, same plan); the four tag-discovery aliases
+/// reshape to Tempo's v1 flat / v2 (no `truncated`) wire shapes
+/// (`compat.rs`); `/api/echo` is a constant. Mounting this router at all
+/// is `crate::compat::apply_aliases`'s job (flag + Reader-mode gated);
+/// this fn just builds the route set. The alias `/api/traces/{traceId}`
+/// coexists with native `/api/traces/v1/...`: the literal `v1` segment
+/// wins over the `{traceId}` param (docs/api.md §8.1's routing note).
+pub(crate) fn compat_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/traces/{traceId}", get(handlers::trace_by_id))
+        .route(
+            "/api/traces/{traceId}/json",
+            get(handlers::trace_by_id_json),
+        )
+        .route("/tempo/api/traces/{traceId}", get(handlers::trace_by_id))
+        .route("/api/search", get(search::search))
+        .route("/api/search/tags", get(compat::tags_v1))
+        .route("/api/search/tag/{tag}/values", get(compat::tag_values_v1))
+        .route("/api/v2/search/tags", get(compat::tags_v2))
+        .route(
+            "/api/v2/search/tag/{tag}/values",
+            get(compat::tag_values_v2),
+        )
+        .route("/api/echo", get(compat::echo))
+        .route(
+            "/api/metrics/query_range",
+            get(metrics::metrics_query_range),
+        )
+        .route("/api/metrics/query", get(metrics::metrics_query))
+        .route(
+            "/tempo/api/metrics/query_range",
+            get(metrics::metrics_query_range),
+        )
+        .route("/tempo/api/metrics/query", get(metrics::metrics_query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +117,18 @@ mod tests {
     #[test]
     fn router_constructs_without_panicking() {
         let _ = router();
+    }
+
+    /// Guards the alias/native route-overlap edge case (issue #61 plan
+    /// risk 1): `/api/traces/{traceId}` vs `/api/traces/v1/trace/...`
+    /// must coexist — a matchit conflict would panic at construction.
+    #[test]
+    fn compat_router_constructs_without_panicking() {
+        let _ = compat_router();
+    }
+
+    #[test]
+    fn native_and_compat_routers_merge_without_conflicts() {
+        let _ = router().merge(compat_router());
     }
 }

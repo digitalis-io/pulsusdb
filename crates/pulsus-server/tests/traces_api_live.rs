@@ -7,6 +7,15 @@
 //! malformed ids, at-least-once dedup, the 16-hex short-id resolution,
 //! and byte-identical JSON across permuted insert orders.
 //!
+//! Issue #61 (T9) adds the seeded byte-identity proof for the eight
+//! pure-binding Tempo query aliases
+//! (`tempo_query_aliases_are_byte_identical_to_native_on_seeded_data`):
+//! alias vs native status + `Content-Type` + body bytes on real traces —
+//! negotiated-JSON, protobuf, and forced-JSON trace bodies plus
+//! non-empty search/metrics bodies. The spawns set
+//! `PULSUS_COMPAT_ENDPOINTS=true` (aliases mounted; native behavior is
+//! unaffected — build-time route merging only).
+//!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
 //! ```text
@@ -16,8 +25,8 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Port 31130 — distinct from every other live suite's fixed ports
-//! (31100-31117 and 31120-31125).
+//! Ports 31130 (fetch suite) and 31135 (alias suite) — distinct from
+//! every other live suite's fixed ports (31100-31134).
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -38,6 +47,10 @@ fn should_run() -> bool {
 }
 
 const PORT: u16 = 31_130;
+/// The issue #61 alias byte-identity suite's own spawn (both tests in
+/// this binary may run concurrently — distinct ports, distinct
+/// throwaway databases).
+const ALIAS_PORT: u16 = 31_135;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -97,12 +110,13 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
 }
 
 fn request(
+    port: u16,
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: Option<(&str, &[u8])>,
 ) -> Option<RawResponse> {
-    let mut stream = TcpStream::connect(("127.0.0.1", PORT)).ok()?;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
     let mut head = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
@@ -158,8 +172,8 @@ fn request(
     })
 }
 
-fn get(path: &str, headers: &[(&str, &str)], ctx: &str) -> RawResponse {
-    request("GET", path, headers, None)
+fn get(port: u16, path: &str, headers: &[(&str, &str)], ctx: &str) -> RawResponse {
+    request(port, "GET", path, headers, None)
         .unwrap_or_else(|| panic!("{ctx}: request must be reachable (transport failure)"))
 }
 
@@ -176,10 +190,10 @@ impl Drop for ChildGuard {
     }
 }
 
-fn spawn_ready(db: &str) -> ChildGuard {
+fn spawn_ready(port: u16, db: &str) -> ChildGuard {
     let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
         .env("PULSUS_HOST", "127.0.0.1")
-        .env("PULSUS_PORT", PORT.to_string())
+        .env("PULSUS_PORT", port.to_string())
         .env(
             "CLICKHOUSE_SERVER",
             std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
@@ -189,13 +203,17 @@ fn spawn_ready(db: &str) -> ChildGuard {
             std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
         )
         .env("CLICKHOUSE_DB", db)
+        // Issue #61 (T9): mount the Tempo compat aliases — needed by the
+        // alias byte-identity suite; a no-op for the native assertions
+        // (router-build-time merging only, no per-request behavior).
+        .env("PULSUS_COMPAT_ENDPOINTS", "true")
         .spawn()
         .expect("spawn pulsusdb");
     let guard = ChildGuard(child);
 
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
-        if request("GET", "/ready", &[], None).is_some_and(|r| r.status == 200) {
+        if request(port, "GET", "/ready", &[], None).is_some_and(|r| r.status == 200) {
             return guard;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -228,7 +246,7 @@ fn span(trace_id: [u8; 16], span_id: [u8; 8], name: &str, start_ns: u64) -> Span
 /// header, so a `200` means the rows are flushed and read-visible), with
 /// the fixed resource (`service.name=checkout`) and scope (`live-scope`)
 /// context every fetch assertion below checks for.
-fn ingest(spans: Vec<Span>, ctx: &str) {
+fn ingest(port: u16, spans: Vec<Span>, ctx: &str) {
     let req = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
@@ -250,6 +268,7 @@ fn ingest(spans: Vec<Span>, ctx: &str) {
         }],
     };
     let res = request(
+        port,
         "POST",
         "/v1/traces",
         &[],
@@ -343,7 +362,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         return;
     }
 
-    let _guard = spawn_ready("pulsus_traces_api_it_live");
+    let _guard = spawn_ready(PORT, "pulsus_traces_api_it_live");
 
     // -- Seed trace A: 3 spans, start times chosen so canonical output
     // order (startTimeUnixNano, spanId) differs from insert order.
@@ -352,12 +371,16 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let s1 = span(trace_a, [1; 8], "span-one", 3_000_000_000_000_000_300);
     let s2 = span(trace_a, [2; 8], "span-two", 3_000_000_000_000_000_100);
     let s3 = span(trace_a, [3; 8], "span-three", 3_000_000_000_000_000_200);
-    ingest(vec![s1.clone(), s2.clone(), s3.clone()], "seed trace A");
+    ingest(
+        PORT,
+        vec![s1.clone(), s2.clone(), s3.clone()],
+        "seed trace A",
+    );
 
     // -- Default representation: 200 application/json, protojson decodes,
     // spans in canonical order, context preserved.
     let ctx = "GET trace A (default)";
-    let res = get(&fetch_path(&a_hex), &[], ctx);
+    let res = get(PORT, &fetch_path(&a_hex), &[], ctx);
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
     let default_json_body = res.body.clone();
@@ -382,7 +405,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
 
     // -- /json suffix: byte-identical to the default JSON.
     let ctx = "GET trace A /json";
-    let res = get(&format!("{}/json", fetch_path(&a_hex)), &[], ctx);
+    let res = get(PORT, &format!("{}/json", fetch_path(&a_hex)), &[], ctx);
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
     assert_eq!(res.body, default_json_body, "{ctx}: byte-identical JSON");
@@ -390,6 +413,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // -- /json with a protobuf Accept: still JSON (forcing ignores Accept).
     let ctx = "GET trace A /json with Accept: application/protobuf";
     let res = get(
+        PORT,
         &format!("{}/json", fetch_path(&a_hex)),
         &[("accept", "application/protobuf")],
         ctx,
@@ -402,7 +426,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // 200 application/protobuf, prost-decodes to the same spans.
     for accept in ["application/protobuf", "application/x-protobuf"] {
         let ctx = format!("GET trace A with Accept: {accept}");
-        let res = get(&fetch_path(&a_hex), &[("accept", accept)], &ctx);
+        let res = get(PORT, &fetch_path(&a_hex), &[("accept", accept)], &ctx);
         assert_eq!(res.status, 200, "{ctx}");
         assert_eq!(
             res.content_type(),
@@ -424,26 +448,26 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // -- 406 over HTTP on the *seeded* trace (plan v3 §3: the mapping is
     // exercised on the success path, not only error paths).
     let ctx = "GET trace A with Accept: text/plain";
-    let res = get(&fetch_path(&a_hex), &[("accept", "text/plain")], ctx);
+    let res = get(PORT, &fetch_path(&a_hex), &[("accept", "text/plain")], ctx);
     assert_error_envelope(&res, 406, "not_acceptable", ctx);
 
     // -- Absent + malformed ids.
     let ctx = "GET absent trace";
-    let res = get(&fetch_path(&"ee".repeat(16)), &[], ctx);
+    let res = get(PORT, &fetch_path(&"ee".repeat(16)), &[], ctx);
     assert_error_envelope(&res, 404, "not_found", ctx);
 
     let ctx = "GET malformed trace id";
-    let res = get(&fetch_path("zzzz"), &[], ctx);
+    let res = get(PORT, &fetch_path("zzzz"), &[], ctx);
     assert_error_envelope(&res, 400, "bad_data", ctx);
 
     // -- Dedup: ingest the same span twice, fetch returns it once.
     let trace_b = [0xbb; 16];
     let b_hex = hex(&trace_b);
     let dup = span(trace_b, [9; 8], "span-dup", 3_000_000_000_000_001_000);
-    ingest(vec![dup.clone()], "seed trace B (first copy)");
-    ingest(vec![dup], "seed trace B (replay)");
+    ingest(PORT, vec![dup.clone()], "seed trace B (first copy)");
+    ingest(PORT, vec![dup], "seed trace B (replay)");
     let ctx = "GET trace B after duplicate ingest";
-    let res = get(&fetch_path(&b_hex), &[], ctx);
+    let res = get(PORT, &fetch_path(&b_hex), &[], ctx);
     assert_eq!(res.status, 200, "{ctx}");
     let decoded: TracesData = serde_json::from_slice(&res.body)
         .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize: {e}"));
@@ -458,6 +482,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let mut trace_c = [0u8; 16];
     trace_c[8..].copy_from_slice(&[0xcc; 8]);
     ingest(
+        PORT,
         vec![span(
             trace_c,
             [7; 8],
@@ -467,7 +492,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         "seed trace C",
     );
     let ctx = "GET trace C by 16-hex short id";
-    let res = get(&fetch_path(&"cc".repeat(8)), &[], ctx);
+    let res = get(PORT, &fetch_path(&"cc".repeat(8)), &[], ctx);
     assert_eq!(res.status, 200, "{ctx}: short id must resolve");
     let decoded: TracesData = serde_json::from_slice(&res.body)
         .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize: {e}"));
@@ -491,6 +516,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // inserts, not one batch).
     for i in [0usize, 1, 2] {
         ingest(
+            PORT,
             vec![span(trace_d, ids[i], &format!("perm-{i}"), starts[i])],
             "seed trace D",
         );
@@ -498,13 +524,14 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     // Trace E: same spans, reversed insert order.
     for i in [2usize, 1, 0] {
         ingest(
+            PORT,
             vec![span(trace_e, ids[i], &format!("perm-{i}"), starts[i])],
             "seed trace E",
         );
     }
     let ctx = "GET traces D/E (insert-order permutation)";
-    let d = get(&fetch_path(&hex(&trace_d)), &[], ctx);
-    let e = get(&fetch_path(&hex(&trace_e)), &[], ctx);
+    let d = get(PORT, &fetch_path(&hex(&trace_d)), &[], ctx);
+    let e = get(PORT, &fetch_path(&hex(&trace_e)), &[], ctx);
     assert_eq!(d.status, 200, "{ctx}: D");
     assert_eq!(e.status, 200, "{ctx}: E");
     let e_body = String::from_utf8(e.body).expect("JSON is UTF-8");
@@ -514,4 +541,199 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
         e_as_d,
         "{ctx}: byte-identical JSON across permuted insert orders (modulo the trace id)"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #61 (T9) AC2: the eight pure-binding Tempo aliases are
+// byte-identical to their native twins on SEEDED data.
+// ---------------------------------------------------------------------
+
+/// One alias/native pair under identical request headers: status,
+/// `Content-Type`, and body BYTES must be equal. Returns the alias
+/// response so the caller can additionally prove the shared body is a
+/// non-trivial success (the empty-DB conformance matrix can only ever
+/// compare 404/empty envelopes — this is the seeded proof).
+fn assert_alias_native_identity(
+    port: u16,
+    alias: &str,
+    native: &str,
+    headers: &[(&str, &str)],
+    ctx: &str,
+) -> RawResponse {
+    let a = get(port, alias, headers, &format!("{ctx}: alias {alias}"));
+    let n = get(port, native, headers, &format!("{ctx}: native {native}"));
+    assert_eq!(
+        a.status, n.status,
+        "{ctx}: alias {alias} status must equal native {native}"
+    );
+    assert_eq!(
+        a.content_type(),
+        n.content_type(),
+        "{ctx}: alias {alias} Content-Type must equal native {native}"
+    );
+    assert_eq!(
+        a.body, n.body,
+        "{ctx}: alias {alias} body bytes must be identical to native {native}"
+    );
+    a
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let port = ALIAS_PORT;
+    let _guard = spawn_ready(port, "pulsus_traces_compat_it_live");
+
+    // Seed one trace: 2 spans, start times chosen so canonical output
+    // order differs from insert order (a real, non-trivial body). Window
+    // math below is in unix SECONDS (magnitude < 10^12).
+    let trace_f = [0xf5; 16];
+    let f_hex = hex(&trace_f);
+    let s1 = span(trace_f, [1; 8], "alias-one", 3_100_000_000_000_000_200);
+    let s2 = span(trace_f, [2; 8], "alias-two", 3_100_000_000_000_000_100);
+    ingest(port, vec![s1, s2], "seed trace F");
+
+    let native_fetch = fetch_path(&f_hex);
+
+    // -- Routes 1 + 3 (trace-by-ID, negotiating handler): default Accept
+    // (negotiated JSON) and Accept: application/protobuf, both on a real
+    // 200 trace body — not the 404 envelope.
+    let mut default_json_body = Vec::new();
+    for alias_prefix in ["/api/traces", "/tempo/api/traces"] {
+        let alias_fetch = format!("{alias_prefix}/{f_hex}");
+
+        let ctx = format!("{alias_fetch} default (negotiated JSON)");
+        let res = assert_alias_native_identity(port, &alias_fetch, &native_fetch, &[], &ctx);
+        assert_eq!(res.status, 200, "{ctx}");
+        assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
+        let decoded: TracesData = serde_json::from_slice(&res.body)
+            .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize: {e}"));
+        assert_eq!(spans_of(&decoded).len(), 2, "{ctx}: non-empty seeded body");
+        default_json_body = res.body;
+
+        let ctx = format!("{alias_fetch} Accept: application/protobuf");
+        let res = assert_alias_native_identity(
+            port,
+            &alias_fetch,
+            &native_fetch,
+            &[("accept", "application/protobuf")],
+            &ctx,
+        );
+        assert_eq!(res.status, 200, "{ctx}");
+        assert_eq!(res.content_type(), Some("application/protobuf"), "{ctx}");
+        let decoded = TracesData::decode(res.body.as_slice())
+            .unwrap_or_else(|e| panic!("{ctx}: body must prost-decode as TracesData: {e}"));
+        assert_eq!(spans_of(&decoded).len(), 2, "{ctx}: non-empty seeded body");
+    }
+
+    // -- Route 2 (trace-by-ID /json, forcing handler): sent WITH a
+    // protobuf Accept — a miswired alias (bound to the negotiating
+    // handler) would return protobuf; the forcing handler ignores Accept
+    // and returns the exact default protojson bytes.
+    let ctx = "/api/traces/{traceId}/json with Accept: application/protobuf (forcing proof)";
+    let res = assert_alias_native_identity(
+        port,
+        &format!("/api/traces/{f_hex}/json"),
+        &format!("{native_fetch}/json"),
+        &[("accept", "application/protobuf")],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}");
+    assert_eq!(
+        res.content_type(),
+        Some("application/json"),
+        "{ctx}: the /json alias must bind the forcing handler, not the negotiating one"
+    );
+    assert_eq!(
+        res.body, default_json_body,
+        "{ctx}: forced JSON is the same protojson bytes as the default representation"
+    );
+
+    // -- Route 4 (search): a seeded match-all window returning a
+    // non-empty `traces` array.
+    let window = "start=3099999000&end=3100001000";
+    let search_query = format!("?q=%7B%7D&{window}");
+    let ctx = "/api/search seeded match-all";
+    let res = assert_alias_native_identity(
+        port,
+        &format!("/api/search{search_query}"),
+        &format!("/api/traces/v1/search{search_query}"),
+        &[],
+        ctx,
+    );
+    assert_eq!(res.status, 200, "{ctx}");
+    let json = res.json(ctx);
+    assert_eq!(
+        json["traces"].as_array().map(Vec::len),
+        Some(1),
+        "{ctx}: the seeded trace must be returned, body {json}"
+    );
+
+    // -- Routes 7-10 (TraceQL metrics, both prefixes): seeded range +
+    // instant windows returning a non-empty matrix / a non-zero vector
+    // sample (the shared Prometheus envelope — the documented §8.1
+    // delta from Tempo's own metrics wire format).
+    let metrics_query = format!("?q=%7B%7D%20%7C%20rate()&{window}&step=60");
+    for alias_prefix in ["/api/metrics", "/tempo/api/metrics"] {
+        let ctx = format!("{alias_prefix}/query_range seeded");
+        let res = assert_alias_native_identity(
+            port,
+            &format!("{alias_prefix}/query_range{metrics_query}"),
+            &format!("/api/traces/v1/metrics/query_range{metrics_query}"),
+            &[],
+            &ctx,
+        );
+        assert_eq!(res.status, 200, "{ctx}");
+        let json = res.json(&ctx);
+        assert_eq!(json["data"]["resultType"], "matrix", "{ctx}: body {json}");
+        assert!(
+            json["data"]["result"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty()),
+            "{ctx}: the seeded window must produce a non-empty matrix, body {json}"
+        );
+
+        let ctx = format!("{alias_prefix}/query seeded");
+        let res = assert_alias_native_identity(
+            port,
+            &format!("{alias_prefix}/query{metrics_query}"),
+            &format!("/api/traces/v1/metrics/query{metrics_query}"),
+            &[],
+            &ctx,
+        );
+        assert_eq!(res.status, 200, "{ctx}");
+        let json = res.json(&ctx);
+        assert_eq!(json["data"]["resultType"], "vector", "{ctx}: body {json}");
+        // Code review (issue #61): guard non-emptiness BEFORE indexing —
+        // serde_json indexing into an empty `result` yields `Null`, and
+        // `Null != "0"` would pass vacuously.
+        assert!(
+            json["data"]["result"]
+                .as_array()
+                .is_some_and(|r| !r.is_empty()),
+            "{ctx}: the seeded window must produce a non-empty vector, body {json}"
+        );
+        // Round-2 review (issue #61): parse the rendered value instead of
+        // string-comparing against "0" — a string compare could in theory
+        // pass on an alternate zero rendering; the seeded window
+        // guarantees a strictly positive, finite rate.
+        let value = json["data"]["result"][0]["value"][1]
+            .as_str()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| {
+                panic!("{ctx}: the vector value must be a numeric string, body {json}")
+            });
+        assert!(
+            value.is_finite() && value > 0.0,
+            "{ctx}: the seeded window must count real spans (finite positive rate), got \
+             {value}, body {json}"
+        );
+    }
 }

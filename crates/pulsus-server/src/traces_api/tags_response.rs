@@ -7,6 +7,14 @@
 //! `truncated` flag (issue #58 plan v2 Δ3 — the non-silent cap
 //! indicator; T9's compat mapping simply drops it).
 //!
+//! T9 (issue #61) adds the four compat projections the §8.1 aliases
+//! serve: `render_tag_names_scoped_v2`/`render_tag_values_typed_v2`
+//! (the native shapes minus `truncated` — Tempo's v2 wire has no
+//! equivalent field) and `render_tag_names_flat`/`render_tag_values_flat`
+//! (Tempo's legacy v1 flat shapes — scope, value types, and `truncated`
+//! all projected away). Pure in-memory projections over the same
+//! already-computed `TagNames`/`TagValues`; no extra query work.
+//!
 //! **Type inference is best-effort by contract** (task-manager
 //! adjudication 2 on issue #58): `trace_tag_catalog` stores `val` as a
 //! bare `String` with no type column (the #54 amendment window is
@@ -18,14 +26,16 @@
 //! implementation exists to drift — `.5s` infers as duration, `0.1ns`
 //! does not).
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use pulsus_read::{TagNames, TagValues};
 
-/// `{"scopes":[{"name":…,"tags":[…]}],"truncated":…}` — rows arrive in
+/// The shared `scopes` array both scoped renderers emit — rows arrive in
 /// the catalog's `(scope, key)` order, so grouping preserves both the
 /// scope order and each scope's ascending key order.
-pub(crate) fn render_tag_names(names: &TagNames) -> Value {
+fn scopes_json(names: &TagNames) -> Vec<Value> {
     let mut scopes: Vec<(String, Vec<String>)> = Vec::new();
     for (scope, key) in &names.names {
         match scopes.last_mut() {
@@ -33,26 +43,71 @@ pub(crate) fn render_tag_names(names: &TagNames) -> Value {
             _ => scopes.push((scope.clone(), vec![key.clone()])),
         }
     }
+    scopes
+        .into_iter()
+        .map(|(name, tags)| json!({"name": name, "tags": tags}))
+        .collect()
+}
+
+/// The shared typed `tagValues` array — values stay strings on the wire
+/// (Tempo shape); `type` is the inferred category.
+fn typed_values_json(values: &TagValues) -> Vec<Value> {
+    values
+        .values
+        .iter()
+        .map(|v| json!({"type": infer_type(v), "value": v}))
+        .collect()
+}
+
+/// Native: `{"scopes":[{"name":…,"tags":[…]}],"truncated":…}`.
+pub(crate) fn render_tag_names(names: &TagNames) -> Value {
     json!({
-        "scopes": scopes
-            .into_iter()
-            .map(|(name, tags)| json!({"name": name, "tags": tags}))
-            .collect::<Vec<_>>(),
+        "scopes": scopes_json(names),
         "truncated": names.truncated,
     })
 }
 
-/// `{"tagValues":[{"type":…,"value":…}],"truncated":…}` — values stay
-/// strings on the wire (Tempo shape); `type` is the inferred category.
+/// Native: `{"tagValues":[{"type":…,"value":…}],"truncated":…}`.
 pub(crate) fn render_tag_values(values: &TagValues) -> Value {
     json!({
-        "tagValues": values
-            .values
-            .iter()
-            .map(|v| json!({"type": infer_type(v), "value": v}))
-            .collect::<Vec<_>>(),
+        "tagValues": typed_values_json(values),
         "truncated": values.truncated,
     })
+}
+
+/// Tempo v2 alias (`/api/v2/search/tags`): the native scoped shape MINUS
+/// the PulsusDB-only `truncated` field (issue #61 plan v2 Δ1 — alias
+/// consumers lose the truncation signal; documented §8.1 delta).
+pub(crate) fn render_tag_names_scoped_v2(names: &TagNames) -> Value {
+    json!({"scopes": scopes_json(names)})
+}
+
+/// Tempo v2 alias (`/api/v2/search/tag/{tag}/values`): the native typed
+/// shape MINUS `truncated`.
+pub(crate) fn render_tag_values_typed_v2(values: &TagValues) -> Value {
+    json!({"tagValues": typed_values_json(values)})
+}
+
+/// Tempo v1 alias (`/api/search/tags`): flat `{"tagNames":[…]}` — the
+/// distinct keys in catalog `(scope, key)` order, deduplicated across
+/// scopes on first occurrence (a key present in both scopes appears
+/// once); scope and `truncated` dropped.
+pub(crate) fn render_tag_names_flat(names: &TagNames) -> Value {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut keys: Vec<&str> = Vec::new();
+    for (_, key) in &names.names {
+        if seen.insert(key.as_str()) {
+            keys.push(key.as_str());
+        }
+    }
+    json!({"tagNames": keys})
+}
+
+/// Tempo v1 alias (`/api/search/tag/{tag}/values`): flat
+/// `{"tagValues":[…]}` — bare value strings; type and `truncated`
+/// dropped.
+pub(crate) fn render_tag_values_flat(values: &TagValues) -> Value {
+    json!({"tagValues": &values.values})
 }
 
 /// Deterministic best-effort type inference over the stored string, in
@@ -153,6 +208,102 @@ mod tests {
             render_tag_values(&empty),
             json!({"tagValues": [], "truncated": false})
         );
+    }
+
+    // -- T9 (issue #61): the four alias projections, pinned. -------------
+
+    fn truncated_names() -> TagNames {
+        TagNames {
+            names: vec![
+                ("resource".to_string(), "env".to_string()),
+                ("resource".to_string(), "service.name".to_string()),
+                ("span".to_string(), "env".to_string()),
+                ("span".to_string(), "http.status_code".to_string()),
+            ],
+            truncated: true,
+        }
+    }
+
+    #[test]
+    fn render_tag_names_scoped_v2_is_the_native_scopes_without_a_truncated_key() {
+        let names = truncated_names();
+        let v2 = render_tag_names_scoped_v2(&names);
+        assert_eq!(v2["scopes"], render_tag_names(&names)["scopes"]);
+        assert!(
+            v2.get("truncated").is_none(),
+            "the v2 alias must drop `truncated` even when the native flag is true: {v2}"
+        );
+        let empty = TagNames {
+            names: vec![],
+            truncated: false,
+        };
+        assert_eq!(render_tag_names_scoped_v2(&empty), json!({"scopes": []}));
+    }
+
+    #[test]
+    fn render_tag_values_typed_v2_is_the_native_typed_values_without_a_truncated_key() {
+        let values = TagValues {
+            values: vec!["checkout".to_string(), "500".to_string()],
+            truncated: true,
+        };
+        let v2 = render_tag_values_typed_v2(&values);
+        assert_eq!(
+            v2,
+            json!({
+                "tagValues": [
+                    {"type": "string", "value": "checkout"},
+                    {"type": "int", "value": "500"},
+                ],
+            })
+        );
+        assert!(
+            v2.get("truncated").is_none(),
+            "the v2 alias must drop `truncated` even when the native flag is true: {v2}"
+        );
+        let empty = TagValues {
+            values: vec![],
+            truncated: false,
+        };
+        assert_eq!(render_tag_values_typed_v2(&empty), json!({"tagValues": []}));
+    }
+
+    #[test]
+    fn render_tag_names_flat_dedups_across_scopes_in_catalog_order() {
+        // `env` exists in BOTH scopes — the flat projection keeps its
+        // first (resource-side) occurrence only.
+        let flat = render_tag_names_flat(&truncated_names());
+        assert_eq!(
+            flat,
+            json!({"tagNames": ["env", "service.name", "http.status_code"]})
+        );
+        assert!(flat.get("truncated").is_none(), "no truncated key: {flat}");
+        assert!(flat.get("scopes").is_none(), "no scopes key: {flat}");
+    }
+
+    #[test]
+    fn render_tag_names_flat_empty_is_the_documented_empty_envelope() {
+        let empty = TagNames {
+            names: vec![],
+            truncated: false,
+        };
+        assert_eq!(render_tag_names_flat(&empty), json!({"tagNames": []}));
+    }
+
+    #[test]
+    fn render_tag_values_flat_emits_bare_strings_without_type_or_truncated() {
+        let values = TagValues {
+            values: vec!["checkout".to_string(), "500".to_string()],
+            truncated: true,
+        };
+        assert_eq!(
+            render_tag_values_flat(&values),
+            json!({"tagValues": ["checkout", "500"]})
+        );
+        let empty = TagValues {
+            values: vec![],
+            truncated: false,
+        };
+        assert_eq!(render_tag_values_flat(&empty), json!({"tagValues": []}));
     }
 
     /// AC3 (plan v2 Δ2 as amended): the pinned inference vectors,
