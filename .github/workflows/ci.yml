@@ -41,14 +41,64 @@ jobs:
         with:
           shared-key: "workspace"
 
+      # Issue #87: pinned nextest for structured (JUnit) test output — the
+      # summarizer steps below feed $GITHUB_STEP_SUMMARY. Bump the pin
+      # deliberately; `latest` would make CI drift.
+      - name: Install cargo-nextest (pinned)
+        run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
       - name: Format check
         run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Issue #87: same test set as `cargo test --workspace` (this is where
+      # the hermetic conformance/drift suites — route_inventory and the
+      # api_conformance/manifest unit halves — run), now via nextest so the
+      # per-suite results land in the run summary. A failing test fails
+      # this step exactly as before (ci/test-summary.sh propagates
+      # nextest's exit code untouched).
       - name: Test
-        run: cargo test --workspace
+        run: ci/test-summary.sh run workspace --workspace
+
+      # Issue #87 review adjudication: the hermetic conformance/drift
+      # suites get their own named summary rows alongside the aggregate
+      # `workspace` row above. These two steps re-run suites the workspace
+      # step already ran — an accepted double-run costing seconds (both
+      # binaries are already built; api_conformance's live tests
+      # env-gate-skip here, its hermetic half is what's being surfaced).
+      # `!cancelled()` (round-2 review): they still run — and still fail
+      # the job on failure, no continue-on-error — when the aggregate
+      # workspace step above is red, exactly the runs where per-suite
+      # visibility matters most.
+      - name: Route-inventory drift guard (dedicated summary row)
+        if: '!cancelled()'
+        run: ci/test-summary.sh run route_inventory -p pulsus-server --test route_inventory
+
+      - name: API conformance, hermetic half (dedicated summary row)
+        if: '!cancelled()'
+        run: ci/test-summary.sh run api_conformance_hermetic -p pulsus-server --test api_conformance
+
+      # nextest never runs doctests; keep them covered separately so the
+      # switch above changes reporting only, never what runs.
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+      # Issue #87: per-suite results table on every run, pass or fail. The
+      # summarizer never fails a green run — generation problems are
+      # warnings only.
+      - name: Write test results summary
+        if: always()
+        run: ci/test-summary.sh render
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-ci
+          path: target/test-summary/
+          if-no-files-found: ignore
 
   # Issue #5: every DDL block in docs/schemas.md must be rendered and
   # executed against a fresh ClickHouse in CI. Single-node 24.8 leg (live
@@ -71,12 +121,17 @@ jobs:
           shared-key: "workspace"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Issue #87: pinned nextest (same pin as the `ci` job) for the
+      # API-suite steps' structured output below.
+      - name: Install cargo-nextest (pinned)
+        run: curl -LsSf https://get.nexte.st/0.9.140/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
       - name: Start ClickHouse 24.8
         run: |
           docker run -d --name pulsus-ch-schema-it -p 19123:8123 -p 19000:9000 \
-            -v $GITHUB_WORKSPACE/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
             clickhouse/clickhouse-server:24.8
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -sf http://localhost:19123/ping && break
             sleep 1
           done
@@ -259,11 +314,16 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-server --test live_server
 
+      # Issue #87: this step and the API-suite steps below run via
+      # ci/test-summary.sh (cargo-nextest + JUnit) so their per-suite
+      # results land in the run summary and the uploaded artifact —
+      # identical test set and gating (the wrapper exits with nextest's
+      # own code).
       - name: Live logs API suite
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test logs_api_live
+        run: ci/test-summary.sh run logs_api_live -p pulsus-server --test logs_api_live
 
       # Issue #32: spawns the real `pulsusdb` binary and drives `/api/v1/*`
       # (discovery incl. matcher-only `match[]`, instant query,
@@ -273,7 +333,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test prom_api_live
+        run: ci/test-summary.sh run prom_api_live -p pulsus-server --test prom_api_live
 
       # Issue #55: spawns the real `pulsusdb` binary and drives the
       # `/api/traces/v1/trace/{traceId}[/json]` fetch surface end-to-end —
@@ -284,7 +344,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test traces_api_live
+        run: ci/test-summary.sh run traces_api_live -p pulsus-server --test traces_api_live
 
       # Issue #57 AC2/AC6 (Tier-1, scale-invariant): EXPLAIN/query_log
       # gates for the two-phase TraceQL search generators (projection
@@ -309,7 +369,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test traces_search_live
+        run: ci/test-summary.sh run traces_search_live -p pulsus-server --test traces_search_live
 
       # Issue #58 AC9 (Tier-1, scale-invariant): the tag-discovery index
       # gates on the exact tags_sql shapes — strict (scope)/(scope, key)
@@ -331,7 +391,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test traces_tags_live
+        run: ci/test-summary.sh run traces_tags_live -p pulsus-server --test traces_tags_live
 
       # Issue #59 AC3 (Tier 1, scale-invariant): EXPLAIN/query_log gates
       # on the real TraceQL metrics pushdown — service PREWHERE hoist ->
@@ -355,7 +415,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-read --test traces_metrics_live
+        run: ci/test-summary.sh run traces_metrics_live -p pulsus-read --test traces_metrics_live
 
       # Issue #36: the live exhaustive API conformance matrix — every
       # mounted route x case-class over loopback HTTP against five
@@ -367,7 +427,7 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
-        run: cargo test -p pulsus-server --test api_conformance
+        run: ci/test-summary.sh run api_conformance -p pulsus-server --test api_conformance
 
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
@@ -393,9 +453,9 @@ jobs:
       - name: Start ClickHouse 24.3 (below the minimum supported version)
         run: |
           docker run -d --name pulsus-ch-schema-it-old -p 19124:8123 -p 19001:9000 \
-            -v $GITHUB_WORKSPACE/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
+            -v "$GITHUB_WORKSPACE"/ci/clickhouse-cluster/users.d/network.xml:/etc/clickhouse-server/users.d/zz-network.xml:ro \
             clickhouse/clickhouse-server:24.3
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -sf http://localhost:19124/ping && break
             sleep 1
           done
@@ -424,6 +484,21 @@ jobs:
         if: always()
         run: docker rm -f pulsus-ch-schema-it-old
 
+      # Issue #87: per-suite results table (plus the api_conformance
+      # matrix dimensions) on every run, pass or fail. The summarizer
+      # never fails a green run — generation problems are warnings only.
+      - name: Write test results summary
+        if: always()
+        run: ci/test-summary.sh render
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-schema-it
+          path: target/test-summary/
+          if-no-files-found: ignore
+
   # Issue #5: the 2-shard + Keeper cluster variant — Replicated engines,
   # `_dist` write/read-back, and the live sharding-identity assertion
   # (docs/schemas.md §7). Fixture at ci/clickhouse-cluster/compose.yaml.
@@ -447,7 +522,7 @@ jobs:
 
       - name: Wait for cluster health
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard1-it 2>/dev/null || echo starting)
             h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-ch-shard2-it 2>/dev/null || echo starting)
             hk=$(docker inspect -f '{{.State.Health.Status}}' pulsus-keeper-it 2>/dev/null || echo starting)
@@ -651,7 +726,7 @@ jobs:
 
       - name: Wait for cluster health
         run: |
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             h1=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard1 2>/dev/null || echo starting)
             h2=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard2 2>/dev/null || echo starting)
             h3=$(docker inspect -f '{{.State.Health.Status}}' pulsus-bench-shard3 2>/dev/null || echo starting)

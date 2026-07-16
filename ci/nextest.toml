@@ -1,0 +1,22 @@
+# Issue #87: nextest configuration for the CI test-summary steps
+# (.github/workflows/ci.yml + ci/test-summary.sh). Kept under ci/ (passed
+# via `--config-file ci/nextest.toml`) rather than the default
+# .config/nextest.toml so plain local `cargo nextest run` invocations are
+# unaffected.
+
+[profile.ci]
+# Deliberate, ratified deviation from `cargo test --workspace`'s failure
+# SCHEDULING (issue #87 review adjudication): cargo test stops after the
+# first failing test *binary* (proven empirically in review with failures
+# injected into two crates — the second crate's suite never ran), while
+# `fail-fast = false` runs every selected test and reports the FULL
+# failure set. On green runs behavior is identical; on red runs this is a
+# strict superset of what cargo test reported, serving exactly this
+# issue's visibility purpose. Gating is unchanged: the step still fails on
+# any failure.
+fail-fast = false
+
+[profile.ci.junit]
+# Written to <target>/nextest/ci/junit.xml; ci/test-summary.sh copies it
+# per suite into <target>/test-summary/junit/ for artifact upload.
+path = "junit.xml"
