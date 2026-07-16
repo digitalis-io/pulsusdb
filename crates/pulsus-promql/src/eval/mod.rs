@@ -27,8 +27,10 @@ use std::collections::HashMap;
 
 use pulsus_model::STALE_NAN_BITS;
 
+use pulsus_model::MatchOp;
+
 use crate::error::PromqlError;
-use crate::plan::{MathFn, PlanExpr, QueryPlan, ScalarFn, SelectorSpec};
+use crate::plan::{MathFn, OverTimeFn, PlanExpr, QueryPlan, ScalarFn, SelectorSpec};
 use crate::value::{InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData};
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
@@ -238,9 +240,19 @@ fn eval_step(
             Ok(StepValue::Vector(out))
         }
 
-        // Issue #37: `*_over_time` also **computes** a new value —
-        // Prometheus drops `__name__` (interactively verified:
-        // `avg_over_time(up[1m])`, PROVENANCE.md's table).
+        // Issue #37: `*_over_time` **computes** a new value — Prometheus
+        // drops `__name__` (interactively verified:
+        // `avg_over_time(up[1m])`, PROVENANCE.md's table) — with exactly
+        // two exceptions (issue #67): `last_over_time`/`first_over_time`
+        // act like a time-shifted selector and KEEP the metric name
+        // (upstream engine.go: "The last_over_time function acts like
+        // offset; thus, it should keep the metric name"; pinned by the
+        // vendored `name_label_dropping.test:42-48` — "Does not drop
+        // __name__ for last_over_time/first_over_time function" — and
+        // arbitrated live by the #67 `last_over_time` differential row).
+        // The synthesis from `sel.metric_name` is sound for the same
+        // reason as the `Selector` arm's (one concrete metric name per
+        // reachable SelectorSpec).
         PlanExpr::OverTime { func, selector } => {
             let sel = &selectors[*selector];
             let eff_t = t_ms - sel.offset_ms;
@@ -248,10 +260,69 @@ fn eval_step(
                 .range_ms
                 .expect("plan() only ever builds OverTime over a matrix selector");
             let lower_excl = eff_t - range_ms;
+            let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
             for series in data.get(*selector) {
                 let windowed = windowed_non_stale(&series.samples, lower_excl, eff_t);
                 if let Some(v) = functions::eval_over_time(*func, &windowed) {
+                    out.push(InstantSample {
+                        labels: series.labels.clone(),
+                        metric_name: keeps_name.then(|| sel.metric_name.clone()),
+                        t_ms,
+                        v,
+                    });
+                }
+            }
+            Ok(StepValue::Vector(out))
+        }
+
+        // Issue #67 (M6-04): parameterized range-window functions — the
+        // same windowing as `OverTime`, plus scalar parameter(s) evaluated
+        // per step. `__name__` DROPS (computed values). `predict_linear`'s
+        // regression intercept is the evaluation **step time** `t_ms`
+        // (upstream `enh.Ts` — the #67 adjudication), passed through as
+        // `eval_t_ms`.
+        PlanExpr::OverTimeParam {
+            func,
+            selector,
+            args,
+        } => {
+            let sel = &selectors[*selector];
+            let eff_t = t_ms - sel.offset_ms;
+            let range_ms = sel
+                .range_ms
+                .expect("plan() only ever builds OverTimeParam over a matrix selector");
+            let lower_excl = eff_t - range_ms;
+            let mut scalars = Vec::with_capacity(args.len());
+            for a in args {
+                let StepValue::Scalar(s) = eval_step(a, selectors, data, t_ms, lookback_ms)? else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!("{func:?} with a non-scalar parameter argument"),
+                    });
+                };
+                scalars.push(s);
+            }
+            let mut out = Vec::new();
+            for series in data.get(*selector) {
+                let windowed = windowed_non_stale(&series.samples, lower_excl, eff_t);
+                // Upstream engine.go only invokes a matrix-argument
+                // function for a series with at least one point in the
+                // step's window (`if len(ss.Floats)+len(ss.Histograms) >
+                // 0`), so per-invocation side effects — specifically
+                // `double_exponential_smoothing`'s factor-validation panic
+                // — never fire for an empty selection (#67 code review
+                // finding 2, resolved empirically against
+                // prom/prometheus:v3.13.0: invalid sf/tf over a
+                // no-match/no-metric/empty-window selector is HTTP 200
+                // with an empty result; the same factors over a selection
+                // with data are a 422 execution error). This skip is that
+                // engine-level guard; the validation itself stays inside
+                // `eval_over_time_param`, mirroring upstream's layering.
+                if windowed.is_empty() {
+                    continue;
+                }
+                if let Some(v) = functions::eval_over_time_param(*func, &windowed, &scalars, t_ms)?
+                {
                     out.push(InstantSample {
                         labels: series.labels.clone(),
                         metric_name: None,
@@ -261,6 +332,66 @@ fn eval_step(
                 }
             }
             Ok(StepValue::Vector(out))
+        }
+
+        // Issue #67 (M6-04): `absent_over_time(m[r])` — one synthetic
+        // series (value `1`) iff **no** matched series has a sample in the
+        // step's window (a selector matching zero series included);
+        // otherwise an empty vector. The synthetic labels port upstream
+        // `createLabelsForAbsentFunction` (v3.13.0) exactly, including its
+        // `has`/delete rule (#67 review round-1 Δ3): walking the matchers
+        // in source order, a first-seen **equality** matcher sets its
+        // label; *any* other matcher targeting that name (a second
+        // equality, or any regex/negation) **deletes** it — so
+        // `m{a="1",a="2"}` and `m{a="1",a=~"x"}` both drop `a`, while
+        // order matters exactly as upstream (`m{a=~"x",a="1"}` KEEPS
+        // `a="1"`). The order-sensitivity is a `labels.Builder`-over-
+        // EmptyLabels artifact, traced at the pinned SHA (40af9c2,
+        // `labels_common.go::{Set,Del}` + both `Builder.Labels()`
+        // variants) for #67 code review finding 1: `Del` removes the name
+        // from the builder's `add` list *at the time it runs* and appends
+        // it to `del`, but `del` only masks the **base** label set —
+        // which is empty here — while `Labels()` appends everything left
+        // in `add` unconditionally; `Set` never consults `del`. So
+        // regex-then-equality survives (Del was a no-op on an empty
+        // `add`; the later Set lands) and equality-then-regex is removed
+        // (Del strips the earlier Set from `add`). Confirmed empirically
+        // against prom/prometheus:v3.13.0:
+        // `absent_over_time(nonexistent{a=~"x",a="1"}[5m])` -> `{a="1"}`,
+        // `absent_over_time(nonexistent{a="1",a=~"x"}[5m])` -> `{}`.
+        // `__name__` is never emitted (upstream skips MetricName
+        // matchers; `sel.matchers` already excludes it by the planner's
+        // metric-scoping rule).
+        PlanExpr::AbsentOverTime { selector } => {
+            let sel = &selectors[*selector];
+            let eff_t = t_ms - sel.offset_ms;
+            let range_ms = sel
+                .range_ms
+                .expect("plan() only ever builds AbsentOverTime over a matrix selector");
+            let lower_excl = eff_t - range_ms;
+            let present = data
+                .get(*selector)
+                .iter()
+                .any(|series| !windowed_non_stale(&series.samples, lower_excl, eff_t).is_empty());
+            if present {
+                return Ok(StepValue::Vector(Vec::new()));
+            }
+            let mut synthesized: Vec<(String, String)> = Vec::new();
+            let mut has: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for m in &sel.matchers {
+                if m.op == MatchOp::Eq && !has.contains(m.key.as_str()) {
+                    synthesized.push((m.key.clone(), m.value.clone()));
+                    has.insert(&m.key);
+                } else {
+                    synthesized.retain(|(k, _)| k != &m.key);
+                }
+            }
+            Ok(StepValue::Vector(vec![InstantSample {
+                labels: Labels::new(synthesized),
+                metric_name: None,
+                t_ms,
+                v: 1.0,
+            }]))
         }
 
         // Issue #37: `histogram_quantile` **computes** a new value from
@@ -1246,6 +1377,214 @@ mod tests {
         assert!(v[0].labels.is_empty());
         assert_eq!(v[0].metric_name, None);
         assert_eq!(v[0].v, 1.0);
+    }
+
+    // --- issue #67 (M6-04): range-vector function completion ---
+
+    fn experimental(p: PlanParams) -> PlanParams {
+        PlanParams {
+            experimental_functions: true,
+            ..p
+        }
+    }
+
+    /// The new `*_over_time`/counter/regression fns **compute** — DROP
+    /// (#37 rule), with the two upstream-pinned exceptions asserted in
+    /// the next test.
+    #[test]
+    fn m6_04_computed_range_fns_drop_metric_name() {
+        for query in [
+            "stddev_over_time(up[1m])",
+            "changes(up[1m])",
+            "deriv(up[1m])",
+            "quantile_over_time(0.5, up[1m])",
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[], vec![s(1, 1.0), s(60_000, 3.0)])]);
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert_eq!(v.len(), 1, "{query}");
+            assert_eq!(v[0].metric_name, None, "{query}");
+        }
+    }
+
+    /// Issue #67: `last_over_time`/`first_over_time` KEEP `__name__` —
+    /// upstream engine.go treats them like a time-shifted selector
+    /// ("acts like offset; thus, it should keep the metric name"), pinned
+    /// by the vendored `name_label_dropping.test:42-48`. This deviates
+    /// from the plan's blanket drop-all-18 note deliberately: the #67
+    /// `last_over_time` differential row compares full label sets against
+    /// real Prometheus and would fail otherwise.
+    #[test]
+    fn last_and_first_over_time_keep_metric_name() {
+        for (query, want) in [
+            ("last_over_time(up[1m])", 3.0),
+            ("first_over_time(up[1m])", 1.0),
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, experimental(params(60_000, 60_000, 0))).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[], vec![s(1, 1.0), s(60_000, 3.0)])]);
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert_eq!(v.len(), 1, "{query}");
+            assert_eq!(v[0].metric_name.as_deref(), Some("up"), "{query}");
+            assert_eq!(v[0].v, want, "{query}");
+        }
+    }
+
+    /// `predict_linear` end-to-end: the intercept anchors at the step
+    /// time (samples at 1s/2s, step at 2s -> 23; see the functions.rs
+    /// golden for the convention contrast).
+    #[test]
+    fn evaluates_predict_linear_at_the_step_time() {
+        let expr = crate::parser::parse("predict_linear(up[1m], 10)").unwrap();
+        let p = plan(&expr, params(2_000, 2_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1_000, 1.0), s(2_000, 3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 23.0);
+        assert_eq!(v[0].metric_name, None);
+    }
+
+    /// An out-of-range smoothing factor surfaces as
+    /// `PromqlError::InvalidParameter` through `evaluate` (never a wrong
+    /// value, never a panic).
+    #[test]
+    fn double_exponential_smoothing_invalid_factor_errors_through_evaluate() {
+        let expr = crate::parser::parse("double_exponential_smoothing(up[1m], 2, 0.5)").unwrap();
+        let p = plan(&expr, experimental(params(60_000, 60_000, 0))).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1, 1.0), s(60_000, 3.0)])]);
+        let err = evaluate(&p, &data).unwrap_err();
+        assert!(
+            matches!(err, PromqlError::InvalidParameter { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// #67 code review finding 2, pinned to real prom/prometheus:v3.13.0
+    /// behavior (empirical: HTTP 200 + empty result in both shapes): an
+    /// invalid smoothing/trend factor over a selection with **no windowed
+    /// samples** — zero matched series, or matched series whose windows
+    /// are empty at the step — succeeds with an empty vector, because the
+    /// engine never invokes the function (and therefore never validates)
+    /// for an empty selection. Only a selection with data errors (the
+    /// test above).
+    #[test]
+    fn double_exponential_smoothing_invalid_factor_over_an_empty_selection_is_empty_not_error() {
+        for (query, bad) in [
+            ("double_exponential_smoothing(up[1m], 2, 0.5)", "sf"),
+            ("double_exponential_smoothing(up[1m], 0.5, 2)", "tf"),
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, experimental(params(60_000, 60_000, 0))).unwrap();
+            // Zero matched series.
+            let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+            assert!(v.is_empty(), "{query} ({bad}) zero-series: got {v:?}");
+            // A matched series whose window is empty at the step (its
+            // only sample lies far outside the 1m range window).
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[], vec![s(10_000_000, 1.0)])]);
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert!(v.is_empty(), "{query} ({bad}) empty-window: got {v:?}");
+        }
+    }
+
+    /// `absent_over_time`: present window -> empty vector; absent window
+    /// (or zero matched series) -> one synthetic series, value 1, labels
+    /// from the equality matchers.
+    #[test]
+    fn absent_over_time_emits_one_series_only_when_every_window_is_empty() {
+        let expr = crate::parser::parse(r#"absent_over_time(up{job="api"}[1m])"#).unwrap();
+        // Present at 60s.
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "api")], vec![s(30_000, 1.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert!(v.is_empty(), "present window must be empty, got {v:?}");
+        // Absent at 10 minutes (sample far outside the window).
+        let p = plan(&expr, params(600_000, 600_000, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 1.0);
+        assert_eq!(v[0].metric_name, None, "absent labels never carry __name__");
+        assert_eq!(
+            v[0].labels,
+            Labels::new(vec![("job".to_string(), "api".to_string())])
+        );
+        // Zero matched series behaves identically to empty windows.
+        let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 1.0);
+    }
+
+    /// The `createLabelsForAbsentFunction` has/delete rule (#67 Δ3):
+    /// a label targeted by a duplicate equality matcher, or by an
+    /// equality-then-regex pair, is dropped entirely; a regex-then-
+    /// equality pair keeps the (first-seen-equality) value — order
+    /// matters exactly as upstream; negations/regexes alone contribute
+    /// nothing.
+    #[test]
+    fn absent_over_time_label_synthesis_ports_the_has_delete_rule() {
+        for (query, want) in [
+            // Duplicate equality -> dropped.
+            (
+                r#"absent_over_time(up{a="1",a="2"}[1m])"#,
+                Labels::default(),
+            ),
+            // Equality then regex on the same name -> dropped.
+            (
+                r#"absent_over_time(up{a="1",a=~"x"}[1m])"#,
+                Labels::default(),
+            ),
+            // Regex then equality -> the later first-seen equality wins
+            // (upstream's delete lands before the set).
+            (
+                r#"absent_over_time(up{a=~"x",a="1"}[1m])"#,
+                Labels::new(vec![("a".to_string(), "1".to_string())]),
+            ),
+            // Mixed with an untouched second label (the upstream
+            // functions.test shape).
+            (
+                r#"absent_over_time(up{a="1",a="2",instance="127.0.0.1"}[1m])"#,
+                Labels::new(vec![("instance".to_string(), "127.0.0.1".to_string())]),
+            ),
+            // Pure regex/negation matchers contribute no labels.
+            (
+                r#"absent_over_time(up{a=~"x",b!="y"}[1m])"#,
+                Labels::default(),
+            ),
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(600_000, 600_000, 0)).unwrap();
+            let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+            assert_eq!(v.len(), 1, "{query}");
+            assert_eq!(v[0].labels, want, "{query}");
+            assert_eq!(v[0].v, 1.0, "{query}");
+        }
+    }
+
+    /// A range query evaluates absence per step: present steps contribute
+    /// nothing, absent steps contribute 1 — the synthetic series appears
+    /// only from the step where the window empties.
+    #[test]
+    fn absent_over_time_range_query_is_per_step() {
+        let expr = crate::parser::parse("absent_over_time(up[1m])").unwrap();
+        // Steps at 60s, 120s, 180s; the only sample is at 50s, so the
+        // 1m window is non-empty at 60s only.
+        let p = plan(&expr, params(60_000, 180_000, 60_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(50_000, 1.0)])]);
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert!(m[0].labels.is_empty());
+                assert_eq!(m[0].points, vec![(120_000, 1.0), (180_000, 1.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
     }
 
     /// Vector-vector comparison, filter mode (no `bool`): KEEP the LHS's

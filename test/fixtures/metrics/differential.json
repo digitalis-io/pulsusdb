@@ -92,6 +92,13 @@
     { "expr": "days_in_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
     { "expr": "hour(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
     { "expr": "minute(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "month()", "modes": ["instant", "range"] }
+    { "expr": "month()", "modes": ["instant", "range"] },
+
+    { "expr": "idelta(mem_usage_bytes{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"] },
+    { "expr": "resets(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "changes(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "last_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "present_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "absent_over_time(nonexistent_metric{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] }
   ]
 }

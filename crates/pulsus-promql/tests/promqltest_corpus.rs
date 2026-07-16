@@ -29,6 +29,7 @@ const PROOF_FILES: &[&str] = &[
     "m2_binops.test",
     "m6_02_math_trig.test",
     "m6_03_time_date.test",
+    "m6_04_range_functions.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {

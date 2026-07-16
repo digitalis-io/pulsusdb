@@ -93,16 +93,21 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket}` | 422 | `execution` |
+/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
 fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
     match e {
         PromqlError::Parse(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
+        // `InvalidParameter` (issue #67: an out-of-range
+        // `double_exponential_smoothing` factor) maps like
+        // `HistogramBucket`: a well-formed query whose evaluation is
+        // rejected — 422 `execution`, the adjudicated precedent.
         PromqlError::Unsupported { .. }
         | PromqlError::BadMatching { .. }
-        | PromqlError::HistogramBucket { .. } => {
+        | PromqlError::HistogramBucket { .. }
+        | PromqlError::InvalidParameter { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
     }
@@ -217,6 +222,24 @@ mod tests {
         let (status, json) = envelope(ApiError::Promql(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "execution");
+    }
+
+    #[tokio::test]
+    async fn promql_invalid_parameter_error_maps_to_422_execution() {
+        // Issue #67: `double_exponential_smoothing`'s factor validation —
+        // maps on the HistogramBucket precedent.
+        let err = PromqlError::InvalidParameter {
+            detail: "invalid smoothing factor: expected 0 < sf < 1, got 2".to_string(),
+        };
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid smoothing factor")
+        );
     }
 
     #[tokio::test]

@@ -15,8 +15,9 @@ pub use eval::evaluate;
 pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{
-    AggOp, BinOp, DEFAULT_LOOKBACK_MS, Grouping, Matching, MathFn, OverTimeFn, PlanExpr,
-    PlanParams, QueryPlan, RangeFn, ScalarFn, SelectorId, SelectorSpec, plan, series_selector,
+    AggOp, BinOp, DEFAULT_LOOKBACK_MS, Grouping, Matching, MathFn, OverTimeFn, OverTimeParamFn,
+    PlanExpr, PlanParams, QueryPlan, RangeFn, ScalarFn, SelectorId, SelectorSpec, plan,
+    series_selector,
 };
 pub use value::{
     FetchedSeries, InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData,

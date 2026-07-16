@@ -1820,14 +1820,23 @@ mod tests {
     /// 78 -> 108 by issue #66 (M6-03): 15 new entries x 2 modes for
     /// time/timestamp (bare + offset)/scalar/vector and the eight date
     /// functions, plus the selector-free `time()`/`vector(time())`/
-    /// `month()` shapes.
+    /// `month()` shapes. Resized 108 -> 120 by issue #67 (M6-04): 6 new
+    /// entries x 2 modes for the bit-exact-eligible non-experimental
+    /// range-vector functions (idelta/resets/changes/last_over_time/
+    /// present_over_time/absent_over_time) — the accumulation- and
+    /// interpolation-based rest (deriv/predict_linear/quantile/mad/
+    /// stddev/stdvar/double_exp) is deliberately excluded from this
+    /// bit-exact matrix, and the experimental functions cannot appear at
+    /// all (the e2e Prometheus runs without
+    /// --enable-feature=promql-experimental-functions and would error
+    /// one-sidedly).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_eight_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_twenty_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 108,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 108 — update \
+            rows, 120,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 120 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

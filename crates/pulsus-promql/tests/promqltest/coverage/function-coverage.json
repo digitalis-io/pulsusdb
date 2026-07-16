@@ -19,8 +19,11 @@
     {
       "name": "absent_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "absent_over_time(m{env=\"prod\"}[1m])"
+      }
     },
     {
       "name": "acos",
@@ -97,8 +100,11 @@
     {
       "name": "changes",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "changes(http_requests[50m])"
+      }
     },
     {
       "name": "clamp",
@@ -211,14 +217,20 @@
     {
       "name": "deriv",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "deriv(testcounter_reset_middle_total[100m])"
+      }
     },
     {
       "name": "double_exponential_smoothing",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "double_exponential_smoothing(http_requests[1m], 0.01, 0.1)"
+      }
     },
     {
       "name": "end",
@@ -238,8 +250,11 @@
     {
       "name": "first_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "first_over_time(m[30s])"
+      }
     },
     {
       "name": "floor",
@@ -313,8 +328,11 @@
     {
       "name": "idelta",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "idelta(http_requests[20m])"
+      }
     },
     {
       "name": "increase",
@@ -355,8 +373,11 @@
     {
       "name": "last_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "last_over_time(m[30s])"
+      }
     },
     {
       "name": "ln",
@@ -388,8 +409,11 @@
     {
       "name": "mad_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "mad_over_time(metric[70s])"
+      }
     },
     {
       "name": "max_of",
@@ -457,20 +481,29 @@
     {
       "name": "predict_linear",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "predict_linear(testcounter_reset_middle_total[50m], 3600)"
+      }
     },
     {
       "name": "present_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "present_over_time(m[30s])"
+      }
     },
     {
       "name": "quantile_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "quantile_over_time(0.5, data[2m])"
+      }
     },
     {
       "name": "rad",
@@ -499,8 +532,11 @@
     {
       "name": "resets",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "resets(http_requests[50m])"
+      }
     },
     {
       "name": "round",
@@ -589,14 +625,20 @@
     {
       "name": "stddev_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "stddev_over_time(metric[2m])"
+      }
     },
     {
       "name": "stdvar_over_time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "stdvar_over_time(metric[2m])"
+      }
     },
     {
       "name": "step",
@@ -652,26 +694,38 @@
     {
       "name": "ts_of_first_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "ts_of_first_over_time(metric[90s])"
+      }
     },
     {
       "name": "ts_of_last_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "ts_of_last_over_time(metric[90s])"
+      }
     },
     {
       "name": "ts_of_max_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "ts_of_max_over_time(metric[90s])"
+      }
     },
     {
       "name": "ts_of_min_over_time",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-04"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_04_range_functions.test",
+        "query": "ts_of_min_over_time(metric[90s])"
+      }
     },
     {
       "name": "vector",

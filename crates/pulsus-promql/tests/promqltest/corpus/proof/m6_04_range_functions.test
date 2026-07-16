@@ -1,0 +1,346 @@
+# Issue #67 (M6-04) proof corpus — witness cases for the 18 range-vector
+# functions (function-coverage.json points each entry's `witness` at the
+# exact query texts below; the coverage drift test replays this file and
+# requires each to pass). Expected values are hand-derived to Prometheus
+# v3.13 semantics; several reuse the upstream functions.test fixtures
+# (that file itself stays skip-manifested behind `expect`/native-histogram
+# directives, so these hand-derived cases are the executable Tier-1
+# anchor).
+#
+# Pinned semantics this file exercises end-to-end:
+#   - last_over_time/first_over_time KEEP __name__ (upstream engine:
+#     "acts like offset"; name_label_dropping.test:42-48) — every other
+#     function here drops it;
+#   - absent_over_time's createLabelsForAbsentFunction has/delete rule
+#     (duplicate-matcher-name labels drop entirely, equality-only);
+#   - quantile_over_time's out-of-range φ clamps to ∓Inf/NaN, never errors;
+#   - ts_of_min/max first-finite-extremum, leading-NaN replacement,
+#     all-NaN-selects-last;
+#   - double_exponential_smoothing's factor validation is a query error.
+#
+# The zero-interval idelta drop (two samples at the same timestamp) cannot
+# be expressed through `load` (its step is a fixed positive interval) — it
+# is pinned by the inline golden
+# `functions.rs::idelta_with_equal_final_two_timestamps_yields_no_result`.
+
+# --- resets() / changes() ------------------------------------------------
+# The upstream resets/changes fixture; [50m] windows are left-open, so the
+# t=0 sample is excluded (9 samples per series).
+
+load 5m
+	http_requests{path="/foo"}	1 2 3 0 1 0 0 1 2 0
+	http_requests{path="/bar"}	1 2 3 4 5 1 2 3 4 5
+	http_requests{path="/biz"}	0 0 0 0 0 1 1 1 1 1
+
+eval instant at 50m resets(http_requests[50m])
+	{path="/foo"} 3
+	{path="/bar"} 1
+	{path="/biz"} 0
+
+eval instant at 50m changes(http_requests[50m])
+	{path="/foo"} 7
+	{path="/bar"} 8
+	{path="/biz"} 1
+
+# Per-step windows in a range query: only the 25m step's window
+# ((10m, 25m] -> 0 0 1) still straddles the 0 -> 1 transition.
+eval range from 25m to 45m step 10m changes(http_requests{path="/biz"}[15m])
+	{path="/biz"} 1 0 0
+
+clear
+
+# NaN rules: changes counts one-sided NaN transitions but never NaN<->NaN;
+# resets never counts a NaN-adjacent pair (IEEE `<` is false).
+load 5m
+	x{a="b"} NaN NaN NaN
+	x{a="c"} 0 NaN 0
+
+eval instant at 15m changes(x[20m])
+	{a="b"} 0
+	{a="c"} 2
+
+eval instant at 15m resets(x[20m])
+	{a="b"} 0
+	{a="c"} 0
+
+clear
+
+# --- idelta() -------------------------------------------------------------
+# The last two samples' plain difference — no counter-reset branch, no
+# per-second division.
+
+load 5m
+	http_requests{path="/foo"}	0 50 100 150
+	http_requests{path="/bar"}	0 50 100 50
+
+eval instant at 20m idelta(http_requests[20m])
+	{path="/foo"} 50
+	{path="/bar"} -50
+
+# A single sample in the window -> no result (idelta needs two).
+eval instant at 20m idelta(http_requests[6m])
+
+clear
+
+# --- deriv() / predict_linear() -------------------------------------------
+# The upstream worked example: 11 samples at 0..50m, values
+# 0 10 20 30 40 0 10 20 30 40 50.
+
+load 5m
+	testcounter_reset_middle_total	0+10x4 0+10x5
+
+# deriv anchors the regression intercept at the window's FIRST sample:
+# covXY = 105000, varX = 9900000 over the full 11-sample window.
+eval instant at 50m deriv(testcounter_reset_middle_total[100m])
+	{} 0.010606060606060607
+
+# predict_linear anchors at the STEP time (3000s; the [50m] window is
+# left-open, dropping t=0): covXY = 67500, varX = 7425000,
+# slope*3600 + intercept = 70 exactly.
+eval instant at 50m predict_linear(testcounter_reset_middle_total[50m], 3600)
+	{} 70
+
+clear
+
+# The linearRegression constY short-circuit: a constant series has slope
+# exactly 0 (and predict = the constant); a constant ±Inf series is NaN.
+load 5m
+	const_metric 5 5 5 5
+	inf_metric Inf Inf Inf Inf
+
+eval instant at 15m deriv(const_metric[20m])
+	{} 0
+
+eval instant at 15m predict_linear(const_metric[20m], 600)
+	{} 5
+
+eval instant at 15m deriv(inf_metric[20m])
+	{} NaN
+
+eval instant at 15m predict_linear(inf_metric[20m], 600)
+	{} NaN
+
+clear
+
+# --- stddev_over_time() / stdvar_over_time() -------------------------------
+# The upstream fixture: mean 4.2, Σ(dev²) = 52.8, /5 = 10.56.
+
+load 10s
+	metric 0 8 8 2 3
+
+eval instant at 1m stdvar_over_time(metric[2m])
+	{} 10.56
+
+eval instant at 1m stddev_over_time(metric[2m])
+	{} 3.249615
+
+clear
+
+# --- quantile_over_time() ---------------------------------------------------
+# Interpolation plus the φ boundary rules: out-of-range φ clamps to
+# ∓Inf and NaN φ yields NaN — never an error.
+
+load 10s
+	data{test="two samples"} 0 1
+	data{test="three samples"} 0 1 2
+	data{test="uneven samples"} 0 1 4
+
+eval instant at 1m quantile_over_time(0, data[2m])
+	{test="two samples"} 0
+	{test="three samples"} 0
+	{test="uneven samples"} 0
+
+eval instant at 1m quantile_over_time(0.5, data[2m])
+	{test="two samples"} 0.5
+	{test="three samples"} 1
+	{test="uneven samples"} 1
+
+eval instant at 1m quantile_over_time(0.75, data[2m])
+	{test="two samples"} 0.75
+	{test="three samples"} 1.5
+	{test="uneven samples"} 2.5
+
+eval instant at 1m quantile_over_time(1, data[2m])
+	{test="two samples"} 1
+	{test="three samples"} 2
+	{test="uneven samples"} 4
+
+eval instant at 1m quantile_over_time(-1, data[2m])
+	{test="two samples"} -Inf
+	{test="three samples"} -Inf
+	{test="uneven samples"} -Inf
+
+eval instant at 1m quantile_over_time(2, data[2m])
+	{test="two samples"} +Inf
+	{test="three samples"} +Inf
+	{test="uneven samples"} +Inf
+
+eval instant at 1m quantile_over_time(NaN, data[2m])
+	{test="two samples"} NaN
+	{test="three samples"} NaN
+	{test="uneven samples"} NaN
+
+clear
+
+# NaN samples sort FIRST (upstream vectorByValueHeap), occupying the low
+# ranks: median of [NaN, 0, 1] is 0; φ=0 selects the NaN itself.
+load 10s
+	nan_data{kind="mid"} 0 NaN 1
+
+eval instant at 1m quantile_over_time(0.5, nan_data[2m])
+	{kind="mid"} 0
+
+eval instant at 1m quantile_over_time(0, nan_data[2m])
+	{kind="mid"} NaN
+
+clear
+
+# --- mad_over_time() --------------------------------------------------------
+# The upstream fixture's [70s] window holds 6 samples (even cardinality):
+# 6 2 1 999 1 2 -> median 2 -> |dev| median 1.
+
+load 10s
+	metric 4 6 2 1 999 1 2
+
+eval instant at 70s mad_over_time(metric[70s])
+	{} 1
+
+clear
+
+# --- ts_of_*_over_time() ----------------------------------------------------
+# Timestamps in seconds of the selected sample. [90s] at 90s holds the
+# samples at 10..80s (values 2 3 0 5 6 2 1 4).
+
+load 10s
+	metric 1 2 3 0 5 6 2 1 4
+
+eval instant at 90s ts_of_min_over_time(metric[90s])
+	{} 30
+
+eval instant at 90s ts_of_max_over_time(metric[90s])
+	{} 50
+
+eval instant at 90s ts_of_first_over_time(metric[90s])
+	{} 10
+
+eval instant at 90s ts_of_last_over_time(metric[90s])
+	{} 80
+
+clear
+
+# Comparison rules: strict </> keeps the FIRST equal extremum; a leading
+# NaN is replaced by the first non-NaN; an all-NaN window selects the
+# LAST sample.
+load 10s
+	tie 1 3 3 1
+	lead_nan NaN 5 2
+	all_nan NaN NaN NaN
+
+eval instant at 30s ts_of_max_over_time(tie[35s])
+	{} 10
+
+eval instant at 30s ts_of_min_over_time(tie[35s])
+	{} 0
+
+eval instant at 20s ts_of_max_over_time(lead_nan[25s])
+	{} 10
+
+eval instant at 20s ts_of_min_over_time(lead_nan[25s])
+	{} 20
+
+eval instant at 20s ts_of_max_over_time(all_nan[25s])
+	{} 20
+
+eval instant at 20s ts_of_min_over_time(all_nan[25s])
+	{} 20
+
+clear
+
+# --- last/first/present/absent_over_time -----------------------------------
+
+load 10s
+	m{env="a"} 1 2 3
+
+# last/first_over_time KEEP __name__ (the selector-like pair).
+eval instant at 25s last_over_time(m[30s])
+	m{env="a"} 3
+
+eval instant at 25s first_over_time(m[30s])
+	m{env="a"} 1
+
+# ... including per step in a range query.
+eval range from 10s to 30s step 10s last_over_time(m[15s])
+	m{env="a"} 2 3 3
+
+# present_over_time computes -> drops __name__.
+eval instant at 25s present_over_time(m[30s])
+	{env="a"} 1
+
+# A non-empty window -> absent_over_time is empty.
+eval instant at 25s absent_over_time(m[30s])
+
+# Empty windows -> one synthetic series, labels from the matchers.
+eval instant at 500s absent_over_time(m[1m])
+	{} 1
+
+eval instant at 500s absent_over_time(m{env="prod"}[1m])
+	{env="prod"} 1
+
+# Duplicate equality matchers on one name drop that label entirely.
+eval instant at 500s absent_over_time(m{env="prod",env="dev"}[1m])
+	{} 1
+
+# Equality-then-regex on one name drops it too; other labels survive.
+eval instant at 500s absent_over_time(m{env="prod",env=~"d.*",job="api"}[1m])
+	{job="api"} 1
+
+# Regex-THEN-equality on one name KEEPS the equality value — matcher
+# order matters (labels.Builder over an empty base at the pinned SHA:
+# Del removes from the add-list at the time it runs but only masks the
+# empty base thereafter; the later first-seen equality Set lands).
+# Empirically confirmed against prom/prometheus:v3.13.0:
+# absent_over_time(nonexistent{a=~"x",a="1"}[5m]) -> {a="1"} 1.
+eval instant at 500s absent_over_time(m{env=~"d.*",env="prod"}[1m])
+	{env="prod"} 1
+
+# Regex/negation matchers alone contribute no labels.
+eval instant at 500s absent_over_time(m{env=~"d.*"}[1m])
+	{} 1
+
+clear
+
+# --- double_exponential_smoothing() ------------------------------------------
+# The upstream positive-trend fixture: a perfectly linear series smooths
+# to exactly its latest value.
+
+load 10s
+	http_requests{job="api-server", instance="0", group="production"}	0+10x1000
+	squares 1 4 9 16 25
+
+eval instant at 8000s double_exponential_smoothing(http_requests[1m], 0.01, 0.1)
+	{job="api-server", instance="0", group="production"} 8000
+
+# Hand-derived recurrence pin (sf = tf = 0.5): s1 walks 4 -> 8 -> 13.75
+# -> 21.6875.
+eval instant at 40s double_exponential_smoothing(squares[50s], 0.5, 0.5)
+	{} 21.6875
+
+# Out-of-range factors over a selection WITH windowed data are query
+# errors naming the parameter and bounds (upstream panics; PulsusDB
+# returns PromqlError::InvalidParameter).
+eval_fail instant at 8000s double_exponential_smoothing(http_requests[1m], 2, 0.5)
+	expected_fail_message invalid function parameter: invalid smoothing factor: expected 0 < sf < 1, got 2
+
+eval_fail instant at 8000s double_exponential_smoothing(http_requests[1m], 0.5, 1)
+	expected_fail_message invalid function parameter: invalid trend factor: expected 0 < tf < 1, got 1
+
+# ... but over an EMPTY selection the same invalid factors succeed with
+# an empty result: the engine never invokes (hence never validates) a
+# matrix function for a series with no windowed samples. Empirically
+# confirmed against prom/prometheus:v3.13.0 (HTTP 200, empty result, for
+# a nonexistent metric, a no-match matcher, and an existing series with
+# an empty window alike).
+eval instant at 8000s double_exponential_smoothing(no_such_series[1m], 2, 0.5)
+
+# squares' samples end at 40s — at 20000s its [1m] window is empty.
+eval instant at 20000s double_exponential_smoothing(squares[1m], 0.5, 2)

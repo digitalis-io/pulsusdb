@@ -43,6 +43,17 @@ pub enum PromqlError {
     /// `+Inf` bucket. Never a silently wrong quantile.
     #[error("histogram_quantile error: {detail}")]
     HistogramBucket { detail: String },
+
+    /// A function parameter is outside its valid domain — issue #67
+    /// (M6-04, on the `HistogramBucket` precedent per the task-manager
+    /// adjudication): `double_exponential_smoothing`'s smoothing/trend
+    /// factors must satisfy `0 < f < 1` (upstream v3.13.0 panics there;
+    /// this engine returns a query error instead). The detail names the
+    /// parameter and its bounds. NOT used for `quantile_over_time`'s
+    /// out-of-range φ, which upstream answers with `±Inf`/`NaN`, never an
+    /// error.
+    #[error("invalid function parameter: {detail}")]
+    InvalidParameter { detail: String },
 }
 
 #[cfg(test)]
@@ -77,5 +88,16 @@ mod tests {
             detail: "no +Inf bucket found".to_string(),
         };
         assert!(err.to_string().contains("+Inf"));
+    }
+
+    #[test]
+    fn invalid_parameter_display_names_the_detail() {
+        let err = PromqlError::InvalidParameter {
+            detail: "invalid smoothing factor: expected 0 < sf < 1, got 2".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid function parameter: invalid smoothing factor: expected 0 < sf < 1, got 2"
+        );
     }
 }

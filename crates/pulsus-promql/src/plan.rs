@@ -91,14 +91,69 @@ pub enum RangeFn {
     Delta,
 }
 
-/// `*_over_time` aggregation functions.
+/// Parameterless range-window functions — every discriminant maps one
+/// windowed sample slice to at most one value (`&[Sample] -> Option<f64>`,
+/// [`crate::eval::functions::eval_over_time`]). The M2 five are the
+/// original `*_over_time` aggregations; issue #67 (M6-04) adds the rest of
+/// the range-vector surface, all sharing the exact same fetch/window
+/// machinery (zero read-path change — the fetch SQL for `deriv(m[5m])` is
+/// byte-identical to `sum_over_time(m[5m])`'s, pinned by
+/// `tests::m6_04_range_fns_keep_the_selector_set_byte_identical`).
+/// `First`/`Mad`/`TsOf*` are experimental (registry `experimental: true`)
+/// — [`plan_call`] rejects them unless
+/// [`PlanParams::experimental_functions`] is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverTimeFn {
+    // M2.
     Avg,
     Min,
     Max,
     Sum,
     Count,
+    // Issue #67 (M6-04), non-experimental.
+    Stddev,
+    Stdvar,
+    Last,
+    Present,
+    Idelta,
+    Resets,
+    Changes,
+    Deriv,
+    // Issue #67 (M6-04), experimental.
+    First,
+    Mad,
+    TsOfMin,
+    TsOfMax,
+    TsOfFirst,
+    TsOfLast,
+}
+
+impl OverTimeFn {
+    /// The registry `experimental: true` subset of the range-window
+    /// surface (`registry-v3.13.json`) — gated behind
+    /// [`PlanParams::experimental_functions`] in [`plan_call`].
+    fn is_experimental(self) -> bool {
+        matches!(
+            self,
+            OverTimeFn::First
+                | OverTimeFn::Mad
+                | OverTimeFn::TsOfMin
+                | OverTimeFn::TsOfMax
+                | OverTimeFn::TsOfFirst
+                | OverTimeFn::TsOfLast
+        )
+    }
+}
+
+/// Range-window functions taking scalar parameter(s) alongside the matrix
+/// selector (issue #67, M6-04): `quantile_over_time(φ, m[r])`,
+/// `predict_linear(m[r], t)`, `double_exponential_smoothing(m[r], sf, tf)`
+/// (the last experimental, gated like [`OverTimeFn::is_experimental`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverTimeParamFn {
+    Quantile,
+    PredictLinear,
+    DoubleExpSmoothing,
 }
 
 /// Aggregation operators. `Group` is **not** in features.md §3's
@@ -264,6 +319,25 @@ pub enum PlanExpr {
     },
     OverTime {
         func: OverTimeFn,
+        selector: SelectorId,
+    },
+    /// Issue #67 (M6-04): a parameterized range-window function. `args`
+    /// carries the scalar parameter expression(s) in registry order —
+    /// exactly one for `Quantile` (φ) and `PredictLinear` (t seconds),
+    /// two for `DoubleExpSmoothing` (sf, tf); planner-enforced arity, the
+    /// evaluator re-checks structurally (a descriptive error, never a
+    /// panic — the `MathFn` pattern).
+    OverTimeParam {
+        func: OverTimeParamFn,
+        selector: SelectorId,
+        args: Vec<Box<PlanExpr>>,
+    },
+    /// Issue #67 (M6-04): `absent_over_time(m[r])` — emits one synthetic
+    /// series (value `1`, labels ported from upstream
+    /// `createLabelsForAbsentFunction`, see the evaluator arm) iff every
+    /// matched series' window is empty at the step; an empty vector
+    /// otherwise.
+    AbsentOverTime {
         selector: SelectorId,
     },
     HistogramQuantile {
@@ -607,9 +681,30 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         "max_over_time" => Some(OverTimeFn::Max),
         "sum_over_time" => Some(OverTimeFn::Sum),
         "count_over_time" => Some(OverTimeFn::Count),
+        // Issue #67 (M6-04): the rest of the parameterless range-window
+        // surface — same shape, same fetch, pure post-fetch computation.
+        "stddev_over_time" => Some(OverTimeFn::Stddev),
+        "stdvar_over_time" => Some(OverTimeFn::Stdvar),
+        "last_over_time" => Some(OverTimeFn::Last),
+        "present_over_time" => Some(OverTimeFn::Present),
+        "idelta" => Some(OverTimeFn::Idelta),
+        "resets" => Some(OverTimeFn::Resets),
+        "changes" => Some(OverTimeFn::Changes),
+        "deriv" => Some(OverTimeFn::Deriv),
+        "first_over_time" => Some(OverTimeFn::First),
+        "mad_over_time" => Some(OverTimeFn::Mad),
+        "ts_of_min_over_time" => Some(OverTimeFn::TsOfMin),
+        "ts_of_max_over_time" => Some(OverTimeFn::TsOfMax),
+        "ts_of_first_over_time" => Some(OverTimeFn::TsOfFirst),
+        "ts_of_last_over_time" => Some(OverTimeFn::TsOfLast),
         _ => None,
     };
     if let Some(func) = over_time_fn {
+        if func.is_experimental() && !planner.experimental {
+            return Err(unsupported(format!(
+                "experimental function {name}() (requires promql-experimental-functions)"
+            )));
+        }
         let [arg] = args.as_slice() else {
             return Err(unsupported(format!("{name}() with != 1 argument")));
         };
@@ -620,6 +715,89 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         };
         let selector = plan_matrix_selector_id(planner, ms)?;
         return Ok(PlanExpr::OverTime { func, selector });
+    }
+
+    // Issue #67 (M6-04): `absent_over_time(m[r])` — the selector's own
+    // variant (its output labels come from the *matchers*, not from any
+    // fetched series). Upstream also accepts a subquery argument — that
+    // form stays `Unsupported` here until M6-08 lands subqueries.
+    if name == "absent_over_time" {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported("absent_over_time() with != 1 argument"));
+        };
+        let Expr::MatrixSelector(ms) = arg.as_ref() else {
+            return Err(unsupported(
+                "absent_over_time() over an expression other than a bare range-vector selector",
+            ));
+        };
+        let selector = plan_matrix_selector_id(planner, ms)?;
+        return Ok(PlanExpr::AbsentOverTime { selector });
+    }
+
+    // Issue #67 (M6-04): parameterized range-window functions. Scalar
+    // parameter sub-expressions plan via `plan_expr` (the
+    // `histogram_quantile` quantile-arg shape), in source-argument order
+    // so any selector a parameter expression contains keeps its id in
+    // source order.
+    if name == "quantile_over_time" {
+        let [phi_arg, matrix_arg] = args.as_slice() else {
+            return Err(unsupported("quantile_over_time() with != 2 arguments"));
+        };
+        let phi = plan_expr(planner, phi_arg)?;
+        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
+            return Err(unsupported(
+                "quantile_over_time() over an expression other than a bare range-vector selector",
+            ));
+        };
+        let selector = plan_matrix_selector_id(planner, ms)?;
+        return Ok(PlanExpr::OverTimeParam {
+            func: OverTimeParamFn::Quantile,
+            selector,
+            args: vec![Box::new(phi)],
+        });
+    }
+    if name == "predict_linear" {
+        let [matrix_arg, t_arg] = args.as_slice() else {
+            return Err(unsupported("predict_linear() with != 2 arguments"));
+        };
+        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
+            return Err(unsupported(
+                "predict_linear() over an expression other than a bare range-vector selector",
+            ));
+        };
+        let selector = plan_matrix_selector_id(planner, ms)?;
+        let t = plan_expr(planner, t_arg)?;
+        return Ok(PlanExpr::OverTimeParam {
+            func: OverTimeParamFn::PredictLinear,
+            selector,
+            args: vec![Box::new(t)],
+        });
+    }
+    if name == "double_exponential_smoothing" {
+        if !planner.experimental {
+            return Err(unsupported(format!(
+                "experimental function {name}() (requires promql-experimental-functions)"
+            )));
+        }
+        let [matrix_arg, sf_arg, tf_arg] = args.as_slice() else {
+            return Err(unsupported(
+                "double_exponential_smoothing() with != 3 arguments",
+            ));
+        };
+        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
+            return Err(unsupported(
+                "double_exponential_smoothing() over an expression other than a bare \
+                 range-vector selector",
+            ));
+        };
+        let selector = plan_matrix_selector_id(planner, ms)?;
+        let sf = plan_expr(planner, sf_arg)?;
+        let tf = plan_expr(planner, tf_arg)?;
+        return Ok(PlanExpr::OverTimeParam {
+            func: OverTimeParamFn::DoubleExpSmoothing,
+            selector,
+            args: vec![Box::new(sf), Box::new(tf)],
+        });
     }
 
     if name == "histogram_quantile" {
@@ -1900,6 +2078,199 @@ mod tests {
             other => panic!("expected VectorOf, got {other:?}"),
         }
         assert!(p.selectors.is_empty(), "vector(1) must emit no selector");
+    }
+
+    // --- issue #67 (M6-04): range-vector function completion ---
+
+    #[test]
+    fn plans_every_new_parameterless_range_fn_to_its_over_time_discriminant() {
+        for (query, want) in [
+            ("stddev_over_time(m[5m])", OverTimeFn::Stddev),
+            ("stdvar_over_time(m[5m])", OverTimeFn::Stdvar),
+            ("last_over_time(m[5m])", OverTimeFn::Last),
+            ("present_over_time(m[5m])", OverTimeFn::Present),
+            ("idelta(m[5m])", OverTimeFn::Idelta),
+            ("resets(m[5m])", OverTimeFn::Resets),
+            ("changes(m[5m])", OverTimeFn::Changes),
+            ("deriv(m[5m])", OverTimeFn::Deriv),
+            // Experimental subset — planned under the flag.
+            ("first_over_time(m[5m])", OverTimeFn::First),
+            ("mad_over_time(m[5m])", OverTimeFn::Mad),
+            ("ts_of_min_over_time(m[5m])", OverTimeFn::TsOfMin),
+            ("ts_of_max_over_time(m[5m])", OverTimeFn::TsOfMax),
+            ("ts_of_first_over_time(m[5m])", OverTimeFn::TsOfFirst),
+            ("ts_of_last_over_time(m[5m])", OverTimeFn::TsOfLast),
+        ] {
+            let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
+            match &p.root {
+                PlanExpr::OverTime { func, selector } => {
+                    assert_eq!(*func, want, "{query}");
+                    assert_eq!(p.selectors[*selector].range_ms, Some(300_000), "{query}");
+                }
+                other => panic!("{query}: expected OverTime, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC2: each of the 7 experimental names is a named `Unsupported`
+    /// without the flag (same gate wording as `max_of`/`min_of`) and
+    /// plans with it.
+    #[test]
+    fn m6_04_experimental_fns_are_gated_behind_the_experimental_flag() {
+        for query in [
+            "first_over_time(m[5m])",
+            "mad_over_time(m[5m])",
+            "ts_of_min_over_time(m[5m])",
+            "ts_of_max_over_time(m[5m])",
+            "ts_of_first_over_time(m[5m])",
+            "ts_of_last_over_time(m[5m])",
+            "double_exponential_smoothing(m[5m], 0.5, 0.5)",
+        ] {
+            let err = plan(&parse(query).unwrap(), params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert!(
+                    construct.contains("experimental")
+                        && construct.contains("promql-experimental-functions"),
+                    "{query}: error must name the gate, got {construct:?}"
+                ),
+                other => panic!("{query}: expected Unsupported, got {other:?}"),
+            }
+            assert!(
+                plan(&parse(query).unwrap(), params_experimental()).is_ok(),
+                "{query} must plan with the flag on"
+            );
+        }
+    }
+
+    #[test]
+    fn m6_04_non_experimental_fns_plan_without_the_experimental_flag() {
+        for query in [
+            "stddev_over_time(m[5m])",
+            "last_over_time(m[5m])",
+            "idelta(m[5m])",
+            "deriv(m[5m])",
+            "absent_over_time(m[5m])",
+            "quantile_over_time(0.5, m[5m])",
+            "predict_linear(m[5m], 60)",
+        ] {
+            assert!(plan(&parse(query).unwrap(), params()).is_ok(), "{query}");
+        }
+    }
+
+    #[test]
+    fn plans_absent_over_time_to_its_own_variant() {
+        let p = plan(
+            &parse(r#"absent_over_time(m{job="api"}[5m])"#).unwrap(),
+            params(),
+        )
+        .unwrap();
+        match &p.root {
+            PlanExpr::AbsentOverTime { selector } => {
+                assert_eq!(p.selectors[*selector].metric_name, "m");
+                assert_eq!(p.selectors[*selector].range_ms, Some(300_000));
+                assert_eq!(p.selectors[*selector].matchers.len(), 1);
+            }
+            other => panic!("expected AbsentOverTime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plans_quantile_over_time_with_phi_before_the_selector() {
+        let p = plan(&parse("quantile_over_time(0.9, m[5m])").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::OverTimeParam {
+                func,
+                selector,
+                args,
+            } => {
+                assert_eq!(*func, OverTimeParamFn::Quantile);
+                assert_eq!(p.selectors[*selector].range_ms, Some(300_000));
+                assert_eq!(args.len(), 1);
+                assert_eq!(*args[0], PlanExpr::Scalar(0.9));
+            }
+            other => panic!("expected OverTimeParam, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plans_predict_linear_and_double_exponential_smoothing_args() {
+        let p = plan(&parse("predict_linear(m[5m], 3600)").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::OverTimeParam { func, args, .. } => {
+                assert_eq!(*func, OverTimeParamFn::PredictLinear);
+                assert_eq!(args.len(), 1);
+                assert_eq!(*args[0], PlanExpr::Scalar(3600.0));
+            }
+            other => panic!("expected OverTimeParam, got {other:?}"),
+        }
+        let p = plan(
+            &parse("double_exponential_smoothing(m[5m], 0.4, 0.2)").unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        match &p.root {
+            PlanExpr::OverTimeParam { func, args, .. } => {
+                assert_eq!(*func, OverTimeParamFn::DoubleExpSmoothing);
+                assert_eq!(args.len(), 2);
+                assert_eq!(*args[0], PlanExpr::Scalar(0.4));
+                assert_eq!(*args[1], PlanExpr::Scalar(0.2));
+            }
+            other => panic!("expected OverTimeParam, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m6_04_fns_over_non_bare_range_arguments_are_unsupported() {
+        // Subquery arguments (upstream-legal) stay named-Unsupported until
+        // M6-08 — the same rule as rate()'s.
+        for query in [
+            "deriv(sum(foo)[5m:1m])",
+            "absent_over_time(rate(foo[5m])[5m:1m])",
+            "quantile_over_time(0.5, sum(foo)[5m:1m])",
+        ] {
+            assert!(plan(&parse(query).unwrap(), params()).is_err(), "{query}");
+        }
+    }
+
+    /// AC7 (Tier-1 perf gate; standing query-performance mandate): every
+    /// M6-04 function is a pure post-fetch computation — its selector set
+    /// (the input the fetch SQL is generated from) is **byte-identical**
+    /// to `sum_over_time`'s over the same matrix selector, so the fetch
+    /// SQL is byte-identical too (same `SelectorSpec` ⇒ same
+    /// `fetch_window` ⇒ same query text). Zero new fetch work, zero new
+    /// round trips; there is no metrics rollup/downsample read path to
+    /// bypass (grep-verified in the plan: `pulsus-read/src/metrics/` has
+    /// none). Scalar parameters add no selector.
+    #[test]
+    fn m6_04_range_fns_keep_the_selector_set_byte_identical() {
+        let bare = plan(
+            &parse(r#"sum_over_time(mem_usage_bytes{service="svc-1"}[5m])"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        for query in [
+            r#"stddev_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"stdvar_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"last_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"first_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"present_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"absent_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"idelta(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"resets(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"changes(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"deriv(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"mad_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"ts_of_min_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"ts_of_max_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"ts_of_first_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"ts_of_last_over_time(mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"quantile_over_time(0.9, mem_usage_bytes{service="svc-1"}[5m])"#,
+            r#"predict_linear(mem_usage_bytes{service="svc-1"}[5m], 3600)"#,
+            r#"double_exponential_smoothing(mem_usage_bytes{service="svc-1"}[5m], 0.5, 0.5)"#,
+        ] {
+            let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
+            assert_eq!(p.selectors, bare.selectors, "{query}");
+        }
     }
 
     /// Perf Tier-1 gate (issue #66 plan; standing query-performance

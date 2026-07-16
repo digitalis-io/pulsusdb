@@ -6,7 +6,7 @@
 
 use crate::error::PromqlError;
 use crate::math::{KahanSum, kahan_inc};
-use crate::plan::{OverTimeFn, RangeFn};
+use crate::plan::{OverTimeFn, OverTimeParamFn, RangeFn};
 use crate::value::Sample;
 
 /// `rate`/`increase`/`delta` + `irate`'s shared entry point. `samples` must
@@ -223,7 +223,362 @@ pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
                 .map(|s| s.v)
                 .fold(f64::NEG_INFINITY, f64::max),
         ),
+        // Issue #67 (M6-04) — the rest of the parameterless range-window
+        // surface, each ported from `promql/functions.go` v3.13.0.
+        OverTimeFn::Stddev => Some(eval_stdvar_over_time(samples).sqrt()),
+        OverTimeFn::Stdvar => Some(eval_stdvar_over_time(samples)),
+        // `funcLastOverTime`/`funcFirstOverTime`: the positional
+        // last/first float sample's value (`el.Floats[len-1]` /
+        // `el.Floats[0]` — floats-only here, #22 owns native histograms).
+        OverTimeFn::Last => samples.last().map(|s| s.v),
+        OverTimeFn::First => samples.first().map(|s| s.v),
+        // `funcPresentOverTime`: `1` for any series with a sample in the
+        // window (the empty case already returned `None` above).
+        OverTimeFn::Present => Some(1.0),
+        OverTimeFn::Idelta => eval_idelta(samples),
+        OverTimeFn::Resets => Some(eval_resets(samples)),
+        OverTimeFn::Changes => Some(eval_changes(samples)),
+        OverTimeFn::Deriv => eval_deriv(samples),
+        OverTimeFn::Mad => Some(eval_mad_over_time(samples)),
+        OverTimeFn::TsOfMin => Some(eval_ts_of_extremum(samples, TsExtremum::Min)),
+        OverTimeFn::TsOfMax => Some(eval_ts_of_extremum(samples, TsExtremum::Max)),
+        // `funcTsOfFirstOverTime`/`funcTsOfLastOverTime`: positional.
+        OverTimeFn::TsOfFirst => samples.first().map(|s| s.t_ms as f64 / 1000.0),
+        OverTimeFn::TsOfLast => samples.last().map(|s| s.t_ms as f64 / 1000.0),
     }
+}
+
+/// The parameterized range-window functions (issue #67, M6-04):
+/// `quantile_over_time(φ, m[r])`, `predict_linear(m[r], t)`,
+/// `double_exponential_smoothing(m[r], sf, tf)`. `args` carries the
+/// already-evaluated scalar parameter(s) in registry order (the planner
+/// guarantees the count; re-checked structurally — a descriptive error,
+/// never a panic). `eval_t_ms` is the evaluation step time —
+/// `predict_linear`'s intercept timestamp (upstream `enh.Ts`; the #67
+/// adjudication pins step time, NOT the offset-adjusted window edge —
+/// the offset golden is M6-08's obligation).
+///
+/// Only `DoubleExpSmoothing` can error ([`PromqlError::InvalidParameter`]
+/// on an out-of-range factor — upstream panics there); `Quantile`'s
+/// out-of-range φ yields `±Inf`/`NaN` per upstream `quantile`, never an
+/// error. The evaluator only calls this for a series with ≥ 1 windowed
+/// sample (upstream's engine-level invocation guard — see
+/// [`eval_double_exponential_smoothing`]'s validation-ordering rule), so
+/// the empty-`samples` paths here are defensive totality, not reachable
+/// through `evaluate`.
+pub fn eval_over_time_param(
+    func: OverTimeParamFn,
+    samples: &[Sample],
+    args: &[f64],
+    eval_t_ms: i64,
+) -> Result<Option<f64>, PromqlError> {
+    match (func, args) {
+        // `funcQuantileOverTime` (v3.13.0): an empty window yields no
+        // sample *before* φ is even ranged-checked; otherwise the shared
+        // `quantile` interpolation (out-of-range φ included — a warn
+        // annotation upstream, never an error).
+        (OverTimeParamFn::Quantile, &[phi]) => {
+            if samples.is_empty() {
+                return Ok(None);
+            }
+            let mut values: Vec<f64> = samples.iter().map(|s| s.v).collect();
+            Ok(Some(quantile_of(phi, &mut values)))
+        }
+        // `funcPredictLinear` (v3.13.0): `slope*duration + intercept`,
+        // regression intercept at `enh.Ts`; `< 2` samples yields nothing.
+        (OverTimeParamFn::PredictLinear, &[duration_s]) => {
+            if samples.len() < 2 {
+                return Ok(None);
+            }
+            let (slope, intercept) = linear_regression(samples, eval_t_ms);
+            Ok(Some(slope * duration_s + intercept))
+        }
+        (OverTimeParamFn::DoubleExpSmoothing, &[sf, tf]) => {
+            eval_double_exponential_smoothing(samples, sf, tf)
+        }
+        (func, _) => Err(PromqlError::Unsupported {
+            construct: format!(
+                "{func:?} with {} scalar argument(s) — plan() guarantees the per-function \
+                 count; this plan was not built by plan()",
+                args.len()
+            ),
+        }),
+    }
+}
+
+/// Simple linear regression — ported operation-for-operation from
+/// `promql/functions.go` v3.13.0's `linearRegression(samples,
+/// interceptTime)`: **plain uncompensated `+=` accumulation** for
+/// `sumX/sumY/sumXY/sumX2` (the #67 review round-1 finding + adjudication:
+/// upstream does NOT Kahan-compensate here, and compensating would itself
+/// be a divergence — the #39 lesson is "match the reference's arithmetic",
+/// not "improve" it), plus the `constY` short-circuit: a constant series
+/// returns `(0, y)` before any division, or `(NaN, NaN)` when the constant
+/// is `±Inf`. `x` is `(t_ms - intercept_time_ms) / 1e3` seconds, exactly
+/// upstream's `float64(sample.T-interceptTime) / 1e3`.
+///
+/// Callers guarantee `samples.len() >= 2` (`deriv`/`predict_linear` both
+/// return `None` below that); `samples[0]` indexing is therefore safe, and
+/// kept total anyway via the non-empty debug assert.
+fn linear_regression(samples: &[Sample], intercept_time_ms: i64) -> (f64, f64) {
+    debug_assert!(samples.len() >= 2, "callers check < 2 samples first");
+    let init_y = samples[0].v;
+    let mut const_y = true;
+    let mut n = 0.0_f64;
+    let mut sum_x = 0.0_f64;
+    let mut sum_y = 0.0_f64;
+    let mut sum_xy = 0.0_f64;
+    let mut sum_x2 = 0.0_f64;
+    for (i, s) in samples.iter().enumerate() {
+        if const_y && i > 0 && s.v != init_y {
+            const_y = false;
+        }
+        n += 1.0;
+        let x = (s.t_ms - intercept_time_ms) as f64 / 1e3;
+        sum_x += x;
+        sum_y += s.v;
+        sum_xy += x * s.v;
+        sum_x2 += x * x;
+    }
+    if const_y {
+        if init_y.is_infinite() {
+            return (f64::NAN, f64::NAN);
+        }
+        return (0.0, init_y);
+    }
+    let cov_xy = sum_xy - sum_x * sum_y / n;
+    let var_x = sum_x2 - sum_x * sum_x / n;
+    let slope = cov_xy / var_x;
+    let intercept = sum_y / n - slope * sum_x / n;
+    (slope, intercept)
+}
+
+/// `deriv` — `funcDeriv` (v3.13.0): the regression slope with the
+/// intercept timestamp anchored at the window's **first sample**
+/// (`samples.Floats[0].T` — upstream's own comment: an arbitrary
+/// timestamp near the values, avoiding float accuracy issues). `< 2`
+/// samples yields nothing.
+fn eval_deriv(samples: &[Sample]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let (slope, _) = linear_regression(samples, samples[0].t_ms);
+    Some(slope)
+}
+
+/// `idelta` — upstream's shared `instantValue(vals, samples, isRate=false)`
+/// rule set, mirroring [`eval_irate`] (v3.13.0 lines 829-880): `< 2`
+/// samples → no sample, **equal last-two timestamps → no sample** (the
+/// zero-interval drop applies to both rate and non-rate modes — #67 review
+/// round-1 Δ2), otherwise the last two floats' plain difference (no
+/// counter-reset branch and no per-second division in non-rate mode).
+fn eval_idelta(samples: &[Sample]) -> Option<f64> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let last = samples[samples.len() - 1];
+    let prev = samples[samples.len() - 2];
+    if last.t_ms - prev.t_ms == 0 {
+        return None;
+    }
+    Some(last.v - prev.v)
+}
+
+/// `resets` — `funcResets` (v3.13.0, floats-only path): counts strict
+/// drops (`cur < prev`) between consecutive samples. IEEE `<` makes any
+/// NaN-adjacent pair a non-reset (both `NaN < x` and `x < NaN` are false).
+fn eval_resets(samples: &[Sample]) -> f64 {
+    let mut resets = 0.0_f64;
+    for w in samples.windows(2) {
+        if w[1].v < w[0].v {
+            resets += 1.0;
+        }
+    }
+    resets
+}
+
+/// `changes` — `funcChanges` (v3.13.0, floats-only path): counts
+/// consecutive pairs where `cur != prev`, except the both-NaN pair
+/// (upstream's explicit `!(IsNaN(cur) && IsNaN(prev))`) — a one-sided NaN
+/// transition (`0 → NaN`, `NaN → 0`) still counts.
+fn eval_changes(samples: &[Sample]) -> f64 {
+    let mut changes = 0.0_f64;
+    for w in samples.windows(2) {
+        let (prev, cur) = (w[0].v, w[1].v);
+        if cur != prev && !(cur.is_nan() && prev.is_nan()) {
+            changes += 1.0;
+        }
+    }
+    changes
+}
+
+/// `stdvar_over_time` (`stddev_over_time` = its square root) —
+/// `funcStdvarOverTime`/`funcStddevOverTime` (v3.13.0): Welford's online
+/// recurrence with **Kahan-compensated** mean and aux accumulators
+/// (`kahanSumInc` on both, exactly upstream — the #67 adjudication keeps
+/// this function family's own Kahan convention; only `linearRegression`
+/// is plain). Callers guarantee non-empty (the shared `eval_over_time`
+/// empty check).
+fn eval_stdvar_over_time(samples: &[Sample]) -> f64 {
+    let mut count = 0.0_f64;
+    let mut mean = 0.0_f64;
+    let mut c_mean = 0.0_f64;
+    let mut aux = 0.0_f64;
+    let mut c_aux = 0.0_f64;
+    for s in samples {
+        count += 1.0;
+        let delta = s.v - (mean + c_mean);
+        let (new_mean, new_c_mean) = kahan_inc(delta / count, mean, c_mean);
+        mean = new_mean;
+        c_mean = new_c_mean;
+        let (new_aux, new_c_aux) = kahan_inc(delta * (s.v - (mean + c_mean)), aux, c_aux);
+        aux = new_aux;
+        c_aux = new_c_aux;
+    }
+    (aux + c_aux) / count
+}
+
+/// `mad_over_time` — `funcMadOverTime` (v3.13.0): the median of absolute
+/// deviations from the median, both medians via the shared [`quantile_of`]
+/// interpolation at φ = 0.5.
+fn eval_mad_over_time(samples: &[Sample]) -> f64 {
+    let mut values: Vec<f64> = samples.iter().map(|s| s.v).collect();
+    let median = quantile_of(0.5, &mut values);
+    let mut deviations: Vec<f64> = samples.iter().map(|s| (s.v - median).abs()).collect();
+    quantile_of(0.5, &mut deviations)
+}
+
+/// Which extremum [`eval_ts_of_extremum`] tracks (an enum, not a boolean
+/// parameter, per house style).
+#[derive(Debug, Clone, Copy)]
+enum TsExtremum {
+    Min,
+    Max,
+}
+
+/// `ts_of_min/max_over_time` — `funcTsOfMinOverTime`/`funcTsOfMaxOverTime`
+/// (v3.13.0), comparison rules pinned per the #67 review round-1 Δ4:
+/// strict `<`/`>` keeps the **first** occurrence of an equal finite
+/// extremum; the `|| IsNaN(extremum)` disjunct **replaces a leading NaN**
+/// with the first non-NaN sample (and keeps replacing while the tracked
+/// extremum is NaN), so an **all-NaN window selects the last sample**.
+/// Result is the selected sample's timestamp in seconds. Callers
+/// guarantee non-empty.
+fn eval_ts_of_extremum(samples: &[Sample], which: TsExtremum) -> f64 {
+    debug_assert!(!samples.is_empty(), "caller already checked non-empty");
+    let mut extremum = samples[0].v;
+    let mut ts_ms = samples[0].t_ms;
+    for s in samples {
+        let better = match which {
+            TsExtremum::Min => s.v < extremum,
+            TsExtremum::Max => s.v > extremum,
+        };
+        if better || extremum.is_nan() {
+            extremum = s.v;
+            ts_ms = s.t_ms;
+        }
+    }
+    ts_ms as f64 / 1000.0
+}
+
+/// The scalar quantile over raw values — ported from `promql/quantile.go`
+/// v3.13.0's `quantile(q, values)`: NaN/out-of-range φ **clamps, never
+/// errors** (`NaN → NaN`, `φ < 0 → -Inf`, `φ > 1 → +Inf` — the same rule
+/// [`histogram_quantile`] above already applies, #67 plan v2 Δ5), then
+/// sorts and linearly interpolates between the two straddling ranks.
+/// Sorting places NaN values **first** (upstream's `vectorByValueHeap.Less`
+/// returns true whenever the left value is NaN), materialized here as a
+/// total order so `sort_by`'s contract holds: NaN < non-NaN, NaN == NaN.
+/// Sorts `values` in place. Shared by `quantile_over_time` and
+/// `mad_over_time`.
+fn quantile_of(phi: f64, values: &mut [f64]) -> f64 {
+    if values.is_empty() || phi.is_nan() {
+        return f64::NAN;
+    }
+    if phi < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if phi > 1.0 {
+        return f64::INFINITY;
+    }
+    values.sort_by(|a, b| match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        // Total by construction: both sides are non-NaN here.
+        (false, false) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
+    });
+
+    let n = values.len() as f64;
+    let rank = phi * (n - 1.0);
+    let lower_index = rank.floor().max(0.0);
+    let upper_index = (lower_index + 1.0).min(n - 1.0);
+    let weight = rank - rank.floor();
+    values[lower_index as usize] * (1.0 - weight) + values[upper_index as usize] * weight
+}
+
+/// `double_exponential_smoothing` — `funcDoubleExponentialSmoothing`
+/// (v3.13.0, experimental): Holt's linear-trend smoothing. Factor
+/// validation mirrors upstream's `sf <= 0 || sf >= 1` panics (here a
+/// [`PromqlError::InvalidParameter`] query error naming the parameter and
+/// bounds — the #67 adjudication).
+///
+/// **Validation-ordering rule** (#67 code review finding 2, pinned
+/// empirically against prom/prometheus:v3.13.0): *within an invocation*,
+/// validation runs **before** the `< 2` samples check, exactly like
+/// upstream — a one-sample window with a bad factor is an error, not an
+/// empty result — but the **engine only invokes a matrix function for a
+/// series with ≥ 1 point in the window** (the `PlanExpr::OverTimeParam`
+/// arm's empty-window skip, mirroring engine.go's
+/// `len(ss.Floats)+len(ss.Histograms) > 0` guard), so a selector matching
+/// nothing (or only empty windows) succeeds with an empty result even
+/// when the factors are invalid. A NaN factor passes both comparisons
+/// (IEEE: `NaN <= 0` and `NaN >= 1` are both false), exactly as
+/// upstream's Go comparisons do — no extra NaN rejection is added.
+fn eval_double_exponential_smoothing(
+    samples: &[Sample],
+    sf: f64,
+    tf: f64,
+) -> Result<Option<f64>, PromqlError> {
+    if sf <= 0.0 || sf >= 1.0 {
+        return Err(PromqlError::InvalidParameter {
+            detail: format!("invalid smoothing factor: expected 0 < sf < 1, got {sf}"),
+        });
+    }
+    if tf <= 0.0 || tf >= 1.0 {
+        return Err(PromqlError::InvalidParameter {
+            detail: format!("invalid trend factor: expected 0 < tf < 1, got {tf}"),
+        });
+    }
+    if samples.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut s0 = 0.0_f64;
+    let mut s1 = samples[0].v;
+    let mut b = samples[1].v - samples[0].v;
+    for (i, sample) in samples.iter().enumerate().skip(1) {
+        // Scale the raw value against the smoothing factor.
+        let x = sf * sample.v;
+        // Scale the last smoothed value with the trend at this point.
+        b = calc_trend_value(i - 1, tf, s0, s1, b);
+        let y = (1.0 - sf) * (s1 + b);
+        s0 = s1;
+        s1 = x + y;
+    }
+    Ok(Some(s1))
+}
+
+/// `calcTrendValue` (v3.13.0): the trend recurrence
+/// `tf*(s1-s0) + (1-tf)*b`, with the seed trend `b` passed through
+/// unchanged on the first iteration (`i == 0`).
+fn calc_trend_value(i: usize, tf: f64, s0: f64, s1: f64, b: f64) -> f64 {
+    if i == 0 {
+        return b;
+    }
+    let x = tf * (s1 - s0);
+    let y = (1.0 - tf) * b;
+    x + y
 }
 
 /// `avg_over_time` — upstream's `funcAvgOverTime` float path
@@ -757,5 +1112,477 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert_eq!(histogram_quantile(1.5, bs).unwrap(), f64::INFINITY);
+    }
+
+    // =======================================================================
+    // Issue #67 (M6-04) hand-derived goldens — AC6. `to_bits` where the
+    // computation is IEEE-exact or pinned to an independently-computed
+    // (Python IEEE-754 double replica of the upstream operation order)
+    // reference; 1e-9 tolerance where the value is hand-derived
+    // arithmetically.
+    // =======================================================================
+
+    // --- linear_regression / deriv / predict_linear ---
+
+    /// The constY short-circuit: a constant finite series has slope
+    /// exactly `0` and intercept exactly the constant — `(0, y)` before
+    /// any division (upstream linearRegression).
+    #[test]
+    fn deriv_and_predict_linear_of_a_constant_series_short_circuit_to_zero_slope() {
+        let samples = vec![s(0, 5.0), s(60_000, 5.0), s(120_000, 5.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Deriv, &samples), Some(0.0));
+        // predict = 0 * t + 5 exactly, regardless of duration/intercept time.
+        assert_eq!(
+            eval_over_time_param(OverTimeParamFn::PredictLinear, &samples, &[600.0], 120_000)
+                .unwrap(),
+            Some(5.0)
+        );
+    }
+
+    /// The constY short-circuit's `±Inf` branch: a constant-infinite
+    /// series yields `(NaN, NaN)`.
+    #[test]
+    fn deriv_and_predict_linear_of_a_constant_infinite_series_are_nan() {
+        for inf in [f64::INFINITY, f64::NEG_INFINITY] {
+            let samples = vec![s(0, inf), s(60_000, inf), s(120_000, inf)];
+            let d = eval_over_time(OverTimeFn::Deriv, &samples).unwrap();
+            assert!(d.is_nan(), "constant {inf} deriv must be NaN, got {d}");
+            let p =
+                eval_over_time_param(OverTimeParamFn::PredictLinear, &samples, &[600.0], 120_000)
+                    .unwrap()
+                    .unwrap();
+            assert!(p.is_nan(), "constant {inf} predict must be NaN, got {p}");
+        }
+    }
+
+    /// The upstream worked example (`functions.test`'s own comment block,
+    /// derivable by hand: covXY = 105000, varX = 9900000): 11 samples at
+    /// 0..3000s, values 0,10,20,30,40,0,10,20,30,40,50 — slope
+    /// 105000/9900000. Bit-exact against the plain-accumulation reference.
+    #[test]
+    fn deriv_matches_the_upstream_worked_example_bit_exactly() {
+        let vals = [
+            0.0, 10.0, 20.0, 30.0, 40.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0,
+        ];
+        let samples: Vec<Sample> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 300_000, v))
+            .collect();
+        let d = eval_over_time(OverTimeFn::Deriv, &samples).unwrap();
+        let expected = 0.010_606_060_606_060_607_f64;
+        assert_eq!(d.to_bits(), expected.to_bits(), "got {d:?}");
+    }
+
+    /// The upstream `predict_linear(testcounter_reset_middle_total[50m],
+    /// 3600)` case: 10 samples at 300..3000s (the left-open window drops
+    /// t=0), intercept at the step time 3000s — hand-derivable to exactly
+    /// 70 (covXY = 67500, varX = 7425000, slope*3600 + intercept = 70).
+    /// Pins both the value and the intercept-at-step-time convention (an
+    /// intercept at samples[0].t would give a different result).
+    #[test]
+    fn predict_linear_matches_the_upstream_worked_example_bit_exactly() {
+        let vals = [10.0, 20.0, 30.0, 40.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0];
+        let samples: Vec<Sample> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s((i as i64 + 1) * 300_000, v))
+            .collect();
+        let p = eval_over_time_param(
+            OverTimeParamFn::PredictLinear,
+            &samples,
+            &[3600.0],
+            3_000_000,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(p.to_bits(), 70.0_f64.to_bits(), "got {p:?}");
+    }
+
+    /// The intercept-timestamp convention isolated on a 2-sample series
+    /// (exact dyadic arithmetic): samples (1s, 1), (2s, 3), slope 2.
+    /// Intercept at the step time 2s ⇒ intercept 3 ⇒ predict(10s) = 23;
+    /// anchoring at samples[0] (1s) would instead give 21 — pinned apart.
+    #[test]
+    fn predict_linear_anchors_the_intercept_at_the_step_time_not_the_first_sample() {
+        let samples = vec![s(1_000, 1.0), s(2_000, 3.0)];
+        let at_step =
+            eval_over_time_param(OverTimeParamFn::PredictLinear, &samples, &[10.0], 2_000)
+                .unwrap()
+                .unwrap();
+        assert_eq!(at_step, 23.0);
+        let at_first_sample =
+            eval_over_time_param(OverTimeParamFn::PredictLinear, &samples, &[10.0], 1_000)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            at_first_sample, 21.0,
+            "sanity: the two anchor conventions genuinely differ on this input"
+        );
+    }
+
+    /// The plain-vs-Kahan discriminator (#67 review round-1 Δ1 test gap):
+    /// an ill-conditioned series (values oscillating between ~1e9 and
+    /// ~1e5 magnitudes with non-dyadic decimals) where upstream's plain
+    /// `+=` accumulation and a Kahan-compensated one produce **different
+    /// bits** for both slope and intercept. Pins the plain-accumulation
+    /// bits (computed independently in Python replicating upstream's
+    /// exact operation order); the Kahan-compensated slope on the same
+    /// input is 0xc13b410ced203bcb — a regression to Kahan here flips
+    /// this assert.
+    #[test]
+    fn linear_regression_uses_plain_accumulation_not_kahan_pinned_by_bits() {
+        let vals = [
+            1_000_465_370.550_9,
+            710_276.683_7,
+            999_540_489.682,
+            -676_624.352_1,
+            1_000_748_348.674_7,
+            124_156.976_2,
+            223_538.645_4,
+        ];
+        let samples: Vec<Sample> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 60_000, v))
+            .collect();
+        // deriv = the regression slope anchored at samples[0].
+        let slope = eval_over_time(OverTimeFn::Deriv, &samples).unwrap();
+        assert_eq!(
+            slope.to_bits(),
+            0xc13b_410c_ed20_3bce,
+            "plain-accumulation slope; Kahan would give 0xc13b410ced203bcb — got {slope:?}"
+        );
+        // predict_linear with duration 0 at intercept time 0 exposes the
+        // intercept: slope * 0.0 is -0.0 here and x + -0.0 == x bit-exactly
+        // for the non-zero intercept.
+        let intercept = eval_over_time_param(OverTimeParamFn::PredictLinear, &samples, &[0.0], 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intercept.to_bits(),
+            0x41c6_5bd8_f4da_c96a,
+            "plain-accumulation intercept; Kahan would give 0x41c65bd8f4dac968 — got {intercept:?}"
+        );
+    }
+
+    #[test]
+    fn deriv_and_predict_linear_need_at_least_two_samples() {
+        assert_eq!(eval_over_time(OverTimeFn::Deriv, &[s(0, 1.0)]), None);
+        assert_eq!(
+            eval_over_time_param(OverTimeParamFn::PredictLinear, &[s(0, 1.0)], &[60.0], 0).unwrap(),
+            None
+        );
+    }
+
+    // --- idelta ---
+
+    #[test]
+    fn idelta_is_the_last_two_samples_plain_difference() {
+        // The upstream fixture: 0 50 100 50 -> idelta = -50 (no
+        // counter-reset branch in non-rate mode, no per-second division).
+        let samples = vec![
+            s(0, 0.0),
+            s(300_000, 50.0),
+            s(600_000, 100.0),
+            s(900_000, 50.0),
+        ];
+        let v = eval_over_time(OverTimeFn::Idelta, &samples).unwrap();
+        assert_eq!(v.to_bits(), (-50.0_f64).to_bits());
+    }
+
+    #[test]
+    fn idelta_with_fewer_than_two_samples_yields_no_result() {
+        assert_eq!(eval_over_time(OverTimeFn::Idelta, &[]), None);
+        assert_eq!(eval_over_time(OverTimeFn::Idelta, &[s(0, 1.0)]), None);
+    }
+
+    /// The shared `instantValue` zero-interval drop (#67 review round-1
+    /// Δ2): equal final-two timestamps yield no sample even in non-rate
+    /// mode — never a `v2 - v1` over a zero interval.
+    #[test]
+    fn idelta_with_equal_final_two_timestamps_yields_no_result() {
+        let samples = vec![s(0, 1.0), s(60_000, 2.0), s(60_000, 5.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Idelta, &samples), None);
+    }
+
+    // --- resets / changes ---
+
+    #[test]
+    fn resets_counts_strict_drops_between_consecutive_samples() {
+        // The upstream fixture rows ([50m] window): 1 2 3 0 1 0 0 1 2 0 ->
+        // 3 resets; 1 2 3 4 5 1 2 3 4 5 -> 1; 0 0 0 0 0 1 1 1 1 1 -> 0.
+        for (vals, want) in [
+            (vec![1.0, 2.0, 3.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0], 3.0),
+            (vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0, 2.0, 3.0, 4.0, 5.0], 1.0),
+            (vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0], 0.0),
+        ] {
+            let samples: Vec<Sample> = vals
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| s(i as i64 * 300_000, v))
+                .collect();
+            assert_eq!(
+                eval_over_time(OverTimeFn::Resets, &samples),
+                Some(want),
+                "{vals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resets_never_counts_nan_adjacent_pairs() {
+        // IEEE `<` is false for any NaN operand, so 0 -> NaN -> 0 has no
+        // reset; a single sample has 0 resets (not absent).
+        let samples = vec![s(0, 0.0), s(300_000, f64::NAN), s(600_000, 0.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Resets, &samples), Some(0.0));
+        assert_eq!(eval_over_time(OverTimeFn::Resets, &[s(0, 7.0)]), Some(0.0));
+    }
+
+    #[test]
+    fn changes_counts_value_changes_including_one_sided_nan_transitions() {
+        // The upstream NaN fixture: NaN NaN NaN -> 0 (NaN <-> NaN never
+        // counts); 0 NaN 0 -> 2 (each one-sided NaN transition counts).
+        let all_nan: Vec<Sample> = (0..3).map(|i| s(i * 300_000, f64::NAN)).collect();
+        assert_eq!(eval_over_time(OverTimeFn::Changes, &all_nan), Some(0.0));
+        let one_sided = vec![s(0, 0.0), s(300_000, f64::NAN), s(600_000, 0.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Changes, &one_sided), Some(2.0));
+        // The counter fixture row, all 10 samples: 1 2 3 0 1 0 0 1 2 0 ->
+        // 8 changes (the 0 -> 0 pair at indices 5,6 is the only
+        // non-change). Upstream's `[50m]` figure of 7 is over the
+        // left-open 9-sample window that drops the t=0 sample — the proof
+        // corpus case pins that windowed form end-to-end.
+        let counter: Vec<Sample> = [1.0, 2.0, 3.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 300_000, v))
+            .collect();
+        assert_eq!(eval_over_time(OverTimeFn::Changes, &counter), Some(8.0));
+        assert_eq!(eval_over_time(OverTimeFn::Changes, &[s(0, 7.0)]), Some(0.0));
+    }
+
+    // --- stddev_over_time / stdvar_over_time ---
+
+    /// The upstream fixture `metric 0 8 8 2 3` -> stdvar 10.56 (mean 4.2,
+    /// Σ(dev²) = 52.8, /5). Pinned bit-exactly to the Kahan-Welford
+    /// reference value (independently computed with upstream's operation
+    /// order); `10.559999999999999` is that exact double, one ULP below
+    /// the decimal literal `10.56`'s nearest double.
+    #[test]
+    fn stdvar_and_stddev_over_time_match_the_kahan_welford_reference() {
+        let samples: Vec<Sample> = [0.0, 8.0, 8.0, 2.0, 3.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 10_000, v))
+            .collect();
+        let var = eval_over_time(OverTimeFn::Stdvar, &samples).unwrap();
+        assert_eq!(
+            var.to_bits(),
+            10.559_999_999_999_999_f64.to_bits(),
+            "got {var:?}"
+        );
+        let dev = eval_over_time(OverTimeFn::Stddev, &samples).unwrap();
+        assert_eq!(dev.to_bits(), var.sqrt().to_bits());
+        assert!((dev - 3.249_615_361_854_384).abs() < 1e-9);
+    }
+
+    /// The upstream #4927 regression fixture: a constant series has
+    /// exactly zero variance (Welford's `delta` is exactly 0 from the
+    /// second sample on) — no catastrophic-cancellation drift.
+    #[test]
+    fn stdvar_over_time_of_a_constant_series_is_exactly_zero() {
+        let samples: Vec<Sample> = (0..3)
+            .map(|i| s(i * 10_000, 1.599_050_563_727_786_8))
+            .collect();
+        assert_eq!(eval_over_time(OverTimeFn::Stdvar, &samples), Some(0.0));
+        assert_eq!(eval_over_time(OverTimeFn::Stddev, &samples), Some(0.0));
+        // A single sample is variance 0, not absent.
+        assert_eq!(eval_over_time(OverTimeFn::Stdvar, &[s(0, 9.0)]), Some(0.0));
+    }
+
+    // --- quantile_over_time / mad_over_time ---
+
+    fn quantile_ot(phi: f64, vals: &[f64]) -> Option<f64> {
+        let samples: Vec<Sample> = vals
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 10_000, v))
+            .collect();
+        eval_over_time_param(OverTimeParamFn::Quantile, &samples, &[phi], 0)
+            .expect("quantile_over_time never errors")
+    }
+
+    #[test]
+    fn quantile_over_time_interpolates_including_even_cardinality() {
+        // The upstream fixture (odd cardinality): 0 1 2 at φ=0.75 -> 1.5.
+        assert_eq!(quantile_ot(0.75, &[0.0, 1.0, 2.0]), Some(1.5));
+        // Even cardinality: 4 values, φ=0.5 -> rank 1.5, midway between
+        // the 2nd and 3rd sorted values.
+        assert_eq!(quantile_ot(0.5, &[1.0, 3.0, 2.0, 4.0]), Some(2.5));
+        // Two samples 0 1 at φ=0.8 -> 0.8 (upstream fixture).
+        let v = quantile_ot(0.8, &[0.0, 1.0]).unwrap();
+        assert!((v - 0.8).abs() < 1e-12, "got {v}");
+    }
+
+    /// NaN samples sort FIRST (upstream vectorByValueHeap's Less), so
+    /// they occupy the low ranks: [NaN, 0, 1] has median 0 and φ=0 -> NaN.
+    #[test]
+    fn quantile_over_time_sorts_nan_samples_first() {
+        assert_eq!(quantile_ot(0.5, &[f64::NAN, 0.0, 1.0]), Some(0.0));
+        assert_eq!(quantile_ot(0.5, &[0.0, f64::NAN, 1.0]), Some(0.0));
+        let v = quantile_ot(0.0, &[0.0, f64::NAN, 1.0]).unwrap();
+        assert!(v.is_nan(), "φ=0 selects the NaN rank, got {v}");
+    }
+
+    /// Out-of-range/NaN φ clamps — NEVER an error (#67 plan v2 Δ5, the
+    /// histogram_quantile rule): φ<0 -> -Inf, φ>1 -> +Inf, NaN -> NaN.
+    #[test]
+    fn quantile_over_time_clamps_out_of_range_phi_without_error() {
+        assert_eq!(quantile_ot(-1.0, &[0.0, 1.0]), Some(f64::NEG_INFINITY));
+        assert_eq!(quantile_ot(2.0, &[0.0, 1.0]), Some(f64::INFINITY));
+        let v = quantile_ot(f64::NAN, &[0.0, 1.0]).unwrap();
+        assert!(v.is_nan(), "got {v}");
+        // An empty window is absent regardless of φ (upstream returns
+        // before ranging φ).
+        assert_eq!(quantile_ot(2.0, &[]), None);
+    }
+
+    #[test]
+    fn mad_over_time_is_the_median_absolute_deviation() {
+        // The upstream fixture's [70s] window: 6 2 1 999 1 2 (even
+        // cardinality) -> median 2, |dev| = 4 0 1 997 1 0 -> median 1.
+        let samples: Vec<Sample> = [6.0, 2.0, 1.0, 999.0, 1.0, 2.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 10_000, v))
+            .collect();
+        assert_eq!(eval_over_time(OverTimeFn::Mad, &samples), Some(1.0));
+    }
+
+    // --- last / first / present / ts_of_* ---
+
+    #[test]
+    fn last_first_present_over_time_are_positional() {
+        let samples = vec![s(0, 5.0), s(10_000, 7.0), s(20_000, 3.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Last, &samples), Some(3.0));
+        assert_eq!(eval_over_time(OverTimeFn::First, &samples), Some(5.0));
+        assert_eq!(eval_over_time(OverTimeFn::Present, &samples), Some(1.0));
+        for func in [OverTimeFn::Last, OverTimeFn::First, OverTimeFn::Present] {
+            assert_eq!(eval_over_time(func, &[]), None, "{func:?} of empty");
+        }
+    }
+
+    #[test]
+    fn ts_of_first_and_last_over_time_are_positional_timestamps_in_seconds() {
+        let samples = vec![s(10_500, 5.0), s(20_500, 7.0), s(30_500, 3.0)];
+        assert_eq!(eval_over_time(OverTimeFn::TsOfFirst, &samples), Some(10.5));
+        assert_eq!(eval_over_time(OverTimeFn::TsOfLast, &samples), Some(30.5));
+    }
+
+    /// Repeated extrema: strict `<`/`>` keeps the FIRST occurrence (#67
+    /// review round-1 Δ4).
+    #[test]
+    fn ts_of_min_max_over_time_keep_the_first_equal_extremum() {
+        let samples = vec![s(0, 1.0), s(10_000, 3.0), s(20_000, 3.0), s(30_000, 1.0)];
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMax, &samples), Some(10.0));
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMin, &samples), Some(0.0));
+    }
+
+    /// A leading NaN is replaced by the first non-NaN sample (the
+    /// `|| IsNaN(extremum)` disjunct), then ordinary comparison resumes.
+    #[test]
+    fn ts_of_min_max_over_time_replace_a_leading_nan() {
+        let samples = vec![s(0, f64::NAN), s(10_000, 5.0), s(20_000, 2.0)];
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMax, &samples), Some(10.0));
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMin, &samples), Some(20.0));
+    }
+
+    /// An all-NaN window keeps replacing the (still-NaN) extremum, so the
+    /// LAST sample's timestamp wins.
+    #[test]
+    fn ts_of_min_max_over_time_of_an_all_nan_window_select_the_last_sample() {
+        let samples: Vec<Sample> = (0..3).map(|i| s(i * 10_000, f64::NAN)).collect();
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMax, &samples), Some(20.0));
+        assert_eq!(eval_over_time(OverTimeFn::TsOfMin, &samples), Some(20.0));
+    }
+
+    // --- double_exponential_smoothing ---
+
+    /// Hand-derived (exact dyadic arithmetic, sf = tf = 0.5, values
+    /// 1,4,9,16,25): s1 walks 4 -> 8 -> 13.75 -> 21.6875. Bit-exact.
+    #[test]
+    fn double_exponential_smoothing_matches_the_hand_derived_recurrence() {
+        let samples: Vec<Sample> = [1.0, 4.0, 9.0, 16.0, 25.0]
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| s(i as i64 * 10_000, v))
+            .collect();
+        let v = eval_over_time_param(
+            OverTimeParamFn::DoubleExpSmoothing,
+            &samples,
+            &[0.5, 0.5],
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(v.to_bits(), 21.6875_f64.to_bits(), "got {v:?}");
+    }
+
+    #[test]
+    fn double_exponential_smoothing_needs_at_least_two_samples() {
+        let one = [s(0, 1.0)];
+        assert_eq!(
+            eval_over_time_param(OverTimeParamFn::DoubleExpSmoothing, &one, &[0.5, 0.5], 0)
+                .unwrap(),
+            None
+        );
+    }
+
+    /// Out-of-range factors are `InvalidParameter` errors naming the
+    /// parameter and bounds — and validation runs BEFORE the sample-count
+    /// check (upstream panics before its `l < 2` guard), so even an
+    /// empty/short window rejects an invalid factor.
+    #[test]
+    fn double_exponential_smoothing_rejects_out_of_range_factors() {
+        let samples = vec![s(0, 1.0), s(10_000, 2.0)];
+        for bad_sf in [0.0, 1.0, 2.0, -0.5] {
+            let err = eval_over_time_param(
+                OverTimeParamFn::DoubleExpSmoothing,
+                &samples,
+                &[bad_sf, 0.5],
+                0,
+            )
+            .unwrap_err();
+            match err {
+                PromqlError::InvalidParameter { detail } => assert!(
+                    detail.contains("smoothing factor") && detail.contains("0 < sf < 1"),
+                    "sf={bad_sf}: got {detail:?}"
+                ),
+                other => panic!("sf={bad_sf}: expected InvalidParameter, got {other:?}"),
+            }
+        }
+        let err = eval_over_time_param(
+            OverTimeParamFn::DoubleExpSmoothing,
+            &samples,
+            &[0.5, 1.5],
+            0,
+        )
+        .unwrap_err();
+        match err {
+            PromqlError::InvalidParameter { detail } => assert!(
+                detail.contains("trend factor") && detail.contains("0 < tf < 1"),
+                "got {detail:?}"
+            ),
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+        // Validation-before-count: a single-sample window still errors.
+        let err = eval_over_time_param(
+            OverTimeParamFn::DoubleExpSmoothing,
+            &[s(0, 1.0)],
+            &[2.0, 0.5],
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PromqlError::InvalidParameter { .. }));
     }
 }

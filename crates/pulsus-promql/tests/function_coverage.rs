@@ -239,7 +239,14 @@ fn every_entry_has_a_home_and_implemented_entries_have_witnesses() {
 /// Builds the auto-probe for a registry function from its `arg_types`
 /// (plan interfaces): `vector -> m`, `matrix -> m[5m]`, `scalar -> 1`,
 /// `string -> "s"`, with the minimum required argument count.
+/// `double_exponential_smoothing` is special-cased (issue #67): the
+/// generic `scalar -> 1` argument is exactly the value its `0 < f < 1`
+/// factor validator rejects, so the auto-probe would spuriously fail an
+/// implemented function — valid mid-range factors probe it instead.
 fn build_function_probe(f: &RegistryFunction) -> String {
+    if f.name == "double_exponential_smoothing" {
+        return "double_exponential_smoothing(m[5m], 0.5, 0.5)".to_string();
+    }
     let required = if f.variadic < 0 {
         f.arg_types.len().saturating_sub(1)
     } else {
@@ -379,10 +386,11 @@ fn probe_classification_matches_every_manifest_status() {
 }
 
 /// Pins today's `implemented` surface exactly: the M2 set, issue #65's
-/// (M6-02) 30 elementwise math/trig + scalar functions, and issue #66's
-/// (M6-03) 12 time/date + scalar/vector functions. Every later M6 issue
-/// flips entries here deliberately — this test makes the flip explicit,
-/// never incidental.
+/// (M6-02) 30 elementwise math/trig + scalar functions, issue #66's
+/// (M6-03) 12 time/date + scalar/vector functions, and issue #67's
+/// (M6-04) 18 range-vector functions. Every later M6 issue flips entries
+/// here deliberately — this test makes the flip explicit, never
+/// incidental.
 #[test]
 fn implemented_set_is_exactly_the_m2_surface_today() {
     let manifest = CoverageManifest::load();
@@ -453,6 +461,27 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "days_in_month",
             "hour",
             "minute",
+            // M6-04 (issue #67): range-vector completion, non-experimental.
+            "absent_over_time",
+            "changes",
+            "deriv",
+            "idelta",
+            "last_over_time",
+            "predict_linear",
+            "present_over_time",
+            "quantile_over_time",
+            "resets",
+            "stddev_over_time",
+            "stdvar_over_time",
+            // M6-04: experimental (planner-gated behind
+            // promql-experimental-functions).
+            "double_exponential_smoothing",
+            "first_over_time",
+            "mad_over_time",
+            "ts_of_first_over_time",
+            "ts_of_last_over_time",
+            "ts_of_max_over_time",
+            "ts_of_min_over_time",
         ])
     );
     let implemented_ops: BTreeSet<&str> = manifest
