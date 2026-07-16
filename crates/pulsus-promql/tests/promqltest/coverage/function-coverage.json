@@ -4,8 +4,11 @@
     {
       "name": "abs",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "abs(simple)"
+      }
     },
     {
       "name": "absent",
@@ -22,38 +25,56 @@
     {
       "name": "acos",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "acos(t_m)"
+      }
     },
     {
       "name": "acosh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "acosh(t_m)"
+      }
     },
     {
       "name": "asin",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "asin(t_m)"
+      }
     },
     {
       "name": "asinh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "asinh(t_m)"
+      }
     },
     {
       "name": "atan",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "atan(t_m)"
+      }
     },
     {
       "name": "atanh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "atanh(t_m)"
+      }
     },
     {
       "name": "avg_over_time",
@@ -67,8 +88,11 @@
     {
       "name": "ceil",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "ceil(simple)"
+      }
     },
     {
       "name": "changes",
@@ -79,32 +103,47 @@
     {
       "name": "clamp",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "clamp(test_clamp, -25, 75)"
+      }
     },
     {
       "name": "clamp_max",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "clamp_max(test_clamp, 75)"
+      }
     },
     {
       "name": "clamp_min",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "clamp_min(test_clamp, -25)"
+      }
     },
     {
       "name": "cos",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "cos(t_m)"
+      }
     },
     {
       "name": "cosh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "cosh(t_m)"
+      }
     },
     {
       "name": "count_over_time",
@@ -142,8 +181,11 @@
     {
       "name": "deg",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "deg(angle)"
+      }
     },
     {
       "name": "delta",
@@ -175,8 +217,11 @@
     {
       "name": "exp",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "exp(exp_root_log)"
+      }
     },
     {
       "name": "first_over_time",
@@ -187,8 +232,11 @@
     {
       "name": "floor",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "floor(simple)"
+      }
     },
     {
       "name": "histogram_avg",
@@ -298,20 +346,29 @@
     {
       "name": "ln",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "ln(exp_root_log)"
+      }
     },
     {
       "name": "log10",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "log10(exp_root_log)"
+      }
     },
     {
       "name": "log2",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "log2(exp_root_log)"
+      }
     },
     {
       "name": "mad_over_time",
@@ -322,8 +379,11 @@
     {
       "name": "max_of",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "max_of(1, 2)"
+      }
     },
     {
       "name": "max_over_time",
@@ -337,8 +397,11 @@
     {
       "name": "min_of",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "min_of(1, 2)"
+      }
     },
     {
       "name": "min_over_time",
@@ -364,8 +427,11 @@
     {
       "name": "pi",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "pi()"
+      }
     },
     {
       "name": "predict_linear",
@@ -388,8 +454,11 @@
     {
       "name": "rad",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "rad(angle)"
+      }
     },
     {
       "name": "range",
@@ -415,8 +484,11 @@
     {
       "name": "round",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "round(r_m)"
+      }
     },
     {
       "name": "scalar",
@@ -427,20 +499,29 @@
     {
       "name": "sgn",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "sgn(simple)"
+      }
     },
     {
       "name": "sin",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "sin(t_m)"
+      }
     },
     {
       "name": "sinh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "sinh(t_m)"
+      }
     },
     {
       "name": "sort",
@@ -469,8 +550,11 @@
     {
       "name": "sqrt",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "sqrt(simple)"
+      }
     },
     {
       "name": "start",
@@ -508,14 +592,20 @@
     {
       "name": "tan",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "tan(t_m)"
+      }
     },
     {
       "name": "tanh",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-02"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_02_math_trig.test",
+        "query": "tanh(t_m)"
+      }
     },
     {
       "name": "time",

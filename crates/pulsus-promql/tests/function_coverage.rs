@@ -282,6 +282,12 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
         end_ms: 300_000,
         step_ms: 0,
         lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+        // Probes run with the experimental gate ON (issue #65): an
+        // implemented experimental function's probe must evaluate `Ok`,
+        // while unimplemented experimental functions still error through
+        // the planner's catch-all — so classification stays sharp for
+        // both.
+        experimental_functions: true,
     };
     let query_plan = plan(&expr, params).map_err(|e| format!("plan: {e}"))?;
     let mut data = SeriesData::new();
@@ -372,9 +378,10 @@ fn probe_classification_matches_every_manifest_status() {
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
-/// Pins today's `implemented` surface to exactly the M2 set (plan AC4).
-/// Every later M6 issue flips entries here deliberately — this test makes
-/// the flip explicit, never incidental.
+/// Pins today's `implemented` surface exactly: the M2 set plus issue
+/// #65's (M6-02) 30 elementwise math/trig + scalar functions. Every
+/// later M6 issue flips entries here deliberately — this test makes the
+/// flip explicit, never incidental.
 #[test]
 fn implemented_set_is_exactly_the_m2_surface_today() {
     let manifest = CoverageManifest::load();
@@ -387,6 +394,7 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
     assert_eq!(
         implemented_fns,
         BTreeSet::from([
+            // M2.
             "rate",
             "irate",
             "increase",
@@ -397,6 +405,40 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "sum_over_time",
             "count_over_time",
             "histogram_quantile",
+            // M6-02 (issue #65): unary IEEE-exact.
+            "abs",
+            "ceil",
+            "floor",
+            "sqrt",
+            "sgn",
+            "deg",
+            "rad",
+            // M6-02: unary transcendental.
+            "exp",
+            "ln",
+            "log2",
+            "log10",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "sinh",
+            "cosh",
+            "tanh",
+            "asinh",
+            "acosh",
+            "atanh",
+            // M6-02: vector+scalar.
+            "clamp",
+            "clamp_min",
+            "clamp_max",
+            "round",
+            // M6-02: scalar (max_of/min_of experimental).
+            "pi",
+            "max_of",
+            "min_of",
         ])
     );
     let implemented_ops: BTreeSet<&str> = manifest

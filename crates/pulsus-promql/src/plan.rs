@@ -35,6 +35,14 @@ pub struct PlanParams {
     /// promote to a per-request/config knob only when a deployment needs
     /// it.
     pub lookback_ms: i64,
+    /// Mirrors upstream Prometheus's
+    /// `--enable-feature=promql-experimental-functions` (issue #65 —
+    /// the first consumer of `ReaderConfig::promql_experimental_functions`,
+    /// per the #64 Q2 adjudication): when `false`, planning an
+    /// experimental function (`max_of`/`min_of`) is rejected by name as
+    /// [`PromqlError::Unsupported`]; when `true`, implemented
+    /// experimental functions plan normally.
+    pub experimental_functions: bool,
 }
 
 /// The PromQL default staleness lookback (5 minutes), milliseconds.
@@ -118,6 +126,54 @@ pub enum AggOp {
     Group,
     Topk,
     Bottomk,
+}
+
+/// Elementwise vector→vector math/trig functions (issue #65, M6-02):
+/// pure post-fetch transforms — every discriminant maps one input sample
+/// to one output value, so the wrapped expression's selector set (and
+/// therefore its fetch SQL) is byte-identical to the unwrapped one's.
+/// The 23 unary discriminants take no scalar arguments; `Clamp` takes
+/// two (`min`, `max`), `ClampMin`/`ClampMax` one, and `Round` one
+/// (`to_nearest`, defaulted to `1` by the planner when omitted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MathFn {
+    Abs,
+    Ceil,
+    Floor,
+    Sqrt,
+    Sgn,
+    Deg,
+    Rad,
+    Exp,
+    Ln,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Clamp,
+    ClampMin,
+    ClampMax,
+    Round,
+}
+
+/// Scalar→scalar functions (issue #65, M6-02). `MaxOf`/`MinOf` are
+/// experimental (registry `experimental: true`) — [`plan_call`] rejects
+/// them unless [`PlanParams::experimental_functions`] is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFn {
+    Pi,
+    MaxOf,
+    MinOf,
 }
 
 /// `by (...)` / `without (...)` grouping.
@@ -210,6 +266,23 @@ pub enum PlanExpr {
         bool_modifier: bool,
         matching: Matching,
     },
+    /// Issue #65 (M6-02): an elementwise math/trig function over a vector
+    /// expression. `scalar_args` carries exactly the argument count
+    /// [`MathFn`]'s doc pins per discriminant (planner-enforced arity —
+    /// the evaluator re-checks structurally and returns
+    /// [`PromqlError::Unsupported`] on the impossible mismatch, never
+    /// panics).
+    MathFn {
+        func: MathFn,
+        arg: Box<PlanExpr>,
+        scalar_args: Vec<Box<PlanExpr>>,
+    },
+    /// Issue #65 (M6-02): a scalar→scalar function. `args` is empty for
+    /// `Pi`, two scalar expressions for `MaxOf`/`MinOf`.
+    ScalarFn {
+        func: ScalarFn,
+        args: Vec<Box<PlanExpr>>,
+    },
     Scalar(f64),
 }
 
@@ -240,11 +313,15 @@ pub struct QueryPlan {
 // (`pulsus-read`'s `MetricsEngine::query_inner`).
 
 /// Planner state: accumulates flattened selectors while recursively
-/// walking the AST. Does not need `params` itself — `PlanParams` only
-/// matters for [`SelectorSpec::fetch_window`], computed later by the
-/// caller (`pulsus-read`'s fetch layer), not during the walk.
+/// walking the AST. Does not need `params` itself beyond the
+/// experimental-function gate — `PlanParams` otherwise only matters for
+/// [`SelectorSpec::fetch_window`], computed later by the caller
+/// (`pulsus-read`'s fetch layer), not during the walk.
 struct Planner {
     selectors: Vec<SelectorSpec>,
+    /// [`PlanParams::experimental_functions`], carried into
+    /// [`plan_call`]'s `max_of`/`min_of` gate.
+    experimental: bool,
 }
 
 impl Planner {
@@ -271,6 +348,7 @@ impl Planner {
 pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
     let mut planner = Planner {
         selectors: Vec::new(),
+        experimental: params.experimental_functions,
     };
     let root = plan_expr(&mut planner, expr)?;
     Ok(QueryPlan {
@@ -501,6 +579,131 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         });
     }
 
+    // Issue #65 (M6-02): the 23 unary elementwise math/trig functions —
+    // one vector argument, no scalar arguments.
+    let unary_fn = match name {
+        "abs" => Some(MathFn::Abs),
+        "ceil" => Some(MathFn::Ceil),
+        "floor" => Some(MathFn::Floor),
+        "sqrt" => Some(MathFn::Sqrt),
+        "sgn" => Some(MathFn::Sgn),
+        "deg" => Some(MathFn::Deg),
+        "rad" => Some(MathFn::Rad),
+        "exp" => Some(MathFn::Exp),
+        "ln" => Some(MathFn::Ln),
+        "log2" => Some(MathFn::Log2),
+        "log10" => Some(MathFn::Log10),
+        "sin" => Some(MathFn::Sin),
+        "cos" => Some(MathFn::Cos),
+        "tan" => Some(MathFn::Tan),
+        "asin" => Some(MathFn::Asin),
+        "acos" => Some(MathFn::Acos),
+        "atan" => Some(MathFn::Atan),
+        "sinh" => Some(MathFn::Sinh),
+        "cosh" => Some(MathFn::Cosh),
+        "tanh" => Some(MathFn::Tanh),
+        "asinh" => Some(MathFn::Asinh),
+        "acosh" => Some(MathFn::Acosh),
+        "atanh" => Some(MathFn::Atanh),
+        _ => None,
+    };
+    if let Some(func) = unary_fn {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported(format!("{name}() with != 1 argument")));
+        };
+        let arg = plan_expr(planner, arg)?;
+        return Ok(PlanExpr::MathFn {
+            func,
+            arg: Box::new(arg),
+            scalar_args: Vec::new(),
+        });
+    }
+
+    // Issue #65 (M6-02): the clamp family — vector plus scalar bound(s).
+    // Scalar sub-arguments plan via `plan_expr` (the same shape as
+    // `histogram_quantile`'s quantile arg), forward-compatible with
+    // `scalar()`/`time()` expressions in those positions.
+    if name == "clamp" {
+        let [vector_arg, min_arg, max_arg] = args.as_slice() else {
+            return Err(unsupported("clamp() with != 3 arguments"));
+        };
+        let arg = plan_expr(planner, vector_arg)?;
+        let min = plan_expr(planner, min_arg)?;
+        let max = plan_expr(planner, max_arg)?;
+        return Ok(PlanExpr::MathFn {
+            func: MathFn::Clamp,
+            arg: Box::new(arg),
+            scalar_args: vec![Box::new(min), Box::new(max)],
+        });
+    }
+    if let Some(func) = match name {
+        "clamp_min" => Some(MathFn::ClampMin),
+        "clamp_max" => Some(MathFn::ClampMax),
+        _ => None,
+    } {
+        let [vector_arg, bound_arg] = args.as_slice() else {
+            return Err(unsupported(format!("{name}() with != 2 arguments")));
+        };
+        let arg = plan_expr(planner, vector_arg)?;
+        let bound = plan_expr(planner, bound_arg)?;
+        return Ok(PlanExpr::MathFn {
+            func,
+            arg: Box::new(arg),
+            scalar_args: vec![Box::new(bound)],
+        });
+    }
+
+    // Issue #65 (M6-02): `round(v [, to_nearest])` — variadic with an
+    // upstream default `to_nearest` of `1`, materialized here at plan
+    // time so the evaluator always sees exactly one scalar argument.
+    if name == "round" {
+        let (vector_arg, to_nearest) = match args.as_slice() {
+            [vector_arg] => (vector_arg, PlanExpr::Scalar(1.0)),
+            [vector_arg, to_nearest_arg] => (vector_arg, plan_expr(planner, to_nearest_arg)?),
+            _ => return Err(unsupported("round() with != 1..2 arguments")),
+        };
+        let arg = plan_expr(planner, vector_arg)?;
+        return Ok(PlanExpr::MathFn {
+            func: MathFn::Round,
+            arg: Box::new(arg),
+            scalar_args: vec![Box::new(to_nearest)],
+        });
+    }
+
+    // Issue #65 (M6-02): scalar→scalar functions. `pi()` takes no
+    // arguments; `max_of`/`min_of` are experimental and gated behind
+    // `PlanParams::experimental_functions` (the #64 Q2 adjudication:
+    // this is the flag's first consumer).
+    if name == "pi" {
+        if !args.is_empty() {
+            return Err(unsupported("pi() with arguments"));
+        }
+        return Ok(PlanExpr::ScalarFn {
+            func: ScalarFn::Pi,
+            args: Vec::new(),
+        });
+    }
+    if let Some(func) = match name {
+        "max_of" => Some(ScalarFn::MaxOf),
+        "min_of" => Some(ScalarFn::MinOf),
+        _ => None,
+    } {
+        if !planner.experimental {
+            return Err(unsupported(format!(
+                "experimental function {name}() (requires promql-experimental-functions)"
+            )));
+        }
+        let [a, b] = args.as_slice() else {
+            return Err(unsupported(format!("{name}() with != 2 arguments")));
+        };
+        let a = plan_expr(planner, a)?;
+        let b = plan_expr(planner, b)?;
+        return Ok(PlanExpr::ScalarFn {
+            func,
+            args: vec![Box::new(a), Box::new(b)],
+        });
+    }
+
     Err(unsupported(format!("function {name}()")))
 }
 
@@ -713,6 +916,14 @@ mod tests {
             end_ms: 1_000_000,
             step_ms: 0,
             lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        }
+    }
+
+    fn params_experimental() -> PlanParams {
+        PlanParams {
+            experimental_functions: true,
+            ..params()
         }
     }
 
@@ -1040,12 +1251,181 @@ mod tests {
     }
 
     #[test]
-    fn a_function_outside_the_m2_list_is_unsupported() {
-        let expr = parse("abs(up)").unwrap();
+    fn a_function_outside_the_implemented_list_is_unsupported() {
+        // `sort` is scheduled for M6-05 — a stand-in for "any function the
+        // planner does not yet map" (issue #65 moved the previous stand-in,
+        // `abs`, into the implemented set).
+        let expr = parse("sort(up)").unwrap();
         let err = plan(&expr, params()).unwrap_err();
         match err {
-            PromqlError::Unsupported { construct } => assert!(construct.contains("abs")),
+            PromqlError::Unsupported { construct } => assert!(construct.contains("sort")),
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // --- issue #65 (M6-02): elementwise math/trig + scalar functions ---
+
+    #[test]
+    fn plans_a_unary_math_fn_over_a_selector() {
+        let expr = parse("abs(up)").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::MathFn {
+                func,
+                arg,
+                scalar_args,
+            } => {
+                assert_eq!(*func, MathFn::Abs);
+                assert_eq!(**arg, PlanExpr::Selector(0));
+                assert!(scalar_args.is_empty());
+            }
+            other => panic!("expected MathFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_unary_math_fn_keeps_the_wrapped_selector_set_byte_identical() {
+        // Perf Tier-1 gate (issue #65 plan; standing query-performance
+        // mandate): `abs(m)`'s selector set — the input the fetch SQL is
+        // generated from — is identical to `m`'s, proving the function
+        // adds no fetch work, no extra round trip, and no SQL change.
+        let wrapped = plan(
+            &parse(r#"abs(mem_usage_bytes{service="svc-1"})"#).unwrap(),
+            params(),
+        )
+        .unwrap();
+        let bare = plan(
+            &parse(r#"mem_usage_bytes{service="svc-1"}"#).unwrap(),
+            params(),
+        )
+        .unwrap();
+        assert_eq!(wrapped.selectors, bare.selectors);
+    }
+
+    #[test]
+    fn plans_clamp_with_two_scalar_args() {
+        let expr = parse("clamp(up, 0, 10)").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::MathFn {
+                func,
+                arg,
+                scalar_args,
+            } => {
+                assert_eq!(*func, MathFn::Clamp);
+                assert_eq!(**arg, PlanExpr::Selector(0));
+                assert_eq!(scalar_args.len(), 2);
+                assert_eq!(*scalar_args[0], PlanExpr::Scalar(0.0));
+                assert_eq!(*scalar_args[1], PlanExpr::Scalar(10.0));
+            }
+            other => panic!("expected MathFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plans_clamp_min_and_clamp_max_with_one_scalar_arg() {
+        for (query, want) in [
+            ("clamp_min(up, 0)", MathFn::ClampMin),
+            ("clamp_max(up, 10)", MathFn::ClampMax),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::MathFn {
+                    func, scalar_args, ..
+                } => {
+                    assert_eq!(*func, want, "{query}");
+                    assert_eq!(scalar_args.len(), 1, "{query}");
+                }
+                other => panic!("{query}: expected MathFn, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn round_defaults_its_to_nearest_argument_to_one() {
+        let expr = parse("round(up)").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::MathFn {
+                func, scalar_args, ..
+            } => {
+                assert_eq!(*func, MathFn::Round);
+                assert_eq!(scalar_args.len(), 1);
+                assert_eq!(*scalar_args[0], PlanExpr::Scalar(1.0));
+            }
+            other => panic!("expected MathFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round_plans_an_explicit_to_nearest_argument() {
+        let expr = parse("round(up, 0.5)").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::MathFn { scalar_args, .. } => {
+                assert_eq!(*scalar_args[0], PlanExpr::Scalar(0.5));
+            }
+            other => panic!("expected MathFn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plans_pi_as_a_scalar_fn() {
+        let expr = parse("pi()").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(
+            p.root,
+            PlanExpr::ScalarFn {
+                func: ScalarFn::Pi,
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn max_of_and_min_of_are_unsupported_without_the_experimental_flag() {
+        for query in ["max_of(1, 2)", "min_of(1, 2)"] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert!(
+                    construct.contains("experimental")
+                        && construct.contains("promql-experimental-functions"),
+                    "{query}: error must name the gate, got {construct:?}"
+                ),
+                other => panic!("{query}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn max_of_and_min_of_plan_with_the_experimental_flag() {
+        for (query, want) in [
+            ("max_of(1, 2)", ScalarFn::MaxOf),
+            ("min_of(1, 2)", ScalarFn::MinOf),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params_experimental()).unwrap();
+            match &p.root {
+                PlanExpr::ScalarFn { func, args } => {
+                    assert_eq!(*func, want, "{query}");
+                    assert_eq!(args.len(), 2, "{query}");
+                    assert_eq!(*args[0], PlanExpr::Scalar(1.0));
+                    assert_eq!(*args[1], PlanExpr::Scalar(2.0));
+                }
+                other => panic!("{query}: expected ScalarFn, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn non_experimental_math_fns_plan_without_the_experimental_flag() {
+        // The gate applies only to the experimental pair — the rest of the
+        // M6-02 surface plans regardless of the flag state.
+        for query in ["abs(up)", "clamp(up, 0, 1)", "round(up)", "pi()"] {
+            let expr = parse(query).unwrap();
+            assert!(plan(&expr, params()).is_ok(), "{query}");
         }
     }
 
@@ -1082,6 +1462,7 @@ mod tests {
             end_ms: 10_000_000,
             step_ms: 0,
             lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
         };
         let (lower_excl, upper_incl) = sel.fetch_window(&p);
         assert_eq!(lower_excl, 10_000_000 - 300_000 - 300_000 - 60_000);

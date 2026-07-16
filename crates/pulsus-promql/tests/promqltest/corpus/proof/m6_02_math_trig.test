@@ -1,0 +1,302 @@
+# Issue #65 (M6-02) proof corpus — witness cases for the 30 elementwise
+# math/trig + scalar functions (function-coverage.json points each
+# entry's `witness` at the exact query texts below; the coverage drift
+# test replays this file and requires each to pass).
+#
+# Expected values are hand-derived to Prometheus semantics (IEEE-754
+# doubles), except the 12 exp/ln/log2/log10 cases, whose expecteds are
+# copied verbatim from the vendored upstream functions.test (that file
+# stays skip-manifested — only its numbers are borrowed); each carries a
+# `# functions.test:<line> @ <prometheus_sha>` provenance comment.
+
+# --- unary IEEE-exact: abs ceil floor sqrt sgn -------------------------
+
+load 5m
+	simple{l="neg"} -3.7 -3.7 -3.7
+	simple{l="zero"} 0 0 0
+	simple{l="pos"} 100.5 100.5 100.5
+	simple{l="nan"} NaN NaN NaN
+
+eval instant at 1m abs(simple)
+	{l="neg"} 3.7
+	{l="zero"} 0
+	{l="pos"} 100.5
+	{l="nan"} NaN
+
+eval instant at 1m ceil(simple)
+	{l="neg"} -3
+	{l="zero"} 0
+	{l="pos"} 101
+	{l="nan"} NaN
+
+eval instant at 1m floor(simple)
+	{l="neg"} -4
+	{l="zero"} 0
+	{l="pos"} 100
+	{l="nan"} NaN
+
+# sqrt of a negative value is NaN.
+eval instant at 1m sqrt(simple)
+	{l="neg"} NaN
+	{l="zero"} 0
+	{l="pos"} 10.024968827881711
+	{l="nan"} NaN
+
+# sgn returns v itself for 0 and NaN — never f64::signum semantics.
+eval instant at 1m sgn(simple)
+	{l="neg"} -1
+	{l="zero"} 0
+	{l="pos"} 1
+	{l="nan"} NaN
+
+# A math function through a range query: per-step values, __name__ still
+# dropped (no __name__ in the expected label sets anywhere in this file).
+eval range from 0 to 10m step 5m abs(simple)
+	{l="neg"} 3.7 3.7 3.7
+	{l="zero"} 0 0 0
+	{l="pos"} 100.5 100.5 100.5
+	{l="nan"} NaN NaN NaN
+
+clear
+
+# --- deg / rad (upstream op order: v*180/pi, v*pi/180) -----------------
+
+load 5m
+	angle{l="a"} 90
+	angle{l="b"} -10
+
+eval instant at 1m deg(angle)
+	{l="a"} 5156.620156177409
+	{l="b"} -572.9577951308232
+
+eval instant at 1m rad(angle)
+	{l="a"} 1.5707963267948966
+	{l="b"} -0.17453292519943295
+
+clear
+
+# --- the 12 trig transcendentals ---------------------------------------
+# (the executed vendored trig_functions.test is the upstream oracle for
+# these; the cases below are hand-derived witnesses at other inputs)
+
+load 5m
+	t_m{l="x"} 0.5
+	t_m{l="z"} 2
+
+eval instant at 1m sin(t_m)
+	{l="x"} 0.479425538604203
+	{l="z"} 0.9092974268256817
+
+eval instant at 1m cos(t_m)
+	{l="x"} 0.8775825618903728
+	{l="z"} -0.4161468365471424
+
+eval instant at 1m tan(t_m)
+	{l="x"} 0.5463024898437905
+	{l="z"} -2.185039863261519
+
+# asin/acos are NaN outside [-1, 1].
+eval instant at 1m asin(t_m)
+	{l="x"} 0.5235987755982989
+	{l="z"} NaN
+
+eval instant at 1m acos(t_m)
+	{l="x"} 1.0471975511965979
+	{l="z"} NaN
+
+eval instant at 1m atan(t_m)
+	{l="x"} 0.4636476090008061
+	{l="z"} 1.1071487177940904
+
+eval instant at 1m sinh(t_m)
+	{l="x"} 0.5210953054937474
+	{l="z"} 3.626860407847019
+
+eval instant at 1m cosh(t_m)
+	{l="x"} 1.1276259652063807
+	{l="z"} 3.7621956910836314
+
+eval instant at 1m tanh(t_m)
+	{l="x"} 0.46211715726000974
+	{l="z"} 0.9640275800758169
+
+eval instant at 1m asinh(t_m)
+	{l="x"} 0.48121182505960347
+	{l="z"} 1.4436354751788103
+
+# acosh is NaN below 1.
+eval instant at 1m acosh(t_m)
+	{l="x"} NaN
+	{l="z"} 1.3169578969248166
+
+# atanh is NaN outside (-1, 1).
+eval instant at 1m atanh(t_m)
+	{l="x"} 0.5493061443340548
+	{l="z"} NaN
+
+clear
+
+# --- exp / ln / log2 / log10 -------------------------------------------
+# Expecteds copied verbatim from the vendored upstream functions.test at
+# the pinned SHA (issue #65 plan v2 Δ1). The upstream load also carries a
+# native-histogram series (exp_root_log_h) that does not affect these
+# float results — dropped here (float-only load).
+
+load 5m
+	exp_root_log{l="x"} 10
+	exp_root_log{l="y"} 20
+
+# functions.test:1900 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m exp(exp_root_log)
+	{l="x"} 22026.465794806718
+	{l="y"} 485165195.4097903
+
+# functions.test:1908 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m exp(exp_root_log - 10)
+	{l="y"} 22026.465794806718
+	{l="x"} 1
+
+# functions.test:1912 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m exp(exp_root_log - 20)
+	{l="x"} 4.5399929762484854e-05
+	{l="y"} 1
+
+# functions.test:1916 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m ln(exp_root_log)
+	{l="x"} 2.302585092994046
+	{l="y"} 2.995732273553991
+
+# functions.test:1924 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+# ln(0) = -Inf.
+eval instant at 1m ln(exp_root_log - 10)
+	{l="y"} 2.302585092994046
+	{l="x"} -Inf
+
+# functions.test:1928 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+# ln of a negative value = NaN.
+eval instant at 1m ln(exp_root_log - 20)
+	{l="y"} -Inf
+	{l="x"} NaN
+
+# functions.test:1948 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log2(exp_root_log)
+	{l="x"} 3.3219280948873626
+	{l="y"} 4.321928094887363
+
+# functions.test:1956 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log2(exp_root_log - 10)
+	{l="y"} 3.3219280948873626
+	{l="x"} -Inf
+
+# functions.test:1960 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log2(exp_root_log - 20)
+	{l="x"} NaN
+	{l="y"} -Inf
+
+# functions.test:1964 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log10(exp_root_log)
+	{l="x"} 1
+	{l="y"} 1.301029995663981
+
+# functions.test:1972 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log10(exp_root_log - 10)
+	{l="y"} 1
+	{l="x"} -Inf
+
+# functions.test:1976 @ 40af9c2cdc0eda00f3622e867a27f6359f7295f3
+eval instant at 1m log10(exp_root_log - 20)
+	{l="x"} NaN
+	{l="y"} -Inf
+
+clear
+
+# --- clamp / clamp_min / clamp_max -------------------------------------
+
+load 5m
+	test_clamp{src="a"} -50
+	test_clamp{src="b"} 0
+	test_clamp{src="c"} 100
+
+eval instant at 1m clamp(test_clamp, -25, 75)
+	{src="a"} -25
+	{src="b"} 0
+	{src="c"} 75
+
+eval instant at 1m clamp_min(test_clamp, -25)
+	{src="a"} -25
+	{src="b"} 0
+	{src="c"} 100
+
+eval instant at 1m clamp_max(test_clamp, 75)
+	{src="a"} -50
+	{src="b"} 0
+	{src="c"} 75
+
+# A NaN bound flows through Go min/max to NaN for every sample (it never
+# triggers the max<min empty-vector branch — NaN comparisons are false).
+eval instant at 1m clamp(test_clamp, 0, NaN)
+	{src="a"} NaN
+	{src="b"} NaN
+	{src="c"} NaN
+
+eval instant at 1m clamp(test_clamp, NaN, 0)
+	{src="a"} NaN
+	{src="b"} NaN
+	{src="c"} NaN
+
+# max < min -> an empty instant vector.
+eval instant at 1m clamp(test_clamp, 5, -5)
+
+clear
+
+# --- round --------------------------------------------------------------
+
+load 5m
+	r_m{l="a"} 2.5
+	r_m{l="b"} -2.5
+	r_m{l="c"} 0.53
+
+# Default to_nearest = 1: ties break upward (floor(v + 0.5)).
+eval instant at 1m round(r_m)
+	{l="a"} 3
+	{l="b"} -2
+	{l="c"} 1
+
+eval instant at 1m round(r_m, 0.5)
+	{l="a"} 2.5
+	{l="b"} -2.5
+	{l="c"} 0.5
+
+clear
+
+# --- scalar functions: pi, max_of, min_of (experimental) ----------------
+
+eval instant at 0s pi()
+	3.141592653589793
+
+eval instant at 0s max_of(1, 2)
+	2
+
+eval instant at 0s min_of(1, 2)
+	1
+
+# Go's Inf-before-NaN precedence (math.Max/math.Min), both argument
+# orders: +Inf beats NaN for max_of, -Inf beats NaN for min_of — but the
+# opposite-signed infinity loses to NaN.
+eval instant at 0s max_of(Inf, NaN)
+	Inf
+
+eval instant at 0s max_of(NaN, Inf)
+	Inf
+
+eval instant at 0s max_of(-Inf, NaN)
+	NaN
+
+eval instant at 0s min_of(-Inf, NaN)
+	-Inf
+
+eval instant at 0s min_of(NaN, -Inf)
+	-Inf
+
+eval instant at 0s min_of(Inf, NaN)
+	NaN

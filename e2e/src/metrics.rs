@@ -1721,14 +1721,20 @@ mod tests {
     /// or a mode fails this test immediately, rather than merely
     /// shrinking coverage unnoticed. Update this constant deliberately
     /// (with a comment explaining the change) whenever the fixture's
-    /// matrix is intentionally resized.
+    /// matrix is intentionally resized. Resized 56 -> 78 by issue #65
+    /// (M6-02): 11 new entries x 2 modes for the IEEE-exact elementwise
+    /// math functions (abs/ceil/floor/sqrt/sgn/deg/rad/clamp/clamp_min/
+    /// clamp_max/round) — the transcendental subset is deliberately
+    /// excluded from this bit-exact matrix (Go-vs-Rust libm ULP
+    /// divergence; those are proven by the executed upstream corpus at
+    /// its own 1e-6 epsilon instead, per the #65 adjudication).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_fifty_six_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_seventy_eight_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 56,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 56 — update \
+            rows, 78,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 78 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

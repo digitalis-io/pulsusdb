@@ -18,6 +18,7 @@
 
 pub mod aggregation;
 pub mod binop;
+pub mod elementwise;
 pub mod functions;
 pub mod staleness;
 
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use pulsus_model::STALE_NAN_BITS;
 
 use crate::error::PromqlError;
-use crate::plan::{PlanExpr, QueryPlan, SelectorSpec};
+use crate::plan::{MathFn, PlanExpr, QueryPlan, ScalarFn, SelectorSpec};
 use crate::value::{InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData};
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
@@ -343,6 +344,125 @@ fn eval_step(
             Ok(StepValue::Vector(out))
         }
 
+        // Issue #65 (M6-02): elementwise math/trig **computes** a new
+        // value per sample — `__name__` DROPS (the same class as
+        // `rate`/`*_over_time` per the #37 keep/drop table).
+        PlanExpr::MathFn {
+            func,
+            arg,
+            scalar_args,
+        } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: format!("{func:?} over a scalar expression"),
+                });
+            };
+            let mut scalars = Vec::with_capacity(scalar_args.len());
+            for sa in scalar_args {
+                let StepValue::Scalar(s) = eval_step(sa, selectors, data, t_ms, lookback_ms)?
+                else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!("{func:?} with a non-scalar bound argument"),
+                    });
+                };
+                scalars.push(s);
+            }
+            // The planner guarantees `scalar_args`' count per MathFn
+            // discriminant; this match re-checks it structurally
+            // (defense-in-depth — a descriptive error, never a panic,
+            // plan v2 Δ3). Resolved to a tiny Copy op enum once per step —
+            // no per-sample or per-step allocation in this hot path.
+            #[derive(Clone, Copy)]
+            enum Op {
+                Clamp(f64, f64),
+                ClampMin(f64),
+                ClampMax(f64),
+                Round(f64),
+                Unary(MathFn),
+            }
+            let op = match (func, scalars.as_slice()) {
+                (MathFn::Clamp, &[min, max]) => {
+                    // Upstream funcClamp: `max < min` empties the whole
+                    // step's vector. Ordinary `<` is NaN-safe here — a
+                    // NaN bound never triggers this branch and flows to
+                    // a NaN per-sample result instead (plan v2 Δ2).
+                    if max < min {
+                        return Ok(StepValue::Vector(Vec::new()));
+                    }
+                    Op::Clamp(min, max)
+                }
+                (MathFn::ClampMin, &[min]) => Op::ClampMin(min),
+                (MathFn::ClampMax, &[max]) => Op::ClampMax(max),
+                (MathFn::Round, &[to_nearest]) => Op::Round(to_nearest),
+                (
+                    func @ (MathFn::Clamp | MathFn::ClampMin | MathFn::ClampMax | MathFn::Round),
+                    _,
+                ) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!(
+                            "{func:?} with {} scalar argument(s) — plan() guarantees the \
+                             per-function count; this plan was not built by plan()",
+                            scalars.len()
+                        ),
+                    });
+                }
+                (func, []) => Op::Unary(*func),
+                (func, _) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!(
+                            "unary {func:?} with {} scalar argument(s) — plan() guarantees \
+                             none; this plan was not built by plan()",
+                            scalars.len()
+                        ),
+                    });
+                }
+            };
+            let out = v
+                .into_iter()
+                .map(|s| InstantSample {
+                    labels: s.labels,
+                    metric_name: None,
+                    t_ms,
+                    v: match op {
+                        Op::Clamp(min, max) => elementwise::clamp(min, max, s.v),
+                        Op::ClampMin(min) => elementwise::clamp_min(min, s.v),
+                        Op::ClampMax(max) => elementwise::clamp_max(max, s.v),
+                        Op::Round(to_nearest) => elementwise::round(to_nearest, s.v),
+                        Op::Unary(func) => elementwise::unary(func, s.v),
+                    },
+                })
+                .collect();
+            Ok(StepValue::Vector(out))
+        }
+
+        // Issue #65 (M6-02): scalar→scalar functions.
+        PlanExpr::ScalarFn { func, args } => {
+            let mut scalars = Vec::with_capacity(args.len());
+            for a in args {
+                let StepValue::Scalar(s) = eval_step(a, selectors, data, t_ms, lookback_ms)? else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!("{func:?} with a non-scalar argument"),
+                    });
+                };
+                scalars.push(s);
+            }
+            let v = match (func, scalars.as_slice()) {
+                (ScalarFn::Pi, []) => elementwise::pi(),
+                (ScalarFn::MaxOf, &[a, b]) => elementwise::max_of(a, b),
+                (ScalarFn::MinOf, &[a, b]) => elementwise::min_of(a, b),
+                (func, _) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!(
+                            "{func:?} with {} argument(s) — plan() guarantees the \
+                             per-function count; this plan was not built by plan()",
+                            scalars.len()
+                        ),
+                    });
+                }
+            };
+            Ok(StepValue::Scalar(v))
+        }
+
         PlanExpr::Binary {
             op,
             lhs,
@@ -382,6 +502,7 @@ mod tests {
             end_ms,
             step_ms,
             lookback_ms: crate::plan::DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
         }
     }
 
@@ -810,6 +931,133 @@ mod tests {
         let v = instant_vector(evaluate(&p, &data).unwrap());
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].metric_name.as_deref(), Some("foo"));
+    }
+
+    // --- issue #65 (M6-02): elementwise math/trig + scalar functions ---
+
+    /// Elementwise math **computes** a new value — DROP, the same class
+    /// as `rate` (#37 keep/drop table). Mirrors `rate_drops_metric_name`.
+    #[test]
+    fn math_fn_drops_metric_name() {
+        let expr = crate::parser::parse("abs(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, -3.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(v[0].v, 3.0);
+    }
+
+    #[test]
+    fn clamp_applies_both_bounds_per_sample() {
+        let expr = crate::parser::parse("clamp(up, -25, 75)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("l", "a")], vec![s(0, -50.0)]),
+                series(2, &[("l", "b")], vec![s(0, 100.0)]),
+            ],
+        );
+        let mut v = instant_vector(evaluate(&p, &data).unwrap());
+        v.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(v[0].v, -25.0);
+        assert_eq!(v[1].v, 75.0);
+    }
+
+    /// Upstream funcClamp: `max < min` -> an **empty vector** for the
+    /// step, not per-sample NaNs.
+    #[test]
+    fn clamp_with_max_below_min_returns_an_empty_vector() {
+        let expr = crate::parser::parse("clamp(up, 5, -5)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("l", "a")], vec![s(0, 1.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert!(v.is_empty(), "clamp(x, 5, -5) must be empty, got {v:?}");
+    }
+
+    /// A NaN bound never trips the `max < min` empty branch (`NaN < x` is
+    /// false) — it flows through go_min/go_max to a NaN result for every
+    /// sample (plan v2 Δ2).
+    #[test]
+    fn clamp_with_a_nan_bound_yields_nan_samples_not_an_empty_vector() {
+        for query in ["clamp(up, 0, NaN)", "clamp(up, NaN, 0)"] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[("l", "a")], vec![s(0, 1.0)])]);
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert_eq!(v.len(), 1, "{query}: NaN bound must keep the sample");
+            assert!(v[0].v.is_nan(), "{query}: expected NaN, got {}", v[0].v);
+        }
+    }
+
+    #[test]
+    fn round_uses_the_planned_default_to_nearest() {
+        let expr = crate::parser::parse("round(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("l", "a")], vec![s(0, 2.5)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].v, 3.0);
+    }
+
+    #[test]
+    fn pi_evaluates_to_a_scalar() {
+        let expr = crate::parser::parse("pi()").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let data = SeriesData::new();
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Scalar(v) => assert_eq!(v, std::f64::consts::PI),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_of_and_min_of_evaluate_with_go_semantics() {
+        let experimental = PlanParams {
+            experimental_functions: true,
+            ..params(0, 0, 0)
+        };
+        for (query, want) in [("max_of(1, 2)", 2.0), ("min_of(1, 2)", 1.0)] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, experimental).unwrap();
+            match evaluate(&p, &SeriesData::new()).unwrap() {
+                QueryValue::Scalar(v) => assert_eq!(v, want, "{query}"),
+                other => panic!("{query}: expected Scalar, got {other:?}"),
+            }
+        }
+        // Go's Inf-before-NaN precedence survives end-to-end.
+        let expr = crate::parser::parse("max_of(Inf, NaN)").unwrap();
+        let p = plan(&expr, experimental).unwrap();
+        match evaluate(&p, &SeriesData::new()).unwrap() {
+            QueryValue::Scalar(v) => assert_eq!(v, f64::INFINITY),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    /// A math fn over a range query produces per-step points like every
+    /// other vector expression.
+    #[test]
+    fn math_fn_range_query_maps_every_step() {
+        let expr = crate::parser::parse("abs(up)").unwrap();
+        let p = plan(&expr, params(0, 60_000, 60_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(1, &[("l", "a")], vec![s(0, -1.0), s(60_000, -2.0)])],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].metric_name, None);
+                assert_eq!(m[0].points, vec![(0, 1.0), (60_000, 2.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
     }
 
     /// Vector-vector comparison, `bool` mode: DROP (interactively

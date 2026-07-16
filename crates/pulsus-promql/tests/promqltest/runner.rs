@@ -228,12 +228,17 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
 }
 
 fn params_for(kind: &EvalKind) -> PlanParams {
+    // `experimental_functions: true` in both arms: upstream promqltest
+    // runs with `EnableExperimentalFunctions` on, so the vendored corpus
+    // (and the proof files' `max_of`/`min_of` cases) plan under the same
+    // gate state (issue #65).
     match *kind {
         EvalKind::Instant { at_ms } => PlanParams {
             start_ms: at_ms,
             end_ms: at_ms,
             step_ms: 0,
             lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
         },
         EvalKind::Range {
             from_ms,
@@ -244,6 +249,7 @@ fn params_for(kind: &EvalKind) -> PlanParams {
             end_ms: to_ms,
             step_ms,
             lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
         },
     }
 }

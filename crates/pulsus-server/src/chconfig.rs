@@ -221,6 +221,9 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),
         metadata_table: "metric_metadata".to_string(),
+        // Issue #65 (M6-02): the experimental-function gate's production
+        // carrier — `ReaderConfig -> MetricsConfig -> PlanParams`.
+        experimental_functions: config.reader.promql_experimental_functions,
     }
 }
 
@@ -467,6 +470,65 @@ mod tests {
         assert_eq!(
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
+        );
+    }
+
+    /// Issue #65 (M6-02): `reader.promql_experimental_functions` maps
+    /// into `MetricsConfig.experimental_functions`, in both flag states.
+    #[test]
+    fn metrics_config_from_maps_the_experimental_functions_flag_both_states() {
+        let mut config = Config::default();
+        assert!(!metrics_config_from(&config).experimental_functions);
+        config.reader.promql_experimental_functions = true;
+        assert!(metrics_config_from(&config).experimental_functions);
+    }
+
+    /// Issue #65 (M6-02) plan v2 Δ4: the hermetic production-path
+    /// composition — the *real* production functions, chained exactly as
+    /// `MetricsEngine::query_inner` chains them
+    /// (`ReaderConfig -> metrics_config_from -> MetricQueryParams::
+    /// plan_params -> pulsus_promql::plan`), with no engine/ChClient.
+    /// Flag off: a named experimental rejection before any I/O could
+    /// happen. Flag on: the query plans to `ScalarFn::MaxOf`.
+    #[test]
+    fn promql_experimental_flag_reaches_plan_through_the_production_composition() {
+        use pulsus_read::MetricQueryParams;
+
+        let expr = pulsus_promql::parse("max_of(1, 1)").expect("parse");
+        let qp = MetricQueryParams {
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 0,
+        };
+
+        // Flag off (the default): rejected by name at plan time.
+        let config = Config::default();
+        let mc = metrics_config_from(&config);
+        let pp = qp.plan_params(mc.experimental_functions);
+        match pulsus_promql::plan(&expr, pp) {
+            Err(pulsus_promql::PromqlError::Unsupported { construct }) => assert!(
+                construct.contains("max_of") && construct.contains("experimental"),
+                "rejection must name the function and the gate, got {construct:?}"
+            ),
+            other => panic!("expected Unsupported with the flag off, got {other:?}"),
+        }
+
+        // Flag on: plans to the experimental scalar function.
+        let mut config = Config::default();
+        config.reader.promql_experimental_functions = true;
+        let mc = metrics_config_from(&config);
+        let pp = qp.plan_params(mc.experimental_functions);
+        let plan = pulsus_promql::plan(&expr, pp).expect("plan with the flag on");
+        assert!(
+            matches!(
+                plan.root,
+                pulsus_promql::PlanExpr::ScalarFn {
+                    func: pulsus_promql::ScalarFn::MaxOf,
+                    ..
+                }
+            ),
+            "expected a ScalarFn::MaxOf root, got {:?}",
+            plan.root
         );
     }
 

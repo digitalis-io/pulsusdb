@@ -65,6 +65,18 @@
     {
       "expr": "histogram_quantile(0.5, rate(request_duration_seconds_bucket{run_id=\"{R}\",service=\"svc-3\"}[5m]))",
       "modes": ["instant", "range"]
-    }
+    },
+
+    { "expr": "abs(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "ceil(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "floor(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "sqrt(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "sgn(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "deg(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "rad(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "clamp(mem_usage_bytes{run_id=\"{R}\"}, 3e8, 7e8)", "modes": ["instant", "range"] },
+    { "expr": "clamp_min(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
+    { "expr": "clamp_max(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
+    { "expr": "round(mem_usage_bytes{run_id=\"{R}\"}, 1000)", "modes": ["instant", "range"] }
   ]
 }

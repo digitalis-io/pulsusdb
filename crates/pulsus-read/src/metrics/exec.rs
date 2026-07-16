@@ -76,6 +76,11 @@ pub struct MetricsConfig {
     /// callers deriving table names from `Config` must not apply the same
     /// `_dist` rule they use for `samples_table`/`series_table`.
     pub metadata_table: String,
+    /// Issue #65 (M6-02): `ReaderConfig::promql_experimental_functions`,
+    /// threaded into every query's `PlanParams` by [`MetricsEngine::
+    /// query_inner`] — the planner rejects experimental functions
+    /// (`max_of`/`min_of`) by name when this is `false`.
+    pub experimental_functions: bool,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -144,12 +149,20 @@ pub struct MetricQueryParams {
 }
 
 impl MetricQueryParams {
-    fn plan_params(&self) -> PlanParams {
+    /// Builds the planner's [`PlanParams`]. `experimental_functions`
+    /// comes from [`MetricsConfig::experimental_functions`] — passed in
+    /// by the caller because this type carries only the request's own
+    /// time span, not engine config (issue #65 plan v2 Δ4; `pub` so the
+    /// server's production-path composition test can exercise the exact
+    /// `ReaderConfig -> MetricsConfig -> PlanParams -> plan()` chain
+    /// hermetically).
+    pub fn plan_params(&self, experimental_functions: bool) -> PlanParams {
         PlanParams {
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             step_ms: self.step_ms,
             lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions,
         }
     }
 }
@@ -200,7 +213,7 @@ impl MetricsEngine {
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
-        let plan_params = p.plan_params();
+        let plan_params = p.plan_params(self.config.experimental_functions);
         let plan = pulsus_promql::plan(expr, plan_params)?;
 
         // Issue #33 architect adjudication (superseding #31's ratified

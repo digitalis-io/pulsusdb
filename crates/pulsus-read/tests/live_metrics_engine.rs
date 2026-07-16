@@ -158,6 +158,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         samples_table: "metric_samples".to_string(),
         series_table: "metric_series".to_string(),
         metadata_table: "metric_metadata".to_string(),
+        experimental_functions: false,
     }
 }
 
@@ -1098,6 +1099,83 @@ async fn rate_end_to_end_against_real_samples() {
         }
         other => panic!("expected Vector, got {other:?}"),
     }
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #65 (M6-02): the experimental-function gate at the real
+/// `MetricsEngine::query` boundary (the one seam the hermetic
+/// production-path composition test in `pulsus-server::chconfig` cannot
+/// cover — `ChClient::new` is async/connecting). Flag off:
+/// `max_of(1, 1)` is rejected by name at plan time, before any fetch.
+/// Flag on: it evaluates to scalar `1` with **zero** sample fetches (the
+/// plan has no selectors — no `sample_fetch` explain stage may appear).
+#[tokio::test]
+async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_experimental_gate";
+    init_db(&bootstrap, db).await;
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let off_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (flag-off engine client)");
+    let on_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (flag-on engine client)");
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+
+    let expr = parse("max_of(1, 1)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: now_ms(),
+        end_ms: now_ms(),
+        step_ms: 0,
+    };
+
+    // Flag off (engine_config's default): a named rejection.
+    let off_engine = MetricsEngine::new(off_client, Arc::clone(&cache), engine_config(db));
+    let err = off_engine
+        .query(&expr, &params)
+        .await
+        .expect_err("max_of must be rejected with the flag off");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("max_of") && msg.contains("experimental"),
+        "rejection must name the function and the gate, got {msg:?}"
+    );
+
+    // Flag on: scalar 1, zero sample fetches.
+    let on_engine = MetricsEngine::new(
+        on_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            ..engine_config(db)
+        },
+    );
+    let (result, explain) = on_engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("max_of must evaluate with the flag on");
+    match result {
+        QueryResult::Scalar(v) => assert_eq!(v, 1.0),
+        other => panic!("expected Scalar, got {other:?}"),
+    }
+    assert!(
+        explain.stages.iter().all(|s| s.name != "sample_fetch"),
+        "max_of(1, 1) has no selectors and must fetch nothing: {:#?}",
+        explain.stages
+    );
 
     drop_database(&bootstrap, db).await;
 }
