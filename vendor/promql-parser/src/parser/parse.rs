@@ -1042,6 +1042,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     Duration::from_secs(5),
+                    None,
                 ),
             ),
             (
@@ -1049,6 +1050,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::MINUTE_DURATION * 5,
+                    None,
                 ),
             ),
             (
@@ -1056,6 +1058,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     Duration::from_secs(330),
+                    None,
                 ),
             ),
             (
@@ -1063,6 +1066,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::HOUR_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.offset_expr(Offset::Pos(duration::MINUTE_DURATION * 5))),
             ),
@@ -1071,6 +1075,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::DAY_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.offset_expr(Offset::Pos(Duration::from_secs(10)))),
             ),
@@ -1079,6 +1084,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::WEEK_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.offset_expr(Offset::Pos(duration::WEEK_DURATION * 2))),
             ),
@@ -1087,7 +1093,7 @@ mod tests {
                     Some(String::from("test")),
                     Matchers::one(Matcher::new(MatchOp::Equal, "a", "b")),
                 )
-                .and_then(|ex| Expr::new_matrix_selector(ex, duration::YEAR_DURATION * 5))
+                .and_then(|ex| Expr::new_matrix_selector(ex, duration::YEAR_DURATION * 5, None))
                 .and_then(|ex| ex.offset_expr(Offset::Pos(duration::DAY_DURATION * 3)))
             }),
             (r#"test{a="b"}[5y] @ 1603774699"#, {
@@ -1095,19 +1101,21 @@ mod tests {
                     Some(String::from("test")),
                     Matchers::one(Matcher::new(MatchOp::Equal, "a", "b")),
                 )
-                .and_then(|ex| Expr::new_matrix_selector(ex, duration::YEAR_DURATION * 5))
+                .and_then(|ex| Expr::new_matrix_selector(ex, duration::YEAR_DURATION * 5, None))
                 .and_then(|ex| ex.at_expr(At::try_from(1603774699_f64).unwrap()))
             }),
             ("foo[1]", {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("foo")),
                     Duration::from_secs(1),
+                    None,
                 )
             }),
             ("some_metric[5m] OFFSET 1", {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("some_metric")),
                     duration::MINUTE_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.offset_expr(Offset::Pos(Duration::from_secs(1))))
             }),
@@ -1115,6 +1123,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("some_metric")),
                     duration::MINUTE_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| {
                     ex.at_expr(At::try_from(duration::MINUTE_DURATION.as_secs_f64()).unwrap())
@@ -1134,16 +1143,19 @@ mod tests {
             ("foo[0m]", "duration must be greater than 0"),
             (
                 r#"foo["5m"]"#,
-                r#"unexpected character inside brackets: '"'"#,
+                r#"unexpected character in duration expression: '"'"#,
             ),
-            (r#"foo[]"#, "missing unit character in duration"),
+            (
+                r#"foo[]"#,
+                r#"unexpected "]" in subquery or range selector, expected number, duration, step(), or range()"#,
+            ),
             (
                 "some_metric[5m] OFFSET 1mm",
                 "bad number or duration syntax: 1mm",
             ),
             (
                 "some_metric[5m] OFFSET",
-                "unexpected end of input in offset, expected duration",
+                "unexpected end of input in offset, expected number, duration, step(), or range()",
             ),
             (
                 "some_metric OFFSET 1m[5m]",
@@ -1340,6 +1352,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("some_metric")),
                     duration::MINUTE_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1372,6 +1385,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("some_metric")),
                     duration::MINUTE_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(
@@ -1418,7 +1432,7 @@ mod tests {
                 let name = String::from("nonexistent");
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "job", "myjob"));
                 Expr::new_vector_selector(Some(name), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION))
+                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION, None))
                     .and_then(|ex| {
                         Expr::new_call(
                             get_function("absent_over_time").unwrap(),
@@ -1439,7 +1453,7 @@ mod tests {
                         ),
                     ]);
                     Expr::new_vector_selector(Some(name), matchers)
-                        .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION))
+                        .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION, None))
                         .and_then(|ex| {
                             Expr::new_call(
                                 get_function("absent_over_time").unwrap(),
@@ -1452,7 +1466,7 @@ mod tests {
                 let name = String::from("cpu_temp_celsius");
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "host", "zeus"));
                 Expr::new_vector_selector(Some(name), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION * 2))
+                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::HOUR_DURATION * 2, None))
                     .and_then(|ex| {
                         Expr::new_call(get_function("delta").unwrap(), FunctionArgs::new_args(ex))
                     })
@@ -1462,6 +1476,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1479,6 +1494,7 @@ mod tests {
                     let rate = Expr::new_matrix_selector(
                         Expr::from(VectorSelector::from("http_request_duration_seconds")),
                         duration::MINUTE_DURATION * 10,
+                        None,
                     )
                     .and_then(|ex| {
                         Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1502,6 +1518,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds")),
                     duration::HOUR_DURATION,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1520,6 +1537,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1536,6 +1554,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds_bucket")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1552,6 +1571,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds_bucket")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1575,6 +1595,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1591,6 +1612,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("http_request_duration_seconds")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                 )
                 .and_then(|ex| {
                     Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
@@ -1606,7 +1628,9 @@ mod tests {
                 let name = String::from("http_requests_total");
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "job", "api-server"));
                 Expr::new_vector_selector(Some(name), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::MINUTE_DURATION * 5))
+                    .and_then(|ex| {
+                        Expr::new_matrix_selector(ex, duration::MINUTE_DURATION * 5, None)
+                    })
                     .and_then(|ex| {
                         Expr::new_call(
                             get_function("increase").unwrap(),
@@ -1618,7 +1642,9 @@ mod tests {
                 let name = String::from("http_requests_total");
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "job", "api-server"));
                 Expr::new_vector_selector(Some(name), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, duration::MINUTE_DURATION * 5))
+                    .and_then(|ex| {
+                        Expr::new_matrix_selector(ex, duration::MINUTE_DURATION * 5, None)
+                    })
                     .and_then(|ex| {
                         Expr::new_call(get_function("irate").unwrap(), FunctionArgs::new_args(ex))
                     })
@@ -1889,6 +1915,181 @@ mod tests {
         assert_cases(Case::new_fail_cases(fail_cases));
     }
 
+    /// PulsusDB patch (docs/decisions/0003, grammar patch G1): duration
+    /// expressions in the range-selector, subquery range/step, and offset
+    /// positions — AST shape, literal folding, guard messages, and the
+    /// `parse -> Display -> parse` round-trip invariant.
+    #[test]
+    fn test_duration_expr() {
+        use crate::parser::DurationExpr as De;
+        fn n(v: f64) -> Box<De> {
+            Box::new(De::Number(v))
+        }
+
+        // AST shapes.
+        let shape_cases = vec![
+            (
+                "foo[26m+4m]",
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::Add(n(1560.0), n(240.0))),
+                ),
+            ),
+            (
+                "foo[step()]",
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::Step),
+                ),
+            ),
+            (
+                "foo[-range()]",
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::Neg(Box::new(De::Range))),
+                ),
+            ),
+            (
+                "foo[min_of(step()+1,1h)]",
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::MinOf(
+                        Box::new(De::Add(Box::new(De::Step), n(1.0))),
+                        n(3600.0),
+                    )),
+                ),
+            ),
+            (
+                "foo[-5m+35m]",
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::Add(n(-300.0), n(2100.0))),
+                ),
+            ),
+            // A (possibly sign-folded/parenthesised) literal offset stays
+            // concrete — no DurationExpr at all.
+            (
+                "foo offset -4",
+                Expr::new_vector_selector(Some(String::from("foo")), Matchers::empty())
+                    .and_then(|ex| ex.offset_expr(Offset::Neg(Duration::from_secs(4)))),
+            ),
+            (
+                "foo offset -(5)",
+                Expr::new_vector_selector(Some(String::from("foo")), Matchers::empty())
+                    .and_then(|ex| ex.offset_expr(Offset::Neg(Duration::from_secs(5)))),
+            ),
+            (
+                "foo offset step()",
+                Expr::new_vector_selector(Some(String::from("foo")), Matchers::empty())
+                    .and_then(|ex| ex.offset_dur_expr(De::Step)),
+            ),
+            (
+                "foo offset (100 + 2)",
+                Expr::new_vector_selector(Some(String::from("foo")), Matchers::empty()).and_then(
+                    |ex| ex.offset_dur_expr(De::Wrapped(Box::new(De::Add(n(100.0), n(2.0))))),
+                ),
+            ),
+            (
+                "foo[4s+4s:1s*2]",
+                Expr::new_vector_selector(Some(String::from("foo")), Matchers::empty()).and_then(
+                    |ex| {
+                        Expr::new_subquery_expr(
+                            ex,
+                            Duration::ZERO,
+                            Some(De::Add(n(4.0), n(4.0))),
+                            None,
+                            Some(De::Mul(n(1.0), n(2.0))),
+                        )
+                    },
+                ),
+            ),
+        ];
+        assert_cases(Case::new_result_cases(shape_cases));
+
+        // Offset terminates before a trailing operator (upstream v3.13
+        // precedence): `offset -2^2` == `(foo offset -2)^2`.
+        let precedence = crate::parser::parse("foo offset -2^2").unwrap();
+        match precedence {
+            Expr::Binary(bin) => {
+                assert_eq!(bin.op.id(), token::T_POW);
+                match *bin.lhs {
+                    Expr::VectorSelector(ref vs) => {
+                        assert_eq!(vs.offset, Some(Offset::Neg(Duration::from_secs(2))));
+                        assert_eq!(vs.offset_expr, None);
+                    }
+                    ref other => panic!("expected offset selector lhs, got {other:?}"),
+                }
+            }
+            other => panic!("expected `(foo offset -2)^2`, got {other:?}"),
+        }
+
+        // Round-trip invariant: parse -> Display -> parse yields an equal AST.
+        for q in [
+            "foo[30m]",
+            "foo[26m+4m]",
+            "foo[2m*(10+5)]",
+            "foo[24m+((1.5*2m)+2m)]",
+            "foo[step()]",
+            "foo[-step()]",
+            "foo[range()]",
+            "foo[2m/range()]",
+            "foo[max_of(min_of(step()+1,1h),1ms)]",
+            "foo[11s+10s-5*2^2]",
+            "foo[-(10s-5s)+20s]",
+            "foo[-2^2]",
+            "foo[0+-2^2]",
+            "foo offset step()",
+            "foo offset -step()",
+            "foo offset +min_of(step(), 1s)",
+            "foo offset -min_of(5s,step()+8s)",
+            "foo offset (-2 ^ 2)",
+            "foo offset 100 + 2",
+            "foo[4s+4s:1s*2] offset (5s-8)",
+            "metric1_total[29s+1s:((((8 - 2) / 3) * 7s) % 4) + 8000ms]",
+        ] {
+            let parsed = crate::parser::parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let rendered = parsed.to_string();
+            let reparsed = crate::parser::parse(&rendered)
+                .unwrap_or_else(|e| panic!("{q} -> {rendered}: {e}"));
+            assert_eq!(parsed, reparsed, "{q} -> {rendered} must round-trip");
+        }
+
+        // Guard messages (upstream v3.13 verbatim).
+        let fail_cases = vec![
+            ("foo[5s/0d]", "division by zero"),
+            ("foo[step()/0d]", "division by zero"),
+            ("foo offset (4d/0)", "division by zero"),
+            ("foo[5s%0d]", "modulo by zero"),
+            // Parenthesised/unary-signed literals keep upstream literal
+            // semantics: the literal guards still fire through
+            // parentheses and unary signs.
+            ("foo[(0)]", "duration must be greater than 0"),
+            ("foo[-(5)]", "duration must be greater than 0"),
+            ("foo[(-5m)]", "duration must be greater than 0"),
+            ("foo[5s/(0)]", "division by zero"),
+            ("foo[5s/-(0)]", "division by zero"),
+            ("foo[5s%(0)]", "modulo by zero"),
+            ("foo[-1]", "duration must be greater than 0"),
+            ("foo[0m]", "duration must be greater than 0"),
+            ("foo offset 9.5e10", "duration out of range"),
+            ("foo[9.5e10]", "duration out of range"),
+            (
+                "foo[]",
+                r#"unexpected "]" in subquery or range selector, expected number, duration, step(), or range()"#,
+            ),
+            (
+                "foo offset",
+                "unexpected end of input in offset, expected number, duration, step(), or range()",
+            ),
+        ];
+        assert_cases(Case::new_fail_cases(fail_cases));
+    }
+
     #[test]
     fn test_subquery() {
         let cases = vec![
@@ -1898,7 +2099,9 @@ mod tests {
                     Expr::new_subquery_expr(
                         ex,
                         duration::MINUTE_DURATION * 10,
+                        None,
                         Some(duration::SECOND_DURATION * 6),
+                        None,
                     )
                 })
             }),
@@ -1908,18 +2111,20 @@ mod tests {
                     Expr::new_subquery_expr(
                         ex,
                         duration::MINUTE_DURATION * 10 + duration::SECOND_DURATION * 5,
+                        None,
                         Some(duration::HOUR_DURATION + duration::MILLI_DURATION * 6),
+                        None,
                     )
                 })
             }),
             ("foo[10m:]", {
                 let ex = Expr::from(VectorSelector::from("foo"));
-                Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 10, None)
+                Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 10, None, None, None)
             }),
             (r#"min_over_time(rate(foo{bar="baz"}[2s])[5m:5s])"#, {
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "bar", "baz"));
                 Expr::new_vector_selector(Some(String::from("foo")), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2)))
+                    .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2), None))
                     .and_then(|ex| {
                         Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
                     })
@@ -1927,7 +2132,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 5,
+                            None,
                             Some(Duration::from_secs(5)),
+                            None,
                         )
                     })
                     .and_then(|ex| {
@@ -1940,11 +2147,13 @@ mod tests {
             (r#"min_over_time(rate(foo{bar="baz"}[2s])[5m:])[4m:3s]"#, {
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "bar", "baz"));
                 Expr::new_vector_selector(Some(String::from("foo")), matchers)
-                    .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2)))
+                    .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2), None))
                     .and_then(|ex| {
                         Expr::new_call(get_function("rate").unwrap(), FunctionArgs::new_args(ex))
                     })
-                    .and_then(|ex| Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None))
+                    .and_then(|ex| {
+                        Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None, None, None)
+                    })
                     .and_then(|ex| {
                         Expr::new_call(
                             get_function("min_over_time").unwrap(),
@@ -1955,7 +2164,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 4,
+                            None,
                             Some(Duration::from_secs(3)),
+                            None,
                         )
                     })
             }),
@@ -1964,7 +2175,7 @@ mod tests {
                 {
                     let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "bar", "baz"));
                     Expr::new_vector_selector(Some(String::from("foo")), matchers)
-                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2)))
+                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2), None))
                         .and_then(|ex| {
                             Expr::new_call(
                                 get_function("rate").unwrap(),
@@ -1972,7 +2183,13 @@ mod tests {
                             )
                         })
                         .and_then(|ex| {
-                            Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None)
+                            Expr::new_subquery_expr(
+                                ex,
+                                duration::MINUTE_DURATION * 5,
+                                None,
+                                None,
+                                None,
+                            )
                         })
                         .and_then(|ex| ex.offset_expr(Offset::Pos(duration::MINUTE_DURATION * 4)))
                         .and_then(|ex| {
@@ -1985,7 +2202,9 @@ mod tests {
                             Expr::new_subquery_expr(
                                 ex,
                                 duration::MINUTE_DURATION * 4,
+                                None,
                                 Some(Duration::from_secs(3)),
+                                None,
                             )
                         })
                 },
@@ -1995,7 +2214,7 @@ mod tests {
                 {
                     let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "bar", "baz"));
                     Expr::new_vector_selector(Some(String::from("foo")), matchers)
-                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2)))
+                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2), None))
                         .and_then(|ex| {
                             Expr::new_call(
                                 get_function("rate").unwrap(),
@@ -2003,7 +2222,13 @@ mod tests {
                             )
                         })
                         .and_then(|ex| {
-                            Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None)
+                            Expr::new_subquery_expr(
+                                ex,
+                                duration::MINUTE_DURATION * 5,
+                                None,
+                                None,
+                                None,
+                            )
                         })
                         .and_then(|ex| ex.at_expr(At::try_from(1603775091_f64).unwrap()))
                         .and_then(|ex| {
@@ -2016,7 +2241,9 @@ mod tests {
                             Expr::new_subquery_expr(
                                 ex,
                                 duration::MINUTE_DURATION * 4,
+                                None,
                                 Some(Duration::from_secs(3)),
+                                None,
                             )
                         })
                 },
@@ -2026,7 +2253,7 @@ mod tests {
                 {
                     let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "bar", "baz"));
                     Expr::new_vector_selector(Some(String::from("foo")), matchers)
-                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2)))
+                        .and_then(|ex| Expr::new_matrix_selector(ex, Duration::from_secs(2), None))
                         .and_then(|ex| {
                             Expr::new_call(
                                 get_function("rate").unwrap(),
@@ -2034,7 +2261,13 @@ mod tests {
                             )
                         })
                         .and_then(|ex| {
-                            Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None)
+                            Expr::new_subquery_expr(
+                                ex,
+                                duration::MINUTE_DURATION * 5,
+                                None,
+                                None,
+                                None,
+                            )
                         })
                         .and_then(|ex| ex.at_expr(At::try_from(-160377509_f64).unwrap()))
                         .and_then(|ex| {
@@ -2047,7 +2280,9 @@ mod tests {
                             Expr::new_subquery_expr(
                                 ex,
                                 duration::MINUTE_DURATION * 4,
+                                None,
                                 Some(Duration::from_secs(3)),
+                                None,
                             )
                         })
                 },
@@ -2072,7 +2307,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 30,
+                            None,
                             Some(Duration::from_secs(10)),
+                            None,
                         )
                     })
                 },
@@ -2085,7 +2322,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 10,
+                            None,
                             Some(Duration::from_secs(5)),
+                            None,
                         )
                     }),
             ),
@@ -2097,7 +2336,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 10,
+                            None,
                             Some(Duration::from_secs(5)),
+                            None,
                         )
                     }),
             ),
@@ -2110,7 +2351,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 10,
+                            None,
                             Some(Duration::from_secs(5)),
+                            None,
                         )
                     }),
             ),
@@ -2123,7 +2366,9 @@ mod tests {
                         Expr::new_subquery_expr(
                             ex,
                             duration::MINUTE_DURATION * 10,
+                            None,
                             Some(Duration::from_secs(5)),
+                            None,
                         )
                     }),
             ),
@@ -2132,7 +2377,9 @@ mod tests {
                 Expr::new_subquery_expr(
                     Expr::from(VectorSelector::from("some_metric")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                     Some(Duration::from_secs(5)),
+                    None,
                 )
                 .and_then(|ex| ex.at_expr(At::try_from(123_f64).unwrap()))
                 .and_then(|ex| ex.offset_expr(Offset::Pos(duration::MINUTE_DURATION))),
@@ -2146,7 +2393,9 @@ mod tests {
                     Expr::new_vector_selector(Some(String::from("bar")), matchers).unwrap(),
                 )
                 .and_then(Expr::new_paren_expr)
-                .and_then(|ex| Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None))
+                .and_then(|ex| {
+                    Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None, None, None)
+                })
             }),
             (r#"(foo + bar{nm="val"})[5m:] offset 10m"#, {
                 let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "nm", "val"));
@@ -2157,7 +2406,9 @@ mod tests {
                     Expr::new_vector_selector(Some(String::from("bar")), matchers).unwrap(),
                 )
                 .and_then(Expr::new_paren_expr)
-                .and_then(|ex| Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None))
+                .and_then(|ex| {
+                    Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None, None, None)
+                })
                 .and_then(|ex| ex.offset_expr(Offset::Pos(duration::MINUTE_DURATION * 10)))
             }),
             (r#"(foo + bar{nm="val"} @ 1234)[5m:] @ 1603775019"#, {
@@ -2173,7 +2424,9 @@ mod tests {
                     rhs,
                 )
                 .and_then(Expr::new_paren_expr)
-                .and_then(|ex| Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None))
+                .and_then(|ex| {
+                    Expr::new_subquery_expr(ex, duration::MINUTE_DURATION * 5, None, None, None)
+                })
                 .and_then(|ex| ex.at_expr(At::try_from(1603775019_f64).unwrap()))
             }),
         ];
@@ -2216,6 +2469,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::YEAR_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.at_expr(At::Start)),
             ),
@@ -2224,6 +2478,7 @@ mod tests {
                 Expr::new_matrix_selector(
                     Expr::from(VectorSelector::from("test")),
                     duration::YEAR_DURATION * 5,
+                    None,
                 )
                 .and_then(|ex| ex.at_expr(At::End)),
             ),
@@ -2232,7 +2487,9 @@ mod tests {
                 Expr::new_subquery_expr(
                     Expr::from(VectorSelector::from("foo")),
                     duration::MINUTE_DURATION * 10,
+                    None,
                     Some(Duration::from_secs(6)),
+                    None,
                 )
                 .and_then(|ex| ex.at_expr(At::Start)),
             ),

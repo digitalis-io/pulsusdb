@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::label::{Labels, METRIC_NAME, Matchers};
+use crate::label::{Labels, Matchers, METRIC_NAME};
 use crate::parser::token::{
-    self, T_BOTTOMK, T_COUNT_VALUES, T_END, T_QUANTILE, T_START, T_TOPK, token_display,
+    self, token_display, T_BOTTOMK, T_COUNT_VALUES, T_END, T_QUANTILE, T_START, T_TOPK,
 };
 use crate::parser::token::{Token, TokenId, TokenType};
 use crate::parser::value::ValueType;
-use crate::parser::{Function, FunctionArgs, MAX_CHARACTERS_PER_LINE, Prettier, indent};
+use crate::parser::{indent, Function, FunctionArgs, Prettier, MAX_CHARACTERS_PER_LINE};
 use crate::util::{display_duration, escape_string};
 use chrono::{DateTime, Utc};
 use std::fmt::{self, Write};
@@ -245,7 +245,11 @@ impl BinModifier {
     }
 
     pub fn bool_str(&self) -> &str {
-        if self.return_bool { "bool " } else { "" }
+        if self.return_bool {
+            "bool "
+        } else {
+            ""
+        }
     }
 }
 
@@ -408,6 +412,106 @@ impl fmt::Display for Offset {
         match self {
             Offset::Pos(dur) => write!(f, "{}", display_duration(dur)),
             Offset::Neg(dur) => write!(f, "-{}", display_duration(dur)),
+        }
+    }
+}
+
+/// A duration expression (PulsusDB patch, docs/decisions/0003 grammar
+/// patch G1) — Prometheus v3.13.0's `DurationExpr` node (at the pinned
+/// conformance SHA), self-contained rather than an [`Expr`] variant: it
+/// only ever appears in the range-selector, subquery range/step, and
+/// `offset` positions, carried in the `*_expr: Option<DurationExpr>`
+/// fields next to the corresponding concrete field (upstream's dual
+/// `Range`+`RangeExpr` model). A plain (possibly sign-folded) literal
+/// resolves to the concrete field at parse time and never builds one of
+/// these; every other form — arithmetic, `step()`, `range()`,
+/// `min_of`/`max_of`, parentheses — parses into this tree and is resolved
+/// against the query's step/range downstream.
+///
+/// `Number` values are seconds (upstream `NumberLiteral.Val`): a
+/// `DURATION` lexeme is folded to `parse_duration(..).as_secs_f64()`.
+/// `Wrapped` preserves explicit parentheses (upstream's `Wrapped` flag) so
+/// `parse -> Display -> parse` round-trips to an equal tree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DurationExpr {
+    /// A literal sub-expression, in seconds.
+    Number(f64),
+    /// `step()` — the query resolution step.
+    Step,
+    /// `range()` — the query range (`end - start`).
+    Range,
+    /// Unary `+`. Upstream folds unary plus away on some paths and keeps
+    /// an `ADD`-with-nil-LHS node on others; this tree keeps it uniformly
+    /// (and displays it) so round-trips are exact. Resolution is identity.
+    Pos(Box<DurationExpr>),
+    /// Unary `-`.
+    Neg(Box<DurationExpr>),
+    Add(Box<DurationExpr>, Box<DurationExpr>),
+    Sub(Box<DurationExpr>, Box<DurationExpr>),
+    Mul(Box<DurationExpr>, Box<DurationExpr>),
+    Div(Box<DurationExpr>, Box<DurationExpr>),
+    Mod(Box<DurationExpr>, Box<DurationExpr>),
+    Pow(Box<DurationExpr>, Box<DurationExpr>),
+    MinOf(Box<DurationExpr>, Box<DurationExpr>),
+    MaxOf(Box<DurationExpr>, Box<DurationExpr>),
+    /// An explicitly parenthesised sub-expression.
+    Wrapped(Box<DurationExpr>),
+}
+
+impl DurationExpr {
+    /// The folded literal seconds value of a parenthesised and/or
+    /// unary-signed numeric literal (`(5m)`, `-(5)`, `-((0))`), or `None`
+    /// for any genuinely computed expression. Upstream v3.13 keeps such a
+    /// tree a `*NumberLiteral` all the way through
+    /// (`paren_duration_expr`'s `$$ = $2` and
+    /// `applyUnaryOpToDurationExpr`'s literal fold), so it stays subject
+    /// to the *literal* guards (positivity, division/modulo by literal
+    /// zero) and the literal nanosecond-rounding path — while the
+    /// parenthesised form is still experimental-gated
+    /// (`experimentalDurationExpr($2)` fires before the literal is
+    /// unwrapped). This crate keeps the `Wrapped`/`Pos`/`Neg` metadata for
+    /// Display round-trip fidelity and gate-presence checks; consumers use
+    /// this accessor to recover the upstream literal semantics.
+    pub fn literal_value(&self) -> Option<f64> {
+        match self {
+            DurationExpr::Number(v) => Some(*v),
+            DurationExpr::Wrapped(e) | DurationExpr::Pos(e) => e.literal_value(),
+            DurationExpr::Neg(e) => e.literal_value().map(|v| -v),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for DurationExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Same rendering as `NumberLiteral` (upstream prints the
+            // literal's value; a re-parse folds it back to the same
+            // seconds value either way).
+            DurationExpr::Number(val) => {
+                if *val == f64::INFINITY {
+                    write!(f, "Inf")
+                } else if *val == f64::NEG_INFINITY {
+                    write!(f, "-Inf")
+                } else if f64::is_nan(*val) {
+                    write!(f, "NaN")
+                } else {
+                    write!(f, "{val}")
+                }
+            }
+            DurationExpr::Step => write!(f, "step()"),
+            DurationExpr::Range => write!(f, "range()"),
+            DurationExpr::Pos(e) => write!(f, "+{e}"),
+            DurationExpr::Neg(e) => write!(f, "-{e}"),
+            DurationExpr::Add(l, r) => write!(f, "{l} + {r}"),
+            DurationExpr::Sub(l, r) => write!(f, "{l} - {r}"),
+            DurationExpr::Mul(l, r) => write!(f, "{l} * {r}"),
+            DurationExpr::Div(l, r) => write!(f, "{l} / {r}"),
+            DurationExpr::Mod(l, r) => write!(f, "{l} % {r}"),
+            DurationExpr::Pow(l, r) => write!(f, "{l} ^ {r}"),
+            DurationExpr::MinOf(l, r) => write!(f, "min_of({l}, {r})"),
+            DurationExpr::MaxOf(l, r) => write!(f, "max_of({l}, {r})"),
+            DurationExpr::Wrapped(e) => write!(f, "({e})"),
         }
     }
 }
@@ -753,6 +857,11 @@ pub struct SubqueryExpr {
     pub expr: Box<Expr>,
     #[cfg_attr(feature = "ser", serde(serialize_with = "Offset::serialize_offset"))]
     pub offset: Option<Offset>,
+    /// `Some` iff the `offset` was written as a non-literal duration
+    /// expression (docs/decisions/0003 grammar patch G1); `offset` is then
+    /// unset and the concrete value is resolved downstream.
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub offset_expr: Option<DurationExpr>,
     #[cfg_attr(feature = "ser", serde(flatten))]
     #[cfg_attr(feature = "ser", serde(serialize_with = "serialize_at_modifier"))]
     pub at: Option<AtModifier>,
@@ -761,21 +870,34 @@ pub struct SubqueryExpr {
         serde(serialize_with = "crate::util::duration::serialize_duration")
     )]
     pub range: Duration,
+    /// `Some` iff the range was written as a non-literal duration
+    /// expression; `range` is then `Duration::ZERO` (upstream's dual
+    /// `Range`+`RangeExpr` model).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub range_expr: Option<DurationExpr>,
     /// Default is the global evaluation interval.
     #[cfg_attr(
         feature = "ser",
         serde(serialize_with = "crate::util::duration::serialize_duration_opt")
     )]
     pub step: Option<Duration>,
+    /// `Some` iff the step was written as a non-literal duration
+    /// expression; `step` is then `None`.
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub step_expr: Option<DurationExpr>,
 }
 
 impl SubqueryExpr {
     fn get_time_suffix_string(&self) -> String {
-        let step = match &self.step {
-            Some(step) => display_duration(step),
-            None => String::from(""),
+        let step = match (&self.step_expr, &self.step) {
+            (Some(e), _) => e.to_string(),
+            (None, Some(step)) => display_duration(step),
+            (None, None) => String::from(""),
         };
-        let range = display_duration(&self.range);
+        let range = match &self.range_expr {
+            Some(e) => e.to_string(),
+            None => display_duration(&self.range),
+        };
 
         let mut s = format!("[{range}:{step}]");
 
@@ -785,6 +907,9 @@ impl SubqueryExpr {
 
         if let Some(offset) = &self.offset {
             write!(s, " offset {offset}").unwrap();
+        }
+        if let Some(e) = &self.offset_expr {
+            write!(s, " offset {e}").unwrap();
         }
         s
     }
@@ -893,6 +1018,11 @@ pub struct VectorSelector {
     pub matchers: Matchers,
     #[cfg_attr(feature = "ser", serde(serialize_with = "Offset::serialize_offset"))]
     pub offset: Option<Offset>,
+    /// `Some` iff the `offset` was written as a non-literal duration
+    /// expression (docs/decisions/0003 grammar patch G1); `offset` is then
+    /// unset and the concrete value is resolved downstream.
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub offset_expr: Option<DurationExpr>,
     #[cfg_attr(feature = "ser", serde(flatten))]
     #[cfg_attr(feature = "ser", serde(serialize_with = "serialize_at_modifier"))]
     pub at: Option<AtModifier>,
@@ -904,6 +1034,7 @@ impl VectorSelector {
             name,
             matchers,
             offset: None,
+            offset_expr: None,
             at: None,
         }
     }
@@ -915,6 +1046,7 @@ impl Default for VectorSelector {
             name: None,
             matchers: Matchers::empty(),
             offset: None,
+            offset_expr: None,
             at: None,
         }
     }
@@ -925,6 +1057,7 @@ impl From<String> for VectorSelector {
         VectorSelector {
             name: Some(name),
             offset: None,
+            offset_expr: None,
             at: None,
             matchers: Matchers::empty(),
         }
@@ -944,6 +1077,7 @@ impl From<String> for VectorSelector {
 /// let vs = VectorSelector {
 ///     name: Some(String::from("foo")),
 ///     offset: None,
+///     offset_expr: None,
 ///     at: None,
 ///     matchers: Matchers::empty(),
 /// };
@@ -980,6 +1114,9 @@ impl fmt::Display for VectorSelector {
         if let Some(offset) = &self.offset {
             write!(f, " offset {offset}")?;
         }
+        if let Some(e) = &self.offset_expr {
+            write!(f, " offset {e}")?;
+        }
         Ok(())
     }
 }
@@ -1000,6 +1137,11 @@ pub struct MatrixSelector {
         serde(serialize_with = "crate::util::duration::serialize_duration")
     )]
     pub range: Duration,
+    /// `Some` iff the range was written as a non-literal duration
+    /// expression (docs/decisions/0003 grammar patch G1); `range` is then
+    /// `Duration::ZERO` (upstream's dual `Range`+`RangeExpr` model).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub range_expr: Option<DurationExpr>,
 }
 
 impl fmt::Display for MatrixSelector {
@@ -1013,7 +1155,10 @@ impl fmt::Display for MatrixSelector {
             write!(f, "{{{matchers}}}")?;
         }
 
-        write!(f, "[{}]", display_duration(&self.range))?;
+        match &self.range_expr {
+            Some(e) => write!(f, "[{e}]")?,
+            None => write!(f, "[{}]", display_duration(&self.range))?,
+        }
 
         if let Some(at) = &self.vs.at {
             write!(f, " {at}")?;
@@ -1021,6 +1166,10 @@ impl fmt::Display for MatrixSelector {
 
         if let Some(offset) = &self.vs.offset {
             write!(f, " offset {offset}")?;
+        }
+
+        if let Some(e) = &self.vs.offset_expr {
+            write!(f, " offset {e}")?;
         }
 
         Ok(())
@@ -1191,14 +1340,19 @@ impl Expr {
     pub(crate) fn new_subquery_expr(
         expr: Expr,
         range: Duration,
+        range_expr: Option<DurationExpr>,
         step: Option<Duration>,
+        step_expr: Option<DurationExpr>,
     ) -> Result<Self, String> {
         let se = Expr::Subquery(SubqueryExpr {
             expr: Box::new(expr),
             offset: None,
+            offset_expr: None,
             at: None,
             range,
+            range_expr,
             step,
+            step_expr,
         });
         Ok(se)
     }
@@ -1211,16 +1365,28 @@ impl Expr {
     }
 
     /// NOTE: @ and offset is not set here.
-    pub(crate) fn new_matrix_selector(expr: Expr, range: Duration) -> Result<Self, String> {
+    pub(crate) fn new_matrix_selector(
+        expr: Expr,
+        range: Duration,
+        range_expr: Option<DurationExpr>,
+    ) -> Result<Self, String> {
         match expr {
             Expr::VectorSelector(VectorSelector {
                 offset: Some(_), ..
+            })
+            | Expr::VectorSelector(VectorSelector {
+                offset_expr: Some(_),
+                ..
             }) => Err("no offset modifiers allowed before range".into()),
             Expr::VectorSelector(VectorSelector { at: Some(_), .. }) => {
                 Err("no @ modifiers allowed before range".into())
             }
             Expr::VectorSelector(vs) => {
-                let ms = Expr::MatrixSelector(MatrixSelector { vs, range });
+                let ms = Expr::MatrixSelector(MatrixSelector {
+                    vs,
+                    range,
+                    range_expr,
+                });
                 Ok(ms)
             }
             _ => Err("ranges only allowed for vector selectors".into()),
@@ -1261,26 +1427,59 @@ impl Expr {
     pub(crate) fn offset_expr(self, offset: Offset) -> Result<Self, String> {
         let already_set_err = Err("offset may not be set multiple times".into());
         match self {
-            Expr::VectorSelector(mut vs) => match vs.offset {
-                None => {
+            Expr::VectorSelector(mut vs) => match (&vs.offset, &vs.offset_expr) {
+                (None, None) => {
                     vs.offset = Some(offset);
                     Ok(Expr::VectorSelector(vs))
                 }
-                Some(_) => already_set_err,
+                _ => already_set_err,
             },
-            Expr::MatrixSelector(mut ms) => match ms.vs.offset {
-                None => {
+            Expr::MatrixSelector(mut ms) => match (&ms.vs.offset, &ms.vs.offset_expr) {
+                (None, None) => {
                     ms.vs.offset = Some(offset);
                     Ok(Expr::MatrixSelector(ms))
                 }
-                Some(_) => already_set_err,
+                _ => already_set_err,
             },
-            Expr::Subquery(mut s) => match s.offset {
-                None => {
+            Expr::Subquery(mut s) => match (&s.offset, &s.offset_expr) {
+                (None, None) => {
                     s.offset = Some(offset);
                     Ok(Expr::Subquery(s))
                 }
-                Some(_) => already_set_err,
+                _ => already_set_err,
+            },
+            _ => {
+                Err("offset modifier must be preceded by an vector selector or matrix selector or a subquery".into())
+            }
+        }
+    }
+
+    /// set the offset *duration-expression* field for specified Expr
+    /// (docs/decisions/0003 grammar patch G1 — upstream's
+    /// `addOffsetExpr`), same set-once rule as [`Expr::offset_expr`].
+    pub(crate) fn offset_dur_expr(self, offset_expr: DurationExpr) -> Result<Self, String> {
+        let already_set_err = Err("offset may not be set multiple times".into());
+        match self {
+            Expr::VectorSelector(mut vs) => match (&vs.offset, &vs.offset_expr) {
+                (None, None) => {
+                    vs.offset_expr = Some(offset_expr);
+                    Ok(Expr::VectorSelector(vs))
+                }
+                _ => already_set_err,
+            },
+            Expr::MatrixSelector(mut ms) => match (&ms.vs.offset, &ms.vs.offset_expr) {
+                (None, None) => {
+                    ms.vs.offset_expr = Some(offset_expr);
+                    Ok(Expr::MatrixSelector(ms))
+                }
+                _ => already_set_err,
+            },
+            Expr::Subquery(mut s) => match (&s.offset, &s.offset_expr) {
+                (None, None) => {
+                    s.offset_expr = Some(offset_expr);
+                    Ok(Expr::Subquery(s))
+                }
+                _ => already_set_err,
             },
             _ => {
                 Err("offset modifier must be preceded by an vector selector or matrix selector or a subquery".into())
@@ -1869,6 +2068,7 @@ mod tests {
             Expr::new_matrix_selector(
                 Expr::from(VectorSelector::from("foo")),
                 Duration::from_secs(1),
+                None,
             )
             .and_then(|ex| ex.at_expr(AtModifier::try_from(1.0).unwrap()))
             .and_then(|ex| ex.at_expr(AtModifier::try_from(1.0).unwrap()))
@@ -1880,6 +2080,8 @@ mod tests {
             Expr::new_subquery_expr(
                 Expr::from(VectorSelector::from("foo")),
                 Duration::from_secs(1),
+                None,
+                None,
                 None,
             )
             .and_then(|ex| ex.at_expr(AtModifier::try_from(1.0).unwrap()))
@@ -1903,6 +2105,7 @@ mod tests {
             Expr::new_matrix_selector(
                 Expr::from(VectorSelector::from("foo")),
                 Duration::from_secs(1),
+                None,
             )
             .and_then(|ex| ex.offset_expr(Offset::Pos(Duration::from_secs(1000))))
             .and_then(|ex| ex.offset_expr(Offset::Pos(Duration::from_secs(1000))))
@@ -1914,6 +2117,8 @@ mod tests {
             Expr::new_subquery_expr(
                 Expr::from(VectorSelector::from("foo")),
                 Duration::from_secs(1),
+                None,
+                None,
                 None,
             )
             .and_then(|ex| ex.offset_expr(Offset::Pos(Duration::from_secs(1000))))

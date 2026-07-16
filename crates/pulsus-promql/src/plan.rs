@@ -19,8 +19,8 @@ use pulsus_model::{LabelMatcher, MatchOp};
 
 use crate::error::PromqlError;
 use crate::parser::{
-    self, AggregateExpr, BinaryExpr, Call, Expr, LabelModifier, MatrixSelector, Offset,
-    PLabelMatchOp, SubqueryExpr, UnaryExpr, VectorMatchCardinality, VectorSelector, token,
+    self, AggregateExpr, BinaryExpr, Call, DurationExpr, Expr, LabelModifier, MatrixSelector,
+    Offset, PLabelMatchOp, SubqueryExpr, UnaryExpr, VectorMatchCardinality, VectorSelector, token,
 };
 
 /// Instant query = `start_ms == end_ms`, `step_ms == 0` (a single-step
@@ -681,13 +681,18 @@ struct SubqueryCtx {
 struct Planner {
     selectors: Vec<SelectorSpec>,
     /// [`PlanParams::experimental_functions`], carried into
-    /// [`plan_call`]'s `max_of`/`min_of` gate.
+    /// [`plan_call`]'s `max_of`/`min_of` gate and issue #84's
+    /// duration-expression gate ([`gate_duration_expr`]).
     experimental: bool,
     /// [`PlanParams::start_ms`]/[`PlanParams::end_ms`] — `@ start()` and
     /// `@ end()` resolve against these (for an instant query both are the
     /// eval time, upstream's own rule).
     start_ms: i64,
     end_ms: i64,
+    /// [`PlanParams::step_ms`] — issue #84: `step()` in a duration
+    /// expression resolves to this (0 for an instant query, upstream's
+    /// own rule).
+    step_ms: i64,
     ctx: SubqueryCtx,
     subquery_depth: usize,
 }
@@ -730,6 +735,41 @@ impl Planner {
         id
     }
 
+    /// Issue #84: `range()` resolves to the query range, `end - start`
+    /// (0 for an instant query, upstream's own rule).
+    fn query_range_ms(&self) -> i64 {
+        self.end_ms - self.start_ms
+    }
+
+    /// Issue #84: the concrete offset — the resolved duration expression
+    /// when one was written (negative permitted, upstream
+    /// `calculateDuration(_, true)`), else the parser-folded literal.
+    /// Callers gate `expr` first ([`gate_duration_expr`]).
+    fn resolve_offset_ms(
+        &self,
+        offset: &Option<Offset>,
+        expr: &Option<DurationExpr>,
+    ) -> Result<i64, PromqlError> {
+        match expr {
+            Some(e) => resolve_duration_expr(e, self.step_ms, self.query_range_ms(), true),
+            None => Ok(offset_ms(offset)),
+        }
+    }
+
+    /// Issue #84: the concrete range/step width — the resolved duration
+    /// expression when one was written (must be positive), else the
+    /// parser-folded literal. Callers gate `expr` first.
+    fn resolve_range_ms(
+        &self,
+        range: std::time::Duration,
+        expr: &Option<DurationExpr>,
+    ) -> Result<i64, PromqlError> {
+        match expr {
+            Some(e) => resolve_duration_expr(e, self.step_ms, self.query_range_ms(), false),
+            None => Ok(duration_ms(range)),
+        }
+    }
+
     /// Resolves an `@` modifier to absolute milliseconds at plan time.
     /// The parser pre-rounds a literal to whole ms (`@ 1.234` →
     /// `1234 ms`); a pre-epoch literal round-trips through the
@@ -753,6 +793,7 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         experimental: params.experimental_functions,
         start_ms: params.start_ms,
         end_ms: params.end_ms,
+        step_ms: params.step_ms,
         ctx: SubqueryCtx::default(),
         subquery_depth: 0,
     };
@@ -838,6 +879,155 @@ fn offset_ms(offset: &Option<Offset>) -> i64 {
     }
 }
 
+/// Issue #84 (M6-08b): the plan-time experimental gate for duration
+/// expressions, keyed on the single [`PlanParams::experimental_functions`]
+/// toggle (the #65 binop-fill-modifiers precedent — one pulsus gate mirrors
+/// the tested upstream feature-flag set, here `--enable-feature=
+/// promql-duration-expr` at the pinned v3.13.0 conformance SHA, OFF by
+/// default). The parser is unconditional; a `*_expr` field is `Some` iff
+/// the grammar built a *non-literal* duration expression (arithmetic,
+/// unary-of-expression, parentheses — including `(2)` — `step()`,
+/// `range()`, `min_of`/`max_of`), so plain and sign-folded literals
+/// (`[1800]`, `offset -4`) are never gated. The `construct` carries
+/// upstream parse.go's rejection verbatim as a substring ("experimental
+/// duration expression is not enabled") plus the house toggle name.
+fn gate_duration_expr(e: &Option<DurationExpr>, experimental: bool) -> Result<(), PromqlError> {
+    if e.is_some() && !experimental {
+        return Err(PromqlError::Unsupported {
+            construct: "experimental duration expression is not enabled \
+                        (requires promql-experimental-functions)"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Issue #84: a resolve-time duration error — upstream
+/// `promql/durations.go` text verbatim (its position prefix excepted),
+/// carried on the [`PromqlError::Parse`] verbatim-text contract.
+fn duration_error(msg: &str) -> PromqlError {
+    PromqlError::Parse(msg.to_string())
+}
+
+/// Issue #84: plan-time constant folding of a duration expression to
+/// concrete milliseconds — upstream `durations.go::calculateDuration`:
+/// evaluate to float seconds, reject NaN/±Inf, require `> 0` unless the
+/// position permits a negative (`offset`), bound to ±(2^63)/1e9 seconds
+/// (Go's `time.Duration` nanosecond range), then truncate to whole
+/// milliseconds exactly like Go's `time.Duration(duration*1000)`
+/// conversion. The result feeds the unchanged `SelectorSpec`/`FetchExtent`
+/// machinery as if the user had typed the literal.
+fn resolve_duration_expr(
+    e: &DurationExpr,
+    step_ms: i64,
+    query_range_ms: i64,
+    allow_negative: bool,
+) -> Result<i64, PromqlError> {
+    // Parenthesised/unary-signed numeric literals keep upstream's
+    // *literal* semantics (v3.13 carries them as `*NumberLiteral`s —
+    // the paren form is still experimental-gated, which is why they
+    // arrive here as a `Some(*_expr)` at all): the selector-boundary
+    // conversion is the literal nanosecond-rounding path
+    // (`time.Duration(math.Round(val*1e9))`, then millisecond
+    // truncation), NOT the durationVisitor's `duration*1000`
+    // truncation — `[(0.0009999996)]` is 1 ms, exactly like the
+    // unparenthesised literal, never 0. The parse-time literal guards
+    // (positivity, div/mod by literal zero, out-of-range) have already
+    // run for these; the checks below are kept as cheap defense in
+    // depth.
+    if let Some(secs) = e.literal_value() {
+        if !secs.is_finite() {
+            return Err(duration_error("duration is NaN or infinite"));
+        }
+        if secs <= 0.0 && !allow_negative {
+            return Err(duration_error("duration must be greater than 0"));
+        }
+        if duration_out_of_range(secs) {
+            // The parse-time literal guard's message (this arm is
+            // defense in depth — parse already rejected it).
+            return Err(duration_error("duration out of range"));
+        }
+        // Integer nanoseconds first, then integer millisecond division —
+        // exactly the bare-literal conversion (`Duration::from_nanos(
+        // round(secs*1e9))` + `as_millis`); a float divide here can be
+        // 1 ms off the bare path at large in-range magnitudes.
+        let ns = (secs * 1e9).round() as i64;
+        return Ok(ns / 1_000_000);
+    }
+
+    let secs = eval_duration_expr(e, step_ms, query_range_ms)?;
+    if secs.is_nan() || secs.is_infinite() {
+        return Err(duration_error("duration is NaN or infinite"));
+    }
+    if secs <= 0.0 && !allow_negative {
+        return Err(duration_error("duration must be greater than 0"));
+    }
+    if duration_out_of_range(secs) {
+        return Err(duration_error("duration is out of range"));
+    }
+    Ok((secs * 1000.0) as i64)
+}
+
+/// Go's `time.Duration` bound, ±(2^63)/1e9 seconds.
+fn duration_out_of_range(secs: f64) -> bool {
+    const MAX_SECS: f64 = (1u64 << 63) as f64 / 1e9;
+    !(-MAX_SECS..=MAX_SECS).contains(&secs)
+}
+
+/// Upstream `durations.go::evaluateDurationExpr`, on this crate's
+/// [`DurationExpr`] shape: recursive float-seconds evaluation.
+/// Division/modulo by a *computed* zero errors here (the literal-zero
+/// forms are already parse errors); `min_of`/`max_of` propagate NaN like
+/// Go's `math.Min`/`math.Max` (Rust's `f64::min` would discard it).
+fn eval_duration_expr(
+    e: &DurationExpr,
+    step_ms: i64,
+    query_range_ms: i64,
+) -> Result<f64, PromqlError> {
+    let eval = |e: &DurationExpr| eval_duration_expr(e, step_ms, query_range_ms);
+    Ok(match e {
+        DurationExpr::Number(v) => *v,
+        DurationExpr::Step => step_ms as f64 / 1000.0,
+        DurationExpr::Range => query_range_ms as f64 / 1000.0,
+        DurationExpr::Pos(e) | DurationExpr::Wrapped(e) => eval(e)?,
+        DurationExpr::Neg(e) => -eval(e)?,
+        DurationExpr::Add(l, r) => eval(l)? + eval(r)?,
+        DurationExpr::Sub(l, r) => eval(l)? - eval(r)?,
+        DurationExpr::Mul(l, r) => eval(l)? * eval(r)?,
+        DurationExpr::Div(l, r) => {
+            let (l, r) = (eval(l)?, eval(r)?);
+            if r == 0.0 {
+                return Err(duration_error("division by zero"));
+            }
+            l / r
+        }
+        DurationExpr::Mod(l, r) => {
+            let (l, r) = (eval(l)?, eval(r)?);
+            if r == 0.0 {
+                return Err(duration_error("modulo by zero"));
+            }
+            l % r
+        }
+        DurationExpr::Pow(l, r) => eval(l)?.powf(eval(r)?),
+        DurationExpr::MinOf(l, r) => {
+            let (l, r) = (eval(l)?, eval(r)?);
+            if l.is_nan() || r.is_nan() {
+                f64::NAN
+            } else {
+                l.min(r)
+            }
+        }
+        DurationExpr::MaxOf(l, r) => {
+            let (l, r) = (eval(l)?, eval(r)?);
+            if l.is_nan() || r.is_nan() {
+                f64::NAN
+            } else {
+                l.max(r)
+            }
+        }
+    })
+}
+
 /// Extracts `(metric_name, matchers-excluding-__name__)` from a
 /// [`VectorSelector`], per the module doc's metric-scoping rule.
 fn extract_name_and_matchers(
@@ -900,9 +1090,12 @@ fn plan_vector_selector(
     planner: &mut Planner,
     vs: &VectorSelector,
 ) -> Result<PlanExpr, PromqlError> {
+    // Issue #84: gate before any resolution.
+    gate_duration_expr(&vs.offset_expr, planner.experimental)?;
     let (metric_name, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
-    let id = planner.push_selector(metric_name, matchers, None, offset_ms(&vs.offset), at_ms);
+    let offset = planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?;
+    let id = planner.push_selector(metric_name, matchers, None, offset, at_ms);
     Ok(PlanExpr::Selector(id))
 }
 
@@ -914,15 +1107,14 @@ fn plan_matrix_selector_id(
     planner: &mut Planner,
     ms: &MatrixSelector,
 ) -> Result<SelectorId, PromqlError> {
+    // Issue #84: gate before any resolution.
+    gate_duration_expr(&ms.range_expr, planner.experimental)?;
+    gate_duration_expr(&ms.vs.offset_expr, planner.experimental)?;
     let (metric_name, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
-    Ok(planner.push_selector(
-        metric_name,
-        matchers,
-        Some(duration_ms(ms.range)),
-        offset_ms(&ms.vs.offset),
-        at_ms,
-    ))
+    let range_ms = planner.resolve_range_ms(ms.range, &ms.range_expr)?;
+    let offset = planner.resolve_offset_ms(&ms.vs.offset, &ms.vs.offset_expr)?;
+    Ok(planner.push_selector(metric_name, matchers, Some(range_ms), offset, at_ms))
 }
 
 /// Plans a range-vector function's argument (issue #83): a bare matrix
@@ -944,6 +1136,38 @@ fn plan_range_source(
     }
 }
 
+/// Issue #84: gates (before any resolution) and resolves a subquery's
+/// `(range_ms, step_ms, offset_ms)`. Deliberately `#[inline(never)]` and
+/// out of [`plan_subquery`]: that function sits on the plan recursion
+/// cycle (`plan_expr -> plan_call -> plan_range_source -> plan_subquery`),
+/// whose per-level debug-build frame budget is what sizes
+/// [`MAX_SUBQUERY_DEPTH`] against the 2 MiB test-thread stack — this
+/// resolution work must not ride every recursion frame.
+#[inline(never)]
+fn resolve_subquery_fields(
+    planner: &Planner,
+    sq: &SubqueryExpr,
+) -> Result<(i64, i64, i64), PromqlError> {
+    gate_duration_expr(&sq.range_expr, planner.experimental)?;
+    gate_duration_expr(&sq.step_expr, planner.experimental)?;
+    gate_duration_expr(&sq.offset_expr, planner.experimental)?;
+    let range_ms = planner.resolve_range_ms(sq.range, &sq.range_expr)?;
+    let step_ms = match &sq.step_expr {
+        Some(e) => resolve_duration_expr(e, planner.step_ms, planner.query_range_ms(), false)?,
+        None => sq.step.map(duration_ms).unwrap_or(DEFAULT_SUBQUERY_STEP_MS),
+    };
+    // The parser rejects zero duration literals and the #84 resolver
+    // rejects non-positive resolved expressions; kept total so the
+    // evaluator's epoch-grid arithmetic can never divide by zero.
+    if step_ms <= 0 || range_ms <= 0 {
+        return Err(unsupported(
+            "subquery with a non-positive range or step".to_string(),
+        ));
+    }
+    let offset = planner.resolve_offset_ms(&sq.offset, &sq.offset_expr)?;
+    Ok((range_ms, step_ms, offset))
+}
+
 /// Plans a subquery `inner[range:step]` (issue #83). The inner expression
 /// is walked under the widened/shifted [`SubqueryCtx`] (own `@` replaces
 /// the enclosing context — the sub-tree is step-invariant; otherwise
@@ -956,16 +1180,7 @@ fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPla
             "subquery nesting deeper than {MAX_SUBQUERY_DEPTH} levels"
         )));
     }
-    let range_ms = duration_ms(sq.range);
-    let step_ms = sq.step.map(duration_ms).unwrap_or(DEFAULT_SUBQUERY_STEP_MS);
-    // The vendored parser rejects zero durations; kept total so the
-    // evaluator's epoch-grid arithmetic can never divide by zero.
-    if step_ms <= 0 || range_ms <= 0 {
-        return Err(unsupported(
-            "subquery with a non-positive range or step".to_string(),
-        ));
-    }
-    let offset = offset_ms(&sq.offset);
+    let (range_ms, step_ms, offset) = resolve_subquery_fields(planner, sq)?;
     let at_ms = planner.resolve_at(&sq.at);
 
     let saved = planner.ctx;
@@ -2118,6 +2333,7 @@ mod tests {
         let expr = parser::Expr::MatrixSelector(parser::MatrixSelector {
             vs: parser::VectorSelector::from("foo"),
             range: std::time::Duration::from_secs(60),
+            range_expr: None,
         });
         let err = plan(&expr, params()).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
@@ -2879,6 +3095,294 @@ mod tests {
         }
     }
 
+    // --- Issue #84 (M6-08b): duration expressions ---
+
+    /// A 60s range query with a 10s step — `step()`/`range()` resolve to
+    /// non-zero values here.
+    fn range_params() -> PlanParams {
+        PlanParams {
+            start_ms: 1_000_000,
+            end_ms: 1_060_000,
+            step_ms: 10_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
+        }
+    }
+
+    /// The AC9 gate-off matrix: every non-literal duration-expression form
+    /// (`+ - * / % ^`, unary, parentheses — including a parenthesised
+    /// bare literal — `step()`, `range()`, `min_of`, `max_of`) × every
+    /// position (range selector, subquery range, subquery step, and the
+    /// vector/matrix/subquery `offset`). Note the arithmetic forms in the
+    /// `offset` position require parentheses by the grammar itself
+    /// (`m offset 26m+4m` is `(m offset 26m) + 4m`, an expression-level
+    /// binary over a *literal* offset — upstream precedence).
+    fn gated_duration_queries() -> Vec<String> {
+        let range_forms = [
+            "26m+4m",
+            "34m-4m",
+            "2m*15",
+            "1h/2",
+            "1h30m%1h",
+            "2m^2",
+            "+step()",
+            "(30m)",
+            "step()",
+            "range()",
+            "min_of(step(),1h)",
+            "max_of(30m,1h)",
+        ];
+        let offset_forms = [
+            "(26m+4m)",
+            "(34m-4m)",
+            "(2m*15)",
+            "(1h/2)",
+            "(1h30m%1h)",
+            "(2^2)",
+            "-step()",
+            "+range()",
+            "(100)",
+            "step()",
+            "range()",
+            "min_of(step(),1s)",
+            "-min_of(step(),1s)",
+            "max_of(3s,1s)",
+        ];
+        let mut queries = Vec::new();
+        for f in range_forms {
+            queries.push(format!("rate(m[{f}])"));
+            // The subquery-range slot needs a digit before the colon (the
+            // lexer's got-duration rule, upstream v3.13 parity — a bare
+            // `m[step():10s]` is a lex error there too), so the
+            // digit-free forms ride an added `+0s` term.
+            if f.contains(|c: char| c.is_ascii_digit()) {
+                queries.push(format!("max_over_time(m[{f}:10s])"));
+            } else {
+                queries.push(format!("max_over_time(m[{f}+0s:10s])"));
+            }
+            queries.push(format!("max_over_time(m[30m:{f}])"));
+        }
+        for f in offset_forms {
+            queries.push(format!("m offset {f}"));
+        }
+        // The matrix-selector and subquery offset positions.
+        queries.push("rate(m[5m] offset step())".to_string());
+        queries.push("max_over_time(m[10s:5s] offset (5s-8))".to_string());
+        queries
+    }
+
+    /// AC9, disabled lane: every non-literal form × position is rejected
+    /// under `experimental_functions: false`, with the pinned upstream
+    /// parse.go substring in the construct.
+    #[test]
+    fn duration_expressions_are_unsupported_without_the_experimental_flag() {
+        for query in gated_duration_queries() {
+            let expr = parse(&query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let err = plan(&expr, params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert!(
+                    construct.contains("experimental duration expression is not enabled"),
+                    "{query}: error must carry the pinned upstream substring, got {construct:?}"
+                ),
+                other => panic!("{query}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC9, companion: plain and sign-folded literals in the same
+    /// positions never trip the gate — they resolve to the concrete
+    /// fields at parse time.
+    #[test]
+    fn literal_durations_plan_without_the_experimental_flag() {
+        for query in [
+            "rate(m[1800])",
+            "rate(m[30m])",
+            "m offset -4",
+            "m offset 300",
+            "m offset -(5)",
+            "m offset +(5)",
+            "max_over_time(m[30m:15s])",
+            "max_over_time(m[1800:15])",
+        ] {
+            let expr = parse(query).unwrap();
+            assert!(plan(&expr, params()).is_ok(), "{query}");
+        }
+    }
+
+    /// AC9, enabled lane: the whole gate-off matrix plans and resolves
+    /// under `experimental_functions: true` (a range query, so
+    /// `step()`/`range()` are non-zero).
+    #[test]
+    fn duration_expressions_plan_with_the_experimental_flag() {
+        for query in gated_duration_queries() {
+            let expr = parse(&query).unwrap();
+            let p = plan(&expr, range_params());
+            assert!(p.is_ok(), "{query}: {p:?}");
+        }
+    }
+
+    /// AC7, the Tier-1 plan-equality perf gate: duration resolution is
+    /// plan-time constant folding — the resulting `QueryPlan` is
+    /// byte-identical to the one the equivalent literal produces, so the
+    /// unchanged fetch machinery sees zero shape change.
+    #[test]
+    fn duration_expressions_fold_to_the_identical_literal_plan() {
+        let expr_a = parse("changes(http_requests[26m+4m])").unwrap();
+        let expr_b = parse("changes(http_requests[30m])").unwrap();
+        assert_eq!(
+            plan(&expr_a, params_experimental()).unwrap(),
+            plan(&expr_b, params_experimental()).unwrap(),
+        );
+
+        let expr_a = parse("count_over_time(m[step()])").unwrap();
+        let expr_b = parse("count_over_time(m[10s])").unwrap();
+        assert_eq!(
+            plan(&expr_a, range_params()).unwrap(),
+            plan(&expr_b, range_params()).unwrap(),
+        );
+    }
+
+    /// Resolution semantics against upstream durations.go: offsets may be
+    /// negative, `step()`/`range()` read the query params, arithmetic
+    /// folds in float seconds and truncates to whole ms.
+    #[test]
+    fn duration_expressions_resolve_offsets_and_subquery_fields() {
+        let expr = parse("m offset -min_of(step(), 1s)").unwrap();
+        let p = plan(&expr, range_params()).unwrap();
+        assert_eq!(p.selectors[0].offset_ms, -1_000);
+
+        let expr = parse("m offset range()").unwrap();
+        let p = plan(&expr, range_params()).unwrap();
+        assert_eq!(p.selectors[0].offset_ms, 60_000);
+
+        let expr = parse("max_over_time(m[29s+1s:((((8 - 2) / 3) * 7s) % 4) + 8000ms])").unwrap();
+        let p = plan(&expr, range_params()).unwrap();
+        match &p.root {
+            PlanExpr::OverTime {
+                source: RangeSource::Subquery(sq),
+                ..
+            } => {
+                assert_eq!(sq.range_ms, 30_000);
+                assert_eq!(sq.step_ms, 10_000);
+            }
+            other => panic!("expected subquery source, got {other:?}"),
+        }
+    }
+
+    /// Instant query: `step()` and `range()` are 0 — `offset range()` is
+    /// offset 0 (the corpus-pinned case), while a zero-width range errors
+    /// with the upstream resolve-time message.
+    #[test]
+    fn duration_expressions_on_an_instant_query_resolve_step_and_range_to_zero() {
+        let expr = parse("m offset range()").unwrap();
+        let p = plan(&expr, params_experimental()).unwrap();
+        assert_eq!(p.selectors[0].offset_ms, 0);
+
+        let expr = parse("rate(m[range()])").unwrap();
+        let err = plan(&expr, params_experimental()).unwrap_err();
+        assert_eq!(
+            err,
+            PromqlError::Parse("duration must be greater than 0".to_string())
+        );
+    }
+
+    /// Resolve-time guards (upstream durations.go verbatim): a *computed*
+    /// zero divisor/modulus, a non-positive range, and an out-of-range
+    /// result — the literal-zero forms are already parse errors.
+    #[test]
+    fn duration_expression_resolve_errors_carry_upstream_messages() {
+        for (query, want) in [
+            ("rate(m[30m/(10-10)])", "division by zero"),
+            ("rate(m[30m%(10-10)])", "modulo by zero"),
+            ("rate(m[-step()])", "duration must be greater than 0"),
+            ("m offset (9e9*9e9)", "duration is out of range"),
+        ] {
+            let expr = parse(query).unwrap();
+            let err = plan(&expr, range_params()).unwrap_err();
+            assert_eq!(
+                err,
+                PromqlError::Parse(want.to_string()),
+                "{query}: expected the upstream resolve-time message"
+            );
+        }
+    }
+
+    /// #84 review round 1: parenthesised/unary-signed numeric literals
+    /// keep upstream's *literal* semantics end to end — (a) the literal
+    /// guards fire at parse time straight through parentheses/signs,
+    /// (b) the selector-boundary conversion is the literal
+    /// nanosecond-rounding path (a sub-millisecond literal is 1 ms
+    /// whether parenthesised or not — never the expression path's
+    /// truncation to 0), and (c) the parenthesised form is still
+    /// experimental-gated (upstream's `paren_duration_expr` gates before
+    /// unwrapping the literal — verified against the pinned oracle).
+    #[test]
+    fn parenthesized_literals_keep_upstream_literal_semantics() {
+        // (a) literal guards through parens/signs are PARSE errors.
+        for (query, want) in [
+            ("rate(m[(0)])", "duration must be greater than 0"),
+            ("rate(m[-(5)])", "duration must be greater than 0"),
+            ("rate(m[5s/(0)])", "division by zero"),
+            ("rate(m[5s%(0)])", "modulo by zero"),
+        ] {
+            let err = parse(query).unwrap_err();
+            assert_eq!(
+                err,
+                PromqlError::Parse(want.to_string()),
+                "{query}: expected the upstream parse-time literal guard"
+            );
+        }
+
+        // (b) sub-millisecond literal rounding: byte-identical plans and
+        // a 1 ms range for both spellings (0.0009999996 s rounds to
+        // 1_000_000 ns == 1 ms on the literal path; the expression
+        // path's `duration*1000` truncation would make the wrapped form
+        // 0 ms and error).
+        let wrapped = parse("rate(m[(0.0009999996)])").unwrap();
+        let plain = parse("rate(m[0.0009999996])").unwrap();
+        let wrapped_plan = plan(&wrapped, params_experimental()).unwrap();
+        assert_eq!(wrapped_plan, plan(&plain, params_experimental()).unwrap());
+        assert_eq!(wrapped_plan.selectors[0].range_ms, Some(1));
+        // ... and at a large in-range magnitude (~285 years): the
+        // resolver's conversion must be integer-ns then integer-ms,
+        // exactly like the bare-literal `Duration::from_nanos` +
+        // `as_millis` path — a float millisecond divide is 1 ms off
+        // here (#84 review round 2).
+        let wrapped = parse("rate(m[(9000000000.008)])").unwrap();
+        let plain = parse("rate(m[9000000000.008])").unwrap();
+        assert_eq!(
+            plan(&wrapped, params_experimental()).unwrap(),
+            plan(&plain, params_experimental()).unwrap(),
+        );
+        // The plain-literal equivalents of the (a) whole-expression
+        // guards, for symmetry: parenthesised 30m folds to the same plan
+        // as the bare literal.
+        let expr_a = parse("rate(m[(30m)])").unwrap();
+        let expr_b = parse("rate(m[30m])").unwrap();
+        assert_eq!(
+            plan(&expr_a, params_experimental()).unwrap(),
+            plan(&expr_b, params_experimental()).unwrap(),
+        );
+        let expr_a = parse("m offset (5)").unwrap();
+        let expr_b = parse("m offset 5").unwrap();
+        assert_eq!(
+            plan(&expr_a, params_experimental()).unwrap(),
+            plan(&expr_b, params_experimental()).unwrap(),
+        );
+
+        // (c) the parenthesised literal is still gated when the flag is
+        // off — upstream parity (`foo[(5m)]` flag-off is the gate error
+        // at the pin).
+        let expr = parse("rate(m[(5m)])").unwrap();
+        match plan(&expr, params()).unwrap_err() {
+            PromqlError::Unsupported { construct } => assert!(
+                construct.contains("experimental duration expression is not enabled"),
+                "got {construct:?}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
     #[test]
     fn plans_histogram_quantile() {
         let expr = parse("histogram_quantile(0.9, rate(x_bucket[5m]))").unwrap();
@@ -3018,6 +3522,7 @@ mod tests {
         let matrix = parser::Expr::MatrixSelector(parser::MatrixSelector {
             vs: parser::VectorSelector::from("up"),
             range: std::time::Duration::from_secs(300),
+            range_expr: None,
         });
         let group_expr = parser::Expr::Aggregate(parser::AggregateExpr {
             op: token::TokenType::new(token::T_GROUP),
@@ -3102,6 +3607,7 @@ mod tests {
         let matrix = parser::Expr::MatrixSelector(parser::MatrixSelector {
             vs: parser::VectorSelector::from("up"),
             range: std::time::Duration::from_secs(300),
+            range_expr: None,
         });
         let paren_wrapped = parser::Expr::Paren(parser::ParenExpr {
             expr: Box::new(matrix),

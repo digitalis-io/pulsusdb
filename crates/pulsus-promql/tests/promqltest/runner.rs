@@ -105,11 +105,19 @@ fn walk(expr: &Expr, c: &mut Constructs) {
             if sq.at.is_some() {
                 c.features.insert("at-modifier".to_string());
             }
+            // Issue #84 (M6-08b): any non-literal duration expression in
+            // the subquery range/step/offset positions.
+            if sq.range_expr.is_some() || sq.step_expr.is_some() || sq.offset_expr.is_some() {
+                c.features.insert("duration-expression".to_string());
+            }
             walk(&sq.expr, c);
         }
         Expr::VectorSelector(vs) => {
             if vs.at.is_some() {
                 c.features.insert("at-modifier".to_string());
+            }
+            if vs.offset_expr.is_some() {
+                c.features.insert("duration-expression".to_string());
             }
             if !vs.matchers.or_matchers.is_empty() {
                 // The UTF-8-quoted label-name-or selector syntax is the
@@ -121,6 +129,9 @@ fn walk(expr: &Expr, c: &mut Constructs) {
         Expr::MatrixSelector(ms) => {
             if ms.vs.at.is_some() {
                 c.features.insert("at-modifier".to_string());
+            }
+            if ms.range_expr.is_some() || ms.vs.offset_expr.is_some() {
+                c.features.insert("duration-expression".to_string());
             }
             if !ms.vs.matchers.or_matchers.is_empty() {
                 c.features.insert("utf8-label-names".to_string());

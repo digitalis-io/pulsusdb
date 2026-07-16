@@ -551,6 +551,12 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // materialize-once epoch-anchored subquery evaluation.
             "at-modifier",
             "subquery",
+            // M6-08b (issue #84): duration expressions — grammar patch G1
+            // on the vendored parser plus plan-time constant folding,
+            // gated behind promql-experimental-functions (the pinned
+            // v3.13.0 promql-duration-expr feature flag is OFF by
+            // default).
+            "duration-expression",
         ])
     );
 }

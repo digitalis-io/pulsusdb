@@ -100,6 +100,11 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.enable-remote-write-receiver
+      # Issue #84 (M6-08b): duration expressions are gated behind this
+      # feature flag at v3.13.0 (OFF by default) — the oracle's feature
+      # set must match the pulsus experimental gate the differential
+      # harness evaluates under.
+      - --enable-feature=promql-duration-expr
     volumes:
       - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:

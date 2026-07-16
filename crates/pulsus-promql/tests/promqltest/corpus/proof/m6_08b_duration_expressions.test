@@ -1,0 +1,104 @@
+# Issue #84 (M6-08b) proof corpus — hand-authored witnesses for duration
+# expressions (the corpus-gated home is the fully-executed
+# `upstream/duration_expression.test`; this file pins the precedence and
+# guard-message goldens that matter most). Semantics ported from
+# Prometheus v3.13.0 @ 40af9c2 (`promql/durations.go`,
+# `promql/parser/generated_parser.y`'s `offset_duration_expr` split —
+# duration expressions are gated there behind
+# `--enable-feature=promql-duration-expr`; this runner, like upstream's
+# promqltest, evaluates with the gate ON).
+#
+# Pinned semantics this file exercises end-to-end:
+#   - OFFSET TERMINATES AT THE FIRST BARE TERM (the split
+#     `offset_duration_expr` non-terminal): `offset 100 + 2` is
+#     `(m offset 100) + 2` and `offset -2 ^ 2` is `(m offset -2) ^ 2` —
+#     the trailing operator binds at expression level, NOT inside the
+#     offset. Parenthesise to keep it in the offset: `offset (100 + 2)`.
+#   - range arithmetic folds at plan time to the exact literal
+#     equivalent: `[2m*(10+5)]` == `[30m]`, `[24m+((1.5*2m)+2m)]` ==
+#     `[30m]`.
+#   - `step()` resolves to the query step, `range()` to `end - start`
+#     (0 on an instant query), `min_of`/`max_of` nest.
+#   - division/modulo by a literal zero, a non-positive literal range,
+#     and an out-of-range literal are PARSE errors with the pinned
+#     upstream messages.
+
+# v changes 3 times on /foo, 4 on /bar, 0 on /biz within (20m, 50m].
+load 5m
+	http_requests{path="/foo"}	1 2 3 0 1 0 0 1 2 0
+	http_requests{path="/bar"}	1 2 3 4 5 1 2 3 4 5
+	http_requests{path="/biz"}	0 0 0 0 0 1 1 1 1 1
+
+# --- Range arithmetic folds to the [30m] literal plan (AC6/AC7). ---
+eval instant at 50m changes(http_requests[30m])
+	{path="/foo"} 3
+	{path="/bar"} 4
+	{path="/biz"} 0
+
+eval instant at 50m changes(http_requests[2m*(10+5)])
+	{path="/foo"} 3
+	{path="/bar"} 4
+	{path="/biz"} 0
+
+eval instant at 50m changes(http_requests[24m+((1.5*2m)+2m)])
+	{path="/foo"} 3
+	{path="/bar"} 4
+	{path="/biz"} 0
+
+clear
+
+# v(t) = t/1 at 1s resolution — offset goldens are arithmetic-exact.
+load 1s
+	metric1_total 0+1x1000
+
+# --- Offset precedence (the split-grammar traps, AC6). ---
+# Parenthesised: the whole sum is the offset (102s back => v = 898).
+eval instant at 1000s metric1_total offset (100 + 2)
+	metric1_total{} 898
+
+# Unparenthesised: `(m offset 100) + 2` => 900 + 2 = 902 (name dropped by
+# the expression-level arithmetic).
+eval instant at 1000s metric1_total offset 100 + 2
+	{} 902
+
+# `offset -2 ^ 2` is `(m offset -2) ^ 2` => (998 + 2)^2.
+eval instant at 998s metric1_total offset -2 ^ 2
+	{} 1000000
+
+# Parenthesised `(-2 ^ 2)` folds inside the offset: -(2^2) = -4s forward.
+eval instant at 996s metric1_total offset (-2 ^ 2)
+	metric1_total{} 1000
+
+# --- step() / range() / min_of / max_of (AC6). ---
+eval range from 50s to 60s step 10s count_over_time(metric1_total[step()])
+	{} 10 10
+
+eval range from 50s to 60s step 5s count_over_time(metric1_total[min_of(step()+1,1h)])
+	{} 6 6 6
+
+eval range from 50s to 60s step 5s count_over_time(metric1_total[max_of(min_of(step()+1,1h),1ms)])
+	{} 6 6 6
+
+eval range from 50s to 60s step 5s metric1_total offset step()
+	metric1_total{} 45 50 55
+
+# range() = end - start = 10s.
+eval range from 50s to 60s step 5s metric1_total offset range()
+	metric1_total{} 40 45 50
+
+# On an instant query range() = 0 — offset 0.
+eval instant at 50s metric1_total offset range()
+	metric1_total{} 50
+
+# --- Guard messages (pinned upstream text, AC6). ---
+eval_fail instant at 0 rate(metric1_total[5s/0d])
+	expected_fail_message division by zero
+
+eval_fail instant at 0 rate(metric1_total[5s%0d])
+	expected_fail_message modulo by zero
+
+eval_fail instant at 0 rate(metric1_total[-1])
+	expected_fail_message duration must be greater than 0
+
+eval_fail instant at 0 metric1_total offset 9.5e10
+	expected_fail_message duration out of range

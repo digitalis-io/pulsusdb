@@ -34,6 +34,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_06_aggregation_operators.test",
     "m6_07_operator_matrix.test",
     "m6_08a_at_subquery.test",
+    "m6_08b_duration_expressions.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {

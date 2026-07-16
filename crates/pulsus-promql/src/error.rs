@@ -18,17 +18,23 @@ use thiserror::Error;
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum PromqlError {
     /// The vendored parser's own error text, carried verbatim (see the
-    /// module doc's pinned contract).
+    /// module doc's pinned contract). Issue #84 rides the same
+    /// verbatim-text contract for plan-time duration-expression
+    /// *resolution* errors (`plan.rs::resolve_duration_expr`), which
+    /// mirror upstream `promql/durations.go` messages ("division by
+    /// zero", "duration must be greater than 0", "duration is out of
+    /// range", ...) with no added prefix.
     #[error("{0}")]
     Parse(String),
 
     /// An out-of-subset function, operator, or modifier — named exactly so
     /// the caller never has to guess what silently failed (architect plan:
     /// "no silent wrong answer"). Covers everything outside the
-    /// implemented subset: the `@` modifier, subqueries,
-    /// duration-expression arithmetic, native-histogram arithmetic,
-    /// gated experimental constructs with the flag off, and every
-    /// unimplemented function.
+    /// implemented subset: native-histogram arithmetic, gated
+    /// experimental constructs with the flag off (including issue #84's
+    /// duration expressions, whose gate-off `construct` carries upstream's
+    /// "experimental duration expression is not enabled" verbatim), and
+    /// every unimplemented function.
     #[error("not yet supported: {construct}")]
     Unsupported { construct: String },
 

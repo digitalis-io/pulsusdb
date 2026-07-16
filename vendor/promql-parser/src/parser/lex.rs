@@ -65,7 +65,12 @@ struct Context {
     brace_open: bool,   // Whether a { is opened.
     bracket_open: bool, // Whether a [ is opened.
     got_colon: bool,    // Whether we got a ':' after [ was opened.
-    eof: bool,          // Whether we got end of file
+    // PulsusDB patch (docs/decisions/0003, grammar patch G1): whether a
+    // number/duration literal was scanned after [ was opened — upstream
+    // v3.13's `gotDuration` (`lexDurationExpr` requires one before the
+    // subquery ':').
+    got_duration: bool,
+    eof: bool, // Whether we got end of file
 }
 
 impl Context {
@@ -80,6 +85,7 @@ impl Context {
             brace_open: false,
             bracket_open: false,
             got_colon: false,
+            got_duration: false,
             eof: false,
         }
     }
@@ -188,6 +194,18 @@ impl Lexer {
 
     fn reset_colon_scanned(&mut self) {
         self.ctx.got_colon = false;
+    }
+
+    fn is_duration_scanned(&self) -> bool {
+        self.ctx.got_duration
+    }
+
+    fn set_duration_scanned(&mut self) {
+        self.ctx.got_duration = true;
+    }
+
+    fn reset_duration_scanned(&mut self) {
+        self.ctx.got_duration = false;
     }
 
     /// true only if paren depth less than MAX
@@ -368,6 +386,7 @@ impl Lexer {
             '}' => State::Err("unexpected right brace '}'".into()),
             '[' => {
                 self.reset_colon_scanned();
+                self.reset_duration_scanned();
                 self.dive_into_brackets();
                 State::Lexeme(T_LEFT_BRACKET)
             }
@@ -624,54 +643,93 @@ impl Lexer {
         }
     }
 
-    // this won't affect the cursor.
-    fn last_char_matches<F>(&mut self, f: F) -> bool
-    where
-        F: Fn(char) -> bool,
-    {
-        // if cursor is at the beginning, then do nothing.
-        if !self.backup() {
-            return false;
-        }
-        let matched = matches!(self.peek(), Some(ch) if f(ch));
-        self.pop();
-        matched
-    }
-
-    // this won't affect the cursor.
-    fn is_colon_the_first_char_in_brackets(&mut self) -> bool {
-        // note: colon has already been consumed, so first backup
-        self.backup();
-        let matched = self.last_char_matches(|ch| ch == '[');
-        self.pop();
-        matched
-    }
-
     // left brackets has already be consumed.
+    //
+    // PulsusDB patch (docs/decisions/0003, grammar patch G1): bracket
+    // interiors are duration *expressions* in Prometheus v3.13
+    // (`lex.go::lexDurationExpr` at the pinned conformance SHA) — the
+    // arithmetic operators, parentheses, comma, and the duration keywords
+    // `step`/`range`/`max_of`/`min_of` are all legal here, not only bare
+    // number/duration literals and the subquery colon.
     fn inside_brackets(&mut self) -> State {
         match self.pop() {
             Some(ch) if ch.is_ascii_whitespace() => State::Space,
             Some(':') => {
-                if self.is_colon_scanned() {
-                    return State::Err("unexpected second colon(:) in brackets".into());
+                if !self.is_duration_scanned() {
+                    return State::Err(
+                        "unexpected colon before duration in duration expression".into(),
+                    );
                 }
-
-                if self.is_colon_the_first_char_in_brackets() {
-                    return State::Err("expect duration before first colon(:) in brackets".into());
+                if self.is_colon_scanned() {
+                    return State::Err("unexpected repeated colon in duration expression".into());
                 }
 
                 self.set_colon_scanned();
                 State::Lexeme(T_COLON)
             }
-            Some(ch) if ch.is_ascii_digit() => self.accept_number_or_duration(),
+            Some('(') => {
+                if self.inc_paren_depth() {
+                    return State::Lexeme(T_LEFT_PAREN);
+                }
+                State::Err("too many left parentheses".into())
+            }
+            Some(')') => {
+                if self.is_paren_balanced() {
+                    return State::Err("unexpected right parenthesis ')'".into());
+                }
+                if self.dec_paren_depth() {
+                    return State::Lexeme(T_RIGHT_PAREN);
+                }
+                State::Err("unexpected right parenthesis ')'".into())
+            }
+            Some('+') => State::Lexeme(T_ADD),
+            Some('-') => State::Lexeme(T_SUB),
+            Some('*') => State::Lexeme(T_MUL),
+            Some('/') => State::Lexeme(T_DIV),
+            Some('%') => State::Lexeme(T_MOD),
+            Some('^') => State::Lexeme(T_POW),
+            Some(',') => State::Lexeme(T_COMMA),
+            Some(ch) if ch.is_ascii_digit() => {
+                self.set_duration_scanned();
+                self.accept_number_or_duration()
+            }
+            Some('.') if matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) => {
+                self.set_duration_scanned();
+                // `accept_number_or_duration` backs up one char first, so
+                // hand it the '.' exactly like the digit branch above.
+                State::NumberOrDuration
+            }
+            Some(ch) if is_duration_keyword_start_char(ch) => self.scan_duration_keyword(ch),
             Some(']') => {
                 self.jump_outof_brackets();
                 self.reset_colon_scanned();
+                self.reset_duration_scanned();
                 State::Lexeme(T_RIGHT_BRACKET)
             }
-            Some('[') => State::Err("unexpected left brace '[' inside brackets".into()),
-            Some(ch) => State::Err(format!("unexpected character inside brackets: '{ch}'")),
-            None => State::Err("unexpected end of input inside brackets".into()),
+            Some(ch) => State::Err(format!(
+                "unexpected character in duration expression: '{ch}'"
+            )),
+            None => State::Err("unexpected end of input in duration expression".into()),
+        }
+    }
+
+    /// Upstream v3.13 `lex.go::scanDurationKeyword`: absorbs the rest of an
+    /// alphabetic word and emits it as one of the four duration-keyword
+    /// tokens (case-insensitive), or errors on any other word. Only
+    /// reachable inside brackets — outside them the ordinary keyword table
+    /// handles these names.
+    fn scan_duration_keyword(&mut self, first: char) -> State {
+        while matches!(self.peek(), Some(ch) if is_alpha(ch)) {
+            self.pop();
+        }
+        match self.lexeme_string().to_lowercase().as_str() {
+            "step" => State::Lexeme(T_STEP),
+            "range" => State::Lexeme(T_RANGE),
+            "max_of" => State::Lexeme(T_MAX_OF),
+            "min_of" => State::Lexeme(T_MIN_OF),
+            _ => State::Err(format!(
+                "unexpected character in duration expression: '{first}'"
+            )),
         }
     }
 
@@ -704,6 +762,12 @@ fn is_alpha_numeric(ch: char) -> bool {
 
 fn is_alpha(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphabetic()
+}
+
+/// Upstream v3.13 `lex.go::isDurationKeywordStartChar`: the lowercase first
+/// letters of `step`/`range`/`max_of`/`min_of`.
+fn is_duration_keyword_start_char(ch: char) -> bool {
+    matches!(ch.to_ascii_lowercase(), 's' | 'r' | 'm')
 }
 
 pub(crate) fn is_label(s: &str) -> bool {
@@ -1192,12 +1256,12 @@ mod tests {
             (
                 "[",
                 vec![(T_LEFT_BRACKET, 0, 1)],
-                Some("unexpected end of input inside brackets"),
+                Some("unexpected end of input in duration expression"),
             ),
             (
                 "[[",
                 vec![(T_LEFT_BRACKET, 0, 1)],
-                Some("unexpected left brace '[' inside brackets"),
+                Some("unexpected character in duration expression: '['"),
             ),
             (
                 "[]]",
@@ -1207,7 +1271,7 @@ mod tests {
             (
                 "[[]]",
                 vec![(T_LEFT_BRACKET, 0, 1)],
-                Some("unexpected left brace '[' inside brackets"),
+                Some("unexpected character in duration expression: '['"),
             ),
             ("]", vec![], Some("unexpected right bracket ']'")),
         ];
@@ -1398,7 +1462,7 @@ mod tests {
                     (T_COLON, 23, 1),
                     (T_DURATION, 24, 2),
                 ],
-                Some("unexpected second colon(:) in brackets"),
+                Some("unexpected repeated colon in duration expression"),
             ),
             (
                 r#"test:name{on!~"bar"}[4m:4s:]"#,
@@ -1414,7 +1478,7 @@ mod tests {
                     (T_COLON, 23, 1),
                     (T_DURATION, 24, 2),
                 ],
-                Some("unexpected second colon(:) in brackets"),
+                Some("unexpected repeated colon in duration expression"),
             ),
             (
                 r#"test:name{on!~"bar"}[4m::]"#,
@@ -1429,7 +1493,7 @@ mod tests {
                     (T_DURATION, 21, 2),
                     (T_COLON, 23, 1),
                 ],
-                Some("unexpected second colon(:) in brackets"),
+                Some("unexpected repeated colon in duration expression"),
             ),
             (
                 r#"test:name{on!~"bar"}[:4s]"#,
@@ -1442,7 +1506,7 @@ mod tests {
                     (T_RIGHT_BRACE, 19, 1),
                     (T_LEFT_BRACKET, 20, 1),
                 ],
-                Some("expect duration before first colon(:) in brackets"),
+                Some("unexpected colon before duration in duration expression"),
             ),
         ];
         assert_matches(cases);

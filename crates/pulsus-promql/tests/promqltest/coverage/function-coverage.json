@@ -991,9 +991,12 @@
     },
     {
       "name": "duration-expression",
-      "status": "scheduled",
-      "issue": "M6-08",
-      "probe": "rate(m[26m+4m])"
+      "status": "implemented",
+      "probe": "rate(m[26m+4m])",
+      "witness": {
+        "file": "upstream/duration_expression.test",
+        "query": "changes(http_requests[26m+4m])"
+      }
     },
     {
       "name": "utf8-label-names",

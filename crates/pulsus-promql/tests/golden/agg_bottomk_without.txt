@@ -13,6 +13,7 @@ Aggregate(
                     or_matchers: [],
                 },
                 offset: None,
+                offset_expr: None,
                 at: None,
             },
         ),

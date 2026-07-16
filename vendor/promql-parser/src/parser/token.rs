@@ -84,6 +84,18 @@ lazy_static! {
             // Preprocessors.
             ("start", T_START),
             ("end", T_END),
+            // PulsusDB patch (docs/decisions/0003, grammar patch G1):
+            // Prometheus v3.13.0 (`promql/parser/lex.go`'s `key` map at the
+            // pinned conformance SHA) reserves the duration-expression
+            // keywords `step`/`range`/`max_of`/`min_of`; they stay usable
+            // as metric/label names via the `metric_identifier`/
+            // `maybe_label` grammar arms (the upstream-handled PATCH-1
+            // hazard) and as scalar function calls via the
+            // `max_of_min_of function_call_body` production.
+            ("step", T_STEP),
+            ("range", T_RANGE),
+            ("max_of", T_MAX_OF),
+            ("min_of", T_MIN_OF),
 
             // Special numbers.
             ("inf", T_NUMBER),
@@ -183,6 +195,9 @@ pub(crate) fn token_display(id: TokenId) -> &'static str {
         T_START => "start",
         T_END => "end",
         T_STEP => "step",
+        T_RANGE => "range",
+        T_MAX_OF => "max_of",
+        T_MIN_OF => "min_of",
         T_PREPROCESSOR_END => "preprocessors_end",
 
         T_STARTSYMBOLS_START
@@ -347,16 +362,19 @@ mod tests {
         assert_eq!(token_display(T_START), "start");
         assert_eq!(token_display(T_END), "end");
         assert_eq!(token_display(T_STEP), "step");
+        assert_eq!(token_display(T_RANGE), "range");
+        assert_eq!(token_display(T_MAX_OF), "max_of");
+        assert_eq!(token_display(T_MIN_OF), "min_of");
         assert_eq!(token_display(T_PREPROCESSOR_END), "preprocessors_end");
 
         // if new token added in promql.y, this has to be updated
-        for i in 80..=85 {
+        for i in 83..=88 {
             assert_eq!(token_display(i), "not used");
         }
 
         // All tokens are now tested individually above
 
-        for i in 86..=u16::MAX {
+        for i in 89..=u16::MAX {
             assert_eq!(token_display(i), "unknown token");
         }
     }
@@ -406,6 +424,10 @@ mod tests {
         ));
         assert!(matches!(get_keyword_token("inf"), Some(T_NUMBER)));
         assert!(matches!(get_keyword_token("nan"), Some(T_NUMBER)));
+        assert!(matches!(get_keyword_token("step"), Some(T_STEP)));
+        assert!(matches!(get_keyword_token("range"), Some(T_RANGE)));
+        assert!(matches!(get_keyword_token("max_of"), Some(T_MAX_OF)));
+        assert!(matches!(get_keyword_token("min_of"), Some(T_MIN_OF)));
 
         // not keywords
         assert!(get_keyword_token("at").is_none());

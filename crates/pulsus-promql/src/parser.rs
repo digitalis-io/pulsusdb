@@ -10,8 +10,8 @@ pub use promql_parser::label::{
 };
 pub use promql_parser::parser::value::ValueType;
 pub use promql_parser::parser::{
-    AggregateExpr, AtModifier, BinModifier, BinaryExpr, Call, Expr, LabelModifier, MatrixSelector,
-    NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr,
+    AggregateExpr, AtModifier, BinModifier, BinaryExpr, Call, DurationExpr, Expr, LabelModifier,
+    MatrixSelector, NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr, UnaryExpr,
     VectorMatchCardinality, VectorSelector, token,
 };
 

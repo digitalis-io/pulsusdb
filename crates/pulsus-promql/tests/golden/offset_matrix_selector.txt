@@ -13,8 +13,10 @@ MatrixSelector(
                     300s,
                 ),
             ),
+            offset_expr: None,
             at: None,
         },
         range: 300s,
+        range_expr: None,
     },
 )

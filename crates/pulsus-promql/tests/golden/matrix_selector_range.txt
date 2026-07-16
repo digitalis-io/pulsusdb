@@ -9,8 +9,10 @@ MatrixSelector(
                 or_matchers: [],
             },
             offset: None,
+            offset_expr: None,
             at: None,
         },
         range: 300s,
+        range_expr: None,
     },
 )

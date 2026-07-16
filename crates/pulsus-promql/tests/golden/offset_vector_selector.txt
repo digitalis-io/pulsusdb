@@ -12,6 +12,7 @@ VectorSelector(
                 300s,
             ),
         ),
+        offset_expr: None,
         at: None,
     },
 )

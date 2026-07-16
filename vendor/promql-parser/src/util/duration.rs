@@ -83,9 +83,16 @@ pub fn parse_duration(ds: &str) -> Result<Duration, String> {
         return Err("empty duration string".into());
     }
 
-    if ds == "0" {
-        return Err("duration must be greater than 0".into());
-    }
+    // PulsusDB patch (docs/decisions/0003, grammar patch G1): a zero
+    // duration is *valid* here, exactly like upstream v3.13's
+    // `model.ParseDuration` — positivity is a grammar-position rule
+    // (promql.y's `positive_duration_expr` literal guard rejects a
+    // zero/negative range or subquery step with "duration must be greater
+    // than 0"), not a lexical one. The previous blanket zero-rejection in
+    // this function made `foo[5s/0d]` fail with the positivity message
+    // instead of upstream's "division by zero" (the `0d` literal must
+    // reach the grammar's division-by-literal-zero check), and rejected
+    // upstream-valid uses like `foo offset 0s` and `[30m+0s]` sub-terms.
 
     // the duration is float number of seconds
     if let Ok(float_duration) = ds.parse::<f64>() {
@@ -114,11 +121,7 @@ pub fn parse_duration(ds: &str) -> Result<Duration, String> {
                 .ok_or_else(|| "duration overflowed".into())
         });
 
-    if matches!(dur, Ok(d) if d == Duration::ZERO) {
-        Err("duration must be greater than 0".into())
-    } else {
-        dur
-    }
+    dur
 }
 
 /// display Duration in Prometheus format
@@ -245,9 +248,20 @@ mod tests {
 
     #[test]
     fn test_invalid_duration() {
-        let ds = vec!["1y1m1d", "-1w", "1.5d", "d", "", "0", "0w", "0s"];
+        let ds = vec!["1y1m1d", "-1w", "1.5d", "d", ""];
         for d in ds {
             assert!(parse_duration(d).is_err(), "{d} is invalid duration!");
+        }
+    }
+
+    // PulsusDB patch (docs/decisions/0003, grammar patch G1): zero
+    // durations are lexically valid (upstream model.ParseDuration parity);
+    // positivity is enforced by the grammar's positive_duration_expr
+    // literal guard instead.
+    #[test]
+    fn test_zero_duration_is_valid() {
+        for d in ["0", "0w", "0s", "0d"] {
+            assert_eq!(parse_duration(d), Ok(Duration::ZERO), "{d} must parse");
         }
     }
 

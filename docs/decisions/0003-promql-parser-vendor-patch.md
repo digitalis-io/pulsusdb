@@ -1,6 +1,7 @@
 # ADR 0003: patch-and-vendor `promql-parser` (supersedes 0002's port fallback)
 
-Status: **Accepted** (2026-07-14)
+Status: **Accepted** (2026-07-14); **Amended** (2026-07-16, issue #84 —
+first grammar-production patch, see the Amendment section)
 Issue: [#31](https://github.com/digitalis-io/pulsusdb/issues/31)
 Supersedes: [0002](0002-promql-parser-selection.md)
 
@@ -76,7 +77,9 @@ wrong answer" failure mode this project exists to avoid.
 All 5 are leaf-level: a lexer state-machine bug, a semantic action routed
 through an already-existing (elsewhere-used) checked function, or a
 `Display` impl — **zero** touch a `promql.y` grammar production's tokens,
-alternatives, or precedence declarations. Full diffs, rationale, and
+alternatives, or precedence declarations. (This zero-grammar-productions
+invariant held as stated at acceptance time; as of issue #84 it no longer
+holds — see the Amendment section below.) Full diffs, rationale, and
 per-fix corpus inputs are in
 [`vendor/promql-parser/PATCHES.md`](../../vendor/promql-parser/PATCHES.md);
 summary:
@@ -153,10 +156,54 @@ On any `promql-parser` version bump or Prometheus reference-version bump:
   implementation environment, which has no outbound network access to
   open a GitHub PR).
 
+## Amendment (2026-07-16, issue #84 / M6-08b): the first grammar-production patch
+
+The original decision's "zero grammar productions touched" invariant no
+longer holds. Issue #84 (Prometheus v3.13 **duration expressions** —
+`[26m+4m]`, `[step()+1]`, `offset -min_of(step(),1s)`, `range()`) is the
+vendored fork's first **grammar-production patch** (`PATCHES.md` patch
+G1): new productions (`duration_expr`, `offset_duration_expr`,
+`positive_duration_expr`, `paren_duration_expr`,
+`number_duration_literal`, `max_of_min_of`, `unary_op`), three new tokens
+(`RANGE`, `MAX_OF`, `MIN_OF`) plus keyword-ization of `step`, a rewritten
+bracket-interior lexer mode (upstream `lexDurationExpr`), a
+`DurationExpr` AST type with `*_expr` fields on the selector nodes, and
+reconciled `%expect`/`%expect-rr` conflict counts.
+
+**Why a grammar patch is unavoidable here:** the feature *is* a grammar —
+upstream implements it as a set of new productions over new tokens with
+deliberate precedence-splitting (`offset_duration_expr` exists solely so
+`foo offset -2^2` parses as `(foo offset -2)^2`). There is no leaf
+lexer/`Display`/action seam that can express it; the alternative would be
+a from-scratch parser port, which this ADR already rejected on
+maintenance-cost/correctness-risk economics that only strengthen here
+(the corpus + golden + round-trip gate remains the regression net either
+way, and now also pins the 51 upstream `duration_expression.test` eval
+cases and the 26 formerly-allowlisted parser-corpus inputs as passing).
+
+Consequences for this ADR's standing rules:
+
+- The patch class taxonomy is now two-tier (leaf fixes 1–5 + grammar
+  patch G1), recorded in `PATCHES.md`. Leaf fix 3's `promql.y` half
+  (the `duration -> NUMBER` action) is superseded by G1's
+  `number_duration_literal` literal guards; its `parse_duration` bound
+  remains.
+- The re-vendor rule gains a caveat: G1 has no delete-on-upstream-fix
+  path short of upstream `promql-parser` itself implementing v3.13
+  duration expressions — on any bump, re-run the corpus gate and re-port
+  G1 rather than assuming it drops.
+- Upstream's `--enable-feature=promql-duration-expr` gate (OFF by
+  default at the pinned conformance SHA) is deliberately **not** in the
+  vendored parser (no options plumbing exists in `parse()`); PulsusDB
+  enforces it at plan time via `PlanParams::experimental_functions`
+  (`pulsus-promql::plan`, issue #84), with upstream's "experimental
+  duration expression is not enabled" rejection text carried verbatim.
+
 ## Reproduction
 
 ```console
 $ cargo test -p pulsus-promql --test upstream_parser_corpus -- --nocapture
 $ cargo test -p pulsus-promql --test m2_subset_ast
+$ cargo test -p pulsus-promql --test promqltest_corpus
 $ cargo test --manifest-path vendor/promql-parser/Cargo.toml
 ```

@@ -18,6 +18,25 @@
 // - no series descriptions rule
 //
 // [1] https://github.com/prometheus/prometheus/blob/v2.45.0/promql/parser/generated_parser.y
+//
+// PulsusDB patch (docs/decisions/0003, grammar patch G1 — the first
+// grammar-production patch, see vendor/promql-parser/PATCHES.md): the
+// duration-expression productions (`number_duration_literal`,
+// `duration_expr`, `paren_duration_expr`, `positive_duration_expr`,
+// `offset_duration_expr`, `max_of_min_of`, `unary_op`) are ported from
+// Prometheus v3.13.0's generated_parser.y at the pinned conformance SHA,
+// and `matrix_selector`/`subquery_expr`/`offset_expr` are rewired to
+// consume them. `STEP`/`RANGE`/`MAX_OF`/`MIN_OF` join
+// `metric_identifier`/`maybe_label` so they stay usable as metric/label
+// names, and `function_call` gains the `max_of_min_of function_call_body`
+// alternative so the already-implemented `max_of`/`min_of` scalar calls
+// keep parsing after keyword-ization. Alternative order within
+// `offset_duration_expr` vs `duration_expr` is load-bearing: grmtools
+// resolves reduce/reduce conflicts in favour of the earlier production,
+// which is what terminates a bare `offset <literal>`/`offset
+// <unary-literal>`/`offset step()` before a trailing operator, so
+// `foo offset 100 + 2` parses as `(foo offset 100) + 2` (upstream
+// semantics, pinned by the eval corpus).
 
 %token EQL
 BLANK
@@ -106,6 +125,9 @@ WITHOUT
 START
 END
 STEP
+RANGE
+MAX_OF
+MIN_OF
 %token PREPROCESSOR_END
 
 // Start symbols for the generated parser.
@@ -119,11 +141,21 @@ START_METRIC_SELECTOR
 %expect-unused 'BLANK' 'COMMENT' 'ERROR' 'SEMICOLON' 'SPACE' 'TIMES' 'OPEN_HIST' 'CLOSE_HIST'
 %expect-unused 'OPERATORS_START' 'OPERATORS_END' 'AGGREGATORS_START' 'AGGREGATORS_END'
 %expect-unused 'KEYWORDS_START' 'KEYWORDS_END' 'PREPROCESSOR_START' 'PREPROCESSOR_END'
-%expect-unused 'STEP' 'STARTSYMBOLS_START'
+%expect-unused 'STARTSYMBOLS_START'
 %expect-unused 'START_METRIC' 'START_SERIES_DESCRIPTION' 'START_EXPRESSION' 'START_METRIC_SELECTOR' 'STARTSYMBOLS_END'
 %expect-unused 'SMOOTHED' 'ANCHORED'
 
-%expect 5
+// PulsusDB patch (docs/decisions/0003, grammar patch G1): the
+// duration-expression productions raise the conflict counts from the
+// original `%expect 5` (shift/reduce, zero reduce/reduce). The
+// shift/reduce conflicts resolve to shift (standard yacc), and every
+// reduce/reduce conflict is the deliberate `offset_duration_expr` /
+// `duration_expr` overlap, resolved by grmtools in favour of the
+// earlier-defined production — offset_duration_expr's arms, which is the
+// upstream precedence behaviour ("foo offset 100 + 2" == "(foo offset
+// 100) + 2"), pinned by the proof corpus.
+%expect 11
+%expect-rr 207
 
 %start start
 
@@ -356,6 +388,18 @@ function_call -> Result<Expr, String>:
                             Some(func) => Expr::new_call(func, $2?)
                         }
                 }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G1): now that
+        // max_of/min_of are keyword tokens (duration expressions), their
+        // already-implemented scalar-function call form must keep parsing —
+        // upstream v3.13's `max_of_min_of function_call_body` alternative.
+        |       max_of_min_of function_call_body
+                {
+                        let name = $1?.val;
+                        match get_function(&name) {
+                            None => Err(format!("unknown function with name '{name}'")),
+                            Some(func) => Expr::new_call(func, $2?)
+                        }
+                }
 ;
 
 function_call_body -> Result<FunctionArgs, String>:
@@ -378,12 +422,100 @@ paren_expr -> Result<Expr, String>:
 
 /*
  * Offset modifiers.
+ *
+ * PulsusDB patch (docs/decisions/0003, grammar patch G1): `offset` takes a
+ * duration expression (upstream v3.13's `offset_duration_expr`). A plain
+ * (possibly sign-folded) literal resolves to the concrete `Offset` here;
+ * everything else is carried as `offset_expr: Some(DurationExpr)`.
  */
 offset_expr -> Result<Expr, String>:
-                expr OFFSET duration { $1?.offset_expr(Offset::Pos($3?)) }
-        |       expr OFFSET ADD duration { $1?.offset_expr(Offset::Pos($4?)) }
-        |       expr OFFSET SUB duration { $1?.offset_expr(Offset::Neg($4?)) }
-        |       expr OFFSET EOF { Err("unexpected end of input in offset, expected duration".into()) }
+                expr OFFSET offset_duration_expr
+                {
+                        match $3? {
+                            DurationExpr::Number(secs) => $1?.offset_expr(offset_from_secs(secs)?),
+                            de => $1?.offset_dur_expr(de),
+                        }
+                }
+        |       expr OFFSET EOF { Err("unexpected end of input in offset, expected number, duration, step(), or range()".into()) }
+;
+
+// offset_duration_expr is needed to handle expressions like "foo offset -2^2"
+// correctly: its single-token/unary/call-like alternatives are defined
+// *before* duration_expr's, so the reduce/reduce conflict between "finish
+// the offset here" and "keep building a duration expression" resolves (per
+// grmtools' earlier-production rule) to finishing the offset — "foo offset
+// -2^2" is "(foo offset -2)^2" and "foo offset 100 + 2" is
+// "(foo offset 100) + 2", upstream v3.13 semantics.
+offset_duration_expr -> Result<DurationExpr, String>:
+                number_duration_literal { checked_number_literal($1?) }
+        |       unary_op number_duration_literal { apply_unary_op_to_duration_expr($1?, $2?, false) }
+        |       STEP LEFT_PAREN RIGHT_PAREN { Ok(DurationExpr::Step) }
+        |       RANGE LEFT_PAREN RIGHT_PAREN { Ok(DurationExpr::Range) }
+        |       unary_op STEP LEFT_PAREN RIGHT_PAREN { Ok(unary_duration_expr($1?, DurationExpr::Step)) }
+        |       unary_op RANGE LEFT_PAREN RIGHT_PAREN { Ok(unary_duration_expr($1?, DurationExpr::Range)) }
+        |       max_of_min_of LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN
+                { Ok(min_of_max_of_expr($1?, $3?, $5?)) }
+        |       unary_op max_of_min_of LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN
+                { Ok(unary_duration_expr($1?, min_of_max_of_expr($2?, $4?, $6?))) }
+        |       unary_op LEFT_PAREN duration_expr RIGHT_PAREN %prec MUL
+                { apply_unary_op_to_duration_expr($1?, $3?, true) }
+        |       duration_expr { $1 }
+;
+
+max_of_min_of -> Result<Token, String>:
+                MAX_OF { lexeme_to_token($lexer, $1) }
+        |       MIN_OF { lexeme_to_token($lexer, $1) }
+;
+
+unary_op -> Result<Token, String>:
+                ADD { lexeme_to_token($lexer, $1) }
+        |       SUB { lexeme_to_token($lexer, $1) }
+;
+
+duration_expr -> Result<DurationExpr, String>:
+                number_duration_literal { checked_number_literal($1?) }
+        |       unary_op duration_expr %prec MUL { apply_unary_op_to_duration_expr($1?, $2?, false) }
+        |       duration_expr ADD duration_expr { duration_binary_expr(T_ADD, $1?, $3?) }
+        |       duration_expr SUB duration_expr { duration_binary_expr(T_SUB, $1?, $3?) }
+        |       duration_expr MUL duration_expr { duration_binary_expr(T_MUL, $1?, $3?) }
+        |       duration_expr DIV duration_expr { duration_binary_expr(T_DIV, $1?, $3?) }
+        |       duration_expr MOD duration_expr { duration_binary_expr(T_MOD, $1?, $3?) }
+        |       duration_expr POW duration_expr { duration_binary_expr(T_POW, $1?, $3?) }
+        |       STEP LEFT_PAREN RIGHT_PAREN { Ok(DurationExpr::Step) }
+        |       RANGE LEFT_PAREN RIGHT_PAREN { Ok(DurationExpr::Range) }
+        |       max_of_min_of LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN
+                { Ok(min_of_max_of_expr($1?, $3?, $5?)) }
+        |       paren_duration_expr { $1 }
+;
+
+paren_duration_expr -> Result<DurationExpr, String>:
+                LEFT_PAREN duration_expr RIGHT_PAREN
+                {
+                        // Idempotent wrap: "((1h))" stays one layer of
+                        // parens on Display, like upstream's boolean
+                        // `Wrapped` flag.
+                        match $2? {
+                            e @ DurationExpr::Wrapped(_) => Ok(e),
+                            e => Ok(DurationExpr::Wrapped(Box::new(e))),
+                        }
+                }
+;
+
+// A duration expression whose *literal* form must be positive — the
+// range-selector and subquery range/step positions. Parenthesised and/or
+// unary-signed literals count as literals here (upstream keeps them
+// `*NumberLiteral`s — `DurationExpr::literal_value`); genuinely computed
+// forms are range-checked at resolve time instead (upstream durations.go).
+positive_duration_expr -> Result<DurationExpr, String>:
+                duration_expr
+                {
+                        let e = $1?;
+                        match e.literal_value() {
+                            Some(secs) if secs <= 0.0 =>
+                                Err("duration must be greater than 0".into()),
+                            _ => Ok(e),
+                        }
+                }
 ;
 
 /*
@@ -417,22 +549,47 @@ at_modifier_preprocessors -> Result<Token, String>:
 
 /*
  * Subquery and range selectors.
+ *
+ * PulsusDB patch (docs/decisions/0003, grammar patch G1): the range and
+ * subquery range/step positions take positive duration expressions
+ * (upstream v3.13). A literal resolves to the concrete Duration field; a
+ * non-literal expression rides the `*_expr` field with a zero placeholder.
  */
 matrix_selector -> Result<Expr, String>:
-                expr LEFT_BRACKET duration RIGHT_BRACKET
+                expr LEFT_BRACKET positive_duration_expr RIGHT_BRACKET
                 {
-                        Expr::new_matrix_selector($1?, $3?)
+                        match $3? {
+                            DurationExpr::Number(secs) =>
+                                Expr::new_matrix_selector($1?, duration_from_secs(secs)?, None),
+                            de => Expr::new_matrix_selector($1?, Duration::ZERO, Some(de)),
+                        }
                 }
         |       expr LEFT_BRACKET RIGHT_BRACKET
                 {
-                        Err("missing unit character in duration".into())
+                        Err("unexpected \"]\" in subquery or range selector, expected number, duration, step(), or range()".into())
                 }
 ;
 
 subquery_expr -> Result<Expr, String>:
-                expr LEFT_BRACKET duration COLON maybe_duration RIGHT_BRACKET
+                expr LEFT_BRACKET positive_duration_expr COLON positive_duration_expr RIGHT_BRACKET
                 {
-                        Expr::new_subquery_expr($1?, $3?, $5?)
+                        let (range, range_expr) = match $3? {
+                            DurationExpr::Number(secs) => (duration_from_secs(secs)?, None),
+                            de => (Duration::ZERO, Some(de)),
+                        };
+                        let (step, step_expr) = match $5? {
+                            DurationExpr::Number(secs) => (Some(duration_from_secs(secs)?), None),
+                            de => (None, Some(de)),
+                        };
+                        Expr::new_subquery_expr($1?, range, range_expr, step, step_expr)
+                }
+        |       expr LEFT_BRACKET positive_duration_expr COLON RIGHT_BRACKET
+                {
+                        let (range, range_expr) = match $3? {
+                            DurationExpr::Number(secs) => (duration_from_secs(secs)?, None),
+                            de => (Duration::ZERO, Some(de)),
+                        };
+                        Expr::new_subquery_expr($1?, range, range_expr, None, None)
                 }
 ;
 
@@ -577,6 +734,13 @@ metric_identifier -> Result<Token, String>:
         |       WITHOUT { lexeme_to_token($lexer, $1) }
         |       START { lexeme_to_token($lexer, $1) }
         |       END { lexeme_to_token($lexer, $1) }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G1): the
+        // duration-expression keywords stay usable as metric names
+        // (upstream v3.13 metric_identifier).
+        |       STEP { lexeme_to_token($lexer, $1) }
+        |       RANGE { lexeme_to_token($lexer, $1) }
+        |       MAX_OF { lexeme_to_token($lexer, $1) }
+        |       MIN_OF { lexeme_to_token($lexer, $1) }
 ;
 
 /*
@@ -639,6 +803,13 @@ maybe_label -> Result<Token, String>:
         |       START { lexeme_to_token($lexer, $1) }
         |       END { lexeme_to_token($lexer, $1) }
         |       ATAN2 { lexeme_to_token($lexer, $1) }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G1): the
+        // duration-expression keywords stay usable as label names
+        // (upstream v3.13 maybe_label).
+        |       STEP { lexeme_to_token($lexer, $1) }
+        |       RANGE { lexeme_to_token($lexer, $1) }
+        |       MAX_OF { lexeme_to_token($lexer, $1) }
+        |       MIN_OF { lexeme_to_token($lexer, $1) }
 ;
 
 match_op -> Result<Token, String>:
@@ -675,41 +846,149 @@ string_identifier -> Result<String, String>:
                 }
 ;
 
-duration -> Result<Duration, String>:
-                DURATION { parse_duration($lexer.span_str($span)) }
-        // PulsusDB patch (docs/decisions/0003): route a bare-number
-        // duration (no unit suffix, e.g. the "9.5e10" in `foo offset
-        // 9.5e10`/`foo[9.5e10]`) through the same `parse_duration` overflow
-        // bound the DURATION-token alternative above already uses, instead
-        // of building an unbounded `Duration` directly via
-        // `Duration::from_secs_f64` — a leaf action-code fix (same tokens,
-        // same alternatives, no grammar production/precedence change).
-        // See vendor/promql-parser/PATCHES.md.
-        |       NUMBER
+// PulsusDB patch (docs/decisions/0003, grammar patch G1): upstream
+// v3.13's number_duration_literal — a NUMBER is plain seconds, a DURATION
+// folds through parse_duration (which carries the leaf overflow-bound
+// patch, PATCHES.md fix 3) to seconds. The out-of-range bound for bare
+// numbers now lives in the duration-expression literal guards
+// (`checked_number_literal`/`apply_unary_op_to_duration_expr`), matching
+// upstream's `durationLiteralOutOfRange` placement.
+number_duration_literal -> Result<DurationExpr, String>:
+                NUMBER
                 {
-                        parse_duration($lexer.span_str($span))
+                        parse_str_radix($lexer.span_str($span)).map(DurationExpr::Number)
                 }
-;
-
-/*
- * Wrappers for optional arguments.
- */
-maybe_duration -> Result<Option<Duration>, String>:
-                { Ok(None) }
-        |       duration { $1.map(Some) }
+        |       DURATION
+                {
+                        parse_duration($lexer.span_str($span)).map(|d| DurationExpr::Number(d.as_secs_f64()))
+                }
 ;
 
 %%
 
 use std::time::Duration;
 use crate::label::{Labels, Matcher, Matchers};
-use crate::parser::{AtModifier, BinModifier, Expr, FunctionArgs, LabelModifier, Offset, VectorMatchCardinality, VectorMatchFillValues};
+use crate::parser::{AtModifier, BinModifier, DurationExpr, Expr, FunctionArgs, LabelModifier, Offset, VectorMatchCardinality, VectorMatchFillValues};
 use crate::parser::ast::check_ast;
 use crate::parser::function::get_function;
 use crate::parser::lex::is_label;
 use crate::parser::production::{lexeme_to_string, lexeme_to_token, span_to_string};
-use crate::parser::token::{Token, T_IDENTIFIER};
+use crate::parser::token::{Token, TokenId, T_ADD, T_DIV, T_IDENTIFIER, T_MAX_OF, T_MOD, T_MUL, T_POW, T_SUB};
 use crate::util::{parse_duration, parse_str_radix, unquote_string};
+
+// ---------------------------------------------------------------------------
+// PulsusDB patch (docs/decisions/0003, grammar patch G1): duration-expression
+// action helpers, mirroring upstream v3.13 parse.go/generated_parser.y.
+// ---------------------------------------------------------------------------
+
+/// Upstream `durationLiteralOutOfRange`: whether `secs`, as seconds, would
+/// overflow Go's `time.Duration` (`i64` nanoseconds).
+fn duration_literal_out_of_range(secs: f64) -> bool {
+    const MAX: f64 = (1u64 << 63) as f64 / 1e9;
+    secs > MAX || secs < -MAX
+}
+
+/// Range-checks a literal duration sub-expression (upstream applies
+/// `durationLiteralOutOfRange` to every literal alternative of
+/// `duration_expr`/`offset_duration_expr`).
+fn checked_number_literal(e: DurationExpr) -> Result<DurationExpr, String> {
+    match e {
+        DurationExpr::Number(secs) if duration_literal_out_of_range(secs) => {
+            Err("duration out of range".into())
+        }
+        e => Ok(e),
+    }
+}
+
+/// Converts a non-negative literal seconds value (already range- and
+/// positivity-checked by the grammar) into a concrete `Duration`.
+fn duration_from_secs(secs: f64) -> Result<Duration, String> {
+    if !secs.is_finite() || secs < 0.0 {
+        // Unreachable via the grammar's own guards; kept total.
+        return Err("duration out of range".into());
+    }
+    Ok(Duration::from_nanos((secs * 1e9).round() as u64))
+}
+
+/// Converts a literal offset seconds value into the signed `Offset`.
+fn offset_from_secs(secs: f64) -> Result<Offset, String> {
+    if secs < 0.0 {
+        Ok(Offset::Neg(duration_from_secs(-secs)?))
+    } else {
+        Ok(Offset::Pos(duration_from_secs(secs)?))
+    }
+}
+
+/// Upstream `applyUnaryOpToDurationExpr`: a unary op over a literal folds
+/// into the (range-checked) literal — parentheses included, so
+/// `offset -(5)` is the concrete literal `-5s`; over anything else it
+/// builds a `Pos`/`Neg` node (wrapping parenthesised operands first).
+fn apply_unary_op_to_duration_expr(
+    op: Token,
+    e: DurationExpr,
+    wrapped: bool,
+) -> Result<DurationExpr, String> {
+    match e {
+        DurationExpr::Number(secs) => {
+            let secs = if op.id() == T_SUB { -secs } else { secs };
+            if duration_literal_out_of_range(secs) {
+                return Err("duration out of range".into());
+            }
+            Ok(DurationExpr::Number(secs))
+        }
+        e => {
+            let e = if wrapped && !matches!(e, DurationExpr::Wrapped(_)) {
+                DurationExpr::Wrapped(Box::new(e))
+            } else {
+                e
+            };
+            Ok(unary_duration_expr(op, e))
+        }
+    }
+}
+
+/// Builds the unary node for a non-literal operand.
+fn unary_duration_expr(op: Token, e: DurationExpr) -> DurationExpr {
+    if op.id() == T_SUB {
+        DurationExpr::Neg(Box::new(e))
+    } else {
+        DurationExpr::Pos(Box::new(e))
+    }
+}
+
+fn min_of_max_of_expr(op: Token, lhs: DurationExpr, rhs: DurationExpr) -> DurationExpr {
+    if op.id() == T_MAX_OF {
+        DurationExpr::MaxOf(Box::new(lhs), Box::new(rhs))
+    } else {
+        DurationExpr::MinOf(Box::new(lhs), Box::new(rhs))
+    }
+}
+
+/// Builds a binary duration node; division/modulo by a *literal* zero is a
+/// parse error (upstream generated_parser.y), by a computed zero a
+/// resolve-time error downstream. Parenthesised/unary-signed zero literals
+/// (`(0)`, `-(0)`) count as literal zeros — upstream folds them to
+/// `*NumberLiteral`s before its `nl.Val == 0` check.
+fn duration_binary_expr(
+    op: TokenId,
+    lhs: DurationExpr,
+    rhs: DurationExpr,
+) -> Result<DurationExpr, String> {
+    let is_literal_zero = rhs.literal_value() == Some(0.0);
+    let (lhs, rhs) = (Box::new(lhs), Box::new(rhs));
+    match op {
+        T_ADD => Ok(DurationExpr::Add(lhs, rhs)),
+        T_SUB => Ok(DurationExpr::Sub(lhs, rhs)),
+        T_MUL => Ok(DurationExpr::Mul(lhs, rhs)),
+        T_DIV if is_literal_zero => Err("division by zero".into()),
+        T_DIV => Ok(DurationExpr::Div(lhs, rhs)),
+        T_MOD if is_literal_zero => Err("modulo by zero".into()),
+        T_MOD => Ok(DurationExpr::Mod(lhs, rhs)),
+        T_POW => Ok(DurationExpr::Pow(lhs, rhs)),
+        // Unreachable: the grammar only routes the six operators above here.
+        _ => Err("unexpected duration expression operator".into()),
+    }
+}
 
 fn update_optional_matching(
     modifier: Option<BinModifier>,
