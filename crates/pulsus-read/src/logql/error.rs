@@ -17,13 +17,25 @@ use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
 use thiserror::Error;
 
-/// Why a query was rejected as too broad. Three structurally separate
+/// Why a query was rejected as too broad. Four structurally separate
 /// reasons, never conflated (architect plan amendment §4; issue #57 adds
-/// the traces row budget): two byte/row *server-budget* families
-/// ([`TooBroadReason::ScanBudgetBytes`], [`TooBroadReason::TraceScanBudgetRows`])
-/// plus the Rust-side structural [`TooBroadReason::StreamCap`]. The row
-/// budget is set only on the traces search path — the LogQL path still
-/// never sets `max_rows_to_read`.
+/// the traces row budget; issue #59 adds the trace-metrics IN-set
+/// budget), each with its own exclusive code path:
+///
+/// - [`TooBroadReason::ScanBudgetBytes`] — byte budgets only: LogQL
+///   `max_bytes_to_read` (code 307), the traces `max_bytes_to_read`/
+///   `max_result_bytes` throw settings (codes 307/396), and the traces
+///   engine's Rust-side retention counter.
+/// - [`TooBroadReason::StreamCap`] — the LogQL Stage-1 fingerprint cap,
+///   a Rust-side structural limit; never produced from a ClickHouse
+///   error code.
+/// - [`TooBroadReason::TraceScanBudgetRows`] — `max_rows_to_read` (code
+///   158) on the traces read paths only; LogQL never sets that setting.
+/// - [`TooBroadReason::TraceMetricsSetRows`] — the trace-metrics
+///   semi-join IN-set limits (`max_rows_in_set`/`max_bytes_in_set`,
+///   throw — code 191) set **only** by `traces::exec`'s metrics query
+///   settings; no other path sets a set limit, and no other code maps
+///   code 191.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooBroadReason {
     /// A ClickHouse-side or engine-side **byte** budget was exceeded. On
@@ -56,6 +68,13 @@ pub enum TooBroadReason {
     /// **only** by `traces::exec`'s own error mapper; LogQL's
     /// `map_read_error` never produces it.
     TraceScanBudgetRows { budget_rows: u64 },
+    /// A TraceQL metrics attribute-filter semi-join's IN-set exceeded its
+    /// budget (`max_rows_in_set`/`max_bytes_in_set` +
+    /// `set_overflow_mode='throw'` — server code 191, issue #59 plan v2
+    /// delta 3 as amended). Set **only** by the trace-metrics error
+    /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
+    /// with the byte scan budget or the trace row budget.
+    TraceMetricsSetRows { max_set_rows: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -79,6 +98,12 @@ impl fmt::Display for TooBroadReason {
             }
             TooBroadReason::TraceScanBudgetRows { budget_rows } => {
                 write!(f, "trace scan budget of {budget_rows} rows exceeded")
+            }
+            TooBroadReason::TraceMetricsSetRows { max_set_rows } => {
+                write!(
+                    f,
+                    "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
+                )
             }
         }
     }
@@ -174,6 +199,16 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("150000"));
         assert!(msg.contains("100000"));
+    }
+
+    #[test]
+    fn trace_metrics_set_rows_display_names_the_set_budget() {
+        let reason = TooBroadReason::TraceMetricsSetRows {
+            max_set_rows: 1_000_000,
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("1000000"));
+        assert!(msg.contains("attribute-set"));
     }
 
     #[test]

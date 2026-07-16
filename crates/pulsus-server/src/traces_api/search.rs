@@ -147,6 +147,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_metrics_stage_on_search_is_400_bad_data_without_a_position() {
+        // Issue #59 error-shape shift: `q={}|rate()` used to be a
+        // positioned NotYetSupported parse error; it now PARSES and
+        // fails in plan_search — still 400 bad_data, but with no
+        // `position` (a plan error, not a parse error).
+        let (status, json) = run("q=%7B%7D%20%7C%20rate()&start=1&end=2").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data", "body {json}");
+        assert!(json.get("position").is_none(), "body {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("metrics")),
+            "message must point at the metrics surface, got {json}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_well_formed_request_without_a_pool_is_503_unavailable() {
         let (status, json) = run("q=%7B%7D&start=1&end=2").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

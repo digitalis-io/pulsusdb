@@ -48,6 +48,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "tag-values catalog read (issue #58) - same class as list_tag_names; hard-bounded by the SQL LIMIT to TAG_VALUES_MAX + 1 rows"),
     ("exec.rs", "search_inner", "HashMap::", 1,
      "the empty-winners roots arm: HashMap::new() with zero entries - nothing to charge"),
+    ("exec.rs", "metrics_range", "Vec::new", 1,
+     "metrics matrix points (issue #59) - outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by the plan's static MAX_METRICS_POINTS bucket cap (11k x 16-byte points)"),
     ("exec.rs", "pick_roots", "HashMap::", 1,
      "root rows charged per row during streaming; map retained via roots_retained_bytes charge before row release"),
     ("exec.rs", "pick_roots", ".collect", 1,

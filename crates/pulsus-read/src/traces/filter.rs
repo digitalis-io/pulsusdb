@@ -49,14 +49,21 @@ pub struct SpanFilterCtx<'a> {
     pub attrs_table: &'a str,
 }
 
-/// Planning failure — always a caller error (`400 bad_data` server-side),
-/// never an execution failure.
+/// Planning failure — always a caller error, never an execution failure.
+/// [`PlanError::UnsupportedField`]/[`PlanError::TypeMismatch`] map to
+/// `400 bad_data` server-side; [`PlanError::MetricsPointCap`] is the one
+/// exception — the adjudicated issue #59 bounded-response contract makes
+/// a metrics range that resolves more than `MAX_METRICS_POINTS` buckets a
+/// static pre-execution `422 query_too_broad`, never a 400 and never a
+/// silent truncation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     #[error("unsupported field: {0}")]
     UnsupportedField(String),
     #[error("type mismatch: {0}")]
     TypeMismatch(String),
+    #[error("metrics range resolves {buckets} buckets, exceeding the {cap}-point cap")]
+    MetricsPointCap { buckets: i64, cap: i64 },
 }
 
 /// The static leaf-class selectivity priority (issue #57 plan v3: "a

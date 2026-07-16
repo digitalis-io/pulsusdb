@@ -17,10 +17,12 @@ pub use metrics::{
     TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus, spawn_refresh_loop,
 };
 pub use traces::{
-    BATCH_TRACES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE, PlanError as TracePlanError,
+    BATCH_TRACES, DEFAULT_METRICS_POINTS, HYDRATION_BYTE_BUDGET, MAX_METRICS_POINTS,
+    MAX_SPANS_PER_TRACE, MetricFunc, MetricsCtx, MetricsParams, PlanError as TracePlanError,
     RootSummary, SearchCtx, SearchOutput, SearchParams, SearchPlan, SpanFilterCtx, SpanSummary,
-    StoredSpan, TAG_NAMES_MAX, TAG_VALUES_MAX, TagNames, TagValues, TraceEngine, TraceReadConfig,
-    TraceSearchResult, compile_span_filter, plan_search,
+    StoredSpan, TAG_NAMES_MAX, TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES,
+    TRACE_METRICS_MAX_SET_ROWS, TagNames, TagValues, TraceEngine, TraceMetricsPlan,
+    TraceReadConfig, TraceSearchResult, compile_span_filter, plan_search, plan_trace_metrics,
 };
 
 #[cfg(test)]

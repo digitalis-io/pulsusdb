@@ -19,14 +19,20 @@
 //! Global `trace_tag_catalog` via `TraceEngine`, never by scanning span
 //! payloads.
 //!
-//! Out of scope here (see the #19 decomposition): TraceQL metrics (T7)
-//! and the Tempo compat aliases (`/api/traces/{traceId}[/json]`, T9 — a
-//! pure route binding onto these same handlers, docs/api.md §8.1).
+//! The §4.4 TraceQL metrics routes (issue #59) live in `metrics.rs`:
+//! thin handlers over `pulsus-read`'s metrics planner/engine, encoding
+//! through the shared `prom_api::encode` Prometheus matrix/vector
+//! envelope.
+//!
+//! Out of scope here (see the #19 decomposition): the Tempo compat
+//! aliases (`/api/traces/{traceId}[/json]`, `/api/metrics/*`, T9 — pure
+//! route bindings onto these same handlers, docs/api.md §8.1).
 
 mod assemble;
 mod error;
 mod handlers;
 mod legacy;
+mod metrics;
 mod negotiate;
 mod params;
 mod search;
@@ -39,7 +45,7 @@ use axum::routing::get;
 
 use crate::app::AppState;
 
-/// The native `/api/traces/v1` surface (docs/api.md §4.1-§4.3):
+/// The native `/api/traces/v1` surface (docs/api.md §4.1-§4.4):
 /// `GET`-only on all routes; the `/json` sibling forces the JSON
 /// representation. `.route`-only composition — like `writer_router`, this
 /// is not a pinned body in the #36 manifest.
@@ -53,6 +59,11 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/api/traces/v1/search", get(search::search))
         .route("/api/traces/v1/tags", get(tags::tags))
         .route("/api/traces/v1/tag/{tag}/values", get(tags::tag_values))
+        .route(
+            "/api/traces/v1/metrics/query_range",
+            get(metrics::metrics_query_range),
+        )
+        .route("/api/traces/v1/metrics/query", get(metrics::metrics_query))
 }
 
 #[cfg(test)]

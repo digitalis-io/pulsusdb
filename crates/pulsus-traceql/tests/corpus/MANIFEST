@@ -29,6 +29,8 @@ accept/intrinsic_status_eq_error
 accept/intrinsic_status_eq_unset
 accept/intrinsic_status_neq_ok
 accept/match_all
+accept/metrics_count_over_time
+accept/metrics_rate
 accept/pipeline_avg_duration
 accept/pipeline_chain
 accept/pipeline_count
@@ -90,10 +92,12 @@ unsupported/arith_slash
 unsupported/arith_star
 unsupported/bare_attribute
 unsupported/bracketed_attribute
-unsupported/metrics_count_over_time
+unsupported/metrics_avg_over_time
+unsupported/metrics_by_grouping
 unsupported/metrics_histogram_over_time
+unsupported/metrics_max_over_time
+unsupported/metrics_min_over_time
 unsupported/metrics_quantile_over_time
-unsupported/metrics_rate
 unsupported/negation
 unsupported/parent_scope
 unsupported/structural_gt

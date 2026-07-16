@@ -5,11 +5,12 @@
 //! `parse(ast.to_string()) == ast`).
 //!
 //! [`PipelineStage`] is the designated additive growth point: T7's
-//! metrics pipeline functions (`rate`, `count_over_time`,
-//! `quantile_over_time`, `histogram_over_time`) land as a new variant,
-//! never a reshape of the existing types or fields. Until then the
-//! parser recognizes them and reports `NotYetSupported` (see
-//! [`UNSUPPORTED_METRIC_FNS`]).
+//! metrics pipeline functions landed as the additive
+//! [`PipelineStage::Metric`] variant (`rate()`, `count_over_time()` —
+//! the committed M4 set), never a reshape of the existing types or
+//! fields. The deferred `*_over_time` functions and metrics grouping
+//! `by` are recognized and reported as `NotYetSupported` (M7 — see
+//! [`UNSUPPORTED_METRIC_FNS`] / [`BOUNDARY_CONSTRUCTS`]).
 
 use std::fmt;
 
@@ -327,8 +328,9 @@ impl fmt::Display for SpanKindValue {
 }
 
 /// A pipeline stage after `|`. M4 implements the search aggregate
-/// filters and `select`; T7 adds a metrics variant here — additive only
-/// (the designated growth point).
+/// filters, `select`, and (issue #59, T7) the zero-arity metrics
+/// functions — [`PipelineStage::Metric`] is the additive fill of the
+/// designated growth point, never a reshape.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PipelineStage {
     /// `count() cmp value` (zero-arity — `field: None`) or
@@ -343,6 +345,11 @@ pub enum PipelineStage {
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
+    /// `rate()` / `count_over_time()` (zero-arity — a stray argument is a
+    /// positioned parse error). Served exclusively by the
+    /// `/api/traces/v1/metrics/*` endpoints; the search planner rejects
+    /// this stage (issue #59).
+    Metric(MetricFn),
 }
 
 impl fmt::Display for PipelineStage {
@@ -367,7 +374,41 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
+            PipelineStage::Metric(func) => write!(f, "{func}()"),
         }
+    }
+}
+
+/// The committed M4 TraceQL metrics functions (issue #59, task-manager
+/// adjudication 1): `rate()` and `count_over_time()` only. The five
+/// deferred `*_over_time` functions stay in [`UNSUPPORTED_METRIC_FNS`]
+/// (M7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetricFn {
+    Rate,
+    CountOverTime,
+}
+
+impl MetricFn {
+    pub(crate) fn from_ident(name: &str) -> Option<Self> {
+        match name {
+            "rate" => Some(Self::Rate),
+            "count_over_time" => Some(Self::CountOverTime),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            MetricFn::Rate => "rate",
+            MetricFn::CountOverTime => "count_over_time",
+        }
+    }
+}
+
+impl fmt::Display for MetricFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -473,13 +514,15 @@ fn quote(value: &str) -> String {
     out
 }
 
-/// The metrics pipeline functions T7 owns (task-manager adjudication 1):
-/// recognized at pipeline position, rejected as `NotYetSupported` with a
-/// position. T7 implements their grammar via a new [`PipelineStage`]
-/// variant.
+/// The deferred metrics pipeline functions (issue #59, task-manager
+/// adjudication 1: re-owned to **M7**): recognized at pipeline position,
+/// rejected as `NotYetSupported` with a position. `rate` and
+/// `count_over_time` left this registry when T7 implemented them via
+/// [`PipelineStage::Metric`].
 pub(crate) const UNSUPPORTED_METRIC_FNS: &[&str] = &[
-    "rate",
-    "count_over_time",
+    "avg_over_time",
+    "min_over_time",
+    "max_over_time",
     "quantile_over_time",
     "histogram_over_time",
 ];
@@ -507,10 +550,12 @@ pub const BOUNDARY_CONSTRUCTS: &[(&str, &str)] = &[
     ("parent scope", "M7"),
     ("bracketed attribute", "M7"),
     ("bare attribute expression", "M7"),
-    ("metrics function 'rate'", "T7"),
-    ("metrics function 'count_over_time'", "T7"),
-    ("metrics function 'quantile_over_time'", "T7"),
-    ("metrics function 'histogram_over_time'", "T7"),
+    ("metrics function 'avg_over_time'", "M7"),
+    ("metrics function 'min_over_time'", "M7"),
+    ("metrics function 'max_over_time'", "M7"),
+    ("metrics function 'quantile_over_time'", "M7"),
+    ("metrics function 'histogram_over_time'", "M7"),
+    ("metrics grouping 'by'", "M7"),
 ];
 
 #[cfg(test)]
@@ -599,7 +644,30 @@ mod tests {
     fn metric_fns_are_not_recognized_as_implemented_aggregates() {
         for name in UNSUPPORTED_METRIC_FNS {
             assert_eq!(AggregateOp::from_ident(name), None);
+            assert_eq!(MetricFn::from_ident(name), None);
         }
+    }
+
+    #[test]
+    fn metric_fns_round_trip_through_from_ident_and_display() {
+        for (name, func) in [
+            ("rate", MetricFn::Rate),
+            ("count_over_time", MetricFn::CountOverTime),
+        ] {
+            assert_eq!(MetricFn::from_ident(name), Some(func));
+            assert_eq!(func.to_string(), name);
+            assert_eq!(AggregateOp::from_ident(name), None);
+        }
+        assert_eq!(MetricFn::from_ident("quantile_over_time"), None);
+    }
+
+    #[test]
+    fn metric_stage_display_renders_the_zero_arity_call() {
+        assert_eq!(PipelineStage::Metric(MetricFn::Rate).to_string(), "rate()");
+        assert_eq!(
+            PipelineStage::Metric(MetricFn::CountOverTime).to_string(),
+            "count_over_time()"
+        );
     }
 
     #[test]

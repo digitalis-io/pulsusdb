@@ -107,6 +107,19 @@ pub enum Surface {
     /// which doubles as the mounting oracle. Errors are the JSON envelope
     /// with `position` present exactly on TraceQL parse errors.
     TracesSearch,
+    /// `GET /api/traces/v1/metrics/{query_range,query}` (issue #59,
+    /// docs/api.md §4.4) — success is the Prometheus query envelope
+    /// (`{"status":"success","data":{"resultType","result"}}`), shared
+    /// byte-for-byte with `prom_api` via its `encode::query_response`.
+    /// Against this suite's empty databases a well-formed request is the
+    /// mounting oracle: `query_range` → 200 with `resultType:"matrix"`,
+    /// `result:[]`; `query` → 200 with `resultType:"vector"` and exactly
+    /// one label-less sample of value `"0"` (a `uniqExact` with no
+    /// `GROUP BY` always returns one row). Errors are the JSON envelope
+    /// with `position` present exactly on TraceQL parse errors; the
+    /// static point-cap rejection is a 422 `query_too_broad` (the
+    /// adjudicated bounded-response contract).
+    TracesMetrics,
     /// `GET /api/traces/v1/tags` and `/api/traces/v1/tag/{tag}/values`
     /// (issue #58, docs/api.md §4.3) — success is the documented native
     /// envelope (`{"scopes":[...],"truncated":...}` /
@@ -787,6 +800,93 @@ const TRACES_SEARCH_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- traces metrics (issue #59, docs/api.md §4.4) -----------------------
+
+/// The base query every metrics case mutates from: match-all
+/// `q={} | rate()` over a fixed, step-ALIGNED 1h window. Deliberately
+/// starts at 1700000100, not the other surfaces' 1700000000: the ingest
+/// matrix (which runs earlier in the manifest walk) stores a fixture
+/// span at exactly t=1700000000, and metrics' outward epoch snap +
+/// left-closed `>=` bound (docs/api.md §4.4) would pull a 1700000000
+/// start back over it — the empty-envelope mounting oracle needs a
+/// window with no stored spans.
+pub const TRACES_METRICS_BASE_QUERY: &str =
+    "q=%7B%7D%20%7C%20rate()&start=1700000100&end=1700003700&step=60";
+
+fn traces_metrics_malformed_q(req: &mut Req) {
+    // "{" — unterminated spanset: a positioned TraceQL parse error.
+    req.query = "q=%7B&start=1700000000&end=1700003600".to_string();
+}
+
+fn traces_metrics_missing_range(req: &mut Req) {
+    req.query = "q=%7B%7D%20%7C%20rate()".to_string();
+}
+
+fn traces_metrics_bad_step(req: &mut Req) {
+    // Fractional-second steps violate the whole-second contract.
+    req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1700003600&step=500ms".to_string();
+}
+
+fn traces_metrics_missing_stage(req: &mut Req) {
+    // A plain search query on the metrics surface: parses, but the
+    // metrics planner requires exactly one metric stage.
+    req.query = "q=%7B%7D&start=1700000000&end=1700003600".to_string();
+}
+
+fn traces_metrics_point_cap(req: &mut Req) {
+    // 1,000,000 one-second buckets >> MAX_METRICS_POINTS (11,000): the
+    // adjudicated static pre-execution 422, never a truncation.
+    req.query = "q=%7B%7D%20%7C%20rate()&start=1700000000&end=1701000000&step=1".to_string();
+}
+
+const TRACES_METRICS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_q",
+        build: traces_metrics_malformed_q,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "missing_range",
+        build: traces_metrics_missing_range,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "bad_step",
+        build: traces_metrics_bad_step,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "missing_metric_stage",
+        build: traces_metrics_missing_stage,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "point_cap_static_422",
+        build: traces_metrics_point_cap,
+        expect_status: 422,
+        expect: ExpectedError::Json {
+            error_type: "query_too_broad",
+            has_position: false,
+        },
+    },
+];
+
 // -- traces tags (issue #58, docs/api.md §4.3) --------------------------
 
 /// The non-trivial `q=` the values route's `base_query` carries —
@@ -1284,6 +1384,34 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: TRACES_TAG_VALUES_BASE_QUERY,
         cases: TRACES_TAG_VALUES_CASES,
+    },
+    // -- Traces metrics (ReaderMode, issue #59) ---------------------------
+    // `success_status` is 200: against this suite's empty databases a
+    // well-formed match-all metrics query returns the documented empty
+    // Prometheus envelope (range: `result:[]`; instant: one `"0"`
+    // sample) — the mounting oracle (`Surface::TracesMetrics`'s doc
+    // comment).
+    RouteSpec {
+        path: "/api/traces/v1/metrics/query_range",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
+    },
+    RouteSpec {
+        path: "/api/traces/v1/metrics/query",
+        methods: &[Method::Get],
+        surface: Surface::TracesMetrics,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_METRICS_BASE_QUERY,
+        cases: TRACES_METRICS_CASES,
     },
     // -- Planned (documented, not yet mounted) ---------------------------
     // Representative, not exhaustive (deviation, see issue #36 implementation

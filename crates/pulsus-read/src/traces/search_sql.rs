@@ -20,7 +20,9 @@ use super::filter::{GenTable, LeafGenerator};
 
 /// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
 /// civil-date conversion (proleptic Gregorian), pure integer math.
-fn date_literal(days: i64) -> String {
+/// `pub(crate)`: [`super::metrics_sql`] reuses it for the metrics
+/// semi-joins' daily-partition pruning.
+pub(crate) fn date_literal(days: i64) -> String {
     // Howard Hinnant's days-to-civil algorithm.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

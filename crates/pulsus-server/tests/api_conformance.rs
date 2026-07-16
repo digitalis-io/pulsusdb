@@ -581,6 +581,48 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 "{ctx}: metrics.limit must be an integer, body {json}"
             );
         }
+        (Surface::TracesMetrics, path) => {
+            // Issue #59: success is the shared Prometheus query envelope
+            // (`prom_api::encode::query_response`). Against this suite's
+            // empty databases the well-formed match-all metrics request
+            // is the mounting oracle: `query_range` → an empty matrix;
+            // `query` → exactly one label-less `"0"` vector sample (a
+            // `uniqExact` with no `GROUP BY` always returns one row).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: metrics envelope content-type"
+            );
+            let json = res.json(ctx);
+            assert_eq!(json["status"], "success", "{ctx}: body {json}");
+            if path.ends_with("/query_range") {
+                assert_eq!(json["data"]["resultType"], "matrix", "{ctx}: body {json}");
+                assert_eq!(
+                    json["data"]["result"],
+                    serde_json::json!([]),
+                    "{ctx}: empty DB must return an empty matrix, body {json}"
+                );
+            } else {
+                assert_eq!(json["data"]["resultType"], "vector", "{ctx}: body {json}");
+                let result = json["data"]["result"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{ctx}: vector result must be an array: {json}"));
+                assert_eq!(
+                    result.len(),
+                    1,
+                    "{ctx}: an instant metrics query always returns one sample, body {json}"
+                );
+                assert_eq!(
+                    result[0]["metric"],
+                    serde_json::json!({}),
+                    "{ctx}: single-series M4 output is label-less, body {json}"
+                );
+                assert_eq!(
+                    result[0]["value"][1], "0",
+                    "{ctx}: empty DB instant value is the quoted \"0\", body {json}"
+                );
+            }
+        }
         (Surface::TracesTags, path) => {
             // Issue #58: success is the documented docs/api.md §4.3
             // native envelope. Against this suite's empty databases both

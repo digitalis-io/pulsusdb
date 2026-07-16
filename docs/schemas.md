@@ -450,16 +450,27 @@ The engine merges the per-generator `(trace_id, bound_ts)` tuples in Rust — an
 
 The worked example `{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s }` (last 3h, limit 20) therefore runs: one Phase-1 generator — the service-equality projection read above (`PREWHERE service = 'checkout'`, the conjunction's most selective leaf) — then per batch one `key = 'http.status_code' AND val_num >= 500 AND scope = 'span'` membership read (date + time pruned within the key prefix), with `duration_ns > 2000000000` evaluated on the hydrated physical column; the byte-frozen SQL lives in `crates/pulsus-read/tests/golden/traces_search/`.
 
-**TraceQL metrics** (`{...} | rate()`) — fully pushed down:
+**TraceQL metrics** (`{...} | rate()` / `| count_over_time()`, issue #59) — one fully-pushed-down, time-bucketed conditional aggregation per request (never the two-phase candidate model). For `{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s } | rate()` at step 60s:
 
 ```sql
-SELECT toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60 SECOND) AS t,
-       count() / 60 AS rate
+SELECT toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60 SECOND)) AS t,
+       uniqExact(trace_id, span_id) AS n
 FROM trace_spans
 PREWHERE service = 'checkout'
-WHERE timestamp_ns > {start} AND timestamp_ns <= {end} AND duration_ns > 2000000000
-GROUP BY t ORDER BY t
+WHERE timestamp_ns >= {S} AND timestamp_ns < {E}
+  AND ((trace_id, span_id) IN (SELECT trace_id, span_id FROM trace_attrs_idx
+       WHERE date >= toDate({S}) AND date <= toDate({E - 1ns})
+         AND timestamp_ns >= {S} AND timestamp_ns < {E}
+         AND key = 'http.status_code' AND val_num >= 500 AND scope = 'span') AND duration_ns > 2000000000)
+GROUP BY t
+ORDER BY t ASC
 ```
+
+- **Counting is `uniqExact(trace_id, span_id)`** — the T5 logical-span identity, so at-least-once replays never inflate a bucket (no `FINAL`). `rate` divides the deduped count by the step **client-side at the encode boundary** (the instant `/query` form drops the `GROUP BY` and divides by the snapped window width); `count_over_time` ships the count as-is — the SQL body is byte-identical for both functions.
+- **Snapped, left-closed buckets:** `{S} = ⌊start/step⌋·step`, `{E} = ⌈end/step⌉·step` (epoch-aligned, outward), the time filter is left-closed/right-open — every emitted bucket `[b, b + step)` is full-width, so the rate denominator is always the full step. `toUnixTimestamp(...)` pins the bucket column to a deterministic `UInt32` epoch-seconds wire type.
+- **Access paths:** a root-AND-spine `resource.service.name =` conjunct (never one inside/under an `||`) hoists to `PREWHERE` and selects the `service_time` projection; every attribute leaf is an index-served `(trace_id, span_id) [NOT] IN` semi-join confined to its `(key[, val][, scope])` prefix plus daily-partition/time pruning (`NOT IN` implements the ratified absent-key negation rule); physical leaves render inline on `trace_spans` columns.
+- **Bounded state:** every metrics query carries the trace read budgets (scan rows/bytes, result bytes, throw) **plus** the semi-join IN-set limits — `max_rows_in_set` (1,000,000) / `max_bytes_in_set` (64 MiB) with `set_overflow_mode = 'throw'` → `422 query_too_broad` via its own dedicated reason, never an unbounded in-memory set. The bucket count itself is capped statically at plan time (docs/api.md §4.4).
+- **Clustered honesty:** the reader additionally injects `distributed_product_mode = 'local'`, rewriting the semi-join subquery to the **local** shard's `trace_attrs_idx` (exact under the `cityHash64(trace_id)` co-sharding, and it kills the `_dist`-inside-`_dist` double-distributed path). The time-bucket `GROUP BY` is **not** shard-local — buckets exist on every shard and the coordinator merges per-bucket partial states, bounded by the point cap × shard count (scale evidence routes to #25).
 
 ---
 

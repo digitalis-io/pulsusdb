@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "metrics grouping 'by'",
+    span: Span {
+        start: 12,
+        end: 14,
+    },
+}

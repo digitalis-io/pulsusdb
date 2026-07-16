@@ -275,8 +275,10 @@ fn membership_predicate(probe: &AttrProbe) -> String {
 
 /// Compiles the anchored full-value regex a `=~`/`!~` leaf evaluates
 /// engine-side (physical columns only; attribute regexes evaluate in
-/// ClickHouse via `match()`).
-fn compile_anchored(pat: &str) -> Result<Regex, PlanError> {
+/// ClickHouse via `match()`). `pub(crate)`: the metrics planner reuses it
+/// as its plan-time regex validator (a bad pattern must be a `400`, never
+/// a mid-query server error — issue #59).
+pub(crate) fn compile_anchored(pat: &str) -> Result<Regex, PlanError> {
     Regex::new(&format!("^(?:{pat})$"))
         .map_err(|e| PlanError::TypeMismatch(format!("invalid regex {pat:?}: {e}")))
 }
@@ -448,6 +450,15 @@ fn plan_pipeline(
                     cmp: *cmp,
                     threshold: aggregate_threshold(*op, field, value)?,
                 });
+            }
+            // Metrics functions are `/api/traces/v1/metrics/*`-only (issue
+            // #59): on the search surface a parsed `| rate()` is a caller
+            // error (400 bad_data), never silently ignored.
+            PipelineStage::Metric(func) => {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{func}() is a metrics function: use /api/traces/v1/metrics/query_range or \
+                     /query, not search"
+                )));
             }
             PipelineStage::Select { fields } => {
                 for field in fields {
@@ -698,6 +709,20 @@ mod tests {
             }
         ));
         assert_eq!(p.select_attrs.len(), 1);
+    }
+
+    #[test]
+    fn a_metric_stage_on_the_search_planner_is_a_type_mismatch() {
+        // Issue #59: `| rate()` now PARSES (no longer a positioned
+        // NotYetSupported) and must fail search planning as a plain
+        // caller error — metrics functions are /metrics-only.
+        let query = parse(r#"{ .k = "v" } | rate()"#).expect("parses since issue #59");
+        match plan_search(&query, &PARAMS, &ctx()) {
+            Err(PlanError::TypeMismatch(msg)) => {
+                assert!(msg.contains("metrics"), "{msg}");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 
     #[test]

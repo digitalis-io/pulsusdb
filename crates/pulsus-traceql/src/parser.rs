@@ -38,8 +38,8 @@
 //! precedent.
 
 use crate::ast::{
-    self, AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Intrinsic, PipelineStage,
-    Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, Value,
+    self, AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
+    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -720,10 +720,11 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
     }
 }
 
-/// `PipelineStage := Aggregate | Select` (plan v2 F5 / v3 F5). Metrics
-/// pipeline functions are recognized here and rejected as
-/// `NotYetSupported` — T7 fills this growth point in (task-manager
-/// adjudication 1).
+/// `PipelineStage := Aggregate | Select | Metric` (plan v2 F5 / v3 F5;
+/// issue #59 adds the zero-arity metrics stage). The deferred
+/// `*_over_time` metrics functions are recognized here and rejected as
+/// `NotYetSupported` (M7, task-manager adjudication 1 on issue #59), as
+/// is metrics grouping `by` after a metric stage.
 fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
     let tok = cursor.peek().clone();
     let name = match &tok.kind {
@@ -750,6 +751,10 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
     if let Some(op) = AggregateOp::from_ident(&name) {
         cursor.advance();
         return parse_aggregate(cursor, op);
+    }
+    if let Some(func) = MetricFn::from_ident(&name) {
+        cursor.advance();
+        return parse_metric(cursor, func);
     }
     if ast::UNSUPPORTED_METRIC_FNS.contains(&name.as_str()) {
         return Err(TraceQlError::NotYetSupported {
@@ -811,6 +816,38 @@ fn parse_aggregate(
         cmp,
         value,
     })
+}
+
+/// `Metric := ("rate"|"count_over_time") "(" ")"` — strictly zero-arity
+/// (a stray argument is a positioned error). A trailing `by` is the
+/// recognized-but-M7 metrics-grouping construct (issue #59 plan v2
+/// delta 7), named rather than left to fail as generic trailing input.
+fn parse_metric(cursor: &mut Cursor<'_>, func: MetricFn) -> Result<PipelineStage, TraceQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if !matches!(cursor.peek().kind, TokenKind::RParen) {
+        let tok = cursor.peek().clone();
+        if matches!(tok.kind, TokenKind::Eof) {
+            return Err(TraceQlError::UnexpectedEof {
+                expected: format!("')' ({func}() takes no argument)"),
+                span: tok.span,
+            });
+        }
+        return Err(TraceQlError::UnexpectedToken {
+            found: describe(&tok.kind),
+            expected: format!("')' ({func}() takes no argument)"),
+            span: tok.span,
+        });
+    }
+    cursor.advance(); // ')'
+    if let TokenKind::Ident(next) = &cursor.peek().kind
+        && next == "by"
+    {
+        return Err(TraceQlError::NotYetSupported {
+            construct: "metrics grouping 'by'".to_string(),
+            span: cursor.peek().span,
+        });
+    }
+    Ok(PipelineStage::Metric(func))
 }
 
 fn parse_comparison_op(cursor: &mut Cursor<'_>) -> Result<ComparisonOp, TraceQlError> {
@@ -1051,5 +1088,68 @@ mod tests {
     fn a_bare_intrinsic_at_end_of_input_is_unexpected_eof() {
         let err = parse("{ kind").unwrap_err();
         assert!(matches!(err, TraceQlError::UnexpectedEof { .. }), "{err}");
+    }
+
+    #[test]
+    fn rate_and_count_over_time_parse_to_the_metric_stage() {
+        for (query, func) in [
+            ("{} | rate()", MetricFn::Rate),
+            ("{} | count_over_time()", MetricFn::CountOverTime),
+        ] {
+            let parsed = parse(query).unwrap();
+            assert_eq!(parsed.pipeline, vec![PipelineStage::Metric(func)]);
+        }
+    }
+
+    #[test]
+    fn a_metric_fn_with_an_argument_is_a_positioned_arity_error() {
+        let err = parse("{} | rate(5)").unwrap_err();
+        match err {
+            TraceQlError::UnexpectedToken { expected, span, .. } => {
+                assert!(expected.contains("rate() takes no argument"), "{expected}");
+                assert_eq!(span.start, 10, "points at the stray argument");
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    #[test]
+    fn a_metric_fn_cut_off_mid_call_is_unexpected_eof() {
+        let err = parse("{} | rate(").unwrap_err();
+        assert!(matches!(err, TraceQlError::UnexpectedEof { .. }), "{err}");
+    }
+
+    #[test]
+    fn metrics_grouping_by_is_the_recognized_m7_boundary() {
+        let query = "{} | rate() by (resource.service.name)";
+        let err = parse(query).unwrap_err();
+        match err {
+            TraceQlError::NotYetSupported { construct, span } => {
+                assert_eq!(construct, "metrics grouping 'by'");
+                assert_eq!(&query[span.start..span.end], "by");
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    #[test]
+    fn deferred_over_time_functions_stay_positioned_not_yet_supported() {
+        for name in [
+            "avg_over_time",
+            "min_over_time",
+            "max_over_time",
+            "quantile_over_time",
+            "histogram_over_time",
+        ] {
+            let query = format!("{{}} | {name}()");
+            let err = parse(&query).unwrap_err();
+            match err {
+                TraceQlError::NotYetSupported { construct, span } => {
+                    assert_eq!(construct, format!("metrics function '{name}'"));
+                    assert_eq!(span.start, 5, "{query}");
+                }
+                other => panic!("{query} -> unexpected {other}"),
+            }
+        }
     }
 }

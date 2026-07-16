@@ -1,0 +1,7 @@
+NotYetSupported {
+    construct: "metrics function 'max_over_time'",
+    span: Span {
+        start: 5,
+        end: 18,
+    },
+}

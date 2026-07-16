@@ -66,14 +66,15 @@ use std::collections::{HashMap, HashSet};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
+use super::metrics_plan::{MetricFunc, MetricsCtx, TraceMetricsPlan};
 use super::rows::{
-    CandidateRow, HydrationRow, MembershipRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow,
-    StrValueRow, TagNameRow, TagValueRow,
+    CandidateRow, HydrationRow, MembershipRow, MetricBucketRow, MetricCountRow, NumValueRow,
+    RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow,
 };
 use super::search_eval::{self, BatchAttrs, HydratedSpan, SpanSummary, TraceMatch, TraceSpans};
 use super::search_plan::{SearchCtx, SearchPlan};
 use crate::logql::error::{ReadError, TooBroadReason};
-use crate::logql::exec::escape_query_placeholders;
+use crate::logql::exec::{MatrixSeries, QueryResult, VectorSample, escape_query_placeholders};
 use crate::logql::explain::PlanExplain;
 
 /// Phase-2 batch width: candidates hydrated/evaluated per round trip.
@@ -118,6 +119,26 @@ pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
 const CODE_TOO_MANY_ROWS: i32 = 158;
 const CODE_TOO_MANY_BYTES: i32 = 307;
 const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
+/// `SET_SIZE_LIMIT_EXCEEDED` — raised only by the metrics semi-join
+/// IN-set limits ([`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`],
+/// `set_overflow_mode='throw'`); no other trace/LogQL query sets a set
+/// limit, so this code maps exclusively on the metrics path (issue #59
+/// plan v2 delta 3 as amended, confirmed against a live 24.8 in
+/// `tests/traces_metrics_explain.rs`).
+const CODE_SET_SIZE_LIMIT_EXCEEDED: i32 = 191;
+
+/// The metrics attribute semi-join IN-set row budget (`max_rows_in_set`,
+/// throw): bounds the materialized `(trace_id, span_id)` set of every
+/// attr-filter membership subquery — a metrics window matching more
+/// than this many attribute rows is a `422 query_too_broad`, never an
+/// unbounded in-memory set. Documented constant (docs/schemas.md §4.2;
+/// promoted to config only on evidence).
+pub const TRACE_METRICS_MAX_SET_ROWS: u64 = 1_000_000;
+
+/// The metrics IN-set byte budget (`max_bytes_in_set`, throw) — the byte
+/// twin of [`TRACE_METRICS_MAX_SET_ROWS`], same scale as
+/// [`TRACE_MAX_RESULT_BYTES`].
+pub const TRACE_METRICS_MAX_SET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Per-entry container-overhead envelope, charged on top of every
 /// retained entry's `size_of`-based payload cost: covers hash-table
@@ -302,6 +323,25 @@ pub(crate) fn merge_candidates(per_generator: &[Vec<([u8; 16], i64)>]) -> Vec<([
     out
 }
 
+/// Maps a ClickHouse error on the **trace metrics** path (issue #59):
+/// code 191 (`SET_SIZE_LIMIT_EXCEEDED`) — raised only by the metrics
+/// semi-join IN-set limits — maps to the dedicated, never-conflated
+/// [`TooBroadReason::TraceMetricsSetRows`]; everything else delegates to
+/// the shared trace mapper ([`map_trace_read_error`]), which never maps
+/// 191 itself.
+fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
+    if let ChError::Server {
+        code: CODE_SET_SIZE_LIMIT_EXCEEDED,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSetRows {
+            max_set_rows: TRACE_METRICS_MAX_SET_ROWS,
+        });
+    }
+    map_trace_read_error(e, config)
+}
+
 /// Maps a ClickHouse error on the **trace search** path. Unlike the
 /// LogQL mapper, this one deliberately sets `max_rows_to_read`, so code
 /// 158 maps to [`TooBroadReason::TraceScanBudgetRows`]; the read/result
@@ -384,6 +424,85 @@ impl TraceEngine {
             max_candidates: self.config.max_candidates,
             distributed: self.config.distributed,
         }
+    }
+
+    /// The metrics planning context this engine's configuration implies —
+    /// callers feed it to [`super::metrics_plan::plan_trace_metrics`]
+    /// (issue #59), mirroring [`Self::search_ctx`].
+    pub fn metrics_ctx(&self) -> MetricsCtx<'_> {
+        MetricsCtx {
+            filter: super::filter::SpanFilterCtx {
+                spans_table: &self.config.spans_table,
+                attrs_table: &self.config.attrs_table,
+            },
+            scan_budget_rows: self.config.scan_budget_rows,
+            distributed: self.config.distributed,
+            skip_unavailable_shards: self.config.skip_unavailable_shards,
+        }
+    }
+
+    /// Executes a metrics range plan (issue #59): one fully-pushed-down
+    /// time-bucketed query — bucketing, replay-deduped counting, and time
+    /// pruning all happen in ClickHouse; the engine only frames at most
+    /// `MAX_METRICS_POINTS` `(t_ms, value)` points (the plan enforced the
+    /// cap statically) and applies the explicit encode-boundary
+    /// conversions (`n as f64`, rate ÷ `step_s`; `t_secs × 1000` → the
+    /// millisecond point unit `prom_api::encode` consumes). Empty result
+    /// → `Matrix(vec![])` (the documented empty-DB oracle); otherwise one
+    /// label-less series (single-series M4 output — `by()` is M7).
+    pub async fn metrics_range(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
+        let settings = metrics_settings(&self.config);
+        let sql = escape_query_placeholders(plan.range_sql());
+        let mut points: Vec<(i64, f64)> = Vec::new();
+        // Scoped stream (module convention): the pooled-connection lease
+        // drops at return, after full consumption (≤ cap buckets).
+        let mut stream = self
+            .client
+            .query_stream::<MetricBucketRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+            points.push((
+                i64::from(row.t_secs) * 1000,
+                metric_value(plan.func(), row.n, plan.step_s()),
+            ));
+        }
+        if points.is_empty() {
+            return Ok(QueryResult::Matrix(vec![]));
+        }
+        Ok(QueryResult::Matrix(vec![MatrixSeries {
+            labels: vec![],
+            points,
+        }]))
+    }
+
+    /// Executes a metrics instant plan (issue #59): the same pushed-down
+    /// body over the whole snapped window `[S, E)` with no bucketing —
+    /// exactly one row (`uniqExact` with no `GROUP BY`), returned as a
+    /// one-sample label-less vector; the instant `rate` denominator is
+    /// the snapped window width (plan v2 delta 2). The caller stamps the
+    /// sample at [`TraceMetricsPlan::snapped_end_ms`].
+    pub async fn metrics_instant(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
+        let settings = metrics_settings(&self.config);
+        let sql = escape_query_placeholders(plan.instant_sql());
+        let mut count: Option<u64> = None;
+        // Scoped stream: same lease/drain contract as metrics_range
+        // (exactly one row by the SQL shape).
+        let mut stream = self
+            .client
+            .query_stream::<MetricCountRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+            count = Some(row.n);
+        }
+        let n = count.unwrap_or(0);
+        Ok(QueryResult::Vector(vec![VectorSample {
+            labels: vec![],
+            value: metric_value(plan.func(), n, plan.window_s()),
+        }]))
     }
 
     /// Streams the §4.2 point read for one trace. `hex32` must already be
@@ -892,6 +1011,42 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("result_overflow_mode", "throw")
 }
 
+/// The Layer-1 settings every metrics query carries (issue #59 plan v2
+/// delta 3): the full search budget set ([`search_settings`]) plus the
+/// IN-set limits bounding every attribute semi-join's materialized set
+/// (`max_rows_in_set`/`max_bytes_in_set`, throw → code 191 → 422 via the
+/// dedicated [`TooBroadReason::TraceMetricsSetRows`]). Clustered mode
+/// additionally injects `distributed_product_mode='local'`, rewriting
+/// `IN (SELECT … FROM trace_attrs_idx_dist …)` to the **local** shard
+/// table — co-sharding on `cityHash64(trace_id)` makes each shard's
+/// semi-join exact and kills the `_dist`-inside-`_dist`
+/// double-distributed path. (Honesty note: the time-bucket `GROUP BY`
+/// itself is *not* shard-local — buckets exist on every shard; the
+/// coordinator merges per-bucket partial states, bounded by the point
+/// cap × shards. Scale evidence routes to #25.)
+fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
+    let base = search_settings(config)
+        .set("max_rows_in_set", TRACE_METRICS_MAX_SET_ROWS)
+        .set("max_bytes_in_set", TRACE_METRICS_MAX_SET_BYTES)
+        .set("set_overflow_mode", "throw");
+    if config.distributed {
+        base.set("distributed_product_mode", "local")
+    } else {
+        base
+    }
+}
+
+/// The explicit encode-boundary value conversion (issue #59 plan v2
+/// delta 5): the SQL side always ships the deduped `UInt64` count;
+/// `rate` divides by its denominator (`step_s` per range bucket, the
+/// snapped window width for an instant) in `f64` here — never in SQL.
+fn metric_value(func: MetricFunc, n: u64, rate_denominator_s: i64) -> f64 {
+    match func {
+        MetricFunc::Rate => n as f64 / rate_denominator_s as f64,
+        MetricFunc::CountOverTime => n as f64,
+    }
+}
+
 /// A fresh `Vec`'s initial reservation, in element slots: `std`'s
 /// `RawVec` first non-zero allocation reserves 4 slots for element types
 /// ≤ 1024 bytes (8 for 1-byte elements — every element type here is far
@@ -1130,6 +1285,74 @@ mod tests {
             }
             other => panic!("expected ScanBudgetBytes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn code_191_maps_to_the_metrics_set_budget_on_the_metrics_path_only() {
+        let e = || ChError::Server {
+            code: 191,
+            message: "Limit for size of set exceeded".to_string(),
+        };
+        match map_trace_metrics_error(e(), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSetRows { max_set_rows }) => {
+                assert_eq!(max_set_rows, TRACE_METRICS_MAX_SET_ROWS);
+            }
+            other => panic!("expected TraceMetricsSetRows, got {other:?}"),
+        }
+        // The search-path mapper never maps 191 — the set limits are set
+        // only on metrics queries, and the reasons stay unconflated.
+        assert!(matches!(
+            map_trace_read_error(e(), &cfg()),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    #[test]
+    fn the_metrics_mapper_delegates_everything_else_to_the_shared_mapper() {
+        let e = ChError::Server {
+            code: 158,
+            message: "Limit for rows to read exceeded".to_string(),
+        };
+        assert!(matches!(
+            map_trace_metrics_error(e, &cfg()),
+            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows: 1_000 })
+        ));
+        let t = ChError::Timeout("deadline".to_string());
+        assert!(matches!(
+            map_trace_metrics_error(t, &cfg()),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    #[test]
+    fn metrics_settings_carry_the_set_limits_and_gate_the_local_product_mode() {
+        let local = format!("{:?}", metrics_settings(&cfg()));
+        for needle in [
+            "max_rows_in_set",
+            "max_bytes_in_set",
+            "set_overflow_mode",
+            "max_rows_to_read",
+            "max_bytes_to_read",
+            "max_result_bytes",
+        ] {
+            assert!(local.contains(needle), "missing {needle} in {local}");
+        }
+        assert!(
+            !local.contains("distributed_product_mode"),
+            "the local-product rewrite is clustered-only: {local}"
+        );
+        let mut clustered_cfg = cfg();
+        clustered_cfg.distributed = true;
+        let clustered = format!("{:?}", metrics_settings(&clustered_cfg));
+        assert!(clustered.contains("distributed_product_mode"));
+        assert!(clustered.contains("local"));
+    }
+
+    #[test]
+    fn metric_values_convert_at_the_encode_boundary() {
+        assert_eq!(metric_value(MetricFunc::Rate, 120, 60), 2.0);
+        assert_eq!(metric_value(MetricFunc::CountOverTime, 120, 60), 120.0);
+        assert_eq!(metric_value(MetricFunc::Rate, 0, 3_600), 0.0);
     }
 
     #[test]

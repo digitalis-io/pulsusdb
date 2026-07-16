@@ -232,7 +232,7 @@ GET /api/traces/v1/trace/{traceId}/json    → force JSON
 |-------|-------|
 | `q` | TraceQL query (preferred) |
 | `tags`, `minDuration`, `maxDuration` | legacy search params, compiled to TraceQL internally (below) |
-| `start`, `end` | unix seconds; **both required**, `end > start` |
+| `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms; integers with magnitude ≥ 10^12 are nanoseconds, smaller ones seconds); **both required**, `end > start` |
 | `limit`, `spss` | result cap (default 20) and spans-per-spanset cap (default 3); positive integers |
 
 **`q` vs legacy params:** mutually exclusive — supplying `q` together with any of `tags`/`minDuration`/`maxDuration` is a `400 bad_data`, never silent precedence. Supplying neither is a valid time-range-only search (`{}`).
@@ -294,12 +294,16 @@ GET /api/traces/v1/metrics/query
 
 | Param | Notes |
 |-------|-------|
-| `q` / `query` | TraceQL metrics expression (e.g. `{span.http.status_code=200} \| rate()`) |
-| `start`, `end` | unix s / ns / RFC3339 |
-| `since` | relative alternative to start/end (`1h`, `30m`) |
-| `step` | resolution; auto-derived when omitted |
+| `q` / `query` | TraceQL metrics expression (e.g. `{span.http.status_code=200} \| rate()`) — exactly one of the two keys |
+| `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms, the same parser as §4.2 search: integers with magnitude ≥ 10^12 are nanoseconds, smaller ones seconds) |
+| `since` | relative alternative to start/end (`1h`, `30m`) — mutually exclusive with them |
+| `step` | resolution in whole seconds (`60`, `60s`, `5m`, `1h`); auto-derived when omitted |
 
-Aggregation is executed in ClickHouse (`GROUP BY toStartOfInterval`); responses use the Prometheus matrix/vector shape.
+The committed M4 function set is **`rate()` and `count_over_time()`** (zero-arity, single spanset, exactly one pipeline stage); `avg`/`min`/`max`/`quantile`/`histogram` `_over_time` and grouping `by()` are recognized and rejected as not-yet-supported (M7). Aggregation is executed entirely in ClickHouse (`GROUP BY toStartOfInterval`, replay-deduped `uniqExact(trace_id, span_id)` counting — docs/schemas.md §4.2); `query_range` responds with the Prometheus **matrix** envelope, `query` with the Prometheus **vector** envelope.
+
+**Bucketing (normative):** buckets are epoch-aligned, **left-closed** intervals `[b, b + step)`. The evaluated window is snapped outward: `S = ⌊start/step⌋·step`, `E = ⌈end/step⌉·step` — an unaligned request over-includes by at most one step on each edge, and every bucket divides by the full step. Empty buckets are omitted (no gap-filling). The instant `query` form evaluates one bucket over the whole snapped window `[S, E)` — `rate` divides by `E − S` seconds — and stamps its single sample at `E`; on an empty window it returns a one-sample vector with value `"0"`.
+
+**Step derivation and the point cap (committed contract):** when `step` is omitted, `step_s = max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` with `DEFAULT_METRICS_POINTS` = 100. The snapped bucket count `(E − S) / step_s` is capped at `MAX_METRICS_POINTS` = 11000: a range resolving more buckets is rejected **statically before execution** with `422 query_too_broad` — deliberately 422 (the bounded-response family), not Prometheus's 400, and never a silent truncation. Attribute-filter semi-joins carry throwing IN-set limits with the same 422 semantics (docs/schemas.md §4.2).
 
 ---
 

@@ -26,7 +26,10 @@
 //! native histograms, real exemplar data, `/api/v1/write` (#28),
 //! `/api/v1/rules` (M7).
 
-mod encode;
+// `pub(crate)`: the TraceQL metrics endpoints (`traces_api::metrics`,
+// issue #59) reuse `encode::query_response` — their responses are the
+// same Prometheus matrix/vector envelope byte-for-byte.
+pub(crate) mod encode;
 mod error;
 mod handlers;
 mod params;

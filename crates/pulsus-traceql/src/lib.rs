@@ -13,12 +13,13 @@
 //!
 //! Every documented-but-unimplemented construct — structural operators
 //! (`>`/`>>`/`<`/`<<`/`~`), negation, arithmetic, `parent.`, bracketed
-//! attributes, bare-attribute existence (M7), and the metrics pipeline
-//! functions `rate`/`count_over_time`/`quantile_over_time`/
-//! `histogram_over_time` (T7, via the additive [`PipelineStage`] growth
-//! point) — is recognized and named in
+//! attributes, bare-attribute existence, the deferred metrics pipeline
+//! functions (`avg`/`min`/`max`/`quantile`/`histogram` `_over_time`),
+//! and metrics grouping `by` (all M7) — is recognized and named in
 //! [`TraceQlError::NotYetSupported`] rather than failing as a generic
-//! syntax error; the frozen registry is [`BOUNDARY_CONSTRUCTS`].
+//! syntax error; the frozen registry is [`BOUNDARY_CONSTRUCTS`]. The
+//! committed M4 metrics functions `rate()`/`count_over_time()` parse to
+//! [`PipelineStage::Metric`] (issue #59, the additive growth-point fill).
 //!
 //! Duration literals follow the normative in-house grammar (docs/api.md
 //! §4.2): an unsigned decimal number immediately followed by exactly one
@@ -39,7 +40,8 @@ mod token;
 
 pub use ast::{
     AggregateOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field, FieldExpr,
-    Intrinsic, PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, Value,
+    Intrinsic, MetricFn, PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter,
+    StatusValue, Value,
 };
 pub use error::TraceQlError;
 pub use parser::parse;
