@@ -534,7 +534,7 @@ fn eval_step(
                     let StepValue::Scalar(k) = eval_step(p, selectors, data, t_ms, lookback_ms)?
                     else {
                         return Err(PromqlError::Unsupported {
-                            construct: "topk/bottomk's k parameter must evaluate to a scalar"
+                            construct: "aggregation parameter must evaluate to a scalar"
                                 .to_string(),
                         });
                     };
@@ -544,6 +544,27 @@ fn eval_step(
             };
             let out = aggregation::aggregate(*op, &v, grouping.as_ref(), param_v)?;
             Ok(StepValue::Vector(out))
+        }
+
+        // Issue #69 (M6-06): `count_values(label, v)` — the two-channel
+        // value-label injection (`__name__` → the metric-name channel)
+        // lives entirely in `aggregation::count_values`; the label name
+        // was validated at plan time.
+        PlanExpr::CountValues {
+            label,
+            expr,
+            grouping,
+        } => {
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "aggregation over a scalar expression".to_string(),
+                });
+            };
+            Ok(StepValue::Vector(aggregation::count_values(
+                &v,
+                label,
+                grouping.as_ref(),
+            )))
         }
 
         // Issue #65 (M6-02): elementwise math/trig **computes** a new
@@ -933,6 +954,106 @@ mod tests {
                 assert_eq!(v.len(), 2);
                 assert_eq!(v[0].v, 3.0);
                 assert_eq!(v[1].v, 5.0);
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// Issue #69 (M6-06, AC3): the lifted `group` restriction end-to-end
+    /// — `group` over computed bodies evaluates to constant 1 per group.
+    #[test]
+    fn evaluates_group_over_computed_expressions_to_one_per_group() {
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("job", "a")], vec![s(0, 3.0)]),
+                series(2, &[("job", "b")], vec![s(0, 7.0)]),
+            ],
+        );
+        for query in ["group(m + m)", "group by (job) (m * 2)"] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            // Both selectors of `m + m` get the same series.
+            let mut d = data.clone();
+            for spec in &p.selectors {
+                d.insert(spec.id, data.get(0).to_vec());
+            }
+            match evaluate(&p, &d).unwrap() {
+                QueryValue::Vector(v) => {
+                    assert!(!v.is_empty(), "{query}");
+                    assert!(v.iter().all(|s| s.v == 1.0), "{query}: {v:?}");
+                    assert!(v.iter().all(|s| s.metric_name.is_none()), "{query}");
+                }
+                other => panic!("{query}: expected Vector, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #69 (M6-06, plan v2 Δ4): a non-scalar aggregation parameter
+    /// (the parser does not type-check limitk/limit_ratio params) is a
+    /// descriptive `Unsupported`, never a wrong answer.
+    #[test]
+    fn a_non_scalar_limitk_parameter_is_unsupported() {
+        let expr = crate::parser::parse("limitk(m, m)").unwrap();
+        let p = plan(
+            &expr,
+            PlanParams {
+                experimental_functions: true,
+                ..params(0, 0, 0)
+            },
+        )
+        .unwrap();
+        let mut data = SeriesData::new();
+        for spec in &p.selectors {
+            data.insert(spec.id, vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]);
+        }
+        let err = evaluate(&p, &data).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => {
+                assert!(construct.contains("scalar"), "{construct:?}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// Issue #69 (M6-06): `count_values` end-to-end through its dedicated
+    /// plan variant, incl. the `__name__` destination writing the
+    /// metric-name channel.
+    #[test]
+    fn evaluates_count_values_end_to_end() {
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("i", "0")], vec![s(0, 6.0)]),
+                series(2, &[("i", "1")], vec![s(0, 6.0)]),
+                series(3, &[("i", "2")], vec![s(0, 7.0)]),
+            ],
+        );
+        let expr = crate::parser::parse(r#"count_values("version", m)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[0].labels.get("version"), Some("6"));
+                assert_eq!(v[0].v, 2.0);
+                assert_eq!(v[1].labels.get("version"), Some("7"));
+                assert_eq!(v[1].v, 1.0);
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+        let expr = crate::parser::parse(r#"count_values("__name__", m)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 2);
+                assert!(v.iter().all(|s| s.labels.is_empty()));
+                let names: Vec<Option<&str>> = v.iter().map(|s| s.metric_name.as_deref()).collect();
+                assert!(
+                    names.contains(&Some("6")) && names.contains(&Some("7")),
+                    "{v:?}"
+                );
             }
             other => panic!("expected Vector, got {other:?}"),
         }

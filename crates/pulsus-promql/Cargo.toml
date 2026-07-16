@@ -26,6 +26,11 @@ pulsus-model = { path = "../pulsus-model" }
 # loaded series).
 regex.workspace = true
 thiserror.workspace = true
+# Issue #69 (M6-06): `limit_ratio`'s deterministic per-series inclusion
+# offset hashes the full label identity with xxh64 (seed 0) — the same
+# workspace hash primitive `pulsus-model::metric_fingerprint` already
+# uses.
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

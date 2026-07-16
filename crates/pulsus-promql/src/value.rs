@@ -69,6 +69,29 @@ impl Labels {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Sets `key` to `val`, overwriting an existing entry (issue #69,
+    /// M6-06: `count_values`' value-label injection — the vendored
+    /// `aggregators.test:467-479` "Overwrite label with output" cases).
+    /// Preserves the sorted-by-key invariant. `__name__` must never be
+    /// passed here — it is carried outside `Labels` by construction (see
+    /// the type doc); callers route it to `InstantSample::metric_name`
+    /// instead (the `eval::labels::set_or_delete` precedent).
+    pub fn set(&mut self, key: String, val: String) {
+        debug_assert!(
+            key != "__name__",
+            "__name__ is carried outside Labels — write metric_name instead"
+        );
+        match self.0.iter().position(|(k, _)| *k == key) {
+            Some(i) => self.0[i].1 = val,
+            None => {
+                // Keys are unique, so key-sorted insertion preserves the
+                // full `(key, value)` sort invariant.
+                let pos = self.0.partition_point(|(k, _)| *k < key);
+                self.0.insert(pos, (key, val));
+            }
+        }
+    }
 }
 
 /// One resolved series' fetched samples, pre-sorted ascending by `t_ms`
@@ -114,10 +137,16 @@ impl SeriesData {
 /// rather than special-cased back into the label vector/grouping-key
 /// machinery every `Labels`-keyed `HashMap` in `eval/{aggregation,binop}.rs`
 /// already relies on. `Some(name)` iff this sample's value is the
-/// **verbatim value of an existing series** (a bare selector match, or a
-/// `topk`/`bottomk`/filter-mode-comparison pass-through of one); `None` iff
-/// the value was **computed** (an aggregation, a range/`_over_time`
-/// function, arithmetic, a `bool`-mode comparison, `histogram_quantile`) —
+/// **verbatim value of an existing series** (a bare selector match, a
+/// `topk`/`bottomk`/filter-mode-comparison pass-through of one, or a
+/// `last_over_time`/`first_over_time` sample — the two name-keeping range
+/// functions, issue #67), **or the name was explicitly (re)assigned** by a
+/// name-writing construct (`sum by(__name__)`-style grouping preservation,
+/// `count_values("__name__", …)`'s metric-name-channel injection — issue
+/// #69 — or `label_replace`/`label_join` writing `__name__` — issue #68);
+/// `None` iff the value was **computed with no name-writing construct
+/// involved** (most aggregations, range/`_over_time` functions, arithmetic,
+/// `bool`-mode comparisons, `histogram_quantile`) —
 /// this is Prometheus's own `dropMetricName` rule, verified per construct
 /// class against real captured `prom/prometheus:v3.13.0` responses; see
 /// `crates/pulsus-server/tests/fixtures/prom_api/PROVENANCE.md`'s

@@ -103,6 +103,10 @@
 
     { "expr": "label_replace(mem_usage_bytes{run_id=\"{R}\"}, \"rewritten\", \"$1-copy\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
     { "expr": "label_join(mem_usage_bytes{run_id=\"{R}\"}, \"joined\", \"-\", \"service\", \"instance\")", "modes": ["instant", "range"] },
-    { "expr": "absent(nonexistent_metric{run_id=\"{R}\"})", "modes": ["instant", "range"] }
+    { "expr": "absent(nonexistent_metric{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+
+    { "expr": "group by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "group without(instance)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
+    { "expr": "count_values(\"v\", mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] }
   ]
 }

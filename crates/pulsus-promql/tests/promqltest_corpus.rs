@@ -31,6 +31,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_03_time_date.test",
     "m6_04_range_functions.test",
     "m6_05_label_sort_absence.test",
+    "m6_06_aggregation_operators.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {

@@ -234,8 +234,10 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
 /// `labels.Compare` treats `__name__` as an ordinary label at its lexical
 /// position — `_` = 0x5f sorts before lowercase, so it is *typically*
 /// first, but a `__a…`-named label sorts before it; the cross-metric-tie
-/// goldens pin exactly that).
-fn full_labels(s: &InstantSample) -> impl Iterator<Item = (&str, &str)> {
+/// goldens pin exactly that). `pub(crate)` since issue #69 (M6-06):
+/// `eval::aggregation::series_offset` hashes exactly this virtual full
+/// label set for `limit_ratio`'s inclusion offset.
+pub(crate) fn full_labels(s: &InstantSample) -> impl Iterator<Item = (&str, &str)> {
     let mut name = s.metric_name.as_deref();
     let mut rest = s.labels.0.iter().peekable();
     std::iter::from_fn(move || {

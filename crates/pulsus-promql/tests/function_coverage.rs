@@ -503,7 +503,26 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
     assert_eq!(
         implemented_ops,
         BTreeSet::from([
-            "sum", "avg", "min", "max", "count", "group", "topk", "bottomk",
+            // M2.
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "count",
+            "group",
+            "topk",
+            "bottomk",
+            // M6-06 (issue #69): the aggregation-operator completion —
+            // stddev/stdvar/quantile/count_values non-experimental,
+            // limitk/limit_ratio experimental (planner-gated behind
+            // promql-experimental-functions). The full 14-operator
+            // registry surface is implemented as of this flip.
+            "stddev",
+            "stdvar",
+            "quantile",
+            "count_values",
+            "limitk",
+            "limit_ratio",
         ])
     );
     let implemented_features: BTreeSet<&str> = manifest

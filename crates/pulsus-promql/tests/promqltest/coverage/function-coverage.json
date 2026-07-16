@@ -798,8 +798,11 @@
     {
       "name": "count_values",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "count_values(\"version\", version)"
+      }
     },
     {
       "name": "group",
@@ -813,14 +816,22 @@
     {
       "name": "limit_ratio",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "rationale": "Documented divergence (issue #69 adjudication): which subset limit_ratio selects depends on reference-internal series-iteration order and labels.Hash(), which PulsusDB does not reproduce — selection here is deterministic (xxh64 seed 0 over the sorted full label identity, offset = hash / 2^64, upstream's AddRatioSample predicate verbatim incl. the offset-rounds-to-1.0 exclusion at r=1.0) but not claimed upstream-identical. Proven surface: boundary sets (r=0/-1, caps), complement partition, cross-step stability, verbatim selection. Excluded from the live differential; empirical hash-parity promotion is possible later if the buffer layout is verified against a pinned upstream build.",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "limit_ratio(-1.0, http_requests)"
+      }
     },
     {
       "name": "limitk",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "rationale": "Documented divergence (issue #69 adjudication): WHICH k series limitk keeps depends on reference-internal series-iteration order, which PulsusDB does not reproduce — selection here is deterministic (first min(k, |group|) members in ascending-fingerprint input order) but not claimed upstream-identical; upstream's own limit.test asserts only count/subset/boundary invariants, followed here. A NaN k is a query error with upstream's exact message (Parameter value is NaN — aggregators.test:425, transcribed in the proof file); ±Inf k is corpus-unpinned and inherits the reviewed topk guard (empty), pinned in unit tests pending a live-differential revision. Excluded from the live differential.",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "count(limitk(100, http_requests))"
+      }
     },
     {
       "name": "max",
@@ -843,20 +854,29 @@
     {
       "name": "quantile",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "quantile without(point)(0.8, data)"
+      }
     },
     {
       "name": "stddev",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "stddev(series)"
+      }
     },
     {
       "name": "stdvar",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-06"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_06_aggregation_operators.test",
+        "query": "stdvar(series)"
+      }
     },
     {
       "name": "sum",

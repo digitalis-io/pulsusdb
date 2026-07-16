@@ -156,21 +156,26 @@ pub enum OverTimeParamFn {
     DoubleExpSmoothing,
 }
 
-/// Aggregation operators. `Group` is **not** in features.md §3's
-/// aggregation list (only `sum/avg/min/max/count/topk/bottomk` are) — it
-/// is sanctioned *only* for `count`/`group` directly over a bare instant
-/// vector selector (code review round 1, finding 4 — architect
-/// adjudication AMEND). [`plan_aggregate`] therefore restricts `Group` to
-/// that structural shape; `group()` over any computed sub-expression is
-/// `Unsupported`. This shape used to double as exactly what
-/// `QueryPlan::cache_answerable` recognized for a now-removed
-/// zero-ClickHouse fast path (issue #33 architect adjudication: the label
-/// cache's activity-bucket granularity cannot reproduce PromQL's exact
-/// 5-minute staleness lookback, so `count`/`group` always fetch+evaluate
-/// now) — the scope restriction on `Group` itself is independent of that
-/// removed optimization and still stands on the features.md §3 grounds
-/// alone. `Count` has no such restriction: it *is* in the §3 list and is
-/// fully general.
+/// Aggregation operators. All are pure post-fetch reductions/selections
+/// over the already-fetched instant vector (identical fetch SQL to the
+/// unwrapped expression — zero extra round-trips).
+///
+/// `Group` was historically restricted to a bare instant-vector selector
+/// body (M2 code review round 1, finding 4; the shape once doubled for
+/// the removed `QueryPlan::cache_answerable` fast path, issue #33) —
+/// issue #69 (M6-06, the aggregation-operator completion) lifts that
+/// restriction: `group()` is fully general like every other operator
+/// here.
+///
+/// Issue #69 additions: `Stddev`/`Stdvar` compute **population** variance
+/// via Welford's recurrence; `Quantile` takes a scalar φ parameter (the
+/// shared upstream `quantile()` interpolation); `LimitK`/`LimitRatio` are
+/// **experimental** (registry `experimental: true`, planner-gated behind
+/// [`PlanParams::experimental_functions`]) and, like `Topk`/`Bottomk`,
+/// select existing series **verbatim** (`__name__` kept). `count_values`
+/// is deliberately NOT an `AggOp` — its parameter is a *string* (the
+/// injected label name), so it plans to the dedicated
+/// [`PlanExpr::CountValues`] variant instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggOp {
     Sum,
@@ -181,6 +186,11 @@ pub enum AggOp {
     Group,
     Topk,
     Bottomk,
+    Stddev,
+    Stdvar,
+    Quantile,
+    LimitK,
+    LimitRatio,
 }
 
 /// Elementwise vector→vector math/trig functions (issue #65, M6-02):
@@ -394,8 +404,21 @@ pub enum PlanExpr {
     Aggregate {
         op: AggOp,
         expr: Box<PlanExpr>,
-        /// `topk`/`bottomk`'s `k` parameter.
+        /// `topk`/`bottomk`/`limitk`'s `k`, `quantile`'s φ, or
+        /// `limit_ratio`'s `r` — always a scalar expression.
         param: Option<Box<PlanExpr>>,
+        grouping: Option<Grouping>,
+    },
+    /// Issue #69 (M6-06): `count_values(label, v)` — the one aggregation
+    /// whose parameter is a *string* (the injected value-label name), so
+    /// it cannot share [`PlanExpr::Aggregate`]'s scalar `param` slot. The
+    /// label name is validated at plan time (`invalid label name "…"` —
+    /// mirroring the label-function dst checks); `label == "__name__"`
+    /// routes to the metric-name channel in the evaluator, never a
+    /// `Labels` entry.
+    CountValues {
+        label: String,
+        expr: Box<PlanExpr>,
         grouping: Option<Grouping>,
     },
     Binary {
@@ -1224,6 +1247,13 @@ fn agg_op(op: token::TokenType) -> Option<AggOp> {
         id if id == token::T_GROUP => Some(AggOp::Group),
         id if id == token::T_TOPK => Some(AggOp::Topk),
         id if id == token::T_BOTTOMK => Some(AggOp::Bottomk),
+        // Issue #69 (M6-06). `count_values` deliberately absent: it plans
+        // to `PlanExpr::CountValues` (string parameter), not an `AggOp`.
+        id if id == token::T_STDDEV => Some(AggOp::Stddev),
+        id if id == token::T_STDVAR => Some(AggOp::Stdvar),
+        id if id == token::T_QUANTILE => Some(AggOp::Quantile),
+        id if id == token::T_LIMITK => Some(AggOp::LimitK),
+        id if id == token::T_LIMIT_RATIO => Some(AggOp::LimitRatio),
         _ => None,
     }
 }
@@ -1231,8 +1261,9 @@ fn agg_op(op: token::TokenType) -> Option<AggOp> {
 /// Strips every layer of `Expr::Paren` wrapping, returning the innermost
 /// non-paren expression — mirrors `plan_expr`'s own `Expr::Paren(p) =>
 /// plan_expr(planner, &p.expr)` transparent unwrap, so raw-AST structural
-/// checks performed *before* planning (e.g. [`plan_aggregate`]'s `group`
-/// restriction) agree with what planning itself would see. `((up))`
+/// checks performed *before* planning (e.g. [`plan_string_arg`]'s
+/// paren-stripped string literals, `absent`/`timestamp`'s bare-selector
+/// detection) agree with what planning itself would see. `((up))`
 /// unwraps to `up` in two iterations; a non-paren expression unwraps to
 /// itself in zero.
 fn unwrap_parens(mut expr: &Expr) -> &Expr {
@@ -1243,9 +1274,6 @@ fn unwrap_parens(mut expr: &Expr) -> &Expr {
 }
 
 fn plan_aggregate(planner: &mut Planner, agg: &AggregateExpr) -> Result<PlanExpr, PromqlError> {
-    let Some(op) = agg_op(agg.op) else {
-        return Err(unsupported(format!("aggregation operator {}", agg.op)));
-    };
     let grouping = agg.modifier.as_ref().map(|m| match m {
         LabelModifier::Include(ls) => Grouping {
             without: false,
@@ -1256,60 +1284,70 @@ fn plan_aggregate(planner: &mut Planner, agg: &AggregateExpr) -> Result<PlanExpr
             labels: ls.labels.clone(),
         },
     });
+
+    // Issue #69 (M6-06): `count_values(label, v)` — its parameter is a
+    // *string* (the injected value-label name), which the shared
+    // scalar-`param` path below cannot carry, so it branches to the
+    // dedicated `PlanExpr::CountValues` variant before `agg_op` (which
+    // deliberately does not map `T_COUNT_VALUES`). The label name is
+    // validated here at plan time (upstream errors inside the engine;
+    // this mirrors `label_replace`'s before-the-loop dst check, so it
+    // errors even over an empty selection). The vendored parser already
+    // type-checks the parameter as a string and requires it, so both
+    // rejections below are defense-in-depth.
+    if agg.op.id() == token::T_COUNT_VALUES {
+        let Some(param) = &agg.param else {
+            return Err(unsupported("count_values without a label parameter"));
+        };
+        let label = plan_string_arg("count_values", param)?;
+        if !crate::eval::labels::is_valid_label_name(&label) {
+            return Err(PromqlError::LabelSet {
+                detail: format!("invalid label name \"{label}\""),
+            });
+        }
+        let expr = plan_expr(planner, &agg.expr)?;
+        return Ok(PlanExpr::CountValues {
+            label,
+            expr: Box::new(expr),
+            grouping,
+        });
+    }
+
+    let Some(op) = agg_op(agg.op) else {
+        return Err(unsupported(format!("aggregation operator {}", agg.op)));
+    };
+    // Issue #69 (M6-06): `limitk`/`limit_ratio` are the two experimental
+    // aggregation operators (lex.go IsExperimentalAggregator) — gated by
+    // name exactly like the experimental functions (plan_call), before
+    // any other work.
+    if matches!(op, AggOp::LimitK | AggOp::LimitRatio) && !planner.experimental {
+        return Err(unsupported(format!(
+            "experimental function {}() (requires promql-experimental-functions)",
+            agg.op
+        )));
+    }
     let param = match &agg.param {
         Some(p) => Some(Box::new(plan_expr(planner, p)?)),
         None => None,
     };
-    if matches!(op, AggOp::Topk | AggOp::Bottomk) && param.is_none() {
-        return Err(unsupported(format!("{} without a k parameter", agg.op)));
-    }
-    // `group` is restricted to a bare **instant** vector-selector body
-    // (code review round 1, finding 4: `group` is not in features.md §3's
-    // aggregation list, sanctioned only over a bare selector — see
-    // `AggOp`'s own doc comment for the now-removed `cache_answerable` fast
-    // path this shape used to double for, issue #33). Checked on the
-    // **raw AST** (`agg.expr`), before planning, so every non-selector body
-    // (a range vector, a function call, an arithmetic expression, a
-    // paren-wrapped range vector...) gets the same named-construct error,
-    // rather than `plan_expr`'s generic `Expr::MatrixSelector` arm firing
-    // first with an unrelated message for the range-vector case
-    // specifically (code review round 2: `group(up[5m])` must name "group"
-    // in its `Unsupported` error, not just "range vector used outside
-    // ..."). `offset` stays permitted (round 2, the ratified
-    // historical-variant sanction): a `VectorSelector` with `offset` set is
-    // still `Expr::VectorSelector` structurally, so it passes this check
-    // unchanged and always routes through the ordinary resolve+fetch path,
-    // which falls back to `metric_series` exactly like any other
-    // out-of-cache-window selector. Nested parentheses are unwrapped first
-    // (code review round 3 — a regression
-    // the round-2 fix introduced: `group((up))` was wrongly rejected,
-    // since this check compared `agg.expr` directly against
-    // `Expr::VectorSelector` without accounting for `plan_expr`'s own
-    // transparent `Expr::Paren` unwrap a few lines below) — so
-    // `group((up))`/`group(((up offset 5m)))` are permitted exactly like
-    // their unparenthesized forms, while `group((up[5m]))` is still
-    // rejected once unwrapping reaches the inner `Expr::MatrixSelector`.
-    if op == AggOp::Group && !matches!(unwrap_parens(&agg.expr), Expr::VectorSelector(_)) {
-        return Err(unsupported("group (except over a bare instant selector)"));
-    }
-    let expr = plan_expr(planner, &agg.expr)?;
-    // Defense-in-depth, redundant given the raw-AST check above (kept in
-    // case that check is ever loosened without updating this one):
-    // `PlanExpr::Selector` is only ever produced by
-    // [`plan_vector_selector`], which always sets `range_ms: None`, so a
-    // range vector can never actually reach this point as `op ==
-    // AggOp::Group` with `expr` a bare `Selector` — this `debug_assert!`
-    // documents and checks that invariant rather than silently relying on
-    // it.
-    if op == AggOp::Group
-        && let PlanExpr::Selector(id) = &expr
+    // Defense-in-depth: the vendored parser's `is_aggregator_with_param`
+    // already requires the parameter for all five at parse time.
+    if matches!(
+        op,
+        AggOp::Topk | AggOp::Bottomk | AggOp::Quantile | AggOp::LimitK | AggOp::LimitRatio
+    ) && param.is_none()
     {
-        debug_assert!(
-            planner.selectors[*id].range_ms.is_none(),
-            "a range-vector selector must never reach plan_aggregate's Group arm as a bare \
-             Selector — the raw-AST check above should have already rejected it"
-        );
+        return Err(unsupported(format!(
+            "{} without its required parameter",
+            agg.op
+        )));
     }
+    // Issue #69 (M6-06) lifted the M2 `group`-over-a-bare-selector-only
+    // restriction (see `AggOp`'s doc): every operator body plans
+    // generally; a range-vector body still fails through `plan_expr`'s
+    // own `Expr::MatrixSelector` arm (a genuine matrix type error —
+    // upstream's parser rejects that shape before it ever reaches us).
+    let expr = plan_expr(planner, &agg.expr)?;
     Ok(PlanExpr::Aggregate {
         op,
         expr: Box::new(expr),
@@ -1979,8 +2017,8 @@ mod tests {
         assert_eq!(upper_incl, 10_000_000 - 60_000);
     }
 
-    // --- `group` restricted to a bare instant selector (code review
-    // round 1, finding 4) ---
+    // --- `group` (issue #69, M6-06: the M2 bare-selector restriction is
+    // lifted — general grouping) ---
 
     #[test]
     fn group_over_a_bare_instant_selector_is_planned() {
@@ -2008,32 +2046,44 @@ mod tests {
         ));
     }
 
+    /// Issue #69 (M6-06): flipped from `…_is_unsupported` — the bare-
+    /// selector restriction is lifted, `group()` over a computed body
+    /// plans like every other aggregation operator.
     #[test]
-    fn group_over_a_computed_expression_is_unsupported() {
+    fn group_over_a_computed_expression_is_planned() {
         let expr = parse(r#"group(rate(x[5m]))"#).unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        match err {
-            PromqlError::Unsupported { construct } => assert!(construct.contains("group")),
-            other => panic!("expected Unsupported, got {other:?}"),
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::Aggregate { op, expr, .. } => {
+                assert_eq!(*op, AggOp::Group);
+                assert!(matches!(**expr, PlanExpr::RangeFn { .. }));
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
         }
     }
 
+    /// Issue #69 (M6-06): flipped from `…_is_unsupported`.
     #[test]
-    fn group_over_vector_scalar_arithmetic_is_unsupported() {
+    fn group_over_vector_scalar_arithmetic_is_planned() {
         let expr = parse(r#"group(up * 2)"#).unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+        let p = plan(&expr, params()).unwrap();
+        assert!(matches!(
+            p.root,
+            PlanExpr::Aggregate {
+                op: AggOp::Group,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn count_over_a_computed_expression_is_still_general() {
-        // `count` is in features.md §3's list — unlike `group`, it is not
-        // restricted to a bare instant selector.
         let expr = parse(r#"count(rate(x[5m]))"#).unwrap();
         assert!(plan(&expr, params()).is_ok());
     }
 
-    // --- `group` over a range vector (code review round 2) ---
+    // --- `group` over a range vector: still a genuine matrix type error,
+    // independent of the lifted restriction ---
 
     #[test]
     fn group_over_a_range_vector_body_is_rejected_by_the_parser_itself() {
@@ -2049,12 +2099,12 @@ mod tests {
 
     #[test]
     fn group_over_a_range_vector_body_is_unsupported_when_hand_constructed() {
-        // Defense-in-depth (code review round 2): even though `parse()`
-        // itself already rejects this shape (see the test above), directly
-        // exercise `plan_aggregate`'s own `range_ms` check by hand-
-        // constructing the AST, bypassing `parse()` entirely — mirrors
-        // `a_bare_matrix_selector_outside_a_range_function_is_unsupported`'s
-        // own bypass technique.
+        // Defense-in-depth: even though `parse()` itself already rejects
+        // this shape (see the test above), hand-construct the AST to
+        // bypass `parse()` entirely. Since issue #69 lifted the group
+        // guard, the rejection now comes from `plan_expr`'s generic
+        // `Expr::MatrixSelector` arm ("range vector used outside …")
+        // rather than a group-specific message.
         let matrix = parser::Expr::MatrixSelector(parser::MatrixSelector {
             vs: parser::VectorSelector::from("up"),
             range: std::time::Duration::from_secs(300),
@@ -2067,14 +2117,14 @@ mod tests {
         });
         let err = plan(&group_expr, params()).unwrap_err();
         match err {
-            PromqlError::Unsupported { construct } => assert!(construct.contains("group")),
+            PromqlError::Unsupported { construct } => assert!(construct.contains("range vector")),
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 
     #[test]
     fn group_over_a_bare_instant_selector_with_offset_is_permitted() {
-        // `offset` stays permitted (code review round 2, the ratified
+        // `offset` permitted (M2 code review round 2, the ratified
         // historical-variant sanction): `group(up offset 5m)` still plans
         // to `PlanExpr::Aggregate { op: Group, expr: Selector(_), .. }`.
         let expr = parse("group(up offset 5m)").unwrap();
@@ -2091,9 +2141,6 @@ mod tests {
             other => panic!("expected Aggregate, got {other:?}"),
         }
     }
-
-    // --- code review round 3: nested parens must not break the `group`
-    // guard (a regression the round-2 fix introduced) ---
 
     #[test]
     fn group_over_a_paren_wrapped_bare_instant_selector_is_permitted() {
@@ -2129,9 +2176,7 @@ mod tests {
         // The vendored parser's own type checker sees through parens too
         // (`group((up[5m]))` fails to parse at all, same as
         // `group(up[5m])`) — asserted here so this stays honest about
-        // which layer actually rejects it; the hand-constructed-AST test
-        // below exercises `plan_aggregate`'s own paren-unwrapping check
-        // directly, bypassing that upstream rejection.
+        // which layer actually rejects it.
         let err = parse("group((up[5m]))").unwrap_err();
         assert!(err.to_string().contains("matrix"));
     }
@@ -2140,9 +2185,10 @@ mod tests {
     fn group_over_a_paren_wrapped_range_vector_is_unsupported_when_hand_constructed() {
         // Defense-in-depth (mirrors
         // `group_over_a_range_vector_body_is_unsupported_when_hand_constructed`):
-        // directly exercises `unwrap_parens` inside `plan_aggregate`'s
-        // `group` guard by hand-building `group((up[5m]))`'s AST, bypassing
-        // `parse()`'s own (also-correct) rejection.
+        // bypasses `parse()`'s own (also-correct) rejection; the rejection
+        // comes from `plan_expr`'s `Expr::MatrixSelector` arm via its
+        // transparent `Expr::Paren` unwrap (issue #69 removed the
+        // group-specific raw-AST guard).
         let matrix = parser::Expr::MatrixSelector(parser::MatrixSelector {
             vs: parser::VectorSelector::from("up"),
             range: std::time::Duration::from_secs(300),
@@ -2158,8 +2204,120 @@ mod tests {
         });
         let err = plan(&group_expr, params()).unwrap_err();
         match err {
-            PromqlError::Unsupported { construct } => assert!(construct.contains("group")),
+            PromqlError::Unsupported { construct } => assert!(construct.contains("range vector")),
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // --- issue #69 (M6-06): the six new aggregation-operator plans ---
+
+    #[test]
+    fn plans_stddev_stdvar_and_quantile() {
+        for (query, want) in [
+            ("stddev(m)", AggOp::Stddev),
+            ("stdvar(m)", AggOp::Stdvar),
+            ("quantile(0.5, m)", AggOp::Quantile),
+        ] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            match &p.root {
+                PlanExpr::Aggregate { op, param, .. } => {
+                    assert_eq!(*op, want, "{query}");
+                    if want == AggOp::Quantile {
+                        assert_eq!(param.as_deref(), Some(&PlanExpr::Scalar(0.5)));
+                    }
+                }
+                other => panic!("{query}: expected Aggregate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plans_count_values_to_its_dedicated_variant() {
+        let p = plan(&parse(r#"count_values("version", m)"#).unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::CountValues {
+                label,
+                expr,
+                grouping,
+            } => {
+                assert_eq!(label, "version");
+                assert!(matches!(**expr, PlanExpr::Selector(_)));
+                assert!(grouping.is_none());
+            }
+            other => panic!("expected CountValues, got {other:?}"),
+        }
+    }
+
+    /// The vendored `aggregators.test:453` shape: the string argument may
+    /// be paren-wrapped (`plan_string_arg` strips parens).
+    #[test]
+    fn plans_count_values_with_a_paren_wrapped_label_and_grouping() {
+        let p = plan(
+            &parse(r#"count_values by (job) ((("version")), m)"#).unwrap(),
+            params(),
+        )
+        .unwrap();
+        match &p.root {
+            PlanExpr::CountValues {
+                label, grouping, ..
+            } => {
+                assert_eq!(label, "version");
+                assert_eq!(
+                    grouping,
+                    &Some(Grouping {
+                        without: false,
+                        labels: vec!["job".to_string()]
+                    })
+                );
+            }
+            other => panic!("expected CountValues, got {other:?}"),
+        }
+    }
+
+    /// The reachable invalid label name is the empty string (a Rust
+    /// `String` cannot hold the vendored corpus's lone `0xC5` byte —
+    /// `aggregators.test:481`'s `"a\xc5z"` case is a parser-level
+    /// divergence, same class as the #68 byte-level error goldens).
+    #[test]
+    fn count_values_with_an_empty_label_name_is_a_query_error() {
+        let err = plan(&parse(r#"count_values("", m)"#).unwrap(), params()).unwrap_err();
+        match err {
+            PromqlError::LabelSet { detail } => {
+                assert_eq!(detail, "invalid label name \"\"");
+            }
+            other => panic!("expected LabelSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn limitk_and_limit_ratio_are_unsupported_without_the_experimental_flag() {
+        for query in ["limitk(1, m)", "limit_ratio(0.5, m)"] {
+            let err = plan(&parse(query).unwrap(), params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert!(
+                    construct.contains("experimental")
+                        && construct.contains("promql-experimental-functions"),
+                    "{query}: rejection must name the gate, got {construct:?}"
+                ),
+                other => panic!("{query}: expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn limitk_and_limit_ratio_plan_with_the_experimental_flag() {
+        for (query, want) in [
+            ("limitk(1, m)", AggOp::LimitK),
+            ("limit_ratio(0.5, m)", AggOp::LimitRatio),
+        ] {
+            let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
+            match &p.root {
+                PlanExpr::Aggregate { op, param, .. } => {
+                    assert_eq!(*op, want, "{query}");
+                    assert!(param.is_some());
+                }
+                other => panic!("{query}: expected Aggregate, got {other:?}"),
+            }
         }
     }
 

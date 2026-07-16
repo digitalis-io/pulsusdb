@@ -1837,13 +1837,26 @@ mod tests {
     /// sort_by_label pair cannot appear at all, both per the #68
     /// adjudication — ordering is proven Tier-1 by the proof corpus's
     /// eval_ordered cases plus the encode-level wire-order test).
+    /// Resized 126 -> 132 by issue #69 (M6-06): 3 new entries x 2 modes
+    /// for `group by`/`group without` (incl. a computed body — the lifted
+    /// bare-selector restriction, live) and `count_values` (the corpus
+    /// gauge is integer-valued, so the formatted value labels are
+    /// cross-engine formatting-safe) — stddev/stdvar/quantile are
+    /// deliberately excluded from this bit-exact matrix
+    /// (accumulation/interpolation ULP, the same #67-recorded discipline)
+    /// and the experimental limitk/limit_ratio cannot appear at all (the
+    /// e2e Prometheus runs without
+    /// --enable-feature=promql-experimental-functions and would error
+    /// one-sidedly; their selection is additionally hash/order-dependent
+    /// — see the coverage manifest rationale). Those are proven Tier-1 by
+    /// the proof corpus + unit tests, per the #69 adjudication.
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_twenty_six_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_thirty_two_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 126,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 126 — update \
+            rows, 132,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 132 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

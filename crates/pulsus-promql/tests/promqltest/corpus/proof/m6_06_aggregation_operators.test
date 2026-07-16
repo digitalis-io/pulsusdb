@@ -1,0 +1,476 @@
+# Issue #69 (M6-06) proof corpus — witness cases for the six aggregation
+# operators this issue completes (stddev/stdvar/quantile/count_values,
+# non-experimental; limitk/limit_ratio, experimental — the driver plans
+# with the gate on, like upstream promqltest) plus the lifted `group`
+# bare-selector restriction and the `by (__name__)` metric-name grouping
+# channel. function-coverage.json points each entry's `witness` at the
+# exact query texts below; the coverage drift test replays this file and
+# requires each to pass.
+#
+# Every transcribed case cites the byte-frozen vendored oracle by line
+# (`upstream/aggregators.test`, `upstream/name_label_dropping.test`,
+# `upstream/limit.test`) with native-histogram series/rows removed (#22)
+# and `expect …` annotation lines omitted (deferred `expect` directive,
+# activates in M6-08) — those vendored files stay skip-manifested behind
+# exactly those directives, so these hand-derived cases are the
+# executable Tier-1 anchor until M6-08 activates the originals.
+#
+# Pinned semantics this file exercises end-to-end:
+#   - stddev/stdvar: POPULATION variance via Welford's recurrence, run
+#     for every sample incl. the first — single finite -> 0, single
+#     Inf/NaN -> NaN, {1,2} -> 0.25/0.5 exactly; computes -> drops
+#     __name__;
+#   - quantile: upstream's shared quantile() — NaN sorts smallest,
+#     rank = phi*(n-1) linear interpolation (through a NaN neighbour ->
+#     NaN), out-of-range/NaN phi CLAMPS to +-Inf/NaN (never an error;
+#     the out-of-range warn annotation is deferred to M6-08); phi from
+#     scalar() incl. per-step range re-evaluation;
+#   - count_values: by/without group key augmented with label=format(v)
+#     (Go strconv.FormatFloat(v,'f',-1,64)); an existing key label is
+#     OVERWRITTEN; "__name__" as the destination writes the metric-name
+#     channel (never a plain label); empty label name is a query error;
+#   - group: general grouping (the M2 bare-selector restriction is
+#     lifted) — constant 1 per group over computed bodies too;
+#   - by (__name__): discriminates and preserves metric names over
+#     name-carrying inputs; name-dropping inputs group namelessly;
+#   - limitk/limit_ratio: verbatim selection (__name__ kept). WHICH
+#     members are selected is PulsusDB-deterministic but not
+#     upstream-defined (upstream's own limit.test asserts only
+#     count/subset/boundary invariants — followed here, minus its
+#     `and`/`or` subset probes, which need M6-07's set ops), so this
+#     file asserts counts, boundary sets, and full-set cases only. The
+#     limit_ratio(1.0, …) = all case below holds because none of the six
+#     fixture series' offsets rounds to exactly 1.0 (offsets can round
+#     to 1.0 and are then excluded at r=1.0 — upstream's own
+#     AddRatioSample non-guarantee; only r=-1.0 guarantees all series).
+#
+# NaN limitk/limit_ratio *parameters* are query errors with upstream's
+# exact messages (aggregators.test:425-429, transcribed below); +-Inf
+# limitk parameters are corpus-unpinned and follow the reviewed topk
+# guard (empty), pinned in src/eval/aggregation.rs unit tests.
+
+# --- stddev / stdvar -----------------------------------------------------
+# Fixture: aggregators.test:799-801 (histogram row :802 excluded).
+
+load 5m
+	series{label="a"} 1
+	series{label="b"} 2
+
+# aggregators.test:805-812: {1,2} -> exactly 0.5 / 0.25.
+eval instant at 0m stddev(series)
+	{} 0.5
+
+eval instant at 0m stdvar(series)
+	{} 0.25
+
+# aggregators.test:820-830: single finite member per group -> exactly 0.
+eval instant at 0m stddev by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+
+eval instant at 0m stdvar by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+
+clear
+
+# aggregators.test:857-877: a NaN member poisons its group.
+load 5m
+	series{label="a"} 1
+	series{label="b"} 2
+	series{label="c"} NaN
+
+eval instant at 0m stddev(series)
+	{} NaN
+
+eval instant at 0m stdvar(series)
+	{} NaN
+
+eval instant at 0m stddev by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+	{label="c"} NaN
+
+eval instant at 0m stdvar by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+	{label="c"} NaN
+
+clear
+
+# aggregators.test:880-900: NaN-first accumulation order.
+load 5m
+	series{label="a"} NaN
+	series{label="b"} 1
+	series{label="c"} 2
+
+eval instant at 0m stddev(series)
+	{} NaN
+
+eval instant at 0m stdvar(series)
+	{} NaN
+
+eval instant at 0m stddev by (label) (series)
+	{label="a"} NaN
+	{label="b"} 0
+	{label="c"} 0
+
+clear
+
+# aggregators.test:903-910: a single NaN sample.
+load 5m
+	series NaN
+
+eval instant at 0m stddev(series)
+	{} NaN
+
+eval instant at 0m stdvar(series)
+	{} NaN
+
+clear
+
+# aggregators.test:913-935: an Inf member poisons its group (the Welford
+# m2 += Inf*(Inf-Inf) edge — why the recurrence runs for the first
+# sample too).
+load 5m
+	series{label="a"} 1
+	series{label="b"} 2
+	series{label="c"} inf
+
+eval instant at 0m stddev (series)
+	{} NaN
+
+eval instant at 0m stdvar (series)
+	{} NaN
+
+eval instant at 0m stddev by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+	{label="c"} NaN
+
+eval instant at 0m stdvar by (label) (series)
+	{label="a"} 0
+	{label="b"} 0
+	{label="c"} NaN
+
+clear
+
+# aggregators.test:960-967: a single Inf sample.
+load 5m
+	series inf
+
+eval instant at 0m stddev(series)
+	{} NaN
+
+eval instant at 0m stdvar(series)
+	{} NaN
+
+# --- quantile ------------------------------------------------------------
+# Fixture: aggregators.test:487-500 (histogram series :499 excluded).
+
+clear
+
+load 10s
+	data{test="two samples",point="a"} 0
+	data{test="two samples",point="b"} 1
+	data{test="three samples",point="a"} 0
+	data{test="three samples",point="b"} 1
+	data{test="three samples",point="c"} 2
+	data{test="uneven samples",point="a"} 0
+	data{test="uneven samples",point="b"} 1
+	data{test="uneven samples",point="c"} 4
+	data{test="NaN sample",point="a"} 0
+	data{test="NaN sample",point="b"} 1
+	data{test="NaN sample",point="c"} NaN
+	foo 0 1 0 1 0 1 0.8
+
+# 80th percentile; the NaN sample is treated as the smallest possible
+# value (aggregators.test:504-510).
+eval instant at 1m quantile without(point)(0.8, data)
+	{test="two samples"} 0.8
+	{test="three samples"} 1.6
+	{test="uneven samples"} 2.8
+	{test="NaN sample"} 0.6
+
+# 20th percentile; a quantile between NaN and 0 interpolates to NaN
+# (aggregators.test:513-518).
+eval instant at 1m quantile without(point)(0.2, data)
+	{test="two samples"} 0.2
+	{test="three samples"} 0.4
+	{test="uneven samples"} 0.4
+	{test="NaN sample"} NaN
+
+# phi from scalar() — upstream bug #5276 (aggregators.test:532-542,
+# paren-wrapped variant included).
+eval instant at 1m quantile without(point)(scalar(foo), data)
+	{test="two samples"} 0.8
+	{test="three samples"} 1.6
+	{test="uneven samples"} 2.8
+	{test="NaN sample"} 0.6
+
+eval instant at 1m quantile without(point)((scalar(foo)), data)
+	{test="two samples"} 0.8
+	{test="three samples"} 1.6
+	{test="uneven samples"} 2.8
+	{test="NaN sample"} 0.6
+
+# NaN phi -> NaN everywhere (aggregators.test:544-549; the warn
+# annotation line is deferred to M6-08 and omitted here).
+eval instant at 1m quantile without(point)(NaN, data)
+	{test="two samples"} NaN
+	{test="three samples"} NaN
+	{test="uneven samples"} NaN
+	{test="NaN sample"} NaN
+
+# Out-of-range phi clamps (hand-derived from upstream quantile()'s
+# phi<0 -> -Inf / phi>1 -> +Inf clamp — the #67 convention shared with
+# quantile_over_time; upstream asserts these only under a deferred warn
+# annotation).
+eval instant at 1m quantile without(point)(1.5, data)
+	{test="two samples"} +Inf
+	{test="three samples"} +Inf
+	{test="uneven samples"} +Inf
+	{test="NaN sample"} +Inf
+
+eval instant at 1m quantile without(point)(-0.5, data)
+	{test="two samples"} -Inf
+	{test="three samples"} -Inf
+	{test="uneven samples"} -Inf
+	{test="NaN sample"} -Inf
+
+# Per-step phi re-evaluation — upstream bug #15971
+# (aggregators.test:552-556).
+eval range from 0m to 1m step 10s quantile without(point) (scalar(foo), data)
+	{test="two samples"} 0 1 0 1 0 1 0.8
+	{test="three samples"} 0 2 0 2 0 2 1.6
+	{test="uneven samples"} 0 4 0 4 0 4 2.8
+	{test="NaN sample"} NaN 1 NaN 1 NaN 1 0.6
+
+# --- group (general grouping — the lifted M2 restriction) ----------------
+# Fixture: aggregators.test:561-571 (histogram row :570 excluded,
+# foo :571 kept).
+
+clear
+
+load 10s
+	data{test="two samples",point="a"} 0
+	data{test="two samples",point="b"} 1
+	data{test="three samples",point="a"} 0
+	data{test="three samples",point="b"} 1
+	data{test="three samples",point="c"} 2
+	data{test="uneven samples",point="a"} 0
+	data{test="uneven samples",point="b"} 1
+	data{test="uneven samples",point="c"} 4
+	foo .8
+
+# aggregators.test:573-577 (minus the histogram-sample row).
+eval instant at 1m group without(point)(data)
+	{test="two samples"} 1
+	{test="three samples"} 1
+	{test="uneven samples"} 1
+
+# aggregators.test:579-580.
+eval instant at 1m group(foo)
+	{} 1
+
+# --- by (__name__) + group over computed bodies --------------------------
+# Fixture: name_label_dropping.test:102-104.
+
+clear
+
+load 1m
+	metric_total{env="1"} 0+1x10
+	metric_total{env="2"} 0+3x10
+
+# Metric name is preserved as there is no function that drops it
+# (name_label_dropping.test:106-108).
+eval instant at 10m sum by (__name__) (metric_total{env="1"})
+	metric_total 10
+
+# Metric name is dropped by rate, so by (__name__) groups namelessly
+# (name_label_dropping.test:110-112).
+eval instant at 10m sum by (__name__) (rate(metric_total{env="2"}[5m]))
+	{} 0.05
+
+# Both channels in the key (name_label_dropping.test:78-80's shape on
+# this block's data).
+eval instant at 10m sum by (__name__, env) (metric_total{env="1"})
+	metric_total{env="1"} 10
+
+# group over computed bodies — the lifted bare-selector restriction
+# (hand-derived; group's constant-1 semantics per aggregators.test:573).
+eval instant at 10m group(rate(metric_total{env="2"}[5m]))
+	{} 1
+
+eval instant at 10m group by (env) (metric_total * 2)
+	{env="1"} 1
+	{env="2"} 1
+
+# --- count_values ---------------------------------------------------------
+# Fixture: aggregators.test:434-443 (the two native-histogram series
+# :444-445 excluded, so every histogram-valued output row is dropped
+# from the expectations).
+
+clear
+
+load 5m
+	version{job="api-server", instance="0", group="production"}	6
+	version{job="api-server", instance="1", group="production"}	6
+	version{job="api-server", instance="2", group="production"}	6
+	version{job="api-server", instance="0", group="canary"}	8
+	version{job="api-server", instance="1", group="canary"}	8
+	version{job="app-server", instance="0", group="production"}	6
+	version{job="app-server", instance="1", group="production"}	6
+	version{job="app-server", instance="0", group="canary"}	7
+	version{job="app-server", instance="1", group="canary"}	7
+
+# aggregators.test:447-451.
+eval instant at 1m count_values("version", version)
+	{version="6"} 5
+	{version="7"} 2
+	{version="8"} 2
+
+# Paren-wrapped string argument (aggregators.test:453-457).
+eval instant at 1m count_values(((("version"))), version)
+	{version="6"} 5
+	{version="7"} 2
+	{version="8"} 2
+
+# aggregators.test:459-464.
+eval instant at 1m count_values without (instance)("version", version)
+	{job="api-server", group="production", version="6"} 3
+	{job="api-server", group="canary", version="8"} 2
+	{job="app-server", group="production", version="6"} 2
+	{job="app-server", group="canary", version="7"} 2
+
+# Overwrite label with output. Don't do this. (aggregators.test:466-472 —
+# distinct jobs sharing a value merge under the overwritten key.)
+eval instant at 1m count_values without (instance)("job", version)
+	{job="6", group="production"} 5
+	{job="8", group="canary"} 2
+	{job="7", group="canary"} 2
+
+# Overwrite label with output. Don't do this. (aggregators.test:473-479.)
+eval instant at 1m count_values by (job, group)("job", version)
+	{job="6", group="production"} 5
+	{job="8", group="canary"} 2
+	{job="7", group="canary"} 2
+
+# "__name__" as the destination writes the metric-name channel — never a
+# plain label — and the output still evaluates downstream (hand-derived;
+# plan v2 delta-1/delta-4, the label_replace __name__-write precedent).
+eval instant at 1m count_values("__name__", version)
+	{__name__="6"} 5
+	{__name__="7"} 2
+	{__name__="8"} 2
+
+eval instant at 1m count(count_values("__name__", version))
+	{} 3
+
+# The reachable invalid label name is the empty string
+# (aggregators.test:481-482's "a\xc5z" lone-byte case is inexpressible
+# in this grammar — a Rust String cannot hold it).
+eval_fail instant at 1m count_values("", version)
+	expected_fail_message invalid label name ""
+
+# --- limitk / limit_ratio (experimental) ----------------------------------
+# Fixture: limit.test:5-11,14 (the two native-histogram series :12-13
+# and bar :15 excluded; foo :14 kept for the scalar-parameter case).
+# Methodology follows limit.test:17-88,102-125: counts, boundary sets and
+# full-set cases only — the vendored `and`/`or` subset/complement probes
+# need M6-07's set ops; the complement-partition and NaN/Inf-parameter
+# invariants are pinned in src/eval/aggregation.rs unit tests instead.
+
+clear
+
+load 5m
+	http_requests{job="api-server", instance="0", group="production"}	0+10x10
+	http_requests{job="api-server", instance="1", group="production"}	0+20x10
+	http_requests{job="api-server", instance="0", group="canary"}	0+30x10
+	http_requests{job="api-server", instance="1", group="canary"}	0+40x10
+	http_requests{job="api-server", instance="2", group="canary"}	0+50x10
+	http_requests{job="api-server", instance="3", group="canary"}	0+60x10
+	foo 1+1x10
+
+# k=0 / k<0 select nothing (limit.test:17-25).
+eval instant at 50m count(limitk by (group) (0, http_requests))
+	# empty
+
+eval instant at 50m count(limitk by (group) (-1, http_requests))
+	# empty
+
+# k=1 per group: 2 groups -> 2 series (limit.test:28-29).
+eval instant at 50m count(limitk by (group) (1, http_requests))
+	{} 2
+
+# k=2 per group: min(2,2) + min(2,4) = 4 (limit.test:31-32).
+eval instant at 50m count(limitk by (group) (2, http_requests))
+	{} 4
+
+# k >= N selects everything (limit.test:34-35).
+eval instant at 50m count(limitk(100, http_requests))
+	{} 6
+
+# Fractional k truncates (hand-derived; the inherited topk k-guard).
+eval instant at 50m count(limitk(2.9, http_requests))
+	{} 2
+
+# k = N: the full set, verbatim — __name__ kept (selection never
+# computes; limit.test:56-59's verbatim-labels shape, float series only).
+eval instant at 50m limitk(6, http_requests)
+	http_requests{job="api-server", instance="0", group="production"} 100
+	http_requests{job="api-server", instance="1", group="production"} 200
+	http_requests{job="api-server", instance="0", group="canary"} 300
+	http_requests{job="api-server", instance="1", group="canary"} 400
+	http_requests{job="api-server", instance="2", group="canary"} 500
+	http_requests{job="api-server", instance="3", group="canary"} 600
+
+# Cross-step count stability (limit.test:86-88, minus the `and` probe).
+eval range from 0 to 50m step 5m count(limitk(2, http_requests))
+	{} 2+0x10
+
+# Scalar k re-evaluated per step — upstream bug #15971 (limit.test:78-80,
+# rescaled to this fixture's 6 float series).
+eval range from 0m to 50m step 5m count(limitk(scalar(foo), http_requests))
+	{} 1 2 3 4 5 6 6 6 6 6 6
+
+# limit_ratio boundaries. r=0 -> empty (limit.test:82-84).
+eval range from 0 to 50m step 5m count(limit_ratio(0.0, http_requests))
+	# empty
+
+# r=1.0 -> all samples HERE (limit.test:109-111): holds because none of
+# this fixture's six offsets rounds to exactly 1.0 — see the header; the
+# only guaranteed-all boundary is r=-1.0 below.
+eval instant at 50m limit_ratio(1.0, http_requests)
+	http_requests{job="api-server", instance="0", group="production"} 100
+	http_requests{job="api-server", instance="1", group="production"} 200
+	http_requests{job="api-server", instance="0", group="canary"} 300
+	http_requests{job="api-server", instance="1", group="canary"} 400
+	http_requests{job="api-server", instance="2", group="canary"} 500
+	http_requests{job="api-server", instance="3", group="canary"} 600
+
+# r=-1.0 -> all samples, unconditionally (limit.test:113-115: offset >=
+# 1.0 + (-1.0) = 0 always holds).
+eval instant at 50m limit_ratio(-1.0, http_requests)
+	http_requests{job="api-server", instance="0", group="production"} 100
+	http_requests{job="api-server", instance="1", group="production"} 200
+	http_requests{job="api-server", instance="0", group="canary"} 300
+	http_requests{job="api-server", instance="1", group="canary"} 400
+	http_requests{job="api-server", instance="2", group="canary"} 500
+	http_requests{job="api-server", instance="3", group="canary"} 600
+
+# Out-of-range r caps to +-1 (limit.test:117-125; the cap warn
+# annotation is deferred to M6-08 and omitted here).
+eval range from 0 to 50m step 5m count(limit_ratio(1.1, http_requests))
+	{} 6+0x10
+
+eval range from 0 to 50m step 5m count(limit_ratio(-1.1, http_requests))
+	{} 6+0x10
+
+# NaN parameters are query errors — even over an empty selection
+# (aggregators.test:425-429).
+eval_fail instant at 50m limitk(NaN, non_existent)
+	expected_fail_message Parameter value is NaN
+
+eval_fail instant at 50m limit_ratio(NaN, non_existent)
+	expected_fail_message Ratio value is NaN

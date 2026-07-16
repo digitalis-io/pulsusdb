@@ -489,9 +489,11 @@ fn eval_ts_of_extremum(samples: &[Sample], which: TsExtremum) -> f64 {
 /// Sorting places NaN values **first** (upstream's `vectorByValueHeap.Less`
 /// returns true whenever the left value is NaN), materialized here as a
 /// total order so `sort_by`'s contract holds: NaN < non-NaN, NaN == NaN.
-/// Sorts `values` in place. Shared by `quantile_over_time` and
-/// `mad_over_time`.
-fn quantile_of(phi: f64, values: &mut [f64]) -> f64 {
+/// Sorts `values` in place. Shared by `quantile_over_time`,
+/// `mad_over_time`, and (issue #69, M6-06) the `quantile` aggregation
+/// operator — upstream's own `quantile()` is likewise the single shared
+/// implementation for all three.
+pub(crate) fn quantile_of(phi: f64, values: &mut [f64]) -> f64 {
     if values.is_empty() || phi.is_nan() {
         return f64::NAN;
     }
