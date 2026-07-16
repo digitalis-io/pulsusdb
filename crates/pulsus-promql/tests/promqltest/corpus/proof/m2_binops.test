@@ -1,0 +1,45 @@
+# Issue #64 (M6-01) proof corpus — binary-operator and vector-matching
+# witnesses (the `vector-matching-on-ignoring` language feature's witness
+# is the `foo * on(job) bar` case; regex matchers prove the driver's
+# fully-anchored `^(?:pat)$` selector semantics).
+
+load 1m
+	foo{job="a",inst="1"} 0+10x10
+	bar{job="a",inst="2"} 0+20x10
+	baz{job="a",inst="1"} 0+5x10
+
+# Values at 5m: foo=50, bar=100, baz=25.
+
+# on(): output labels are exactly the on-set; __name__ drops (computed).
+eval instant at 5m foo * on(job) bar
+	{job="a"} 5000
+
+# ignoring(): the ignored label drops, everything else survives.
+eval instant at 5m foo * ignoring(inst) bar
+	{job="a"} 5000
+
+# Default matching over identical label sets.
+eval instant at 5m foo + baz
+	{job="a",inst="1"} 75
+
+# Vector-scalar arithmetic drops the metric name.
+eval instant at 5m foo * 2
+	{job="a",inst="1"} 100
+
+# Filter-mode comparison keeps the metric name.
+eval instant at 5m foo > 10
+	foo{job="a",inst="1"} 50
+
+# bool-mode comparison computes 0/1 and drops the name.
+eval instant at 5m foo > bool 1000
+	{job="a",inst="1"} 0
+
+# Anchored regex matcher: "a" must not match "ab"-style values, and the
+# alternation must select exactly the two loaded metrics' series.
+eval instant at 5m foo{job=~"a"}
+	foo{job="a",inst="1"} 50
+
+eval instant at 5m foo{job=~"b.*"}
+
+eval instant at 5m foo{inst!~"2"}
+	foo{job="a",inst="1"} 50

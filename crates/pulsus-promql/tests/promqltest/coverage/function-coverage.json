@@ -1,0 +1,768 @@
+{
+  "prometheus_tag": "v3.13.0",
+  "functions": [
+    {
+      "name": "abs",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "absent",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "absent_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "acos",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "acosh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "asin",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "asinh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "atan",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "atanh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "avg_over_time",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "avg_over_time(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "ceil",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "changes",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "clamp",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "clamp_max",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "clamp_min",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "cos",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "cosh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "count_over_time",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "count_over_time(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "day_of_month",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "day_of_week",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "day_of_year",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "days_in_month",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "deg",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "delta",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "delta(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "deriv",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "double_exponential_smoothing",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "end",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-08"
+    },
+    {
+      "name": "exp",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "first_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "floor",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "histogram_avg",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_count",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_fraction",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_quantile",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "histogram_quantile(0.5, hist_bucket)"
+      }
+    },
+    {
+      "name": "histogram_quantiles",
+      "experimental": true,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_stddev",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_stdvar",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "histogram_sum",
+      "experimental": false,
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+    },
+    {
+      "name": "hour",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "idelta",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "increase",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "increase(http_req[5m])"
+      }
+    },
+    {
+      "name": "info",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "irate",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "irate(http_req[5m])"
+      }
+    },
+    {
+      "name": "label_join",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "label_replace",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "last_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "ln",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "log10",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "log2",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "mad_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "max_of",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "max_over_time",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "max_over_time(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "min_of",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "min_over_time",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "min_over_time(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "minute",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "month",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "pi",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "predict_linear",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "present_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "quantile_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "rad",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "range",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-08"
+    },
+    {
+      "name": "rate",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "rate(http_req[5m])"
+      }
+    },
+    {
+      "name": "resets",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "round",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "scalar",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "sgn",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "sin",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "sinh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "sort",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "sort_by_label",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "sort_by_label_desc",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "sort_desc",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-05"
+    },
+    {
+      "name": "sqrt",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "start",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-08"
+    },
+    {
+      "name": "stddev_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "stdvar_over_time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "step",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-08"
+    },
+    {
+      "name": "sum_over_time",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "sum_over_time(gauge_m[5m])"
+      }
+    },
+    {
+      "name": "tan",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "tanh",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-02"
+    },
+    {
+      "name": "time",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "timestamp",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "ts_of_first_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "ts_of_last_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "ts_of_max_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "ts_of_min_over_time",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-04"
+    },
+    {
+      "name": "vector",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    },
+    {
+      "name": "year",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-03"
+    }
+  ],
+  "aggregation_operators": [
+    {
+      "name": "avg",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "avg(m)"
+      }
+    },
+    {
+      "name": "bottomk",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "bottomk(1, m)"
+      }
+    },
+    {
+      "name": "count",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "count(m)"
+      }
+    },
+    {
+      "name": "count_values",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "group",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "group(m)"
+      }
+    },
+    {
+      "name": "limit_ratio",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "limitk",
+      "experimental": true,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "max",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "max(m)"
+      }
+    },
+    {
+      "name": "min",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "min(m)"
+      }
+    },
+    {
+      "name": "quantile",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "stddev",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "stdvar",
+      "experimental": false,
+      "status": "scheduled",
+      "issue": "M6-06"
+    },
+    {
+      "name": "sum",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "sum(m)"
+      }
+    },
+    {
+      "name": "topk",
+      "experimental": false,
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_aggregations.test",
+        "query": "topk(2, m)"
+      }
+    }
+  ],
+  "language_features": [
+    {
+      "name": "set-op-and",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m and m"
+    },
+    {
+      "name": "set-op-or",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m or m"
+    },
+    {
+      "name": "set-op-unless",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m unless m"
+    },
+    {
+      "name": "vector-matching-on-ignoring",
+      "status": "implemented",
+      "probe": "m * on(l) m",
+      "witness": {
+        "file": "proof/m2_binops.test",
+        "query": "foo * on(job) bar"
+      }
+    },
+    {
+      "name": "group_left",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m * on(l) group_left m"
+    },
+    {
+      "name": "group_right",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m * on(l) group_right m"
+    },
+    {
+      "name": "atan2",
+      "status": "scheduled",
+      "issue": "M6-07",
+      "probe": "m atan2 m"
+    },
+    {
+      "name": "at-modifier",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe": "m @ 100"
+    },
+    {
+      "name": "subquery",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe": "max_over_time(m[5m:1m])"
+    },
+    {
+      "name": "duration-expression",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe": "rate(m[26m+4m])"
+    },
+    {
+      "name": "utf8-label-names",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe": "m{q=\"x\" or w=\"y\"}"
+    },
+    {
+      "name": "annotations",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe_rationale": "annotation assertions are .test directives (expect warn/info/...), not a PromQL expression \u2014 enforcement lives in the skip-manifest drift test until M6-08 activates the expect-directive files"
+    },
+    {
+      "name": "native-histogram-values",
+      "status": "deferred",
+      "rationale": "native histograms \u2014 M7 (#22)",
+      "probe_rationale": "native-histogram sample literals ({{...}}) exist only in .test series syntax; no float-era PromQL expression can exercise them \u2014 enforcement lives in the skip-manifest drift test until #22"
+    },
+    {
+      "name": "type-and-unit-labels",
+      "status": "scheduled",
+      "issue": "M6-08",
+      "probe_rationale": "PROM-39 __type__/__unit__ metadata-label semantics are label-propagation behaviour on computed values, not a distinct expression form \u2014 no PromQL probe can isolate them; M6-08 evaluates-and-decides (issue #64 adjudication) with the 9 upstream/type_and_unit.test eval-divergences ledger entries as its input"
+    }
+  ]
+}

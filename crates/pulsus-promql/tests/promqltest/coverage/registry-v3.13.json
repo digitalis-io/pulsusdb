@@ -1,0 +1,880 @@
+{
+  "prometheus_tag": "v3.13.0",
+  "prometheus_sha": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+  "functions": [
+    {
+      "name": "abs",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "absent",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "absent_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "acos",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "acosh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "asin",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "asinh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "atan",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "atanh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "avg_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "ceil",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "changes",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "clamp",
+      "arg_types": [
+        "vector",
+        "scalar",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "clamp_max",
+      "arg_types": [
+        "vector",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "clamp_min",
+      "arg_types": [
+        "vector",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "cos",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "cosh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "count_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "day_of_month",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "day_of_week",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "day_of_year",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "days_in_month",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "deg",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "delta",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "deriv",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "double_exponential_smoothing",
+      "arg_types": [
+        "matrix",
+        "scalar",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "end",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "exp",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "first_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "floor",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_avg",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_count",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_fraction",
+      "arg_types": [
+        "scalar",
+        "scalar",
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_quantile",
+      "arg_types": [
+        "scalar",
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_quantiles",
+      "arg_types": [
+        "vector",
+        "string",
+        "scalar",
+        "scalar"
+      ],
+      "variadic": 9,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "histogram_stddev",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_stdvar",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "histogram_sum",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "hour",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "idelta",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "increase",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "info",
+      "arg_types": [
+        "vector",
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "irate",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "label_join",
+      "arg_types": [
+        "vector",
+        "string",
+        "string",
+        "string"
+      ],
+      "variadic": -1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "label_replace",
+      "arg_types": [
+        "vector",
+        "string",
+        "string",
+        "string",
+        "string"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "last_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "ln",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "log10",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "log2",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "mad_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "max_of",
+      "arg_types": [
+        "scalar",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "max_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "min_of",
+      "arg_types": [
+        "scalar",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "min_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "minute",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "month",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "pi",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": false
+    },
+    {
+      "name": "predict_linear",
+      "arg_types": [
+        "matrix",
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "present_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "quantile_over_time",
+      "arg_types": [
+        "scalar",
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "rad",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "range",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "rate",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "resets",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "round",
+      "arg_types": [
+        "vector",
+        "scalar"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "scalar",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": false
+    },
+    {
+      "name": "sgn",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "sin",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "sinh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "sort",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "sort_by_label",
+      "arg_types": [
+        "vector",
+        "string"
+      ],
+      "variadic": -1,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "sort_by_label_desc",
+      "arg_types": [
+        "vector",
+        "string"
+      ],
+      "variadic": -1,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "sort_desc",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "sqrt",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "start",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "stddev_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "stdvar_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "step",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": true
+    },
+    {
+      "name": "sum_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "tan",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "tanh",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "time",
+      "arg_types": [],
+      "variadic": 0,
+      "return_type": "scalar",
+      "experimental": false
+    },
+    {
+      "name": "timestamp",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "ts_of_first_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "ts_of_last_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "ts_of_max_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "ts_of_min_over_time",
+      "arg_types": [
+        "matrix"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": true
+    },
+    {
+      "name": "vector",
+      "arg_types": [
+        "scalar"
+      ],
+      "variadic": 0,
+      "return_type": "vector",
+      "experimental": false
+    },
+    {
+      "name": "year",
+      "arg_types": [
+        "vector"
+      ],
+      "variadic": 1,
+      "return_type": "vector",
+      "experimental": false
+    }
+  ],
+  "aggregation_operators": [
+    {
+      "name": "avg",
+      "experimental": false
+    },
+    {
+      "name": "bottomk",
+      "experimental": false
+    },
+    {
+      "name": "count",
+      "experimental": false
+    },
+    {
+      "name": "count_values",
+      "experimental": false
+    },
+    {
+      "name": "group",
+      "experimental": false
+    },
+    {
+      "name": "limit_ratio",
+      "experimental": true
+    },
+    {
+      "name": "limitk",
+      "experimental": true
+    },
+    {
+      "name": "max",
+      "experimental": false
+    },
+    {
+      "name": "min",
+      "experimental": false
+    },
+    {
+      "name": "quantile",
+      "experimental": false
+    },
+    {
+      "name": "stddev",
+      "experimental": false
+    },
+    {
+      "name": "stdvar",
+      "experimental": false
+    },
+    {
+      "name": "sum",
+      "experimental": false
+    },
+    {
+      "name": "topk",
+      "experimental": false
+    }
+  ]
+}

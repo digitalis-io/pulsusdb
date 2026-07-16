@@ -21,6 +21,11 @@ pulsus-model = { path = "../pulsus-model" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# `regex` is test-only: the promqltest driver's synthetic store must apply
+# `MatchOp::Re`/`Nre` with Prometheus's full anchoring (`^(?:pat)$`) when
+# selecting loaded series — a mismatch would mis-select series and fake a
+# corpus divergence (issue #64 plan, edge cases).
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

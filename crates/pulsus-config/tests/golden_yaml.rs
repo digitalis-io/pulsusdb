@@ -54,8 +54,10 @@ reader:
   cache_window: 24h
   promql_max_samples: 50000000
   promql_lookback: 5m
+  promql_experimental_functions: false
   logql_scan_budget_bytes: 50GiB
   traceql_max_candidates: 100000
+  traceql_scan_budget_rows: 50000000
 
 downsampling:
   enabled: false

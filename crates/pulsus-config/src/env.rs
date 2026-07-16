@@ -49,6 +49,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_CACHE_WINDOW",
     "PULSUS_PROMQL_MAX_SAMPLES",
     "PULSUS_PROMQL_LOOKBACK",
+    "PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS",
     "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
@@ -228,6 +229,10 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_PROMQL_LOOKBACK") {
         cfg.reader.promql_lookback = parse_dur("PULSUS_PROMQL_LOOKBACK", &v)?;
     }
+    if let Some(v) = read("PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS") {
+        cfg.reader.promql_experimental_functions =
+            parse_bool("PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS", &v)?;
+    }
     if let Some(v) = read("PULSUS_LOGQL_SCAN_BUDGET_BYTES") {
         cfg.reader.logql_scan_budget_bytes = parse_size("PULSUS_LOGQL_SCAN_BUDGET_BYTES", &v)?;
     }
@@ -266,8 +271,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            42,
-            "docs/configuration.md §§1-8 document exactly 42 variables"
+            43,
+            "docs/configuration.md §§1-8 document exactly 43 variables"
         );
     }
 

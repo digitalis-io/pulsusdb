@@ -1,0 +1,8 @@
+{
+  "prometheus_tag": "v3.13.0",
+  "prometheus_sha": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+  "sha256": "1fd4f11469115785320e0f1b9ff292abcf279c1d395a3fc73bd96935a4bc8f91",
+  "function_count": 89,
+  "experimental_function_count": 17,
+  "aggregation_operator_count": 14
+}

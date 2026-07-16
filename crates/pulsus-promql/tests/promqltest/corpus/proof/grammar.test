@@ -1,0 +1,93 @@
+# Issue #64 (M6-01) proof corpus — executed-grammar coverage.
+# Exercises every directive and series-value notation the driver commits
+# to: clear, load (v, vxN, v+dxN, v-dxN, _, _xN, stale, NaN, Inf, -Inf),
+# eval instant at, eval range, eval_fail with expected_fail_message and
+# expected_fail_regexp, empty-vector expectations, and scalar results.
+# 100% green against today's M2 surface by construction.
+
+load 10s
+	old_m 1 2 3
+
+eval instant at 20s old_m
+	old_m 3
+
+clear
+
+load 10s
+	n1{k="v"} 1 2 _ 4 stale NaN Inf -Inf
+	n2 1x3
+	n3 5-1x4
+	n4 _x2 7
+	n5 0+10x6
+
+# old_m is gone after clear: an empty expectation asserts an empty vector.
+eval instant at 20s old_m
+
+eval instant at 30s n1
+	n1{k="v"} 4
+
+# The staleness marker suppresses the series at its own timestamp.
+eval instant at 40s n1
+
+eval instant at 50s n1
+	n1{k="v"} NaN
+
+eval instant at 60s n1
+	n1{k="v"} Inf
+
+eval instant at 70s n1
+	n1{k="v"} -Inf
+
+# `1x3` = four samples of 1 at 0..30s; the 5m lookback carries the last
+# one to 70s.
+eval instant at 70s n2
+	n2 1
+
+# `5-1x4` = 5 4 3 2 1 at 0..40s.
+eval instant at 40s n3
+	n3 1
+
+# `_x2 7` = gaps at 0s and 10s, first real sample at 20s.
+eval instant at 20s n4
+	n4 7
+
+# `0+10x6` = 0 10 .. 60 at 0..60s.
+eval instant at 60s n5
+	n5 60
+
+# Bare instant form: `at` omitted, eval time defaults to T0 = 0 (binding
+# grammar `eval [...] instant [at <dur>] <expr>`; upstream's regex also
+# makes the clause optional — see grammar.rs for the verified upstream
+# comparison).
+eval instant n3
+	n3 5
+
+# Range query over the arithmetic progression.
+eval range from 0 to 40s step 10s n3
+	n3 5 4 3 2 1
+
+# Range query across a gap: the lookback fills t=20s from t=10s; the
+# stale marker suppresses its step entirely; NaN/Inf pass through.
+eval range from 0 to 70s step 10s n1
+	n1{k="v"} 1 2 2 4 _ NaN Inf -Inf
+
+# Scalar result line.
+eval instant at 0 1 + 1
+	2
+
+# eval_fail + expected_fail_message (substring of the error Display): an
+# out-of-subset function is named in PromqlError::Unsupported.
+eval_fail instant at 0 abs(n1)
+	expected_fail_message not yet supported: function abs()
+
+# eval_fail + expected_fail_regexp (regex over the error Display).
+eval_fail instant at 0 n1 @ 100
+	expected_fail_regexp not yet supported: .*@.*
+
+# eval_fail without a message: any error satisfies it (a selector with no
+# concrete metric name is rejected by the metric-scoped planner).
+eval_fail instant at 0 {k="v"}
+
+# eval_fail on a range query.
+eval_fail range from 0 to 20s step 10s abs(n1)
+	expected_fail_message function abs()

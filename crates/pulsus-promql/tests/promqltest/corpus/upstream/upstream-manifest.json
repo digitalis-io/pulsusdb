@@ -1,0 +1,112 @@
+{
+  "prometheus_tag": "v3.13.0",
+  "prometheus_sha": "40af9c2cdc0eda00f3622e867a27f6359f7295f3",
+  "files": [
+    {
+      "name": "aggregators.test",
+      "sha256": "d9201ff19258995d2b78fc5e79515a913e62fb60957ff0996a7447ceb1f00d40",
+      "lines": 967
+    },
+    {
+      "name": "at_modifier.test",
+      "sha256": "e323ea87e4f042e1c3e6b29c7b3cc6ed6169d1a5877dd71427fb827c03287c9b",
+      "lines": 310
+    },
+    {
+      "name": "collision.test",
+      "sha256": "7d477979b45192d1aa2ba7bc1928e16c69fe8c84babe74e010f2cbc4f4b2c412",
+      "lines": 23
+    },
+    {
+      "name": "duration_expression.test",
+      "sha256": "b3b177b6792c4a28ee57c605a9fba3c05b4c1e1b81a3bf34014b240cfe550163",
+      "lines": 251
+    },
+    {
+      "name": "extended_vectors.test",
+      "sha256": "9f5912bb7afef4289073894c05970ce786daf259a08452af3ebcd3d4202f6917",
+      "lines": 779
+    },
+    {
+      "name": "fill-modifier.test",
+      "sha256": "8de100df12a014f5259c17289187cf24b634d90e82a3d3de0560f1ed780d3a75",
+      "lines": 398
+    },
+    {
+      "name": "functions.test",
+      "sha256": "99e4c26282b171ab7b46d864f49a99e55d42fd6d4a817e5261bcb3226b91214b",
+      "lines": 2241
+    },
+    {
+      "name": "histograms.test",
+      "sha256": "0f8e5029e3dce4465c030fb324eeedd80f05b4a3f26ad359d7945bafc70f9594",
+      "lines": 1236
+    },
+    {
+      "name": "info.test",
+      "sha256": "8ac3b3154306ce2bf15fb36dd8e4f826609ced9c2ecf37ea8e0021d385cec043",
+      "lines": 305
+    },
+    {
+      "name": "limit.test",
+      "sha256": "b4bc01948bd00644ff52a11e59af3d0e59980bedd7a292d34f96a38ff9416293",
+      "lines": 174
+    },
+    {
+      "name": "literals.test",
+      "sha256": "0561b22f1d0c89bb8495174f9f4faf9a05b70cc4170454671c26d3e70d84110c",
+      "lines": 74
+    },
+    {
+      "name": "name_label_dropping.test",
+      "sha256": "8149d92f071f057c7484a8e8409d52bf639a79cb1bfba3ecb7a6a0006e6095c2",
+      "lines": 142
+    },
+    {
+      "name": "operators.test",
+      "sha256": "f1cdbbfee88b9f1f9a35f6ab3936d5b2e0170fb2f6f3f300cf0501074190f074",
+      "lines": 1019
+    },
+    {
+      "name": "range_queries.test",
+      "sha256": "ad22d27d5db2dfe6218ab75526dcca93c189eb5541ea9593e24a73feb772162b",
+      "lines": 122
+    },
+    {
+      "name": "selectors.test",
+      "sha256": "70a827b6cb133d95d139d7f0433db742f1f310d5bc1dd5e4b138031970ebc43c",
+      "lines": 207
+    },
+    {
+      "name": "staleness.test",
+      "sha256": "178a655095f05f2ffb9f08f677dcd40f2a34e578099b3d3127ea486a9981f736",
+      "lines": 58
+    },
+    {
+      "name": "start_timestamps.test",
+      "sha256": "927affeabf3fbe9d27c493ea0fc0249836451c3a3cf0829a5e5643160722e55c",
+      "lines": 176
+    },
+    {
+      "name": "subquery.test",
+      "sha256": "37c4534e7a98e4fe7fdd0e273e9bbf8c59c2fb7b0363c4b4b4af6fcf756f62a6",
+      "lines": 161
+    },
+    {
+      "name": "trig_functions.test",
+      "sha256": "d9cba332e8b6294276e7fbdeb5bbfb715e11bad6ec6aa568fe01aa82ed802a8f",
+      "lines": 101
+    },
+    {
+      "name": "type_and_unit.test",
+      "sha256": "23f604731f005563f9c7219c913eb65008f366fbe6999d64e1d9a22614e21426",
+      "lines": 280
+    }
+  ],
+  "excluded": [
+    {
+      "name": "native_histograms.test",
+      "reason": "native histograms are M7 (#22) \u2014 the sole permitted M6 corpus exclusion (features.md section 7); vendored and activated by #22"
+    }
+  ]
+}

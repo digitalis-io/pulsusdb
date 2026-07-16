@@ -76,6 +76,7 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_CACHE_WINDOW` | `24h` | active-series window loaded into the cache; the cache only answers queries whose data window lies inside it — older ranges always resolve from `metric_series` in ClickHouse. Reader RAM budget ≈ active series × (labels JSON + maps overhead, ~300–600 B/series): plan ~2–3 GiB per reader at 5M active series |
 | `PULSUS_PROMQL_MAX_SAMPLES` | `50000000` | evaluation sample budget per query |
 | `PULSUS_PROMQL_LOOKBACK` | `5m` | staleness/lookback delta |
+| `PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS` | `false` | permit the experimental slice of the pinned Prometheus function registry (mirrors upstream `--enable-feature=promql-experimental-functions`); inert until the first experimental function lands (M6) — the machine-checked inventory of what it will gate is `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json` |
 | `PULSUS_LOGQL_SCAN_BUDGET_BYTES` | `50GiB` | per-query scan cap; exceeding returns "query too broad" |
 | `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
@@ -164,8 +165,10 @@ reader:
   cache_window: 24h
   promql_max_samples: 50000000
   promql_lookback: 5m
+  promql_experimental_functions: false
   logql_scan_budget_bytes: 50GiB
   traceql_max_candidates: 100000
+  traceql_scan_budget_rows: 50000000
 
 downsampling:
   enabled: false

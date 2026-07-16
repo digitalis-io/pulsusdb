@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 41 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8, 43 variables) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -202,6 +202,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.promql_lookback.0 == Duration::from_secs(7 * 60),
     },
     Row {
+        var: "PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS",
+        value: "true",
+        check: |c| c.reader.promql_experimental_functions,
+    },
+    Row {
         var: "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
         value: "1GiB",
         check: |c| c.reader.logql_scan_budget_bytes == ByteSize(1024 * 1024 * 1024),
@@ -251,8 +256,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        42,
-        "docs/configuration.md §§1-8 document exactly 42 variables"
+        43,
+        "docs/configuration.md §§1-8 document exactly 43 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

@@ -1,0 +1,49 @@
+# Issue #64 (M6-01) proof corpus — witness cases for every implemented
+# M2 aggregation operator (function-coverage.json points its `witness`
+# fields at the exact query texts below).
+
+load 1m
+	m{job="a",g="x"} 0+10x10
+	m{job="b",g="x"} 0+20x10
+	m{job="c",g="y"} 0+40x10
+
+# Values at 5m: a=50, b=100, c=200.
+
+eval instant at 5m sum(m)
+	{} 350
+
+eval instant at 5m sum by (g) (m)
+	{g="x"} 150
+	{g="y"} 200
+
+eval instant at 5m sum without (job) (m)
+	{g="x"} 150
+	{g="y"} 200
+
+eval instant at 5m avg(m)
+	{} 116.66666666666667
+
+eval instant at 5m min(m)
+	{} 50
+
+eval instant at 5m max(m)
+	{} 200
+
+eval instant at 5m count(m)
+	{} 3
+
+eval instant at 5m count by (g) (m)
+	{g="x"} 2
+	{g="y"} 1
+
+eval instant at 5m group(m)
+	{} 1
+
+# topk selects existing series verbatim (metric name kept) and returns
+# them in descending value order — asserted as an ordered list.
+eval_ordered instant at 5m topk(2, m)
+	m{job="c",g="y"} 200
+	m{job="b",g="x"} 100
+
+eval instant at 5m bottomk(1, m)
+	m{job="a",g="x"} 50

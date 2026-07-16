@@ -1,0 +1,59 @@
+# Issue #64 (M6-01) proof corpus — witness cases for every implemented
+# M2 function (function-coverage.json points its `witness` fields at the
+# exact query texts below; the coverage drift test replays this file and
+# requires each to pass).
+
+load 1m
+	http_req{job="a"} 0+60x10
+	http_req{job="b"} 0+120x10
+	gauge_m 1 2 3 4 5 6 7 8 9 10 11
+	hist_bucket{le="0.1"} 0+1x10
+	hist_bucket{le="0.2"} 0+2x10
+	hist_bucket{le="0.5"} 0+5x10
+	hist_bucket{le="1"} 0+10x10
+	hist_bucket{le="+Inf"} 0+10x10
+
+# rate: counter increase 240 over the sampled 240s, extrapolated to the
+# full 300s window (durationToStart=60s < threshold 66s) -> 300/300 = 1.
+eval instant at 10m rate(http_req[5m])
+	{job="a"} 1
+	{job="b"} 2
+
+# irate: last two samples only.
+eval instant at 10m irate(http_req[5m])
+	{job="a"} 1
+	{job="b"} 2
+
+eval instant at 10m increase(http_req[5m])
+	{job="a"} 300
+	{job="b"} 600
+
+# delta over a gauge: 11-7 = 4 over 240s sampled, extrapolated *1.25 = 5.
+eval instant at 10m delta(gauge_m[5m])
+	{} 5
+
+# Window (5m, 10m] holds samples 7..11.
+eval instant at 10m avg_over_time(gauge_m[5m])
+	{} 9
+
+eval instant at 10m min_over_time(gauge_m[5m])
+	{} 7
+
+eval instant at 10m max_over_time(gauge_m[5m])
+	{} 11
+
+eval instant at 10m sum_over_time(gauge_m[5m])
+	{} 45
+
+eval instant at 10m count_over_time(gauge_m[5m])
+	{} 5
+
+# Classic-bucket quantile: rank 50 of 100 lands exactly on the upper
+# bound of the (0.2, 0.5] bucket.
+eval instant at 10m histogram_quantile(0.5, hist_bucket)
+	{} 0.5
+
+# A range query through a range function: constant-rate counter.
+eval range from 5m to 10m step 1m rate(http_req[5m])
+	{job="a"} 1 1 1 1 1 1
+	{job="b"} 2 2 2 2 2 2
