@@ -128,3 +128,11 @@ sha2 = "0.10"
 # bump, re-run the #29 corpus + golden gate before accepting the bump.
 [patch.crates-io]
 promql-parser = { path = "vendor/promql-parser" }
+
+# Dev-profile debuginfo is line-tables-only: full DWARF across the workspace's
+# ~70 test binaries accumulated 45+ GB in target/debug/deps and filled the
+# disk repeatedly (owner decision 2026-07-16). Backtraces keep file/line info —
+# what tests and CI consume; flip back to `debug = true` locally if stepping
+# through locals in a debugger.
+[profile.dev]
+debug = "line-tables-only"
