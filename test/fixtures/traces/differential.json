@@ -1,0 +1,186 @@
+{
+  "_comment": "issue #60 M4 traces differential corpus + coverage matrix (e2e/src/traces_corpus.rs + e2e/src/traces.rs). `{R}` in every case's `q` is replaced with this run's run_id at execution time; every case conjoins `resource.run_id = \"{R}\"` so a stale stack can never leak foreign traces into a set-equality comparison. Gate discipline (plan v2 deltas 2+3): every committed M4 TraceQL construct whose expected trace-ID set is corpus-computable is listed, and every case starts `mode: \"gated\"` — the exclusion list starts EMPTY. A case moves to `mode: \"informational\"` only via the #33 triage discipline: an observed live divergence, triaged fix-our-bug vs ratify-documented-difference, recorded in docs/benchmarks/traces-differential-ledger.md (the `ledger` field names the entry). `limit` is the search request cap on both stores; every case's expected set is sized below it (validity gates: our metrics.partial == false, Tempo result_count < limit).",
+  "seed": 20260716,
+  "step_ns": 1000000000,
+  "ci": { "trace_count": 24 },
+  "full": { "trace_count": 120 },
+  "limit": 500,
+  "cases": [
+    {
+      "case_id": "service_eq",
+      "construct": "resource.service.name equality (promoted service column, service_time projection generator)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.service.name = \"svc-checkout\" }"
+    },
+    {
+      "case_id": "service_eq_child",
+      "construct": "resource.service.name equality matched via a non-root resource (multi-resource trace)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.service.name = \"svc-notify\" }"
+    },
+    {
+      "case_id": "service_regex",
+      "construct": "resource.service.name =~ (full-value anchored regex, indexed attr generator)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.service.name =~ \"svc-(checkout|payments)\" }"
+    },
+    {
+      "case_id": "span_attr_int_gte",
+      "construct": "span-scoped attr numeric >= (val_num key-only scan)",
+      "attr_type": "int",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && span.http.status_code >= 500 }"
+    },
+    {
+      "case_id": "span_attr_int_eq",
+      "construct": "span-scoped attr numeric =",
+      "attr_type": "int",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && span.http.status_code = 200 }"
+    },
+    {
+      "case_id": "span_attr_bool",
+      "construct": "span-scoped attr bool =",
+      "attr_type": "bool",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && span.cache_hit = true }"
+    },
+    {
+      "case_id": "span_attr_float_gt",
+      "construct": "span-scoped attr float >",
+      "attr_type": "float",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && span.sample_ratio > 0.5 }"
+    },
+    {
+      "case_id": "resource_attr_eq",
+      "construct": "resource-scoped attr string =",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.env = \"prod\" }"
+    },
+    {
+      "case_id": "unscoped_attr",
+      "construct": "unscoped attr (.key resolves both scopes)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && .tier = \"gold\" }"
+    },
+    {
+      "case_id": "attr_regex",
+      "construct": "attr =~ (positive regex never matches a missing key)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.env =~ \"prod|staging\" }"
+    },
+    {
+      "case_id": "neg_attr_key_on_all",
+      "construct": "attr != where every span carries the key (no missing-key dependence)",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.region != \"eu\" }"
+    },
+    {
+      "case_id": "neg_regex_key_on_all",
+      "construct": "attr !~ where every span carries the key",
+      "attr_type": "string",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.region !~ \"u.*\" }"
+    },
+    {
+      "case_id": "neg_attr_missing_key",
+      "construct": "attr != where some spans lack the key entirely (docs/api.md §4.2 matches-missing rule)",
+      "attr_type": "string",
+      "mode": "informational",
+      "ledger": "2026-07-16-negation-matches-missing-key",
+      "q": "{ resource.run_id = \"{R}\" && resource.env != \"prod\" }"
+    },
+    {
+      "case_id": "name_eq",
+      "construct": "name intrinsic =",
+      "attr_type": "intrinsic",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && name = \"charge-card\" }"
+    },
+    {
+      "case_id": "status_error",
+      "construct": "status intrinsic (non-indexed physical column path)",
+      "attr_type": "intrinsic",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && status = error }"
+    },
+    {
+      "case_id": "kind_consumer",
+      "construct": "kind intrinsic (non-indexed physical column path)",
+      "attr_type": "intrinsic",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && kind = consumer }"
+    },
+    {
+      "case_id": "duration_gt",
+      "construct": "duration intrinsic >",
+      "attr_type": "duration",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && duration > 800ms }"
+    },
+    {
+      "case_id": "conj_service_error",
+      "construct": "same-span && conjunction across service, numeric attr, and status (the worked-example shape)",
+      "attr_type": "mixed",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && resource.service.name = \"svc-checkout\" && span.http.status_code >= 500 && status = error }"
+    },
+    {
+      "case_id": "or_spansets",
+      "construct": "{A} || {B} trace-level union",
+      "attr_type": "mixed",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && status = error } || { resource.run_id = \"{R}\" && kind = consumer }"
+    },
+    {
+      "case_id": "cross_spanset_and",
+      "construct": "{A} && {B} cross-spanset intersection satisfied by different spans (same-span conjunction would be empty)",
+      "attr_type": "mixed",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && .tier = \"gold\" } && { resource.run_id = \"{R}\" && kind = consumer }"
+    },
+    {
+      "case_id": "count_gt",
+      "construct": "pipeline aggregate count() over the matched span set",
+      "attr_type": "aggregate",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" } | count() > 4"
+    },
+    {
+      "case_id": "avg_duration_gt",
+      "construct": "pipeline aggregate avg(duration) over the matched span set",
+      "attr_type": "aggregate",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" } | avg(duration) > 250ms"
+    },
+    {
+      "case_id": "select_status",
+      "construct": "select() projection (never changes the matched trace set)",
+      "attr_type": "int",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && span.http.status_code >= 500 } | select(span.http.status_code)"
+    },
+    {
+      "case_id": "nested_bool",
+      "construct": "nested (a || b) && (c || d) boolean tree, same-span semantics",
+      "attr_type": "mixed",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && (resource.env = \"prod\" || span.http.status_code = 200) && (kind = consumer || span.cache_hit = true) }"
+    }
+  ],
+  "informational": {
+    "_comment": "Never-gating comparisons (ratified on #19/#60): tags-vs-Tempo runs parameterlessly against both tag surfaces; each metrics query below runs against both stores' TraceQL-metrics query_range endpoints. Deltas are dumped to target/e2e-artifacts/traces-diff/<variant>/informational-*.json and the scenario returns Ok regardless.",
+    "metrics_queries": [
+      "{ resource.run_id = \"{R}\" } | rate()",
+      "{ resource.run_id = \"{R}\" && status = error } | count_over_time()"
+    ]
+  }
+}

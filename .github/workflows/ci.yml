@@ -606,6 +606,11 @@ jobs:
       - name: Run the ${{ matrix.variant }} e2e harness (full 10k-series differential tier)
         env:
           PULSUS_E2E_METRICS_SCALE: full
+          # Issue #60 AC3: the traces scenarios' full tier rides this
+          # same nightly/dispatch job (per-PR legs run the `ci` tier
+          # default); the single leg exercises the Tempo differential at
+          # full scale, the cluster leg the native roundtrip.
+          PULSUS_E2E_TRACES_SCALE: full
         run: cargo run -p pulsus-e2e -- --variant ${{ matrix.variant }} --engine docker
 
       - name: Upload metrics-differential evidence/mismatch artifacts

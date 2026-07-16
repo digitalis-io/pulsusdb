@@ -187,7 +187,7 @@ static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// combiner). [`dump_mismatch`] additionally guards against the residual
 /// (astronomically unlikely, now) collision risk with an atomic
 /// `create_new` + retry rather than trusting uniqueness alone.
-fn unique_id() -> Result<u64> {
+pub(crate) fn unique_id() -> Result<u64> {
     let nanos = now_unix_nanos()? as u64;
     let pid = u64::from(std::process::id());
     let seq = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -901,18 +901,25 @@ struct Mismatch<'a> {
 const ARTIFACT_CREATE_RETRIES: u32 = 8;
 
 /// Writes one pre-built artifact `serde_json::Value` under
-/// `target/e2e-artifacts/metrics-diff/<variant>/<prefix>-<unique_id>.json`
+/// `target/e2e-artifacts/<area>/<variant>/<prefix>-<unique_id>.json`
 /// — the shared file-creation mechanics both [`dump_mismatch`] (the
 /// value-matrix path) and `assert_discovery_contract_window`'s
-/// documented-contract dump share; only the artifact *shape* differs
-/// between them.
-fn write_artifact(ctx: &Ctx, prefix: &str, artifact: &serde_json::Value) -> Result<PathBuf> {
+/// documented-contract dump share (`area = "metrics-diff"`), and the
+/// issue #60 traces differential reuses under `area = "traces-diff"`;
+/// only the artifact *shape* differs between callers.
+pub(crate) fn write_artifact(
+    ctx: &Ctx,
+    area: &str,
+    prefix: &str,
+    artifact: &serde_json::Value,
+) -> Result<PathBuf> {
     let variant_dir = match ctx.variant {
         Variant::Single => "single",
         Variant::Cluster => "cluster",
     };
     let dir = crate::engine::workspace_root()
-        .join("target/e2e-artifacts/metrics-diff")
+        .join("target/e2e-artifacts")
+        .join(area)
         .join(variant_dir);
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create artifact dir {}", dir.display()))?;
@@ -960,7 +967,7 @@ fn dump_mismatch(ctx: &Ctx, prefix: &str, m: &Mismatch) -> Result<PathBuf> {
         "prometheus_result": m.prom_body,
         "detail": m.detail,
     });
-    write_artifact(ctx, prefix, &artifact)
+    write_artifact(ctx, "metrics-diff", prefix, &artifact)
 }
 
 // ---------------------------------------------------------------------
@@ -1122,7 +1129,7 @@ async fn assert_discovery_endpoint(
         "prometheus_reference_only": prom_reference,
         "detail": detail,
     });
-    let artifact_path = write_artifact(ctx, "series-labels", &artifact)?;
+    let artifact_path = write_artifact(ctx, "metrics-diff", "series-labels", &artifact)?;
     bail!(
         "documented-contract mismatch: {detail} (repro dumped to {})",
         artifact_path.display()

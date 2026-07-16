@@ -40,6 +40,11 @@ pub struct Ctx {
     /// The reference Prometheus's published base URL (issue #33 architect
     /// plan) — `crate::metrics::metrics_differential`'s oracle backend.
     pub prometheus_url: String,
+    /// The reference Tempo's published base URL (issue #60 architect
+    /// plan) — `crate::traces::traces_differential`'s oracle backend,
+    /// single-variant only (the cluster overlay ships no `tempo`
+    /// service; only single-variant scenarios dereference this).
+    pub tempo_url: String,
     pub variant: Variant,
     pub fixtures_dir: PathBuf,
     pub compose: Compose,
@@ -104,6 +109,26 @@ pub const SCENARIOS: &[Scenario] = &[
         // own `run_id`, so ordering relative to them is immaterial.
         variants: &[Variant::Single, Variant::Cluster],
         run: |ctx| Box::pin(crate::metrics::metrics_differential(ctx)),
+    },
+    Scenario {
+        name: "traces_roundtrip",
+        // Both variants (issue #60 architect plan, mirroring
+        // `logs_roundtrip`): the M4 DoD's "collector traces pipeline
+        // lands and is searchable" through every native endpoint, with
+        // the cluster leg adding the shard-local `trace_spans`
+        // count-sum check. Independent data via its own `run_id`.
+        variants: &[Variant::Single, Variant::Cluster],
+        run: |ctx| Box::pin(crate::traces::traces_roundtrip(ctx)),
+    },
+    Scenario {
+        name: "traces_differential",
+        // Single-variant only (issue #60 task-manager adjudication 1):
+        // set-equivalence correctness is topology-invariant, multi-shard
+        // fan-out is already Tier-1-gated by #57's cluster evidence plus
+        // the cluster `traces_roundtrip` leg above, and the reference
+        // Tempo container ships only in `deploy/e2e/compose.single.yaml`.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(crate::traces::traces_differential(ctx)),
     },
 ];
 

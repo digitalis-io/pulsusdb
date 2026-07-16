@@ -13,6 +13,8 @@ mod engine;
 mod harness;
 mod metrics;
 mod scenarios;
+mod traces;
+mod traces_corpus;
 
 use std::process::ExitCode;
 
@@ -65,6 +67,12 @@ async fn main() -> ExitCode {
         // same host port too (issue #33 architect plan) — see
         // `deploy/e2e/compose.{single,cluster}.yaml`.
         prometheus_url: "http://127.0.0.1:9090".to_string(),
+        // The reference Tempo publishes `:3200` on the single variant
+        // only (issue #60 adjudication 1: the traces differential is
+        // single-node; the cluster overlay ships no `tempo` service) —
+        // still a fixed value like the others, since only single-variant
+        // scenarios ever dereference it.
+        tempo_url: "http://127.0.0.1:3200".to_string(),
     };
 
     match harness::run(opts).await {

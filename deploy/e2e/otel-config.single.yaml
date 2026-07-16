@@ -5,10 +5,10 @@
 # static-IP network is that no inter-container hostname resolution is
 # required, and that must hold for the collector's outbound target too.
 #
-# logs + metrics pipelines (issue #15/#33): `pulsusdb` mounts no traces/
-# profiles ingest routes yet (M4/M5), so those pipelines would 404 against
-# it on every export attempt and spam the collector's own log — trimmed
-# until the milestones that add them land.
+# logs + metrics + traces pipelines (issue #15/#33/#60): `pulsusdb`
+# mounts no profiles ingest route yet (M5), so that pipeline would 404
+# against it on every export attempt and spam the collector's own log —
+# trimmed until the milestone that adds it lands.
 #
 # Explicit `0.0.0.0` binds (CI regression fix, issue #15): modern
 # `otel-collector-contrib` defaults the `otlp` receiver's `grpc`/`http`
@@ -43,9 +43,23 @@ exporters:
   prometheusremotewrite/prom:
     endpoint: http://172.29.0.14:9090/api/v1/write
     add_metric_suffixes: false
+  # The M4 traces-differential fan-out's second leg (issue #60): the
+  # same received OTLP traces go verbatim to the pinned reference Tempo
+  # (`deploy/e2e/compose.single.yaml`'s `tempo`, static ipv4_address
+  # 172.29.0.15) over OTLP/gRPC — its receiver is wired in
+  # `deploy/e2e/tempo.yaml`. The first leg is the existing `otlphttp`
+  # exporter above, whose OTLP/HTTP export appends `/v1/traces` onto
+  # pulsusdb's `:3100` automatically. Both stores therefore ingest the
+  # collector's identical typed span data (plan v2 delta 1), which is
+  # what makes the set differential valid.
+  otlp/tempo:
+    endpoint: 172.29.0.15:4317
+    tls:
+      insecure: true
 
 service:
   pipelines:
     logs: { receivers: [otlp], exporters: [otlphttp] }
     metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus, prometheusremotewrite/prom] }
-    # traces/profiles pipelines land with their own milestones (M4/M5)
+    traces: { receivers: [otlp], exporters: [otlphttp, otlp/tempo] }
+    # the profiles pipeline lands with its own milestone (M5)

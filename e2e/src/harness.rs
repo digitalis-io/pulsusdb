@@ -28,18 +28,24 @@ const READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// under this name in both `deploy/e2e/compose.{single,cluster}.yaml`, so
 /// a failed differential run dumps its logs alongside `pulsusdb`'s own.
 const DIAGNOSTIC_SERVICES: &[&str] = &["pulsusdb", "otel-collector", "prometheus"];
+/// Extra services dumped on the single-node leg only (issue #60):
+/// `tempo`, the traces differential's reference backend, ships only in
+/// `deploy/e2e/compose.single.yaml` (task-manager adjudication 1 —
+/// single-node differential topology).
+const SINGLE_DIAGNOSTIC_SERVICES: &[&str] = &["tempo"];
 /// Extra services dumped on the cluster leg only (issue #15): the 2-shard
 /// ClickHouse containers `ci/clickhouse-cluster/compose.yaml` defines,
 /// absent from the single-node variant.
 const CLUSTER_DIAGNOSTIC_SERVICES: &[&str] = &["ch-shard1", "ch-shard2"];
 
 /// Every service to dump logs for on a failed run of `variant` —
-/// [`DIAGNOSTIC_SERVICES`] plus, on the cluster leg,
-/// [`CLUSTER_DIAGNOSTIC_SERVICES`].
+/// [`DIAGNOSTIC_SERVICES`] plus the per-variant extras
+/// ([`SINGLE_DIAGNOSTIC_SERVICES`] / [`CLUSTER_DIAGNOSTIC_SERVICES`]).
 fn diagnostic_services(variant: Variant) -> Vec<&'static str> {
     let mut services = DIAGNOSTIC_SERVICES.to_vec();
-    if variant == Variant::Cluster {
-        services.extend_from_slice(CLUSTER_DIAGNOSTIC_SERVICES);
+    match variant {
+        Variant::Single => services.extend_from_slice(SINGLE_DIAGNOSTIC_SERVICES),
+        Variant::Cluster => services.extend_from_slice(CLUSTER_DIAGNOSTIC_SERVICES),
     }
     services
 }
@@ -61,6 +67,12 @@ pub struct RunOptions {
     /// (`deploy/e2e/compose.{single,cluster}.yaml`, `:9090`), so this is
     /// fixed like `collector_url`, not derived per-variant.
     pub prometheus_url: String,
+    /// The reference Tempo's published base URL (issue #60 architect
+    /// plan, mirrors `prometheus_url`) — published by the single-node
+    /// overlay only (`deploy/e2e/compose.single.yaml`, `:3200`); a fixed
+    /// value regardless, since only single-variant scenarios dereference
+    /// it.
+    pub tempo_url: String,
 }
 
 /// The `-f` file list + project name for one variant (architect plan:
@@ -123,6 +135,7 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         base_url: opts.base_url.clone(),
         collector_url: opts.collector_url.clone(),
         prometheus_url: opts.prometheus_url.clone(),
+        tempo_url: opts.tempo_url.clone(),
         variant: opts.variant,
         fixtures_dir: workspace_root().join("test/fixtures"),
         compose: compose.clone(),

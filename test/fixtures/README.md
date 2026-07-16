@@ -41,3 +41,16 @@ scenario registered for `<v>` automatically.
   `query_matrix` (`{R}` substituted with the run's `run_id` at execution
   time) every entry runs in `instant` and/or `range` mode against both
   PulsusDB and a reference Prometheus.
+- `traces/differential.json` — the M4 traces corpus + TraceQL coverage
+  matrix (issue #60, `e2e/src/traces_corpus.rs` + `e2e/src/traces.rs`'s
+  `traces_roundtrip`/`traces_differential` scenarios): `seed`/`step_ns`
+  plus per-tier trace counts (`ci` gates every PR; `full` rides the
+  nightly/dispatch job via `PULSUS_E2E_TRACES_SCALE=full`), the search
+  request `limit` both stores are queried with, and the committed
+  `cases[]` coverage matrix — one entry per corpus-computable TraceQL
+  construct, each `{case_id, q, construct, attr_type, mode}` with `{R}`
+  substituted with the run's `run_id`. Every case starts
+  `mode: "gated"` (three-way trace-ID set equality: PulsusDB == corpus
+  == the pinned Tempo); a case moves to `"informational"` only via the
+  divergence-ledger discipline
+  (docs/benchmarks/traces-differential-ledger.md).

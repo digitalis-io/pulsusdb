@@ -111,6 +111,31 @@ services:
     # `:3100` publish above.
     ports: [ "9090:9090" ]
 
+  # The M4 traces-differential reference backend (issue #60,
+  # `e2e/src/traces.rs`'s `traces_differential`): receives the identical
+  # OTLP traces corpus via the collector's `otlp/tempo` exporter
+  # (`otel-config.single.yaml`) so trace-by-ID span sets and search
+  # trace-ID sets can be diffed. Pinned by tag AND digest (task-manager
+  # adjudication 2, the prom/prometheus:v3.13.0 precedent) — grafana/tempo
+  # 3.0.2, multi-arch manifest digest recorded below; upgrades are
+  # deliberate future commits, never floating. Single-variant only
+  # (adjudication 1: the differential rides e2e-single; the cluster
+  # overlay ships no tempo service). Config notes: deploy/e2e/tempo.yaml.
+  tempo:
+    image: grafana/tempo:3.0.2@sha256:cda87c212d8c584dc0b89e337e7ed648a5100feb657e5d528480ee4fa03dbbe3
+    command:
+      - -config.file=/etc/tempo.yaml
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/tempo.yaml:/etc/tempo.yaml:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.15
+    # Published so the harness's differential HTTP client (running on
+    # the host, like every other Ctx.http call) can drive
+    # `/api/traces/{id}` + `/api/search` directly — same rationale as
+    # `prometheus`'s `:9090` publish above.
+    ports: [ "3200:3200" ]
+
   # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
   # surface (issue #14, task-manager-approved option A): proves alias
   # routing + Loki-datasource compatibility end to end via
