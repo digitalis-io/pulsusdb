@@ -77,6 +77,21 @@
     { "expr": "clamp(mem_usage_bytes{run_id=\"{R}\"}, 3e8, 7e8)", "modes": ["instant", "range"] },
     { "expr": "clamp_min(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
     { "expr": "clamp_max(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
-    { "expr": "round(mem_usage_bytes{run_id=\"{R}\"}, 1000)", "modes": ["instant", "range"] }
+    { "expr": "round(mem_usage_bytes{run_id=\"{R}\"}, 1000)", "modes": ["instant", "range"] },
+    { "expr": "time()", "modes": ["instant", "range"] },
+    { "expr": "vector(time())", "modes": ["instant", "range"] },
+    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"} offset 1m)", "modes": ["instant", "range"] },
+    { "expr": "scalar(sum(mem_usage_bytes{run_id=\"{R}\"}))", "modes": ["instant", "range"] },
+    { "expr": "vector(scalar(sum(mem_usage_bytes{run_id=\"{R}\"})))", "modes": ["instant", "range"] },
+    { "expr": "year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "day_of_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "day_of_week(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "day_of_year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "days_in_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "hour(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "minute(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "month()", "modes": ["instant", "range"] }
   ]
 }

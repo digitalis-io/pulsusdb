@@ -1727,22 +1727,41 @@ mod tests {
     /// clamp_max/round) — the transcendental subset is deliberately
     /// excluded from this bit-exact matrix (Go-vs-Rust libm ULP
     /// divergence; those are proven by the executed upstream corpus at
-    /// its own 1e-6 epsilon instead, per the #65 adjudication).
+    /// its own 1e-6 epsilon instead, per the #65 adjudication). Resized
+    /// 78 -> 108 by issue #66 (M6-03): 15 new entries x 2 modes for
+    /// time/timestamp (bare + offset)/scalar/vector and the eight date
+    /// functions, plus the selector-free `time()`/`vector(time())`/
+    /// `month()` shapes.
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_seventy_eight_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_eight_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 78,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 78 — update \
+            rows, 108,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 108 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }
+
+    /// Issue #66 (M6-03): the only fixture entries allowed to skip
+    /// `run_id` scoping — queries with **no selector at all** (they touch
+    /// no corpus data, so run isolation is structurally moot). Pinned by
+    /// exact query text so the guard below stays strict for every
+    /// data-touching entry.
+    const SELECTOR_FREE_ENTRIES: &[&str] = &["time()", "vector(time())", "month()"];
 
     #[test]
     fn shipped_fixture_every_query_matrix_entry_substitutes_run_id_cleanly() {
         let fixture = shipped_fixture();
         for entry in &fixture.query_matrix {
+            if SELECTOR_FREE_ENTRIES.contains(&entry.expr.as_str()) {
+                assert!(
+                    !entry.expr.contains("{R}"),
+                    "selector-free entry {:?} must not carry a run_id placeholder",
+                    entry.expr
+                );
+                continue;
+            }
             let rendered = entry.expr.replace("{R}", "e2e-metrics-test-run");
             assert!(
                 !rendered.contains("{R}"),

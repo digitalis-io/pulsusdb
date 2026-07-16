@@ -1180,6 +1180,92 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
     drop_database(&bootstrap, db).await;
 }
 
+/// Issue #66 (M6-03) perf gate at the exec boundary: a query with **no
+/// selector at all** (`time()`, `vector(time())`) executes through the
+/// real `MetricsEngine::query_explained` with zero resolve/fetch stages —
+/// no `series_resolution`, no `sample_fetch`, no ClickHouse sample I/O.
+/// The plan-level selector-identity assertions live in `pulsus-promql`'s
+/// own tests; this proves the same story survives the fetch layer.
+#[tokio::test]
+async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_time_only";
+    init_db(&bootstrap, db).await;
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+
+    let eval_ms = now_ms();
+    let params = MetricQueryParams {
+        start_ms: eval_ms,
+        end_ms: eval_ms,
+        step_ms: 0,
+    };
+
+    // time() -> the eval time in seconds, as a scalar.
+    let expr = parse("time()").expect("parse");
+    let (result, explain) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("time() query");
+    match result {
+        QueryResult::Scalar(v) => assert_eq!(v, eval_ms as f64 / 1000.0),
+        other => panic!("expected Scalar, got {other:?}"),
+    }
+    assert!(
+        explain
+            .stages
+            .iter()
+            .all(|s| s.name != "sample_fetch" && s.name != "series_resolution"),
+        "time() has no selectors and must resolve/fetch nothing: {:#?}",
+        explain.stages
+    );
+
+    // vector(time()) -> a one-element vector with the empty label set
+    // (no __name__ spliced back in), same zero-fetch story.
+    let expr = parse("vector(time())").expect("parse");
+    let (result, explain) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("vector(time()) query");
+    match result {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert!(
+                v[0].labels.is_empty(),
+                "vector(time()) must have an empty label set: {:?}",
+                v[0].labels
+            );
+            assert_eq!(v[0].value, eval_ms as f64 / 1000.0);
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+    assert!(
+        explain
+            .stages
+            .iter()
+            .all(|s| s.name != "sample_fetch" && s.name != "series_resolution"),
+        "vector(time()) has no selectors and must resolve/fetch nothing: {:#?}",
+        explain.stages
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
 /// Code review round 1, finding 5 (architect adjudication AMEND):
 /// `X-Pulsus-Explain`'s `sample_fetch` stage must carry the actual
 /// generated SQL, not just a table name + series count. Covers both

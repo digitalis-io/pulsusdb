@@ -18,6 +18,7 @@
 
 pub mod aggregation;
 pub mod binop;
+pub mod datetime;
 pub mod elementwise;
 pub mod functions;
 pub mod staleness;
@@ -461,6 +462,129 @@ fn eval_step(
                 }
             };
             Ok(StepValue::Scalar(v))
+        }
+
+        // Issue #66 (M6-03): `time()` — the evaluation step time in
+        // seconds, a scalar (per-step in a range query via `evaluate`'s
+        // ordinary scalar-step accumulation).
+        PlanExpr::Time => Ok(StepValue::Scalar(t_ms as f64 / 1000.0)),
+
+        // Issue #66 (M6-03): the date/time-field family **computes** a
+        // new value — `__name__` DROPS (the same class as `rate` per the
+        // #37 keep/drop table).
+        PlanExpr::DateFn { func, arg } => match arg {
+            // No argument: the field of the evaluation step time, one
+            // empty-labelset element (upstream's `vector(time())`
+            // default). Go computes `time.Unix(enh.Ts/1000, 0)` — integer
+            // division truncating toward zero, exactly Rust `i64 /`.
+            None => Ok(StepValue::Vector(vec![InstantSample {
+                labels: Labels::default(),
+                metric_name: None,
+                t_ms,
+                v: datetime::field(*func, t_ms / 1000),
+            }])),
+            // Vector argument: each element's VALUE is the unix-seconds
+            // instant. `to_unix_secs` is the total conversion (plan v2
+            // Δ1): NaN/±Inf/|v| >= 2^63 yield a NaN result element (kept,
+            // labels minus `__name__`), never a platform-defined cast.
+            Some(arg) => {
+                let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+                else {
+                    return Err(PromqlError::Unsupported {
+                        construct: format!("{func:?} over a scalar expression"),
+                    });
+                };
+                let out = v
+                    .into_iter()
+                    .map(|s| InstantSample {
+                        labels: s.labels,
+                        metric_name: None,
+                        t_ms,
+                        v: datetime::to_unix_secs(s.v)
+                            .map(|secs| datetime::field(*func, secs))
+                            .unwrap_or(f64::NAN),
+                    })
+                    .collect();
+                Ok(StepValue::Vector(out))
+            }
+        },
+
+        // Issue #66 (M6-03): `timestamp(v)` — `__name__` DROPS (computed
+        // value). The bare-(paren-stripped)-selector case returns each
+        // series' REAL sample timestamp (upstream's special case: the
+        // sample resolved by the ordinary staleness lookup at the
+        // offset-shifted step time, its own `t_ms` in seconds — the raw
+        // stored time, with no offset added back; the differential row
+        // `timestamp(... offset 1m)` arbitrates that choice per the #66
+        // adjudication). Every computed argument instead stamps the
+        // evaluation step time per element.
+        PlanExpr::Timestamp { arg, bare_selector } => match bare_selector {
+            Some(id) => {
+                let sel = &selectors[*id];
+                let eff_t = t_ms - sel.offset_ms;
+                let mut out = Vec::new();
+                for series in data.get(*id) {
+                    if let Some(sample) =
+                        staleness::instant_value(&series.samples, eff_t, lookback_ms)
+                    {
+                        out.push(InstantSample {
+                            labels: series.labels.clone(),
+                            metric_name: None,
+                            t_ms,
+                            v: sample.t_ms as f64 / 1000.0,
+                        });
+                    }
+                }
+                Ok(StepValue::Vector(out))
+            }
+            None => {
+                let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+                else {
+                    return Err(PromqlError::Unsupported {
+                        construct: "timestamp() over a scalar expression".to_string(),
+                    });
+                };
+                let out = v
+                    .into_iter()
+                    .map(|s| InstantSample {
+                        labels: s.labels,
+                        metric_name: None,
+                        t_ms,
+                        v: t_ms as f64 / 1000.0,
+                    })
+                    .collect();
+                Ok(StepValue::Vector(out))
+            }
+        },
+
+        // Issue #66 (M6-03): `scalar(v)` — the singleton element's value,
+        // NaN for zero or multiple elements (upstream funcScalar).
+        PlanExpr::ScalarOf { arg } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "scalar() over a scalar expression".to_string(),
+                });
+            };
+            Ok(StepValue::Scalar(match v.as_slice() {
+                [only] => only.v,
+                _ => f64::NAN,
+            }))
+        }
+
+        // Issue #66 (M6-03): `vector(s)` — one element with the EMPTY
+        // label set (and no `__name__`, upstream funcVector).
+        PlanExpr::VectorOf { arg } => {
+            let StepValue::Scalar(s) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+                return Err(PromqlError::Unsupported {
+                    construct: "vector() over a non-scalar expression".to_string(),
+                });
+            };
+            Ok(StepValue::Vector(vec![InstantSample {
+                labels: Labels::default(),
+                metric_name: None,
+                t_ms,
+                v: s,
+            }]))
         }
 
         PlanExpr::Binary {
@@ -917,6 +1041,211 @@ mod tests {
         data.insert(1, vec![series(2, &[("job", "a")], vec![s(0, 3.0)])]);
         let v = instant_vector(evaluate(&p, &data).unwrap());
         assert_eq!(v[0].metric_name, None);
+    }
+
+    // --- issue #66 (M6-03): time/date functions + scalar/vector ---
+
+    #[test]
+    fn time_evaluates_to_the_eval_time_in_seconds() {
+        let expr = crate::parser::parse("time()").unwrap();
+        let p = plan(&expr, params(55_000, 55_000, 0)).unwrap();
+        match evaluate(&p, &SeriesData::new()).unwrap() {
+            QueryValue::Scalar(v) => assert_eq!(v, 55.0),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    /// AC6: `time()` varies per step in a range query — the existing
+    /// `t_ms` threading, no new machinery.
+    #[test]
+    fn time_range_query_varies_per_step() {
+        let expr = crate::parser::parse("time()").unwrap();
+        let p = plan(&expr, params(0, 120_000, 60_000)).unwrap();
+        match evaluate(&p, &SeriesData::new()).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert!(m[0].labels.is_empty());
+                assert_eq!(
+                    m[0].points,
+                    vec![(0, 0.0), (60_000, 60.0), (120_000, 120.0)]
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_of_a_singleton_vector_is_its_value() {
+        let expr = crate::parser::parse("scalar(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 42.0)])]);
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Scalar(v) => assert_eq!(v, 42.0),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_of_a_non_singleton_or_empty_vector_is_nan() {
+        let expr = crate::parser::parse("scalar(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        // Two elements -> NaN.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("job", "a")], vec![s(0, 1.0)]),
+                series(2, &[("job", "b")], vec![s(0, 2.0)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Scalar(v) => assert!(v.is_nan(), "two elements must be NaN, got {v}"),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+        // Zero elements -> NaN.
+        match evaluate(&p, &SeriesData::new()).unwrap() {
+            QueryValue::Scalar(v) => assert!(v.is_nan(), "empty must be NaN, got {v}"),
+            other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_of_a_scalar_is_a_single_empty_labelset_element() {
+        let expr = crate::parser::parse("vector(3)").unwrap();
+        let p = plan(&expr, params(7_000, 7_000, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].labels.is_empty(), "vector() labels must be empty");
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(v[0].v, 3.0);
+        assert_eq!(v[0].t_ms, 7_000);
+    }
+
+    /// AC6: `timestamp(m)` over a bare selector returns the REAL sample
+    /// timestamp — instant at 90s over 1-minute samples resolves the 60s
+    /// sample, so the value is 60, not 90.
+    #[test]
+    fn timestamp_of_a_bare_selector_returns_the_sample_time_not_the_step_time() {
+        let expr = crate::parser::parse("timestamp(up)").unwrap();
+        let p = plan(&expr, params(90_000, 90_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(1, &[("job", "a")], vec![s(0, 5.0), s(60_000, 7.0)])],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 60.0, "must be the sample time (60s), not 90s");
+        assert_eq!(v[0].metric_name, None, "timestamp() drops __name__");
+        assert_eq!(
+            v[0].t_ms, 90_000,
+            "the reported step time stays the query's own"
+        );
+    }
+
+    /// The eval-time branch: a computed argument stamps the step time per
+    /// element (contrast with the bare-selector case above).
+    #[test]
+    fn timestamp_of_a_computed_argument_returns_the_step_time() {
+        for query in [
+            "timestamp(abs(up))",
+            "timestamp(up + 0)",
+            "timestamp(timestamp(up))",
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(90_000, 90_000, 0)).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(
+                0,
+                vec![series(1, &[("job", "a")], vec![s(0, 5.0), s(60_000, 7.0)])],
+            );
+            let v = instant_vector(evaluate(&p, &data).unwrap());
+            assert_eq!(v.len(), 1, "{query}");
+            assert_eq!(
+                v[0].v, 90.0,
+                "{query}: computed args carry the eval step time"
+            );
+        }
+    }
+
+    /// `timestamp(m offset 1m)`: the base implementation returns the raw
+    /// stored sample time (no offset added back) — the differential row
+    /// arbitrates this against real Prometheus (#66 adjudication).
+    #[test]
+    fn timestamp_with_offset_returns_the_raw_stored_sample_time() {
+        let expr = crate::parser::parse("timestamp(up offset 1m)").unwrap();
+        let p = plan(&expr, params(120_000, 120_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(45_000, 9.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 45.0);
+    }
+
+    #[test]
+    fn date_fn_reads_element_values_as_unix_seconds_and_drops_metric_name() {
+        let expr = crate::parser::parse("month(ts)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("t", "epoch")], vec![s(0, 0.0)]),
+                series(2, &[("t", "nov85")], vec![s(0, 500_000_000.0)]),
+            ],
+        );
+        let mut v = instant_vector(evaluate(&p, &data).unwrap());
+        v.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].v, 1.0); // epoch -> January
+        assert_eq!(v[1].v, 11.0); // 500000000 -> November 1985
+        assert!(v.iter().all(|s| s.metric_name.is_none()));
+    }
+
+    /// Plan v2 Δ1: NaN/±Inf/out-of-range date inputs yield NaN result
+    /// elements (kept, labels minus `__name__`) — our documented, total
+    /// behavior — while finite siblings compute normally.
+    #[test]
+    fn date_fn_maps_nan_and_inf_inputs_to_nan_elements() {
+        let expr = crate::parser::parse("year(ts)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("t", "nan")], vec![s(0, f64::NAN)]),
+                series(2, &[("t", "inf")], vec![s(0, f64::INFINITY)]),
+                series(3, &[("t", "ninf")], vec![s(0, f64::NEG_INFINITY)]),
+                series(4, &[("t", "big")], vec![s(0, 1e19)]),
+                series(5, &[("t", "fin")], vec![s(0, 500_000_000.0)]),
+            ],
+        );
+        let mut v = instant_vector(evaluate(&p, &data).unwrap());
+        v.sort_by(|a, b| a.labels.cmp(&b.labels));
+        let by_t: Vec<(&str, f64)> = v
+            .iter()
+            .map(|s| (s.labels.get("t").unwrap(), s.v))
+            .collect();
+        assert_eq!(v.len(), 5, "every element is kept");
+        for (t, val) in &by_t {
+            match *t {
+                "fin" => assert_eq!(*val, 1985.0),
+                _ => assert!(val.is_nan(), "{t} must yield NaN, got {val}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_argument_date_fn_uses_the_eval_time_with_an_empty_labelset() {
+        // 4000s = 1970-01-01 01:06:40 UTC.
+        let expr = crate::parser::parse("hour()").unwrap();
+        let p = plan(&expr, params(4_000_000, 4_000_000, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &SeriesData::new()).unwrap());
+        assert_eq!(v.len(), 1);
+        assert!(v[0].labels.is_empty());
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(v[0].v, 1.0);
     }
 
     /// Vector-vector comparison, filter mode (no `bool`): KEEP the LHS's

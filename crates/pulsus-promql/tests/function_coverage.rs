@@ -378,10 +378,11 @@ fn probe_classification_matches_every_manifest_status() {
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
-/// Pins today's `implemented` surface exactly: the M2 set plus issue
-/// #65's (M6-02) 30 elementwise math/trig + scalar functions. Every
-/// later M6 issue flips entries here deliberately — this test makes the
-/// flip explicit, never incidental.
+/// Pins today's `implemented` surface exactly: the M2 set, issue #65's
+/// (M6-02) 30 elementwise math/trig + scalar functions, and issue #66's
+/// (M6-03) 12 time/date + scalar/vector functions. Every later M6 issue
+/// flips entries here deliberately — this test makes the flip explicit,
+/// never incidental.
 #[test]
 fn implemented_set_is_exactly_the_m2_surface_today() {
     let manifest = CoverageManifest::load();
@@ -439,6 +440,19 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "pi",
             "max_of",
             "min_of",
+            // M6-03 (issue #66): time/date + scalar/vector.
+            "time",
+            "timestamp",
+            "scalar",
+            "vector",
+            "year",
+            "month",
+            "day_of_month",
+            "day_of_week",
+            "day_of_year",
+            "days_in_month",
+            "hour",
+            "minute",
         ])
     );
     let implemented_ops: BTreeSet<&str> = manifest

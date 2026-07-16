@@ -1,0 +1,200 @@
+# Issue #66 (M6-03) proof corpus — witness cases for the 12 time/date +
+# scalar/vector functions (function-coverage.json points each entry's
+# `witness` at the exact query texts below; the coverage drift test
+# replays this file and requires each to pass).
+#
+# Expected values are hand-derived to Prometheus semantics. The
+# timestamp() cases pin the load-bearing semantic of this issue: a
+# (paren-stripped) BARE selector argument returns each series' REAL
+# sample timestamp, while every computed argument carries the evaluation
+# step time (plan v2 Δ2's five value-asserting cases, contrasting 50 vs
+# 55 at the same instant; the range case replicates the upstream
+# functions.test sample-time-lags-step shape — that file itself stays
+# skip-manifested, so these hand-derived cases are the executable
+# anchor).
+#
+# Documented deviation (plan v2 Δ1): the date functions map NaN/±Inf/
+# |v| >= 2^63 input values to NaN result elements — Go's int64(float64)
+# is platform-defined on exactly those inputs, so PulsusDB pins its own
+# total behavior instead of mirroring one platform's; such inputs are
+# deliberately excluded from the real-Prometheus differential matrix.
+
+# --- time() -------------------------------------------------------------
+
+# The eval time in seconds, as a scalar.
+eval instant at 55s time()
+	55
+
+# Per-step variation in a range query (the existing t_ms threading).
+eval range from 0 to 120s step 60s time()
+	{} 0 60 120
+
+# --- timestamp(): sample time vs eval-step time -------------------------
+
+load 10s
+	m 0+1x10
+
+# Bare selector -> real SAMPLE time (sample at 50s), not step time (55s).
+eval instant at 55s timestamp(m)
+	{} 50
+
+# Parentheses are stripped before the bare-selector detection — same
+# real-sample-time branch as timestamp(m).
+eval instant at 55s timestamp(((m)))
+	{} 50
+
+# Computed args -> each element carries the eval STEP time (55s).
+eval instant at 55s timestamp(abs(m))
+	{} 55
+
+eval instant at 55s timestamp(m + 0)
+	{} 55
+
+eval instant at 55s timestamp(rate(m[1m]))
+	{} 55
+
+# Nested: the inner timestamp() yields a COMPUTED vector, so the outer
+# timestamp() takes the eval-time branch -> step time, not the inner
+# value.
+eval instant at 55s timestamp(timestamp(m))
+	{} 55
+
+clear
+
+# Range shape: samples every 1m, steps every 1s — the bare-selector
+# branch's values lag the step until the next sample lands (0 for steps
+# 0..59s, 60 for 60..119s, 120 at 120s), exactly the upstream
+# functions.test contour.
+load 1m
+	metric 0+1x4
+
+eval range from 0 to 2m step 1s timestamp(metric)
+	{} 0x59 60x59 120
+
+clear
+
+# --- scalar() ------------------------------------------------------------
+
+load 5m
+	s_one{l="a"} 42
+	s_two{l="a"} 1
+	s_two{l="b"} 2
+
+# Singleton -> the element's value.
+eval instant at 1m scalar(s_one)
+	42
+
+# Non-singleton -> NaN.
+eval instant at 1m scalar(s_two)
+	NaN
+
+# Empty vector -> NaN.
+eval instant at 1m scalar(s_missing)
+	NaN
+
+# --- vector() ------------------------------------------------------------
+
+# A one-element instant vector with the EMPTY label set (no __name__).
+eval instant at 1m vector(7)
+	{} 7
+
+# vector(time()) — the canonical composition: the eval time as a vector.
+eval instant at 1m vector(time())
+	{} 60
+
+clear
+
+# --- the eight date/time-field functions ---------------------------------
+# Element values are unix seconds:
+#   0         = 1970-01-01 00:00:00 UTC (Thursday, day 1, 31-day month)
+#   500000000 = 1985-11-05 00:53:20 UTC (Tuesday, day 309, 30-day month)
+#   1111111   = 1970-01-13 20:38:31 UTC (Tuesday, day 13)
+
+load 5m
+	ts{t="a"} 0
+	ts{t="b"} 500000000
+	ts{t="c"} 1111111
+
+eval instant at 1m year(ts)
+	{t="a"} 1970
+	{t="b"} 1985
+	{t="c"} 1970
+
+eval instant at 1m month(ts)
+	{t="a"} 1
+	{t="b"} 11
+	{t="c"} 1
+
+eval instant at 1m day_of_month(ts)
+	{t="a"} 1
+	{t="b"} 5
+	{t="c"} 13
+
+# Sunday = 0 anchor (the epoch was a Thursday).
+eval instant at 1m day_of_week(ts)
+	{t="a"} 4
+	{t="b"} 2
+	{t="c"} 2
+
+eval instant at 1m day_of_year(ts)
+	{t="a"} 1
+	{t="b"} 309
+	{t="c"} 13
+
+eval instant at 1m days_in_month(ts)
+	{t="a"} 31
+	{t="b"} 30
+	{t="c"} 31
+
+eval instant at 1m hour(ts)
+	{t="a"} 0
+	{t="b"} 0
+	{t="c"} 20
+
+eval instant at 1m minute(ts)
+	{t="a"} 0
+	{t="b"} 53
+	{t="c"} 38
+
+clear
+
+# Leap rules through the query surface: 2000 is a leap year (century
+# divisible by 400), 2100 is not.
+#   951782400  = 2000-02-29 00:00:00 UTC (leap February)
+#   4107456000 = 2100-02-28 00:00:00 UTC (non-leap century February)
+load 5m
+	leap{y="2000"} 951782400
+	leap{y="2100"} 4107456000
+
+eval instant at 1m days_in_month(leap)
+	{y="2000"} 29
+	{y="2100"} 28
+
+clear
+
+# No-argument forms read the eval time itself, one empty-labelset
+# element. 4000s = 1970-01-01 01:06:40 UTC.
+eval instant at 4000s hour()
+	{} 1
+
+eval instant at 4000s minute()
+	{} 6
+
+eval instant at 4000s month()
+	{} 1
+
+# --- documented NaN/Inf/out-of-range date-input behavior (Δ1) ------------
+
+load 5m
+	odd{l="nan"} NaN
+	odd{l="inf"} Inf
+	odd{l="ninf"} -Inf
+	odd{l="big"} 1e19
+	odd{l="fin"} 1111111
+
+eval instant at 1m month(odd)
+	{l="nan"} NaN
+	{l="inf"} NaN
+	{l="ninf"} NaN
+	{l="big"} NaN
+	{l="fin"} 1

@@ -157,26 +157,38 @@
     {
       "name": "day_of_month",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "day_of_month(ts)"
+      }
     },
     {
       "name": "day_of_week",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "day_of_week(ts)"
+      }
     },
     {
       "name": "day_of_year",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "day_of_year(ts)"
+      }
     },
     {
       "name": "days_in_month",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "days_in_month(ts)"
+      }
     },
     {
       "name": "deg",
@@ -292,8 +304,11 @@
     {
       "name": "hour",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "hour(ts)"
+      }
     },
     {
       "name": "idelta",
@@ -415,14 +430,20 @@
     {
       "name": "minute",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "minute(ts)"
+      }
     },
     {
       "name": "month",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "month(ts)"
+      }
     },
     {
       "name": "pi",
@@ -493,8 +514,11 @@
     {
       "name": "scalar",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "scalar(s_one)"
+      }
     },
     {
       "name": "sgn",
@@ -610,14 +634,20 @@
     {
       "name": "time",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "time()"
+      }
     },
     {
       "name": "timestamp",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "timestamp(m)"
+      }
     },
     {
       "name": "ts_of_first_over_time",
@@ -646,14 +676,20 @@
     {
       "name": "vector",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "vector(7)"
+      }
     },
     {
       "name": "year",
       "experimental": false,
-      "status": "scheduled",
-      "issue": "M6-03"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_03_time_date.test",
+        "query": "year(ts)"
+      }
     }
   ],
   "aggregation_operators": [

@@ -176,6 +176,24 @@ pub enum ScalarFn {
     MinOf,
 }
 
+/// The eight date/time-field functions (issue #66, M6-03): each maps a
+/// unix-seconds instant to one UTC calendar/clock field, computed by the
+/// pure integer civil calendar in [`crate::eval::datetime`]. All are
+/// pure post-fetch transforms — the optional vector argument's selector
+/// set (and therefore its fetch SQL) is byte-identical to the bare
+/// expression's, and the no-argument form emits no selector at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateFn {
+    Year,
+    Month,
+    DayOfMonth,
+    DayOfWeek,
+    DayOfYear,
+    DaysInMonth,
+    Hour,
+    Minute,
+}
+
 /// `by (...)` / `without (...)` grouping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grouping {
@@ -282,6 +300,43 @@ pub enum PlanExpr {
     ScalarFn {
         func: ScalarFn,
         args: Vec<Box<PlanExpr>>,
+    },
+    /// Issue #66 (M6-03): `time()` — the evaluation step time as a scalar
+    /// (`t_ms / 1000` seconds, varying per step in a range query). Emits
+    /// no selector.
+    Time,
+    /// Issue #66 (M6-03): one of the eight date/time-field functions.
+    /// `arg: None` is the upstream no-argument default (the field of the
+    /// evaluation step time — `vector(time())` semantics); `Some` applies
+    /// the field per element, reading each element's **value** as unix
+    /// seconds.
+    DateFn {
+        func: DateFn,
+        arg: Option<Box<PlanExpr>>,
+    },
+    /// Issue #66 (M6-03): `timestamp(v)`. Prometheus special-cases a
+    /// (paren-stripped) **bare vector selector** argument to return each
+    /// series' real sample timestamp — `bare_selector` carries that
+    /// selector's id, and the evaluator reads
+    /// `staleness::instant_value(...).t_ms` directly instead of the step
+    /// time. Every computed argument (`timestamp(m+0)`,
+    /// `timestamp(abs(m))`, nested `timestamp(timestamp(m))`, ...) takes
+    /// the `None` branch: each output element carries the evaluation
+    /// step time (upstream `at_modifier.test`'s own contrast).
+    Timestamp {
+        arg: Box<PlanExpr>,
+        bare_selector: Option<SelectorId>,
+    },
+    /// Issue #66 (M6-03): `scalar(v)` — the single element's value when
+    /// the vector has exactly one element, `NaN` otherwise (including
+    /// empty).
+    ScalarOf {
+        arg: Box<PlanExpr>,
+    },
+    /// Issue #66 (M6-03): `vector(s)` — a one-element instant vector with
+    /// the empty label set. Emits no selector of its own.
+    VectorOf {
+        arg: Box<PlanExpr>,
     },
     Scalar(f64),
 }
@@ -702,6 +757,78 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
             func,
             args: vec![Box::new(a), Box::new(b)],
         });
+    }
+
+    // Issue #66 (M6-03): time/date functions + scalar/vector.
+    if name == "time" {
+        if !args.is_empty() {
+            return Err(unsupported("time() with arguments"));
+        }
+        return Ok(PlanExpr::Time);
+    }
+    if let Some(func) = match name {
+        "year" => Some(DateFn::Year),
+        "month" => Some(DateFn::Month),
+        "day_of_month" => Some(DateFn::DayOfMonth),
+        "day_of_week" => Some(DateFn::DayOfWeek),
+        "day_of_year" => Some(DateFn::DayOfYear),
+        "days_in_month" => Some(DateFn::DaysInMonth),
+        "hour" => Some(DateFn::Hour),
+        "minute" => Some(DateFn::Minute),
+        _ => None,
+    } {
+        // Registry arity: 0 or 1 argument (the upstream default is the
+        // evaluation step time).
+        let arg = match args.as_slice() {
+            [] => None,
+            [arg] => Some(Box::new(plan_expr(planner, arg)?)),
+            _ => return Err(unsupported(format!("{name}() with > 1 argument"))),
+        };
+        return Ok(PlanExpr::DateFn { func, arg });
+    }
+    if name == "timestamp" {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported("timestamp() with != 1 argument"));
+        };
+        // Prometheus strips parentheses before deciding whether the
+        // argument is a bare selector (real-sample-time branch) — mirror
+        // that with the same `unwrap_parens` the `group` guard uses.
+        // Routing through `plan_vector_selector` keeps its existing `@`
+        // reject (and metric-scoping rules) in force here too.
+        return Ok(match unwrap_parens(arg) {
+            Expr::VectorSelector(vs) => {
+                let planned = plan_vector_selector(planner, vs)?;
+                let PlanExpr::Selector(id) = planned else {
+                    // `plan_vector_selector` only ever builds a Selector —
+                    // kept total (a descriptive error, never a panic).
+                    return Err(unsupported(
+                        "timestamp() over an unexpected selector plan shape",
+                    ));
+                };
+                PlanExpr::Timestamp {
+                    arg: Box::new(PlanExpr::Selector(id)),
+                    bare_selector: Some(id),
+                }
+            }
+            other => PlanExpr::Timestamp {
+                arg: Box::new(plan_expr(planner, other)?),
+                bare_selector: None,
+            },
+        });
+    }
+    if name == "scalar" {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported("scalar() with != 1 argument"));
+        };
+        let arg = plan_expr(planner, arg)?;
+        return Ok(PlanExpr::ScalarOf { arg: Box::new(arg) });
+    }
+    if name == "vector" {
+        let [arg] = args.as_slice() else {
+            return Err(unsupported("vector() with != 1 argument"));
+        };
+        let arg = plan_expr(planner, arg)?;
+        return Ok(PlanExpr::VectorOf { arg: Box::new(arg) });
     }
 
     Err(unsupported(format!("function {name}()")))
@@ -1650,6 +1777,155 @@ mod tests {
         match err {
             PromqlError::Unsupported { construct } => assert!(construct.contains("group")),
             other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // --- issue #66 (M6-03): time/date functions + scalar/vector ---
+
+    #[test]
+    fn plans_time_as_a_zero_selector_scalar_node() {
+        let p = plan(&parse("time()").unwrap(), params()).unwrap();
+        assert_eq!(p.root, PlanExpr::Time);
+        assert!(p.selectors.is_empty(), "time() must emit no selector");
+    }
+
+    #[test]
+    fn time_with_arguments_is_unsupported() {
+        // The vendored parser's arity check already rejects `time(m)`;
+        // hand-construct the call to exercise plan_call's own guard.
+        let expr = parse("time()").unwrap();
+        let Expr::Call(call) = &expr else {
+            panic!("expected Call")
+        };
+        let mut call = call.clone();
+        call.args.args.push(Box::new(parse("m").unwrap()));
+        let err = plan(&Expr::Call(call), params()).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn plans_every_date_fn_over_a_vector_argument() {
+        for (query, want) in [
+            ("year(m)", DateFn::Year),
+            ("month(m)", DateFn::Month),
+            ("day_of_month(m)", DateFn::DayOfMonth),
+            ("day_of_week(m)", DateFn::DayOfWeek),
+            ("day_of_year(m)", DateFn::DayOfYear),
+            ("days_in_month(m)", DateFn::DaysInMonth),
+            ("hour(m)", DateFn::Hour),
+            ("minute(m)", DateFn::Minute),
+        ] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            match &p.root {
+                PlanExpr::DateFn { func, arg } => {
+                    assert_eq!(*func, want, "{query}");
+                    assert_eq!(arg.as_deref(), Some(&PlanExpr::Selector(0)), "{query}");
+                }
+                other => panic!("{query}: expected DateFn, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plans_a_no_argument_date_fn_with_zero_selectors() {
+        let p = plan(&parse("month()").unwrap(), params()).unwrap();
+        assert_eq!(
+            p.root,
+            PlanExpr::DateFn {
+                func: DateFn::Month,
+                arg: None,
+            }
+        );
+        assert!(p.selectors.is_empty(), "month() must emit no selector");
+    }
+
+    #[test]
+    fn plans_timestamp_over_a_bare_selector_with_the_special_branch() {
+        let p = plan(&parse("timestamp(m)").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::Timestamp { arg, bare_selector } => {
+                assert_eq!(**arg, PlanExpr::Selector(0));
+                assert_eq!(*bare_selector, Some(0));
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_strips_parentheses_before_detecting_a_bare_selector() {
+        // Prometheus paren-strips the argument, so `timestamp(((m)))`
+        // takes the real-sample-time branch exactly like `timestamp(m)`.
+        let p = plan(&parse("timestamp(((m)))").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::Timestamp { bare_selector, .. } => assert_eq!(*bare_selector, Some(0)),
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn timestamp_over_a_computed_argument_takes_the_eval_time_branch() {
+        for query in [
+            "timestamp(m + 0)",
+            "timestamp(abs(m))",
+            "timestamp(rate(m[1m]))",
+        ] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            match &p.root {
+                PlanExpr::Timestamp { bare_selector, .. } => {
+                    assert_eq!(*bare_selector, None, "{query}");
+                }
+                other => panic!("{query}: expected Timestamp, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_over_a_selector_with_at_modifier_is_unsupported() {
+        // The bare-selector branch routes through plan_vector_selector,
+        // whose existing `@` reject stays in force.
+        let err = plan(&parse("timestamp(m @ 100)").unwrap(), params()).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn plans_scalar_and_vector_wrappers() {
+        let p = plan(&parse("scalar(m)").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::ScalarOf { arg } => assert_eq!(**arg, PlanExpr::Selector(0)),
+            other => panic!("expected ScalarOf, got {other:?}"),
+        }
+        let p = plan(&parse("vector(1)").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::VectorOf { arg } => assert_eq!(**arg, PlanExpr::Scalar(1.0)),
+            other => panic!("expected VectorOf, got {other:?}"),
+        }
+        assert!(p.selectors.is_empty(), "vector(1) must emit no selector");
+    }
+
+    /// Perf Tier-1 gate (issue #66 plan; standing query-performance
+    /// mandate): the M6-03 wrappers add no fetch work — a wrapped
+    /// expression's selector set (the input the fetch SQL is generated
+    /// from) is byte-identical to the bare expression's, and the
+    /// selector-free shapes emit no selector at all.
+    #[test]
+    fn m6_03_wrappers_keep_the_selector_set_byte_identical() {
+        let bare = plan(
+            &parse(r#"mem_usage_bytes{service="svc-1"}"#).unwrap(),
+            params(),
+        )
+        .unwrap();
+        for query in [
+            r#"timestamp(mem_usage_bytes{service="svc-1"})"#,
+            r#"scalar(mem_usage_bytes{service="svc-1"})"#,
+            r#"month(mem_usage_bytes{service="svc-1"})"#,
+            r#"timestamp(timestamp(mem_usage_bytes{service="svc-1"}))"#,
+        ] {
+            let wrapped = plan(&parse(query).unwrap(), params()).unwrap();
+            assert_eq!(wrapped.selectors, bare.selectors, "{query}");
+        }
+        for query in ["time()", "month()", "vector(1)", "vector(time())"] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            assert!(p.selectors.is_empty(), "{query} must emit no selector");
         }
     }
 }

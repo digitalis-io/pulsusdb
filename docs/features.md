@@ -79,6 +79,7 @@ gzip/snappy/zstd request decompression · sync/async insert selection per reques
 - *Math & trig:* `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `ln`, `log2`, `log10`, `sgn`, `clamp{,_min,_max}`, full trig set, `deg`, `rad`, `pi`
 - *Label & sort:* `label_replace`, `label_join`, `sort{,_desc}`, `sort_by_label{,_desc}`
 - *Other:* `absent`, `absent_over_time`, `scalar`, `vector`, `time`, `timestamp`; `group_left()`/`group_right()` matching; set operators
+- *Documented deviation (M6-03):* the date/time-field functions (`year`, `month`, `day_of_month`, `day_of_week`, `day_of_year`, `days_in_month`, `hour`, `minute`) map `NaN`/`±Inf`/out-of-`int64`-range input values to `NaN` — Go's `int64(float64)` conversion is platform-defined on exactly those inputs, so PulsusDB pins a total, documented behavior instead; finite in-range inputs truncate toward zero identically to Go
 - *Modifiers:* `@` timestamp lands with M3
 - *Subqueries* `metric[1h:5m]`, duration expressions, UTF-8 label names, and flag-gated experimental functions — all part of M6 full compliance
 - *Native histograms:* **M7** (committed, not aspirational) — histogram sample storage, OTLP exponential-histogram native ingestion, the histogram function set, and the upstream `native_histograms.test` corpus file passing
