@@ -546,6 +546,11 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "group_right",
             "atan2",
             "binop-fill-modifier",
+            // M6-08a (issue #83): the @ modifier and subqueries — plan-
+            // time @ resolution + own-@-dominant fetch extents, and
+            // materialize-once epoch-anchored subquery evaluation.
+            "at-modifier",
+            "subquery",
         ])
     );
 }
@@ -747,8 +752,8 @@ const EXPR_MAPPING: &[(&str, Bucket)] = &[
         "Unary",
         Bucket::CoreExclusion(
             "M2 core (scalar negation folds in the parser; unary over a \
-                               vector is Unsupported and surfaces as a value divergence, \
-                               not a tracked feature)",
+                               vector desugars to 0-minus-operand — issue #83 folded it in \
+                               per the M6-08 split adjudication, not a tracked feature)",
         ),
     ),
     // Plain arith/comparison Binary is M2 core; the tracked feature

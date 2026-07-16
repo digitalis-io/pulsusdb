@@ -25,12 +25,14 @@ pub mod labels;
 mod quote;
 pub mod staleness;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pulsus_model::STALE_NAN_BITS;
 
 use crate::error::PromqlError;
-use crate::plan::{MathFn, OverTimeFn, PlanExpr, QueryPlan, ScalarFn, SelectorSpec};
+use crate::plan::{
+    MathFn, OverTimeFn, PlanExpr, QueryPlan, RangeSource, ScalarFn, SelectorSpec, SubqueryPlan,
+};
 use crate::value::{InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData};
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
@@ -48,14 +50,45 @@ type SeriesIdentity = (Option<String>, Labels);
 
 /// Evaluates `plan` against `data` — pure, no I/O.
 pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, PromqlError> {
+    evaluate_counted(plan, data).map(|(value, _)| value)
+}
+
+/// [`evaluate`] plus the total count of subquery inner-grid evaluations —
+/// the issue #83 round-2 evaluation-count gate's hook: a per-outer-step
+/// re-evaluation implementation counts a multiple of the union-grid size
+/// and fails `tests::subqueries_materialize_once_over_the_union_grid`.
+fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, u64), PromqlError> {
     let p = &plan.params;
+
+    // Issue #83 (round-2 amendment): materialize every subquery ONCE over
+    // its epoch-anchored union grid — inside-out for nested subqueries —
+    // before any stepping; each step below only slices `(mint, maxt]`
+    // windows from the shared results.
+    let mut subqueries = SubqueryCache::default();
+    let mut inner_evals = 0u64;
+    prepare_subqueries(
+        &plan.root,
+        &plan.selectors,
+        data,
+        (p.start_ms, p.end_ms),
+        p.lookback_ms,
+        &mut subqueries,
+        &mut inner_evals,
+    )?;
+
     if p.step_ms == 0 {
-        return Ok(
-            match eval_step(&plan.root, &plan.selectors, data, p.start_ms, p.lookback_ms)? {
-                StepValue::Vector(v) => QueryValue::Vector(v),
-                StepValue::Scalar(s) => QueryValue::Scalar(s),
-            },
-        );
+        let value = match eval_step(
+            &plan.root,
+            &plan.selectors,
+            data,
+            p.start_ms,
+            p.lookback_ms,
+            &subqueries,
+        )? {
+            StepValue::Vector(v) => QueryValue::Vector(v),
+            StepValue::Scalar(s) => QueryValue::Scalar(s),
+        };
+        return Ok((value, inner_evals));
     }
 
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
@@ -84,7 +117,14 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
 
     let mut t = p.start_ms;
     while t <= p.end_ms {
-        match eval_step(&plan.root, &plan.selectors, data, t, p.lookback_ms)? {
+        match eval_step(
+            &plan.root,
+            &plan.selectors,
+            data,
+            t,
+            p.lookback_ms,
+            &subqueries,
+        )? {
             StepValue::Vector(v) => {
                 saw_vector = true;
                 for s in v {
@@ -109,11 +149,14 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
     }
 
     if saw_scalar && !saw_vector {
-        return Ok(QueryValue::Matrix(vec![RangeSeries {
-            labels: Labels::default(),
-            metric_name: None,
-            points: scalar_points,
-        }]));
+        return Ok((
+            QueryValue::Matrix(vec![RangeSeries {
+                labels: Labels::default(),
+                metric_name: None,
+                points: scalar_points,
+            }]),
+            inner_evals,
+        ));
     }
 
     let mut out: Vec<RangeSeries> = vector_points
@@ -129,7 +172,334 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
     // internal determinism when two full identities share their non-name
     // labels.
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
-    Ok(QueryValue::Matrix(out))
+    Ok((QueryValue::Matrix(out), inner_evals))
+}
+
+// ---------------------------------------------------------------------------
+// Subquery materialization (issue #83)
+// ---------------------------------------------------------------------------
+
+/// One materialized subquery: its inner expression evaluated exactly once
+/// per query over the epoch-anchored union grid, grouped per series.
+/// Samples are ascending by construction (the grid is walked ascending).
+#[derive(Debug, Clone)]
+struct MaterializedSubquery {
+    series: Vec<MaterializedSeries>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedSeries {
+    labels: Labels,
+    metric_name: Option<String>,
+    samples: Vec<Sample>,
+}
+
+/// Materialized subqueries keyed by the [`SubqueryPlan`] node's address —
+/// the plan tree is borrowed immutably for the whole evaluation, so node
+/// identity is stable; each node appears in the tree exactly once.
+type SubqueryCache = HashMap<*const SubqueryPlan, MaterializedSubquery>;
+
+/// The first inner-grid timestamp for a subquery window `(mint, maxt]`:
+/// the smallest multiple of `step` STRICTLY GREATER than `mint` — the
+/// epoch-anchored ascending grid (upstream `runSubquery`: `subqStart :=
+/// step * floor(mint/step)`, corrected up one step on the boundary).
+///
+/// NOTE (issue #83 plan v2 Δ1): the vendored `at_modifier.test:159`
+/// inline comment ("inner subquery: at 905=…, at 915=…") mis-states this
+/// grid — the compiled engine at the pinned SHA emits `{900s, 910s}` for
+/// that case (epoch-anchored), and the asserted aggregate (360)
+/// coincidentally matches both. Do not re-derive an end-anchored grid
+/// from that comment; `proof/m6_08a_at_subquery.test`'s
+/// `sum_over_time(vector(time())[10s:3s] @ 25) = 63` golden fails any
+/// end-anchored port (which would yield 66).
+fn subquery_grid_start(mint: i64, step: i64) -> i64 {
+    debug_assert!(step > 0, "plan_subquery rejects non-positive steps");
+    let s = (mint / step) * step;
+    if s <= mint { s + step } else { s }
+}
+
+/// Walks `expr` and materializes every [`RangeSource::Subquery`] node —
+/// children (nested subqueries) first, so each materialization's own
+/// inner evaluations find their nested results already cached. `span` is
+/// the closed `[start, end]` range of evaluation times this node will be
+/// evaluated at (the query's own span at the root; a subquery's grid
+/// extent for its inner expression).
+fn prepare_subqueries(
+    expr: &PlanExpr,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    span: (i64, i64),
+    lookback_ms: i64,
+    cache: &mut SubqueryCache,
+    inner_evals: &mut u64,
+) -> Result<(), PromqlError> {
+    match expr {
+        PlanExpr::Selector(_) | PlanExpr::Scalar(_) | PlanExpr::Time => Ok(()),
+        PlanExpr::RangeFn { source, .. }
+        | PlanExpr::OverTime { source, .. }
+        | PlanExpr::AbsentOverTime { source } => prepare_source(
+            source,
+            selectors,
+            data,
+            span,
+            lookback_ms,
+            cache,
+            inner_evals,
+        ),
+        PlanExpr::OverTimeParam { source, args, .. } => {
+            for a in args {
+                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            }
+            prepare_source(
+                source,
+                selectors,
+                data,
+                span,
+                lookback_ms,
+                cache,
+                inner_evals,
+            )
+        }
+        PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::Timestamp { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg } => {
+            prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+        PlanExpr::DateFn { arg, .. } => match arg {
+            Some(arg) => {
+                prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)
+            }
+            None => Ok(()),
+        },
+        PlanExpr::HistogramQuantile { quantile, expr } => {
+            prepare_subqueries(
+                quantile,
+                selectors,
+                data,
+                span,
+                lookback_ms,
+                cache,
+                inner_evals,
+            )?;
+            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+        PlanExpr::Aggregate { expr, param, .. } => {
+            if let Some(p) = param {
+                prepare_subqueries(p, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            }
+            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+        PlanExpr::CountValues { expr, .. } => {
+            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+        PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
+            prepare_subqueries(lhs, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            prepare_subqueries(rhs, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => {
+            prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            for a in scalar_args {
+                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            }
+            Ok(())
+        }
+        PlanExpr::ScalarFn { args, .. } => {
+            for a in args {
+                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn prepare_source(
+    source: &RangeSource,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    span: (i64, i64),
+    lookback_ms: i64,
+    cache: &mut SubqueryCache,
+    inner_evals: &mut u64,
+) -> Result<(), PromqlError> {
+    match source {
+        RangeSource::Selector(_) => Ok(()),
+        RangeSource::Subquery(sq) => {
+            prepare_subquery(sq, selectors, data, span, lookback_ms, cache, inner_evals)
+        }
+    }
+}
+
+/// Materializes one subquery over the epoch-anchored ASCENDING union
+/// grid: the union of every outer step's `(mint, maxt]` window over
+/// `span` (a single window when the subquery carries its own `@` — the
+/// anchor is fixed), realized as `{ k·step : k·step > mint_min, k·step ≤
+/// maxt_max }`, each point evaluated exactly once. Recursion depth is
+/// bounded by the planner's `MAX_SUBQUERY_DEPTH` guard.
+fn prepare_subquery(
+    sq: &SubqueryPlan,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    span: (i64, i64),
+    lookback_ms: i64,
+    cache: &mut SubqueryCache,
+    inner_evals: &mut u64,
+) -> Result<(), PromqlError> {
+    let (anchor_min, anchor_max) = match sq.at_ms {
+        Some(at) => (at, at),
+        None => span,
+    };
+    let maxt_max = anchor_max - sq.offset_ms;
+    let mint_min = anchor_min - sq.offset_ms - sq.range_ms;
+    let grid_start = subquery_grid_start(mint_min, sq.step_ms);
+
+    // Series identity → grid samples, BTreeMap for deterministic order.
+    let mut acc: BTreeMap<SeriesIdentity, Vec<Sample>> = BTreeMap::new();
+    if grid_start <= maxt_max {
+        // Children first (inside-out): the inner expression's own nested
+        // subqueries must be materialized before it can be evaluated. Its
+        // evaluation span is exactly this grid's extent.
+        let grid_last = maxt_max - (maxt_max - grid_start).rem_euclid(sq.step_ms);
+        prepare_subqueries(
+            &sq.inner,
+            selectors,
+            data,
+            (grid_start, grid_last),
+            lookback_ms,
+            cache,
+            inner_evals,
+        )?;
+
+        let mut it = grid_start;
+        while it <= maxt_max {
+            *inner_evals += 1;
+            match eval_step(&sq.inner, selectors, data, it, lookback_ms, cache)? {
+                StepValue::Vector(v) => {
+                    for s in v {
+                        acc.entry((s.metric_name, s.labels))
+                            .or_default()
+                            .push(Sample { t_ms: it, v: s.v });
+                    }
+                }
+                // The vendored parser type-checks subqueries as
+                // instant-vector-only; kept total (defense-in-depth).
+                StepValue::Scalar(_) => {
+                    return Err(PromqlError::Unsupported {
+                        construct: "subquery over a scalar expression".to_string(),
+                    });
+                }
+            }
+            it += sq.step_ms;
+        }
+    }
+
+    let series = acc
+        .into_iter()
+        .map(|((metric_name, labels), samples)| MaterializedSeries {
+            labels,
+            metric_name,
+            samples,
+        })
+        .collect();
+    // Always insert — an empty grid/result must still satisfy the
+    // stepping phase's cache lookup (the at_modifier.test:227-255
+    // empty-@ non-panic cases).
+    cache.insert(sq as *const _, MaterializedSubquery { series });
+    Ok(())
+}
+
+/// One range-vector function input series at one step, already windowed.
+struct WindowedSeries {
+    labels: Labels,
+    /// The source's metric name (kept only by `last_over_time`/
+    /// `first_over_time`) — the selector's own name, or the materialized
+    /// inner series' name for a subquery source.
+    metric_name: Option<String>,
+    samples: Vec<Sample>,
+}
+
+/// A range source resolved at one evaluation step: the `(lower_excl,
+/// upper_incl]` window (`upper_incl` = the effective evaluation time) and
+/// every series' windowed, non-stale samples — the shared input for all
+/// four range-function arms (issue #83's `eval_range_source` helper).
+struct WindowedSource {
+    range_ms: i64,
+    lower_excl: i64,
+    upper_incl: i64,
+    series: Vec<WindowedSeries>,
+}
+
+fn windowed_range_source(
+    source: &RangeSource,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    subqueries: &SubqueryCache,
+    t_ms: i64,
+) -> WindowedSource {
+    match source {
+        RangeSource::Selector(id) => {
+            let sel = &selectors[*id];
+            let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
+            let range_ms = sel
+                .range_ms
+                .expect("plan() only ever builds a range source over a matrix selector");
+            let lower_excl = eff_t - range_ms;
+            let series = data
+                .get(*id)
+                .iter()
+                .map(|s| WindowedSeries {
+                    labels: s.labels.clone(),
+                    metric_name: Some(sel.metric_name.clone()),
+                    samples: windowed_non_stale(&s.samples, lower_excl, eff_t),
+                })
+                .collect();
+            WindowedSource {
+                range_ms,
+                lower_excl,
+                upper_incl: eff_t,
+                series,
+            }
+        }
+        RangeSource::Subquery(sq) => {
+            let materialized = subqueries
+                .get(&(sq.as_ref() as *const _))
+                // Documented invariant: `prepare_subqueries` walks the
+                // exact same tree `eval_step` walks and always inserts an
+                // entry (empty grids included) before stepping begins.
+                .expect("prepare_subqueries materializes every subquery before stepping");
+            let eff_t = sq.at_ms.unwrap_or(t_ms) - sq.offset_ms;
+            let lower_excl = eff_t - sq.range_ms;
+            // Slice this step's (mint, maxt] window from the shared
+            // materialized grid — never re-evaluate the inner expression.
+            // Materialized values are computed, never stale-marked, so a
+            // plain slice (no stale filter) is exact.
+            let series = materialized
+                .series
+                .iter()
+                .map(|s| {
+                    let start = s.samples.partition_point(|p| p.t_ms <= lower_excl);
+                    let end = s.samples.partition_point(|p| p.t_ms <= eff_t);
+                    WindowedSeries {
+                        labels: s.labels.clone(),
+                        metric_name: s.metric_name.clone(),
+                        samples: s.samples[start..end].to_vec(),
+                    }
+                })
+                .collect();
+            WindowedSource {
+                range_ms: sq.range_ms,
+                lower_excl,
+                upper_incl: eff_t,
+                series,
+            }
+        }
+    }
 }
 
 /// Slices `samples` (sorted ascending) to the left-open right-closed
@@ -152,6 +522,7 @@ fn eval_step(
     data: &SeriesData,
     t_ms: i64,
     lookback_ms: i64,
+    subqueries: &SubqueryCache,
 ) -> Result<StepValue, PromqlError> {
     match expr {
         PlanExpr::Scalar(v) => Ok(StepValue::Scalar(*v)),
@@ -187,7 +558,9 @@ fn eval_step(
                 "every SelectorSpec carries exactly one concrete, non-empty metric name — \
                  plan.rs rejects nameless/regex-__name__ selectors before a QueryPlan exists"
             );
-            let eff_t = t_ms - sel.offset_ms;
+            // Issue #83: an own `@` fixes the evaluation time (offset
+            // applies relative to it) — step-invariant by construction.
+            let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
             let mut out = Vec::new();
             for series in data.get(*id) {
                 if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
@@ -205,22 +578,22 @@ fn eval_step(
 
         // Issue #37: `rate`/`irate`/`increase`/`delta` **compute** a new
         // value from the windowed samples — Prometheus drops `__name__`
-        // here (captured: `query.name_rate_drops_get.json`).
-        PlanExpr::RangeFn { func, selector } => {
-            let sel = &selectors[*selector];
-            let eff_t = t_ms - sel.offset_ms;
-            let range_ms = sel
-                .range_ms
-                .expect("plan() only ever builds RangeFn over a matrix selector");
-            let lower_excl = eff_t - range_ms;
+        // here (captured: `query.name_rate_drops_get.json`). Issue #83:
+        // the source may be a subquery — `windowed_range_source` slices
+        // its step window from the once-materialized union grid.
+        PlanExpr::RangeFn { func, source } => {
+            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
             let mut out = Vec::new();
-            for series in data.get(*selector) {
-                let windowed = windowed_non_stale(&series.samples, lower_excl, eff_t);
-                if let Some(v) =
-                    functions::eval_range_fn(*func, &windowed, range_ms, lower_excl, eff_t)
-                {
+            for series in src.series {
+                if let Some(v) = functions::eval_range_fn(
+                    *func,
+                    &series.samples,
+                    src.range_ms,
+                    src.lower_excl,
+                    src.upper_incl,
+                ) {
                     out.push(InstantSample {
-                        labels: series.labels.clone(),
+                        labels: series.labels,
                         metric_name: None,
                         t_ms,
                         v,
@@ -243,21 +616,18 @@ fn eval_step(
         // The synthesis from `sel.metric_name` is sound for the same
         // reason as the `Selector` arm's (one concrete metric name per
         // reachable SelectorSpec).
-        PlanExpr::OverTime { func, selector } => {
-            let sel = &selectors[*selector];
-            let eff_t = t_ms - sel.offset_ms;
-            let range_ms = sel
-                .range_ms
-                .expect("plan() only ever builds OverTime over a matrix selector");
-            let lower_excl = eff_t - range_ms;
+        PlanExpr::OverTime { func, source } => {
+            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
-            for series in data.get(*selector) {
-                let windowed = windowed_non_stale(&series.samples, lower_excl, eff_t);
-                if let Some(v) = functions::eval_over_time(*func, &windowed) {
+            for series in src.series {
+                if let Some(v) = functions::eval_over_time(*func, &series.samples) {
                     out.push(InstantSample {
-                        labels: series.labels.clone(),
-                        metric_name: keeps_name.then(|| sel.metric_name.clone()),
+                        labels: series.labels,
+                        // Selector source: the selector's one concrete
+                        // metric name; subquery source: the materialized
+                        // inner series' own kept name (if any).
+                        metric_name: if keeps_name { series.metric_name } else { None },
                         t_ms,
                         v,
                     });
@@ -272,29 +642,21 @@ fn eval_step(
         // regression intercept is the evaluation **step time** `t_ms`
         // (upstream `enh.Ts` — the #67 adjudication), passed through as
         // `eval_t_ms`.
-        PlanExpr::OverTimeParam {
-            func,
-            selector,
-            args,
-        } => {
-            let sel = &selectors[*selector];
-            let eff_t = t_ms - sel.offset_ms;
-            let range_ms = sel
-                .range_ms
-                .expect("plan() only ever builds OverTimeParam over a matrix selector");
-            let lower_excl = eff_t - range_ms;
+        PlanExpr::OverTimeParam { func, source, args } => {
             let mut scalars = Vec::with_capacity(args.len());
             for a in args {
-                let StepValue::Scalar(s) = eval_step(a, selectors, data, t_ms, lookback_ms)? else {
+                let StepValue::Scalar(s) =
+                    eval_step(a, selectors, data, t_ms, lookback_ms, subqueries)?
+                else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar parameter argument"),
                     });
                 };
                 scalars.push(s);
             }
+            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
             let mut out = Vec::new();
-            for series in data.get(*selector) {
-                let windowed = windowed_non_stale(&series.samples, lower_excl, eff_t);
+            for series in src.series {
                 // Upstream engine.go only invokes a matrix-argument
                 // function for a series with at least one point in the
                 // step's window (`if len(ss.Floats)+len(ss.Histograms) >
@@ -308,13 +670,20 @@ fn eval_step(
                 // with data are a 422 execution error). This skip is that
                 // engine-level guard; the validation itself stays inside
                 // `eval_over_time_param`, mirroring upstream's layering.
-                if windowed.is_empty() {
+                // It also keeps the at_modifier.test:227-255 empty-@
+                // subquery cases empty-not-panicking (issue #83).
+                if series.samples.is_empty() {
                     continue;
                 }
-                if let Some(v) = functions::eval_over_time_param(*func, &windowed, &scalars, t_ms)?
+                // `predict_linear`'s regression intercept stays the outer
+                // evaluation STEP time `t_ms` — never the `@`/offset-
+                // shifted window edge (the #67 adjudication; the offset
+                // golden lives in proof/m6_08a_at_subquery.test).
+                if let Some(v) =
+                    functions::eval_over_time_param(*func, &series.samples, &scalars, t_ms)?
                 {
                     out.push(InstantSample {
-                        labels: series.labels.clone(),
+                        labels: series.labels,
                         metric_name: None,
                         t_ms,
                         v,
@@ -335,22 +704,22 @@ fn eval_step(
         // helper's doc). `__name__` is never emitted (upstream skips
         // MetricName matchers; `sel.matchers` already excludes it by the
         // planner's metric-scoping rule).
-        PlanExpr::AbsentOverTime { selector } => {
-            let sel = &selectors[*selector];
-            let eff_t = t_ms - sel.offset_ms;
-            let range_ms = sel
-                .range_ms
-                .expect("plan() only ever builds AbsentOverTime over a matrix selector");
-            let lower_excl = eff_t - range_ms;
-            let present = data
-                .get(*selector)
-                .iter()
-                .any(|series| !windowed_non_stale(&series.samples, lower_excl, eff_t).is_empty());
+        PlanExpr::AbsentOverTime { source } => {
+            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
+            let present = src.series.iter().any(|s| !s.samples.is_empty());
             if present {
                 return Ok(StepValue::Vector(Vec::new()));
             }
+            // Selector source: labels synthesized from the matchers;
+            // subquery source (issue #83): the empty label set (upstream's
+            // createLabelsForAbsentFunction walk only applies to a
+            // vector-selector argument).
+            let labels = match source {
+                RangeSource::Selector(id) => labels::labels_for_absent(&selectors[*id].matchers),
+                RangeSource::Subquery(_) => Labels::default(),
+            };
             Ok(StepValue::Vector(vec![InstantSample {
-                labels: labels::labels_for_absent(&sel.matchers),
+                labels,
                 metric_name: None,
                 t_ms,
                 v: 1.0,
@@ -366,7 +735,9 @@ fn eval_step(
         // (`sum(...)`, `a+b`, `rate(...)`, a filter comparison) yields
         // the empty label set (:1735-1750). `__name__` is never emitted.
         PlanExpr::Absent { arg, selector } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "absent() over a scalar expression".to_string(),
                 });
@@ -395,7 +766,8 @@ fn eval_step(
         // encoder preserves this order on the wire for sort-rooted
         // instant queries (`expr_is_sort_root`).
         PlanExpr::Sort { descending, arg } => {
-            let StepValue::Vector(mut v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+            let StepValue::Vector(mut v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "sort()/sort_desc() over a scalar expression".to_string(),
@@ -414,7 +786,8 @@ fn eval_step(
             labels: names,
             arg,
         } => {
-            let StepValue::Vector(mut v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+            let StepValue::Vector(mut v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "sort_by_label()/sort_by_label_desc() over a scalar expression"
@@ -436,7 +809,9 @@ fn eval_step(
             src,
             regex,
         } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "label_replace() over a scalar expression".to_string(),
                 });
@@ -455,7 +830,9 @@ fn eval_step(
             separator,
             src_labels,
         } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "label_join() over a scalar expression".to_string(),
                 });
@@ -470,14 +847,17 @@ fn eval_step(
         // verified: `histogram_quantile(0.5, x_bucket_histogram_bucket)`
         // -> `"metric":{}`, PROVENANCE.md's table).
         PlanExpr::HistogramQuantile { quantile, expr } => {
-            let StepValue::Scalar(q) = eval_step(quantile, selectors, data, t_ms, lookback_ms)?
+            let StepValue::Scalar(q) =
+                eval_step(quantile, selectors, data, t_ms, lookback_ms, subqueries)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "histogram_quantile's first argument must evaluate to a scalar"
                         .to_string(),
                 });
             };
-            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "histogram_quantile's second argument must evaluate to a vector"
                         .to_string(),
@@ -525,14 +905,17 @@ fn eval_step(
             param,
             grouping,
         } => {
-            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "aggregation over a scalar expression".to_string(),
                 });
             };
             let param_v = match param {
                 Some(p) => {
-                    let StepValue::Scalar(k) = eval_step(p, selectors, data, t_ms, lookback_ms)?
+                    let StepValue::Scalar(k) =
+                        eval_step(p, selectors, data, t_ms, lookback_ms, subqueries)?
                     else {
                         return Err(PromqlError::Unsupported {
                             construct: "aggregation parameter must evaluate to a scalar"
@@ -556,7 +939,9 @@ fn eval_step(
             expr,
             grouping,
         } => {
-            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "aggregation over a scalar expression".to_string(),
                 });
@@ -576,14 +961,17 @@ fn eval_step(
             arg,
             scalar_args,
         } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: format!("{func:?} over a scalar expression"),
                 });
             };
             let mut scalars = Vec::with_capacity(scalar_args.len());
             for sa in scalar_args {
-                let StepValue::Scalar(s) = eval_step(sa, selectors, data, t_ms, lookback_ms)?
+                let StepValue::Scalar(s) =
+                    eval_step(sa, selectors, data, t_ms, lookback_ms, subqueries)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar bound argument"),
@@ -663,7 +1051,9 @@ fn eval_step(
         PlanExpr::ScalarFn { func, args } => {
             let mut scalars = Vec::with_capacity(args.len());
             for a in args {
-                let StepValue::Scalar(s) = eval_step(a, selectors, data, t_ms, lookback_ms)? else {
+                let StepValue::Scalar(s) =
+                    eval_step(a, selectors, data, t_ms, lookback_ms, subqueries)?
+                else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar argument"),
                     });
@@ -711,7 +1101,8 @@ fn eval_step(
             // Δ1): NaN/±Inf/|v| >= 2^63 yield a NaN result element (kept,
             // labels minus `__name__`), never a platform-defined cast.
             Some(arg) => {
-                let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+                let StepValue::Vector(v) =
+                    eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} over a scalar expression"),
@@ -744,7 +1135,10 @@ fn eval_step(
         PlanExpr::Timestamp { arg, bare_selector } => match bare_selector {
             Some(id) => {
                 let sel = &selectors[*id];
-                let eff_t = t_ms - sel.offset_ms;
+                // Issue #83: an own `@` fixes the lookup time, so the
+                // returned sample timestamp is constant across steps
+                // (at_modifier.test:168/:207/:279 — `timestamp(m @ T)`).
+                let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
                 let mut out = Vec::new();
                 for series in data.get(*id) {
                     if let Some(sample) =
@@ -761,7 +1155,8 @@ fn eval_step(
                 Ok(StepValue::Vector(out))
             }
             None => {
-                let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)?
+                let StepValue::Vector(v) =
+                    eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: "timestamp() over a scalar expression".to_string(),
@@ -783,7 +1178,9 @@ fn eval_step(
         // Issue #66 (M6-03): `scalar(v)` — the singleton element's value,
         // NaN for zero or multiple elements (upstream funcScalar).
         PlanExpr::ScalarOf { arg } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Vector(v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "scalar() over a scalar expression".to_string(),
                 });
@@ -797,7 +1194,9 @@ fn eval_step(
         // Issue #66 (M6-03): `vector(s)` — one element with the EMPTY
         // label set (and no `__name__`, upstream funcVector).
         PlanExpr::VectorOf { arg } => {
-            let StepValue::Scalar(s) = eval_step(arg, selectors, data, t_ms, lookback_ms)? else {
+            let StepValue::Scalar(s) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            else {
                 return Err(PromqlError::Unsupported {
                     construct: "vector() over a non-scalar expression".to_string(),
                 });
@@ -819,8 +1218,8 @@ fn eval_step(
             group,
             fill,
         } => {
-            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms)?;
-            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms)?;
+            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, subqueries)?;
+            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, subqueries)?;
             // The planner's typed scalar-operand guard (issue #70,
             // parse.go:807-814) discards `group`/`fill` whenever either
             // operand is scalar-typed, so the scalar arms below can never
@@ -875,8 +1274,8 @@ fn eval_step(
             rhs,
             matching,
         } => {
-            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms)?;
-            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms)?;
+            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, subqueries)?;
+            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, subqueries)?;
             match (l, r) {
                 (StepValue::Vector(l), StepValue::Vector(r)) => {
                     Ok(StepValue::Vector(binop::set_op(*op, matching, &l, &r)))
@@ -2344,5 +2743,193 @@ mod tests {
             err.to_string(),
             "vector cannot contain metrics with the same labelset"
         );
+    }
+
+    // --- issue #83 (M6-08a): @ modifier + subqueries ---
+
+    /// The epoch-anchored grid start: the smallest multiple of `step`
+    /// STRICTLY GREATER than `mint`, for positive, boundary-aligned, and
+    /// negative `mint` (Rust integer division truncates toward zero — the
+    /// negative cases pin that the correction still lands on the right
+    /// multiple, at_modifier.test:140's `(-50s, 50s]` window).
+    #[test]
+    fn subquery_grid_start_is_the_smallest_step_multiple_strictly_above_mint() {
+        assert_eq!(subquery_grid_start(15_000, 3_000), 18_000);
+        assert_eq!(subquery_grid_start(897, 10), 900);
+        assert_eq!(subquery_grid_start(900, 10), 910, "boundary is exclusive");
+        assert_eq!(subquery_grid_start(0, 1_000), 1_000);
+        assert_eq!(subquery_grid_start(-50_000, 25_000), -25_000);
+        assert_eq!(subquery_grid_start(-60_000, 25_000), -50_000);
+        assert_eq!(subquery_grid_start(-1, 25), 0);
+    }
+
+    #[test]
+    fn an_at_fixed_selector_is_step_invariant_across_a_range_query() {
+        let expr = crate::parser::parse("up @ 100").unwrap();
+        let p = plan(&expr, params(0, 120_000, 60_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![s(60_000, 5.0), s(100_000, 7.0), s(120_000, 9.0)],
+            )],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                // Every step reads the fixed time 100s → 7.0.
+                assert_eq!(m[0].points, vec![(0, 7.0), (60_000, 7.0), (120_000, 7.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offset_applies_relative_to_at() {
+        let expr = crate::parser::parse("up @ 100 offset 50s").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(1, &[], vec![s(50_000, 3.0), s(100_000, 9.0)])],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].v, 3.0, "lookup time is @100s − 50s = 50s");
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// The issue #83 round-2 evaluation-count gate: over a multi-step
+    /// outer range query, a subquery's inner expression is evaluated
+    /// EXACTLY once per union-grid point — a per-outer-step reevaluation
+    /// implementation counts a multiple of the grid size and fails here.
+    #[test]
+    fn subqueries_materialize_once_over_the_union_grid() {
+        let expr = crate::parser::parse("sum_over_time(up[60s:10s])").unwrap();
+        // 7 outer steps (0..=60s step 10s); overlapping windows share
+        // their inner-grid points.
+        let p = plan(&expr, params(0, 60_000, 10_000)).unwrap();
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=12).map(|k| s(k * 10_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+        let (value, inner_evals) = evaluate_counted(&p, &data).unwrap();
+        // Union grid: multiples of 10s in (0−60s, 60s] = (−60s, 60s] →
+        // {−50s, …, 60s} = 12 points. A per-outer-step reevaluation
+        // implementation would count one eval per (window, point) pair —
+        // 7 overlapping windows of 6–7 points each, i.e. ≫ 12.
+        assert_eq!(
+            inner_evals, 12,
+            "the inner expression must evaluate once per distinct union-grid point"
+        );
+        // And the sliced windows are still per-step correct: `up` has
+        // samples from 0s on, so the sum of 1.0-valued grid points in
+        // (t−60s, t] grows to 6 and saturates.
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(
+            m[0].points,
+            vec![
+                (0, 1.0),
+                (10_000, 2.0),
+                (20_000, 3.0),
+                (30_000, 4.0),
+                (40_000, 5.0),
+                (50_000, 6.0),
+                (60_000, 6.0),
+            ]
+        );
+    }
+
+    /// Nested subqueries materialize inside-out under the same rule: the
+    /// inner subquery evaluates once over ITS union grid (driven by the
+    /// outer's grid extent), never per outer-grid point.
+    #[test]
+    fn nested_subqueries_materialize_inside_out() {
+        let expr = crate::parser::parse("sum_over_time(sum_over_time(up[10s:10s])[30s:10s] @ 100)")
+            .unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=10).map(|k| s(k * 10_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[], samples)]);
+        let (value, inner_evals) = evaluate_counted(&p, &data).unwrap();
+        // Outer grid: (70s, 100s] step 10s = {80, 90, 100}s → 3 evals of
+        // the outer's inner expression. Inner union grid (materialized
+        // FIRST, over the outer grid's extent): windows (70,80] ∪ (80,90]
+        // ∪ (90,100] step 10s = {80, 90, 100}s → 3 evals of `up`. Exact
+        // total: 3 + 3 = 6.
+        assert_eq!(inner_evals, 6);
+        let QueryValue::Vector(v) = value else {
+            panic!("expected Vector");
+        };
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].v, 3.0, "three inner windows of one 1.0 sample each");
+    }
+
+    /// at_modifier.test:227-255's shape: a subquery `@` pointed at a
+    /// data-free time returns empty — never panics (upstream note: "these
+    /// were panicking before the fix").
+    #[test]
+    fn a_subquery_at_a_data_free_time_is_empty_not_a_panic() {
+        for query in [
+            "max_over_time(up[1h:1m] @ 1111111000)",
+            "predict_linear(up[1h:1m] @ 1111111000, 0.1)",
+            "rate(up[1h:1m] @ 1111111000)",
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(1_111_111_000_000, 1_111_111_000_000, 0)).unwrap();
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[], vec![s(0, 1.0), s(10_000, 2.0)])]);
+            match evaluate(&p, &data).unwrap() {
+                QueryValue::Vector(v) => assert!(v.is_empty(), "{query}: {v:?}"),
+                other => panic!("{query}: expected Vector, got {other:?}"),
+            }
+        }
+    }
+
+    /// `last_over_time` over a subquery keeps the materialized series'
+    /// own metric name (the selector-source path keeps the selector's) —
+    /// the keeps-name rule survives the source generalization.
+    #[test]
+    fn last_over_time_over_a_subquery_keeps_the_inner_series_name() {
+        let expr = crate::parser::parse("last_over_time(up[60s:10s])").unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 4.0)])]);
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+                assert_eq!(v[0].v, 4.0);
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// Unary minus end-to-end (the adjudicated #83 fold): arithmetic-
+    /// class — negated values, `__name__` dropped, labels kept; stacked
+    /// unaries nest.
+    #[test]
+    fn unary_minus_negates_a_vector_and_drops_the_metric_name() {
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 10.0)])]);
+        for (query, want) in [("-up", -10.0), ("---up", -10.0), ("--up", 10.0)] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            match evaluate(&p, &data).unwrap() {
+                QueryValue::Vector(v) => {
+                    assert_eq!(v.len(), 1, "{query}");
+                    assert_eq!(v[0].v, want, "{query}");
+                    assert_eq!(v[0].metric_name, None, "{query}: arithmetic drops __name__");
+                    assert_eq!(v[0].labels.get("job"), Some("a"), "{query}");
+                }
+                other => panic!("{query}: expected Vector, got {other:?}"),
+            }
+        }
     }
 }

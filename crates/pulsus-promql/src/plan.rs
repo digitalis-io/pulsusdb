@@ -48,26 +48,78 @@ pub struct PlanParams {
 /// The PromQL default staleness lookback (5 minutes), milliseconds.
 pub const DEFAULT_LOOKBACK_MS: i64 = 300_000;
 
+/// The default subquery step when `expr[range:]` omits one — upstream's
+/// default evaluation interval (1 minute). A `const` on the
+/// `DEFAULT_LOOKBACK_MS`/#31-resolution-#4 precedent (issue #83 Q2
+/// adjudication): no config knob carries the evaluation interval today;
+/// promote only when a deployment needs one.
+pub const DEFAULT_SUBQUERY_STEP_MS: i64 = 60_000;
+
+/// The subquery nesting cap (issue #83, on the #56 stack-safety
+/// precedent — `pulsus-traceql`'s `MAX_DEPTH`): planning (and therefore
+/// the evaluator's inside-out subquery materialization, whose recursion
+/// depth mirrors the plan's) refuses subqueries nested deeper than this,
+/// as a named error rather than an unbounded-recursion risk.
+pub const MAX_SUBQUERY_DEPTH: usize = 64;
+
 pub type SelectorId = usize;
 
 /// One flattened `VectorSelector`/`MatrixSelector` — the resolver/fetch
 /// unit. `matchers` excludes `__name__` (see the module doc).
+///
+/// **Eval fields vs fetch fields (issue #83, the top correctness trap):**
+/// the evaluator uses only `range_ms`/`offset_ms`/`at_ms` (the selector's
+/// *own* syntactic modifiers — `eff_t = at_ms.unwrap_or(t) - offset_ms`);
+/// the fetch layer uses only [`FetchExtent`] (the *accumulated* window
+/// context, folding in every enclosing subquery's range/offset/`@`).
+/// Never mix the two: an enclosing subquery's offset shifts what must be
+/// **fetched**, but the selector's per-step evaluation time is computed
+/// from the inner step time the subquery evaluator hands it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectorSpec {
     pub id: SelectorId,
     pub metric_name: String,
     pub matchers: Vec<LabelMatcher>,
     /// `Some` for a matrix selector (the range-vector width); `None` for
-    /// an instant vector selector.
+    /// an instant vector selector. Eval **and** fetch.
     pub range_ms: Option<i64>,
+    /// The selector's own syntactic `offset`. Eval `eff_t` only — the
+    /// fetch window reads [`FetchExtent::total_offset_ms`] instead.
     pub offset_ms: i64,
+    /// The selector's own `@`, resolved to absolute ms at plan time
+    /// (`start()`/`end()` from [`PlanParams`]). Eval `eff_t` only.
+    pub at_ms: Option<i64>,
+    /// Accumulated fetch-window context. Fetch only; never affects eval.
+    pub fetch: FetchExtent,
+}
+
+/// The fetch-window context accumulated over a selector's enclosing
+/// subqueries (issue #83). A selector's own `@` **dominates**: it makes
+/// the sub-tree step-invariant, so the enclosing subquery context is
+/// discarded (`extra_range_ms = 0`, `total_offset_ms =` own offset).
+/// Otherwise the nearest enclosing subquery `@` governs (`at_ms`), with
+/// every enclosing subquery range below it widening the window and every
+/// enclosing subquery offset shifting it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FetchExtent {
+    /// The governing `@` (the selector's own, or the nearest enclosing
+    /// subquery's); `None` ⇒ the window spans the whole eval range.
+    pub at_ms: Option<i64>,
+    /// Σ enclosing subquery ranges below the governing `@` — the window
+    /// widening subquery inner grids need.
+    pub extra_range_ms: i64,
+    /// Own offset + Σ enclosing subquery offsets below the governing `@`.
+    pub total_offset_ms: i64,
 }
 
 impl SelectorSpec {
     /// Fetch bounds for the whole eval span (every step of a range query,
-    /// or the single step of an instant query). Left-open right-closed:
-    /// `lower_excl = start − range − lookback − offset`, `upper_incl = end
-    /// − offset` (architect plan interfaces). The `lookback` term is
+    /// or the single step of an instant query). Left-open right-closed.
+    /// With no governing `@`: `lower_excl = start − range − extra_range −
+    /// lookback − total_offset`, `upper_incl = end − total_offset`. With a
+    /// governing `@` the `start`/`end` terms are both replaced by the
+    /// fixed `@` time — the window is **invariant across eval spans**
+    /// (issue #83 AC3, the Tier-1 pushdown gate). The `lookback` term is
     /// always subtracted, even for a matrix selector with its own
     /// `range_ms` — deliberately conservative (over-fetches by up to one
     /// lookback width for range-vector-only queries) rather than
@@ -75,10 +127,47 @@ impl SelectorSpec {
     /// never wrong, only occasionally fetches a little more than the
     /// evaluator strictly needs.
     pub fn fetch_window(&self, p: &PlanParams) -> (i64, i64) {
-        let lower_excl = p.start_ms - self.range_ms.unwrap_or(0) - p.lookback_ms - self.offset_ms;
-        let upper_incl = p.end_ms - self.offset_ms;
-        (lower_excl, upper_incl)
+        let width = self.range_ms.unwrap_or(0) + self.fetch.extra_range_ms + p.lookback_ms;
+        match self.fetch.at_ms {
+            Some(at) => (
+                at - width - self.fetch.total_offset_ms,
+                at - self.fetch.total_offset_ms,
+            ),
+            None => (
+                p.start_ms - width - self.fetch.total_offset_ms,
+                p.end_ms - self.fetch.total_offset_ms,
+            ),
+        }
     }
+}
+
+/// What a range-vector function ranges over (issue #83): a bare matrix
+/// selector (the M2 shape) or a subquery. Exactly one [`SelectorSpec`]
+/// per underlying selector either way — a subquery's inner selectors are
+/// flattened into the plan's ordinary selector set with widened
+/// [`FetchExtent`]s, never fetched per inner step (the one-fetch-per-
+/// selector pushdown gate).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeSource {
+    Selector(SelectorId),
+    Subquery(Box<SubqueryPlan>),
+}
+
+/// A planned subquery `inner[range:step] (offset o)? (@ t)?` — only ever
+/// built as a range-function argument (a bare top-level subquery stays an
+/// error, mirroring the bare-`MatrixSelector` arm). `at_ms` is resolved
+/// at plan time exactly like [`SelectorSpec::at_ms`]. The evaluator
+/// materializes `inner` **once per query** over the epoch-anchored union
+/// grid and slices each outer step's `(mint, maxt]` window from that
+/// shared result (issue #83 round-2 amendment) — see
+/// `eval::prepare_subquery`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryPlan {
+    pub inner: Box<PlanExpr>,
+    pub range_ms: i64,
+    pub step_ms: i64,
+    pub offset_ms: i64,
+    pub at_ms: Option<i64>,
 }
 
 /// Range-vector functions with counter-reset correction + extrapolation
@@ -365,11 +454,12 @@ pub enum PlanExpr {
     Selector(SelectorId),
     RangeFn {
         func: RangeFn,
-        selector: SelectorId,
+        /// Issue #83: a bare matrix selector or a subquery.
+        source: RangeSource,
     },
     OverTime {
         func: OverTimeFn,
-        selector: SelectorId,
+        source: RangeSource,
     },
     /// Issue #67 (M6-04): a parameterized range-window function. `args`
     /// carries the scalar parameter expression(s) in registry order —
@@ -379,16 +469,18 @@ pub enum PlanExpr {
     /// panic — the `MathFn` pattern).
     OverTimeParam {
         func: OverTimeParamFn,
-        selector: SelectorId,
+        source: RangeSource,
         args: Vec<Box<PlanExpr>>,
     },
     /// Issue #67 (M6-04): `absent_over_time(m[r])` — emits one synthetic
     /// series (value `1`, labels ported from upstream
     /// `createLabelsForAbsentFunction`, see the evaluator arm) iff every
     /// matched series' window is empty at the step; an empty vector
-    /// otherwise.
+    /// otherwise. A subquery source (issue #83) synthesizes the **empty**
+    /// label set (upstream's matcher walk only applies to a vector-
+    /// selector argument).
     AbsentOverTime {
-        selector: SelectorId,
+        source: RangeSource,
     },
     /// Issue #68 (M6-05): `absent(v)` — the instant-vector counterpart of
     /// [`PlanExpr::AbsentOverTime`]. When the (paren-stripped) argument is
@@ -570,16 +662,34 @@ pub struct QueryPlan {
 // evaluator applies the real 5-minute lookback per step
 // (`pulsus-read`'s `MetricsEngine::query_inner`).
 
+/// The enclosing-subquery fetch context threaded through the walk (issue
+/// #83): saved/replaced around [`plan_subquery`]'s inner-expression walk
+/// and folded into every pushed selector's [`FetchExtent`] (unless the
+/// selector's own `@` dominates). Mirrors [`FetchExtent`]'s field
+/// semantics exactly.
+#[derive(Debug, Clone, Copy, Default)]
+struct SubqueryCtx {
+    at_ms: Option<i64>,
+    extra_range_ms: i64,
+    total_offset_ms: i64,
+}
+
 /// Planner state: accumulates flattened selectors while recursively
-/// walking the AST. Does not need `params` itself beyond the
-/// experimental-function gate — `PlanParams` otherwise only matters for
-/// [`SelectorSpec::fetch_window`], computed later by the caller
-/// (`pulsus-read`'s fetch layer), not during the walk.
+/// walking the AST. Carries `start_ms`/`end_ms` from [`PlanParams`] for
+/// plan-time `@ start()`/`@ end()` resolution (issue #83), plus the
+/// enclosing-subquery fetch context and nesting depth.
 struct Planner {
     selectors: Vec<SelectorSpec>,
     /// [`PlanParams::experimental_functions`], carried into
     /// [`plan_call`]'s `max_of`/`min_of` gate.
     experimental: bool,
+    /// [`PlanParams::start_ms`]/[`PlanParams::end_ms`] — `@ start()` and
+    /// `@ end()` resolve against these (for an instant query both are the
+    /// eval time, upstream's own rule).
+    start_ms: i64,
+    end_ms: i64,
+    ctx: SubqueryCtx,
+    subquery_depth: usize,
 }
 
 impl Planner {
@@ -589,7 +699,24 @@ impl Planner {
         matchers: Vec<LabelMatcher>,
         range_ms: Option<i64>,
         offset_ms: i64,
+        at_ms: Option<i64>,
     ) -> SelectorId {
+        // Own `@` dominates and discards the accumulated subquery context
+        // (the sub-tree is step-invariant at that fixed time); otherwise
+        // the enclosing context governs and the selector's own offset
+        // stacks onto it.
+        let fetch = match at_ms {
+            Some(at) => FetchExtent {
+                at_ms: Some(at),
+                extra_range_ms: 0,
+                total_offset_ms: offset_ms,
+            },
+            None => FetchExtent {
+                at_ms: self.ctx.at_ms,
+                extra_range_ms: self.ctx.extra_range_ms,
+                total_offset_ms: self.ctx.total_offset_ms + offset_ms,
+            },
+        };
         let id = self.selectors.len();
         self.selectors.push(SelectorSpec {
             id,
@@ -597,8 +724,25 @@ impl Planner {
             matchers,
             range_ms,
             offset_ms,
+            at_ms,
+            fetch,
         });
         id
+    }
+
+    /// Resolves an `@` modifier to absolute milliseconds at plan time.
+    /// The parser pre-rounds a literal to whole ms (`@ 1.234` →
+    /// `1234 ms`); a pre-epoch literal round-trips through the
+    /// `SystemTime` error's own duration (upstream permits negative `@`).
+    fn resolve_at(&self, at: &Option<parser::AtModifier>) -> Option<i64> {
+        at.as_ref().map(|a| match a {
+            parser::AtModifier::Start => self.start_ms,
+            parser::AtModifier::End => self.end_ms,
+            parser::AtModifier::At(st) => match st.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_millis() as i64,
+                Err(e) => -(e.duration().as_millis() as i64),
+            },
+        })
     }
 }
 
@@ -607,6 +751,10 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
     let mut planner = Planner {
         selectors: Vec::new(),
         experimental: params.experimental_functions,
+        start_ms: params.start_ms,
+        end_ms: params.end_ms,
+        ctx: SubqueryCtx::default(),
+        subquery_depth: 0,
     };
     let root = plan_expr(&mut planner, expr)?;
     Ok(QueryPlan {
@@ -752,11 +900,9 @@ fn plan_vector_selector(
     planner: &mut Planner,
     vs: &VectorSelector,
 ) -> Result<PlanExpr, PromqlError> {
-    if vs.at.is_some() {
-        return Err(unsupported("the @ modifier"));
-    }
     let (metric_name, matchers) = extract_name_and_matchers(vs)?;
-    let id = planner.push_selector(metric_name, matchers, None, offset_ms(&vs.offset));
+    let at_ms = planner.resolve_at(&vs.at);
+    let id = planner.push_selector(metric_name, matchers, None, offset_ms(&vs.offset), at_ms);
     Ok(PlanExpr::Selector(id))
 }
 
@@ -768,16 +914,85 @@ fn plan_matrix_selector_id(
     planner: &mut Planner,
     ms: &MatrixSelector,
 ) -> Result<SelectorId, PromqlError> {
-    if ms.vs.at.is_some() {
-        return Err(unsupported("the @ modifier"));
-    }
     let (metric_name, matchers) = extract_name_and_matchers(&ms.vs)?;
+    let at_ms = planner.resolve_at(&ms.vs.at);
     Ok(planner.push_selector(
         metric_name,
         matchers,
         Some(duration_ms(ms.range)),
         offset_ms(&ms.vs.offset),
+        at_ms,
     ))
+}
+
+/// Plans a range-vector function's argument (issue #83): a bare matrix
+/// selector (the M2 shape) or a subquery — anything else stays a named
+/// rejection. Shared by all four range-source variants' call sites.
+fn plan_range_source(
+    planner: &mut Planner,
+    name: &str,
+    arg: &Expr,
+) -> Result<RangeSource, PromqlError> {
+    match arg {
+        Expr::MatrixSelector(ms) => {
+            Ok(RangeSource::Selector(plan_matrix_selector_id(planner, ms)?))
+        }
+        Expr::Subquery(sq) => Ok(RangeSource::Subquery(Box::new(plan_subquery(planner, sq)?))),
+        _ => Err(unsupported(format!(
+            "{name}() over an expression other than a range-vector selector or subquery"
+        ))),
+    }
+}
+
+/// Plans a subquery `inner[range:step]` (issue #83). The inner expression
+/// is walked under the widened/shifted [`SubqueryCtx`] (own `@` replaces
+/// the enclosing context — the sub-tree is step-invariant; otherwise
+/// range/offset stack onto it), so every inner selector's [`FetchExtent`]
+/// covers the whole union grid in **one** fetch. Nesting is capped at
+/// [`MAX_SUBQUERY_DEPTH`] (the #56 stack-safety convention).
+fn plan_subquery(planner: &mut Planner, sq: &SubqueryExpr) -> Result<SubqueryPlan, PromqlError> {
+    if planner.subquery_depth >= MAX_SUBQUERY_DEPTH {
+        return Err(unsupported(format!(
+            "subquery nesting deeper than {MAX_SUBQUERY_DEPTH} levels"
+        )));
+    }
+    let range_ms = duration_ms(sq.range);
+    let step_ms = sq.step.map(duration_ms).unwrap_or(DEFAULT_SUBQUERY_STEP_MS);
+    // The vendored parser rejects zero durations; kept total so the
+    // evaluator's epoch-grid arithmetic can never divide by zero.
+    if step_ms <= 0 || range_ms <= 0 {
+        return Err(unsupported(
+            "subquery with a non-positive range or step".to_string(),
+        ));
+    }
+    let offset = offset_ms(&sq.offset);
+    let at_ms = planner.resolve_at(&sq.at);
+
+    let saved = planner.ctx;
+    planner.ctx = match at_ms {
+        Some(at) => SubqueryCtx {
+            at_ms: Some(at),
+            extra_range_ms: range_ms,
+            total_offset_ms: offset,
+        },
+        None => SubqueryCtx {
+            at_ms: saved.at_ms,
+            extra_range_ms: saved.extra_range_ms + range_ms,
+            total_offset_ms: saved.total_offset_ms + offset,
+        },
+    };
+    planner.subquery_depth += 1;
+    let inner = plan_expr(planner, &sq.expr);
+    planner.subquery_depth -= 1;
+    planner.ctx = saved;
+
+    Ok(SubqueryPlan {
+        inner: Box::new(inner?),
+        range_ms,
+        step_ms,
+        offset_ms: offset,
+        at_ms,
+    })
 }
 
 fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError> {
@@ -795,13 +1010,8 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         let [arg] = args.as_slice() else {
             return Err(unsupported(format!("{name}() with != 1 argument")));
         };
-        let Expr::MatrixSelector(ms) = arg.as_ref() else {
-            return Err(unsupported(format!(
-                "{name}() over an expression other than a bare range-vector selector"
-            )));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
-        return Ok(PlanExpr::RangeFn { func, selector });
+        let source = plan_range_source(planner, name, arg)?;
+        return Ok(PlanExpr::RangeFn { func, source });
     }
 
     let over_time_fn = match name {
@@ -837,30 +1047,20 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         let [arg] = args.as_slice() else {
             return Err(unsupported(format!("{name}() with != 1 argument")));
         };
-        let Expr::MatrixSelector(ms) = arg.as_ref() else {
-            return Err(unsupported(format!(
-                "{name}() over an expression other than a bare range-vector selector"
-            )));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
-        return Ok(PlanExpr::OverTime { func, selector });
+        let source = plan_range_source(planner, name, arg)?;
+        return Ok(PlanExpr::OverTime { func, source });
     }
 
     // Issue #67 (M6-04): `absent_over_time(m[r])` — the selector's own
     // variant (its output labels come from the *matchers*, not from any
-    // fetched series). Upstream also accepts a subquery argument — that
-    // form stays `Unsupported` here until M6-08 lands subqueries.
+    // fetched series). Issue #83: a subquery argument (upstream-legal)
+    // plans too — its synthetic labels are the empty set.
     if name == "absent_over_time" {
         let [arg] = args.as_slice() else {
             return Err(unsupported("absent_over_time() with != 1 argument"));
         };
-        let Expr::MatrixSelector(ms) = arg.as_ref() else {
-            return Err(unsupported(
-                "absent_over_time() over an expression other than a bare range-vector selector",
-            ));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
-        return Ok(PlanExpr::AbsentOverTime { selector });
+        let source = plan_range_source(planner, name, arg)?;
+        return Ok(PlanExpr::AbsentOverTime { source });
     }
 
     // Issue #67 (M6-04): parameterized range-window functions. Scalar
@@ -873,15 +1073,10 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
             return Err(unsupported("quantile_over_time() with != 2 arguments"));
         };
         let phi = plan_expr(planner, phi_arg)?;
-        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
-            return Err(unsupported(
-                "quantile_over_time() over an expression other than a bare range-vector selector",
-            ));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
+        let source = plan_range_source(planner, name, matrix_arg)?;
         return Ok(PlanExpr::OverTimeParam {
             func: OverTimeParamFn::Quantile,
-            selector,
+            source,
             args: vec![Box::new(phi)],
         });
     }
@@ -889,16 +1084,11 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         let [matrix_arg, t_arg] = args.as_slice() else {
             return Err(unsupported("predict_linear() with != 2 arguments"));
         };
-        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
-            return Err(unsupported(
-                "predict_linear() over an expression other than a bare range-vector selector",
-            ));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
+        let source = plan_range_source(planner, name, matrix_arg)?;
         let t = plan_expr(planner, t_arg)?;
         return Ok(PlanExpr::OverTimeParam {
             func: OverTimeParamFn::PredictLinear,
-            selector,
+            source,
             args: vec![Box::new(t)],
         });
     }
@@ -913,18 +1103,12 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
                 "double_exponential_smoothing() with != 3 arguments",
             ));
         };
-        let Expr::MatrixSelector(ms) = matrix_arg.as_ref() else {
-            return Err(unsupported(
-                "double_exponential_smoothing() over an expression other than a bare \
-                 range-vector selector",
-            ));
-        };
-        let selector = plan_matrix_selector_id(planner, ms)?;
+        let source = plan_range_source(planner, name, matrix_arg)?;
         let sf = plan_expr(planner, sf_arg)?;
         let tf = plan_expr(planner, tf_arg)?;
         return Ok(PlanExpr::OverTimeParam {
             func: OverTimeParamFn::DoubleExpSmoothing,
-            selector,
+            source,
             args: vec![Box::new(sf), Box::new(tf)],
         });
     }
@@ -1617,10 +1801,33 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
         Expr::Paren(p) => plan_expr(planner, &p.expr),
         Expr::NumberLiteral(n) => Ok(PlanExpr::Scalar(n.val)),
         Expr::StringLiteral(_) => Err(unsupported("string literal")),
-        Expr::Unary(UnaryExpr { .. }) => {
-            Err(unsupported("unary negation of a non-scalar expression"))
+        // Issue #83 (adjudicated fold from the M6-08 split): unary minus
+        // desugars to `0 - operand` — upstream semantics exactly (unary
+        // minus is arithmetic-class: per-element negation, `__name__`
+        // dropped like every arithmetic operator; scalar operands negate
+        // through the same scalar-scalar path). The vendored parser folds
+        // unary over a bare number literal itself, so this arm only sees
+        // composite operands (`-metric`, `-10^3` ≡ `-(10^3)`, `---m`).
+        // Pinned by `at_modifier.test:61,65` (`-metric @ 100`,
+        // `---metric @ 100`).
+        Expr::Unary(UnaryExpr { expr }) => {
+            let operand = plan_expr(planner, expr)?;
+            Ok(PlanExpr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(PlanExpr::Scalar(0.0)),
+                rhs: Box::new(operand),
+                bool_modifier: false,
+                matching: Matching::default_ignoring_none(),
+                group: Group::OneToOne,
+                fill: FillValues::default(),
+            })
         }
-        Expr::Subquery(SubqueryExpr { .. }) => Err(unsupported("subquery")),
+        // Issue #83: subqueries plan only as range-function arguments
+        // ([`plan_range_source`]) — a bare subquery in a vector/scalar
+        // position mirrors the bare-`MatrixSelector` rejection above.
+        Expr::Subquery(SubqueryExpr { .. }) => Err(unsupported(
+            "subquery used outside a range-vector function argument",
+        )),
         Expr::Extension(_) => Err(unsupported("extension expression")),
     }
 }
@@ -1797,11 +2004,91 @@ mod tests {
         assert_eq!(p.selectors[0].offset_ms, -300_000);
     }
 
+    // --- issue #83 (M6-08a): the @ modifier ---
+
     #[test]
-    fn the_at_modifier_is_unsupported() {
+    fn plans_the_at_modifier_into_at_ms() {
         let expr = parse("up @ 100").unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].at_ms, Some(100_000));
+        assert_eq!(p.selectors[0].offset_ms, 0);
+        // Own `@` governs the fetch window too.
+        assert_eq!(p.selectors[0].fetch.at_ms, Some(100_000));
+    }
+
+    #[test]
+    fn the_at_modifier_pre_rounds_to_whole_milliseconds() {
+        // The vendored parser rounds `@ 1.234` to 1234 ms before this
+        // crate ever sees it (at_modifier.test:70's ms-precision case).
+        let expr = parse("m @ 1.234").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].at_ms, Some(1_234));
+    }
+
+    #[test]
+    fn at_start_and_at_end_resolve_against_the_plan_params() {
+        let p_range = PlanParams {
+            start_ms: 5_000,
+            end_ms: 65_000,
+            step_ms: 10_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        let p = plan(&parse("m @ start()").unwrap(), p_range).unwrap();
+        assert_eq!(p.selectors[0].at_ms, Some(5_000));
+        let p = plan(&parse("m @ end()").unwrap(), p_range).unwrap();
+        assert_eq!(p.selectors[0].at_ms, Some(65_000));
+    }
+
+    #[test]
+    fn a_negative_at_literal_resolves_to_negative_milliseconds() {
+        // Upstream permits pre-epoch `@` times; the parser carries them as
+        // a SystemTime before UNIX_EPOCH.
+        let expr = parse("m @ -100").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].at_ms, Some(-100_000));
+    }
+
+    #[test]
+    fn offset_applies_relative_to_at_regardless_of_spelling_order() {
+        for query in ["m @ 100 offset 50s", "m offset 50s @ 100"] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            assert_eq!(p.selectors[0].at_ms, Some(100_000), "{query}");
+            assert_eq!(p.selectors[0].offset_ms, 50_000, "{query}");
+            assert_eq!(p.selectors[0].fetch.total_offset_ms, 50_000, "{query}");
+        }
+    }
+
+    /// AC3(b), Tier-1 pushdown gate (standing query-performance mandate):
+    /// an `@ T` selector's fetch window is **byte-identical across two
+    /// different eval spans** — the fetch never scales with the query
+    /// range.
+    #[test]
+    fn an_at_fixed_selector_fetch_window_is_invariant_across_eval_spans() {
+        let expr = parse("m @ 100").unwrap();
+        let span_a = PlanParams {
+            start_ms: 0,
+            end_ms: 60_000,
+            step_ms: 10_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        let span_b = PlanParams {
+            start_ms: 9_000_000,
+            end_ms: 90_000_000,
+            step_ms: 60_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        let plan_a = plan(&expr, span_a).unwrap();
+        let plan_b = plan(&expr, span_b).unwrap();
+        let win_a = plan_a.selectors[0].fetch_window(&span_a);
+        let win_b = plan_b.selectors[0].fetch_window(&span_b);
+        assert_eq!(
+            win_a, win_b,
+            "@-fixed fetch window must not track the eval span"
+        );
+        assert_eq!(win_a, (100_000 - DEFAULT_LOOKBACK_MS, 100_000));
     }
 
     #[test]
@@ -1813,7 +2100,7 @@ mod tests {
             p.root,
             PlanExpr::RangeFn {
                 func: RangeFn::Rate,
-                selector: 0
+                source: RangeSource::Selector(0)
             }
         );
     }
@@ -1837,10 +2124,176 @@ mod tests {
     }
 
     #[test]
-    fn rate_over_anything_other_than_a_bare_matrix_selector_is_unsupported() {
+    fn rate_over_a_subquery_plans_a_subquery_source() {
+        // Pre-#83 this was the named `Unsupported` rejection; subqueries
+        // now plan as range sources.
         let expr = parse("rate(sum(foo)[5m:1m])").unwrap();
-        let err = plan(&expr, params());
-        assert!(err.is_err());
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::RangeFn {
+                func: RangeFn::Rate,
+                source: RangeSource::Subquery(sq),
+            } => {
+                assert_eq!(sq.range_ms, 300_000);
+                assert_eq!(sq.step_ms, 60_000);
+                assert_eq!(sq.offset_ms, 0);
+                assert_eq!(sq.at_ms, None);
+                assert!(matches!(*sq.inner, PlanExpr::Aggregate { .. }));
+            }
+            other => panic!("expected RangeFn over a subquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_over_an_instant_vector_is_rejected_by_the_parser_type_check() {
+        // The vendored parser's own type checker rejects a vector-typed
+        // argument before plan() is ever reached — the plan-level
+        // `plan_range_source` rejection stays as defense-in-depth for
+        // hand-constructed ASTs.
+        let err = parse("rate(foo)").unwrap_err();
+        assert!(matches!(err, PromqlError::Parse(_)));
+    }
+
+    #[test]
+    fn a_subquery_without_an_explicit_step_uses_the_default_step_const() {
+        let expr = parse("max_over_time(m[10m:])").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        match &p.root {
+            PlanExpr::OverTime {
+                source: RangeSource::Subquery(sq),
+                ..
+            } => {
+                assert_eq!(sq.step_ms, DEFAULT_SUBQUERY_STEP_MS);
+                assert_eq!(DEFAULT_SUBQUERY_STEP_MS, 60_000);
+            }
+            other => panic!("expected OverTime over a subquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_subquery_outside_a_range_function_is_unsupported() {
+        let expr = parse("m[5m:1m]").unwrap();
+        let err = plan(&expr, params()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => {
+                assert!(construct.contains("subquery"), "{construct:?}")
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subquery_nesting_beyond_the_depth_cap_is_a_named_rejection() {
+        // MAX_SUBQUERY_DEPTH + 1 nested subqueries.
+        let mut query = String::from("m");
+        for _ in 0..=MAX_SUBQUERY_DEPTH {
+            query = format!("last_over_time({query}[5m:1m])");
+        }
+        let expr = parse(&query).unwrap();
+        let err = plan(&expr, params()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => assert!(
+                construct.contains("nesting") && construct.contains("64"),
+                "{construct:?}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        // Exactly at the cap still plans.
+        let mut query = String::from("m");
+        for _ in 0..MAX_SUBQUERY_DEPTH {
+            query = format!("last_over_time({query}[5m:1m])");
+        }
+        assert!(plan(&parse(&query).unwrap(), params()).is_ok());
+    }
+
+    /// AC3(a), Tier-1 pushdown gate: a subquery plans to **exactly one**
+    /// `SelectorSpec` per inner selector — never O(inner-steps) fetches —
+    /// over any eval span.
+    #[test]
+    fn a_subquery_plans_exactly_one_selector_over_any_eval_span() {
+        for p in [
+            params(),
+            PlanParams {
+                start_ms: 0,
+                end_ms: 86_400_000,
+                step_ms: 60_000,
+                lookback_ms: DEFAULT_LOOKBACK_MS,
+                experimental_functions: false,
+            },
+        ] {
+            let planned = plan(&parse("max_over_time(m[1h:5m])").unwrap(), p).unwrap();
+            assert_eq!(
+                planned.selectors.len(),
+                1,
+                "one SelectorSpec regardless of the eval span / inner step count"
+            );
+        }
+    }
+
+    /// AC3(c), Tier-1 pushdown gate: the subquery selector's fetch-window
+    /// lower bound is widened by exactly the enclosing subquery's
+    /// `range_ms` (and its upper bound shifted by the subquery offset) —
+    /// compared against the bare selector's window under identical params.
+    #[test]
+    fn a_subquery_widens_the_inner_selector_fetch_window_by_exactly_its_range() {
+        let p = params();
+        let bare = plan(&parse("m").unwrap(), p).unwrap();
+        let subq = plan(&parse("max_over_time(m[1h:5m])").unwrap(), p).unwrap();
+        let (bare_lower, bare_upper) = bare.selectors[0].fetch_window(&p);
+        let (subq_lower, subq_upper) = subq.selectors[0].fetch_window(&p);
+        assert_eq!(subq_upper, bare_upper);
+        assert_eq!(subq_lower, bare_lower - 3_600_000);
+        assert_eq!(subq.selectors[0].fetch.extra_range_ms, 3_600_000);
+    }
+
+    #[test]
+    fn nested_subqueries_accumulate_ranges_and_offsets_below_the_governing_at() {
+        // Outer subquery carries @ 1000 (governing); the middle subquery's
+        // range and offset accumulate below it (at_modifier.test:159's
+        // shape).
+        let expr = parse(
+            "sum_over_time(sum_over_time(sum_over_time(m[20s])[20s:10s] offset 10s)[100s:25s] @ 1000)",
+        )
+        .unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors.len(), 1);
+        let sel = &p.selectors[0];
+        assert_eq!(sel.range_ms, Some(20_000));
+        assert_eq!(sel.at_ms, None, "the selector has no own @");
+        assert_eq!(sel.fetch.at_ms, Some(1_000_000), "outer @ governs");
+        assert_eq!(
+            sel.fetch.extra_range_ms,
+            100_000 + 20_000,
+            "both subquery ranges widen"
+        );
+        assert_eq!(sel.fetch.total_offset_ms, 10_000);
+        let pp = params();
+        let (lower, upper) = sel.fetch_window(&pp);
+        assert_eq!(upper, 1_000_000 - 10_000);
+        assert_eq!(
+            lower,
+            1_000_000 - 10_000 - 20_000 - 120_000 - DEFAULT_LOOKBACK_MS
+        );
+    }
+
+    #[test]
+    fn an_inner_selectors_own_at_dominates_the_enclosing_subquery_context() {
+        // at_modifier.test:125's shape: the inner selector's own @ makes
+        // its sub-tree step-invariant — the enclosing subquery context is
+        // discarded from its fetch extent.
+        let expr = parse("sum_over_time(sum_over_time(m[100s] @ 100)[100s:25s] @ 50)").unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors.len(), 1);
+        let sel = &p.selectors[0];
+        assert_eq!(sel.at_ms, Some(100_000));
+        assert_eq!(
+            sel.fetch,
+            FetchExtent {
+                at_ms: Some(100_000),
+                extra_range_ms: 0,
+                total_offset_ms: 0,
+            }
+        );
     }
 
     #[test]
@@ -1873,6 +2326,33 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
+    }
+
+    /// Issue #83 (adjudicated unary fold): unary minus desugars to
+    /// `0 - operand` — arithmetic-class, so `__name__` drops and scalar
+    /// operands negate through the ordinary scalar path.
+    #[test]
+    fn unary_minus_desugars_to_zero_minus_operand() {
+        let p = plan(&parse("-up").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::Binary {
+                op: BinOp::Sub,
+                lhs,
+                rhs,
+                bool_modifier: false,
+                ..
+            } => {
+                assert_eq!(**lhs, PlanExpr::Scalar(0.0));
+                assert_eq!(**rhs, PlanExpr::Selector(0));
+            }
+            other => panic!("expected 0 - up, got {other:?}"),
+        }
+        // Stacked unaries nest (at_modifier.test:65's `---metric`).
+        assert!(plan(&parse("---up").unwrap(), params()).is_ok());
+        // Composite scalar operands too (`-10^3` ≡ `-(10^3)`).
+        assert!(plan(&parse("-10^3").unwrap(), params()).is_ok());
+        // Unary over an aggregate.
+        assert!(plan(&parse("-sum(up)").unwrap(), params()).is_ok());
     }
 
     #[test]
@@ -2426,6 +2906,14 @@ mod tests {
             matchers: Vec::new(),
             range_ms: Some(300_000),
             offset_ms: 60_000,
+            at_ms: None,
+            // What push_selector builds for an own offset with no
+            // enclosing subquery context.
+            fetch: FetchExtent {
+                at_ms: None,
+                extra_range_ms: 0,
+                total_offset_ms: 60_000,
+            },
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -2843,11 +3331,19 @@ mod tests {
     }
 
     #[test]
-    fn timestamp_over_a_selector_with_at_modifier_is_unsupported() {
-        // The bare-selector branch routes through plan_vector_selector,
-        // whose existing `@` reject stays in force.
-        let err = plan(&parse("timestamp(m @ 100)").unwrap(), params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    fn timestamp_over_an_at_fixed_selector_keeps_the_bare_selector_branch() {
+        // Issue #83 lifted the `@` rejection: the bare-selector branch
+        // routes through plan_vector_selector, which now stamps at_ms —
+        // the evaluator returns the fixed sample time, constant across
+        // steps (at_modifier.test:168/:279).
+        let p = plan(&parse("timestamp(m @ 100)").unwrap(), params()).unwrap();
+        match &p.root {
+            PlanExpr::Timestamp {
+                bare_selector: Some(id),
+                ..
+            } => assert_eq!(p.selectors[*id].at_ms, Some(100_000)),
+            other => panic!("expected Timestamp with a bare selector, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2888,7 +3384,10 @@ mod tests {
         ] {
             let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
             match &p.root {
-                PlanExpr::OverTime { func, selector } => {
+                PlanExpr::OverTime {
+                    func,
+                    source: RangeSource::Selector(selector),
+                } => {
                     assert_eq!(*func, want, "{query}");
                     assert_eq!(p.selectors[*selector].range_ms, Some(300_000), "{query}");
                 }
@@ -2950,7 +3449,9 @@ mod tests {
         )
         .unwrap();
         match &p.root {
-            PlanExpr::AbsentOverTime { selector } => {
+            PlanExpr::AbsentOverTime {
+                source: RangeSource::Selector(selector),
+            } => {
                 assert_eq!(p.selectors[*selector].metric_name, "m");
                 assert_eq!(p.selectors[*selector].range_ms, Some(300_000));
                 assert_eq!(p.selectors[*selector].matchers.len(), 1);
@@ -2965,7 +3466,7 @@ mod tests {
         match &p.root {
             PlanExpr::OverTimeParam {
                 func,
-                selector,
+                source: RangeSource::Selector(selector),
                 args,
             } => {
                 assert_eq!(*func, OverTimeParamFn::Quantile);
@@ -3005,15 +3506,33 @@ mod tests {
     }
 
     #[test]
-    fn m6_04_fns_over_non_bare_range_arguments_are_unsupported() {
-        // Subquery arguments (upstream-legal) stay named-Unsupported until
-        // M6-08 — the same rule as rate()'s.
+    fn m6_04_fns_over_subquery_arguments_plan_subquery_sources() {
+        // Issue #83 lifted the pre-M6-08 rejection: subquery arguments
+        // (upstream-legal) plan for every range-source variant.
         for query in [
             "deriv(sum(foo)[5m:1m])",
             "absent_over_time(rate(foo[5m])[5m:1m])",
             "quantile_over_time(0.5, sum(foo)[5m:1m])",
         ] {
-            assert!(plan(&parse(query).unwrap(), params()).is_err(), "{query}");
+            let p = plan(&parse(query).unwrap(), params()).unwrap_or_else(|e| {
+                panic!("{query}: {e}");
+            });
+            let source = match &p.root {
+                PlanExpr::RangeFn { source, .. }
+                | PlanExpr::OverTime { source, .. }
+                | PlanExpr::OverTimeParam { source, .. }
+                | PlanExpr::AbsentOverTime { source } => source,
+                other => panic!("{query}: unexpected root {other:?}"),
+            };
+            assert!(
+                matches!(source, RangeSource::Subquery(_)),
+                "{query}: expected a subquery source"
+            );
+        }
+        // An instant-vector argument never reaches plan() — the vendored
+        // parser's type checker rejects it first.
+        for query in ["deriv(foo)", "quantile_over_time(0.5, sum(foo))"] {
+            assert!(parse(query).is_err(), "{query}");
         }
     }
 

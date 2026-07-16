@@ -1,0 +1,113 @@
+# Issue #83 (M6-08a) proof corpus — hand-authored witnesses for the `@`
+# modifier and subqueries (the corpus-gated home is the fully-executed
+# `upstream/at_modifier.test`; this file adds the goldens that file cannot
+# pin). Semantics ported from Prometheus v3.13.0 `promql/engine.go` @
+# 40af9c2 (`runSubquery`, the step-invariant `@` preprocessing, and the
+# unary-minus arithmetic fold adjudicated into this issue).
+#
+# Pinned semantics this file exercises end-to-end:
+#   - EPOCH-ANCHORED ASCENDING subquery grid: inner steps are the
+#     multiples of `step` in the left-open window `(mint, maxt]`,
+#     `maxt = (at or t) - offset` — NOT an end-anchored decrement grid.
+#     The distinguishing golden below (63, not 66) fails any end-anchored
+#     port; see the grid-slip note in `upstream/PROVENANCE.md`
+#     (at_modifier.test:159's inline comment mis-states the grid).
+#     Differential-eligible: exact inner timestamps observable via time().
+#   - `@` fixes a selector's evaluation time (step-invariant across a
+#     range query); offset applies relative to `@` in either spelling
+#     order.
+#   - `[range:]` without an explicit step uses the default subquery step
+#     (60s — `DEFAULT_SUBQUERY_STEP_MS`), untestable from the vendored
+#     corpus (every upstream subquery there has an explicit step).
+#   - the #67 obligation: `predict_linear(m[..] @ T offset O, S)`
+#     extrapolates from the evaluation STEP time (regression intercept =
+#     `enh.Ts`), never the `@`/offset-shifted window edge.
+#   - time()/timestamp() inside subqueries use the INNER evaluation times;
+#     `timestamp(bare @ T)` is the fixed sample time, constant across
+#     inner steps.
+#   - unary minus over a vector: 0-minus-operand, arithmetic-class
+#     (`__name__` drops), stacked unaries nest.
+
+# v(t) = t/10 for t a multiple of 10s up to 1000s — exactly linear, so
+# the predict_linear golden is arithmetic-exact.
+load 10s
+	m{job="a"} 0+1x100
+
+# --- The epoch-grid distinguishing golden (plan v2 delta 1). ---
+# maxt = 25s is NOT step-aligned: epoch grid over (15s, 25s] with step 3s
+# is {18, 21, 24}s => sum_over_time(vector(time())) = 63. An end-anchored
+# decrement grid would give {25, 22, 19}s => 66.
+eval instant at 25s sum_over_time(vector(time())[10s:3s] @ 25)
+	{} 63
+
+# Offset applies relative to @: anchor 35s - offset 10s = the same
+# (15s, 25s] window and the same epoch grid, from any eval time.
+eval instant at 0s sum_over_time(vector(time())[10s:3s] @ 35 offset 10s)
+	{} 63
+
+# --- @ step-invariance over a range query (AC6). ---
+# Every step returns the value at the fixed time 100s (v = 10).
+eval range from 0 to 60s step 10s m{job="a"} @ 100
+	m{job="a"} 10 10 10 10 10 10 10
+
+# @ start() / @ end() resolve against the query range.
+eval range from 0 to 60s step 10s m{job="a"} @ start()
+	m{job="a"} 0 0 0 0 0 0 0
+
+eval range from 0 to 60s step 10s m{job="a"} @ end()
+	m{job="a"} 6 6 6 6 6 6 6
+
+# --- Nested subquery (AC6). ---
+# Outer [30s:10s] @ 100: grid {80, 90, 100}s. Inner sum_over_time(m[10s])
+# windows (70,80] => 8, (80,90] => 9, (90,100] => 10. Sum = 27.
+eval instant at 0s sum_over_time(sum_over_time(m{job="a"}[10s])[30s:10s] @ 100)
+	{job="a"} 27
+
+# --- Time functions inside a subquery (AC6). ---
+# [300s:60s] @ 600: grid {360, 420, 480, 540, 600}s => minutes
+# {6, 7, 8, 9, 10} => 40.
+eval instant at 0s sum_over_time(minute()[300s:60s] @ 600)
+	{} 40
+
+# timestamp(bare @ T) inside a subquery: the fixed sample time (50s),
+# constant across the 3 inner steps => 150.
+eval instant at 0s sum_over_time(timestamp(m{job="a"} @ 50)[30s:10s] @ 100)
+	{job="a"} 150
+
+# --- The #67 predict_linear offset golden (AC5). ---
+# Selector window: @ 200 offset 50s => (50s, 150s], samples v = 6..15 —
+# an exact fit v(t) = t/10 (slope 0.1/s). The regression intercept is the
+# evaluation STEP time (1000s => v = 100), so the prediction 400s out is
+# 0.1*400 + 100 = 140. An implementation extrapolating from the
+# offset/@-shifted window edge (150s) would give 55; from the @ time
+# (200s), 60.
+eval instant at 1000s predict_linear(m{job="a"}[100s] @ 200 offset 50s, 400)
+	{job="a"} 140
+
+# --- Default subquery step (no explicit step => 60s). ---
+# [10m:] @ 600: grid {60, 120, ..., 600}s — 10 points, each with a sample
+# in its 5m lookback.
+eval instant at 0s count_over_time(m{job="a"}[10m:] @ 600)
+	{job="a"} 10
+
+# --- A range function over a subquery of a computed inner expression. ---
+# sum(m) on the (900s, 1000s] grid rises 1 per 10s; rate extrapolates to
+# the window boundary => exactly 0.1.
+eval instant at 1000s rate(sum(m{job="a"})[100s:10s])
+	{} 0.1
+
+# --- Empty-@ non-panic: a subquery window pointed at data-free time. ---
+eval instant at 2000s max_over_time(m{job="a"}[1m:10s] @ 5000)
+
+# --- Unary negation (adjudicated fold; at_modifier.test:61/65's home). ---
+eval instant at 30s -m{job="a"}
+	{job="a"} -3
+
+eval instant at 30s ---m{job="a"}
+	{job="a"} -3
+
+eval instant at 30s -sum(m)
+	{} -3
+
+eval instant at 30s -(m{job="a"} + 1)
+	{job="a"} -4

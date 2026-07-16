@@ -58,6 +58,24 @@ The upstream driver grammar (directive regexes in
 - Lookback: 5m (upstream `LookbackDelta` default), matching
   `pulsus_promql::DEFAULT_LOOKBACK_MS`.
 
+## Known fixture-comment slip: `at_modifier.test:159`'s subquery grid
+
+The inline comment above `at_modifier.test:159` ("inner subquery: at
+905=90+89, at 915=91+90", etc.) mis-states the subquery inner-step grid.
+The compiled engine at the pinned SHA (`promql/engine.go::runSubquery`)
+computes an **epoch-anchored ascending** grid — the multiples of `step`
+in the left-open window `(mint, maxt]`, `subqStart = step *
+floor(mint/step)` corrected up one step on the boundary — which for that
+case emits `{900s, 910s}`, not the comment's `{905s, 915s}`; the
+asserted aggregate (360) coincidentally matches both (issue #83 plan v2
+Δ1, proven by instrumenting the engine). Do **not** re-derive an
+end-anchored decrement grid from that comment:
+`proof/m6_08a_at_subquery.test`'s
+`sum_over_time(vector(time())[10s:3s] @ 25) = 63` golden exposes the
+exact inner timestamps and fails any end-anchored port (which yields
+66). The grid helper itself (`src/eval/mod.rs::subquery_grid_start`)
+carries the same note.
+
 ## Executed vs skipped at vendor time
 
 7 files execute fully under the M6-01 grammar subset (`at_modifier`,

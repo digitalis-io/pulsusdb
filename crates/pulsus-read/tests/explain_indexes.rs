@@ -748,6 +748,144 @@ fn expected_metric_instant_raw_usage() -> Vec<String> {
     ])
 }
 
+// ---------------------------------------------------------------------
+// PromQL metric reads (issue #83, M6-08a) — the @-fixed and the
+// subquery-widened fetch windows must keep the `(metric_name,
+// fingerprint, unix_milli)` primary index on `metric_samples`: both plan
+// to exactly one bounded `sample_fetch` whose `EXPLAIN indexes = 1`
+// extract matches the plain raw-fetch expectation (no index loss from
+// the fixed/widened bounds).
+// ---------------------------------------------------------------------
+
+const MFP: u64 = 18_374_000_000_000_000_002;
+
+async fn seed_metric_samples(client: &ChClient, db: &str, now_ms: i64) {
+    // A few samples in the last minute — enough for genuine index
+    // analysis (recent so `ttl_only_drop_parts` retention can't race it,
+    // the same rule as `now_ns()`'s doc).
+    let values: Vec<String> = (0..6)
+        .map(|k| format!("('mq', {MFP}, {}, {k}.0)", now_ms - k * 10_000))
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
+                 VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed metric_samples");
+}
+
+/// Plans `query` (single-selector by construction), computes its fetch
+/// window, and renders the real `sample_fetch` SQL against
+/// `{db}.metric_samples` — the same builder `MetricsEngine` executes.
+fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &str) -> String {
+    let expr = pulsus_promql::parse(query).expect("parse");
+    let plan = pulsus_promql::plan(&expr, params).expect("plan");
+    assert_eq!(
+        plan.selectors.len(),
+        1,
+        "{query}: one bounded sample fetch, never per-inner-step fetches"
+    );
+    let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
+    let table = format!("{db}.metric_samples");
+    pulsus_read::metrics::sample_sql::sample_fetch(
+        &table,
+        &plan.selectors[0].metric_name,
+        &[MFP],
+        lower_excl,
+        upper_incl,
+    )
+}
+
+/// The `(metric_name, fingerprint, unix_milli)` primary key on
+/// `metric_samples` — the shared raw-fetch expectation both PromQL cases
+/// below assert against: the full three-column key condition plus MinMax
+/// time pruning (the `toDate(...)` partition analysis reports
+/// `Condition: true` here — time-range partition pruning surfaces through
+/// the MinMax block instead).
+fn expected_metric_samples_fetch_usage() -> Vec<String> {
+    v(&[
+        "MinMax",
+        "Keys:",
+        "unix_milli",
+        "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+        "Partition",
+        "Condition: true",
+        "PrimaryKey",
+        "Keys:",
+        "metric_name",
+        "fingerprint",
+        "unix_milli",
+        "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in ['mq', 'mq']))",
+    ])
+}
+
+fn promql_params(start_ms: i64, end_ms: i64, step_ms: i64) -> pulsus_promql::PlanParams {
+    pulsus_promql::PlanParams {
+        start_ms,
+        end_ms,
+        step_ms,
+        lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+        experimental_functions: false,
+    }
+}
+
+#[tokio::test]
+async fn promql_at_fixed_metric_read_stays_on_the_metric_samples_primary_key() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_promql_at";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_samples(&client, db, now_ms).await;
+
+    // `@` fixed at (roughly) now; the fetch window is invariant across
+    // eval spans (the hermetic plan.rs gate) — asserted here against two
+    // spans before the live EXPLAIN, tying AC4 to AC3.
+    let at_s = now_ms / 1000;
+    let query = format!("mq @ {at_s}");
+    let span_a = promql_params(now_ms, now_ms, 0);
+    let span_b = promql_params(now_ms - 86_400_000, now_ms, 60_000);
+    let sql_a = promql_sample_fetch_sql(&query, span_a, db);
+    let sql_b = promql_sample_fetch_sql(&query, span_b, db);
+    assert_eq!(
+        sql_a, sql_b,
+        "@-fixed fetch SQL must not track the eval span"
+    );
+
+    let usage = explain(&client, &sql_a).await;
+    assert_eq!(usage, expected_metric_samples_fetch_usage());
+}
+
+#[tokio::test]
+async fn promql_subquery_widened_metric_read_stays_on_the_metric_samples_primary_key() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_promql_subq";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_samples(&client, db, now_ms).await;
+
+    // One widened window for the whole inner grid — exactly one fetch,
+    // lower bound widened by exactly the subquery range vs the bare
+    // selector's.
+    let params = promql_params(now_ms, now_ms, 0);
+    let subq_sql = promql_sample_fetch_sql("max_over_time(mq[1h:5m])", params, db);
+    let bare_expr = pulsus_promql::parse("mq").expect("parse");
+    let bare_plan = pulsus_promql::plan(&bare_expr, params).expect("plan");
+    let (bare_lower, bare_upper) = bare_plan.selectors[0].fetch_window(&params);
+    assert!(subq_sql.contains(&format!("unix_milli > {}", bare_lower - 3_600_000)));
+    assert!(subq_sql.contains(&format!("unix_milli <= {bare_upper}")));
+
+    let usage = explain(&client, &subq_sql).await;
+    assert_eq!(usage, expected_metric_samples_fetch_usage());
+}
+
 #[tokio::test]
 async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();

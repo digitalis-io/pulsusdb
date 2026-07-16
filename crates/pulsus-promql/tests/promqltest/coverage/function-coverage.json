@@ -972,15 +972,22 @@
     },
     {
       "name": "at-modifier",
-      "status": "scheduled",
-      "issue": "M6-08",
-      "probe": "m @ 100"
+      "status": "implemented",
+      "probe": "m @ 100",
+      "witness": {
+        "file": "upstream/at_modifier.test",
+        "query": "metric @ 100"
+      },
+      "rationale": "Documented divergence until #88: range queries over @-fixed eval-time-dependent subtrees recompute per step; upstream's StepInvariantExpr evaluates once at the start step and copies. No vendored corpus case reaches the divergent combination. #88 implements once-and-copy parity."
     },
     {
       "name": "subquery",
-      "status": "scheduled",
-      "issue": "M6-08",
-      "probe": "max_over_time(m[5m:1m])"
+      "status": "implemented",
+      "probe": "max_over_time(m[5m:1m])",
+      "witness": {
+        "file": "upstream/at_modifier.test",
+        "query": "sum_over_time(metric{job=\"1\"}[100s:1s] @ 100)"
+      }
     },
     {
       "name": "duration-expression",

@@ -84,8 +84,10 @@ eval_fail instant at 0 histogram_count(n1)
 	expected_fail_message not yet supported: function histogram_count()
 
 # eval_fail + expected_fail_regexp (regex over the error Display).
-eval_fail instant at 0 n1 @ 100
-	expected_fail_regexp not yet supported: .*@.*
+# (Issue #83 implemented the previous stand-in, `n1 @ 100`; a bare
+# subquery outside a range-vector function argument is its successor.)
+eval_fail instant at 0 n1[5m:1m]
+	expected_fail_regexp not yet supported: .*subquery.*
 
 # eval_fail without a message: any error satisfies it (a selector with no
 # concrete metric name is rejected by the metric-scoped planner).
