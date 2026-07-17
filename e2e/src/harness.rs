@@ -21,6 +21,16 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// (`run`, below), so the overall `READY_POLL_TIMEOUT` deadline is honored
 /// regardless of which layer actually cuts a stuck attempt off.
 const READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds a single scenario *query* (issue #92): the shared client's
+/// [`READY_REQUEST_TIMEOUT`] is a readiness-probe budget, and letting it
+/// bound matrix queries broke the nightly `Full`-tier run — a
+/// `count_values` range query needing ~0.55s locally exceeds 5s on a
+/// shared 4-vCPU runner (~10-15x slower on this path). Applied per
+/// request via `RequestBuilder::timeout` at the query call sites
+/// (`metrics::query_get_raw`), which *replaces* the client-level total
+/// timeout for that request (reqwest semantics), so readiness polling
+/// keeps its tight 5s budget untouched.
+pub const QUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Service names dumped on failure — present under these exact names in
 /// both variants' overlays. `prometheus` (issue #33): the reference
@@ -124,7 +134,11 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         // Belt-and-suspenders with `wait_ready`'s own per-attempt
         // `tokio::time::timeout` wrap (review fix): a client-level request
         // timeout means a stalled `/ready` (or scenario) request fails on
-        // its own, without relying solely on the wrapper.
+        // its own, without relying solely on the wrapper. Strictly a
+        // *readiness/default* budget (issue #92): the scenario query paths
+        // override it per request with `QUERY_REQUEST_TIMEOUT` via
+        // `RequestBuilder::timeout`, so heavyweight matrix queries are
+        // never cut off at 5s on a slow shared runner.
         .timeout(READY_REQUEST_TIMEOUT)
         .build()
         .context("failed to build the HTTP client")?;

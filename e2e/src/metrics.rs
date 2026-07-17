@@ -56,7 +56,7 @@ use prost::Message;
 use serde::Deserialize;
 
 use crate::corpus::{self, Corpus, CorpusSpec, FamilyCounts, Scale};
-use crate::harness::poll_until;
+use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
 use crate::scenarios::{Ctx, Variant};
 
 const FIXTURE_PATH: &str = "metrics/differential.json";
@@ -530,6 +530,11 @@ async fn query_get_raw(
     let res = http
         .get(format!("{base_url}{path}"))
         .query(params)
+        // Issue #92: a *request*-level timeout replaces the shared
+        // client's 5s readiness budget for this request (reqwest
+        // semantics) — matrix queries get a realistic 60s ceiling
+        // instead of failing mid-body on a slow shared CI runner.
+        .timeout(QUERY_REQUEST_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("GET {base_url}{path} failed"))?;
@@ -604,8 +609,24 @@ async fn compare_query(
     // Raw text kept alongside the parsed body so timestamps can be
     // re-extracted byte-exact ([`extract_raw_timestamps`]) rather than
     // only through `serde_json`'s lossy `f64` number representation.
+    let pulsus_started = std::time::Instant::now();
     let pulsus_raw = query_get_raw(&ctx.http, &ctx.base_url, path, &params_ref).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let prom_started = std::time::Instant::now();
     let prom_raw = query_get_raw(&ctx.http, &ctx.prometheus_url, path, &params_ref).await?;
+    let prom_elapsed = prom_started.elapsed();
+    // One elapsed line per matrix entry (issue #92): the nightly's only
+    // per-query diagnostic. A future budget breach (or creeping slowdown
+    // toward `QUERY_REQUEST_TIMEOUT`) is then locatable from CI logs
+    // alone — the 5s-cutoff failure this replaces was invisible until a
+    // local replay reproduced it.
+    println!(
+        "pulsus-e2e: query {expr:?} ({mode:?}) pulsusdb {}ms/{}B prometheus {}ms/{}B",
+        pulsus_elapsed.as_millis(),
+        pulsus_raw.len(),
+        prom_elapsed.as_millis(),
+        prom_raw.len(),
+    );
     let pulsus_body: serde_json::Value = serde_json::from_str(&pulsus_raw)
         .with_context(|| format!("pulsusdb {path} body was not JSON: {pulsus_raw}"))?;
     let prom_body: serde_json::Value = serde_json::from_str(&prom_raw)
@@ -1422,6 +1443,127 @@ async fn stalenan_micro_case(ctx: &Ctx) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #92 regression proof, tripping the nightly's actual failure
+    /// mode: the shared harness client carries a tight readiness-probe
+    /// timeout, and before the fix that budget bounded every matrix
+    /// query — a backend merely *slower* than the budget failed mid-body
+    /// with zero server-side errors. Reproduced here with a server that
+    /// answers correctly but only after the client-level budget has
+    /// elapsed: the bare client request (the pre-fix path) must time
+    /// out, while [`query_get_raw`] — which sets the per-request
+    /// `QUERY_REQUEST_TIMEOUT` — must succeed against the same server,
+    /// proving `RequestBuilder::timeout` *replaces* the client's total
+    /// timeout rather than merely racing it.
+    #[tokio::test]
+    async fn query_request_timeout_overrides_the_clients_readiness_budget() {
+        use tokio::io::AsyncWriteExt;
+
+        const CLIENT_BUDGET: Duration = Duration::from_millis(100);
+        const RESPONSE_DELAY: Duration = Duration::from_millis(400);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(RESPONSE_DELAY).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        // Same shape as the harness's scenario client: a client-level
+        // total timeout shorter than the server's response time.
+        let http = reqwest::Client::builder()
+            .timeout(CLIENT_BUDGET)
+            .build()
+            .unwrap();
+        let base = format!("http://{addr}");
+
+        // Pre-fix path: the client-level budget cuts the request off.
+        let bare = http.get(format!("{base}/api/v1/query")).send().await;
+        assert!(
+            bare.is_err(),
+            "expected the {CLIENT_BUDGET:?} client budget to cut off a {RESPONSE_DELAY:?} response"
+        );
+
+        // Fixed path: `query_get_raw`'s per-request timeout wins and the
+        // full body arrives intact.
+        let body = query_get_raw(&http, &base, "/api/v1/query", &[("query", "up")])
+            .await
+            .expect("the per-request query timeout should override the client budget");
+        assert_eq!(body, "ok");
+
+        server.abort();
+    }
+
+    /// Serves `body` as a well-formed `HTTP/1.1 200` JSON response on an
+    /// ephemeral loopback port for every connection — a stand-in query
+    /// backend for [`compare_query`]'s hermetic success-path test below.
+    async fn spawn_stub_backend(body: &'static str) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Issue #92: drives [`compare_query`] end-to-end against two stub
+    /// backends returning byte-identical vector responses — the compose
+    /// leg stays CI-authoritative for real matrix replays, but this
+    /// proves hermetically that the success path (including the new
+    /// per-entry elapsed log line, visible under `--nocapture`) runs
+    /// clean: identical answers compare equal and no mismatch artifact
+    /// is attempted.
+    #[tokio::test]
+    async fn compare_query_accepts_identical_stub_backends_and_logs_elapsed() {
+        const BODY: &str = r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"up"},"value":[1435781451.781,"1"]}]}}"#;
+        let pulsus_addr = spawn_stub_backend(BODY).await;
+        let prom_addr = spawn_stub_backend(BODY).await;
+
+        let ctx = Ctx {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{pulsus_addr}"),
+            collector_url: String::new(),
+            prometheus_url: format!("http://{prom_addr}"),
+            tempo_url: String::new(),
+            loki_url: String::new(),
+            variant: Variant::Single,
+            fixtures_dir: PathBuf::new(),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "pulsus-e2e-metrics-unit-stub",
+            ),
+        };
+        let window = QueryWindow {
+            eval_ms: 1_435_781_451_781,
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 0,
+        };
+        compare_query(&ctx, "mismatch", "up", Mode::Instant, window)
+            .await
+            .expect("byte-identical stub responses must compare equal");
+    }
 
     /// Issue #33 code review, [medium]: a per-metric-family compensating
     /// miscount (one family short, another over, by the same amount) must

@@ -34,7 +34,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::poll_until;
+use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
 use crate::logs_corpus::{
     self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector,
 };
@@ -242,6 +242,11 @@ async fn query_store(
             ("limit", limit_s.as_str()),
             ("direction", "forward"),
         ])
+        // Issue #92 (all four GET chokepoints in this module): a
+        // request-level timeout replaces the shared client's 5s
+        // readiness budget for scenario queries (see
+        // `harness::QUERY_REQUEST_TIMEOUT`).
+        .timeout(QUERY_REQUEST_TIMEOUT)
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -617,6 +622,7 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
                 .http
                 .get(&url)
                 .query(&[("query", q.as_str()), ("time", time.as_str())])
+                .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
                 .send()
                 .await
                 .with_context(|| format!("GET {url} failed"))?;
@@ -625,8 +631,19 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
             Ok::<(u16, String), anyhow::Error>((status, body))
         }
     };
+    let pulsus_started = std::time::Instant::now();
     let (pulsus_status, pulsus_body) = fetch(ctx.url("/api/logs/v1/query")).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let oracle_started = std::time::Instant::now();
     let (oracle_status, oracle_body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+    let oracle_elapsed = oracle_started.elapsed();
+    // Per-case elapsed line (issue #92, see `run_streams_case`).
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        oracle_elapsed.as_millis(),
+    );
 
     let dump = |detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -688,6 +705,7 @@ async fn query_instant(
         .http
         .get(url)
         .query(&[("query", query), ("time", time.as_str())])
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -719,7 +737,10 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
         expected.len(),
     );
 
+    let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_instant(ctx, &ctx.url("/api/logs/v1/query"), &q, eval_ns).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let oracle_started = std::time::Instant::now();
     let oracle_body = query_instant(
         ctx,
         &format!("{}/loki/api/v1/query", ctx.loki_url),
@@ -727,6 +748,14 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
         eval_ns,
     )
     .await?;
+    let oracle_elapsed = oracle_started.elapsed();
+    // Per-case elapsed line (issue #92, see `run_streams_case`).
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        oracle_elapsed.as_millis(),
+    );
     // `vector_result_set` hard-fails on duplicate label sets (validity
     // gate; a truncation gate is not applicable — metric vectors carry
     // no request limit).
@@ -843,6 +872,7 @@ async fn run_metric_range_case(
                     ("end", end.as_str()),
                     ("step", step.as_str()),
                 ])
+                .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
                 .send()
                 .await
                 .with_context(|| format!("GET {url} failed"))?;
@@ -856,8 +886,19 @@ async fn run_metric_range_case(
                 .with_context(|| format!("{url} body was not JSON"))
         }
     };
+    let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_range(ctx.url("/api/logs/v1/query_range")).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let oracle_started = std::time::Instant::now();
     let oracle_body = query_range(format!("{}/loki/api/v1/query_range", ctx.loki_url)).await?;
+    let oracle_elapsed = oracle_started.elapsed();
+    // Per-case elapsed line (issue #92, see `run_streams_case`).
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        oracle_elapsed.as_millis(),
+    );
     let pulsus_set = matrix_result_set(&pulsus_body)?;
     let oracle_set = matrix_result_set(&oracle_body)?;
 
@@ -951,8 +992,22 @@ async fn run_streams_case(
         expected.len(),
     );
 
+    // One elapsed line per case (issue #92, the metrics-differential
+    // precedent): budget breaches against `QUERY_REQUEST_TIMEOUT` stay
+    // diagnosable from CI logs alone. Elapsed only — these helpers
+    // return parsed JSON, so no raw byte count is in hand.
+    let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let loki_started = std::time::Instant::now();
     let loki_body = query_loki(ctx, &q, window, fixture.limit).await?;
+    let loki_elapsed = loki_started.elapsed();
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        loki_elapsed.as_millis(),
+    );
     let pulsus_set = result_set(&pulsus_body)?;
     let loki_set = result_set(&loki_body)?;
 

@@ -52,7 +52,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::poll_until;
+use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
 use crate::metrics::write_artifact;
 use crate::scenarios::{Ctx, Variant};
 use crate::traces_corpus::{self, TraceCorpus, TraceCorpusSpec, hex};
@@ -454,6 +454,11 @@ async fn fetch_pulsus_trace(ctx: &Ctx, trace_hex: &str) -> Result<Option<serde_j
     let res = ctx
         .http
         .get(ctx.url(&format!("/api/traces/v1/trace/{trace_hex}/json")))
+        // Issue #92 (every GET query chokepoint in this module): a
+        // request-level timeout replaces the shared client's 5s
+        // readiness budget for scenario queries (see
+        // `harness::QUERY_REQUEST_TIMEOUT`).
+        .timeout(QUERY_REQUEST_TIMEOUT)
         .send()
         .await
         .context("GET /api/traces/v1/trace/{id}/json failed")?;
@@ -474,6 +479,7 @@ async fn fetch_tempo_trace(ctx: &Ctx, trace_hex: &str) -> Result<Option<serde_js
     let res = ctx
         .http
         .get(format!("{}/api/traces/{trace_hex}", ctx.tempo_url))
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tempo /api/traces/{id} failed")?;
@@ -504,6 +510,7 @@ async fn search_pulsus(
             ("end", end.as_str()),
             ("limit", limit_s.as_str()),
         ])
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET /api/traces/v1/search failed")?;
@@ -533,6 +540,7 @@ async fn search_tempo(
             ("end", end.as_str()),
             ("limit", limit_s.as_str()),
         ])
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tempo /api/search failed")?;
@@ -744,6 +752,7 @@ async fn assert_tags_roundtrip(ctx: &Ctx) -> Result<()> {
     let res = ctx
         .http
         .get(ctx.url("/api/traces/v1/tags"))
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET /api/traces/v1/tags failed")?;
@@ -779,6 +788,7 @@ async fn assert_tags_roundtrip(ctx: &Ctx) -> Result<()> {
     let res = ctx
         .http
         .get(ctx.url("/api/traces/v1/tag/resource.region/values"))
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tag values failed")?;
@@ -823,6 +833,7 @@ async fn assert_metrics_roundtrip(
             ("end", end.as_str()),
             ("step", "60s"),
         ])
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET metrics/query_range failed")?;
@@ -857,6 +868,7 @@ async fn assert_metrics_roundtrip(
             ("start", start.as_str()),
             ("end", end.as_str()),
         ])
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .context("GET metrics/query failed")?;
@@ -1110,8 +1122,22 @@ async fn run_search_case(
         expected.len()
     );
 
+    // One elapsed line per case (issue #92, the metrics-differential
+    // precedent): budget breaches against `QUERY_REQUEST_TIMEOUT` stay
+    // diagnosable from CI logs alone. Elapsed only — these helpers
+    // return parsed JSON, so no raw byte count is in hand.
+    let pulsus_started = std::time::Instant::now();
     let pulsus_body = search_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let tempo_started = std::time::Instant::now();
     let tempo_body = search_tempo(ctx, &q, window, fixture.limit).await?;
+    let tempo_elapsed = tempo_started.elapsed();
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms tempo {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        tempo_elapsed.as_millis(),
+    );
     let pulsus_ids = search_trace_ids(&pulsus_body)?;
     let tempo_ids = search_trace_ids(&tempo_body)?;
 
@@ -1494,6 +1520,7 @@ async fn get_json(ctx: &Ctx, url: &str) -> Result<serde_json::Value> {
     let res = ctx
         .http
         .get(url)
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -1514,6 +1541,7 @@ async fn get_json_with(
         .http
         .get(url)
         .query(params)
+        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
