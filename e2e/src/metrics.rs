@@ -1861,14 +1861,39 @@ mod tests {
     /// Prometheus runs without
     /// --enable-feature=promql-experimental-functions and would error
     /// one-sidedly; proven by the fully-green upstream fill-modifier
-    /// corpus file instead, per the #70 adjudication).
+    /// corpus file instead, per the #70 adjudication). Resized 146 -> 156
+    /// by issue #86 (M6-08d, incl. review rounds 1-2): 5 new entries x 2
+    /// modes proving bit-parity under DELAYED name removal against the
+    /// flag-on oracle (both compose files now run the Prometheus
+    /// reference with --enable-feature=promql-delayed-name-removal,
+    /// matching PulsusDB's sole unconditional model) —
+    /// `sum by(__name__)` over a name-dropping single-name body; the
+    /// same aggregation fed by TWO distinct metric names with MIXED
+    /// verdicts (gauge kept + counter rate dropped: a delayed engine
+    /// leaking the retained counter name emits `requests_total` instead
+    /// of `{}` and mismatches the oracle); the round-2 GENUINELY
+    /// eager-vs-delayed-discriminating row — two distinctly-named
+    /// DROP-MARKED sources bridged through `label_replace` (reads the
+    /// retained names, re-writes `__name__`, clears the verdicts) into
+    /// one `by(__name__)` aggregation, live-verified BOTH ways: flag-on
+    /// v3.13.0 yields two NAMED series, flag-off yields one anonymous
+    /// `{}` group (the UNBRIDGED both-dropped form necessarily ERRORS
+    /// under delayed — post-drop `{}` identities always collide, also
+    /// live-verified — and this harness's contract is success-only, so
+    /// that form is pinned by the corpus/proof expect-fail cases
+    /// instead); the OR name-propagation shape whose group merges only
+    /// under the retained-name model; and the plan-v2-Δ1 alternating
+    /// filter/arithmetic range expression whose per-series `__name__` is
+    /// decided by the first-step drop_name latch (the 200000150
+    /// threshold splits the pinned seed's noise band for the
+    /// svc-0/inst-000/slot-1 gauge series both ways across the window).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_forty_six_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_fifty_six_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 146,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 146 — update \
+            rows, 156,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 156 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

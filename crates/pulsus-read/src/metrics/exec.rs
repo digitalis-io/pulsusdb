@@ -1063,6 +1063,10 @@ fn value_to_query_result(value: QueryValue) -> QueryResult {
                 .collect(),
         ),
         QueryValue::Scalar(v) => QueryResult::Scalar(v),
+        // Issue #86 (M6-08d): a top-level string-literal query — value
+        // only; the encoder stamps the eval-time timestamp (the Scalar
+        // precedent).
+        QueryValue::String(s) => QueryResult::String(s),
     }
 }
 
@@ -1191,6 +1195,7 @@ mod tests {
                 .map(|s| InstantSample {
                     labels: s.labels.clone(),
                     metric_name: None,
+                    drop_name: false,
                     t_ms: 0,
                     v: s.samples[0].v,
                 })
@@ -1424,6 +1429,7 @@ mod tests {
         let vector = vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             metric_name: None,
+            drop_name: false,
             t_ms: 0,
             v: 3.0,
         }];
@@ -1445,6 +1451,7 @@ mod tests {
         let vector = vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             metric_name: Some("up".to_string()),
+            drop_name: false,
             t_ms: 0,
             v: 1.0,
         }];
@@ -1469,6 +1476,7 @@ mod tests {
         let vector = vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             metric_name: None,
+            drop_name: false,
             t_ms: 0,
             v: 1.0,
         }];
@@ -1488,11 +1496,23 @@ mod tests {
         }
     }
 
+    /// Issue #86 (M6-08d, plan v2 Δ5): a top-level string-literal query
+    /// maps value-only — the encoder stamps the eval-time timestamp
+    /// externally (the Scalar precedent).
+    #[test]
+    fn value_to_query_result_maps_string() {
+        match value_to_query_result(QueryValue::String("Foo".to_string())) {
+            QueryResult::String(s) => assert_eq!(s, "Foo"),
+            other => panic!("expected String, got {other:?}"),
+        }
+    }
+
     #[test]
     fn value_to_query_result_maps_matrix() {
         let matrix = vec![RangeSeries {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             metric_name: None,
+            drop_name: false,
             points: vec![(0, 1.0), (1000, 2.0)],
         }];
         match value_to_query_result(QueryValue::Matrix(matrix)) {
@@ -1513,6 +1533,7 @@ mod tests {
         let matrix = vec![RangeSeries {
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             metric_name: Some("up".to_string()),
+            drop_name: false,
             points: vec![(0, 1.0), (1000, 2.0)],
         }];
         match value_to_query_result(QueryValue::Matrix(matrix)) {

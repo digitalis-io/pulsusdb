@@ -105,6 +105,13 @@ pub enum QueryResult {
     Vector(Vec<VectorSample>),
     Matrix(Vec<MatrixSeries>),
     Scalar(f64),
+    /// A top-level PromQL string-literal query (issue #86, M6-08d) —
+    /// `pulsus_promql::QueryValue::String`, rendered by the prom API as
+    /// `resultType:"string"`. Like [`QueryResult::Scalar`], the wire
+    /// timestamp is stamped externally by the encoder from the request's
+    /// evaluation time (`at_ms`), never carried in the variant. LogQL
+    /// never produces it.
+    String(String),
 }
 
 pub struct LogQlEngine {

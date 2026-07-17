@@ -36,6 +36,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_08a_at_subquery.test",
     "m6_08b_duration_expressions.test",
     "m6_08c_utf8_selectors.test",
+    "m6_08d_directives_delayed_name.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {
@@ -104,6 +105,9 @@ fn proof_corpus_is_fully_green_and_exercises_every_executed_directive() {
         totals.eval_fail += run.counts.eval_fail;
         totals.fail_message += run.counts.fail_message;
         totals.fail_regexp += run.counts.fail_regexp;
+        totals.expect_fail += run.counts.expect_fail;
+        totals.expect_fail_tagged += run.counts.expect_fail_tagged;
+        totals.expect_string += run.counts.expect_string;
     }
 
     assert!(
@@ -141,6 +145,18 @@ fn proof_corpus_is_fully_green_and_exercises_every_executed_directive() {
     assert!(
         totals.fail_regexp > 0,
         "proof corpus never exercised `expected_fail_regexp`"
+    );
+    assert!(
+        totals.expect_fail > 0,
+        "proof corpus never exercised the block `expect fail` directive (issue #86)"
+    );
+    assert!(
+        totals.expect_fail_tagged > 0,
+        "proof corpus never exercised `expect fail` with an inline msg:/regex: tail"
+    );
+    assert!(
+        totals.expect_string > 0,
+        "proof corpus never exercised `expect string`"
     );
 }
 

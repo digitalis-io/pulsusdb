@@ -145,58 +145,87 @@ impl SeriesData {
 
 /// One instant-vector series: labels plus a single `(t_ms, value)`.
 ///
-/// **`metric_name` (issue #37 fix):** `__name__` is deliberately carried
-/// *outside* [`Labels`] (which never contains it, see that type's own doc)
-/// rather than special-cased back into the label vector/grouping-key
-/// machinery every `Labels`-keyed `HashMap` in `eval/{aggregation,binop}.rs`
-/// already relies on. `Some(name)` iff this sample's value is the
-/// **verbatim value of an existing series** (a bare selector match, a
-/// `topk`/`bottomk`/filter-mode-comparison pass-through of one, or a
-/// `last_over_time`/`first_over_time` sample — the two name-keeping range
-/// functions, issue #67), **or the name was explicitly (re)assigned** by a
-/// name-writing construct (`sum by(__name__)`-style grouping preservation,
-/// `count_values("__name__", …)`'s metric-name-channel injection — issue
-/// #69 — or `label_replace`/`label_join` writing `__name__` — issue #68);
-/// `None` iff the value was **computed with no name-writing construct
-/// involved** (most aggregations, range/`_over_time` functions, arithmetic,
-/// `bool`-mode comparisons, `histogram_quantile`) —
-/// this is Prometheus's own `dropMetricName` rule, verified per construct
-/// class against real captured `prom/prometheus:v3.13.0` responses; see
-/// `crates/pulsus-server/tests/fixtures/prom_api/PROVENANCE.md`'s
-/// "`__name__` keep/drop rule per construct class" table, and each
-/// `eval::eval_step` arm's own citation of it. Consumed by
-/// `pulsus-read::metrics::exec` to splice `__name__` back into the
-/// rendered label object exactly where `/api/v1/series` already does.
+/// **`metric_name` (issue #37; retargeted by issue #86, M6-08d):**
+/// `__name__` is deliberately carried *outside* [`Labels`] (which never
+/// contains it, see that type's own doc) rather than special-cased back
+/// into the label vector/grouping-key machinery every `Labels`-keyed
+/// `HashMap` in `eval/{aggregation,binop}.rs` already relies on.
+/// `metric_name` is the series' **retained** name — `Some` whenever the
+/// series has (or still had) one — and the keep/drop **verdict** lives in
+/// [`InstantSample::drop_name`], mirroring upstream's delayed-name-removal
+/// model (`promql/value.go` `Sample.DropName` at the pinned v3.13.0 SHA;
+/// the corpus oracle runs with `EnableDelayedNameRemoval: true`,
+/// `promql/promqltest/test.go:111`). Mid-tree, a name-dropping construct
+/// (`rate`, arithmetic, `bool` comparisons, most aggregations, …) RETAINS
+/// the input's name and sets `drop_name: true`, so downstream name readers
+/// (`label_replace`/`label_join` on `__name__`, `by(__name__)` grouping)
+/// still see it — the vendored `name_label_dropping.test` cases. The one
+/// deliberate exception is vector-vector **arithmetic**, whose upstream
+/// `resultMetric` deletes the name immediately (`changesMetricSchema`,
+/// engine.go) — there `metric_name` really is `None` mid-tree. The
+/// terminal `eval::finalize_metadata_labels` cleanup then nulls
+/// `metric_name` (and strips `__type__`/`__unit__`) for every
+/// `drop_name == true` element, so `evaluate()`'s **final** output still
+/// carries `None` for dropped series — the contract
+/// `pulsus-read::metrics::exec::with_metric_name` and the corpus judge
+/// consume (they read `metric_name` only, never `drop_name`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct InstantSample {
     pub labels: Labels,
     pub metric_name: Option<String>,
+    /// The delayed name-removal verdict: `true` means the terminal cleanup
+    /// drops `__name__` + `__type__` + `__unit__` for this element (see
+    /// [`InstantSample::metric_name`]). Invariants:
+    /// - name-dropping op: `out.metric_name = in.metric_name`,
+    ///   `out.drop_name = true`;
+    /// - name-keeping op: `out.metric_name = in.metric_name`,
+    ///   `out.drop_name = in.drop_name`;
+    /// - genuinely nameless output (scalar-derived, `absent`/`vector()`,
+    ///   vector-vector arithmetic via `resultMetric`):
+    ///   `metric_name = None`, `drop_name = false`;
+    /// - explicit `__name__` write (`label_replace`/`label_join` dst):
+    ///   sets `metric_name` and CLEARS `drop_name` (upstream
+    ///   `funcLabelReplace`/`evalLabelJoin`: `DropName = false` when
+    ///   `dst == __name__` — an empty value is an explicit delete, not a
+    ///   drop).
+    pub drop_name: bool,
     pub t_ms: i64,
     pub v: f64,
 }
 
 /// One range-vector (matrix) series: labels plus its ascending points. See
-/// [`InstantSample::metric_name`]'s doc for the keep/drop contract — a
-/// range query's `metric_name` is constant across every step of the same
-/// series (an evaluated step's `PlanExpr` shape, and therefore its
-/// keep/drop verdict, never changes mid-query), so accumulating it once
-/// per series (not once per step) is correct.
+/// [`InstantSample::metric_name`]'s doc for the retained-name/`drop_name`
+/// contract. `drop_name` here is the **first-step latch** (issue #86 plan
+/// v2 Δ1): upstream keys range accumulation on the full metric identity
+/// (retained `__name__` included) and sets `DropName` once, when the
+/// series is first created at a step (`engine.go` `rangeEval`
+/// `seriess[h]` else-branch); later steps of the same identity never
+/// touch it — so `(m > 0) or (m + 1)`, whose per-step verdict alternates,
+/// is decided by whichever branch produced the identity's first step.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangeSeries {
     pub labels: Labels,
     pub metric_name: Option<String>,
+    /// See [`InstantSample::drop_name`] — latched at the series' first
+    /// evaluated step.
+    pub drop_name: bool,
     /// `(t_ms, value)`, ascending by `t_ms` — one point per evaluated step.
     pub points: Vec<(i64, f64)>,
 }
 
 /// The evaluator's result. An instant query ([`crate::plan::PlanParams`]
-/// with `start_ms == end_ms`) always yields [`QueryValue::Vector`] or
-/// [`QueryValue::Scalar`]; a range query yields [`QueryValue::Matrix`].
+/// with `start_ms == end_ms`) yields [`QueryValue::Vector`],
+/// [`QueryValue::Scalar`], or — for a top-level string-literal query
+/// (issue #86, M6-08d) — [`QueryValue::String`]; a range query yields
+/// [`QueryValue::Matrix`]. `String` carries the literal's value only: the
+/// wire timestamp is stamped externally by the response encoder from the
+/// request's evaluation time (the `Scalar`/`at_ms` precedent).
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryValue {
     Vector(Vec<InstantSample>),
     Matrix(Vec<RangeSeries>),
     Scalar(f64),
+    String(String),
 }
 
 #[cfg(test)]

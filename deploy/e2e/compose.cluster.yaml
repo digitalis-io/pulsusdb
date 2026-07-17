@@ -80,6 +80,12 @@ services:
       # set must match the pulsus experimental gate the differential
       # harness evaluates under.
       - --enable-feature=promql-duration-expr
+      # Issue #86 (M6-08d): delayed __name__ removal is PulsusDB's sole,
+      # unconditional evaluation model (the corpus oracle's own mode,
+      # promqltest test.go:111) — the reference backend must run the same
+      # opt-in flag so the differential validates live parity under
+      # matching flag state (adjudicated on #86).
+      - --enable-feature=promql-delayed-name-removal
     volumes:
       - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:

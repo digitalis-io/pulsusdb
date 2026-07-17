@@ -1700,3 +1700,42 @@ async fn logql_scan_budget_query_too_broad_live_case() {
         "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422",
     );
 }
+
+// ---------------------------------------------------------------------
+// Issue #86 (M6-08d, plan v2 Δ5): the `resultType:"string"` matrix-audit
+// row — a top-level PromQL string-literal query on the LIVE /api/v1/query
+// route renders the Prometheus string envelope byte-exactly (the request's
+// own `time` param stamped as the result timestamp). Zero seed data
+// needed: a string query plans with no selectors and touches no tables.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prom_query_string_literal_renders_result_type_string_live_case() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_126;
+    let db = "pulsus_api_conformance_it_string_result";
+    let _guard = spawn_ready(port, db, &[]);
+
+    let ctx = "[spawn=all] GET /api/v1/query case=string-literal-200";
+    let res = get(port, "/api/v1/query?query=%22conformance%22&time=123", ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert!(
+        res.content_type()
+            .is_some_and(|ct| ct.starts_with("application/json")),
+        "{ctx}: content-type, got {:?}",
+        res.content_type()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&res.body),
+        r#"{"status":"success","data":{"resultType":"string","result":[123,"conformance"]}}"#,
+        "{ctx}: byte-exact string envelope"
+    );
+}

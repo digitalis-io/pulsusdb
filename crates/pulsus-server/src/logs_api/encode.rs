@@ -359,6 +359,21 @@ pub(crate) fn query_response(
             );
             json_response(Body::from(format!("{body}}}")))
         }
+        // Unreachable: `QueryResult::String` is a PromQL-only variant of
+        // the shared enum (issue #86; a top-level string-literal metrics
+        // query) — LogQL has no string result type at all. Kept as a
+        // well-formed error response rather than a panic, mirroring
+        // `prom_api::encode`'s own handling of the LogQL-only
+        // `QueryResult::Streams` variant.
+        QueryResult::String(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "errorType": "internal",
+                "error": "unexpected string result from a logs query",
+            })),
+        )
+            .into_response(),
     }
 }
 

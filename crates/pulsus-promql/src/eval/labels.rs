@@ -336,6 +336,13 @@ pub fn sort_by_label_vector(v: &mut [InstantSample], names: &[String], descendin
 fn set_or_delete(s: &mut InstantSample, dst: &str, value: String) {
     if dst == "__name__" {
         s.metric_name = if value.is_empty() { None } else { Some(value) };
+        // An EXPLICIT `__name__` write clears the delayed drop verdict
+        // (issue #86; upstream funcLabelReplace/evalLabelJoin:
+        // `DropName = false` when `dst == MetricName`, functions.go:2411/
+        // :2463) — an empty value is an explicit delete, not a drop, so
+        // the terminal cleanup must NOT strip `__type__`/`__unit__` for
+        // it (the 08c `metric_name.is_none()`-proxy residual, now fixed).
+        s.drop_name = false;
         return;
     }
     let labels = &mut s.labels.0;
@@ -442,6 +449,7 @@ mod tests {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             metric_name: name.map(str::to_string),
+            drop_name: false,
             t_ms: 0,
             v,
         }

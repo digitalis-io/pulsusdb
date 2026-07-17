@@ -386,6 +386,21 @@ pub(crate) fn query_response(
             );
             json_response(Body::from(format!("{data_body}}}}}")))
         }
+        // Issue #86 (M6-08d): a top-level string-literal query — the
+        // Prometheus `resultType:"string"` shape, `result: [<t>,"<val>"]`
+        // with the request's evaluation time stamped here (the Scalar
+        // precedent; the value variant carries no timestamp).
+        QueryResult::String(s) => {
+            let data_body = explain_suffix(
+                format!(
+                    "{{\"status\":\"success\",\"data\":{{\"resultType\":\"string\",\"result\":[{},{}]",
+                    prom_timestamp(at_ms),
+                    json_string(&s)
+                ),
+                explain.as_ref(),
+            );
+            json_response(Body::from(format!("{data_body}}}}}")))
+        }
         // Unreachable: `MetricsEngine` never produces `QueryResult::Streams`
         // (a `LogQlEngine`-only variant of the shared `QueryResult` type,
         // mirrors `logs_api::encode`'s own historical handling of
@@ -759,6 +774,31 @@ mod tests {
         assert_eq!(
             body,
             r#"{"status":"success","data":{"resultType":"scalar","result":[1,"2"]}}"#
+        );
+    }
+
+    /// Issue #86 (M6-08d): a top-level string-literal query renders the
+    /// Prometheus `resultType:"string"` shape, timestamp stamped from the
+    /// request's evaluation time and the value JSON-escaped.
+    #[tokio::test]
+    async fn string_envelope_is_byte_exact() {
+        let res = query_response(QueryResult::String("Foo".to_string()), None, 1_000, false);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"string","result":[1,"Foo"]}}"#
+        );
+        // Escaping + fractional eval time.
+        let res = query_response(
+            QueryResult::String("a\"b\\c".to_string()),
+            None,
+            1_500,
+            false,
+        );
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"string","result":[1.5,"a\"b\\c"]}}"#
         );
     }
 

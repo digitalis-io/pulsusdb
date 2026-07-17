@@ -8,16 +8,23 @@
 //!   `expected_fail_message <msg>` / `expected_fail_regexp <pat>` for
 //!   `eval_fail`
 //! - `eval[_fail] range from <dur> to <dur> step <dur> <expr>`
+//! - block-form `expect fail [msg:<s>|regex:<p>]` and
+//!   `expect string <quoted>` result lines (issue #86, M6-08d — the
+//!   executable subset of upstream's `expect` family; `parseExpect`/
+//!   `parseAsStringLiteral` at the pinned SHA)
 //!
-//! Everything else in the upstream grammar (`eval_warn`/`eval_info`,
-//! `expect …` annotation/error lines, `load_with_nhcb`, `{{…}}`
-//! native-histogram sample syntax, `@st` start-timestamp lines) is a
-//! **deferred directive**: [`scan_deferred_directives`] detects them
-//! before grammar parsing, and the corpus test requires any file using one
-//! to be listed — loudly, wholesale — in `corpus/skip-manifest.json` with
-//! an activation issue (plan v2 Δ2's skip-manifest contract). A directive
+//! Everything else in the upstream grammar (`eval_warn`/`eval_info`, the
+//! `expect warn|no_warn|info|no_info|ordered` annotation forms and
+//! `expect range vector`, `load_with_nhcb`, `{{…}}` native-histogram
+//! sample syntax, `@st` start-timestamp lines) is a **deferred
+//! directive**: [`scan_deferred_directives`] detects them before grammar
+//! parsing, and the corpus test requires any file using one to be listed
+//! — loudly, wholesale — in `corpus/skip-manifest.json` with an
+//! activation issue (plan v2 Δ2's skip-manifest contract). A directive
 //! recognised by *neither* the executed subset nor the deferred scan is a
-//! hard parse error, never a silent skip.
+//! hard parse error, never a silent skip. (The pre-existing `eval_ordered`
+//! PREFIX directive stays executable; only the block `expect ordered`
+//! form is deferred — issue #86 plan v2 Δ3.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -121,11 +128,15 @@ pub enum Expected {
     /// Range result lines: per-series value sequences, positionally one
     /// per step (`_` = the series has no point at that step).
     Matrix(Vec<ExpectedSeries>),
-    /// `eval_fail`'s expectation.
+    /// `eval_fail`'s (or the block `expect fail` directive's, issue #86)
+    /// expectation.
     Fail {
         message: Option<String>,
         regexp: Option<String>,
     },
+    /// `expect string <quoted>` (issue #86): the instant query must
+    /// evaluate to exactly this string.
+    String(String),
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +150,12 @@ pub struct EvalCmd {
     /// eval time defaults to `T0`) — counted so the proof corpus provably
     /// exercises it.
     pub bare_instant: bool,
+    /// `true` when the block used the `expect fail` directive (issue
+    /// #86) — the mode was upgraded to [`EvalMode::Fail`], but the
+    /// directive counts track it separately from `eval_fail`.
+    pub expect_fail: bool,
+    /// `true` when the block used `expect string` (issue #86).
+    pub expect_string: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +173,12 @@ pub enum Command {
 /// committed activation home in `corpus/skip-manifest.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeferredDirective {
-    /// `expect fail|warn|no_warn|info|no_info|ordered …` assertion lines.
+    /// The still-deferred block-`expect` forms (issue #86 split the
+    /// family): `expect warn|no_warn|info|no_info` (annotation emission,
+    /// #22), `expect ordered` (no activatable file uses it — every
+    /// carrier is also native-histogram-blocked; plan v2 Δ3), and
+    /// `expect range vector`. `expect fail`/`expect string` are
+    /// EXECUTABLE and never route here.
     ExpectLine,
     /// `eval_warn …` (annotation assertion).
     EvalWarn,
@@ -225,7 +247,19 @@ pub fn scan_deferred_directives(text: &str) -> BTreeSet<DeferredDirective> {
         }
         let first_word = line.split_ascii_whitespace().next().unwrap_or("");
         if first_word == "expect" {
-            out.insert(DeferredDirective::ExpectLine);
+            // Issue #86: `expect` is deferred IFF its second token is one
+            // of the annotation forms, `ordered`, or `range` (`expect
+            // range vector`); `expect fail`/`expect string` are part of
+            // the executed subset. Any OTHER second token is left for the
+            // grammar parser, which hard-errors on it (loud, never
+            // skipped).
+            let second = line.split_ascii_whitespace().nth(1).unwrap_or("");
+            if matches!(
+                second,
+                "ordered" | "warn" | "no_warn" | "info" | "no_info" | "range"
+            ) {
+                out.insert(DeferredDirective::ExpectLine);
+            }
         }
         if first_word == "eval_warn" {
             out.insert(DeferredDirective::EvalWarn);
@@ -445,6 +479,14 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
 
     // Result lines until the next blank line.
     let mut i = start + 1;
+    let mut mode = mode;
+    // The PREFIX directive's own fail mode (`eval_fail`) — kept separate
+    // from a block-`expect fail` upgrade so `expected_fail_message`/
+    // `expected_fail_regexp` lines stay legal ONLY under `eval_fail`
+    // (upstream pairs `expect fail` with inline `msg:`/`regex:` instead).
+    let directive_fail = mode == EvalMode::Fail;
+    let mut expect_fail = false;
+    let mut expect_string: Option<String> = None;
     let mut fail_message: Option<String> = None;
     let mut fail_regexp: Option<String> = None;
     let mut result_series: Vec<ExpectedSeries> = Vec::new();
@@ -452,7 +494,7 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
 
     while i < lines.len() && !lines[i].is_empty() {
         let line = &lines[i];
-        if mode == EvalMode::Fail {
+        if directive_fail {
             if let Some(msg) = line.strip_prefix("expected_fail_message") {
                 fail_message = Some(msg.trim().to_string());
                 i += 1;
@@ -467,6 +509,39 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
                 file,
                 i,
                 "eval_fail accepts only expected_fail_message/expected_fail_regexp lines",
+            ));
+        }
+
+        // Block-form `expect` directives (issue #86). Like upstream, only
+        // a line whose FIRST whitespace-delimited token is literally
+        // `expect` routes here — a metric named `expect` is still
+        // writable as `expect{}`.
+        if line.split_ascii_whitespace().next() == Some("expect") {
+            if scalar.is_some() || !result_series.is_empty() {
+                return Err(err_at(
+                    file,
+                    i,
+                    "an `expect` directive cannot follow result lines in one eval block",
+                ));
+            }
+            parse_expect_line(file, i, line, &kind, &mut expect_fail, &mut expect_string).map(
+                |(msg, pat)| {
+                    if msg.is_some() {
+                        fail_message = msg;
+                    }
+                    if pat.is_some() {
+                        fail_regexp = pat;
+                    }
+                },
+            )?;
+            i += 1;
+            continue;
+        }
+        if expect_fail || expect_string.is_some() {
+            return Err(err_at(
+                file,
+                i,
+                "result lines cannot follow an `expect fail`/`expect string` directive",
             ));
         }
 
@@ -504,11 +579,17 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
         i += 1;
     }
 
+    if expect_fail {
+        mode = EvalMode::Fail;
+    }
+    let used_expect_string = expect_string.is_some();
     let expected = if mode == EvalMode::Fail {
         Expected::Fail {
             message: fail_message,
             regexp: fail_regexp,
         }
+    } else if let Some(s) = expect_string {
+        Expected::String(s)
     } else if let Some(v) = scalar {
         Expected::Scalar(v)
     } else {
@@ -526,9 +607,237 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
             mode,
             expected,
             bare_instant,
+            expect_fail,
+            expect_string: used_expect_string,
         },
         i,
     ))
+}
+
+/// Parses one block-form `expect …` line (issue #86). Executable forms:
+/// `expect fail [msg:<s>|regex:<p>]` (upstream `patExpect`, test.go:55 —
+/// the optional tail must be `msg:`/`regex:`-tagged) and
+/// `expect string <quoted>` (upstream `parseAsStringLiteral`). The
+/// deferred forms (`ordered`/`warn`/`no_warn`/`info`/`no_info`/`range
+/// vector`) are routed to the skip-manifest by
+/// [`scan_deferred_directives`] before this parser runs — reaching here
+/// is a hard error (defense in depth), as is any unrecognised form.
+/// Returns `expect fail`'s optional `(message, regexp)` pair.
+fn parse_expect_line(
+    file: &str,
+    line_no: usize,
+    line: &str,
+    kind: &EvalKind,
+    expect_fail: &mut bool,
+    expect_string: &mut Option<String>,
+) -> Result<(Option<String>, Option<String>), String> {
+    if line == "expect string" {
+        return Err(err_at(
+            file,
+            line_no,
+            "expected string literal not valid - a quoted string literal is required",
+        ));
+    }
+    if let Some(literal) = line.strip_prefix("expect string ") {
+        if matches!(kind, EvalKind::Range { .. }) {
+            return Err(err_at(
+                file,
+                line_no,
+                "expect string is only valid for an instant eval",
+            ));
+        }
+        if expect_string.is_some() || *expect_fail {
+            return Err(err_at(
+                file,
+                line_no,
+                "expect string cannot repeat or combine with expect fail",
+            ));
+        }
+        *expect_string = Some(go_unquote(literal).map_err(|e| err_at(file, line_no, e))?);
+        return Ok((None, None));
+    }
+
+    let mut words = line.split_ascii_whitespace();
+    let _expect = words.next();
+    match words.next() {
+        Some("fail") => {
+            if *expect_fail || expect_string.is_some() {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "invalid expect lines, multiple expect fail lines are not allowed",
+                ));
+            }
+            *expect_fail = true;
+            // Optional `msg:<s>` / `regex:<p>` tail — everything after
+            // the tag, trimmed (upstream captures `(.+)` and TrimSpaces).
+            let tail = line.split_once("fail").map(|(_, t)| t.trim()).unwrap_or("");
+            if tail.is_empty() {
+                return Ok((None, None));
+            }
+            if let Some(msg) = tail.strip_prefix("msg:") {
+                return Ok((Some(msg.trim().to_string()), None));
+            }
+            if let Some(pat) = tail.strip_prefix("regex:") {
+                return Ok((None, Some(pat.trim().to_string())));
+            }
+            Err(err_at(
+                file,
+                line_no,
+                format!("invalid token after expect fail: {tail:?} (want msg:/regex:)"),
+            ))
+        }
+        Some(deferred @ ("ordered" | "warn" | "no_warn" | "info" | "no_info" | "range")) => {
+            Err(err_at(
+                file,
+                line_no,
+                format!(
+                    "deferred `expect {deferred}` directive reached the executed-grammar \
+                     parser — scan_deferred_directives must route this file to the \
+                     skip-manifest first"
+                ),
+            ))
+        }
+        other => Err(err_at(
+            file,
+            line_no,
+            format!(
+                "invalid expect statement {other:?} — executable forms are `expect fail` and \
+                 `expect string`"
+            ),
+        )),
+    }
+}
+
+/// Go `strconv.Unquote` for the forms upstream `.test` files use
+/// (`parseAsStringLiteral`): a backquoted RAW string (no escapes; may not
+/// contain a backquote; Go drops carriage returns) and a double-quoted
+/// string with the Go escape set (`\a \b \f \n \r \t \v \\ \' \" \xHH
+/// \OOO \uXXXX \UXXXXXXXX`). Go semantics per escape class
+/// (`strconv.unquoteChar` at the pin): `\xHH` and octal `\OOO` produce
+/// one raw BYTE each (a Go string is a byte slice — `"\xe4\xb8\x96"` is
+/// the three UTF-8 bytes of `世`, never three separate code points), and
+/// an octal value above 255 is a syntax error; `\uXXXX`/`\UXXXXXXXX`
+/// produce one CODE POINT, UTF-8-encoded. One deliberate narrowing:
+/// Go tolerates byte escapes that do not form valid UTF-8 (its strings
+/// are arbitrary bytes) — a Rust `String` cannot, so such input is a
+/// loud error here rather than lossy replacement; no vendored file uses
+/// one. Single-quoted rune literals are not used by any vendored file
+/// and are rejected loudly (extend if a corpus file legitimately needs
+/// them — the `series.rs::scan_quoted_string` convention).
+fn go_unquote(s: &str) -> Result<String, String> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return Err(format!("invalid quoted string {s:?}"));
+    }
+    let quote = bytes[0];
+    if bytes[bytes.len() - 1] != quote {
+        return Err(format!("unbalanced quotes in {s:?}"));
+    }
+    let inner = &s[1..s.len() - 1];
+    match quote {
+        b'`' => {
+            if inner.contains('`') {
+                return Err(format!("backquoted string contains a backquote: {s:?}"));
+            }
+            Ok(inner.replace('\r', ""))
+        }
+        b'"' => {
+            // Accumulate BYTES, not chars: `\xHH`/`\OOO` are raw bytes in
+            // Go, so multibyte UTF-8 sequences spelled byte-by-byte must
+            // concatenate before decoding.
+            let mut out: Vec<u8> = Vec::with_capacity(inner.len());
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    return Err(format!("unescaped quote inside {s:?}"));
+                }
+                if c != '\\' {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    continue;
+                }
+                let esc = chars
+                    .next()
+                    .ok_or_else(|| format!("dangling backslash in {s:?}"))?;
+                let simple: Option<u8> = match esc {
+                    'a' => Some(0x07),
+                    'b' => Some(0x08),
+                    'f' => Some(0x0C),
+                    'n' => Some(b'\n'),
+                    'r' => Some(b'\r'),
+                    't' => Some(b'\t'),
+                    'v' => Some(0x0B),
+                    '\\' => Some(b'\\'),
+                    '\'' => Some(b'\''),
+                    '"' => Some(b'"'),
+                    _ => None,
+                };
+                if let Some(b) = simple {
+                    out.push(b);
+                    continue;
+                }
+                match esc {
+                    // `\xHH`: one raw byte (Go `if c == 'x' { value = v }`
+                    // with multibyte=false — appended as a single byte).
+                    'x' => {
+                        let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                        if hex.len() != 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                            return Err(format!("invalid \\x escape in {s:?}"));
+                        }
+                        let b = u8::from_str_radix(&hex, 16)
+                            .map_err(|e| format!("invalid \\x escape in {s:?}: {e}"))?;
+                        out.push(b);
+                    }
+                    // `\uXXXX`/`\UXXXXXXXX`: one code point, UTF-8-encoded.
+                    'u' | 'U' => {
+                        let width = if esc == 'u' { 4 } else { 8 };
+                        let hex: String = (0..width).filter_map(|_| chars.next()).collect();
+                        if hex.len() != width || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                            return Err(format!("invalid \\{esc} escape in {s:?}"));
+                        }
+                        let code = u32::from_str_radix(&hex, 16)
+                            .map_err(|e| format!("invalid \\{esc} escape in {s:?}: {e}"))?;
+                        let c = char::from_u32(code)
+                            .ok_or_else(|| format!("invalid code point in {s:?}"))?;
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                    // Octal `\OOO`: exactly three digits, one raw byte;
+                    // a value above 255 is a syntax error (Go
+                    // `if v > 255 { return ErrSyntax }`), so `\400` is
+                    // rejected — never truncated or widened.
+                    d @ '0'..='7' => {
+                        let mut val = d as u32 - '0' as u32;
+                        for _ in 0..2 {
+                            let n = chars
+                                .next()
+                                .filter(|c| ('0'..='7').contains(c))
+                                .ok_or_else(|| format!("invalid octal escape in {s:?}"))?;
+                            val = val * 8 + (n as u32 - '0' as u32);
+                        }
+                        if val > 255 {
+                            return Err(format!(
+                                "octal escape above \\377 in {s:?} (Go rejects octal > 255)"
+                            ));
+                        }
+                        out.push(val as u8);
+                    }
+                    other => return Err(format!("unsupported escape \\{other} in {s:?}")),
+                }
+            }
+            String::from_utf8(out).map_err(|e| {
+                format!(
+                    "byte escapes in {s:?} do not form valid UTF-8 ({e}) — Go permits \
+                     non-UTF-8 strings, a Rust String cannot; no vendored file needs one"
+                )
+            })
+        }
+        _ => Err(format!(
+            "unsupported quote style in {s:?} — extend grammar.rs::go_unquote if the corpus \
+             legitimately needs it"
+        )),
+    }
 }
 
 /// Parses a lone-number result line (scalar expectation). Rejects
@@ -543,5 +852,46 @@ fn parse_scalar_line(line: &str) -> Option<f64> {
     match scan_signed_number(t) {
         Some((v, "")) => Some(v),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::go_unquote;
+
+    /// Finding 1 (code review round 1): byte-escape semantics match Go
+    /// `strconv.Unquote` — `\xHH` is a raw BYTE, so a multibyte UTF-8
+    /// sequence spelled byte-by-byte decodes to ONE character (Go:
+    /// `strconv.Unquote("\"\\xe4\\xb8\\x96\"")` == `"世"`), never three
+    /// mojibake code points.
+    #[test]
+    fn go_unquote_hex_escapes_are_raw_bytes_multibyte_sequences_decode_as_utf8() {
+        assert_eq!(go_unquote(r#""\xe4\xb8\x96""#).unwrap(), "世");
+        assert_eq!(go_unquote(r#""\x41\x42""#).unwrap(), "AB");
+        // Bytes that do NOT form valid UTF-8 are a loud error (documented
+        // narrowing vs Go's arbitrary-byte strings).
+        assert!(go_unquote(r#""\xff""#).unwrap_err().contains("UTF-8"));
+    }
+
+    /// Octal escapes are raw bytes too (Go: `"\101\102"` == `"AB"`,
+    /// `"\344\270\226"` == `"世"`), and out-of-range octal (> `\377`) is
+    /// a syntax error exactly like Go's `v > 255` check — never accepted
+    /// as a widened code point.
+    #[test]
+    fn go_unquote_octal_escapes_are_raw_bytes_and_reject_values_above_255() {
+        assert_eq!(go_unquote(r#""\101\102""#).unwrap(), "AB");
+        assert_eq!(go_unquote(r#""\344\270\226""#).unwrap(), "世");
+        assert!(go_unquote(r#""\400""#).unwrap_err().contains("377"));
+        assert!(go_unquote(r#""\777""#).unwrap_err().contains("377"));
+    }
+
+    /// `\u`/`\U` stay CODE-POINT escapes (Go multibyte=true path), and
+    /// the raw/simple forms round-trip.
+    #[test]
+    fn go_unquote_unicode_escapes_are_code_points_and_raw_strings_pass_through() {
+        assert_eq!(go_unquote(r#""世""#).unwrap(), "世");
+        assert_eq!(go_unquote(r#""\U0001F600""#).unwrap(), "😀");
+        assert_eq!(go_unquote("`a\\n b`").unwrap(), "a\\n b");
+        assert_eq!(go_unquote(r#""a\tb\"c""#).unwrap(), "a\tb\"c");
     }
 }

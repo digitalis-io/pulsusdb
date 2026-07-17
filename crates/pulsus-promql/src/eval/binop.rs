@@ -105,25 +105,29 @@ pub fn vector_scalar(
                 (s.v, scalar)
             };
             // Issue #37: a filter-mode comparison (no `bool`) passes the
-            // matched element's value — and `__name__` — through verbatim
-            // (captured: `up > 0` keeps `__name__`); arithmetic and
+            // matched element through verbatim (`__name__` AND its own
+            // `drop_name` — upstream `VectorscalarBinop` copies
+            // `lhsSample` and only overwrites `F`); arithmetic and
             // `bool`-mode comparisons both **compute** a new value, so
-            // both drop `__name__` (captured: `up * 2`, `up > bool 0`).
-            let (v, metric_name) = if op.is_comparison() {
+            // both drop `__name__` — under the delayed model (issue #86)
+            // that is a RETAINED name + `DropName = true` (engine.go:3410
+            // `changesMetricSchema(op) || returnBool`), nulled terminally.
+            let (v, metric_name, drop_name) = if op.is_comparison() {
                 let keep = apply_compare(op, l, r);
                 if bool_modifier {
-                    (f64::from(keep), None)
+                    (f64::from(keep), s.metric_name.clone(), true)
                 } else if keep {
-                    (s.v, s.metric_name.clone())
+                    (s.v, s.metric_name.clone(), s.drop_name)
                 } else {
                     return None;
                 }
             } else {
-                (apply_arith(op, l, r), None)
+                (apply_arith(op, l, r), s.metric_name.clone(), true)
             };
             Some(InstantSample {
                 labels: s.labels.clone(),
                 metric_name,
+                drop_name,
                 t_ms: s.t_ms,
                 v,
             })
@@ -313,33 +317,48 @@ fn emit_pair(
         (apply_arith(ctx.op, vl, vr), true)
     };
 
-    // resultMetric: `dropMetricName || changesMetricSchema(op)` deletes
-    // the name FIRST (plan v2 D2: `!is_comparison(op) || bool` — a filter
-    // comparison keeps the many-side name), then the one-to-one
-    // `on`/`ignoring` reduction (one-to-one ONLY — the many side's labels
-    // pass through whole under `group_*`), then the include-label copy
-    // from the one side (which may re-set `__name__` via the metric-name
-    // channel).
-    let drop_name = !ctx.op.is_comparison() || ctx.bool_modifier;
+    // resultMetric under the delayed model (issue #86, pinned
+    // engine.go:3246/:3331): `dropMetricName` is `!delayed && returnBool`
+    // — always false for us — so the IMMEDIATE name+metadata deletion
+    // (`schema.Metadata{}.SetToLabels`) fires iff `changesMetricSchema
+    // (op)` = arithmetic (atan2 included). This is the one construct
+    // whose name really is gone mid-tree (a downstream `__name__` read
+    // sees empty); comparisons — filter AND `bool` — retain it, subject
+    // to the one-to-one `Keep(on)`/`Del(ignoring)` reduction (one-to-one
+    // ONLY — the many side's labels pass through whole under `group_*`),
+    // then the include-label copy from the one side (which may re-set
+    // `__name__` via the metric-name channel). The output's DELAYED
+    // verdict is `DropName: returnBool` (engine.go:3279) — `bool`-mode
+    // output drops terminally; a filter comparison's does not.
+    let immediate_drop = !ctx.op.is_comparison();
+    let drop_name = ctx.bool_modifier;
     let one_to_one = ctx.include.is_none();
     let (mut labels, mut metric_name) = if one_to_one {
         // `Keep(on)`/`Del(ignoring)` over the ls labels == the signature's
         // ordinary-label reduction; `__name__` survives iff it survives
         // the same reduction (`name_kept`).
-        let name = if drop_name || !name_kept(ctx.matching) {
+        let name = if immediate_drop || !name_kept(ctx.matching) {
             None
         } else {
             ls.metric_name.clone()
         };
         (key.0.clone(), name)
     } else {
-        let name = if drop_name {
+        let name = if immediate_drop {
             None
         } else {
             ls.metric_name.clone()
         };
         (ls.labels.clone(), name)
     };
+    if immediate_drop {
+        // `Metadata{}.SetToLabels` deletes `__type__`/`__unit__` too —
+        // the single metadata drop that stays eager under delayed
+        // removal (see `eval::METADATA_LABEL_KEYS`'s doc).
+        labels
+            .0
+            .retain(|(k, _)| !super::METADATA_LABEL_KEYS.contains(&k.as_str()));
+    }
     if let Some(include) = ctx.include {
         for ln in include {
             if ln == "__name__" {
@@ -386,6 +405,7 @@ fn emit_pair(
         state.out.push(InstantSample {
             labels,
             metric_name,
+            drop_name,
             t_ms: ls.t_ms,
             v: value,
         });
@@ -457,6 +477,9 @@ fn synthetic_fill_sample(key: &MatchKey, other: &InstantSample, fill: f64) -> In
         } else {
             None
         },
+        // A fresh synthetic sample (upstream constructs a default
+        // `Sample{Metric, F}`) — never drop-marked of its own accord.
+        drop_name: false,
         t_ms: other.t_ms,
         v: fill,
     }
@@ -591,6 +614,7 @@ mod tests {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             metric_name: Some("test_metric".to_string()),
+            drop_name: false,
             t_ms: 0,
             v,
         }
@@ -603,6 +627,7 @@ mod tests {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             metric_name: Some(name.to_string()),
+            drop_name: false,
             t_ms: 0,
             v,
         }
@@ -773,11 +798,15 @@ mod tests {
 
     // --- issue #37: `__name__` keep/drop rule ---
 
+    /// Delayed model (issue #86): the IMMEDIATE output retains the name
+    /// with `drop_name: true`; `evaluate()`'s terminal cleanup nulls it
+    /// (the end-to-end drop assertions live in `eval::tests`).
     #[test]
-    fn vector_scalar_arithmetic_drops_metric_name() {
+    fn vector_scalar_arithmetic_retains_name_and_marks_drop() {
         let vector = vec![sample(&[("job", "a")], 2.0)];
         let out = vector_scalar(BinOp::Mul, false, &vector, 10.0, false);
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(out[0].drop_name);
     }
 
     #[test]
@@ -785,13 +814,34 @@ mod tests {
         let vector = vec![sample(&[("job", "a")], 5.0)];
         let out = vector_scalar(BinOp::Gt, false, &vector, 3.0, false);
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(!out[0].drop_name, "a filter pass-through is not a drop");
     }
 
+    /// Review round 1 gap (b): a filter comparison passes the input's
+    /// ALREADY-TRUE verdict through verbatim (upstream copies
+    /// `lhsSample`, engine.go:3410 only ever SETS the flag) — forcing
+    /// `drop_name: false` here would resurrect a name `rate` had
+    /// already marked for dropping.
     #[test]
-    fn vector_scalar_bool_comparison_drops_metric_name() {
+    fn vector_scalar_filter_comparison_propagates_an_already_true_drop_verdict() {
+        let mut marked = sample(&[("job", "a")], 5.0);
+        marked.drop_name = true; // e.g. the immediate output of rate()
+        let out = vector_scalar(BinOp::Gt, false, &[marked], 3.0, false);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(
+            out[0].drop_name,
+            "the input's drop verdict must survive a filter pass-through"
+        );
+    }
+
+    /// Delayed model (issue #86): `bool` mode retains + marks.
+    #[test]
+    fn vector_scalar_bool_comparison_retains_name_and_marks_drop() {
         let vector = vec![sample(&[("job", "a")], 5.0)];
         let out = vector_scalar(BinOp::Gt, true, &vector, 3.0, false);
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(out[0].drop_name);
     }
 
     #[test]
@@ -810,12 +860,16 @@ mod tests {
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
     }
 
+    /// Delayed model (issue #86): vector-vector `bool` retains + marks
+    /// (upstream `Sample{…, DropName: returnBool}`, engine.go:3279) —
+    /// only vector-vector ARITHMETIC deletes the name immediately.
     #[test]
-    fn vector_vector_bool_comparison_drops_metric_name() {
+    fn vector_vector_bool_comparison_retains_name_and_marks_drop() {
         let lhs = vec![sample(&[("job", "a")], 5.0)];
         let rhs = vec![sample(&[("job", "a")], 3.0)];
         let out = vv(BinOp::Gt, true, &ignoring_default(), &lhs, &rhs).unwrap();
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(out[0].drop_name);
     }
 
     // --- issue #37 code-review finding 3: `name_kept` (the exact
@@ -1179,6 +1233,9 @@ mod tests {
 
     /// atan2 is arithmetic-class: elementwise `l.atan2(r)`, `__name__`
     /// dropped, one-to-one label reduction like every arithmetic op.
+    /// Delayed model (issue #86): the vector-vector form deletes the name
+    /// IMMEDIATELY (`resultMetric`/`changesMetricSchema`); the
+    /// vector-scalar form retains it with `drop_name: true`.
     #[test]
     fn atan2_is_elementwise_and_drops_the_metric_name() {
         let lhs = vec![named_sample("foo", &[("job", "a")], 10.0)];
@@ -1187,9 +1244,11 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 10.0_f64.atan2(100.0));
         assert_eq!(out[0].metric_name, None);
+        assert!(!out[0].drop_name);
         let out = vector_scalar(BinOp::Atan2, false, &lhs, 2.0, false);
         assert_eq!(out[0].v, 10.0_f64.atan2(2.0));
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("foo"));
+        assert!(out[0].drop_name);
     }
 
     // --- group_left/group_right ---
@@ -1306,7 +1365,9 @@ mod tests {
         assert_eq!(out[0].v, 100.0);
         assert_eq!(out[0].labels.get("o"), Some("t"));
 
-        // requests < bool on(s) group_left(o) limits — bool drops.
+        // requests < bool on(s) group_left(o) limits — bool drops
+        // (delayed, issue #86: retained name + drop_name mark; nulled
+        // terminally).
         let out = vv_group(
             BinOp::Lt,
             true,
@@ -1316,12 +1377,13 @@ mod tests {
             &one,
         )
         .unwrap();
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("requests"));
+        assert!(out[0].drop_name);
         assert_eq!(out[0].v, 1.0);
         assert_eq!(
             out[0].labels.get("o"),
             Some("t"),
-            "include applied after drop"
+            "include applied alongside the drop mark"
         );
 
         // limits > on(s) group_right(o) requests — filter keeps the MANY
@@ -1339,7 +1401,8 @@ mod tests {
         assert_eq!(out[0].metric_name.as_deref(), Some("requests"));
         assert_eq!(out[0].v, 1000.0, "filter passes the source-lhs value");
 
-        // limits > bool on(s) group_right(o) requests — bool drops.
+        // limits > bool on(s) group_right(o) requests — bool drops
+        // (delayed: many-side name retained + marked).
         let out = vv_group(
             BinOp::Gt,
             true,
@@ -1349,7 +1412,8 @@ mod tests {
             &many,
         )
         .unwrap();
-        assert_eq!(out[0].metric_name, None);
+        assert_eq!(out[0].metric_name.as_deref(), Some("requests"));
+        assert!(out[0].drop_name);
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -1478,10 +1542,13 @@ mod tests {
         );
     }
 
-    /// Plan v2 D2: the duplicate-output identity hashes on the full
+    /// Plan v2 D2 (revised by issue #86's delayed model): the
+    /// duplicate-output identity hashes on the full
     /// `(Labels, metric_name)` split — two outputs sharing labels but
-    /// differing in kept metric name are NOT duplicates (filter mode);
-    /// dropping the names (bool) makes them collide.
+    /// differing in RETAINED metric name are never mid-tree duplicates,
+    /// in `bool` mode too (upstream `insertSig = metric.Hash()` over the
+    /// still-retained name); the `bool`-mode collision now surfaces at
+    /// the TERMINAL cleanup instead, once both names are nulled.
     #[test]
     fn duplicate_output_identity_hashes_on_labels_and_metric_name_both() {
         // Two many-side samples, same labels, different names (a legal
@@ -1502,8 +1569,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.len(), 2);
-        // bool mode drops both names -> identical identities -> error.
-        let err = vv_group(
+        // bool mode RETAINS both names mid-tree (drop-marked) -> still
+        // distinct identities -> Ok here...
+        let out = vv_group(
             BinOp::Gt,
             true,
             &on(&["job"]),
@@ -1511,10 +1579,16 @@ mod tests {
             &many,
             &one,
         )
-        .unwrap_err();
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|s| s.drop_name && s.metric_name.is_some()));
+        // ...and the collision surfaces at the terminal cleanup, once the
+        // retained names are nulled (upstream cleanupMetricLabels).
+        let err = super::super::finalize_metadata_labels(crate::value::QueryValue::Vector(out))
+            .unwrap_err();
         assert!(
             err.to_string()
-                .contains("grouping labels must ensure unique matches"),
+                .contains("vector cannot contain metrics with the same labelset"),
             "got {err}"
         );
     }
@@ -1867,6 +1941,7 @@ mod tests {
         let many = vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "a".to_string())]),
             metric_name: None,
+            drop_name: false,
             t_ms: 0,
             v: 1.0,
         }];
@@ -1874,12 +1949,14 @@ mod tests {
             InstantSample {
                 labels: Labels::new(vec![("z".to_string(), "a".to_string())]),
                 metric_name: None,
+                drop_name: false,
                 t_ms: 0,
                 v: 1.0,
             },
             InstantSample {
                 labels: Labels::new(vec![("z".to_string(), "b".to_string())]),
                 metric_name: None,
+                drop_name: false,
                 t_ms: 0,
                 v: 2.0,
             },

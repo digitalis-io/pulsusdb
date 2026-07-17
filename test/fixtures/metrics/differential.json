@@ -115,6 +115,12 @@
     { "expr": "requests_total{run_id=\"{R}\"} unless on(instance, run_id) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
     { "expr": "mem_usage_bytes{run_id=\"{R}\"} / on(service, run_id) group_left max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
     { "expr": "mem_usage_bytes{run_id=\"{R}\"} * on(service, run_id) group_left(team) label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
-    { "expr": "label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\") * on(service, run_id) group_right(team) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] }
+    { "expr": "label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\") * on(service, run_id) group_right(team) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+
+    { "expr": "sum by(__name__)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
+    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} or rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]))", "modes": ["instant", "range"] },
+    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\"} or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-2\"} * 1))", "modes": ["instant", "range"] },
+    { "expr": "(mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} > 200000150) or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} * 1)", "modes": ["instant", "range"] },
+    { "expr": "sum by(__name__)(label_replace(rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]) or delta(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}[5m]), \"__name__\", \"$1\", \"__name__\", \"(.+)\"))", "modes": ["instant", "range"] }
   ]
 }

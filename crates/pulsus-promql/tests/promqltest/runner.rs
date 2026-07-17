@@ -215,6 +215,13 @@ pub struct DirectiveCounts {
     pub eval_fail: usize,
     pub fail_message: usize,
     pub fail_regexp: usize,
+    /// Block-form `expect fail` directives (issue #86) — counted apart
+    /// from the `eval_fail` prefix form.
+    pub expect_fail: usize,
+    /// `expect fail` lines carrying an inline `msg:`/`regex:` tail.
+    pub expect_fail_tagged: usize,
+    /// `expect string` directives (issue #86).
+    pub expect_string: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +263,14 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                 }
                 match cmd.mode {
                     EvalMode::Ordered => counts.eval_ordered += 1,
+                    EvalMode::Fail if cmd.expect_fail => {
+                        counts.expect_fail += 1;
+                        if let Expected::Fail { message, regexp } = &cmd.expected
+                            && (message.is_some() || regexp.is_some())
+                        {
+                            counts.expect_fail_tagged += 1;
+                        }
+                    }
                     EvalMode::Fail => {
                         counts.eval_fail += 1;
                         if let Expected::Fail { message, regexp } = &cmd.expected {
@@ -268,6 +283,9 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                         }
                     }
                     EvalMode::Pass => {}
+                }
+                if cmd.expect_string {
+                    counts.expect_string += 1;
                 }
                 cases.push(run_eval(&storage, cmd)?);
             }
@@ -377,6 +395,23 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
             format!("eval_fail expected an error but the query succeeded with {v:?}"),
         )),
         (_, Err(err_text)) => Ok((false, format!("query errored: {err_text}"))),
+        // `expect string` (issue #86): exact string comparison — no
+        // epsilon, no normalization (upstream compares the unquoted
+        // literal against the `promql.String` value verbatim).
+        (Expected::String(want), Ok(QueryValue::String(got))) => {
+            if *want == got {
+                Ok((true, String::new()))
+            } else {
+                Ok((
+                    false,
+                    format!("string mismatch: got {got:?}, want {want:?}"),
+                ))
+            }
+        }
+        (Expected::String(want), Ok(other)) => Ok((
+            false,
+            format!("expected string {want:?}, got non-string {other:?}"),
+        )),
         (Expected::Scalar(want), Ok(QueryValue::Scalar(got))) => {
             if almost_equal(*want, got) {
                 Ok((true, String::new()))

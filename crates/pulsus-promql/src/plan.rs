@@ -652,6 +652,16 @@ pub enum PlanExpr {
         arg: Box<PlanExpr>,
     },
     Scalar(f64),
+    /// Issue #86 (M6-08d): a **top-level** string-literal query (`"Foo"`,
+    /// `("Foo")` — parens are transparent). Only ever the plan ROOT:
+    /// [`plan`] lifts it before `plan_expr` runs, so no other variant can
+    /// contain one; nested string literals stay routed through the
+    /// dedicated string-argument extractors (`plan_string_arg`) and are
+    /// otherwise rejected by `plan_expr` exactly as before. Instant
+    /// queries only — upstream rejects a string-typed range query
+    /// ("invalid expression type ... for range query"), mirrored as a
+    /// plan-time rejection.
+    StringLiteral(String),
 }
 
 /// A parsed query, planned against `params`.
@@ -808,6 +818,32 @@ impl Planner {
 
 /// Plans `expr` into a [`QueryPlan`] against `params`.
 pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
+    // Issue #86 (M6-08d): a TOP-LEVEL string literal is a valid instant
+    // query (`"Foo"` → `resultType:"string"`; the vendored
+    // `literals.test` `expect string` cases). Lifted here — before
+    // `plan_expr`, which keeps rejecting nested string literals — with
+    // parens stripped (upstream's parser treats them as transparent).
+    // Range queries stay rejected: upstream errors with `invalid
+    // expression type "string" for range query` at query construction.
+    {
+        let mut stripped = expr;
+        while let Expr::Paren(p) = stripped {
+            stripped = &p.expr;
+        }
+        if let Expr::StringLiteral(s) = stripped {
+            if params.step_ms != 0 {
+                return Err(unsupported(
+                    "invalid expression type \"string\" for range query",
+                ));
+            }
+            return Ok(QueryPlan {
+                root: PlanExpr::StringLiteral(s.val.clone()),
+                selectors: Vec::new(),
+                params,
+            });
+        }
+    }
+
     let mut planner = Planner {
         selectors: Vec::new(),
         experimental: params.experimental_functions,
@@ -2061,6 +2097,11 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
         Expr::Binary(bin) => plan_binary(planner, bin),
         Expr::Paren(p) => plan_expr(planner, &p.expr),
         Expr::NumberLiteral(n) => Ok(PlanExpr::Scalar(n.val)),
+        // A NESTED string literal (issue #86): the top-level form is
+        // lifted by `plan` itself before this walker runs, and every
+        // legitimate nested string position (function label/regex
+        // arguments) routes through `plan_string_arg` — anything reaching
+        // here (`"a" + 1`, `sum("x")`, …) is genuinely unplannable.
         Expr::StringLiteral(_) => Err(unsupported("string literal")),
         // Issue #83 (adjudicated fold from the M6-08 split): unary minus
         // desugars to `0 - operand` — upstream semantics exactly (unary
@@ -3413,6 +3454,33 @@ mod tests {
                 "{query}: expected the upstream resolve-time message"
             );
         }
+    }
+
+    /// Issue #86 (M6-08d, AC4): a TOP-LEVEL string literal plans (was a
+    /// blanket `unsupported`), parens transparently; a NESTED string
+    /// literal stays rejected; a string-typed RANGE query is a plan-time
+    /// rejection (upstream's "invalid expression type" check).
+    #[test]
+    fn top_level_string_literals_plan_and_nested_or_range_forms_stay_rejected() {
+        for query in ["\"x\"", "(\"x\")", "((`x`))"] {
+            let p = plan(&parse(query).unwrap(), params()).unwrap();
+            assert_eq!(p.root, PlanExpr::StringLiteral("x".to_string()), "{query}");
+            assert!(p.selectors.is_empty(), "{query}: no selectors");
+        }
+        // A nested string literal never even reaches `plan_expr`'s
+        // rejection arm through `parse()` — the vendored parser
+        // type-checks it out first (the arm stays as defense in depth).
+        assert!(parse("\"a\" + 1").is_err());
+        let err = plan(
+            &parse("\"x\"").unwrap(),
+            PlanParams {
+                end_ms: 60_000,
+                step_ms: 60_000,
+                ..params()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("range query"), "{err}");
     }
 
     /// #84 review round 1: parenthesised/unary-signed numeric literals

@@ -1,12 +1,12 @@
 {
-  "_comment": "Issue #64 plan v2 \u03942: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Homes: expect/eval_warn/eval_info annotation-and-error assertion lines and @st start-timestamp lines -> M6-08 (language completion); load_with_nhcb and {{...}} native-histogram sample literals -> #22 (M7). The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest.",
+  "_comment": "Issue #64 plan v2 \u03942: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Homes (issue #86, M6-08d split the expect family): the still-deferred expect forms (warn/no_warn/info/no_info annotation lines, expect ordered, expect range vector), eval_warn/eval_info, and @st start-timestamp lines -> #22; load_with_nhcb and {{...}} native-histogram sample literals -> #22 (M7). expect fail and expect string are EXECUTABLE since #86 (literals/collision/name_label_dropping activated). The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest.",
   "files": [
     {
       "file": "aggregators.test",
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -15,20 +15,11 @@
       ]
     },
     {
-      "file": "collision.test",
-      "blocking_directives": [
-        {
-          "directive": "expect",
-          "activation_issue": "M6-08"
-        }
-      ]
-    },
-    {
       "file": "extended_vectors.test",
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -41,7 +32,7 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -54,7 +45,7 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "load_with_nhcb",
@@ -70,10 +61,6 @@
       "file": "info.test",
       "blocking_directives": [
         {
-          "directive": "expect",
-          "activation_issue": "M6-08"
-        },
-        {
           "directive": "native-histogram-value",
           "activation_issue": "#22"
         }
@@ -84,7 +71,7 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -93,29 +80,11 @@
       ]
     },
     {
-      "file": "literals.test",
-      "blocking_directives": [
-        {
-          "directive": "expect",
-          "activation_issue": "M6-08"
-        }
-      ]
-    },
-    {
-      "file": "name_label_dropping.test",
-      "blocking_directives": [
-        {
-          "directive": "expect",
-          "activation_issue": "M6-08"
-        }
-      ]
-    },
-    {
       "file": "operators.test",
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "load_with_nhcb",
@@ -132,7 +101,7 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -145,7 +114,7 @@
       "blocking_directives": [
         {
           "directive": "@st",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",
@@ -158,7 +127,7 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "M6-08"
+          "activation_issue": "#22"
         },
         {
           "directive": "native-histogram-value",

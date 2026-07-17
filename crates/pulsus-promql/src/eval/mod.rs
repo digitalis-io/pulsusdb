@@ -37,10 +37,14 @@ use crate::value::{InstantSample, Labels, QueryValue, RangeSeries, Sample, Serie
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
 /// whole query (instant, or every range-query step) has been evaluated.
+/// `String` (issue #86, M6-08d) only ever appears at the plan ROOT
+/// (`plan` lifts top-level string literals and rejects string-typed range
+/// queries), so no nested `eval_step` arm ever sees it.
 #[derive(Debug, Clone)]
 enum StepValue {
     Vector(Vec<InstantSample>),
     Scalar(f64),
+    String(String),
 }
 
 /// The FULL upstream series identity (plan v3 Δ5): the kept metric name
@@ -87,6 +91,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
         )? {
             StepValue::Vector(v) => QueryValue::Vector(v),
             StepValue::Scalar(s) => QueryValue::Scalar(s),
+            StepValue::String(s) => QueryValue::String(s),
         };
         return Ok((finalize_metadata_labels(value)?, inner_evals));
     }
@@ -110,7 +115,19 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
     // full identity at disjoint step times still merge into one output
     // series (they never coexist at a step; the per-step duplicate check
     // in `eval::labels` errors when they do overlap).
-    let mut vector_points: HashMap<SeriesIdentity, Vec<(i64, f64)>> = HashMap::new();
+    //
+    // Issue #86 (plan v2 Δ1): `drop_name` is deliberately NOT part of the
+    // identity key — it is LATCHED at the identity's first evaluated step
+    // and never updated (upstream `rangeEval`, engine.go ~:1556-1565: the
+    // `seriess[h]` else-branch sets `DropName` at series creation; the
+    // `ok` append-branch never touches it). `(m > 0) or (m + 1)`
+    // legitimately alternates the per-step verdict for ONE identity (the
+    // filter comparison keeps, the arithmetic drops), and upstream's
+    // answer is whichever branch produced the first step. Folding
+    // `drop_name` into the key instead would split that series into a
+    // kept half and a dropped half with DIFFERENT post-strip labelsets —
+    // two output series where upstream has one.
+    let mut vector_points: HashMap<SeriesIdentity, (bool, Vec<(i64, f64)>)> = HashMap::new();
     let mut scalar_points: Vec<(i64, f64)> = Vec::new();
     let mut saw_vector = false;
     let mut saw_scalar = false;
@@ -131,18 +148,30 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
                     let InstantSample {
                         labels,
                         metric_name,
+                        drop_name,
                         t_ms: _,
                         v: value,
                     } = s;
                     vector_points
                         .entry((metric_name, labels))
-                        .or_default()
+                        // First step wins (the latch): later inserts only
+                        // append points.
+                        .or_insert_with(|| (drop_name, Vec::new()))
+                        .1
                         .push((t, value));
                 }
             }
             StepValue::Scalar(v) => {
                 saw_scalar = true;
                 scalar_points.push((t, v));
+            }
+            // Unreachable through `plan()`: string-typed range queries
+            // are rejected at plan time (defense in depth, the scalar-
+            // subquery precedent).
+            StepValue::String(_) => {
+                return Err(PromqlError::Unsupported {
+                    construct: "string literal in a range query".to_string(),
+                });
             }
         }
         t += p.step_ms;
@@ -153,6 +182,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
             QueryValue::Matrix(vec![RangeSeries {
                 labels: Labels::default(),
                 metric_name: None,
+                drop_name: false,
                 points: scalar_points,
             }]),
             inner_evals,
@@ -161,9 +191,10 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
 
     let mut out: Vec<RangeSeries> = vector_points
         .into_iter()
-        .map(|((metric_name, labels), points)| RangeSeries {
+        .map(|((metric_name, labels), (drop_name, points))| RangeSeries {
             labels,
             metric_name,
+            drop_name,
             points,
         })
         .collect();
@@ -186,48 +217,63 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
 /// covers alongside `__name__` (`schema/labels.go` at the pinned v3.13.0
 /// SHA). `__name__` itself is carried outside [`Labels`] by construction
 /// (`InstantSample::metric_name`), so only these two ever appear in a
-/// label vector.
-const METADATA_LABEL_KEYS: [&str; 2] = ["__type__", "__unit__"];
+/// label vector. `pub(crate)` since issue #86: [`binop::emit_pair`] ports
+/// upstream `resultMetric`'s IMMEDIATE metadata deletion for
+/// vector-vector arithmetic (the one metadata drop that is unconditional
+/// even under delayed removal — `schema.Metadata{}.SetToLabels` runs
+/// whenever `changesMetricSchema(op)`, engine.go:3349).
+pub(crate) const METADATA_LABEL_KEYS: [&str; 2] = ["__type__", "__unit__"];
 
-/// Removes `__type__`/`__unit__` from `labels` iff the series' name was
-/// dropped (`metric_name.is_none()`) — the PROM-39 metadata drop, unified
-/// with name removal exactly like upstream's terminal `cleanupMetricLabels`
-/// (`engine.go:4224`): `DropReserved(schema.IsMetadataLabel)` for every
-/// series with `DropName` set. Our eager `metric_name == None` verdict is
-/// the `DropName` proxy.
+/// Removes `__type__`/`__unit__` from `labels` iff the series' name is
+/// dropped (`drop_name == true` — issue #86, M6-08d: the explicit delayed
+/// verdict replacing 08c's `metric_name == None` proxy) — the PROM-39
+/// metadata drop, unified with name removal exactly like upstream's
+/// terminal `cleanupMetricLabels` (`engine.go:4224`):
+/// `DropReserved(schema.IsMetadataLabel)` for every series with
+/// `DropName` set. Keying on `drop_name` fixes the 08c residual: a
+/// `label_replace` that DELETES `__name__` (an explicit write, not a
+/// drop) now leaves `__type__`/`__unit__` intact, matching upstream.
 ///
-/// **Timing is root-only, deliberately (plan v3 Δ1, adjudicated):** the
-/// corpus oracle runs upstream with `EnableDelayedNameRemoval: true`
+/// **Timing is root-only, deliberately (plan v3 Δ1, adjudicated; #86
+/// makes the delayed model the engine's sole one):** the corpus oracle
+/// runs upstream with `EnableDelayedNameRemoval: true`
 /// (`promql/promqltest/test.go:111`), under which every per-node
 /// `DropReserved` is guarded OFF and the only metadata drop is this
-/// terminal one. Mid-tree, `__type__`/`__unit__` stay in `Labels` so
-/// vector matching/grouping see the full signature — per-node stripping
-/// would provably break `type_and_unit.test:77/92/222/237` (the set-op
-/// signature excludes only `__name__`, `engine.go:1471`). Upstream's LIVE
-/// default is the eager per-node path — a documented divergence recorded
-/// in `function-coverage.json`'s `type-and-unit-labels` rationale,
-/// resolved when #86 (M6-08d) adopts delayed name+metadata removal
-/// together; this function is that seam.
-fn strip_metadata_labels(metric_name: &Option<String>, labels: &mut Labels) {
-    if metric_name.is_none() {
+/// terminal one (the single upstream exception — vector-vector
+/// arithmetic's `resultMetric` deletion — is ported at its own site,
+/// `binop::emit_pair`). Mid-tree, `__type__`/`__unit__` stay in `Labels`
+/// so vector matching/grouping see the full signature — per-node
+/// stripping would provably break `type_and_unit.test:77/92/222/237`
+/// (the set-op signature excludes only `__name__`, `engine.go:1471`).
+/// The e2e differential oracle runs with
+/// `--enable-feature=promql-delayed-name-removal` so live parity is
+/// validated under matching flag state (#86 adjudication).
+fn strip_metadata_labels(drop_name: bool, labels: &mut Labels) {
+    if drop_name {
         labels
             .0
             .retain(|(k, _)| !METADATA_LABEL_KEYS.contains(&k.as_str()));
     }
 }
 
-/// The terminal `cleanupMetricLabels`-equivalent (issue #85 plan v4 Δ1),
-/// applied once to the final assembled [`QueryValue`]: strip metadata
-/// labels per [`strip_metadata_labels`], then resolve post-strip identity
-/// collisions with pinned upstream semantics —
+/// The terminal `cleanupMetricLabels`-equivalent (issue #85 plan v4 Δ1;
+/// re-keyed on `drop_name` by issue #86), applied once to the final
+/// assembled [`QueryValue`]: for every `drop_name == true` element, strip
+/// metadata labels per [`strip_metadata_labels`] AND null the retained
+/// `metric_name` (the load-bearing named contract — `evaluate()`'s final
+/// output carries `None` for dropped series, so the wire consumer
+/// `with_metric_name` and the corpus judge never see a retained
+/// to-be-dropped name), then resolve post-drop identity collisions with
+/// pinned upstream semantics —
 ///
 /// - **instant vector:** a duplicate `(metric_name, Labels)` identity is a
 ///   hard error, `vector cannot contain metrics with the same labelset`
 ///   (upstream `vec.ContainsSameLabelset()` → `errorf`, engine.go:4238);
-/// - **range matrix:** series sharing a post-strip identity **merge** when
+/// - **range matrix:** series sharing a post-drop identity **merge** when
 ///   their timestamps are disjoint, and error with the same message when
 ///   any timestamp overlaps (upstream `mergeSeriesWithSameLabelset`,
-///   engine.go:4252).
+///   engine.go:4252);
+/// - **string/scalar:** passthrough.
 fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError> {
     fn same_labelset_error() -> PromqlError {
         PromqlError::LabelSet {
@@ -236,10 +282,13 @@ fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError
     }
 
     match value {
-        QueryValue::Scalar(_) => Ok(value),
+        QueryValue::Scalar(_) | QueryValue::String(_) => Ok(value),
         QueryValue::Vector(mut v) => {
             for s in &mut v {
-                strip_metadata_labels(&s.metric_name, &mut s.labels);
+                strip_metadata_labels(s.drop_name, &mut s.labels);
+                if s.drop_name {
+                    s.metric_name = None;
+                }
             }
             let mut seen: std::collections::HashSet<(Option<&str>, &Labels)> =
                 std::collections::HashSet::with_capacity(v.len());
@@ -255,7 +304,10 @@ fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError
             let mut by_identity: HashMap<SeriesIdentity, usize> = HashMap::with_capacity(m.len());
             let mut out: Vec<RangeSeries> = Vec::with_capacity(m.len());
             for mut s in m {
-                strip_metadata_labels(&s.metric_name, &mut s.labels);
+                strip_metadata_labels(s.drop_name, &mut s.labels);
+                if s.drop_name {
+                    s.metric_name = None;
+                }
                 let key = (s.metric_name.clone(), s.labels.clone());
                 match by_identity.get(&key) {
                     Some(&i) => {
@@ -300,6 +352,15 @@ struct MaterializedSubquery {
 struct MaterializedSeries {
     labels: Labels,
     metric_name: Option<String>,
+    /// The inner expression's delayed name-removal verdict, latched at
+    /// the identity's first inner-grid step exactly like the outer range
+    /// accumulator (issue #86 plan v2 Δ1) — upstream materializes a
+    /// subquery through the same `rangeEval` seriess accumulation, and
+    /// the consuming range function ORs it in
+    /// (`seriesDropName = dropName || inputDropName`, engine.go:2281):
+    /// `last_over_time(abs(m)[10m:])` must drop the name the inner `abs`
+    /// marked.
+    drop_name: bool,
     samples: Vec<Sample>,
 }
 
@@ -343,7 +404,10 @@ fn prepare_subqueries(
     inner_evals: &mut u64,
 ) -> Result<(), PromqlError> {
     match expr {
-        PlanExpr::Selector(_) | PlanExpr::Scalar(_) | PlanExpr::Time => Ok(()),
+        PlanExpr::Selector(_)
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_)
+        | PlanExpr::Time => Ok(()),
         PlanExpr::RangeFn { source, .. }
         | PlanExpr::OverTime { source, .. }
         | PlanExpr::AbsentOverTime { source } => prepare_source(
@@ -468,8 +532,10 @@ fn prepare_subquery(
     let mint_min = anchor_min - sq.offset_ms - sq.range_ms;
     let grid_start = subquery_grid_start(mint_min, sq.step_ms);
 
-    // Series identity → grid samples, BTreeMap for deterministic order.
-    let mut acc: BTreeMap<SeriesIdentity, Vec<Sample>> = BTreeMap::new();
+    // Series identity → (first-step-latched drop_name, grid samples),
+    // BTreeMap for deterministic order. The latch mirrors the outer range
+    // accumulator's (issue #86 plan v2 Δ1 — see `MaterializedSeries`).
+    let mut acc: BTreeMap<SeriesIdentity, (bool, Vec<Sample>)> = BTreeMap::new();
     if grid_start <= maxt_max {
         // Children first (inside-out): the inner expression's own nested
         // subqueries must be materialized before it can be evaluated. Its
@@ -492,15 +558,16 @@ fn prepare_subquery(
                 StepValue::Vector(v) => {
                     for s in v {
                         acc.entry((s.metric_name, s.labels))
-                            .or_default()
+                            .or_insert_with(|| (s.drop_name, Vec::new()))
+                            .1
                             .push(Sample { t_ms: it, v: s.v });
                     }
                 }
                 // The vendored parser type-checks subqueries as
                 // instant-vector-only; kept total (defense-in-depth).
-                StepValue::Scalar(_) => {
+                StepValue::Scalar(_) | StepValue::String(_) => {
                     return Err(PromqlError::Unsupported {
-                        construct: "subquery over a scalar expression".to_string(),
+                        construct: "subquery over a non-vector expression".to_string(),
                     });
                 }
             }
@@ -510,11 +577,14 @@ fn prepare_subquery(
 
     let series = acc
         .into_iter()
-        .map(|((metric_name, labels), samples)| MaterializedSeries {
-            labels,
-            metric_name,
-            samples,
-        })
+        .map(
+            |((metric_name, labels), (drop_name, samples))| MaterializedSeries {
+                labels,
+                metric_name,
+                drop_name,
+                samples,
+            },
+        )
         .collect();
     // Always insert — an empty grid/result must still satisfy the
     // stepping phase's cache lookup (the at_modifier.test:227-255
@@ -526,10 +596,17 @@ fn prepare_subquery(
 /// One range-vector function input series at one step, already windowed.
 struct WindowedSeries {
     labels: Labels,
-    /// The source's metric name (kept only by `last_over_time`/
-    /// `first_over_time`) — the fetched series' own per-row name (issue
-    /// #85), or the materialized inner series' name for a subquery source.
+    /// The source's RETAINED metric name — the fetched series' own
+    /// per-row name (issue #85), or the materialized inner series' name
+    /// for a subquery source. Under the delayed model (issue #86) every
+    /// range-function output retains it; the verdict is `drop_name`.
     metric_name: Option<String>,
+    /// The input's own delayed verdict (`false` for a selector source —
+    /// a fetched series always keeps its name; the materialized inner
+    /// series' latched verdict for a subquery source). The consuming arm
+    /// ORs the function's verdict in (upstream
+    /// `seriesDropName = dropName || inputDropName`, engine.go:2281).
+    drop_name: bool,
     samples: Vec<Sample>,
 }
 
@@ -568,6 +645,7 @@ fn windowed_range_source(
                     // concrete-name-only fallback the `Selector` arm
                     // documents.
                     metric_name: s.metric_name.clone().or_else(|| sel.metric_name.clone()),
+                    drop_name: false,
                     samples: windowed_non_stale(&s.samples, lower_excl, eff_t),
                 })
                 .collect();
@@ -600,6 +678,7 @@ fn windowed_range_source(
                     WindowedSeries {
                         labels: s.labels.clone(),
                         metric_name: s.metric_name.clone(),
+                        drop_name: s.drop_name,
                         samples: s.samples[start..end].to_vec(),
                     }
                 })
@@ -639,6 +718,11 @@ fn eval_step(
     match expr {
         PlanExpr::Scalar(v) => Ok(StepValue::Scalar(*v)),
 
+        // Issue #86 (M6-08d): a top-level string-literal query — the
+        // literal's value verbatim; the wire timestamp is stamped by the
+        // response encoder (the `Scalar`/`at_ms` precedent).
+        PlanExpr::StringLiteral(s) => Ok(StepValue::String(s.clone())),
+
         // Issue #37: a bare selector returns the **verbatim value of an
         // existing series** — Prometheus keeps `__name__` here (captured:
         // `query.name_selector_keeps_get.json`; PROVENANCE.md's
@@ -675,6 +759,7 @@ fn eval_step(
                             .metric_name
                             .clone()
                             .or_else(|| sel.metric_name.clone()),
+                        drop_name: false,
                         t_ms,
                         v: sample.v,
                     });
@@ -684,10 +769,15 @@ fn eval_step(
         }
 
         // Issue #37: `rate`/`irate`/`increase`/`delta` **compute** a new
-        // value from the windowed samples — Prometheus drops `__name__`
-        // here (captured: `query.name_rate_drops_get.json`). Issue #83:
-        // the source may be a subquery — `windowed_range_source` slices
-        // its step window from the once-materialized union grid.
+        // value from the windowed samples — a name-DROPPING class. Under
+        // the delayed model (issue #86) the input's name is RETAINED with
+        // `drop_name: true` (upstream funcCall wrapper: `seriesDropName =
+        // dropName || inputDropName`, engine.go:2281 — `dropName` is true
+        // for every range function but last/first_over_time), so a
+        // downstream `label_replace(rate(…), …, "__name__", …)` still
+        // reads it; the terminal cleanup nulls it. Issue #83: the source
+        // may be a subquery — `windowed_range_source` slices its step
+        // window from the once-materialized union grid.
         PlanExpr::RangeFn { func, source } => {
             let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
             let mut out = Vec::new();
@@ -701,7 +791,8 @@ fn eval_step(
                 ) {
                     out.push(InstantSample {
                         labels: series.labels,
-                        metric_name: None,
+                        metric_name: series.metric_name,
+                        drop_name: true,
                         t_ms,
                         v,
                     });
@@ -731,10 +822,17 @@ fn eval_step(
                 if let Some(v) = functions::eval_over_time(*func, &series.samples) {
                     out.push(InstantSample {
                         labels: series.labels,
-                        // Selector source: the fetched series' own name
-                        // (issue #85); subquery source: the materialized
-                        // inner series' own kept name (if any).
-                        metric_name: if keeps_name { series.metric_name } else { None },
+                        // Retained name always (issue #86: selector
+                        // source — the fetched series' own name, issue
+                        // #85; subquery source — the materialized inner
+                        // series' name); the verdict is the upstream OR:
+                        // the function's own drop (everything but
+                        // last/first_over_time) OR the input's (a
+                        // subquery whose inner expression dropped —
+                        // `name_label_dropping.test:50`,
+                        // `last_over_time(abs(m)[10m:])`).
+                        metric_name: series.metric_name,
+                        drop_name: !keeps_name || series.drop_name,
                         t_ms,
                         v,
                     });
@@ -791,7 +889,10 @@ fn eval_step(
                 {
                     out.push(InstantSample {
                         labels: series.labels,
-                        metric_name: None,
+                        // Name-dropping class: retained name + verdict
+                        // (issue #86, delayed model).
+                        metric_name: series.metric_name,
+                        drop_name: true,
                         t_ms,
                         v,
                     });
@@ -828,6 +929,7 @@ fn eval_step(
             Ok(StepValue::Vector(vec![InstantSample {
                 labels,
                 metric_name: None,
+                drop_name: false,
                 t_ms,
                 v: 1.0,
             }]))
@@ -859,6 +961,7 @@ fn eval_step(
             Ok(StepValue::Vector(vec![InstantSample {
                 labels,
                 metric_name: None,
+                drop_name: false,
                 t_ms,
                 v: 1.0,
             }]))
@@ -972,7 +1075,15 @@ fn eval_step(
             };
 
             let le_key = "le".to_string();
-            let mut groups: HashMap<Labels, Vec<functions::Bucket>> = HashMap::new();
+            // Group key = the FULL retained identity minus `le` (issue
+            // #86): upstream's bucket signature is
+            // `BytesWithoutLabels(le)` over the whole metric — under the
+            // delayed model that still includes the retained `__name__`
+            // (`excludedLabels` at the pin is `le` alone, quantile.go:51),
+            // so two bucket families sharing non-name labels never merge;
+            // the output retains the group's name with `drop_name: true`
+            // (funcHistogramQuantile, functions.go).
+            let mut groups: HashMap<SeriesIdentity, Vec<functions::Bucket>> = HashMap::new();
             for s in v {
                 let le_str = s
                     .labels
@@ -983,22 +1094,27 @@ fn eval_step(
                 let le: f64 = le_str.parse().map_err(|_| PromqlError::HistogramBucket {
                     detail: format!("invalid 'le' label value: {le_str:?}"),
                 })?;
-                let key = s.labels.without(std::slice::from_ref(&le_key));
+                let key = (
+                    s.metric_name.clone(),
+                    s.labels.without(std::slice::from_ref(&le_key)),
+                );
                 groups
                     .entry(key)
                     .or_default()
                     .push(functions::Bucket { le, count: s.v });
             }
 
-            let mut keys: Vec<Labels> = groups.keys().cloned().collect();
+            let mut keys: Vec<SeriesIdentity> = groups.keys().cloned().collect();
             keys.sort();
             let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 let buckets = groups.remove(&key).expect("key came from groups.keys()");
                 let v = functions::histogram_quantile(q, buckets)?;
+                let (metric_name, labels) = key;
                 out.push(InstantSample {
-                    labels: key,
-                    metric_name: None,
+                    labels,
+                    metric_name,
+                    drop_name: true,
                     t_ms,
                     v,
                 });
@@ -1140,7 +1256,9 @@ fn eval_step(
                 .into_iter()
                 .map(|s| InstantSample {
                     labels: s.labels,
-                    metric_name: None,
+                    // Name-dropping class (issue #86): retained + marked.
+                    metric_name: s.metric_name,
+                    drop_name: true,
                     t_ms,
                     v: match op {
                         Op::Clamp(min, max) => elementwise::clamp(min, max, s.v),
@@ -1199,7 +1317,10 @@ fn eval_step(
             // division truncating toward zero, exactly Rust `i64 /`.
             None => Ok(StepValue::Vector(vec![InstantSample {
                 labels: Labels::default(),
+                // Scalar-derived (the implicit `vector(time())`): a
+                // genuinely nameless element, never a drop verdict.
                 metric_name: None,
+                drop_name: false,
                 t_ms,
                 v: datetime::field(*func, t_ms / 1000),
             }])),
@@ -1219,7 +1340,10 @@ fn eval_step(
                     .into_iter()
                     .map(|s| InstantSample {
                         labels: s.labels,
-                        metric_name: None,
+                        // Name-dropping class (issue #86): retained +
+                        // marked.
+                        metric_name: s.metric_name,
+                        drop_name: true,
                         t_ms,
                         v: datetime::to_unix_secs(s.v)
                             .map(|secs| datetime::field(*func, secs))
@@ -1253,7 +1377,15 @@ fn eval_step(
                     {
                         out.push(InstantSample {
                             labels: series.labels.clone(),
-                            metric_name: None,
+                            // Name-dropping class (issue #86): retained
+                            // (the fetched series' own per-row name, with
+                            // the `Selector` arm's concrete-name
+                            // fallback) + marked.
+                            metric_name: series
+                                .metric_name
+                                .clone()
+                                .or_else(|| sel.metric_name.clone()),
+                            drop_name: true,
                             t_ms,
                             v: sample.t_ms as f64 / 1000.0,
                         });
@@ -1273,7 +1405,10 @@ fn eval_step(
                     .into_iter()
                     .map(|s| InstantSample {
                         labels: s.labels,
-                        metric_name: None,
+                        // Name-dropping class (issue #86): retained +
+                        // marked.
+                        metric_name: s.metric_name,
+                        drop_name: true,
                         t_ms,
                         v: t_ms as f64 / 1000.0,
                     })
@@ -1311,6 +1446,7 @@ fn eval_step(
             Ok(StepValue::Vector(vec![InstantSample {
                 labels: Labels::default(),
                 metric_name: None,
+                drop_name: false,
                 t_ms,
                 v: s,
             }]))
@@ -1368,6 +1504,11 @@ fn eval_step(
                 (StepValue::Vector(l), StepValue::Vector(r)) => Ok(StepValue::Vector(
                     binop::vector_vector(*op, *bool_modifier, matching, group, fill, &l, &r)?,
                 )),
+                // Unreachable through `plan()`: a string literal only ever
+                // plans as the ROOT (defense in depth, issue #86).
+                _ => Err(PromqlError::Unsupported {
+                    construct: "binary operator over a string operand".to_string(),
+                }),
             }
         }
 
@@ -3105,10 +3246,10 @@ mod tests {
             ])
         };
         let mut kept = build();
-        strip_metadata_labels(&Some("m".to_string()), &mut kept);
+        strip_metadata_labels(false, &mut kept);
         assert_eq!(kept, build(), "kept name ⇒ metadata labels stay");
         let mut dropped = build();
-        strip_metadata_labels(&None, &mut dropped);
+        strip_metadata_labels(true, &mut dropped);
         assert_eq!(
             dropped,
             Labels::new(vec![("job".to_string(), "api".to_string())]),
@@ -3264,6 +3405,248 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "vector cannot contain metrics with the same labelset"
+        );
+    }
+
+    // --- issue #86 (M6-08d): delayed name removal + string results ---
+
+    /// AC5 / plan v2 Δ2 Class B contract: the IMMEDIATE output of a
+    /// name-dropping function retains the input name with
+    /// `drop_name: true` (so downstream name readers still see it), and
+    /// `evaluate()`'s terminal cleanup nulls it — the load-bearing named
+    /// contract every `metric_name`-reading consumer relies on.
+    #[test]
+    fn a_name_dropping_function_retains_the_name_mid_tree_and_the_final_output_nulls_it() {
+        let expr = crate::parser::parse("abs(up)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, -3.0)])]);
+
+        // Mid-tree (one raw step, before finalize): retained + marked.
+        let step = eval_step(
+            &p.root,
+            &p.selectors,
+            &data,
+            0,
+            crate::plan::DEFAULT_LOOKBACK_MS,
+            &SubqueryCache::default(),
+        )
+        .unwrap();
+        let StepValue::Vector(v) = step else {
+            panic!("expected a vector step");
+        };
+        assert_eq!(v[0].metric_name.as_deref(), Some("up"));
+        assert!(v[0].drop_name);
+
+        // Final output: the terminal cleanup nulls the retained name.
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(v[0].v, 3.0);
+    }
+
+    /// `label_replace` reads the RETAINED (to-be-dropped) name — the
+    /// vendored `name_label_dropping.test:56-65` shapes: rewriting it
+    /// into an ordinary label (name still dropped terminally) and
+    /// re-writing `__name__` itself (drop verdict cleared).
+    #[test]
+    fn label_replace_reads_a_to_be_dropped_name_and_can_preserve_it() {
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1, 0.0), s(60_000, 60.0)])]);
+
+        let expr = crate::parser::parse(
+            r#"label_replace(rate(up[1m]), "my_name", "rate_$1", "__name__", "(.+)")"#,
+        )
+        .unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].labels.get("my_name"), Some("rate_up"));
+        assert_eq!(v[0].metric_name, None, "rate's drop still lands");
+
+        let expr = crate::parser::parse(
+            r#"label_replace(rate(up[1m]), "__name__", "rate_$1", "__name__", "(.+)")"#,
+        )
+        .unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(
+            v[0].metric_name.as_deref(),
+            Some("rate_up"),
+            "an explicit __name__ write clears the drop verdict"
+        );
+    }
+
+    /// The 08c residual, fixed by keying the terminal cleanup on
+    /// `drop_name`: `label_replace` DELETING `__name__` is an explicit
+    /// write (not a drop), so `__type__`/`__unit__` must be RETAINED —
+    /// while a genuine drop (`abs`) strips them.
+    #[test]
+    fn deleting_the_name_via_label_replace_retains_metadata_labels() {
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("__type__", "counter"), ("job", "a")],
+                vec![s(0, 1.0)],
+            )],
+        );
+
+        let expr = crate::parser::parse(r#"label_replace(m, "__name__", "", "", "")"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None, "the name was explicitly deleted");
+        assert_eq!(
+            v[0].labels.get("__type__"),
+            Some("counter"),
+            "an explicit delete is not a drop — metadata stays"
+        );
+
+        let expr = crate::parser::parse("abs(m)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(
+            v[0].labels.get("__type__"),
+            None,
+            "a genuine drop strips metadata"
+        );
+    }
+
+    /// Plan v2 Δ1: the range accumulator LATCHES `drop_name` at an
+    /// identity's first step (upstream `rangeEval`'s seriess else-branch)
+    /// — `(m > 0) or (m + 1)` alternates the per-step verdict for ONE
+    /// identity, and the first step decides the output's name.
+    #[test]
+    fn range_drop_name_latches_at_the_identitys_first_step() {
+        let expr = crate::parser::parse("(m > 0) or (m + 1)").unwrap();
+        let p = plan(&expr, params(0, 300_000, 300_000)).unwrap();
+        // The same series feeds both operand selectors.
+        let make_data = |samples: Vec<Sample>| {
+            let mut data = SeriesData::new();
+            for spec in &p.selectors {
+                data.insert(spec.id, vec![series(1, &[], samples.clone())]);
+            }
+            data
+        };
+
+        // First step passes the filter (drop_name=false latched) ⇒ the
+        // name survives even though the second step came from the
+        // name-dropping arithmetic arm.
+        let data = make_data(vec![s(0, 1.0), s(300_000, -1.0)]);
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "{m:?}");
+                assert_eq!(m[0].metric_name.as_deref(), Some("m"));
+                assert_eq!(m[0].points, vec![(0, 1.0), (300_000, 0.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+
+        // First step comes from the arithmetic arm (drop_name=true
+        // latched) ⇒ the name is nulled for the whole series.
+        let data = make_data(vec![s(0, -1.0), s(300_000, 1.0)]);
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "{m:?}");
+                assert_eq!(m[0].metric_name, None);
+                assert_eq!(m[0].points, vec![(0, 0.0), (300_000, 1.0)]);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// Review round 1 gap (a): the SUBQUERY materialization latches
+    /// `drop_name` at an identity's first inner-grid step, exactly like
+    /// the outer range accumulator — observed through `last_over_time`
+    /// (name-keeping, ORs the input verdict): the inner
+    /// `(m > 0) or (m + 1)` alternates its per-step verdict across the
+    /// grid, and the FIRST grid step decides whether the output keeps
+    /// the name. A per-step fold (or last-step-wins) implementation
+    /// flips one of the two cases.
+    #[test]
+    fn subquery_materialization_latches_drop_name_at_the_first_inner_grid_step() {
+        let expr = crate::parser::parse("last_over_time(((m > 0) or (m + 1))[4m:2m])").unwrap();
+        let p = plan(&expr, params(240_000, 240_000, 0)).unwrap();
+        let make_data = |samples: Vec<Sample>| {
+            let mut data = SeriesData::new();
+            for spec in &p.selectors {
+                data.insert(spec.id, vec![series(1, &[], samples.clone())]);
+            }
+            data
+        };
+
+        // Inner grid = {120s, 240s}. First grid step takes the filter
+        // branch (drop_name=false latched) ⇒ last_over_time's input
+        // verdict is false ⇒ the name survives, even though the LAST
+        // grid step came from the name-dropping arithmetic branch.
+        let data = make_data(vec![s(120_000, 1.0), s(240_000, -1.0)]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name.as_deref(), Some("m"));
+        assert_eq!(
+            v[0].v, 0.0,
+            "last grid point is the arithmetic branch's m+1"
+        );
+
+        // First grid step takes the arithmetic branch (drop_name=true
+        // latched) ⇒ the name drops, even though the LAST grid step was
+        // the name-keeping filter branch.
+        let data = make_data(vec![s(120_000, -1.0), s(240_000, 1.0)]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(
+            v[0].v, 1.0,
+            "last grid point is the filter branch's pass-through"
+        );
+    }
+
+    /// Review round 1 gap (b), end-to-end companion of the binop
+    /// direct-call test: a vector-scalar FILTER comparison over an
+    /// already-drop-marked input (`rate`) propagates the verdict — the
+    /// final output must NOT resurrect the retained name.
+    #[test]
+    fn filter_comparison_over_a_drop_marked_input_still_drops_the_name_terminally() {
+        let expr = crate::parser::parse("rate(up[1m]) > 0").unwrap();
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[], vec![s(1, 0.0), s(60_000, 60.0)])]);
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1, "the comparison passes (rate > 0)");
+        assert_eq!(
+            v[0].metric_name, None,
+            "the filter pass-through carries rate's drop verdict — a forced \
+             drop_name=false would leak the retained name here"
+        );
+    }
+
+    /// AC4: a top-level string literal evaluates to
+    /// [`QueryValue::String`] (parens transparent); nested strings stay
+    /// rejected; string-typed range queries are rejected at plan time.
+    #[test]
+    fn a_top_level_string_literal_evaluates_to_a_string_value() {
+        for query in ["\"Foo\"", "(\"Foo\")"] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            match evaluate(&p, &SeriesData::new()).unwrap() {
+                QueryValue::String(got) => assert_eq!(got, "Foo", "{query}"),
+                other => panic!("{query}: expected String, got {other:?}"),
+            }
+        }
+        let expr = crate::parser::parse("\"\"").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        assert_eq!(
+            evaluate(&p, &SeriesData::new()).unwrap(),
+            QueryValue::String(String::new())
+        );
+
+        let expr = crate::parser::parse("\"Foo\"").unwrap();
+        let err = plan(&expr, params(0, 60_000, 60_000)).unwrap_err();
+        assert!(
+            err.to_string().contains("range query"),
+            "string range queries are a plan-time rejection: {err}"
         );
     }
 }

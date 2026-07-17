@@ -58,17 +58,13 @@ impl GroupKey {
 ///   (upstream deletes `__name__` unconditionally in its without branch);
 /// - no grouping: the single anonymous group.
 ///
-/// **Scoped divergence (issue #69 plan v2 Δ1, recorded on the issue):**
-/// upstream v3.13's *delayed* `__name__` dropping retains the
-/// to-be-dropped name string plus a drop flag, so `sum by(__name__)` over
-/// name-dropped inputs (e.g. `rate(…)`) partitions on the retained
-/// strings and then errors with a duplicate labelset for multiple such
-/// series (`name_label_dropping.test:84`). Our split-name channel stores
-/// `Option<String>` with no retained dropped string, so those inputs
-/// merge under one no-name group instead of erroring. Reproducing that
-/// case needs `or`/drop-flag propagation (M6-07+) and `expect fail`
-/// (M6-08); every reproducible case (`by(__name__)` over named inputs;
-/// single-group computed inputs → `{}`) matches the oracle.
+/// **Issue #86 (M6-08d) resolves the #69-recorded divergence:** under the
+/// delayed model, `metric_name` is the RETAINED name even for
+/// drop-marked inputs, so `by(__name__)` over `rate(…)` now partitions on
+/// the retained strings exactly like upstream — multiple such series
+/// yield distinct drop-marked groups whose post-drop labelsets collide at
+/// the terminal cleanup (`name_label_dropping.test:84`'s `expect fail`).
+/// The group's own verdict is the member OR ([`Acc::drop_name`]).
 fn group_key(s: &InstantSample, grouping: Option<&Grouping>) -> GroupKey {
     match grouping {
         None => GroupKey {
@@ -113,6 +109,15 @@ struct Acc {
     min: f64,
     max: f64,
     count: f64,
+    /// Issue #86 (M6-08d): the group's delayed name-removal verdict — the
+    /// OR of every member's `drop_name` (upstream `groupedAggregation.
+    /// dropName`, "True if any sample in this group has DropName set",
+    /// engine.go:3579; seeded at group creation :3608, OR-folded :3665,
+    /// emitted :3945). Meaningful when `by(__name__)` retained the name
+    /// in the group key: `sum by(__name__)(m or rate(n[5m]))` keeps the
+    /// retained name mid-tree but drops it terminally iff any member was
+    /// drop-marked (`name_label_dropping.test`'s OR-propagation cases).
+    drop_name: bool,
     /// Welford running mean/M2 for `stddev`/`stdvar` (issue #69, M6-06 —
     /// upstream `aggregation()`'s own recurrence, run for EVERY sample
     /// including the first; that exact form is load-bearing for the
@@ -136,10 +141,12 @@ fn aggregate_reduce(
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
             count: 0.0,
+            drop_name: false,
             mean: 0.0,
             m2: 0.0,
             t_ms: s.t_ms,
         });
+        acc.drop_name |= s.drop_name;
         acc.kahan.add(s.v);
         acc.min = acc.min.min(s.v);
         acc.max = acc.max.max(s.v);
@@ -185,6 +192,7 @@ fn aggregate_reduce(
             InstantSample {
                 labels: key.labels,
                 metric_name: key.name,
+                drop_name: acc.drop_name,
                 t_ms: acc.t_ms,
                 v,
             }
@@ -250,14 +258,16 @@ fn aggregate_quantile(
         detail: "quantile requires a quantile parameter".to_string(),
     })?;
 
-    let mut groups: HashMap<GroupKey, (Vec<f64>, i64)> = HashMap::new();
+    // `(values, group drop_name OR — issue #86, the `Acc::drop_name`
+    // rule, t_ms)` per group.
+    let mut groups: HashMap<GroupKey, (Vec<f64>, bool, i64)> = HashMap::new();
     for s in vector {
         let key = group_key(s, grouping);
-        groups
+        let entry = groups
             .entry(key)
-            .or_insert_with(|| (Vec::new(), s.t_ms))
-            .0
-            .push(s.v);
+            .or_insert_with(|| (Vec::new(), false, s.t_ms));
+        entry.0.push(s.v);
+        entry.1 |= s.drop_name;
     }
 
     let mut group_keys: Vec<GroupKey> = groups.keys().cloned().collect();
@@ -265,11 +275,13 @@ fn aggregate_quantile(
 
     let mut out = Vec::with_capacity(group_keys.len());
     for key in group_keys {
-        let (mut values, t_ms) = groups.remove(&key).expect("key came from groups.keys()");
+        let (mut values, drop_name, t_ms) =
+            groups.remove(&key).expect("key came from groups.keys()");
         let v = quantile_of(phi, &mut values);
         out.push(InstantSample {
             labels: key.labels,
             metric_name: key.name,
+            drop_name,
             t_ms,
             v,
         });
@@ -381,6 +393,11 @@ pub fn count_values(
         .map(|(key, (count, t_ms))| InstantSample {
             labels: key.labels,
             metric_name: key.name,
+            // A counted output is a fresh sample, never drop-marked
+            // (upstream `countValues` constructs a default `Sample`) —
+            // its `__name__` channel, when written, was written
+            // explicitly.
+            drop_name: false,
             t_ms,
             v: count,
         })
@@ -461,6 +478,7 @@ mod tests {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             metric_name: Some("test_metric".to_string()),
+            drop_name: false,
             t_ms: 0,
             v,
         }
@@ -669,6 +687,7 @@ mod tests {
         InstantSample {
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             metric_name: name.map(str::to_string),
+            drop_name: false,
             t_ms: 0,
             v,
         }

@@ -1,0 +1,141 @@
+# Issue #86 (M6-08d): hand-authored witnesses for the executable block
+# `expect` directives (`expect fail [msg:|regex:]`, `expect string`),
+# top-level string results, and delayed __name__ removal (retained name +
+# drop verdict, terminal cleanup, first-step range latch).
+
+# --- expect string: double-quote, backtick raw, space-preserving, empty ---
+
+eval instant at 0 "Foo"
+	expect string "Foo"
+
+eval instant at 0 (`Foo`)
+	expect string `Foo`
+
+eval instant at 0 " Foo "
+	expect string " Foo "
+
+eval instant at 0 ("")
+	expect string ""
+
+# --- expect fail: bare, msg:, regex: — all via the delayed-model
+# duplicate-labelset side effect ---
+
+load 5m
+	metric_total{env="1"}	0 60 120
+	other_total{env="1"}	60 120 180
+
+# Aggregating by the retained (to-be-dropped) names yields two groups
+# whose post-drop labelsets collide at the terminal cleanup.
+eval instant at 10m sum by (__name__) (rate({env="1"}[10m]))
+	expect fail
+
+eval instant at 10m sum by (__name__) (ceil({env="1"}))
+	expect fail msg:vector cannot contain metrics with the same labelset
+
+# A name-dropping function over two same-labelset metrics collides
+# directly (no aggregation involved).
+eval instant at 10m ceil({env="1"})
+	expect fail regex:same labelset
+
+# A subquery inner drop is respected by the name-keeping last_over_time
+# (input drop-verdict OR).
+eval instant at 10m last_over_time(abs(metric_total{env="1"})[10m:])
+	{env="1"} 120
+
+clear
+
+# --- OR name-propagation + aggregation drop-flag propagation ---
+
+load 1m
+	metric_total{env="1"} 0+1x10
+	metric_total{env="2"} 0+3x10
+
+# No dropping construct: the retained name survives by(__name__).
+eval instant at 10m sum by (__name__) (metric_total{env="1"})
+	metric_total 10
+
+# Any drop-marked member drops the whole group's name.
+eval instant at 10m sum by (__name__) (metric_total{env="1"} or rate(metric_total{env="2"}[5m]))
+	{} 10.05
+
+eval instant at 10m sum by (__name__) (rate(metric_total{env="2"}[5m]) or metric_total{env="1"})
+	{} 10.05
+
+# Non-matching drop-marked side: the surviving side decides.
+eval instant at 10m sum by (__name__) (rate(metric_total{env="3"}[5m]) or metric_total{env="1"})
+	metric_total 10
+
+# topk passes the group's drop flag through verbatim.
+eval instant at 10m topk(10, sum by (__name__, env) (rate(metric_total{env="2"}[5m])))
+	{env="2"} 0.05
+
+# --- label_replace / label_join read the RETAINED (to-be-dropped) name ---
+
+eval instant at 10m label_replace(rate(metric_total{env="2"}[5m]), "src", "$1", "__name__", "(.+)")
+	{env="2", src="metric_total"} 0.05
+
+eval instant at 10m label_join(rate(metric_total{env="2"}[5m]), "__name__", "_", "__name__", "env")
+	metric_total_2{env="2"} 0.05
+
+clear
+
+# --- two DISTINCT metric names, mixed verdicts, one by(__name__)
+# aggregation (the #86 review round-1 differential-row shape): the
+# kept-verdict group keeps its name, the drop-marked group lands
+# nameless — a retained-name leak would emit `dropped_total` instead ---
+
+load 1m
+	kept_total{env="1"} 0+1x10
+	dropped_total{env="2"} 0+3x10
+
+eval instant at 10m sum by (__name__) (kept_total or rate(dropped_total[5m]))
+	kept_total 10
+	{} 0.05
+
+# TWO distinctly-named DROP-MARKED sources, bridged through label_replace
+# (which reads the retained names and re-writes __name__, clearing the
+# verdicts) into one by(__name__) aggregation — the #86 round-2
+# differential-row shape: DELAYED yields two NAMED series (verified live
+# against the flag-on v3.13.0 oracle); eager upstream yields one
+# anonymous group (names are gone before label_replace's regex can match
+# — verified live against the flag-off oracle). The unbridged form of
+# the same scenario is the duplicate-labelset `expect fail` above.
+eval instant at 10m sum by (__name__) (label_replace(rate(kept_total[5m]) or rate(dropped_total[5m]), "__name__", "$1", "__name__", "(.+)"))
+	kept_total 0.016666666666666666
+	dropped_total 0.05
+
+clear
+
+# --- metadata retained on an explicit name DELETE; stripped on a drop ---
+
+load 1m
+	typed{__type__="counter", job="a"} 5
+
+eval instant at 0 label_replace(typed, "__name__", "", "", "")
+	{__type__="counter", job="a"} 5
+
+eval instant at 0 abs(typed)
+	{job="a"} 5
+
+clear
+
+# --- plan v2 Δ1: the range accumulator latches drop_name at the
+# identity's FIRST step ---
+
+load 5m
+	m 1 -1
+
+# Step 0 takes the filter branch (name kept) — the latch keeps the name
+# even though step 5m came from the name-dropping arithmetic branch.
+eval range from 0 to 5m step 5m (m > 0) or (m + 1)
+	m 1 0
+
+clear
+
+load 5m
+	m -1 1
+
+# Step 0 takes the arithmetic branch (drop marked) — the latch drops the
+# name for the whole series.
+eval range from 0 to 5m step 5m (m > 0) or (m + 1)
+	{} 0 1
