@@ -25,6 +25,11 @@
 //!   OLDEST frames with exact `dropped_total` accounting and a bounded
 //!   `dropped_entries` sample, proven through the encoded frames
 //!   (review round 1);
+//! - retention clamp (issue #94 item 1): an ancient `start=0` is clamped
+//!   up to the retention floor (`now − retention·day − 1 partition-day`),
+//!   proven from the FIRST keyset poll's `timestamp_ns > N` bound in
+//!   `system.query_log` — within-retention rows still delivered, catch-up
+//!   collapsed to a handful of polls (port 31142);
 //! - the `/loki/api/v1/tail` compat alias streams identically.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
@@ -1047,6 +1052,146 @@ async fn slow_consumer_backpressure_evicts_oldest_with_exact_drop_accounting() {
         "some frames must actually have been evicted"
     );
     ws.close();
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 7) Retention clamp: an ancient start=0 is clamped up to the retention
+//    floor, proven from the FIRST keyset poll's start bound in
+//    system.query_log (issue #94 item 1, port 31142)
+// ---------------------------------------------------------------------
+
+/// Extracts `N` from a first-page keyset query's `timestamp_ns > N` bound
+/// (the exclusive `Start` form; the `>=` keyset-resume form is skipped by
+/// the trailing space in the needle).
+fn parse_first_page_start_bound(query: &str) -> i64 {
+    let needle = "timestamp_ns > ";
+    let idx = query.find(needle).expect("first-page start bound present");
+    let rest = &query[idx + needle.len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse().expect("bound integer")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ancient_start_is_clamped_to_the_retention_floor_in_the_first_poll() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const DAY_NS: i64 = 86_400_000_000_000;
+    let port = 31_142;
+    let db = "pulsus_tail_it_clamp";
+    drop_db(db).await;
+    // Retention 1 day ⇒ clamp floor is now − 1·day − 1 partition-day slack
+    // (issue #94). A 7-day catch-up slice makes the ~2-day clamped window a
+    // single slice, so catch-up is a handful of polls, never thousands (a
+    // raw start=0 without the clamp would grind ~decades of empty slices).
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_RETENTION_DAYS", "1"),
+            ("PULSUS_TAIL_POLL_INTERVAL", "200ms"),
+            ("PULSUS_TAIL_CATCHUP_SLICE", "7d"),
+            ("PULSUS_TAIL_MAX_FETCH_LIMIT", "1000000"),
+        ],
+    );
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+    // Recent rows within the clamped window AND below the delay horizon
+    // (delay_for=5 ⇒ horizon = now − 5s): seed synchronously before
+    // connecting, well older than the horizon so they are query-visible.
+    let base = now_ns();
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, base - 30_000_000_000, "recent-a"),
+            (1, base - 20_000_000_000, "recent-b"),
+            (1, base - 10_000_000_000, "recent-c"),
+        ],
+    )
+    .await;
+
+    // #77 tail-visibility discipline: bound `start` (the clamp does this,
+    // raising the ancient 0) AND set delay_for>=5 — seed-before-connect
+    // does not by itself guarantee CH visibility under async batching.
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&limit=1000000&delay_for=5";
+    let run_marker_us = now_ns() / 1_000;
+    let before_connect = now_ns();
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start=0"));
+
+    // The three recent rows arrive (the clamp did NOT skip within-retention
+    // data; ascending, exactly-once).
+    let entries = collect_entries(&mut ws, 3, Instant::now() + Duration::from_secs(30));
+    let after_connect = now_ns();
+    assert_eq!(
+        entries.len(),
+        3,
+        "recent within-window rows delivered: {entries:?}"
+    );
+    let bodies: Vec<&str> = entries.iter().map(|(_, _, l)| l.as_str()).collect();
+    assert_eq!(
+        bodies,
+        vec!["recent-a", "recent-b", "recent-c"],
+        "ascending order"
+    );
+    ws.close();
+
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let sql = format!(
+        "SELECT query, read_rows FROM system.query_log \
+         WHERE type = 'QueryFinish' AND current_database = '{db}' \
+           AND query_start_time_microseconds >= fromUnixTimestamp64Micro({run_marker_us}) \
+           AND query LIKE '%cityHash64(body) AS body_hash%' \
+           AND query NOT LIKE '%system.query_log%' \
+         ORDER BY query_start_time_microseconds ASC"
+    );
+    let mut polls: Vec<QueryLogRow> = Vec::new();
+    {
+        let mut stream = client
+            .query_stream::<QueryLogRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log stream");
+        while let Some(row) = stream.next().await {
+            polls.push(row.expect("query_log row"));
+        }
+    }
+    assert!(!polls.is_empty(), "at least one keyset poll ran");
+
+    // The clamp fired: the FIRST keyset poll's start bound is the retention
+    // floor (≈ now − 2·day), NOT the raw start=0 (or a negative value).
+    let n = parse_first_page_start_bound(&polls[0].query);
+    let slice_ns = 7 * DAY_NS;
+    let lo = before_connect - 2 * DAY_NS - slice_ns;
+    assert!(
+        n > 0,
+        "the clamp fired — the first poll's bound is NOT the raw start=0: got {n}\n{}",
+        polls[0].query
+    );
+    assert!(
+        n >= lo && n <= after_connect,
+        "first poll bound {n} must sit at the retention floor (≈ now − 2·day), \
+         within [{lo}, {after_connect}]:\n{}",
+        polls[0].query
+    );
+
+    // Catch-up collapsed to a handful of polls — an unclamped start=0 with a
+    // 7-day slice would emit thousands (decades of empty slices).
+    assert!(
+        polls.len() < 100,
+        "clamped catch-up must be a handful of polls, got {} (unclamped would be thousands)",
+        polls.len()
+    );
     drop_db(db).await;
 }
 

@@ -1230,10 +1230,27 @@ pub struct TailPage {
 /// plan machinery and the SAME `CompiledPipeline` as `query()`
 /// (semantics-drift-free; the task-manager-ratified invariant), only the
 /// fetch ordering/cursor differ.
+///
+/// Beyond the (public) `plan`/`compiled`, the setup carries crate-private
+/// state for the best-effort month-boundary refresh (issue #94 item 2):
+/// the original `expr` and `base_params` are replanned — with **no DB
+/// I/O** — into a fresh `plan` whose stage-1 month IN-list covers a newly
+/// crossed calendar month, and `month_horizon` is the highest month the
+/// current `plan` already covers (`year_month` of the setup end bound).
+/// These fields are only ever constructed by [`LogQlEngine::tail_setup`],
+/// so `TailSetup`'s public re-export surface is unchanged.
 #[derive(Debug)]
 pub struct TailSetup {
     pub plan: StreamsPlan,
     pub compiled: CompiledPipeline,
+    /// The original tail expression, replanned on a month crossing.
+    expr: Expr,
+    /// The setup `QueryParams` (`Copy`); its `end_ns` is bumped to the
+    /// crossing poll's `upper_ns` on refresh (the `start_ns` stays put so
+    /// older-month streams remain resolvable — issue #94 edge case 5).
+    base_params: QueryParams,
+    /// `year_month` of the highest month the current `plan` covers.
+    month_horizon: (i64, u32),
 }
 
 impl LogQlEngine {
@@ -1387,13 +1404,46 @@ impl LogQlEngine {
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
                 let compiled = CompiledPipeline::compile(&sp.pipeline)?;
-                Ok(TailSetup { plan: sp, compiled })
+                Ok(TailSetup {
+                    plan: sp,
+                    compiled,
+                    expr: expr.clone(),
+                    base_params: *params,
+                    month_horizon: plan::year_month(spec_end_ns(&params.spec)),
+                })
             }
             Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
                 reason: "tail requires a log stream query (metric queries cannot be tailed)"
                     .to_string(),
             }),
         }
+    }
+
+    /// Best-effort stage-1 month refresh (issue #94 item 2): the stage-1
+    /// month IN-list is baked into `setup.plan.stage1_sql` at setup, so a
+    /// stream born in a calendar month later than the setup window would
+    /// otherwise stay invisible until a reconnect. When a poll's
+    /// `upper_ns` crosses into a month the current plan doesn't cover,
+    /// this re-plans (reusing [`plan::plan`] — **no ClickHouse I/O**, a
+    /// pure `stage1_sql` string rebuild) and swaps in a fresh
+    /// [`StreamsPlan`] whose IN-list spans the setup month through the new
+    /// month (the `start_ns` is unchanged, so prior-month streams are
+    /// never dropped). A no-op within the current month, so it fires at
+    /// most once per calendar month per connection and adds no per-poll
+    /// round-trip.
+    ///
+    /// The caller invokes this best-effort (`let _ = …`): on a re-plan
+    /// error `setup` is left untouched and the tail keeps running on the
+    /// PRIOR month set — it degrades to pre-#94 behaviour (new-month
+    /// streams surface on the next successful refresh or a reconnect) and
+    /// never errors the connection.
+    pub fn tail_refresh_months(
+        &self,
+        setup: &mut TailSetup,
+        upper_ns: i64,
+    ) -> Result<(), ReadError> {
+        let ctx = self.config.plan_ctx();
+        refresh_tail_months(&ctx, setup, upper_ns)
     }
 
     /// One live-tail poll (issue #74): re-resolves fingerprints under
@@ -1485,6 +1535,41 @@ impl LogQlEngine {
             fetched,
         })
     }
+}
+
+/// The `end` bound of a [`QuerySpec`] (the `at` instant for an instant
+/// query) — the month-horizon anchor for [`TailSetup`] (issue #94).
+fn spec_end_ns(spec: &QuerySpec) -> i64 {
+    match *spec {
+        QuerySpec::Range { end_ns, .. } => end_ns,
+        QuerySpec::Instant { at_ns } => at_ns,
+    }
+}
+
+/// Client-free core of [`LogQlEngine::tail_refresh_months`] (issue #94
+/// item 2), unit-testable with a [`PlanCtx`] literal. Re-plans only when
+/// `upper_ns` crosses into a later calendar month than `setup` covers;
+/// [`plan::plan`] here does **no** I/O (a pure `stage1_sql` rebuild). A
+/// non-`Streams` plan (unreachable — the setup expr already planned as
+/// `Streams`) or a re-plan error leaves `setup` untouched, so the caller
+/// can swallow the result and keep tailing on the prior month set.
+fn refresh_tail_months(
+    ctx: &PlanCtx<'_>,
+    setup: &mut TailSetup,
+    upper_ns: i64,
+) -> Result<(), ReadError> {
+    if plan::year_month(upper_ns) <= setup.month_horizon {
+        return Ok(());
+    }
+    let mut qp = setup.base_params; // QueryParams: Copy
+    if let QuerySpec::Range { end_ns, .. } = &mut qp.spec {
+        *end_ns = upper_ns;
+    }
+    if let Plan::Streams(sp) = plan::plan(&setup.expr, &qp, ctx)? {
+        setup.plan = sp;
+        setup.month_horizon = plan::year_month(upper_ns);
+    }
+    Ok(())
 }
 
 /// The occurrence-count cursor update (round-4 adjudication #1): the new
@@ -3380,6 +3465,123 @@ mod tests {
     fn a_count_at_or_below_the_cap_is_not_too_broad() {
         assert!(check_stream_cap(100_000, 100_000).is_ok());
         assert!(check_stream_cap(1, 100_000).is_ok());
+    }
+
+    // -- tail month-boundary refresh (issue #94 item 2) -----------------
+
+    const DAY_NS: i64 = 86_400_000_000_000;
+
+    fn tail_test_ctx() -> PlanCtx<'static> {
+        PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        }
+    }
+
+    /// Builds a `TailSetup` client-free (no engine/DB) — the shape
+    /// `LogQlEngine::tail_setup` produces, so `refresh_tail_months` can be
+    /// exercised against a `PlanCtx` literal.
+    fn build_tail_setup(ctx: &PlanCtx<'_>, query: &str, start_ns: i64, end_ns: i64) -> TailSetup {
+        let expr = pulsus_logql::parse(query).expect("parse");
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns,
+                end_ns,
+                step_ns: 1_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Forward,
+        };
+        match plan::plan(&expr, &params, ctx).expect("plan") {
+            Plan::Streams(sp) => {
+                let compiled = CompiledPipeline::compile(&sp.pipeline).expect("compile");
+                TailSetup {
+                    plan: sp,
+                    compiled,
+                    expr,
+                    base_params: params,
+                    month_horizon: plan::year_month(end_ns),
+                }
+            }
+            _ => panic!("stream selector must plan to Plan::Streams"),
+        }
+    }
+
+    fn month_literal(ts_ns: i64) -> String {
+        let (y, m) = plan::year_month(ts_ns);
+        format!("'{y:04}-{m:02}-01'")
+    }
+
+    /// Item 2 AC: a refresh whose `upper_ns` stays inside the current
+    /// month leaves `stage1_sql` byte-identical and `month_horizon`
+    /// unchanged (no re-plan, no fire).
+    #[test]
+    fn tail_refresh_months_is_a_noop_within_the_current_month() {
+        let ctx = tail_test_ctx();
+        // 2023-11-14T22:13:20Z — comfortably mid-month.
+        let setup_end = 1_700_000_000_000_000_000i64;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_end - DAY_NS, setup_end);
+        let sql0 = setup.plan.stage1_sql.clone();
+        let horizon0 = setup.month_horizon;
+
+        let same_month_upper = setup_end + 3_600_000_000_000; // +1h, still November
+        assert_eq!(plan::year_month(same_month_upper), horizon0, "same month");
+        refresh_tail_months(&ctx, &mut setup, same_month_upper).expect("no I/O, cannot fail");
+        assert_eq!(
+            setup.plan.stage1_sql, sql0,
+            "no-op keeps stage1_sql byte-identical"
+        );
+        assert_eq!(setup.month_horizon, horizon0);
+    }
+
+    /// Item 2 AC: crossing into a later calendar month rebuilds
+    /// `stage1_sql` so it covers BOTH the setup month and the new month
+    /// (a prior-month stream must not vanish), advances `month_horizon`,
+    /// and a second call at the same `upper` is a no-op.
+    #[test]
+    fn tail_refresh_months_rebuilds_across_a_boundary_covering_both_months() {
+        let ctx = tail_test_ctx();
+        let setup_end = 1_700_000_000_000_000_000i64; // November 2023
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_end - DAY_NS, setup_end);
+        let setup_month_lit = month_literal(setup_end);
+
+        // +40 days lands in December (the next calendar month).
+        let next_month_upper = setup_end + 40 * DAY_NS;
+        let new_month_lit = month_literal(next_month_upper);
+        assert_ne!(setup_month_lit, new_month_lit, "the test crosses a month");
+
+        refresh_tail_months(&ctx, &mut setup, next_month_upper).expect("no I/O, cannot fail");
+        assert!(
+            setup.plan.stage1_sql.contains(&new_month_lit),
+            "rebuilt stage1_sql covers the new month {new_month_lit}: {}",
+            setup.plan.stage1_sql
+        );
+        assert!(
+            setup.plan.stage1_sql.contains(&setup_month_lit),
+            "rebuilt stage1_sql still covers the setup month {setup_month_lit} \
+             (prior-month streams stay resolvable): {}",
+            setup.plan.stage1_sql
+        );
+        assert_eq!(
+            setup.month_horizon,
+            plan::year_month(next_month_upper),
+            "month_horizon advanced to the crossed month"
+        );
+
+        // A second call at the same later upper is a no-op (no double-fire).
+        let sql_after = setup.plan.stage1_sql.clone();
+        refresh_tail_months(&ctx, &mut setup, next_month_upper).expect("no I/O");
+        assert_eq!(
+            setup.plan.stage1_sql, sql_after,
+            "no double-fire within the month"
+        );
     }
 
     #[test]

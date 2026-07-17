@@ -1003,7 +1003,12 @@ fn civil_from_days(z: i64) -> (i64, u32) {
     (if m <= 2 { y + 1 } else { y }, m)
 }
 
-fn year_month(ts_ns: i64) -> (i64, u32) {
+/// The `(year, month)` UTC calendar month a nanosecond instant falls in.
+/// `pub(crate)` so the live-tail month-boundary refresh (issue #94 item 2,
+/// [`super::exec::LogQlEngine::tail_refresh_months`]) can detect when a
+/// poll's watermark crosses into a month the current plan doesn't cover.
+/// Lexicographic `(i64, u32)` ordering is exactly year-then-month order.
+pub(crate) fn year_month(ts_ns: i64) -> (i64, u32) {
     civil_from_days(ts_ns.div_euclid(NANOS_PER_DAY))
 }
 

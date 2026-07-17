@@ -87,6 +87,37 @@ fn clamped_fetch_limit(client_limit: u64, cap: u32) -> u32 {
     u32::try_from(client_limit).unwrap_or(u32::MAX).min(cap)
 }
 
+/// One daily `log_samples` partition, in nanoseconds — the partition-day
+/// SLACK the retention clamp subtracts below the retention window.
+const PARTITION_DAY_NS: i64 = 86_400_000_000_000;
+
+/// The retention floor an ancient tail `start` is clamped up to (issue
+/// #94 item 1): `now − retention_days·day − 1 partition-day`.
+///
+/// `log_samples` TTLs everything older than `retention_days`
+/// (`TTL … + INTERVAL {retention_days} DAY DELETE`) and partitions daily,
+/// so no non-expired data can exist before this floor and an ancient
+/// `start` (e.g. `0`) need not walk pre-retention history one empty slice
+/// per poll — the clamp bounds catch-up to the retention window and
+/// collapses the stage-1 month IN-list a raw `start=0` would explode to
+/// ~670 monthly literals.
+///
+/// The extra **partition-day slack** (binding adjudication
+/// issuecomment-5007695597 / -5007752964) is load-bearing: with
+/// `ttl_only_drop_parts=1` a daily partition is deleted only once WHOLLY
+/// expired, so up to one partition-day of still-present, sub-retention
+/// data can sit just below `now − retention`. Subtracting one partition-
+/// day keeps that data reachable — the clamp never silently skips present
+/// rows. All arithmetic saturates (a `u32::MAX` retention can never
+/// overflow `i64`); the floor only ever RAISES an ancient `start`, never
+/// lowers a legitimate recent one (the caller applies it via `max`).
+fn retention_floor_ns(retention_days: u32, now_ns: i64) -> i64 {
+    let win = i64::from(retention_days)
+        .saturating_mul(PARTITION_DAY_NS)
+        .saturating_add(PARTITION_DAY_NS);
+    now_ns.saturating_sub(win)
+}
+
 fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailParams, ApiError> {
     let query = params::get(pairs, "query").ok_or(ParamError::MissingQuery)?;
     let expr = pulsus_logql::parse(query)?;
@@ -109,6 +140,12 @@ fn parse_tail_params(pairs: &[(String, String)], cfg: &Config) -> Result<TailPar
         Some(v) => params::parse_ts(v)?,
         None => params::default_start_ns(params::now_ns()),
     };
+    // Retention clamp (issue #94 item 1): raise an ancient first-page
+    // lower bound to the retention floor so catch-up never walks
+    // pre-retention (already-TTL'd) history one empty slice per poll.
+    // `max` only ever RAISES the floor — a legitimate recent `start`
+    // (default 1h, or an explicit within-retention value) is untouched.
+    let start_ns = start_ns.max(retention_floor_ns(cfg.retention_days, params::now_ns()));
     // `delay_for`: default 0, clamped at `reader.tail_max_delay` (the
     // adjudicated public ceiling, docs/api.md §2.4).
     let delay_secs: u64 = match params::get(pairs, "delay_for") {
@@ -248,6 +285,16 @@ impl TailFetcher for EngineFetcher {
         upper_ns: i64,
         fetch_limit: u32,
     ) -> Result<TailPage, ReadError> {
+        // Best-effort month refresh (issue #94 item 2): re-resolve the
+        // stage-1 month set when this poll's `upper_ns` crosses into a
+        // calendar month the plan doesn't cover — a pure `plan::plan`
+        // string rebuild, NO ClickHouse round-trip, ≤ once per calendar
+        // month per connection. Swallowed on failure (`let _`): the tail
+        // continues on the PRIOR plan (new-month streams surface on the
+        // next successful refresh or a reconnect) — a re-plan error can
+        // never tear down a working connection. The mutable borrow ends
+        // before `tail_poll`'s immutable borrows begin.
+        let _ = self.engine.tail_refresh_months(&mut self.setup, upper_ns);
         self.engine
             .tail_poll(
                 &self.setup.compiled,
@@ -778,6 +825,100 @@ mod tests {
             clamped_fetch_limit(9_999_999, 5_000),
         );
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
+    }
+
+    // -- retention clamp (issue #94 item 1) -----------------------------
+
+    const DAY_NS: i64 = 86_400_000_000_000;
+
+    /// Item 1 AC (binding arithmetic, adjudication -5007752964): the floor
+    /// is `now − retention_days·day − ONE partition-day` (the slack), and a
+    /// `u32::MAX` retention saturates without overflowing `i64`.
+    #[test]
+    fn retention_floor_is_the_window_plus_a_partition_day_slack_and_saturates() {
+        let now = 1_700_000_000_000_000_000i64;
+        // 7-day retention ⇒ 8 days below now (7 + 1 partition-day slack).
+        assert_eq!(retention_floor_ns(7, now), now - 8 * DAY_NS);
+        assert_eq!(retention_floor_ns(1, now), now - 2 * DAY_NS);
+        // Degenerate saturation: no panic, floor sits far below `now` so it
+        // can never raise a legitimate start.
+        let floor = retention_floor_ns(u32::MAX, now);
+        assert!(floor <= now, "saturating floor never exceeds now: {floor}");
+    }
+
+    /// Binding fixture (adjudication -5007695597): the partition-day slack
+    /// KEEPS an oldest-still-present part within retention — a row just
+    /// below `now − retention` (in a partially-expired daily partition that
+    /// `ttl_only_drop_parts=1` has not yet dropped) sits ABOVE the clamp
+    /// floor (so it is INCLUDED), whereas a no-slack floor would skip it.
+    #[test]
+    fn retention_clamp_includes_the_oldest_still_present_part_via_the_slack() {
+        let now = 1_700_000_000_000_000_000i64;
+        // A still-present row half a partition-day below the 7-day edge.
+        let oldest_still_present = now - 7 * DAY_NS - DAY_NS / 2;
+        let slack_floor = retention_floor_ns(7, now);
+        assert!(
+            slack_floor < oldest_still_present,
+            "with the slack the floor sits below still-present data (INCLUDED)"
+        );
+        // Without the slack the floor would sit ABOVE it — silently skipped.
+        let no_slack_floor = now - 7 * DAY_NS;
+        assert!(
+            no_slack_floor > oldest_still_present,
+            "the no-slack floor would skip the still-present part"
+        );
+        // Through the clamp (with the REAL wall clock parse_tail_params
+        // uses): an ancient start=0 lands at the slack floor, which is
+        // below a still-present row half a partition-day past the retention
+        // edge, so a `timestamp_ns > start` stage-3 predicate keeps it.
+        let now_real = params::now_ns();
+        let oldest_still_present_real = now_real - 7 * DAY_NS - DAY_NS / 2;
+        let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D&start=0");
+        let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
+        assert!(
+            p.start_ns < oldest_still_present_real,
+            "clamped start {} must stay below still-present data {oldest_still_present_real}",
+            p.start_ns
+        );
+    }
+
+    /// Item 1 AC: an ancient `start=0` is clamped up to the retention
+    /// floor; a legitimate recent `start` (10 min ago) is UNTOUCHED.
+    #[test]
+    fn retention_clamp_raises_ancient_start_but_never_lowers_a_recent_one() {
+        let cfg = cfg_default();
+        // start=0 ⇒ clamped to ~now − 8 days (default 7d retention + slack).
+        let base = "query=%7Ba%3D%22x%22%7D";
+        let before = params::now_ns();
+        let ancient = params::parse_pairs(&format!("{base}&start=0"));
+        let p = parse_tail_params(&ancient, &cfg).expect("ok");
+        let after = params::now_ns();
+        let floor_lo = before - 8 * DAY_NS;
+        let floor_hi = after - 8 * DAY_NS;
+        assert!(
+            p.start_ns >= floor_lo && p.start_ns <= floor_hi,
+            "start=0 clamped to the retention floor, got {}",
+            p.start_ns
+        );
+        assert!(p.start_ns > 0, "the clamp fired (not the raw start=0)");
+
+        // A recent explicit start (10 min ago) is well within retention —
+        // returned verbatim, never lowered.
+        let recent = params::now_ns() - 600_000_000_000;
+        let recent_pairs = params::parse_pairs(&format!("{base}&start={recent}"));
+        let p = parse_tail_params(&recent_pairs, &cfg).expect("ok");
+        assert_eq!(p.start_ns, recent, "a within-retention start is untouched");
+
+        // The default start (1h ago) is likewise within retention.
+        let default_pairs = params::parse_pairs(base);
+        let before = params::now_ns();
+        let p = parse_tail_params(&default_pairs, &cfg).expect("ok");
+        let after = params::now_ns();
+        let hour = 3_600_000_000_000i64;
+        assert!(
+            p.start_ns >= before - hour && p.start_ns <= after - hour,
+            "the default 1h-ago start is within retention, unclamped"
+        );
     }
 
     // -- scan state (watermark + boundary) ------------------------------
