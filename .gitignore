@@ -37,3 +37,4 @@ crates/pulsus-write/spool/
 deploy/charts/pulsusdb/tests/bdd/.kubeconfig-*
 **/__pycache__/
 *.pyc
+codex.pid
