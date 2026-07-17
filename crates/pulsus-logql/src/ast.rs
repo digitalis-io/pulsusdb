@@ -13,9 +13,10 @@
 //! additive: the `param` field on [`MetricExpr::Vector`] (the raw
 //! `topk`/`bottomk` `k`), the [`MetricExpr::Literal`] variant (a bare
 //! scalar number), and the [`MetricExpr::Binary`] variant with [`BinOp`]/
-//! [`BinModifier`] (binary operations; `on`/`ignoring`/`group_left`/
-//! `group_right` matching modifiers stay enumerated-`NotYetSupported`).
-//! No existing field changed shape.
+//! [`BinModifier`] (binary operations). Issue #91 extended
+//! [`BinModifier`] with the `on`/`ignoring`/`group_left`/`group_right`
+//! vector-matching clause ([`VectorMatching`]) — additive, though
+//! [`BinModifier`] drops its `Copy` derive to own the label list.
 
 use std::fmt;
 
@@ -398,9 +399,9 @@ pub enum MetricExpr {
     /// (issue M6-10), raw text — parsed to `f64` by the planner.
     Literal(String),
     /// A binary operation between metric expressions (issue M6-10).
-    /// `on()`/`ignoring()`/`group_left()`/`group_right()` matching
-    /// modifiers are deferred (enumerated `NotYetSupported`); `modifier`
-    /// carries only the `bool` comparison modifier.
+    /// `modifier` carries the `bool` comparison modifier and (issue #91)
+    /// the `on()`/`ignoring()`/`group_left()`/`group_right()` vector-
+    /// matching clause.
     Binary {
         op: BinOp,
         modifier: Option<BinModifier>,
@@ -453,8 +454,13 @@ impl fmt::Display for MetricExpr {
             } => {
                 Self::fmt_operand(lhs, f)?;
                 write!(f, " {op} ")?;
-                if matches!(modifier, Some(BinModifier { return_bool: true })) {
-                    write!(f, "bool ")?;
+                if let Some(m) = modifier {
+                    if m.return_bool {
+                        write!(f, "bool ")?;
+                    }
+                    if let Some(vm) = &m.matching {
+                        write!(f, "{vm} ")?;
+                    }
                 }
                 Self::fmt_operand(rhs, f)
             }
@@ -517,12 +523,76 @@ impl fmt::Display for BinOp {
     }
 }
 
-/// Binary-operation modifier. Only `bool` (comparison 0/1 instead of
-/// filtering) in M6-10; `on`/`ignoring`/`group_left`/`group_right` extend
-/// this struct when the matching-modifier follow-up lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Binary-operation modifier: `bool` (comparison 0/1 instead of
+/// filtering) and, since issue #91, the optional
+/// `on`/`ignoring`/`group_left`/`group_right` vector-matching clause.
+///
+/// No longer `Copy` (issue #91): `matching` owns a `Vec<String>` label
+/// list. Both consumers pattern-match by reference (ast Display, the
+/// planner's `build_metric_node`), so the derive was never load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BinModifier {
     pub return_bool: bool,
+    pub matching: Option<VectorMatching>,
+}
+
+/// The `on(...)`/`ignoring(...)` match-signature clause with an optional
+/// `group_left`/`group_right` grouping (issue #91). Semantics are Loki's
+/// (which mirror Prometheus's), oracle-pinned against `grafana/loki:3.4.2`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VectorMatching {
+    /// `true` = `on(labels)` (restrict the signature to the listed
+    /// labels); `false` = `ignoring(labels)` (drop the listed labels).
+    pub on: bool,
+    /// The `on`/`ignoring` label list (may be empty: `on()`).
+    pub labels: Vec<String>,
+    /// `group_left`/`group_right` many-side selection with its include
+    /// labels; `None` for one-to-one matching. The parser only ever
+    /// populates this when an `on`/`ignoring` clause precedes it — a bare
+    /// `group_left`/`group_right` is a parse error (oracle: HTTP 400).
+    pub group: Option<MatchGroup>,
+}
+
+/// The many side of a grouped match and its include-label list (copied
+/// from the one side onto the many-side output). `Left` = `group_left`
+/// (many-to-one, lhs is the many side); `Right` = `group_right`
+/// (one-to-many, rhs is the many side).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MatchGroup {
+    Left(Vec<String>),
+    Right(Vec<String>),
+}
+
+impl fmt::Display for VectorMatching {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kw = if self.on { "on" } else { "ignoring" };
+        write!(f, "{kw}(")?;
+        for (i, l) in self.labels.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{l}")?;
+        }
+        write!(f, ")")?;
+        if let Some(group) = &self.group {
+            let (kw, labels) = match group {
+                MatchGroup::Left(l) => ("group_left", l),
+                MatchGroup::Right(l) => ("group_right", l),
+            };
+            write!(f, " {kw}")?;
+            if !labels.is_empty() {
+                write!(f, "(")?;
+                for (i, l) in labels.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{l}")?;
+                }
+                write!(f, ")")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `LogExpr [duration]` — the operand of every range aggregation.
@@ -813,11 +883,11 @@ pub(crate) const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds",
 /// binary operators in any LogQL milestone.
 pub(crate) const BINARY_OP_KEYWORDS: &[&str] = &["and", "or", "unless"];
 
-/// The vector-matching modifier keywords deferred out of M6-10
-/// (adjudication: individually enumerated `NotYetSupported`, no
-/// catch-all) — recognized after a binary operator and named one by one.
-pub(crate) const VECTOR_MATCHING_KEYWORDS: &[&str] =
-    &["on", "ignoring", "group_left", "group_right"];
+// The vector-matching modifier keywords (`on`/`ignoring`/`group_left`/
+// `group_right`) are recognized directly by the parser
+// (`parse_vector_matching`) since issue #91 — no lookup table is needed,
+// the clause is fully parsed into a [`VectorMatching`] rather than named
+// `NotYetSupported`.
 
 #[cfg(test)]
 mod tests {

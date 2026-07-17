@@ -85,6 +85,12 @@ struct CaseRaw {
     /// `metric_range` only: the request step in seconds.
     #[serde(default)]
     step_s: Option<u64>,
+    /// `metric_match_error` only (issue #91): the shared error-body
+    /// substring both stores must carry. Oracle-pinned against
+    /// `grafana/loki:3.4.2`; status codes are NOT gated (Loki returns 500
+    /// for these runtime matching errors, PulsusDB 400 — see the ledger).
+    #[serde(default)]
+    expect_error_substr: Option<String>,
     query: String,
 }
 
@@ -596,6 +602,7 @@ async fn run_case(
         "metric_instant" => run_metric_instant_case(ctx, corpus, case).await,
         "metric_range" => run_metric_range_case(ctx, corpus, case, window).await,
         "metric_error" => run_metric_error_case(ctx, corpus, case).await,
+        "metric_match_error" => run_metric_match_error_case(ctx, corpus, case).await,
         other => bail!("case {:?} has unknown kind {other:?}", case.case_id),
     }
 }
@@ -679,6 +686,98 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
             let path = dump(&format!("{store} 400 body lacks SampleExtractionErr"))?;
             bail!(
                 "case {:?}: {store} error does not carry the SampleExtractionErr class (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Issue #91 matching-error witness: a vector-matching query that is a
+/// runtime error on BOTH stores (`many-to-one`/`many-to-many`). Gated on
+/// the shared error-body substring (oracle-pinned against
+/// `grafana/loki:3.4.2`); the HTTP status is deliberately NOT gated —
+/// Loki returns 500, PulsusDB 400 for these, an informational divergence
+/// recorded in docs/benchmarks/logs-differential-ledger.md. Both stores
+/// must still return SOME error (>= 400).
+async fn run_metric_match_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) -> Result<()> {
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let eval_ns = metric_eval_ns(corpus);
+    let substr = case.expect_error_substr.as_deref().with_context(|| {
+        format!(
+            "case {:?} is metric_match_error but carries no expect_error_substr",
+            case.case_id
+        )
+    })?;
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: expecting an error carrying {:?} on both stores \
+         (status not gated — Loki 500 vs PulsusDB 400)",
+        case.case_id, case.mode, case.construct, substr,
+    );
+
+    let fetch = |url: String| {
+        let q = q.clone();
+        async move {
+            let time = eval_ns.to_string();
+            let res = ctx
+                .http
+                .get(&url)
+                .query(&[("query", q.as_str()), ("time", time.as_str())])
+                .timeout(QUERY_REQUEST_TIMEOUT)
+                .send()
+                .await
+                .with_context(|| format!("GET {url} failed"))?;
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            Ok::<(u16, String), anyhow::Error>((status, body))
+        }
+    };
+    let (pulsus_status, pulsus_body) = fetch(ctx.url("/api/logs/v1/query")).await?;
+    let (oracle_status, oracle_body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+
+    let dump = |detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_metric_pipeline",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": "matching_error_witness",
+            "query": q,
+            "eval_ns": eval_ns,
+            "expect_error_substr": substr,
+            "pulsusdb_status": pulsus_status,
+            "pulsusdb_body": pulsus_body,
+            "oracle_status": oracle_status,
+            "oracle_body": oracle_body,
+            "detail": detail,
+        });
+        write_artifact(
+            ctx,
+            ARTIFACT_AREA,
+            "metric-matching-error-witness",
+            &artifact,
+        )
+    };
+
+    for (store, status, body) in [
+        ("pulsusdb", pulsus_status, &pulsus_body),
+        ("oracle", oracle_status, &oracle_body),
+    ] {
+        if status < 400 {
+            let path = dump(&format!(
+                "{store} returned {status}, expected an error (>= 400)"
+            ))?;
+            bail!(
+                "case {:?}: {store} returned {status} instead of an error for a matching failure \
+                 (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        if !body.contains(substr) {
+            let path = dump(&format!("{store} error body lacks {substr:?}"))?;
+            bail!(
+                "case {:?}: {store} error body does not carry {substr:?} (repro {})",
                 case.case_id,
                 path.display()
             );
@@ -1159,7 +1258,16 @@ mod tests {
     /// by-construction (the M1 tumbling contract), classified in the
     /// ledger at introduction per the M6-10 plan — PulsusDB stays
     /// hard-gated against the tumbling corpus expectation.
-    const INFORMATIONAL_CASE_IDS: &[&str] = &["metric_rate_tumbling"];
+    const INFORMATIONAL_CASE_IDS: &[&str] = &[
+        "metric_rate_tumbling",
+        // Issue #91 range matching cases share the tumbling-vs-sliding
+        // window divergence (pulsus == the tumbling corpus is still hard-
+        // gated; only the oracle comparison is informational).
+        "metric_match_on_range",
+        "metric_match_ignoring_range",
+        "metric_match_group_left_range",
+        "metric_match_group_right_range",
+    ];
 
     fn shipped_fixture() -> LogsFixture {
         let root = crate::engine::workspace_root();
@@ -1200,7 +1308,7 @@ mod tests {
                 continue;
             }
             match case.kind() {
-                "metric_instant" | "metric_error" => {
+                "metric_instant" | "metric_error" | "metric_match_error" => {
                     assert!(case.step_s.is_none(), "{}", case.case_id)
                 }
                 "metric_range" => assert!(case.step_s.is_some(), "{}", case.case_id),
@@ -1296,9 +1404,11 @@ mod tests {
 
     fn hermetic_params(case: &CaseRaw, corpus: &LogCorpus) -> pulsus_read::logql::QueryParams {
         let spec = match case.kind() {
-            "metric_instant" => pulsus_read::logql::QuerySpec::Instant {
-                at_ns: metric_eval_ns(corpus),
-            },
+            "metric_instant" | "metric_error" | "metric_match_error" => {
+                pulsus_read::logql::QuerySpec::Instant {
+                    at_ns: metric_eval_ns(corpus),
+                }
+            }
             _ => pulsus_read::logql::QuerySpec::Range {
                 start_ns: corpus.first_ts_ns - WINDOW_SLACK_NS,
                 end_ns: corpus.last_ts_ns + WINDOW_SLACK_NS,
@@ -1654,11 +1764,13 @@ mod tests {
             pulsus_read::logql::MetricNode::Binary {
                 op,
                 return_bool,
+                matching,
                 lhs,
                 rhs,
             } => pulsus_read::logql::combine_binary(
                 *op,
                 *return_bool,
+                matching.as_ref(),
                 evaluate_node_hermetically(corpus, lhs, service),
                 evaluate_node_hermetically(corpus, rhs, service),
             )

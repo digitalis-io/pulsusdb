@@ -314,4 +314,72 @@ fn per_row_allocation_bounds_hold() {
         "client-agg filter+count: {total} allocations over {rows_n} rows — the zero-per-row \
          aggregation loop regressed"
     );
+
+    // --- Issue #91: the binop (vector-matching) join path. The matrix
+    // --- join is an INDEPENDENT per-step instant join; its cost is
+    // --- O(series x steps), never per raw row — and the per-step scratch
+    // --- (`lhs_items`/`rhs_items`) is REUSED across steps, so allocations
+    // --- must stay linear in (series x steps), not grow super-linearly.
+    // --- This gate pins that discipline for a many-to-one group_left
+    // --- join over many steps.
+    use pulsus_logql::{BinOp, MatchGroup, VectorMatching};
+    use pulsus_read::logql::{MatrixSeries, QueryResult, combine_binary};
+
+    const JOIN_STEPS: i64 = 2_000;
+    const JOIN_SERIES: usize = 8; // per side
+    let many: Vec<MatrixSeries> = (0..JOIN_SERIES)
+        .map(|s| MatrixSeries {
+            labels: vec![
+                ("app".to_string(), "p".to_string()),
+                ("inst".to_string(), s.to_string()),
+            ],
+            points: (0..JOIN_STEPS).map(|t| (t, (s as f64) + 1.0)).collect(),
+        })
+        .collect();
+    // One "one"-side series matching the shared on(app) signature.
+    let one = vec![MatrixSeries {
+        labels: vec![("app".to_string(), "p".to_string())],
+        points: (0..JOIN_STEPS).map(|t| (t, 2.0)).collect(),
+    }];
+    let matching = VectorMatching {
+        on: true,
+        labels: vec!["app".to_string()],
+        group: Some(MatchGroup::Left(vec![])),
+    };
+    // Warm-up (allocator internals) + prove output exists.
+    let warm = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&matching),
+        QueryResult::Matrix(many.clone()),
+        QueryResult::Matrix(one.clone()),
+    )
+    .expect("join");
+    assert!(
+        matches!(&warm, QueryResult::Matrix(m) if m.len() == JOIN_SERIES),
+        "the group_left join must produce one output series per many-side series"
+    );
+    let start = ALLOCS.load(Ordering::Relaxed);
+    let out = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&matching),
+        QueryResult::Matrix(many),
+        QueryResult::Matrix(one),
+    )
+    .expect("join");
+    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    std::hint::black_box(&out);
+    // Per step the core touches ~(one-side + many-side) signatures, the
+    // per-many output labels, and the output-point pushes — a small
+    // constant times the per-step series count. Bound generously at <= 24
+    // allocations per (step x many-side series); a per-input-point or
+    // quadratic regression (e.g. re-indexing the whole operand each step,
+    // or re-allocating the scratch item vectors) blows past it.
+    let units = JOIN_STEPS as u64 * JOIN_SERIES as u64;
+    assert!(
+        total <= 24 * units,
+        "binop join: {total} allocations over {units} (step x series) units — the per-step \
+         instant-join scratch-reuse discipline regressed (bound 24/unit)"
+    );
 }

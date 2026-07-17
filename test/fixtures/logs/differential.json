@@ -1,9 +1,13 @@
 {
-  "_comment": "issue M6-09 LogQL-pipeline differential corpus + coverage matrix (e2e/src/logs_corpus.rs + e2e/src/logs.rs). `{R}` in every case's `query` is replaced with this run's run_id at execution time; every case conjoins `run_id=\"{R}\"` plus a `service_name` scope pinning the body shape its parser expects, so a stale stack can never leak foreign streams into a set-equality comparison. Gate discipline (traces precedent, plan v3 delta 5): every stage has >= 1 case, every case starts `mode: \"gated\"`, and the exclusion list starts EMPTY. A case moves to `mode: \"informational\"` only via the triage discipline — an observed live divergence, classified fix-our-bug vs ratify-documented-oracle-delta, recorded in docs/benchmarks/logs-differential-ledger.md (the `ledger` field names the entry); PulsusDB stays hard-gated against the corpus expectation even then. `limit` is the query_range request cap on both stores; every case's expected entry set is sized strictly below it (validity gates in logs.rs).",
+  "_comment": "issue M6-09 LogQL-pipeline differential corpus + coverage matrix (e2e/src/logs_corpus.rs + e2e/src/logs.rs). `{R}` in every case's `query` is replaced with this run's run_id at execution time; every case conjoins `run_id=\"{R}\"` plus a `service_name` scope pinning the body shape its parser expects, so a stale stack can never leak foreign streams into a set-equality comparison. Gate discipline (traces precedent, plan v3 delta 5): every stage has >= 1 case, every case starts `mode: \"gated\"`, and the exclusion list starts EMPTY. A case moves to `mode: \"informational\"` only via the triage discipline \u2014 an observed live divergence, classified fix-our-bug vs ratify-documented-oracle-delta, recorded in docs/benchmarks/logs-differential-ledger.md (the `ledger` field names the entry); PulsusDB stays hard-gated against the corpus expectation even then. `limit` is the query_range request cap on both stores; every case's expected entry set is sized strictly below it (validity gates in logs.rs).",
   "seed": 20260717,
   "step_ns": 1000000000,
-  "ci": { "record_count": 60 },
-  "full": { "record_count": 300 },
+  "ci": {
+    "record_count": 60
+  },
+  "full": {
+    "record_count": 300
+  },
   "limit": 1000,
   "cases": [
     {
@@ -68,7 +72,7 @@
     },
     {
       "case_id": "metric_filtered_count",
-      "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores — no tumbling divergence)",
+      "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 no tumbling divergence)",
       "mode": "gated",
       "kind": "metric_instant",
       "query": "count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" [30m])"
@@ -96,7 +100,7 @@
     },
     {
       "case_id": "metric_rate_tumbling",
-      "construct": "M6-10 seeded ledger entry: range-query rate — PulsusDB's epoch-aligned tumbling buckets vs the oracle's request-aligned sliding windows (PulsusDB stays hard-gated against the tumbling by-construction expectation)",
+      "construct": "M6-10 seeded ledger entry: range-query rate \u2014 PulsusDB's epoch-aligned tumbling buckets vs the oracle's request-aligned sliding windows (PulsusDB stays hard-gated against the tumbling by-construction expectation)",
       "mode": "informational",
       "kind": "metric_range",
       "step_s": 60,
@@ -105,10 +109,90 @@
     },
     {
       "case_id": "metric_unwrap_error",
-      "construct": "M6-10 D1 witness: a GENUINE unwrap conversion failure surviving the pipeline (svc-badunit's took=abc) fails the metric query on BOTH stores — HTTP 400 carrying SampleExtractionErr, never silent exclusion",
+      "construct": "M6-10 D1 witness: a GENUINE unwrap conversion failure surviving the pipeline (svc-badunit's took=abc) fails the metric query on BOTH stores \u2014 HTTP 400 carrying SampleExtractionErr, never silent exclusion",
       "mode": "gated",
       "kind": "metric_error",
       "query": "sum_over_time({run_id=\"{R}\", service_name=\"svc-badunit\"} | logfmt | unwrap duration(took) [30m])"
+    },
+    {
+      "case_id": "metric_match_on",
+      "construct": "issue #91 one-to-one on(method) vector matching; output labels are the reduced signature (method)",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / on(method) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"200\" [30m]))"
+    },
+    {
+      "case_id": "metric_match_ignoring",
+      "construct": "issue #91 one-to-one ignoring(status) vector matching over by(method) operands",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / ignoring(status) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"503\" [30m]))"
+    },
+    {
+      "case_id": "metric_match_group_left",
+      "construct": "issue #91 many-to-one on(status) group_left; the many (lhs) side {method,status} passes through whole",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / on(status) group_left sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m]))"
+    },
+    {
+      "case_id": "metric_match_group_right",
+      "construct": "issue #91 one-to-many on(status) group_right; the many (rhs) side {method,status} passes through whole",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) * on(status) group_right sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m]))"
+    },
+    {
+      "case_id": "metric_match_on_range",
+      "construct": "issue #91 on(method) matching on the RANGE path (per-step instant join); informational \u2014 same tumbling-vs-sliding window divergence as metric_rate_tumbling",
+      "mode": "informational",
+      "ledger": "tumbling-vs-sliding-rate",
+      "kind": "metric_range",
+      "step_s": 60,
+      "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / on(method) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"200\" [1m]))"
+    },
+    {
+      "case_id": "metric_match_ignoring_range",
+      "construct": "issue #91 ignoring(status) matching on the RANGE path; informational (tumbling-vs-sliding)",
+      "mode": "informational",
+      "ledger": "tumbling-vs-sliding-rate",
+      "kind": "metric_range",
+      "step_s": 60,
+      "query": "sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / ignoring(status) sum by (method) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"503\" [1m]))"
+    },
+    {
+      "case_id": "metric_match_group_left_range",
+      "construct": "issue #91 on(status) group_left matching on the RANGE path; informational (tumbling-vs-sliding)",
+      "mode": "informational",
+      "ledger": "tumbling-vs-sliding-rate",
+      "kind": "metric_range",
+      "step_s": 60,
+      "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) / on(status) group_left sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m]))"
+    },
+    {
+      "case_id": "metric_match_group_right_range",
+      "construct": "issue #91 on(status) group_right matching on the RANGE path; informational (tumbling-vs-sliding)",
+      "mode": "informational",
+      "ledger": "tumbling-vs-sliding-rate",
+      "kind": "metric_range",
+      "step_s": 60,
+      "query": "sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m])) * on(status) group_right sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [1m]))"
+    },
+    {
+      "case_id": "metric_match_multiple_err",
+      "construct": "issue #91 many-to-one WITHOUT group_left/right: both stores reject the query (multiple matches for labels: many-to-one matching must be explicit)",
+      "mode": "gated",
+      "kind": "metric_match_error",
+      "expect_error_substr": "multiple matches for labels: many-to-one matching must be explicit",
+      "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / on(status) sum by (status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m]))"
+    },
+    {
+      "case_id": "metric_match_duplicate_err",
+      "construct": "issue #91 duplicate one-side signature (many-to-many): both stores reject the query (many-to-many matching not allowed: matching labels must be unique on one side)",
+      "mode": "gated",
+      "kind": "metric_match_error",
+      "expect_error_substr": "many-to-many matching not allowed: matching labels must be unique on one side",
+      "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / on(status) group_left sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m]))"
     }
   ]
 }

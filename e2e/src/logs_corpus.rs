@@ -62,6 +62,20 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     "metric_binary_scalar",
     "metric_rate_tumbling",
     "metric_unwrap_error",
+    // Issue #91 vector-matching modifiers (instant; gated).
+    "metric_match_on",
+    "metric_match_ignoring",
+    "metric_match_group_left",
+    "metric_match_group_right",
+    // Issue #91 vector-matching modifiers (range; informational — the
+    // same tumbling-vs-sliding window divergence as metric_rate_tumbling).
+    "metric_match_on_range",
+    "metric_match_ignoring_range",
+    "metric_match_group_left_range",
+    "metric_match_group_right_range",
+    // Issue #91 matching runtime errors (both stores fail the query).
+    "metric_match_multiple_err",
+    "metric_match_duplicate_err",
 ];
 
 pub const SVC_JSON: &str = "svc-json";
@@ -320,6 +334,59 @@ impl LogCorpus {
                     }
                 }
             }
+            // Issue #91 vector-matching modifiers over svc-json counts.
+            "metric_match_on" => {
+                // one-to-one `on(method)`: total(method) / count200(method).
+                let joined = join_by_construction(
+                    MatchOp::Div,
+                    true,
+                    &["method"],
+                    MatchG::OneToOne,
+                    &svc_json_counts(&self.records, &["method"], None),
+                    &svc_json_counts(&self.records, &["method"], Some(200)),
+                );
+                out.extend(joined);
+            }
+            "metric_match_ignoring" => {
+                // one-to-one `ignoring(status)`: total(method) / count503(method).
+                let joined = join_by_construction(
+                    MatchOp::Div,
+                    false,
+                    &["status"],
+                    MatchG::OneToOne,
+                    &svc_json_counts(&self.records, &["method"], None),
+                    &svc_json_counts(&self.records, &["method"], Some(503)),
+                );
+                out.extend(joined);
+            }
+            "metric_match_group_left" => {
+                // many-to-one `on(status) group_left`: the many (lhs) side
+                // {method,status} passes through whole; value =
+                // count(method,status) / total(status).
+                let joined = join_by_construction(
+                    MatchOp::Div,
+                    true,
+                    &["status"],
+                    MatchG::Left,
+                    &svc_json_counts(&self.records, &["method", "status"], None),
+                    &svc_json_counts(&self.records, &["status"], None),
+                );
+                out.extend(joined);
+            }
+            "metric_match_group_right" => {
+                // one-to-many `on(status) group_right`: the many (rhs) side
+                // {method,status} passes through whole; value =
+                // total(status) * count(method,status).
+                let joined = join_by_construction(
+                    MatchOp::Mul,
+                    true,
+                    &["status"],
+                    MatchG::Right,
+                    &svc_json_counts(&self.records, &["status"], None),
+                    &svc_json_counts(&self.records, &["method", "status"], None),
+                );
+                out.extend(joined);
+            }
             other => panic!("expected_metric_vector: unknown case id {other:?}"),
         }
         out
@@ -330,29 +397,83 @@ impl LogCorpus {
     /// epoch-aligned `floor(ts/step)*step` buckets, `rate` = count/step
     /// seconds, non-empty buckets only.
     pub fn expected_metric_matrix(&self, case_id: &str, step_ns: i64) -> MetricMatrix {
-        assert_eq!(
-            case_id, "metric_rate_tumbling",
-            "expected_metric_matrix: unknown case id {case_id:?}"
-        );
-        let mut buckets: BTreeMap<i64, f64> = BTreeMap::new();
-        for r in &self.records {
-            if r.service == SVC_JSON {
-                let bucket = r.ts_ns.div_euclid(step_ns) * step_ns;
-                *buckets.entry(bucket).or_insert(0.0) += 1.0;
+        if case_id == "metric_rate_tumbling" {
+            let mut buckets: BTreeMap<i64, f64> = BTreeMap::new();
+            for r in &self.records {
+                if r.service == SVC_JSON {
+                    let bucket = r.ts_ns.div_euclid(step_ns) * step_ns;
+                    *buckets.entry(bucket).or_insert(0.0) += 1.0;
+                }
             }
+            let step_seconds = step_ns as f64 / 1e9;
+            let points: BTreeMap<i64, f64> = buckets
+                .into_iter()
+                .map(|(b, n)| (b, n / step_seconds))
+                .collect();
+            let mut out = MetricMatrix::new();
+            if !points.is_empty() {
+                let base = BTreeMap::from([
+                    ("service_name".to_string(), SVC_JSON.to_string()),
+                    (RUN_ATTR.to_string(), self.run_id.clone()),
+                ]);
+                out.insert(base, points);
+            }
+            return out;
         }
-        let step_seconds = step_ns as f64 / 1e9;
-        let points: BTreeMap<i64, f64> = buckets
-            .into_iter()
-            .map(|(b, n)| (b, n / step_seconds))
-            .collect();
+
+        // Issue #91 vector-matching modifiers, RANGE path: an INDEPENDENT
+        // per-bucket instant join over epoch-aligned `count_over_time`
+        // buckets (the same shape the shipped engine produces per step).
+        // These match the four instant cases' queries, run as
+        // range queries — the join is applied fresh per shared bucket.
+        let (op, on, keys, group, lhs_spec, rhs_spec) = match case_id {
+            "metric_match_on_range" => (
+                MatchOp::Div,
+                true,
+                &["method"][..],
+                MatchG::OneToOne,
+                (&["method"][..], None),
+                (&["method"][..], Some(200)),
+            ),
+            "metric_match_ignoring_range" => (
+                MatchOp::Div,
+                false,
+                &["status"][..],
+                MatchG::OneToOne,
+                (&["method"][..], None),
+                (&["method"][..], Some(503)),
+            ),
+            "metric_match_group_left_range" => (
+                MatchOp::Div,
+                true,
+                &["status"][..],
+                MatchG::Left,
+                (&["method", "status"][..], None),
+                (&["status"][..], None),
+            ),
+            "metric_match_group_right_range" => (
+                MatchOp::Mul,
+                true,
+                &["status"][..],
+                MatchG::Right,
+                (&["status"][..], None),
+                (&["method", "status"][..], None),
+            ),
+            other => panic!("expected_metric_matrix: unknown case id {other:?}"),
+        };
+        let lhs = svc_json_bucket_counts(&self.records, lhs_spec.0, lhs_spec.1, step_ns);
+        let rhs = svc_json_bucket_counts(&self.records, rhs_spec.0, rhs_spec.1, step_ns);
+        let mut buckets: BTreeSet<i64> = BTreeSet::new();
+        buckets.extend(lhs.keys().copied());
+        buckets.extend(rhs.keys().copied());
         let mut out = MetricMatrix::new();
-        if !points.is_empty() {
-            let base = BTreeMap::from([
-                ("service_name".to_string(), SVC_JSON.to_string()),
-                (RUN_ATTR.to_string(), self.run_id.clone()),
-            ]);
-            out.insert(base, points);
+        let empty = Vec::new();
+        for b in buckets {
+            let l = lhs.get(&b).unwrap_or(&empty);
+            let r = rhs.get(&b).unwrap_or(&empty);
+            for (labels, value) in join_by_construction(op, on, keys, group, l, r) {
+                out.entry(labels).or_default().insert(b, value);
+            }
         }
         out
     }
@@ -369,6 +490,174 @@ impl LogCorpus {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #91: an ENGINE-INDEPENDENT by-construction oracle for the
+// vector-matching join (the corpus never calls `pulsus-read` — the
+// circularity breaker). Mirrors the shipped join semantics
+// (`instant_join`) but computed from the typed feature fields.
+// ---------------------------------------------------------------------
+
+type Labels = BTreeMap<String, String>;
+
+/// One matching arithmetic operator used by the #91 differential cases.
+#[derive(Clone, Copy)]
+pub enum MatchOp {
+    Div,
+    Mul,
+}
+
+/// The grouping side, mirroring the AST's `MatchGroup` (include lists are
+/// empty for every committed #91 case).
+#[derive(Clone, Copy)]
+pub enum MatchG {
+    OneToOne,
+    Left,
+    Right,
+}
+
+/// The reduced match signature: `on` keeps only the listed keys,
+/// `ignoring` (on = false) drops them.
+fn match_sig(labels: &Labels, on: bool, keys: &[&str]) -> Labels {
+    labels
+        .iter()
+        .filter(|(k, _)| on == keys.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The engine-independent instant join for one step (or one instant):
+/// one-to-one output = the reduced signature; `group_left`/`group_right`
+/// output = the many side's full labels (no include copies in the
+/// committed cases). Panics on a duplicate one-side signature — the
+/// committed success cases never trigger it (the error cases are asserted
+/// live, not by-construction).
+fn join_by_construction(
+    op: MatchOp,
+    on: bool,
+    keys: &[&str],
+    group: MatchG,
+    lhs: &[(Labels, f64)],
+    rhs: &[(Labels, f64)],
+) -> Vec<(Labels, f64)> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return Vec::new();
+    }
+    let (many, one, swapped) = match group {
+        MatchG::OneToOne | MatchG::Left => (lhs, rhs, false),
+        MatchG::Right => (rhs, lhs, true),
+    };
+    let one_to_one = matches!(group, MatchG::OneToOne);
+    let mut one_by_sig: BTreeMap<Labels, f64> = BTreeMap::new();
+    for (labels, v) in one {
+        let sig = match_sig(labels, on, keys);
+        assert!(
+            one_by_sig.insert(sig, *v).is_none(),
+            "by-construction join: duplicate one-side signature (a success case must be \
+             genuinely 1:1 or many-to-one)"
+        );
+    }
+    let mut out: Vec<(Labels, f64)> = Vec::new();
+    let mut seen: BTreeSet<Labels> = BTreeSet::new();
+    for (labels, mv) in many {
+        let sig = match_sig(labels, on, keys);
+        let Some(ov) = one_by_sig.get(&sig) else {
+            continue;
+        };
+        let (l, r) = if swapped { (*ov, *mv) } else { (*mv, *ov) };
+        let value = match op {
+            MatchOp::Div => l / r,
+            MatchOp::Mul => l * r,
+        };
+        let out_labels = if one_to_one { sig } else { labels.clone() };
+        if one_to_one {
+            assert!(
+                seen.insert(out_labels.clone()),
+                "by-construction join: one-to-one signature matched twice"
+            );
+        }
+        out.push((out_labels, value));
+    }
+    out
+}
+
+/// Counts svc-json records grouped by the requested label keys (subset of
+/// `{method, status}`), optionally filtered to a single status — the
+/// instant `count_over_time` value per group.
+fn svc_json_counts(
+    records: &[GeneratedRecord],
+    group: &[&str],
+    status: Option<i64>,
+) -> Vec<(Labels, f64)> {
+    let mut acc: BTreeMap<Labels, f64> = BTreeMap::new();
+    for r in records {
+        if r.service != SVC_JSON {
+            continue;
+        }
+        if let Some(s) = status
+            && r.status != s
+        {
+            continue;
+        }
+        let mut labels = Labels::new();
+        for k in group {
+            match *k {
+                "method" => {
+                    labels.insert("method".to_string(), r.method.to_string());
+                }
+                "status" => {
+                    labels.insert("status".to_string(), r.status.to_string());
+                }
+                other => panic!("svc_json_counts: unsupported group key {other:?}"),
+            }
+        }
+        *acc.entry(labels).or_insert(0.0) += 1.0;
+    }
+    acc.into_iter().collect()
+}
+
+/// The per-tumbling-bucket variant of [`svc_json_counts`] — the range
+/// `count_over_time` value per group per epoch-aligned bucket.
+fn svc_json_bucket_counts(
+    records: &[GeneratedRecord],
+    group: &[&str],
+    status: Option<i64>,
+    step_ns: i64,
+) -> BTreeMap<i64, Vec<(Labels, f64)>> {
+    let mut per_bucket: BTreeMap<i64, BTreeMap<Labels, f64>> = BTreeMap::new();
+    for r in records {
+        if r.service != SVC_JSON {
+            continue;
+        }
+        if let Some(s) = status
+            && r.status != s
+        {
+            continue;
+        }
+        let bucket = r.ts_ns.div_euclid(step_ns) * step_ns;
+        let mut labels = Labels::new();
+        for k in group {
+            match *k {
+                "method" => {
+                    labels.insert("method".to_string(), r.method.to_string());
+                }
+                "status" => {
+                    labels.insert("status".to_string(), r.status.to_string());
+                }
+                other => panic!("svc_json_bucket_counts: unsupported group key {other:?}"),
+            }
+        }
+        *per_bucket
+            .entry(bucket)
+            .or_default()
+            .entry(labels)
+            .or_insert(0.0) += 1.0;
+    }
+    per_bucket
+        .into_iter()
+        .map(|(b, m)| (b, m.into_iter().collect()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------

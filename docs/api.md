@@ -36,8 +36,10 @@ POST /v1/logs                    ExportLogsServiceRequest
 POST /v1/metrics                 ExportMetricsServiceRequest
 POST /v1/traces                  ExportTraceServiceRequest
 POST /v1development/profiles     ExportProfilesServiceRequest (OTLP profiles, experimental signal)
-Content-Type: application/x-protobuf   (OTLP/JSON accepted from M6)
+Content-Type: application/x-protobuf   (default; OTLP/JSON via application/json since M6)
 ```
+
+- Content negotiation: the body encoding is selected by `Content-Type` — `application/json` decodes the body as OTLP/JSON (proto3-JSON: hex `trace_id`/`span_id`, camelCase fields, u64 timestamps as strings, non-finite doubles as `"NaN"`/`"Infinity"`/`"-Infinity"`); anything else (including absent, or `application/x-protobuf`) decodes as protobuf. Both encodings feed the identical parse/row path, so they are byte-identical downstream. Enum fields are accepted in their integer form (the form real OTLP/JSON emitters send); a string enum name is rejected `400`. `Content-Encoding` (gzip/zstd/snappy) applies to a JSON body unchanged.
 
 - Resource + scope attributes flatten into labels under the canonical label model ([architecture.md §2.3](architecture.md)): for logs and metrics, attribute keys are normalized to Prometheus-style names at ingest (`service.name` → `service_name`); trace attributes keep their OTel names verbatim and are queried as such in TraceQL. Log body → line; spans → trace tables with original protobuf retained as payload; metric data points → metric samples with `__name__` from the metric name; profiles → pprof-equivalent tree precomputation.
 - Responses: `200` with OTLP partial-success message when applicable; `429` on backpressure.
@@ -87,6 +89,8 @@ Response: `{"status":"success","data":{"resultType":"streams"|"matrix","result":
 - **streams**: `result: [{"stream":{k:v,...},"values":[["<ts_ns>", "<line>"],...]}, ...]`. `ts_ns` is a **string** (nanosecond precision overflows JS's safe-integer range). `stats: {"streams":N,"entries":N,"bytes":N}` (`bytes` = decoded line bytes).
 - **matrix**: `result: [{"metric":{k:v,...},"values":[[<unix_seconds>, "<value>"],...]}, ...]`. Timestamps are Prometheus-style unix-seconds numbers (millisecond resolution — exact for every M1 step, which is always `>= 1s`); `value` is a quoted string (`"NaN"`/`"+Inf"`/`"-Inf"` as applicable, matching §3.1's convention). `stats: {"series":N}`.
 - With `X-Pulsus-Explain: 1`, `data.explain = {"result_type","routing":{"chosen":"rollup"|"raw","reason":"..."}|null,"stages":[{"name","sql","note"|null},...]}` is added alongside `data.stats`.
+
+**Metric binary operations & vector matching (issue #91).** LogQL metric expressions support binary operations between range vectors — arithmetic, comparison (with `bool`), and the `and`/`or`/`unless` set operators — with the full `on(...)`/`ignoring(...)` and `group_left(...)`/`group_right(...)` vector-matching modifiers (semantics oracle-verified against `grafana/loki:3.4.2`). One-to-one matches output the reduced (`on`/`ignoring`) signature; `group_left`/`group_right` pass the many side's labels through whole and copy the include labels from the one side. A cardinality violation is a `400 bad_data` carrying the reference store's exact message (`multiple matches for labels: many-to-one matching must be explicit …` / `… many-to-many matching not allowed: matching labels must be unique on one side`); a bare `group_left`/`group_right` with no preceding `on`/`ignoring` is a parse-time `400`. Matrix (range) binops apply the vector match independently per step. Note: the reference store returns HTTP `500` for these runtime matching errors while PulsusDB returns `400` (the semantically correct bad-request code); the error bodies agree. The `__error_details__` label is a named follow-up — error series carry `__error__` only.
 
 ### 2.2 `GET|POST /api/logs/v1/query`
 

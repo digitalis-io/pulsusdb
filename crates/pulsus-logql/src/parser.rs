@@ -313,9 +313,9 @@ fn peek_binop(cursor: &Cursor<'_>) -> Option<(BinOp, u8, bool)> {
 
 /// Precedence-climbing binary-operation layer over metric primaries
 /// (issue M6-10). After each operator, the `bool` modifier is accepted on
-/// comparisons only, and the deferred vector-matching modifiers
-/// (`on`/`ignoring`/`group_left`/`group_right`) are individually named
-/// `NotYetSupported` (adjudication: enumerated, no catch-all).
+/// comparisons only, followed by the optional vector-matching clause
+/// (`on`/`ignoring` with an optional `group_left`/`group_right`), issue
+/// #91.
 fn parse_binary_expr(
     cursor: &mut Cursor<'_>,
     depth: usize,
@@ -345,37 +345,103 @@ fn parse_binary_expr(
     Ok(lhs)
 }
 
-/// Parses the optional modifier(s) after a binary operator: `bool` on a
-/// comparison builds a [`BinModifier`]; the deferred matching modifiers
-/// are enumerated `NotYetSupported`.
+/// Parses the optional modifier(s) after a binary operator: an optional
+/// `bool` (comparison operators only), then an optional vector-matching
+/// clause `("on"|"ignoring") "(" labels ")"` with an optional trailing
+/// `("group_left"|"group_right") ("(" labels ")")?` (issue #91). Returns
+/// `None` when neither is present (byte-identical to the pre-#91
+/// clause-free path). A `group_left`/`group_right` with no preceding
+/// `on`/`ignoring` is a positional parse error — oracle-pinned: Loki
+/// rejects it HTTP 400.
 fn parse_bin_modifier(
     cursor: &mut Cursor<'_>,
     op: BinOp,
 ) -> Result<Option<BinModifier>, LogQlError> {
-    let tok = cursor.peek().clone();
-    if let TokenKind::Ident(name) = &tok.kind {
-        if ast::VECTOR_MATCHING_KEYWORDS.contains(&name.as_str()) {
-            return Err(LogQlError::NotYetSupported {
-                construct: name.clone(),
+    let mut return_bool = false;
+    if let TokenKind::Ident(name) = &cursor.peek().kind
+        && name == "bool"
+        && op.is_comparison()
+    {
+        cursor.advance();
+        return_bool = true;
+    }
+
+    let matching = parse_vector_matching(cursor)?;
+    if !return_bool && matching.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(BinModifier {
+        return_bool,
+        matching,
+    }))
+}
+
+/// Parses an optional `("on"|"ignoring") "(" labels ")"` clause plus an
+/// optional trailing `group_left`/`group_right` grouping (issue #91). A
+/// bare `group_left`/`group_right` (no `on`/`ignoring` first) is rejected
+/// as an unexpected token — matching the oracle's HTTP 400.
+fn parse_vector_matching(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<ast::VectorMatching>, LogQlError> {
+    let on = match &cursor.peek().kind {
+        TokenKind::Ident(name) if name == "on" => true,
+        TokenKind::Ident(name) if name == "ignoring" => false,
+        TokenKind::Ident(name) if name == "group_left" || name == "group_right" => {
+            let tok = cursor.peek();
+            return Err(LogQlError::UnexpectedToken {
+                found: format!("identifier {name:?}"),
+                expected: "'on' or 'ignoring' before a grouping modifier".to_string(),
                 span: tok.span,
             });
         }
-        if name == "bool" && op.is_comparison() {
+        _ => return Ok(None),
+    };
+    cursor.advance();
+    let labels = parse_label_list_parens(cursor)?;
+
+    let group = match &cursor.peek().kind {
+        TokenKind::Ident(name) if name == "group_left" || name == "group_right" => {
+            let left = name == "group_left";
             cursor.advance();
-            // A matching modifier may also follow `bool` — still deferred.
-            let after = cursor.peek().clone();
-            if let TokenKind::Ident(next) = &after.kind
-                && ast::VECTOR_MATCHING_KEYWORDS.contains(&next.as_str())
-            {
-                return Err(LogQlError::NotYetSupported {
-                    construct: next.clone(),
-                    span: after.span,
-                });
+            // The include-label list is optional: `group_left` or
+            // `group_left(a, b)`.
+            let includes = if matches!(cursor.peek().kind, TokenKind::LParen) {
+                parse_label_list_parens(cursor)?
+            } else {
+                Vec::new()
+            };
+            Some(if left {
+                ast::MatchGroup::Left(includes)
+            } else {
+                ast::MatchGroup::Right(includes)
+            })
+        }
+        _ => None,
+    };
+
+    Ok(Some(ast::VectorMatching { on, labels, group }))
+}
+
+/// Parses a parenthesized comma-separated label-name list `"(" (ident
+/// ("," ident)*)? ")"` — the shape shared by `on`/`ignoring`,
+/// `group_left`/`group_right`, and `by`/`without` grouping. An empty list
+/// `()` is allowed (`on()`).
+fn parse_label_list_parens(cursor: &mut Cursor<'_>) -> Result<Vec<String>, LogQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let mut labels = Vec::new();
+    if !matches!(cursor.peek().kind, TokenKind::RParen) {
+        loop {
+            let (label, _) = cursor.expect_ident()?;
+            labels.push(label);
+            if matches!(cursor.peek().kind, TokenKind::Comma) {
+                cursor.advance();
+                continue;
             }
-            return Ok(Some(BinModifier { return_bool: true }));
+            break;
         }
     }
-    Ok(None)
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(labels)
 }
 
 /// A metric-expression primary: a parenthesized binary expression, a bare
@@ -942,19 +1008,6 @@ fn parse_grouping(cursor: &mut Cursor<'_>) -> Result<Grouping, LogQlError> {
             });
         }
     };
-    cursor.expect(&TokenKind::LParen, "'('")?;
-    let mut labels = Vec::new();
-    if !matches!(cursor.peek().kind, TokenKind::RParen) {
-        loop {
-            let (label, _) = cursor.expect_ident()?;
-            labels.push(label);
-            if matches!(cursor.peek().kind, TokenKind::Comma) {
-                cursor.advance();
-                continue;
-            }
-            break;
-        }
-    }
-    cursor.expect(&TokenKind::RParen, "')'")?;
+    let labels = parse_label_list_parens(cursor)?;
     Ok(Grouping { kind, labels })
 }

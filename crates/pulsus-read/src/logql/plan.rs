@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use pulsus_logql::{
     BinModifier, BinOp, Expr, Grouping, LineFilter, LineFilterOp, LogExpr, MatchOp, Matcher,
-    MetricExpr, RangeAggOp, Stage, StreamSelector, VectorAggOp,
+    MetricExpr, RangeAggOp, Stage, StreamSelector, VectorAggOp, VectorMatching,
 };
 
 use super::error::ReadError;
@@ -189,6 +189,10 @@ pub enum MetricNode {
         op: BinOp,
         /// The `bool` comparison modifier (0/1 instead of filtering).
         return_bool: bool,
+        /// The `on`/`ignoring`/`group_left`/`group_right` vector-matching
+        /// clause (issue #91); `None` = default full-label one-to-one
+        /// matching (the pre-#91 behavior, byte-identical).
+        matching: Option<VectorMatching>,
         lhs: Box<MetricNode>,
         rhs: Box<MetricNode>,
     },
@@ -300,7 +304,14 @@ fn build_metric_node(
             rhs,
         } => Ok(MetricNode::Binary {
             op: *op,
-            return_bool: matches!(modifier, Some(BinModifier { return_bool: true })),
+            return_bool: matches!(
+                modifier,
+                Some(BinModifier {
+                    return_bool: true,
+                    ..
+                })
+            ),
+            matching: modifier.as_ref().and_then(|m| m.matching.clone()),
             lhs: Box::new(build_metric_node(lhs, p, ctx)?),
             rhs: Box::new(build_metric_node(rhs, p, ctx)?),
         }),

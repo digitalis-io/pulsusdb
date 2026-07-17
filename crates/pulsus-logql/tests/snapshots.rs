@@ -960,8 +960,168 @@ fn bool_modifier_is_captured_and_rendered() {
     let pulsus_logql::Expr::Metric(MetricExpr::Binary { modifier, .. }) = &expr else {
         panic!("expected a binary expr");
     };
-    assert_eq!(*modifier, Some(BinModifier { return_bool: true }));
+    assert_eq!(
+        *modifier,
+        Some(BinModifier {
+            return_bool: true,
+            matching: None,
+        })
+    );
     assert_eq!(expr.to_string(), r#"rate({a="b"}[5m]) > bool 0.5"#);
+}
+
+/// Issue #91: every vector-matching modifier form parses into the
+/// specified [`VectorMatching`] and round-trips through `Display`.
+#[test]
+fn vector_matching_modifiers_are_captured_and_render() {
+    use pulsus_logql::{BinModifier, MatchGroup, MetricExpr, VectorMatching};
+
+    let cases: &[(&str, VectorMatching)] = &[
+        (
+            r#"rate({a="b"}[5m]) / on(app) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec!["app".to_string()],
+                group: None,
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) / ignoring(inst) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: false,
+                labels: vec!["inst".to_string()],
+                group: None,
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) / on(app) group_left rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec!["app".to_string()],
+                group: Some(MatchGroup::Left(vec![])),
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) * on(app) group_left(extra) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec!["app".to_string()],
+                group: Some(MatchGroup::Left(vec!["extra".to_string()])),
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) * on(app) group_right(a, b) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec!["app".to_string()],
+                group: Some(MatchGroup::Right(vec!["a".to_string(), "b".to_string()])),
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) == bool on() rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec![],
+                group: None,
+            },
+        ),
+    ];
+
+    for (query, want) in cases {
+        let expr = parse(query).unwrap_or_else(|e| panic!("parse {query:?}: {e}"));
+        let pulsus_logql::Expr::Metric(MetricExpr::Binary { modifier, .. }) = &expr else {
+            panic!("expected a binary expr for {query:?}");
+        };
+        let modifier = modifier.as_ref().expect("a modifier");
+        assert_eq!(
+            modifier.matching.as_ref(),
+            Some(want),
+            "matching clause for {query:?}"
+        );
+        // Round-trip: reparse of the rendered form equals the original.
+        assert_round_trip(query);
+    }
+
+    // `bool` + matching coexist on a comparison.
+    let expr = parse(r#"rate({a="b"}[5m]) == bool on() rate({a="c"}[5m])"#).unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { modifier, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(
+        *modifier,
+        Some(BinModifier {
+            return_bool: true,
+            matching: Some(VectorMatching {
+                on: true,
+                labels: vec![],
+                group: None,
+            }),
+        })
+    );
+}
+
+/// Issue #91: a bare `group_left`/`group_right` with no preceding
+/// `on`/`ignoring` is a positional parse error (an `UnexpectedToken`,
+/// NOT `NotYetSupported`) — oracle-pinned: Loki rejects it HTTP 400.
+#[test]
+fn group_modifier_without_on_or_ignoring_is_a_parse_error() {
+    use pulsus_logql::LogQlError;
+    for q in [
+        r#"rate({a="b"}[5m]) / group_left rate({a="c"}[5m])"#,
+        r#"rate({a="b"}[5m]) / group_right(x) rate({a="c"}[5m])"#,
+    ] {
+        let err = parse(q).expect_err("must reject a bare grouping modifier");
+        assert!(
+            matches!(err, LogQlError::UnexpectedToken { .. }),
+            "expected UnexpectedToken for {q:?}, got {err:?}"
+        );
+    }
+}
+
+/// Issue #91 (review round 2, finding 1): a label appearing in BOTH the
+/// `on`/`ignoring` signature AND the `group_left`/`group_right` include
+/// list. Prometheus rejects this at parse time ("label \"x\" must not
+/// occur in ON and GROUP clause at once"), and the review expected Loki
+/// to inherit that rule — but the `grafana/loki:3.4.2` oracle does NOT:
+/// it PARSES and EVALUATES `... on(x) group_left(x) ...` (probed live —
+/// HTTP 200 with a correctly joined result, both `query` and
+/// `query_range`). Matching the oracle (the standing "don't invent rules,
+/// match Loki" mandate), we therefore ACCEPT the overlap rather than
+/// synthesize a Prometheus-only rejection Loki lacks. This test locks the
+/// oracle-confirmed acceptance so a future "add the Prometheus check"
+/// change cannot silently regress LogQL/Loki parity.
+#[test]
+fn a_label_shared_by_on_and_group_clauses_parses_matching_the_loki_oracle() {
+    use pulsus_logql::{MatchGroup, MetricExpr, VectorMatching};
+    for (query, want) in [
+        (
+            r#"rate({a="b"}[5m]) / on(x) group_left(x) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: true,
+                labels: vec!["x".to_string()],
+                group: Some(MatchGroup::Left(vec!["x".to_string()])),
+            },
+        ),
+        (
+            r#"rate({a="b"}[5m]) / ignoring(y) group_left(y) rate({a="c"}[5m])"#,
+            VectorMatching {
+                on: false,
+                labels: vec!["y".to_string()],
+                group: Some(MatchGroup::Left(vec!["y".to_string()])),
+            },
+        ),
+    ] {
+        let expr = parse(query).unwrap_or_else(|e| panic!("must parse {query:?}: {e}"));
+        let pulsus_logql::Expr::Metric(MetricExpr::Binary { modifier, .. }) = &expr else {
+            panic!("expected a binary expr for {query:?}");
+        };
+        assert_eq!(
+            modifier.as_ref().and_then(|m| m.matching.as_ref()),
+            Some(&want),
+            "matching clause for {query:?}"
+        );
+        assert_round_trip(query);
+    }
 }
 
 /// Parenthesized grouping overrides precedence and the tree shape

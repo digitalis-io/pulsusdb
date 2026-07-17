@@ -1061,9 +1061,10 @@ fn eval_scalar_query(query: &str) -> f64 {
             MetricNode::Binary {
                 op,
                 return_bool,
+                matching,
                 lhs,
                 rhs,
-            } => combine_binary(*op, *return_bool, eval(lhs)?, eval(rhs)?),
+            } => combine_binary(*op, *return_bool, matching.as_ref(), eval(lhs)?, eval(rhs)?),
             MetricNode::VectorAgg { aggs, inner } => Ok(apply_vector_aggs(eval(inner)?, aggs)),
             MetricNode::Leaf(_) => panic!("scalar-only trees expected"),
         }
@@ -1109,6 +1110,7 @@ fn scalar_left_and_scalar_right_subtraction_differ() {
     let left = combine_binary(
         BinOp::Sub,
         false,
+        None,
         QueryResult::Scalar(2.0),
         one_sample_vector(8.0),
     )
@@ -1117,6 +1119,7 @@ fn scalar_left_and_scalar_right_subtraction_differ() {
     let right = combine_binary(
         BinOp::Sub,
         false,
+        None,
         one_sample_vector(8.0),
         QueryResult::Scalar(2.0),
     )
@@ -1129,6 +1132,7 @@ fn scalar_left_division_and_power_preserve_orientation() {
     let div = combine_binary(
         BinOp::Div,
         false,
+        None,
         QueryResult::Scalar(100.0),
         one_sample_vector(4.0),
     )
@@ -1137,6 +1141,7 @@ fn scalar_left_division_and_power_preserve_orientation() {
     let pow = combine_binary(
         BinOp::Pow,
         false,
+        None,
         QueryResult::Scalar(2.0),
         one_sample_vector(3.0),
     )
@@ -1150,6 +1155,7 @@ fn comparison_filters_keep_the_vector_value_in_both_orientations() {
     let kept = combine_binary(
         BinOp::Lt,
         false,
+        None,
         QueryResult::Scalar(5.0),
         one_sample_vector(10.0),
     )
@@ -1158,6 +1164,7 @@ fn comparison_filters_keep_the_vector_value_in_both_orientations() {
     let dropped = combine_binary(
         BinOp::Gt,
         false,
+        None,
         QueryResult::Scalar(5.0),
         one_sample_vector(10.0),
     )
@@ -1167,6 +1174,7 @@ fn comparison_filters_keep_the_vector_value_in_both_orientations() {
     let kept = combine_binary(
         BinOp::Gt,
         false,
+        None,
         one_sample_vector(10.0),
         QueryResult::Scalar(5.0),
     )
@@ -1175,6 +1183,7 @@ fn comparison_filters_keep_the_vector_value_in_both_orientations() {
     let dropped = combine_binary(
         BinOp::Gt,
         false,
+        None,
         one_sample_vector(10.0),
         QueryResult::Scalar(100.0),
     )
@@ -1188,6 +1197,7 @@ fn bool_comparison_returns_zero_or_one_and_never_filters() {
     let hit = combine_binary(
         BinOp::Gt,
         true,
+        None,
         one_sample_vector(10.0),
         QueryResult::Scalar(5.0),
     )
@@ -1196,6 +1206,7 @@ fn bool_comparison_returns_zero_or_one_and_never_filters() {
     let miss = combine_binary(
         BinOp::Gt,
         true,
+        None,
         one_sample_vector(10.0),
         QueryResult::Scalar(100.0),
     )
@@ -1241,7 +1252,7 @@ fn vector_vector_arithmetic_matches_on_identical_full_label_sets() {
             value: 9.0,
         },
     ]);
-    let by_app = vector_by_app(combine_binary(BinOp::Sub, false, lhs, rhs).unwrap());
+    let by_app = vector_by_app(combine_binary(BinOp::Sub, false, None, lhs, rhs).unwrap());
     assert_eq!(by_app.len(), 1);
     assert_eq!(by_app["a"], 6.0);
 }
@@ -1259,15 +1270,17 @@ fn and_or_unless_are_label_set_operations() {
             value: 100.0,
         },
     ]);
-    let and = vector_by_app(combine_binary(BinOp::And, false, lhs.clone(), rhs.clone()).unwrap());
+    let and =
+        vector_by_app(combine_binary(BinOp::And, false, None, lhs.clone(), rhs.clone()).unwrap());
     assert_eq!(and.len(), 1);
     assert_eq!(and["b"], 2.0, "and keeps LHS values");
-    let or = vector_by_app(combine_binary(BinOp::Or, false, lhs.clone(), rhs.clone()).unwrap());
+    let or =
+        vector_by_app(combine_binary(BinOp::Or, false, None, lhs.clone(), rhs.clone()).unwrap());
     assert_eq!(or.len(), 3);
     assert_eq!(or["a"], 1.0);
     assert_eq!(or["b"], 2.0, "or prefers LHS on a label-set collision");
     assert_eq!(or["c"], 100.0);
-    let unless = vector_by_app(combine_binary(BinOp::Unless, false, lhs, rhs).unwrap());
+    let unless = vector_by_app(combine_binary(BinOp::Unless, false, None, lhs, rhs).unwrap());
     assert_eq!(unless.len(), 1);
     assert_eq!(unless["a"], 1.0);
 }
@@ -1284,14 +1297,15 @@ fn matrix_binary_ops_align_per_shared_step() {
         points: vec![(0, 4.0), (2 * STEP, 1.0)],
     }]);
     let QueryResult::Matrix(items) =
-        combine_binary(BinOp::Add, false, lhs.clone(), rhs.clone()).unwrap()
+        combine_binary(BinOp::Add, false, None, lhs.clone(), rhs.clone()).unwrap()
     else {
         panic!("expected a matrix");
     };
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].points, vec![(0, 14.0)]);
     // `or` unions per step: lhs points win, rhs fills gaps.
-    let QueryResult::Matrix(items) = combine_binary(BinOp::Or, false, lhs, rhs).unwrap() else {
+    let QueryResult::Matrix(items) = combine_binary(BinOp::Or, false, None, lhs, rhs).unwrap()
+    else {
         panic!("expected a matrix");
     };
     assert_eq!(items.len(), 1);
@@ -1308,6 +1322,7 @@ fn set_operations_against_a_scalar_are_a_named_rejection() {
     let err = combine_binary(
         BinOp::And,
         false,
+        None,
         one_sample_vector(1.0),
         QueryResult::Scalar(2.0),
     )
@@ -1319,4 +1334,564 @@ fn set_operations_against_a_scalar_are_a_named_rejection() {
         reason.contains("logical/set binary operation (and)"),
         "{reason}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #91: vector-matching modifiers (on/ignoring/group_left/
+// group_right). Semantics oracle-pinned against grafana/loki:3.4.2.
+// ---------------------------------------------------------------------
+
+use pulsus_logql::{MatchGroup, VectorMatching};
+
+fn sample(labels: &[(&str, &str)], value: f64) -> VectorSample {
+    VectorSample {
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        value,
+    }
+}
+
+fn on(labels: &[&str], group: Option<MatchGroup>) -> VectorMatching {
+    VectorMatching {
+        on: true,
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+        group,
+    }
+}
+
+fn ignoring(labels: &[&str], group: Option<MatchGroup>) -> VectorMatching {
+    VectorMatching {
+        on: false,
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+        group,
+    }
+}
+
+fn as_vector(result: QueryResult) -> Vec<VectorSample> {
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    items
+}
+
+/// `on(app)` one-to-one: output labels are the REDUCED signature (just
+/// `app`), NOT the full LHS label set. Oracle-pinned.
+#[test]
+fn on_one_to_one_output_is_the_reduced_signature() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 10.0)]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("zone", "z")], 2.0)]);
+    let out =
+        as_vector(combine_binary(BinOp::Div, false, Some(&on(&["app"], None)), lhs, rhs).unwrap());
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].labels, vec![("app".to_string(), "p".to_string())]);
+    assert_eq!(out[0].value, 5.0);
+}
+
+/// `ignoring(inst)` one-to-one: the signature drops `inst`, so two series
+/// differing only in `inst` match; output is the reduced set (`app`).
+#[test]
+fn ignoring_one_to_one_drops_the_listed_label_from_the_signature() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 8.0)]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "2")], 4.0)]);
+    let out = as_vector(
+        combine_binary(
+            BinOp::Div,
+            false,
+            Some(&ignoring(&["inst"], None)),
+            lhs,
+            rhs,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].labels, vec![("app".to_string(), "p".to_string())]);
+    assert_eq!(out[0].value, 2.0);
+}
+
+/// `on(app) group_left(extra)`: the MANY (lhs) side passes through whole;
+/// the `extra` include label is copied from the ONE (rhs) side.
+#[test]
+fn group_left_passes_many_side_through_and_copies_include_labels() {
+    let lhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 10.0),
+        sample(&[("app", "p"), ("inst", "2")], 20.0),
+    ]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("extra", "E")], 2.0)]);
+    let out = as_vector(
+        combine_binary(
+            BinOp::Div,
+            false,
+            Some(&on(
+                &["app"],
+                Some(MatchGroup::Left(vec!["extra".to_string()])),
+            )),
+            lhs,
+            rhs,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 2);
+    // Full many-side labels + copied `extra=E`, key-sorted.
+    assert_eq!(
+        out[0].labels,
+        vec![
+            ("app".to_string(), "p".to_string()),
+            ("extra".to_string(), "E".to_string()),
+            ("inst".to_string(), "1".to_string()),
+        ]
+    );
+    assert_eq!(out[0].value, 5.0);
+    assert_eq!(out[1].value, 10.0);
+    assert_eq!(out[1].labels[2], ("inst".to_string(), "2".to_string()));
+}
+
+/// `on(app) group_right`: rhs is the many side; output = full rhs labels,
+/// and the value restores source operand order (lhs OP rhs).
+#[test]
+fn group_right_makes_rhs_the_many_side_and_restores_value_order() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p")], 100.0)]);
+    let rhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 10.0),
+        sample(&[("app", "p"), ("inst", "2")], 20.0),
+    ]);
+    let out = as_vector(
+        combine_binary(
+            BinOp::Div,
+            false,
+            Some(&on(&["app"], Some(MatchGroup::Right(vec![])))),
+            lhs,
+            rhs,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 2);
+    // Full many-side (rhs) labels; value = lhs/rhs = 100/10, 100/20.
+    assert_eq!(
+        out[0].labels,
+        vec![
+            ("app".to_string(), "p".to_string()),
+            ("inst".to_string(), "1".to_string()),
+        ]
+    );
+    assert_eq!(out[0].value, 10.0);
+    assert_eq!(out[1].value, 5.0);
+}
+
+/// An empty include value drops the label (upstream treats `""` as
+/// absent).
+#[test]
+fn group_left_include_with_empty_value_drops_the_label() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 10.0)]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("extra", "")], 2.0)]);
+    let out = as_vector(
+        combine_binary(
+            BinOp::Mul,
+            false,
+            Some(&on(
+                &["app"],
+                Some(MatchGroup::Left(vec!["extra".to_string()])),
+            )),
+            lhs,
+            rhs,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    // `extra` absent — only the many-side labels survive.
+    assert_eq!(
+        out[0].labels,
+        vec![
+            ("app".to_string(), "p".to_string()),
+            ("inst".to_string(), "1".to_string()),
+        ]
+    );
+}
+
+/// A second LHS series matching an already-consumed one-to-one signature
+/// is the "many-to-one matching must be explicit" error (oracle-pinned).
+#[test]
+fn one_to_one_second_many_side_match_is_multiple_matches_error() {
+    let lhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 10.0),
+        sample(&[("app", "p"), ("inst", "2")], 20.0),
+    ]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p")], 2.0)]);
+    let err = combine_binary(BinOp::Div, false, Some(&on(&["app"], None)), lhs, rhs).unwrap_err();
+    let ReadError::PipelineInvalid { reason } = &err else {
+        panic!("expected PipelineInvalid, got {err:?}");
+    };
+    assert!(
+        reason.contains("multiple matches for labels: many-to-one matching must be explicit"),
+        "{reason}"
+    );
+}
+
+/// A duplicate ONE-side signature is many-to-many — errors for EVERY
+/// cardinality, including a plain one-to-one (the one-side map is built
+/// unconditionally). Oracle-pinned wording.
+#[test]
+fn duplicate_one_side_signature_is_many_to_many_error() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 10.0)]);
+    // Two rhs series reduce to the same on(app) signature.
+    let rhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 2.0),
+        sample(&[("app", "p"), ("inst", "2")], 3.0),
+    ]);
+    let err = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&on(&["app"], Some(MatchGroup::Left(vec![])))),
+        lhs,
+        rhs,
+    )
+    .unwrap_err();
+    let ReadError::PipelineInvalid { reason } = &err else {
+        panic!("expected PipelineInvalid, got {err:?}");
+    };
+    assert!(
+        reason.contains(
+            "many-to-many matching not allowed: matching labels must be unique on one side"
+        ),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("found duplicate series on the right hand-side"),
+        "{reason}"
+    );
+}
+
+/// The empty-operand short-circuit is scoped to arithmetic/comparison: a
+/// duplicate one-side signature that could never pair (empty other side)
+/// must NOT surface a spurious error.
+#[test]
+fn empty_operand_short_circuits_arithmetic_before_duplicate_detection() {
+    let lhs: QueryResult = QueryResult::Vector(vec![]);
+    let rhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 2.0),
+        sample(&[("app", "p"), ("inst", "2")], 3.0),
+    ]);
+    let out = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&on(&["app"], Some(MatchGroup::Left(vec![])))),
+        lhs,
+        rhs,
+    )
+    .unwrap();
+    assert_eq!(out, QueryResult::Vector(Vec::new()));
+}
+
+/// Set ops key on the reduced signature under `on`/`ignoring`, and their
+/// empty-operand semantics differ from arithmetic (NO short-circuit):
+/// `lhs or ∅`→lhs, `∅ or rhs`→rhs, `lhs and ∅`→∅, `lhs unless ∅`→lhs.
+#[test]
+fn set_ops_key_on_signature_and_keep_their_own_empty_semantics() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 1.0)]);
+    let rhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("zone", "z")], 9.0)]);
+    // `and on(app)`: signatures match on app -> lhs survives (LHS value).
+    let out = as_vector(
+        combine_binary(
+            BinOp::And,
+            false,
+            Some(&on(&["app"], None)),
+            lhs.clone(),
+            rhs.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].value, 1.0);
+    // `lhs or ∅` -> lhs.
+    let empty = QueryResult::Vector(vec![]);
+    let out = as_vector(
+        combine_binary(
+            BinOp::Or,
+            false,
+            Some(&on(&["app"], None)),
+            lhs.clone(),
+            empty.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    // `∅ or rhs` -> rhs.
+    let out = as_vector(
+        combine_binary(
+            BinOp::Or,
+            false,
+            Some(&on(&["app"], None)),
+            empty.clone(),
+            rhs.clone(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    // `lhs and ∅` -> ∅.
+    let out = combine_binary(
+        BinOp::And,
+        false,
+        Some(&on(&["app"], None)),
+        lhs.clone(),
+        empty.clone(),
+    )
+    .unwrap();
+    assert_eq!(out, QueryResult::Vector(Vec::new()));
+    // `lhs unless ∅` -> lhs.
+    let out = as_vector(
+        combine_binary(
+            BinOp::Unless,
+            false,
+            Some(&on(&["app"], None)),
+            lhs.clone(),
+            empty,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+}
+
+/// MATRIX per-step join: two same-(reduced-)signature series whose points
+/// never share a step must NOT error; a same-timestamp ambiguity MUST.
+#[test]
+fn matrix_join_is_per_step_scoped_for_duplicate_detection() {
+    // Same on(app) signature, DISJOINT timestamps on the one side -> no
+    // per-step ambiguity, no error.
+    let lhs = QueryResult::Matrix(vec![MatrixSeries {
+        labels: vec![
+            ("app".to_string(), "p".to_string()),
+            ("inst".to_string(), "1".to_string()),
+        ],
+        points: vec![(0, 10.0), (STEP, 20.0)],
+    }]);
+    let rhs = QueryResult::Matrix(vec![
+        MatrixSeries {
+            labels: vec![
+                ("app".to_string(), "p".to_string()),
+                ("z".to_string(), "a".to_string()),
+            ],
+            points: vec![(0, 2.0)],
+        },
+        MatrixSeries {
+            labels: vec![
+                ("app".to_string(), "p".to_string()),
+                ("z".to_string(), "b".to_string()),
+            ],
+            points: vec![(STEP, 4.0)],
+        },
+    ]);
+    let QueryResult::Matrix(items) =
+        combine_binary(BinOp::Div, false, Some(&on(&["app"], None)), lhs, rhs).unwrap()
+    else {
+        panic!("expected a matrix");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].labels, vec![("app".to_string(), "p".to_string())]);
+    assert_eq!(items[0].points, vec![(0, 5.0), (STEP, 5.0)]);
+
+    // Same signature COLLIDING at one timestamp -> per-step error.
+    let lhs = QueryResult::Matrix(vec![MatrixSeries {
+        labels: vec![
+            ("app".to_string(), "p".to_string()),
+            ("inst".to_string(), "1".to_string()),
+        ],
+        points: vec![(0, 10.0)],
+    }]);
+    let rhs = QueryResult::Matrix(vec![
+        MatrixSeries {
+            labels: vec![
+                ("app".to_string(), "p".to_string()),
+                ("z".to_string(), "a".to_string()),
+            ],
+            points: vec![(0, 2.0)],
+        },
+        MatrixSeries {
+            labels: vec![
+                ("app".to_string(), "p".to_string()),
+                ("z".to_string(), "b".to_string()),
+            ],
+            points: vec![(0, 4.0)],
+        },
+    ]);
+    let err = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&on(&["app"], Some(MatchGroup::Left(vec![])))),
+        lhs,
+        rhs,
+    )
+    .unwrap_err();
+    assert!(matches!(err, ReadError::PipelineInvalid { .. }));
+}
+
+/// MATRIX set ops with an empty opposite operand on the RANGE path
+/// (adjudicated coverage): `or` returns the non-empty side, `unless`
+/// keeps lhs, `and` empties — all per step.
+#[test]
+fn matrix_set_ops_with_empty_operand_per_step() {
+    let lhs = QueryResult::Matrix(vec![MatrixSeries {
+        labels: vec![("app".to_string(), "p".to_string())],
+        points: vec![(0, 10.0), (STEP, 20.0)],
+    }]);
+    let empty = QueryResult::Matrix(vec![]);
+    // `lhs or ∅` -> lhs unchanged.
+    let QueryResult::Matrix(items) = combine_binary(
+        BinOp::Or,
+        false,
+        Some(&on(&["app"], None)),
+        lhs.clone(),
+        empty.clone(),
+    )
+    .unwrap() else {
+        panic!("matrix");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].points, vec![(0, 10.0), (STEP, 20.0)]);
+    // `lhs unless ∅` -> lhs.
+    let QueryResult::Matrix(items) = combine_binary(
+        BinOp::Unless,
+        false,
+        Some(&on(&["app"], None)),
+        lhs.clone(),
+        empty.clone(),
+    )
+    .unwrap() else {
+        panic!("matrix");
+    };
+    assert_eq!(items[0].points, vec![(0, 10.0), (STEP, 20.0)]);
+    // `lhs and ∅` -> ∅.
+    let out = combine_binary(BinOp::And, false, Some(&on(&["app"], None)), lhs, empty).unwrap();
+    assert_eq!(out, QueryResult::Matrix(Vec::new()));
+}
+
+/// MATRIX set ops on the RANGE path with the EMPTY operand on the LEFT
+/// (issue #91, review round 2 test-gap 4 — the reversed companions to the
+/// `lhs OP ∅` cases above, previously untested): `∅ or rhs` -> rhs and
+/// `∅ unless rhs` -> ∅, both at the per-step level. Semantics pinned
+/// against `grafana/loki:3.4.2`'s set-op empty-operand handling (`set_op`
+/// in binop.rs): `or` yields whichever side is present; `unless` with no
+/// lhs has nothing to keep.
+#[test]
+fn matrix_set_ops_with_empty_left_operand_per_step() {
+    let empty = QueryResult::Matrix(vec![]);
+    let rhs = QueryResult::Matrix(vec![
+        MatrixSeries {
+            labels: vec![("app".to_string(), "p".to_string())],
+            points: vec![(0, 10.0), (STEP, 20.0)],
+        },
+        MatrixSeries {
+            labels: vec![("app".to_string(), "q".to_string())],
+            points: vec![(STEP, 7.0)],
+        },
+    ]);
+    // `∅ or rhs` -> rhs unchanged, per step (every rhs step surfaces).
+    let QueryResult::Matrix(items) = combine_binary(
+        BinOp::Or,
+        false,
+        Some(&on(&["app"], None)),
+        empty.clone(),
+        rhs.clone(),
+    )
+    .unwrap() else {
+        panic!("matrix");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].labels, vec![("app".to_string(), "p".to_string())]);
+    assert_eq!(items[0].points, vec![(0, 10.0), (STEP, 20.0)]);
+    assert_eq!(items[1].labels, vec![("app".to_string(), "q".to_string())]);
+    assert_eq!(items[1].points, vec![(STEP, 7.0)]);
+    // `∅ unless rhs` -> ∅ (no lhs series to keep at any step).
+    let out = combine_binary(BinOp::Unless, false, Some(&on(&["app"], None)), empty, rhs).unwrap();
+    assert_eq!(out, QueryResult::Matrix(Vec::new()));
+}
+
+/// Issue #91, review round 2 test-gap 3: the "grouping labels must ensure
+/// unique matches" error path — reachable when `group_left`/`group_right`
+/// include-label copying COLLAPSES two distinct many-side output labels
+/// into one identity. Here `ignoring(y) group_left(y)` reduces both many
+/// series (`y=p`, `y=q`) to the same `on`-signature `{x}`, then copies `y`
+/// from a one side that HAS no `y` (so `y` is dropped from the output),
+/// making both many series render as the identical `{x}` output — the
+/// duplicate grouped identity Prometheus/Loki reject. Oracle-pinned live
+/// against `grafana/loki:3.4.2` (HTTP 500, byte-identical body:
+/// "multiple matches for labels: grouping labels must ensure unique
+/// matches").
+#[test]
+fn group_left_include_collapsing_distinct_many_labels_is_grouping_unique_error() {
+    let lhs = QueryResult::Vector(vec![
+        sample(&[("x", "1"), ("y", "p")], 10.0),
+        sample(&[("x", "1"), ("y", "q")], 20.0),
+    ]);
+    // The one side carries no `y`, so copying the `y` include drops it
+    // from BOTH many-side outputs -> both collapse to `{x=1}`.
+    let rhs = QueryResult::Vector(vec![sample(&[("x", "1")], 2.0)]);
+    let err = combine_binary(
+        BinOp::Div,
+        false,
+        Some(&ignoring(
+            &["y"],
+            Some(MatchGroup::Left(vec!["y".to_string()])),
+        )),
+        lhs,
+        rhs,
+    )
+    .unwrap_err();
+    let ReadError::PipelineInvalid { reason } = &err else {
+        panic!("expected PipelineInvalid, got {err:?}");
+    };
+    assert_eq!(
+        reason, "multiple matches for labels: grouping labels must ensure unique matches",
+        "byte-identical to the grafana/loki:3.4.2 oracle body"
+    );
+}
+
+/// Issue #91, review round 2 finding 2: a matching modifier
+/// (`on`/`ignoring`/`group_left`/`group_right`) on a binop with a SCALAR
+/// operand. Prometheus rejects a non-empty `on`/`ignoring` list here
+/// ("vector matching only allowed between instant vectors"), and the
+/// review expected Loki to mirror that — but the `grafana/loki:3.4.2`
+/// oracle does NOT: it SILENTLY ACCEPTS the modifier and ignores it
+/// (probed live — `sum(...) > on(x) 5`, `... + on(x) 5`, `... > on(x)
+/// group_left(y) 5`, scalar on either side all return HTTP 200 with the
+/// modifier discarded). The engine already mirrors this — the scalar arms
+/// of `combine_binary` never consult `matching` — so this test locks the
+/// oracle-parity behavior (evaluate, don't reject) against a future
+/// "add the Prometheus rejection" regression.
+#[test]
+fn a_matching_modifier_on_a_scalar_operand_is_ignored_matching_the_loki_oracle() {
+    let vector = QueryResult::Vector(vec![
+        sample(&[("app", "p")], 10.0),
+        sample(&[("app", "q")], 3.0),
+    ]);
+    let matching = on(&["app"], Some(MatchGroup::Left(vec!["y".to_string()])));
+    // vector OP scalar: `> 5` filters on value, modifier ignored.
+    let out = as_vector(
+        combine_binary(
+            BinOp::Gt,
+            false,
+            Some(&matching),
+            vector.clone(),
+            QueryResult::Scalar(5.0),
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].labels, vec![("app".to_string(), "p".to_string())]);
+    assert_eq!(out[0].value, 10.0);
+    // scalar OP vector: arithmetic applies to every sample, modifier
+    // ignored (never a "vector matching only allowed..." rejection).
+    let out = as_vector(
+        combine_binary(
+            BinOp::Add,
+            false,
+            Some(&matching),
+            QueryResult::Scalar(100.0),
+            vector,
+        )
+        .unwrap(),
+    );
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].value, 110.0);
+    assert_eq!(out[1].value, 103.0);
 }

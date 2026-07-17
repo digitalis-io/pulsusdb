@@ -38,7 +38,13 @@ Out of this ledger's scope by design:
 
 - **Case:** `metric_rate_tumbling` (issue M6-10 — the range-window
   divergence deliberately left for the metric differential by the M6-09
-  ledger).
+  ledger), and the issue #91 RANGE vector-matching cases
+  `metric_match_on_range`, `metric_match_ignoring_range`,
+  `metric_match_group_left_range`, `metric_match_group_right_range` (the
+  per-step instant join over `count_over_time` inherits the SAME
+  tumbling-vs-sliding bucket-alignment divergence — the join is applied
+  identically per step on both stores, so the only delta is the
+  underlying range-window alignment already ratified here).
 - **Exact accepted delta:** for RANGE metric queries, PulsusDB evaluates
   fixed, epoch-aligned, non-overlapping tumbling buckets
   (`intDiv(timestamp_ns, step) * step`; `rate` = bucket count / step
@@ -58,3 +64,28 @@ Out of this ledger's scope by design:
   queries have identical window semantics on both stores (`(t - range,
   t]` at one evaluation instant) — every other M6-10 metric case is
   instant-shaped and stays fully gated.
+
+### matching-error-status-divergence (informational note, not a gate downgrade)
+
+- **Cases:** `metric_match_multiple_err`, `metric_match_duplicate_err`
+  (issue #91). These queries are runtime vector-matching failures on both
+  stores.
+- **Probed live against `grafana/loki:3.4.2`:**
+  - many-to-one without a grouping modifier → HTTP **500**, body
+    `multiple matches for labels: many-to-one matching must be explicit
+    (group_left/group_right)` (byte-identical to PulsusDB's message).
+  - duplicate one-side signature (many-to-many) → HTTP **500**, body
+    `found duplicate series on the right hand-side;many-to-many matching
+    not allowed: matching labels must be unique on one side`
+    (PulsusDB emits the same string).
+- **Exact accepted delta:** Loki returns HTTP **500** for these
+  execution-time matching errors; PulsusDB classifies them as a bad
+  request (`ReadError::PipelineInvalid` → HTTP **400**), which is the
+  semantically correct code for a user-query cardinality error. The two
+  stores therefore agree on the error BODY (the gated substring) but not
+  the status code. The `metric_match_error` differential cases stay
+  **gated on the shared error-body substring** and deliberately do NOT
+  gate the HTTP status (per the plan-adjudication probe decision: bodies
+  share a substring, so gate on it). This entry records the status-code
+  divergence for the record; it is not a `mode: "informational"`
+  downgrade (the cases remain gated on their substring).

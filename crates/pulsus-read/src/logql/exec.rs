@@ -8,11 +8,13 @@
 //! tests (architect plan amendment §4).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
-use pulsus_logql::{BinOp, Expr, Grouping, GroupingKind, RangeAggOp, Stage, VectorAggOp};
+use pulsus_logql::{
+    BinOp, Expr, Grouping, GroupingKind, MatchGroup, RangeAggOp, Stage, VectorAggOp, VectorMatching,
+};
 
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
@@ -833,12 +835,13 @@ impl LogQlEngine {
                 MetricNode::Binary {
                     op,
                     return_bool,
+                    matching,
                     lhs,
                     rhs,
                 } => {
                     let l = self.run_metric_node(lhs, explain.as_deref_mut()).await?;
                     let r = self.run_metric_node(rhs, explain).await?;
-                    combine_binary(*op, *return_bool, l, r)
+                    combine_binary(*op, *return_bool, matching.as_ref(), l, r)
                 }
             }
         })
@@ -2060,14 +2063,19 @@ fn scalar_apply(
     }
 }
 
-/// Combines two evaluated metric results (issue M6-10). Scope per the
-/// adjudication: vector⊗scalar in BOTH orientations, identical-full-
-/// label-set one-to-one vector⊗vector, `bool`, and the `and`/`or`/
-/// `unless` set operations; matrices align per shared step. `pub` for
-/// the hermetic golden suite.
+/// Combines two evaluated metric results (issue M6-10, extended by #91).
+/// Scope: vector⊗scalar in BOTH orientations, vector⊗vector and
+/// matrix⊗matrix with one-to-one AND `group_left`/`group_right` vector
+/// matching (`on`/`ignoring` signatures), `bool`, and the `and`/`or`/
+/// `unless` set operations. Matrix binops are an INDEPENDENT per-step
+/// instant join (Prometheus/Loki re-evaluate the instant join per
+/// timestamp — see [`combine_matrices`]). `matching` is the parsed
+/// clause, `None` for default full-label one-to-one. `pub` for the
+/// hermetic golden suite.
 pub fn combine_binary(
     op: BinOp,
     return_bool: bool,
+    matching: Option<&VectorMatching>,
     lhs: QueryResult,
     rhs: QueryResult,
 ) -> Result<QueryResult, ReadError> {
@@ -2110,12 +2118,12 @@ pub fn combine_binary(
                 scalar_apply(op, return_bool, s, v, false)
             }))
         }
-        (QueryResult::Vector(l), QueryResult::Vector(r)) => {
-            Ok(QueryResult::Vector(combine_vectors(op, return_bool, l, r)))
-        }
-        (QueryResult::Matrix(l), QueryResult::Matrix(r)) => {
-            Ok(QueryResult::Matrix(combine_matrices(op, return_bool, l, r)))
-        }
+        (QueryResult::Vector(l), QueryResult::Vector(r)) => Ok(QueryResult::Vector(
+            combine_vectors(op, return_bool, matching, l, r)?,
+        )),
+        (QueryResult::Matrix(l), QueryResult::Matrix(r)) => Ok(QueryResult::Matrix(
+            combine_matrices(op, return_bool, matching, l, r)?,
+        )),
         // Both operands evaluate under the same QuerySpec, so a
         // vector/matrix mix (or a streams/string operand) is structurally
         // impossible — defensive named error, never a panic.
@@ -2170,175 +2178,354 @@ fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResu
     }
 }
 
-/// Identical-full-label-set one-to-one vector matching (the adjudicated
-/// M6-10 scope; `on`/`ignoring` grouping is the deferred follow-up).
+/// A reduced match signature — the `on`/`ignoring` projection of a
+/// series' (already key-sorted) labels.
+type MatchSig = Vec<(String, String)>;
+
+/// Per-matrix-series timestamp index for the per-step join: each series'
+/// borrowed labels paired with its `timestamp → value` map.
+type StepIndex<'a> = Vec<(&'a [(String, String)], BTreeMap<i64, f64>)>;
+
+/// One instant-vector element for the shared join core — labels borrowed
+/// from the caller's operand (a [`VectorSample`] or a per-step projection
+/// of a [`MatrixSeries`]) plus the sample value.
+struct JoinItem<'a> {
+    labels: &'a [(String, String)],
+    value: f64,
+}
+
+/// Projects a series' labels onto its match signature: `on(l)` keeps only
+/// the listed keys, `ignoring(l)` drops them, `None` keeps the full set
+/// (byte-identical to the pre-#91 full-`LabelSet` key). Input is
+/// key-sorted (aggregation sorts labels), so the output stays sorted.
+fn match_signature(labels: &[(String, String)], matching: Option<&VectorMatching>) -> MatchSig {
+    match matching {
+        None => labels.to_vec(),
+        Some(vm) if vm.on => labels
+            .iter()
+            .filter(|(k, _)| vm.labels.iter().any(|l| l == k))
+            .cloned()
+            .collect(),
+        Some(vm) => labels
+            .iter()
+            .filter(|(k, _)| !vm.labels.iter().any(|l| l == k))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// Sets `key`=`value` in a key-sorted label vector, replacing an existing
+/// entry or inserting in sorted position (keeps the vector sorted so
+/// downstream identity/equality stays canonical).
+fn set_label_sorted(labels: &mut Vec<(String, String)>, key: &str, value: &str) {
+    match labels.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+        Ok(i) => labels[i].1 = value.to_string(),
+        Err(i) => labels.insert(i, (key.to_string(), value.to_string())),
+    }
+}
+
+/// Removes `key` from a key-sorted label vector (no-op if absent).
+fn remove_label_sorted(labels: &mut Vec<(String, String)>, key: &str) {
+    if let Ok(i) = labels.binary_search_by(|(k, _)| k.as_str().cmp(key)) {
+        labels.remove(i);
+    }
+}
+
+fn duplicate_one_side_error(swapped: bool) -> ReadError {
+    // Oracle-pinned (grafana/loki:3.4.2): the "one" side is the source
+    // rhs normally, the source lhs under `group_right`.
+    let side = if swapped { "left" } else { "right" };
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "found duplicate series on the {side} hand-side;many-to-many matching not allowed: \
+             matching labels must be unique on one side"
+        ),
+    }
+}
+
+fn multiple_matches_error() -> ReadError {
+    // Oracle-pinned (grafana/loki:3.4.2), byte-exact.
+    ReadError::PipelineInvalid {
+        reason: "multiple matches for labels: many-to-one matching must be explicit \
+                 (group_left/group_right)"
+            .to_string(),
+    }
+}
+
+fn grouping_unique_error() -> ReadError {
+    // Prometheus/Loki wording for a duplicate grouped output identity;
+    // unreachable with distinct many-side series, kept for completeness.
+    ReadError::PipelineInvalid {
+        reason: "multiple matches for labels: grouping labels must ensure unique matches"
+            .to_string(),
+    }
+}
+
+/// The shared instant-join core (issue #91). BOTH the vector path
+/// ([`combine_vectors`], one virtual step) and the matrix path
+/// ([`combine_matrices`], looped over shared timestamps) call this, so the
+/// two can never diverge. Fresh per-call state ⇒ duplicate detection is
+/// per-step-scoped for matrices.
+///
+/// Semantics verified against `pulsus_promql::eval::binop` and pinned
+/// against `grafana/loki:3.4.2`:
+/// - one-to-one output labels = the reduced signature; the many side
+///   passes through whole under `group_left`/`group_right`, include labels
+///   copied from the one side (empty value ⇒ label absent).
+/// - the one-side signature map is built UNCONDITIONALLY first, so a
+///   duplicate one-side signature errors for every cardinality.
+/// - the empty-operand short-circuit is scoped to arithmetic/comparison
+///   ONLY (adjudicated); set ops get their own empty handling in
+///   [`set_op_join`].
+fn instant_join(
+    op: BinOp,
+    return_bool: bool,
+    matching: Option<&VectorMatching>,
+    lhs: &[JoinItem<'_>],
+    rhs: &[JoinItem<'_>],
+) -> Result<Vec<VectorSample>, ReadError> {
+    if is_set_op(op) {
+        return Ok(set_op_join(op, matching, lhs, rhs));
+    }
+
+    // Arithmetic/comparison empty-operand short-circuit — BEFORE the
+    // one-side map is built, so an unpairable duplicate never surfaces a
+    // spurious error (mirrors binop.rs). Scoped to arithmetic/comparison
+    // ONLY; set ops handled above.
+    if lhs.is_empty() || rhs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Operand roles: `group_right` swaps sides so the loop always sees
+    // `many` = the many side and `one` = the one side; the value
+    // computation swaps back below.
+    let (many, one, include, swapped) = match matching.and_then(|m| m.group.as_ref()) {
+        None => (lhs, rhs, None, false),
+        Some(MatchGroup::Left(inc)) => (lhs, rhs, Some(inc.as_slice()), false),
+        Some(MatchGroup::Right(inc)) => (rhs, lhs, Some(inc.as_slice()), true),
+    };
+    let one_to_one = include.is_none();
+
+    // The one side, hashed by match signature — a duplicate here is
+    // many-to-many, an error for every cardinality.
+    let mut one_by_key: HashMap<MatchSig, &JoinItem<'_>> = HashMap::with_capacity(one.len());
+    for r in one {
+        let key = match_signature(r.labels, matching);
+        if one_by_key.insert(key, r).is_some() {
+            return Err(duplicate_one_side_error(swapped));
+        }
+    }
+
+    let mut one_to_one_matched: HashSet<MatchSig> = HashSet::new();
+    let mut many_matched: HashMap<MatchSig, HashSet<MatchSig>> = HashMap::new();
+    let mut out: Vec<VectorSample> = Vec::new();
+    for l in many {
+        let key = match_signature(l.labels, matching);
+        let Some(r) = one_by_key.get(&key) else {
+            continue;
+        };
+        // Restore source operand order for the value (upstream swap-back).
+        let (vl, vr) = if swapped {
+            (r.value, l.value)
+        } else {
+            (l.value, r.value)
+        };
+        let (value, keep) = if op.is_comparison() {
+            let hit = compare(op, vl, vr);
+            if return_bool {
+                (if hit { 1.0 } else { 0.0 }, true)
+            } else {
+                (vl, hit)
+            }
+        } else {
+            (arith(op, vl, vr), true)
+        };
+
+        let labels: MatchSig = if one_to_one {
+            key.clone()
+        } else {
+            // Many side passes through whole; include labels copied from
+            // the one side (empty value ⇒ absent, per binop.rs).
+            let mut labels = l.labels.to_vec();
+            if let Some(inc) = include {
+                for ln in inc {
+                    match r.labels.iter().find(|(k, _)| k == ln) {
+                        Some((_, v)) if !v.is_empty() => set_label_sorted(&mut labels, ln, v),
+                        _ => remove_label_sorted(&mut labels, ln),
+                    }
+                }
+            }
+            labels
+        };
+
+        // Duplicate detection — BEFORE the keep filter (a filtered-out
+        // comparison still consumes its signature, upstream-exact).
+        if one_to_one {
+            if !one_to_one_matched.insert(key.clone()) {
+                return Err(multiple_matches_error());
+            }
+        } else if !many_matched
+            .entry(key.clone())
+            .or_default()
+            .insert(labels.clone())
+        {
+            return Err(grouping_unique_error());
+        }
+
+        if keep {
+            out.push(VectorSample { labels, value });
+        }
+    }
+    Ok(out)
+}
+
+/// The `and`/`or`/`unless` set operators keyed on the match signature
+/// (issue #70 semantics, extended by #91 to reduced signatures under an
+/// `on`/`ignoring` clause; a `group_left`/`group_right` on a set op is a
+/// no-op, per the grafana/loki:3.4.2 probe). No empty-operand
+/// short-circuit — each operator keeps its own empty handling
+/// (`lhs and ∅`→∅; `lhs or ∅`→lhs, `∅ or rhs`→rhs; `lhs unless ∅`→lhs,
+/// `∅ unless rhs`→∅), which per-step covers the matrix path.
+fn set_op_join(
+    op: BinOp,
+    matching: Option<&VectorMatching>,
+    lhs: &[JoinItem<'_>],
+    rhs: &[JoinItem<'_>],
+) -> Vec<VectorSample> {
+    let own = |it: &JoinItem<'_>| VectorSample {
+        labels: it.labels.to_vec(),
+        value: it.value,
+    };
+    match op {
+        BinOp::And => {
+            let rhs_sigs: HashSet<MatchSig> = rhs
+                .iter()
+                .map(|s| match_signature(s.labels, matching))
+                .collect();
+            lhs.iter()
+                .filter(|l| rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .map(own)
+                .collect()
+        }
+        BinOp::Unless => {
+            let rhs_sigs: HashSet<MatchSig> = rhs
+                .iter()
+                .map(|s| match_signature(s.labels, matching))
+                .collect();
+            lhs.iter()
+                .filter(|l| !rhs_sigs.contains(&match_signature(l.labels, matching)))
+                .map(own)
+                .collect()
+        }
+        BinOp::Or => {
+            let lhs_sigs: HashSet<MatchSig> = lhs
+                .iter()
+                .map(|s| match_signature(s.labels, matching))
+                .collect();
+            let mut out: Vec<VectorSample> = lhs.iter().map(own).collect();
+            out.extend(
+                rhs.iter()
+                    .filter(|r| !lhs_sigs.contains(&match_signature(r.labels, matching)))
+                    .map(own),
+            );
+            out
+        }
+        _ => unreachable!("is_set_op gates the arm"),
+    }
+}
+
+/// Vector⊗vector: the [`instant_join`] core over one virtual step.
 fn combine_vectors(
     op: BinOp,
     return_bool: bool,
+    matching: Option<&VectorMatching>,
     lhs: Vec<VectorSample>,
     rhs: Vec<VectorSample>,
-) -> Vec<VectorSample> {
-    let rhs_by_labels: HashMap<LabelSet, f64> =
-        rhs.iter().map(|s| (s.labels.clone(), s.value)).collect();
-    if is_set_op(op) {
-        return match op {
-            BinOp::And => lhs
-                .into_iter()
-                .filter(|s| rhs_by_labels.contains_key(&s.labels))
-                .collect(),
-            BinOp::Unless => lhs
-                .into_iter()
-                .filter(|s| !rhs_by_labels.contains_key(&s.labels))
-                .collect(),
-            BinOp::Or => {
-                let lhs_labels: std::collections::HashSet<LabelSet> =
-                    lhs.iter().map(|s| s.labels.clone()).collect();
-                let mut out = lhs;
-                out.extend(rhs.into_iter().filter(|s| !lhs_labels.contains(&s.labels)));
-                out
-            }
-            _ => unreachable!("is_set_op gates the arm"),
-        };
-    }
-    lhs.into_iter()
-        .filter_map(|s| {
-            let r = *rhs_by_labels.get(&s.labels)?;
-            let value = if op.is_comparison() {
-                let hit = compare(op, s.value, r);
-                if return_bool {
-                    if hit { 1.0 } else { 0.0 }
-                } else if hit {
-                    s.value
-                } else {
-                    return None;
-                }
-            } else {
-                arith(op, s.value, r)
-            };
-            Some(VectorSample {
-                labels: s.labels,
-                value,
-            })
+) -> Result<Vec<VectorSample>, ReadError> {
+    let lhs_items: Vec<JoinItem<'_>> = lhs
+        .iter()
+        .map(|s| JoinItem {
+            labels: &s.labels,
+            value: s.value,
         })
-        .collect()
+        .collect();
+    let rhs_items: Vec<JoinItem<'_>> = rhs
+        .iter()
+        .map(|s| JoinItem {
+            labels: &s.labels,
+            value: s.value,
+        })
+        .collect();
+    instant_join(op, return_bool, matching, &lhs_items, &rhs_items)
 }
 
-/// Matrix⊗matrix: the vector semantics applied per shared step (plan v1:
-/// "Range (matrix) binary ops align per shared step").
+/// Matrix⊗matrix: an INDEPENDENT per-step instant join (issue #91 delta
+/// 1). Prometheus/Loki re-evaluate the instant join at every timestamp;
+/// two same-signature series whose points never share a step therefore
+/// never collide, while a same-timestamp ambiguity errors. The per-step
+/// core is [`instant_join`] — the exact function the vector path uses.
 fn combine_matrices(
     op: BinOp,
     return_bool: bool,
+    matching: Option<&VectorMatching>,
     lhs: Vec<MatrixSeries>,
     rhs: Vec<MatrixSeries>,
-) -> Vec<MatrixSeries> {
-    let rhs_by_labels: HashMap<LabelSet, BTreeMap<i64, f64>> = rhs
+) -> Result<Vec<MatrixSeries>, ReadError> {
+    // Index each side's points by timestamp once (labels stay borrowable
+    // from the owned operands for the whole loop).
+    let lhs_maps: StepIndex<'_> = lhs
         .iter()
-        .map(|s| (s.labels.clone(), s.points.iter().copied().collect()))
+        .map(|s| (s.labels.as_slice(), s.points.iter().copied().collect()))
         .collect();
-    if is_set_op(op) {
-        return match op {
-            // `a and b`: an lhs point survives iff rhs has a same-labels
-            // point at the same step.
-            BinOp::And => lhs
-                .into_iter()
-                .filter_map(|s| {
-                    let r = rhs_by_labels.get(&s.labels)?;
-                    let points: Vec<(i64, f64)> = s
-                        .points
-                        .into_iter()
-                        .filter(|(ts, _)| r.contains_key(ts))
-                        .collect();
-                    (!points.is_empty()).then_some(MatrixSeries {
-                        labels: s.labels,
-                        points,
-                    })
-                })
-                .collect(),
-            // `a unless b`: an lhs point survives iff rhs has NO
-            // same-labels point at that step.
-            BinOp::Unless => lhs
-                .into_iter()
-                .filter_map(|s| {
-                    let points: Vec<(i64, f64)> = match rhs_by_labels.get(&s.labels) {
-                        None => s.points,
-                        Some(r) => s
-                            .points
-                            .into_iter()
-                            .filter(|(ts, _)| !r.contains_key(ts))
-                            .collect(),
-                    };
-                    (!points.is_empty()).then_some(MatrixSeries {
-                        labels: s.labels,
-                        points,
-                    })
-                })
-                .collect(),
-            // `a or b`: all lhs points, plus rhs points at steps where
-            // no same-labels lhs point exists.
-            BinOp::Or => {
-                let lhs_by_labels: HashMap<LabelSet, BTreeSet<i64>> = lhs
-                    .iter()
-                    .map(|s| {
-                        (
-                            s.labels.clone(),
-                            s.points.iter().map(|(ts, _)| *ts).collect(),
-                        )
-                    })
-                    .collect();
-                let mut out = lhs;
-                for s in rhs {
-                    let extra: Vec<(i64, f64)> = match lhs_by_labels.get(&s.labels) {
-                        None => s.points,
-                        Some(l) => s
-                            .points
-                            .into_iter()
-                            .filter(|(ts, _)| !l.contains(ts))
-                            .collect(),
-                    };
-                    if extra.is_empty() {
-                        continue;
-                    }
-                    if let Some(existing) = out.iter_mut().find(|o| o.labels == s.labels) {
-                        existing.points.extend(extra);
-                        existing.points.sort_by_key(|(ts, _)| *ts);
-                    } else {
-                        out.push(MatrixSeries {
-                            labels: s.labels,
-                            points: extra,
-                        });
-                    }
-                }
-                out
-            }
-            _ => unreachable!("is_set_op gates the arm"),
-        };
+    let rhs_maps: StepIndex<'_> = rhs
+        .iter()
+        .map(|s| (s.labels.as_slice(), s.points.iter().copied().collect()))
+        .collect();
+
+    // The union of every timestamp on either side (ascending) — set ops
+    // need lhs-only / rhs-only steps too (`or`/`unless`).
+    let mut timestamps: BTreeSet<i64> = BTreeSet::new();
+    for (_, m) in lhs_maps.iter().chain(rhs_maps.iter()) {
+        timestamps.extend(m.keys().copied());
     }
-    lhs.into_iter()
-        .filter_map(|s| {
-            let r = rhs_by_labels.get(&s.labels)?;
-            let points: Vec<(i64, f64)> = s
-                .points
-                .into_iter()
-                .filter_map(|(ts, lv)| {
-                    let rv = *r.get(&ts)?;
-                    if op.is_comparison() {
-                        let hit = compare(op, lv, rv);
-                        if return_bool {
-                            Some((ts, if hit { 1.0 } else { 0.0 }))
-                        } else {
-                            hit.then_some((ts, lv))
-                        }
-                    } else {
-                        Some((ts, arith(op, lv, rv)))
-                    }
-                })
-                .collect();
-            (!points.is_empty()).then_some(MatrixSeries {
-                labels: s.labels,
-                points,
-            })
+
+    // Output series keyed by output labels, first-seen order preserved.
+    let mut order: Vec<MatchSig> = Vec::new();
+    let mut out: HashMap<MatchSig, Vec<(i64, f64)>> = HashMap::new();
+    // Reused per-step scratch (allocation discipline).
+    let mut lhs_items: Vec<JoinItem<'_>> = Vec::new();
+    let mut rhs_items: Vec<JoinItem<'_>> = Vec::new();
+    for &t in &timestamps {
+        lhs_items.clear();
+        rhs_items.clear();
+        for (labels, m) in &lhs_maps {
+            if let Some(v) = m.get(&t) {
+                lhs_items.push(JoinItem { labels, value: *v });
+            }
+        }
+        for (labels, m) in &rhs_maps {
+            if let Some(v) = m.get(&t) {
+                rhs_items.push(JoinItem { labels, value: *v });
+            }
+        }
+        for sample in instant_join(op, return_bool, matching, &lhs_items, &rhs_items)? {
+            match out.get_mut(&sample.labels) {
+                Some(points) => points.push((t, sample.value)),
+                None => {
+                    order.push(sample.labels.clone());
+                    out.insert(sample.labels, vec![(t, sample.value)]);
+                }
+            }
+        }
+    }
+
+    Ok(order
+        .into_iter()
+        .map(|labels| {
+            let points = out.remove(&labels).expect("every ordered key was inserted");
+            MatrixSeries { labels, points }
         })
-        .collect()
+        .collect())
 }
 
 /// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:

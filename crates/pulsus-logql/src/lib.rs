@@ -26,9 +26,9 @@ mod token;
 
 pub use ast::{
     BinModifier, BinOp, CompareOp, Duration, Expr, Grouping, GroupingKind, LabelExtraction,
-    LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher,
-    MetricExpr, NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap,
-    VectorAggOp,
+    LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LogExpr, LogRange, MatchGroup, MatchOp,
+    Matcher, MetricExpr, NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap,
+    VectorAggOp, VectorMatching,
 };
 pub use error::LogQlError;
 pub use parser::{parse, parse_selector};

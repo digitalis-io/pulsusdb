@@ -15,20 +15,36 @@ fn assert_not_yet_supported(query: &str, construct: &str) {
     }
 }
 
-// --- Vector-matching modifiers: the M6-10 adjudicated deferral —
-// --- individually enumerated by name, no catch-all. ---
+// --- Vector-matching modifiers (issue #91): now fully parsed, no longer
+// --- `NotYetSupported`. A grammar violation is a positional
+// --- `UnexpectedToken`, never `NotYetSupported`. ---
 
 #[test]
-fn every_vector_matching_modifier_is_named_not_yet_supported() {
-    for modifier in ["on", "ignoring", "group_left", "group_right"] {
-        let query = format!(r#"rate({{a="b"}}[5m]) + {modifier}(x) rate({{a="c"}}[5m])"#);
-        assert_not_yet_supported(&query, modifier);
+fn every_vector_matching_modifier_now_parses() {
+    for query in [
+        r#"rate({a="b"}[5m]) + on(x) rate({a="c"}[5m])"#,
+        r#"rate({a="b"}[5m]) + ignoring(x) rate({a="c"}[5m])"#,
+        r#"rate({a="b"}[5m]) + on(x) group_left rate({a="c"}[5m])"#,
+        r#"rate({a="b"}[5m]) + on(x) group_right(y) rate({a="c"}[5m])"#,
+    ] {
+        parse(query).unwrap_or_else(|e| panic!("query {query:?} should parse now: {e}"));
     }
 }
 
 #[test]
-fn a_matching_modifier_after_bool_is_still_named_not_yet_supported() {
-    assert_not_yet_supported(r#"rate({a="b"}[5m]) > bool on(x) rate({a="c"}[5m])"#, "on");
+fn a_matching_modifier_after_bool_parses() {
+    parse(r#"rate({a="b"}[5m]) > bool on(x) rate({a="c"}[5m])"#)
+        .expect("bool + matching should parse");
+}
+
+#[test]
+fn an_incomplete_matching_clause_is_an_unexpected_token_not_not_yet_supported() {
+    // A missing paren after `on` is a positional grammar error, not a
+    // `NotYetSupported` for the keyword (issue #91 AC2).
+    match parse(r#"rate({a="b"}[5m]) + on rate({a="c"}[5m])"#) {
+        Err(LogQlError::UnexpectedToken { .. }) => {}
+        other => panic!("expected UnexpectedToken for a bare `on`, got {other:?}"),
+    }
 }
 
 // --- Aggregation parameter arity (issue M6-10) ---
