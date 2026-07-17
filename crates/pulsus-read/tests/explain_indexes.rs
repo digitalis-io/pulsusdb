@@ -795,7 +795,10 @@ fn promql_sample_fetch_sql(query: &str, params: pulsus_promql::PlanParams, db: &
     let table = format!("{db}.metric_samples");
     pulsus_read::metrics::sample_sql::sample_fetch(
         &table,
-        &plan.selectors[0].metric_name,
+        plan.selectors[0]
+            .metric_name
+            .as_deref()
+            .expect("these cases use concrete-name selectors"),
         &[MFP],
         lower_excl,
         upper_incl,
@@ -884,6 +887,81 @@ async fn promql_subquery_widened_metric_read_stays_on_the_metric_samples_primary
 
     let usage = explain(&client, &subq_sql).await;
     assert_eq!(usage, expected_metric_samples_fetch_usage());
+}
+
+/// Issue #85 (M6-08c) — the name-less/regex-`__name__` fan-out gate: the
+/// flat `sample_fetch_multi` SQL (one query, `PREWHERE metric_name IN
+/// (…)` + `fingerprint IN (…)`) must engage BOTH components of the
+/// `(metric_name, fingerprint, unix_milli)` primary key in the live
+/// ClickHouse plan (round-4 adjudication item 2) — the `IN`-set prune is
+/// what makes the fan-out bounded instead of a name-less full scan.
+/// Concrete-name selectors' plan stays byte-identical to the existing
+/// single-eq expectation (no regression from adding the multi shape).
+#[tokio::test]
+async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_keys() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_promql_multi";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    // Series across TWO metric names (`mq` via the shared seeder, `mq2`
+    // here) — the fan-out shape is only meaningful over >= 2 metrics.
+    seed_metric_samples(&client, db, now_ms).await;
+    const MFP2: u64 = 18_374_000_000_000_000_003;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
+                 VALUES ('mq2', {MFP2}, {now_ms}, 1.0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed mq2 samples");
+
+    // The real fetch SQL a name-less selector's resolved (name, fp) set
+    // produces — the same builder `MetricsEngine::plan_multi_metric_fetch`
+    // renders.
+    let params = promql_params(now_ms, now_ms, 0);
+    let expr = pulsus_promql::parse(r#"{__name__=~"mq.*"}"#).expect("parse");
+    let plan = pulsus_promql::plan(&expr, params).expect("plan");
+    assert_eq!(plan.selectors[0].metric_name, None, "name-less selector");
+    let (lower_excl, upper_incl) = plan.selectors[0].fetch_window(&params);
+    let table = format!("{db}.metric_samples");
+    let sql = pulsus_read::metrics::sample_sql::sample_fetch_multi(
+        &table,
+        &["mq".to_string(), "mq2".to_string()],
+        &[MFP, MFP2],
+        lower_excl,
+        upper_incl,
+    );
+
+    let usage = explain(&client, &sql).await;
+    assert_eq!(
+        usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "fingerprint",
+            "unix_milli",
+            "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in #-element set))",
+        ]),
+        "both the metric_name IN and fingerprint IN components must engage the primary key"
+    );
+
+    // Control: a concrete-name selector's plan is unchanged by the multi
+    // shape's existence — the exact pre-#85 extract.
+    let single_sql = promql_sample_fetch_sql("mq", params, db);
+    let single_usage = explain(&client, &single_sql).await;
+    assert_eq!(single_usage, expected_metric_samples_fetch_usage());
 }
 
 #[tokio::test]

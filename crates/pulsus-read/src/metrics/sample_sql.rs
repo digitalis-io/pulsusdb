@@ -58,6 +58,36 @@ pub fn sample_fetch_subquery(
     )
 }
 
+/// The issue #85 (M6-08c) multi-metric fan-out fetch: ONE flat query for
+/// a name-less/regex-`__name__` selector's whole resolved set —
+/// `PREWHERE metric_name IN (<matched names>)` (leading-primary-key
+/// granule pruning, the EXPLAIN-gated compound prune's first component)
+/// plus `fingerprint IN (<matched fps>)` (the second PK component),
+/// never a global unfiltered sample scan. Sound without per-pair
+/// filtering (plan v3 Δ2, reviewer-verified): label matchers exclude
+/// `__name__` and apply uniformly across metrics, so any
+/// `(metric_name, fingerprint)` cross-pair naming a real series has
+/// matcher-passing labels by construction — the IN×IN cannot over-match.
+/// `metric_name` joins the projection so rows group into per-
+/// `(metric_name, fingerprint)` series ([`super::sample_rows::MultiSampleRow`]).
+pub fn sample_fetch_multi(
+    table: &str,
+    metric_names: &[String],
+    fps: &[u64],
+    lower_excl_ms: i64,
+    upper_incl_ms: i64,
+) -> String {
+    let name_list = metric_names
+        .iter()
+        .map(|n| ch_string(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fp_list = render_fingerprint_list(fps);
+    format!(
+        "SELECT metric_name, fingerprint, unix_milli, value\nFROM {table}\nPREWHERE metric_name IN ({name_list})\nWHERE unix_milli > {lower_excl_ms} AND unix_milli <= {upper_incl_ms}\n  AND fingerprint IN ({fp_list})\nORDER BY metric_name, fingerprint, unix_milli"
+    )
+}
+
 fn render_fingerprint_list(fps: &[u64]) -> String {
     fps.iter()
         .map(u64::to_string)
@@ -182,5 +212,64 @@ mod tests {
     #[test]
     fn chunk_threshold_matches_the_documented_500_cap() {
         assert_eq!(CHUNK_THRESHOLD, 500);
+    }
+
+    // --- sample_fetch_multi (issue #85, M6-08c) ---
+
+    #[test]
+    fn sample_fetch_multi_renders_the_flat_in_in_shape() {
+        let sql = sample_fetch_multi(
+            "metric_samples",
+            &["foo_total".to_string(), "bar_total".to_string()],
+            &[101, 205],
+            1_000,
+            2_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT metric_name, fingerprint, unix_milli, value\n\
+             FROM metric_samples\n\
+             PREWHERE metric_name IN ('foo_total', 'bar_total')\n\
+             WHERE unix_milli > 1000 AND unix_milli <= 2000\n\
+             \x20 AND fingerprint IN (101, 205)\n\
+             ORDER BY metric_name, fingerprint, unix_milli"
+        );
+    }
+
+    #[test]
+    fn sample_fetch_multi_window_is_left_open_right_closed() {
+        let sql = sample_fetch_multi("metric_samples", &["up".to_string()], &[1], 0, 100);
+        assert!(sql.contains("unix_milli > 0 AND unix_milli <= 100"));
+        assert!(!sql.contains("unix_milli >= 0"));
+    }
+
+    #[test]
+    fn sample_fetch_multi_metric_name_injection_stays_inside_one_literal() {
+        let payload = "up'; DROP TABLE metric_samples; --".to_string();
+        let sql = sample_fetch_multi(
+            "metric_samples",
+            std::slice::from_ref(&payload),
+            &[1],
+            0,
+            100,
+        );
+        assert!(sql.contains(&format!("metric_name IN ({})", ch_string(&payload))));
+    }
+
+    /// The concrete-name fetch SQL is byte-unchanged by #85 — the flat
+    /// IN-set shape is a *new* builder alongside it, never a rewrite of
+    /// the single-metric fast path (the EXPLAIN-gated PK prune).
+    #[test]
+    fn sample_fetch_single_name_shape_is_untouched_by_the_multi_builder() {
+        let sql = sample_fetch("metric_samples", "up", &[1, 2], 0, 100);
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, unix_milli, value\n\
+             FROM metric_samples\n\
+             PREWHERE metric_name = 'up'\n\
+             WHERE unix_milli > 0 AND unix_milli <= 100\n\
+             \x20 AND fingerprint IN (1, 2)\n\
+             ORDER BY fingerprint, unix_milli"
+        );
     }
 }

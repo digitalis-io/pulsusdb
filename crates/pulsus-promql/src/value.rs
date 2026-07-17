@@ -96,9 +96,22 @@ impl Labels {
 
 /// One resolved series' fetched samples, pre-sorted ascending by `t_ms`
 /// (the fetch `ORDER BY fingerprint, unix_milli` — docs/schemas.md §2.3).
+///
+/// **`metric_name` (issue #85, M6-08c):** each fetched series' own metric
+/// name, carried by the fetch layer alongside the `__name__`-free
+/// [`Labels`] — the same split-name channel [`InstantSample::metric_name`]
+/// documents, now starting at the fetch boundary. A concrete-name
+/// selector's fetch sets every series to that one name; a matcher-only or
+/// regex-`__name__` selector (`SelectorSpec::metric_name: None`) resolves
+/// per-series names from its name-keyed source (the live label cache /
+/// the test store's stored `__name__`), so the evaluator's bare-selector
+/// arm emits **per-series** names instead of synthesizing one from the
+/// spec. `None` only when the fetch source itself has no name for the
+/// series (never the case for `metric_samples`-backed fetches).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchedSeries {
     pub fingerprint: u64,
+    pub metric_name: Option<String>,
     pub labels: Labels,
     pub samples: Vec<Sample>,
 }
@@ -244,6 +257,7 @@ mod tests {
         let mut data = SeriesData::new();
         let series = vec![FetchedSeries {
             fingerprint: 1,
+            metric_name: Some("up".to_string()),
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             samples: vec![Sample { t_ms: 0, v: 1.0 }],
         }];

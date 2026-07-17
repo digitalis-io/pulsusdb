@@ -178,6 +178,223 @@ pub enum LabelledResolution {
     SqlFallback { sql: String, reason: FallbackReason },
 }
 
+/// One matched metric's series set from a multi-metric resolution
+/// (issue #85, M6-08c): the metric name plus its matcher-passing
+/// `(fingerprint, labels)` pairs, sorted by fingerprint.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetricSeriesGroup {
+    pub metric_name: String,
+    pub series: Vec<(Fingerprint, LabelSet)>,
+}
+
+/// [`LabelCache::resolve_multi_metric`]'s result (issue #85, M6-08c) —
+/// the name-less/regex-`__name__` selector resolution. Unlike
+/// [`Resolution`]/[`LabelledResolution`] there is **no SQL fallback
+/// variant**: the metric-scoped `historical_series_subquery` shape cannot
+/// express "every metric name matching these name matchers", so a
+/// degraded cache is a named, bounded failure — never an unbounded scan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultiMetricResolution {
+    /// Matched series grouped per metric name — names sorted ascending,
+    /// fingerprints sorted within each group. Only non-empty groups are
+    /// returned (a metric whose series all fail the label matchers never
+    /// enters the fetch `IN` set).
+    Groups(Vec<MetricSeriesGroup>),
+    /// The cache is not authoritative for this window (cold / out-of-
+    /// window / stale) or a matcher regex could not be evaluated
+    /// in-process — the caller surfaces a named error.
+    Unresolvable { reason: FallbackReason },
+    /// More metric names matched than the configured fan-out cap
+    /// (`ReaderConfig::promql_max_metric_fanout`, default 1000 — the #85
+    /// adjudication) — the caller surfaces the named
+    /// metric-fan-out-exceeded error; operator-scale tuning routes to
+    /// issue #25.
+    FanoutExceeded { matched: usize, cap: u64 },
+}
+
+/// Issue #85: evaluates a selector's `name_matchers` against one concrete
+/// candidate metric name. Regexes compile directly (anchored `^(?:…)$`,
+/// the same anchoring as [`RegexCache`]/the SQL path) rather than through
+/// the bounded cache — this runs once per query per matcher, never
+/// per-series. `Err` carries the uncompilable pattern's label key
+/// (unreachable through `parse()`, which validates matcher regexes —
+/// kept total rather than trusting that upstream invariant).
+pub(crate) fn concrete_name_matches(
+    name_matchers: &[LabelMatcher],
+    name: &str,
+) -> Result<bool, FallbackReason> {
+    for m in name_matchers {
+        let ok = match m.op {
+            MatchOp::Eq => name == m.value,
+            MatchOp::Neq => name != m.value,
+            MatchOp::Re | MatchOp::Nre => {
+                let re = Regex::new(&format!("^(?:{})$", m.value))
+                    .map_err(|_| FallbackReason::RegexUnsupported { key: m.key.clone() })?;
+                let is_match = re.is_match(name);
+                if m.op == MatchOp::Re {
+                    is_match
+                } else {
+                    !is_match
+                }
+            }
+        };
+        if !ok {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Evaluates `name_matchers` against a candidate metric name via the
+/// bounded compiled-regex cache — the per-cache-key hot path of
+/// [`resolve_multi_metric_over`].
+fn cached_name_matches(
+    regex_cache: &RegexCache,
+    name_matchers: &[LabelMatcher],
+    name: &str,
+) -> Result<bool, FallbackReason> {
+    for m in name_matchers {
+        let ok = match m.op {
+            MatchOp::Eq => name == m.value,
+            MatchOp::Neq => name != m.value,
+            MatchOp::Re => regex_cache
+                .is_match(&m.value, name)
+                .ok_or_else(|| FallbackReason::RegexUnsupported { key: m.key.clone() })?,
+            MatchOp::Nre => !regex_cache
+                .is_match(&m.value, name)
+                .ok_or_else(|| FallbackReason::RegexUnsupported { key: m.key.clone() })?,
+        };
+        if !ok {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The issue #85 name-less/regex-`__name__` resolution, pure over the
+/// snapshot (the [`resolve_over`] factoring precedent): walk the
+/// name-keyed `by_metric` map in sorted-name order, keep the names
+/// passing `name_matchers`, evaluate the ordinary label `matchers` over
+/// each kept name's series, and return the non-empty per-metric groups.
+/// Shares [`resolve_over`]'s cold/out-of-window/stale gates verbatim (a
+/// snapshot that cannot answer a single-metric query cannot answer a
+/// multi-metric one either); both the fan-out cap and the
+/// `cache_max_series` total-series guard short-circuit the walk, so the
+/// worst case is bounded by the resident snapshot, never by the query.
+#[allow(clippy::too_many_arguments)] // mirrors resolve_over/resolve_labelled_over's shape
+pub(crate) fn resolve_multi_metric_over(
+    snapshot: &CacheSnapshot,
+    regex_cache: &RegexCache,
+    metrics: &CacheMetrics,
+    config: &LabelCacheConfig,
+    name_matchers: &[LabelMatcher],
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+    fanout_cap: u64,
+) -> MultiMetricResolution {
+    if snapshot.generation == 0 {
+        metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
+        return MultiMetricResolution::Unresolvable {
+            reason: FallbackReason::ColdCache,
+        };
+    }
+    if window.start_ms < snapshot.covered_from_ms {
+        metrics
+            .miss_out_of_window_total
+            .fetch_add(1, Ordering::Relaxed);
+        return MultiMetricResolution::Unresolvable {
+            reason: FallbackReason::OutOfWindow,
+        };
+    }
+    let staleness_threshold_ms =
+        config.ttl.as_millis() as i64 * i64::from(config.staleness_multiplier);
+    let recency_edge_ms = snapshot
+        .sweep_time_ms
+        .saturating_add(staleness_threshold_ms);
+    if window.end_ms > recency_edge_ms {
+        let age_ms = window.end_ms.saturating_sub(snapshot.sweep_time_ms).max(0) as u64;
+        metrics.miss_stale_total.fetch_add(1, Ordering::Relaxed);
+        return MultiMetricResolution::Unresolvable {
+            reason: FallbackReason::StaleCache { age_ms },
+        };
+    }
+
+    // Sorted-name walk: deterministic group order (and therefore a
+    // deterministic `IN` list / explain trace) regardless of HashMap
+    // iteration order.
+    let mut names: Vec<&String> = snapshot.by_metric.keys().collect();
+    names.sort_unstable();
+
+    let mut groups: Vec<MetricSeriesGroup> = Vec::new();
+    let mut total_series = 0usize;
+    for name in names {
+        match cached_name_matches(regex_cache, name_matchers, name) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(reason) => {
+                metrics
+                    .miss_regex_unsupported_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return MultiMetricResolution::Unresolvable { reason };
+            }
+        }
+        let Some(candidates) = snapshot.by_metric.get(name) else {
+            continue;
+        };
+        let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
+        for &fp in candidates {
+            let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
+                continue;
+            };
+            match matches(regex_cache, labels, matchers) {
+                Ok(true) => matched.push((fp, labels.clone())),
+                Ok(false) => {}
+                Err(reason) => {
+                    metrics
+                        .miss_regex_unsupported_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return MultiMetricResolution::Unresolvable { reason };
+                }
+            }
+        }
+        if matched.is_empty() {
+            continue;
+        }
+        total_series += matched.len();
+        if total_series as u64 > config.cache_max_series {
+            metrics
+                .miss_over_cardinality_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::OverCardinality {
+                    matched: total_series,
+                    cap: config.cache_max_series,
+                },
+            };
+        }
+        if groups.len() as u64 >= fanout_cap {
+            // One more non-empty group would exceed the cap — a named,
+            // early-bailing rejection, never an unbounded IN set. The
+            // reported `matched` is a lower bound (the walk stops here).
+            metrics
+                .miss_over_cardinality_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MultiMetricResolution::FanoutExceeded {
+                matched: groups.len() + 1,
+                cap: fanout_cap,
+            };
+        }
+        matched.sort_unstable_by_key(|(fp, _)| *fp);
+        groups.push(MetricSeriesGroup {
+            metric_name: name.clone(),
+            series: matched,
+        });
+    }
+
+    metrics.hits_total.fetch_add(1, Ordering::Relaxed);
+    MultiMetricResolution::Groups(groups)
+}
+
 /// Pure over the current snapshot. Implemented by [`LabelCache`]; a
 /// separate trait (rather than an inherent method) so issue #31 can depend
 /// on the contract without depending on the concrete refresh/ClickHouse
@@ -707,6 +924,33 @@ impl LabelCache {
             metric_name,
             matchers,
             window,
+        )
+    }
+
+    /// Issue #85 (M6-08c): resolves a name-less/regex-`__name__` selector
+    /// over the name-keyed snapshot — see [`resolve_multi_metric_over`]
+    /// and [`MultiMetricResolution`] for the contract (no SQL fallback;
+    /// degraded caches and cap breaches are named outcomes). `fanout_cap`
+    /// is `ReaderConfig::promql_max_metric_fanout`, threaded per call by
+    /// `MetricsEngine` rather than stored here (it is a reader/query cap,
+    /// not a cache-shape parameter).
+    pub fn resolve_multi_metric(
+        &self,
+        name_matchers: &[LabelMatcher],
+        matchers: &[LabelMatcher],
+        window: DataWindow,
+        fanout_cap: u64,
+    ) -> MultiMetricResolution {
+        let snapshot = self.current_snapshot();
+        resolve_multi_metric_over(
+            &snapshot,
+            &self.regex_cache,
+            &self.metrics,
+            &self.config,
+            name_matchers,
+            matchers,
+            window,
+            fanout_cap,
         )
     }
 }
@@ -1347,6 +1591,298 @@ mod tests {
             summary.series_count_by_metric_name,
             vec![("alpha".to_string(), 1), ("zeta".to_string(), 1)]
         );
+    }
+
+    // --- resolve_multi_metric_over (issue #85, M6-08c) ---
+
+    fn name_re(pattern: &str) -> LabelMatcher {
+        LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Re,
+            value: pattern.to_string(),
+        }
+    }
+
+    fn resolve_multi(
+        snap: &CacheSnapshot,
+        cfg: &LabelCacheConfig,
+        name_matchers: &[LabelMatcher],
+        matchers: &[LabelMatcher],
+        w: DataWindow,
+        fanout_cap: u64,
+    ) -> MultiMetricResolution {
+        let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
+        let metrics = CacheMetrics::default();
+        resolve_multi_metric_over(
+            snap,
+            &regex_cache,
+            &metrics,
+            cfg,
+            name_matchers,
+            matchers,
+            w,
+            fanout_cap,
+        )
+    }
+
+    #[test]
+    fn multi_metric_matcher_only_groups_every_metric_with_matching_series() {
+        let snap = snapshot(
+            vec![
+                ("bbb", 2, &[("job", "api")]),
+                ("aaa", 1, &[("job", "api")]),
+                ("ccc", 3, &[("job", "web")]),
+            ],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "api".to_string(),
+        };
+        match resolve_multi(&snap, &config(), &[], &[m], window(0, 1_000), 1_000) {
+            MultiMetricResolution::Groups(groups) => {
+                // Sorted by name; `ccc` (no matching series) is absent.
+                let names: Vec<&str> = groups.iter().map(|g| g.metric_name.as_str()).collect();
+                assert_eq!(names, vec!["aaa", "bbb"]);
+                assert_eq!(groups[0].series[0].0, 1);
+                assert_eq!(groups[1].series[0].0, 2);
+            }
+            other => panic!("expected Groups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_metric_name_regex_prunes_the_key_set_first() {
+        let snap = snapshot(
+            vec![
+                ("http_total", 1, &[]),
+                ("http_errors", 2, &[]),
+                ("grpc_total", 3, &[]),
+            ],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        match resolve_multi(
+            &snap,
+            &config(),
+            &[name_re("http_.*")],
+            &[],
+            window(0, 1_000),
+            1_000,
+        ) {
+            MultiMetricResolution::Groups(groups) => {
+                let names: Vec<&str> = groups.iter().map(|g| g.metric_name.as_str()).collect();
+                assert_eq!(names, vec!["http_errors", "http_total"]);
+            }
+            other => panic!("expected Groups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_metric_negative_name_matcher_excludes_the_named_metric() {
+        let snap = snapshot(
+            vec![("keep", 1, &[]), ("drop", 2, &[])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let neq = LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Neq,
+            value: "drop".to_string(),
+        };
+        match resolve_multi(&snap, &config(), &[neq], &[], window(0, 1_000), 1_000) {
+            MultiMetricResolution::Groups(groups) => {
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].metric_name, "keep");
+            }
+            other => panic!("expected Groups, got {other:?}"),
+        }
+    }
+
+    /// A snapshot with `n` one-series metrics (`m0000`..), for the cap
+    /// boundary tests.
+    fn many_metric_snapshot(n: usize) -> CacheSnapshot {
+        let mut by_fingerprint = HashMap::new();
+        let mut by_metric: HashMap<String, Vec<Fingerprint>> = HashMap::new();
+        for i in 0..n {
+            by_fingerprint.insert(i as Fingerprint, labels(&[]));
+            by_metric.insert(format!("m{i:04}"), vec![i as Fingerprint]);
+        }
+        CacheSnapshot {
+            by_fingerprint,
+            by_metric,
+            sweep_time_ms: BASE_SWEEP_MS,
+            covered_from_ms: 0,
+            generation: 1,
+        }
+    }
+
+    /// The adjudicated boundary (issuecomment-4997289437/-4997456745):
+    /// exactly 1000 matched metric names pass under the default cap;
+    /// 1001 reject with the named fan-out outcome.
+    #[test]
+    fn multi_metric_fanout_cap_passes_at_1000_and_rejects_at_1001() {
+        let cfg = config();
+        match resolve_multi(
+            &many_metric_snapshot(1_000),
+            &cfg,
+            &[],
+            &[],
+            window(0, 1_000),
+            1_000,
+        ) {
+            MultiMetricResolution::Groups(groups) => assert_eq!(groups.len(), 1_000),
+            other => panic!("1000 matched metrics must pass at cap 1000, got {other:?}"),
+        }
+        match resolve_multi(
+            &many_metric_snapshot(1_001),
+            &cfg,
+            &[],
+            &[],
+            window(0, 1_000),
+            1_000,
+        ) {
+            MultiMetricResolution::FanoutExceeded { matched, cap } => {
+                assert_eq!(cap, 1_000);
+                assert!(matched > 1_000, "reported matched is the breach point");
+            }
+            other => panic!("1001 matched metrics must reject at cap 1000, got {other:?}"),
+        }
+    }
+
+    /// The cap is a config knob, not a constant: an override is honored
+    /// in both directions.
+    #[test]
+    fn multi_metric_fanout_cap_override_is_honored() {
+        let snap = many_metric_snapshot(3);
+        assert!(matches!(
+            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 2),
+            MultiMetricResolution::FanoutExceeded { cap: 2, .. }
+        ));
+        assert!(matches!(
+            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 3),
+            MultiMetricResolution::Groups(_)
+        ));
+    }
+
+    #[test]
+    fn multi_metric_cold_stale_and_out_of_window_are_unresolvable_not_scans() {
+        let cfg = config();
+        // Cold.
+        assert!(matches!(
+            resolve_multi(
+                &CacheSnapshot::default(),
+                &cfg,
+                &[],
+                &[],
+                window(0, 1_000),
+                1_000
+            ),
+            MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::ColdCache
+            }
+        ));
+        // Out of window.
+        let snap = snapshot(vec![("up", 1, &[])], 10_000, BASE_SWEEP_MS, 1);
+        assert!(matches!(
+            resolve_multi(&snap, &cfg, &[], &[], window(0, 20_000), 1_000),
+            MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::OutOfWindow
+            }
+        ));
+        // Stale.
+        let mut stale_cfg = config();
+        stale_cfg.ttl = Duration::from_millis(1);
+        stale_cfg.staleness_multiplier = 1;
+        let snap = snapshot(vec![("up", 1, &[])], 0, 0, 1);
+        assert!(matches!(
+            resolve_multi(&snap, &stale_cfg, &[], &[], window(0, 1_000), 1_000),
+            MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::StaleCache { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn multi_metric_total_series_over_cache_max_series_is_unresolvable() {
+        let mut cfg = config();
+        cfg.cache_max_series = 1;
+        let snap = snapshot(vec![("a", 1, &[]), ("b", 2, &[])], 0, BASE_SWEEP_MS, 1);
+        assert!(matches!(
+            resolve_multi(&snap, &cfg, &[], &[], window(0, 1_000), 1_000),
+            MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::OverCardinality { matched: 2, cap: 1 }
+            }
+        ));
+    }
+
+    #[test]
+    fn multi_metric_uncompilable_name_regex_is_unresolvable() {
+        let snap = snapshot(vec![("up", 1, &[])], 0, BASE_SWEEP_MS, 1);
+        assert!(matches!(
+            resolve_multi(
+                &snap,
+                &config(),
+                &[name_re("(unclosed")],
+                &[],
+                window(0, 1_000),
+                1_000
+            ),
+            MultiMetricResolution::Unresolvable {
+                reason: FallbackReason::RegexUnsupported { .. }
+            }
+        ));
+    }
+
+    // --- concrete_name_matches (issue #85: name_matchers over a
+    // concrete-name selector) ---
+
+    #[test]
+    fn concrete_name_matches_evaluates_every_operator_anchored() {
+        let name = "http_requests_total";
+        for (m, want) in [
+            (name_re("http_.*"), true),
+            (name_re("http"), false), // anchored: no substring match
+            (
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Nre,
+                    value: "grpc_.*".to_string(),
+                },
+                true,
+            ),
+            (
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Eq,
+                    value: name.to_string(),
+                },
+                true,
+            ),
+            (
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Neq,
+                    value: name.to_string(),
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(
+                concrete_name_matches(std::slice::from_ref(&m), name).unwrap(),
+                want,
+                "{m:?}"
+            );
+        }
+        assert!(matches!(
+            concrete_name_matches(&[name_re("(unclosed")], name),
+            Err(FallbackReason::RegexUnsupported { .. })
+        ));
     }
 
     #[test]

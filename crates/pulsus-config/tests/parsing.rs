@@ -53,6 +53,7 @@ reader:
   cache_window: 12h
   promql_max_samples: 1000000
   promql_lookback: 10m
+  promql_max_metric_fanout: 123
   logql_scan_budget_bytes: 10GiB
   traceql_max_candidates: 5000
 
@@ -135,6 +136,7 @@ fn full_fixture_round_trips_into_typed_values() {
     assert_eq!(cfg.reader.cache_window.0, Duration::from_secs(12 * 3_600));
     assert_eq!(cfg.reader.promql_max_samples, 1_000_000);
     assert_eq!(cfg.reader.promql_lookback.0, Duration::from_secs(600));
+    assert_eq!(cfg.reader.promql_max_metric_fanout, 123);
     assert_eq!(
         cfg.reader.logql_scan_budget_bytes,
         ByteSize(10 * 1024 * 1024 * 1024)

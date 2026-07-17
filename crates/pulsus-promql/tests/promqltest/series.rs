@@ -112,6 +112,11 @@ type LabelPairs = Vec<(String, String)>;
 
 /// Scans `key="value"` pairs after an opening `{`, through the closing
 /// `}`. Returns the pairs and the remainder after `}`.
+///
+/// Issue #85 (M6-08c): the UTF-8 quoted-name forms of the upstream series
+/// grammar are supported too — a **bare quoted string** entry is the
+/// metric name (`{"utf8.metric", ...}` ⇒ a `__name__` pair), and a quoted
+/// string followed by `=` is a quoted **label name** (`{"label.dot"="x"}`).
 fn scan_label_pairs(mut s: &str) -> Result<(LabelPairs, &str), String> {
     let mut pairs = Vec::new();
     loop {
@@ -123,16 +128,36 @@ fn scan_label_pairs(mut s: &str) -> Result<(LabelPairs, &str), String> {
             return Err("unterminated label set (no closing '}')".to_string());
         }
 
-        let name_end = s
-            .char_indices()
-            .find(|&(_, c)| !is_label_name_char(c))
-            .map(|(i, _)| i)
-            .unwrap_or(s.len());
-        if name_end == 0 || !s.starts_with(is_label_name_start) {
-            return Err(format!("invalid label name at {s:?}"));
-        }
-        let key = s[..name_end].to_string();
-        s = s[name_end..].trim_start();
+        let key = if s.starts_with(['"', '\'']) {
+            let (quoted, rest) = scan_quoted_string(s)?;
+            s = rest.trim_start();
+            if !s.starts_with('=') {
+                // A bare quoted entry is the metric name itself.
+                pairs.push(("__name__".to_string(), quoted));
+                if let Some(after_comma) = s.strip_prefix(',') {
+                    s = after_comma;
+                } else if !s.starts_with('}') {
+                    return Err(format!(
+                        "expected ',' or '}}' after quoted metric name, at {s:?}"
+                    ));
+                }
+                continue;
+            }
+            quoted
+        } else {
+            let name_end = s
+                .char_indices()
+                .find(|&(_, c)| !is_label_name_char(c))
+                .map(|(i, _)| i)
+                .unwrap_or(s.len());
+            if name_end == 0 || !s.starts_with(is_label_name_start) {
+                return Err(format!("invalid label name at {s:?}"));
+            }
+            let key = s[..name_end].to_string();
+            s = &s[name_end..];
+            key
+        };
+        s = s.trim_start();
 
         let Some(after_eq) = s.strip_prefix('=') else {
             return Err(format!("expected '=' after label name {key:?}, at {s:?}"));

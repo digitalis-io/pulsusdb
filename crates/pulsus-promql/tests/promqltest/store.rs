@@ -73,7 +73,11 @@ impl TestStorage {
     }
 
     /// Resolves and windows every selector of `plan` — the driver's stand-in
-    /// for the resolve+fetch layer.
+    /// for the resolve+fetch layer. Issue #85 (M6-08c): a selector with
+    /// `metric_name: None` scans every stored series (the name-keyed-cache
+    /// stand-in), `name_matchers` filter candidate names on both paths,
+    /// and every fetched series carries its own stored `__name__` on the
+    /// per-series `FetchedSeries::metric_name` channel.
     pub fn fetch(&self, plan: &QueryPlan) -> Result<SeriesData, String> {
         let mut data = SeriesData::new();
         for spec in &plan.selectors {
@@ -81,15 +85,26 @@ impl TestStorage {
             let mut fetched = Vec::new();
             for (idx, stored) in self.series.iter().enumerate() {
                 let name = stored.labels.get("__name__").map(String::as_str);
-                if name != Some(spec.metric_name.as_str()) {
+                if let Some(want) = &spec.metric_name
+                    && name != Some(want.as_str())
+                {
                     continue;
                 }
                 let mut matched = true;
+                for m in &spec.name_matchers {
+                    // Absent `__name__` matches as `""`, like any label.
+                    if !matcher_matches(&m.op, &m.value, name.unwrap_or(""))? {
+                        matched = false;
+                        break;
+                    }
+                }
                 for m in &spec.matchers {
+                    if !matched {
+                        break;
+                    }
                     let value = stored.labels.get(&m.key).map(String::as_str).unwrap_or("");
                     if !matcher_matches(&m.op, &m.value, value)? {
                         matched = false;
-                        break;
                     }
                 }
                 if !matched {
@@ -103,6 +118,7 @@ impl TestStorage {
                     .collect();
                 fetched.push(FetchedSeries {
                     fingerprint: idx as u64,
+                    metric_name: name.map(str::to_string),
                     // `Labels::new` drops `__name__` itself.
                     labels: Labels::new(stored.labels.iter().map(|(k, v)| (k.clone(), v.clone()))),
                     samples,

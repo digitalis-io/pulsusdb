@@ -146,7 +146,13 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::EmptyMatcherSet
         | ReadError::ContradictoryMatchers
         | ReadError::InvalidStep => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
-        ReadError::QueryTooBroad(_) => {
+        // Issue #85 (M6-08c): the name-less-selector fan-out cap
+        // (`TooBroadReason::MetricFanout`) rides the existing
+        // QueryTooBroad -> 422 `execution` mapping; the degraded-cache
+        // name-less failure is likewise a well-formed query the engine
+        // declines to execute — 422 `execution`, never a 5xx (ClickHouse
+        // is healthy; the in-process cache just cannot answer it).
+        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
     }

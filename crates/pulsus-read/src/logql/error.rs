@@ -75,6 +75,13 @@ pub enum TooBroadReason {
     /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
     /// with the byte scan budget or the trace row budget.
     TraceMetricsSetRows { max_set_rows: u64 },
+    /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
+    /// matched more metric names than the configured fan-out cap
+    /// (`reader.promql_max_metric_fanout`, default 1000 — the adjudicated
+    /// value). A Rust-side structural limit produced **only** by
+    /// `metrics::exec`'s multi-metric resolution — never from a
+    /// ClickHouse error code. Operator-scale tuning routes to issue #25.
+    MetricFanout { matched: usize, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -103,6 +110,17 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
+                )
+            }
+            // Lower-bound wording (code review round 1, finding 2):
+            // resolution bails at the breach point, so `matched` is a
+            // lower bound, never the final count — the message must not
+            // imply an exact tally.
+            TooBroadReason::MetricFanout { matched: _, cap } => {
+                write!(
+                    f,
+                    "name-less selector matched more than {cap} metric names, exceeding the \
+                     fan-out cap (reader.promql_max_metric_fanout)"
                 )
             }
         }
@@ -149,6 +167,22 @@ pub enum ReadError {
     #[error("query too broad: {0}")]
     QueryTooBroad(TooBroadReason),
 
+    /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
+    /// resolves exclusively through the warm in-process label cache (the
+    /// name-keyed `by_metric` map) — no metric-scoped SQL fallback shape
+    /// exists for "every metric name matching these matchers". When the
+    /// cache is not authoritative for the query's window (cold, stale,
+    /// out-of-window, over-cardinality, or an in-process-unevaluable
+    /// regex), the selector fails with this named error rather than
+    /// falling back to an unbounded scan. `reason` is the
+    /// [`crate::metrics::FallbackReason`]'s debug rendering.
+    #[error(
+        "name-less selector cannot be resolved: {reason} — a selector without a single \
+         concrete metric name requires the warm in-process label cache (no metric-scoped \
+         SQL fallback exists for it)"
+    )]
+    NamelessSelectorUnresolvable { reason: String },
+
     /// A `Range` metric query's `step_ns` was zero. `0.is_multiple_of(_)`
     /// is trivially `true`, which would otherwise let the routing decision
     /// pick rollup and render `intDiv(bucket_ns, 0)` — undefined in
@@ -177,6 +211,37 @@ mod tests {
             estimate: None,
         };
         assert!(reason.to_string().contains("1024"));
+    }
+
+    /// Issue #85 (M6-08c), review round 1 finding 2: the fan-out breach
+    /// message uses LOWER-BOUND wording ("more than {cap}") — resolution
+    /// bails at cap+1, so an exact matched count would be a lie.
+    #[test]
+    fn metric_fanout_display_uses_lower_bound_wording_and_names_the_knob() {
+        let reason = TooBroadReason::MetricFanout {
+            matched: 1_001,
+            cap: 1_000,
+        };
+        let msg = ReadError::QueryTooBroad(reason).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(msg.contains("matched more than 1000 metric names"), "{msg}");
+        assert!(
+            !msg.contains("1001"),
+            "must not present the breach point as an exact count: {msg}"
+        );
+        assert!(msg.contains("promql_max_metric_fanout"), "{msg}");
+    }
+
+    /// Issue #85 (M6-08c): the degraded-cache name-less-selector failure
+    /// is named and explains itself.
+    #[test]
+    fn nameless_selector_unresolvable_display_names_the_reason() {
+        let err = ReadError::NamelessSelectorUnresolvable {
+            reason: "ColdCache".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("name-less selector"), "{msg}");
+        assert!(msg.contains("ColdCache"), "{msg}");
     }
 
     #[test]

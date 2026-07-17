@@ -88,7 +88,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
             StepValue::Vector(v) => QueryValue::Vector(v),
             StepValue::Scalar(s) => QueryValue::Scalar(s),
         };
-        return Ok((value, inner_evals));
+        return Ok((finalize_metadata_labels(value)?, inner_evals));
     }
 
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
@@ -172,7 +172,116 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
     // internal determinism when two full identities share their non-name
     // labels.
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
-    Ok((QueryValue::Matrix(out), inner_evals))
+    Ok((
+        finalize_metadata_labels(QueryValue::Matrix(out))?,
+        inner_evals,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Terminal metadata-label cleanup (issue #85, M6-08c — PROM-39)
+// ---------------------------------------------------------------------------
+
+/// The reserved metadata label names upstream `schema.IsMetadataLabel`
+/// covers alongside `__name__` (`schema/labels.go` at the pinned v3.13.0
+/// SHA). `__name__` itself is carried outside [`Labels`] by construction
+/// (`InstantSample::metric_name`), so only these two ever appear in a
+/// label vector.
+const METADATA_LABEL_KEYS: [&str; 2] = ["__type__", "__unit__"];
+
+/// Removes `__type__`/`__unit__` from `labels` iff the series' name was
+/// dropped (`metric_name.is_none()`) — the PROM-39 metadata drop, unified
+/// with name removal exactly like upstream's terminal `cleanupMetricLabels`
+/// (`engine.go:4224`): `DropReserved(schema.IsMetadataLabel)` for every
+/// series with `DropName` set. Our eager `metric_name == None` verdict is
+/// the `DropName` proxy.
+///
+/// **Timing is root-only, deliberately (plan v3 Δ1, adjudicated):** the
+/// corpus oracle runs upstream with `EnableDelayedNameRemoval: true`
+/// (`promql/promqltest/test.go:111`), under which every per-node
+/// `DropReserved` is guarded OFF and the only metadata drop is this
+/// terminal one. Mid-tree, `__type__`/`__unit__` stay in `Labels` so
+/// vector matching/grouping see the full signature — per-node stripping
+/// would provably break `type_and_unit.test:77/92/222/237` (the set-op
+/// signature excludes only `__name__`, `engine.go:1471`). Upstream's LIVE
+/// default is the eager per-node path — a documented divergence recorded
+/// in `function-coverage.json`'s `type-and-unit-labels` rationale,
+/// resolved when #86 (M6-08d) adopts delayed name+metadata removal
+/// together; this function is that seam.
+fn strip_metadata_labels(metric_name: &Option<String>, labels: &mut Labels) {
+    if metric_name.is_none() {
+        labels
+            .0
+            .retain(|(k, _)| !METADATA_LABEL_KEYS.contains(&k.as_str()));
+    }
+}
+
+/// The terminal `cleanupMetricLabels`-equivalent (issue #85 plan v4 Δ1),
+/// applied once to the final assembled [`QueryValue`]: strip metadata
+/// labels per [`strip_metadata_labels`], then resolve post-strip identity
+/// collisions with pinned upstream semantics —
+///
+/// - **instant vector:** a duplicate `(metric_name, Labels)` identity is a
+///   hard error, `vector cannot contain metrics with the same labelset`
+///   (upstream `vec.ContainsSameLabelset()` → `errorf`, engine.go:4238);
+/// - **range matrix:** series sharing a post-strip identity **merge** when
+///   their timestamps are disjoint, and error with the same message when
+///   any timestamp overlaps (upstream `mergeSeriesWithSameLabelset`,
+///   engine.go:4252).
+fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError> {
+    fn same_labelset_error() -> PromqlError {
+        PromqlError::LabelSet {
+            detail: "vector cannot contain metrics with the same labelset".to_string(),
+        }
+    }
+
+    match value {
+        QueryValue::Scalar(_) => Ok(value),
+        QueryValue::Vector(mut v) => {
+            for s in &mut v {
+                strip_metadata_labels(&s.metric_name, &mut s.labels);
+            }
+            let mut seen: std::collections::HashSet<(Option<&str>, &Labels)> =
+                std::collections::HashSet::with_capacity(v.len());
+            for s in &v {
+                if !seen.insert((s.metric_name.as_deref(), &s.labels)) {
+                    return Err(same_labelset_error());
+                }
+            }
+            Ok(QueryValue::Vector(v))
+        }
+        QueryValue::Matrix(m) => {
+            let mut merged_at: Vec<usize> = Vec::new();
+            let mut by_identity: HashMap<SeriesIdentity, usize> = HashMap::with_capacity(m.len());
+            let mut out: Vec<RangeSeries> = Vec::with_capacity(m.len());
+            for mut s in m {
+                strip_metadata_labels(&s.metric_name, &mut s.labels);
+                let key = (s.metric_name.clone(), s.labels.clone());
+                match by_identity.get(&key) {
+                    Some(&i) => {
+                        out[i].points.extend(s.points);
+                        merged_at.push(i);
+                    }
+                    None => {
+                        by_identity.insert(key, out.len());
+                        out.push(s);
+                    }
+                }
+            }
+            for i in merged_at {
+                let points = &mut out[i].points;
+                points.sort_by_key(|(t, _)| *t);
+                if points.windows(2).any(|w| w[0].0 == w[1].0) {
+                    return Err(same_labelset_error());
+                }
+            }
+            // Re-establish the assembly sort — a merge (or the strip
+            // itself) can perturb the pre-strip `(labels, metric_name)`
+            // order.
+            out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
+            Ok(QueryValue::Matrix(out))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -418,8 +527,8 @@ fn prepare_subquery(
 struct WindowedSeries {
     labels: Labels,
     /// The source's metric name (kept only by `last_over_time`/
-    /// `first_over_time`) — the selector's own name, or the materialized
-    /// inner series' name for a subquery source.
+    /// `first_over_time`) — the fetched series' own per-row name (issue
+    /// #85), or the materialized inner series' name for a subquery source.
     metric_name: Option<String>,
     samples: Vec<Sample>,
 }
@@ -455,7 +564,10 @@ fn windowed_range_source(
                 .iter()
                 .map(|s| WindowedSeries {
                     labels: s.labels.clone(),
-                    metric_name: Some(sel.metric_name.clone()),
+                    // Per-series name (issue #85), with the same
+                    // concrete-name-only fallback the `Selector` arm
+                    // documents.
+                    metric_name: s.metric_name.clone().or_else(|| sel.metric_name.clone()),
                     samples: windowed_non_stale(&s.samples, lower_excl, eff_t),
                 })
                 .collect();
@@ -532,32 +644,24 @@ fn eval_step(
         // `query.name_selector_keeps_get.json`; PROVENANCE.md's
         // "`__name__` keep/drop rule" table).
         //
-        // **Invariant this synthesizes `__name__` from `sel.metric_name`
-        // rather than a per-fetched-row metric name (architect
-        // adjudication on issue #37 code review, finding 1 — REJECT,
-        // guarded here):** every reachable `SelectorSpec` carries exactly
-        // one concrete metric name — `plan.rs::extract_name_and_matchers`
-        // rejects both a name-less selector (`{job="x"}`) and a
-        // `__name__` `Re`/`NotRe`/`NotEqual` matcher (`{__name__=~"a|b"}`)
-        // as `PromqlError::Unsupported` *before* any `QueryPlan`/
-        // `SelectorSpec` exists — so every series `data.get(*id)` returns
-        // was fetched under `PREWHERE metric_name = {sel.metric_name}`
-        // (the #30 resolver is metric-scoped the same way) and is
-        // provably that one metric. See
-        // `plan::tests::{a_selector_without_a_concrete_metric_name_is_unsupported,
-        // a_regex_name_matcher_is_unsupported,
-        // a_name_alternation_regex_matcher_is_unsupported}`.
-        // M6's multi-metric selectors (`{__name__=~"a|b"}`) will need a
-        // real per-row `metric_name` carried on `FetchedSeries` from the
-        // fetch layer — this `debug_assert!` exists so that work can't
-        // silently reuse this single-name synthesis by accident.
+        // Issue #85 (M6-08c): the name comes from the fetched series' own
+        // `FetchedSeries::metric_name` channel — a matcher-only/
+        // regex-`__name__` selector (`sel.metric_name: None`) matches
+        // series across metrics, and each output element must carry its
+        // own series' real name. The fetch layer (live:
+        // `pulsus-read::metrics::exec`'s per-metric cache resolution;
+        // hermetic: the corpus test store) owns both the
+        // `sel.name_matchers` filter and the per-series name; the
+        // evaluator never re-derives either. The `or_else` fallback to
+        // `sel.metric_name` fires only for a **concrete-name** selector
+        // whose fetch left the per-series channel empty — sound by the
+        // fetch contract (every series of a `Some(name)` selector was
+        // fetched under `PREWHERE metric_name = name` and is provably
+        // that metric); it can never resurrect the pre-#85 single-name
+        // synthesis for a multi-metric selector, whose spec name is
+        // `None` by construction.
         PlanExpr::Selector(id) => {
             let sel = &selectors[*id];
-            debug_assert!(
-                !sel.metric_name.is_empty(),
-                "every SelectorSpec carries exactly one concrete, non-empty metric name — \
-                 plan.rs rejects nameless/regex-__name__ selectors before a QueryPlan exists"
-            );
             // Issue #83: an own `@` fixes the evaluation time (offset
             // applies relative to it) — step-invariant by construction.
             let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
@@ -567,7 +671,10 @@ fn eval_step(
                 {
                     out.push(InstantSample {
                         labels: series.labels.clone(),
-                        metric_name: Some(sel.metric_name.clone()),
+                        metric_name: series
+                            .metric_name
+                            .clone()
+                            .or_else(|| sel.metric_name.clone()),
                         t_ms,
                         v: sample.v,
                     });
@@ -613,9 +720,9 @@ fn eval_step(
         // vendored `name_label_dropping.test:42-48` — "Does not drop
         // __name__ for last_over_time/first_over_time function" — and
         // arbitrated live by the #67 `last_over_time` differential row).
-        // The synthesis from `sel.metric_name` is sound for the same
-        // reason as the `Selector` arm's (one concrete metric name per
-        // reachable SelectorSpec).
+        // The kept name is the fetched series' own per-row
+        // `FetchedSeries::metric_name` (issue #85 — see the `Selector`
+        // arm), threaded through `WindowedSeries::metric_name`.
         PlanExpr::OverTime { func, source } => {
             let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
@@ -624,8 +731,8 @@ fn eval_step(
                 if let Some(v) = functions::eval_over_time(*func, &series.samples) {
                     out.push(InstantSample {
                         labels: series.labels,
-                        // Selector source: the selector's one concrete
-                        // metric name; subquery source: the materialized
+                        // Selector source: the fetched series' own name
+                        // (issue #85); subquery source: the materialized
                         // inner series' own kept name (if any).
                         metric_name: if keeps_name { series.metric_name } else { None },
                         t_ms,
@@ -1304,11 +1411,32 @@ mod tests {
         }
     }
 
+    /// A fetched series with an EMPTY per-series name channel — the
+    /// concrete-name selector arms fall back to `sel.metric_name` for
+    /// these (see the `Selector` arm's fallback doc), so every
+    /// single-metric test keeps working without stamping a name; tests
+    /// exercising the #85 per-series channel use [`named_series`].
     fn series(fp: u64, labels: &[(&str, &str)], samples: Vec<Sample>) -> FetchedSeries {
         FetchedSeries {
             fingerprint: fp,
+            metric_name: None,
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             samples,
+        }
+    }
+
+    /// A fetched series carrying its own per-series metric name (issue
+    /// #85) — what the fetch layer hands the evaluator for matcher-only /
+    /// regex-`__name__` selectors.
+    fn named_series(
+        name: &str,
+        fp: u64,
+        labels: &[(&str, &str)],
+        samples: Vec<Sample>,
+    ) -> FetchedSeries {
+        FetchedSeries {
+            metric_name: Some(name.to_string()),
+            ..series(fp, labels, samples)
         }
     }
 
@@ -2931,5 +3059,211 @@ mod tests {
                 other => panic!("{query}: expected Vector, got {other:?}"),
             }
         }
+    }
+
+    // --- issue #85 (M6-08c): per-series names + the PROM-39 terminal
+    // metadata strip ---
+
+    /// AC6: a regex-`__name__` selector over multi-metric fetched data
+    /// emits **per-series** metric names — the pre-#85 single-name
+    /// synthesis from `sel.metric_name` is gone (the spec's name is
+    /// `None` here, so the fallback is structurally inert).
+    #[test]
+    fn regex_name_selector_emits_per_series_metric_names() {
+        let expr = crate::parser::parse(r#"{__name__=~"foo|bar"}"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                named_series("foo", 1, &[("job", "a")], vec![s(0, 1.0)]),
+                named_series("bar", 2, &[("job", "a")], vec![s(0, 2.0)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                let mut names: Vec<Option<&str>> =
+                    v.iter().map(|smp| smp.metric_name.as_deref()).collect();
+                names.sort();
+                assert_eq!(names, vec![Some("bar"), Some("foo")]);
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// `strip_metadata_labels` drops `__type__`/`__unit__` iff the name
+    /// was dropped — the unified name+metadata rule of upstream's
+    /// terminal `cleanupMetricLabels`.
+    #[test]
+    fn strip_metadata_labels_drops_type_and_unit_iff_name_dropped() {
+        let build = || {
+            Labels::new(vec![
+                ("__type__".to_string(), "counter".to_string()),
+                ("__unit__".to_string(), "request".to_string()),
+                ("job".to_string(), "api".to_string()),
+            ])
+        };
+        let mut kept = build();
+        strip_metadata_labels(&Some("m".to_string()), &mut kept);
+        assert_eq!(kept, build(), "kept name ⇒ metadata labels stay");
+        let mut dropped = build();
+        strip_metadata_labels(&None, &mut dropped);
+        assert_eq!(
+            dropped,
+            Labels::new(vec![("job".to_string(), "api".to_string())]),
+            "dropped name ⇒ __type__/__unit__ stripped"
+        );
+    }
+
+    /// The strip is terminal (root-only, the delayed-oracle timing —
+    /// plan v3 Δ1): mid-tree the metadata labels stay in `Labels` so set-
+    /// op matching sees the full signature (`type_and_unit.test:77`'s
+    /// shape), and only the final output loses them.
+    #[test]
+    fn metadata_labels_match_mid_tree_and_strip_only_at_the_root() {
+        let expr = crate::parser::parse("(m + 1) and m").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let sv = || {
+            vec![named_series(
+                "m",
+                1,
+                &[("__type__", "counter"), ("__unit__", "request"), ("l", "x")],
+                vec![s(0, 5.0)],
+            )]
+        };
+        let mut data = SeriesData::new();
+        data.insert(0, sv());
+        data.insert(1, sv());
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                // Non-empty ⇒ the LHS (metadata kept mid-tree, name
+                // dropped) matched the RHS on the full signature; a
+                // per-node strip would have emptied this.
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].v, 6.0);
+                assert_eq!(v[0].metric_name, None);
+                assert_eq!(
+                    v[0].labels,
+                    Labels::new(vec![("l".to_string(), "x".to_string())]),
+                    "root strip removes __type__/__unit__ from the name-dropped output"
+                );
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+        // Control: the bare selector keeps its name, so the metadata
+        // labels survive the root cleanup untouched.
+        let expr = crate::parser::parse("m").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, sv());
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Vector(v) => {
+                assert_eq!(v[0].metric_name.as_deref(), Some("m"));
+                assert_eq!(v[0].labels.get("__type__"), Some("counter"));
+                assert_eq!(v[0].labels.get("__unit__"), Some("request"));
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+    }
+
+    /// Plan v4 Δ1 (instant): two output samples whose identities collapse
+    /// to one labelset after the terminal strip are a **hard error** with
+    /// the pinned upstream message (`vec.ContainsSameLabelset()` →
+    /// `errorf`, engine.go:4238).
+    #[test]
+    fn instant_metadata_collapse_is_the_upstream_duplicate_labelset_error() {
+        let expr = crate::parser::parse("m + 0").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                named_series(
+                    "m",
+                    1,
+                    &[("__type__", "counter"), ("l", "x")],
+                    vec![s(0, 1.0)],
+                ),
+                named_series(
+                    "m",
+                    2,
+                    &[("__type__", "gauge"), ("l", "x")],
+                    vec![s(0, 2.0)],
+                ),
+            ],
+        );
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset"
+        );
+    }
+
+    /// Plan v4 Δ1 (range): post-strip same-identity series **merge** when
+    /// their timestamps are disjoint (upstream
+    /// `mergeSeriesWithSameLabelset`) and **error** with the same message
+    /// when any timestamp overlaps.
+    #[test]
+    fn range_metadata_collapse_merges_disjoint_timestamps_and_errors_on_overlap() {
+        let expr = crate::parser::parse("m + 0").unwrap();
+        let p = plan(&expr, params(0, 300_000, 300_000)).unwrap();
+        // Disjoint: counter-typed series only at step 0, gauge-typed only
+        // at step 300s — one merged output series.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                named_series(
+                    "m",
+                    1,
+                    &[("__type__", "counter"), ("l", "x")],
+                    vec![s(0, 1.0)],
+                ),
+                named_series(
+                    "m",
+                    2,
+                    &[("__type__", "gauge"), ("l", "x")],
+                    vec![s(300_000, 2.0)],
+                ),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "disjoint post-strip identities merge: {m:?}");
+                assert_eq!(m[0].points, vec![(0, 1.0), (300_000, 2.0)]);
+                assert_eq!(
+                    m[0].labels,
+                    Labels::new(vec![("l".to_string(), "x".to_string())])
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+        // Overlap: both series present at step 0 (the 5m lookback keeps
+        // the t=0 samples visible at step 300s too) — the merge finds a
+        // duplicate timestamp and fails with the pinned message.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                named_series(
+                    "m",
+                    1,
+                    &[("__type__", "counter"), ("l", "x")],
+                    vec![s(0, 1.0)],
+                ),
+                named_series(
+                    "m",
+                    2,
+                    &[("__type__", "gauge"), ("l", "x")],
+                    vec![s(0, 2.0)],
+                ),
+            ],
+        );
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset"
+        );
     }
 }

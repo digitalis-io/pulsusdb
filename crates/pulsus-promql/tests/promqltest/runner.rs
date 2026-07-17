@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
-use pulsus_promql::parser::{Expr, VectorMatchCardinality, token};
+use pulsus_promql::parser::{Expr, PLabelMatchOp, VectorMatchCardinality, VectorSelector, token};
 use pulsus_promql::{PlanParams, QueryValue, evaluate, plan};
 
 use super::grammar::{Command, EvalCmd, EvalKind, EvalMode, Expected, ExpectedSeries, parse_file};
@@ -119,12 +119,7 @@ fn walk(expr: &Expr, c: &mut Constructs) {
             if vs.offset_expr.is_some() {
                 c.features.insert("duration-expression".to_string());
             }
-            if !vs.matchers.or_matchers.is_empty() {
-                // The UTF-8-quoted label-name-or selector syntax is the
-                // slice of UTF-8 support the planner still rejects (plain
-                // quoted label/metric names already flow through).
-                c.features.insert("utf8-label-names".to_string());
-            }
+            collect_selector_name_features(vs, c);
         }
         Expr::MatrixSelector(ms) => {
             if ms.vs.at.is_some() {
@@ -133,15 +128,63 @@ fn walk(expr: &Expr, c: &mut Constructs) {
             if ms.range_expr.is_some() || ms.vs.offset_expr.is_some() {
                 c.features.insert("duration-expression".to_string());
             }
-            if !ms.vs.matchers.or_matchers.is_empty() {
-                c.features.insert("utf8-label-names".to_string());
-            }
+            collect_selector_name_features(&ms.vs, c);
         }
         Expr::Paren(p) => walk(&p.expr, c),
         Expr::Unary(u) => walk(&u.expr, c),
         Expr::NumberLiteral(_) | Expr::StringLiteral(_) => {}
         Expr::Extension(_) => {}
     }
+}
+
+/// Issue #85 (M6-08c): `utf8-label-names` is emitted when a selector uses
+/// a metric or label name outside the legacy (pre-UTF-8) charset — i.e. a
+/// name only reachable through the quoted-name syntax (`{"utf8.metric"}`,
+/// `m{"label.dot"="x"}`). The previous mapping keyed on the parser's
+/// brace-level `or_matchers` extension is gone: pinned upstream v3.13.0
+/// has no such syntax (`label_match_list` is comma-only), so it is a
+/// permanent plan-time rejection, not the UTF-8 feature.
+fn collect_selector_name_features(vs: &VectorSelector, c: &mut Constructs) {
+    let mut utf8 = vs
+        .name
+        .as_deref()
+        .is_some_and(|n| !is_legacy_metric_name(n));
+    for m in vs
+        .matchers
+        .matchers
+        .iter()
+        .chain(vs.matchers.or_matchers.iter().flatten())
+    {
+        if m.name == "__name__" {
+            if matches!(m.op, PLabelMatchOp::Equal) && !is_legacy_metric_name(&m.value) {
+                utf8 = true;
+            }
+        } else if !is_legacy_label_name(&m.name) {
+            utf8 = true;
+        }
+    }
+    if utf8 {
+        c.features.insert("utf8-label-names".to_string());
+    }
+}
+
+/// The legacy metric-name charset, `[a-zA-Z_:][a-zA-Z0-9_:]*` (upstream
+/// `model.IsValidLegacyMetricName`).
+fn is_legacy_metric_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().enumerate().all(|(i, ch)| {
+            ch.is_ascii_alphabetic() || ch == '_' || ch == ':' || (i > 0 && ch.is_ascii_digit())
+        })
+}
+
+/// The legacy label-name charset, `[a-zA-Z_][a-zA-Z0-9_]*` (upstream
+/// `model.LabelName.IsValidLegacy`).
+fn is_legacy_label_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, ch)| ch.is_ascii_alphabetic() || ch == '_' || (i > 0 && ch.is_ascii_digit()))
 }
 
 /// One executed case's outcome.

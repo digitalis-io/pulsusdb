@@ -50,6 +50,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_PROMQL_MAX_SAMPLES",
     "PULSUS_PROMQL_LOOKBACK",
     "PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS",
+    "PULSUS_PROMQL_MAX_METRIC_FANOUT",
     "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
@@ -233,6 +234,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
         cfg.reader.promql_experimental_functions =
             parse_bool("PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS", &v)?;
     }
+    if let Some(v) = read("PULSUS_PROMQL_MAX_METRIC_FANOUT") {
+        cfg.reader.promql_max_metric_fanout = parse_int("PULSUS_PROMQL_MAX_METRIC_FANOUT", &v)?;
+    }
     if let Some(v) = read("PULSUS_LOGQL_SCAN_BUDGET_BYTES") {
         cfg.reader.logql_scan_budget_bytes = parse_size("PULSUS_LOGQL_SCAN_BUDGET_BYTES", &v)?;
     }
@@ -271,8 +275,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            43,
-            "docs/configuration.md §§1-8 document exactly 43 variables"
+            44,
+            "docs/configuration.md §§1-8 document exactly 44 variables"
         );
     }
 
@@ -287,5 +291,13 @@ mod tests {
     #[test]
     fn parse_bool_rejects_other_values() {
         assert!(parse_bool("X", "yes").is_err());
+    }
+
+    /// Issue #85 (M6-08c): a non-integer `PULSUS_PROMQL_MAX_METRIC_FANOUT`
+    /// is rejected at config load through the shared `parse_int` path.
+    #[test]
+    fn invalid_promql_max_metric_fanout_is_rejected_at_load() {
+        let err = parse_int::<u64>("PULSUS_PROMQL_MAX_METRIC_FANOUT", "not-a-number").unwrap_err();
+        assert!(err.to_string().contains("PULSUS_PROMQL_MAX_METRIC_FANOUT"));
     }
 }

@@ -159,6 +159,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         series_table: "metric_series".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
+        max_metric_fanout: 1_000,
     }
 }
 
@@ -1962,6 +1963,311 @@ async fn tsdb_status_reports_series_counts_with_zero_sample_table_access() {
         status.series_count_by_metric_name,
         vec![("up".to_string(), 2)]
     );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #85 (M6-08c): the name-less/regex-`__name__` selector end-to-end
+/// through the live engine — the round-1 review's live-reader test gap.
+/// Proves, against real ClickHouse:
+///   - name-regex filtering (the `other_metric` series never appears);
+///   - per-series metric names in the rendered output (`__name__` spliced
+///     per matched metric, not synthesized from a single spec name);
+///   - a fingerprint shared across two metric names yields one series per
+///     `(metric_name, fingerprint)` pair — no cross-group duplication or
+///     merging;
+///   - the explain trace carries exactly ONE flat `sample_fetch` whose
+///     SQL is the `PREWHERE metric_name IN (…) … fingerprint IN (…)`
+///     shape (one round trip, never a global scan or per-metric queries);
+///   - a fan-out cap below the matched-name count fails with the named
+///     query-too-broad error instead of fetching.
+#[tokio::test]
+async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fetch() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_nameless_fanout";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    // Fingerprint 1 exists under BOTH http_a_total and http_b_total (the
+    // same label set fingerprints identically across metric names —
+    // metric_fingerprint excludes __name__); other_metric must be pruned
+    // by the name regex.
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "http_a_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "http_b_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "other_metric".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[
+            SeedSampleRow {
+                metric_name: "http_a_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                value: 11.0,
+            },
+            SeedSampleRow {
+                metric_name: "http_b_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                value: 22.0,
+            },
+            SeedSampleRow {
+                metric_name: "other_metric".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                value: 99.0,
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+    let engine = MetricsEngine::new(engine_client, Arc::clone(&cache), engine_config(db));
+
+    let expr = parse(r#"{__name__=~"http_.*", job="api"}"#).expect("parse");
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+    let (result, explain) = engine
+        .query_explained(&expr, &params)
+        .await
+        .expect("query_explained");
+
+    // Exactly one flat IN-set fetch — never one query per metric, never
+    // an unfiltered scan.
+    let fetches: Vec<_> = explain
+        .stages
+        .iter()
+        .filter(|s| s.name == "sample_fetch")
+        .collect();
+    assert_eq!(fetches.len(), 1, "one flat fetch: {:#?}", explain.stages);
+    let sql = &fetches[0].sql;
+    assert!(
+        sql.contains("PREWHERE metric_name IN ('http_a_total', 'http_b_total')"),
+        "flat IN-set prune must name exactly the regex-matched metrics: {sql}"
+    );
+    assert!(sql.contains("fingerprint IN (1)"), "{sql}");
+    assert!(!sql.contains("other_metric"), "{sql}");
+
+    match result {
+        QueryResult::Vector(mut v) => {
+            v.sort_by(|a, b| a.labels.cmp(&b.labels));
+            assert_eq!(v.len(), 2, "one series per (metric_name, fp): {v:?}");
+            let name_of = |s: &pulsus_read::VectorSample| {
+                s.labels
+                    .iter()
+                    .find(|(k, _)| k == "__name__")
+                    .map(|(_, v)| v.clone())
+                    .expect("per-series __name__ present")
+            };
+            let mut by_name: Vec<(String, f64)> = v.iter().map(|s| (name_of(s), s.value)).collect();
+            by_name.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                by_name,
+                vec![
+                    ("http_a_total".to_string(), 11.0),
+                    ("http_b_total".to_string(), 22.0),
+                ],
+                "per-series names with each series' own value"
+            );
+            assert!(
+                v.iter()
+                    .all(|s| s.labels.contains(&("job".to_string(), "api".to_string())))
+            );
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+
+    // Cap below the matched-name count: the named fan-out error, before
+    // any fetch.
+    let capped_engine = MetricsEngine::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (capped engine client)"),
+        cache,
+        MetricsConfig {
+            max_metric_fanout: 1,
+            ..engine_config(db)
+        },
+    );
+    let err = capped_engine
+        .query(&expr, &params)
+        .await
+        .expect_err("fan-out above the cap must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("query too broad") && msg.contains("fan-out cap"),
+        "named metric-fan-out rejection, got {msg:?}"
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #85 code review round 1, finding 1 (live gap): a genuine
+/// `(metric_name, fingerprint)` cross-pair the cache did NOT resolve —
+/// the name is known via one fingerprint, the fingerprint via another
+/// name, and the pair itself exists only in `metric_samples` (a series
+/// registered inside the post-sweep recency gap). The flat IN×IN fetch
+/// returns its rows; they must surface with the fingerprint's hydrated
+/// (name-invariant) labels, NEVER an empty label set.
+#[tokio::test]
+async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_engine_cross_pair";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    // Pre-sweep registrations: cross_a_total resolves fp1, cross_b_total
+    // resolves fp2 — so the fan-out's IN lists contain BOTH names and
+    // BOTH fingerprints, but the (cross_b_total, fp1) pair is unresolved.
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "cross_a_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "cross_b_total".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"web"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    // POST-sweep: the cross-pair's samples land (its metric_series row
+    // would land too in production, but the resident snapshot predates
+    // it — the sanctioned recency gap). fp1's labels are name-invariant
+    // ({job:"api"}), known to the cache only via cross_a_total.
+    seed_samples(
+        &client,
+        &[
+            SeedSampleRow {
+                metric_name: "cross_a_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                value: 1.0,
+            },
+            SeedSampleRow {
+                metric_name: "cross_b_total".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                value: 2.0,
+            },
+            SeedSampleRow {
+                metric_name: "cross_b_total".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                value: 3.0,
+            },
+        ],
+    )
+    .await;
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let expr = parse(r#"{__name__=~"cross_.*"}"#).expect("parse");
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+    let result = engine.query(&expr, &params).await.expect("query");
+
+    match result {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 3, "both resolved pairs + the cross-pair: {v:?}");
+            assert!(
+                v.iter()
+                    .all(|s| s.labels.iter().any(|(k, _)| k != "__name__")),
+                "no series may surface with empty (name-only) labels: {v:?}"
+            );
+            let cross = v
+                .iter()
+                .find(|s| {
+                    s.labels
+                        .contains(&("__name__".to_string(), "cross_b_total".to_string()))
+                        && s.value == 3.0
+                })
+                .unwrap_or_else(|| panic!("cross-pair series missing: {v:?}"));
+            assert!(
+                cross
+                    .labels
+                    .contains(&("job".to_string(), "api".to_string())),
+                "cross-pair must carry fp1's hydrated name-invariant labels: {cross:?}"
+            );
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
 
     drop_database(&bootstrap, db).await;
 }

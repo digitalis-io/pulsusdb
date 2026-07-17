@@ -168,6 +168,12 @@ pub struct ReaderConfig {
     /// coverage authority for what "experimental" covers is
     /// `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json`.
     pub promql_experimental_functions: bool,
+    /// Issue #85 (M6-08c): the cap on how many metric names one
+    /// name-less/regex-`__name__` PromQL selector may fan out to before
+    /// the query is rejected as too broad (default 1000, the #85
+    /// adjudication) — the bound on the flat `PREWHERE metric_name IN
+    /// (…)` fetch's `IN`-set width. Operator-scale tuning routes to #25.
+    pub promql_max_metric_fanout: u64,
     pub logql_scan_budget_bytes: ByteSize,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
@@ -183,6 +189,7 @@ impl Default for ReaderConfig {
             promql_max_samples: 50_000_000,
             promql_lookback: HumanDuration(Duration::from_secs(300)),
             promql_experimental_functions: false,
+            promql_max_metric_fanout: 1_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,

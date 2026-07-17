@@ -89,9 +89,11 @@ eval_fail instant at 0 histogram_count(n1)
 eval_fail instant at 0 n1[5m:1m]
 	expected_fail_regexp not yet supported: .*subquery.*
 
-# eval_fail without a message: any error satisfies it (a selector with no
-# concrete metric name is rejected by the metric-scoped planner).
-eval_fail instant at 0 {k="v"}
+# eval_fail without a message: any error satisfies it (issue #85
+# implemented the previous stand-in, the matcher-only selector `{k="v"}`;
+# the brace-level `or` extension — permanently plan-rejected, see
+# m6_08c_utf8_selectors.test — is its successor).
+eval_fail instant at 0 {k="v" or q="w"}
 
 # eval_fail on a range query.
 eval_fail range from 0 to 20s step 10s histogram_count(n1)

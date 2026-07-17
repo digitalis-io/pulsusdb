@@ -128,6 +128,10 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         cfg.reader.series_activity_bucket,
     )?;
     positive_u64("reader.promql_max_samples", cfg.reader.promql_max_samples)?;
+    positive_u64(
+        "reader.promql_max_metric_fanout",
+        cfg.reader.promql_max_metric_fanout,
+    )?;
     positive_bytes(
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
@@ -374,6 +378,18 @@ mod tests {
     fn zero_series_activity_bucket_is_rejected() {
         let mut cfg = Config::default();
         cfg.reader.series_activity_bucket = HumanDuration(std::time::Duration::ZERO);
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #85 (M6-08c): the name-less-selector fan-out cap follows the
+    /// sibling u64 caps' validation shape — zero is an invalid value,
+    /// rejected at config load, and the documented default is the
+    /// adjudicated 1000.
+    #[test]
+    fn zero_promql_max_metric_fanout_is_rejected_and_the_default_is_1000() {
+        assert_eq!(Config::default().reader.promql_max_metric_fanout, 1_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_metric_fanout = 0;
         assert!(validate(&cfg).is_err());
     }
 

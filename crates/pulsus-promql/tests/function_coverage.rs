@@ -309,6 +309,10 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
             spec.id,
             vec![FetchedSeries {
                 fingerprint: spec.id as u64,
+                // The per-series name channel (issue #85): the selector's
+                // own concrete name when it has one, else a fixed
+                // synthetic name (name-less probes still evaluate).
+                metric_name: spec.metric_name.clone().or_else(|| Some("m".to_string())),
                 labels: Labels::new(vec![
                     ("l".to_string(), "a".to_string()),
                     ("le".to_string(), "+Inf".to_string()),
@@ -557,6 +561,13 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // v3.13.0 promql-duration-expr feature flag is OFF by
             // default).
             "duration-expression",
+            // M6-08c (issue #85): quoted UTF-8 metric/label names flow
+            // through the completed selector model (matcher-only and
+            // regex-__name__ selectors plan and evaluate; the probe is a
+            // genuine quoted-name selector — the parser crate's
+            // brace-level `or` extension is NOT this feature and stays
+            // plan-rejected).
+            "utf8-label-names",
         ])
     );
 }

@@ -1,0 +1,131 @@
+# Issue #85 (M6-08c) proof corpus — hand-authored witnesses for the
+# completed selector model (matcher-only, regex/negative-__name__, quoted
+# UTF-8 names) and the PROM-39 terminal metadata strip. Semantics ported
+# from Prometheus v3.13.0 @ 40af9c2 under the corpus oracle's own flag
+# state: promqltest runs with EnableDelayedNameRemoval=true
+# (promql/promqltest/test.go:111), so the ONLY __type__/__unit__ drop is
+# the terminal cleanupMetricLabels (engine.go:4224) — root-only, unified
+# with name removal, with its pinned collision semantics (instant
+# duplicate labelset = hard error; range matrix merges disjoint-timestamp
+# collisions, errors on overlap — mergeSeriesWithSameLabelset,
+# engine.go:4252).
+#
+# Worked example (values at 50m, load step 5m, sample k at k*5m):
+#   http_requests_total{instance="0"} = 0+10x10 -> 10*10  = 100
+#   http_requests_total{instance="1"} = 0+20x10 -> 20*10  = 200
+#   other_requests_total{instance="0"} = 0+30x10 -> 30*10 = 300
+#   {"utf8.metric"}                    = 0+7x10  -> 7*10  = 70
+
+load 5m
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="0"}	0+10x10
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="1"}	0+20x10
+	other_requests_total{job="api", instance="0"}	0+30x10
+	x{y="testvalue"}	0+5x10
+	{"utf8.metric", "label.dot"="dotted", job="api"}	0+7x10
+
+# --- Quoted UTF-8 metric + label names (the utf8-label-names witness):
+# a genuine quoted-name selector — __name__ Eq via the quoted metric
+# name, a dotted quoted label name as an ordinary matcher.
+eval instant at 50m {"utf8.metric", "label.dot"="dotted"}
+	{"utf8.metric", "label.dot"="dotted", job="api"} 70
+
+# Quoted UTF-8 label name under a regex matcher.
+eval instant at 50m {"utf8.metric", "label.dot"=~"dot.*"}
+	{"utf8.metric", "label.dot"="dotted", job="api"} 70
+
+# --- Regex-__name__ selector: multi-metric, per-series names kept
+# verbatim (a bare selector keeps __name__ — and therefore keeps
+# __type__/__unit__ too, the delayed-oracle rule).
+eval instant at 50m {__name__=~".*_requests_total"}
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="0"} 100
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="1"} 200
+	other_requests_total{job="api", instance="0"} 300
+
+# Negative name matcher stacked on the regex.
+eval instant at 50m {__name__=~".*_requests_total", __name__!="other_requests_total"}
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="0"} 100
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="1"} 200
+
+# Regex-__name__ under a range function: rate computes (name + metadata
+# drop at the root), per-metric windows stay per-series.
+# rate over (25m, 50m] = 5 deltas of 10 (resp. 20) over 1500s, upstream
+# extrapolation makes it exactly 50/1500 resp. 100/1500 per second.
+eval instant at 50m rate({__name__=~"http_.*"}[25m]) * 25 * 60
+	{job="api", instance="0"} 50
+	{job="api", instance="1"} 100
+
+# Regex-__name__ over a range query: per-series names in the matrix too.
+eval range from 40m to 50m step 5m {__name__=~"other_.*"}
+	other_requests_total{job="api", instance="0"} 240 270 300
+
+# --- Matcher-only selector (no name constraint at all): everything
+# carrying the matched labels, each with its own name.
+eval instant at 50m {job="api", instance="0"}
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="0"} 100
+	other_requests_total{job="api", instance="0"} 300
+
+eval instant at 50m sum({job="api", instance="0"})
+	{} 400
+
+# --- PROM-39: computed value ⇒ unified name+metadata drop at the root.
+eval instant at 50m -http_requests_total{instance="0"}
+	{job="api", instance="0"} -100
+
+# Keep case: the bare selector keeps the name, so the metadata labels
+# survive untouched.
+eval instant at 50m http_requests_total{instance="0"}
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="0"} 100
+
+# --- Root-only timing witnesses (plan v3 Δ1): mid-tree the metadata
+# labels stay in Labels, so the set-op signature (full labels minus
+# __name__) still matches a metadata-carrying RHS. A per-node strip
+# would empty both results (type_and_unit.test:77/92's shape).
+eval instant at 50m (http_requests_total{instance="0"} + 1) and http_requests_total{job="api"}
+	{job="api", instance="0"} 101
+
+# On overlap the rhs samples must be dropped — the signature comparison
+# happens on the *unstripped* labels, the strip on the final output only.
+eval instant at 50m (http_requests_total{instance="0"} + 1) or http_requests_total{job="api"}
+	{job="api", instance="0"} 101
+	http_requests_total{__type__="counter", __unit__="request", job="api", instance="1"} 200
+
+# --- The brace-level `or` extension is NOT PromQL: pinned upstream
+# v3.13.0's label_match_list is comma-only (generated_parser.y), so the
+# vendored parser crate's or_matchers syntax is permanently rejected at
+# plan time. This witness pins the exact rejection text — a parser bump
+# that silently starts planning it fails here.
+eval_fail instant at 50m {job="api" or instance="0"}
+	expected_fail_message label matchers must be comma-separated; "or" between matchers is not valid Prometheus selector syntax
+
+clear
+
+# --- Terminal metadata-collapse collision semantics (plan v4 Δ1), pinned
+# to cleanupMetricLabels: after the root strip, two computed series
+# differing only in __type__/__unit__ share one labelset.
+load 5m
+	collide{__type__="counter", l="x"}	0+10x10
+	collide{__type__="gauge", l="x"}	0+20x10
+	part{__type__="counter", l="y"}	0 5 _ _
+	part{__type__="gauge", l="y"}	_ _ 10 15
+
+# Bare selector: names kept ⇒ no strip, both series distinct.
+eval instant at 50m collide
+	collide{__type__="counter", l="x"} 100
+	collide{__type__="gauge", l="x"} 200
+
+# Instant vector: post-strip duplicate labelset is a HARD error
+# (vec.ContainsSameLabelset() -> errorf, engine.go:4238).
+eval_fail instant at 50m collide + 0
+	expected_fail_message vector cannot contain metrics with the same labelset
+
+# Range matrix, disjoint timestamps: the two post-strip identities MERGE
+# into one series (mergeSeriesWithSameLabelset) — counter-typed samples
+# cover steps 0/5m, gauge-typed 10m/15m, never the same step (the 5m
+# lookback window is left-open, so a 5m-old sample is already gone).
+eval range from 0 to 15m step 5m part + 0
+	{l="y"} 0 5 10 15
+
+# Range matrix, overlapping timestamps: the merge finds duplicate
+# timestamps and fails with the same pinned message.
+eval_fail range from 0 to 15m step 5m collide + 0
+	expected_fail_message vector cannot contain metrics with the same labelset

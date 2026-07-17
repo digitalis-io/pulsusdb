@@ -16,6 +16,20 @@ pub struct SampleRow {
     pub value: f64,
 }
 
+/// One `metric_samples` row from [`super::sample_sql::sample_fetch_multi`]
+/// (issue #85, M6-08c): the multi-metric fan-out fetch additionally
+/// selects `metric_name`, because a fingerprint can exist under more than
+/// one metric name (`metric_fingerprint` excludes `__name__`,
+/// docs/schemas.md §2.1) — rows must group into per-`(metric_name,
+/// fingerprint)` series, not per-fingerprint alone.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MultiSampleRow {
+    pub metric_name: String,
+    pub fingerprint: u64,
+    pub unix_milli: i64,
+    pub value: f64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

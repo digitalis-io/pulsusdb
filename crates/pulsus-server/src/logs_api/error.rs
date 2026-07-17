@@ -103,7 +103,12 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         ReadError::EmptyMatcherSet | ReadError::ContradictoryMatchers | ReadError::InvalidStep => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
         }
-        ReadError::QueryTooBroad(_) => (
+        // Issue #85: `NamelessSelectorUnresolvable` is a PromQL-only
+        // variant (the LogQL engine never produces it), matched here for
+        // exhaustiveness like `ReadError::Promql` below — mapped as a
+        // too-broad-class client rejection, mirroring
+        // `prom_api::error::read_error_parts`'s own 422 for it.
+        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
             e.to_string(),

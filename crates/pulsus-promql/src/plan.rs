@@ -6,14 +6,21 @@
 //! typed evaluator IR ([`PlanExpr`]) [`crate::eval::evaluate`] walks.
 //!
 //! **Metric-scoping is structural** (edge case 9): `__name__` is always
-//! extracted into `SelectorSpec::metric_name`, never left in `matchers` —
-//! this is docs/schemas.md §2.1's metric-scoped model, load-bearing for
-//! both the fetch `PREWHERE metric_name = ...` and issue #30's
-//! `SeriesResolver::resolve(metric_name, matchers, window)` signature. A
-//! selector with no concrete metric name (a `__name__`-less matcher-only
-//! selector, or a regex `__name__` matcher) cannot be resolved through
-//! that API and is rejected as [`PromqlError::Unsupported`] — never
-//! silently mis-scoped.
+//! extracted out of `matchers` — this is docs/schemas.md §2.1's
+//! metric-scoped model, load-bearing for both the fetch
+//! `PREWHERE metric_name = ...` and issue #30's
+//! `SeriesResolver::resolve(metric_name, matchers, window)` signature.
+//! Issue #85 (M6-08c) completes the selector model: a single concrete
+//! `Eq`/bare name extracts into `SelectorSpec::metric_name = Some(name)`
+//! (the PK-pruned single-metric fast path, byte-identical to the M2
+//! shape); a `__name__`-less matcher-only selector or a
+//! regex/negative-`__name__` selector plans with `metric_name: None` and
+//! the non-`Eq` `__name__` matchers carried in
+//! [`SelectorSpec::name_matchers`] — the fetch layer resolves those
+//! against its name-keyed label cache (`pulsus-read`'s per-metric
+//! fan-out, capped) and carries each fetched series' own name on
+//! `FetchedSeries::metric_name`, so `__name__` still never enters the
+//! matcher list or the evaluator's `Labels`.
 
 use pulsus_model::{LabelMatcher, MatchOp};
 
@@ -78,7 +85,18 @@ pub type SelectorId = usize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectorSpec {
     pub id: SelectorId,
-    pub metric_name: String,
+    /// `Some` ⟺ the selector names exactly one concrete metric (a bare
+    /// name or a single `__name__` `Eq` matcher) — the PK-pruned
+    /// single-metric fast path, byte-identical to the pre-#85 fetch SQL.
+    /// `None` ⟺ a matcher-only or regex/negative-`__name__` selector —
+    /// the fetch layer fans out over its name-keyed cache (issue #85).
+    pub metric_name: Option<String>,
+    /// Non-`Eq` `__name__` matchers (`=~`/`!~`/`!=`), evaluated by the
+    /// fetch layer against candidate metric *names* (the single concrete
+    /// name when `metric_name` is `Some`, the cache's name key set when
+    /// `None`) — never against `Labels`, which excludes `__name__` by
+    /// construction.
+    pub name_matchers: Vec<LabelMatcher>,
     pub matchers: Vec<LabelMatcher>,
     /// `Some` for a matrix selector (the range-vector width); `None` for
     /// an instant vector selector. Eval **and** fetch.
@@ -700,7 +718,8 @@ struct Planner {
 impl Planner {
     fn push_selector(
         &mut self,
-        metric_name: String,
+        metric_name: Option<String>,
+        name_matchers: Vec<LabelMatcher>,
         matchers: Vec<LabelMatcher>,
         range_ms: Option<i64>,
         offset_ms: i64,
@@ -726,6 +745,7 @@ impl Planner {
         self.selectors.push(SelectorSpec {
             id,
             metric_name,
+            name_matchers,
             matchers,
             range_ms,
             offset_ms,
@@ -833,9 +853,10 @@ pub fn series_selector(expr: &Expr) -> Result<(Option<String>, Vec<LabelMatcher>
         ));
     };
     if !vs.matchers.or_matchers.is_empty() {
-        return Err(unsupported(
-            "UTF-8-quoted label-name-or selector syntax (or_matchers)",
-        ));
+        // Issue #85: same permanent rejection as the query path (see
+        // `or_matchers_rejection`) — brace-level `or` is not upstream
+        // v3.13.0 syntax anywhere, `match[]` included.
+        return Err(or_matchers_rejection());
     }
 
     let mut metric_name: Option<String> = vs.name.clone();
@@ -850,6 +871,11 @@ pub fn series_selector(expr: &Expr) -> Result<(Option<String>, Vec<LabelMatcher>
                     return Err(unsupported("selector with a metric name set twice"));
                 }
                 _ => {
+                    // Still rejected here (unlike the #85 query path):
+                    // `DiscoveryFilter`/`sql::discovery_query` carry no
+                    // name-matcher channel — regex/negative metric-name
+                    // *discovery* needs its own query shape and stays a
+                    // named limitation of the match[] surface.
                     return Err(unsupported("__name__ regex/negative in match[]"));
                 }
             }
@@ -1028,18 +1054,37 @@ fn eval_duration_expr(
     })
 }
 
-/// Extracts `(metric_name, matchers-excluding-__name__)` from a
-/// [`VectorSelector`], per the module doc's metric-scoping rule.
-fn extract_name_and_matchers(
-    vs: &VectorSelector,
-) -> Result<(String, Vec<LabelMatcher>), PromqlError> {
+/// The brace-level `or` (`{a="x" or b="y"}`) rejection (issue #85 plan v2
+/// Δ1/v3 Δ3): the vendored parser crate accepts this syntax, but pinned
+/// upstream Prometheus v3.13.0 does not — `generated_parser.y`'s
+/// `label_match_list` is COMMA-only, so accepting it would be a silent
+/// divergence with no upstream oracle. Rejected at plan time (the parse
+/// already happened) as a **permanent** [`PromqlError::Parse`] — never an
+/// `Unsupported` "not yet supported" feature. The exact final string is
+/// pinned by the `m6_08c_utf8_selectors.test` `eval_fail` witness, so a
+/// parser bump that silently starts planning it fails loudly.
+fn or_matchers_rejection() -> PromqlError {
+    PromqlError::Parse(
+        "label matchers must be comma-separated; \"or\" between matchers is not valid \
+         Prometheus selector syntax"
+            .to_string(),
+    )
+}
+
+/// Extracts `(metric_name, name_matchers, matchers-excluding-__name__)`
+/// from a [`VectorSelector`], per the module doc's metric-scoping rule
+/// (issue #85: matcher-only and regex/negative-`__name__` selectors now
+/// extract instead of erroring — `metric_name: None` plus the non-`Eq`
+/// `__name__` matchers in the dedicated name channel).
+type ExtractedSelector = (Option<String>, Vec<LabelMatcher>, Vec<LabelMatcher>);
+
+fn extract_name_and_matchers(vs: &VectorSelector) -> Result<ExtractedSelector, PromqlError> {
     if !vs.matchers.or_matchers.is_empty() {
-        return Err(unsupported(
-            "UTF-8-quoted label-name-or selector syntax (or_matchers)",
-        ));
+        return Err(or_matchers_rejection());
     }
 
     let mut metric_name: Option<String> = vs.name.clone();
+    let mut name_matchers = Vec::new();
     let mut matchers = Vec::with_capacity(vs.matchers.matchers.len());
     for m in &vs.matchers.matchers {
         if m.name == "__name__" {
@@ -1055,9 +1100,7 @@ fn extract_name_and_matchers(
                     return Err(unsupported("selector with a metric name set twice"));
                 }
                 _ => {
-                    return Err(unsupported(
-                        "__name__ matched via regex or negation (no single concrete metric name)",
-                    ));
+                    name_matchers.push(convert_matcher(m)?);
                 }
             }
             continue;
@@ -1065,11 +1108,7 @@ fn extract_name_and_matchers(
         matchers.push(convert_matcher(m)?);
     }
 
-    let metric_name = metric_name.ok_or_else(|| {
-        unsupported("selector without a concrete metric name (docs/schemas.md's metric-scoped model requires one)")
-    })?;
-
-    Ok((metric_name, matchers))
+    Ok((metric_name, name_matchers, matchers))
 }
 
 fn convert_matcher(m: &parser::PMatcher) -> Result<LabelMatcher, PromqlError> {
@@ -1092,10 +1131,10 @@ fn plan_vector_selector(
 ) -> Result<PlanExpr, PromqlError> {
     // Issue #84: gate before any resolution.
     gate_duration_expr(&vs.offset_expr, planner.experimental)?;
-    let (metric_name, matchers) = extract_name_and_matchers(vs)?;
+    let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
     let offset = planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?;
-    let id = planner.push_selector(metric_name, matchers, None, offset, at_ms);
+    let id = planner.push_selector(metric_name, name_matchers, matchers, None, offset, at_ms);
     Ok(PlanExpr::Selector(id))
 }
 
@@ -1110,11 +1149,18 @@ fn plan_matrix_selector_id(
     // Issue #84: gate before any resolution.
     gate_duration_expr(&ms.range_expr, planner.experimental)?;
     gate_duration_expr(&ms.vs.offset_expr, planner.experimental)?;
-    let (metric_name, matchers) = extract_name_and_matchers(&ms.vs)?;
+    let (metric_name, name_matchers, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
     let range_ms = planner.resolve_range_ms(ms.range, &ms.range_expr)?;
     let offset = planner.resolve_offset_ms(&ms.vs.offset, &ms.vs.offset_expr)?;
-    Ok(planner.push_selector(metric_name, matchers, Some(range_ms), offset, at_ms))
+    Ok(planner.push_selector(
+        metric_name,
+        name_matchers,
+        matchers,
+        Some(range_ms),
+        offset,
+        at_ms,
+    ))
 }
 
 /// Plans a range-vector function's argument (issue #83): a bare matrix
@@ -2074,7 +2120,8 @@ mod tests {
         let expr = parse("up").unwrap();
         let p = plan(&expr, params()).unwrap();
         assert_eq!(p.selectors.len(), 1);
-        assert_eq!(p.selectors[0].metric_name, "up");
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("up"));
+        assert!(p.selectors[0].name_matchers.is_empty());
         assert!(p.selectors[0].matchers.is_empty());
         assert_eq!(p.root, PlanExpr::Selector(0));
     }
@@ -2083,7 +2130,7 @@ mod tests {
     fn plans_a_selector_with_matchers_excluding_name() {
         let expr = parse(r#"up{job="api"}"#).unwrap();
         let p = plan(&expr, params()).unwrap();
-        assert_eq!(p.selectors[0].metric_name, "up");
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("up"));
         assert_eq!(
             p.selectors[0].matchers,
             vec![LabelMatcher {
@@ -2098,37 +2145,98 @@ mod tests {
     fn plans_an_explicit_name_matcher_form() {
         let expr = parse(r#"{__name__="up",job="api"}"#).unwrap();
         let p = plan(&expr, params()).unwrap();
-        assert_eq!(p.selectors[0].metric_name, "up");
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("up"));
+        assert_eq!(p.selectors[0].matchers.len(), 1);
+        assert_eq!(p.selectors[0].matchers[0].key, "job");
+    }
+
+    // --- issue #85 (M6-08c): the completed selector model — matcher-only
+    // and regex/negative-`__name__` selectors plan Ok (previously
+    // named-Unsupported by the M2 metric-scoped model). ---
+
+    #[test]
+    fn a_matcher_only_selector_plans_with_no_metric_name() {
+        let expr = parse(r#"{job="api"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        assert!(p.selectors[0].name_matchers.is_empty());
+        assert_eq!(
+            p.selectors[0].matchers,
+            vec![LabelMatcher {
+                key: "job".to_string(),
+                op: MatchOp::Eq,
+                value: "api".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_regex_name_matcher_plans_into_the_name_matcher_channel() {
+        let expr = parse(r#"{__name__=~"up.*"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Re,
+                value: "up.*".to_string(),
+            }]
+        );
+        assert!(p.selectors[0].matchers.is_empty());
+    }
+
+    /// The multi-metric alternation shape the #37 adjudication once
+    /// pinned as rejected — issue #85 activates it: `{__name__=~"foo|bar"}`
+    /// plans with `metric_name: None` and the alternation in the name
+    /// channel (the fetch layer resolves the matched names and carries
+    /// each series' own name on `FetchedSeries::metric_name`).
+    #[test]
+    fn a_name_alternation_regex_matcher_plans_into_the_name_matcher_channel() {
+        let expr = parse(r#"{__name__=~"foo|bar"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        assert_eq!(p.selectors[0].name_matchers.len(), 1);
+        assert_eq!(p.selectors[0].name_matchers[0].op, MatchOp::Re);
+    }
+
+    #[test]
+    fn a_negative_name_matcher_plans_alongside_ordinary_matchers() {
+        let expr = parse(r#"{__name__!="up",job="api"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        assert_eq!(p.selectors[0].name_matchers.len(), 1);
+        assert_eq!(p.selectors[0].name_matchers[0].op, MatchOp::Neq);
         assert_eq!(p.selectors[0].matchers.len(), 1);
         assert_eq!(p.selectors[0].matchers[0].key, "job");
     }
 
     #[test]
-    fn a_selector_without_a_concrete_metric_name_is_unsupported() {
-        let expr = parse(r#"{job="api"}"#).unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+    fn a_regex_name_matrix_selector_plans_too() {
+        let expr = parse(r#"rate({__name__=~"up.*"}[5m])"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name, None);
+        assert_eq!(p.selectors[0].range_ms, Some(300_000));
+        assert_eq!(p.selectors[0].name_matchers.len(), 1);
     }
 
+    /// Issue #85 plan v2 Δ1 (adjudicated): brace-level `or`
+    /// (`{a="x" or b="y"}`) is a vendored-parser-crate extension with no
+    /// pinned-upstream oracle (v3.13.0 `label_match_list` is COMMA-only)
+    /// — permanently rejected at plan time as a `Parse` error whose exact
+    /// text the `m6_08c_utf8_selectors.test` `eval_fail` witness pins.
     #[test]
-    fn a_regex_name_matcher_is_unsupported() {
-        let expr = parse(r#"{__name__=~"up.*"}"#).unwrap();
+    fn brace_level_or_matchers_are_rejected_as_a_parse_error() {
+        let expr = parse(r#"{a="x" or b="y"}"#).unwrap();
         let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
-    }
-
-    /// Issue #37 architect adjudication (code-review finding 1, REJECT —
-    /// guard test): the specific multi-metric-alternation shape the
-    /// finding named (`{__name__=~"foo|bar"}`) is rejected by `plan()`
-    /// exactly like the simpler `up.*` case above — pins the invariant
-    /// `eval::eval_step`'s `PlanExpr::Selector` arm's `debug_assert!`
-    /// documents: every reachable `SelectorSpec` carries exactly one
-    /// concrete metric name, never a multi-metric alternation.
-    #[test]
-    fn a_name_alternation_regex_matcher_is_unsupported() {
-        let expr = parse(r#"{__name__=~"foo|bar"}"#).unwrap();
-        let err = plan(&expr, params()).unwrap_err();
-        assert!(matches!(err, PromqlError::Unsupported { .. }));
+        match err {
+            PromqlError::Parse(msg) => assert_eq!(
+                msg,
+                "label matchers must be comma-separated; \"or\" between matchers is not valid \
+                 Prometheus selector syntax"
+            ),
+            other => panic!("expected Parse, got {other:?}"),
+        }
     }
 
     // --- series_selector (issue #32 code-review round-1 fix) ---
@@ -3406,7 +3514,8 @@ mod tests {
     fn fetch_window_subtracts_range_lookback_and_offset() {
         let sel = SelectorSpec {
             id: 0,
-            metric_name: "up".to_string(),
+            metric_name: Some("up".to_string()),
+            name_matchers: Vec::new(),
             matchers: Vec::new(),
             range_ms: Some(300_000),
             offset_ms: 60_000,
@@ -3958,7 +4067,7 @@ mod tests {
             PlanExpr::AbsentOverTime {
                 source: RangeSource::Selector(selector),
             } => {
-                assert_eq!(p.selectors[*selector].metric_name, "m");
+                assert_eq!(p.selectors[*selector].metric_name.as_deref(), Some("m"));
                 assert_eq!(p.selectors[*selector].range_ms, Some(300_000));
                 assert_eq!(p.selectors[*selector].matchers.len(), 1);
             }

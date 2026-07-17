@@ -1000,9 +1000,13 @@
     },
     {
       "name": "utf8-label-names",
-      "status": "scheduled",
-      "issue": "M6-08",
-      "probe": "m{q=\"x\" or w=\"y\"}"
+      "status": "implemented",
+      "probe": "{\"utf8.metric\", \"label.dot\"=\"x\"}",
+      "witness": {
+        "file": "proof/m6_08c_utf8_selectors.test",
+        "query": "{\"utf8.metric\", \"label.dot\"=\"dotted\"}"
+      },
+      "rationale": "Issue #85 (M6-08c): quoted UTF-8 metric/label names plan and evaluate through the completed selector model (matcher-only and regex-__name__ selectors included). The probe was re-pointed off the vendored parser crate's brace-level `or` extension ({a=\"x\" or b=\"y\"}): pinned upstream v3.13.0 has no such syntax (generated_parser.y label_match_list is comma-only), so or_matchers are a permanent plan-time Parse rejection (pinned by the m6_08c_utf8_selectors.test eval_fail witness), not part of this feature."
     },
     {
       "name": "annotations",
@@ -1018,9 +1022,9 @@
     },
     {
       "name": "type-and-unit-labels",
-      "status": "scheduled",
-      "issue": "M6-08",
-      "probe_rationale": "PROM-39 __type__/__unit__ metadata-label semantics are label-propagation behaviour on computed values, not a distinct expression form \u2014 no PromQL probe can isolate them; M6-08 evaluates-and-decides (issue #64 adjudication) with the 9 upstream/type_and_unit.test eval-divergences ledger entries as its input"
+      "status": "deferred",
+      "rationale": "PROM-39, settled by issue #85 (M6-08c): the ENGINE-side __type__/__unit__ drop is implemented as unconditional parity \u2014 the corpus oracle runs upstream with EnableDelayedNameRemoval=true (promql/promqltest/test.go:111), under which the only metadata drop is the terminal cleanupMetricLabels (engine.go:4224), a unified DropReserved(schema.IsMetadataLabel) = __name__ + __type__ + __unit__ for every DropName series; PulsusDB mirrors it as eval's terminal strip_metadata_labels keyed on metric_name==None, with pinned collision semantics (an instant duplicate labelset hard-errors 'vector cannot contain metrics with the same labelset'; a range matrix merges disjoint-timestamp collisions and errors on overlap). type_and_unit.test is fully green and its 15 ledger entries are removed. What stays DEFERRED is the type-and-unit-labels feature flag itself, which at the pin is ingest/scrape metadata-label INJECTION (model/textparse) \u2014 not implemented and not planned until an owner asks for it. DOCUMENTED DIVERGENCE: upstream's LIVE default is EAGER per-node metadata drops (promql-delayed-name-removal is opt-in at the pin), so a default-flags upstream can differ from PulsusDB's delayed/root-only model on set-operation shapes like (a+1) and b over metadata-labelled series; resolved when #86 (M6-08d) adopts the delayed model for name+metadata removal together \u2014 strip_metadata_labels is that seam. Exceptions to carry forward: simpleHistogramFunc (functions.go:1947) drops ONLY __name__, keeping __type__/__unit__ \u2014 #22 must preserve that when native-histogram functions activate (they must NOT reuse the drop-all-metadata rule). Untested residuals (no corpus case): name-writing constructs over metadata-labelled series (label_replace to __name__, count_values) and by(__type__)/by(__unit__) grouping, where the metric_name==None proxy diverges from upstream's per-node DropName.",
+      "probe_rationale": "PROM-39 __type__/__unit__ metadata-label semantics are label-propagation behaviour on computed values, not a distinct expression form \u2014 no PromQL probe can isolate them; the behaviour is pinned by type_and_unit.test (fully green since #85) and the m6_08c_utf8_selectors.test metadata-strip/collision cases"
     }
   ]
 }

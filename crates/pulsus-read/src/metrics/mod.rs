@@ -67,7 +67,8 @@ pub mod stats;
 pub use exec::{MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus};
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
-    LabelledResolution, Resolution, SeriesResolver, TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
+    LabelledResolution, MetricSeriesGroup, MultiMetricResolution, Resolution, SeriesResolver,
+    TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot,
 };
 pub use matcher::{DataWindow, DiscoveryFilter, LabelMatcher, MatchOp};
 pub use refresh::spawn_refresh_loop;

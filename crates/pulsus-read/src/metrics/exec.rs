@@ -46,11 +46,11 @@ use pulsus_promql::{
     Sample, SelectorSpec, SeriesData,
 };
 
-use super::labels::LabelledResolution;
+use super::labels::{LabelledResolution, MetricSeriesGroup, MultiMetricResolution};
 use super::matcher::{DataWindow, DiscoveryFilter};
-use super::sample_rows::SampleRow;
+use super::sample_rows::{MultiSampleRow, SampleRow};
 use super::sample_sql;
-use crate::logql::error::ReadError;
+use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::exec::{MatrixSeries, QueryResult, VectorSample, escape_query_placeholders};
 use crate::logql::explain::PlanExplain;
 
@@ -81,6 +81,13 @@ pub struct MetricsConfig {
     /// query_inner`] — the planner rejects experimental functions
     /// (`max_of`/`min_of`) by name when this is `false`.
     pub experimental_functions: bool,
+    /// Issue #85 (M6-08c): `ReaderConfig::promql_max_metric_fanout` — the
+    /// cap on how many metric names a single name-less/regex-`__name__`
+    /// selector may fan out to (default 1000, the adjudicated value).
+    /// Above it the query fails with the named
+    /// [`crate::logql::error::TooBroadReason::MetricFanout`] error, never
+    /// an unbounded `IN` set. Operator-scale tuning routes to issue #25.
+    pub max_metric_fanout: u64,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -261,9 +268,50 @@ impl MetricsEngine {
                 start_ms: lower_excl,
                 end_ms: upper_incl,
             };
-            let resolution =
-                self.resolver
-                    .resolve_labelled(&sel.metric_name, &sel.matchers, window);
+
+            // Issue #85 (M6-08c): a selector without a single concrete
+            // metric name resolves through the name-keyed cache into a
+            // capped per-metric fan-out and ONE flat IN-set fetch.
+            let Some(metric_name) = &sel.metric_name else {
+                let fetch_plan = self.plan_multi_metric_fetch(
+                    sel,
+                    window,
+                    lower_excl,
+                    upper_incl,
+                    explain.as_deref_mut(),
+                )?;
+                fetch_plans.push(fetch_plan);
+                continue;
+            };
+
+            // A concrete-name selector may still carry non-Eq `__name__`
+            // matchers (`up{__name__!~"..."}`) — evaluated once, here,
+            // against the one concrete name.
+            match super::labels::concrete_name_matches(&sel.name_matchers, metric_name) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Some(e) = explain.as_mut() {
+                        e.push(
+                            "series_resolution",
+                            "name matchers exclude the selector's concrete metric name \
+                             (empty result)"
+                                .to_string(),
+                            None,
+                        );
+                    }
+                    fetch_plans.push(SelectorFetchPlan::Empty);
+                    continue;
+                }
+                Err(reason) => {
+                    return Err(ReadError::NamelessSelectorUnresolvable {
+                        reason: format!("{reason:?}"),
+                    });
+                }
+            }
+
+            let resolution = self
+                .resolver
+                .resolve_labelled(metric_name, &sel.matchers, window);
             if let Some(e) = explain.as_mut() {
                 match &resolution {
                     LabelledResolution::Series(pairs) => e.push(
@@ -287,7 +335,7 @@ impl MetricsEngine {
                     let total_fps = fps.len();
                     let sqls = build_chunk_sqls(
                         &self.config.samples_table,
-                        &sel.metric_name,
+                        metric_name,
                         fps,
                         lower_excl,
                         upper_incl,
@@ -313,7 +361,7 @@ impl MetricsEngine {
                 LabelledResolution::SqlFallback { sql, .. } => {
                     let fetch_sql = sample_sql::sample_fetch_subquery(
                         &self.config.samples_table,
-                        &sel.metric_name,
+                        metric_name,
                         &sql,
                         lower_excl,
                         upper_incl,
@@ -346,25 +394,125 @@ impl MetricsEngine {
         Ok(value_to_query_result(value))
     }
 
+    /// Issue #85 (M6-08c): builds a name-less/regex-`__name__` selector's
+    /// fetch plan — resolve `(metric_name → fingerprints)` groups from
+    /// the name-keyed cache (capped by `max_metric_fanout`), then render
+    /// ONE flat `PREWHERE metric_name IN (…) … fingerprint IN (…)` fetch
+    /// (each PK component prunes; see `sample_sql::sample_fetch_multi`'s
+    /// soundness note and the `explain_indexes.rs` gate). A degraded
+    /// cache is a named error, never an unbounded scan.
+    fn plan_multi_metric_fetch(
+        &self,
+        sel: &SelectorSpec,
+        window: DataWindow,
+        lower_excl: i64,
+        upper_incl: i64,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<SelectorFetchPlan, ReadError> {
+        let resolution = self.resolver.resolve_multi_metric(
+            &sel.name_matchers,
+            &sel.matchers,
+            window,
+            self.config.max_metric_fanout,
+        );
+        let groups: Vec<MetricSeriesGroup> = match resolution {
+            MultiMetricResolution::Groups(groups) => groups,
+            MultiMetricResolution::Unresolvable { reason } => {
+                return Err(ReadError::NamelessSelectorUnresolvable {
+                    reason: format!("{reason:?}"),
+                });
+            }
+            MultiMetricResolution::FanoutExceeded { matched, cap } => {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
+                    matched,
+                    cap,
+                }));
+            }
+        };
+
+        let total_series: usize = groups.iter().map(|g| g.series.len()).sum();
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "series_resolution",
+                format!(
+                    "label cache: {total_series} matching series across {} metric names \
+                     (name-less selector fan-out, cap {})",
+                    groups.len(),
+                    self.config.max_metric_fanout
+                ),
+                None,
+            );
+        }
+        if groups.is_empty() {
+            return Ok(SelectorFetchPlan::Empty);
+        }
+
+        // Group order is sorted-by-name (the resolver's contract) and
+        // fingerprints are sorted within each group, so the rendered IN
+        // lists — and therefore the explain trace — are deterministic.
+        let names: Vec<String> = groups.iter().map(|g| g.metric_name.clone()).collect();
+        let mut fps: Vec<Fingerprint> = groups
+            .iter()
+            .flat_map(|g| g.series.iter().map(|(fp, _)| *fp))
+            .collect();
+        fps.sort_unstable();
+        fps.dedup();
+        let mut labels_by: HashMap<(String, Fingerprint), LabelSet> = HashMap::new();
+        // Cross-pair hydration source (code review round 1, finding 1):
+        // `metric_fingerprint` excludes `__name__` (docs/schemas.md §2.1),
+        // so a fingerprint's label set is name-invariant — any resolved
+        // `(name', fp)` entry carries the exact labels of every genuine
+        // `(name, fp)` cross-pair the flat IN×IN fetch may return that
+        // the cache didn't resolve (a series registered under a second
+        // name inside the sanctioned post-sweep recency gap).
+        let mut labels_by_fp: HashMap<Fingerprint, LabelSet> = HashMap::new();
+        for g in groups {
+            for (fp, labels) in g.series {
+                labels_by_fp.entry(fp).or_insert_with(|| labels.clone());
+                labels_by.insert((g.metric_name.clone(), fp), labels);
+            }
+        }
+
+        let sql = sample_sql::sample_fetch_multi(
+            &self.config.samples_table,
+            &names,
+            &fps,
+            lower_excl,
+            upper_incl,
+        );
+        if let Some(e) = explain.as_mut() {
+            e.push("sample_fetch", sql.clone(), None);
+        }
+        Ok(SelectorFetchPlan::Multi {
+            sql,
+            labels_by,
+            labels_by_fp,
+        })
+    }
+
     /// Executes one selector's already-built [`SelectorFetchPlan`]: the
     /// cache-hit path fetches every chunk's pre-built SQL concurrently;
     /// the `SqlFallback` path issues the single nested-subquery sample
     /// fetch, then hydrates labels for just the fingerprints that returned
-    /// samples.
+    /// samples; the `Multi` path (issue #85) issues its single flat
+    /// IN-set fetch and groups rows per `(metric_name, fingerprint)`.
     async fn execute_fetch_plan(
         &self,
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
     ) -> Result<Vec<FetchedSeries>, ReadError> {
         match fetch_plan {
+            SelectorFetchPlan::Empty => Ok(Vec::new()),
             SelectorFetchPlan::Chunks { sqls, labels_by_fp } => {
                 if sqls.is_empty() {
                     return Ok(Vec::new());
                 }
+                let metric_name = concrete_name(sel)?;
                 let rows = fetch_all_concurrently(sqls, |sql| self.fetch_rows(sql)).await?;
-                Ok(group_rows(rows, &labels_by_fp))
+                Ok(group_rows(rows, &labels_by_fp, metric_name))
             }
             SelectorFetchPlan::Fallback { sql } => {
+                let metric_name = concrete_name(sel)?;
                 let rows: Vec<SampleRow> = self.fetch_rows(sql).await?;
                 if rows.is_empty() {
                     return Ok(Vec::new());
@@ -374,7 +522,7 @@ impl MetricsEngine {
                 fps.dedup();
                 let hydrate_sql = super::sql::series_labels_by_fingerprint(
                     &self.config.series_table,
-                    &sel.metric_name,
+                    metric_name,
                     &fps,
                 );
                 let series_rows: Vec<HydratedLabelsRow> = self.fetch_rows(hydrate_sql).await?;
@@ -382,7 +530,15 @@ impl MetricsEngine {
                     .into_iter()
                     .map(|r| (r.fingerprint, parse_canonical_labels(&r.labels)))
                     .collect();
-                Ok(group_rows(rows, &labels_by_fp))
+                Ok(group_rows(rows, &labels_by_fp, metric_name))
+            }
+            SelectorFetchPlan::Multi {
+                sql,
+                labels_by,
+                labels_by_fp,
+            } => {
+                let rows: Vec<MultiSampleRow> = self.fetch_rows(sql).await?;
+                Ok(group_multi_rows(rows, &labels_by, &labels_by_fp))
             }
         }
     }
@@ -587,6 +743,38 @@ enum SelectorFetchPlan {
     /// SQL — labels are hydrated afterward, from whichever fingerprints
     /// the fetch actually returns.
     Fallback { sql: String },
+    /// Issue #85 (M6-08c): the name-less/regex-`__name__` fan-out — one
+    /// flat `metric_name IN (…) AND fingerprint IN (…)` fetch, labels
+    /// pre-resolved per `(metric_name, fingerprint)` (a fingerprint can
+    /// exist under several metric names, so the map key must carry both).
+    /// `labels_by_fp` is the cross-pair hydration source (code review
+    /// round 1, finding 1): the IN×IN can return a genuine pair the cache
+    /// didn't resolve (post-sweep recency gap); its labels are recovered
+    /// from the fingerprint's name-invariant label set, never fabricated
+    /// empty — see [`group_multi_rows`].
+    Multi {
+        sql: String,
+        labels_by: HashMap<(String, Fingerprint), LabelSet>,
+        labels_by_fp: HashMap<Fingerprint, LabelSet>,
+    },
+    /// Provably-empty selection with no fetch at all: a concrete-name
+    /// selector whose `name_matchers` exclude its own name (issue #85),
+    /// or a fan-out that matched zero metric names.
+    Empty,
+}
+
+/// The concrete metric name a [`SelectorFetchPlan::Chunks`]/`Fallback`
+/// plan was built for. Those variants are only ever built on the
+/// `Some(metric_name)` branch of `query_inner`, so the `None` arm is a
+/// documented impossibility kept as a descriptive error (never a panic).
+fn concrete_name(sel: &SelectorSpec) -> Result<&str, ReadError> {
+    sel.metric_name
+        .as_deref()
+        .ok_or_else(|| ReadError::NamelessSelectorUnresolvable {
+            reason: "internal: a Chunks/Fallback fetch plan was built for a name-less \
+                     selector (query_inner routes those to the Multi plan)"
+                .to_string(),
+        })
 }
 
 /// Sorts `fps` ascending, then splits into chunks and renders each
@@ -649,9 +837,13 @@ where
 /// that order — never re-sorted via a `HashMap` (edge case 4/7: the
 /// evaluator's Kahan accumulation order is pinned to ascending-fingerprint
 /// input order, which must survive every merge step unchanged).
+/// `metric_name` is the metric-scoped fetch's one concrete name, stamped
+/// onto every series' per-series name channel (issue #85 —
+/// `FetchedSeries::metric_name`).
 fn group_rows(
     rows: Vec<SampleRow>,
     labels_by_fp: &HashMap<Fingerprint, LabelSet>,
+    metric_name: &str,
 ) -> Vec<FetchedSeries> {
     let mut out: Vec<FetchedSeries> = Vec::new();
     for row in rows {
@@ -670,11 +862,78 @@ fn group_rows(
                     .unwrap_or_default();
                 out.push(FetchedSeries {
                     fingerprint: row.fingerprint,
+                    metric_name: Some(metric_name.to_string()),
                     labels: to_promql_labels(&labels),
                     samples: vec![sample],
                 });
             }
         }
+    }
+    out
+}
+
+/// Issue #85 (M6-08c): [`group_rows`]'s multi-metric counterpart — rows
+/// arrive `ORDER BY metric_name, fingerprint, unix_milli`, so consecutive
+/// grouping on the `(metric_name, fingerprint)` pair yields one
+/// [`FetchedSeries`] per matched series, each carrying its own name on
+/// the per-series channel. Order stays deterministic (sorted names, then
+/// ascending fingerprints) without any re-sort here.
+///
+/// **Labels are never fabricated (code review round 1, finding 1):** a
+/// pair absent from `labels_by` is a genuine cross-pair the cache didn't
+/// resolve (a series registered under a second metric name after the last
+/// sweep — the sanctioned recency gap). Its labels are hydrated from
+/// `labels_by_fp`: `metric_fingerprint` excludes `__name__`, so the
+/// fingerprint's label set is name-invariant and already known from the
+/// resolved sibling pair — and those labels passed the selector's
+/// matchers (matchers apply uniformly across names, the v3 Δ2 soundness
+/// argument), so the pair is a legitimate member of the matched set. A
+/// fingerprint absent from *both* maps is structurally impossible (the
+/// `IN` list is built from the resolved set) — skipped for totality, so
+/// an empty-labels series can never reach the evaluator.
+fn group_multi_rows(
+    rows: Vec<MultiSampleRow>,
+    labels_by: &HashMap<(String, Fingerprint), LabelSet>,
+    labels_by_fp: &HashMap<Fingerprint, LabelSet>,
+) -> Vec<FetchedSeries> {
+    let mut out: Vec<FetchedSeries> = Vec::new();
+    let mut current: Option<(String, Fingerprint)> = None;
+    // Whether `current` produced an output series (false = the pair was
+    // skipped, so its remaining rows must not attach to `out.last_mut()`,
+    // which belongs to an earlier pair).
+    let mut current_kept = false;
+    for row in rows {
+        let sample = Sample {
+            t_ms: row.unix_milli,
+            v: row.value,
+        };
+        let same = current
+            .as_ref()
+            .is_some_and(|(name, fp)| *name == row.metric_name && *fp == row.fingerprint);
+        if same {
+            if current_kept && let Some(last) = out.last_mut() {
+                last.samples.push(sample);
+            }
+            continue;
+        }
+        let key = (row.metric_name, row.fingerprint);
+        let labels = labels_by
+            .get(&key)
+            .or_else(|| labels_by_fp.get(&key.1))
+            .cloned();
+        current_kept = match labels {
+            Some(labels) => {
+                out.push(FetchedSeries {
+                    fingerprint: row.fingerprint,
+                    metric_name: Some(key.0.clone()),
+                    labels: to_promql_labels(&labels),
+                    samples: vec![sample],
+                });
+                true
+            }
+            None => false,
+        };
+        current = Some(key);
     }
     out
 }
@@ -923,8 +1182,8 @@ mod tests {
         .unwrap();
 
         let labels_by_fp = HashMap::new();
-        let chunked_series = group_rows(chunked_rows, &labels_by_fp);
-        let reference_series = group_rows(reference_rows, &labels_by_fp);
+        let chunked_series = group_rows(chunked_rows, &labels_by_fp, "m");
+        let reference_series = group_rows(reference_rows, &labels_by_fp, "m");
 
         let to_vector = |series: &[FetchedSeries]| -> Vec<InstantSample> {
             series
@@ -994,7 +1253,7 @@ mod tests {
         let mut labels_by_fp = HashMap::new();
         labels_by_fp.insert(1, ls(&[("job", "a")]));
         labels_by_fp.insert(2, ls(&[("job", "b")]));
-        let series = group_rows(rows, &labels_by_fp);
+        let series = group_rows(rows, &labels_by_fp, "up");
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].fingerprint, 1);
         assert_eq!(series[0].samples.len(), 2);
@@ -1004,7 +1263,7 @@ mod tests {
 
     #[test]
     fn group_rows_of_an_empty_input_is_empty() {
-        assert!(group_rows(Vec::new(), &HashMap::new()).is_empty());
+        assert!(group_rows(Vec::new(), &HashMap::new(), "up").is_empty());
     }
 
     #[test]
@@ -1014,8 +1273,138 @@ mod tests {
             unix_milli: 0,
             value: 1.0,
         }];
-        let series = group_rows(rows, &HashMap::new());
+        let series = group_rows(rows, &HashMap::new(), "up");
         assert!(series[0].labels.is_empty());
+    }
+
+    // --- group_multi_rows (issue #85, M6-08c) ---
+
+    #[test]
+    fn group_multi_rows_splits_a_shared_fingerprint_across_metric_names() {
+        // The same fingerprint under two metric names (legal:
+        // metric_fingerprint excludes __name__) must yield TWO series,
+        // each with its own per-series name.
+        let rows = vec![
+            MultiSampleRow {
+                metric_name: "aaa".to_string(),
+                fingerprint: 7,
+                unix_milli: 0,
+                value: 1.0,
+            },
+            MultiSampleRow {
+                metric_name: "aaa".to_string(),
+                fingerprint: 7,
+                unix_milli: 1_000,
+                value: 2.0,
+            },
+            MultiSampleRow {
+                metric_name: "bbb".to_string(),
+                fingerprint: 7,
+                unix_milli: 0,
+                value: 9.0,
+            },
+        ];
+        let mut labels_by = HashMap::new();
+        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
+        labels_by.insert(("bbb".to_string(), 7), ls(&[("job", "a")]));
+        let mut labels_by_fp = HashMap::new();
+        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
+        assert_eq!(series[0].samples.len(), 2);
+        assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
+        assert_eq!(series[1].samples.len(), 1);
+    }
+
+    #[test]
+    fn group_multi_rows_of_an_empty_input_is_empty() {
+        assert!(group_multi_rows(Vec::new(), &HashMap::new(), &HashMap::new()).is_empty());
+    }
+
+    /// Code review round 1, finding 1: a genuine cross-pair the cache
+    /// didn't resolve (`(bbb, 7)` absent from `labels_by`) hydrates from
+    /// the fingerprint's name-invariant labels — NEVER an empty label
+    /// set.
+    #[test]
+    fn group_multi_rows_hydrates_an_unresolved_cross_pair_from_the_fingerprint_labels() {
+        let rows = vec![
+            MultiSampleRow {
+                metric_name: "aaa".to_string(),
+                fingerprint: 7,
+                unix_milli: 0,
+                value: 1.0,
+            },
+            MultiSampleRow {
+                metric_name: "bbb".to_string(),
+                fingerprint: 7,
+                unix_milli: 0,
+                value: 2.0,
+            },
+        ];
+        let mut labels_by = HashMap::new();
+        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
+        let mut labels_by_fp = HashMap::new();
+        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[1].metric_name.as_deref(), Some("bbb"));
+        assert_eq!(
+            series[1].labels.get("job"),
+            Some("a"),
+            "cross-pair labels hydrated from the fingerprint, not empty: {series:?}"
+        );
+    }
+
+    /// Finding 1's totality arm: a fingerprint absent from BOTH maps
+    /// (structurally impossible — the IN list is built from the resolved
+    /// set) is skipped whole, including its follow-on rows, which must
+    /// not attach to the preceding series.
+    #[test]
+    fn group_multi_rows_skips_a_wholly_unknown_pair_and_all_its_rows() {
+        let rows = vec![
+            MultiSampleRow {
+                metric_name: "aaa".to_string(),
+                fingerprint: 7,
+                unix_milli: 0,
+                value: 1.0,
+            },
+            MultiSampleRow {
+                metric_name: "bbb".to_string(),
+                fingerprint: 9, // unknown to both maps
+                unix_milli: 0,
+                value: 2.0,
+            },
+            MultiSampleRow {
+                metric_name: "bbb".to_string(),
+                fingerprint: 9,
+                unix_milli: 1_000,
+                value: 3.0,
+            },
+        ];
+        let mut labels_by = HashMap::new();
+        labels_by.insert(("aaa".to_string(), 7), ls(&[("job", "a")]));
+        let mut labels_by_fp = HashMap::new();
+        labels_by_fp.insert(7, ls(&[("job", "a")]));
+        let series = group_multi_rows(rows, &labels_by, &labels_by_fp);
+        assert_eq!(series.len(), 1, "unknown pair never surfaces: {series:?}");
+        assert_eq!(series[0].metric_name.as_deref(), Some("aaa"));
+        assert_eq!(
+            series[0].samples.len(),
+            1,
+            "the skipped pair's rows must not leak into the previous series"
+        );
+    }
+
+    #[test]
+    fn group_rows_stamps_the_concrete_metric_name_on_every_series() {
+        let rows = vec![SampleRow {
+            fingerprint: 1,
+            unix_milli: 0,
+            value: 1.0,
+        }];
+        let series = group_rows(rows, &HashMap::new(), "up");
+        assert_eq!(series[0].metric_name.as_deref(), Some("up"));
     }
 
     #[test]

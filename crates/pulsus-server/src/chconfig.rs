@@ -224,6 +224,10 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // Issue #65 (M6-02): the experimental-function gate's production
         // carrier — `ReaderConfig -> MetricsConfig -> PlanParams`.
         experimental_functions: config.reader.promql_experimental_functions,
+        // Issue #85 (M6-08c): the name-less-selector fan-out cap's
+        // production carrier — `ReaderConfig -> MetricsConfig ->
+        // MetricsEngine::plan_multi_metric_fetch`.
+        max_metric_fanout: config.reader.promql_max_metric_fanout,
     }
 }
 
@@ -481,6 +485,17 @@ mod tests {
         assert!(!metrics_config_from(&config).experimental_functions);
         config.reader.promql_experimental_functions = true;
         assert!(metrics_config_from(&config).experimental_functions);
+    }
+
+    /// Issue #85 (M6-08c): `reader.promql_max_metric_fanout` maps into
+    /// `MetricsConfig.max_metric_fanout` — the adjudicated 1000 default
+    /// and an override both survive the production carrier.
+    #[test]
+    fn metrics_config_from_maps_the_metric_fanout_cap() {
+        let mut config = Config::default();
+        assert_eq!(metrics_config_from(&config).max_metric_fanout, 1_000);
+        config.reader.promql_max_metric_fanout = 250;
+        assert_eq!(metrics_config_from(&config).max_metric_fanout, 250);
     }
 
     /// Issue #65 (M6-02) plan v2 Δ4: the hermetic production-path
