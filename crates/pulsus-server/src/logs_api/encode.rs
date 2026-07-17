@@ -37,7 +37,8 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    ExplainStage, MatrixSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample,
+    ExplainStage, LogStats, MatrixSeries, PlanExplain, QueryResult, RouteChoice, StreamResult,
+    VectorSample,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -231,13 +232,90 @@ fn render_entries(entries: &[(i64, String)]) -> String {
     out
 }
 
-fn render_stream_item(s: &StreamResult) -> Vec<u8> {
+fn render_stream_item_str(s: &StreamResult) -> String {
     format!(
         "{{\"stream\":{},\"values\":[{}]}}",
         s.labels_json,
         render_entries(&s.entries)
     )
-    .into_bytes()
+}
+
+fn render_stream_item(s: &StreamResult) -> Vec<u8> {
+    render_stream_item_str(s).into_bytes()
+}
+
+/// Encodes a `/api/logs/v1/stats` result (issue #74, docs/api.md §2.5):
+/// the bare `{"streams","chunks","entries","bytes"}` object (no
+/// status/data envelope — the reference wire shape), with `explain`
+/// added as a sibling key when requested. Fixed-size — no streaming
+/// needed.
+pub(crate) fn stats_response(stats: LogStats, explain: Option<PlanExplain>) -> Response {
+    let mut body = format!(
+        "{{\"streams\":{},\"chunks\":{},\"entries\":{},\"bytes\":{}",
+        stats.streams, stats.chunks, stats.entries, stats.bytes
+    );
+    if let Some(e) = &explain {
+        body.push_str(",\"explain\":");
+        body.push_str(&explain_json(e));
+    }
+    body.push('}');
+    json_response(Body::from(body))
+}
+
+/// Encodes one live-tail WebSocket frame (issue #74, docs/api.md §2.4):
+/// `{"streams":[...],"dropped_entries":[...],"dropped_total":N}`.
+/// `dropped_entries` is the bounded representative sample of evicted
+/// rows (`{"labels":{...},"timestamp":"<ns>"}` — labels spliced verbatim
+/// from the stream's canonical JSON, ns as a string like stream values);
+/// `dropped_total` is the EXACT cumulative drop count since the last
+/// emitted frame — the documented additive field, so counts are never
+/// lost while the array never grows unbounded. Streams sort by
+/// `(labels_json, fingerprint)` for a deterministic wire order,
+/// mirroring [`query_response`].
+pub(crate) fn tail_frame(
+    mut streams: Vec<StreamResult>,
+    dropped: &[super::tail::Dropped],
+    dropped_total: u64,
+) -> String {
+    streams.sort_by(|a, b| (&a.labels_json, a.fingerprint).cmp(&(&b.labels_json, b.fingerprint)));
+    // Pre-size the output (review round 1, low): labels + entry bodies
+    // dominate; ~48 bytes covers per-entry/per-drop JSON scaffolding.
+    let capacity: usize = 64
+        + streams
+            .iter()
+            .map(|s| {
+                s.labels_json.len()
+                    + 32
+                    + s.entries
+                        .iter()
+                        .map(|(_, line)| line.len() + 48)
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+        + dropped
+            .iter()
+            .map(|d| d.labels_json.len() + 48)
+            .sum::<usize>();
+    let mut out = String::with_capacity(capacity);
+    out.push_str("{\"streams\":[");
+    for (i, s) in streams.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&render_stream_item_str(s));
+    }
+    out.push_str("],\"dropped_entries\":[");
+    for (i, d) in dropped.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"labels\":{},\"timestamp\":\"{}\"}}",
+            d.labels_json, d.timestamp_ns
+        ));
+    }
+    out.push_str(&format!("],\"dropped_total\":{dropped_total}}}"));
+    out
 }
 
 fn render_matrix_item(s: &MatrixSeries) -> Vec<u8> {

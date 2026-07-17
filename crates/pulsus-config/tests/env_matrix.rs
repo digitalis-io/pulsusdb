@@ -232,6 +232,46 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_scan_budget_rows == 12_345,
     },
     Row {
+        var: "PULSUS_TAIL_POLL_INTERVAL",
+        value: "250ms",
+        check: |c| c.reader.tail_poll_interval.0 == Duration::from_millis(250),
+    },
+    Row {
+        var: "PULSUS_TAIL_MAX_DELAY",
+        value: "3s",
+        check: |c| c.reader.tail_max_delay.0 == Duration::from_secs(3),
+    },
+    Row {
+        var: "PULSUS_TAIL_MAX_CONNECTIONS",
+        value: "7",
+        check: |c| c.reader.tail_max_connections == 7,
+    },
+    Row {
+        var: "PULSUS_TAIL_MAX_ENTRIES_PER_FRAME",
+        value: "123",
+        check: |c| c.reader.tail_max_entries_per_frame == 123,
+    },
+    Row {
+        var: "PULSUS_TAIL_CHANNEL_DEPTH",
+        value: "9",
+        check: |c| c.reader.tail_channel_depth == 9,
+    },
+    Row {
+        var: "PULSUS_TAIL_SEND_TIMEOUT",
+        value: "45s",
+        check: |c| c.reader.tail_send_timeout.0 == Duration::from_secs(45),
+    },
+    Row {
+        var: "PULSUS_TAIL_MAX_FETCH_LIMIT",
+        value: "777",
+        check: |c| c.reader.tail_max_fetch_limit == 777,
+    },
+    Row {
+        var: "PULSUS_TAIL_CATCHUP_SLICE",
+        value: "2m",
+        check: |c| c.reader.tail_catchup_slice.0 == Duration::from_secs(120),
+    },
+    Row {
         var: "PULSUS_TIER_POLICY",
         value: "fast",
         check: |c| c.downsampling.tier_policy == TierPolicy::Fast,
@@ -266,8 +306,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        45,
-        "docs/configuration.md §§1-8 document exactly 45 variables"
+        53,
+        "docs/configuration.md §§1-8 document exactly 53 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

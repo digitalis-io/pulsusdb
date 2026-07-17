@@ -162,6 +162,131 @@ pub fn stage3(
     sql
 }
 
+/// The lower-bound mode of one [`stage3_keyset`] page (issue #74, live
+/// tail — plan v4 D1/D2 + the round-4 adjudication).
+///
+/// - [`KeysetLower::Start`] — the first page: the API `start` bound,
+///   rendered as the repo's stage-3 exclusive convention
+///   (`timestamp_ns > start_ns`, docs/schemas.md §3.2). No keyset term.
+/// - [`KeysetLower::After`] — every later page: the occurrence-count
+///   keyset. The composite predicate is **inclusive** (`>=` the boundary
+///   tuple) so a tie group split by `LIMIT` is re-fetched rather than
+///   skipped, and the server-side `OFFSET` skips exactly the
+///   already-delivered rows of the boundary tuple (deterministic under
+///   the total `ORDER BY` below). The redundant `timestamp_ns >= ts`
+///   term keeps the primary index's time column engaged for granule
+///   pruning (the tuple comparison alone does not prune).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysetLower {
+    Start {
+        start_ns: i64,
+    },
+    After {
+        /// The boundary `(timestamp_ns, fingerprint, cityHash64(body))`.
+        tuple: (i64, u64, u64),
+        /// How many rows equal to `tuple` were already delivered — the
+        /// SQL `OFFSET`.
+        offset: u32,
+    },
+}
+
+/// Stage 3, keyset-pagination mode (issue #74 — the live-tail cursor;
+/// deliberately a reusable builder, the foundation for future streams
+/// pagination, not a tail-only hack). Leaves the frozen [`stage3`]
+/// untouched; shares its `PREWHERE service`/`fingerprint IN`/line-filter
+/// pushdown contract byte-for-byte.
+///
+/// The total `ORDER BY timestamp_ns, fingerprint, body_hash, body`
+/// (raw `body` as final tiebreaker) makes equal-`(ts, fp, hash)` rows —
+/// including genuine CityHash collisions — a stable adjacent run across
+/// queries, so [`KeysetLower::After`]'s occurrence-count `OFFSET` is
+/// well-defined. `cityHash64(body)` is projected by ClickHouse and
+/// captured as `body_hash` (no CH/Rust divergence at the boundary).
+pub fn stage3_keyset(
+    samples_table: &str,
+    services: &[String],
+    fingerprints: &[u64],
+    lower: KeysetLower,
+    upper_ns: i64,
+    line_filters: &[String],
+    limit: u32,
+) -> String {
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+
+    let mut sql = format!(
+        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
+    );
+    match lower {
+        KeysetLower::Start { start_ns } => {
+            sql.push_str(&format!(
+                "\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {upper_ns}"
+            ));
+        }
+        KeysetLower::After {
+            tuple: (ts, fp, hash),
+            ..
+        } => {
+            sql.push_str(&format!(
+                "\n  AND timestamp_ns >= {ts} AND timestamp_ns <= {upper_ns}\n  AND (timestamp_ns, fingerprint, cityHash64(body)) >= ({ts}, {fp}, {hash})"
+            ));
+        }
+    }
+    for clause in line_filters {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause);
+    }
+    sql.push_str("\nORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC");
+    match lower {
+        KeysetLower::Start { .. } => sql.push_str(&format!("\nLIMIT {limit}")),
+        KeysetLower::After { offset, .. } => {
+            sql.push_str(&format!("\nLIMIT {limit} OFFSET {offset}"))
+        }
+    }
+    sql
+}
+
+/// The `/api/logs/v1/stats` rollup-served aggregation (issue #74, no line
+/// filter): zero body reads — `sum(count)`/`sum(bytes)` off
+/// `log_metrics_<res>` (PK `(fingerprint, bucket_ns)`), `streams` as
+/// `uniqExact(fingerprint)`, and `chunks` as the adjudicated
+/// selector-scoped partition-count proxy (`uniqExact` of the bucket's
+/// date — docs/api.md §2.5). Same half-open bucket predicate as
+/// [`metric_range`].
+pub fn log_stats_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWindow) -> String {
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    format!(
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}"
+    )
+}
+
+/// The `/api/logs/v1/stats` raw fallback (issue #74, line-filtered): the
+/// rollup is body-content-blind, so a line filter forces a `log_samples`
+/// scan with the identical `PREWHERE service` + skip-index line-filter
+/// prefilters [`stage3`] emits (granule-skipped, PK-pruned). Same
+/// `streams`/`chunks` shape as [`log_stats_rollup`]; `entries`/`bytes`
+/// count matching lines exactly.
+pub fn log_stats_raw(
+    samples_table: &str,
+    services: &[String],
+    fingerprints: &[u64],
+    window: TimeWindow,
+    line_filters: &[String],
+) -> String {
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    let mut sql = format!(
+        "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in line_filters {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause);
+    }
+    sql
+}
+
 /// A range metric query bucketed by `step_ns` (`intDiv(bucket_col, step) *
 /// step`, docs/schemas.md §3.2). `extra_predicates` carries line-filter
 /// pushdown for the (line-filter-forced) raw fallback.
@@ -414,6 +539,128 @@ mod tests {
             &[],
         );
         assert!(sql.contains("PREWHERE service IN ('checkout', 'billing')\n"));
+    }
+
+    /// Issue #74 first-bound AC (hermetic half): the first tail page
+    /// carries the explicit exclusive API `start` bound — the repo
+    /// stage-3 convention — and NO keyset term, byte-exact.
+    #[test]
+    fn stage3_keyset_first_page_is_byte_exact_with_the_exclusive_start_bound() {
+        let sql = stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[18374],
+            KeysetLower::Start { start_ns: 1_000 },
+            2_000,
+            &[],
+            500,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+             FROM log_samples\n\
+             PREWHERE service = 'checkout'\n\
+             WHERE fingerprint IN (18374)\n\
+             \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
+             ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
+             LIMIT 500"
+        );
+    }
+
+    /// Issue #74 (round-4 adjudication #1): the keyset page — inclusive
+    /// `>=` composite predicate, redundant time lower bound for granule
+    /// pruning, total ORDER BY with the raw-`body` tiebreaker, and the
+    /// server-side occurrence-count `OFFSET` — byte-exact.
+    #[test]
+    fn stage3_keyset_later_page_is_byte_exact_with_inclusive_tuple_and_offset() {
+        let sql = stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string(), "'billing'".to_string()],
+            &[1, 2],
+            KeysetLower::After {
+                tuple: (1_500, 7, 42),
+                offset: 3,
+            },
+            2_000,
+            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+            500,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+             FROM log_samples\n\
+             PREWHERE service IN ('checkout', 'billing')\n\
+             WHERE fingerprint IN (1, 2)\n\
+             \x20 AND timestamp_ns >= 1500 AND timestamp_ns <= 2000\n\
+             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) >= (1500, 7, 42)\n\
+             \x20 AND positionCaseSensitive(body, 'err') > 0\n\
+             ORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC\n\
+             LIMIT 500 OFFSET 3"
+        );
+    }
+
+    /// Issue #74 pre-query clamp AC (hermetic half): the caller-clamped
+    /// fetch limit is exactly what lands in the SQL `LIMIT` — nothing in
+    /// the builder can widen it back.
+    #[test]
+    fn stage3_keyset_limit_is_the_callers_clamped_fetch_limit_verbatim() {
+        let sql = stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[1],
+            KeysetLower::Start { start_ns: 0 },
+            10,
+            &[],
+            5_000,
+        );
+        assert!(sql.ends_with("LIMIT 5000"), "{sql}");
+    }
+
+    /// Issue #74 AC6 (hermetic half): the no-filter stats aggregation is
+    /// rollup-served — zero body reads — byte-exact.
+    #[test]
+    fn log_stats_rollup_is_byte_exact() {
+        let sql = log_stats_rollup(
+            "log_metrics_5s",
+            &[18374, 99120],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+        );
+        assert_eq!(
+            sql,
+            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(bucket_ns))) AS chunks, sum(count) AS entries, sum(bytes) AS bytes\n\
+             FROM log_metrics_5s\n\
+             WHERE fingerprint IN (18374, 99120) AND bucket_ns > 1000 AND bucket_ns <= 2000"
+        );
+        assert!(!sql.contains("body"), "rollup stats must never read body");
+    }
+
+    /// Issue #74 AC6 (hermetic half): the line-filtered stats fallback
+    /// scans `log_samples` with stage-3's exact PREWHERE + skip-index
+    /// line-filter pushdown — byte-exact.
+    #[test]
+    fn log_stats_raw_is_byte_exact_with_line_filter_pushdown() {
+        let sql = log_stats_raw(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[18374],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+        );
+        assert_eq!(
+            sql,
+            "SELECT uniqExact(fingerprint) AS streams, uniqExact(toDate(fromUnixTimestamp64Nano(timestamp_ns))) AS chunks, count() AS entries, sum(length(body)) AS bytes\n\
+             FROM log_samples\n\
+             PREWHERE service = 'checkout'\n\
+             WHERE fingerprint IN (18374)\n\
+             \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
+             \x20 AND positionCaseSensitive(body, 'err') > 0"
+        );
     }
 
     #[test]

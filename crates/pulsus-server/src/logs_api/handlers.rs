@@ -31,7 +31,7 @@ fn wants_explain(headers: &HeaderMap) -> bool {
 /// pattern: clone the `Option` out from behind the lock, drop the guard
 /// before doing anything else) and builds a `LogQlEngine` over it —
 /// `503 unavailable` before the pool is established, matching `/ready`.
-async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError> {
+pub(super) async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError> {
     let pool = {
         let guard = state.pool.read().await;
         guard.clone()
@@ -42,7 +42,7 @@ async fn engine_for(state: &AppState) -> Result<LogQlEngine, ApiError> {
 
 /// Parses `start`/`end` (defaults: `end = now`, `start = end - 1h`,
 /// docs/api.md §2.1).
-fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ParamError> {
+pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ParamError> {
     let now = params::now_ns();
     let end_ns = match params::get(pairs, "end") {
         Some(v) => params::parse_ts(v)?,
@@ -381,6 +381,7 @@ mod tests {
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
     }
 

@@ -26,6 +26,10 @@ pub(crate) enum ApiError {
     /// already-live pool), but the same "not yet serving" contract every
     /// other data-plane route needs before a pool exists.
     PoolUnavailable,
+    /// Issue #74: every live-tail connection slot
+    /// (`reader.tail_max_connections`) is taken — rejected `429` BEFORE
+    /// the WebSocket upgrade (docs/api.md §2.4).
+    TailBusy,
 }
 
 impl From<ParamError> for ApiError {
@@ -71,6 +75,12 @@ impl IntoResponse for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
                 "clickhouse pool not yet established".to_string(),
+                None,
+            ),
+            ApiError::TailBusy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+                "tail connection limit reached (reader.tail_max_connections)".to_string(),
                 None,
             ),
         };
@@ -282,5 +292,20 @@ mod tests {
         let (status, json) = envelope(ApiError::PoolUnavailable).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
+    }
+
+    /// Issue #74: tail slot exhaustion is `429 too_many_requests`,
+    /// naming the knob, in the standard JSON envelope.
+    #[tokio::test]
+    async fn tail_busy_maps_to_429_too_many_requests() {
+        let (status, json) = envelope(ApiError::TailBusy).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(json["errorType"], "too_many_requests");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("tail_max_connections")
+        );
     }
 }

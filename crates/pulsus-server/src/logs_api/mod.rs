@@ -12,14 +12,19 @@
 //! `compat.rs` only decides *whether* [`compat_router`] gets merged in
 //! (flag + mode gating) — it never duplicates the route list itself.
 //!
-//! Out of scope here (see the architect plan): `/tail` (WebSocket, §2.4),
-//! `/stats` (§2.5), the drilldown endpoints (§2.6, M7), and every other
-//! `/loki/...` compat alias (M6+, per docs/api.md §8.1's table).
+//! Issue #74 (M6-11) adds `/tail` (WebSocket, §2.4) and `/stats` (§2.5)
+//! plus their `/loki/api/v1/{tail,index/stats}` aliases. The stats alias
+//! suffix is **not** a prefix swap of the native path (`/index/stats` vs
+//! `/stats`), so both new routes mount explicitly below rather than
+//! through [`mount_log_query_routes`]. Still out of scope: the drilldown
+//! endpoints (§2.6, M7) and their aliases.
 
 mod encode;
 mod error;
 mod handlers;
 mod params;
+mod stats;
+mod tail;
 
 use axum::Router;
 use axum::routing::get;
@@ -59,10 +64,13 @@ fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppS
         )
 }
 
-/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.3). Unchanged
-/// behaviour — now delegates to [`mount_log_query_routes`].
+/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.5): the five
+/// query routes via [`mount_log_query_routes`], plus `/tail` (WebSocket,
+/// issue #74) and `/stats` mounted explicitly (both `GET`-only).
 pub(crate) fn router() -> Router<AppState> {
     mount_log_query_routes(Router::new(), "/api/logs/v1")
+        .route("/api/logs/v1/tail", get(tail::tail))
+        .route("/api/logs/v1/stats", get(stats::stats))
 }
 
 /// The `/loki/api/v1/*` compat alias surface (docs/api.md §8.1, issue #14).
@@ -73,6 +81,11 @@ pub(crate) fn router() -> Router<AppState> {
 /// gated); this fn just builds the route set.
 pub(crate) fn compat_router() -> Router<AppState> {
     mount_log_query_routes(Router::new(), "/loki/api/v1")
+        // Issue #74: the M6 aliases. `/index/stats` is deliberately NOT
+        // derived from the native `/stats` path — the alias suffix is not
+        // a prefix swap (docs/api.md §8.1's M6 row).
+        .route("/loki/api/v1/tail", get(tail::tail))
+        .route("/loki/api/v1/index/stats", get(stats::stats))
 }
 
 #[cfg(test)]

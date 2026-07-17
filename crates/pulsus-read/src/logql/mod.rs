@@ -68,8 +68,9 @@ pub mod sql;
 
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    ClientWindow, EngineConfig, LogQlEngine, MatrixSeries, QueryResult, StreamResult, VectorSample,
-    apply_vector_aggs, combine_binary, run_client_agg_rows,
+    ClientWindow, EngineConfig, LogQlEngine, LogStats, MatrixSeries, QueryResult, StreamResult,
+    TailCursor, TailLower, TailPage, TailSetup, VectorSample, apply_vector_aggs, combine_binary,
+    run_client_agg_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};

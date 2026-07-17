@@ -68,6 +68,7 @@ mod tests {
             ))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
     }
 

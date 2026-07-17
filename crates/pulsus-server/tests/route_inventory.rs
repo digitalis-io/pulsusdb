@@ -1319,6 +1319,12 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::OpsPublic | Surface::OpsAuthed => spec.gate == Gate::Always,
             Surface::Ingest => spec.gate == Gate::WriterMode,
             Surface::LogsQuery => matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader),
+            // Issue #74: tail/stats follow the LogsQuery precedent —
+            // native under ReaderMode, `/loki` aliases under
+            // CompatAndReader.
+            Surface::LogsTail | Surface::LogsStats => {
+                matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
+            }
             Surface::PromApi => spec.gate == Gate::ReaderMode,
             // The native traces routes are ReaderMode; their issue #61
             // pure-binding aliases reuse the same surfaces under

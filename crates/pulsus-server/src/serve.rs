@@ -122,6 +122,13 @@ pub async fn run(config: Config) -> ExitCode {
         label_cache_refresh_tx,
     );
 
+    // The live-tail shutdown signal (issue #74): fired inside the
+    // graceful-shutdown future below so every tail poll/send loop breaks
+    // BEFORE `axum::serve` waits on in-flight connections — a long-lived
+    // WebSocket can never wedge the shutdown ordering that follows
+    // (writer drain, background-task teardown).
+    let (tail_shutdown_tx, tail_shutdown_rx) = tokio::sync::watch::channel(false);
+
     let state = AppState {
         pool: Arc::clone(&pool_slot),
         config: Arc::clone(&config),
@@ -132,6 +139,10 @@ pub async fn run(config: Config) -> ExitCode {
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
         started_at: std::time::SystemTime::now(),
+        tail: Arc::new(crate::app::TailRuntime::new(
+            tail_shutdown_rx,
+            config.reader.tail_max_connections,
+        )),
     };
 
     let router = match app::build_router(state, &config) {
@@ -156,7 +167,13 @@ pub async fn run(config: Config) -> ExitCode {
     tracing::info!(%addr, mode = ?config.mode, "pulsusdb listening");
 
     if let Err(err) = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Break every live-tail loop first (issue #74): axum's
+            // graceful stop waits for in-flight connections, and an
+            // upgraded WebSocket is in-flight until its handler returns.
+            let _ = tail_shutdown_tx.send(true);
+        })
         .await
     {
         tracing::error!(error = %err, "server exited with an error");

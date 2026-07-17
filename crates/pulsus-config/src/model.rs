@@ -188,6 +188,45 @@ pub struct ReaderConfig {
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #74 (M6-11) live tail: how often an idle (caught-up) tail
+    /// connection re-polls ClickHouse for new rows. Must be > 0
+    /// (validated at startup) — a zero interval would busy-spin the poll
+    /// loop.
+    pub tail_poll_interval: HumanDuration,
+    /// Issue #74: the ceiling on a tail client's `delay_for` request
+    /// param (seconds tolerated for late arrivals); values above it are
+    /// clamped, never rejected (docs/api.md §2.4).
+    pub tail_max_delay: HumanDuration,
+    /// Issue #74: process-wide cap on concurrent tail WebSocket
+    /// connections; the next connection past it is rejected `429` before
+    /// the upgrade. Must be >= 1 (validated at startup).
+    pub tail_max_connections: usize,
+    /// Issue #74: the bound on the per-frame `dropped_entries`
+    /// representative sample a slow tail consumer is sent (the exact
+    /// cumulative count always arrives as `dropped_total` — docs/api.md
+    /// §2.4).
+    pub tail_max_entries_per_frame: usize,
+    /// Issue #74: how many undelivered tail frames may queue between the
+    /// poll loop and a slow WebSocket writer before the OLDEST frame is
+    /// evicted into `dropped_entries`/`dropped_total`. Must be >= 1
+    /// (validated at startup — a zero-capacity buffer could never hold
+    /// the frame just produced).
+    pub tail_channel_depth: usize,
+    /// Issue #74: per-send deadline on a tail WebSocket write; a client
+    /// that stops reading past this is disconnected rather than pinning
+    /// the connection (and its slot) forever.
+    pub tail_send_timeout: HumanDuration,
+    /// Issue #74: the hard cap on one tail poll's fetched-row `LIMIT`;
+    /// a client `limit` above it is clamped BEFORE the query is built
+    /// (the row allocation is bounded pre-query). Must be >= 1
+    /// (validated at startup).
+    pub tail_max_fetch_limit: u32,
+    /// Issue #74: the maximum time window one tail poll may scan/sort.
+    /// Catch-up over a long backlog proceeds one slice per query (the
+    /// loop re-polls immediately until caught up), so no single query
+    /// ever sorts an unbounded backlog. Must be > 0 (validated at
+    /// startup).
+    pub tail_catchup_slice: HumanDuration,
 }
 
 impl Default for ReaderConfig {
@@ -205,6 +244,14 @@ impl Default for ReaderConfig {
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            tail_poll_interval: HumanDuration(Duration::from_secs(1)),
+            tail_max_delay: HumanDuration(Duration::from_secs(5)),
+            tail_max_connections: 100,
+            tail_max_entries_per_frame: 1_000,
+            tail_channel_depth: 4,
+            tail_send_timeout: HumanDuration(Duration::from_secs(30)),
+            tail_max_fetch_limit: 5_000,
+            tail_catchup_slice: HumanDuration(Duration::from_secs(60)),
         }
     }
 }

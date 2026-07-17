@@ -195,6 +195,7 @@ mod tests {
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
     }
 
@@ -261,6 +262,7 @@ mod tests {
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         };
         let res = config_handler(State(state)).await.into_response();
         assert_eq!(res.status(), StatusCode::OK);

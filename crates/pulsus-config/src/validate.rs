@@ -147,6 +147,27 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.traceql_max_candidates",
         cfg.reader.traceql_max_candidates,
     )?;
+    // Issue #74 (M6-11) plan v3 delta 6 (+ v4's slice floor): the live-tail
+    // floors. A zero poll interval busy-spins the poll loop; a zero
+    // connection cap makes every tail a 429; a zero channel depth is a
+    // frame buffer that cannot hold the frame just produced; a zero fetch
+    // limit renders `LIMIT 0` (a tail that can never deliver); a zero
+    // catch-up slice renders an empty scan window (catch-up never
+    // progresses).
+    positive_duration("reader.tail_poll_interval", cfg.reader.tail_poll_interval)?;
+    positive_u64(
+        "reader.tail_max_connections",
+        cfg.reader.tail_max_connections as u64,
+    )?;
+    positive_u64(
+        "reader.tail_channel_depth",
+        cfg.reader.tail_channel_depth as u64,
+    )?;
+    positive_u64(
+        "reader.tail_max_fetch_limit",
+        u64::from(cfg.reader.tail_max_fetch_limit),
+    )?;
+    positive_duration("reader.tail_catchup_slice", cfg.reader.tail_catchup_slice)?;
     positive_duration("rotation_interval", cfg.rotation_interval)?;
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
@@ -415,6 +436,60 @@ mod tests {
         let mut cfg = Config::default();
         cfg.reader.promql_max_metric_fanout = 0;
         assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #74 (M6-11) plan v3 delta 6 + v4: each live-tail floor is
+    /// rejected at load as `ConfigError::Value` naming its field, and the
+    /// container defaults match the documented values.
+    #[test]
+    fn tail_floors_are_rejected_and_defaults_match_the_documented_values() {
+        let d = Config::default();
+        assert_eq!(
+            d.reader.tail_poll_interval.0,
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(d.reader.tail_max_delay.0, std::time::Duration::from_secs(5));
+        assert_eq!(d.reader.tail_max_connections, 100);
+        assert_eq!(d.reader.tail_max_entries_per_frame, 1_000);
+        assert_eq!(d.reader.tail_channel_depth, 4);
+        assert_eq!(
+            d.reader.tail_send_timeout.0,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(d.reader.tail_max_fetch_limit, 5_000);
+        assert_eq!(
+            d.reader.tail_catchup_slice.0,
+            std::time::Duration::from_secs(60)
+        );
+
+        type Mutator = fn(&mut Config);
+        let cases: &[(&str, Mutator)] = &[
+            ("reader.tail_poll_interval", |c| {
+                c.reader.tail_poll_interval = HumanDuration(std::time::Duration::ZERO)
+            }),
+            ("reader.tail_max_connections", |c| {
+                c.reader.tail_max_connections = 0
+            }),
+            ("reader.tail_channel_depth", |c| {
+                c.reader.tail_channel_depth = 0
+            }),
+            ("reader.tail_max_fetch_limit", |c| {
+                c.reader.tail_max_fetch_limit = 0
+            }),
+            ("reader.tail_catchup_slice", |c| {
+                c.reader.tail_catchup_slice = HumanDuration(std::time::Duration::ZERO)
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            match validate(&cfg) {
+                Err(ConfigError::Value { field: got, .. }) => {
+                    assert_eq!(&got, field, "wrong field named for {field}")
+                }
+                other => panic!("{field}: expected a Value error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

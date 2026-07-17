@@ -55,6 +55,14 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
+    "PULSUS_TAIL_POLL_INTERVAL",
+    "PULSUS_TAIL_MAX_DELAY",
+    "PULSUS_TAIL_MAX_CONNECTIONS",
+    "PULSUS_TAIL_MAX_ENTRIES_PER_FRAME",
+    "PULSUS_TAIL_CHANNEL_DEPTH",
+    "PULSUS_TAIL_SEND_TIMEOUT",
+    "PULSUS_TAIL_MAX_FETCH_LIMIT",
+    "PULSUS_TAIL_CATCHUP_SLICE",
     "PULSUS_TIER_POLICY",
     "PULSUS_RULER_ENABLED",
     "PULSUS_RULER_POLL_INTERVAL",
@@ -250,6 +258,30 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TRACEQL_SCAN_BUDGET_ROWS") {
         cfg.reader.traceql_scan_budget_rows = parse_int("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", &v)?;
     }
+    if let Some(v) = read("PULSUS_TAIL_POLL_INTERVAL") {
+        cfg.reader.tail_poll_interval = parse_dur("PULSUS_TAIL_POLL_INTERVAL", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_MAX_DELAY") {
+        cfg.reader.tail_max_delay = parse_dur("PULSUS_TAIL_MAX_DELAY", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_MAX_CONNECTIONS") {
+        cfg.reader.tail_max_connections = parse_int("PULSUS_TAIL_MAX_CONNECTIONS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_MAX_ENTRIES_PER_FRAME") {
+        cfg.reader.tail_max_entries_per_frame = parse_int("PULSUS_TAIL_MAX_ENTRIES_PER_FRAME", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_CHANNEL_DEPTH") {
+        cfg.reader.tail_channel_depth = parse_int("PULSUS_TAIL_CHANNEL_DEPTH", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_SEND_TIMEOUT") {
+        cfg.reader.tail_send_timeout = parse_dur("PULSUS_TAIL_SEND_TIMEOUT", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_MAX_FETCH_LIMIT") {
+        cfg.reader.tail_max_fetch_limit = parse_int("PULSUS_TAIL_MAX_FETCH_LIMIT", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TAIL_CATCHUP_SLICE") {
+        cfg.reader.tail_catchup_slice = parse_dur("PULSUS_TAIL_CATCHUP_SLICE", &v)?;
+    }
     if let Some(v) = read("PULSUS_TIER_POLICY") {
         cfg.downsampling.tier_policy = parse_enum("PULSUS_TIER_POLICY", &v)?;
     }
@@ -279,8 +311,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            45,
-            "docs/configuration.md §§1-8 document exactly 45 variables"
+            53,
+            "docs/configuration.md §§1-8 document exactly 53 variables"
         );
     }
 

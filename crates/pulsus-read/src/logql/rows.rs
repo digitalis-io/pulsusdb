@@ -33,6 +33,29 @@ pub struct SampleRow {
     pub body: String,
 }
 
+/// A live-tail keyset page row (issue #74): stage 3's sample columns plus
+/// the ClickHouse-computed `cityHash64(body)` the composite cursor is
+/// keyed on (projected server-side so the cursor can never diverge from
+/// the SQL predicate's own hash).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TailSampleRow {
+    pub fingerprint: u64,
+    pub timestamp_ns: i64,
+    pub body: String,
+    pub body_hash: u64,
+}
+
+/// The single `/api/logs/v1/stats` aggregation row (issue #74): both the
+/// rollup-served and the raw-fallback shapes project exactly these four
+/// counters, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LogStatsRow {
+    pub streams: u64,
+    pub chunks: u64,
+    pub entries: u64,
+    pub bytes: u64,
+}
+
 /// Labels discovery (`log_streams_idx`): one distinct label key.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LabelNameRow {

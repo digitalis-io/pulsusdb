@@ -429,6 +429,32 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run api_conformance -p pulsus-server --test api_conformance
 
+      # Issue #74: spawns the real `pulsusdb` binary and drives the
+      # /api/logs/v1/tail WebSocket end-to-end — live streaming through a
+      # pipeline, keyset tie-split exactly-once (WS and engine level,
+      # incl. the below/above-composite-cursor late-arrival contract),
+      # the first-page start bound and slice-bounded backlog scans proven
+      # from system.query_log, the live slow-consumer eviction/accounting
+      # contract, the tail-vs-range differential, and the
+      # /loki/api/v1/tail alias. Ports 31140-31146. Reuses this job's
+      # ClickHouse 24.8 container.
+      - name: Live logs tail (WebSocket) suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run logs_tail_live -p pulsus-server --test logs_tail_live
+
+      # Issue #74: /api/logs/v1/stats — seeded exact counters (chunks =
+      # the adjudicated partition-count proxy), the Tier-1 rollup-vs-raw
+      # pushdown routing gate from X-Pulsus-Explain stage SQL, and
+      # /loki/api/v1/index/stats byte-identity. Port 31145. Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Live logs stats suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run logs_stats_live -p pulsus-server --test logs_stats_live
+
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
 

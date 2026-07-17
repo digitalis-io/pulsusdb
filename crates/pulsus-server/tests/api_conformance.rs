@@ -540,6 +540,45 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 );
             }
         }
+        (Surface::LogsTail, _) => {
+            // The pinned bare-GET `WebSocketUpgrade` rejection (issue
+            // #74; `Surface::LogsTail`'s doc comment — pinned empirically
+            // by `logs_api/tail.rs`'s own unit test): exact plain-text
+            // body. The mounting oracle: an unmounted path is an EMPTY
+            // 404 instead.
+            assert_eq!(
+                res.content_type(),
+                Some("text/plain; charset=utf-8"),
+                "{ctx}: tail bare-GET rejection content-type"
+            );
+            assert_eq!(
+                res.body,
+                b"Connection header did not include 'upgrade'",
+                "{ctx}: tail bare-GET rejection body, got {:?}",
+                String::from_utf8_lossy(&res.body)
+            );
+        }
+        (Surface::LogsStats, _) => {
+            // Issue #74, docs/api.md §2.5: the bare stats object — no
+            // status/data envelope. Against this suite's empty databases
+            // every counter is exactly 0 (the mounting oracle).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: stats content-type"
+            );
+            let json = res.json(ctx);
+            for field in ["streams", "chunks", "entries", "bytes"] {
+                assert_eq!(
+                    json[field], 0,
+                    "{ctx}: empty-DB stats must be zeroed, body {json}"
+                );
+            }
+            assert!(
+                json.get("status").is_none(),
+                "{ctx}: stats is the bare object, never the status envelope, body {json}"
+            );
+        }
         (Surface::TracesFetch, _) => {
             // Against this suite's empty databases the documented outcome
             // of a well-formed fetch is the mounted-but-absent `404
@@ -1014,6 +1053,163 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
     }
 }
 
+/// Attempts a WebSocket handshake (`Connection: Upgrade` — the one shape
+/// [`raw_request`]'s hardcoded `Connection: close` cannot express) and
+/// returns the HTTP response. On `101` the body is empty and the still-
+/// open stream is returned (dropping it closes the connection); on any
+/// other status the (content-length-framed) error body is read fully.
+fn ws_attempt(port: u16, target: &str, ctx: &str) -> (RawResponse, Option<TcpStream>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .unwrap_or_else(|e| panic!("{ctx}: connect failed: {e}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set read timeout");
+    let head = format!(
+        "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .unwrap_or_else(|e| panic!("{ctx}: write failed: {e}"));
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while find_subslice(&buf, b"\r\n\r\n").is_none() {
+        let n = stream.read(&mut chunk).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let split_at = find_subslice(&buf, b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("{ctx}: no response-header terminator"));
+    let head_text = String::from_utf8_lossy(&buf[..split_at]).into_owned();
+    let mut lines = head_text.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("{ctx}: unparsable status line"));
+    let headers: HashMap<String, String> = lines
+        .filter_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+
+    if status == 101 {
+        return (
+            RawResponse {
+                status,
+                headers,
+                body: Vec::new(),
+            },
+            Some(stream),
+        );
+    }
+    let mut body = buf[split_at + 4..].to_vec();
+    if let Some(len) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        while body.len() < len {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(len);
+    }
+    (
+        RawResponse {
+            status,
+            headers,
+            body,
+        },
+        None,
+    )
+}
+
+/// The dedicated live-tail WebSocket matrix (issue #74;
+/// `Surface::LogsTail` is special-cased at the dispatch site exactly as
+/// `Surface::Ingest`/`TracesFetch` are — the generic matrix's
+/// `Connection: close` requests cannot perform an upgrade handshake):
+/// bare GET → the empirically-pinned 400 rejection (mounting oracle);
+/// real handshake + valid selector → `101`; handshake + missing/metric
+/// query → the 400 JSON envelope BEFORE any upgrade; `POST` → 405
+/// `Allow: GET,HEAD`; sibling nonexistent path → empty 404. Streaming
+/// content is `logs_tail_live.rs`'s job; slot exhaustion (429) gets its
+/// own spawn below.
+fn assert_tail_route(port: u16, spec: &RouteSpec, spawn: &str) {
+    let path = resolve_path(spec.path);
+
+    // Bare GET (no upgrade headers): the pinned rejection.
+    let ctx = format!("[{spawn}] GET {} case=bare-get-pinned-rejection", spec.path);
+    let mut req = manifest::Req::new("GET", path.clone());
+    req.query = spec.base_query.to_string();
+    let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        spec.success_status,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_success_envelope(spec, &res, &ctx);
+
+    // Real handshake with a valid selector: 101 Switching Protocols.
+    let ctx = format!("[{spawn}] GET {} case=handshake-101", spec.path);
+    let (res, stream) = ws_attempt(port, &format!("{path}?{}", spec.base_query), &ctx);
+    assert_eq!(res.status, 101, "{ctx}: status");
+    assert!(stream.is_some(), "{ctx}: upgraded stream returned");
+    drop(stream); // closing the TCP stream ends the tail connection
+
+    // Handshake with a MISSING query: rejected 400 (JSON envelope)
+    // before any upgrade — the response is plain HTTP, never a 101.
+    let ctx = format!(
+        "[{spawn}] GET {} case=handshake-missing-query-400",
+        spec.path
+    );
+    let (res, stream) = ws_attempt(port, &path, &ctx);
+    assert!(stream.is_none(), "{ctx}: must not upgrade");
+    assert_eq!(res.status, 400, "{ctx}: status");
+    assert_case_envelope(
+        &res,
+        &ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+        &ctx,
+    );
+
+    // Handshake with a METRIC query: same pre-upgrade 400.
+    let ctx = format!(
+        "[{spawn}] GET {} case=handshake-metric-query-400",
+        spec.path
+    );
+    let metric_q = "query=count_over_time(%7Bservice_name%3D%22checkout%22%7D%5B1h%5D)";
+    let (res, stream) = ws_attempt(port, &format!("{path}?{metric_q}"), &ctx);
+    assert!(stream.is_none(), "{ctx}: must not upgrade");
+    assert_eq!(res.status, 400, "{ctx}: status");
+    assert_case_envelope(
+        &res,
+        &ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+        &ctx,
+    );
+
+    let ctx = format!("[{spawn}] POST {} case=undocumented-method-405", spec.path);
+    let post = manifest::Req::new("POST", path.clone());
+    let res = raw_request(port, &post).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_405_with_allow(&res, &ctx, spec.methods);
+
+    let ctx = format!("[{spawn}] GET {} case=sibling-nonexistent-404", spec.path);
+    let sibling = format!("{path}-conformance-nonexistent");
+    let res = get(port, &sibling, &ctx);
+    assert_404_empty(&res, &ctx);
+}
+
 fn run_case(port: u16, spec: &RouteSpec, case: &CaseClass, spawn: &str) {
     let mut req = manifest::Req::new(spec.methods[0].as_str(), resolve_path(spec.path));
     (case.build)(&mut req);
@@ -1330,6 +1526,7 @@ async fn all_mode_auth_off_compat_on_full_matrix() {
             Surface::TracesFetch => {
                 assert_traces_fetch_route(port, spec, "spawn=all,auth=off,compat=on")
             }
+            Surface::LogsTail => assert_tail_route(port, spec, "spawn=all,auth=off,compat=on"),
             _ => assert_full_route_matrix(port, spec, "spawn=all,auth=off,compat=on"),
         }
     }
@@ -1699,6 +1896,73 @@ async fn logql_scan_budget_query_too_broad_live_case() {
         },
         "[spawn=all,scan-budget=1B] GET /api/logs/v1/query_range case=query_too_broad-422",
     );
+}
+
+// ---------------------------------------------------------------------
+// Issue #74 (M6-11): tail slot exhaustion — with
+// PULSUS_TAIL_MAX_CONNECTIONS=1, one held tail connection makes the next
+// handshake a pre-upgrade `429 too_many_requests`, and releasing the
+// slot (closing the first connection) restores a `101`.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tail_slot_exhaustion_returns_429_before_the_upgrade() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_127;
+    let db = "pulsus_api_conformance_it_tail_slots";
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_MAX_CONNECTIONS", "1")]);
+
+    let target = "/api/logs/v1/tail?query=%7Bservice_name%3D%22checkout%22%7D";
+    let spawn = "spawn=all,tail-slots=1";
+
+    let ctx = format!("[{spawn}] GET /api/logs/v1/tail case=first-connection-101");
+    let (res, held) = ws_attempt(port, target, &ctx);
+    assert_eq!(res.status, 101, "{ctx}: status");
+    let held = held.unwrap_or_else(|| panic!("{ctx}: upgraded stream"));
+
+    let ctx = format!("[{spawn}] GET /api/logs/v1/tail case=slot-exhausted-429");
+    let (res, stream) = ws_attempt(port, target, &ctx);
+    assert!(stream.is_none(), "{ctx}: must not upgrade");
+    assert_eq!(
+        res.status,
+        429,
+        "{ctx}: status (body: {:?})",
+        String::from_utf8_lossy(&res.body)
+    );
+    assert_case_envelope(
+        &res,
+        &ExpectedError::Json {
+            error_type: "too_many_requests",
+            has_position: false,
+        },
+        &ctx,
+    );
+
+    // Releasing the held connection frees its owned permit: the next
+    // handshake upgrades again (bounded retry — permit release runs
+    // asynchronously after the socket drops).
+    drop(held);
+    let ctx = format!("[{spawn}] GET /api/logs/v1/tail case=slot-released-101");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (res, stream) = ws_attempt(port, target, &ctx);
+        if res.status == 101 {
+            drop(stream);
+            break;
+        }
+        assert_eq!(
+            res.status, 429,
+            "{ctx}: only 429 is expected while the slot drains"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{ctx}: the slot must be released once the connection closes"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // ---------------------------------------------------------------------

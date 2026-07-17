@@ -82,6 +82,14 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` | `10` | LogQL pipeline scan oversample (must be >= 1): when a query pipeline contains an in-engine dropping stage that cannot push down to SQL (a label filter, or a line filter placed after `line_format`), the stage-3 scan `LIMIT` becomes `limit × factor` and the true `limit` is re-applied to pipeline survivors — responses never over-return. If the oversampled scan itself hits its `LIMIT` ceiling and the pipeline drops more than `(factor-1)/factor` of the scanned lines, the response may return fewer than `limit` entries (documented divergence; raise the factor to trade scan headroom for fewer under-returns). `PULSUS_LOGQL_SCAN_BUDGET_BYTES` still caps the scan and always aborts first |
 | `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
+| `PULSUS_TAIL_POLL_INTERVAL` | `1s` | how often an idle (caught-up) live-tail connection re-polls for new rows (must be > 0) |
+| `PULSUS_TAIL_MAX_DELAY` | `5s` | ceiling on a tail client's `delay_for` param (docs/api.md §2.4); larger requests are clamped |
+| `PULSUS_TAIL_MAX_CONNECTIONS` | `100` | process-wide cap on concurrent tail WebSocket connections; the next one is rejected `429` before the upgrade (must be >= 1) |
+| `PULSUS_TAIL_MAX_ENTRIES_PER_FRAME` | `1000` | bound on the per-frame `dropped_entries` representative sample sent to a slow consumer (the exact count always arrives as `dropped_total`) |
+| `PULSUS_TAIL_CHANNEL_DEPTH` | `4` | undelivered tail frames buffered ahead of a slow WebSocket writer before the oldest frame is evicted into `dropped_entries`/`dropped_total` (must be >= 1) |
+| `PULSUS_TAIL_SEND_TIMEOUT` | `30s` | per-send deadline on a tail WebSocket write; a client that stops reading past it is disconnected |
+| `PULSUS_TAIL_MAX_FETCH_LIMIT` | `5000` | hard cap on one tail poll's fetched-row `LIMIT`; a client `limit` above it is silently clamped before the query is built (must be >= 1) |
+| `PULSUS_TAIL_CATCHUP_SLICE` | `60s` | maximum time window one tail poll may scan/sort; backlog catch-up proceeds one slice per query, re-polling immediately until caught up (must be > 0) |
 
 ## 7. Downsampling (M3)
 
@@ -173,6 +181,14 @@ reader:
   logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
+  tail_poll_interval: 1s
+  tail_max_delay: 5s
+  tail_max_connections: 100
+  tail_max_entries_per_frame: 1000
+  tail_channel_depth: 4
+  tail_send_timeout: 30s
+  tail_max_fetch_limit: 5000
+  tail_catchup_slice: 60s
 
 downsampling:
   enabled: false

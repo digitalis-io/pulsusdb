@@ -50,6 +50,58 @@ pub(crate) struct AppState {
     pub(crate) trace_writer: Arc<TraceWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
     pub(crate) started_at: std::time::SystemTime,
+    /// The live-tail runtime bundle (issue #74): the process shutdown
+    /// signal every tail loop races its awaits against, plus the
+    /// connection-slot semaphore. One bundled field so the ~12
+    /// `AppState` constructors stay a one-line change.
+    pub(crate) tail: Arc<TailRuntime>,
+}
+
+/// The live-tail runtime (issue #74): `shutdown` is the process-wide
+/// `watch` signal `serve::run` fires from its graceful-shutdown future —
+/// tail loops break on it BEFORE `axum::serve` waits on in-flight
+/// connections, so a long-lived WebSocket can never wedge the shutdown
+/// ordering. `slots` caps concurrent tail connections
+/// (`reader.tail_max_connections`); a connection acquires an OWNED permit
+/// pre-upgrade (`429` on exhaustion) and holds it for the socket's
+/// lifetime.
+pub(crate) struct TailRuntime {
+    pub(crate) shutdown: tokio::sync::watch::Receiver<bool>,
+    pub(crate) slots: Arc<tokio::sync::Semaphore>,
+    /// Keeps `for_tests`'s never-signaled sender alive — a dropped
+    /// sender reads as cancellation (`watch::Receiver::changed` errors),
+    /// which would end every test tail loop instantly. `None` in
+    /// production: `serve::run`'s shutdown future owns the real sender.
+    _test_shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl TailRuntime {
+    pub(crate) fn new(
+        shutdown: tokio::sync::watch::Receiver<bool>,
+        max_connections: usize,
+    ) -> Self {
+        TailRuntime {
+            shutdown,
+            slots: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            _test_shutdown_tx: None,
+        }
+    }
+
+    /// A never-signaled shutdown channel + the default connection cap —
+    /// the one-liner every `test_state()` constructor uses. `cfg(test)`:
+    /// the production binary never constructs it (only in-crate unit
+    /// tests do), and an ungated helper would be dead code there.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        TailRuntime {
+            shutdown: rx,
+            slots: Arc::new(tokio::sync::Semaphore::new(
+                pulsus_config::Config::default().reader.tail_max_connections,
+            )),
+            _test_shutdown_tx: Some(tx),
+        }
+    }
 }
 
 /// `/buildinfo` payload (docs/api.md §7): `{"version","revision","builtAt","rustc"}`.
@@ -131,6 +183,7 @@ mod tests {
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
     }
 

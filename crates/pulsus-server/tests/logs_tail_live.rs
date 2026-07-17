@@ -1,0 +1,1082 @@
+//! Live end-to-end tests for `GET /api/logs/v1/tail` (issue #74): spawns
+//! the real `pulsusdb` binary against a live ClickHouse (same podman
+//! harness as `logs_api_live.rs`), seeds `log_streams`/`log_samples`
+//! directly via `ChClient`, and drives the WebSocket with a minimal
+//! hand-rolled client (bare `TcpStream` — the repo's no-HTTP-client-dep
+//! idiom, extended with RFC 6455 frame parsing).
+//!
+//! Coverage (the adjudicated plan's live ACs):
+//! - streaming through a real pipeline, ascending order, exactly-once;
+//! - AC2 keyset semantics, deterministically at the ENGINE level
+//!   (`LogQlEngine::tail_poll` driven page by page): a tie group split by
+//!   `LIMIT` across pages delivered exactly once via `>=` + `OFFSET
+//!   seen`; a post-page-1 same-timestamp row ABOVE the composite cursor
+//!   delivered, BELOW it the documented late-arrival non-delivery; a
+//!   byte-identical duplicate of the boundary row delivered exactly once;
+//! - first-page SQL carries the explicit `timestamp_ns > <start>` bound
+//!   (asserted from `system.query_log`, not just the builder);
+//! - backlog catch-up is slice-bounded: per-poll `query_log.read_rows`
+//!   stays within one `tail_catchup_slice` window (+ one granule of
+//!   slack), never the whole backlog;
+//! - AC1 differential: the same window and pipeline through paged
+//!   `tail_poll` versus the ordinary `query()` streams path delivers
+//!   the identical entry set (review round 1);
+//! - AC3 live slow consumer: real WebSocket backpressure evicts the
+//!   OLDEST frames with exact `dropped_total` accounting and a bounded
+//!   `dropped_entries` sample, proven through the encoded frames
+//!   (review round 1);
+//! - the `/loki/api/v1/tail` compat alias streams identically.
+//!
+//! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
+//!
+//! ```text
+//! podman run -d --rm --name pulsus-ch-test -p 19123:8123 -p 19000:9000 \
+//!     clickhouse/clickhouse-server:24.8
+//! PULSUS_TEST_CLICKHOUSE=1 cargo test -p pulsus-server --test logs_tail_live
+//! podman rm -f pulsus-ch-test
+//! ```
+//!
+//! Ports 31140-31146, distinct from every other live suite.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
+use futures::StreamExt;
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
+use pulsus_read::{
+    Direction, EngineConfig, LogQlEngine, QueryParams, QuerySpec, StreamResult, TailCursor,
+    TailLower,
+};
+
+fn should_run() -> bool {
+    std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
+}
+
+fn ch_host() -> String {
+    std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string())
+}
+
+fn ch_http_port() -> u16 {
+    std::env::var("PULSUS_TEST_CH_HTTP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(19123)
+}
+
+fn now_ns() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    )
+    .expect("now fits in i64")
+}
+
+// ---------------------------------------------------------------------
+// Process lifecycle + seeding (the logs_api_live idiom)
+// ---------------------------------------------------------------------
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn http_get_status(port: u16, path: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf);
+    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn spawn_ready(port: u16, db: &str, extra_env: &[(&str, &str)]) -> ChildGuard {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pulsusdb"));
+    command
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("CLICKHOUSE_SERVER", ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
+        .env("CLICKHOUSE_DB", db);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let child = command.spawn().expect("spawn pulsusdb");
+    let guard = ChildGuard(child);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if http_get_status(port, "/ready") == Some(200) {
+            return guard;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("/ready never reached 200 within 60s (port {port}, db {db})");
+}
+
+async fn data_client(db: &str) -> ChClient {
+    ChClient::new(ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: db.to_string(),
+        proto: ChProto::Http,
+        pool_size: 4,
+        query_timeout: Duration::from_secs(30),
+        ..ChConnConfig::default()
+    })
+    .await
+    .expect("connect data client")
+}
+
+async fn drop_db(db: &str) {
+    let admin = ChClient::new(ChConnConfig {
+        server: ch_host(),
+        http_port: ch_http_port(),
+        database: "default".to_string(),
+        proto: ChProto::Http,
+        pool_size: 2,
+        query_timeout: Duration::from_secs(30),
+        ..ChConnConfig::default()
+    })
+    .await
+    .expect("connect admin client");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop db");
+}
+
+/// Seeds one `log_streams` row whose `month` matches `at_ns` (stage-1
+/// resolution is month-scoped, so the stream's month must overlap the
+/// tail window). Direct `log_streams` inserts fire the
+/// `log_streams_idx` MV, so stage 1 resolves without further seeding.
+async fn seed_stream(client: &ChClient, db: &str, fp: u64, labels: &str, at_ns: i64) {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({at_ns}))), {fp}, \
+                 'checkout', '{labels}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+}
+
+async fn seed_samples(client: &ChClient, db: &str, rows: &[(u64, i64, &str)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let values = rows
+        .iter()
+        .map(|(fp, ts, body)| format!("('checkout', {fp}, {ts}, 0, '{body}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES {values}"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_samples");
+}
+
+// ---------------------------------------------------------------------
+// Minimal WebSocket client (RFC 6455, text/close only — the server never
+// fragments or pings)
+// ---------------------------------------------------------------------
+
+struct WsClient {
+    stream: TcpStream,
+    buf: Vec<u8>,
+}
+
+enum WsFrame {
+    Text(String),
+    Close,
+}
+
+impl WsClient {
+    fn connect(port: u16, target: &str) -> WsClient {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("read timeout");
+        let head = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).expect("handshake write");
+        // Read up to the header terminator; anything after it is already
+        // WebSocket frame data.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let split_at = loop {
+            if let Some(i) = find_subslice(&buf, b"\r\n\r\n") {
+                break i;
+            }
+            assert!(Instant::now() < deadline, "no handshake response");
+            match stream.read(&mut chunk) {
+                Ok(0) => panic!("connection closed during handshake"),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => panic!("handshake read failed: {e}"),
+            }
+        };
+        let head_text = String::from_utf8_lossy(&buf[..split_at]).into_owned();
+        let status: u16 = head_text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .expect("status line");
+        assert_eq!(status, 101, "handshake must upgrade: {head_text}");
+        let leftover = buf[split_at + 4..].to_vec();
+        WsClient {
+            stream,
+            buf: leftover,
+        }
+    }
+
+    /// The next text frame before `deadline`; `None` on timeout or Close.
+    fn next_text(&mut self, deadline: Instant) -> Option<String> {
+        let mut chunk = [0u8; 65536];
+        loop {
+            if let Some((frame, consumed)) = parse_ws_frame(&self.buf) {
+                self.buf.drain(..consumed);
+                match frame {
+                    Some(WsFrame::Text(text)) => return Some(text),
+                    Some(WsFrame::Close) => return None,
+                    None => continue, // ping/pong/etc — ignore
+                }
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            match self.stream.read(&mut chunk) {
+                Ok(0) => return None,
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    fn close(mut self) {
+        // A masked, empty client Close frame.
+        let _ = self.stream.write_all(&[0x88, 0x80, 0x12, 0x34, 0x56, 0x78]);
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Parses one complete server frame off the front of `buf`:
+/// `Some((frame, consumed))` when whole, `None` when more bytes are
+/// needed. The inner `Option` is `None` for ignorable opcodes.
+#[allow(clippy::type_complexity)]
+fn parse_ws_frame(buf: &[u8]) -> Option<(Option<WsFrame>, usize)> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let opcode = buf[0] & 0x0F;
+    let len7 = (buf[1] & 0x7F) as usize;
+    let (len, header) = match len7 {
+        126 => {
+            if buf.len() < 4 {
+                return None;
+            }
+            (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4)
+        }
+        127 => {
+            if buf.len() < 10 {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[2..10]);
+            (u64::from_be_bytes(b) as usize, 10)
+        }
+        n => (n, 2),
+    };
+    if buf.len() < header + len {
+        return None;
+    }
+    let payload = &buf[header..header + len];
+    let frame = match opcode {
+        0x1 => Some(WsFrame::Text(String::from_utf8_lossy(payload).into_owned())),
+        0x8 => Some(WsFrame::Close),
+        _ => None,
+    };
+    Some((frame, header + len))
+}
+
+/// Collects `(labels, ts, line)` entries from tail frames until `want`
+/// entries arrive or `deadline` passes.
+fn collect_entries(
+    ws: &mut WsClient,
+    want: usize,
+    deadline: Instant,
+) -> Vec<(serde_json::Value, i64, String)> {
+    let mut out = Vec::new();
+    while out.len() < want && Instant::now() < deadline {
+        let Some(text) = ws.next_text(deadline) else {
+            break;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("frame JSON");
+        for stream in frame["streams"].as_array().expect("streams array") {
+            for value in stream["values"].as_array().expect("values array") {
+                let ts: i64 = value[0].as_str().expect("ns string").parse().expect("ns");
+                out.push((
+                    stream["stream"].clone(),
+                    ts,
+                    value[1].as_str().expect("line").to_string(),
+                ));
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// 1) WS end-to-end: streaming through a real pipeline, ascending,
+//    exactly-once (port 31140)
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tail_streams_new_rows_through_a_pipeline_in_order_exactly_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_140;
+    let db = "pulsus_tail_it_stream";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_TAIL_POLL_INTERVAL", "200ms")]);
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+
+    let start = now_ns() - 60_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D%20%7C%3D%20%22keep%22";
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+
+    // Insert AFTER connecting: two matching lines and one the pushed-down
+    // `|= "keep"` filter must drop.
+    let t0 = now_ns();
+    seed_samples(
+        &client,
+        db,
+        &[
+            (1, t0, "keep alpha"),
+            (1, t0 + 1_000_000, "drop beta"),
+            (1, t0 + 2_000_000, "keep gamma"),
+        ],
+    )
+    .await;
+
+    let entries = collect_entries(&mut ws, 2, Instant::now() + Duration::from_secs(20));
+    assert_eq!(entries.len(), 2, "both matching lines arrive: {entries:?}");
+    assert_eq!(entries[0].2, "keep alpha");
+    assert_eq!(entries[1].2, "keep gamma");
+    assert!(entries[0].1 < entries[1].1, "ascending timestamps");
+    assert_eq!(entries[0].0["service_name"], "checkout");
+
+    // Two more poll cycles: nothing is re-delivered.
+    let extra = collect_entries(&mut ws, 1, Instant::now() + Duration::from_millis(700));
+    assert!(extra.is_empty(), "no duplicate delivery: {extra:?}");
+    ws.close();
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 2) WS end-to-end: a same-timestamp tie group larger than the fetch
+//    limit is delivered exactly once (port 31141)
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tie_group_split_by_the_fetch_limit_is_delivered_exactly_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_141;
+    let db = "pulsus_tail_it_ties";
+    drop_db(db).await;
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TAIL_POLL_INTERVAL", "200ms"),
+            // LIMIT 3 < the 8-row tie group: pages MUST split the group.
+            ("PULSUS_TAIL_MAX_FETCH_LIMIT", "3"),
+        ],
+    );
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+    seed_stream(
+        &client,
+        db,
+        2,
+        r#"{"env":"prod","service_name":"checkout"}"#,
+        now_ns(),
+    )
+    .await;
+
+    // Eight rows sharing ONE timestamp across two fingerprints.
+    let ts0 = now_ns() - 10_000_000_000;
+    let rows: Vec<(u64, i64, String)> = (0..8)
+        .map(|i| ((i % 2) + 1, ts0, format!("tie-{i}")))
+        .collect();
+    let rows_ref: Vec<(u64, i64, &str)> = rows
+        .iter()
+        .map(|(fp, ts, b)| (*fp, *ts, b.as_str()))
+        .collect();
+    seed_samples(&client, db, &rows_ref).await;
+
+    let start = ts0 - 1_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D";
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+
+    let entries = collect_entries(&mut ws, 8, Instant::now() + Duration::from_secs(20));
+    let mut bodies: Vec<&str> = entries.iter().map(|(_, _, line)| line.as_str()).collect();
+    bodies.sort_unstable();
+    let expected: Vec<String> = (0..8).map(|i| format!("tie-{i}")).collect();
+    assert_eq!(
+        bodies,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "every tied row exactly once despite LIMIT 3 pages"
+    );
+    assert!(entries.iter().all(|(_, ts, _)| *ts == ts0));
+
+    // Two more poll cycles: the tie group is never re-delivered.
+    let extra = collect_entries(&mut ws, 1, Instant::now() + Duration::from_millis(700));
+    assert!(extra.is_empty(), "no duplicates after catch-up: {extra:?}");
+    ws.close();
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 3) Engine-level keyset cursor semantics (deterministic, page by page)
+//    — uses `--mode init` for the schema, no server needed (port n/a)
+// ---------------------------------------------------------------------
+
+fn engine_for_db(client: ChClient) -> LogQlEngine {
+    LogQlEngine::new(
+        client,
+        EngineConfig {
+            db: String::new(),
+            streams_idx: "log_streams_idx".to_string(),
+            streams: "log_streams".to_string(),
+            samples: "log_samples".to_string(),
+            rollup_table: "log_metrics_5s".to_string(),
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        },
+    )
+}
+
+fn init_schema(db: &str) {
+    let status = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("CLICKHOUSE_SERVER", ch_host())
+        .env("CLICKHOUSE_HTTP_PORT", ch_http_port().to_string())
+        .env("CLICKHOUSE_DB", db)
+        .args(["--mode", "init"])
+        .status()
+        .expect("run --mode init");
+    assert!(status.success(), "--mode init must succeed");
+}
+
+/// A body whose `(fingerprint, cityHash64(body))` sorts strictly
+/// below/above `boundary_hash` — searched deterministically over a
+/// numbered candidate space.
+fn body_with_hash<F: Fn(u64) -> bool>(prefix: &str, pred: F) -> (String, u64) {
+    for i in 0..100_000u64 {
+        let candidate = format!("{prefix}-{i}");
+        let h = pulsus_model::raw_cityhash64(candidate.as_bytes());
+        if pred(h) {
+            return (candidate, h);
+        }
+    }
+    panic!("no candidate body found");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_keyset_pages_resume_split_ties_and_honor_the_composite_cursor() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let db = "pulsus_tail_it_keyset";
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    // One hour back keeps the tie group inside the same stage-1 month
+    // as the (now-derived) plan window.
+    let ts0 = now_ns() - 3_600_000_000_000;
+    seed_stream(&client, db, 7, r#"{"service_name":"checkout"}"#, ts0).await;
+
+    // Five rows at ONE timestamp, one fingerprint, distinct bodies.
+    let bodies: Vec<String> = (0..5).map(|i| format!("seed-{i}")).collect();
+    let rows: Vec<(u64, i64, &str)> = bodies.iter().map(|b| (7u64, ts0, b.as_str())).collect();
+    seed_samples(&client, db, &rows).await;
+
+    let engine = engine_for_db(data_client(db).await);
+    let expr = pulsus_logql::parse(r#"{service_name="checkout"}"#).expect("parse");
+    let qp = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: ts0 - 1_000_000_000,
+            end_ns: ts0 + 1_000_000_000,
+            step_ns: 1_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Forward,
+    };
+    let setup = engine.tail_setup(&expr, &qp).expect("setup");
+    let upper = ts0 + 1_000_000_000;
+
+    // Page 1: LIMIT 2 splits the 5-row tie group.
+    let page1 = engine
+        .tail_poll(
+            &setup.compiled,
+            &setup.plan,
+            TailLower::Start {
+                start_ns: ts0 - 1_000_000_000,
+            },
+            upper,
+            2,
+        )
+        .await
+        .expect("page 1");
+    assert_eq!(page1.fetched, 2);
+    let c1: TailCursor = page1.next.expect("cursor after rows");
+    assert_eq!(c1.tuple.0, ts0);
+    // Distinct bodies ⇒ distinct hashes ⇒ the boundary tuple's trailing
+    // run is exactly the last row.
+    assert_eq!(c1.seen, 1);
+    let delivered_1: Vec<String> = page_lines(&page1.streams);
+
+    // Between pages: three same-timestamp inserts —
+    //  (a) BELOW the composite cursor (hash < boundary hash): the
+    //      documented late-arrival non-delivery;
+    //  (b) ABOVE it (hash > boundary hash): must be delivered;
+    //  (c) a BYTE-IDENTICAL duplicate of the boundary row itself: one
+    //      more occurrence of the boundary tuple, delivered exactly once
+    //      via the occurrence-count OFFSET.
+    let boundary_hash = c1.tuple.2;
+    let (below, _) = body_with_hash("below", |h| h < boundary_hash);
+    let (above, _) = body_with_hash("above", |h| h > boundary_hash);
+    // The boundary row is the delivered line whose hash IS the cursor's
+    // (page_lines sorts lexicographically, so `.last()` would be wrong).
+    let boundary_body = delivered_1
+        .iter()
+        .find(|b| pulsus_model::raw_cityhash64(b.as_bytes()) == boundary_hash)
+        .expect("boundary row is in page 1")
+        .clone();
+    seed_samples(
+        &client,
+        db,
+        &[
+            (7, ts0, below.as_str()),
+            (7, ts0, above.as_str()),
+            (7, ts0, boundary_body.as_str()),
+        ],
+    )
+    .await;
+
+    // Page 2 (and onwards) from the cursor: everything at/after the
+    // boundary tuple, minus the `seen` already-delivered occurrences.
+    let mut delivered_rest: Vec<String> = Vec::new();
+    let mut cursor = c1;
+    for _ in 0..10 {
+        let page = engine
+            .tail_poll(
+                &setup.compiled,
+                &setup.plan,
+                TailLower::After(cursor),
+                upper,
+                2,
+            )
+            .await
+            .expect("page");
+        delivered_rest.extend(page_lines(&page.streams));
+        match page.next {
+            Some(next) if page.fetched > 0 => cursor = next,
+            _ => break,
+        }
+        if page.fetched < 2 {
+            break;
+        }
+    }
+
+    let mut all: Vec<String> = delivered_1.to_vec();
+    all.extend(delivered_rest.iter().cloned());
+    all.sort_unstable();
+
+    let mut expected: Vec<String> = bodies.clone();
+    expected.push(above.clone()); // the above-cursor insert IS delivered
+    expected.push(boundary_body.clone()); // the duplicate: a second copy, exactly once
+    expected.sort_unstable();
+
+    assert_eq!(
+        all, expected,
+        "exactly-once across split pages: all 5 seeds once, the boundary duplicate once \
+         more, the above-cursor insert once, the below-cursor insert never"
+    );
+    assert!(
+        !all.contains(&below),
+        "the below-cursor late arrival is the documented non-delivery"
+    );
+    drop_db(db).await;
+}
+
+/// Issue #74 AC1 (review round 1: the required tail-versus-range
+/// DIFFERENTIAL, not two invocations of the same helper): the same
+/// window and the same pipeline'd expression through (a) the ordinary
+/// `query()` streams path and (b) `tail_poll` paged with a small
+/// `fetch_limit` across many keyset pages — the delivered
+/// `(labels_json, ts, line)` multisets must be identical.
+#[tokio::test(flavor = "multi_thread")]
+async fn tail_pages_and_range_query_deliver_identical_entry_sets() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let db = "pulsus_tail_it_diff";
+    drop_db(db).await;
+    init_schema(db);
+    let client = data_client(db).await;
+    let ts0 = now_ns() - 3_600_000_000_000;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, ts0).await;
+    seed_stream(
+        &client,
+        db,
+        2,
+        r#"{"env":"prod","service_name":"checkout"}"#,
+        ts0,
+    )
+    .await;
+
+    // 12 rows across two fingerprints, with timestamp ties and lines the
+    // pipeline (`|= "keep" | logfmt | y="z"`) partially drops/regroups.
+    let mut rows: Vec<(u64, i64, String)> = Vec::new();
+    for i in 0..12i64 {
+        let fp = (i % 2 + 1) as u64;
+        let ts = ts0 + (i / 4) * 1_000_000_000; // groups of 4 share a ts
+        let body = if i % 3 == 0 {
+            format!("keep y=z msg=m{i}")
+        } else if i % 3 == 1 {
+            format!("keep y=other msg=m{i}") // dropped by the label filter
+        } else {
+            format!("drop me {i}") // dropped by the pushed |= filter
+        };
+        rows.push((fp, ts, body));
+    }
+    let rows_ref: Vec<(u64, i64, &str)> =
+        rows.iter().map(|(f, t, b)| (*f, *t, b.as_str())).collect();
+    seed_samples(&client, db, &rows_ref).await;
+
+    let engine = engine_for_db(data_client(db).await);
+    let expr = pulsus_logql::parse(r#"{service_name="checkout"} |= "keep" | logfmt | y="z""#)
+        .expect("parse");
+    let start = ts0 - 1_000_000_000;
+    let end = ts0 + 60_000_000_000;
+    let qp = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start,
+            end_ns: end,
+            step_ns: 1_000_000_000,
+        },
+        limit: 5_000,
+        direction: Direction::Forward,
+    };
+
+    // (a) The ordinary query path.
+    let range_result = engine.query(&expr, &qp).await.expect("range query");
+    let pulsus_read::QueryResult::Streams(range_streams) = range_result else {
+        panic!("stream selector must return Streams");
+    };
+    let mut range_entries = entry_set(&range_streams);
+
+    // (b) tail_poll paged with fetch_limit 3 — several pages, split ties.
+    let setup = engine.tail_setup(&expr, &qp).expect("setup");
+    let mut tail_streams: Vec<StreamResult> = Vec::new();
+    let mut lower = TailLower::Start { start_ns: start };
+    for _ in 0..32 {
+        let page = engine
+            .tail_poll(&setup.compiled, &setup.plan, lower, end, 3)
+            .await
+            .expect("tail page");
+        tail_streams.extend(page.streams);
+        let fetched = page.fetched;
+        match page.next {
+            Some(next) if fetched > 0 => lower = TailLower::After(next),
+            _ => {}
+        }
+        if fetched < 3 {
+            break;
+        }
+    }
+    let mut tail_entries = entry_set(&tail_streams);
+
+    range_entries.sort();
+    tail_entries.sort();
+    assert!(
+        !range_entries.is_empty(),
+        "the pipeline must keep some rows or the differential is vacuous"
+    );
+    assert_eq!(
+        tail_entries, range_entries,
+        "tail pages and the range query must deliver the identical entry set"
+    );
+    drop_db(db).await;
+}
+
+fn entry_set(streams: &[StreamResult]) -> Vec<(String, i64, String)> {
+    streams
+        .iter()
+        .flat_map(|s| {
+            s.entries
+                .iter()
+                .map(|(ts, line)| (s.labels_json.clone(), *ts, line.clone()))
+        })
+        .collect()
+}
+
+fn page_lines(streams: &[StreamResult]) -> Vec<String> {
+    let mut out: Vec<String> = streams
+        .iter()
+        .flat_map(|s| s.entries.iter().map(|(_, line)| line.clone()))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+// ---------------------------------------------------------------------
+// 4) First-page start bound + slice-bounded backlog scans, proven from
+//    system.query_log (port 31143)
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Row, serde::Serialize, serde::Deserialize)]
+struct QueryLogRow {
+    query: String,
+    read_rows: u64,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn backlog_catch_up_is_slice_bounded_and_the_first_page_carries_the_start_bound() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_143;
+    let db = "pulsus_tail_it_backlog";
+    drop_db(db).await;
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TAIL_POLL_INTERVAL", "100ms"),
+            ("PULSUS_TAIL_CATCHUP_SLICE", "60s"),
+            ("PULSUS_TAIL_MAX_FETCH_LIMIT", "1000000"),
+        ],
+    );
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+
+    // A 5-minute backlog, 100k rows at 3ms spacing — 20k rows per 60s
+    // slice, several granules per slice (index_granularity 8192), so an
+    // unsliced scan would be caught red-handed by read_rows.
+    const TOTAL_ROWS: u64 = 100_000;
+    const ROWS_PER_SLICE: u64 = 20_000;
+    let ts0 = now_ns() - 320_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) SELECT 'checkout', 1, {ts0} + toInt64(number) * 3000000, 0, \
+                 concat('line-', toString(number)) FROM numbers({TOTAL_ROWS})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("bulk seed");
+
+    let start = ts0 - 1_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&limit=1000000";
+    // `system.query_log` outlives DROP DATABASE: scope the assertions to
+    // THIS run via a wall-clock marker taken just before connecting.
+    let run_marker_us = now_ns() / 1_000;
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+    let entries = collect_entries(
+        &mut ws,
+        TOTAL_ROWS as usize,
+        Instant::now() + Duration::from_secs(60),
+    );
+    assert_eq!(entries.len() as u64, TOTAL_ROWS, "whole backlog delivered");
+    // Global ascending order across the whole catch-up.
+    assert!(
+        entries.windows(2).all(|w| w[0].1 <= w[1].1),
+        "ascending timestamps across frames"
+    );
+    ws.close();
+
+    client
+        .execute(
+            "SYSTEM FLUSH LOGS",
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("flush logs");
+    let sql = format!(
+        "SELECT query, read_rows FROM system.query_log \
+         WHERE type = 'QueryFinish' AND current_database = '{db}' \
+           AND query_start_time_microseconds >= fromUnixTimestamp64Micro({run_marker_us}) \
+           AND query LIKE '%cityHash64(body) AS body_hash%' \
+           AND query NOT LIKE '%system.query_log%' \
+         ORDER BY query_start_time_microseconds ASC"
+    );
+    let mut polls: Vec<QueryLogRow> = Vec::new();
+    {
+        let mut stream = client
+            .query_stream::<QueryLogRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log stream");
+        while let Some(row) = stream.next().await {
+            polls.push(row.expect("query_log row"));
+        }
+    }
+    assert!(
+        polls.len() >= 5,
+        "a 5-slice backlog takes at least 5 keyset polls, got {}",
+        polls.len()
+    );
+
+    // First-bound AC: the FIRST keyset query carries the API start bound,
+    // exclusive, verbatim.
+    assert!(
+        polls[0].query.contains(&format!("timestamp_ns > {start}")),
+        "first poll must carry the explicit start bound: {}",
+        polls[0].query
+    );
+
+    // Slice-bound AC (Tier 1, scale-invariant): no single poll reads more
+    // than one slice's rows (+ one granule of alignment slack) — checking
+    // only the emitted LIMIT would not prove bounded work.
+    const GRANULE_SLACK: u64 = 8_192 * 2;
+    for poll in &polls {
+        assert!(
+            poll.read_rows <= ROWS_PER_SLICE + GRANULE_SLACK,
+            "one poll read {} rows — more than one {ROWS_PER_SLICE}-row slice (+{GRANULE_SLACK} \
+             granule slack); the catch-up window is not slice-bounded.\nquery: {}",
+            poll.read_rows,
+            poll.query
+        );
+        // Both time bounds present in every poll's SQL.
+        assert!(
+            poll.query.contains("timestamp_ns <= "),
+            "sliced upper bound present: {}",
+            poll.query
+        );
+        assert!(
+            poll.query.contains("timestamp_ns > ") || poll.query.contains("timestamp_ns >= "),
+            "lower bound present: {}",
+            poll.query
+        );
+    }
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 5) Live slow consumer: real WebSocket backpressure evicts the OLDEST
+//    frames with exact dropped_total accounting through the encoded
+//    frames (port 31146) — review round 1 / AC3
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_consumer_backpressure_evicts_oldest_with_exact_drop_accounting() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_146;
+    let db = "pulsus_tail_it_slow";
+    drop_db(db).await;
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TAIL_POLL_INTERVAL", "100ms"),
+            // Depth 1: any second undelivered frame evicts the oldest.
+            ("PULSUS_TAIL_CHANNEL_DEPTH", "1"),
+            // 100-row pages: the 2000-row backlog becomes ~20 frames.
+            ("PULSUS_TAIL_MAX_FETCH_LIMIT", "100"),
+            // A small sample cap so the bounded-sample contract is
+            // observable (each evicted frame alone exceeds it).
+            ("PULSUS_TAIL_MAX_ENTRIES_PER_FRAME", "25"),
+            // Longer than the deliberate non-reading window below — the
+            // writer must stay blocked, never disconnect.
+            ("PULSUS_TAIL_SEND_TIMEOUT", "60s"),
+        ],
+    );
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+
+    // A 2000-row backlog of ~8KB bodies (~16MB of frames) — far beyond
+    // loopback socket buffering, so a non-reading client genuinely
+    // backpressures the writer mid-send while the producer keeps paging.
+    const TOTAL_ROWS: u64 = 2_000;
+    let ts0 = now_ns() - 30_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) SELECT 'checkout', 1, {ts0} + toInt64(number) * 1000000, 0, \
+                 concat('bulk-', toString(number), '-', repeat('x', 8000)) \
+                 FROM numbers({TOTAL_ROWS})"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("bulk seed");
+
+    let start = ts0 - 1_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D&limit=100";
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+
+    // Do NOT read for a while: the producer walks the whole backlog into
+    // a depth-1 buffer against a blocked writer — evicting oldest frames.
+    std::thread::sleep(Duration::from_secs(4));
+
+    // Now drain everything and account exactly: every seeded row is
+    // either delivered in some frame or counted in a dropped_total.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut delivered: u64 = 0;
+    let mut dropped_total_sum: u64 = 0;
+    let mut saw_drop_report = false;
+    while delivered + dropped_total_sum < TOTAL_ROWS && Instant::now() < deadline {
+        let Some(text) = ws.next_text(deadline) else {
+            break;
+        };
+        let frame: serde_json::Value = serde_json::from_str(&text).expect("frame JSON");
+        let frame_dropped = frame["dropped_total"].as_u64().expect("dropped_total");
+        dropped_total_sum += frame_dropped;
+        let sample = frame["dropped_entries"].as_array().expect("array");
+        assert!(
+            sample.len() <= 25,
+            "dropped_entries sample must stay within the cap, got {}",
+            sample.len()
+        );
+        if frame_dropped > 0 {
+            saw_drop_report = true;
+            assert!(
+                !sample.is_empty(),
+                "a frame reporting drops carries a non-empty sample"
+            );
+        }
+        let mut frame_min_ts: Option<i64> = None;
+        for stream in frame["streams"].as_array().expect("streams") {
+            for value in stream["values"].as_array().expect("values") {
+                delivered += 1;
+                let ts: i64 = value[0].as_str().expect("ns").parse().expect("ns");
+                frame_min_ts = Some(frame_min_ts.map_or(ts, |m| m.min(ts)));
+            }
+        }
+        // OLDEST-eviction proof on the wire: the evicted rows a frame
+        // reports are strictly older pages than the frame that survived
+        // to carry the report (all seeded timestamps are distinct).
+        if let (true, Some(min_ts)) = (frame_dropped > 0, frame_min_ts) {
+            for d in sample {
+                let dropped_ts: i64 = d["timestamp"].as_str().expect("ns").parse().expect("ns");
+                assert!(
+                    dropped_ts < min_ts,
+                    "evicted rows must be OLDER than the surviving frame's rows \
+                     (dropped {dropped_ts} vs delivered min {min_ts})"
+                );
+            }
+        }
+    }
+    assert!(
+        saw_drop_report,
+        "a genuinely backpressured consumer must see a non-zero dropped_total \
+         (delivered={delivered}, dropped={dropped_total_sum})"
+    );
+    assert_eq!(
+        delivered + dropped_total_sum,
+        TOTAL_ROWS,
+        "exact accounting: every row is delivered exactly once or counted dropped"
+    );
+    assert!(
+        delivered < TOTAL_ROWS,
+        "some frames must actually have been evicted"
+    );
+    ws.close();
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 6) The /loki/api/v1/tail compat alias streams identically (port 31144)
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loki_tail_alias_streams_like_native() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_144;
+    let db = "pulsus_tail_it_alias";
+    drop_db(db).await;
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TAIL_POLL_INTERVAL", "200ms"),
+            ("PULSUS_COMPAT_ENDPOINTS", "true"),
+        ],
+    );
+    let client = data_client(db).await;
+    seed_stream(&client, db, 1, r#"{"service_name":"checkout"}"#, now_ns()).await;
+
+    let start = now_ns() - 60_000_000_000;
+    let query = "query=%7Bservice_name%3D%22checkout%22%7D";
+    let mut ws = WsClient::connect(port, &format!("/loki/api/v1/tail?{query}&start={start}"));
+    seed_samples(&client, db, &[(1, now_ns(), "via-alias")]).await;
+    let entries = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(20));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].2, "via-alias");
+    ws.close();
+    drop_db(db).await;
+}

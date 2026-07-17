@@ -85,6 +85,7 @@ mod tests {
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
             started_at: std::time::SystemTime::now(),
+            tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         };
         let router = writer_router().with_state(state);
         let request = Request::builder()

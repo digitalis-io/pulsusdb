@@ -10,7 +10,10 @@ name = "pulsusdb"
 path = "src/main.rs"
 
 [dependencies]
-axum.workspace = true
+# `ws` (issue #74): the `/api/logs/v1/tail` live-tail WebSocket
+# (`axum::extract::ws`) — a feature flag on the existing dependency, not a
+# new one.
+axum = { workspace = true, features = ["ws"] }
 bytes.workspace = true
 # RFC3339 timestamp parsing for `/api/logs/v1`'s `start`/`end`/`time` params
 # (issue #13 architect plan interfaces: "else RFC3339 (chrono) ⇒ ns"); no

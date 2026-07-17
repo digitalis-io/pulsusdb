@@ -121,16 +121,18 @@ Responses: `{"status":"success","data":[...]}` — `labels`/`label/{name}/values
 
 | Param | Notes |
 |-------|-------|
-| `query` | LogQL stream selector + optional line filters |
-| `limit` | cap on entries per frame |
+| `query` | LogQL log stream query (selector + pipeline, evaluated by the same engine as §2.1); metric queries are rejected `400` |
+| `limit` | cap on entries per frame (default 100; values above `PULSUS_TAIL_MAX_FETCH_LIMIT` are silently clamped) |
 | `start` | starting timestamp (ns), default now − 1h |
-| `delay_for` | seconds to delay to tolerate late arrivals |
+| `delay_for` | seconds to delay to tolerate late arrivals (default 0; values above `PULSUS_TAIL_MAX_DELAY` — 5s — are clamped) |
 
-Frames: `{"streams":[...],"dropped_entries":[{"labels":...,"timestamp":...}]}`. Slow consumers get entries dropped and reported, never unbounded buffering.
+Frames: `{"streams":[...],"dropped_entries":[{"labels":{...},"timestamp":"<ns>"}],"dropped_total":<n>}`. Slow consumers get the **oldest** undelivered frames evicted and reported, never unbounded buffering: `dropped_entries` is a bounded representative sample (at most `PULSUS_TAIL_MAX_ENTRIES_PER_FRAME` rows), and `dropped_total` — a PulsusDB **additive** field next to the reference frame shape; clients that don't know it ignore the extra key — carries the *exact* cumulative count dropped since the previous frame (`0` on a normal frame). Exceeding `PULSUS_TAIL_MAX_CONNECTIONS` concurrent tail connections rejects the next one `429 too_many_requests` before the upgrade.
+
+Delivery: tail polls ClickHouse (there is no push channel) with a deterministic composite keyset cursor — `(timestamp_ns, fingerprint, cityHash64(body))` plus an occurrence count — catching up over a backlog one `PULSUS_TAIL_CATCHUP_SLICE` window per query, so no single query scans unbounded history. Every row from `start` forward is delivered **exactly once**, including timestamp tie groups split across fetch pages and byte-identical duplicate lines inside a scanned window. Sole documented limitation: an entry arriving later than `delay_for` at an already-scanned position — at or below the cursor/watermark, e.g. a late byte-identical duplicate of an already-delivered same-nanosecond line — is genuinely late and is not delivered.
 
 ### 2.5 `GET /api/logs/v1/stats`
 
-`?query={selector}&start=<ns>&end=<ns>` → `{"streams":N,"chunks":N,"entries":N,"bytes":N}` (chunks reported as partition-part counts).
+`?query={selector}&start=<ns>&end=<ns>` → `{"streams":N,"chunks":N,"entries":N,"bytes":N}`. `query` accepts a stream selector plus optional line filters; anything else (parsers, formats, label filters, metric queries) is rejected `400`. `chunks` is a **partition-count proxy**: the selector-scoped distinct count of partition dates touched, not a physical MergeTree part count (per-part fidelity, if ever demanded, routes to the scale-validation milestone). Without a line filter the counters are served from the rollup with zero body reads (entries/bytes are 5s-bucket-granular at window edges, the same rollup-routing caveat as `count_over_time`); a line filter forces an exact `log_samples` scan. With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape) is added as a sibling key of the four counters.
 
 ### 2.6 Drilldown (M7)
 

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
-use pulsus_logql::{BinOp, Expr, Grouping, GroupingKind, RangeAggOp, VectorAggOp};
+use pulsus_logql::{BinOp, Expr, Grouping, GroupingKind, RangeAggOp, Stage, VectorAggOp};
 
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
@@ -20,8 +20,8 @@ use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
-    LabelNameRow, LabelValueRow, MetricBucketRow, MetricInstantRow, SampleRow, StreamMetaRow,
-    StreamRow,
+    LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow, SampleRow,
+    StreamMetaRow, StreamRow, TailSampleRow,
 };
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
@@ -963,6 +963,340 @@ impl LogQlEngine {
         explain.push("metric_read", metric_sql, Some(mp.routing.reason.clone()));
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #74 (M6-11): `/api/logs/v1/stats` + the live-tail keyset poll.
+// ---------------------------------------------------------------------
+
+/// The `/api/logs/v1/stats` aggregate (docs/api.md §2.5). `chunks` is the
+/// adjudicated selector-scoped **partition-count proxy**
+/// (`uniqExact` of the row's partition date), not a physical MergeTree
+/// part count — per-part fidelity, if ever demanded, routes to #25.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LogStats {
+    pub streams: u64,
+    pub chunks: u64,
+    pub entries: u64,
+    pub bytes: u64,
+}
+
+/// The occurrence-count keyset cursor (issue #74 plan v4 D2 + the round-4
+/// adjudication): `tuple` is the last fetched row's
+/// `(timestamp_ns, fingerprint, cityHash64(body))`; `seen` counts how
+/// many rows equal to `tuple` have already been delivered (the SQL
+/// `OFFSET` of the next page), resetting to 0 whenever the tuple
+/// changes. Split tie groups are re-fetched via the inclusive `>=`
+/// predicate and skipped server-side by `OFFSET seen` — every row of a
+/// tie group is delivered exactly once even when `LIMIT` splits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TailCursor {
+    /// `(timestamp_ns, fingerprint, cityHash64(body))`.
+    pub tuple: (i64, u64, u64),
+    /// Rows equal to `tuple` already delivered — the next page's `OFFSET`.
+    pub seen: u32,
+}
+
+/// One tail poll's lower bound (issue #74 plan v4 D1): the two predicate
+/// modes are distinct and never conflated — the first page carries the
+/// API `start` bound (`timestamp_ns > start_ns`, the repo stage-3
+/// convention); every later page carries the keyset term instead (the
+/// cursor dominates `start`).
+#[derive(Debug, Clone, Copy)]
+pub enum TailLower {
+    Start { start_ns: i64 },
+    After(TailCursor),
+}
+
+/// One tail poll's result. `next` is the advanced boundary cursor
+/// (unchanged when the page fetched no rows); `fetched` is the RAW
+/// fetched-row count — `fetched == fetch_limit` means the slice may hold
+/// more rows and the caller must re-poll from `next` before advancing
+/// its scan watermark (see `logs_api/tail.rs`'s producer loop).
+#[derive(Debug)]
+pub struct TailPage {
+    pub streams: Vec<StreamResult>,
+    pub next: Option<TailCursor>,
+    pub fetched: u32,
+}
+
+/// The per-connection tail setup (issue #74): the streams plan and the
+/// compiled pipeline, built ONCE before the WebSocket upgrade (a bad
+/// regex/template is a 400 rejection, never an upgraded-then-closed
+/// socket). Every poll reuses both — tail runs the identical stage-1/2/3
+/// plan machinery and the SAME `CompiledPipeline` as `query()`
+/// (semantics-drift-free; the task-manager-ratified invariant), only the
+/// fetch ordering/cursor differ.
+#[derive(Debug)]
+pub struct TailSetup {
+    pub plan: StreamsPlan,
+    pub compiled: CompiledPipeline,
+}
+
+impl LogQlEngine {
+    /// `/api/logs/v1/stats` (docs/api.md §2.5): stage-1 fingerprint
+    /// resolution, then ONE aggregation — rollup-routed (zero body
+    /// reads) when the query carries no line filter, a skip-index
+    /// `log_samples` scan otherwise. `expr` must be a log stream
+    /// selector with (at most) line-filter pipeline stages; anything
+    /// else is a 400-class rejection.
+    pub async fn stats(&self, expr: &Expr, b: TimeBounds) -> Result<LogStats, ReadError> {
+        self.stats_inner(expr, b, None).await
+    }
+
+    /// [`LogQlEngine::stats`] plus its `X-Pulsus-Explain` trace, in the
+    /// same single pass (no second scan) — the `query_explained`
+    /// contract.
+    pub async fn stats_explained(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+    ) -> Result<(LogStats, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("stats");
+        let stats = self.stats_inner(expr, b, Some(&mut explain)).await?;
+        Ok((stats, explain))
+    }
+
+    async fn stats_inner(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<LogStats, ReadError> {
+        let ctx = self.config.plan_ctx();
+        // `limit`/`direction`/`step` are unused placeholders — stats
+        // never reads samples through stage 3 (same idiom as `series`).
+        let qp = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: b.start_ns,
+                end_ns: b.end_ns,
+                step_ns: 1_000_000_000,
+            },
+            limit: 1,
+            direction: Direction::Forward,
+        };
+        let sp = match plan::plan(expr, &qp, &ctx)? {
+            Plan::Streams(sp) => sp,
+            Plan::Metric(_) | Plan::MetricBinary(_) => {
+                return Err(ReadError::PipelineInvalid {
+                    reason: "stats requires a log stream selector query (a metric query has no \
+                             stream statistics)"
+                        .to_string(),
+                });
+            }
+        };
+        // Only line filters have a pushdown aggregation shape; a parser/
+        // format/label-filter stage would silently over-count if ignored
+        // (defense in depth — the API layer rejects these before parsing
+        // reaches the engine).
+        if !sp
+            .pipeline
+            .iter()
+            .all(|s| matches!(s, Stage::LineFilter(_)))
+        {
+            return Err(ReadError::PipelineInvalid {
+                reason: "stats supports a stream selector plus line filters only".to_string(),
+            });
+        }
+
+        if let Some(e) = explain.as_mut() {
+            e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+        }
+        let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
+        if fingerprints.is_empty() {
+            return Ok(LogStats::default());
+        }
+
+        let window = super::sql::TimeWindow {
+            start_ns: b.start_ns,
+            end_ns: b.end_ns,
+        };
+        let (sql, routing) = if sp.line_filters.is_empty() {
+            (
+                super::sql::log_stats_rollup(&self.config.rollup_table, &fingerprints, window),
+                super::plan::RoutingDecision {
+                    chosen: super::plan::RouteChoice::Rollup,
+                    reason: "rollup: no line filter — stats served from the rollup with zero \
+                             body reads"
+                        .to_string(),
+                },
+            )
+        } else {
+            // The raw fallback needs the `service` PREWHERE re-injected
+            // to keep `log_samples`'s primary-key prefix engaged — the
+            // stage-3/metric-raw contract.
+            if let Some(e) = explain.as_mut() {
+                e.push(
+                    "stage2_hydration",
+                    super::sql::stage2(&sp.streams_table, &fingerprints),
+                    None,
+                );
+            }
+            let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
+            let services = distinct_escaped_services(&meta);
+            (
+                super::sql::log_stats_raw(
+                    &sp.samples_table,
+                    &services,
+                    &fingerprints,
+                    window,
+                    &sp.line_filters,
+                ),
+                super::plan::RoutingDecision {
+                    chosen: super::plan::RouteChoice::Raw,
+                    reason: format!(
+                        "raw: {} line filter(s) force a log_samples scan (the rollup is \
+                         body-content-blind)",
+                        sp.line_filters.len()
+                    ),
+                },
+            )
+        };
+        if let Some(e) = explain.as_mut() {
+            e.set_routing(routing.clone());
+            e.push("stats_read", sql.clone(), Some(routing.reason.clone()));
+        }
+
+        // An aggregation with no GROUP BY always returns exactly one row.
+        let mut result = LogStats::default();
+        let mut stream = self
+            .query_stream::<LogStatsRow>(&sql, &self.budget_settings())
+            .await
+            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            result = LogStats {
+                streams: row.streams,
+                chunks: row.chunks,
+                entries: row.entries,
+                bytes: row.bytes,
+            };
+        }
+        Ok(result)
+    }
+
+    /// Builds a tail connection's [`TailSetup`] — plan + compiled
+    /// pipeline — once, BEFORE the WebSocket upgrade. A metric
+    /// expression or an uncompilable pipeline is a 400-class rejection
+    /// here, never a wasted upgrade.
+    pub fn tail_setup(&self, expr: &Expr, params: &QueryParams) -> Result<TailSetup, ReadError> {
+        let ctx = self.config.plan_ctx();
+        match plan::plan(expr, params, &ctx)? {
+            Plan::Streams(sp) => {
+                let compiled = CompiledPipeline::compile(&sp.pipeline)?;
+                Ok(TailSetup { plan: sp, compiled })
+            }
+            Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
+                reason: "tail requires a log stream query (metric queries cannot be tailed)"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// One live-tail poll (issue #74): re-resolves fingerprints under
+    /// the stage-1 stream cap (new streams appear mid-tail), hydrates,
+    /// fetches one keyset page (`fetch_limit` is pre-clamped by the
+    /// caller — plan v3 D5), and runs the SAME `CompiledPipeline` the
+    /// query path runs. The cursor advances past every *fetched* row
+    /// (pipeline-dropped lines never re-fetch).
+    pub async fn tail_poll(
+        &self,
+        compiled: &CompiledPipeline,
+        sp: &StreamsPlan,
+        lower: TailLower,
+        upper_ns: i64,
+        fetch_limit: u32,
+    ) -> Result<TailPage, ReadError> {
+        let prev = match lower {
+            TailLower::After(c) => Some(c),
+            TailLower::Start { .. } => None,
+        };
+        let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
+        if fingerprints.is_empty() {
+            return Ok(TailPage {
+                streams: Vec::new(),
+                next: prev,
+                fetched: 0,
+            });
+        }
+        let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
+        let services = distinct_escaped_services(&meta);
+
+        let ks_lower = match lower {
+            TailLower::Start { start_ns } => super::sql::KeysetLower::Start { start_ns },
+            TailLower::After(c) => super::sql::KeysetLower::After {
+                tuple: c.tuple,
+                offset: c.seen,
+            },
+        };
+        let sql = super::sql::stage3_keyset(
+            &sp.samples_table,
+            &services,
+            &fingerprints,
+            ks_lower,
+            upper_ns,
+            &sp.line_filters,
+            fetch_limit,
+        );
+
+        let mut rows: Vec<TailSampleRow> = Vec::new();
+        {
+            // Scoped: the row stream holds its pooled connection until
+            // dropped (the `ChRowStream` lease rule).
+            let mut stream = self
+                .query_stream::<TailSampleRow>(&sql, &self.budget_settings())
+                .await
+                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            while let Some(row) = stream.next().await {
+                rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+            }
+        }
+        let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        let next = advance_tail_cursor(prev, &rows);
+
+        let sample_rows: Vec<SampleRow> = rows
+            .into_iter()
+            .map(|r| SampleRow {
+                fingerprint: r.fingerprint,
+                timestamp_ns: r.timestamp_ns,
+                body: r.body,
+            })
+            .collect();
+        let streams = run_pipeline_rows(sample_rows, compiled, &meta, fetch_limit);
+        Ok(TailPage {
+            streams,
+            next,
+            fetched,
+        })
+    }
+}
+
+/// The occurrence-count cursor update (round-4 adjudication #1): the new
+/// tuple is the LAST raw row's; `seen` counts this page's trailing run
+/// of rows equal to it, plus the previous `seen` when the tuple did not
+/// change (the `OFFSET` already skipped those). Equal-tuple rows are
+/// adjacent under the total `ORDER BY` (raw `body` tiebreaker), so the
+/// trailing-run count is deterministic even under hash collisions. An
+/// empty page leaves the cursor unchanged.
+fn advance_tail_cursor(prev: Option<TailCursor>, rows: &[TailSampleRow]) -> Option<TailCursor> {
+    let last = match rows.last() {
+        Some(last) => last,
+        None => return prev,
+    };
+    let bt = (last.timestamp_ns, last.fingerprint, last.body_hash);
+    let run = rows
+        .iter()
+        .rev()
+        .take_while(|r| (r.timestamp_ns, r.fingerprint, r.body_hash) == bt)
+        .count() as u32;
+    let carry = match prev {
+        Some(c) if c.tuple == bt => c.seen,
+        _ => 0,
+    };
+    Some(TailCursor {
+        tuple: bt,
+        seen: run.saturating_add(carry),
+    })
 }
 
 /// The `resultType` a binary metric plan produces: `scalar` for a
@@ -2604,6 +2938,186 @@ mod tests {
     fn a_timeout_is_never_reinterpreted_as_a_budget_error() {
         let e = ChError::Timeout("deadline".to_string());
         assert!(matches!(map_read_error(e, 1024), ReadError::Clickhouse(_)));
+    }
+
+    fn tail_row(ts: i64, fp: u64, hash: u64) -> TailSampleRow {
+        TailSampleRow {
+            fingerprint: fp,
+            timestamp_ns: ts,
+            body: format!("b{hash}"),
+            body_hash: hash,
+        }
+    }
+
+    /// Issue #74: an empty page never moves the boundary cursor (the
+    /// scan watermark, owned by the caller, advances instead — round-4
+    /// adjudication #2).
+    #[test]
+    fn advance_tail_cursor_keeps_the_previous_cursor_on_an_empty_page() {
+        let prev = Some(TailCursor {
+            tuple: (10, 1, 5),
+            seen: 2,
+        });
+        assert_eq!(advance_tail_cursor(prev, &[]), prev);
+        assert_eq!(advance_tail_cursor(None, &[]), None);
+    }
+
+    /// Issue #74 (round-4 adjudication #1): `seen` counts exactly the
+    /// trailing run of rows equal to the last row's tuple.
+    #[test]
+    fn advance_tail_cursor_counts_the_trailing_tie_run() {
+        let rows = [
+            tail_row(10, 1, 1),
+            tail_row(10, 2, 7),
+            tail_row(10, 2, 7),
+            tail_row(10, 2, 7),
+        ];
+        let next = advance_tail_cursor(None, &rows).expect("non-empty page");
+        assert_eq!(next.tuple, (10, 2, 7));
+        assert_eq!(next.seen, 3);
+    }
+
+    /// Issue #74: when a tie group is split across pages (`OFFSET` skipped
+    /// the prior page's rows), the unchanged tuple carries `seen` forward;
+    /// a changed tuple resets it.
+    #[test]
+    fn advance_tail_cursor_carries_seen_for_an_unchanged_tuple_and_resets_on_change() {
+        let prev = Some(TailCursor {
+            tuple: (10, 2, 7),
+            seen: 3,
+        });
+        // Page 2 of the same tie group: every row still equals the tuple.
+        let same = [tail_row(10, 2, 7), tail_row(10, 2, 7)];
+        let next = advance_tail_cursor(prev, &same).expect("non-empty page");
+        assert_eq!(next.tuple, (10, 2, 7));
+        assert_eq!(next.seen, 5, "3 already delivered + 2 new");
+
+        // The cursor tuple changed: the count restarts at the new run.
+        let moved = [tail_row(10, 2, 7), tail_row(11, 1, 4)];
+        let next = advance_tail_cursor(prev, &moved).expect("non-empty page");
+        assert_eq!(next.tuple, (11, 1, 4));
+        assert_eq!(next.seen, 1);
+    }
+
+    /// Issue #74 v4 AC2 collision seam (review round 1): two DISTINCT
+    /// bodies sharing one `body_hash` — a genuine CityHash collision is
+    /// impractical to construct, so the equal-hash pair is injected at
+    /// the comparator seam. The cursor treats them as one tuple run
+    /// (the SQL side keeps them adjacent and stably ordered via the raw
+    /// `body` tiebreaker), so the occurrence count paginates each
+    /// exactly once: a `LIMIT`-split collision pair carries `seen`
+    /// across pages instead of re-delivering or skipping the second
+    /// body.
+    #[test]
+    fn advance_tail_cursor_paginates_a_hash_collision_pair_exactly_once() {
+        // Page 1 fetched only the first colliding body (LIMIT split the
+        // pair mid-run).
+        let first = TailSampleRow {
+            fingerprint: 7,
+            timestamp_ns: 10,
+            body: "alpha".to_string(),
+            body_hash: 42,
+        };
+        let second = TailSampleRow {
+            fingerprint: 7,
+            timestamp_ns: 10,
+            body: "beta".to_string(),
+            body_hash: 42, // injected collision: distinct body, same hash
+        };
+        let c1 = advance_tail_cursor(None, std::slice::from_ref(&first)).expect("cursor");
+        assert_eq!(c1.tuple, (10, 7, 42));
+        assert_eq!(
+            c1.seen, 1,
+            "one occurrence of the colliding tuple delivered"
+        );
+
+        // Page 2 (SQL: `>= tuple OFFSET 1`) fetches exactly the second
+        // colliding body; the unchanged tuple carries the count forward.
+        let c2 = advance_tail_cursor(Some(c1), std::slice::from_ref(&second)).expect("cursor");
+        assert_eq!(c2.tuple, (10, 7, 42));
+        assert_eq!(
+            c2.seen, 2,
+            "both distinct bodies of the collision counted — the next OFFSET skips exactly both"
+        );
+
+        // Both bodies in ONE page: the trailing run spans the whole
+        // equal-hash group regardless of the differing bodies.
+        let both = [first, second];
+        let c = advance_tail_cursor(None, &both).expect("cursor");
+        assert_eq!(c.seen, 2);
+    }
+
+    /// Issue #74 AC1 (v1, still standing): a pipeline'd tail poll and the
+    /// query path evaluate lines through the SAME `CompiledPipeline`
+    /// compiled from the SAME `StreamsPlan` — identical per-line output
+    /// on identical rows (tail is the query path, not a parallel engine).
+    #[test]
+    fn tail_pipeline_output_is_identical_to_the_query_paths_on_the_same_rows() {
+        let expr = pulsus_logql::parse(r#"{app="x"} |= "keep" | logfmt | y="z""#).expect("parse");
+        let ctx = PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1,
+            max_streams: 100,
+            pipeline_scan_factor: 10,
+        };
+        let qp = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000,
+                step_ns: 1_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Forward,
+        };
+        let Ok(Plan::Streams(sp)) = plan::plan(&expr, &qp, &ctx) else {
+            panic!("stream selector must plan to Plan::Streams");
+        };
+        // The two compile sites (tail_setup and run_streams_inner) both
+        // compile `sp.pipeline` — prove the outputs coincide per line.
+        let tail_compiled = CompiledPipeline::compile(&sp.pipeline).expect("compile");
+        let query_compiled = CompiledPipeline::compile(&sp.pipeline).expect("compile");
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"app":"x","service_name":"checkout"}"#.to_string(),
+            },
+        );
+        // Rows model the post-SQL fetch: the `|= "keep"` prefix is pushed
+        // down into stage-3/keyset SQL on BOTH paths (never re-evaluated
+        // in-engine), so every synthetic row already contains it; the
+        // in-engine `logfmt | y="z"` label filter is what drops row 11.
+        let rows = || {
+            vec![
+                SampleRow {
+                    fingerprint: 1,
+                    timestamp_ns: 10,
+                    body: "keep y=z msg=a".to_string(),
+                },
+                SampleRow {
+                    fingerprint: 1,
+                    timestamp_ns: 11,
+                    body: "keep y=other".to_string(),
+                },
+            ]
+        };
+        let mut tail_out = run_pipeline_rows(rows(), &tail_compiled, &meta, 100);
+        let mut query_out = run_pipeline_rows(rows(), &query_compiled, &meta, 100);
+        tail_out.sort_by(|a, b| a.labels_json.cmp(&b.labels_json));
+        query_out.sort_by(|a, b| a.labels_json.cmp(&b.labels_json));
+        assert_eq!(tail_out, query_out);
+        // And the pipeline genuinely evaluated: only the `y="z"` +
+        // `|= "keep"` survivor remains.
+        let entries: Vec<_> = tail_out.iter().flat_map(|s| s.entries.clone()).collect();
+        assert_eq!(entries, vec![(10, "keep y=z msg=a".to_string())]);
     }
 
     #[test]

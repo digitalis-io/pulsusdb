@@ -85,6 +85,28 @@ pub enum Surface {
     /// `/api/logs/v1/*` and its `/loki/api/v1/*` alias — LogQL JSON query
     /// envelope (`{"status","errorType","error","position"?}`).
     LogsQuery,
+    /// `GET /api/logs/v1/tail` and its `/loki/api/v1/tail` alias (issue
+    /// #74) — a WebSocket route. The generic matrix cannot drive it (a
+    /// full upgrade handshake never fits `Connection: close` HTTP), so
+    /// it is special-cased at the dispatch site (`assert_tail_route`)
+    /// exactly as `Surface::Ingest`/`TracesFetch` are. Mounting oracle,
+    /// empirically pinned by
+    /// `logs_api/tail.rs::bare_get_without_upgrade_headers_is_the_pinned_rejection_status`:
+    /// a bare GET (no upgrade headers) returns axum's `400` plain-text
+    /// `WebSocketUpgrade` rejection ("Connection header did not include
+    /// 'upgrade'") — an unmounted path returns the EMPTY 404 instead.
+    /// `success_status` carries that pinned 400. Param/shape errors are
+    /// the LogsQuery JSON envelope, asserted with real upgrade headers
+    /// in `assert_tail_route`; slot exhaustion is `429
+    /// too_many_requests` (its own dedicated spawn).
+    LogsTail,
+    /// `GET /api/logs/v1/stats` and its `/loki/api/v1/index/stats` alias
+    /// (issue #74, docs/api.md §2.5) — success is the bare
+    /// `{"streams","chunks","entries","bytes"}` object (no status/data
+    /// envelope); against this suite's empty databases every field is 0
+    /// — the mounting oracle. Errors are the LogsQuery JSON envelope
+    /// (`position` present exactly on LogQL parse errors).
+    LogsStats,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`).
     PromApi,
@@ -375,6 +397,61 @@ const LOGS_LABELS_CASES: &[CaseClass] = &[CaseClass {
         has_position: false,
     },
 }];
+
+// -- logs stats (issue #74, docs/api.md §2.5) ---------------------------
+
+fn logs_stats_metric_query(req: &mut Req) {
+    // A metric query has no stream statistics — explicit 400.
+    req.query = format!(
+        "query={}",
+        enc(r#"count_over_time({service_name="checkout"}[1h])"#)
+    );
+}
+
+fn logs_stats_parser_pipeline(req: &mut Req) {
+    // Parsers/formats/label filters have no pushdown aggregation shape —
+    // explicit 400, never a silent over-count.
+    req.query = format!("query={}", enc(r#"{service_name="checkout"} | logfmt"#));
+}
+
+const LOGS_STATS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_query",
+        build: logs_missing_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "metric_query_rejected",
+        build: logs_stats_metric_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "parser_pipeline_rejected",
+        build: logs_stats_parser_pipeline,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
 
 const LOGS_SERIES_CASES: &[CaseClass] = &[
     CaseClass {
@@ -1140,6 +1217,34 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "match%5B%5D=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_SERIES_CASES,
     },
+    // -- Logs tail + stats, native (ReaderMode, issue #74) ----------------
+    // Tail's `success_status` is the empirically-pinned 400 a bare GET
+    // (no upgrade headers) receives from axum's `WebSocketUpgrade`
+    // extractor — the mounting oracle (`Surface::LogsTail`'s doc
+    // comment); the real handshake/error matrix lives in
+    // `assert_tail_route` + `logs_tail_live.rs`.
+    RouteSpec {
+        path: "/api/logs/v1/tail",
+        methods: &[Method::Get],
+        surface: Surface::LogsTail,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 400,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/api/logs/v1/stats",
+        methods: &[Method::Get],
+        surface: Surface::LogsStats,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_STATS_CASES,
+    },
     // -- Logs query, `/loki/api/v1` compat alias (CompatAndReader) -------
     RouteSpec {
         path: "/loki/api/v1/query_range",
@@ -1204,6 +1309,33 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "match%5B%5D=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_SERIES_CASES,
+    },
+    // -- Logs tail + stats, M6 compat aliases (CompatAndReader, #74) -----
+    // `DocRef::Verbatim`, not `LokiAliasSuffix`: the §8.1 M6 row spells
+    // both alias paths out in full (and `LokiAliasSuffix` is scoped to
+    // the M1 row's line). Note the stats alias is `/index/stats` — NOT a
+    // prefix swap of the native `/stats`.
+    RouteSpec {
+        path: "/loki/api/v1/tail",
+        methods: &[Method::Get],
+        surface: Surface::LogsTail,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 400,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: &[],
+    },
+    RouteSpec {
+        path: "/loki/api/v1/index/stats",
+        methods: &[Method::Get],
+        surface: Surface::LogsStats,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_STATS_CASES,
     },
     // -- Prom API (ReaderMode, no compat aliases) ------------------------
     RouteSpec {
@@ -1621,28 +1753,6 @@ static MANIFEST: &[RouteSpec] = &[
         cases: &[],
     },
     RouteSpec {
-        path: "/api/logs/v1/tail",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M6" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
-        path: "/api/logs/v1/stats",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M6" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
         path: "/api/logs/v1/volume",
         methods: &[Method::Get],
         surface: Surface::LogsQuery,
@@ -1795,15 +1905,19 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "reader_router",
         body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
     },
+    // Re-pinned for issue #74 (M6-11): tail + stats mount explicitly on
+    // both surfaces (the stats alias suffix `/index/stats` is not a
+    // prefix swap, so neither route goes through
+    // `mount_log_query_routes`).
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "router",
-        body: "mount_log_query_routes(Router::new(), \"/api/logs/v1\")",
+        body: "mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats))",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "compat_router",
-        body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\")",
+        body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats))",
     },
 ];
 

@@ -52,6 +52,28 @@ pub(crate) enum ParamError {
     UnsupportedContentType(String),
     #[error("request body is not valid UTF-8")]
     InvalidFormBody,
+    /// Issue #74: `/tail` and `/stats` take log stream queries only — a
+    /// metric expression has no tail frames / stream statistics.
+    #[error(
+        "'query' must be a log stream selector query: {endpoint} does not support metric queries"
+    )]
+    MetricQueryUnsupported { endpoint: &'static str },
+    /// Issue #74: `/stats` aggregates via pushdown only — parsers/
+    /// formats/label filters have no pushdown aggregation shape, so they
+    /// are rejected rather than silently over-counting.
+    #[error("'query' supports a stream selector plus line filters only on the stats endpoint")]
+    StatsPipelineUnsupported,
+    /// Issue #74: the tail `limit` (entries per frame) — unlike the
+    /// query endpoints' capped `limit`, values above
+    /// `reader.tail_max_fetch_limit` are silently clamped, but zero or
+    /// non-numeric input is still a 400.
+    #[error("invalid 'limit' {0:?}: expected a positive integer")]
+    InvalidTailLimit(String),
+    /// Issue #74: `delay_for` (seconds tolerated for late arrivals) —
+    /// values above `reader.tail_max_delay` are clamped, but non-numeric
+    /// input is a 400.
+    #[error("invalid 'delay_for' {0:?}: expected a non-negative integer number of seconds")]
+    InvalidDelayFor(String),
 }
 
 /// Nanoseconds since the Unix epoch, right now. Matches the rest of the
