@@ -18,6 +18,18 @@ pub struct SeriesRow {
     pub labels: String,
 }
 
+/// Issue #96's degraded-cache discovery probe result row: the single
+/// `metric_name` column of the bounded `SELECT DISTINCT metric_name`
+/// probe ([`super::sql::distinct_metric_names_probe`]). Deliberately not
+/// [`SeriesRow`] (which also carries `fingerprint`/`labels`, columns the
+/// probe never selects — reusing the 3-field row here would be a
+/// column-count mismatch against the 1-column result set), mirroring the
+/// `HydratedLabelsRow` precedent in [`super::exec`].
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricNameRow {
+    pub metric_name: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,6 +40,15 @@ mod tests {
             fingerprint: 1,
             metric_name: "up".to_string(),
             labels: "{}".to_string(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn metric_name_row_derives_are_usable() {
+        let a = MetricNameRow {
+            metric_name: "up".to_string(),
         };
         let b = a.clone();
         assert_eq!(a, b);

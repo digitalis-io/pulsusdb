@@ -1155,6 +1155,69 @@ async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprin
     );
 }
 
+/// Issue #96 (degraded-cache discovery fallback) — the probe-derived
+/// **fetch** gate: `discovery_fetch_by_names` (`metric_name IN (…)` + the
+/// `unix_milli` window, label matchers in SQL, NO `fingerprint IN`) must
+/// engage the leading `metric_name` component of the `(metric_name,
+/// fingerprint, unix_milli)` primary key on `metric_series` in the live
+/// plan — the same Tier-1 evidence class as #89's `discovery_fetch_multi`
+/// gate above, minus the fingerprint component (the degraded route resolves
+/// NAMES only; the label matchers narrow within each pruned metric). This
+/// is what keeps the degraded fallback's dominant-cost stage PK-pruned, not
+/// a name-less full scan. The PROBE itself is deliberately NOT gated here
+/// (a regex `metric_name` predicate can't range-prune the leading PK
+/// column — its bound, not index engagement, is the perf gate; see
+/// `live_discovery_fallback.rs`).
+#[tokio::test]
+async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_component() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_discovery_by_names";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_series(&client, db, now_ms).await;
+
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let table = format!("{db}.metric_series");
+    // The exact fetch a degraded-cache name-matcher discovery filter's
+    // probe produces (`MetricsEngine::discovery_series` wave 2): the probed
+    // names IN-set, with a label matcher applied in SQL. `bucket_ms = 1`
+    // floors to the exact bounds so the seeded rows stay in-window.
+    let sql = pulsus_read::metrics::sql::discovery_fetch_by_names(
+        &table,
+        &["sv".to_string(), "sv2".to_string()],
+        &[pulsus_read::metrics::LabelMatcher {
+            key: "job".to_string(),
+            op: pulsus_read::metrics::MatchOp::Eq,
+            value: "api".to_string(),
+        }],
+        window,
+        1,
+    );
+
+    let usage = explain(&client, &sql).await;
+    assert_eq!(
+        usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in #-element set)))",
+        ]),
+        "the metric_name IN component must engage the metric_series primary key"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Issue M6-10 (AC3, the launch's named rollup-vs-raw gate): an un-piped
 // `count_over_time` stays rollup-served (`log_metrics_<res>`); an

@@ -633,14 +633,49 @@ impl MetricsEngine {
         };
         // Resolve pre-pass (synchronous, in-process cache reads only) —
         // a filter whose name matchers can be answered statically
-        // contributes no query at all.
-        let mut sqls: Vec<String> = Vec::with_capacity(effective.len());
+        // contributes no query at all. A regex/negated-`__name__` filter
+        // against a degraded/cold cache yields a [`DiscoveryQuery::Probe`]
+        // (issue #96) rather than a named error.
+        let mut fetch_sqls: Vec<String> = Vec::with_capacity(effective.len());
+        let mut probe_specs: Vec<ProbeSpec> = Vec::new();
         for filter in &effective {
-            if let Some(sql) = self.discovery_sql_for(filter, window, bucket_ms)? {
-                sqls.push(sql);
+            match self.discovery_query_for(filter, window, bucket_ms)? {
+                Some(DiscoveryQuery::Sql(sql)) => fetch_sqls.push(sql),
+                Some(DiscoveryQuery::Probe {
+                    name_matchers,
+                    matchers,
+                }) => probe_specs.push(ProbeSpec {
+                    name_matchers,
+                    matchers,
+                }),
+                None => {}
             }
         }
-        let fetches = sqls
+        // Wave 1 (issue #96): run every degraded-cache name probe
+        // concurrently; each non-empty probe result feeds the SAME flat
+        // `metric_name IN (…)` fetch shape (with label matchers in SQL),
+        // appended to the fetch set below. Scoped so no probe's pooled
+        // connection lease survives into wave 2.
+        if !probe_specs.is_empty() {
+            let probe_futs = probe_specs
+                .iter()
+                .map(|spec| self.probe_distinct_names(&spec.name_matchers, window, bucket_ms));
+            let probe_results: Vec<Result<Vec<String>, ReadError>> = join_all(probe_futs).await;
+            for (names, spec) in probe_results.into_iter().zip(&probe_specs) {
+                let names = names?;
+                if !names.is_empty() {
+                    fetch_sqls.push(super::sql::discovery_fetch_by_names(
+                        &self.config.series_table,
+                        &names,
+                        &spec.matchers,
+                        window,
+                        bucket_ms,
+                    ));
+                }
+            }
+        }
+        // Wave 2: fetch every (direct + probe-derived) query concurrently.
+        let fetches = fetch_sqls
             .into_iter()
             .map(|sql| self.fetch_rows::<super::rows::SeriesRow>(sql));
         let results: Vec<Result<Vec<super::rows::SeriesRow>, ReadError>> = join_all(fetches).await;
@@ -680,19 +715,25 @@ impl MetricsEngine {
     ///   and deliberately NOT routed through the fan-out cap —
     ///   `{job="api"}` must not fail on a deployment with many metric
     ///   names, and its SQL already prunes without a resolved name set.
-    fn discovery_sql_for(
+    fn discovery_query_for(
         &self,
         filter: &DiscoveryFilter,
         window: DataWindow,
         bucket_ms: i64,
-    ) -> Result<Option<String>, ReadError> {
-        let discovery_query =
-            || super::sql::discovery_query(&self.config.series_table, filter, window, bucket_ms);
+    ) -> Result<Option<DiscoveryQuery>, ReadError> {
+        let discovery_query = || {
+            DiscoveryQuery::Sql(super::sql::discovery_query(
+                &self.config.series_table,
+                filter,
+                window,
+                bucket_ms,
+            ))
+        };
         let Some(name) = filter.metric_name.as_deref() else {
             if filter.name_matchers.is_empty() {
                 return Ok(Some(discovery_query()));
             }
-            return self.discovery_multi_sql(filter, window, bucket_ms);
+            return self.discovery_multi_query(filter, window, bucket_ms);
         };
         match super::labels::concrete_name_matches(&filter.name_matchers, name) {
             Ok(true) => Ok(Some(discovery_query())),
@@ -703,15 +744,22 @@ impl MetricsEngine {
         }
     }
 
-    /// The name-matcher discovery route: cache resolution (capped) ->
-    /// one flat `metric_name IN (…) AND fingerprint IN (…)` fetch. Error
-    /// mapping mirrors [`Self::plan_multi_metric_fetch`] exactly.
-    fn discovery_multi_sql(
+    /// The name-matcher discovery route (issue #89 warm path + issue #96
+    /// degraded fallback): cache resolution (capped) -> one flat
+    /// `metric_name IN (…) AND fingerprint IN (…)` fetch when the cache is
+    /// authoritative; a degraded/cold cache ([`MultiMetricResolution::
+    /// Unresolvable`]) instead yields a [`DiscoveryQuery::Probe`] (issue
+    /// #96) — a bounded `SELECT DISTINCT metric_name` probe over
+    /// `metric_series` whose sorted names feed the SAME flat fetch shape
+    /// with label matchers in SQL. The cap-breach error mapping stays
+    /// identical to [`Self::plan_multi_metric_fetch`] (the query path keeps
+    /// its degraded `422`; only discovery falls back).
+    fn discovery_multi_query(
         &self,
         filter: &DiscoveryFilter,
         window: DataWindow,
         bucket_ms: i64,
-    ) -> Result<Option<String>, ReadError> {
+    ) -> Result<Option<DiscoveryQuery>, ReadError> {
         let resolution = self.resolver.resolve_multi_metric(
             &filter.name_matchers,
             &filter.matchers,
@@ -720,10 +768,17 @@ impl MetricsEngine {
         );
         let groups: Vec<MetricSeriesGroup> = match resolution {
             MultiMetricResolution::Groups(groups) => groups,
-            MultiMetricResolution::Unresolvable { reason } => {
-                return Err(ReadError::NamelessSelectorUnresolvable {
-                    reason: format!("{reason:?}"),
-                });
+            MultiMetricResolution::Unresolvable { .. } => {
+                // Issue #96: a degraded/cold cache (cold / stale / out-of-
+                // window / regex-cache-full) no longer surfaces a named
+                // `422` on the discovery path — it defers to a bounded SQL
+                // probe over `metric_series`. Only the NAME matchers go to
+                // the probe (names-only superset cap, adjudicated); the
+                // label matchers apply in the downstream fetch.
+                return Ok(Some(DiscoveryQuery::Probe {
+                    name_matchers: filter.name_matchers.clone(),
+                    matchers: filter.matchers.clone(),
+                }));
             }
             MultiMetricResolution::FanoutExceeded { matched, cap } => {
                 return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
@@ -745,13 +800,59 @@ impl MetricsEngine {
             .collect();
         fps.sort_unstable();
         fps.dedup();
-        Ok(Some(super::sql::discovery_fetch_multi(
+        Ok(Some(DiscoveryQuery::Sql(
+            super::sql::discovery_fetch_multi(
+                &self.config.series_table,
+                &names,
+                &fps,
+                window,
+                bucket_ms,
+            ),
+        )))
+    }
+
+    /// Issue #96's degraded-cache discovery probe: resolves the candidate
+    /// metric-name set for a regex/negated-`__name__` selector when the
+    /// label cache cannot ([`MultiMetricResolution::Unresolvable`]). Runs
+    /// the bounded [`super::sql::distinct_metric_names_probe`] (`SELECT
+    /// DISTINCT metric_name … LIMIT cap+1`), then enforces the fan-out
+    /// **bound** on the RETURNED rows: more than `cap` distinct names is
+    /// [`TooBroadReason::MetricFanout`] (a names-only superset cap — the
+    /// name regex is what bounds the scan; label matchers apply later in
+    /// the fetch). Never an unbounded `IN` set. Returns sorted, deduped
+    /// names; an empty set means no fetch at all. The probe is NOT
+    /// EXPLAIN-index-gated (a regex `metric_name` predicate can't
+    /// range-prune the leading primary-key column); its bound is the gate,
+    /// its scan rows are recorded (issue #25 for scale wall-time).
+    async fn probe_distinct_names(
+        &self,
+        name_matchers: &[super::matcher::LabelMatcher],
+        window: DataWindow,
+        bucket_ms: i64,
+    ) -> Result<Vec<String>, ReadError> {
+        let cap = self.config.max_metric_fanout;
+        let sql = super::sql::distinct_metric_names_probe(
             &self.config.series_table,
-            &names,
-            &fps,
+            name_matchers,
             window,
             bucket_ms,
-        )))
+            cap,
+        );
+        let rows: Vec<super::rows::MetricNameRow> = self.fetch_rows(sql).await?;
+        // `LIMIT cap+1` caps the returned rows: seeing more than `cap`
+        // means the name predicate matched more distinct names than the
+        // fan-out ceiling. `matched` is a lower bound (the probe stopped at
+        // cap+1), mirroring the warm path's `FanoutExceeded` reporting.
+        if rows.len() as u64 > cap {
+            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
+                matched: rows.len(),
+                cap,
+            }));
+        }
+        let mut names: Vec<String> = rows.into_iter().map(|r| r.metric_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        Ok(names)
     }
 
     /// `GET|POST /api/v1/labels` (issue #32): the union of label keys over
@@ -864,6 +965,33 @@ impl MetricsEngine {
             series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
         })
     }
+}
+
+/// One discovery filter's resolved plan (issue #89 + #96): either a ready
+/// `metric_series` fetch SQL, or — for a regex/negated-`__name__` filter
+/// against a degraded/cold cache — a deferred [`Self::Probe`] step whose
+/// bounded `SELECT DISTINCT metric_name` probe resolves the candidate name
+/// set before the fetch is built. Keeps `discovery_query_for` synchronous
+/// (in-process cache reads only); the async probe runs in
+/// `discovery_series`'s wave 1.
+enum DiscoveryQuery {
+    /// A ready-to-run `metric_series` fetch SQL (concrete-name, matcher-
+    /// only, or the warm name-matcher [`super::sql::discovery_fetch_multi`]
+    /// path).
+    Sql(String),
+    /// Issue #96: the degraded-cache name-matcher route — the name matchers
+    /// bound a probe; the label matchers apply in the probe-derived fetch.
+    Probe {
+        name_matchers: Vec<super::matcher::LabelMatcher>,
+        matchers: Vec<super::matcher::LabelMatcher>,
+    },
+}
+
+/// A pending [`DiscoveryQuery::Probe`] carried from `discovery_series`'s
+/// synchronous pre-pass into its concurrent wave-1 probe execution.
+struct ProbeSpec {
+    name_matchers: Vec<super::matcher::LabelMatcher>,
+    matchers: Vec<super::matcher::LabelMatcher>,
 }
 
 /// A selector's fully pre-built fetch plan — built once, synchronously, in

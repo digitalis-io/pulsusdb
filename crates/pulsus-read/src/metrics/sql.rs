@@ -223,6 +223,100 @@ pub fn discovery_fetch_multi(
     )
 }
 
+/// Renders one `__name__` matcher as a predicate against the
+/// **`metric_name` column** (issue #96's degraded-cache discovery probe) —
+/// the leading primary-key column of `metric_series`, NOT
+/// `JSONExtractString(labels, …)` (`__name__` is never a stored label,
+/// docs/schemas.md §2.1). Only ever fed the non-`Eq` name matchers a
+/// regex/negated-`__name__` selector carries (`Neq`/`Re`/`Nre`); the `Eq`
+/// arm is the concrete-name route, which never reaches this builder — kept
+/// total (rendered identically to `metric_name = '<v>'`) rather than
+/// panicking on an unreachable input. Reuses the same [`ch_string`]/
+/// [`ch_regex_anchored`] injection primitives and `^(?:…)$` anchoring as
+/// [`matcher_predicate`], so a regex here carries the accepted RE2-vs-Rust
+/// differential this module's header already documents.
+fn metric_name_predicate(m: &LabelMatcher) -> String {
+    match m.op {
+        MatchOp::Eq => format!("metric_name = {}", ch_string(&m.value)),
+        MatchOp::Neq => format!("metric_name != {}", ch_string(&m.value)),
+        MatchOp::Re => format!("match(metric_name, {})", ch_regex_anchored(&m.value)),
+        MatchOp::Nre => format!("NOT match(metric_name, {})", ch_regex_anchored(&m.value)),
+    }
+}
+
+/// Issue #96's degraded-cache discovery **probe**: the bounded
+/// `SELECT DISTINCT metric_name` over `metric_series` that resolves the
+/// candidate metric-name set when the resident label cache cannot (cold /
+/// stale / out-of-window / regex-cache-full — [`MultiMetricResolution::
+/// Unresolvable`](super::labels::MultiMetricResolution::Unresolvable)).
+/// Only the selector's **name matchers** are pushed (as `metric_name`
+/// predicates); the ordinary label matchers apply later, in the
+/// [`discovery_fetch_by_names`] fetch — a deliberately cheap names-only
+/// probe with a fail-safe superset cap (the #96 adjudication).
+///
+/// `LIMIT {fanout_cap + 1}` bounds the **returned** row count: the caller
+/// aborts to `QueryTooBroad(MetricFanout)` when it sees more than
+/// `fanout_cap` rows, never an unbounded `IN` set. The `+1` is computed
+/// with [`u64::saturating_add`] so a `fanout_cap` at `u64::MAX` (config
+/// only rejects zero) cannot overflow the limit. **NOT** EXPLAIN-index-
+/// gated: a regex/negated `metric_name` predicate cannot range-prune the
+/// leading primary-key column, so its bound (returned-rows) is the gate;
+/// its scan rows are recorded, not asserted (scale routes to issue #25).
+pub fn distinct_metric_names_probe(
+    series_table: &str,
+    name_matchers: &[LabelMatcher],
+    window: DataWindow,
+    bucket_ms: i64,
+    fanout_cap: u64,
+) -> String {
+    let lower = floored_bound(window.start_ms, bucket_ms);
+    let upper = floored_bound(window.end_ms, bucket_ms);
+    let limit = fanout_cap.saturating_add(1);
+    let mut sql = format!(
+        "SELECT DISTINCT metric_name\nFROM {series_table}\nWHERE unix_milli >= {lower} AND unix_milli <= {upper}"
+    );
+    for m in name_matchers {
+        sql.push_str("\n  AND ");
+        sql.push_str(&metric_name_predicate(m));
+    }
+    sql.push_str(&format!("\nORDER BY metric_name\nLIMIT {limit}"));
+    sql
+}
+
+/// Issue #96's degraded-cache discovery **fetch**: the names-only analog of
+/// [`discovery_fetch_multi`] — one flat `metric_name IN (<probed names>)`
+/// query (the leading primary-key component of `metric_series ORDER BY
+/// (metric_name, fingerprint, unix_milli)`, EXPLAIN-gated in
+/// `explain_indexes.rs`) with the ordinary **label matchers** applied in
+/// SQL and the request window re-applied (bucket-floored), so the below-cap
+/// result set is byte-identical to the warm [`discovery_fetch_multi`] path.
+/// `metric_names` is the probe's sorted, deduped, non-empty output (caller
+/// guarantees non-empty — an empty probe result skips the fetch entirely).
+/// No `fingerprint IN (…)` component: the probe resolves names only, so the
+/// label matchers here — not a resolved fingerprint set — narrow within
+/// each primary-key-pruned metric.
+pub fn discovery_fetch_by_names(
+    series_table: &str,
+    metric_names: &[String],
+    matchers: &[LabelMatcher],
+    window: DataWindow,
+    bucket_ms: i64,
+) -> String {
+    let lower = floored_bound(window.start_ms, bucket_ms);
+    let upper = floored_bound(window.end_ms, bucket_ms);
+    let name_list = metric_names
+        .iter()
+        .map(|n| ch_string(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut sql = format!(
+        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND unix_milli >= {lower} AND unix_milli <= {upper}"
+    );
+    append_matchers(&mut sql, matchers);
+    sql.push_str("\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint");
+    sql
+}
+
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
 /// `ReplacingMergeTree(updated_ns)` (docs/schemas.md §2.1) whose merges are
 /// asynchronous, so a plain `SELECT` can observe more than one row per
@@ -564,6 +658,152 @@ mod tests {
             "metric_series",
             &[payload.to_string()],
             &[1],
+            window(),
+            3_600_000,
+        );
+        assert!(sql.contains(&format!("metric_name IN ({})", ch_string(payload))));
+        assert_no_unescaped_quote(&ch_string(payload));
+    }
+
+    // --- distinct_metric_names_probe / discovery_fetch_by_names (issue #96) ---
+
+    fn name_re(value: &str) -> LabelMatcher {
+        LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Re,
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn distinct_metric_names_probe_renders_the_capped_name_predicate_shape() {
+        let sql = distinct_metric_names_probe(
+            "metric_series",
+            &[name_re("up.*")],
+            window(),
+            3_600_000,
+            2,
+        );
+        assert_eq!(
+            sql,
+            "SELECT DISTINCT metric_name\n\
+             FROM metric_series\n\
+             WHERE unix_milli >= 0 AND unix_milli <= 3600000\n\
+             \x20 AND match(metric_name, '^(?:up.*)$')\n\
+             ORDER BY metric_name\n\
+             LIMIT 3"
+        );
+    }
+
+    #[test]
+    fn distinct_metric_names_probe_renders_neq_and_nre_against_the_metric_name_column() {
+        let neq = LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Neq,
+            value: "up".to_string(),
+        };
+        let nre = LabelMatcher {
+            key: "__name__".to_string(),
+            op: MatchOp::Nre,
+            value: "down.*".to_string(),
+        };
+        let sql = distinct_metric_names_probe("metric_series", &[neq, nre], window(), 3_600_000, 5);
+        assert!(sql.contains("AND metric_name != 'up'"));
+        assert!(sql.contains("AND NOT match(metric_name, '^(?:down.*)$')"));
+        assert!(!sql.contains("JSONExtractString"));
+    }
+
+    /// The limit is `cap + 1` (one extra row detects "more than cap distinct
+    /// names matched" without an unbounded set).
+    #[test]
+    fn distinct_metric_names_probe_limits_to_cap_plus_one() {
+        let sql = distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, 999);
+        assert!(sql.ends_with("LIMIT 1000"), "got: {sql}");
+    }
+
+    /// Boundary value (plan-review finding / adjudication): at the maximum
+    /// accepted `promql_max_metric_fanout` (`u64::MAX`) the `cap + 1` limit
+    /// must NOT overflow or panic — `saturating_add(1)` clamps to `u64::MAX`.
+    #[test]
+    fn distinct_metric_names_probe_does_not_overflow_at_max_fanout() {
+        let sql =
+            distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, u64::MAX);
+        assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
+    }
+
+    #[test]
+    fn distinct_metric_names_probe_floors_both_window_bounds_to_the_bucket() {
+        let sql = distinct_metric_names_probe(
+            "metric_series",
+            &[name_re("x")],
+            DataWindow {
+                start_ms: 3_600_001,
+                end_ms: 7_300_000,
+            },
+            3_600_000,
+            10,
+        );
+        assert!(sql.contains("unix_milli >= 3600000 AND unix_milli <= 7200000"));
+    }
+
+    #[test]
+    fn distinct_metric_names_probe_name_injection_stays_inside_one_anchored_literal() {
+        let payload = r#"up'; DROP TABLE metric_series; --"#;
+        let sql = distinct_metric_names_probe(
+            "metric_series",
+            &[name_re(payload)],
+            window(),
+            3_600_000,
+            2,
+        );
+        let expected = ch_regex_anchored(payload);
+        assert_no_unescaped_quote(&expected);
+        assert!(sql.contains(&format!("match(metric_name, {expected})")));
+    }
+
+    #[test]
+    fn discovery_fetch_by_names_renders_the_flat_name_in_with_label_matchers() {
+        let sql = discovery_fetch_by_names(
+            "metric_series",
+            &["up".to_string(), "up_alias".to_string()],
+            &[eq("job", "api")],
+            window(),
+            3_600_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, metric_name, labels\n\
+             FROM metric_series\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             \x20 AND JSONExtractString(labels, 'job') = 'api'\n\
+             ORDER BY unix_milli DESC\n\
+             LIMIT 1 BY metric_name, fingerprint"
+        );
+    }
+
+    #[test]
+    fn discovery_fetch_by_names_has_no_fingerprint_in_component() {
+        let sql = discovery_fetch_by_names(
+            "metric_series",
+            &["up".to_string()],
+            &[],
+            window(),
+            3_600_000,
+        );
+        assert!(!sql.contains("fingerprint IN"));
+        assert!(sql.contains("metric_name IN ('up')"));
+        assert!(sql.contains("AND unix_milli >= "));
+        assert!(sql.ends_with("ORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"));
+    }
+
+    #[test]
+    fn discovery_fetch_by_names_metric_name_injection_stays_inside_one_literal() {
+        let payload = "up'; DROP TABLE metric_series; --";
+        let sql = discovery_fetch_by_names(
+            "metric_series",
+            &[payload.to_string()],
+            &[],
             window(),
             3_600_000,
         );

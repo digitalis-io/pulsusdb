@@ -520,13 +520,16 @@ fn prom_series_missing_match(req: &mut Req) {
 /// for why the LogQL `query_too_broad` analog is not live-tested here).
 ///
 /// Retargeted from `match[]={__name__=~"up.*"}` by issue #89: regex/
-/// negated `__name__` discovery is now supported, and its runtime outcome
-/// is label-cache-state-dependent (warm -> 200, degraded -> named 422),
-/// which is not a hermetically assertable conformance pin — that behavior
-/// is covered by the seeded `prom_api_live.rs` cases instead. `sum(up)`
-/// keeps this case-class deterministic and pool-independent. Note an
-/// `or`-matcher selector would NOT do: it is `PromqlError::Parse` ->
-/// `400 bad_data`, a different case-class.
+/// negated `__name__` discovery is supported, and its runtime outcome is
+/// label-cache-state-dependent (warm -> 200, and since issue #96 a
+/// degraded/cold cache -> 200 too, via the bounded `metric_series` probe
+/// fallback — only the fan-out-cap breach is a named `422`), which is not a
+/// hermetically assertable conformance pin — that behavior is covered by
+/// the seeded `prom_api_live.rs` cases and `pulsus-read`'s
+/// `live_discovery_fallback.rs` instead. `sum(up)` keeps this case-class
+/// deterministic and pool-independent. Note an `or`-matcher selector would
+/// NOT do: it is `PromqlError::Parse` -> `400 bad_data`, a different
+/// case-class.
 fn prom_series_non_selector_unsupported(req: &mut Req) {
     req.query = format!("match%5B%5D={}", enc("sum(up)"));
 }
