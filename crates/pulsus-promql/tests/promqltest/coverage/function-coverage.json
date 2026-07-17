@@ -980,8 +980,7 @@
       "witness": {
         "file": "upstream/at_modifier.test",
         "query": "metric @ 100"
-      },
-      "rationale": "Residual divergence (adjudicated out of #88; scheduled as #95): an eval-time-dependent aggregate param INSIDE a non-@ subquery (e.g. sum_over_time((topk(time()%2, m @ 30))[4s:1s])). Upstream wraps an invariant subquery INNER in its own nested StepInvariantExpr regardless of the subquery's own @ (engine.go:4577-4585 at the pin), so the inner freezes once per subquery evaluation w.r.t. that evaluation's start — and the subquery itself is evaluated per outer step. Our ratified #83 union-grid model materializes the inner once for the whole query with per-grid-point recompute, so no root placement can reproduce upstream's per-outer-step answers. A pre-existing #83 consequence, not a #88 gap: root-level once-and-copy is implemented (proof/m6_08e_step_invariant.test) and no cache root is placed inside subquery inners. No vendored corpus case reaches this corner."
+      }
     },
     {
       "name": "subquery",

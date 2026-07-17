@@ -21,20 +21,18 @@
 #     whose EXPRESSION carries no `@`) must still vary per step — a
 #     spurious mark collapses them to constants and fails here.
 #
-# OUT OF #88 SCOPE (adjudicated Δ3; scheduled as #95, residual on the
-# `at-modifier` coverage entry): an eval-time-dependent aggregate param
-# INSIDE a non-`@` subquery (`sum_over_time((topk(time()%2, m @ 30))[4s:1s])`).
-# Upstream wraps an invariant subquery INNER in its own nested
-# StepInvariantExpr regardless of the subquery's own `@` (engine.go
-# :4577-4585 at the pin) — the inner freezes once per subquery
-# evaluation w.r.t. that evaluation's start, and the subquery itself is
-# evaluated per outer step. Our ratified #83 union-grid model
-# materializes the inner once for the whole query — a pre-existing #83
-# consequence no root placement inside subquery inners could reconcile
-# (descending would mint a third answer matching neither). No cache root
-# is ever placed inside a subquery inner; `@`-fixed
-# eval-time-INDEPENDENT subtrees inside subqueries are value-equal
-# either way (the subquery-equivalence golden below).
+# RESOLVED in #95 (see proof/m6_08f_subquery_step_invariant.test): an
+# eval-time-dependent aggregate param INSIDE a non-`@` subquery
+# (`sum_over_time((topk(time()%2, m @ 30))[4s:1s])`). The #88 adjudication
+# scoped this out on a rationale later disproved at the pin: upstream
+# wraps the invariant subquery INNER in a nested StepInvariantExpr frozen
+# once at `subqStart` (engine.go:4577-4585), and `subqStart` equals our
+# `subquery_grid_start` at every nesting level — so the #83 single
+# union-grid materialization is faithful and the fix is a #88-machinery
+# reuse (freeze `sq.inner` at `grid_start`), not a model rework. The
+# subquery-equivalence golden below (`@`-fixed eval-time-INDEPENDENT
+# subtree, value-equal either way) stays as the regression-neutral
+# control.
 
 # m{job="a"}: v(t) = t/10 (exactly linear — the predict_linear negative
 # control is arithmetic-exact); m{job="b"}: v(t) = t/5 (the second series

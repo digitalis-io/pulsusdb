@@ -1,0 +1,64 @@
+# Issue #95 (M6-08f) proof corpus — step-invariant subtrees nested INSIDE
+# a non-`@`-fixed subquery, parity with upstream Prometheus v3.13.0 @
+# 40af9c2 (`preprocessExprHelper` SubqueryExpr arm / `runSubquery`,
+# promql/engine.go).
+#
+# Model (pin-verified): upstream materializes a subquery ONCE per query
+# (evalSubquery -> runSubquery), over the child grid [subqStart, subqEnd];
+# `preprocessExprHelper` wraps an invariant subquery INNER in a nested
+# StepInvariantExpr (engine.go:4577-4585) so it is evaluated ONCE at
+# subqStart and copied to every child grid point. `subqStart` is derived
+# from the OUTER query start (`step*floor((start-off-range)/step)`,
+# corrected up one step on the boundary) — which is EXACTLY our
+# `subquery_grid_start(mint_min, step)` at every nesting level. So #83's
+# single union-grid materialization is faithful; #95 just freezes the
+# invariant inner once at `grid_start` (reusing #88's machinery) instead
+# of recomputing it per grid point. This reverses the #88 residual text:
+# the subquery is NOT evaluated per outer step and the fix is not a model
+# rework.
+#
+# Every eval line below is oracle-pinned. These are RED under today's
+# per-grid-point recompute (the aggregate param-IGNORING quirk makes the
+# frozen k differ from the oscillating per-point k) and GREEN under the
+# `grid_start`-anchored freeze.
+
+# m{job="a"}: v(t) = t/10, so m @ 30 = 3 and the plain m{job="a"} reads 0
+# at 7-9s and 1 at 10-13s (last-sample lookback on the 10s grid).
+load 10s
+	m{job="a"} 0+1x100
+
+# --- The flagship: topk(time()%2, m @ 30) frozen once at subqStart. ---
+# Range 6s..9s: subqStart = 3 => time()%2 = 1 => k = 1 => topk = {m 3};
+# each 4-point window sums 4*3 = 12 at every step.
+eval range from 6s to 9s step 1s sum_over_time((topk(time() % 2, m{job="a"} @ 30))[4s:1s])
+	{job="a"} 12 12 12 12
+
+# Range 7s..10s: subqStart = 4 => time()%2 = 0 => topk(0) => empty at
+# every step (a per-grid-point recompute would emit on odd-second points).
+eval range from 7s to 10s step 1s sum_over_time((topk(time() % 2, m{job="a"} @ 30))[4s:1s])
+
+# Range 10s..13s: subqStart = 7 => k = 1 => 12 again (the freeze anchor
+# tracks the outer start, not an absolute second).
+eval range from 10s to 13s step 1s sum_over_time((topk(time() % 2, m{job="a"} @ 30))[4s:1s])
+	{job="a"} 12 12 12 12
+
+# --- The discriminating outer-start-anchor witness. ---
+# The SAME query as an instant at 7s: subqStart = 4 => k = 0 => empty.
+# Contrast with the range 6s..9s above, whose 7s STEP reads 12: same eval
+# timestamp, different value. No per-step / per-grid-point model can
+# produce this pair — only a freeze anchored at the outer query start.
+eval instant at 7s sum_over_time((topk(time() % 2, m{job="a"} @ 30))[4s:1s])
+
+# --- Partial-invariant nesting: only the topk subtree is frozen. ---
+# Range 10s..13s: subqStart = 7 => topk frozen at k = 1 => 3; the sibling
+# m{job="a"} VARIES per grid point (0 at 7-9s, 1 at 10-13s), windowed per
+# outer step => the 13 14 15 16 ramp.
+eval range from 10s to 13s step 1s sum_over_time((topk(time() % 2, m{job="a"} @ 30) + m{job="a"})[4s:1s])
+	{job="a"} 13 14 15 16
+
+# --- Regression-neutral control (the #88 subquery-equivalence shape). ---
+# abs(m @ 30) is eval-time-INDEPENDENT: per-grid-point == frozen in value,
+# so this stays 12 with or without the freeze — it guards against the
+# freeze changing an already-correct case.
+eval range from 10s to 13s step 1s sum_over_time((abs(m{job="a"} @ 30))[4s:1s])
+	{job="a"} 12 12 12 12

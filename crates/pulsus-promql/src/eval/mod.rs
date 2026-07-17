@@ -110,6 +110,11 @@ fn evaluate_counted(
     // its horizon-wide identifying-label narrowing (`prepare_info`).
     let mut caches = EvalCaches::default();
     let mut counts = EvalCounts::default();
+    // The classifier instance is per-call, like the caches (Δ4). It is
+    // threaded through `prepare_subqueries` too (issue #95): each
+    // subquery's invariant inner subtrees are frozen once at that
+    // subquery's own grid start, from inside `prepare_subquery`.
+    let mut classifier = crate::plan::StepInvariance::new(&plan.selectors);
     prepare_subqueries(
         &plan.root,
         &plan.selectors,
@@ -122,6 +127,7 @@ fn evaluate_counted(
         p.lookback_ms,
         &mut caches,
         &mut counts.inner_evals,
+        &mut classifier,
     )?;
 
     // Issue #88: freeze every highest step-invariant subtree — evaluated
@@ -129,8 +135,6 @@ fn evaluate_counted(
     // clone (upstream `StepInvariantExpr`'s once-and-copy). AFTER
     // `prepare_subqueries`, necessarily: a root over an `@`-anchored
     // subquery evaluates against the already-materialized union grid.
-    // The classifier instance is per-call, like the caches (Δ4).
-    let mut classifier = crate::plan::StepInvariance::new(&plan.selectors);
     prepare_step_invariant(
         &plan.root,
         &plan.selectors,
@@ -556,6 +560,9 @@ fn subquery_grid_start(mint: i64, step: i64) -> i64 {
 /// the closed `[start, end]` range of evaluation times this node will be
 /// evaluated at (the query's own span at the root; a subquery's grid
 /// extent for its inner expression).
+// Issue #95 threads the step-invariance classifier through the subquery
+// prep recursion (plan-mandated signature), pushing this to 8 params.
+#[allow(clippy::too_many_arguments)]
 fn prepare_subqueries(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
@@ -564,6 +571,7 @@ fn prepare_subqueries(
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
+    classifier: &mut crate::plan::StepInvariance<'_>,
 ) -> Result<(), PromqlError> {
     match expr {
         PlanExpr::Selector(_)
@@ -580,6 +588,7 @@ fn prepare_subqueries(
             lookback_ms,
             caches,
             inner_evals,
+            classifier,
         ),
         PlanExpr::OverTimeParam { source, args, .. } => {
             for a in args {
@@ -591,6 +600,7 @@ fn prepare_subqueries(
                     lookback_ms,
                     caches,
                     inner_evals,
+                    classifier,
                 )?;
             }
             prepare_source(
@@ -601,6 +611,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )
         }
         PlanExpr::Absent { arg, .. }
@@ -618,6 +629,7 @@ fn prepare_subqueries(
             lookback_ms,
             caches,
             inner_evals,
+            classifier,
         ),
         PlanExpr::DateFn { arg, .. } => match arg {
             Some(arg) => prepare_subqueries(
@@ -628,6 +640,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             ),
             None => Ok(()),
         },
@@ -640,6 +653,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )?;
             prepare_subqueries(
                 expr,
@@ -649,6 +663,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )
         }
         PlanExpr::Aggregate { expr, param, .. } => {
@@ -661,6 +676,7 @@ fn prepare_subqueries(
                     lookback_ms,
                     caches,
                     inner_evals,
+                    classifier,
                 )?;
             }
             prepare_subqueries(
@@ -671,6 +687,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )
         }
         PlanExpr::CountValues { expr, .. } => prepare_subqueries(
@@ -681,6 +698,7 @@ fn prepare_subqueries(
             lookback_ms,
             caches,
             inner_evals,
+            classifier,
         ),
         PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
             prepare_subqueries(
@@ -691,6 +709,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )?;
             prepare_subqueries(
                 rhs,
@@ -700,6 +719,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )
         }
         PlanExpr::MathFn {
@@ -713,6 +733,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )?;
             for a in scalar_args {
                 prepare_subqueries(
@@ -723,6 +744,7 @@ fn prepare_subqueries(
                     lookback_ms,
                     caches,
                     inner_evals,
+                    classifier,
                 )?;
             }
             Ok(())
@@ -737,6 +759,7 @@ fn prepare_subqueries(
                     lookback_ms,
                     caches,
                     inner_evals,
+                    classifier,
                 )?;
             }
             Ok(())
@@ -756,6 +779,7 @@ fn prepare_subqueries(
                 lookback_ms,
                 caches,
                 inner_evals,
+                classifier,
             )?;
             prepare_info(expr, selectors, data, horizon, lookback_ms, caches)
         }
@@ -841,6 +865,8 @@ fn prepare_info(
     Ok(())
 }
 
+// Issue #95: threads the classifier to `prepare_subquery` (8 params).
+#[allow(clippy::too_many_arguments)]
 fn prepare_source(
     source: &RangeSource,
     selectors: &[SelectorSpec],
@@ -849,12 +875,20 @@ fn prepare_source(
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
+    classifier: &mut crate::plan::StepInvariance<'_>,
 ) -> Result<(), PromqlError> {
     match source {
         RangeSource::Selector(_) => Ok(()),
-        RangeSource::Subquery(sq) => {
-            prepare_subquery(sq, selectors, data, span, lookback_ms, caches, inner_evals)
-        }
+        RangeSource::Subquery(sq) => prepare_subquery(
+            sq,
+            selectors,
+            data,
+            span,
+            lookback_ms,
+            caches,
+            inner_evals,
+            classifier,
+        ),
     }
 }
 
@@ -864,6 +898,15 @@ fn prepare_source(
 /// anchor is fixed), realized as `{ k·step : k·step > mint_min, k·step ≤
 /// maxt_max }`, each point evaluated exactly once. Recursion depth is
 /// bounded by the planner's `MAX_SUBQUERY_DEPTH` guard.
+///
+/// Issue #95: after the inside-out `prepare_subqueries` recursion and
+/// before the grid loop, [`prepare_step_invariant`] freezes the highest
+/// step-invariant subtrees of `sq.inner` at `grid_start`, so the grid
+/// loop's per-point `eval_step(&sq.inner, …, it)` returns the frozen
+/// clone for those marked nodes — upstream's nested `StepInvariantExpr`
+/// copy at `subqStart == grid_start`.
+// Issue #95 adds the classifier param (plan-mandated), pushing to 8.
+#[allow(clippy::too_many_arguments)]
 fn prepare_subquery(
     sq: &SubqueryPlan,
     selectors: &[SelectorSpec],
@@ -872,6 +915,7 @@ fn prepare_subquery(
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
+    classifier: &mut crate::plan::StepInvariance<'_>,
 ) -> Result<(), PromqlError> {
     let (anchor_min, anchor_max) = match sq.at_ms {
         Some(at) => (at, at),
@@ -904,6 +948,28 @@ fn prepare_subquery(
             lookback_ms,
             caches,
             inner_evals,
+            classifier,
+        )?;
+
+        // Issue #95: freeze the highest step-invariant subtrees INSIDE
+        // this subquery's inner, anchored at `grid_start` — upstream's
+        // `preprocessExprHelper` `SubqueryExpr` arm wraps the invariant
+        // inner in a nested `StepInvariantExpr` evaluated once at
+        // `subqStart` (engine.go:4577-4585 at the pin), which equals this
+        // `grid_start` at every nesting level. The per-grid-point
+        // `eval_step(&sq.inner, …, it)` below then returns the frozen
+        // clone for those marked nodes instead of recomputing. Anchored
+        // at `grid_start`, NOT the outer query start: the outer walk in
+        // `prepare_step_invariant` stops at range sources and never
+        // descends here, so the two anchors never collide.
+        prepare_step_invariant(
+            &sq.inner,
+            selectors,
+            data,
+            grid_start,
+            lookback_ms,
+            caches,
+            classifier,
         )?;
 
         let mut it = grid_start;
@@ -971,12 +1037,15 @@ fn prepare_subquery(
 /// - **aggregate params** — upstream's `AggregateExpr` arm never
 ///   descends into `n.Param`, so no wrapper ever lands inside one (the
 ///   param-ignoring quirk's flip side);
-/// - **subquery inners** (adjudicated Δ3) — no cache root is ever placed
-///   inside a [`SubqueryPlan::inner`]: the union-grid materialization
-///   (#83) already evaluates it once per grid point, and descending
-///   would mint values matching neither upstream nor the ratified #83
-///   model (the residual documented on the `at-modifier` coverage
-///   entry);
+/// - **subquery inners** (issue #95) — roots ARE placed inside a
+///   [`SubqueryPlan::inner`], but exclusively by [`prepare_subquery`]'s
+///   own call anchored at that subquery's `grid_start` (its `subqStart`),
+///   NEVER by this walk: this walk still stops at range sources (below),
+///   so it can never leak the outer `start_ms` anchor into a subquery
+///   inner. Upstream's `preprocessExprHelper` wraps the invariant inner
+///   in a nested `StepInvariantExpr` frozen once at `subqStart`
+///   (engine.go:4577-4585 at the pin), which #95 reproduces by the
+///   `grid_start`-anchored freeze there;
 /// - **range sources** as such — a matrix selector is not a [`PlanExpr`]
 ///   node (upstream: `MatrixSelector` returns `shouldWrap = false`; the
 ///   enclosing call is the wrap candidate), and an `@`-fixed subquery
@@ -3729,6 +3798,9 @@ mod tests {
             counts.inner_evals, 12,
             "the inner expression must evaluate once per distinct union-grid point"
         );
+        // Issue #95: the `up` inner is non-`@` ⇒ not step-invariant ⇒
+        // unmarked; the subquery-inner freeze registers no root here.
+        assert_eq!(counts.step_invariant_evals, 0);
         // And the sliced windows are still per-step correct: `up` has
         // samples from 0s on, so the sum of 1.0-valued grid points in
         // (t−60s, t] grows to 6 and saturates.
@@ -3767,6 +3839,13 @@ mod tests {
         // ∪ (90,100] step 10s = {80, 90, 100}s → 3 evals of `up`. Exact
         // total: 3 + 3 = 6.
         assert_eq!(counts.inner_evals, 6);
+        // Issue #95: the two `up` inners are non-`@` ⇒ not step-invariant ⇒
+        // the #95 subquery-inner freeze marks nothing here. But the outer
+        // subquery's `@ 100` fixes its whole result, so `sum_over_time(… @
+        // 100)` is a step-invariant ROOT — the pre-existing #88 outer-root
+        // freeze (unchanged by #95) marks it once. Verified pre-existing:
+        // the count is 1 with the #95 sq.inner freeze disabled too.
+        assert_eq!(counts.step_invariant_evals, 1);
         let QueryValue::Vector(v) = value else {
             panic!("expected Vector");
         };
@@ -3822,6 +3901,124 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m[0].points.iter().all(|&(_, v)| v == 3.0), "{:?}", m[0]);
         assert_eq!(m[0].points.len(), 7);
+    }
+
+    /// The flagship #95 sample set: `m{job="a"} = t/10` on a 10s grid, so
+    /// `m @ 30 = 3` (frozen at the pin) and the plain `m{job="a"}` reads
+    /// 0 at 7–9s and 1 at 10–13s (last-sample lookback).
+    fn m_ten_second_grid() -> Vec<Sample> {
+        vec![s(0, 0.0), s(10_000, 1.0), s(20_000, 2.0), s(30_000, 3.0)]
+    }
+
+    /// Issue #95 (Tier-1 gate — the subquery-inner freeze count): the
+    /// step-invariant `topk(time()%2, m @ 30)` nested INSIDE a non-`@`-fixed
+    /// subquery is frozen ONCE at the subquery grid start (`subqStart = 3`
+    /// ⇒ `time()%2 = 1` ⇒ `k = 1`) and copied to every grid point, so
+    /// `step_invariant_evals == 1`. A freeze-removal regresses to 0 (nothing
+    /// marked), a per-grid-point recompute to `#grid` — both trip this gate
+    /// AND the value goldens (the frozen `k = 1` vs oscillating parity).
+    #[test]
+    fn a_step_invariant_subquery_inner_freezes_once_at_the_grid_start() {
+        let expr =
+            crate::parser::parse("sum_over_time((topk(time() % 2, m{job=\"a\"} @ 30))[4s:1s])")
+                .unwrap();
+        // Range 6s..9s step 1s: subqStart = 3 ⇒ time()%2 = 1 ⇒ k = 1.
+        let p = plan(&expr, params(6_000, 9_000, 1_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.step_invariant_evals, 1,
+            "the invariant subquery inner freezes exactly once at the subquery grid start"
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        // Each grid point copies the frozen m@30 = 3; each outer window
+        // holds 4 grid points ⇒ 12 at every step.
+        assert_eq!(
+            m[0].points,
+            vec![(6_000, 12.0), (7_000, 12.0), (8_000, 12.0), (9_000, 12.0)]
+        );
+    }
+
+    /// Issue #95 (the discriminating anchor gate): the freeze anchor is the
+    /// SUBQUERY grid start — derived from the OUTER query start — not the
+    /// eval timestamp. The identical query as an instant at 7s yields empty
+    /// (`subqStart = 4` ⇒ `time()%2 = 0` ⇒ `topk(0)`), but the 7s STEP of the
+    /// range 6s..9s yields 12 (`subqStart = 3` ⇒ `k = 1`): same eval
+    /// timestamp, different value. No per-step or per-grid-point model can
+    /// produce this pair — it is the load-bearing outer-start-anchor proof.
+    #[test]
+    fn the_subquery_inner_freeze_anchors_at_the_outer_start_not_the_eval_step() {
+        let expr =
+            crate::parser::parse("sum_over_time((topk(time() % 2, m{job=\"a\"} @ 30))[4s:1s])")
+                .unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
+
+        // Instant at 7s: subqStart = 4 ⇒ k = 0 ⇒ topk(0) ⇒ empty.
+        let p = plan(&expr, params(7_000, 7_000, 0)).unwrap();
+        let (value, _) = evaluate_counted(&p, &data).unwrap();
+        let QueryValue::Vector(v) = value else {
+            panic!("expected Vector");
+        };
+        assert!(
+            v.is_empty(),
+            "instant@7s freezes topk(0) ⇒ empty, got {v:?}"
+        );
+
+        // Range 6s..9s: the 7s step reads 12, frozen at subqStart = 3 (k = 1).
+        let p = plan(&expr, params(6_000, 9_000, 1_000)).unwrap();
+        let (value, _) = evaluate_counted(&p, &data).unwrap();
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        let seven = m[0].points.iter().find(|&&(t, _)| t == 7_000).map(|p| p.1);
+        assert_eq!(
+            seven,
+            Some(12.0),
+            "the 7s step of the range is frozen at the outer start (12), not empty like instant@7"
+        );
+    }
+
+    /// Issue #95 (partial-invariant nesting): only the step-invariant `topk`
+    /// subtree is frozen (`subqStart = 7` ⇒ `k = 1` ⇒ `m@30 = 3`); the
+    /// sibling `m{job="a"}` VARIES per grid point (0 at 7–9s, 1 at 10–13s by
+    /// last-sample lookback) and is windowed per outer step. Exactly one
+    /// freeze; the `13 14 15 16` ramp proves the frozen and per-point halves
+    /// coexist on disjoint node addresses.
+    #[test]
+    fn a_partially_invariant_subquery_inner_freezes_only_the_invariant_subtree() {
+        let expr = crate::parser::parse(
+            "sum_over_time((topk(time() % 2, m{job=\"a\"} @ 30) + m{job=\"a\"})[4s:1s])",
+        )
+        .unwrap();
+        // Range 10s..13s step 1s: subqStart = 7 ⇒ time()%2 = 1 ⇒ k = 1.
+        let p = plan(&expr, params(10_000, 13_000, 1_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
+        data.insert(1, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.step_invariant_evals, 1,
+            "only the topk subtree is frozen; the sibling m{{job=a}} varies per grid point"
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].points,
+            vec![
+                (10_000, 13.0),
+                (11_000, 14.0),
+                (12_000, 15.0),
+                (13_000, 16.0)
+            ]
+        );
     }
 
     /// Issue #93 (finding 3 — the M6-08 reclaim Tier-1 gate): a
