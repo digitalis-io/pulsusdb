@@ -589,8 +589,37 @@ async fn pushed_stream_appears_in_tail() {
     assert_eq!(res.status, 204, "seed push -> 204 (body {})", res.body);
     wait_for_line(port, service, base_ns, seed_line);
 
+    // Two robustness knobs, both the real production levers — this test
+    // exercises the LIVE ingest path (push → LogSink → flush → CH), unlike
+    // `logs_tail_live.rs`, which seeds rows straight into ClickHouse (so
+    // they are visible the instant they are written and it needs neither
+    // knob).
+    //
+    // 1. `start` — bound the tail to a recent window (mirroring every
+    //    sibling live-tail test). Without an explicit `start` the tail
+    //    defaults to one hour ago and must walk ~60 catch-up slices (three
+    //    ClickHouse round-trips each) before it reaches "now"; on a loaded
+    //    CI runner that backlog walk alone can exceed the 20s deadline. A
+    //    60s-ago start caps catch-up at a single slice.
+    //
+    // 2. `delay_for` — hold the tail horizon behind wall-clock (docs/api.md
+    //    §2.4), the production answer to ingest visibility latency. The
+    //    tail's forward watermark advances with wall-clock and never
+    //    re-scans a passed instant; a line pushed at `ts` only becomes
+    //    queryable once its batch has flushed to ClickHouse (a window that
+    //    widens under load). With `delay_for=0` the watermark can sweep past
+    //    `ts` while that flush is still in flight, stranding the row below
+    //    the cursor forever (a bimodal "delivered in ~2s or never" race). A
+    //    5s delay (the adjudicated ceiling) keeps the horizon behind `ts`
+    //    until the flush is certainly visible; the 20s deadline below
+    //    comfortably absorbs it. Real tailing clients set `delay_for` for
+    //    exactly this reason.
     let query = urlencode(&format!(r#"{{service_name="{service}"}}"#));
-    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?query={query}"));
+    let start = now_ns() - 60_000_000_000;
+    let mut ws = WsClient::connect(
+        port,
+        &format!("/api/logs/v1/tail?query={query}&start={start}&delay_for=5"),
+    );
 
     // Give the tail its initial poll cursor a moment to settle, then push a
     // brand-new line via #77 with a fresh timestamp.
