@@ -82,6 +82,18 @@ pub fn decode(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> 
     Ok(ExportLogsServiceRequest::decode(body)?)
 }
 
+/// Decodes a (decompressed) OTLP/JSON (proto3-JSON) `/v1/logs` request body —
+/// the `Content-Type: application/json` sibling of [`decode`] (issue #76).
+/// Feeds the exact same `Export*ServiceRequest` into the exact same [`parse`],
+/// so protobuf and JSON of one logical payload yield byte-identical rows. The
+/// canonical protojson mapping (hex trace/span IDs, camelCase, u64-as-string,
+/// base64 `bytesValue`) is supplied by `opentelemetry-proto`'s `with-serde`
+/// impls; a malformed body is the same whole-request atomic failure as a bad
+/// protobuf, mapped to 400/code 3 via [`LogsIngestError::DecodeJson`].
+pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> {
+    Ok(serde_json::from_slice(body)?)
+}
+
 /// Parses a decoded `ExportLogsServiceRequest` into normalized rows. Pure:
 /// a function of `req` and `now_ns` only, no I/O, no clock reads — the
 /// caller (the ingest handler) is the only clock/IO boundary, so `parse`

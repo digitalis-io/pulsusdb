@@ -128,6 +128,20 @@ sha2 = "0.10"
 # bump, re-run the #29 corpus + golden gate before accepting the bump.
 [patch.crates-io]
 promql-parser = { path = "vendor/promql-parser" }
+# ADR 0004 (vendor+patch `opentelemetry-proto 0.32.0`, issue #76): the
+# upstream `with-serde` impls wire the special-double serde helpers
+# (`serialize_f64_special`/`deserialize_f64_special`, which emit/accept the
+# protojson strings `"NaN"`/`"Infinity"`/`"-Infinity"`) to only the
+# `SummaryDataPoint.ValueAtQuantile` pair, so a spec-valid OTLP/JSON body
+# carrying a non-finite double on any other field fails to decode (silent
+# metric-data loss). The vendored copy applies those helpers to every
+# double-bearing field and adds the `#[serde(flatten)]` upstream forgot on
+# `Exemplar.value` — all additive, the prost wire codec is byte-identical.
+# See vendor/opentelemetry-proto/PATCHES.md for the exhaustive change list and
+# re-vendor rule. The `=0.32.0` requirement + feature set above are unchanged;
+# this entry only redirects them to the patched tree, so every
+# `opentelemetry_proto::...` import path is untouched.
+opentelemetry-proto = { path = "vendor/opentelemetry-proto" }
 
 # Dev-profile debuginfo is line-tables-only: full DWARF across the workspace's
 # ~70 test binaries accumulated 45+ GB in target/debug/deps and filled the

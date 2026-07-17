@@ -54,6 +54,17 @@ pub enum LogsIngestError {
     #[error("malformed ExportLogsServiceRequest protobuf: {0}")]
     Decode(#[from] prost::DecodeError),
 
+    /// The (decompressed) request body was sent with `Content-Type:
+    /// application/json` but is not a valid OTLP/JSON (proto3-JSON) encoding
+    /// of the signal's `Export*ServiceRequest` — malformed JSON, a wrong
+    /// field shape, or a value form this receiver does not accept (e.g. a
+    /// string enum name; OTLP/JSON emitters send integer enums — issue #76).
+    /// Same whole-request 400-class as [`Self::Decode`]: OTLP/JSON is a second
+    /// wire encoding of the identical message, so a decode failure is the same
+    /// structural error, never a partial apply.
+    #[error("malformed OTLP/JSON request body: {0}")]
+    DecodeJson(#[from] serde_json::Error),
+
     /// A decoded message's repeated-field count exceeds a documented
     /// structural bound (issue #28 code review hardening finding): a
     /// decode-time DoS guard against a body that decodes successfully

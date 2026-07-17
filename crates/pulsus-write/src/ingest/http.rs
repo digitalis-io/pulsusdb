@@ -377,11 +377,13 @@ fn decode_loki_push(
     }
 }
 
-/// `true` when the request's `Content-Type` selects the Loki JSON push path
-/// (contains `application/json`, case-insensitively — a real client sends
-/// `application/json` or `application/json; charset=utf-8`). Anything else,
-/// or an absent header, selects the snappy-protobuf path (the agent
-/// default).
+/// `true` when the request's `Content-Type` selects a JSON body — the Loki
+/// JSON push path (issue #77) and the OTLP/JSON encoding on `/v1/logs`,
+/// `/v1/metrics`, `/v1/traces` (issue #76) share this one predicate (contains
+/// `application/json`, case-insensitively — a real client sends
+/// `application/json` or `application/json; charset=utf-8`). Anything else, or
+/// an absent header, selects the protobuf path (the agent default;
+/// `application/x-protobuf` for OTLP, snappy-protobuf for Loki).
 fn is_json_content_type(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -439,7 +441,11 @@ fn decode_request(
 ) -> Result<ExportLogsServiceRequest, LogsIngestError> {
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
-    otlp_logs::decode(&decompressed)
+    if is_json_content_type(headers) {
+        otlp_logs::decode_json(&decompressed)
+    } else {
+        otlp_logs::decode(&decompressed)
+    }
 }
 
 /// Reads `Content-Encoding` (defaulting to `identity` when absent or
@@ -451,7 +457,11 @@ fn decode_metrics_request(
 ) -> Result<ExportMetricsServiceRequest, LogsIngestError> {
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
-    otlp_metrics::decode(&decompressed)
+    if is_json_content_type(headers) {
+        otlp_metrics::decode_json(&decompressed)
+    } else {
+        otlp_metrics::decode(&decompressed)
+    }
 }
 
 /// Reads `Content-Encoding` (defaulting to `identity` when absent or
@@ -463,7 +473,11 @@ fn decode_traces_request(
 ) -> Result<ExportTraceServiceRequest, LogsIngestError> {
     let encoding = content_encoding(headers)?;
     let decompressed = decompress::decompress(encoding, body)?;
-    otlp_traces::decode(&decompressed)
+    if is_json_content_type(headers) {
+        otlp_traces::decode_json(&decompressed)
+    } else {
+        otlp_traces::decode(&decompressed)
+    }
 }
 
 /// Decompresses (always block-snappy — see [`ingest_remote_write`]'s doc
@@ -513,7 +527,8 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
-        | LogsIngestError::Decode(_) => (StatusCode::BAD_REQUEST, 3),
+        | LogsIngestError::Decode(_)
+        | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
         LogsIngestError::BodyRead(_) | LogsIngestError::FlushFailed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, 13)
         }
@@ -781,6 +796,76 @@ mod tests {
         assert_eq!(with_header.status(), without_header.status());
         assert_eq!(sink_with_header.admitted.lock().unwrap().len(), 1);
         assert_eq!(sink_without_header.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// OTLP/JSON (proto3-JSON) encoding of [`valid_request_body`]'s exact
+    /// logical payload — used by the content-negotiation tests (issue #76).
+    fn valid_json_request_body() -> Vec<u8> {
+        let record = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: Some(AnyValue {
+                value: Some(Value::StringValue("hello".to_string())),
+            }),
+            ..Default::default()
+        };
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope: None,
+                    log_records: vec![record],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        serde_json::to_vec(&req).expect("serialize OTLP/JSON logs body")
+    }
+
+    /// Issue #76 dispatch (a): a valid OTLP/JSON body under `Content-Type:
+    /// application/json` selects the JSON decode fork and admits exactly once.
+    #[tokio::test]
+    async fn json_content_type_admits_a_valid_otlp_json_body() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(
+            router(sink.clone()),
+            valid_json_request_body(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    /// Issue #76 dispatch (b): a protobuf body under `Content-Type:
+    /// application/json` is routed to the JSON decoder (content negotiation is
+    /// real, not ignored) and rejected 400/code 3 — the conformance flip.
+    #[tokio::test]
+    async fn json_content_type_rejects_a_protobuf_body_with_400_code_3() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(
+            router(sink.clone()),
+            valid_request_body(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 0);
+    }
+
+    /// Issue #76 dispatch (c): a JSON body with NO / non-JSON Content-Type is
+    /// decoded as protobuf (protobuf stays the default) and therefore 400s —
+    /// proving the fork keys strictly on `application/json`.
+    #[tokio::test]
+    async fn absent_content_type_decodes_json_body_as_protobuf_and_400s() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = post_body(router(sink.clone()), valid_json_request_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

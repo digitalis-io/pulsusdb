@@ -161,6 +161,15 @@ pub fn decode(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError>
     Ok(ExportTraceServiceRequest::decode(body)?)
 }
 
+/// Decodes a (decompressed) OTLP/JSON (proto3-JSON) `/v1/traces` request body
+/// — the `Content-Type: application/json` sibling of [`decode`] (issue #76),
+/// feeding the same [`parse`] as protobuf (so the [`MAX_EXPANDED_BYTES`]
+/// expansion budget, enforced in `parse`, applies to JSON unchanged). A
+/// malformed body maps to 400/code 3 via [`LogsIngestError::DecodeJson`].
+pub fn decode_json(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError> {
+    Ok(serde_json::from_slice(body)?)
+}
+
 /// Parses a decoded `ExportTraceServiceRequest` into normalized rows.
 /// Pure: a function of `req` and `now_ns` only, no I/O, no clock reads —
 /// the caller (the ingest handler) is the only clock/IO boundary. `now_ns`

@@ -40,6 +40,17 @@ pub fn decode(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsIngestErro
     Ok(ExportMetricsServiceRequest::decode(body)?)
 }
 
+/// Decodes a (decompressed) OTLP/JSON (proto3-JSON) `/v1/metrics` request body
+/// — the `Content-Type: application/json` sibling of [`decode`] (issue #76),
+/// feeding the same [`parse`] as protobuf. Non-finite doubles (`"NaN"`/
+/// `"Infinity"`/`"-Infinity"`) on any data-point field decode correctly via
+/// the vendored+patched `opentelemetry-proto` special-double serde
+/// (docs/decisions/0004); a malformed body maps to 400/code 3 via
+/// [`LogsIngestError::DecodeJson`].
+pub fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsIngestError> {
+    Ok(serde_json::from_slice(body)?)
+}
+
 /// Parses a decoded `ExportMetricsServiceRequest` into normalized rows.
 /// Pure: a function of `req` and `now_ns` only, no I/O, no clock reads —
 /// the caller (the ingest handler) is the only clock/IO boundary. `now_ns`

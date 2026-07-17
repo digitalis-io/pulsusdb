@@ -363,6 +363,86 @@ fn valid_otlp_traces_body() -> Vec<u8> {
     req.encode_to_vec()
 }
 
+// OTLP/JSON (proto3-JSON) bodies for the content-negotiation cells (issue
+// #76). The SAME logical `Export*ServiceRequest` as the protobuf builders
+// above, serialized through `opentelemetry-proto`'s `with-serde` impls (hex
+// IDs, camelCase, string timestamps) — sent with `Content-Type:
+// application/json`, they select the JSON decode fork in `ingest/http.rs`.
+fn valid_otlp_logs_json_body() -> Vec<u8> {
+    let record = LogRecord {
+        time_unix_nano: 1_700_000_000_000_000_000,
+        body: Some(AnyValue {
+            value: Some(Value::StringValue("conformance".to_string())),
+        }),
+        ..Default::default()
+    };
+    let req = ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![record],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    serde_json::to_vec(&req).expect("serialize OTLP/JSON logs body")
+}
+
+fn valid_otlp_metrics_json_body() -> Vec<u8> {
+    let req = ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: "conformance_metric".to_string(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: vec![],
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            attributes: vec![],
+                            start_time_unix_nano: 0,
+                            time_unix_nano: 1_700_000_000_000_000_000,
+                            exemplars: vec![],
+                            flags: 0,
+                            value: Some(number_data_point::Value::AsDouble(1.0)),
+                        }],
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    serde_json::to_vec(&req).expect("serialize OTLP/JSON metrics body")
+}
+
+fn valid_otlp_traces_json_body() -> Vec<u8> {
+    let span = Span {
+        trace_id: vec![1; 16],
+        span_id: vec![2; 8],
+        name: "conformance-span".to_string(),
+        start_time_unix_nano: 1_700_000_000_000_000_000,
+        end_time_unix_nano: 1_700_000_001_000_000_000,
+        ..Default::default()
+    };
+    let req = ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![span],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    };
+    serde_json::to_vec(&req).expect("serialize OTLP/JSON traces body")
+}
+
 fn valid_remote_write_body() -> Vec<u8> {
     use pulsus_write::protocols::remote_write::{Label, Sample, TimeSeries, WriteRequest};
     let req = WriteRequest {
@@ -1345,27 +1425,51 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
         assert_ingest_success_envelope(spec, &res, &ctx);
     }
 
-    // Case-class 6's "wrong Content-Type" cell, OTLP-only (review round-2
-    // finding): `ingest/http.rs` never inspects `Content-Type` at all (it
-    // decodes every body as protobuf unconditionally — its own doc comment,
-    // and `an_explicit_protobuf_content_type_header_admits_identically_to_no_header`'s
-    // unit coverage). A **valid**, decodable protobuf body labeled
-    // `Content-Type: application/json` therefore still succeeds — pinning
-    // that reality directly here (not as a `CaseClass`, which has no way
-    // to know which signal-specific valid body — logs vs metrics — to
-    // build) rather than asserting a `400` that would never actually
-    // happen.
+    // OTLP content-negotiation, OTLP-only (issue #76 — the conformance FLIP
+    // of #36's deferred "reject-or-ignore under application/json" question).
+    // `ingest/http.rs` now forks on `Content-Type`: `application/json` selects
+    // the OTLP/JSON decode path, everything else stays protobuf. Two pinned
+    // cells replace the prior "Content-Type ignored, protobuf-under-json → 200"
+    // assertion the #36 adjudication explicitly deferred here:
+    //   (a) a valid OTLP/JSON body + `application/json` → the ordinary success
+    //       envelope (JSON is a first-class second encoding);
+    //   (b) a protobuf body + `application/json` → 400 / google.rpc.Status.code
+    //       == 3 (now undecodable as JSON — negotiation is real, not ignored).
     //
     // Skipped for the empty-204 family: remote-write ignores Content-Type
     // entirely (its own always-snappy path), and the Loki push receiver
-    // (issue #77) DOES negotiate on it — a valid snappy-protobuf body
-    // labeled `application/json` is routed to the JSON parser and correctly
-    // 400s, so the "wrong Content-Type still succeeds" invariant does not
-    // hold there. The Loki negotiation matrix is pinned by the `ingest/
-    // http.rs` handler tests + `LOKI_PUSH_CASES` instead.
+    // (issue #77) negotiates on it with its own JSON grammar — both pinned by
+    // the `ingest/http.rs` handler tests + `LOKI_PUSH_CASES` instead.
     if !is_empty_204 {
+        let json_body_for = |path: &str| -> Vec<u8> {
+            match path {
+                "/v1/logs" => valid_otlp_logs_json_body(),
+                "/v1/metrics" => valid_otlp_metrics_json_body(),
+                "/v1/traces" => valid_otlp_traces_json_body(),
+                other => panic!("no OTLP/JSON body builder registered for ingest route {other}"),
+            }
+        };
+
+        // (a) valid OTLP/JSON body under application/json → success.
         let ctx = format!(
-            "[{spawn}] POST {} case=wrong-content-type-valid-body-pinned-success",
+            "[{spawn}] POST {} case=otlp-json-body-negotiated-success",
+            spec.path
+        );
+        let mut req = manifest::Req::new("POST", spec.path);
+        req.content_type = Some("application/json");
+        req.body = json_body_for(spec.path);
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_eq!(
+            res.status, spec.success_status,
+            "{ctx}: a valid OTLP/JSON body under Content-Type: application/json must succeed"
+        );
+        assert_ingest_success_envelope(spec, &res, &ctx);
+
+        // (b) protobuf body under application/json → 400 / code 3 (the flip:
+        // content negotiation now routes it to the JSON decoder, which rejects
+        // it — this exact body used to be pinned as a 200).
+        let ctx = format!(
+            "[{spawn}] POST {} case=protobuf-body-under-json-now-400",
             spec.path
         );
         let mut req = manifest::Req::new("POST", spec.path);
@@ -1373,11 +1477,21 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
         req.body = body_for(spec.path);
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
         assert_eq!(
-            res.status, spec.success_status,
-            "{ctx}: Content-Type is not enforced — a valid protobuf body must still succeed \
-             regardless of the (wrong) Content-Type header"
+            res.status, 400,
+            "{ctx}: a protobuf body under Content-Type: application/json is now undecodable-as-JSON \
+             (the #76 conformance flip)"
         );
-        assert_ingest_success_envelope(spec, &res, &ctx);
+        assert_eq!(
+            res.content_type(),
+            Some("application/x-protobuf"),
+            "{ctx}: OTLP error content-type"
+        );
+        let status = Status::decode(res.body.as_slice())
+            .unwrap_or_else(|e| panic!("{ctx}: invalid google.rpc.Status protobuf: {e}"));
+        assert_eq!(
+            status.code, 3,
+            "{ctx}: google.rpc.Status.code (INVALID_ARGUMENT)"
+        );
     }
 
     let ctx = format!(

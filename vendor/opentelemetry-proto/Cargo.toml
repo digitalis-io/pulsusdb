@@ -1,0 +1,68 @@
+# PulsusDB vendoring note (docs/decisions/0004): this file lives under the
+# root PulsusDB workspace's directory tree but is deliberately NOT a
+# workspace member (not listed in the root Cargo.toml's `members`) — it is
+# consumed exclusively via the root `[patch.crates-io]` entry, so
+# `cargo test --workspace`/`cargo check --workspace` at the repo root never
+# touches this crate's own `#[cfg(test)]` modules. The empty `[workspace]`
+# table below only stops Cargo's workspace auto-detection from treating this
+# directory as an orphaned member of the root workspace (a Cargo requirement
+# for any nested manifest); it does not add this crate as a workspace member.
+#
+# This is a patched, vendored copy of `opentelemetry-proto 0.32.0`. The only
+# changes against pinned upstream are the additive OTLP/JSON non-finite-double
+# serde wiring enumerated in PATCHES.md — the prost protobuf wire codec is
+# byte-for-byte untouched. Dependency versions below are copied verbatim from
+# upstream's published (normalized) manifest so resolution is identical to the
+# crates.io release; only the `[workspace]`/path shims and this note differ.
+[workspace]
+
+[package]
+name = "opentelemetry-proto"
+version = "0.32.0"
+description = "Protobuf generated files and transformations."
+homepage = "https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto"
+repository = "https://github.com/open-telemetry/opentelemetry-rust/tree/main/opentelemetry-proto"
+readme = "README.md"
+categories = [
+    "development-tools::debugging",
+    "development-tools::profiling",
+    "asynchronous",
+]
+keywords = ["opentelemetry", "otlp", "logging", "tracing", "metrics"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.75.0"
+autotests = false
+autobenches = false
+
+[lib]
+name = "opentelemetry_proto"
+path = "src/lib.rs"
+doctest = false
+bench = false
+
+[features]
+default = ["full"]
+full = ["gen-tonic", "trace", "logs", "metrics", "zpages", "with-serde", "internal-logs"]
+gen-tonic = ["gen-tonic-messages", "tonic", "tonic-prost", "tonic/channel"]
+gen-tonic-messages = ["prost"]
+trace = ["opentelemetry/trace", "opentelemetry_sdk/trace"]
+metrics = ["opentelemetry/metrics", "opentelemetry_sdk/metrics"]
+logs = ["opentelemetry/logs", "opentelemetry_sdk/logs"]
+zpages = ["trace"]
+profiles = []
+testing = ["opentelemetry/testing"]
+internal-logs = ["opentelemetry/internal-logs"]
+with-schemars = ["schemars"]
+with-serde = ["serde", "const-hex", "base64"]
+
+[dependencies]
+tonic = { version = "0.14.1", optional = true, default-features = false, features = ["codegen"] }
+tonic-prost = { version = "0.14.1", optional = true }
+prost = { version = "0.14", optional = true }
+opentelemetry = { version = "0.32", default-features = false }
+opentelemetry_sdk = { version = "0.32", default-features = false }
+schemars = { version = "1.0", optional = true }
+serde = { version = "1.0", optional = true, default-features = false, features = ["serde_derive", "std"] }
+const-hex = { version = "1.14.1", optional = true }
+base64 = { version = "0.22.1", optional = true }

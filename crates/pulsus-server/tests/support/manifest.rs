@@ -659,32 +659,24 @@ fn otlp_wrong_content_encoding(req: &mut Req) {
     req.headers.push(("content-encoding", "br".to_string()));
 }
 
-// Case-class 6's "wrong Content-Type" cell (architect plan v1: "wrong
-// Content-Type / undecodable body on ingest (400)") is **not** a
-// `CaseClass` here (review round-2 finding: round-1's version sent
-// undecodable JSON, which is indistinguishable from `malformed_body` —
-// it never actually tested what the header does). Verified by reading
-// `ingest/http.rs` (`content_encoding`/`decode_request`'s own doc comment:
-// "this handler decodes every request body as protobuf unconditionally
-// ... never inspects Content-Type") and confirmed live: a **valid**
-// `Export{Logs,Metrics}ServiceRequest` protobuf body labeled
-// `Content-Type: application/json` still returns the ordinary `200`
-// success envelope, byte-identical to the same body sent with the
-// documented `application/x-protobuf` header — conformance pins this
-// reality (`Content-Type` is not enforced) rather than a 400 that would
-// never actually happen. Modeled as a direct success-path assertion in
-// `api_conformance.rs::assert_ingest_route` (needs a signal-specific valid
-// body — `ExportLogsServiceRequest` vs `ExportMetricsServiceRequest` —
-// which a single shared `CaseClass::build` fn can't express, since it has
-// no way to know which of `/v1/logs`/`/v1/metrics` it is building for).
+// OTLP content negotiation (`Content-Type`) is **not** a `CaseClass` here:
+// the two negotiation cells need a signal-specific valid body
+// (`ExportLogsServiceRequest` vs `…Metrics…` vs `…Trace…`) which a single
+// shared `CaseClass::build` fn can't express (it has no way to know which of
+// `/v1/logs`/`/v1/metrics`/`/v1/traces` it is building for). They are modeled
+// as direct assertions in `api_conformance.rs::assert_ingest_route` instead.
 //
-// Task-manager adjudication, issue #36 round 7
-// (https://github.com/digitalis-io/pulsusdb/issues/36#issuecomment-4978613793):
-// plan v2's "wrong Content-Type -> 400" case is formally amended — the
-// handlers were determined not to enforce Content-Type at all; whether
-// ingest SHOULD reject a mismatched Content-Type is a product question
-// out of scope for #36 (deferred to a follow-up if desired). These
-// pinned-reality assertions stand as-is.
+// History: #36 (round 7 adjudication,
+// https://github.com/digitalis-io/pulsusdb/issues/36#issuecomment-4978613793)
+// pinned the then-reality that the handlers did NOT inspect `Content-Type` —
+// a valid protobuf body labeled `application/json` still returned `200` — and
+// explicitly DEFERRED the "reject-or-ignore under application/json" question
+// to a follow-up. Issue #76 IS that follow-up: `ingest/http.rs` now forks on
+// `Content-Type`, so `application/json` selects the OTLP/JSON decode path.
+// `assert_ingest_route` was flipped in the same change to pin the new reality —
+// (a) valid OTLP/JSON body + `application/json` → success; (b) protobuf body +
+// `application/json` → 400/code 3. The `otlp_undecodable_with_correct_content_type`
+// case below is unaffected (it sends the documented `application/x-protobuf`).
 
 /// Case-class 6's "undecodable body" cell, with the *correct* documented
 /// `Content-Type: application/x-protobuf` header set (unlike

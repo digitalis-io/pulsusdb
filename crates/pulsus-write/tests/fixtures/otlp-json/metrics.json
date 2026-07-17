@@ -1,0 +1,168 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "api"
+            }
+          }
+        ],
+        "droppedAttributesCount": 0,
+        "entityRefs": []
+      },
+      "scopeMetrics": [
+        {
+          "scope": null,
+          "metrics": [
+            {
+              "name": "temperature",
+              "description": "",
+              "unit": "",
+              "metadata": [],
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000001",
+                    "exemplars": [],
+                    "flags": 0,
+                    "asDouble": 21.5
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000002",
+                    "exemplars": [],
+                    "flags": 0,
+                    "asDouble": "NaN"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000003",
+                    "exemplars": [],
+                    "flags": 0,
+                    "asDouble": "Infinity"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000004",
+                    "exemplars": [],
+                    "flags": 0,
+                    "asDouble": "-Infinity"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "requests",
+              "description": "",
+              "unit": "",
+              "metadata": [],
+              "sum": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000005",
+                    "exemplars": [],
+                    "flags": 0,
+                    "asDouble": 1234.0
+                  }
+                ],
+                "aggregationTemporality": 2,
+                "isMonotonic": true
+              }
+            },
+            {
+              "name": "latency",
+              "description": "",
+              "unit": "",
+              "metadata": [],
+              "histogram": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "host",
+                        "value": {
+                          "stringValue": "h1"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "1700000000000000006",
+                    "count": "3",
+                    "sum": "NaN",
+                    "bucketCounts": [
+                      "1",
+                      "2"
+                    ],
+                    "explicitBounds": [
+                      "Infinity"
+                    ],
+                    "exemplars": [
+                      {
+                        "filteredAttributes": [],
+                        "timeUnixNano": "1700000000000000006",
+                        "spanId": "",
+                        "traceId": "",
+                        "asDouble": "Infinity"
+                      }
+                    ],
+                    "flags": 0,
+                    "min": null,
+                    "max": null
+                  }
+                ],
+                "aggregationTemporality": 2
+              }
+            }
+          ],
+          "schemaUrl": ""
+        }
+      ],
+      "schemaUrl": ""
+    }
+  ]
+}

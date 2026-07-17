@@ -1,0 +1,106 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "checkout"
+            }
+          }
+        ],
+        "droppedAttributesCount": 0,
+        "entityRefs": []
+      },
+      "scopeLogs": [
+        {
+          "scope": null,
+          "logRecords": [
+            {
+              "timeUnixNano": "1700000000000000123",
+              "observedTimeUnixNano": "1700000000000000456",
+              "severityNumber": 9,
+              "severityText": "INFO",
+              "body": {
+                "stringValue": "hello world"
+              },
+              "attributes": [
+                {
+                  "key": "str.attr",
+                  "value": {
+                    "stringValue": "s"
+                  }
+                },
+                {
+                  "key": "bool.attr",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "int.attr",
+                  "value": {
+                    "intValue": "42"
+                  }
+                },
+                {
+                  "key": "double.attr",
+                  "value": {
+                    "doubleValue": 3.5
+                  }
+                },
+                {
+                  "key": "bytes.attr",
+                  "value": {
+                    "bytesValue": "3q2+7w=="
+                  }
+                },
+                {
+                  "key": "nested.attr",
+                  "value": {
+                    "kvlistValue": {
+                      "values": [
+                        {
+                          "key": "inner.str",
+                          "value": {
+                            "stringValue": "nested"
+                          }
+                        },
+                        {
+                          "key": "inner.arr",
+                          "value": {
+                            "arrayValue": {
+                              "values": [
+                                {
+                                  "intValue": "7"
+                                },
+                                {
+                                  "doubleValue": 2.5
+                                },
+                                {
+                                  "boolValue": false
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ],
+              "droppedAttributesCount": 0,
+              "flags": 0,
+              "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "spanId": "00f067aa0ba902b7",
+              "eventName": ""
+            }
+          ],
+          "schemaUrl": ""
+        }
+      ],
+      "schemaUrl": ""
+    }
+  ]
+}
