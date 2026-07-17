@@ -27,6 +27,19 @@
 //! just the sample-heavy stages (code-review fix-plan amendment §1: a
 //! broad `log_streams_idx` scan must abort structured, never run uncapped).
 //!
+//! **LIMIT vs a filtering pipeline (issue M6-09, documented divergence):**
+//! stage 3's SQL `LIMIT` bounds *scanned* rows, not surviving entries.
+//! When the pipeline contains an in-engine dropping stage that cannot
+//! push down (a label filter, or a line filter after `line_format`), the
+//! plan oversamples the scan (`scan_limit = limit ×
+//! reader.logql_pipeline_scan_factor`, default 10) and re-applies the
+//! true `limit` to survivors — a response never over-returns. If the
+//! oversampled scan hits its own `LIMIT` ceiling and the pipeline drops
+//! more than `(factor-1)/factor` of the scanned lines, the response may
+//! return fewer than `limit` entries; exact fetch-until-limit (iterative
+//! top-up) is a named follow-up. The scan stays bounded either way:
+//! `max_bytes_to_read` is untouched and aborts first.
+//!
 //! **Selectivity probes are plan-only in M1.** [`plan::ProbePlan`] SQL is
 //! generated and surfaced in [`PlanExplain`], but never *executed* to
 //! reorder matchers or produce a pre-flight budget estimate — see
@@ -38,6 +51,7 @@ pub mod escape;
 pub mod exec;
 pub mod explain;
 pub mod params;
+pub mod pipeline;
 pub mod plan;
 pub mod rows;
 pub mod sql;
@@ -46,6 +60,7 @@ pub use error::{ReadError, TooBroadReason};
 pub use exec::{EngineConfig, LogQlEngine, MatrixSeries, QueryResult, StreamResult, VectorSample};
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+pub use pipeline::{CompiledPipeline, EntryOut, PipelineError};
 pub use plan::{MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, plan};
 
 #[cfg(test)]

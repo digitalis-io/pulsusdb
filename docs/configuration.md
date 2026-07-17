@@ -79,6 +79,7 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS` | `false` | permit the experimental slice of the pinned Prometheus function registry (mirrors upstream `--enable-feature=promql-experimental-functions`); inert until the first experimental function lands (M6) — the machine-checked inventory of what it will gate is `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json` |
 | `PULSUS_PROMQL_MAX_METRIC_FANOUT` | `1000` | cap on how many metric names one name-less/regex-`__name__` PromQL selector (e.g. `{job="api"}`, `{__name__=~"http_.*"}`) may fan out to; resolved from the warm label cache into a single `metric_name IN (...)` fetch — exceeding the cap returns "query too broad", never an unbounded scan |
 | `PULSUS_LOGQL_SCAN_BUDGET_BYTES` | `50GiB` | per-query scan cap; exceeding returns "query too broad" |
+| `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` | `10` | LogQL pipeline scan oversample (must be >= 1): when a query pipeline contains an in-engine dropping stage that cannot push down to SQL (a label filter, or a line filter placed after `line_format`), the stage-3 scan `LIMIT` becomes `limit × factor` and the true `limit` is re-applied to pipeline survivors — responses never over-return. If the oversampled scan itself hits its `LIMIT` ceiling and the pipeline drops more than `(factor-1)/factor` of the scanned lines, the response may return fewer than `limit` entries (documented divergence; raise the factor to trade scan headroom for fewer under-returns). `PULSUS_LOGQL_SCAN_BUDGET_BYTES` still caps the scan and always aborts first |
 | `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
 
@@ -169,6 +170,7 @@ reader:
   promql_experimental_functions: false
   promql_max_metric_fanout: 1000
   logql_scan_budget_bytes: 50GiB
+  logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
 

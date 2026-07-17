@@ -247,6 +247,7 @@ fn plan_ctx(db: &str) -> PlanCtx<'_> {
         rollup_res_ns: RES_NS as u64,
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
+        pipeline_scan_factor: 10,
     }
 }
 
@@ -497,6 +498,7 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
             rollup_res_ns: RES_NS as u64,
             scan_budget_bytes: 50 * 1024 * 1024 * 1024,
             max_streams: 100_000,
+            pipeline_scan_factor: 10,
         },
     );
 

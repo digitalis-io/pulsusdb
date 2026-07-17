@@ -175,6 +175,17 @@ pub struct ReaderConfig {
     /// (…)` fetch's `IN`-set width. Operator-scale tuning routes to #25.
     pub promql_max_metric_fanout: u64,
     pub logql_scan_budget_bytes: ByteSize,
+    /// Issue M6-09 (LogQL pipelines): the stage-3 SQL `LIMIT` oversample
+    /// multiplier applied when a query pipeline contains an in-engine
+    /// dropping stage that cannot push down (a label filter, or a line
+    /// filter after `line_format`) — the scan bound becomes
+    /// `limit * factor` so lightly-filtering pipelines don't under-return,
+    /// while the true `limit` is re-applied to survivors in-engine (never
+    /// over-returned). Still capped by `logql_scan_budget_bytes`, which
+    /// aborts first. Must be >= 1 (validated at startup); the container
+    /// `Default` (not a field-level serde default, which would resolve a
+    /// partial YAML object to 0) supplies 10.
+    pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
 }
@@ -191,6 +202,7 @@ impl Default for ReaderConfig {
             promql_experimental_functions: false,
             promql_max_metric_fanout: 1_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
+            logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
         }

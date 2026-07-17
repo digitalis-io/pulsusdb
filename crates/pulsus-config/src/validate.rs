@@ -136,6 +136,13 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
     )?;
+    // Issue M6-09 plan v3 delta 2: a zero factor would render the stage-3
+    // SQL as `LIMIT 0` whenever a pipeline oversamples — silently empty
+    // responses. Floor of 1, catching both YAML and env (`0`).
+    positive_u64(
+        "reader.logql_pipeline_scan_factor",
+        u64::from(cfg.reader.logql_pipeline_scan_factor),
+    )?;
     positive_u64(
         "reader.traceql_max_candidates",
         cfg.reader.traceql_max_candidates,
@@ -379,6 +386,23 @@ mod tests {
         let mut cfg = Config::default();
         cfg.reader.series_activity_bucket = HumanDuration(std::time::Duration::ZERO);
         assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue M6-09 plan v3 delta 2 / AC9(iii): a zero pipeline scan
+    /// factor — from YAML or env — is rejected as `ConfigError::Value`
+    /// naming the field (a zero factor would render `LIMIT 0`), and the
+    /// container default is 10.
+    #[test]
+    fn zero_logql_pipeline_scan_factor_is_rejected_and_the_default_is_10() {
+        assert_eq!(Config::default().reader.logql_pipeline_scan_factor, 10);
+        let mut cfg = Config::default();
+        cfg.reader.logql_pipeline_scan_factor = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.logql_pipeline_scan_factor");
+            }
+            other => panic!("expected a Value error for the zero factor, got {other:?}"),
+        }
     }
 
     /// Issue #85 (M6-08c): the name-less-selector fan-out cap follows the

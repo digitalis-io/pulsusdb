@@ -40,10 +40,27 @@ pub struct StreamsPlan {
     pub start_ns: i64,
     pub end_ns: i64,
     pub direction: Direction,
-    pub limit: u32,
-    /// One pre-rendered predicate fragment per pipeline `LineFilter` stage,
-    /// ANDed together by [`super::sql::stage3`].
+    /// The stage-3 SQL `LIMIT` — a *scan* bound (issue M6-09 plan v3
+    /// delta 4). Equal to [`StreamsPlan::result_limit`] unless the
+    /// pipeline contains an unpushed dropping stage (a label filter, or a
+    /// line filter after `line_format`), in which case it is
+    /// `result_limit × PlanCtx::pipeline_scan_factor` (saturating) so
+    /// lightly-filtering pipelines don't under-return. The byte scan
+    /// budget still caps the read and aborts first.
+    pub scan_limit: u32,
+    /// The true response cap — re-applied in-engine to pipeline
+    /// survivors, globally across streams. Responses never over-return.
+    pub result_limit: u32,
+    /// One pre-rendered predicate fragment per **pushed-down** pipeline
+    /// `LineFilter` stage — those positioned before the first
+    /// `line_format` stage, which reference the original `body` — ANDed
+    /// together by [`super::sql::stage3`]. Line filters after a
+    /// `line_format` reference the rewritten line and evaluate in-engine
+    /// instead ([`super::pipeline::CompiledPipeline`]).
     pub line_filters: Vec<String>,
+    /// The full ordered pipeline, compiled per query by
+    /// [`super::exec::LogQlEngine`] into the in-engine evaluator.
+    pub pipeline: Vec<Stage>,
     pub probes: Vec<ProbePlan>,
 }
 
@@ -152,7 +169,28 @@ fn streams_plan(
         &normalized.negative_branches,
     );
     let probes = build_probes(ctx, &months, &normalized.probe_keys);
+
+    // A bare log query cannot evaluate `unwrap` — the unwrapped value
+    // only means something inside a range aggregation (plan v3 delta 1).
+    if log_expr
+        .pipeline
+        .iter()
+        .any(|s| matches!(s, Stage::Unwrap(_)))
+    {
+        return Err(ReadError::PipelineInvalid {
+            reason: "`unwrap` is only valid inside a range aggregation (e.g. \
+                     sum_over_time({...} | unwrap x [5m]))"
+                .to_string(),
+        });
+    }
+
     let line_filters = compile_line_filters(&log_expr.pipeline);
+    let result_limit = p.limit;
+    let scan_limit = if has_unpushed_dropping_stage(&log_expr.pipeline) {
+        result_limit.saturating_mul(ctx.pipeline_scan_factor)
+    } else {
+        result_limit
+    };
 
     Ok(StreamsPlan {
         stage1_sql,
@@ -161,9 +199,48 @@ fn streams_plan(
         start_ns,
         end_ns,
         direction: p.direction,
-        limit: p.limit,
+        scan_limit,
+        result_limit,
         line_filters,
+        pipeline: log_expr.pipeline.clone(),
         probes,
+    })
+}
+
+/// Oversample eligibility (plan v3 delta 4): the pipeline contains a
+/// stage that drops lines **in-engine** — a label filter, or a line
+/// filter positioned after the first `line_format` (which references the
+/// rewritten line and cannot push down). Parsers and `label_format` are
+/// non-dropping (a parse failure keeps the line with an `__error__`
+/// label; fan-out only regroups), so they alone never trigger the
+/// oversample and parser-only pipelines keep byte-identical SQL.
+fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
+    let mut seen_line_format = false;
+    for stage in pipeline {
+        match stage {
+            Stage::LineFormat(_) => seen_line_format = true,
+            Stage::LabelFilter(_) => return true,
+            Stage::LineFilter(_) if seen_line_format => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The construct name a metric-pipeline rejection reports — the first
+/// beyond-line-filter stage in pipeline order.
+fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
+    use pulsus_logql::ParserStage;
+    pipeline.iter().find_map(|stage| match stage {
+        Stage::LineFilter(_) => None,
+        Stage::Parser(ParserStage::Json { .. }) => Some("json"),
+        Stage::Parser(ParserStage::Logfmt { .. }) => Some("logfmt"),
+        Stage::Parser(ParserStage::Regexp(_)) => Some("regexp"),
+        Stage::Parser(ParserStage::Pattern(_)) => Some("pattern"),
+        Stage::LabelFilter(_) => Some("label filter"),
+        Stage::LineFormat(_) => Some("line_format"),
+        Stage::LabelFormat(_) => Some("label_format"),
+        Stage::Unwrap(_) => Some("unwrap"),
     })
 }
 
@@ -190,6 +267,24 @@ fn metric_plan(
         // structurally always `Range` — the AST has no third variant.
         unreachable!("unwrap_vector_aggs always bottoms out at MetricExpr::Range")
     };
+    // M6-09 → M6-10 seam: executing a parser/label-filter/format/unwrap
+    // pipeline *inside* a range aggregation (correct in-engine counting
+    // over the filtered/parsed line set) is the metric-pipeline
+    // milestone's scope. Rejected by name here — never a silently-wrong
+    // `count_over_time({...} | json | x="y" [5m])` counting unfiltered
+    // lines. `range.unwrap` is checked too for defense in depth, though
+    // the parser only ever emits the pipeline `Stage::Unwrap` form.
+    if let Some(construct) = metric_pipeline_construct(&range.selector.pipeline) {
+        return Err(ReadError::PipelineUnsupportedInMetric {
+            construct: construct.to_string(),
+        });
+    }
+    if range.unwrap.is_some() {
+        return Err(ReadError::PipelineUnsupportedInMetric {
+            construct: "unwrap".to_string(),
+        });
+    }
+
     let range_ns = range.range.as_nanos();
 
     let (start_ns, end_ns, step_ns, rate_window_ns) = match p.spec {
@@ -224,13 +319,13 @@ fn metric_plan(
     //
     // This routing decision assumes every `RangeAggOp` reaching here is
     // count-only (M1's four: `Rate`/`CountOverTime`/`BytesRate`/
-    // `BytesOverTime`, `ast.rs`) — a future non-count op (M6) must gate
-    // eligibility on `op` too, not just line-filter/step shape. Likewise,
-    // "pipeline-created label dependencies" (a pipeline stage that derives
-    // a label the query then groups/filters on) are structurally
-    // impossible in M1: the only pipeline stage this crate parses is
-    // `LineFilter` (`Stage`, `ast.rs`), which never produces a label. Both
-    // are guard comments only — nothing to gate on yet.
+    // `BytesOverTime`, `ast.rs`) — a future non-count op (M6-10) must
+    // gate eligibility on `op` too, not just line-filter/step shape.
+    // Likewise, "pipeline-created label dependencies" (a pipeline stage
+    // that derives a label the query then groups/filters on) cannot reach
+    // this point: `metric_pipeline_construct` above rejects every metric
+    // pipeline beyond plain line filters until M6-10 executes them
+    // in-engine. Both are guard comments only — nothing to gate on yet.
     // `Instant` is matched *first*, ahead of the line-filter/resolution
     // checks below: an instant window ([at - range, at]) has no step to
     // test against the resolution regardless of what else is true about
@@ -479,14 +574,24 @@ fn normalize_matchers(selector: &StreamSelector) -> Result<NormalizedMatchers, R
     })
 }
 
-/// Compiles every pipeline `LineFilter` stage into a stage-3 predicate
-/// fragment, in pipeline order (architect plan amendment: line filters
-/// "ALWAYS paired with the exact predicate").
+/// Compiles the **pushed-down** pipeline `LineFilter` stages — those
+/// positioned before the first `line_format` — into stage-3 predicate
+/// fragments, in pipeline order (architect plan amendment: line filters
+/// "ALWAYS paired with the exact predicate"). Filters before a parser
+/// still push down (parsers read but never rewrite the line — the
+/// M6-09 skip-index-preservation gate, `tests/explain_indexes.rs`);
+/// filters after a `line_format` reference the rewritten line and are
+/// deliberately absent here (evaluated in-engine instead).
 pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
-    pipeline
-        .iter()
-        .map(|Stage::LineFilter(lf)| compile_line_filter(lf))
-        .collect()
+    let mut out = Vec::new();
+    for stage in pipeline {
+        match stage {
+            Stage::LineFilter(lf) => out.push(compile_line_filter(lf)),
+            Stage::LineFormat(_) => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// ClickHouse's `tokenbf_v1` splits on non-alphanumeric ASCII; a `hasToken`
@@ -625,6 +730,7 @@ mod tests {
             rollup_res_ns: 5_000_000_000,
             scan_budget_bytes: 1024,
             max_streams: 100_000,
+            pipeline_scan_factor: 10,
         }
     }
 
@@ -874,6 +980,177 @@ mod tests {
             months_overlapping(start, end),
             vec!["'2026-12-01'".to_string(), "'2027-01-01'".to_string()]
         );
+    }
+
+    fn streams_sp(query: &str) -> StreamsPlan {
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let expr = parse(query).expect("parse");
+        match plan(&expr, &params, &test_ctx()).expect("plan") {
+            Plan::Streams(sp) => sp,
+            Plan::Metric(_) => panic!("expected a Streams plan"),
+        }
+    }
+
+    // --- AC9(i), issue M6-09: scan_limit oversample eligibility. ---
+
+    #[test]
+    fn a_label_filter_pipeline_oversamples_the_scan_limit_by_the_factor() {
+        let sp = streams_sp(r#"{env="prod"} | json | status = "500""#);
+        assert_eq!(sp.result_limit, 100);
+        assert_eq!(sp.scan_limit, 1_000, "scan_limit must be limit * factor");
+    }
+
+    #[test]
+    fn a_line_filter_after_line_format_oversamples_the_scan_limit() {
+        let sp = streams_sp(r#"{env="prod"} | line_format "{{.x}}" |= "err""#);
+        assert_eq!(sp.result_limit, 100);
+        assert_eq!(sp.scan_limit, 1_000);
+        // And the unpushable filter is absent from the stage-3 predicates.
+        assert!(sp.line_filters.is_empty());
+    }
+
+    #[test]
+    fn a_line_filter_only_pipeline_keeps_scan_limit_equal_to_the_limit() {
+        let sp = streams_sp(r#"{env="prod"} |= "err" != "debug""#);
+        assert_eq!(sp.result_limit, 100);
+        assert_eq!(sp.scan_limit, 100, "fast path must stay byte-identical");
+        assert_eq!(sp.line_filters.len(), 2);
+    }
+
+    #[test]
+    fn a_parser_only_pipeline_keeps_scan_limit_equal_to_the_limit() {
+        // Parsers are non-dropping (a parse failure keeps the line with
+        // an `__error__` label) — no oversample.
+        let sp = streams_sp(r#"{env="prod"} |= "err" | json"#);
+        assert_eq!(sp.scan_limit, 100);
+        assert_eq!(
+            sp.line_filters.len(),
+            1,
+            "the line filter still pushes down"
+        );
+    }
+
+    #[test]
+    fn scan_limit_saturates_instead_of_overflowing() {
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            limit: u32::MAX,
+            direction: Direction::Backward,
+        };
+        let expr = parse(r#"{env="prod"} | json | status = "500""#).expect("parse");
+        let Plan::Streams(sp) = plan(&expr, &params, &test_ctx()).expect("plan") else {
+            panic!("expected a Streams plan");
+        };
+        assert_eq!(sp.scan_limit, u32::MAX);
+    }
+
+    // --- AC6, issue M6-09: metric-pipeline deferral to M6-10. ---
+
+    #[test]
+    fn every_beyond_line_filter_stage_in_a_metric_query_is_rejected_by_name() {
+        for (query, construct) in [
+            (r#"count_over_time({env="prod"} | json [5m])"#, "json"),
+            (r#"count_over_time({env="prod"} | logfmt [5m])"#, "logfmt"),
+            (
+                r#"count_over_time({env="prod"} | regexp "(?P<x>.*)" [5m])"#,
+                "regexp",
+            ),
+            (
+                r#"count_over_time({env="prod"} | pattern "<x> y" [5m])"#,
+                "pattern",
+            ),
+            (
+                r#"count_over_time({env="prod"} | json | status = "500" [5m])"#,
+                "json",
+            ),
+            (
+                r#"rate({env="prod"} | level = "error" [5m])"#,
+                "label filter",
+            ),
+            (
+                r#"rate({env="prod"} | line_format "{{.x}}" [5m])"#,
+                "line_format",
+            ),
+            (
+                r#"rate({env="prod"} | label_format a=b [5m])"#,
+                "label_format",
+            ),
+            (
+                r#"count_over_time({env="prod"} | json | unwrap latency [5m])"#,
+                "json",
+            ),
+            (
+                r#"count_over_time({env="prod"} | unwrap latency [5m])"#,
+                "unwrap",
+            ),
+        ] {
+            let err = metric_mp(
+                query,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000_000,
+                    step_ns: 60_000_000_000,
+                },
+            )
+            .unwrap_err();
+            match err {
+                ReadError::PipelineUnsupportedInMetric { construct: got } => {
+                    assert_eq!(got, construct, "query: {query}");
+                }
+                other => {
+                    panic!("expected {query:?} to be PipelineUnsupportedInMetric, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_metric_query_with_only_line_filters_still_plans() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"} |= "err" [5m])"#,
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+        )
+        .expect("line-filter-only metric pipelines are in scope");
+        assert_eq!(mp.extra_predicates.len(), 1);
+    }
+
+    // --- Bare-query unwrap: the planner-owned rejection (plan v3 D1). ---
+
+    #[test]
+    fn a_bare_log_query_with_unwrap_is_rejected_as_pipeline_invalid() {
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000_000,
+                step_ns: 60_000_000_000,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let expr = parse(r#"{env="prod"} | json | unwrap latency"#).expect("parse");
+        let err = plan(&expr, &params, &test_ctx()).unwrap_err();
+        match err {
+            ReadError::PipelineInvalid { reason } => {
+                assert!(reason.contains("range aggregation"), "{reason}");
+            }
+            other => panic!("expected PipelineInvalid, got {other:?}"),
+        }
     }
 
     #[test]

@@ -19,6 +19,7 @@ fn ctx() -> PlanCtx<'static> {
         rollup_res_ns: 5_000_000_000,
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
+        pipeline_scan_factor: 10,
     }
 }
 
@@ -227,7 +228,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
         },
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
     assert_eq!(
         sql,
@@ -292,6 +293,95 @@ fn direction_backward_orders_descending() {
         25,
     );
     assert!(sql.contains("ORDER BY timestamp_ns DESC"));
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-09 (AC3): pushdown byte-identity around parser stages. A line
+// filter BEFORE a parser keeps the exact `hasToken`+`position` pushdown
+// (the parser is pure post-fetch — the named perf gate); a line filter
+// AFTER `line_format` references the rewritten line and must be ABSENT
+// from the stage-3 SQL.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_line_filter_before_a_parser_still_pushes_down_byte_identically() {
+    let plain = streams_plan(
+        r#"{service_name="checkout"} |= "connection refused""#,
+        &range_params(100, Direction::Backward),
+    );
+    let with_parser = streams_plan(
+        r#"{service_name="checkout"} |= "connection refused" | json | status = "500""#,
+        &range_params(100, Direction::Backward),
+    );
+    assert_eq!(
+        with_parser.line_filters, plain.line_filters,
+        "the parser/label-filter stages must not disturb the pushdown predicate"
+    );
+    assert_eq!(
+        with_parser.line_filters,
+        vec![
+            "hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
+                .to_string()
+        ]
+    );
+    // The label filter is an unpushed dropping stage: the scan oversamples
+    // while the response cap stays put (AC9's plan-side half).
+    assert_eq!(with_parser.result_limit, 100);
+    assert_eq!(with_parser.scan_limit, 1_000);
+
+    let sql = sql::stage3(
+        &with_parser.samples_table,
+        &["'checkout'".to_string()],
+        &[18374],
+        TimeWindow {
+            start_ns: with_parser.start_ns,
+            end_ns: with_parser.end_ns,
+        },
+        &with_parser.line_filters,
+        with_parser.direction,
+        with_parser.scan_limit,
+    );
+    assert!(
+        sql.contains(
+            "AND hasToken(body, 'connection') AND hasToken(body, 'refused') AND position(body, 'connection refused') > 0"
+        ),
+        "stage-3 SQL must render the pushdown predicate: {sql}"
+    );
+    assert!(sql.ends_with("LIMIT 1000"), "{sql}");
+}
+
+#[test]
+fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
+    let sp = streams_plan(
+        r#"{service_name="checkout"} | line_format "{{.x}}" |= "err""#,
+        &range_params(100, Direction::Backward),
+    );
+    assert!(
+        sp.line_filters.is_empty(),
+        "a post-line_format filter references the rewritten line and cannot push down"
+    );
+    let sql = sql::stage3(
+        &sp.samples_table,
+        &["'checkout'".to_string()],
+        &[18374],
+        TimeWindow {
+            start_ns: sp.start_ns,
+            end_ns: sp.end_ns,
+        },
+        &sp.line_filters,
+        sp.direction,
+        sp.scan_limit,
+    );
+    assert!(
+        !sql.contains("body,"),
+        "no body predicate may appear in stage-3 SQL: {sql}"
+    );
+    assert!(
+        !sql.contains("hasToken") && !sql.contains("position(body"),
+        "{sql}"
+    );
+    // The unpushed dropping filter triggers the oversample.
+    assert!(sql.ends_with("LIMIT 1000"), "{sql}");
 }
 
 // ---------------------------------------------------------------------

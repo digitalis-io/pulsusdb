@@ -11,8 +11,9 @@
 //! none of them overlap in when they run (architect plan amendments 1-3).
 
 use crate::ast::{
-    self, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp,
-    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, VectorAggOp,
+    self, CompareOp, Expr, Grouping, GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt,
+    LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher, MetricExpr, NumericLiteral,
+    ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap, VectorAggOp,
 };
 use crate::duration;
 use crate::error::{LogQlError, MAX_DEPTH};
@@ -262,92 +263,364 @@ fn check_no_binary_op(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
     }
 }
 
-/// `LogExpr := StreamSelector (LineFilter)*` — the stage loop is greedy:
-/// as many line filters chain directly as appear, no separator required
-/// (`{app="x"} |= "a" != "b" !~ "c"`). Any other token at stage position
-/// (in particular a bare `|`) ends the loop and control returns to the
-/// caller. A bare `|` is handled specially: it always introduces an M6
-/// stage keyword or a label filter, both `NotYetSupported`.
+/// `LogExpr := StreamSelector (Stage)*` — the stage loop is greedy: line
+/// filters chain with no separator (`{app="x"} |= "a" != "b" !~ "c"`);
+/// a bare `|` introduces a parser stage, label filter, `line_format`,
+/// `label_format`, or `unwrap` (issue M6-09). Any other token at stage
+/// position ends the loop and control returns to the caller.
+///
+/// **Post-`unwrap` grammar rule (plan v3 delta 1):** the LogQL pipeline
+/// allows only label filters after `unwrap` — a parser/format/line-filter
+/// stage there is an `UnexpectedToken` naming the rule, so the invalid
+/// ordering is unrepresentable in a parsed pipeline.
 fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
     let selector = parse_stream_selector(cursor)?;
     let mut pipeline = Vec::new();
+    let mut saw_unwrap = false;
     loop {
-        match &cursor.peek().kind {
-            TokenKind::PipeExact => {
-                cursor.advance();
-                let (value, _) = cursor.expect_string()?;
-                pipeline.push(Stage::LineFilter(LineFilter {
-                    op: LineFilterOp::Contains,
-                    value,
-                }));
+        let stage_span = cursor.peek().span;
+        let line_filter_op = match &cursor.peek().kind {
+            TokenKind::PipeExact => Some(LineFilterOp::Contains),
+            TokenKind::Neq => Some(LineFilterOp::NotContains),
+            TokenKind::PipeMatch => Some(LineFilterOp::Regex),
+            TokenKind::Nre => Some(LineFilterOp::NotRegex),
+            _ => None,
+        };
+        if let Some(op) = line_filter_op {
+            if saw_unwrap {
+                return Err(post_unwrap_stage_error(
+                    describe(&cursor.peek().kind),
+                    stage_span,
+                ));
             }
-            TokenKind::Neq => {
-                cursor.advance();
-                let (value, _) = cursor.expect_string()?;
-                pipeline.push(Stage::LineFilter(LineFilter {
-                    op: LineFilterOp::NotContains,
-                    value,
-                }));
-            }
-            TokenKind::PipeMatch => {
-                cursor.advance();
-                let (value, _) = cursor.expect_string()?;
-                pipeline.push(Stage::LineFilter(LineFilter {
-                    op: LineFilterOp::Regex,
-                    value,
-                }));
-            }
-            TokenKind::Nre => {
-                cursor.advance();
-                let (value, _) = cursor.expect_string()?;
-                pipeline.push(Stage::LineFilter(LineFilter {
-                    op: LineFilterOp::NotRegex,
-                    value,
-                }));
-            }
-            TokenKind::Pipe => {
-                cursor.advance();
-                return Err(future_stage_error(cursor));
-            }
-            _ => break,
+            cursor.advance();
+            let (value, _) = cursor.expect_string()?;
+            pipeline.push(Stage::LineFilter(LineFilter { op, value }));
+            continue;
         }
+        if matches!(cursor.peek().kind, TokenKind::Pipe) {
+            cursor.advance();
+            let stage = parse_pipe_stage(cursor)?;
+            match &stage {
+                Stage::LabelFilter(_) => {}
+                other if saw_unwrap => {
+                    return Err(post_unwrap_stage_error(
+                        format!("stage `{other}`"),
+                        stage_span,
+                    ));
+                }
+                Stage::Unwrap(_) => saw_unwrap = true,
+                _ => {}
+            }
+            pipeline.push(stage);
+            continue;
+        }
+        break;
     }
     Ok(LogExpr { selector, pipeline })
 }
 
-/// Classifies what follows a bare `|` at stage position into a named
-/// `NotYetSupported` construct, or an `UnexpectedToken`/`UnexpectedEof`
-/// if it is not even a plausible stage keyword.
-fn future_stage_error(cursor: &mut Cursor<'_>) -> LogQlError {
+fn post_unwrap_stage_error(found: String, span: crate::token::Span) -> LogQlError {
+    LogQlError::UnexpectedToken {
+        found,
+        expected: "a label filter (only label filters may follow `unwrap`)".to_string(),
+        span,
+    }
+}
+
+/// Dispatches the stage after a bare `|`: a stage keyword (`json`,
+/// `logfmt`, `regexp`, `pattern`, `line_format`, `label_format`,
+/// `unwrap`), a still-unsupported keyword (named `NotYetSupported`), or —
+/// any other identifier / an opening paren — a label-filter expression.
+fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
     let tok = cursor.peek().clone();
-    match tok.kind {
-        TokenKind::Ident(name) => {
-            cursor.advance();
-            if ast::FUTURE_PARSERS.contains(&name.as_str())
-                || ast::FUTURE_STAGE_KEYWORDS.contains(&name.as_str())
-            {
-                LogQlError::NotYetSupported {
-                    construct: name,
-                    span: tok.span,
-                }
-            } else {
-                // Any other identifier at stage position starts a label
-                // filter (e.g. `| status="500"`, `| status>=500`).
-                LogQlError::NotYetSupported {
-                    construct: "label filter".to_string(),
-                    span: tok.span,
-                }
+    match &tok.kind {
+        TokenKind::Ident(name) => match name.as_str() {
+            "json" => {
+                cursor.advance();
+                Ok(Stage::Parser(ParserStage::Json {
+                    extractions: parse_extraction_list(cursor)?,
+                }))
             }
-        }
-        TokenKind::Eof => LogQlError::UnexpectedEof {
+            "logfmt" => {
+                cursor.advance();
+                Ok(Stage::Parser(ParserStage::Logfmt {
+                    extractions: parse_extraction_list(cursor)?,
+                }))
+            }
+            "regexp" => {
+                cursor.advance();
+                let (re, _) = cursor.expect_string()?;
+                Ok(Stage::Parser(ParserStage::Regexp(re)))
+            }
+            "pattern" => {
+                cursor.advance();
+                let (p, _) = cursor.expect_string()?;
+                Ok(Stage::Parser(ParserStage::Pattern(p)))
+            }
+            "line_format" => {
+                cursor.advance();
+                let (tmpl, _) = cursor.expect_string()?;
+                Ok(Stage::LineFormat(tmpl))
+            }
+            "label_format" => {
+                cursor.advance();
+                Ok(Stage::LabelFormat(parse_label_format_list(cursor)?))
+            }
+            "unwrap" => {
+                cursor.advance();
+                Ok(Stage::Unwrap(parse_unwrap(cursor)?))
+            }
+            name if ast::REMAINING_UNSUPPORTED_STAGES.contains(&name) => {
+                Err(LogQlError::NotYetSupported {
+                    construct: name.to_string(),
+                    span: tok.span,
+                })
+            }
+            // Any other identifier at stage position starts a label
+            // filter (e.g. `| status="500"`, `| status >= 500`).
+            _ => Ok(Stage::LabelFilter(parse_label_filter_or(cursor)?)),
+        },
+        TokenKind::LParen => Ok(Stage::LabelFilter(parse_label_filter_or(cursor)?)),
+        TokenKind::Eof => Err(LogQlError::UnexpectedEof {
             expected: "a pipeline stage".to_string(),
             span: tok.span,
-        },
-        _ => LogQlError::UnexpectedToken {
+        }),
+        _ => Err(LogQlError::UnexpectedToken {
             found: describe(&tok.kind),
             expected: "a pipeline stage".to_string(),
             span: tok.span,
+        }),
+    }
+}
+
+/// `json`/`logfmt` extraction list: zero or more `label` /
+/// `label="expression"` entries, comma-separated. A bare identifier is
+/// shorthand for `label="label"`.
+fn parse_extraction_list(cursor: &mut Cursor<'_>) -> Result<Vec<LabelExtraction>, LogQlError> {
+    let mut out = Vec::new();
+    while matches!(cursor.peek().kind, TokenKind::Ident(_)) {
+        let (label, _) = cursor.expect_ident()?;
+        let expression = if matches!(cursor.peek().kind, TokenKind::Eq)
+            && matches!(cursor.peek2().kind, TokenKind::String(_))
+        {
+            cursor.advance();
+            cursor.expect_string()?.0
+        } else {
+            label.clone()
+        };
+        out.push(LabelExtraction { label, expression });
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    Ok(out)
+}
+
+/// `label_format` list: one or more `dst=src` (identifier RHS, a rename)
+/// or `dst="<template>"` (string RHS) entries, comma-separated.
+fn parse_label_format_list(cursor: &mut Cursor<'_>) -> Result<Vec<LabelFmt>, LogQlError> {
+    let mut out = Vec::new();
+    loop {
+        let (dst, _) = cursor.expect_ident()?;
+        cursor.expect(&TokenKind::Eq, "'='")?;
+        let tok = cursor.peek().clone();
+        match tok.kind {
+            TokenKind::Ident(src) => {
+                cursor.advance();
+                out.push(LabelFmt::Rename { dst, src });
+            }
+            TokenKind::String(tmpl) => {
+                cursor.advance();
+                out.push(LabelFmt::Template { dst, tmpl });
+            }
+            TokenKind::Eof => {
+                return Err(LogQlError::UnexpectedEof {
+                    expected: "a source label or a template string".to_string(),
+                    span: tok.span,
+                });
+            }
+            _ => {
+                return Err(LogQlError::UnexpectedToken {
+                    found: describe(&tok.kind),
+                    expected: "a source label or a template string".to_string(),
+                    span: tok.span,
+                });
+            }
+        }
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    Ok(out)
+}
+
+/// `unwrap <label>` or `unwrap <conversion>(<label>)` where the
+/// conversion is one of `duration`, `duration_seconds`, `bytes`.
+fn parse_unwrap(cursor: &mut Cursor<'_>) -> Result<Unwrap, LogQlError> {
+    let (first, first_span) = cursor.expect_ident()?;
+    if matches!(cursor.peek().kind, TokenKind::LParen) {
+        if !ast::UNWRAP_CONVERSIONS.contains(&first.as_str()) {
+            return Err(LogQlError::UnexpectedToken {
+                found: format!("identifier {first:?}"),
+                expected: "an unwrap conversion: 'duration', 'duration_seconds', or 'bytes'"
+                    .to_string(),
+                span: first_span,
+            });
+        }
+        cursor.advance();
+        let (label, _) = cursor.expect_ident()?;
+        cursor.expect(&TokenKind::RParen, "')'")?;
+        Ok(Unwrap {
+            label,
+            conversion: Some(first),
+        })
+    } else {
+        Ok(Unwrap {
+            label: first,
+            conversion: None,
+        })
+    }
+}
+
+/// Label-filter boolean grammar, precedence-climbing: `or` binds loosest,
+/// `and`/`,` bind tighter, parentheses group.
+fn parse_label_filter_or(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
+    let mut left = parse_label_filter_and(cursor)?;
+    while matches!(&cursor.peek().kind, TokenKind::Ident(name) if name == "or") {
+        cursor.advance();
+        let right = parse_label_filter_and(cursor)?;
+        left = LabelFilterExpr::Or(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn parse_label_filter_and(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
+    let mut left = parse_label_filter_factor(cursor)?;
+    loop {
+        let is_and = match &cursor.peek().kind {
+            TokenKind::Comma => true,
+            TokenKind::Ident(name) if name == "and" => true,
+            _ => false,
+        };
+        if !is_and {
+            return Ok(left);
+        }
+        cursor.advance();
+        let right = parse_label_filter_factor(cursor)?;
+        left = LabelFilterExpr::And(Box::new(left), Box::new(right));
+    }
+}
+
+fn parse_label_filter_factor(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
+    if matches!(cursor.peek().kind, TokenKind::LParen) {
+        cursor.advance();
+        let inner = parse_label_filter_or(cursor)?;
+        cursor.expect(&TokenKind::RParen, "')'")?;
+        return Ok(inner);
+    }
+    parse_label_filter_predicate(cursor)
+}
+
+/// One `name <op> <rhs>` predicate, RHS-typed (plan v1): a string RHS is
+/// a string matcher (`=`/`!=`/`=~`/`!~`), a number/duration RHS is a
+/// numeric comparison (`==`/`=`/`!=`/`>`/`>=`/`<`/`<=`).
+fn parse_label_filter_predicate(cursor: &mut Cursor<'_>) -> Result<LabelFilterExpr, LogQlError> {
+    let (name, _) = cursor.expect_ident()?;
+    let op_tok = cursor.peek().clone();
+    cursor.advance();
+    let rhs_tok = cursor.peek().clone();
+
+    /// Which operator family the operator token belongs to.
+    enum OpForms {
+        /// `=`/`!=`: legal with both a string RHS (matcher) and a numeric
+        /// RHS (comparison).
+        Both { m: MatchOp, c: CompareOp },
+        /// `=~`/`!~`: string RHS only.
+        StringOnly(MatchOp),
+        /// `==`/`>`/`>=`/`<`/`<=`: numeric RHS only.
+        NumericOnly(CompareOp),
+    }
+
+    let forms = match op_tok.kind {
+        TokenKind::Eq => OpForms::Both {
+            m: MatchOp::Eq,
+            c: CompareOp::Eq,
         },
+        TokenKind::Neq => OpForms::Both {
+            m: MatchOp::Neq,
+            c: CompareOp::Neq,
+        },
+        TokenKind::Re => OpForms::StringOnly(MatchOp::Re),
+        TokenKind::Nre => OpForms::StringOnly(MatchOp::Nre),
+        TokenKind::EqEq => OpForms::NumericOnly(CompareOp::Eq),
+        TokenKind::Gt => OpForms::NumericOnly(CompareOp::Gt),
+        TokenKind::Gte => OpForms::NumericOnly(CompareOp::Gte),
+        TokenKind::Lt => OpForms::NumericOnly(CompareOp::Lt),
+        TokenKind::Lte => OpForms::NumericOnly(CompareOp::Lte),
+        TokenKind::Eof => {
+            return Err(LogQlError::UnexpectedEof {
+                expected: "a label-filter operator".to_string(),
+                span: op_tok.span,
+            });
+        }
+        _ => {
+            return Err(LogQlError::UnexpectedToken {
+                found: describe(&op_tok.kind),
+                expected:
+                    "a label-filter operator ('=', '!=', '=~', '!~', '==', '>', '>=', '<', '<=')"
+                        .to_string(),
+                span: op_tok.span,
+            });
+        }
+    };
+
+    let numeric_rhs = |cursor: &mut Cursor<'_>| -> Result<NumericLiteral, LogQlError> {
+        let tok = cursor.peek().clone();
+        match tok.kind {
+            TokenKind::Number(raw) => {
+                cursor.advance();
+                Ok(NumericLiteral::Number(raw))
+            }
+            TokenKind::Duration(raw) => {
+                cursor.advance();
+                Ok(NumericLiteral::DurationOrBytes(raw))
+            }
+            TokenKind::Eof => Err(LogQlError::UnexpectedEof {
+                expected: "a number, duration, or bytes literal".to_string(),
+                span: tok.span,
+            }),
+            _ => Err(LogQlError::UnexpectedToken {
+                found: describe(&tok.kind),
+                expected: "a number, duration, or bytes literal".to_string(),
+                span: tok.span,
+            }),
+        }
+    };
+
+    match forms {
+        OpForms::Both { m, c } => match &rhs_tok.kind {
+            TokenKind::String(_) => {
+                let (value, _) = cursor.expect_string()?;
+                Ok(LabelFilterExpr::Match(Matcher { name, op: m, value }))
+            }
+            _ => {
+                let rhs = numeric_rhs(cursor)?;
+                Ok(LabelFilterExpr::Compare { name, op: c, rhs })
+            }
+        },
+        OpForms::StringOnly(m) => {
+            let (value, _) = cursor.expect_string()?;
+            Ok(LabelFilterExpr::Match(Matcher { name, op: m, value }))
+        }
+        OpForms::NumericOnly(c) => {
+            let rhs = numeric_rhs(cursor)?;
+            Ok(LabelFilterExpr::Compare { name, op: c, rhs })
+        }
     }
 }
 

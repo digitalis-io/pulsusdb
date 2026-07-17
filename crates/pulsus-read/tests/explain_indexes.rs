@@ -211,6 +211,7 @@ fn plan_ctx(db: &str) -> PlanCtx<'_> {
         rollup_res_ns: 5_000_000_000,
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
+        pipeline_scan_factor: 10,
     }
 }
 
@@ -520,7 +521,7 @@ async fn stage3_usage(db: &str, ts_ns: i64, client: &ChClient, query: &str) -> V
         },
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
     explain(client, &sql).await
 }
@@ -620,6 +621,28 @@ async fn stage3_not_regex_line_filter_over_a_metacharacter_pattern_still_lists_t
         ts_ns,
         &client,
         r#"{service_name="checkout"} !~ "err.*""#,
+    )
+    .await;
+    assert_eq!(usage, expected_stage3_line_filter_usage());
+}
+
+/// Issue M6-09 AC4 (Tier-1, the named perf gate): a line filter followed
+/// by parser/label-filter stages keeps the stage-3 `EXPLAIN indexes = 1`
+/// extract EXACTLY equal to the plain line-filter expectation — the
+/// `json`/`status` stages are pure post-fetch and add nothing to the SQL,
+/// so the `tokenbf_v1` skip index stays engaged for `|= "refused"`.
+#[tokio::test]
+async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_s3_parser_pushdown";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let usage = stage3_usage(
+        db,
+        ts_ns,
+        &client,
+        r#"{service_name="checkout"} |= "connection refused" | json | status = "500""#,
     )
     .await;
     assert_eq!(usage, expected_stage3_line_filter_usage());

@@ -25,8 +25,9 @@ mod parser;
 mod token;
 
 pub use ast::{
-    Duration, Expr, Grouping, GroupingKind, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp,
-    Matcher, MetricExpr, RangeAggOp, Stage, StreamSelector, Unwrap, VectorAggOp,
+    CompareOp, Duration, Expr, Grouping, GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt,
+    LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher, MetricExpr, NumericLiteral,
+    ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap, VectorAggOp,
 };
 pub use error::LogQlError;
 pub use parser::{parse, parse_selector};

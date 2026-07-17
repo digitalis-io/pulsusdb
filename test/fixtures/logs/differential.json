@@ -1,0 +1,70 @@
+{
+  "_comment": "issue M6-09 LogQL-pipeline differential corpus + coverage matrix (e2e/src/logs_corpus.rs + e2e/src/logs.rs). `{R}` in every case's `query` is replaced with this run's run_id at execution time; every case conjoins `run_id=\"{R}\"` plus a `service_name` scope pinning the body shape its parser expects, so a stale stack can never leak foreign streams into a set-equality comparison. Gate discipline (traces precedent, plan v3 delta 5): every stage has >= 1 case, every case starts `mode: \"gated\"`, and the exclusion list starts EMPTY. A case moves to `mode: \"informational\"` only via the triage discipline — an observed live divergence, classified fix-our-bug vs ratify-documented-oracle-delta, recorded in docs/benchmarks/logs-differential-ledger.md (the `ledger` field names the entry); PulsusDB stays hard-gated against the corpus expectation even then. `limit` is the query_range request cap on both stores; every case's expected entry set is sized strictly below it (validity gates in logs.rs).",
+  "seed": 20260717,
+  "step_ns": 1000000000,
+  "ci": { "record_count": 60 },
+  "full": { "record_count": 300 },
+  "limit": 1000,
+  "cases": [
+    {
+      "case_id": "json_string_filter",
+      "construct": "json parser (full flatten, incl. a nested member) + string label filter =",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\""
+    },
+    {
+      "case_id": "json_label_filter_regex",
+      "construct": "json parser + string label filter =~ (anchored)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-json\"} | json | method =~ \"GET|DELETE\""
+    },
+    {
+      "case_id": "logfmt_string_filter",
+      "construct": "logfmt parser + string label filter =",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | level = \"error\""
+    },
+    {
+      "case_id": "regexp_extract_filter",
+      "construct": "regexp parser (named captures) + string label filter over an extracted label",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-plain\"} | regexp `^(?P<method>\\w+) (?P<path>\\S+) (?P<status>\\d+)` | status = \"503\""
+    },
+    {
+      "case_id": "pattern_extract_filter",
+      "construct": "pattern parser (<name> captures between literals) + string label filter",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-plain\"} | pattern \"<method> <path> <status> <took>\" | method = \"PUT\""
+    },
+    {
+      "case_id": "numeric_number_filter",
+      "construct": "numeric label filter >= over a plain number",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-json\"} | json | status >= 500"
+    },
+    {
+      "case_id": "numeric_duration_filter",
+      "construct": "numeric label filter > over a duration literal (unit conversion)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | took > 250ms"
+    },
+    {
+      "case_id": "numeric_bytes_filter",
+      "construct": "numeric label filter > over a bytes literal (unit conversion)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | size > 5KB"
+    },
+    {
+      "case_id": "line_format_rewrite",
+      "construct": "line_format {{.label}} substitution over parsed labels (rewritten line bodies)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" | line_format \"{{.method}} {{.req_path}}\""
+    },
+    {
+      "case_id": "label_format_rename",
+      "construct": "label_format rename (dst=src moves the value, removes the source label)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | level = \"error\" | label_format lvl=level"
+    }
+  ]
+}

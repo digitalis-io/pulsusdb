@@ -42,6 +42,11 @@ futures.workspace = true
 # In-process matcher evaluation for the label cache's `Re`/`Nre` matchers
 # (issue #30), bounded by a compiled-regex cache.
 regex.workspace = true
+# The LogQL `json` parser stage (issue M6-09, `logql::pipeline`): each
+# surviving line's body is parsed once per query with the compiled
+# pipeline — cost bounded to rows that already passed line-filter
+# pushdown.
+serde_json.workspace = true
 # The refresh loop (`spawn_refresh_loop`) and the resident snapshot slot
 # (`std::sync::RwLock<Arc<CacheSnapshot>>` plus the `tokio::task::JoinHandle`
 # the loop runs in) are the first async/task-spawning code in this crate

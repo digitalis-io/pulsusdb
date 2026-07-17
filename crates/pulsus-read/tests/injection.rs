@@ -21,6 +21,7 @@ fn ctx() -> PlanCtx<'static> {
         rollup_res_ns: 5_000_000_000,
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
+        pipeline_scan_factor: 10,
     }
 }
 

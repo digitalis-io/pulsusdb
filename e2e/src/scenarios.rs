@@ -45,6 +45,10 @@ pub struct Ctx {
     /// single-variant only (the cluster overlay ships no `tempo`
     /// service; only single-variant scenarios dereference this).
     pub tempo_url: String,
+    /// The reference log store's published base URL (issue M6-09) —
+    /// `crate::logs::logs_pipeline_differential`'s oracle backend,
+    /// single-variant only (same contract as `tempo_url`).
+    pub loki_url: String,
     pub variant: Variant,
     pub fixtures_dir: PathBuf,
     pub compose: Compose,
@@ -119,6 +123,17 @@ pub const SCENARIOS: &[Scenario] = &[
         // count-sum check. Independent data via its own `run_id`.
         variants: &[Variant::Single, Variant::Cluster],
         run: |ctx| Box::pin(crate::traces::traces_roundtrip(ctx)),
+    },
+    Scenario {
+        name: "logs_pipeline_differential",
+        // Single-variant only (issue M6-09 plan v2 delta A: the
+        // differential rides e2e-single, like `traces_differential`; the
+        // cluster overlay ships no reference log store). Additionally
+        // self-gated on PULSUS_E2E_LOGS_DIFFERENTIAL=1 — set only by the
+        // nightly/dispatch full-tier ci.yml job ("no per-PR gate, no new
+        // job"); a per-PR e2e-single run prints a skip and returns Ok.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(crate::logs::logs_pipeline_differential(ctx)),
     },
     Scenario {
         name: "traces_differential",

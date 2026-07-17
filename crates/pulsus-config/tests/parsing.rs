@@ -141,6 +141,11 @@ fn full_fixture_round_trips_into_typed_values() {
         cfg.reader.logql_scan_budget_bytes,
         ByteSize(10 * 1024 * 1024 * 1024)
     );
+    // AC9(iii), issue M6-09: the fixture's partial `reader:` block omits
+    // `logql_pipeline_scan_factor`, so it must resolve from the
+    // container-level `Default` (10) — never from `u32::default()` (0),
+    // which a field-level `#[serde(default)]` would have produced.
+    assert_eq!(cfg.reader.logql_pipeline_scan_factor, 10);
     assert_eq!(cfg.reader.traceql_max_candidates, 5_000);
 
     assert!(cfg.downsampling.enabled);
@@ -159,6 +164,49 @@ fn full_fixture_round_trips_into_typed_values() {
     assert_eq!(cfg.ruler.poll_interval.0, Duration::from_secs(15));
     assert_eq!(cfg.ruler.max_result_bytes, ByteSize(5 * 1024 * 1024));
 
+    let _ = std::fs::remove_file(&path);
+    support::clear_all();
+}
+
+/// AC9(iii), issue M6-09: a zero `logql_pipeline_scan_factor` — whether
+/// it arrives via YAML or via `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` — is
+/// rejected by the load pipeline as `ConfigError::Value` naming the
+/// field; a non-zero YAML value parses through normally.
+#[test]
+fn zero_logql_pipeline_scan_factor_is_rejected_from_yaml_and_env() {
+    let _guard = support::lock_env();
+    support::clear_all();
+
+    // YAML: 0 fails `load` (parse + validate) with the named field.
+    let path = support::write_temp_yaml(
+        "zero-scan-factor",
+        "reader:\n  logql_pipeline_scan_factor: 0\n",
+    );
+    match pulsus_config::load(Some(&path), None) {
+        Err(pulsus_config::ConfigError::Value { field, .. }) => {
+            assert_eq!(field, "reader.logql_pipeline_scan_factor");
+        }
+        other => panic!("expected a Value error for YAML factor 0, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&path);
+
+    // Env: 0 fails `load` the same way.
+    support::set("PULSUS_LOGQL_PIPELINE_SCAN_FACTOR", "0");
+    match pulsus_config::load(None, None) {
+        Err(pulsus_config::ConfigError::Value { field, .. }) => {
+            assert_eq!(field, "reader.logql_pipeline_scan_factor");
+        }
+        other => panic!("expected a Value error for env factor 0, got {other:?}"),
+    }
+    support::clear_all();
+
+    // A non-zero YAML value parses and validates through.
+    let path = support::write_temp_yaml(
+        "nonzero-scan-factor",
+        "reader:\n  logql_pipeline_scan_factor: 4\n",
+    );
+    let cfg = pulsus_config::load(Some(&path), None).expect("factor 4 must load");
+    assert_eq!(cfg.reader.logql_pipeline_scan_factor, 4);
     let _ = std::fs::remove_file(&path);
     support::clear_all();
 }

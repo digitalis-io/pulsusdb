@@ -232,7 +232,9 @@ fn matcher_context_neq_and_filter_context_neq_in_one_query() {
     };
     assert_eq!(log.selector.matchers[1].op, pulsus_logql::MatchOp::Neq);
     assert_eq!(log.pipeline.len(), 1);
-    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0];
+    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0] else {
+        panic!("expected a line filter stage");
+    };
     assert_eq!(lf.op, pulsus_logql::LineFilterOp::NotContains);
 }
 
@@ -565,6 +567,224 @@ fn min_and_max_and_count_vector_aggs_parse() {
         let query = format!(r#"{op_name}(count_over_time({{app="x"}}[5m]))"#);
         assert!(parse(&query).is_ok(), "expected {query:?} to parse");
     }
+}
+
+// ---------------------------------------------------------------------
+// M6-09 pipeline stages: parsers, label filters, formats, unwrap. Every
+// construct that moved out of `errors.rs`'s NotYetSupported set gets a
+// round-trip snapshot (`parse(ast.to_string()) == ast` — AC1); key
+// shapes also pin their full Debug form.
+// ---------------------------------------------------------------------
+
+/// The round-trip half of [`assert_snapshot`] alone, for the wide M6-09
+/// construct matrix where the full Debug form would add bulk without
+/// pinning anything the round-trip identity doesn't.
+fn assert_round_trip(query: &str) {
+    let expr = parse(query).unwrap_or_else(|e| panic!("expected {query:?} to parse, got {e}"));
+    let rendered = expr.to_string();
+    let reparsed = parse(&rendered)
+        .unwrap_or_else(|e| panic!("expected the rendered form {rendered:?} to reparse, got {e}"));
+    assert_eq!(
+        reparsed, expr,
+        "round-trip mismatch: {query:?} -> {rendered:?}"
+    );
+}
+
+#[test]
+fn a_json_parser_stage_with_a_label_filter() {
+    assert_snapshot(
+        r#"{app="x"} | json | status = "500""#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            Parser(
+                Json {
+                    extractions: [],
+                },
+            ),
+            LabelFilter(
+                Match(
+                    Matcher {
+                        name: "status",
+                        op: Eq,
+                        value: "500",
+                    },
+                ),
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_numeric_label_filter_carries_the_raw_literal() {
+    assert_snapshot(
+        r#"{app="x"} | logfmt | took > 250ms"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            Parser(
+                Logfmt {
+                    extractions: [],
+                },
+            ),
+            LabelFilter(
+                Compare {
+                    name: "took",
+                    op: Gt,
+                    rhs: DurationOrBytes(
+                        "250ms",
+                    ),
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+/// The plan v3 delta 1 combined form: unwrap as an ordered stage with
+/// post-unwrap label filters preserved in position, inside a range
+/// aggregation.
+#[test]
+fn unwrap_with_post_unwrap_label_filters_round_trips_in_position() {
+    let query = r#"count_over_time({a="b"} | json | unwrap duration(latency) | __error__ = "" | latency > 1s [5m])"#;
+    assert_round_trip(query);
+
+    let expr = parse(query).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) = &expr else {
+        panic!("expected a range aggregation");
+    };
+    // `LogRange.unwrap` stays retained-but-unused: the stage lives in the
+    // ordered pipeline instead.
+    assert_eq!(range.unwrap, None);
+    let pipeline = &range.selector.pipeline;
+    assert_eq!(pipeline.len(), 4);
+    assert!(matches!(
+        &pipeline[1],
+        pulsus_logql::Stage::Unwrap(u)
+            if u.label == "latency" && u.conversion.as_deref() == Some("duration")
+    ));
+    assert!(matches!(&pipeline[2], pulsus_logql::Stage::LabelFilter(_)));
+    assert!(matches!(&pipeline[3], pulsus_logql::Stage::LabelFilter(_)));
+}
+
+#[test]
+fn every_new_pipeline_construct_round_trips() {
+    let queries = [
+        // Parsers, bare and with extractions (incl. the bare-identifier
+        // shorthand, which canonicalizes to `label="label"`).
+        r#"{a="b"} | json"#,
+        r#"{a="b"} | json first_server="servers[0]", ua="request.headers.User-Agent""#,
+        r#"{a="b"} | json host"#,
+        r#"{a="b"} | logfmt"#,
+        r#"{a="b"} | logfmt host="hostname""#,
+        r#"{a="b"} | regexp "(?P<method>\\w+) (?P<path>\\S+)""#,
+        r#"{a="b"} | regexp `(?P<method>\w+) (?P<path>\S+)`"#,
+        r#"{a="b"} | pattern "<method> <path> <_> <status>""#,
+        // String label filters, all four operators.
+        r#"{a="b"} | status = "500""#,
+        r#"{a="b"} | status != "500""#,
+        r#"{a="b"} | status =~ "5..""#,
+        r#"{a="b"} | status !~ "2..""#,
+        // Numeric label filters over number / duration / bytes literals.
+        r#"{a="b"} | status == 500"#,
+        r#"{a="b"} | status != 500"#,
+        r#"{a="b"} | ratio > 0.5"#,
+        r#"{a="b"} | took >= 250ms"#,
+        r#"{a="b"} | took < 1h30m"#,
+        r#"{a="b"} | size <= 5KB"#,
+        r#"{a="b"} | size > 1MiB"#,
+        // Boolean mini-grammar: `and`, `or`, `,`, parens, nesting.
+        r#"{a="b"} | json | status = "500" and level = "error""#,
+        r#"{a="b"} | json | status = "500", level = "error""#,
+        r#"{a="b"} | json | status = "500" or level = "error""#,
+        r#"{a="b"} | json | (status = "500" or status = "503") and level = "error""#,
+        r#"{a="b"} | json | level = "error" or (took > 250ms and size > 5KB)"#,
+        // Formats.
+        r#"{a="b"} | json | line_format "{{.method}} {{.path}}""#,
+        r#"{a="b"} | logfmt | label_format lvl=level"#,
+        r#"{a="b"} | logfmt | label_format lvl=level, summary="{{.method}} {{.path}}""#,
+        // Unwrap, bare and converted, log-range position.
+        r#"count_over_time({a="b"} | logfmt | unwrap bytes_processed [5m])"#,
+        r#"rate({a="b"} | json | unwrap duration_seconds(latency) [1m])"#,
+        r#"rate({a="b"} | json | unwrap bytes(sz) [1m])"#,
+        // Line filters interleaved with the new stages (pre-unwrap).
+        r#"{a="b"} |= "err" | json | status = "500""#,
+        r#"{a="b"} | line_format "{{.msg}}" |= "err""#,
+        // A bare log query with unwrap parses (the planner, not the
+        // parser, owns the "unwrap needs a range aggregation" rejection).
+        r#"{a="b"} | json | unwrap latency"#,
+    ];
+    for q in queries {
+        assert_round_trip(q);
+    }
+}
+
+#[test]
+fn boolean_label_filters_default_to_and_binding_tighter_than_or() {
+    let expr = parse(r#"{a="b"} | x = "1" or y = "2" and z = "3""#).unwrap();
+    let pulsus_logql::Expr::Log(log) = &expr else {
+        panic!("expected a log expr");
+    };
+    let pulsus_logql::Stage::LabelFilter(filter) = &log.pipeline[0] else {
+        panic!("expected a label filter stage");
+    };
+    // `or` is loosest: x or (y and z).
+    let pulsus_logql::LabelFilterExpr::Or(left, right) = filter else {
+        panic!("expected Or at the root, got {filter:?}");
+    };
+    assert!(matches!(**left, pulsus_logql::LabelFilterExpr::Match(_)));
+    assert!(matches!(**right, pulsus_logql::LabelFilterExpr::And(..)));
+}
+
+#[test]
+fn consecutive_label_filter_stages_stay_separate_stages() {
+    let expr = parse(r#"{a="b"} | json | status = "500" | level = "error""#).unwrap();
+    let pulsus_logql::Expr::Log(log) = &expr else {
+        panic!("expected a log expr");
+    };
+    assert_eq!(log.pipeline.len(), 3);
+    assert!(matches!(
+        &log.pipeline[1],
+        pulsus_logql::Stage::LabelFilter(_)
+    ));
+    assert!(matches!(
+        &log.pipeline[2],
+        pulsus_logql::Stage::LabelFilter(_)
+    ));
+}
+
+#[test]
+fn an_eq_label_filter_with_a_numeric_rhs_canonicalizes_to_double_eq() {
+    // RHS-typed dispatch: `= 500` is the numeric comparison (upstream
+    // accepts both spellings); canonical Display renders `== 500`.
+    let expr = parse(r#"{a="b"} | status = 500"#).unwrap();
+    assert_eq!(expr.to_string(), r#"{a="b"} | status == 500"#);
+    assert_round_trip(r#"{a="b"} | status = 500"#);
 }
 
 #[test]

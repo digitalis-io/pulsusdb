@@ -1,0 +1,64 @@
+# Reference log-query oracle config for the M6-09 LogQL-pipeline
+# differential (`e2e/src/logs.rs`'s `logs_pipeline_differential`
+# scenario). All-in-one single-binary mode against local filesystem
+# storage — KISS: no TLS, no auth, no DNS (the collector reaches the OTLP
+# endpoint by this service's static ipv4_address,
+# deploy/e2e/compose.single.yaml).
+#
+# Pinned image: grafana/loki:3.4.2 (see compose.single.yaml for the
+# digest — tag AND digest, the grafana/tempo:3.0.2 / prom/prometheus
+# precedent; upgrades are deliberate future commits, never floating).
+#
+# The differential's stream-label-set equality rests on this file's
+# limits_config (M6-09 plan v3 delta 3):
+#   - `otlp_config` promotes the corpus's isolation attribute (`run_id`)
+#     to an INDEX (stream) label; `service.name` is already promoted by
+#     the default OTLP mapping (-> `service_name`). The corpus emits
+#     exactly those two resource attributes and nothing else (no scope,
+#     no severity, no record attributes), so neither store grows extra
+#     stream labels or structured metadata.
+#   - `discover_log_levels: false` — otherwise the oracle injects a
+#     `detected_level` structured-metadata field per entry, which its
+#     query results surface as an extra label and which PulsusDB
+#     deliberately does not synthesize.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem:
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+# v13 + TSDB: required for structured metadata / the OTLP endpoint.
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  allow_structured_metadata: true
+  discover_log_levels: false
+  otlp_config:
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes:
+            - run_id
+
+analytics:
+  reporting_enabled: false

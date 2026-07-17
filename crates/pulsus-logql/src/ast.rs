@@ -109,19 +109,218 @@ impl fmt::Display for MatchOp {
     }
 }
 
-/// A pipeline stage. M1 implements only line filters; M6 adds parsers
-/// (`json`/`logfmt`/`regexp`/`pattern`), label filters, `line_format`,
-/// `label_format`, and `unwrap` as new variants — additive only, per the
-/// AST-stability contract.
+/// A pipeline stage. M1 implemented only line filters; M6-09 adds the
+/// parsers (`json`/`logfmt`/`regexp`/`pattern`), label filters,
+/// `line_format`, `label_format`, and `unwrap` as additive variants, per
+/// the AST-stability contract. `unwrap` is an ordered stage in the same
+/// pipeline (the grammar allows only label filters after it — enforced by
+/// the parser); the still-unimplemented stage keywords are listed in
+/// [`REMAINING_UNSUPPORTED_STAGES`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Stage {
     LineFilter(LineFilter),
+    Parser(ParserStage),
+    LabelFilter(LabelFilterExpr),
+    /// `| line_format "<template>"` — raw template text (e.g.
+    /// `"{{.method}} {{.status}}"`); template validation/compilation is a
+    /// `pulsus-read` concern (this crate stays purely syntactic).
+    LineFormat(String),
+    LabelFormat(Vec<LabelFmt>),
+    Unwrap(Unwrap),
 }
 
 impl fmt::Display for Stage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Stage::LineFilter(lf) => write!(f, "{lf}"),
+            Stage::Parser(p) => write!(f, "| {p}"),
+            Stage::LabelFilter(lf) => write!(f, "| {lf}"),
+            Stage::LineFormat(tmpl) => write!(f, "| line_format {}", quote(tmpl)),
+            Stage::LabelFormat(fmts) => {
+                write!(f, "| label_format ")?;
+                for (i, lf) in fmts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{lf}")?;
+                }
+                Ok(())
+            }
+            Stage::Unwrap(u) => match &u.conversion {
+                Some(conv) => write!(f, "| unwrap {conv}({})", u.label),
+                None => write!(f, "| unwrap {}", u.label),
+            },
+        }
+    }
+}
+
+/// A parser stage: extracts labels from the (unmodified) log line. Regex
+/// and pattern bodies are raw text here — validated/compiled in
+/// `pulsus-read` (the "regex not validated" contract, same as `Matcher`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ParserStage {
+    /// `| json` (full flatten) or `| json foo="a.b", bar` (targeted
+    /// extractions; a bare identifier is shorthand for `foo="foo"`).
+    Json { extractions: Vec<LabelExtraction> },
+    /// `| logfmt` or `| logfmt foo="source_key", bar`.
+    Logfmt { extractions: Vec<LabelExtraction> },
+    /// `| regexp "<re>"` — named capture groups become labels.
+    Regexp(String),
+    /// `| pattern "<p>"` — `<name>` captures between literal delimiters,
+    /// `<_>` discards.
+    Pattern(String),
+}
+
+impl fmt::Display for ParserStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn extraction_list(f: &mut fmt::Formatter<'_>, ex: &[LabelExtraction]) -> fmt::Result {
+            for (i, e) in ex.iter().enumerate() {
+                write!(
+                    f,
+                    "{}{}={}",
+                    if i > 0 { ", " } else { " " },
+                    e.label,
+                    quote(&e.expression)
+                )?;
+            }
+            Ok(())
+        }
+        match self {
+            ParserStage::Json { extractions } => {
+                write!(f, "json")?;
+                extraction_list(f, extractions)
+            }
+            ParserStage::Logfmt { extractions } => {
+                write!(f, "logfmt")?;
+                extraction_list(f, extractions)
+            }
+            ParserStage::Regexp(re) => write!(f, "regexp {}", quote(re)),
+            ParserStage::Pattern(p) => write!(f, "pattern {}", quote(p)),
+        }
+    }
+}
+
+/// One `label="expression"` pair in a `json`/`logfmt` extraction list.
+/// The expression is raw text (a JSON path for `json`, a source key for
+/// `logfmt`) — interpreted in `pulsus-read`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LabelExtraction {
+    pub label: String,
+    pub expression: String,
+}
+
+/// A label-filter expression: string matchers, numeric comparisons, and
+/// the `and`/`or`/`,` boolean mini-grammar (`,` and `and` both AND; `and`
+/// binds tighter than `or`; parentheses group).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LabelFilterExpr {
+    /// String form: `name =|!=|=~|!~ "value"`.
+    Match(Matcher),
+    /// Numeric form: `name ==|!=|>|>=|<|<= <number|duration|bytes>`.
+    Compare {
+        name: String,
+        op: CompareOp,
+        rhs: NumericLiteral,
+    },
+    And(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
+    Or(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
+}
+
+impl LabelFilterExpr {
+    /// Renders a child of a boolean node, parenthesizing nested boolean
+    /// children so `Display` round-trips the exact tree shape (the parser
+    /// is left-associative; an unparenthesized nested right child would
+    /// re-associate on reparse).
+    fn fmt_child(child: &LabelFilterExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match child {
+            LabelFilterExpr::And(..) | LabelFilterExpr::Or(..) => write!(f, "({child})"),
+            leaf => write!(f, "{leaf}"),
+        }
+    }
+}
+
+impl fmt::Display for LabelFilterExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LabelFilterExpr::Match(m) => write!(f, "{m}"),
+            LabelFilterExpr::Compare { name, op, rhs } => write!(f, "{name} {op} {rhs}"),
+            LabelFilterExpr::And(a, b) => {
+                Self::fmt_child(a, f)?;
+                write!(f, " and ")?;
+                Self::fmt_child(b, f)
+            }
+            LabelFilterExpr::Or(a, b) => {
+                Self::fmt_child(a, f)?;
+                write!(f, " or ")?;
+                Self::fmt_child(b, f)
+            }
+        }
+    }
+}
+
+/// Numeric label-filter comparison operators (`==` `!=` `>` `>=` `<`
+/// `<=`). A `=` with a numeric RHS also parses as [`CompareOp::Eq`]
+/// (canonical `Display` renders `==`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompareOp {
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+}
+
+impl fmt::Display for CompareOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            CompareOp::Eq => "==",
+            CompareOp::Neq => "!=",
+            CompareOp::Gt => ">",
+            CompareOp::Gte => ">=",
+            CompareOp::Lt => "<",
+            CompareOp::Lte => "<=",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// A numeric label-filter RHS, kept as raw text (this crate never parses
+/// numbers/units — `Eq`/`Hash` stay derivable, and duration-vs-bytes
+/// disambiguation is a `pulsus-read` concern).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NumericLiteral {
+    /// A bare number token, e.g. `500`, `0.25`.
+    Number(String),
+    /// A unit-suffixed literal the lexer scanned as one duration-shaped
+    /// token, e.g. `250ms`, `5KB`, `1MiB` — interpreted (duration vs
+    /// bytes) by the shared unit parser in `pulsus-read`.
+    DurationOrBytes(String),
+}
+
+impl fmt::Display for NumericLiteral {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NumericLiteral::Number(raw) | NumericLiteral::DurationOrBytes(raw) => {
+                write!(f, "{raw}")
+            }
+        }
+    }
+}
+
+/// One `label_format` operation: `dst=src` renames (identifier RHS),
+/// `dst="<template>"` computes (string RHS).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum LabelFmt {
+    Rename { dst: String, src: String },
+    Template { dst: String, tmpl: String },
+}
+
+impl fmt::Display for LabelFmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LabelFmt::Rename { dst, src } => write!(f, "{dst}={src}"),
+            LabelFmt::Template { dst, tmpl } => write!(f, "{dst}={}", quote(tmpl)),
         }
     }
 }
@@ -203,8 +402,11 @@ impl fmt::Display for MetricExpr {
 }
 
 /// `LogExpr [duration]` — the operand of every range aggregation.
-/// `unwrap` is reserved for M6 (`| unwrap <label>`); the M1 parser always
-/// emits `None`.
+/// `unwrap` is retained-but-unused (issue M6-09 plan v3 delta 1): the
+/// parser represents `| unwrap …` as an ordered [`Stage::Unwrap`] inside
+/// `selector.pipeline` — so post-unwrap label filters keep their position
+/// — and always leaves this field `None`. Kept so `LogRange` never
+/// reshapes (the ast.rs additive-only freeze).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogRange {
     pub selector: LogExpr,
@@ -218,9 +420,11 @@ impl fmt::Display for LogRange {
     }
 }
 
-/// Reserved for M6's `| unwrap <label> [| <conversion>]` stage. The M1
-/// parser never constructs one — present now so `LogRange` doesn't
-/// reshape when `unwrap` lands.
+/// `| unwrap <label>` / `| unwrap <conversion>(<label>)` — carried by
+/// [`Stage::Unwrap`] (issue M6-09). `conversion` is
+/// `Some("duration"|"duration_seconds"|"bytes")` for the wrapped forms.
+/// Parse-only in M6-09: feeding the unwrapped value into range
+/// aggregations is the M6-10 seam.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Unwrap {
     pub label: String,
@@ -434,12 +638,15 @@ pub(crate) const FUTURE_RANGE_AGG: &[&str] = &[
 /// The remaining vector aggregations.
 pub(crate) const FUTURE_VECTOR_AGG: &[&str] = &["stddev", "stdvar", "topk", "bottomk"];
 
-/// M6 pipeline parser stages, recognized after a bare `|`.
-pub(crate) const FUTURE_PARSERS: &[&str] = &["json", "logfmt", "regexp", "pattern"];
+/// Pipeline stage keywords still outside the implemented set after
+/// M6-09 (which emptied the former `FUTURE_PARSERS`/
+/// `FUTURE_STAGE_KEYWORDS` tables): recognized after a bare `|` and named
+/// in `NotYetSupported`.
+pub(crate) const REMAINING_UNSUPPORTED_STAGES: &[&str] =
+    &["unpack", "drop", "keep", "decolorize", "distinct", "ip"];
 
-/// M6 pipeline stage keywords (other than the parsers above), recognized
-/// after a bare `|`.
-pub(crate) const FUTURE_STAGE_KEYWORDS: &[&str] = &["line_format", "label_format", "unwrap"];
+/// The conversion functions `unwrap` accepts in its wrapped form.
+pub(crate) const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];
 
 /// The exact expression-level binary-op recognition table (architect plan
 /// amendment 2 §2, corrected by amendment 3): `+ - * / % ^ == != > < >=

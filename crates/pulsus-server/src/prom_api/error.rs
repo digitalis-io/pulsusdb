@@ -145,7 +145,11 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         ReadError::Parse(_)
         | ReadError::EmptyMatcherSet
         | ReadError::ContradictoryMatchers
-        | ReadError::InvalidStep => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
+        | ReadError::InvalidStep
+        | ReadError::PipelineInvalid { .. }
+        | ReadError::PipelineUnsupportedInMetric { .. } => {
+            (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
+        }
         // Issue #85 (M6-08c): the name-less-selector fan-out cap
         // (`TooBroadReason::MetricFanout`) rides the existing
         // QueryTooBroad -> 422 `execution` mapping; the degraded-cache

@@ -96,6 +96,7 @@ fn plan_ctx(db: &str) -> PlanCtx<'_> {
         rollup_res_ns: 5_000_000_000,
         scan_budget_bytes: 50 * 1024 * 1024 * 1024,
         max_streams: 100_000,
+        pipeline_scan_factor: 10,
     }
 }
 
@@ -359,7 +360,7 @@ async fn stage3_narrow_window_read_rows_are_index_confined_not_a_full_scan() {
         },
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
 
     let (returned, evidence) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(
@@ -419,7 +420,7 @@ async fn body_search_skip_index_prunes_most_granules() {
         },
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
 
     let (returned, evidence) = run_and_capture::<pulsus_read::logql::rows::SampleRow>(

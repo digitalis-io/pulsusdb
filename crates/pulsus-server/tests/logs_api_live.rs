@@ -1300,6 +1300,136 @@ async fn gzip_accept_encoding_is_byte_identical_and_never_panics_across_all_endp
     }
 }
 
+/// Issue M6-09 AC5: the fan-out pipeline path end to end — seed JSON
+/// bodies, run `| json | status = "500" | line_format "{{.method}}"`, and
+/// assert (a) only matching lines survive, (b) line bodies are
+/// reformatted, (c) result streams split by parsed-label set (one source
+/// stream fans out into one result stream per distinct `method`), with
+/// parsed labels present in each stream's label object.
+#[tokio::test]
+async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_pipeline_fanout";
+    let port = 31_118;
+    // Exact-count assertions below: `log_samples` is a plain MergeTree, so
+    // a stale database from a previous run would double the seeded rows
+    // (see `drop_database`'s doc comment).
+    drop_database(db).await;
+    let guard = spawn_ready_server(port, db);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    let base_ns = now_ns();
+
+    // One stream, five JSON lines: three status=500 (methods GET/GET/PUT),
+    // one status=200, one non-JSON line (gets `__error__`, then dropped by
+    // the status filter).
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_A}, 'checkout', \
+                 '{{\"env\":\"prod\",\"service_name\":\"checkout\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    let bodies = [
+        r#"{"method":"GET","status":"500"}"#,
+        r#"{"method":"GET","status":"500"}"#,
+        r#"{"method":"PUT","status":"500"}"#,
+        r#"{"method":"GET","status":"200"}"#,
+        "plain text line",
+    ];
+    let values: Vec<String> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let ts = base_ns - (bodies.len() as i64 - i as i64) * 1_000_000_000;
+            format!(
+                "('checkout', {FP_A}, {ts}, 0, '{}')",
+                body.replace('\'', "\\'")
+            )
+        })
+        .collect();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_samples");
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let res = http_get(
+        port,
+        &q(
+            "/api/logs/v1/query_range",
+            &[
+                (
+                    "query",
+                    r#"{service_name="checkout"} | json | status = "500" | line_format "{{.method}}""#,
+                ),
+                ("start", &start.to_string()),
+                ("end", &end.to_string()),
+                ("limit", "100"),
+                ("direction", "forward"),
+            ],
+        ),
+    )
+    .expect("query_range reachable");
+    assert_eq!(res.status, 200, "body: {}", res.body);
+    let body = json(&res);
+    assert_eq!(body["data"]["resultType"], "streams");
+    let streams = body["data"]["result"].as_array().expect("streams array");
+
+    // (c) fan-out: one result stream per final parsed-label set.
+    assert_eq!(
+        streams.len(),
+        2,
+        "expected a GET stream and a PUT stream, got: {streams:?}"
+    );
+    let mut by_method: HashMap<String, &serde_json::Value> = HashMap::new();
+    for s in streams {
+        let labels = &s["stream"];
+        assert_eq!(labels["env"], "prod", "base labels must be preserved");
+        assert_eq!(labels["service_name"], "checkout");
+        assert_eq!(
+            labels["status"], "500",
+            "parsed labels must be stream-level"
+        );
+        let method = labels["method"].as_str().expect("method label").to_string();
+        by_method.insert(method, s);
+    }
+
+    // (a)+(b): only matching lines survive, and bodies are reformatted to
+    // the template output.
+    let get_values = by_method["GET"]["values"].as_array().unwrap();
+    assert_eq!(get_values.len(), 2);
+    for v in get_values {
+        assert_eq!(v[1], "GET", "line must be rewritten by line_format");
+    }
+    let put_values = by_method["PUT"]["values"].as_array().unwrap();
+    assert_eq!(put_values.len(), 1);
+    assert_eq!(put_values[0][1], "PUT");
+    assert_eq!(
+        body["data"]["stats"]["entries"], 3,
+        "the status=200 and non-JSON lines must not survive"
+    );
+
+    drop(guard);
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

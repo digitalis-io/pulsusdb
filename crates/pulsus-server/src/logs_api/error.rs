@@ -100,7 +100,17 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
             e.to_string(),
             Some(inner.span().start),
         ),
-        ReadError::EmptyMatcherSet | ReadError::ContradictoryMatchers | ReadError::InvalidStep => {
+        // Issue M6-09 plan v3 delta 6: pipeline-validation failures (bad
+        // regex / unsupported template function / bad parser expression /
+        // `unwrap` outside a range aggregation) and the M6-10
+        // metric-pipeline deferral are both client-caused query-shape
+        // rejections — 400 `bad_data`, alongside the other planner
+        // validation variants.
+        ReadError::EmptyMatcherSet
+        | ReadError::ContradictoryMatchers
+        | ReadError::InvalidStep
+        | ReadError::PipelineInvalid { .. }
+        | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
         }
         // Issue #85: `NamelessSelectorUnresolvable` is a PromQL-only
@@ -184,6 +194,36 @@ mod tests {
         let (status, json) = envelope(ApiError::Read(ReadError::InvalidStep)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["errorType"], "bad_data");
+    }
+
+    /// Issue M6-09 plan v3 delta 6: both pipeline rejection classes map
+    /// to 400 `bad_data` (matching the
+    /// `read_error_empty_matcher_set_maps_to_400_bad_data` idiom).
+    #[tokio::test]
+    async fn read_error_pipeline_invalid_maps_to_400_bad_data() {
+        let err = ReadError::PipelineInvalid {
+            reason: "bad regex: unclosed group".to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid pipeline")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_error_pipeline_unsupported_in_metric_maps_to_400_bad_data() {
+        let err = ReadError::PipelineUnsupportedInMetric {
+            construct: "json".to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(json["error"].as_str().unwrap_or_default().contains("json"));
     }
 
     #[tokio::test]

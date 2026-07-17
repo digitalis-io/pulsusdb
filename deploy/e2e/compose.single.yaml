@@ -147,6 +147,32 @@ services:
     # `prometheus`'s `:9090` publish above.
     ports: [ "3200:3200" ]
 
+  # The M6-09 LogQL-pipeline differential's reference backend
+  # (`e2e/src/logs.rs`'s `logs_pipeline_differential`, nightly/dispatch
+  # tier): receives the identical OTLP logs corpus via the collector's
+  # `otlphttp/loki` exporter fan-out (`otel-config.single.yaml`) so
+  # pipeline query results can be diffed set-equal. Pinned by tag AND
+  # digest (the grafana/tempo:3.0.2 / prom/prometheus:v3.13.0 precedent
+  # — multi-arch manifest-list digest recorded at pull time; upgrades
+  # are deliberate future commits, never floating). Single-variant only,
+  # like `tempo`. Host publish is `3101` (pulsusdb owns host `3100`;
+  # distinct static IPs mean no in-network conflict). Config notes:
+  # deploy/e2e/loki.yaml.
+  loki:
+    image: grafana/loki:3.4.2@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08
+    command:
+      - -config.file=/etc/loki/config.yaml
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/loki.yaml:/etc/loki/config.yaml:ro
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.16
+    # Published so the harness's differential HTTP client (running on the
+    # host, like every other Ctx.http call) can drive
+    # `/loki/api/v1/query_range` directly — same rationale as `tempo`'s
+    # `:3200` publish above.
+    ports: [ "3101:3100" ]
+
   # Grafana, provisioned with a Loki datasource pointed at pulsusdb's compat
   # surface (issue #14, task-manager-approved option A): proves alias
   # routing + Loki-datasource compatibility end to end via

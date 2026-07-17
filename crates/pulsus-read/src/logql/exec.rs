@@ -49,6 +49,9 @@ pub struct EngineConfig {
     pub rollup_res_ns: u64,
     pub scan_budget_bytes: u64,
     pub max_streams: usize,
+    /// `reader.logql_pipeline_scan_factor` (issue M6-09) — see
+    /// [`PlanCtx::pipeline_scan_factor`].
+    pub pipeline_scan_factor: u32,
 }
 
 impl EngineConfig {
@@ -62,6 +65,7 @@ impl EngineConfig {
             rollup_res_ns: self.rollup_res_ns,
             scan_budget_bytes: self.scan_budget_bytes,
             max_streams: self.max_streams,
+            pipeline_scan_factor: self.pipeline_scan_factor,
         }
     }
 }
@@ -424,11 +428,27 @@ impl LogQlEngine {
     /// every stage's already-computed SQL is pushed into it in the same
     /// single pass that executes it — no second run (architect plan
     /// amendment §3; see [`LogQlEngine::query_explained`]).
+    ///
+    /// Three response paths (issue M6-09):
+    /// - **fast** — line-filter-only pipeline (everything pushed down):
+    ///   the M1 shape, byte-identical (`labels_json` verbatim, SQL `LIMIT
+    ///   == limit`, zero new per-row work);
+    /// - **transform** — the pipeline drops/rewrites lines but never
+    ///   changes the label set: per-fingerprint grouping, `labels_json`
+    ///   verbatim, entries filtered/rewritten;
+    /// - **fan-out** — a parser/`label_format` (or an `__error__`-adding
+    ///   numeric filter) can change the label set: surviving entries
+    ///   regroup by final label set, one `StreamResult` per set with a
+    ///   canonically re-rendered `labels_json`.
     async fn run_streams_inner(
         &self,
         sp: &StreamsPlan,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<Vec<StreamResult>, ReadError> {
+        // Compile before any I/O: a bad regex/template is a 400-class
+        // rejection, never a wasted scan.
+        let compiled = super::pipeline::CompiledPipeline::compile(&sp.pipeline)?;
+
         if let Some(e) = explain.as_mut() {
             e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
             for probe in &sp.probes {
@@ -463,36 +483,55 @@ impl LogQlEngine {
             },
             &sp.line_filters,
             sp.direction,
-            sp.limit,
+            sp.scan_limit,
         );
         if let Some(e) = explain.as_mut() {
             e.push("stage3_samples", sql.clone(), None);
         }
 
-        let mut by_fp: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
+        if compiled.is_line_filter_only() {
+            // Fast path: today's per-fingerprint shape, `labels_json`
+            // verbatim (`scan_limit == result_limit` by construction).
+            let mut by_fp: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
+            let mut stream = self
+                .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                .await
+                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                by_fp
+                    .entry(row.fingerprint)
+                    .or_default()
+                    .push((row.timestamp_ns, row.body));
+            }
+
+            return Ok(by_fp
+                .into_iter()
+                .filter_map(|(fp, entries)| {
+                    meta.get(&fp).map(|m| StreamResult {
+                        fingerprint: fp,
+                        service: m.service.clone(),
+                        labels_json: m.labels.clone(),
+                        entries,
+                    })
+                })
+                .collect());
+        }
+
+        // Transform/fan-out paths: collect rows in arrival order (stage 3
+        // orders globally by timestamp in the requested direction, so
+        // arrival order IS the response order — the global `result_limit`
+        // truncation below depends on it). Bounded by `scan_limit`.
+        let mut rows: Vec<SampleRow> = Vec::new();
         let mut stream = self
             .query_stream::<SampleRow>(&sql, &self.budget_settings())
             .await
             .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
-            by_fp
-                .entry(row.fingerprint)
-                .or_default()
-                .push((row.timestamp_ns, row.body));
+            rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
         }
 
-        Ok(by_fp
-            .into_iter()
-            .filter_map(|(fp, entries)| {
-                meta.get(&fp).map(|m| StreamResult {
-                    fingerprint: fp,
-                    service: m.service.clone(),
-                    labels_json: m.labels.clone(),
-                    entries,
-                })
-            })
-            .collect())
+        Ok(run_pipeline_rows(rows, &compiled, &meta, sp.result_limit))
     }
 
     /// Executes a [`MetricPlan`] end to end. Same single-pass explain
@@ -668,7 +707,7 @@ impl LogQlEngine {
             },
             &sp.line_filters,
             sp.direction,
-            sp.limit,
+            sp.scan_limit,
         );
         explain.push("stage3_samples", stage3_sql, None);
         Ok(explain)
@@ -767,6 +806,200 @@ pub(crate) fn escape_query_placeholders(sql: &str) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(sql)
     }
+}
+
+/// The pure transform/fan-out assembly (issue M6-09): runs already-
+/// fetched stage-3 rows — **in arrival order**, which stage 3's global
+/// `ORDER BY timestamp_ns` makes the requested direction's order —
+/// through the compiled pipeline, truncates survivors at `result_limit`
+/// **globally across streams** (AC9: never per-stream, and never
+/// over-returning), then groups:
+/// - transform path (`!mutates_labels`): by source fingerprint,
+///   `labels_json` verbatim from hydration;
+/// - fan-out path: by final label set, with a canonical re-rendered
+///   `labels_json` and a deterministic content-hash fingerprint.
+///
+/// `pub` (not `pub(crate)`) deliberately: this is the ChClient-free pure
+/// half of the streams pipeline path, and the allocation-regression
+/// suite (`tests/logql_pipeline_alloc.rs`, review round 2) pins its
+/// per-row allocation bounds from outside the crate — the same hermetic
+/// surface the in-module unit tests use.
+pub fn run_pipeline_rows(
+    rows: Vec<SampleRow>,
+    compiled: &super::pipeline::CompiledPipeline,
+    meta: &HashMap<u64, StreamMetaRow>,
+    result_limit: u32,
+) -> Vec<StreamResult> {
+    // Base labels parsed once per fingerprint, not per row.
+    let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    for (fp, m) in meta {
+        base_labels.insert(*fp, parse_flat_labels(&m.labels));
+    }
+
+    let fan_out = compiled.mutates_labels();
+    let mut survivors = 0u32;
+    // Transform path groups by source fingerprint; fan-out groups by the
+    // canonical rendered labels JSON (sorted keys — it doubles as the
+    // equality key). Two maps instead of a shared key enum so the
+    // fan-out entry API can reuse its own `String` key without a
+    // per-row clone (review round 2, finding 1); the fan-out value holds
+    // only the per-group accumulator, and the map-owned key MOVES into
+    // `StreamResult.labels_json` at final collection — never cloned out
+    // of the entry, so high-cardinality fan-out (every row a new group)
+    // pays no per-group key duplication either (review round 3).
+    let mut fp_groups: HashMap<u64, StreamResult> = HashMap::new();
+    let mut label_groups: HashMap<String, FanOutGroup> = HashMap::new();
+    // One label scratch reused across every row (issue #72 review round
+    // 1, finding 3): all rows share the loop-invariant lifetime of
+    // `rows`/`base_labels`/`compiled`, so `run_into` clears and refills
+    // the same vector — zero per-row label-vector allocations on the
+    // dropped-row path.
+    let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+
+    for row in &rows {
+        if survivors >= result_limit {
+            break;
+        }
+        let Some(m) = meta.get(&row.fingerprint) else {
+            continue;
+        };
+        let base = &base_labels[&row.fingerprint];
+        let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
+            continue;
+        };
+        survivors += 1;
+
+        if fan_out {
+            // Render the canonical JSON DIRECTLY from the sorted borrowed
+            // scratch (round-2 finding 1: no owned intermediate label
+            // vector, no second clone at render time). Per surviving row
+            // this costs exactly the `labels_json` string (needed as the
+            // group key either way) + the owned output line; the
+            // `StreamResult` fields materialize once per NEW group only.
+            scratch.sort_unstable();
+            let labels_json = render_labels_json_sorted(&scratch);
+            let entry = (row.timestamp_ns, line.into_owned());
+            match label_groups.entry(labels_json) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    e.into_mut().entries.push(entry);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let service = scratch
+                        .iter()
+                        .find(|(k, _)| k == "service_name")
+                        .map(|(_, v)| v.to_string())
+                        .unwrap_or_else(|| m.service.clone());
+                    let fingerprint = fnv1a64(e.key().as_bytes());
+                    e.insert(FanOutGroup {
+                        fingerprint,
+                        service,
+                        entries: vec![entry],
+                    });
+                }
+            }
+        } else {
+            fp_groups
+                .entry(row.fingerprint)
+                .or_insert_with(|| StreamResult {
+                    fingerprint: row.fingerprint,
+                    service: m.service.clone(),
+                    labels_json: m.labels.clone(),
+                    entries: Vec::new(),
+                })
+                .entries
+                .push((row.timestamp_ns, line.into_owned()));
+        }
+    }
+
+    fp_groups
+        .into_values()
+        .chain(
+            label_groups
+                .into_iter()
+                .map(|(labels_json, g)| StreamResult {
+                    fingerprint: g.fingerprint,
+                    service: g.service,
+                    labels_json,
+                    entries: g.entries,
+                }),
+        )
+        .collect()
+}
+
+/// One fan-out group's accumulator — deliberately WITHOUT `labels_json`:
+/// the map key is the single owned copy of the rendered label set, moved
+/// into [`StreamResult`] when the map drains (review round 3: no
+/// per-new-group key clone, which under high-cardinality fan-out is
+/// effectively per-row).
+struct FanOutGroup {
+    fingerprint: u64,
+    service: String,
+    entries: Vec<(i64, String)>,
+}
+
+/// Renders a **sorted** label set to the canonical flat-label JSON shape
+/// (`{"key":"value",...}`, sorted keys, no nesting — docs/architecture.md
+/// §2.3), matching what the writer produces for base streams so the
+/// server encoder can splice it verbatim either way. Hand-rolled
+/// escaping (byte-compatible with `serde_json`'s string escaping —
+/// unit-tested below) so rendering borrows the label pairs instead of
+/// cloning them into a `serde_json::Map` (round-2 finding 1).
+fn render_labels_json_sorted(sorted_labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> String {
+    let mut out = String::with_capacity(
+        2 + sorted_labels
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 6)
+            .sum::<usize>(),
+    );
+    out.push('{');
+    for (i, (k, v)) in sorted_labels.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, k);
+        out.push(':');
+        push_json_string(&mut out, v);
+    }
+    out.push('}');
+    out
+}
+
+/// Appends `s` as a quoted JSON string, escaping exactly the mandatory
+/// set the same way `serde_json` does (`"`/`\` escaped, the five short
+/// control escapes, `\u00xx` lowercase for the rest of C0, everything
+/// else verbatim).
+fn push_json_string(out: &mut String, s: &str) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                // Infallible: `write!` to a String cannot fail.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// FNV-1a 64 — the fan-out path's deterministic label-set fingerprint
+/// (`fingerprint = hash(final labels)`, plan v1). Not a stored/write-path
+/// fingerprint: purely a stable response identity for derived streams.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Maps a ClickHouse error to [`ReadError`], translating the byte-budget
@@ -1123,6 +1356,211 @@ mod tests {
     fn escape_query_placeholders_doubles_a_literal_double_question_mark() {
         assert_eq!(escape_query_placeholders("a??"), "a????");
         assert_eq!(escape_query_placeholders("????"), "????????");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue M6-09 AC9(ii): the true limit applies globally after
+    // in-engine filtering — both directions, fan-out, post-line_format
+    // line filters. Hermetic over `run_pipeline_rows`, the exact function
+    // `run_streams_inner` hands fetched rows to.
+    // -----------------------------------------------------------------
+
+    fn pipeline_of(query: &str) -> super::super::pipeline::CompiledPipeline {
+        let expr = pulsus_logql::parse(query).expect("parse");
+        let pulsus_logql::Expr::Log(log) = expr else {
+            panic!("expected a log expr");
+        };
+        super::super::pipeline::CompiledPipeline::compile(&log.pipeline).expect("compile")
+    }
+
+    fn meta_two_streams() -> HashMap<u64, StreamMetaRow> {
+        HashMap::from([
+            (
+                1u64,
+                StreamMetaRow {
+                    fingerprint: 1,
+                    service: "checkout".to_string(),
+                    labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+                },
+            ),
+            (
+                2u64,
+                StreamMetaRow {
+                    fingerprint: 2,
+                    service: "billing".to_string(),
+                    labels: r#"{"env":"staging","service_name":"billing"}"#.to_string(),
+                },
+            ),
+        ])
+    }
+
+    fn sample(fp: u64, ts: i64, body: &str) -> SampleRow {
+        SampleRow {
+            fingerprint: fp,
+            timestamp_ns: ts,
+            body: body.to_string(),
+        }
+    }
+
+    /// Backward-direction arrival order (newest first), interleaved
+    /// across two streams; every row survives the filter — the global
+    /// truncation must keep the first `limit` in ARRIVAL order, not
+    /// `limit` per stream.
+    #[test]
+    fn result_limit_applies_globally_across_streams_in_backward_order() {
+        let compiled = pipeline_of(r#"{a="b"} | json | status = "500""#);
+        let rows = vec![
+            sample(1, 40, r#"{"status":"500","m":"d"}"#),
+            sample(2, 30, r#"{"status":"500","m":"c"}"#),
+            sample(1, 20, r#"{"status":"500","m":"b"}"#),
+            sample(2, 10, r#"{"status":"500","m":"a"}"#),
+        ];
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3);
+        let total: usize = results.iter().map(|r| r.entries.len()).sum();
+        assert_eq!(total, 3, "global cap, not per-stream");
+        let mut kept: Vec<i64> = results
+            .iter()
+            .flat_map(|r| r.entries.iter().map(|(ts, _)| *ts))
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![20, 30, 40], "newest three in backward order");
+    }
+
+    #[test]
+    fn result_limit_applies_globally_in_forward_order_too() {
+        let compiled = pipeline_of(r#"{a="b"} | json | status = "500""#);
+        let rows = vec![
+            sample(2, 10, r#"{"status":"500","m":"a"}"#),
+            sample(1, 20, r#"{"status":"500","m":"b"}"#),
+            sample(2, 30, r#"{"status":"500","m":"c"}"#),
+            sample(1, 40, r#"{"status":"500","m":"d"}"#),
+        ];
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 3);
+        let mut kept: Vec<i64> = results
+            .iter()
+            .flat_map(|r| r.entries.iter().map(|(ts, _)| *ts))
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![10, 20, 30], "oldest three in forward order");
+    }
+
+    /// The fan-out path splits one source stream by parsed label set and
+    /// still respects the global limit; dropped lines don't count toward
+    /// it.
+    #[test]
+    fn fan_out_regroups_by_final_label_set_with_canonical_labels_json() {
+        let compiled = pipeline_of(r#"{a="b"} | json | status = "500""#);
+        let rows = vec![
+            sample(1, 10, r#"{"status":"500","method":"GET"}"#),
+            sample(1, 20, r#"{"status":"200","method":"GET"}"#), // dropped
+            sample(1, 30, r#"{"status":"500","method":"PUT"}"#),
+        ];
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100);
+        assert_eq!(results.len(), 2, "one result stream per final label set");
+        let total: usize = results.iter().map(|r| r.entries.len()).sum();
+        assert_eq!(total, 2);
+        for r in &results {
+            assert!(
+                r.labels_json.contains(r#""env":"prod""#)
+                    && r.labels_json.contains(r#""status":"500""#),
+                "canonical labels_json must carry base + parsed labels: {}",
+                r.labels_json
+            );
+            // Canonical rendering: sorted keys.
+            assert!(
+                r.labels_json.find("\"env\"").unwrap() < r.labels_json.find("\"method\"").unwrap()
+            );
+            assert_eq!(r.fingerprint, fnv1a64(r.labels_json.as_bytes()));
+            assert_eq!(r.service, "checkout");
+        }
+    }
+
+    /// A post-`line_format` line filter evaluates in-engine over the
+    /// REWRITTEN line, drops non-matching entries, and the survivors
+    /// respect the global limit.
+    #[test]
+    fn a_post_line_format_line_filter_drops_in_engine_and_respects_the_limit() {
+        let compiled =
+            pipeline_of(r#"{a="b"} | json | line_format "{{.method}} {{.status}}" |= "500""#);
+        let rows = vec![
+            sample(1, 10, r#"{"status":"500","method":"GET"}"#),
+            sample(1, 20, r#"{"status":"200","method":"GET"}"#), // rewritten line lacks "500"
+            sample(1, 30, r#"{"status":"500","method":"PUT"}"#),
+            sample(1, 40, r#"{"status":"500","method":"DELETE"}"#),
+        ];
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 2);
+        let mut entries: Vec<(i64, String)> = results
+            .iter()
+            .flat_map(|r| r.entries.iter().cloned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![(10, "GET 500".to_string()), (30, "PUT 500".to_string())],
+            "rewritten survivors only, capped globally at 2"
+        );
+    }
+
+    /// The transform path (drops/rewrites but never touches labels) keeps
+    /// the hydrated `labels_json` verbatim and the source fingerprint.
+    #[test]
+    fn transform_path_keeps_labels_json_verbatim() {
+        let compiled = pipeline_of(r#"{a="b"} | line_format "L={{.env}}" |= "L=prod""#);
+        let rows = vec![
+            sample(1, 10, "anything"),
+            sample(2, 20, "anything"), // env=staging -> rewritten "L=staging" -> dropped
+        ];
+        let results = run_pipeline_rows(rows, &compiled, &meta_two_streams(), 100);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].fingerprint, 1);
+        assert_eq!(
+            results[0].labels_json, r#"{"env":"prod","service_name":"checkout"}"#,
+            "transform path must splice hydration labels verbatim"
+        );
+        assert_eq!(results[0].entries, vec![(10, "L=prod".to_string())]);
+    }
+
+    /// Round-2 finding 1: the hand-rolled borrowed-label JSON renderer
+    /// must stay byte-compatible with `serde_json`'s escaping (the shape
+    /// the writer/encoder ecosystem produces and splices verbatim).
+    #[test]
+    fn render_labels_json_sorted_matches_serde_json_escaping_byte_for_byte() {
+        let pairs = [
+            ("plain", "value"),
+            ("quote", r#"a"b"#),
+            ("backslash", r"a\b"),
+            ("newline_tab", "a\nb\tc"),
+            ("carriage_bs_ff", "a\rb\u{08}c\u{0C}d"),
+            ("low_control", "a\u{01}b\u{1f}c"),
+            ("unicode", "日本語µ"),
+        ];
+        let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = pairs
+            .iter()
+            .map(|(k, v)| (Cow::Borrowed(*k), Cow::Borrowed(*v)))
+            .collect();
+        let ours = render_labels_json_sorted(&sorted);
+        // serde_json reference rendering of the same ordered pairs.
+        let mut reference = String::from("{");
+        for (i, (k, v)) in pairs.iter().enumerate() {
+            if i > 0 {
+                reference.push(',');
+            }
+            reference.push_str(&serde_json::to_string(k).unwrap());
+            reference.push(':');
+            reference.push_str(&serde_json::to_string(v).unwrap());
+        }
+        reference.push('}');
+        assert_eq!(ours, reference);
+        // And the canonical shape stays round-trippable / re-parseable.
+        let parsed = parse_flat_labels(&ours);
+        assert_eq!(parsed.len(), pairs.len());
+    }
+
+    #[test]
+    fn fnv1a64_is_stable_and_content_sensitive() {
+        let a = fnv1a64(br#"{"a":"1"}"#);
+        assert_eq!(a, fnv1a64(br#"{"a":"1"}"#));
+        assert_ne!(a, fnv1a64(br#"{"a":"2"}"#));
     }
 
     #[test]

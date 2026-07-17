@@ -217,6 +217,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.logql_scan_budget_bytes == ByteSize(1024 * 1024 * 1024),
     },
     Row {
+        var: "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
+        value: "25",
+        check: |c| c.reader.logql_pipeline_scan_factor == 25,
+    },
+    Row {
         var: "PULSUS_TRACEQL_MAX_CANDIDATES",
         value: "77",
         check: |c| c.reader.traceql_max_candidates == 77,
@@ -261,8 +266,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        44,
-        "docs/configuration.md §§1-8 document exactly 44 variables"
+        45,
+        "docs/configuration.md §§1-8 document exactly 45 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

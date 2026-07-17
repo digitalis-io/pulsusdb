@@ -56,10 +56,21 @@ exporters:
     endpoint: 172.29.0.15:4317
     tls:
       insecure: true
+  # The M6-09 LogQL-pipeline differential fan-out's second leg: the same
+  # received OTLP logs go verbatim to the pinned reference log store
+  # (`compose.single.yaml`'s `loki`, static ipv4_address 172.29.0.16)
+  # over OTLP/HTTP. The endpoint is the bare base with the service's
+  # OTLP path prefix — the collector auto-appends `/v1/logs`, yielding
+  # `/otlp/v1/logs` on the wire (M6-09 plan v3 delta 3; a full
+  # `/otlp/v1/logs` endpoint here would double-suffix). Both stores thus
+  # ingest the collector's identical typed log records, which is what
+  # makes the set differential valid.
+  otlphttp/loki:
+    endpoint: http://172.29.0.16:3100/otlp
 
 service:
   pipelines:
-    logs: { receivers: [otlp], exporters: [otlphttp] }
+    logs: { receivers: [otlp], exporters: [otlphttp, otlphttp/loki] }
     metrics: { receivers: [otlp], exporters: [prometheusremotewrite/pulsus, prometheusremotewrite/prom] }
     traces: { receivers: [otlp], exporters: [otlphttp, otlp/tempo] }
     # the profiles pipeline lands with its own milestone (M5)

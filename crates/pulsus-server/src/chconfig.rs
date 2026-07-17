@@ -98,6 +98,7 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
         rollup_res_ns: config.log_rollup_resolution.0.as_nanos() as u64,
         scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
         max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
+        pipeline_scan_factor: config.reader.logql_pipeline_scan_factor,
     }
 }
 
@@ -434,6 +435,17 @@ mod tests {
             config.reader.logql_scan_budget_bytes.0
         );
         assert_eq!(engine_cfg.max_streams, pulsus_read::DEFAULT_MAX_STREAMS);
+    }
+
+    /// Issue M6-09: `reader.logql_pipeline_scan_factor` maps into
+    /// `EngineConfig.pipeline_scan_factor` — the default 10 and an
+    /// override both survive the production carrier.
+    #[test]
+    fn engine_config_from_maps_the_pipeline_scan_factor() {
+        let mut config = Config::default();
+        assert_eq!(engine_config_from(&config).pipeline_scan_factor, 10);
+        config.reader.logql_pipeline_scan_factor = 3;
+        assert_eq!(engine_config_from(&config).pipeline_scan_factor, 3);
     }
 
     #[test]

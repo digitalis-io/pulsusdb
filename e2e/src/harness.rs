@@ -73,6 +73,11 @@ pub struct RunOptions {
     /// value regardless, since only single-variant scenarios dereference
     /// it.
     pub tempo_url: String,
+    /// The reference log store's published base URL (issue M6-09,
+    /// mirrors `tempo_url`) — published by the single-node overlay only
+    /// (`deploy/e2e/compose.single.yaml`, `:3101`); a fixed value
+    /// regardless, since only single-variant scenarios dereference it.
+    pub loki_url: String,
 }
 
 /// The `-f` file list + project name for one variant (architect plan:
@@ -136,6 +141,7 @@ pub async fn run(opts: RunOptions) -> Result<()> {
         collector_url: opts.collector_url.clone(),
         prometheus_url: opts.prometheus_url.clone(),
         tempo_url: opts.tempo_url.clone(),
+        loki_url: opts.loki_url.clone(),
         variant: opts.variant,
         fixtures_dir: workspace_root().join("test/fixtures"),
         compose: compose.clone(),

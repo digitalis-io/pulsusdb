@@ -183,6 +183,25 @@ pub enum ReadError {
     )]
     NamelessSelectorUnresolvable { reason: String },
 
+    /// Issue M6-09: a metric query whose log range carries a pipeline
+    /// stage beyond plain line filters (a parser, label filter,
+    /// `line_format`, `label_format`, or `unwrap`). Executing the pipeline
+    /// inside a range aggregation is the M6-10 seam — rejected by name
+    /// here rather than silently counting unfiltered lines.
+    #[error(
+        "`{construct}` is not yet supported inside a metric query: pipeline execution within \
+         range aggregations lands with the M6-10 metric-pipeline milestone (features.md §2)"
+    )]
+    PipelineUnsupportedInMetric { construct: String },
+
+    /// Issue M6-09: a log pipeline that parses but cannot be compiled or
+    /// planned — a bad `regexp`/`pattern` expression, an unsupported
+    /// template function, an invalid `json` extraction path, an
+    /// uninterpretable numeric literal, or `unwrap` outside a range
+    /// aggregation. Always a 400-class client error.
+    #[error("invalid pipeline: {reason}")]
+    PipelineInvalid { reason: String },
+
     /// A `Range` metric query's `step_ns` was zero. `0.is_multiple_of(_)`
     /// is trivially `true`, which would otherwise let the routing decision
     /// pick rollup and render `intDiv(bucket_ns, 0)` — undefined in
@@ -198,6 +217,14 @@ pub enum ReadError {
     /// server exception not mapped to [`ReadError::QueryTooBroad`]).
     #[error("clickhouse: {0}")]
     Clickhouse(#[from] ChError),
+}
+
+impl From<super::pipeline::PipelineError> for ReadError {
+    fn from(e: super::pipeline::PipelineError) -> Self {
+        ReadError::PipelineInvalid {
+            reason: e.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]

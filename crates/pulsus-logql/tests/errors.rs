@@ -92,55 +92,107 @@ fn bottomk_is_not_yet_supported() {
     assert_not_yet_supported(r#"bottomk(5, rate({a="b"}[5m]))"#, "bottomk");
 }
 
-// --- Parsers: json, logfmt, regexp, pattern ---
+// --- Remaining unsupported pipeline stage keywords (issue M6-09: the
+// --- parsers/label filters/formats/unwrap now parse; these still don't).
 
 #[test]
-fn json_parser_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | json"#, "json");
+fn every_remaining_unsupported_stage_keyword_is_named() {
+    for keyword in ["unpack", "drop", "keep", "decolorize", "distinct", "ip"] {
+        // `drop`/`keep` take label arguments upstream, but the keyword is
+        // rejected before any argument is consumed, so the bare form is
+        // representative for all six.
+        let query = format!(r#"{{a="b"}} | {keyword}"#);
+        assert_not_yet_supported(&query, keyword);
+    }
+}
+
+// --- Post-`unwrap` ordering: only label filters may follow (plan v3
+// --- delta 1 — the grammar rule, enforced by the parser).
+
+fn assert_post_unwrap_rejected(query: &str) {
+    match parse(query) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(
+                expected.contains("only label filters may follow `unwrap`"),
+                "query {query:?}: expected the post-unwrap rule to be named, got {expected:?}"
+            );
+        }
+        other => panic!("expected {query:?} to be rejected post-unwrap, got {other:?}"),
+    }
 }
 
 #[test]
-fn logfmt_parser_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | logfmt"#, "logfmt");
+fn a_parser_stage_after_unwrap_is_rejected_with_the_named_rule() {
+    assert_post_unwrap_rejected(r#"count_over_time({a="b"} | json | unwrap x | logfmt [5m])"#);
 }
 
 #[test]
-fn regexp_parser_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | regexp "(?P<x>.*)""#, "regexp");
+fn a_line_filter_after_unwrap_is_rejected_with_the_named_rule() {
+    assert_post_unwrap_rejected(r#"count_over_time({a="b"} | json | unwrap x |= "err" [5m])"#);
 }
 
 #[test]
-fn pattern_parser_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | pattern "<x>""#, "pattern");
-}
-
-// --- line_format, label_format, unwrap ---
-
-#[test]
-fn line_format_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | line_format "{{.x}}""#, "line_format");
+fn a_line_format_after_unwrap_is_rejected_with_the_named_rule() {
+    assert_post_unwrap_rejected(
+        r#"count_over_time({a="b"} | json | unwrap x | line_format "{{.y}}" [5m])"#,
+    );
 }
 
 #[test]
-fn label_format_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | label_format x="y""#, "label_format");
+fn a_second_unwrap_after_unwrap_is_rejected_with_the_named_rule() {
+    assert_post_unwrap_rejected(r#"count_over_time({a="b"} | json | unwrap x | unwrap y [5m])"#);
+}
+
+// --- Malformed new-stage syntax ---
+
+#[test]
+fn an_unknown_unwrap_conversion_names_the_accepted_set() {
+    match parse(r#"count_over_time({a="b"} | unwrap seconds(x) [5m])"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("duration_seconds"), "{expected}");
+        }
+        other => panic!("expected an unknown conversion to be rejected, got {other:?}"),
+    }
 }
 
 #[test]
-fn unwrap_stage_is_not_yet_supported() {
-    assert_not_yet_supported(r#"count_over_time({a="b"} | unwrap x [5m])"#, "unwrap");
-}
-
-// --- Label filter (a label matcher at stage position) ---
-
-#[test]
-fn a_label_filter_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | status="500""#, "label filter");
+fn a_regex_label_filter_with_a_numeric_rhs_is_rejected() {
+    match parse(r#"{a="b"} | status =~ 500"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("a string"), "{expected}");
+        }
+        other => panic!("expected =~ with a numeric RHS to be rejected, got {other:?}"),
+    }
 }
 
 #[test]
-fn a_numeric_label_filter_is_not_yet_supported() {
-    assert_not_yet_supported(r#"{a="b"} | status >= 500"#, "label filter");
+fn a_comparison_label_filter_with_a_string_rhs_is_rejected() {
+    match parse(r#"{a="b"} | status > "500""#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("number"), "{expected}");
+        }
+        other => panic!("expected > with a string RHS to be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_unclosed_label_filter_paren_is_reported() {
+    match parse(r#"{a="b"} | (status="500" or level="error""#) {
+        Err(LogQlError::UnexpectedEof { expected, .. }) => {
+            assert!(expected.contains(')'), "{expected}");
+        }
+        other => panic!("expected an unclosed paren to be UnexpectedEof, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_label_format_with_a_numeric_rhs_is_rejected() {
+    match parse(r#"{a="b"} | label_format x=5"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("template"), "{expected}");
+        }
+        other => panic!("expected label_format x=5 to be rejected, got {other:?}"),
+    }
 }
 
 // --- Binary operations: the exact recognition table ---
@@ -178,7 +230,9 @@ fn neq_after_a_log_expr_is_a_line_filter_not_a_binary_operation() {
         panic!("expected a log expr");
     };
     assert_eq!(log.pipeline.len(), 1);
-    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0];
+    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0] else {
+        panic!("expected a line filter stage");
+    };
     assert_eq!(lf.op, pulsus_logql::LineFilterOp::NotContains);
 }
 
@@ -197,7 +251,9 @@ fn nre_after_a_log_expr_is_a_line_filter() {
         panic!("expected a log expr");
     };
     assert_eq!(log.pipeline.len(), 1);
-    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0];
+    let pulsus_logql::Stage::LineFilter(lf) = &log.pipeline[0] else {
+        panic!("expected a line filter stage");
+    };
     assert_eq!(lf.op, pulsus_logql::LineFilterOp::NotRegex);
 }
 

@@ -11,6 +11,8 @@
 mod corpus;
 mod engine;
 mod harness;
+mod logs;
+mod logs_corpus;
 mod metrics;
 mod scenarios;
 mod traces;
@@ -73,6 +75,10 @@ async fn main() -> ExitCode {
         // still a fixed value like the others, since only single-variant
         // scenarios ever dereference it.
         tempo_url: "http://127.0.0.1:3200".to_string(),
+        // The reference log store publishes host `:3101` on the single
+        // variant only (issue M6-09; pulsusdb owns host `:3100`) — fixed
+        // like the others, only single-variant scenarios dereference it.
+        loki_url: "http://127.0.0.1:3101".to_string(),
     };
 
     match harness::run(opts).await {

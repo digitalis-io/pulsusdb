@@ -37,3 +37,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # #33 implementation notes.
 prost.workspace = true
 snap.workspace = true
+
+# Issue M6-09 (`logs.rs` hermetic locks only — dev-deps, so the harness
+# BINARY keeps its "HTTP only, no ClickHouse client" shape): the shipped
+# fixture's queries must parse under the real grammar and their
+# pipelines must compile + agree with the corpus projection under the
+# real evaluator, hermetically — a fixture typo or a corpus↔evaluator
+# drift fails `cargo test --workspace`, never a nightly run.
+[dev-dependencies]
+pulsus-logql = { path = "../crates/pulsus-logql" }
+pulsus-read = { path = "../crates/pulsus-read" }

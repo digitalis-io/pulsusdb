@@ -859,6 +859,7 @@ impl Tables {
             rollup_res_ns: 5_000_000_000,
             scan_budget_bytes: 200 * 1024 * 1024 * 1024,
             max_streams: 1_000_000,
+            pipeline_scan_factor: 10,
         }
     }
 }
@@ -1036,7 +1037,7 @@ async fn run_streams_once(
         },
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
     let settings3 = reader_settings(dist, &s3_id);
     let returned = {

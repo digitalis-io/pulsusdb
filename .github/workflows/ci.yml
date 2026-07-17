@@ -686,6 +686,13 @@ jobs:
           # default); the single leg exercises the Tempo differential at
           # full scale, the cluster leg the native roundtrip.
           PULSUS_E2E_TRACES_SCALE: full
+          # Issue M6-09 plan v2 delta A: the LogQL-pipeline differential
+          # (`logs_pipeline_differential`, single variant only) is
+          # nightly/dispatch-tier — the scenario self-gates on this flag
+          # and prints a skip on per-PR e2e-single runs (no per-PR gate,
+          # no new job).
+          PULSUS_E2E_LOGS_DIFFERENTIAL: "1"
+          PULSUS_E2E_LOGS_SCALE: full
         run: cargo run -p pulsus-e2e -- --variant ${{ matrix.variant }} --engine docker
 
       - name: Upload metrics-differential evidence/mismatch artifacts

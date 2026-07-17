@@ -82,6 +82,7 @@ impl Tables {
             // and below §3.2's 100k cap (architect plan edge case #5): the
             // sweep stays deliberately sub-cap.
             max_streams: 1_000_000,
+            pipeline_scan_factor: 10,
         }
     }
 }
@@ -399,7 +400,7 @@ pub async fn run_variant_once(
         window,
         &sp.line_filters,
         sp.direction,
-        sp.limit,
+        sp.scan_limit,
     );
     let s3_settings = settings(&s3_id, &log_comment(variant, breadth, "samples"));
     let sample_rows = fetch_rows::<SampleRow>(client, &sql3, &s3_settings).await?;
@@ -606,7 +607,7 @@ pub async fn correctness_gate(
             window,
             &sp.line_filters,
             sp.direction,
-            sp.limit,
+            sp.scan_limit,
         );
         let id = format!("gate-samples-{path_name}-{}", summary.breadth);
         let rows = fetch_rows::<SampleRow>(

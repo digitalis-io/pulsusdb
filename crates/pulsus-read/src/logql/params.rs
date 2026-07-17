@@ -71,6 +71,11 @@ pub struct PlanCtx<'a> {
     pub rollup_res_ns: u64,
     pub scan_budget_bytes: u64,
     pub max_streams: usize,
+    /// `reader.logql_pipeline_scan_factor` (issue M6-09): the stage-3
+    /// `LIMIT` oversample applied when the pipeline contains an unpushed
+    /// dropping stage (see [`super::plan::StreamsPlan::scan_limit`]).
+    /// Validated `>= 1` at config load.
+    pub pipeline_scan_factor: u32,
 }
 
 /// A `[start_ns, end_ns]` time window for label/series discovery reads
