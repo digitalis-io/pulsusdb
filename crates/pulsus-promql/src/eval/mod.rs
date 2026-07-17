@@ -82,6 +82,17 @@ struct EvalCounts {
     /// bypasses the cache and re-evaluates the marked subtree (`1 +
     /// steps` either way).
     step_invariant_evals: u64,
+    /// Times [`finalize_metadata_labels`]'s `Matrix` arm ran its full
+    /// clone + `HashMap` merge machinery (issue #93, finding 3 — the
+    /// M6-08 reclaim gate). When NO element of the assembled matrix is
+    /// `drop_name`, that pass is provably a no-op (the range accumulator
+    /// already deduped on the identical `(metric_name, Labels)` identity
+    /// and pre-sorted, and both metadata strips are guarded on
+    /// `drop_name`), so it short-circuits WITHOUT incrementing this — a
+    /// `drop_name`-free range MUST count 0
+    /// (`tests::finalize_skips_the_matrix_merge_pass_when_no_series_is_drop_marked`),
+    /// a `drop_name` case MUST count > 0.
+    finalize_matrix_merge_passes: u64,
 }
 
 /// [`evaluate`] plus [`EvalCounts`].
@@ -144,7 +155,8 @@ fn evaluate_counted(
             StepValue::String(s) => QueryValue::String(s),
         };
         counts.step_invariant_evals = caches.step_invariant_evals.get();
-        return Ok((finalize_metadata_labels(value)?, counts));
+        let value = finalize_metadata_labels(value, &mut counts.finalize_matrix_merge_passes)?;
+        return Ok((value, counts));
     }
 
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
@@ -248,7 +260,11 @@ fn evaluate_counted(
     // internal determinism when two full identities share their non-name
     // labels.
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
-    Ok((finalize_metadata_labels(QueryValue::Matrix(out))?, counts))
+    let value = finalize_metadata_labels(
+        QueryValue::Matrix(out),
+        &mut counts.finalize_matrix_merge_passes,
+    )?;
+    Ok((value, counts))
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +332,10 @@ fn strip_metadata_labels(drop_name: bool, labels: &mut Labels) {
 ///   any timestamp overlaps (upstream `mergeSeriesWithSameLabelset`,
 ///   engine.go:4252);
 /// - **string/scalar:** passthrough.
-fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError> {
+fn finalize_metadata_labels(
+    value: QueryValue,
+    merge_passes: &mut u64,
+) -> Result<QueryValue, PromqlError> {
     fn same_labelset_error() -> PromqlError {
         PromqlError::LabelSet {
             detail: "vector cannot contain metrics with the same labelset".to_string(),
@@ -342,6 +361,27 @@ fn finalize_metadata_labels(value: QueryValue) -> Result<QueryValue, PromqlError
             Ok(QueryValue::Vector(v))
         }
         QueryValue::Matrix(m) => {
+            // Issue #93 (finding 3 — M6-08 reclaim): short-circuit when
+            // NO element is drop-marked. The range accumulator
+            // (`evaluate_counted`, above) already deduped the matrix on
+            // the EXACT `(metric_name, Labels)` identity this arm merges
+            // on, and pre-sorted it. With no `drop_name`,
+            // `strip_metadata_labels` and the `metric_name = None` write
+            // are BOTH no-ops (each is guarded on `drop_name`), so every
+            // post-strip identity equals the accumulator's already-unique,
+            // already-sorted key: no merge is reachable, no same-labelset
+            // collision is reachable, and the re-sort would re-establish
+            // an order that already holds. Returning `m` verbatim is
+            // therefore provably outcome-identical to running the full
+            // pass — and it skips a per-series clone + `HashMap` build.
+            // The `finalize_matrix_merge_passes` counter stays 0 (the
+            // Tier-1 reclaim gate); a `drop_name` matrix falls through and
+            // increments it. Corpus `expect fail` same-labelset cases
+            // exercise the `drop_name` branch, so they never short-circuit.
+            if m.iter().all(|s| !s.drop_name) {
+                return Ok(QueryValue::Matrix(m));
+            }
+            *merge_passes += 1;
             let mut merged_at: Vec<usize> = Vec::new();
             let mut by_identity: HashMap<SeriesIdentity, usize> = HashMap::with_capacity(m.len());
             let mut out: Vec<RangeSeries> = Vec::with_capacity(m.len());
@@ -3782,6 +3822,160 @@ mod tests {
         assert_eq!(m.len(), 1);
         assert!(m[0].points.iter().all(|&(_, v)| v == 3.0), "{:?}", m[0]);
         assert_eq!(m[0].points.len(), 7);
+    }
+
+    /// Issue #93 (finding 3 — the M6-08 reclaim Tier-1 gate): a
+    /// `drop_name`-FREE range matrix short-circuits
+    /// [`finalize_metadata_labels`]'s `Matrix` arm, so
+    /// `finalize_matrix_merge_passes` stays 0; a `drop_name` range falls
+    /// through the full clone + merge pass and counts > 0.
+    ///
+    /// The gate proves the skip is OUTCOME-neutral, not merely
+    /// counter-neutral, on BOTH branches (review round 1, finding 2):
+    ///
+    /// - **short-circuit branch** — the real `count_values` pipeline output
+    ///   (drop_name-free, metadata-free, `metric_name: None`) is fed BACK
+    ///   through `finalize_metadata_labels` with `drop_name` forced true,
+    ///   which forces the full pass over the SAME series content (strip and
+    ///   name-null are then content no-ops). The two results are asserted
+    ///   identical on labels / name / points / order — so the taken
+    ///   short-circuit provably yields exactly what the full pass yields on
+    ///   the same input.
+    /// - **full-pass branch** — a hand-built `drop_name` matrix whose two
+    ///   series share a POST-strip identity with disjoint timestamps is
+    ///   asserted to merge into one series with the metadata label stripped,
+    ///   the name nulled, and the combined, time-sorted points — the exact
+    ///   expected output, so the gate detects any full-pass output change.
+    #[test]
+    fn finalize_skips_the_matrix_merge_pass_when_no_series_is_drop_marked() {
+        // --- short-circuit branch: `count_values` retains no name and marks
+        // --- no series (aggregation stamps `drop_name: false`), the exact
+        // --- M6-08 count_values-range shape the reclaim targets.
+        let expr = crate::parser::parse(r#"count_values("v", m{job="a"})"#).unwrap();
+        let p = plan(&expr, params(0, 20_000, 10_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(
+                    1,
+                    &[("job", "a")],
+                    vec![s(0, 1.0), s(10_000, 1.0), s(20_000, 2.0)],
+                ),
+                series(
+                    2,
+                    &[("job", "a")],
+                    vec![s(0, 1.0), s(10_000, 3.0), s(20_000, 2.0)],
+                ),
+            ],
+        );
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.finalize_matrix_merge_passes, 0,
+            "a drop_name-free range must short-circuit the finalize Matrix merge pass"
+        );
+        let QueryValue::Matrix(sc) = value else {
+            panic!("expected Matrix");
+        };
+        assert!(!sc.is_empty());
+        assert!(
+            sc.iter().all(|sers| sers.metric_name.is_none()),
+            "count_values output carries no metric name"
+        );
+
+        // Outcome-neutrality of the SKIP: force the full pass over the same
+        // series content (metadata-free, `metric_name: None`, so
+        // `drop_name = true` leaves strip + name-null content-neutral) and
+        // prove it reproduces the short-circuit result on the
+        // outcome-relevant fields — labels, name, points, and order.
+        let forced = QueryValue::Matrix(
+            sc.iter()
+                .cloned()
+                .map(|mut r| {
+                    r.drop_name = true;
+                    r
+                })
+                .collect(),
+        );
+        let mut forced_passes = 0u64;
+        let QueryValue::Matrix(fp) = finalize_metadata_labels(forced, &mut forced_passes).unwrap()
+        else {
+            panic!("expected Matrix");
+        };
+        assert!(
+            forced_passes > 0,
+            "forcing drop_name must exercise the full merge pass, not the skip"
+        );
+        assert_eq!(
+            sc.len(),
+            fp.len(),
+            "short-circuit and full pass disagree on series count"
+        );
+        for (a, b) in sc.iter().zip(&fp) {
+            assert_eq!(
+                a.labels, b.labels,
+                "short-circuit vs full-pass labels diverge"
+            );
+            assert_eq!(
+                a.metric_name, b.metric_name,
+                "short-circuit vs full-pass metric_name diverge"
+            );
+            assert_eq!(
+                a.points, b.points,
+                "short-circuit vs full-pass points diverge"
+            );
+        }
+
+        // --- full-pass branch: two `drop_name` series that share a POST-strip
+        // --- identity with disjoint timestamps MUST merge into one series
+        // --- with `__unit__` stripped, the name nulled, and the combined,
+        // --- time-sorted points. Asserts the exact expected output so the
+        // --- gate catches any change in what the full pass produces.
+        let lbls = |unit: bool| {
+            let mut v = vec![("job".to_string(), "a".to_string())];
+            if unit {
+                v.push(("__unit__".to_string(), "seconds".to_string()));
+            }
+            Labels::new(v)
+        };
+        let matrix = QueryValue::Matrix(vec![
+            RangeSeries {
+                labels: lbls(true),
+                metric_name: Some("http_seconds".to_string()),
+                drop_name: true,
+                points: vec![(0, 1.0), (10_000, 2.0)],
+            },
+            RangeSeries {
+                labels: lbls(true),
+                metric_name: Some("http_seconds".to_string()),
+                drop_name: true,
+                points: vec![(20_000, 3.0)],
+            },
+        ]);
+        let mut passes = 0u64;
+        let QueryValue::Matrix(merged) = finalize_metadata_labels(matrix, &mut passes).unwrap()
+        else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(
+            passes, 1,
+            "a drop_name matrix must run the full finalize Matrix merge pass"
+        );
+        assert_eq!(merged.len(), 1, "post-strip identical series must merge");
+        assert_eq!(
+            merged[0].labels,
+            lbls(false),
+            "__unit__ must be stripped from a dropped-name series"
+        );
+        assert_eq!(
+            merged[0].metric_name, None,
+            "a dropped name must be nulled by the full pass"
+        );
+        assert_eq!(
+            merged[0].points,
+            vec![(0, 1.0), (10_000, 2.0), (20_000, 3.0)],
+            "merged points must be the combined, time-sorted union"
+        );
     }
 
     /// Issue #88 (Δ4): the step-invariant cache is fresh per `evaluate`

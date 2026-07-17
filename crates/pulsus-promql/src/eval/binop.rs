@@ -262,22 +262,68 @@ struct PairCtx<'a> {
     swapped: bool,
 }
 
+/// Hashes a value with a fixed-seed deterministic hasher (issue #93,
+/// finding 1). Used ONLY to key the many-to-one **output-identity** dedup
+/// set on a 64-bit hash rather than a per-pair full-`Labels` clone — the
+/// exact analogue of upstream's `insertSig := metric.Hash()` (engine.go @
+/// 40af9c2 L3258), where a 64-bit collision is likewise accepted. The
+/// SIGNATURE-level dedup does NOT use this: it keys on the full
+/// [`MatchKey`] (collision-free), mirroring upstream's collision-free
+/// `sigOrdinal` — see [`MatchState`]. `DefaultHasher::new` is fixed-seed
+/// (not the randomized `RandomState`), so the same identity always hashes
+/// the same within a run; determinism across runs is irrelevant here (each
+/// set lives one `vector_vector` call).
+fn identity_hash<T: std::hash::Hash>(v: &T) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
 /// Match-signature bookkeeping + output accumulator for one
 /// [`vector_vector`] call. Mirrors upstream `VectorBinop`'s
 /// `matchedSigsPresent` (one-to-one) / `matchedSigs` (many-to-one, a set
-/// of output identities per signature — hashed on the full
-/// `(Labels, metric_name)` identity, plan v2 D2).
+/// of output identities per signature).
+///
+/// **Signature matching is COLLISION-FREE, exactly like upstream** —
+/// verified against the pin `git show 40af9c2:promql/engine.go`:
+/// - upstream computes each series' join **signature ordinal** ONCE in
+///   `rangeEval` (`signatureToOrdinal := make(map[string]int)`, L1478),
+///   keyed on the signature BYTES (`sigf` → `BytesWith[out]Labels`) — a
+///   collision-free string identity — then indexes `matchedSigsPresent
+///   []bool` (one-to-one, L3207/L3250) and the OUTER slot of `matchedSigs`
+///   (many-to-one) by that ordinal;
+/// - only the INNER many-to-one output-dup set is hash-keyed: `matchedSigs
+///   []map[uint64]struct{}`, inner key `insertSig := metric.Hash()`
+///   (L3211/L3258-L3268), a `uint64` where a collision IS accepted.
+///
+/// So the SIGNATURE dedup keys on the full [`MatchKey`] here (collision-free
+/// equality — our per-call analogue of upstream's per-series `sigOrdinal`),
+/// and ONLY the inner output-identity set uses the 64-bit
+/// [`identity_hash`] (upstream `metric.Hash()`).
+///
+/// **Issue #93 (finding 1 — range-binop allocation reclaim), round-2
+/// correction:** the profiled hotspot was the per-(step × many-side series)
+/// full-`Labels` clone of the OUTPUT identity into the inner set (~34%, see
+/// `docs/benchmarks/metrics-read-path.md`); that is what became the 64-bit
+/// hash. The OUTER signature key stays the full `MatchKey` and is cloned
+/// only on the FIRST sight of each distinct signature (a handful per step,
+/// not per matched pair — see [`emit_pair`]), so the reclaim holds WITHOUT
+/// the signature-level collision risk a hashed outer key would introduce.
+/// `promqltest_corpus` + the e2e differential prove the reclaim
+/// outcome-neutral.
 struct MatchState {
     one_to_one_matched: HashSet<MatchKey>,
-    many_matched: HashMap<MatchKey, HashSet<(Labels, Option<String>)>>,
+    many_matched: HashMap<MatchKey, HashSet<u64>>,
     out: Vec<InstantSample>,
 }
 
 impl MatchState {
-    /// Whether `key` was consumed by the main (many-side) loop — the
-    /// fill-LHS pass skips such signatures (upstream: `matchedSigsPresent
-    /// [sigOrd]` / `len(matchedSigs[sigOrd]) > 0`). Registration happens
-    /// in [`emit_pair`] *before* the keep filter, so a filtered-out
+    /// Whether the signature (by its full [`MatchKey`]) was consumed by
+    /// the main (many-side) loop — the fill-LHS pass skips such signatures
+    /// (upstream: `matchedSigsPresent[sigOrd]` /
+    /// `len(matchedSigs[sigOrd]) > 0`). Registration happens in
+    /// [`emit_pair`] *before* the keep filter, so a filtered-out
     /// comparison still blocks filling — upstream-exact.
     fn already_matched(&self, one_to_one: bool, key: &MatchKey) -> bool {
         if one_to_one {
@@ -377,22 +423,34 @@ fn emit_pair(
         }
     }
 
-    // Duplicate detection — BEFORE the keep filter (upstream registers
-    // the signature/identity even for a filtered-out comparison).
+    // Duplicate detection — BEFORE the keep filter (upstream registers the
+    // signature/identity even for a filtered-out comparison). Issue #93
+    // (finding 1) + round-2 review: the SIGNATURE key is the full
+    // [`MatchKey`] (collision-free, upstream's `sigOrdinal`), cloned only on
+    // the FIRST sight of each distinct signature — never per matched pair,
+    // so the per-cell full-`Labels` clone the profile pinned stays gone.
+    // The INNER many-to-one output-identity set keeps the 64-bit
+    // [`identity_hash`] (upstream `metric.Hash()`, collision-accepted).
     if one_to_one {
-        if !state.one_to_one_matched.insert(key.clone()) {
+        if state.one_to_one_matched.contains(key) {
             return Err(PromqlError::BadMatching {
                 detail: "multiple matches for labels: many-to-one matching must be explicit \
                          (group_left/group_right)"
                     .to_string(),
             });
         }
+        state.one_to_one_matched.insert(key.clone());
     } else {
-        let inserted = state
-            .many_matched
-            .entry(key.clone())
-            .or_default()
-            .insert((labels.clone(), metric_name.clone()));
+        let out_hash = identity_hash(&(&labels, &metric_name));
+        let inserted = match state.many_matched.get_mut(key) {
+            Some(set) => set.insert(out_hash),
+            None => {
+                state
+                    .many_matched
+                    .insert(key.clone(), HashSet::from([out_hash]));
+                true
+            }
+        };
         if !inserted {
             return Err(PromqlError::BadMatching {
                 detail: "multiple matches for labels: grouping labels must ensure unique matches"
@@ -1584,13 +1642,73 @@ mod tests {
         assert!(out.iter().all(|s| s.drop_name && s.metric_name.is_some()));
         // ...and the collision surfaces at the terminal cleanup, once the
         // retained names are nulled (upstream cleanupMetricLabels).
-        let err = super::super::finalize_metadata_labels(crate::value::QueryValue::Vector(out))
-            .unwrap_err();
+        let err =
+            super::super::finalize_metadata_labels(crate::value::QueryValue::Vector(out), &mut 0)
+                .unwrap_err();
         assert!(
             err.to_string()
                 .contains("vector cannot contain metrics with the same labelset"),
             "got {err}"
         );
+    }
+
+    /// Round-2 review (#93): the SIGNATURE-level many-to-one dedup must be
+    /// COLLISION-FREE, exactly like upstream — `matchedSigs` is indexed by
+    /// the collision-free `sigOrdinal`, and ONLY the inner output-identity
+    /// set uses the 64-bit `metric.Hash()`. This pins that split by driving
+    /// [`emit_pair`] directly: two DISTINCT signatures carrying an
+    /// IDENTICAL output identity are kept in SEPARATE outer buckets (no
+    /// spurious "grouping labels must ensure unique matches"), while a
+    /// repeat of the SAME (signature, output identity) pair IS the
+    /// duplicate error. The outer key is the full [`MatchKey`] — this test
+    /// would not even COMPILE against a `HashMap<u64, _>` outer (a hashed
+    /// signature key, whose collisions would conflate two match groups).
+    #[test]
+    fn many_to_one_signature_dedup_is_collision_free() {
+        let include: [String; 0] = [];
+        let matching = ignoring_default();
+        let ctx = PairCtx {
+            op: BinOp::Add,       // arithmetic -> output name dropped, so the
+            bool_modifier: false, // output identity is exactly `ls`'s labels
+            matching: &matching,
+            include: Some(&include),
+            swapped: false,
+        };
+        let mut state = MatchState {
+            one_to_one_matched: HashSet::new(),
+            many_matched: HashMap::new(),
+            out: Vec::new(),
+        };
+        // One fixed many-side sample -> one fixed output identity, whatever
+        // signature we register it under.
+        let ls = sample(&[("g", "1"), ("inst", "a")], 2.0);
+        let rs = sample(&[("g", "1")], 3.0);
+        // Two DISTINCT match signatures (different reduced labels).
+        let sig_a: MatchKey = (Labels::new([("g".to_string(), "1".to_string())]), None);
+        let sig_b: MatchKey = (Labels::new([("g".to_string(), "2".to_string())]), None);
+        assert_ne!(sig_a, sig_b, "the two signatures are distinct");
+
+        // Same output identity under two distinct signatures -> both
+        // accepted, two separate outer buckets. A hashed outer key that
+        // collided would wrongly reject the second as a duplicate.
+        emit_pair(&ctx, &mut state, &ls, &rs, &sig_a).expect("first signature accepted");
+        emit_pair(&ctx, &mut state, &ls, &rs, &sig_b)
+            .expect("a distinct signature is not a duplicate");
+        assert_eq!(
+            state.many_matched.len(),
+            2,
+            "distinct signatures stay in separate outer buckets"
+        );
+        // The outer keys are the full signatures, not hashes.
+        assert!(state.many_matched.contains_key(&sig_a));
+        assert!(state.many_matched.contains_key(&sig_b));
+
+        // The SAME (signature, output identity) again IS the duplicate
+        // error — the inner 64-bit output-identity dedup (upstream
+        // `metric.Hash()`).
+        let err = emit_pair(&ctx, &mut state, &ls, &rs, &sig_a)
+            .expect_err("a repeated output identity under one signature is a duplicate");
+        assert!(matches!(err, PromqlError::BadMatching { .. }), "got {err}");
     }
 
     // --- fill (one-to-one, both directions; the group-side swap) ---

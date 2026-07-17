@@ -390,7 +390,37 @@ impl MetricsEngine {
             data.insert(sel.id, series?);
         }
 
-        let value = pulsus_promql::evaluate(&plan, &data)?;
+        // Issue #93 (finding 2): `pulsus_promql::evaluate` is CPU-bound and
+        // multi-hundred-ms at scale — offload it off the reactor onto the
+        // blocking pool so a heavy range eval cannot stall a tokio worker
+        // (the sole latency win here). `plan`/`data` are owned
+        // (`QueryPlan`/`SeriesData` carry no lifetimes) and `Send + 'static`,
+        // and `fetch_rows` fully drained every `ChRowStream` into a `Vec`
+        // before `join_all` completed above, so NO pooled-connection lease
+        // is held across this offload.
+        //
+        // Cancellation/concurrency bound (plan v3 Δ2, adjudicated): tokio
+        // does NOT cancel a `spawn_blocking` task when its awaiter is
+        // dropped, but that changes nothing here. Concurrently EXECUTING
+        // evals are bounded by `max_blocking_threads` (default 512) — a
+        // bounded constant, the offloaded analogue of today's synchronous
+        // ceiling of `worker_threads`. QUEUED (not-yet-started) evals are
+        // bounded only by request arrival rate / the upstream `TimeoutLayer`
+        // — which is ALREADY true of the pre-#93 synchronous path (pending
+        // query tasks queue on the tokio scheduler identically). A request
+        // future can only be dropped BETWEEN polls, and the synchronous
+        // `evaluate` ran inside a single await-free poll, so on client
+        // disconnect or the 408 timeout it ALREADY ran to completion before
+        // the drop was observed — `spawn_blocking` does not introduce that.
+        // A tight eval-concurrency permit is deferred to its own hardening
+        // issue (not smuggled into this perf change).
+        //
+        // The only reachable `JoinError` is a PANIC in `evaluate`: we own
+        // the handle and `.await` it directly (never `abort`, never drop it
+        // early), so cancellation is unreachable. Re-raising the panic
+        // preserves today's panic-on-bug behavior exactly (no new
+        // `ReadError` variant — a panic is not a domain error).
+        let value = evaluate_offloaded(plan, data).await?;
         Ok(value_to_query_result(value))
     }
 
@@ -886,6 +916,26 @@ fn concrete_name(sel: &SelectorSpec) -> Result<&str, ReadError> {
         })
 }
 
+/// Issue #93 (finding 2): runs `pulsus_promql::evaluate` on the blocking
+/// pool so its CPU-bound, multi-hundred-ms-at-scale work cannot stall a
+/// tokio reactor worker. `plan`/`data` are owned + `Send + 'static` and
+/// moved into the closure; the caller has already drained every
+/// `ChRowStream` so no pooled-connection lease crosses this offload. The
+/// sole reachable `JoinError` is a panic in `evaluate` (we own and directly
+/// await the handle, never cancel), re-raised verbatim to preserve
+/// panic-on-bug behavior — no new `ReadError` variant. Extracted so the
+/// reactor-non-starvation gate (`tests::offloaded_evaluate_does_not_starve_
+/// the_reactor`) exercises this exact code path.
+async fn evaluate_offloaded(
+    plan: pulsus_promql::QueryPlan,
+    data: pulsus_promql::SeriesData,
+) -> Result<pulsus_promql::QueryValue, ReadError> {
+    match tokio::task::spawn_blocking(move || pulsus_promql::evaluate(&plan, &data)).await {
+        Ok(res) => Ok(res?),
+        Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
 /// Sorts `fps` ascending, then splits into chunks and renders each
 /// chunk's `sample_fetch` SQL (code review round 1, finding 3): the
 /// `sort_unstable` here is a local hardening of the ascending-fingerprint
@@ -1331,6 +1381,122 @@ mod tests {
         // summation of these four values in this order loses everything
         // but the finite terms; Neumaier recovers 1.0 + 2.0 = 3.0 exactly.
         assert_eq!(chunked_sum[0].v, 3.0);
+    }
+
+    /// Builds a deliberately heavy in-memory range eval (a group_right
+    /// binop over many series × steps) — a synthetic, ClickHouse-free
+    /// stand-in for a multi-hundred-ms production query. Rebuilt per call
+    /// (rather than cloned) so each arm of the reactor gate gets its own
+    /// owned `plan`/`data`.
+    fn heavy_eval_fixture() -> (pulsus_promql::QueryPlan, pulsus_promql::SeriesData) {
+        use pulsus_promql::{FetchedSeries, Labels, PlanParams, Sample, SeriesData};
+        const GROUPS: usize = 8;
+        const MANY: usize = 8;
+        const STEPS: i64 = 200;
+        const STEP_MS: i64 = 15_000;
+        let params = PlanParams {
+            start_ms: 0,
+            end_ms: (STEPS - 1) * STEP_MS,
+            step_ms: STEP_MS,
+            lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+            experimental_functions: false,
+        };
+        let expr = pulsus_promql::parse("foo / on(g) group_right bar").unwrap();
+        let plan = pulsus_promql::plan(&expr, params).unwrap();
+        let samples = |base: f64| -> Vec<Sample> {
+            (0..STEPS)
+                .map(|k| Sample {
+                    t_ms: k * STEP_MS,
+                    v: base + k as f64,
+                })
+                .collect()
+        };
+        let mut data = SeriesData::new();
+        for sel in &plan.selectors {
+            let name = sel.metric_name.clone().unwrap();
+            let mut series = Vec::new();
+            if name == "foo" {
+                for g in 0..GROUPS {
+                    series.push(FetchedSeries {
+                        fingerprint: g as u64,
+                        metric_name: Some("foo".to_string()),
+                        labels: Labels::new([("g".to_string(), format!("g{g}"))]),
+                        samples: samples(1.0),
+                    });
+                }
+            } else {
+                let mut fp = 100_000u64;
+                for g in 0..GROUPS {
+                    for m in 0..MANY {
+                        series.push(FetchedSeries {
+                            fingerprint: fp,
+                            metric_name: Some("bar".to_string()),
+                            labels: Labels::new([
+                                ("g".to_string(), format!("g{g}")),
+                                ("inst".to_string(), format!("i{m}")),
+                                ("region".to_string(), "us-east-1".to_string()),
+                            ]),
+                            samples: samples(2.0),
+                        });
+                        fp += 1;
+                    }
+                }
+            }
+            data.insert(sel.id, series);
+        }
+        (plan, data)
+    }
+
+    /// Issue #93 (finding 2 — the reactor-non-starvation gate): on a
+    /// SINGLE-THREADED (`current_thread`) runtime, a concurrently-spawned
+    /// cooperative task can only run when the driving future YIELDS to the
+    /// scheduler. `evaluate_offloaded` awaits `spawn_blocking`, so it
+    /// yields while the CPU-bound eval runs on the blocking pool — the
+    /// concurrent task is polled and makes progress DURING the eval. The
+    /// contrast arm runs the SAME eval INLINE (await-free, exactly the
+    /// pre-#93 shape): it never yields, so the concurrent task is starved —
+    /// the failure mode the fix removes. Both assertions are booleans
+    /// ("did it make progress at all"), never a wall-time bound, so the
+    /// gate is robust on a loaded CI box.
+    #[tokio::test(flavor = "current_thread")]
+    async fn offloaded_evaluate_does_not_starve_the_reactor() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // --- OFFLOAD path (the fix): the eval runs off-reactor, so the
+        // --- concurrent task completes while it is in flight.
+        let (plan, data) = heavy_eval_fixture();
+        let progressed = Arc::new(AtomicBool::new(false));
+        let flag = progressed.clone();
+        tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+        // No `.await` between the spawn and here: the task cannot have run
+        // yet on a current_thread runtime.
+        assert!(
+            !progressed.load(Ordering::SeqCst),
+            "sanity: the spawned task must not run before the driver yields"
+        );
+        let out = evaluate_offloaded(plan, data).await.unwrap();
+        assert!(
+            progressed.load(Ordering::SeqCst),
+            "the concurrent task made progress during the offloaded eval — the reactor stayed live"
+        );
+        assert!(
+            matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+            "the heavy fixture must produce a non-empty matrix"
+        );
+
+        // --- CONTRAST (failure-mode proof): the identical eval run INLINE
+        // --- on this runtime never yields, so the concurrent task starves.
+        let (plan, data) = heavy_eval_fixture();
+        let starved = Arc::new(AtomicBool::new(false));
+        let flag = starved.clone();
+        tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+        let inline = pulsus_promql::evaluate(&plan, &data).unwrap();
+        assert!(
+            !starved.load(Ordering::SeqCst),
+            "inline (non-offloaded) eval starves the reactor: the concurrent task must NOT have run"
+        );
+        std::hint::black_box(&inline);
     }
 
     #[test]
