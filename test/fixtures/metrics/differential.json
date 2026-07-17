@@ -127,6 +127,8 @@
 
     { "expr": "info(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
     { "expr": "info(mem_usage_bytes{run_id=\"{R}\"}, {version=~\".+\"})", "modes": ["instant", "range"] },
-    { "expr": "info(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}, {__name__=\"target_info\"})", "modes": ["instant", "range"] }
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}, {__name__=\"target_info\"})", "modes": ["instant", "range"] },
+
+    { "expr": "topk(time() % 2, mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} @ start())", "modes": ["range"] }
   ]
 }

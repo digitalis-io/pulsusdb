@@ -2294,6 +2294,189 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step-invariance classification (issue #88)
+// ---------------------------------------------------------------------------
+
+/// Plan-time step-invariance classification (issue #88): whether `expr`'s
+/// value is provably independent of the evaluation step time
+/// (`invariant`), and whether the node is a legal once-and-copy cache
+/// root (`wrappable`). Mirrors upstream `preprocessExprHelper`
+/// (`promql/engine.go:4509-4610` at the pinned v3.13.0 SHA) EXACTLY,
+/// including its two quirks:
+///
+/// - **Aggregate params are IGNORED** — upstream's `AggregateExpr` arm
+///   returns `preprocessExprHelper(n.Expr)` alone, so
+///   `topk(time() % 2, m @ 10)` freezes the WHOLE aggregate (an
+///   eval-time-dependent `k` included) at the range start
+///   (oracle-confirmed at the pin, plan v2 Δ1). `histogram_quantile`/
+///   binary operands are NOT quirked — their params flow through the
+///   `Call`/`BinaryExpr` arms' all-args AND.
+/// - **`timestamp()` of a bare `@`-fixed selector is invariant** despite
+///   `timestamp` being `@`-modifier-unsafe (upstream
+///   `isTimestampWithAllArgsStepInvariantSafe`): the returned value is
+///   the fixed sample's own timestamp. Any computed argument reads the
+///   step time and stays variant.
+///
+/// The exclusion set is `AtModifierUnsafeFunctions`
+/// (`promql/functions.go:2654`): `time`, the eight date/time-field
+/// functions, `predict_linear`, `timestamp` (plus `range`/`step`/
+/// `start`/`end`, which have no [`PlanExpr`] node in this subset — they
+/// resolve at plan time). `invariant && !wrappable` is the
+/// scalar/string-literal shape (upstream `NumberLiteral`/`StringLiteral`:
+/// constant, but never worth a wrapper of its own).
+///
+/// [`PlanExpr::Info`] is deliberately `(false, false)` — a marked info()
+/// root would interact with the per-step `InfoCache`/`prepare_info`
+/// machinery (#82) for no value change (conservative; forgoes only a
+/// perf micro-win on an experimental function).
+///
+/// Classification is memoized by node address (code review round 1,
+/// finding 3): the prepare walk in `eval` classifies a node, then
+/// descends and classifies its children — without the memo a left-deep
+/// chain re-walks every suffix (quadratic). With it, each node's verdict
+/// is computed exactly once per [`StepInvariance`] instance (O(n) total,
+/// gated by `eval::tests::the_prepare_walk_classifies_each_node_once`),
+/// and instances live no longer than one `evaluate` call — the same
+/// borrowed-plan address-stability argument as the eval-side caches.
+#[derive(Debug)]
+pub(crate) struct StepInvariance<'a> {
+    selectors: &'a [SelectorSpec],
+    memo: std::collections::HashMap<*const PlanExpr, (bool, bool)>,
+    /// Genuine (non-memo-hit) classification executions — the O(n)
+    /// single-pass observable, test-only.
+    #[cfg(test)]
+    pub(crate) computed: u64,
+}
+
+impl<'a> StepInvariance<'a> {
+    pub(crate) fn new(selectors: &'a [SelectorSpec]) -> Self {
+        Self {
+            selectors,
+            memo: std::collections::HashMap::new(),
+            #[cfg(test)]
+            computed: 0,
+        }
+    }
+
+    /// The memoizing entry point: `(invariant, wrappable)` for `expr`.
+    pub(crate) fn classify(&mut self, expr: &PlanExpr) -> (bool, bool) {
+        let addr = expr as *const PlanExpr;
+        if let Some(&verdict) = self.memo.get(&addr) {
+            return verdict;
+        }
+        #[cfg(test)]
+        {
+            self.computed += 1;
+        }
+        let verdict = self.compute(expr);
+        self.memo.insert(addr, verdict);
+        verdict
+    }
+
+    /// The per-variant table (see the struct doc for provenance).
+    fn compute(&mut self, expr: &PlanExpr) -> (bool, bool) {
+        match expr {
+            // Upstream NumberLiteral/StringLiteral: constant, never
+            // wrapped.
+            PlanExpr::Scalar(_) | PlanExpr::StringLiteral(_) => (true, false),
+            // Upstream VectorSelector: `n.Timestamp != nil` twice over.
+            PlanExpr::Selector(id) => {
+                let inv = self.selectors[*id].at_ms.is_some();
+                (inv, inv)
+            }
+            // Calls over a range source (functions all `@`-safe):
+            // upstream routes the MatrixSelector/SubqueryExpr arms —
+            // invariance is the source's own `@` (`n.Timestamp != nil`),
+            // and the matrix selector itself is never wrapped (the
+            // enclosing call is).
+            PlanExpr::RangeFn { source, .. }
+            | PlanExpr::OverTime { source, .. }
+            | PlanExpr::AbsentOverTime { source } => {
+                let inv = range_source_invariant(source, self.selectors);
+                (inv, inv)
+            }
+            PlanExpr::OverTimeParam { func, source, args } => {
+                let inv = !over_time_param_fn_is_at_modifier_unsafe(*func)
+                    && range_source_invariant(source, self.selectors)
+                    && args.iter().all(|a| self.classify(a).0);
+                (inv, inv)
+            }
+            // Single-vector-argument `@`-safe calls: all args invariant
+            // ⟺ the arg is (label/string parameters are literals).
+            PlanExpr::Absent { arg, .. }
+            | PlanExpr::Sort { arg, .. }
+            | PlanExpr::SortByLabel { arg, .. }
+            | PlanExpr::LabelReplace { arg, .. }
+            | PlanExpr::LabelJoin { arg, .. }
+            | PlanExpr::ScalarOf { arg }
+            | PlanExpr::VectorOf { arg } => {
+                let inv = self.classify(arg).0;
+                (inv, inv)
+            }
+            // `time()` and the date/time-field functions are
+            // `@`-modifier-unsafe regardless of their arguments.
+            PlanExpr::Time | PlanExpr::DateFn { .. } => (false, false),
+            // The `isTimestampWithAllArgsStepInvariantSafe` special
+            // case: a bare `@`-fixed selector argument is invariant (the
+            // fixed sample time); everything else keeps `timestamp`
+            // unsafe.
+            PlanExpr::Timestamp { bare_selector, .. } => match bare_selector {
+                Some(id) if self.selectors[*id].at_ms.is_some() => (true, true),
+                _ => (false, false),
+            },
+            PlanExpr::HistogramQuantile { quantile, expr } => {
+                let inv = self.classify(quantile).0 && self.classify(expr).0;
+                (inv, inv)
+            }
+            // The param-IGNORING quirk: upstream's AggregateExpr arm
+            // returns `preprocessExprHelper(n.Expr)` verbatim — the
+            // param is neither classified nor ever wrapped.
+            // `CountValues`' param is a string literal, so the same rule
+            // is trivially exact for it.
+            PlanExpr::Aggregate { expr, .. } | PlanExpr::CountValues { expr, .. } => {
+                self.classify(expr)
+            }
+            PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
+                let inv = self.classify(lhs).0 && self.classify(rhs).0;
+                (inv, inv)
+            }
+            PlanExpr::MathFn {
+                arg, scalar_args, ..
+            } => {
+                let inv = self.classify(arg).0 && scalar_args.iter().all(|a| self.classify(a).0);
+                (inv, inv)
+            }
+            PlanExpr::ScalarFn { args, .. } => {
+                let inv = args.iter().all(|a| self.classify(a).0);
+                (inv, inv)
+            }
+            PlanExpr::Info { .. } => (false, false),
+        }
+    }
+}
+
+/// `n.Timestamp != nil` for a range source: the matrix selector's own
+/// `@` ([`SelectorSpec::at_ms`]) or the subquery node's
+/// ([`SubqueryPlan::at_ms`]). A subquery's invariance is SOLELY its own
+/// `@` — upstream never consults the inner expression for it (the inner
+/// is handled inside the subquery's own evaluation, which #88
+/// deliberately does not descend into — adjudicated Δ3).
+fn range_source_invariant(source: &RangeSource, selectors: &[SelectorSpec]) -> bool {
+    match source {
+        RangeSource::Selector(id) => selectors[*id].at_ms.is_some(),
+        RangeSource::Subquery(sq) => sq.at_ms.is_some(),
+    }
+}
+
+/// The `AtModifierUnsafeFunctions` membership for the parameterized
+/// range-window functions: only `predict_linear` (its intercept is the
+/// evaluation step time); `quantile_over_time`/
+/// `double_exponential_smoothing` are safe.
+fn over_time_param_fn_is_at_modifier_unsafe(func: OverTimeParamFn) -> bool {
+    matches!(func, OverTimeParamFn::PredictLinear)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4810,5 +4993,80 @@ mod tests {
                 .contains("vector selector must contain at least one non-empty matcher"),
             "{err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #88 (M6-08e): step-invariance classification
+    // -----------------------------------------------------------------
+
+    /// Plans `query` and classifies its root.
+    fn classify(query: &str) -> (bool, bool) {
+        let p = plan(&parse(query).unwrap(), params()).unwrap();
+        StepInvariance::new(&p.selectors).classify(&p.root)
+    }
+
+    /// AC1: the classifier mirrors `preprocessExprHelper`'s per-variant
+    /// verdicts exactly — each case asserts the exact
+    /// `(invariant, wrappable)` pair for the plan root.
+    #[test]
+    fn m6_08e_step_invariance_mirrors_the_upstream_classifier() {
+        for (query, want) in [
+            // Wrap-roots: every input `@`-fixed, function `@`-safe.
+            ("abs(m @ 30)", (true, true)),
+            ("timestamp(m @ 50)", (true, true)),
+            ("m @ 100 + m @ 200", (true, true)),
+            ("rate(m[5m] @ 100)", (true, true)),
+            ("sum_over_time(vector(time())[10s:3s] @ 25)", (true, true)),
+            ("sum(m @ 100)", (true, true)),
+            // The Aggregate param-IGNORING quirk (plan v2 Δ1): the
+            // eval-time-dependent k/φ does NOT block the freeze.
+            ("topk(time() % 2, m @ 10)", (true, true)),
+            ("bottomk(time() % 2, m @ 10)", (true, true)),
+            ("quantile(time() / 4, m @ 10)", (true, true)),
+            // Variant roots.
+            ("time()", (false, false)),
+            ("vector(time())", (false, false)),
+            ("timestamp(abs(m @ 30))", (false, false)),
+            ("predict_linear(m[5m] @ 100, 60)", (false, false)),
+            ("sum_over_time(m[5m])", (false, false)),
+            ("topk(time() % 2, m)", (false, false)),
+            // NOT quirked: histogram_quantile's φ and MathFn scalar args
+            // flow through the all-args AND (upstream Call arm).
+            ("histogram_quantile(time(), h @ 10)", (false, false)),
+            ("clamp(m @ 10, 0, time())", (false, false)),
+            // hour()/month()/… are unsafe regardless of the argument.
+            ("hour(m @ 100)", (false, false)),
+            // The plan-v1 edge-case-2 statement: the alternating-verdict
+            // delayed-name class is never marked (no `@` anywhere).
+            ("(m > 0) or (m + 1)", (false, false)),
+        ] {
+            assert_eq!(classify(query), want, "{query}");
+        }
+    }
+
+    /// `timestamp(abs(m @ 30))`: the outer call stays variant (the
+    /// upstream special case demands a BARE selector argument), while the
+    /// inner `abs` subtree is a wrap-root of its own — the lower-root
+    /// contrast `proof/m6_08e_step_invariant.test` pins by value.
+    #[test]
+    fn m6_08e_timestamp_of_a_computed_arg_exposes_the_inner_root() {
+        let p = plan(&parse("timestamp(abs(m @ 30))").unwrap(), params()).unwrap();
+        let mut classifier = StepInvariance::new(&p.selectors);
+        assert_eq!(classifier.classify(&p.root), (false, false));
+        let PlanExpr::Timestamp { arg, bare_selector } = &p.root else {
+            panic!("expected Timestamp root, got {:?}", p.root);
+        };
+        assert_eq!(*bare_selector, None);
+        assert_eq!(classifier.classify(arg), (true, true));
+    }
+
+    /// Scalar/string literals are invariant but never wrappable
+    /// (upstream `NumberLiteral`/`StringLiteral` → `(true, false)`);
+    /// a composite all-scalar subtree IS wrappable (`BinaryExpr` both
+    /// sides invariant → `(true, true)`).
+    #[test]
+    fn m6_08e_literals_are_invariant_but_not_wrappable() {
+        assert_eq!(classify("3"), (true, false));
+        assert_eq!(classify("1 + 2"), (true, true));
     }
 }

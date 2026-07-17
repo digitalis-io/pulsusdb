@@ -2093,13 +2093,23 @@ mod tests {
     /// appear at all" notes above describe the pre-#82 flag state.
     /// info() passes base sample values through verbatim, so the rows
     /// stay bit-exact-eligible.
+    /// Resized 162 -> 163 by issue #88 (M6-08e): one range-only row for
+    /// the step-invariant once-and-copy aggregate-param quirk —
+    /// `topk(time() % 2, ... @ start())` freezes the eval-time-dependent
+    /// k at the range start on both engines (upstream wraps the whole
+    /// aggregate in a StepInvariantExpr because its AggregateExpr arm
+    /// classifies the expression alone, param ignored); a per-step
+    /// recompute oscillates k with the 15s step's odd-second parity and
+    /// mismatches the oracle on half the steps whichever parity the
+    /// run's wall-clock start lands on. Plain query text — no new
+    /// oracle flags (the `@` modifier and start() are stable upstream).
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_two_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_three_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 162,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 162 — update \
+            rows, 163,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 163 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

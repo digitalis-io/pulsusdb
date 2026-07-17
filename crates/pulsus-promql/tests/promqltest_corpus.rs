@@ -38,6 +38,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_08b_duration_expressions.test",
     "m6_08c_utf8_selectors.test",
     "m6_08d_directives_delayed_name.test",
+    "m6_08e_step_invariant.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {

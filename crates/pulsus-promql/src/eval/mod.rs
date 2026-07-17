@@ -26,7 +26,8 @@ pub mod labels;
 mod quote;
 pub mod staleness;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use pulsus_model::STALE_NAN_BITS;
 
@@ -58,11 +59,36 @@ pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, Promq
     evaluate_counted(plan, data).map(|(value, _)| value)
 }
 
-/// [`evaluate`] plus the total count of subquery inner-grid evaluations —
-/// the issue #83 round-2 evaluation-count gate's hook: a per-outer-step
-/// re-evaluation implementation counts a multiple of the union-grid size
-/// and fails `tests::subqueries_materialize_once_over_the_union_grid`.
-fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, u64), PromqlError> {
+/// The evaluation-count observables [`evaluate_counted`] returns
+/// alongside the value — each one a Tier-1 (scale-invariant) perf gate's
+/// hook, never a wall-time assert.
+#[derive(Debug, Default, Clone, Copy)]
+struct EvalCounts {
+    /// Subquery inner-grid evaluations (issue #83 round-2 gate): a
+    /// per-outer-step re-evaluation implementation counts a multiple of
+    /// the union-grid size and fails
+    /// `tests::subqueries_materialize_once_over_the_union_grid`.
+    inner_evals: u64,
+    /// Genuine evaluations of MARKED step-invariant roots (issue #88):
+    /// [`eval_step`] increments whenever a marked node is actually
+    /// evaluated rather than served from cache — which happens exactly
+    /// once, during [`prepare_step_invariant`] (it marks before
+    /// evaluating, so its own single evaluation is counted through the
+    /// same instrument). Per-step cache HITS return early and never
+    /// count, so the `== 1` Tier-1 gate
+    /// (`tests::step_invariant_roots_evaluate_once_across_a_range`)
+    /// catches BOTH regression shapes (code review round 1, finding 1):
+    /// a prep pass that recomputes per step, and a stepping phase that
+    /// bypasses the cache and re-evaluates the marked subtree (`1 +
+    /// steps` either way).
+    step_invariant_evals: u64,
+}
+
+/// [`evaluate`] plus [`EvalCounts`].
+fn evaluate_counted(
+    plan: &QueryPlan,
+    data: &SeriesData,
+) -> Result<(QueryValue, EvalCounts), PromqlError> {
     let p = &plan.params;
 
     // Issue #83 (round-2 amendment): materialize every subquery ONCE over
@@ -72,7 +98,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
     // every `info()` node's arg0 horizon is walked once here to build
     // its horizon-wide identifying-label narrowing (`prepare_info`).
     let mut caches = EvalCaches::default();
-    let mut inner_evals = 0u64;
+    let mut counts = EvalCounts::default();
     prepare_subqueries(
         &plan.root,
         &plan.selectors,
@@ -84,7 +110,24 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
         },
         p.lookback_ms,
         &mut caches,
-        &mut inner_evals,
+        &mut counts.inner_evals,
+    )?;
+
+    // Issue #88: freeze every highest step-invariant subtree — evaluated
+    // ONCE at the range start, the per-step loop below returns the cached
+    // clone (upstream `StepInvariantExpr`'s once-and-copy). AFTER
+    // `prepare_subqueries`, necessarily: a root over an `@`-anchored
+    // subquery evaluates against the already-materialized union grid.
+    // The classifier instance is per-call, like the caches (Δ4).
+    let mut classifier = crate::plan::StepInvariance::new(&plan.selectors);
+    prepare_step_invariant(
+        &plan.root,
+        &plan.selectors,
+        data,
+        p.start_ms,
+        p.lookback_ms,
+        &mut caches,
+        &mut classifier,
     )?;
 
     if p.step_ms == 0 {
@@ -100,7 +143,8 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
             StepValue::Scalar(s) => QueryValue::Scalar(s),
             StepValue::String(s) => QueryValue::String(s),
         };
-        return Ok((finalize_metadata_labels(value)?, inner_evals));
+        counts.step_invariant_evals = caches.step_invariant_evals.get();
+        return Ok((finalize_metadata_labels(value)?, counts));
     }
 
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
@@ -177,6 +221,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
         t += p.step_ms;
     }
 
+    counts.step_invariant_evals = caches.step_invariant_evals.get();
     if saw_scalar && !saw_vector {
         return Ok((
             QueryValue::Matrix(vec![RangeSeries {
@@ -185,7 +230,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
                 drop_name: false,
                 points: scalar_points,
             }]),
-            inner_evals,
+            counts,
         ));
     }
 
@@ -203,10 +248,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
     // internal determinism when two full identities share their non-name
     // labels.
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
-    Ok((
-        finalize_metadata_labels(QueryValue::Matrix(out))?,
-        inner_evals,
-    ))
+    Ok((finalize_metadata_labels(QueryValue::Matrix(out))?, counts))
 }
 
 // ---------------------------------------------------------------------------
@@ -394,13 +436,42 @@ struct PreparedInfo {
 /// (the [`SubqueryCache`] node-identity precedent).
 type InfoCache = HashMap<*const PlanExpr, PreparedInfo>;
 
+/// Step-invariant cache roots keyed by node address (issue #88, the
+/// [`SubqueryCache`]/[`InfoCache`] node-identity precedent): the highest
+/// wrappable-invariant subtrees ([`crate::plan::step_invariance`]),
+/// each evaluated exactly once at the range start by
+/// [`prepare_step_invariant`]; [`eval_step`] short-circuits to the cached
+/// clone at every step.
+type StepInvariantCache = HashMap<*const PlanExpr, StepValue>;
+
 /// Everything the prepare pass materializes before stepping begins —
-/// subquery grids (issue #83) and `info()` horizons (issue #82), bundled
-/// so [`eval_step`]'s signature carries one shared read-only handle.
+/// subquery grids (issue #83), `info()` horizons (issue #82), and
+/// step-invariant roots (issue #88), bundled so [`eval_step`]'s signature
+/// carries one shared read-only handle.
+///
+/// **Lifetime (issue #88, plan v2 Δ4):** constructed fresh inside every
+/// [`evaluate_counted`] call and dropped with it — the address keys carry
+/// neither start time nor data identity, so any reuse across evaluations
+/// would return stale values
+/// (`tests::the_step_invariant_cache_is_fresh_per_evaluate_call`).
 #[derive(Debug, Default)]
 struct EvalCaches {
     subqueries: SubqueryCache,
     infos: InfoCache,
+    step_invariant: StepInvariantCache,
+    /// The marked-root address set, inserted BEFORE the root's single
+    /// prep-pass evaluation (so that evaluation is itself observed by
+    /// [`eval_step`]'s instrument). Identical keys to `step_invariant`
+    /// once preparation finishes; kept separate so the count instrument
+    /// works during the window where a root is being evaluated but not
+    /// yet cached.
+    step_invariant_marked: HashSet<*const PlanExpr>,
+    /// Interior-mutable eval counter (a [`Cell`], because [`eval_step`]
+    /// holds `&EvalCaches`); copied into
+    /// [`EvalCounts::step_invariant_evals`] after stepping completes.
+    /// Single-threaded by construction — the evaluator never shares
+    /// `EvalCaches` across threads.
+    step_invariant_evals: Cell<u64>,
 }
 
 /// The evaluation grid a node will be stepped over: the closed
@@ -839,6 +910,200 @@ fn prepare_subquery(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Step-invariant once-and-copy preparation (issue #88)
+// ---------------------------------------------------------------------------
+
+/// Registers the HIGHEST wrappable step-invariant subtrees as cache
+/// roots, evaluating each exactly once at `start_ms` — the evaluation
+/// model of upstream's `StepInvariantExpr` arm (engine.go:2563-2600 at
+/// the pin: the wrapped expr is evaluated with `endTimestamp =
+/// startTimestamp` and the single result duplicated across steps; our
+/// range accumulator re-stamps step timestamps itself, so returning the
+/// cached clone per step is the exact copy).
+///
+/// The walk mirrors where upstream `preprocessExprHelper` places
+/// `StepInvariantExpr` wrappers: a wrappable-invariant node is a root
+/// (descent stops — every evaluated descendant of an invariant node is
+/// itself invariant, so roots are pairwise disjoint and never nested);
+/// otherwise its children are walked, EXCEPT
+///
+/// - **aggregate params** — upstream's `AggregateExpr` arm never
+///   descends into `n.Param`, so no wrapper ever lands inside one (the
+///   param-ignoring quirk's flip side);
+/// - **subquery inners** (adjudicated Δ3) — no cache root is ever placed
+///   inside a [`SubqueryPlan::inner`]: the union-grid materialization
+///   (#83) already evaluates it once per grid point, and descending
+///   would mint values matching neither upstream nor the ratified #83
+///   model (the residual documented on the `at-modifier` coverage
+///   entry);
+/// - **range sources** as such — a matrix selector is not a [`PlanExpr`]
+///   node (upstream: `MatrixSelector` returns `shouldWrap = false`; the
+///   enclosing call is the wrap candidate), and an `@`-fixed subquery
+///   node needs no root (its materialized grid and per-step slice are
+///   already step-invariant by construction).
+///
+/// Must run AFTER [`prepare_subqueries`]: a root's single evaluation may
+/// slice from materialized subquery grids.
+///
+/// A root is MARKED (`step_invariant_marked`) before its single
+/// evaluation, so that evaluation flows through [`eval_step`]'s
+/// marked-node count instrument — the one genuine eval the Tier-1
+/// `== 1` gate expects; every later count is a cache-bypass regression
+/// (review round 1, finding 1). `classifier` memoizes by node address,
+/// so the walk classifies each node exactly once overall
+/// (`tests::the_prepare_walk_classifies_each_node_once` — finding 3).
+fn prepare_step_invariant(
+    expr: &PlanExpr,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    start_ms: i64,
+    lookback_ms: i64,
+    caches: &mut EvalCaches,
+    classifier: &mut crate::plan::StepInvariance<'_>,
+) -> Result<(), PromqlError> {
+    let (invariant, wrappable) = classifier.classify(expr);
+    if invariant && wrappable {
+        let addr = expr as *const PlanExpr;
+        caches.step_invariant_marked.insert(addr);
+        let value = eval_step(expr, selectors, data, start_ms, lookback_ms, caches)?;
+        caches.step_invariant.insert(addr, value);
+        return Ok(());
+    }
+    match expr {
+        // No children (or none reachable): leaves, and the range-source
+        // arms per the doc comment above.
+        PlanExpr::Selector(_)
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_)
+        | PlanExpr::Time
+        | PlanExpr::RangeFn { .. }
+        | PlanExpr::OverTime { .. }
+        | PlanExpr::AbsentOverTime { .. } => Ok(()),
+        // Scalar parameters of a variant call are wrap candidates of
+        // their own (upstream wraps invariant args of an unsafe call).
+        PlanExpr::OverTimeParam { args, .. } | PlanExpr::ScalarFn { args, .. } => {
+            for a in args {
+                prepare_step_invariant(
+                    a,
+                    selectors,
+                    data,
+                    start_ms,
+                    lookback_ms,
+                    caches,
+                    classifier,
+                )?;
+            }
+            Ok(())
+        }
+        PlanExpr::Absent { arg, .. }
+        | PlanExpr::Sort { arg, .. }
+        | PlanExpr::SortByLabel { arg, .. }
+        | PlanExpr::LabelReplace { arg, .. }
+        | PlanExpr::LabelJoin { arg, .. }
+        | PlanExpr::Timestamp { arg, .. }
+        | PlanExpr::ScalarOf { arg }
+        | PlanExpr::VectorOf { arg } => prepare_step_invariant(
+            arg,
+            selectors,
+            data,
+            start_ms,
+            lookback_ms,
+            caches,
+            classifier,
+        ),
+        PlanExpr::DateFn { arg, .. } => match arg {
+            Some(arg) => prepare_step_invariant(
+                arg,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            ),
+            None => Ok(()),
+        },
+        PlanExpr::HistogramQuantile {
+            quantile: a,
+            expr: b,
+        }
+        | PlanExpr::Binary { lhs: a, rhs: b, .. }
+        | PlanExpr::SetOp { lhs: a, rhs: b, .. } => {
+            prepare_step_invariant(
+                a,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )?;
+            prepare_step_invariant(
+                b,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )
+        }
+        // The param (when present) is deliberately NOT walked — see the
+        // doc comment.
+        PlanExpr::Aggregate { expr, .. } | PlanExpr::CountValues { expr, .. } => {
+            prepare_step_invariant(
+                expr,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )
+        }
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => {
+            prepare_step_invariant(
+                arg,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )?;
+            for a in scalar_args {
+                prepare_step_invariant(
+                    a,
+                    selectors,
+                    data,
+                    start_ms,
+                    lookback_ms,
+                    caches,
+                    classifier,
+                )?;
+            }
+            Ok(())
+        }
+        // `Info` is never a root (classifier: `(false, false)`); its
+        // base may hold lower roots. The registered root's prepared value
+        // is only consulted if the base is re-evaluated (the stepping
+        // phase reads `PreparedInfo::base_steps` instead) — harmless
+        // either way, and faithful to the upstream wrapper placement.
+        PlanExpr::Info { base, .. } => prepare_step_invariant(
+            base,
+            selectors,
+            data,
+            start_ms,
+            lookback_ms,
+            caches,
+            classifier,
+        ),
+    }
+}
+
 /// One range-vector function input series at one step, already windowed.
 struct WindowedSeries {
     labels: Labels,
@@ -961,6 +1226,29 @@ fn eval_step(
     lookback_ms: i64,
     caches: &EvalCaches,
 ) -> Result<StepValue, PromqlError> {
+    // Issue #88: a step-invariant cache root short-circuits to its
+    // once-evaluated value — the copy half of once-and-copy (the range
+    // accumulator/consuming arm stamps the step time, exactly like
+    // upstream's duplicate-with-changed-timestamps). The `is_empty()`
+    // guard keeps the common no-`@` query path at one bool check per
+    // node, never a hash probe.
+    if !caches.step_invariant_marked.is_empty() {
+        let addr = expr as *const PlanExpr;
+        if let Some(cached) = caches.step_invariant.get(&addr) {
+            return Ok(cached.clone());
+        }
+        // A MARKED root reaching past the cache probe is being genuinely
+        // evaluated. That happens exactly once — the prep-pass eval in
+        // `prepare_step_invariant`, which marks before evaluating so
+        // this instrument observes it. Any additional increment is a
+        // per-step cache-bypass regression (review round 1, finding 1),
+        // tripping the Tier-1 `== 1` gate.
+        if caches.step_invariant_marked.contains(&addr) {
+            caches
+                .step_invariant_evals
+                .set(caches.step_invariant_evals.get() + 1);
+        }
+    }
     match expr {
         PlanExpr::Scalar(v) => Ok(StepValue::Scalar(*v)),
 
@@ -3392,13 +3680,13 @@ mod tests {
         let mut data = SeriesData::new();
         let samples: Vec<Sample> = (0..=12).map(|k| s(k * 10_000, 1.0)).collect();
         data.insert(0, vec![series(1, &[("job", "a")], samples)]);
-        let (value, inner_evals) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
         // Union grid: multiples of 10s in (0−60s, 60s] = (−60s, 60s] →
         // {−50s, …, 60s} = 12 points. A per-outer-step reevaluation
         // implementation would count one eval per (window, point) pair —
         // 7 overlapping windows of 6–7 points each, i.e. ≫ 12.
         assert_eq!(
-            inner_evals, 12,
+            counts.inner_evals, 12,
             "the inner expression must evaluate once per distinct union-grid point"
         );
         // And the sliced windows are still per-step correct: `up` has
@@ -3432,18 +3720,146 @@ mod tests {
         let mut data = SeriesData::new();
         let samples: Vec<Sample> = (0..=10).map(|k| s(k * 10_000, 1.0)).collect();
         data.insert(0, vec![series(1, &[], samples)]);
-        let (value, inner_evals) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
         // Outer grid: (70s, 100s] step 10s = {80, 90, 100}s → 3 evals of
         // the outer's inner expression. Inner union grid (materialized
         // FIRST, over the outer grid's extent): windows (70,80] ∪ (80,90]
         // ∪ (90,100] step 10s = {80, 90, 100}s → 3 evals of `up`. Exact
         // total: 3 + 3 = 6.
-        assert_eq!(inner_evals, 6);
+        assert_eq!(counts.inner_evals, 6);
         let QueryValue::Vector(v) = value else {
             panic!("expected Vector");
         };
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].v, 3.0, "three inner windows of one 1.0 sample each");
+    }
+
+    /// Issue #88 (Δ2, the Tier-1 once-and-copy gate at the eval site): a
+    /// wrappable step-invariant root is genuinely evaluated EXACTLY once
+    /// across a multi-step range — a per-step recompute counts once per
+    /// step (4 here) and, this being the aggregate-param quirk query,
+    /// also flips the values (frozen `k = time()%2 = 1` vs oscillating
+    /// `1 _ 1 _`) — double-caught.
+    #[test]
+    fn step_invariant_roots_evaluate_once_across_a_range() {
+        let expr = crate::parser::parse("topk(time() % 2, m{job=\"a\"} @ 10)").unwrap();
+        // Range 1s..4s step 1s — 4 steps, odd start ⇒ frozen k = 1.
+        let p = plan(&expr, params(1_000, 4_000, 1_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(10_000, 1.0)])]);
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.step_invariant_evals, 1,
+            "the marked aggregate root must evaluate once, not per step"
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].metric_name.as_deref(), Some("m"), "topk keeps names");
+        assert_eq!(
+            m[0].points,
+            vec![(1_000, 1.0), (2_000, 1.0), (3_000, 1.0), (4_000, 1.0)],
+            "the frozen start-step value is copied to every step"
+        );
+    }
+
+    /// Issue #88 (v1 AC2): the plain (non-quirk) once-and-copy shape —
+    /// `abs(m @ 30)` over 7 steps evaluates the marked root once. Value
+    /// parity for this class already held pre-#88 (the `@` pushdown), so
+    /// the counter is the load-bearing assert.
+    #[test]
+    fn an_at_fixed_function_root_evaluates_once_over_seven_steps() {
+        let expr = crate::parser::parse("abs(m{job=\"a\"} @ 30)").unwrap();
+        let p = plan(&expr, params(0, 60_000, 10_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(30_000, -3.0)])]);
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(counts.step_invariant_evals, 1);
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert!(m[0].points.iter().all(|&(_, v)| v == 3.0), "{:?}", m[0]);
+        assert_eq!(m[0].points.len(), 7);
+    }
+
+    /// Issue #88 (Δ4): the step-invariant cache is fresh per `evaluate`
+    /// call — the same plan evaluated against different data reflects
+    /// each call's own inputs (a leaked address-keyed cache would return
+    /// the first call's frozen value for the second).
+    #[test]
+    fn the_step_invariant_cache_is_fresh_per_evaluate_call() {
+        let expr = crate::parser::parse("abs(m{job=\"a\"} @ 30)").unwrap();
+        let p = plan(&expr, params(0, 20_000, 10_000)).unwrap();
+        for want in [3.0, 7.0] {
+            let mut data = SeriesData::new();
+            data.insert(0, vec![series(1, &[("job", "a")], vec![s(30_000, -want)])]);
+            let QueryValue::Matrix(m) = evaluate(&p, &data).unwrap() else {
+                panic!("expected Matrix");
+            };
+            assert_eq!(m.len(), 1);
+            assert!(
+                m[0].points.iter().all(|&(_, v)| v == want),
+                "want {want}: {:?}",
+                m[0]
+            );
+        }
+    }
+
+    /// Issue #88 (review round 1, finding 3): the prepare walk is
+    /// single-pass — over a left-deep chain of `n` additions (2n+1 plan
+    /// nodes, none invariant, so the walk descends the whole chain) the
+    /// classifier COMPUTES each node's verdict exactly once (memo hits
+    /// excluded); the pre-review shape re-walked every suffix per level
+    /// (≈ n²/2 ≫ 2n+1 computes).
+    #[test]
+    fn the_prepare_walk_classifies_each_node_once() {
+        let n = 60;
+        let query = format!("m{}", " + 1".repeat(n));
+        let expr = crate::parser::parse(&query).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut classifier = crate::plan::StepInvariance::new(&p.selectors);
+        let mut caches = EvalCaches::default();
+        let data = SeriesData::new();
+        prepare_step_invariant(
+            &p.root,
+            &p.selectors,
+            &data,
+            0,
+            300_000,
+            &mut caches,
+            &mut classifier,
+        )
+        .unwrap();
+        assert_eq!(
+            classifier.computed,
+            2 * n as u64 + 1,
+            "each of the 2n+1 nodes must be classified exactly once"
+        );
+    }
+
+    /// Issue #88 (Δ1 negative control): the freeze needs an `@`-fixed
+    /// expression — without one the aggregate is unmarked and the
+    /// eval-time-dependent `k` still oscillates per step (`5 _ 5 _`,
+    /// upstream-identical), and no genuine step-invariant eval happens.
+    #[test]
+    fn an_aggregate_without_at_is_not_marked_and_still_oscillates() {
+        let expr = crate::parser::parse("topk(time() % 2, m{job=\"a\"})").unwrap();
+        let p = plan(&expr, params(1_000, 4_000, 1_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 5.0)])]);
+        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(counts.step_invariant_evals, 0);
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].points,
+            vec![(1_000, 5.0), (3_000, 5.0)],
+            "k oscillates 1,0,1,0 — only the odd-second steps emit"
+        );
     }
 
     /// at_modifier.test:227-255's shape: a subquery `@` pointed at a

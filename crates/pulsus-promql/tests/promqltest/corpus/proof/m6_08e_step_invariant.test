@@ -1,0 +1,110 @@
+# Issue #88 (M6-08e) proof corpus — step-invariant once-and-copy parity
+# with upstream Prometheus v3.13.0 @ 40af9c2 (`preprocessExprHelper` /
+# the `StepInvariantExpr` eval arm, promql/engine.go). A subtree whose
+# value is provably independent of the evaluation step time (all
+# selectors/subqueries `@`-fixed, no `@`-modifier-unsafe function) is
+# evaluated ONCE at the range start and copied to every step.
+#
+# Pinned semantics this file exercises end-to-end:
+#   - the Aggregate param-IGNORING quirk (upstream's AggregateExpr arm
+#     classifies `n.Expr` alone): `topk(time() % 2, m @ 10)` FREEZES the
+#     whole aggregate — the eval-time-dependent k included — at the range
+#     start. These are the #88 flip witnesses: red under a per-step
+#     recompute, green under once-and-copy (every expected line below is
+#     oracle-verified against the pin's promqltest harness).
+#   - the timestamp() special case: `timestamp(bare @ T)` is invariant
+#     (the fixed sample time); `timestamp(computed)` stays variant while
+#     its `@`-fixed argument is a lower cache root — the copy-timestamp
+#     contrast.
+#   - over-marking negative controls: eval-time-dependent expressions
+#     (`vector(time())`, `predict_linear(... @ ..., t)`, an aggregate
+#     whose EXPRESSION carries no `@`) must still vary per step — a
+#     spurious mark collapses them to constants and fails here.
+#
+# OUT OF #88 SCOPE (adjudicated Δ3; scheduled as #95, residual on the
+# `at-modifier` coverage entry): an eval-time-dependent aggregate param
+# INSIDE a non-`@` subquery (`sum_over_time((topk(time()%2, m @ 30))[4s:1s])`).
+# Upstream wraps an invariant subquery INNER in its own nested
+# StepInvariantExpr regardless of the subquery's own `@` (engine.go
+# :4577-4585 at the pin) — the inner freezes once per subquery
+# evaluation w.r.t. that evaluation's start, and the subquery itself is
+# evaluated per outer step. Our ratified #83 union-grid model
+# materializes the inner once for the whole query — a pre-existing #83
+# consequence no root placement inside subquery inners could reconcile
+# (descending would mint a third answer matching neither). No cache root
+# is ever placed inside a subquery inner; `@`-fixed
+# eval-time-INDEPENDENT subtrees inside subqueries are value-equal
+# either way (the subquery-equivalence golden below).
+
+# m{job="a"}: v(t) = t/10 (exactly linear — the predict_linear negative
+# control is arithmetic-exact); m{job="b"}: v(t) = t/5 (the second series
+# for the quantile quirk golden); mc{job="a"}: constant 5 (the no-@
+# negative control).
+load 10s
+	m{job="a"} 0+1x100
+	m{job="b"} 0+2x100
+	mc{job="a"} 5+0x100
+
+# --- Once-and-copy value parity (v1 AC3). ---
+# abs(m @ 30) is a wrap-root: evaluated once (value 3), copied.
+eval range from 0 to 60s step 10s abs(m{job="a"} @ 30)
+	{job="a"} 3 3 3 3 3 3 3
+
+# The #83 epoch-grid distinguishing golden as a range query: the whole
+# call is a wrap-root (subquery `@ 25`), inner grid {18,21,24}s => 63 at
+# every step.
+eval range from 0 to 60s step 10s sum_over_time(vector(time())[10s:3s] @ 25)
+	{} 63 63 63 63 63 63 63
+
+# timestamp(bare @ T): the special-case wrap-root — the fixed sample
+# time, copied.
+eval range from 0 to 60s step 10s timestamp(m{job="a"} @ 50)
+	{job="a"} 50 50 50 50 50 50 50
+
+# The copy-timestamp contrast: the inner abs(m @ 30) is the cache root
+# (evaluated once), but the outer timestamp() of a COMPUTED argument
+# reads the step time — the output varies while its input is frozen.
+eval range from 0 to 60s step 10s timestamp(abs(m{job="a"} @ 30))
+	{job="a"} 0 10 20 30 40 50 60
+
+# --- Subquery equivalence (Δ3): an `@`-fixed eval-time-independent
+# subtree INSIDE a subquery needs no inner root — per-grid-point
+# materialization equals once-and-copy in value. Grid (50s,100s] step
+# 10s = {60..100}s, 5 points of 3 => 15.
+eval range from 0 to 60s step 10s sum_over_time((abs(m{job="a"} @ 30))[50s:10s] @ 100)
+	{job="a"} 15 15 15 15 15 15 15
+
+# --- The aggregate param-IGNORING quirk (v2 Δ1 flip witnesses). ---
+# Odd start (1s): k = time() % 2 = 1 frozen for the whole range. A
+# per-step recompute oscillates `1 _ 1 _` instead.
+eval range from 1s to 4s step 1s topk(time() % 2, m{job="a"} @ 10)
+	m{job="a"} 1 1 1 1
+
+eval range from 1s to 4s step 1s bottomk(time() % 2, m{job="a"} @ 10)
+	m{job="a"} 1 1 1 1
+
+# Even start (2s): k frozen at 0 => empty at EVERY step (a per-step
+# recompute would emit on the odd-second steps).
+eval range from 2s to 5s step 1s topk(time() % 2, m{job="a"} @ 10)
+
+# quantile: φ = time()/4 = 0.25 frozen; members {1, 2} => 1.25 at every
+# step (a per-step recompute walks φ 0.25→1.0 => 1.25 1.5 1.75 2).
+eval range from 1s to 4s step 1s quantile(time() / 4, m @ 10)
+	{} 1.25 1.25 1.25 1.25
+
+# --- Over-marking negative controls (v1 AC4 + v2). ---
+# The freeze needs an `@`-fixed EXPRESSION: without one the aggregate is
+# unmarked and k still oscillates per step, upstream-identical.
+eval range from 1s to 4s step 1s topk(time() % 2, mc{job="a"})
+	mc{job="a"} 5 _ 5 _
+
+# vector(time()) is `@`-unsafe: still varies per step.
+eval range from 0 to 40s step 10s vector(time())
+	{} 0 10 20 30 40
+
+# predict_linear is `@`-unsafe even over an `@`-fixed window: the
+# regression intercept is the evaluation STEP time. Window @ 200 offset
+# 50s => (50s,150s], exact fit v(t) = t/10, prediction 400s out =
+# 0.1*(T+400) => 140, 190, 240. A spurious mark would freeze 140.
+eval range from 1000s to 2000s step 500s predict_linear(m{job="a"}[100s] @ 200 offset 50s, 400)
+	{job="a"} 140 190 240
