@@ -47,6 +47,16 @@ impl QuerySettings {
         self
     }
 
+    /// The value of one setting, if present. Introspection only (tests /
+    /// gate assertions); the client applies settings via
+    /// [`Self::apply_to_query`], not through this accessor.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// docs/schemas.md §7 clustered-reader settings block, emitted exactly:
     /// `optimize_skip_unused_shards`, `optimize_distributed_group_by_sharding_key`,
     /// `distributed_aggregation_memory_efficient`, `prefer_localhost_replica`

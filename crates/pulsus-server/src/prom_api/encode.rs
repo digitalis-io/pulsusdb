@@ -407,7 +407,7 @@ pub(crate) fn query_response(
         // `QueryResult::Scalar` before issue #31 landed). Kept as a
         // well-formed error response rather than a panic — never trust an
         // upstream invariant to hold forever in a shared enum.
-        QueryResult::Streams(_) => (
+        QueryResult::Streams { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(UnreachableStreamsError {
                 status: "error",

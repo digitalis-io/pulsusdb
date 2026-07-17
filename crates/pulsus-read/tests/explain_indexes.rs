@@ -649,6 +649,93 @@ async fn stage3_line_filter_before_a_parser_keeps_the_exact_skip_index_usage() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #90 — the fetch-until-limit keyset PAGE (a later `After` page)
+// must keep the primary index engaged in BOTH directions. The composite
+// tuple comparison alone does not prune granules; the redundant
+// `timestamp_ns` bound (`>= ts` Forward / `<= ts` Backward) is what keeps
+// `PrimaryKey` on `timestamp_ns` in play — proving no per-page full scan.
+// ---------------------------------------------------------------------
+
+async fn keyset_page_usage(
+    db: &str,
+    ts_ns: i64,
+    client: &ChClient,
+    direction: Direction,
+) -> Vec<String> {
+    let table = format!("{db}.log_samples");
+    let sql = sql::stage3_keyset(
+        &table,
+        &["'checkout'".to_string()],
+        &[FP_PROD],
+        TimeWindow {
+            start_ns: ts_ns - 6 * 3_600_000_000_000,
+            end_ns: ts_ns + 3_600_000_000_000,
+        },
+        sql::KeysetLower::After {
+            tuple: (ts_ns, FP_PROD, 42),
+            offset: 1,
+        },
+        direction,
+        &[],
+        500,
+    );
+    explain(client, &sql).await
+}
+
+#[tokio::test]
+async fn keyset_forward_page_keeps_the_primary_key_engaged_via_the_redundant_time_bound() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_keyset_fwd";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let usage = keyset_page_usage(db, ts_ns, &client, Direction::Forward).await;
+    // The PrimaryKey block must be present with `timestamp_ns` among its
+    // keys and a `Condition:` that references it (granule pruning), not a
+    // `Condition: true` full scan.
+    assert!(
+        usage.iter().any(|l| l == "PrimaryKey"),
+        "forward keyset page must engage the PrimaryKey: {usage:?}"
+    );
+    let pk_pos = usage.iter().position(|l| l == "PrimaryKey").unwrap();
+    assert!(
+        usage[pk_pos..].iter().any(|l| l == "timestamp_ns"),
+        "timestamp_ns must be a PrimaryKey column: {usage:?}"
+    );
+    assert!(
+        usage[pk_pos..]
+            .iter()
+            .any(|l| l.starts_with("Condition:") && l.contains("timestamp_ns")),
+        "the PrimaryKey Condition must prune on timestamp_ns (redundant bound): {usage:?}"
+    );
+}
+
+#[tokio::test]
+async fn keyset_backward_page_keeps_the_primary_key_engaged_via_the_redundant_time_bound() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_keyset_bwd";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let usage = keyset_page_usage(db, ts_ns, &client, Direction::Backward).await;
+    assert!(
+        usage.iter().any(|l| l == "PrimaryKey"),
+        "backward keyset page must engage the PrimaryKey: {usage:?}"
+    );
+    let pk_pos = usage.iter().position(|l| l == "PrimaryKey").unwrap();
+    assert!(
+        usage[pk_pos..].iter().any(|l| l == "timestamp_ns"),
+        "timestamp_ns must be a PrimaryKey column: {usage:?}"
+    );
+    assert!(
+        usage[pk_pos..]
+            .iter()
+            .any(|l| l.starts_with("Condition:") && l.contains("timestamp_ns")),
+        "the PrimaryKey Condition must prune on timestamp_ns (redundant bound): {usage:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // Metric reads — rollup-served vs raw fallback, range vs instant.
 // ---------------------------------------------------------------------
 

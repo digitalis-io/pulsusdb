@@ -217,7 +217,12 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, LogQlError> {
                     sc.current_byte(),
                 );
             }
-            c if c.is_ascii_digit() => {
+            c if c.is_ascii_digit()
+                || (c == '.' && matches!(sc.peek_at(1), Some(d) if d.is_ascii_digit())) =>
+            {
+                // A leading `.` followed by a digit begins a
+                // fractional literal (`.5`, `.5s`) — Loki accepts a
+                // leading-dot mantissa in label-filter/unwrap position.
                 let kind = scan_number_or_duration(&mut sc, start);
                 push(&mut tokens, kind, start, sc.current_byte());
             }
@@ -330,50 +335,66 @@ fn scan_backtick(sc: &mut Scanner<'_>, start: usize) -> Result<String, LogQlErro
     }
 }
 
-/// Scans a run starting at a digit: either a plain/decimal number, or a
-/// compound duration literal (one or more `<digits><unit>` groups, e.g.
-/// `1h30m`). The lexer only decides *which kind* of token this is —
-/// `duration::parse_duration` does the actual unit-to-nanoseconds work.
+/// Scans a run starting at a digit (or a leading `.` before a digit):
+/// either a plain/decimal number, or a compound duration literal (one or
+/// more `<mantissa><unit>` groups, e.g. `1h30m`, `1.5s`, `.5s`,
+/// `1h1.5m`). Each mantissa may carry a fractional `.<digits>` part.
+/// Loki accepts fractional durations in label-filter/unwrap position
+/// (`time.ParseDuration` semantics); a fractional mantissa followed by a
+/// unit lexes here as a single `Duration` token so the fractional value
+/// reaches `parse_duration_seconds` intact. A fractional mantissa with no
+/// unit stays a plain `Number` (`2.5`, `.5`). The lexer only decides
+/// *which kind* of token this is — unit-to-nanoseconds work lives in
+/// `duration::parse_duration` / `parse_duration_seconds`.
 fn scan_number_or_duration(sc: &mut Scanner<'_>, start: usize) -> TokenKind {
-    let mut is_duration = false;
-    loop {
-        let mut consumed_digit = false;
+    // A mantissa is an optional integer digit run plus an optional
+    // `.<digits>` fraction (a leading `.5` has no integer part); at least
+    // one digit must appear. Returns whether any digit was consumed.
+    fn scan_mantissa(sc: &mut Scanner<'_>) -> bool {
+        let mut consumed = false;
         while matches!(sc.peek(), Some(c) if c.is_ascii_digit()) {
             sc.advance();
-            consumed_digit = true;
+            consumed = true;
         }
-        if !consumed_digit {
-            break;
-        }
-
-        if !is_duration
-            && sc.peek() == Some('.')
-            && matches!(sc.peek_at(1), Some(c) if c.is_ascii_digit())
-        {
-            // A decimal point makes this a plain number (M1's grammar has
-            // no fractional duration components); consume the fractional
-            // digits and stop — no unit lookup follows a decimal.
-            sc.advance();
+        if sc.peek() == Some('.') && matches!(sc.peek_at(1), Some(c) if c.is_ascii_digit()) {
+            sc.advance(); // '.'
             while matches!(sc.peek(), Some(c) if c.is_ascii_digit()) {
                 sc.advance();
             }
+            consumed = true;
+        }
+        consumed
+    }
+
+    let mut is_duration = false;
+    loop {
+        if !scan_mantissa(sc) {
             break;
         }
 
         if matches!(sc.peek(), Some(c) if c.is_alphabetic()) {
-            // A maximal run of letters right after a digit run is always
+            // A maximal run of letters right after a mantissa is always
             // *shaped* like a duration unit, valid or not — the lexer
             // only decides the token kind; `duration::parse_duration`
             // owns unit-table validation, so an unknown unit (`5x`) or a
             // corrupted one (`5se`) surfaces as a named `InvalidDuration`
             // parse error instead of silently splitting into a `Number`
-            // plus a stray `Ident`.
+            // plus a stray `Ident`. A fractional mantissa + unit (`1.5s`)
+            // stays one `Duration` token; the range parser still rejects
+            // it downstream (`parse_duration` is integer-only), matching
+            // Loki, while `parse_duration_seconds` accepts it for label
+            // filters.
             while matches!(sc.peek(), Some(c) if c.is_alphabetic()) {
                 sc.advance();
             }
             is_duration = true;
-            if matches!(sc.peek(), Some(c) if c.is_ascii_digit()) {
-                continue; // compound duration, e.g. the "30m" in "1h30m"
+            // A compound duration continues if another mantissa follows
+            // (the "30m" in "1h30m", the "1.5m" in "1h1.5m").
+            if matches!(sc.peek(), Some(c) if c.is_ascii_digit())
+                || (sc.peek() == Some('.')
+                    && matches!(sc.peek_at(1), Some(c) if c.is_ascii_digit()))
+            {
+                continue;
             }
             break;
         }
@@ -468,6 +489,49 @@ mod tests {
         assert_eq!(
             kinds("0.95"),
             vec![TokenKind::Number("0.95".to_string()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_fractional_mantissa_with_a_unit_lexes_as_one_duration_token() {
+        // Loki accepts fractional durations in label-filter/unwrap RHS
+        // position; the whole mantissa+unit must be one Duration token so
+        // the fraction survives to parse_duration_seconds.
+        assert_eq!(
+            kinds("1.5s"),
+            vec![TokenKind::Duration("1.5s".to_string()), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds("250.5ms"),
+            vec![TokenKind::Duration("250.5ms".to_string()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_leading_dot_fractional_duration_lexes_as_one_duration_token() {
+        assert_eq!(
+            kinds(".5s"),
+            vec![TokenKind::Duration(".5s".to_string()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_compound_duration_with_a_fractional_component() {
+        assert_eq!(
+            kinds("1h1.5m"),
+            vec![TokenKind::Duration("1h1.5m".to_string()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_fractional_mantissa_without_a_unit_stays_a_number() {
+        assert_eq!(
+            kinds("2.5"),
+            vec![TokenKind::Number("2.5".to_string()), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds(".5"),
+            vec![TokenKind::Number(".5".to_string()), TokenKind::Eof]
         );
     }
 

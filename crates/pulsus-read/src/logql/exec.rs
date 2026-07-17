@@ -108,7 +108,16 @@ pub struct MatrixSeries {
 /// LogQL never produces it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
-    Streams(Vec<StreamResult>),
+    /// Log-line streams. `partial` (issue #90) signals a budget-exhausted
+    /// fetch-until-limit result: the paging loop stopped because the byte
+    /// scan budget was spent, not because the window ran out of matching
+    /// lines. The encoder surfaces it as `stats.pulsus_partial`
+    /// (skip-if-false, so ordinary responses stay byte-identical). Always
+    /// `false` on the fast/non-dropping paths and on genuine exhaustion.
+    Streams {
+        items: Vec<StreamResult>,
+        partial: bool,
+    },
     Vector(Vec<VectorSample>),
     Matrix(Vec<MatrixSeries>),
     Scalar(f64),
@@ -137,7 +146,7 @@ impl LogQlEngine {
             Plan::Streams(sp) => self
                 .run_streams_inner(&sp, None)
                 .await
-                .map(QueryResult::Streams),
+                .map(|(items, partial)| QueryResult::Streams { items, partial }),
             Plan::Metric(mp) => self.run_metric_inner(&mp, None).await,
             Plan::MetricBinary(node) => self.run_metric_node(&node, None).await,
         }
@@ -159,8 +168,8 @@ impl LogQlEngine {
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => {
                 let mut explain = PlanExplain::new("streams");
-                let result = self.run_streams_inner(&sp, Some(&mut explain)).await?;
-                Ok((QueryResult::Streams(result), explain))
+                let (items, partial) = self.run_streams_inner(&sp, Some(&mut explain)).await?;
+                Ok((QueryResult::Streams { items, partial }, explain))
             }
             Plan::Metric(mp) => {
                 let result_type = if mp.step_ns.is_none() {
@@ -449,6 +458,33 @@ impl LogQlEngine {
             .set("read_overflow_mode", "throw")
     }
 
+    /// Per-page settings for the fetch-until-limit paging loop (issue
+    /// #90). `remaining` is the decrementing `budget − spent` cap so
+    /// cumulative scan across pages never exceeds the budget (see
+    /// [`LogQlEngine::run_streams_paged`]). `wait_end_of_query = 1` forces
+    /// ClickHouse to emit the FINAL `read_bytes` in the summary — the
+    /// clickhouse 0.15.1 crate captures the summary from the initial
+    /// response header and never updates it, so without this the
+    /// per-page `read_bytes` used to decrement the budget would be
+    /// understated and the cumulative ceiling unsound. Each page is
+    /// `LIMIT page_size`-bounded, so `wait_end_of_query` buffers only the
+    /// (small) result, not the scan.
+    ///
+    /// `pub` for introspection: the AC5 gate asserts `wait_end_of_query = 1`
+    /// is present here. That guard cannot live on `system.query_log` —
+    /// `wait_end_of_query` is an HTTP-interface-only parameter (absent from
+    /// `system.settings`, never recorded in `query_log.Settings`), and the
+    /// summed server-side `read_bytes` is identical with or without it
+    /// (the setting only affects the CLIENT-side per-page `read_bytes` this
+    /// method's caller uses for budget accounting), so the wiring is only
+    /// observable here, at the settings object (issue #90).
+    pub fn paging_settings(&self, remaining: u64) -> QuerySettings {
+        QuerySettings::new()
+            .set("max_bytes_to_read", remaining)
+            .set("read_overflow_mode", "throw")
+            .set("wait_end_of_query", 1)
+    }
+
     /// Executes a [`StreamsPlan`] end to end. When `explain` is `Some`,
     /// every stage's already-computed SQL is pushed into it in the same
     /// single pass that executes it — no second run (architect plan
@@ -465,11 +501,17 @@ impl LogQlEngine {
     ///   numeric filter) can change the label set: surviving entries
     ///   regroup by final label set, one `StreamResult` per set with a
     ///   canonically re-rendered `labels_json`.
+    ///
+    /// Returns `(streams, partial)`: `partial` is set only on the
+    /// fetch-until-limit dropping path when the byte scan budget is
+    /// exhausted mid-paging (issue #90's signaled partial — surfaced as
+    /// `stats.pulsus_partial`); the fast/non-dropping paths and genuine
+    /// exhaustion always return `partial == false`.
     async fn run_streams_inner(
         &self,
         sp: &StreamsPlan,
         mut explain: Option<&mut PlanExplain>,
-    ) -> Result<Vec<StreamResult>, ReadError> {
+    ) -> Result<(Vec<StreamResult>, bool), ReadError> {
         // Compile before any I/O: a bad regex/template is a 400-class
         // rejection, never a wasted scan.
         let compiled = super::pipeline::CompiledPipeline::compile(&sp.pipeline)?;
@@ -486,7 +528,7 @@ impl LogQlEngine {
         }
         let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
         if fingerprints.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         if let Some(e) = explain.as_mut() {
             e.push(
@@ -530,23 +572,37 @@ impl LogQlEngine {
                     .push((row.timestamp_ns, row.body));
             }
 
-            return Ok(by_fp
-                .into_iter()
-                .filter_map(|(fp, entries)| {
-                    meta.get(&fp).map(|m| StreamResult {
-                        fingerprint: fp,
-                        service: m.service.clone(),
-                        labels_json: m.labels.clone(),
-                        entries,
+            return Ok((
+                by_fp
+                    .into_iter()
+                    .filter_map(|(fp, entries)| {
+                        meta.get(&fp).map(|m| StreamResult {
+                            fingerprint: fp,
+                            service: m.service.clone(),
+                            labels_json: m.labels.clone(),
+                            entries,
+                        })
                     })
-                })
-                .collect());
+                    .collect(),
+                false,
+            ));
         }
 
-        // Transform/fan-out paths: collect rows in arrival order (stage 3
-        // orders globally by timestamp in the requested direction, so
-        // arrival order IS the response order — the global `result_limit`
-        // truncation below depends on it). Bounded by `scan_limit`.
+        // Dropping sub-case (issue #90): a label filter, or a line filter
+        // after `line_format`, drops lines in-engine — a single oversampled
+        // `LIMIT` scan could under-return. Keyset-page until the limit
+        // fills, the window exhausts, or the budget is spent.
+        if sp.fetch_until_limit {
+            return self
+                .run_streams_paged(sp, &compiled, &meta, &services, &fingerprints)
+                .await;
+        }
+
+        // Non-dropping transform/fan-out path: collect rows in arrival
+        // order (stage 3 orders globally by timestamp in the requested
+        // direction, so arrival order IS the response order — the global
+        // `result_limit` truncation below depends on it). A single
+        // `stage3` `LIMIT = result_limit` scan, byte-identical to today.
         let mut rows: Vec<SampleRow> = Vec::new();
         let mut stream = self
             .query_stream::<SampleRow>(&sql, &self.budget_settings())
@@ -556,7 +612,151 @@ impl LogQlEngine {
             rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
         }
 
-        Ok(run_pipeline_rows(rows, &compiled, &meta, sp.result_limit))
+        Ok((
+            run_pipeline_rows(rows, &compiled, &meta, sp.result_limit),
+            false,
+        ))
+    }
+
+    /// The fetch-until-limit paging loop (issue #90 — the dropping
+    /// sub-case). Keyset-pages PK-pruned pages **in the plan's direction**
+    /// through one shared [`StreamAccumulator`] until `result_limit`
+    /// survivors are collected, the window is exhausted, or the byte scan
+    /// budget is spent, returning `(streams, partial)`.
+    ///
+    /// **Cumulative byte ceiling — by construction (adjudication
+    /// issuecomment-5006041978).** Every page, page 1 included (`spent ==
+    /// 0` ⇒ `cap == budget`), runs with `max_bytes_to_read = budget −
+    /// spent` and `read_overflow_mode = throw`, so ClickHouse aborts any
+    /// page that would exceed its own cap. Hence for the terminal overflow
+    /// page `actual ≤ cap = budget − spent_prev`, so cumulative =
+    /// `spent_prev + actual ≤ budget` — the identical hard ceiling as the
+    /// old single scan, regardless of the aborted page's own read_bytes.
+    /// `wait_end_of_query = 1` (see [`LogQlEngine::paging_settings`]) makes
+    /// each page's `read_bytes` the FINAL scanned total (the clickhouse
+    /// 0.15.1 crate otherwise captures an understated header-time value),
+    /// so `spent` bounds cumulative scan soundly; an unknown (`None`)
+    /// read_bytes charges the full cap (conservative), keeping the bound
+    /// without server cooperation.
+    ///
+    /// **Termination.** The cursor advances past every *fetched* row
+    /// (`advance_tail_cursor` over the raw page, not survivors — so a page
+    /// entirely filtered out by the pipeline never stalls the loop), with
+    /// occurrence-count `OFFSET` handling tie-runs larger than a page
+    /// (carried from #74). Over a finite window the cursor advances
+    /// monotonically, so the loop must eventually fetch `< page_size`
+    /// (window exhausted) or spend the budget.
+    ///
+    /// **Terminal branches.** limit filled / window exhausted → `partial =
+    /// false`; budget spent mid-paging → `partial = true`; first-page
+    /// budget overflow (`spent == 0`) → propagate `QueryTooBroad` (a
+    /// genuinely too-broad query, preserving today's error); mid-paging
+    /// overflow → signaled partial.
+    async fn run_streams_paged(
+        &self,
+        sp: &StreamsPlan,
+        compiled: &super::pipeline::CompiledPipeline,
+        meta: &HashMap<u64, StreamMetaRow>,
+        services: &[String],
+        fingerprints: &[u64],
+    ) -> Result<(Vec<StreamResult>, bool), ReadError> {
+        let budget = self.config.scan_budget_bytes;
+        let window = super::sql::TimeWindow {
+            start_ns: sp.start_ns,
+            end_ns: sp.end_ns,
+        };
+        // First-page size = the oversample hint; subsequent pages reuse it.
+        let page_size = sp.scan_limit.max(1);
+        let mut acc = StreamAccumulator::new(meta, sp.result_limit);
+        let mut cursor: Option<TailCursor> = None;
+        let mut spent: u64 = 0;
+
+        loop {
+            let page_cap = budget.saturating_sub(spent);
+            let ks_lower = match cursor {
+                None => super::sql::KeysetLower::First,
+                Some(c) => super::sql::KeysetLower::After {
+                    tuple: c.tuple,
+                    offset: c.seen,
+                },
+            };
+            let sql = super::sql::stage3_keyset(
+                &sp.samples_table,
+                services,
+                fingerprints,
+                window,
+                ks_lower,
+                sp.direction,
+                &sp.line_filters,
+                page_size,
+            );
+
+            // Fetch and fully drain one page; `read_bytes` is meaningful
+            // only after the drain (wait_end_of_query=1). Scoped so the
+            // stream's pooled-connection lease releases before the next
+            // page.
+            let mut rows: Vec<TailSampleRow> = Vec::new();
+            let page_result: Result<Option<u64>, ChError> = async {
+                let mut stream = self
+                    .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
+                    .await?;
+                while let Some(row) = stream.next().await {
+                    rows.push(row?);
+                }
+                Ok(stream.read_bytes())
+            }
+            .await;
+
+            let read = match page_result {
+                Ok(rb) => rb.unwrap_or(page_cap),
+                Err(e) => {
+                    let mapped = map_read_error(e, budget);
+                    if matches!(
+                        mapped,
+                        ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
+                    ) {
+                        if spent == 0 {
+                            // First page overflows the FULL budget: this is
+                            // a genuinely too-broad query — preserve the
+                            // error the old single-scan path raised.
+                            return Err(mapped);
+                        }
+                        // Mid-paging overflow: the aborted page scanned ≤
+                        // page_cap = budget − spent, so cumulative ≤ budget
+                        // still holds — keep the survivors, signal partial.
+                        return Ok((acc.into_streams(), true));
+                    }
+                    return Err(mapped);
+                }
+            };
+            spent = spent.saturating_add(read);
+
+            let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+            cursor = advance_tail_cursor(cursor, &rows);
+            let sample_rows: Vec<SampleRow> = rows
+                .into_iter()
+                .map(|r| SampleRow {
+                    fingerprint: r.fingerprint,
+                    timestamp_ns: r.timestamp_ns,
+                    body: r.body,
+                })
+                .collect();
+            let filled = acc.feed(&sample_rows, compiled);
+
+            if filled {
+                // Result limit filled — a complete result, never partial.
+                return Ok((acc.into_streams(), false));
+            }
+            if fetched < page_size {
+                // Fewer rows than asked ⇒ the window is exhausted — a
+                // complete result over the whole window, never partial.
+                return Ok((acc.into_streams(), false));
+            }
+            if budget.saturating_sub(spent) == 0 {
+                // Budget spent with more window to scan: signaled partial.
+                return Ok((acc.into_streams(), true));
+            }
+        }
     }
 
     /// Executes a [`MetricPlan`] end to end. Same single-pass explain
@@ -1225,8 +1425,20 @@ impl LogQlEngine {
         let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
         let services = distinct_escaped_services(&meta);
 
+        // Tail is forward-only (oldest→newest); `KeysetLower::First`
+        // carries the API `start` bound in the window, later pages carry
+        // the keyset (window `start_ns` is then unused by the Forward
+        // After rendering).
+        let start_ns = match lower {
+            TailLower::Start { start_ns } => start_ns,
+            TailLower::After(_) => 0,
+        };
+        let window = super::sql::TimeWindow {
+            start_ns,
+            end_ns: upper_ns,
+        };
         let ks_lower = match lower {
-            TailLower::Start { start_ns } => super::sql::KeysetLower::Start { start_ns },
+            TailLower::Start { .. } => super::sql::KeysetLower::First,
             TailLower::After(c) => super::sql::KeysetLower::After {
                 tuple: c.tuple,
                 offset: c.seen,
@@ -1236,8 +1448,9 @@ impl LogQlEngine {
             &sp.samples_table,
             &services,
             &fingerprints,
+            window,
             ks_lower,
-            upper_ns,
+            Direction::Forward,
             &sp.line_filters,
             fetch_limit,
         );
@@ -1368,100 +1581,157 @@ pub fn run_pipeline_rows(
     meta: &HashMap<u64, StreamMetaRow>,
     result_limit: u32,
 ) -> Vec<StreamResult> {
-    // Base labels parsed once per fingerprint, not per row.
-    let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
-    for (fp, m) in meta {
-        base_labels.insert(*fp, parse_flat_labels(&m.labels));
-    }
+    // A one-shot feed over the whole slice — byte-identical output and
+    // per-row allocation profile to the pre-#90 monolithic function (the
+    // `logql_pipeline_alloc`/`logql_pipeline_golden` suites pin both).
+    let mut acc = StreamAccumulator::new(meta, result_limit);
+    acc.feed(&rows, compiled);
+    acc.into_streams()
+}
 
-    let fan_out = compiled.mutates_labels();
-    let mut survivors = 0u32;
+/// The stateful grouping/counting core of [`run_pipeline_rows`], extracted
+/// (issue #90) so the fetch-until-limit paging loop can stream multiple
+/// keyset pages through ONE accumulator: fan-out/transform grouping and
+/// the *global* `result_limit` truncation must span pages (a per-page
+/// `run_pipeline_rows` + concat would regroup and re-truncate wrongly).
+/// Owns the fp/label group maps + parsed base labels + the survivor
+/// counter across [`StreamAccumulator::feed`] calls; the per-row label
+/// scratch is re-created per `feed` (a page's borrows cannot outlive the
+/// call) but reused across every row within the page, preserving the
+/// zero-per-row-alloc dropped-row path.
+pub struct StreamAccumulator<'m> {
+    meta: &'m HashMap<u64, StreamMetaRow>,
+    result_limit: u32,
+    // Base labels parsed once per fingerprint, not per row.
+    base_labels: HashMap<u64, Vec<(String, String)>>,
     // Transform path groups by source fingerprint; fan-out groups by the
     // canonical rendered labels JSON (sorted keys — it doubles as the
-    // equality key). Two maps instead of a shared key enum so the
-    // fan-out entry API can reuse its own `String` key without a
-    // per-row clone (review round 2, finding 1); the fan-out value holds
-    // only the per-group accumulator, and the map-owned key MOVES into
-    // `StreamResult.labels_json` at final collection — never cloned out
-    // of the entry, so high-cardinality fan-out (every row a new group)
-    // pays no per-group key duplication either (review round 3).
-    let mut fp_groups: HashMap<u64, StreamResult> = HashMap::new();
-    let mut label_groups: HashMap<String, FanOutGroup> = HashMap::new();
-    // One label scratch reused across every row (issue #72 review round
-    // 1, finding 3): all rows share the loop-invariant lifetime of
-    // `rows`/`base_labels`/`compiled`, so `run_into` clears and refills
-    // the same vector — zero per-row label-vector allocations on the
-    // dropped-row path.
-    let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+    // equality key). Two maps instead of a shared key enum so the fan-out
+    // entry API can reuse its own `String` key without a per-row clone
+    // (review round 2, finding 1); the fan-out value holds only the
+    // per-group accumulator, and the map-owned key MOVES into
+    // `StreamResult.labels_json` at final collection — never cloned out of
+    // the entry, so high-cardinality fan-out (every row a new group) pays
+    // no per-group key duplication either (review round 3).
+    fp_groups: HashMap<u64, StreamResult>,
+    label_groups: HashMap<String, FanOutGroup>,
+    survivors: u32,
+}
 
-    for row in &rows {
-        if survivors >= result_limit {
-            break;
+impl<'m> StreamAccumulator<'m> {
+    pub fn new(meta: &'m HashMap<u64, StreamMetaRow>, result_limit: u32) -> Self {
+        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        for (fp, m) in meta {
+            base_labels.insert(*fp, parse_flat_labels(&m.labels));
         }
-        let Some(m) = meta.get(&row.fingerprint) else {
-            continue;
-        };
-        let base = &base_labels[&row.fingerprint];
-        let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
-            continue;
-        };
-        survivors += 1;
-
-        if fan_out {
-            // Render the canonical JSON DIRECTLY from the sorted borrowed
-            // scratch (round-2 finding 1: no owned intermediate label
-            // vector, no second clone at render time). Per surviving row
-            // this costs exactly the `labels_json` string (needed as the
-            // group key either way) + the owned output line; the
-            // `StreamResult` fields materialize once per NEW group only.
-            scratch.sort_unstable();
-            let labels_json = render_labels_json_sorted(&scratch);
-            let entry = (row.timestamp_ns, line.into_owned());
-            match label_groups.entry(labels_json) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    e.into_mut().entries.push(entry);
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let service = scratch
-                        .iter()
-                        .find(|(k, _)| k == "service_name")
-                        .map(|(_, v)| v.to_string())
-                        .unwrap_or_else(|| m.service.clone());
-                    let fingerprint = fnv1a64(e.key().as_bytes());
-                    e.insert(FanOutGroup {
-                        fingerprint,
-                        service,
-                        entries: vec![entry],
-                    });
-                }
-            }
-        } else {
-            fp_groups
-                .entry(row.fingerprint)
-                .or_insert_with(|| StreamResult {
-                    fingerprint: row.fingerprint,
-                    service: m.service.clone(),
-                    labels_json: m.labels.clone(),
-                    entries: Vec::new(),
-                })
-                .entries
-                .push((row.timestamp_ns, line.into_owned()));
+        Self {
+            meta,
+            result_limit,
+            base_labels,
+            fp_groups: HashMap::new(),
+            label_groups: HashMap::new(),
+            survivors: 0,
         }
     }
 
-    fp_groups
-        .into_values()
-        .chain(
-            label_groups
-                .into_iter()
-                .map(|(labels_json, g)| StreamResult {
-                    fingerprint: g.fingerprint,
-                    service: g.service,
-                    labels_json,
-                    entries: g.entries,
-                }),
-        )
-        .collect()
+    /// Feeds one page of rows in arrival (direction) order — arrival order
+    /// IS the response order, so the global `result_limit` truncation
+    /// below is correct across pages. Returns `true` once `survivors ==
+    /// result_limit` (the caller stops paging).
+    pub fn feed(
+        &mut self,
+        rows: &[SampleRow],
+        compiled: &super::pipeline::CompiledPipeline,
+    ) -> bool {
+        let Self {
+            meta,
+            result_limit,
+            base_labels,
+            fp_groups,
+            label_groups,
+            survivors,
+        } = self;
+        let fan_out = compiled.mutates_labels();
+        // One label scratch reused across every row of this page (issue
+        // #72 review round 1, finding 3): `run_into` clears and refills the
+        // same vector — zero per-row label-vector allocations on the
+        // dropped-row path.
+        let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+
+        for row in rows {
+            if *survivors >= *result_limit {
+                break;
+            }
+            let Some(m) = meta.get(&row.fingerprint) else {
+                continue;
+            };
+            let base = &base_labels[&row.fingerprint];
+            let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
+                continue;
+            };
+            *survivors += 1;
+
+            if fan_out {
+                // Render the canonical JSON DIRECTLY from the sorted
+                // borrowed scratch (round-2 finding 1: no owned
+                // intermediate label vector, no second clone at render
+                // time). Per surviving row this costs exactly the
+                // `labels_json` string (needed as the group key either way)
+                // + the owned output line; the `StreamResult` fields
+                // materialize once per NEW group only.
+                scratch.sort_unstable();
+                let labels_json = render_labels_json_sorted(&scratch);
+                let entry = (row.timestamp_ns, line.into_owned());
+                match label_groups.entry(labels_json) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        e.into_mut().entries.push(entry);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let service = scratch
+                            .iter()
+                            .find(|(k, _)| k == "service_name")
+                            .map(|(_, v)| v.to_string())
+                            .unwrap_or_else(|| m.service.clone());
+                        let fingerprint = fnv1a64(e.key().as_bytes());
+                        e.insert(FanOutGroup {
+                            fingerprint,
+                            service,
+                            entries: vec![entry],
+                        });
+                    }
+                }
+            } else {
+                fp_groups
+                    .entry(row.fingerprint)
+                    .or_insert_with(|| StreamResult {
+                        fingerprint: row.fingerprint,
+                        service: m.service.clone(),
+                        labels_json: m.labels.clone(),
+                        entries: Vec::new(),
+                    })
+                    .entries
+                    .push((row.timestamp_ns, line.into_owned()));
+            }
+        }
+
+        *survivors >= *result_limit
+    }
+
+    pub fn into_streams(self) -> Vec<StreamResult> {
+        self.fp_groups
+            .into_values()
+            .chain(
+                self.label_groups
+                    .into_iter()
+                    .map(|(labels_json, g)| StreamResult {
+                        fingerprint: g.fingerprint,
+                        service: g.service,
+                        labels_json,
+                        entries: g.entries,
+                    }),
+            )
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3484,6 +3754,87 @@ mod tests {
             entries,
             vec![(10, "GET 500".to_string()), (30, "PUT 500".to_string())],
             "rewritten survivors only, capped globally at 2"
+        );
+    }
+
+    /// Issue #90 AC1 (exact fill, hermetic): a heavily-dropping pipeline
+    /// fed page-by-page through ONE `StreamAccumulator` fills to exactly
+    /// `result_limit`, whereas the pre-#90 single oversampled scan (one
+    /// `run_pipeline_rows` over just the first page) under-returned. The
+    /// accumulator's grouping and global truncation span pages.
+    #[test]
+    fn stream_accumulator_fills_exactly_to_the_limit_across_pages() {
+        // Only every 4th line matches `status = "500"` — sparse survivors.
+        let compiled = pipeline_of(r#"{a="b"} | json | status = "500""#);
+        let statuses = ["200", "404", "500", "503"];
+        let page = |base_ts: i64| -> Vec<SampleRow> {
+            (0..4)
+                .map(|i| {
+                    let ts = base_ts + i;
+                    sample(
+                        1,
+                        ts,
+                        &format!(r#"{{"status":"{}","m":"{ts}"}}"#, statuses[i as usize]),
+                    )
+                })
+                .collect()
+        };
+        let meta = meta_two_streams();
+
+        // The pre-#90 behaviour: a single page of 4 rows yields only ONE
+        // survivor — an under-return against a limit of 3.
+        assert_eq!(
+            run_pipeline_rows(page(0), &compiled, &meta, 3)
+                .iter()
+                .map(|r| r.entries.len())
+                .sum::<usize>(),
+            1,
+            "one page under-returns (1 < limit 3) — the old divergence",
+        );
+
+        // Fetch-until-limit: feed successive pages until the accumulator
+        // reports the limit is filled.
+        let mut acc = StreamAccumulator::new(&meta, 3);
+        let mut pages = 0;
+        let mut base_ts = 0;
+        loop {
+            let filled = acc.feed(&page(base_ts), &compiled);
+            pages += 1;
+            base_ts += 4;
+            if filled {
+                break;
+            }
+            assert!(pages < 100, "must terminate");
+        }
+        let total: usize = acc.into_streams().iter().map(|r| r.entries.len()).sum();
+        assert_eq!(total, 3, "exact fill to the limit across pages");
+        assert_eq!(
+            pages, 3,
+            "one survivor per 4-row page ⇒ 3 pages fill limit 3"
+        );
+    }
+
+    /// Issue #90: the accumulator never over-fills — once the limit is
+    /// reached, a further `feed` adds nothing and keeps reporting filled.
+    #[test]
+    fn stream_accumulator_never_over_returns_on_a_later_page() {
+        let compiled = pipeline_of(r#"{a="b"} | json | status = "500""#);
+        let rows = |ts: i64| {
+            vec![
+                sample(1, ts, r#"{"status":"500","m":"x"}"#),
+                sample(1, ts + 1, r#"{"status":"500","m":"y"}"#),
+            ]
+        };
+        let meta = meta_two_streams();
+        let mut acc = StreamAccumulator::new(&meta, 3);
+        assert!(!acc.feed(&rows(0), &compiled), "2 < 3, not filled");
+        assert!(acc.feed(&rows(10), &compiled), "2 + 2 ⇒ filled at 3");
+        // A further page must not push the total past the limit.
+        acc.feed(&rows(20), &compiled);
+        let total: usize = acc.into_streams().iter().map(|r| r.entries.len()).sum();
+        assert_eq!(
+            total, 3,
+            "global cap holds across pages, never over-returns"
         );
     }
 

@@ -722,7 +722,11 @@ async fn tail_pages_and_range_query_deliver_identical_entry_sets() {
 
     // (a) The ordinary query path.
     let range_result = engine.query(&expr, &qp).await.expect("range query");
-    let pulsus_read::QueryResult::Streams(range_streams) = range_result else {
+    let pulsus_read::QueryResult::Streams {
+        items: range_streams,
+        ..
+    } = range_result
+    else {
         panic!("stream selector must return Streams");
     };
     let mut range_entries = entry_set(&range_streams);

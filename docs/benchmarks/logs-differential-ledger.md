@@ -26,11 +26,20 @@ but keeps the entry for history.
 
 Out of this ledger's scope by design:
 
-- **The `limit`-oversample under-return boundary** is a PulsusDB-vs-
-  requested-limit contract (docs/configuration.md §6,
-  `reader.logql_pipeline_scan_factor`), gated hermetically (AC9), not an
-  oracle delta — the differential corpus is sized strictly below the
-  request limit so it can never trip it.
+- **The `limit`-oversample under-return divergence is removed (#90).**
+  Filtering pipelines now fetch-until-limit via keyset paging (fill exactly
+  to `limit`, docs/configuration.md §6, `reader.logql_pipeline_scan_factor`
+  now a first-page-size hint), so there is no under-return boundary to
+  ratify. The exactness is gated **hermetically** by the #90 AC1 tests (a
+  heavily-dropping pipeline over a corpus sized ABOVE `limit × factor`
+  matching lines returns exactly `limit`, asserted by construction — no
+  oracle store involved). A nightly-Loki (`grafana/loki:3.4.2`)
+  differential case for the same property was found infeasible in the
+  current set-equality diff harness and is **deferred to follow-up issue
+  #100**; it is NOT part of this ledger's diff today. The
+  byte-budget-truncated partial (`data.stats.pulsus_partial`) is a
+  PulsusDB-only contract with no Loki equivalent and stays out of oracle
+  scope.
 
 ## Entries
 

@@ -236,6 +236,22 @@ pub struct ChRowStream<'a, R> {
     _conn: PooledConn<'a>,
 }
 
+impl<R> ChRowStream<'_, R> {
+    /// The server-reported number of bytes read by the query so far,
+    /// from ClickHouse's `X-ClickHouse-Summary` (`Option::None` until a
+    /// summary frame has been observed). The clickhouse 0.15.1 crate
+    /// captures the summary from the **initial** response header, so this
+    /// only reflects the FINAL scanned-byte total once the query ran with
+    /// `wait_end_of_query=1` and the stream has been fully drained — the
+    /// invariant the streams fetch-until-limit paging loop relies on to
+    /// keep its cumulative-scan budget accounting sound (issue #90).
+    pub fn read_bytes(&self) -> Option<u64> {
+        self.cursor
+            .summary()
+            .and_then(clickhouse::QuerySummary::read_bytes)
+    }
+}
+
 impl<R> Stream for ChRowStream<'_, R>
 where
     R: ChRow,

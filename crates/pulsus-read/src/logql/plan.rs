@@ -48,14 +48,26 @@ pub struct StreamsPlan {
     /// The stage-3 SQL `LIMIT` — a *scan* bound (issue M6-09 plan v3
     /// delta 4). Equal to [`StreamsPlan::result_limit`] unless the
     /// pipeline contains an unpushed dropping stage (a label filter, or a
-    /// line filter after `line_format`), in which case it is
-    /// `result_limit × PlanCtx::pipeline_scan_factor` (saturating) so
-    /// lightly-filtering pipelines don't under-return. The byte scan
-    /// budget still caps the read and aborts first.
+    /// line filter after `line_format`), in which case it is the
+    /// **first-page fetch size** for fetch-until-limit paging (issue #90):
+    /// `result_limit × PlanCtx::pipeline_scan_factor` (saturating). It is
+    /// no longer a truncation ceiling — when [`StreamsPlan::fetch_until_limit`]
+    /// is set the engine keyset-pages this many rows at a time through the
+    /// pipeline until the limit fills, the window is exhausted, or the byte
+    /// scan budget is spent. The byte scan budget is still the hard
+    /// cumulative ceiling and aborts first.
     pub scan_limit: u32,
     /// The true response cap — re-applied in-engine to pipeline
     /// survivors, globally across streams. Responses never over-return.
     pub result_limit: u32,
+    /// Fetch-until-limit paging is engaged (issue #90): set iff the
+    /// pipeline has an unpushed dropping stage (label filter, or a line
+    /// filter after `line_format`). The engine keyset-pages the dropping
+    /// path exactly until `result_limit` survivors are collected (no more
+    /// under-return), rather than truncating a single oversampled scan.
+    /// Non-dropping plans leave this `false` and keep byte-identical
+    /// single-`LIMIT` SQL (`scan_limit == result_limit`).
+    pub fetch_until_limit: bool,
     /// One pre-rendered predicate fragment per **pushed-down** pipeline
     /// `LineFilter` stage — those positioned before the first
     /// `line_format` stage, which reference the original `body` — ANDed
@@ -411,7 +423,8 @@ fn streams_plan(
 
     let line_filters = compile_line_filters(&log_expr.pipeline);
     let result_limit = p.limit;
-    let scan_limit = if has_unpushed_dropping_stage(&log_expr.pipeline) {
+    let fetch_until_limit = has_unpushed_dropping_stage(&log_expr.pipeline);
+    let scan_limit = if fetch_until_limit {
         result_limit.saturating_mul(ctx.pipeline_scan_factor)
     } else {
         result_limit
@@ -426,6 +439,7 @@ fn streams_plan(
         direction: p.direction,
         scan_limit,
         result_limit,
+        fetch_until_limit,
         line_filters,
         pipeline: log_expr.pipeline.clone(),
         probes,
@@ -1313,7 +1327,12 @@ mod tests {
     fn a_label_filter_pipeline_oversamples_the_scan_limit_by_the_factor() {
         let sp = streams_sp(r#"{env="prod"} | json | status = "500""#);
         assert_eq!(sp.result_limit, 100);
-        assert_eq!(sp.scan_limit, 1_000, "scan_limit must be limit * factor");
+        assert_eq!(
+            sp.scan_limit, 1_000,
+            "scan_limit must be the first-page size limit * factor"
+        );
+        // Issue #90 AC2: a dropping pipeline engages fetch-until-limit.
+        assert!(sp.fetch_until_limit);
     }
 
     #[test]
@@ -1321,6 +1340,7 @@ mod tests {
         let sp = streams_sp(r#"{env="prod"} | line_format "{{.x}}" |= "err""#);
         assert_eq!(sp.result_limit, 100);
         assert_eq!(sp.scan_limit, 1_000);
+        assert!(sp.fetch_until_limit);
         // And the unpushable filter is absent from the stage-3 predicates.
         assert!(sp.line_filters.is_empty());
     }
@@ -1330,15 +1350,18 @@ mod tests {
         let sp = streams_sp(r#"{env="prod"} |= "err" != "debug""#);
         assert_eq!(sp.result_limit, 100);
         assert_eq!(sp.scan_limit, 100, "fast path must stay byte-identical");
+        // Issue #90 AC2: the fast path never pages.
+        assert!(!sp.fetch_until_limit);
         assert_eq!(sp.line_filters.len(), 2);
     }
 
     #[test]
     fn a_parser_only_pipeline_keeps_scan_limit_equal_to_the_limit() {
         // Parsers are non-dropping (a parse failure keeps the line with
-        // an `__error__` label) — no oversample.
+        // an `__error__` label) — no oversample, no paging.
         let sp = streams_sp(r#"{env="prod"} |= "err" | json"#);
         assert_eq!(sp.scan_limit, 100);
+        assert!(!sp.fetch_until_limit);
         assert_eq!(
             sp.line_filters.len(),
             1,

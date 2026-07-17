@@ -162,25 +162,27 @@ pub fn stage3(
     sql
 }
 
-/// The lower-bound mode of one [`stage3_keyset`] page (issue #74, live
-/// tail — plan v4 D1/D2 + the round-4 adjudication).
+/// The lower-bound mode of one [`stage3_keyset`] page (issue #74 live
+/// tail, generalized for issue #90 streams paging — plan v4 D1/D2 + the
+/// round-4 adjudication).
 ///
-/// - [`KeysetLower::Start`] — the first page: the API `start` bound,
-///   rendered as the repo's stage-3 exclusive convention
-///   (`timestamp_ns > start_ns`, docs/schemas.md §3.2). No keyset term.
+/// - [`KeysetLower::First`] — the first page: the API window's exclusive
+///   `start`/inclusive `end` bounds (`timestamp_ns > start_ns AND
+///   timestamp_ns <= end_ns`, docs/schemas.md §3.2), carried by the
+///   `window` argument. No keyset term. Direction-agnostic.
 /// - [`KeysetLower::After`] — every later page: the occurrence-count
 ///   keyset. The composite predicate is **inclusive** (`>=` the boundary
-///   tuple) so a tie group split by `LIMIT` is re-fetched rather than
-///   skipped, and the server-side `OFFSET` skips exactly the
-///   already-delivered rows of the boundary tuple (deterministic under
-///   the total `ORDER BY` below). The redundant `timestamp_ns >= ts`
-///   term keeps the primary index's time column engaged for granule
-///   pruning (the tuple comparison alone does not prune).
+///   tuple when walking Forward, `<=` when walking Backward) so a tie
+///   group split by `LIMIT` is re-fetched rather than skipped, and the
+///   server-side `OFFSET` skips exactly the already-delivered rows of the
+///   boundary tuple (deterministic under the total `ORDER BY` below). The
+///   redundant `timestamp_ns >= ts` (Forward) / `timestamp_ns <= ts`
+///   (Backward) term keeps the primary index's time column engaged for
+///   granule pruning (the tuple comparison alone does not prune).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeysetLower {
-    Start {
-        start_ns: i64,
-    },
+    /// The first page; the `window` argument carries both time bounds.
+    First,
     After {
         /// The boundary `(timestamp_ns, fingerprint, cityHash64(body))`.
         tuple: (i64, u64, u64),
@@ -190,45 +192,75 @@ pub enum KeysetLower {
     },
 }
 
-/// Stage 3, keyset-pagination mode (issue #74 — the live-tail cursor;
-/// deliberately a reusable builder, the foundation for future streams
-/// pagination, not a tail-only hack). Leaves the frozen [`stage3`]
-/// untouched; shares its `PREWHERE service`/`fingerprint IN`/line-filter
-/// pushdown contract byte-for-byte.
+/// Stage 3, keyset-pagination mode (issue #74 live tail; issue #90
+/// streams fetch-until-limit — deliberately a reusable builder, the
+/// foundation for streams pagination, not a tail-only hack). Leaves the
+/// frozen [`stage3`] untouched; shares its `PREWHERE
+/// service`/`fingerprint IN`/line-filter pushdown contract byte-for-byte.
 ///
-/// The total `ORDER BY timestamp_ns, fingerprint, body_hash, body`
-/// (raw `body` as final tiebreaker) makes equal-`(ts, fp, hash)` rows —
-/// including genuine CityHash collisions — a stable adjacent run across
-/// queries, so [`KeysetLower::After`]'s occurrence-count `OFFSET` is
-/// well-defined. `cityHash64(body)` is projected by ClickHouse and
-/// captured as `body_hash` (no CH/Rust divergence at the boundary).
+/// The total `ORDER BY timestamp_ns, fingerprint, body_hash, body` (raw
+/// `body` as final tiebreaker), all columns following `direction`, makes
+/// equal-`(ts, fp, hash)` rows — including genuine CityHash collisions —
+/// a stable adjacent run across queries, so [`KeysetLower::After`]'s
+/// occurrence-count `OFFSET` is well-defined. `cityHash64(body)` is
+/// projected by ClickHouse and captured as `body_hash` (no CH/Rust
+/// divergence at the boundary).
+///
+/// **`direction` mirrors the whole page.** Forward (ASC, tail's only
+/// mode — byte-identical to issue #74's rendering) walks oldest→newest
+/// with a `>=` composite and the redundant `timestamp_ns >= ts` lower
+/// bound; Backward (DESC, the query default's newest-first mode) walks
+/// newest→oldest with a `<=` composite and the redundant `timestamp_ns
+/// <= ts` upper bound, keeping the API's `start` bound as the fixed
+/// lower.
+// One arg over clippy's threshold: `window`, `lower`, and `direction`
+// are each independent page coordinates that cannot fold without
+// obscuring the SQL contract (the sibling `stage3` sits at the 7-arg
+// limit for the same reason).
+#[allow(clippy::too_many_arguments)]
 pub fn stage3_keyset(
     samples_table: &str,
     services: &[String],
     fingerprints: &[u64],
+    window: TimeWindow,
     lower: KeysetLower,
-    upper_ns: i64,
+    direction: Direction,
     line_filters: &[String],
     limit: u32,
 ) -> String {
     let service_pred = service_predicate(services);
     let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
 
     let mut sql = format!(
         "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
     );
-    match lower {
-        KeysetLower::Start { start_ns } => {
+    match (direction, lower) {
+        (_, KeysetLower::First) => {
             sql.push_str(&format!(
-                "\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {upper_ns}"
+                "\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
             ));
         }
-        KeysetLower::After {
-            tuple: (ts, fp, hash),
-            ..
-        } => {
+        (
+            Direction::Forward,
+            KeysetLower::After {
+                tuple: (ts, fp, hash),
+                ..
+            },
+        ) => {
             sql.push_str(&format!(
-                "\n  AND timestamp_ns >= {ts} AND timestamp_ns <= {upper_ns}\n  AND (timestamp_ns, fingerprint, cityHash64(body)) >= ({ts}, {fp}, {hash})"
+                "\n  AND timestamp_ns >= {ts} AND timestamp_ns <= {end_ns}\n  AND (timestamp_ns, fingerprint, cityHash64(body)) >= ({ts}, {fp}, {hash})"
+            ));
+        }
+        (
+            Direction::Backward,
+            KeysetLower::After {
+                tuple: (ts, fp, hash),
+                ..
+            },
+        ) => {
+            sql.push_str(&format!(
+                "\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {ts}\n  AND (timestamp_ns, fingerprint, cityHash64(body)) <= ({ts}, {fp}, {hash})"
             ));
         }
     }
@@ -236,9 +268,15 @@ pub fn stage3_keyset(
         sql.push_str("\n  AND ");
         sql.push_str(clause);
     }
-    sql.push_str("\nORDER BY timestamp_ns ASC, fingerprint ASC, body_hash ASC, body ASC");
+    let ord = match direction {
+        Direction::Forward => "ASC",
+        Direction::Backward => "DESC",
+    };
+    sql.push_str(&format!(
+        "\nORDER BY timestamp_ns {ord}, fingerprint {ord}, body_hash {ord}, body {ord}"
+    ));
     match lower {
-        KeysetLower::Start { .. } => sql.push_str(&format!("\nLIMIT {limit}")),
+        KeysetLower::First => sql.push_str(&format!("\nLIMIT {limit}")),
         KeysetLower::After { offset, .. } => {
             sql.push_str(&format!("\nLIMIT {limit} OFFSET {offset}"))
         }
@@ -550,8 +588,12 @@ mod tests {
             "log_samples",
             &["'checkout'".to_string()],
             &[18374],
-            KeysetLower::Start { start_ns: 1_000 },
-            2_000,
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+            KeysetLower::First,
+            Direction::Forward,
             &[],
             500,
         );
@@ -577,11 +619,15 @@ mod tests {
             "log_samples",
             &["'checkout'".to_string(), "'billing'".to_string()],
             &[1, 2],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
             KeysetLower::After {
                 tuple: (1_500, 7, 42),
                 offset: 3,
             },
-            2_000,
+            Direction::Forward,
             &["positionCaseSensitive(body, 'err') > 0".to_string()],
             500,
         );
@@ -599,6 +645,75 @@ mod tests {
         );
     }
 
+    /// Issue #90 (backward paging): the query default's newest-first
+    /// keyset — DESC on every ORDER column, the exclusive API `start` as
+    /// the fixed lower bound, and the mirrored redundant `timestamp_ns <=
+    /// end` upper bound so the first page's granule pruning matches the
+    /// forward form.
+    #[test]
+    fn stage3_keyset_backward_first_page_is_byte_exact_desc_with_the_window_bounds() {
+        let sql = stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string()],
+            &[18374],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+            KeysetLower::First,
+            Direction::Backward,
+            &[],
+            500,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+             FROM log_samples\n\
+             PREWHERE service = 'checkout'\n\
+             WHERE fingerprint IN (18374)\n\
+             \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 2000\n\
+             ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
+             LIMIT 500"
+        );
+    }
+
+    /// Issue #90 (backward paging): a later newest-first page — the
+    /// inclusive `<=` composite tuple, the redundant `timestamp_ns <= ts`
+    /// upper bound (walking down), the fixed exclusive `timestamp_ns >
+    /// start` lower bound, DESC total order, and the occurrence-count
+    /// `OFFSET` — byte-exact.
+    #[test]
+    fn stage3_keyset_backward_later_page_is_byte_exact_with_le_tuple_and_offset() {
+        let sql = stage3_keyset(
+            "log_samples",
+            &["'checkout'".to_string(), "'billing'".to_string()],
+            &[1, 2],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+            KeysetLower::After {
+                tuple: (1_500, 7, 42),
+                offset: 3,
+            },
+            Direction::Backward,
+            &["positionCaseSensitive(body, 'err') > 0".to_string()],
+            500,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+             FROM log_samples\n\
+             PREWHERE service IN ('checkout', 'billing')\n\
+             WHERE fingerprint IN (1, 2)\n\
+             \x20 AND timestamp_ns > 1000 AND timestamp_ns <= 1500\n\
+             \x20 AND (timestamp_ns, fingerprint, cityHash64(body)) <= (1500, 7, 42)\n\
+             \x20 AND positionCaseSensitive(body, 'err') > 0\n\
+             ORDER BY timestamp_ns DESC, fingerprint DESC, body_hash DESC, body DESC\n\
+             LIMIT 500 OFFSET 3"
+        );
+    }
+
     /// Issue #74 pre-query clamp AC (hermetic half): the caller-clamped
     /// fetch limit is exactly what lands in the SQL `LIMIT` — nothing in
     /// the builder can widen it back.
@@ -608,8 +723,12 @@ mod tests {
             "log_samples",
             &["'checkout'".to_string()],
             &[1],
-            KeysetLower::Start { start_ns: 0 },
-            10,
+            TimeWindow {
+                start_ns: 0,
+                end_ns: 10,
+            },
+            KeysetLower::First,
+            Direction::Forward,
             &[],
             5_000,
         );

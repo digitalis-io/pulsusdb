@@ -132,6 +132,17 @@ struct StreamStats {
     streams: usize,
     entries: usize,
     bytes: usize,
+    /// Issue #90 signaled partial: `true` iff a fetch-until-limit
+    /// filtering query stopped early because the byte scan budget was
+    /// exhausted (distinguishable from genuine exhaustion). Skipped when
+    /// `false` so ordinary responses stay byte-identical to pre-#90.
+    #[serde(skip_serializing_if = "is_false")]
+    pulsus_partial: bool,
+}
+
+/// `serde` `skip_serializing_if` predicate for a defaulted-`false` flag.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize)]
@@ -367,7 +378,7 @@ pub(crate) fn query_response(
     at_ns: i64,
 ) -> Response {
     match result {
-        QueryResult::Streams(mut items) => {
+        QueryResult::Streams { mut items, partial } => {
             items.sort_by(|a, b| {
                 (&a.labels_json, a.fingerprint).cmp(&(&b.labels_json, b.fingerprint))
             });
@@ -379,6 +390,7 @@ pub(crate) fn query_response(
                     .flat_map(|s| s.entries.iter())
                     .map(|(_, line)| line.len())
                     .sum(),
+                pulsus_partial: partial,
             };
             let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
             let prefix =
@@ -521,11 +533,14 @@ mod tests {
 
     #[tokio::test]
     async fn streams_envelope_is_byte_exact_for_a_single_stream() {
-        let result = QueryResult::Streams(vec![stream(
-            1,
-            r#"{"env":"prod","service_name":"checkout"}"#,
-            vec![(100, "hello"), (200, "world")],
-        )]);
+        let result = QueryResult::Streams {
+            items: vec![stream(
+                1,
+                r#"{"env":"prod","service_name":"checkout"}"#,
+                vec![(100, "hello"), (200, "world")],
+            )],
+            partial: false,
+        };
         let res = query_response(result, None, 0);
         let body = body_string(res).await;
         assert_eq!(
@@ -535,11 +550,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streams_stats_omit_pulsus_partial_when_not_budget_truncated() {
+        // Issue #90 Delta 2: an ordinary (complete) streams result carries
+        // NO `pulsus_partial` field — byte-identical to pre-#90.
+        let result = QueryResult::Streams {
+            items: vec![stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")])],
+            partial: false,
+        };
+        let body = body_string(query_response(result, None, 0)).await;
+        assert!(
+            !body.contains("pulsus_partial"),
+            "complete result must not carry the partial signal: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_stats_carry_pulsus_partial_true_on_budget_truncation() {
+        // Issue #90 Delta 2: a budget-truncated fetch-until-limit result
+        // signals incompleteness via `stats.pulsus_partial=true`,
+        // distinguishable from a genuinely-exhausted complete result.
+        let result = QueryResult::Streams {
+            items: vec![stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")])],
+            partial: true,
+        };
+        let body = body_string(query_response(result, None, 0)).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["data"]["stats"]["pulsus_partial"], true);
+    }
+
+    #[tokio::test]
     async fn streams_envelope_sorts_multiple_streams_by_label_set_deterministically() {
-        let result = QueryResult::Streams(vec![
-            stream(2, r#"{"service_name":"zeta"}"#, vec![(1, "z")]),
-            stream(1, r#"{"service_name":"alpha"}"#, vec![(1, "a")]),
-        ]);
+        let result = QueryResult::Streams {
+            items: vec![
+                stream(2, r#"{"service_name":"zeta"}"#, vec![(1, "z")]),
+                stream(1, r#"{"service_name":"alpha"}"#, vec![(1, "a")]),
+            ],
+            partial: false,
+        };
         let res = query_response(result, None, 0);
         let body = body_string(res).await;
         // "alpha" sorts before "zeta" lexicographically.
@@ -555,10 +602,13 @@ mod tests {
         // encoder faithfully reports whatever total the engine already
         // capped to (2 entries total across 2 streams), not a per-stream
         // count.
-        let result = QueryResult::Streams(vec![
-            stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")]),
-            stream(2, r#"{"service_name":"b"}"#, vec![(1, "y")]),
-        ]);
+        let result = QueryResult::Streams {
+            items: vec![
+                stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")]),
+                stream(2, r#"{"service_name":"b"}"#, vec![(1, "y")]),
+            ],
+            partial: false,
+        };
         let res = query_response(result, None, 0);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -570,7 +620,10 @@ mod tests {
     async fn streams_envelope_carries_data_explain_when_requested() {
         let mut explain = PlanExplain::new("streams");
         explain.push("stage1_stream_resolution", "SELECT 1", None);
-        let result = QueryResult::Streams(vec![]);
+        let result = QueryResult::Streams {
+            items: vec![],
+            partial: false,
+        };
         let res = query_response(result, Some(explain), 0);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -661,7 +714,14 @@ mod tests {
 
     #[tokio::test]
     async fn empty_streams_result_still_renders_a_well_formed_envelope() {
-        let res = query_response(QueryResult::Streams(vec![]), None, 0);
+        let res = query_response(
+            QueryResult::Streams {
+                items: vec![],
+                partial: false,
+            },
+            None,
+            0,
+        );
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["result"], serde_json::json!([]));
@@ -758,7 +818,14 @@ mod tests {
             })
             .collect();
 
-        let res = query_response(QueryResult::Streams(items), None, 0);
+        let res = query_response(
+            QueryResult::Streams {
+                items,
+                partial: false,
+            },
+            None,
+            0,
+        );
         let mut stream = res.into_body().into_data_stream();
 
         let mut chunk_count = 0usize;
@@ -798,11 +865,14 @@ mod tests {
     /// at `unfold.rs:108`) on `Body::from_stream(stream)` without `.fuse()`.
     #[tokio::test]
     async fn stream_array_body_yields_none_instead_of_panicking_when_polled_after_completion() {
-        let result = QueryResult::Streams(vec![stream(
-            1,
-            r#"{"service_name":"checkout"}"#,
-            vec![(100, "hello")],
-        )]);
+        let result = QueryResult::Streams {
+            items: vec![stream(
+                1,
+                r#"{"service_name":"checkout"}"#,
+                vec![(100, "hello")],
+            )],
+            partial: false,
+        };
         let res = query_response(result, None, 0);
         let mut body_stream = res.into_body().into_data_stream();
 
@@ -872,18 +942,21 @@ mod tests {
     #[tokio::test]
     async fn gzip_streams_response_matches_identity_byte_for_byte() {
         fn build() -> Response {
-            let result = QueryResult::Streams(vec![
-                stream(
-                    1,
-                    r#"{"env":"prod","service_name":"checkout"}"#,
-                    vec![(100, "hello"), (200, "world")],
-                ),
-                stream(
-                    2,
-                    r#"{"env":"staging","service_name":"checkout"}"#,
-                    vec![(150, "another line")],
-                ),
-            ]);
+            let result = QueryResult::Streams {
+                items: vec![
+                    stream(
+                        1,
+                        r#"{"env":"prod","service_name":"checkout"}"#,
+                        vec![(100, "hello"), (200, "world")],
+                    ),
+                    stream(
+                        2,
+                        r#"{"env":"staging","service_name":"checkout"}"#,
+                        vec![(150, "another line")],
+                    ),
+                ],
+                partial: false,
+            };
             query_response(result, None, 0)
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
@@ -892,7 +965,14 @@ mod tests {
     #[tokio::test]
     async fn gzip_empty_streams_response_matches_identity_byte_for_byte() {
         fn build() -> Response {
-            query_response(QueryResult::Streams(vec![]), None, 0)
+            query_response(
+                QueryResult::Streams {
+                    items: vec![],
+                    partial: false,
+                },
+                None,
+                0,
+            )
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }

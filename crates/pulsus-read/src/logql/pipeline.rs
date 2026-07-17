@@ -1486,6 +1486,64 @@ mod tests {
     }
 
     #[test]
+    fn fractional_duration_label_filters_parse_compile_and_evaluate() {
+        // AC7 (#90): grafana/loki:3.4.2 accepts fractional durations in
+        // label-filter RHS position (time.ParseDuration); the lexer fix
+        // makes `1.5s`/`0.3s`/`.5s` reach parse_duration_seconds as one
+        // Duration token. Each parses, compiles, and thresholds correctly.
+        for (query, threshold_secs) in [
+            (r#"{a="b"} | logfmt | latency > 1.5s"#, 1.5),
+            (r#"{a="b"} | logfmt | latency >= 0.3s"#, 0.3),
+            (r#"{a="b"} | logfmt | latency > .5s"#, 0.5),
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).expect(query);
+            let base = vec![("app".to_string(), "x".to_string())];
+            // A line above the threshold survives; one below is dropped.
+            let above = format!("latency={}s", threshold_secs + 1.0);
+            let below = format!("latency={}s", threshold_secs / 2.0);
+            assert!(
+                compiled.run(&above, &base).is_some(),
+                "{query}: {above:?} should survive"
+            );
+            assert!(
+                compiled.run(&below, &base).is_none(),
+                "{query}: {below:?} should be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn fractional_unwrap_duration_pipeline_parses_and_compiles() {
+        // AC7 (#90): the unwrap + fractional label-filter form parses.
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(d) | latency > 1.5s [5m])"#,
+        ))
+        .expect("fractional unwrap pipeline compiles");
+        let base = vec![("app".to_string(), "x".to_string())];
+        // Metric extraction still works end-to-end.
+        let mut labels = Vec::new();
+        let _ = compiled.run_metric_into("d=250ms latency=2s", &base, &mut labels);
+    }
+
+    #[test]
+    fn fractional_range_duration_is_rejected_matching_loki() {
+        // AC7 (#90): grafana/loki:3.4.2 REJECTS fractional RANGE `[...]`
+        // durations; our range parser (duration::parse_duration,
+        // integer-only) rejects them too. The lexer now hands the whole
+        // `1.5h` as one Duration token, so the error is a clean
+        // InvalidDuration-class message naming the literal.
+        for query in [
+            r#"count_over_time({a="b"}[1.5h])"#,
+            r#"count_over_time({a="b"}[.5s])"#,
+        ] {
+            assert!(
+                pulsus_logql::parse(query).is_err(),
+                "{query} must be rejected (Loki parity)"
+            );
+        }
+    }
+
+    #[test]
     fn every_excluded_template_function_is_rejected_by_name() {
         for func in EXCLUDED_TEMPLATE_FUNCTIONS {
             let tmpl = format!("{{{{ {func} .x }}}}");

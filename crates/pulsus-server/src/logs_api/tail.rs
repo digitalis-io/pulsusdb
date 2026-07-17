@@ -768,8 +768,12 @@ mod tests {
             "log_samples",
             &["'checkout'".to_string()],
             &[1],
-            pulsus_read::logql::sql::KeysetLower::Start { start_ns: 0 },
-            10,
+            pulsus_read::logql::sql::TimeWindow {
+                start_ns: 0,
+                end_ns: 10,
+            },
+            pulsus_read::logql::sql::KeysetLower::First,
+            pulsus_read::logql::params::Direction::Forward,
             &[],
             clamped_fetch_limit(9_999_999, 5_000),
         );
