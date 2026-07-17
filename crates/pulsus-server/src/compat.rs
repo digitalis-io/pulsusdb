@@ -29,8 +29,15 @@ pub(crate) fn apply_aliases(router: Router<AppState>, cfg: &Config) -> Router<Ap
         router = router.merge(crate::logs_api::compat_router());
         router = router.merge(crate::traces_api::compat_router());
     }
-    // Future issues add further compat surfaces here, one per docs/api.md
-    // §8 row, once the native handler exists.
+    // The §8.2 Loki push receiver (issue #77) is the first WRITER-side
+    // compat surface: it mounts iff the flag is on (guarded by the early
+    // return above) AND the Writer subsystem is mounted — never on the
+    // Reader compat flag alone (`Gate::CompatAndWriter`). Kept a separate
+    // block from the Reader one so each surface 404s exactly where its
+    // native twin does.
+    if modes::mounted(cfg).contains(&Subsystem::Writer) {
+        router = router.merge(crate::ingest::loki_push_compat_router());
+    }
     router
 }
 
@@ -112,6 +119,61 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         assert_ne!(status(router, "/api/search").await, StatusCode::NOT_FOUND);
+    }
+
+    /// Loki push (issue #77) `Gate::CompatAndWriter` isolation at the
+    /// router-build level: a POST probe distinguishes mounted (405 —
+    /// method-mismatch on a real route; the route is POST-only and this
+    /// helper's default matters little, but a mounted POST route reaches its
+    /// handler) from unmounted (404). Three cases prove mount iff (Writer
+    /// role AND compat flag): flag-on + writer mounts; flag-on + reader-only
+    /// 404s (flag alone never mounts writer-side); flag-off + all-mode 404s.
+    async fn push_status(cfg: &Config) -> StatusCode {
+        let router = apply_aliases(Router::new(), cfg);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/loki/api/v1/push")
+            .body(Body::empty())
+            .expect("build request");
+        router
+            .with_state(test_state())
+            .oneshot(request)
+            .await
+            .expect("router does not fail the request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn loki_push_mounts_with_flag_on_and_writer_subsystem() {
+        let cfg = Config {
+            compat_endpoints: true,
+            mode: Mode::Writer,
+            ..Config::default()
+        };
+        assert_ne!(push_status(&cfg).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn loki_push_404s_with_flag_on_but_reader_only_mode() {
+        // The flag alone never mounts the writer-side push route: reader-only
+        // mode has no Writer subsystem, so the route stays absent even with
+        // compat on — proving `CompatAndWriter`, never on the flag alone.
+        let cfg = Config {
+            compat_endpoints: true,
+            mode: Mode::Reader,
+            ..Config::default()
+        };
+        assert_eq!(push_status(&cfg).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn loki_push_404s_with_flag_off_even_in_all_mode() {
+        let cfg = Config {
+            compat_endpoints: false,
+            mode: Mode::All,
+            ..Config::default()
+        };
+        assert_eq!(push_status(&cfg).await, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

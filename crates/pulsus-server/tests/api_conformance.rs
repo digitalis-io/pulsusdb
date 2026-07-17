@@ -383,6 +383,29 @@ fn valid_remote_write_body() -> Vec<u8> {
         .expect("snappy-compress a valid WriteRequest")
 }
 
+/// A valid snappy-protobuf Loki `PushRequest` body (issue #77): one stream
+/// `{service_name="checkout"}` with one entry — the agent-default wire form
+/// (`Content-Type: application/x-protobuf`, implicit snappy, no
+/// `Content-Encoding`).
+fn valid_loki_push_body() -> Vec<u8> {
+    use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: r#"{service_name="checkout"}"#.to_string(),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                line: "conformance".to_string(),
+            }],
+        }],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy-compress a valid Loki PushRequest")
+}
+
 /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
 /// protobuf (mirrors `pulsus-write/src/ingest/http.rs`'s private `Status`
 /// type — not exported, so this test binary defines its own decode-only
@@ -1233,14 +1256,17 @@ fn run_case(port: u16, spec: &RouteSpec, case: &CaseClass, spawn: &str) {
 /// (round-9 finding: failures name the exact cell, including header/
 /// credential variant, not just the path).
 fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
-    if spec.path == "/api/v1/write" {
+    // The empty-204 family (remote-write `/api/v1/write` + the Loki push
+    // receiver `/loki/api/v1/push`, issue #77): a 204/202 success carries no
+    // Content-Type and an empty body.
+    if spec.success_status == 204 {
         assert!(
             res.content_type().is_none(),
-            "{ctx}: a 204/202 remote-write success must carry no Content-Type header"
+            "{ctx}: a 204/202 empty-body ingest success must carry no Content-Type header"
         );
         assert!(
             res.body.is_empty(),
-            "{ctx}: a 204/202 remote-write success must have an empty body"
+            "{ctx}: a 204/202 empty-body ingest success must have an empty body"
         );
         return;
     }
@@ -1274,17 +1300,23 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
 /// and every `CaseClass` in the manifest.
 fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     let is_remote_write = spec.path == "/api/v1/write";
+    // Both remote-write and the Loki push receiver (issue #77) have the
+    // empty-`204`/plain-text response family — distinguished from the OTLP
+    // routes' `200` + `Export*ServiceResponse` protobuf by their documented
+    // 204 success status.
+    let is_empty_204 = spec.success_status == 204;
     let body_for = |path: &str| -> Vec<u8> {
         match path {
             "/v1/logs" => valid_otlp_logs_body(),
             "/v1/metrics" => valid_otlp_metrics_body(),
             "/v1/traces" => valid_otlp_traces_body(),
             "/api/v1/write" => valid_remote_write_body(),
+            "/loki/api/v1/push" => valid_loki_push_body(),
             other => panic!("no valid-body builder registered for ingest route {other}"),
         }
     };
 
-    let async_cases: &[(Option<&str>, u16)] = if is_remote_write {
+    let async_cases: &[(Option<&str>, u16)] = if is_empty_204 {
         &[(None, 204), (Some("0"), 204), (Some("1"), 202)]
     } else {
         &[(None, 200), (Some("0"), 200), (Some("1"), 202)]
@@ -1323,7 +1355,15 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     // to know which signal-specific valid body — logs vs metrics — to
     // build) rather than asserting a `400` that would never actually
     // happen.
-    if !is_remote_write {
+    //
+    // Skipped for the empty-204 family: remote-write ignores Content-Type
+    // entirely (its own always-snappy path), and the Loki push receiver
+    // (issue #77) DOES negotiate on it — a valid snappy-protobuf body
+    // labeled `application/json` is routed to the JSON parser and correctly
+    // 400s, so the "wrong Content-Type still succeeds" invariant does not
+    // hold there. The Loki negotiation matrix is pinned by the `ingest/
+    // http.rs` handler tests + `LOKI_PUSH_CASES` instead.
+    if !is_empty_204 {
         let ctx = format!(
             "[{spawn}] POST {} case=wrong-content-type-valid-body-pinned-success",
             spec.path
@@ -1585,6 +1625,7 @@ async fn all_mode_auth_on_perimeter() {
                 "/v1/metrics" => valid_otlp_metrics_body(),
                 "/v1/traces" => valid_otlp_traces_body(),
                 "/api/v1/write" => valid_remote_write_body(),
+                "/loki/api/v1/push" => valid_loki_push_body(),
                 other => panic!("no valid-body builder for {other}"),
             };
             r
@@ -1667,7 +1708,24 @@ async fn all_mode_compat_off_alias_404() {
     let _guard = spawn_ready(port, db, &[]); // PULSUS_COMPAT_ENDPOINTS unset => false.
 
     for spec in route_manifest() {
-        if spec.status != RouteStatus::Mounted || spec.gate != Gate::CompatAndReader {
+        if spec.status != RouteStatus::Mounted
+            || !matches!(spec.gate, Gate::CompatAndReader | Gate::CompatAndWriter)
+        {
+            continue;
+        }
+        // The push receiver (issue #77) is POST-only: probe it with POST so
+        // its 404 proves the route is genuinely absent (flag off), not a
+        // method mismatch on a mounted route.
+        if spec.surface == Surface::Ingest {
+            let ctx = format!(
+                "[spawn=all,auth=off,compat=off] POST {} case=compat-flag-off-404",
+                spec.path
+            );
+            let mut req = manifest::Req::new("POST", spec.path);
+            req.content_type = Some("application/x-protobuf");
+            req.body = valid_loki_push_body();
+            let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+            assert_404_empty(&res, &ctx);
             continue;
         }
         let ctx = format!(
@@ -1732,6 +1790,11 @@ async fn writer_only_mode_reader_routes_404() {
                 assert_success_envelope(spec, &res, &ctx);
             }
             Gate::WriterMode => assert_ingest_route(port, spec, spawn),
+            // Issue #77: writer role + compat flag ON is exactly the
+            // condition that mounts the Loki push receiver — the POSITIVE
+            // assertion that distinguishes `CompatAndWriter` from
+            // `CompatAndReader` (which stays 404 here, no Reader role).
+            Gate::CompatAndWriter => assert_ingest_route(port, spec, spawn),
         }
     }
 }
@@ -1792,6 +1855,12 @@ async fn reader_only_mode_writer_routes_404() {
             // skip here to avoid asserting two conflated preconditions in
             // one spawn.
             Gate::CompatAndReader => {}
+            // Likewise `CompatAndWriter` (issue #77): compat is off in this
+            // spawn AND the Writer role is absent, so both preconditions
+            // fail at once — the isolated proofs live in
+            // `reader_only_mode_compat_on_writer_compat_route_404` (flag on,
+            // Writer role still absent) and spawn 3 (flag off).
+            Gate::CompatAndWriter => {}
             Gate::ReaderMode => {
                 let method = spec.methods[0];
                 let ctx = format!(
@@ -1810,6 +1879,55 @@ async fn reader_only_mode_writer_routes_404() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Spawn 5b (issue #77 delta 3): mode=reader + compat flag ON — the Loki
+// push receiver (`CompatAndWriter`) STILL 404s. The dedicated negative that
+// isolates the writer-role requirement: unlike spawn 5 (flag off) and spawn
+// 3 (flag off, all-mode), here the flag IS on, so a 404 proves the flag
+// alone never mounts the writer-side push route without the Writer role —
+// completing the "mounted iff (Writer role AND compat flag)" matrix
+// alongside spawn 4's positive mount.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reader_only_mode_compat_on_writer_compat_route_404() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let port = 31_128;
+    let db = "pulsus_api_conformance_it_reader_compat_on";
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_MODE", "reader"),
+            ("PULSUS_COMPAT_ENDPOINTS", "true"),
+        ],
+    );
+
+    let mut any = false;
+    for spec in route_manifest() {
+        if spec.status != RouteStatus::Mounted || spec.gate != Gate::CompatAndWriter {
+            continue;
+        }
+        any = true;
+        let ctx = format!(
+            "[spawn=reader-only,compat=on] POST {} case=writer-role-absent-404",
+            spec.path
+        );
+        let mut req = manifest::Req::new("POST", spec.path);
+        req.content_type = Some("application/x-protobuf");
+        req.body = valid_loki_push_body();
+        let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+        assert_404_empty(&res, &ctx);
+    }
+    assert!(
+        any,
+        "manifest must carry at least one Gate::CompatAndWriter route for this spawn to isolate"
+    );
 }
 
 // ---------------------------------------------------------------------

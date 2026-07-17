@@ -72,6 +72,18 @@ pub enum LogsIngestError {
         actual: usize,
     },
 
+    /// A Loki push body (issue #77) was structurally decodable but
+    /// semantically malformed: bad JSON, a malformed Prometheus label-set
+    /// literal in a `StreamAdapter.labels` string, or a non-numeric/
+    /// overflowing entry timestamp. A whole-request 400-class failure (Loki
+    /// has no partial-success channel) — same `(400, code = 3)` group as the
+    /// structural/decode variants above, added to [`classify`]'s 400 arm
+    /// (`ingest/http.rs`).
+    ///
+    /// [`classify`]: crate::ingest::http
+    #[error("malformed Loki push request: {0}")]
+    LokiDecode(String),
+
     /// A sync-mode ([`crate::ingest::LogSink::admit_flush`]) request's
     /// completion future resolved with an error the writer core did not
     /// classify further (e.g. the writer shut down mid-flush without

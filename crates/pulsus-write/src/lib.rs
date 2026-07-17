@@ -7,10 +7,16 @@ pub mod protocols;
 pub mod writer;
 
 pub use error::LogsIngestError;
-pub use ingest::http::{ingest, ingest_metrics, ingest_remote_write, ingest_traces};
+pub use ingest::http::{
+    ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces,
+};
 pub use ingest::metrics::{MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef};
 pub use ingest::traces::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
 pub use ingest::{Backpressure, FlushWait, LogSink};
+pub use protocols::loki_push::{
+    decode_protobuf as decode_loki_protobuf, parse_json as parse_loki_json,
+    parse_protobuf as parse_loki_protobuf,
+};
 pub use protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow, decode, parse};
 pub use protocols::otlp_metrics::{decode as decode_metrics, parse as parse_metrics};
 pub use protocols::otlp_traces::{decode as decode_traces, parse as parse_traces};

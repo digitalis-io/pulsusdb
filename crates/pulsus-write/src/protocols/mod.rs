@@ -3,6 +3,7 @@
 //! bytes to normalized rows — no I/O, trivially unit-testable against
 //! captured fixtures.
 
+pub mod loki_push;
 pub mod otlp_logs;
 pub mod otlp_metrics;
 pub mod otlp_traces;

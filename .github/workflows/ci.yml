@@ -455,6 +455,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run logs_stats_live -p pulsus-server --test logs_stats_live
 
+      # Issue #77 (M6-14): spawns the real `pulsusdb` binary with
+      # PULSUS_COMPAT_ENDPOINTS on, pushes a stream to /loki/api/v1/push in
+      # BOTH encodings (JSON + snappy-protobuf), then proves the load-bearing
+      # correctness gate live: the pushed stream is queryable via LogQL
+      # query_range (native + /loki alias) and appears in
+      # /api/logs/v1/tail with its exact entries + labels. Ports 31150-31151.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Live Loki push receiver round-trip
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run loki_push_live -p pulsus-server --test loki_push_live
+
       - name: Build pulsusdb
         run: cargo build -p pulsus-server --bin pulsusdb
 

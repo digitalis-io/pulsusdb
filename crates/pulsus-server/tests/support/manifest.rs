@@ -197,6 +197,12 @@ pub enum Gate {
     /// Mounted only when `PULSUS_COMPAT_ENDPOINTS=true` **and** the Reader
     /// subsystem is mounted.
     CompatAndReader,
+    /// Mounted only when `PULSUS_COMPAT_ENDPOINTS=true` **and** the Writer
+    /// subsystem is mounted (issue #77 — the first writer-side compat gate,
+    /// `compat.rs::apply_aliases`'s writer branch). Distinct from
+    /// [`Gate::CompatAndReader`]: the flag alone never mounts a
+    /// `CompatAndWriter` route without the Writer role.
+    CompatAndWriter,
 }
 
 /// Whether a manifest entry is actually mounted today (drift-guarded,
@@ -1053,6 +1059,51 @@ const REMOTE_WRITE_CASES: &[CaseClass] = &[CaseClass {
     expect: ExpectedError::PlainText,
 }];
 
+// -- Loki push (issue #77, docs/api.md §8.2) ----------------------------
+// Oracle-pinned against grafana/loki:3.4.2 (provenance +
+// probe matrix: `crates/pulsus-write/tests/fixtures/loki-push/README.md`):
+// success is 204 empty both encodings; malformed / undecodable / unsupported
+// Content-Type all default to the protobuf path and 400 plain-text. The
+// success/async/backpressure/oversize cells are exercised in
+// `assert_ingest_route` and the `ingest/http.rs` handler-test matrix; these
+// generic cases cover the two 400 plain-text rows the round-2 review demanded
+// as distinct: a genuinely undecodable body, and a truly unsupported
+// Content-Type (distinct from "JSON body under protobuf negotiation").
+
+/// A raw (non-snappy) body under the default protobuf negotiation — the
+/// snappy decode fails (oracle: `snappy: corrupt input` -> 400 plain-text),
+/// the Loki analog of `rw_bad_snappy`.
+fn loki_bad_snappy(req: &mut Req) {
+    req.content_type = Some("application/x-protobuf");
+    req.body = b"\xFF\xFF\xFF not snappy".to_vec();
+}
+
+/// A genuinely UNSUPPORTED Content-Type (`text/plain`) carrying a
+/// non-protobuf body (issue #77 round-2 adjudication item 1): negotiation
+/// defaults the unrecognized type to the protobuf path, so the non-snappy
+/// body fails decode -> 400 plain-text. Distinct from `loki_bad_snappy`'s
+/// documented-protobuf-header malformed-payload row.
+fn loki_unsupported_content_type(req: &mut Req) {
+    req.content_type = Some("text/plain");
+    req.body =
+        br#"{"streams":[{"stream":{"a":"b"},"values":[["1700000000000000000","x"]]}]}"#.to_vec();
+}
+
+const LOKI_PUSH_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "bad_snappy",
+        build: loki_bad_snappy,
+        expect_status: 400,
+        expect: ExpectedError::PlainText,
+    },
+    CaseClass {
+        name: "unsupported_content_type",
+        build: loki_unsupported_content_type,
+        expect_status: 400,
+        expect: ExpectedError::PlainText,
+    },
+];
+
 // ---------------------------------------------------------------------
 // RouteSpec — the manifest itself
 // ---------------------------------------------------------------------
@@ -1347,6 +1398,26 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_STATS_CASES,
+    },
+    // -- Loki push receiver, `/loki/api/v1` compat alias (CompatAndWriter,
+    //    issue #77) -------------------------------------------------------
+    // The first WRITER-side compat surface (docs/api.md §8.2): a foreign-
+    // format decoder feeding the existing log-storage path, not a route
+    // binding onto a native handler. `success_status` is 204 (empty-body,
+    // both encodings — oracle-pinned against grafana/loki:3.4.2), so
+    // `assert_ingest_route` treats it in the empty-204 family alongside
+    // `/api/v1/write`. `DocRef::Verbatim`: the §8.2 table spells the full
+    // path out.
+    RouteSpec {
+        path: "/loki/api/v1/push",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 204,
+        base_query: "",
+        cases: LOKI_PUSH_CASES,
     },
     // -- Prom API (ReaderMode, no compat aliases) ------------------------
     RouteSpec {
@@ -1907,9 +1978,11 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        // Re-pinned for issue #61 (T9): the Tempo trace-alias merge joins
-        // the Loki one inside the same Reader-mounted block.
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} router",
+        // Re-pinned for issue #77 (M6-14): a second, Writer-gated branch
+        // joins the Reader one — the Loki push receiver's `CompatAndWriter`
+        // mount. (Previously re-pinned for issue #61's Tempo trace-alias
+        // merge inside the Reader block.)
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",

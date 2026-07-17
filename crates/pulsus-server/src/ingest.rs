@@ -20,10 +20,12 @@
 
 use std::sync::{Arc, OnceLock};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
+use axum::routing::post;
 
 use pulsus_write::{
     Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
@@ -168,6 +170,29 @@ pub(crate) async fn ingest_remote_write(
     body: Body,
 ) -> Response {
     pulsus_write::ingest_remote_write(state.metric_writer.as_ref(), headers, body).await
+}
+
+/// `POST /loki/api/v1/push` (docs/api.md §8.2, issue #77): the flag-gated
+/// Loki log push receiver. Pulls `AppState`'s `WriterSink` — the same
+/// instance `ingest_logs` uses (a Loki push feeds the *existing* log-storage
+/// path) — and hands straight into `pulsus_write::ingest_loki_push`'s reused
+/// core; no logic of its own beyond that seam.
+pub(crate) async fn ingest_loki_push(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_loki_push(state.writer.as_ref(), headers, body).await
+}
+
+/// The Loki push compat surface (issue #77): a single writer-side compat
+/// route, merged by `compat::apply_aliases` iff `PULSUS_COMPAT_ENDPOINTS`
+/// **and** the Writer subsystem is mounted (`Gate::CompatAndWriter`) — the
+/// first compat surface gated on Writer rather than Reader. Kept here beside
+/// the handler (mirroring `logs_api::compat_router`'s co-location with its
+/// query handlers).
+pub(crate) fn loki_push_compat_router() -> Router<AppState> {
+    Router::new().route("/loki/api/v1/push", post(ingest_loki_push))
 }
 
 #[cfg(test)]

@@ -58,7 +58,7 @@ use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{Backpressure, LogSink};
-use crate::protocols::{otlp_logs, otlp_metrics, otlp_traces, remote_write};
+use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
 /// selects async-mode (enqueue, `202`); absent or any other value selects
@@ -297,6 +297,98 @@ pub async fn ingest_remote_write(
     }
 }
 
+/// `POST /loki/api/v1/push` (issue #77, docs/api.md §8.2): the flag-gated
+/// Loki log push receiver. A **decoder** feeding the *existing* log-storage
+/// path — no new read path, no schema change — so it is the structural
+/// analog of [`ingest_remote_write`] (empty `204`/`202` success, plain-text
+/// errors, the shared 64 MiB [`read_capped_body`] cap), but with a
+/// content-negotiated body and the OTLP-log admission unit ([`ParsedLogs`]):
+///
+/// - **Both encodings** (task-manager Q2 adjudication, oracle-pinned against
+///   grafana/loki 3.4.2): `Content-Type` containing `application/json` →
+///   the JSON path (honoring `Content-Encoding`, since a Loki JSON body may
+///   be gzip); anything else or absent → the protobuf path, which — like
+///   [`decode_remote_write_request`] and Loki's own server — **always
+///   block-snappy-decompresses** (a Loki agent sends
+///   `application/x-protobuf` with a snappy body and no `Content-Encoding`).
+///   Uncompressed protobuf is therefore unsupported, exactly as upstream.
+/// - **All-or-nothing** (Loki has no partial-success channel): a malformed
+///   body / label string / timestamp is a whole-request `LokiDecode` 400,
+///   never a per-entry drop — `parsed.rejected` is always 0 here.
+/// - **Structured metadata accept-and-drop** (task-manager Q1): parsed only
+///   as far as prost's byte-skip (the tag is undeclared), never stored —
+///   `log_samples` has no per-entry column (docs/api.md §8.2, follow-up
+///   filed).
+///
+/// Response codes are oracle-pinned where Loki has an equivalent (204
+/// success both encodings, 400 plain-text malformed/oversize) and PulsusDB-
+/// contract where it does not (202 async, 429 backpressure) — see the issue
+/// #77 v2 response matrix.
+pub async fn ingest_loki_push(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Response {
+    let now_ns = now_unix_nanos();
+
+    let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
+        Ok(body) => body,
+        // Reuses the signal-neutral empty-`204`/plain-text response family
+        // (the `rw_*` helpers) — Loki and remote-write share that exact
+        // response shape.
+        Err(err) => return rw_error_response(&err),
+    };
+
+    let parsed = match decode_loki_push(&headers, &body, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return rw_error_response(&err),
+    };
+
+    if is_async(&headers) {
+        return match sink.admit(parsed) {
+            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Err(Backpressure) => rw_backpressure_response(),
+        };
+    }
+
+    match sink.admit_flush(parsed) {
+        Ok(wait) => match wait.await {
+            Ok(()) => rw_success_response(StatusCode::NO_CONTENT),
+            Err(err) => rw_error_response(&err),
+        },
+        Err(Backpressure) => rw_backpressure_response(),
+    }
+}
+
+/// Content-negotiates and decodes a Loki push body into [`ParsedLogs`]. See
+/// [`ingest_loki_push`]'s doc comment for the negotiation rule; the two
+/// paths funnel through `loki_push::parse_json`/`parse_protobuf`, both of
+/// which route labels through the identical `LabelSet::from_normalized` +
+/// `stream_fingerprint` seam `otlp_logs::parse` uses.
+fn decode_loki_push(
+    headers: &HeaderMap,
+    body: &[u8],
+    now_ns: i64,
+) -> Result<otlp_logs::ParsedLogs, LogsIngestError> {
+    if is_json_content_type(headers) {
+        let encoding = content_encoding(headers)?;
+        let decompressed = decompress::decompress(encoding, body)?;
+        loki_push::parse_json(&decompressed, now_ns)
+    } else {
+        let decompressed = decompress::decompress(Encoding::Snappy, body)?;
+        let request = loki_push::decode_protobuf(&decompressed)?;
+        loki_push::parse_protobuf(&request, now_ns)
+    }
+}
+
+/// `true` when the request's `Content-Type` selects the Loki JSON push path
+/// (contains `application/json`, case-insensitively — a real client sends
+/// `application/json` or `application/json; charset=utf-8`). Anything else,
+/// or an absent header, selects the snappy-protobuf path (the agent
+/// default).
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+}
+
 /// `true` when `X-Pulsus-Async: 1` selects async-mode admission.
 fn is_async(headers: &HeaderMap) -> bool {
     headers
@@ -420,6 +512,7 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::Decompress { .. }
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
+        | LogsIngestError::LokiDecode(_)
         | LogsIngestError::Decode(_) => (StatusCode::BAD_REQUEST, 3),
         LogsIngestError::BodyRead(_) | LogsIngestError::FlushFailed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, 13)
@@ -1528,5 +1621,242 @@ mod tests {
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].rejected, 1);
         assert!(admitted[0].samples.is_empty());
+    }
+
+    // -- `/loki/api/v1/push` (issue #77) ----------------------------------
+    // The oracle-pinned response matrix (issue #77 v2 delta 4, probed against
+    // grafana/loki 3.4.2): success 204 both encodings, 202 async
+    // (PulsusDB), malformed/oversize 400 plain-text, backpressure 429
+    // (PulsusDB). Reuses `MockSink` (the `LogSink` double) and the
+    // remote-write `snappy_compress`/`plain_text_body` helpers.
+
+    use crate::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
+
+    fn valid_loki_protobuf_body() -> Vec<u8> {
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout", env="prod"}"#.to_string(),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(Timestamp {
+                        seconds: 1_700_000_000,
+                        nanos: 0,
+                    }),
+                    line: "hello".to_string(),
+                }],
+            }],
+        };
+        snappy_compress(&req.encode_to_vec())
+    }
+
+    fn valid_loki_json_body() -> Vec<u8> {
+        br#"{"streams":[{"stream":{"service_name":"checkout","env":"prod"},
+            "values":[["1700000000000000000","hello"]]}]}"#
+            .to_vec()
+    }
+
+    async fn call_loki(sink: &MockSink, body: Vec<u8>, headers: &[(&str, &str)]) -> Response {
+        let mut header_map = HeaderMap::new();
+        for (name, value) in headers {
+            header_map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        ingest_loki_push(sink, header_map, Body::from(body)).await
+    }
+
+    #[tokio::test]
+    async fn loki_protobuf_default_sync_returns_204_empty() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            valid_loki_protobuf_body(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.headers().get(header::CONTENT_TYPE).is_none());
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty(), "204 success must carry no body");
+    }
+
+    #[tokio::test]
+    async fn loki_protobuf_absent_content_type_defaults_to_protobuf_204() {
+        // A Loki agent sends a snappy protobuf body with no Content-Type;
+        // negotiation defaults non-JSON to the protobuf path.
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(&sink, valid_loki_protobuf_body(), &[]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loki_json_sync_returns_204() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            valid_loki_json_body(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(admitted[0].rows[0].service, "checkout");
+    }
+
+    #[tokio::test]
+    async fn loki_async_mode_returns_202_empty() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            valid_loki_protobuf_body(),
+            &[
+                ("content-type", "application/x-protobuf"),
+                ("x-pulsus-async", "1"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loki_json_body_sent_as_protobuf_is_400_plain_text() {
+        // Oracle (loki 3.4.2): "snappy: corrupt input" -> 400. A raw JSON
+        // body under `application/x-protobuf` fails the mandatory snappy
+        // decompress.
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            valid_loki_json_body(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!plain_text_body(res).await.is_empty());
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_unsupported_content_type_defaults_to_protobuf_and_400s() {
+        // Oracle (loki 3.4.2): an unrecognized Content-Type (`text/plain`)
+        // carrying a non-protobuf body defaults to the protobuf path and
+        // fails snappy decode -> 400 plain-text.
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            valid_loki_json_body(),
+            &[("content-type", "text/plain")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_malformed_json_is_400_plain_text() {
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            b"{not json".to_vec(),
+            &[("content-type", "application/json")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_bad_label_string_is_400_plain_text() {
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: "not a label set".to_string(),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(Timestamp {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
+                    line: "x".to_string(),
+                }],
+            }],
+        };
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            snappy_compress(&req.encode_to_vec()),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(!plain_text_body(res).await.is_empty());
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_structured_metadata_is_accepted_and_dropped_204() {
+        // A JSON `values` entry with a trailing structured-metadata object:
+        // accepted (never an error), the metadata dropped.
+        let body = br#"{"streams":[{"stream":{"a":"b"},
+            "values":[["1700000000000000000","hello",{"trace_id":"abc"}]]}]}"#
+            .to_vec();
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(&sink, body, &[("content-type", "application/json")]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted[0].rows.len(), 1);
+        assert_eq!(admitted[0].rows[0].body, "hello");
+    }
+
+    #[tokio::test]
+    async fn loki_sink_backpressure_returns_429_plain_text() {
+        let sink = MockSink::new(Outcome::Backpressure);
+        let res = call_loki(
+            &sink,
+            valid_loki_protobuf_body(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn loki_flush_failure_returns_500_plain_text() {
+        let sink = MockSink::new(Outcome::FlushFails);
+        let res = call_loki(
+            &sink,
+            valid_loki_protobuf_body(),
+            &[("content-type", "application/x-protobuf")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!plain_text_body(res).await.is_empty());
+    }
+
+    /// Gzip-encoded JSON is honored on the JSON path (`Content-Encoding`
+    /// respected there, unlike the always-snappy protobuf path).
+    #[tokio::test]
+    async fn loki_gzip_encoded_json_is_decoded_and_admitted() {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&valid_loki_json_body()).unwrap();
+        let gz = encoder.finish().unwrap();
+        let sink = MockSink::new(Outcome::Admit);
+        let res = call_loki(
+            &sink,
+            gz,
+            &[
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+            ],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
     }
 }

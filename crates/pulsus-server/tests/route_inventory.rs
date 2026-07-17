@@ -1317,7 +1317,10 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
         }
         let ok = match spec.surface {
             Surface::OpsPublic | Surface::OpsAuthed => spec.gate == Gate::Always,
-            Surface::Ingest => spec.gate == Gate::WriterMode,
+            // Native OTLP/remote-write ingest is WriterMode; the issue #77
+            // Loki push compat receiver is the same Ingest surface under
+            // CompatAndWriter (the first writer-side compat gate).
+            Surface::Ingest => matches!(spec.gate, Gate::WriterMode | Gate::CompatAndWriter),
             Surface::LogsQuery => matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader),
             // Issue #74: tail/stats follow the LogsQuery precedent —
             // native under ReaderMode, `/loki` aliases under
