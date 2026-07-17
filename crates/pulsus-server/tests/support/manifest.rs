@@ -503,15 +503,26 @@ fn prom_series_missing_match(req: &mut Req) {
     req.query.clear();
 }
 
-/// `422 execution`: a `__name__` regex matcher in `match[]` — the
-/// documented M2 out-of-subset-construct limitation
-/// (`prom_api/handlers.rs::parse_match_selectors`), reachable **without**
+/// `422 execution`: a non-vector-selector `match[]` value — the remaining
+/// out-of-subset-construct limitation of the discovery surface
+/// (`pulsus_promql::series_selector`'s "match[] selector must be a bare
+/// vector selector" -> `PromqlError::Unsupported`, via
+/// `prom_api/handlers.rs::parse_match_selectors`), reachable **without**
 /// any pool/seed data (fails before `engine_for` is ever called) — stands
 /// in for the "over-broad/unsupported selector" case-class the issue body
 /// asks for on the metrics surface (see `api_conformance.rs`'s module doc
 /// for why the LogQL `query_too_broad` analog is not live-tested here).
-fn prom_name_regex_unsupported(req: &mut Req) {
-    req.query = format!("match%5B%5D={}", enc(r#"{__name__=~"up.*"}"#));
+///
+/// Retargeted from `match[]={__name__=~"up.*"}` by issue #89: regex/
+/// negated `__name__` discovery is now supported, and its runtime outcome
+/// is label-cache-state-dependent (warm -> 200, degraded -> named 422),
+/// which is not a hermetically assertable conformance pin — that behavior
+/// is covered by the seeded `prom_api_live.rs` cases instead. `sum(up)`
+/// keeps this case-class deterministic and pool-independent. Note an
+/// `or`-matcher selector would NOT do: it is `PromqlError::Parse` ->
+/// `400 bad_data`, a different case-class.
+fn prom_series_non_selector_unsupported(req: &mut Req) {
+    req.query = format!("match%5B%5D={}", enc("sum(up)"));
 }
 
 const PROM_QUERY_CASES: &[CaseClass] = &[
@@ -585,8 +596,8 @@ const PROM_QUERY_RANGE_CASES: &[CaseClass] = &[
 
 const PROM_LABELS_CASES: &[CaseClass] = &[
     CaseClass {
-        name: "name_regex_unsupported",
-        build: prom_name_regex_unsupported,
+        name: "non_selector_unsupported",
+        build: prom_series_non_selector_unsupported,
         expect_status: 422,
         expect: ExpectedError::Json {
             error_type: "execution",
@@ -615,8 +626,8 @@ const PROM_SERIES_CASES: &[CaseClass] = &[
         },
     },
     CaseClass {
-        name: "name_regex_unsupported",
-        build: prom_name_regex_unsupported,
+        name: "non_selector_unsupported",
+        build: prom_series_non_selector_unsupported,
         expect_status: 422,
         expect: ExpectedError::Json {
             error_type: "execution",

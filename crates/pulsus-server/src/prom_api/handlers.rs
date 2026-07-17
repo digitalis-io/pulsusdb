@@ -89,18 +89,20 @@ fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), ParamError> {
 /// `{job="api"}`). `series_selector` permits a missing metric name
 /// (`DiscoveryFilter::metric_name = None`, routing to
 /// `discovery_query`'s already-existing unscoped branch — see that
-/// function's own doc comment); a `__name__` regex/negative matcher is
-/// still `PromqlError::Unsupported` (a documented M2 limitation, `422
-/// execution` — `metric_name` is a physical column, not a `labels`-JSON
-/// key, so regex discovery over it needs its own query shape, deferred to
-/// M6 parity).
+/// function's own doc comment) and, since issue #89, extracts a
+/// `__name__` regex/negative matcher into `DiscoveryFilter::name_matchers`
+/// rather than rejecting it: the outcome is now the read path's to decide
+/// (cache-resolved flat IN×IN fetch; a degraded cache is a named `422`).
+/// A non-vector-selector `match[]` value (e.g. `sum(up)`) remains
+/// `PromqlError::Unsupported` -> `422 execution`.
 fn parse_match_selectors(raw_matches: &[&str]) -> Result<Vec<DiscoveryFilter>, ApiError> {
     let mut filters = Vec::with_capacity(raw_matches.len());
     for raw in raw_matches {
         let expr = pulsus_promql::parse(raw)?;
-        let (metric_name, matchers) = pulsus_promql::series_selector(&expr)?;
+        let (metric_name, name_matchers, matchers) = pulsus_promql::series_selector(&expr)?;
         filters.push(DiscoveryFilter {
             metric_name,
+            name_matchers,
             matchers,
         });
     }
@@ -643,11 +645,12 @@ mod tests {
         assert_eq!(json["errorType"], "unavailable");
     }
 
-    /// A `__name__` regex matcher in `match[]` is still `422 execution` — a
-    /// documented M2 limitation (`series_selector`'s own contract), not a
-    /// regression of the matcher-only fix above.
+    /// Issue #89: a `__name__` regex matcher in `match[]` is no longer a
+    /// parse-time rejection — it reaches the read path (here: the pool
+    /// check) carrying its name matchers, exactly as the matcher-only
+    /// selector above does.
     #[tokio::test]
-    async fn labels_with_a_name_regex_matcher_is_422_execution() {
+    async fn labels_with_a_name_regex_matcher_reaches_the_pool_check() {
         let res = labels(
             State(test_state()),
             RawQuery(Some(
@@ -656,8 +659,45 @@ mod tests {
         )
         .await;
         let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["errorType"], "unavailable");
+    }
+
+    /// A non-vector-selector `match[]` value stays `422 execution` — the
+    /// remaining, deterministic `series_selector` rejection (the
+    /// conformance manifest's retargeted `unsupported-selector` pin).
+    #[tokio::test]
+    async fn labels_with_a_non_selector_match_is_422_execution() {
+        let res = labels(
+            State(test_state()),
+            RawQuery(Some(r#"match[]=sum(up)"#.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "execution");
+    }
+
+    /// AC2: the parse layer populates the `name_matchers` channel.
+    #[test]
+    fn parse_match_selectors_extracts_a_name_regex_into_the_name_channel() {
+        let filters = parse_match_selectors(&[r#"{__name__=~"up.*",job="api"}"#]).unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].metric_name, None);
+        assert_eq!(filters[0].name_matchers.len(), 1);
+        assert_eq!(filters[0].name_matchers[0].key, "__name__");
+        assert_eq!(filters[0].matchers.len(), 1);
+        assert_eq!(filters[0].matchers[0].key, "job");
+    }
+
+    /// The common cases keep an empty name channel (no fan-out routing).
+    #[test]
+    fn parse_match_selectors_leaves_the_name_channel_empty_for_ordinary_selectors() {
+        let filters = parse_match_selectors(&[r#"up{job="api"}"#, r#"{job="api"}"#]).unwrap();
+        assert_eq!(filters[0].metric_name, Some("up".to_string()));
+        assert!(filters[0].name_matchers.is_empty());
+        assert_eq!(filters[1].metric_name, None);
+        assert!(filters[1].name_matchers.is_empty());
     }
 
     #[tokio::test]

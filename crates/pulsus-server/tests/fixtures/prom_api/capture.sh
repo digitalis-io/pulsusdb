@@ -242,6 +242,11 @@ capture_get "series.with_match_get" "/api/v1/series?match[]=up&start=$((REF_TS -
 capture_post "series.with_match_post" "/api/v1/series" "match%5B%5D=up&start=$((REF_TS - 60))&end=$((REF_TS + 60))"
 capture_get_allow_error "series.no_match_error_get" "/api/v1/series"
 capture_get "series.matcher_only_get" "/api/v1/series?match[]=%7Bjob%3D%22node%22%7D&start=$((REF_TS - 60))&end=$((REF_TS + 60))"
+# Issue #89: a regex `__name__` selector — `{__name__=~"up.*"}` matches both
+# `up` series and `up_alias` (never `http_requests_total`), the discovery
+# analog of #85's query-path regex-name resolution. The oracle for the
+# new regex/negated-`__name__` discovery parity's wire golden.
+capture_get "series.name_regex_get" "/api/v1/series?match[]=%7B__name__%3D~%22up.%2A%22%7D&start=$((REF_TS - 60))&end=$((REF_TS + 60))"
 
 echo "==> capturing /api/v1/metadata"
 capture_get "metadata.scrape_derived_get" "/api/v1/metadata?metric=go_goroutines"

@@ -181,6 +181,48 @@ pub fn discovery_query(
     sql
 }
 
+/// Issue #89's discovery analog of [`super::sample_sql::sample_fetch_multi`]:
+/// ONE flat query for a regex/negated-`__name__` `match[]` selector's whole
+/// resolved candidate set — `metric_name IN (<resolved names>)` (the leading
+/// primary-key component of `metric_series ORDER BY (metric_name,
+/// fingerprint, unix_milli)`) plus `fingerprint IN (<resolved fps>)` (the
+/// second component), both EXPLAIN-gated in `explain_indexes.rs`. The
+/// request window is re-applied here with the same bucket-floored bounds as
+/// [`discovery_query`], so the label cache's wider resident superset (the
+/// resolution source for the IN sets) never leaks into a narrower discovery
+/// response — the `discovery_series` invariant.
+///
+/// Sound without per-pair filtering, by `sample_fetch_multi`'s argument: a
+/// `metric_name` is in the IN set only if it passed the selector's
+/// `name_matchers`, and `metric_fingerprint` excludes `__name__`
+/// (docs/schemas.md §2.1) so a fingerprint's label set is name-invariant —
+/// every `(metric_name, fingerprint)` cross-pair naming a real series is a
+/// genuine match. `LIMIT 1 BY metric_name, fingerprint` dedups to one row
+/// per series, as in [`discovery_query`].
+pub fn discovery_fetch_multi(
+    series_table: &str,
+    metric_names: &[String],
+    fps: &[u64],
+    window: DataWindow,
+    bucket_ms: i64,
+) -> String {
+    let lower = floored_bound(window.start_ms, bucket_ms);
+    let upper = floored_bound(window.end_ms, bucket_ms);
+    let name_list = metric_names
+        .iter()
+        .map(|n| ch_string(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fp_list = fps
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT fingerprint, metric_name, labels\nFROM {series_table}\nWHERE metric_name IN ({name_list})\n  AND fingerprint IN ({fp_list})\n  AND unix_milli >= {lower} AND unix_milli <= {upper}\nORDER BY unix_milli DESC\nLIMIT 1 BY metric_name, fingerprint"
+    )
+}
+
 /// `GET /api/v1/metadata` (issue #32): `metric_metadata` is a
 /// `ReplacingMergeTree(updated_ns)` (docs/schemas.md §2.1) whose merges are
 /// asynchronous, so a plain `SELECT` can observe more than one row per
@@ -425,6 +467,7 @@ mod tests {
     fn discovery_query_with_a_metric_name_filters_on_it() {
         let filter = DiscoveryFilter {
             metric_name: Some("up".to_string()),
+            name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
         let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
@@ -446,6 +489,7 @@ mod tests {
     fn discovery_query_without_a_metric_name_still_applies_matchers() {
         let filter = DiscoveryFilter {
             metric_name: None,
+            name_matchers: vec![],
             matchers: vec![eq("job", "api")],
         };
         let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
@@ -457,10 +501,73 @@ mod tests {
         let payload = "up'; DROP TABLE metric_series; --";
         let filter = DiscoveryFilter {
             metric_name: Some(payload.to_string()),
+            name_matchers: vec![],
             matchers: vec![],
         };
         let sql = discovery_query("metric_series", &filter, window(), 3_600_000);
         assert!(sql.contains(&format!("metric_name = {}", ch_string(payload))));
+        assert_no_unescaped_quote(&ch_string(payload));
+    }
+
+    // --- discovery_fetch_multi (issue #89) ---
+
+    #[test]
+    fn discovery_fetch_multi_renders_the_flat_in_by_in_shape() {
+        let sql = discovery_fetch_multi(
+            "metric_series",
+            &["up".to_string(), "up_alias".to_string()],
+            &[101, 205],
+            window(),
+            3_600_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT fingerprint, metric_name, labels\n\
+             FROM metric_series\n\
+             WHERE metric_name IN ('up', 'up_alias')\n\
+             \x20 AND fingerprint IN (101, 205)\n\
+             \x20 AND unix_milli >= 0 AND unix_milli <= 3600000\n\
+             ORDER BY unix_milli DESC\n\
+             LIMIT 1 BY metric_name, fingerprint"
+        );
+    }
+
+    #[test]
+    fn discovery_fetch_multi_floors_both_window_bounds_to_the_bucket() {
+        let sql = discovery_fetch_multi(
+            "metric_series",
+            &["up".to_string()],
+            &[7],
+            DataWindow {
+                start_ms: 3_600_001,
+                end_ms: 7_300_000,
+            },
+            3_600_000,
+        );
+        assert!(sql.contains("unix_milli >= 3600000 AND unix_milli <= 7200000"));
+    }
+
+    /// The window is re-applied in SQL (not inherited from the label
+    /// cache's wider resident superset) — the `discovery_series`
+    /// no-residency-leak invariant.
+    #[test]
+    fn discovery_fetch_multi_always_constrains_the_request_window() {
+        let sql = discovery_fetch_multi("metric_series", &["up".to_string()], &[1], window(), 1);
+        assert!(sql.contains("AND unix_milli >= "));
+        assert!(sql.contains(" AND unix_milli <= "));
+    }
+
+    #[test]
+    fn discovery_fetch_multi_metric_name_injection_stays_inside_one_literal() {
+        let payload = "up'; DROP TABLE metric_series; --";
+        let sql = discovery_fetch_multi(
+            "metric_series",
+            &[payload.to_string()],
+            &[1],
+            window(),
+            3_600_000,
+        );
+        assert!(sql.contains(&format!("metric_name IN ({})", ch_string(payload))));
         assert_no_unescaped_quote(&ch_string(payload));
     }
 

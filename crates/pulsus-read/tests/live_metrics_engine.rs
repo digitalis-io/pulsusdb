@@ -1527,6 +1527,7 @@ async fn discovery_endpoints_honor_the_query_window_and_include_name() {
     };
     let filters = vec![DiscoveryFilter {
         metric_name: Some("up".to_string()),
+        name_matchers: vec![],
         matchers: vec![],
     }];
 
@@ -1706,6 +1707,7 @@ async fn series_applies_regex_matchers() {
     };
     let filters = vec![DiscoveryFilter {
         metric_name: Some("http_requests_total".to_string()),
+        name_matchers: vec![],
         matchers: vec![LabelMatcher {
             key: "status".to_string(),
             op: MatchOp::Re,
@@ -1786,6 +1788,7 @@ async fn series_with_a_matcher_only_filter_matches_across_metric_names() {
     };
     let filters = vec![DiscoveryFilter {
         metric_name: None,
+        name_matchers: vec![],
         matchers: vec![LabelMatcher {
             key: "job".to_string(),
             op: MatchOp::Eq,

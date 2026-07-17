@@ -1722,6 +1722,32 @@ mod tests {
             assert_eq!(body_string(res).await, fixture);
         }
 
+        /// Issue #89: the regex-`__name__` discovery result's wire golden
+        /// — `match[]={__name__=~"up.*"}` resolves both `up` series and
+        /// `up_alias`, the discovery analog of #85's query-path regex-name
+        /// resolution. Byte-exact against the pinned Prometheus capture.
+        #[tokio::test]
+        async fn series_name_regex_matches_the_captured_prometheus_response() {
+            let fixture = include_str!("../../tests/fixtures/prom_api/series.name_regex_get.json");
+            let res = series_response(vec![
+                vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                vec![
+                    ("__name__".to_string(), "up".to_string()),
+                    ("instance".to_string(), "localhost:9101".to_string()),
+                    ("job".to_string(), "node".to_string()),
+                ],
+                vec![
+                    ("__name__".to_string(), "up_alias".to_string()),
+                    ("instance".to_string(), "localhost:9100".to_string()),
+                ],
+            ]);
+            assert_eq!(body_string(res).await, fixture);
+        }
+
         #[tokio::test]
         async fn query_exemplars_matches_the_captured_prometheus_response() {
             let fixture =

@@ -254,6 +254,27 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     assert!(query_body.contains("\"resultType\":\"vector\""));
     assert!(query_body.contains("\"job\":\"web\""));
 
+    // Issue #89 (AC4): a regex-`__name__` discovery selector is now served
+    // rather than rejected — unlike the concrete-name/matcher-only paths
+    // above (which read `metric_series` directly), it resolves candidate
+    // metric names through the label cache under the fan-out cap, so it is
+    // asserted here, after the cache-warm poll. `{__name__=~"up.*"}`
+    // resolves `up` and returns its seeded series (one flat `metric_name
+    // IN … AND fingerprint IN …` fetch).
+    let name_regex = "%7B__name__%3D~%22up.%2A%22%7D"; // {__name__=~"up.*"}
+    let (status, body) = http_get(port, &format!("/api/v1/series?match[]={name_regex}"))
+        .expect("/series (name regex) reachable");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("\"__name__\":\"up\""), "body: {body}");
+    assert!(body.contains("\"job\":\"api\""), "body: {body}");
+    assert!(body.contains("\"job\":\"web\""), "body: {body}");
+
+    let (status, body) = http_get(port, &format!("/api/v1/labels?match[]={name_regex}"))
+        .expect("/labels (name regex) reachable");
+    assert_eq!(status, 200, "body: {body}");
+    assert!(body.contains("__name__"), "body: {body}");
+    assert!(body.contains("job"), "body: {body}");
+
     let (status, body) =
         http_get(port, "/api/v1/status/tsdb").expect("/api/v1/status/tsdb reachable");
     assert_eq!(status, 200);
@@ -271,6 +292,136 @@ async fn prom_api_serves_discovery_and_query_against_real_clickhouse() {
     assert_eq!(status, 400);
     assert!(body.contains("\"errorType\":\"bad_data\""), "body: {body}");
     assert!(!body.contains("\"position\""), "body: {body}");
+
+    let bootstrap = ChClient::new(test_ch_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    bootstrap
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            pulsus_clickhouse::Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+}
+
+/// Issue #89 (AC5): a regex-`__name__` discovery selector whose resolved
+/// candidate-name set exceeds `PULSUS_PROMQL_MAX_METRIC_FANOUT` is
+/// `422 execution` — the same `QueryTooBroad(MetricFanout)` mapping the
+/// query path uses, now reached from the discovery surface. A dedicated
+/// server process (the cap is a load-time config knob) seeded with two
+/// metric names and a cap of 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn prom_api_name_regex_discovery_over_the_fanout_cap_is_422_execution() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test");
+        return;
+    }
+
+    let db = "pulsus_prom_api_live_fanout_test";
+    let port: u16 = 31_102;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pulsusdb"))
+        .env("PULSUS_HOST", "127.0.0.1")
+        .env("PULSUS_PORT", port.to_string())
+        .env("PULSUS_CACHE_TTL", "1s")
+        // The cap under test: two matching metric names resolve, one is
+        // the ceiling -> the fan-out breach the assertion pins.
+        .env("PULSUS_PROMQL_MAX_METRIC_FANOUT", "1")
+        .env(
+            "CLICKHOUSE_SERVER",
+            std::env::var("PULSUS_TEST_CH_HOST").unwrap_or_else(|_| "localhost".to_string()),
+        )
+        .env(
+            "CLICKHOUSE_HTTP_PORT",
+            std::env::var("PULSUS_TEST_CH_HTTP_PORT").unwrap_or_else(|_| "19123".to_string()),
+        )
+        .env("CLICKHOUSE_DB", db)
+        .spawn()
+        .expect("spawn pulsusdb");
+    let _guard = ChildGuard(child);
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut became_ready = false;
+    while Instant::now() < deadline {
+        if let Some((200, _)) = http_get(port, "/ready") {
+            became_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(became_ready, "/ready never reached 200 within 60s");
+
+    let client = ChClient::new(test_ch_config(db))
+        .await
+        .expect("connect to seed data");
+    let bucket_ms: i64 = 3_600_000;
+    let now = now_ms();
+    let recent_bucket = (now / bucket_ms) * bucket_ms;
+    // Two distinct metric names, both matching `up.*` -> a resolved
+    // candidate-name set of 2 against a cap of 1.
+    client
+        .insert_block(
+            "metric_series",
+            &[
+                SeedSeriesRow {
+                    metric_name: "up".to_string(),
+                    fingerprint: 1,
+                    unix_milli: recent_bucket,
+                    labels: r#"{"job":"api"}"#.to_string(),
+                },
+                SeedSeriesRow {
+                    metric_name: "up_alias".to_string(),
+                    fingerprint: 2,
+                    unix_milli: recent_bucket,
+                    labels: r#"{"job":"web"}"#.to_string(),
+                },
+            ],
+        )
+        .await
+        .expect("seed metric_series");
+
+    // Warm the label cache with BOTH seeded names before asserting. The
+    // fan-out count is taken over the resident snapshot, so until both `up`
+    // and `up_alias` are swept in the name-less selector can transiently
+    // fail as `NamelessSelectorUnresolvable` (a cold-cache race) — which
+    // maps to the *same* (422, "execution") tuple as the fan-out breach
+    // (prom_api/error.rs), differing only in message text. Warming first
+    // makes the breach deterministic so the message assertion below proves
+    // the FAN-OUT CAP specifically, not the cold-cache race. `status/tsdb`
+    // is served entirely from the resident label cache (zero ClickHouse),
+    // so its `numSeries` reaching 2 is a direct signal that both seeded
+    // series are resident — and unlike `/query` it needs no seeded samples
+    // (this test seeds `metric_series` rows only).
+    let warm_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((200, body)) = http_get(port, "/api/v1/status/tsdb")
+            && body.contains("\"numSeries\":2")
+            && body.contains("up_alias")
+        {
+            break;
+        }
+        if Instant::now() > warm_deadline {
+            panic!("label cache never warmed with both seeded names within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Both names are resident: the name-less selector now resolves 2 names
+    // against a cap of 1 -> a deterministic fan-out breach.
+    let name_regex = "%7B__name__%3D~%22up.%2A%22%7D"; // {__name__=~"up.*"}
+    let (status, body) = http_get(port, &format!("/api/v1/series?match[]={name_regex}"))
+        .expect("/series (name regex over cap) reachable");
+    assert_eq!(status, 422, "body: {body}");
+    assert!(body.contains("\"errorType\":\"execution\""), "body: {body}");
+    // Discriminate the fan-out breach from the (identically-tupled)
+    // `NamelessSelectorUnresolvable` cold-cache error by its message text:
+    // only the fan-out message names the cap knob.
+    assert!(
+        body.contains("fan-out cap (reader.promql_max_metric_fanout)"),
+        "expected the fan-out-cap breach message, not the nameless-unresolvable one; body: {body}"
+    );
 
     let bootstrap = ChClient::new(test_ch_config("default"))
         .await

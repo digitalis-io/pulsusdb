@@ -585,6 +585,11 @@ impl MetricsEngine {
     /// unioned and deduplicated by `(metric_name, fingerprint)` (a
     /// fingerprint is shared across metric names — see
     /// `super::refresh::run_sweep`'s own comment on the same invariant).
+    ///
+    /// Issue #89: a filter carrying regex/negated `__name__` matchers
+    /// instead routes through [`Self::discovery_sql_for`]'s cache-resolved
+    /// flat IN×IN fetch — still one `metric_series` query per filter, still
+    /// window-bound in SQL.
     async fn discovery_series(
         &self,
         filters: &[DiscoveryFilter],
@@ -596,11 +601,18 @@ impl MetricsEngine {
         } else {
             filters.to_vec()
         };
-        let fetches = effective.iter().map(|filter| {
-            let sql =
-                super::sql::discovery_query(&self.config.series_table, filter, window, bucket_ms);
-            self.fetch_rows::<super::rows::SeriesRow>(sql)
-        });
+        // Resolve pre-pass (synchronous, in-process cache reads only) —
+        // a filter whose name matchers can be answered statically
+        // contributes no query at all.
+        let mut sqls: Vec<String> = Vec::with_capacity(effective.len());
+        for filter in &effective {
+            if let Some(sql) = self.discovery_sql_for(filter, window, bucket_ms)? {
+                sqls.push(sql);
+            }
+        }
+        let fetches = sqls
+            .into_iter()
+            .map(|sql| self.fetch_rows::<super::rows::SeriesRow>(sql));
         let results: Vec<Result<Vec<super::rows::SeriesRow>, ReadError>> = join_all(fetches).await;
         let mut seen: std::collections::HashSet<(String, Fingerprint)> =
             std::collections::HashSet::new();
@@ -613,6 +625,103 @@ impl MetricsEngine {
             }
         }
         Ok(out)
+    }
+
+    /// Builds one [`DiscoveryFilter`]'s `metric_series` query (issue #89's
+    /// discovery/query-path selector parity), or `None` when the filter is
+    /// statically empty and needs no round-trip at all. Three routes:
+    ///
+    /// - **concrete name** (`metric_name = Some(n)`): any non-`Eq`
+    ///   `__name__` matchers are evaluated once against `n`
+    ///   ([`super::labels::concrete_name_matches`], the query path's own
+    ///   helper); a miss is `None`, a hit is the existing
+    ///   [`super::sql::discovery_query`] — byte-unchanged.
+    /// - **name-matcher-only** (`metric_name = None`, `name_matchers`
+    ///   non-empty): candidate `(metric_name, fingerprint)` pairs resolve
+    ///   in-process via [`super::labels::LabelCache::resolve_multi_metric`]
+    ///   under the fan-out cap, then ONE
+    ///   [`super::sql::discovery_fetch_multi`] fetch — the request window
+    ///   re-applied there, so the cache's wider residency window cannot
+    ///   leak into the response. A degraded cache is a named error, never
+    ///   an unbounded scan (`MultiMetricResolution` has no SQL-fallback
+    ///   variant).
+    /// - **matcher-only / unfiltered** (`name_matchers` empty): the
+    ///   existing unscoped [`super::sql::discovery_query`], byte-unchanged
+    ///   and deliberately NOT routed through the fan-out cap —
+    ///   `{job="api"}` must not fail on a deployment with many metric
+    ///   names, and its SQL already prunes without a resolved name set.
+    fn discovery_sql_for(
+        &self,
+        filter: &DiscoveryFilter,
+        window: DataWindow,
+        bucket_ms: i64,
+    ) -> Result<Option<String>, ReadError> {
+        let discovery_query =
+            || super::sql::discovery_query(&self.config.series_table, filter, window, bucket_ms);
+        let Some(name) = filter.metric_name.as_deref() else {
+            if filter.name_matchers.is_empty() {
+                return Ok(Some(discovery_query()));
+            }
+            return self.discovery_multi_sql(filter, window, bucket_ms);
+        };
+        match super::labels::concrete_name_matches(&filter.name_matchers, name) {
+            Ok(true) => Ok(Some(discovery_query())),
+            Ok(false) => Ok(None),
+            Err(reason) => Err(ReadError::NamelessSelectorUnresolvable {
+                reason: format!("{reason:?}"),
+            }),
+        }
+    }
+
+    /// The name-matcher discovery route: cache resolution (capped) ->
+    /// one flat `metric_name IN (…) AND fingerprint IN (…)` fetch. Error
+    /// mapping mirrors [`Self::plan_multi_metric_fetch`] exactly.
+    fn discovery_multi_sql(
+        &self,
+        filter: &DiscoveryFilter,
+        window: DataWindow,
+        bucket_ms: i64,
+    ) -> Result<Option<String>, ReadError> {
+        let resolution = self.resolver.resolve_multi_metric(
+            &filter.name_matchers,
+            &filter.matchers,
+            window,
+            self.config.max_metric_fanout,
+        );
+        let groups: Vec<MetricSeriesGroup> = match resolution {
+            MultiMetricResolution::Groups(groups) => groups,
+            MultiMetricResolution::Unresolvable { reason } => {
+                return Err(ReadError::NamelessSelectorUnresolvable {
+                    reason: format!("{reason:?}"),
+                });
+            }
+            MultiMetricResolution::FanoutExceeded { matched, cap } => {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
+                    matched,
+                    cap,
+                }));
+            }
+        };
+        if groups.is_empty() {
+            return Ok(None);
+        }
+        // Group order is sorted-by-name and fingerprints are sorted within
+        // each group (the resolver's contract), so the rendered IN lists
+        // are deterministic.
+        let names: Vec<String> = groups.iter().map(|g| g.metric_name.clone()).collect();
+        let mut fps: Vec<Fingerprint> = groups
+            .iter()
+            .flat_map(|g| g.series.iter().map(|(fp, _)| *fp))
+            .collect();
+        fps.sort_unstable();
+        fps.dedup();
+        Ok(Some(super::sql::discovery_fetch_multi(
+            &self.config.series_table,
+            &names,
+            &fps,
+            window,
+            bucket_ms,
+        )))
     }
 
     /// `GET|POST /api/v1/labels` (issue #32): the union of label keys over

@@ -35,13 +35,24 @@ pub struct DataWindow {
 /// `/label/{name}/values` contract when `match[]` is omitted entirely,
 /// docs/api.md §3.3) as the single filter `DiscoveryFilter { metric_name:
 /// None, matchers: vec![] }`. `/series` requires at least one selector
-/// (enforced by the caller, `pulsus-server`'s param parsing) with a
-/// concrete metric name (the #31 planner's own structural contract — a
-/// nameless/regex-`__name__` PromQL selector is `PromqlError::Unsupported`
-/// before it ever reaches this type).
+/// (enforced by the caller, `pulsus-server`'s param parsing).
+///
+/// Issue #89 brings the discovery path to the query path's selector
+/// parity: a regex/negated `__name__` matcher is no longer rejected at
+/// parse time but extracted into [`DiscoveryFilter::name_matchers`],
+/// which `MetricsEngine::discovery_series` resolves to candidate metric
+/// names through the label cache (bounded by the fan-out cap) before one
+/// flat `metric_name IN (…) AND fingerprint IN (…)` fetch. `metric_name`
+/// and `name_matchers` are never both meaningful for the same `__name__`
+/// matcher: an `Eq` name populates `metric_name`, anything else
+/// populates `name_matchers`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveryFilter {
     pub metric_name: Option<String>,
+    /// Non-`Eq` (`Re`/`Nre`/`Neq`) `__name__` matchers — empty for the
+    /// common concrete-name and matcher-only cases, which keep their
+    /// existing single-query SQL paths untouched.
+    pub name_matchers: Vec<LabelMatcher>,
     pub matchers: Vec<LabelMatcher>,
 }
 

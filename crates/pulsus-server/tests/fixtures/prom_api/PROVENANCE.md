@@ -103,6 +103,19 @@ to match this captured evidence — see that function's own doc comment in
   strip suffixes (code-review round-1 finding, disposition: not a defect,
   kept verbatim).
 
+## Regex-`__name__` discovery fixture (issue #89)
+
+- `series.name_regex_get.json` — `match[]={__name__=~"up.*"}`: the
+  discovery analog of #85's query-path regex-name resolution, added to
+  lock issue #89's discovery/query-path selector parity. `{__name__=~"up.*"}`
+  matches both seeded `up` series (`instance` `9100`/`9101`) and
+  `up_alias` (`instance="localhost:9100"`), never `http_requests_total` —
+  proving regex `__name__` in `match[]` is now served (not a parse-time
+  rejection). Reuses the existing seed set (`up`, `up_alias` already
+  present from the issue #37 round-3 addition), so every prior fixture
+  stays byte-identical. Encoder-side wire golden asserted in
+  `src/prom_api/encode.rs`.
+
 ## `status/tsdb`'s `numSamples` (code-review round-1 fix)
 
 The original implementation queried `SELECT count() FROM metric_samples`

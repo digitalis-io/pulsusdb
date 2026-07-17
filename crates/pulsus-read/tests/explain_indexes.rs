@@ -987,6 +987,87 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     assert_eq!(single_usage, expected_metric_samples_fetch_usage());
 }
 
+// A pair of `metric_series` rows across TWO metric names sharing one
+// activity bucket — the discovery-side fan-out shape is only meaningful
+// over >= 2 metric names, and the flat `IN`×`IN` prune needs genuine data
+// in the queried partition/time-range so the optimizer keeps a real
+// `ReadFromMergeTree` (not a short-circuited `NullSource`).
+const SFP1: u64 = 18_374_000_000_000_000_004;
+const SFP2: u64 = 18_374_000_000_000_000_005;
+
+async fn seed_metric_series(client: &ChClient, db: &str, now_ms: i64) {
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
+                 VALUES ('sv', {SFP1}, {now_ms}, '{{\"job\":\"api\"}}'), \
+                        ('sv2', {SFP2}, {now_ms}, '{{\"job\":\"api\"}}')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed metric_series");
+}
+
+/// Issue #89 (discovery-path selector parity) — the regex/negated-
+/// `__name__` discovery fan-out gate: the flat `discovery_fetch_multi` SQL
+/// (one query, `metric_name IN (…)` + `fingerprint IN (…)`) must engage
+/// BOTH components of the `(metric_name, fingerprint, unix_milli)` primary
+/// key on `metric_series` in the live ClickHouse plan — the same Tier-1
+/// evidence class as #85's `sample_fetch_multi` gate on `metric_samples`,
+/// carried onto the discovery table the `/series`+`/labels` name-matcher
+/// selector resolves against. The `IN`-set prune is what keeps the
+/// cache-resolved fan-out bounded instead of a name-less full scan.
+#[tokio::test]
+async fn discovery_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_keys() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_discovery_multi";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_series(&client, db, now_ms).await;
+
+    // The real fetch SQL a name-matcher discovery filter's resolved
+    // (name, fp) set produces — the same builder
+    // `MetricsEngine::discovery_multi_sql` renders. `bucket_ms = 1` floors
+    // to the exact bounds (the flooring itself is unit-tested in `sql.rs`),
+    // so the seeded now-stamped rows stay inside the queried window and the
+    // primary-key analysis runs against a populated part.
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let table = format!("{db}.metric_series");
+    let sql = pulsus_read::metrics::sql::discovery_fetch_multi(
+        &table,
+        &["sv".to_string(), "sv2".to_string()],
+        &[SFP1, SFP2],
+        window,
+        1,
+    );
+
+    let usage = explain(&client, &sql).await;
+    assert_eq!(
+        usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "fingerprint",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), and((fingerprint in #-element set), (metric_name in #-element set))))",
+        ]),
+        "both the metric_name IN and fingerprint IN components must engage the metric_series primary key"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Issue M6-10 (AC3, the launch's named rollup-vs-raw gate): an un-piped
 // `count_over_time` stays rollup-served (`log_metrics_<res>`); an
