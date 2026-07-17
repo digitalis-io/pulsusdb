@@ -1,5 +1,5 @@
 {
-  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan).",
+  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan). Issue #82 (M6-05b) adds the `target_info` info-metric family (one series per instance — instance-keyed ONLY, no job, matching the base families' identifying labels; data labels `version`/`env`) plus three `info(...)` entries x 2 modes, growing the pinned matrix 156 -> 162 rows; both compose files' Prometheus oracle gained --enable-feature=promql-experimental-functions for them.",
   "seed": 424242,
   "step_ms": 15000,
   "sample_count": 40,
@@ -9,14 +9,16 @@
     "gauge_instances": 23,
     "gauge_slots": 3,
     "counter_instances": 68,
-    "histogram_instances": 6
+    "histogram_instances": 6,
+    "target_info_instances": 23
   },
   "full": {
     "services": 5,
     "gauge_instances": 225,
     "gauge_slots": 3,
     "counter_instances": 680,
-    "histogram_instances": 58
+    "histogram_instances": 58,
+    "target_info_instances": 225
   },
   "query_matrix": [
     { "expr": "mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
@@ -121,6 +123,10 @@
     { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} or rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]))", "modes": ["instant", "range"] },
     { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\"} or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-2\"} * 1))", "modes": ["instant", "range"] },
     { "expr": "(mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} > 200000150) or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} * 1)", "modes": ["instant", "range"] },
-    { "expr": "sum by(__name__)(label_replace(rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]) or delta(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}[5m]), \"__name__\", \"$1\", \"__name__\", \"(.+)\"))", "modes": ["instant", "range"] }
+    { "expr": "sum by(__name__)(label_replace(rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]) or delta(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}[5m]), \"__name__\", \"$1\", \"__name__\", \"(.+)\"))", "modes": ["instant", "range"] },
+
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"}, {version=~\".+\"})", "modes": ["instant", "range"] },
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}, {__name__=\"target_info\"})", "modes": ["instant", "range"] }
   ]
 }

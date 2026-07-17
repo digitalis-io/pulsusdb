@@ -46,6 +46,18 @@ use serde::{Deserialize, Serialize};
 pub const GAUGE_METRIC: &str = "mem_usage_bytes";
 pub const COUNTER_METRIC: &str = "requests_total";
 pub const HISTOGRAM_METRIC: &str = "request_duration_seconds";
+/// Issue #82 (M6-05b): the info-metric family the `info(...)` query
+/// matrix rows join against. Keyed by `instance` ONLY (the #82 round-2
+/// adjudication): the base families carry `service`+`instance` and no
+/// `job`, and info-join signatures match on the PRESENT identifying
+/// labels (`instance`, `job`) — a `job`-carrying target_info series
+/// could never signature-match this corpus, so the differential would
+/// "pass" as a no-op. One series per corpus instance, constant value 1
+/// across the whole window (no gaps/staleness — every instant/range
+/// step joins deterministically), carrying two data labels
+/// ([`target_info_version`]/[`target_info_env`]) whose live appearance
+/// on the enriched output `metrics.rs` asserts explicitly.
+pub const INFO_METRIC: &str = "target_info";
 
 /// The histogram family's collector-flattened suffix names (module doc
 /// comment: the actual `_bucket`/`_sum`/`_count` split happens in the
@@ -101,6 +113,12 @@ pub struct FamilyCounts {
     pub gauge_slots: usize,
     pub counter_instances: usize,
     pub histogram_instances: usize,
+    /// Issue #82: how many [`INFO_METRIC`] series to emit — one per
+    /// instance index (`instance` is the sole identifying label; no
+    /// per-service dimension). Sized to the gauge instance count in the
+    /// shipped fixture so every `mem_usage_bytes` series has a matching
+    /// info series.
+    pub target_info_instances: usize,
 }
 
 /// Generation parameters for one corpus (issue #33 architect plan
@@ -206,6 +224,11 @@ pub struct Corpus {
     pub gauges: Vec<GaugeSeries>,
     pub counters: Vec<CounterSeries>,
     pub histograms: Vec<HistogramSeries>,
+    /// Issue #82: [`INFO_METRIC`] series count — series `i` carries
+    /// `instance = instance_label(i)` plus the two deterministic data
+    /// labels; identity is fully derived from the index (no per-series
+    /// struct needed).
+    pub target_info_instances: usize,
     pub histogram_bounds: Vec<f64>,
     pub series: Vec<SeriesSpec>,
     pub expected_series: usize,
@@ -305,6 +328,19 @@ impl Corpus {
                     ("service", &service),
                 ]),
                 buckets,
+            });
+        }
+
+        for i in 0..self.target_info_instances {
+            out.push(DiscoverableSeries {
+                labels: sorted_labels(&[
+                    ("__name__", INFO_METRIC),
+                    ("env", &target_info_env(i)),
+                    ("instance", &instance_label(i)),
+                    (RUN_ID_LABEL, &self.run_id),
+                    ("version", &target_info_version(i)),
+                ]),
+                buckets: self.bucket_span(0, self.sample_count.saturating_sub(1)),
             });
         }
 
@@ -690,6 +726,13 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
         });
     }
 
+    for _ in 0..f.target_info_instances {
+        series.push(SeriesSpec {
+            metric_name: INFO_METRIC.to_string(),
+            samples_emitted: spec.sample_count,
+        });
+    }
+
     let expected_series = series.len();
     let expected_samples: usize = series.iter().map(|s| s.samples_emitted).sum();
 
@@ -706,6 +749,7 @@ pub fn generate(spec: &CorpusSpec) -> Corpus {
         gauges,
         counters,
         histograms,
+        target_info_instances: f.target_info_instances,
         histogram_bounds: spec.histogram_bounds.clone(),
         series,
         expected_series,
@@ -741,6 +785,23 @@ pub fn instance_label(instance_idx: usize) -> String {
 
 pub fn slot_label(slot_idx: usize) -> String {
     format!("slot-{slot_idx}")
+}
+
+/// Issue #82: the [`INFO_METRIC`] `version` data label — deterministic
+/// per instance index, non-empty for every index (the `info(...,
+/// {version=~".+"})` matrix row must match every info series).
+pub fn target_info_version(instance_idx: usize) -> String {
+    format!("v1.{}.0", instance_idx % 3)
+}
+
+/// Issue #82: the [`INFO_METRIC`] `env` data label — deterministic per
+/// instance index, non-empty for every index.
+pub fn target_info_env(instance_idx: usize) -> String {
+    if instance_idx.is_multiple_of(2) {
+        "prod".to_string()
+    } else {
+        "staging".to_string()
+    }
 }
 
 /// Builds this corpus's OTLP `ExportMetricsServiceRequest` JSON bodies,
@@ -819,7 +880,23 @@ fn build_request(c: &Corpus, ts_idx: usize) -> serde_json::Value {
         })
         .collect();
 
-    let mut metrics = Vec::with_capacity(3);
+    let target_info_points: Vec<serde_json::Value> = (0..c.target_info_instances)
+        .map(|i| {
+            let attrs = vec![
+                otlp_attr("instance", &instance_label(i)),
+                otlp_attr("version", &target_info_version(i)),
+                otlp_attr("env", &target_info_env(i)),
+                otlp_attr(RUN_ID_LABEL, &c.run_id),
+            ];
+            serde_json::json!({
+                "attributes": attrs,
+                "timeUnixNano": time_ns,
+                "asDouble": 1.0,
+            })
+        })
+        .collect();
+
+    let mut metrics = Vec::with_capacity(4);
     if !gauge_points.is_empty() {
         metrics.push(serde_json::json!({
             "name": GAUGE_METRIC,
@@ -838,6 +915,14 @@ fn build_request(c: &Corpus, ts_idx: usize) -> serde_json::Value {
             "isMonotonic": true,
         },
     }));
+    if !target_info_points.is_empty() {
+        metrics.push(serde_json::json!({
+            "name": INFO_METRIC,
+            "unit": "1",
+            "description": "issue #82 e2e differential info-metric corpus",
+            "gauge": { "dataPoints": target_info_points },
+        }));
+    }
     metrics.push(serde_json::json!({
         "name": HISTOGRAM_METRIC,
         "unit": "s",
@@ -867,6 +952,7 @@ mod tests {
             gauge_slots: 2,
             counter_instances: 5,
             histogram_instances: 2,
+            target_info_instances: 4,
         }
     }
 
@@ -907,9 +993,51 @@ mod tests {
         let hist_series = f.services * f.histogram_instances * series_per_hist;
         assert_eq!(
             c.expected_series,
-            gauge_series + counter_series + hist_series
+            gauge_series + counter_series + hist_series + f.target_info_instances
         );
         assert_eq!(c.series.len(), c.expected_series);
+    }
+
+    /// Issue #82: target_info series are keyed by `instance` ONLY (no
+    /// `service`, no `job` — a job-carrying info series could never
+    /// signature-match this corpus's base families), carry the two
+    /// non-empty data labels, and never gap (every step joins).
+    #[test]
+    fn target_info_series_are_instance_keyed_gap_free_and_carry_data_labels() {
+        let c = generate(&spec(21));
+        let info: Vec<_> = c
+            .discoverable_series()
+            .into_iter()
+            .filter(|d| {
+                d.labels
+                    .contains(&("__name__".to_string(), INFO_METRIC.to_string()))
+            })
+            .collect();
+        assert_eq!(info.len(), small_families().target_info_instances);
+        for d in &info {
+            let keys: Vec<&str> = d.labels.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec!["__name__", "env", "instance", "run_id", "version"]
+            );
+            for (k, v) in &d.labels {
+                assert!(!v.is_empty(), "{k} must be non-empty");
+            }
+        }
+
+        // Every per-timestamp OTLP request carries every info point — no
+        // gaps, no staleness.
+        for req in to_otlp_export_requests(&c) {
+            let metrics = req["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+                .as_array()
+                .unwrap();
+            let info_metric = metrics.iter().find(|m| m["name"] == INFO_METRIC).unwrap();
+            let points = info_metric["gauge"]["dataPoints"].as_array().unwrap();
+            assert_eq!(points.len(), small_families().target_info_instances);
+            for p in points {
+                assert_eq!(p["asDouble"], 1.0);
+            }
+        }
     }
 
     #[test]
@@ -956,6 +1084,7 @@ mod tests {
             gauge_slots: 3,
             counter_instances: 680,
             histogram_instances: 58,
+            target_info_instances: 225,
         };
         let s = CorpusSpec {
             seed: 1,

@@ -51,6 +51,10 @@ services:
       # this variant so the `grafana` service below can exercise the
       # `/loki/api/v1/*` surface through a real Loki datasource.
       PULSUS_COMPAT_ENDPOINTS: "true"
+      # Issue #82 (M6-05b): the info() differential rows plan only under
+      # the experimental gate — flag parity with the prometheus oracle's
+      # --enable-feature=promql-experimental-functions below.
+      PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS: "true"
     networks:
       pulsus-e2e-single:
         ipv4_address: 172.29.0.11
@@ -111,6 +115,12 @@ services:
       # opt-in flag so the differential validates live parity under
       # matching flag state (adjudicated on #86).
       - --enable-feature=promql-delayed-name-removal
+      # Issue #82 (M6-05b): the info() matrix rows are experimental at
+      # v3.13.0 — without this flag the oracle cannot execute info() at
+      # all (verified: flag-off is a 400 parse error). Flag parity with
+      # the pulsusdb service's PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS
+      # below (#82 adjudication 5, the duration-expr precedent).
+      - --enable-feature=promql-experimental-functions
     volumes:
       - ${PULSUS_E2E_ROOT}/deploy/e2e/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     networks:

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::parser::{lex, Expr, INVALID_QUERY_INFO};
+use crate::parser::{Expr, INVALID_QUERY_INFO, lex};
 
 /// Parse the given query literal to an AST (which is [`Expr`] in this crate).
 pub fn parse(input: &str) -> Result<Expr, String> {
@@ -21,7 +21,18 @@ pub fn parse(input: &str) -> Result<Expr, String> {
         Ok(lexer) => {
             // NOTE: the errs is ignored so far.
             let (res, _errs) = crate::promql_y::parse(&lexer);
-            res.ok_or_else(|| String::from(INVALID_QUERY_INFO))?
+            let expr = res.ok_or_else(|| String::from(INVALID_QUERY_INFO))??;
+            // PATCHES.md #6: the empty-selector rejection runs over the
+            // finished tree so info()'s second argument can be exempted
+            // (upstream `BypassEmptyMatcherCheck`, v3.13.0). A rejected
+            // tree is dismantled iteratively so this path adds no stack
+            // use beyond the generated parser's own recursion bound
+            // (see `dismantle`'s doc).
+            if let Err(e) = crate::parser::ast::check_no_empty_selectors(&expr) {
+                crate::parser::ast::dismantle(expr);
+                return Err(e);
+            }
+            Ok(expr)
         }
     }
 }
@@ -39,12 +50,12 @@ mod tests {
     use crate::parser;
     use crate::parser::function::get_function;
     use crate::parser::{
-        token, AtModifier as At, BinModifier, Expr, FunctionArgs, LabelModifier, Offset,
-        VectorMatchCardinality, VectorSelector, INVALID_QUERY_INFO,
+        AtModifier as At, BinModifier, Expr, FunctionArgs, INVALID_QUERY_INFO, LabelModifier,
+        Offset, VectorMatchCardinality, VectorSelector, token,
     };
     use crate::util::duration;
     use crate::{
-        label::{Labels, MatchOp, Matcher, Matchers, METRIC_NAME},
+        label::{Labels, METRIC_NAME, MatchOp, Matcher, Matchers},
         util::duration::{DAY_DURATION, HOUR_DURATION, MINUTE_DURATION, YEAR_DURATION},
     };
     use std::time::Duration;
@@ -108,12 +119,11 @@ mod tests {
             ("08", Expr::from(8.0)),
             ("+5.5e-3", Expr::from(0.0055)),
             ("-0755", Expr::from(-493.0)),
-
             // for abnormal input
             ("NaN", Expr::from(f64::NAN)),
             (
                 "999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
-                Expr::from(f64::INFINITY)
+                Expr::from(f64::INFINITY),
             ),
         ];
         assert_cases(Case::new_expr_cases(cases));
@@ -773,9 +783,18 @@ mod tests {
         assert_cases(Case::new_expr_cases(cases));
 
         let cases = vec![
-            (r#"-"string""#, "unary expression only allowed on expressions of type scalar or vector, got: string"),
-            ("-test[5m]", "unary expression only allowed on expressions of type scalar or vector, got: matrix"),
-            (r#"-"foo""#, "unary expression only allowed on expressions of type scalar or vector, got: string"),
+            (
+                r#"-"string""#,
+                "unary expression only allowed on expressions of type scalar or vector, got: string",
+            ),
+            (
+                "-test[5m]",
+                "unary expression only allowed on expressions of type scalar or vector, got: matrix",
+            ),
+            (
+                r#"-"foo""#,
+                "unary expression only allowed on expressions of type scalar or vector, got: string",
+            ),
         ];
         assert_cases(Case::new_fail_cases(cases));
     }
@@ -1309,8 +1328,14 @@ mod tests {
             ),
             ("MIN keep_common (some_metric)", INVALID_QUERY_INFO),
             ("MIN (some_metric) keep_common", INVALID_QUERY_INFO),
-            ("sum (some_metric) without (test) by (test)", INVALID_QUERY_INFO),
-            ("sum without (test) (some_metric) by (test)", INVALID_QUERY_INFO),
+            (
+                "sum (some_metric) without (test) by (test)",
+                INVALID_QUERY_INFO,
+            ),
+            (
+                "sum without (test) (some_metric) by (test)",
+                INVALID_QUERY_INFO,
+            ),
             (
                 "topk(some_metric)",
                 "wrong number of arguments for aggregate expression provided, expected 2, got 1",
@@ -1329,7 +1354,7 @@ mod tests {
             ),
             (
                 "rate(some_metric[5m]) @ 1234",
-                "@ modifier must be preceded by an vector selector or matrix selector or a subquery"
+                "@ modifier must be preceded by an vector selector or matrix selector or a subquery",
             ),
         ];
         assert_cases(Case::new_fail_cases(fail_cases));
@@ -2542,10 +2567,7 @@ mod tests {
     fn test_corner_fail_cases() {
         let fail_cases = vec![
             ("", "no expression found in input"),
-            (
-                "# just a comment\n\n",
-                "no expression found in input",
-            ),
+            ("# just a comment\n\n", "no expression found in input"),
             ("1+", INVALID_QUERY_INFO),
             (".", "unexpected character: '.'"),
             ("2.5.", "bad number or duration syntax: 2.5."),
@@ -2561,14 +2583,13 @@ mod tests {
             ("*test", INVALID_QUERY_INFO),
             (
                 "1 offset 1d",
-                "offset modifier must be preceded by an vector selector or matrix selector or a subquery"
+                "offset modifier must be preceded by an vector selector or matrix selector or a subquery",
             ),
             (
                 "foo offset 1s offset 2s",
-                "offset may not be set multiple times"
+                "offset may not be set multiple times",
             ),
             ("a - on(b) ignoring(c) d", INVALID_QUERY_INFO),
-
             // Fuzzing regression tests.
             ("-=", INVALID_QUERY_INFO),
             ("++-++-+-+-<", INVALID_QUERY_INFO),
@@ -2576,7 +2597,7 @@ mod tests {
             ("a>b()", "unknown function with name 'b'"),
             (
                 "rate(avg)",
-                "expected type matrix in call to function 'rate', got vector"
+                "expected type matrix in call to function 'rate', got vector",
             ),
         ];
         assert_cases(Case::new_fail_cases(fail_cases));
@@ -2585,6 +2606,19 @@ mod tests {
             // This is testing that we are not re-rendering the expression string for each error, which would timeout.
             {
                 let input = "(".to_string() + &"-{}-1".repeat(10_000) + ")" + &"[1m:]".repeat(1000);
+                let expected =
+                    Err("vector selector must contain at least one non-empty matcher".into());
+                Case { input, expected }
+            },
+            // PATCHES.md #6: an all-empty-matching selector (matchers
+            // present, all matching "") is rejected by the DEFERRED
+            // post-parse walk — the full tree is built first, so the
+            // rejection and the rejected tree's destruction must both be
+            // stack-safe (iterative walk + `ast::dismantle`). 4_000 units
+            // (~8k nested nodes) sits well inside the generated parser's
+            // own measured recursion bound (~8k units on 2 MiB).
+            {
+                let input = "(".to_string() + &r#"-{x!="a"}-1"#.repeat(4_000) + ")";
                 let expected =
                     Err("vector selector must contain at least one non-empty matcher".into());
                 Case { input, expected }

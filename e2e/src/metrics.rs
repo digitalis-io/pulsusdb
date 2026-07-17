@@ -254,6 +254,7 @@ pub async fn metrics_differential(ctx: &Ctx) -> Result<()> {
     .context("differential corpus never reached completeness on both backends")?;
 
     run_query_matrix(ctx, &corpus, &fixture).await?;
+    assert_info_enrichment(ctx, &corpus).await?;
     assert_label_resolution(ctx, &corpus).await?;
     stalenan_micro_case(ctx).await?;
 
@@ -500,6 +501,53 @@ async fn run_query_matrix(ctx: &Ctx, corpus: &Corpus, fixture: &DifferentialFixt
             compare_query(ctx, "mismatch", &expr, mode, window)
                 .await
                 .with_context(|| format!("query {expr:?} ({mode:?})"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Issue #82 (M6-05b, adjudication 3): the `info()` matrix rows must
+/// prove REAL enrichment, not just backend parity — a corpus whose
+/// target_info series could never signature-match the base families
+/// (e.g. one carrying a `job` label the gauges lack) would pass the
+/// value-matrix comparison trivially as a no-op join on BOTH engines.
+/// Re-runs the `{__name__="target_info"}` matrix row as an instant query
+/// on BOTH backends and requires every result series to carry the
+/// corpus's `version` and `env` data labels with non-empty values.
+async fn assert_info_enrichment(ctx: &Ctx, corpus: &Corpus) -> Result<()> {
+    let expr = format!(
+        r#"info(mem_usage_bytes{{{label}="{run_id}",service="svc-3"}}, {{__name__="target_info"}})"#,
+        label = corpus::RUN_ID_LABEL,
+        run_id = corpus.run_id,
+    );
+    let time = ts_param(corpus.last_ts_ms);
+    for base_url in [ctx.base_url.as_str(), ctx.prometheus_url.as_str()] {
+        let body = query_get(
+            &ctx.http,
+            base_url,
+            "/api/v1/query",
+            &[("query", expr.as_str()), ("time", time.as_str())],
+        )
+        .await?;
+        let result = body["data"]["result"]
+            .as_array()
+            .with_context(|| format!("{base_url}: data.result was not an array: {body}"))?;
+        if result.is_empty() {
+            bail!(
+                "info() enrichment probe returned an empty vector on {base_url} — the \
+                 target_info corpus family never joined ({expr})"
+            );
+        }
+        for item in result {
+            for data_label in ["version", "env"] {
+                let value = item["metric"][data_label].as_str().unwrap_or("");
+                if value.is_empty() {
+                    bail!(
+                        "info() enrichment probe on {base_url}: result series is missing the \
+                         enriched {data_label:?} data label ({item}) — the join was a no-op"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -2029,13 +2077,29 @@ mod tests {
     /// decided by the first-step drop_name latch (the 200000150
     /// threshold splits the pinned seed's noise band for the
     /// svc-0/inst-000/slot-1 gauge series both ways across the window).
+    /// Resized 156 -> 162 by issue #82 (M6-05b): 3 new entries x 2 modes
+    /// for the experimental info() metadata-join over the new
+    /// instance-keyed `target_info` corpus family (bare default-family,
+    /// `{version=~".+"}` single-data-label, and the
+    /// `{__name__="target_info"}` explicit-family form whose REAL
+    /// enrichment `assert_info_enrichment` additionally proves on both
+    /// backends — parity alone could pass a no-op join). These are the
+    /// first experimental rows in the matrix: BOTH compose files'
+    /// Prometheus oracle now runs
+    /// --enable-feature=promql-experimental-functions and the pulsusdb
+    /// services set PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS (the
+    /// duration-expr/delayed-name-removal flag-parity precedent, #82
+    /// adjudication 5) — the earlier "experimental functions cannot
+    /// appear at all" notes above describe the pre-#82 flag state.
+    /// info() passes base sample values through verbatim, so the rows
+    /// stay bit-exact-eligible.
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_fifty_six_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_two_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 156,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 156 — update \
+            rows, 162,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 162 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }

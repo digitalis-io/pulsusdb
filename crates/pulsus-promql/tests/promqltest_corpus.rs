@@ -31,6 +31,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_03_time_date.test",
     "m6_04_range_functions.test",
     "m6_05_label_sort_absence.test",
+    "m6_05b_info.test",
     "m6_06_aggregation_operators.test",
     "m6_07_operator_matrix.test",
     "m6_08a_at_subquery.test",

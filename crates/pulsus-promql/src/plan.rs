@@ -651,6 +651,32 @@ pub enum PlanExpr {
     VectorOf {
         arg: Box<PlanExpr>,
     },
+    /// Issue #82 (M6-05b, experimental): `info(v [, data-selector])` —
+    /// the metadata-join. The info-family fetch is ONE ordinary synthetic
+    /// [`SelectorSpec`] (`info_selector`, flattened into
+    /// `plan.selectors` like any other instant selector: effective
+    /// `__name__` matchers in the `metric_name`/`name_matchers` channels,
+    /// arg1's non-name matchers pushed into `matchers`, `offset`/`@`
+    /// copied from arg0's first selector — upstream `infoSelectHints`'s
+    /// first-selector rule), so the fetch layers resolve it with zero
+    /// special-casing and no new SQL shape. The join itself is
+    /// [`crate::eval::info::combine`], driven by the horizon-wide
+    /// identifying-label narrowing `eval::prepare_info` reconstructs.
+    Info {
+        base: Box<PlanExpr>,
+        info_selector: SelectorId,
+        /// The effective `__name__` matchers (post
+        /// [`crate::eval::info::effective_info_name_matchers`]): the
+        /// eligibility filter for both "ignore this base series" and
+        /// "this fetched series is a valid info source".
+        name_matchers: Vec<LabelMatcher>,
+        /// arg1's non-`__name__` matchers grouped by label name; drives
+        /// the client-side include/conflict/empty-fallback logic.
+        /// `__name__` never appears here (the structural
+        /// `removeNameFromDataLabelMatchers` port — it selects the info
+        /// family, it is not a data label).
+        data_matchers: Vec<(String, Vec<LabelMatcher>)>,
+    },
     Scalar(f64),
     /// Issue #86 (M6-08d): a **top-level** string-literal query (`"Foo"`,
     /// `("Foo")` — parens are transparent). Only ever the plan ROOT:
@@ -1759,7 +1785,141 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         });
     }
 
+    // Issue #82 (M6-05b): `info(v [, data-selector])` — experimental at
+    // the pin (`parser/functions.go:247`), gated like `max_of`/`min_of`.
+    // Out-of-line (the `resolve_subquery_fields` precedent): `plan_call`
+    // sits on the plan recursion cycle whose per-level debug-build frame
+    // budget sizes `MAX_SUBQUERY_DEPTH` — this arm's locals must not
+    // ride every recursion frame.
+    if name == "info" {
+        return plan_info(planner, args);
+    }
+
     Err(unsupported(format!("function {name}()")))
+}
+
+/// The `info()` planning arm (issue #82) — see the call site's comment
+/// for why this is a separate `#[inline(never)]` function.
+#[inline(never)]
+fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, PromqlError> {
+    {
+        if !planner.experimental {
+            return Err(unsupported(
+                "experimental function info() (requires promql-experimental-functions)",
+            ));
+        }
+        let (base_arg, label_arg) = match args {
+            [base_arg] => (base_arg, None),
+            [base_arg, label_arg] => (base_arg, Some(label_arg)),
+            _ => return Err(unsupported("info() with != 1..2 arguments")),
+        };
+        // arg0 first, so its selectors keep source-order ids and the
+        // synthetic info-family selector lands after them (AC2).
+        let base = plan_expr(planner, base_arg)?;
+
+        // arg1 must be a bare vector selector (the absent()/timestamp()
+        // bare-selector precedent): upstream type-asserts
+        // `args[1].(*parser.VectorSelector)` and would panic on anything
+        // else — rejected here as a named error instead. Only its
+        // matchers are read (upstream ignores any offset/@ on it); a
+        // bare metric name is the parser's own `__name__` equality.
+        let mut info_name_matchers: Vec<LabelMatcher> = Vec::new();
+        let mut data_matchers: Vec<(String, Vec<LabelMatcher>)> = Vec::new();
+        if let Some(arg) = label_arg {
+            let Expr::VectorSelector(vs) = arg.as_ref() else {
+                return Err(unsupported(
+                    "info() with a second argument that is not a plain label selector",
+                ));
+            };
+            if !vs.matchers.or_matchers.is_empty() {
+                return Err(or_matchers_rejection());
+            }
+            // Upstream rejects a bare metric name in this position at
+            // parse time ("expected label selectors only, got vector
+            // selector instead", parse.go:852) — mirrored here as a
+            // plan-time rejection carrying the same wording.
+            if vs.name.is_some() {
+                return Err(unsupported(
+                    "info() second argument: expected label selectors only, \
+                     got vector selector instead",
+                ));
+            }
+            for m in &vs.matchers.matchers {
+                let lm = convert_matcher(m)?;
+                if m.name == "__name__" {
+                    info_name_matchers.push(lm);
+                } else {
+                    match data_matchers.iter_mut().find(|(k, _)| *k == m.name) {
+                        Some((_, ms)) => ms.push(lm),
+                        None => data_matchers.push((m.name.clone(), vec![lm])),
+                    }
+                }
+            }
+        }
+        let effective = crate::eval::info::effective_info_name_matchers(info_name_matchers);
+
+        // Split the effective matchers into the synthetic selector's
+        // name channels, the `extract_name_and_matchers` rule: a single
+        // `Eq` is the PK-pruned single-metric fast path; anything else
+        // fans out through the name-matcher channel (issue #85).
+        let (metric_name, name_channel) = match effective.as_slice() {
+            [only] if only.op == MatchOp::Eq => (Some(only.value.clone()), Vec::new()),
+            _ => (None, effective.clone()),
+        };
+        // arg1's data matchers narrow the fetch (upstream fetchInfoSeries
+        // pushes them into its Select), flat and in source order.
+        let sel_matchers: Vec<LabelMatcher> = data_matchers
+            .iter()
+            .flat_map(|(_, ms)| ms.iter().cloned())
+            .collect();
+        // `offset`/`@` copied from arg0's FIRST selector (upstream
+        // infoSelectHints' `parser.Inspect … "end traversal"` rule); no
+        // selector → 0/None.
+        let (offset_ms, at_ms) = match first_vector_selector(base_arg) {
+            Some(vs) => (
+                planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?,
+                planner.resolve_at(&vs.at),
+            ),
+            None => (0, None),
+        };
+        let info_selector = planner.push_selector(
+            metric_name,
+            name_channel,
+            sel_matchers,
+            None,
+            offset_ms,
+            at_ms,
+        );
+        Ok(PlanExpr::Info {
+            base: Box::new(base),
+            info_selector,
+            name_matchers: effective,
+            data_matchers,
+        })
+    }
+}
+
+/// The first `VectorSelector` in pre-order source order — the port of
+/// upstream `infoSelectHints`'s `parser.Inspect(expr, …)` walk (which
+/// captures the first selector's `Timestamp`/`OriginalOffset` and ends
+/// traversal). Child order mirrors the pinned `parser.ChildrenIter`:
+/// aggregate body before its param, binary LHS before RHS, call args in
+/// source order, a matrix selector yields its inner vector selector.
+fn first_vector_selector(expr: &Expr) -> Option<&VectorSelector> {
+    match expr {
+        Expr::VectorSelector(vs) => Some(vs),
+        Expr::MatrixSelector(ms) => Some(&ms.vs),
+        Expr::Paren(p) => first_vector_selector(&p.expr),
+        Expr::Unary(u) => first_vector_selector(&u.expr),
+        Expr::Subquery(sq) => first_vector_selector(&sq.expr),
+        Expr::Aggregate(agg) => first_vector_selector(&agg.expr)
+            .or_else(|| agg.param.as_deref().and_then(first_vector_selector)),
+        Expr::Binary(bin) => {
+            first_vector_selector(&bin.lhs).or_else(|| first_vector_selector(&bin.rhs))
+        }
+        Expr::Call(call) => call.args.args.iter().find_map(|a| first_vector_selector(a)),
+        Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => None,
+    }
 }
 
 /// Extracts a string-literal argument for the label/sort functions
@@ -4451,5 +4611,204 @@ mod tests {
                 other => panic!("{query}: expected Absent without a selector, got {other:?}"),
             }
         }
+    }
+
+    // --- issue #82 (M6-05b): info() ---
+
+    /// AC1: the experimental gate, the `max_of`/`min_of` wording.
+    #[test]
+    fn m6_05b_info_is_gated_behind_the_experimental_flag() {
+        let err = plan(&parse("info(m)").unwrap(), params()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => assert!(
+                construct.contains("experimental")
+                    && construct.contains("info()")
+                    && construct.contains("promql-experimental-functions"),
+                "error must name the gate, got {construct:?}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(plan(&parse("info(m)").unwrap(), params_experimental()).is_ok());
+    }
+
+    /// AC2 (the Tier-1 pushdown gate): `info(m)` flattens exactly two
+    /// selectors — base `m` plus a `metric_name: Some("target_info")`
+    /// instant selector (the PK-pruned single-metric fast path; the fetch
+    /// SQL is byte-identical to any existing concrete-name shape).
+    #[test]
+    fn m6_05b_info_flattens_the_base_plus_one_concrete_target_info_selector() {
+        let p = plan(&parse("info(m)").unwrap(), params_experimental()).unwrap();
+        assert_eq!(p.selectors.len(), 2);
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("m"));
+        assert_eq!(p.selectors[1].metric_name.as_deref(), Some("target_info"));
+        assert!(p.selectors[1].name_matchers.is_empty());
+        assert!(p.selectors[1].matchers.is_empty());
+        assert_eq!(p.selectors[1].range_ms, None);
+        match &p.root {
+            PlanExpr::Info {
+                base,
+                info_selector,
+                name_matchers,
+                data_matchers,
+            } => {
+                assert_eq!(**base, PlanExpr::Selector(0));
+                assert_eq!(*info_selector, 1);
+                assert_eq!(
+                    name_matchers,
+                    &vec![LabelMatcher {
+                        key: "__name__".to_string(),
+                        op: MatchOp::Eq,
+                        value: "target_info".to_string(),
+                    }]
+                );
+                assert!(data_matchers.is_empty());
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    /// AC2: a regex `__name__` arg1 plans a `metric_name: None` selector
+    /// carrying the matcher in the issue-#85 name channel.
+    #[test]
+    fn m6_05b_info_regex_name_arg_plans_through_the_name_matcher_channel() {
+        let p = plan(
+            &parse(r#"info(m, {__name__=~".+_info"})"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        assert_eq!(p.selectors.len(), 2);
+        assert_eq!(p.selectors[1].metric_name, None);
+        assert_eq!(
+            p.selectors[1].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Re,
+                value: ".+_info".to_string(),
+            }]
+        );
+        assert!(p.selectors[1].matchers.is_empty());
+    }
+
+    /// AC2: arg1's data matchers are pushed onto the synthetic selector's
+    /// `matchers` (the fetch narrowing) AND grouped on the Info node.
+    #[test]
+    fn m6_05b_info_data_matchers_are_pushed_onto_the_info_selector() {
+        let p = plan(
+            &parse(r#"info(m, {data=~".+"})"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        let want = LabelMatcher {
+            key: "data".to_string(),
+            op: MatchOp::Re,
+            value: ".+".to_string(),
+        };
+        assert_eq!(p.selectors[1].metric_name.as_deref(), Some("target_info"));
+        assert_eq!(p.selectors[1].matchers, vec![want.clone()]);
+        match &p.root {
+            PlanExpr::Info { data_matchers, .. } => {
+                assert_eq!(data_matchers, &vec![("data".to_string(), vec![want])]);
+            }
+            other => panic!("expected Info, got {other:?}"),
+        }
+    }
+
+    /// An only-negative arg1 `__name__` set gets the synthetic `.+_info`
+    /// prepended (effective-matcher branch 2) — carried on both the
+    /// selector's name channel and the Info node.
+    #[test]
+    fn m6_05b_info_only_negative_name_matchers_prepend_the_synthetic_info_regex() {
+        let p = plan(
+            &parse(r#"info(m, {__name__!~"websvc_.+"})"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        assert_eq!(p.selectors[1].metric_name, None);
+        assert_eq!(p.selectors[1].name_matchers.len(), 2);
+        assert_eq!(p.selectors[1].name_matchers[0].op, MatchOp::Re);
+        assert_eq!(p.selectors[1].name_matchers[0].value, ".+_info");
+        assert_eq!(p.selectors[1].name_matchers[1].op, MatchOp::Nre);
+    }
+
+    /// The info selector copies arg0's FIRST selector's `offset`/`@`
+    /// (upstream `infoSelectHints`'s first-selector rule); a selector-free
+    /// arg0 leaves them at `0`/`None`.
+    #[test]
+    fn m6_05b_info_selector_copies_the_first_base_selector_offset_and_at() {
+        let p = plan(&parse("info(m offset 1m)").unwrap(), params_experimental()).unwrap();
+        assert_eq!(p.selectors[1].offset_ms, 60_000);
+        assert_eq!(p.selectors[1].at_ms, None);
+
+        let p = plan(&parse("info(m @ 60)").unwrap(), params_experimental()).unwrap();
+        assert_eq!(p.selectors[1].at_ms, Some(60_000));
+
+        let p = plan(
+            &parse("info(sum(rate(m[5m] offset 2m)) / on() group_left sum(n))").unwrap(),
+            params_experimental(),
+        )
+        .unwrap();
+        let info_sel = p.selectors.last().unwrap();
+        assert_eq!(info_sel.metric_name.as_deref(), Some("target_info"));
+        assert_eq!(info_sel.offset_ms, 120_000, "first selector in pre-order");
+
+        let p = plan(&parse("info(vector(1))").unwrap(), params_experimental()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("target_info"));
+        assert_eq!(p.selectors[0].offset_ms, 0);
+        assert_eq!(p.selectors[0].at_ms, None);
+    }
+
+    /// arg1 must be a bare vector selector — upstream type-asserts and
+    /// would panic on anything else; we reject by name.
+    #[test]
+    fn m6_05b_info_rejects_a_non_selector_second_argument() {
+        let err = plan(&parse("info(m, sum(x))").unwrap(), params_experimental()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => {
+                assert!(construct.contains("info()"), "{construct}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A bare metric name in arg1 is rejected — upstream's parse-time
+    /// "expected label selectors only, got vector selector instead"
+    /// (parse.go:852), mirrored as a plan-time rejection.
+    #[test]
+    fn m6_05b_info_rejects_a_bare_metric_name_second_argument() {
+        let err = plan(
+            &parse(r#"info(m, build_info{data="x"})"#).unwrap(),
+            params_experimental(),
+        )
+        .unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => assert!(
+                construct.contains("expected label selectors only, got vector selector instead"),
+                "{construct}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// The vendor patch (PATCHES.md #6): an all-empty-matching arg1 —
+    /// legal upstream via `BypassEmptyMatcherCheck` — parses and plans;
+    /// the same selector anywhere else keeps failing at parse time.
+    #[test]
+    fn m6_05b_info_arg1_bypasses_the_empty_matcher_check() {
+        for query in [
+            r#"info(m, {data=~".*"})"#,
+            r#"info(m, {__name__!="target_info"})"#,
+            r#"info(m, {__name__!~".+_info", data=~".*"})"#,
+        ] {
+            assert!(
+                plan(&parse(query).unwrap(), params_experimental()).is_ok(),
+                "{query}"
+            );
+        }
+        let err = parse(r#"{data=~".*"}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vector selector must contain at least one non-empty matcher"),
+            "{err}"
+        );
     }
 }

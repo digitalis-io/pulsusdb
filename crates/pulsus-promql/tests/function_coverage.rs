@@ -496,6 +496,9 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // promql-experimental-functions).
             "sort_by_label",
             "sort_by_label_desc",
+            // M6-05b (issue #82): the info() metadata-join, experimental
+            // (planner-gated behind promql-experimental-functions).
+            "info",
         ])
     );
     let implemented_ops: BTreeSet<&str> = manifest

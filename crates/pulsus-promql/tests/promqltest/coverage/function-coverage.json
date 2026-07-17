@@ -349,8 +349,11 @@
     {
       "name": "info",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "M6-05b"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m6_05b_info.test",
+        "query": "info(metric)"
+      }
     },
     {
       "name": "irate",

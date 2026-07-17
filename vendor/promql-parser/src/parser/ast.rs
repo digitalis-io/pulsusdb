@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::label::{Labels, Matchers, METRIC_NAME};
+use crate::label::{Labels, METRIC_NAME, Matchers};
 use crate::parser::token::{
-    self, token_display, T_BOTTOMK, T_COUNT_VALUES, T_END, T_QUANTILE, T_START, T_TOPK,
+    self, T_BOTTOMK, T_COUNT_VALUES, T_END, T_QUANTILE, T_START, T_TOPK, token_display,
 };
 use crate::parser::token::{Token, TokenId, TokenType};
 use crate::parser::value::ValueType;
-use crate::parser::{indent, Function, FunctionArgs, Prettier, MAX_CHARACTERS_PER_LINE};
+use crate::parser::{Function, FunctionArgs, MAX_CHARACTERS_PER_LINE, Prettier, indent};
 use crate::util::{display_duration, escape_string};
 use chrono::{DateTime, Utc};
 use std::fmt::{self, Write};
@@ -245,11 +245,7 @@ impl BinModifier {
     }
 
     pub fn bool_str(&self) -> &str {
-        if self.return_bool {
-            "bool "
-        } else {
-            ""
-        }
+        if self.return_bool { "bool " } else { "" }
     }
 }
 
@@ -1925,13 +1921,129 @@ fn check_ast_for_vector_selector(ex: VectorSelector) -> Result<Expr, String> {
             )),
             None => Ok(Expr::VectorSelector(ex)),
         },
-        None if ex.matchers.is_empty_matchers() => {
-            // When name is None, a vector selector must contain at least one non-empty matcher
-            // to prevent implicit selection of all metrics (e.g. by a typo).
+        // NOTE (PATCHES.md #6): the "at least one non-empty matcher"
+        // rejection for a selector CARRYING matchers no longer lives
+        // here. This reduction-time check runs before any enclosing call
+        // is known, but upstream (v3.13.0 parse.go checkAST) exempts
+        // exactly one context — `info()`'s second argument
+        // (`VectorSelector.BypassEmptyMatcherCheck`), a
+        // label-selector-only position where an all-empty-matching
+        // selector like `{data=~".*"}` is legal. That case is deferred to
+        // [`check_no_empty_selectors`], which `parse()` runs over the
+        // finished tree with the context available. The literal `{}`
+        // (zero matchers) KEEPS failing here: erroring at the first
+        // reduction short-circuits the pinned deep fuzz-regression input
+        // (`(-{}-1…` ×10k) before the generated LR parser ever builds
+        // its tree — that input sits beyond the parser's own measured
+        // recursion bound (~9k units on a 2 MiB stack, valid input
+        // included), so deferring `{}` would turn the pinned Err into a
+        // stack-overflow abort inside the grammar itself. The one
+        // recorded divergence is that `info(m, {})` stays rejected where
+        // upstream's bypass would admit it (see PATCHES.md #6).
+        None if ex.matchers.matchers.is_empty() && ex.matchers.or_matchers.is_empty() => {
             Err("vector selector must contain at least one non-empty matcher".into())
         }
         _ => Ok(Expr::VectorSelector(ex)),
     }
+}
+
+/// Iteratively dismantles a rejected AST (PATCHES.md #6): the deferred
+/// [`check_no_empty_selectors`] walk can reject a tree as deep as the
+/// generated LR parser can build (measured ~8k `-{…}-1` units on a
+/// 2 MiB stack before the GRAMMAR's own recursion — a pre-existing,
+/// input-kind-independent bound — overflows first), and letting that
+/// tree simply fall out of scope would recursively drop one stack frame
+/// per nesting level. Children are moved out of their boxes onto an
+/// explicit worklist so every shell drops shallowly — the rejection
+/// path adds O(1) stack beyond the parser's own bound. Only the `Expr`
+/// spine needs this: every other field (matchers, durations, literals)
+/// has depth bounded by its own written form independent of expression
+/// nesting.
+pub(crate) fn dismantle(expr: Expr) {
+    let mut work: Vec<Expr> = vec![expr];
+    while let Some(node) = work.pop() {
+        match node {
+            Expr::Aggregate(agg) => {
+                work.push(*agg.expr);
+                if let Some(param) = agg.param {
+                    work.push(*param);
+                }
+            }
+            Expr::Unary(u) => work.push(*u.expr),
+            Expr::Binary(b) => {
+                work.push(*b.lhs);
+                work.push(*b.rhs);
+            }
+            Expr::Paren(p) => work.push(*p.expr),
+            Expr::Subquery(sq) => work.push(*sq.expr),
+            Expr::Call(c) => work.extend(c.args.args.into_iter().map(|b| *b)),
+            Expr::NumberLiteral(_)
+            | Expr::StringLiteral(_)
+            | Expr::VectorSelector(_)
+            | Expr::MatrixSelector(_)
+            | Expr::Extension(_) => {}
+        }
+    }
+}
+
+/// The deferred "vector selector must contain at least one non-empty
+/// matcher" check (PATCHES.md #6): walks the finished tree iteratively
+/// (an explicit stack — a deep left-associative chain must not overflow
+/// the call stack where the old reduction-time check errored before ever
+/// building one) and rejects every name-less, all-empty-matching vector
+/// selector EXCEPT one in `info()`'s second-argument position — the port
+/// of upstream `BypassEmptyMatcherCheck` (v3.13.0 parse.go:846-921).
+pub(crate) fn check_no_empty_selectors(expr: &Expr) -> Result<(), String> {
+    fn selector_violates(name: &Option<String>, matchers: &Matchers) -> bool {
+        // When name is None, a vector selector must contain at least one
+        // non-empty matcher to prevent implicit selection of all metrics
+        // (e.g. by a typo).
+        name.is_none() && matchers.is_empty_matchers()
+    }
+
+    // (node, bypass): `bypass` is true only for info()'s second argument.
+    let mut stack: Vec<(&Expr, bool)> = vec![(expr, false)];
+    while let Some((node, bypass)) = stack.pop() {
+        match node {
+            Expr::VectorSelector(vs) => {
+                if !bypass && selector_violates(&vs.name, &vs.matchers) {
+                    return Err(
+                        "vector selector must contain at least one non-empty matcher".into(),
+                    );
+                }
+            }
+            Expr::MatrixSelector(ms) => {
+                // A matrix selector is never info()'s second argument
+                // (type-checked as vector), so no bypass applies.
+                if selector_violates(&ms.vs.name, &ms.vs.matchers) {
+                    return Err(
+                        "vector selector must contain at least one non-empty matcher".into(),
+                    );
+                }
+            }
+            Expr::Call(call) => {
+                let bypass_second = call.func.name == "info";
+                for (i, arg) in call.args.args.iter().enumerate() {
+                    stack.push((arg, bypass_second && i == 1));
+                }
+            }
+            Expr::Aggregate(agg) => {
+                stack.push((&agg.expr, false));
+                if let Some(param) = &agg.param {
+                    stack.push((param, false));
+                }
+            }
+            Expr::Binary(bin) => {
+                stack.push((&bin.lhs, false));
+                stack.push((&bin.rhs, false));
+            }
+            Expr::Paren(p) => stack.push((&p.expr, false)),
+            Expr::Unary(u) => stack.push((&u.expr, false)),
+            Expr::Subquery(sq) => stack.push((&sq.expr, false)),
+            Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -21,11 +21,12 @@ pub mod binop;
 pub mod datetime;
 pub mod elementwise;
 pub mod functions;
+pub(crate) mod info;
 pub mod labels;
 mod quote;
 pub mod staleness;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pulsus_model::STALE_NAN_BITS;
 
@@ -67,16 +68,22 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
     // Issue #83 (round-2 amendment): materialize every subquery ONCE over
     // its epoch-anchored union grid — inside-out for nested subqueries —
     // before any stepping; each step below only slices `(mint, maxt]`
-    // windows from the shared results.
-    let mut subqueries = SubqueryCache::default();
+    // windows from the shared results. Issue #82 rides the same pass:
+    // every `info()` node's arg0 horizon is walked once here to build
+    // its horizon-wide identifying-label narrowing (`prepare_info`).
+    let mut caches = EvalCaches::default();
     let mut inner_evals = 0u64;
     prepare_subqueries(
         &plan.root,
         &plan.selectors,
         data,
-        (p.start_ms, p.end_ms),
+        Horizon {
+            start_ms: p.start_ms,
+            end_ms: p.end_ms,
+            step_ms: p.step_ms,
+        },
         p.lookback_ms,
-        &mut subqueries,
+        &mut caches,
         &mut inner_evals,
     )?;
 
@@ -87,7 +94,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
             data,
             p.start_ms,
             p.lookback_ms,
-            &subqueries,
+            &caches,
         )? {
             StepValue::Vector(v) => QueryValue::Vector(v),
             StepValue::Scalar(s) => QueryValue::Scalar(s),
@@ -134,14 +141,7 @@ fn evaluate_counted(plan: &QueryPlan, data: &SeriesData) -> Result<(QueryValue, 
 
     let mut t = p.start_ms;
     while t <= p.end_ms {
-        match eval_step(
-            &plan.root,
-            &plan.selectors,
-            data,
-            t,
-            p.lookback_ms,
-            &subqueries,
-        )? {
+        match eval_step(&plan.root, &plan.selectors, data, t, p.lookback_ms, &caches)? {
             StepValue::Vector(v) => {
                 saw_vector = true;
                 for s in v {
@@ -369,6 +369,57 @@ struct MaterializedSeries {
 /// identity is stable; each node appears in the tree exactly once.
 type SubqueryCache = HashMap<*const SubqueryPlan, MaterializedSubquery>;
 
+/// One `info()` node's prepared horizon (issue #82): the arg0 vector
+/// materialized per evaluation step (upstream materializes the same
+/// matrix via `ev.eval(args[0])`), plus the HORIZON-WIDE
+/// identifying-label allowed-value map — built once from the full
+/// non-ignored base matrix before any per-step combining, exactly as the
+/// pin does (`fetchInfoSeries`'s `idLblValues`; the #82 round-2
+/// adjudication rejected a per-step reconstruction, which would break
+/// churn and duplicate-error semantics).
+#[derive(Debug, Clone)]
+struct PreparedInfo {
+    /// Step time → the evaluated arg0 vector at that step. Keys are
+    /// exactly the evaluation times of the node's enclosing horizon (the
+    /// query's own steps at the root, a subquery's inner grid inside
+    /// one) — `prepare_info` and the stepping phase walk the same grid.
+    base_steps: HashMap<i64, Vec<InstantSample>>,
+    /// Identifying label → its present, non-empty values across the
+    /// non-ignored base matrix. Empty ⇒ the `info.go:183` short-circuit
+    /// (zero info participation for the whole horizon).
+    id_lbl_values: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Prepared `info()` nodes keyed by the [`PlanExpr::Info`] node's address
+/// (the [`SubqueryCache`] node-identity precedent).
+type InfoCache = HashMap<*const PlanExpr, PreparedInfo>;
+
+/// Everything the prepare pass materializes before stepping begins —
+/// subquery grids (issue #83) and `info()` horizons (issue #82), bundled
+/// so [`eval_step`]'s signature carries one shared read-only handle.
+#[derive(Debug, Default)]
+struct EvalCaches {
+    subqueries: SubqueryCache,
+    infos: InfoCache,
+}
+
+/// The evaluation grid a node will be stepped over: the closed
+/// `[start_ms, end_ms]` span plus its step (`0` ⇒ a single step at
+/// `start_ms` — the instant-query shape). The query's own grid at the
+/// root; a subquery's inner grid for its inner expression.
+#[derive(Debug, Clone, Copy)]
+struct Horizon {
+    start_ms: i64,
+    end_ms: i64,
+    step_ms: i64,
+}
+
+impl Horizon {
+    fn span(self) -> (i64, i64) {
+        (self.start_ms, self.end_ms)
+    }
+}
+
 /// The first inner-grid timestamp for a subquery window `(mint, maxt]`:
 /// the smallest multiple of `step` STRICTLY GREATER than `mint` — the
 /// epoch-anchored ascending grid (upstream `runSubquery`: `subqStart :=
@@ -398,9 +449,9 @@ fn prepare_subqueries(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
     data: &SeriesData,
-    span: (i64, i64),
+    horizon: Horizon,
     lookback_ms: i64,
-    cache: &mut SubqueryCache,
+    caches: &mut EvalCaches,
     inner_evals: &mut u64,
 ) -> Result<(), PromqlError> {
     match expr {
@@ -414,22 +465,30 @@ fn prepare_subqueries(
             source,
             selectors,
             data,
-            span,
+            horizon.span(),
             lookback_ms,
-            cache,
+            caches,
             inner_evals,
         ),
         PlanExpr::OverTimeParam { source, args, .. } => {
             for a in args {
-                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+                prepare_subqueries(
+                    a,
+                    selectors,
+                    data,
+                    horizon,
+                    lookback_ms,
+                    caches,
+                    inner_evals,
+                )?;
             }
             prepare_source(
                 source,
                 selectors,
                 data,
-                span,
+                horizon.span(),
                 lookback_ms,
-                cache,
+                caches,
                 inner_evals,
             )
         }
@@ -440,13 +499,25 @@ fn prepare_subqueries(
         | PlanExpr::LabelJoin { arg, .. }
         | PlanExpr::Timestamp { arg, .. }
         | PlanExpr::ScalarOf { arg }
-        | PlanExpr::VectorOf { arg } => {
-            prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)
-        }
+        | PlanExpr::VectorOf { arg } => prepare_subqueries(
+            arg,
+            selectors,
+            data,
+            horizon,
+            lookback_ms,
+            caches,
+            inner_evals,
+        ),
         PlanExpr::DateFn { arg, .. } => match arg {
-            Some(arg) => {
-                prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)
-            }
+            Some(arg) => prepare_subqueries(
+                arg,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            ),
             None => Ok(()),
         },
         PlanExpr::HistogramQuantile { quantile, expr } => {
@@ -454,42 +525,209 @@ fn prepare_subqueries(
                 quantile,
                 selectors,
                 data,
-                span,
+                horizon,
                 lookback_ms,
-                cache,
+                caches,
                 inner_evals,
             )?;
-            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
+            prepare_subqueries(
+                expr,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )
         }
         PlanExpr::Aggregate { expr, param, .. } => {
             if let Some(p) = param {
-                prepare_subqueries(p, selectors, data, span, lookback_ms, cache, inner_evals)?;
+                prepare_subqueries(
+                    p,
+                    selectors,
+                    data,
+                    horizon,
+                    lookback_ms,
+                    caches,
+                    inner_evals,
+                )?;
             }
-            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
+            prepare_subqueries(
+                expr,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )
         }
-        PlanExpr::CountValues { expr, .. } => {
-            prepare_subqueries(expr, selectors, data, span, lookback_ms, cache, inner_evals)
-        }
+        PlanExpr::CountValues { expr, .. } => prepare_subqueries(
+            expr,
+            selectors,
+            data,
+            horizon,
+            lookback_ms,
+            caches,
+            inner_evals,
+        ),
         PlanExpr::Binary { lhs, rhs, .. } | PlanExpr::SetOp { lhs, rhs, .. } => {
-            prepare_subqueries(lhs, selectors, data, span, lookback_ms, cache, inner_evals)?;
-            prepare_subqueries(rhs, selectors, data, span, lookback_ms, cache, inner_evals)
+            prepare_subqueries(
+                lhs,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )?;
+            prepare_subqueries(
+                rhs,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )
         }
         PlanExpr::MathFn {
             arg, scalar_args, ..
         } => {
-            prepare_subqueries(arg, selectors, data, span, lookback_ms, cache, inner_evals)?;
+            prepare_subqueries(
+                arg,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )?;
             for a in scalar_args {
-                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+                prepare_subqueries(
+                    a,
+                    selectors,
+                    data,
+                    horizon,
+                    lookback_ms,
+                    caches,
+                    inner_evals,
+                )?;
             }
             Ok(())
         }
         PlanExpr::ScalarFn { args, .. } => {
             for a in args {
-                prepare_subqueries(a, selectors, data, span, lookback_ms, cache, inner_evals)?;
+                prepare_subqueries(
+                    a,
+                    selectors,
+                    data,
+                    horizon,
+                    lookback_ms,
+                    caches,
+                    inner_evals,
+                )?;
             }
             Ok(())
         }
+        // Issue #82 (M6-05b): recurse into the base FIRST (nested
+        // subqueries and nested info() nodes materialize inside-out,
+        // like `prepare_subquery`), then walk the base over this node's
+        // full horizon once to build the horizon-wide identifying-label
+        // narrowing. The info-family selector itself is a plain instant
+        // selector — never a subquery — so only `base` recurses.
+        PlanExpr::Info { base, .. } => {
+            prepare_subqueries(
+                base,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+            )?;
+            prepare_info(expr, selectors, data, horizon, lookback_ms, caches)
+        }
     }
+}
+
+/// Walks one `info()` node's arg0 over its enclosing horizon exactly
+/// once (issue #82) — the evaluation-time counterpart of upstream
+/// `evalInfo`'s `ev.eval(args[0])` matrix + `fetchInfoSeries`'s
+/// `idLblValues` construction (`info.go:150-170`), which are both
+/// horizon-wide, never per-step (the #82 round-2 adjudication). Caches
+/// each step's base vector (reused verbatim by the stepping phase — the
+/// base is never evaluated twice) and the allowed identifying-label
+/// values of every NON-ignored base series (ignored ⟺ the retained name
+/// matches all effective name matchers; empty values never register).
+fn prepare_info(
+    node: &PlanExpr,
+    selectors: &[SelectorSpec],
+    data: &SeriesData,
+    horizon: Horizon,
+    lookback_ms: i64,
+    caches: &mut EvalCaches,
+) -> Result<(), PromqlError> {
+    let PlanExpr::Info {
+        base,
+        name_matchers,
+        ..
+    } = node
+    else {
+        // Only ever called from the `PlanExpr::Info` arm above.
+        return Err(PromqlError::Unsupported {
+            construct: "prepare_info over a non-info node".to_string(),
+        });
+    };
+    let mut matcher_cache = info::MatcherCache::new();
+    let mut base_steps: HashMap<i64, Vec<InstantSample>> = HashMap::new();
+    let mut id_lbl_values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    let mut t = horizon.start_ms;
+    loop {
+        let StepValue::Vector(v) = eval_step(base, selectors, data, t, lookback_ms, caches)? else {
+            // The vendored parser type-checks info()'s first argument as
+            // an instant vector; kept total (defense-in-depth).
+            return Err(PromqlError::Unsupported {
+                construct: "info() over a non-vector expression".to_string(),
+            });
+        };
+        for s in &v {
+            let retained = s.metric_name.as_deref().unwrap_or("");
+            if info::matches_all(&mut matcher_cache, name_matchers, retained)? {
+                // Ignored (an info series itself) — contributes no
+                // identifying-label values (info.go:152-154).
+                continue;
+            }
+            for label in info::identifying_labels() {
+                if let Some(value) = s.labels.get(label)
+                    && !value.is_empty()
+                {
+                    id_lbl_values
+                        .entry(label.to_string())
+                        .or_default()
+                        .insert(value.to_string());
+                }
+            }
+        }
+        base_steps.insert(t, v);
+        // A single step for an instant query (step 0, span.0 == span.1);
+        // the enclosing horizon's own grid otherwise — exactly the steps
+        // the stepping phase will evaluate this node at.
+        if horizon.step_ms <= 0 || t >= horizon.end_ms {
+            break;
+        }
+        t += horizon.step_ms;
+    }
+
+    caches.infos.insert(
+        node as *const _,
+        PreparedInfo {
+            base_steps,
+            id_lbl_values,
+        },
+    );
+    Ok(())
 }
 
 fn prepare_source(
@@ -498,13 +736,13 @@ fn prepare_source(
     data: &SeriesData,
     span: (i64, i64),
     lookback_ms: i64,
-    cache: &mut SubqueryCache,
+    caches: &mut EvalCaches,
     inner_evals: &mut u64,
 ) -> Result<(), PromqlError> {
     match source {
         RangeSource::Selector(_) => Ok(()),
         RangeSource::Subquery(sq) => {
-            prepare_subquery(sq, selectors, data, span, lookback_ms, cache, inner_evals)
+            prepare_subquery(sq, selectors, data, span, lookback_ms, caches, inner_evals)
         }
     }
 }
@@ -521,7 +759,7 @@ fn prepare_subquery(
     data: &SeriesData,
     span: (i64, i64),
     lookback_ms: i64,
-    cache: &mut SubqueryCache,
+    caches: &mut EvalCaches,
     inner_evals: &mut u64,
 ) -> Result<(), PromqlError> {
     let (anchor_min, anchor_max) = match sq.at_ms {
@@ -545,16 +783,22 @@ fn prepare_subquery(
             &sq.inner,
             selectors,
             data,
-            (grid_start, grid_last),
+            // The inner horizon's own grid: nested subqueries AND any
+            // nested info() nodes are evaluated on it.
+            Horizon {
+                start_ms: grid_start,
+                end_ms: grid_last,
+                step_ms: sq.step_ms,
+            },
             lookback_ms,
-            cache,
+            caches,
             inner_evals,
         )?;
 
         let mut it = grid_start;
         while it <= maxt_max {
             *inner_evals += 1;
-            match eval_step(&sq.inner, selectors, data, it, lookback_ms, cache)? {
+            match eval_step(&sq.inner, selectors, data, it, lookback_ms, caches)? {
                 StepValue::Vector(v) => {
                     for s in v {
                         acc.entry((s.metric_name, s.labels))
@@ -589,7 +833,9 @@ fn prepare_subquery(
     // Always insert — an empty grid/result must still satisfy the
     // stepping phase's cache lookup (the at_modifier.test:227-255
     // empty-@ non-panic cases).
-    cache.insert(sq as *const _, MaterializedSubquery { series });
+    caches
+        .subqueries
+        .insert(sq as *const _, MaterializedSubquery { series });
     Ok(())
 }
 
@@ -713,7 +959,7 @@ fn eval_step(
     data: &SeriesData,
     t_ms: i64,
     lookback_ms: i64,
-    subqueries: &SubqueryCache,
+    caches: &EvalCaches,
 ) -> Result<StepValue, PromqlError> {
     match expr {
         PlanExpr::Scalar(v) => Ok(StepValue::Scalar(*v)),
@@ -779,7 +1025,7 @@ fn eval_step(
         // may be a subquery — `windowed_range_source` slices its step
         // window from the once-materialized union grid.
         PlanExpr::RangeFn { func, source } => {
-            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
+            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms);
             let mut out = Vec::new();
             for series in src.series {
                 if let Some(v) = functions::eval_range_fn(
@@ -815,7 +1061,7 @@ fn eval_step(
         // `FetchedSeries::metric_name` (issue #85 — see the `Selector`
         // arm), threaded through `WindowedSeries::metric_name`.
         PlanExpr::OverTime { func, source } => {
-            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
+            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms);
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
             for series in src.series {
@@ -851,7 +1097,7 @@ fn eval_step(
             let mut scalars = Vec::with_capacity(args.len());
             for a in args {
                 let StepValue::Scalar(s) =
-                    eval_step(a, selectors, data, t_ms, lookback_ms, subqueries)?
+                    eval_step(a, selectors, data, t_ms, lookback_ms, caches)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar parameter argument"),
@@ -859,7 +1105,7 @@ fn eval_step(
                 };
                 scalars.push(s);
             }
-            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
+            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms);
             let mut out = Vec::new();
             for series in src.series {
                 // Upstream engine.go only invokes a matrix-argument
@@ -913,7 +1159,7 @@ fn eval_step(
         // MetricName matchers; `sel.matchers` already excludes it by the
         // planner's metric-scoping rule).
         PlanExpr::AbsentOverTime { source } => {
-            let src = windowed_range_source(source, selectors, data, subqueries, t_ms);
+            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms);
             let present = src.series.iter().any(|s| !s.samples.is_empty());
             if present {
                 return Ok(StepValue::Vector(Vec::new()));
@@ -944,8 +1190,7 @@ fn eval_step(
         // (`sum(...)`, `a+b`, `rate(...)`, a filter comparison) yields
         // the empty label set (:1735-1750). `__name__` is never emitted.
         PlanExpr::Absent { arg, selector } => {
-            let StepValue::Vector(v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "absent() over a scalar expression".to_string(),
@@ -977,7 +1222,7 @@ fn eval_step(
         // instant queries (`expr_is_sort_root`).
         PlanExpr::Sort { descending, arg } => {
             let StepValue::Vector(mut v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+                eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "sort()/sort_desc() over a scalar expression".to_string(),
@@ -997,7 +1242,7 @@ fn eval_step(
             arg,
         } => {
             let StepValue::Vector(mut v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+                eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "sort_by_label()/sort_by_label_desc() over a scalar expression"
@@ -1019,8 +1264,7 @@ fn eval_step(
             src,
             regex,
         } => {
-            let StepValue::Vector(v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "label_replace() over a scalar expression".to_string(),
@@ -1040,8 +1284,7 @@ fn eval_step(
             separator,
             src_labels,
         } => {
-            let StepValue::Vector(v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "label_join() over a scalar expression".to_string(),
@@ -1058,15 +1301,14 @@ fn eval_step(
         // -> `"metric":{}`, PROVENANCE.md's table).
         PlanExpr::HistogramQuantile { quantile, expr } => {
             let StepValue::Scalar(q) =
-                eval_step(quantile, selectors, data, t_ms, lookback_ms, subqueries)?
+                eval_step(quantile, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "histogram_quantile's first argument must evaluate to a scalar"
                         .to_string(),
                 });
             };
-            let StepValue::Vector(v) =
-                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "histogram_quantile's second argument must evaluate to a vector"
@@ -1128,8 +1370,7 @@ fn eval_step(
             param,
             grouping,
         } => {
-            let StepValue::Vector(v) =
-                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "aggregation over a scalar expression".to_string(),
@@ -1138,7 +1379,7 @@ fn eval_step(
             let param_v = match param {
                 Some(p) => {
                     let StepValue::Scalar(k) =
-                        eval_step(p, selectors, data, t_ms, lookback_ms, subqueries)?
+                        eval_step(p, selectors, data, t_ms, lookback_ms, caches)?
                     else {
                         return Err(PromqlError::Unsupported {
                             construct: "aggregation parameter must evaluate to a scalar"
@@ -1162,8 +1403,7 @@ fn eval_step(
             expr,
             grouping,
         } => {
-            let StepValue::Vector(v) =
-                eval_step(expr, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "aggregation over a scalar expression".to_string(),
@@ -1184,8 +1424,7 @@ fn eval_step(
             arg,
             scalar_args,
         } => {
-            let StepValue::Vector(v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: format!("{func:?} over a scalar expression"),
@@ -1194,7 +1433,7 @@ fn eval_step(
             let mut scalars = Vec::with_capacity(scalar_args.len());
             for sa in scalar_args {
                 let StepValue::Scalar(s) =
-                    eval_step(sa, selectors, data, t_ms, lookback_ms, subqueries)?
+                    eval_step(sa, selectors, data, t_ms, lookback_ms, caches)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar bound argument"),
@@ -1277,7 +1516,7 @@ fn eval_step(
             let mut scalars = Vec::with_capacity(args.len());
             for a in args {
                 let StepValue::Scalar(s) =
-                    eval_step(a, selectors, data, t_ms, lookback_ms, subqueries)?
+                    eval_step(a, selectors, data, t_ms, lookback_ms, caches)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} with a non-scalar argument"),
@@ -1330,7 +1569,7 @@ fn eval_step(
             // labels minus `__name__`), never a platform-defined cast.
             Some(arg) => {
                 let StepValue::Vector(v) =
-                    eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+                    eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: format!("{func:?} over a scalar expression"),
@@ -1395,7 +1634,7 @@ fn eval_step(
             }
             None => {
                 let StepValue::Vector(v) =
-                    eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+                    eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
                 else {
                     return Err(PromqlError::Unsupported {
                         construct: "timestamp() over a scalar expression".to_string(),
@@ -1420,8 +1659,7 @@ fn eval_step(
         // Issue #66 (M6-03): `scalar(v)` — the singleton element's value,
         // NaN for zero or multiple elements (upstream funcScalar).
         PlanExpr::ScalarOf { arg } => {
-            let StepValue::Vector(v) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "scalar() over a scalar expression".to_string(),
@@ -1436,8 +1674,7 @@ fn eval_step(
         // Issue #66 (M6-03): `vector(s)` — one element with the EMPTY
         // label set (and no `__name__`, upstream funcVector).
         PlanExpr::VectorOf { arg } => {
-            let StepValue::Scalar(s) =
-                eval_step(arg, selectors, data, t_ms, lookback_ms, subqueries)?
+            let StepValue::Scalar(s) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "vector() over a non-scalar expression".to_string(),
@@ -1461,8 +1698,8 @@ fn eval_step(
             group,
             fill,
         } => {
-            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, subqueries)?;
-            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, subqueries)?;
+            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, caches)?;
+            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, caches)?;
             // The planner's typed scalar-operand guard (issue #70,
             // parse.go:807-814) discards `group`/`fill` whenever either
             // operand is scalar-typed, so the scalar arms below can never
@@ -1522,8 +1759,8 @@ fn eval_step(
             rhs,
             matching,
         } => {
-            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, subqueries)?;
-            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, subqueries)?;
+            let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, caches)?;
+            let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, caches)?;
             match (l, r) {
                 (StepValue::Vector(l), StepValue::Vector(r)) => {
                     Ok(StepValue::Vector(binop::set_op(*op, matching, &l, &r)))
@@ -1532,6 +1769,75 @@ fn eval_step(
                     construct: "set operator over a scalar operand".to_string(),
                 }),
             }
+        }
+
+        // Issue #82 (M6-05b): `info()` — the metadata-join. The base
+        // vector comes from this node's prepared horizon (`prepare_info`
+        // evaluated arg0 exactly once per step); the info vector resolves
+        // from the synthetic selector's fetch at ITS own effective time
+        // (offset/@ copied from arg0's first selector at plan time),
+        // carrying each series' real metric name and the resolved
+        // sample's ORIGINAL timestamp (the newest-wins dedup key). All
+        // narrowing/dedup/join semantics live in `info::combine` —
+        // name-keeping with the delayed verdict CLEARED: the pin builds
+        // fresh DropName-less output samples, so a name-dropping arg0
+        // re-emerges with its retained name kept (see `combine`'s doc).
+        PlanExpr::Info {
+            base: _,
+            info_selector,
+            name_matchers,
+            data_matchers,
+        } => {
+            let prepared = caches
+                .infos
+                .get(&(expr as *const _))
+                // Documented invariant: `prepare_subqueries` walks the
+                // exact same tree `eval_step` walks and prepares every
+                // info node before stepping begins (the SubqueryCache
+                // precedent).
+                .expect("prepare_subqueries prepares every info node before stepping");
+            let base_v = prepared
+                .base_steps
+                .get(&t_ms)
+                // Documented invariant: `prepare_info` walked exactly the
+                // enclosing horizon's evaluation grid (the query's own
+                // steps, or the enclosing subquery's inner grid).
+                .expect("prepare_info covers every evaluation step of its horizon")
+                .clone();
+
+            let sel = &selectors[*info_selector];
+            let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
+            let mut info_v = Vec::new();
+            for series in data.get(*info_selector) {
+                if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
+                {
+                    // Per-series name with the concrete-name fallback
+                    // (the `Selector` arm's contract); a genuinely
+                    // nameless series can never be an info source.
+                    let Some(metric_name) = series
+                        .metric_name
+                        .clone()
+                        .or_else(|| sel.metric_name.clone())
+                    else {
+                        continue;
+                    };
+                    info_v.push(info::InfoSeriesAtStep {
+                        metric_name,
+                        labels: series.labels.clone(),
+                        orig_t_ms: sample.t_ms,
+                    });
+                }
+            }
+
+            let out = info::combine(
+                base_v,
+                info_v,
+                &prepared.id_lbl_values,
+                name_matchers,
+                data_matchers,
+                t_ms,
+            )?;
+            Ok(StepValue::Vector(out))
         }
     }
 }
@@ -3429,7 +3735,7 @@ mod tests {
             &data,
             0,
             crate::plan::DEFAULT_LOOKBACK_MS,
-            &SubqueryCache::default(),
+            &EvalCaches::default(),
         )
         .unwrap();
         let StepValue::Vector(v) = step else {
