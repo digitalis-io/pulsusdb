@@ -31,9 +31,30 @@ Out of this ledger's scope by design:
   `reader.logql_pipeline_scan_factor`), gated hermetically (AC9), not an
   oracle delta — the differential corpus is sized strictly below the
   request limit so it can never trip it.
-- **Count/rate window semantics** belong to the M6-10 metric-pipeline
-  differential (M6-09 rejects metric pipelines outright).
 
 ## Entries
 
-_None yet._
+### tumbling-vs-sliding-rate
+
+- **Case:** `metric_rate_tumbling` (issue M6-10 — the range-window
+  divergence deliberately left for the metric differential by the M6-09
+  ledger).
+- **Exact accepted delta:** for RANGE metric queries, PulsusDB evaluates
+  fixed, epoch-aligned, non-overlapping tumbling buckets
+  (`intDiv(timestamp_ns, step) * step`; `rate` = bucket count / step
+  seconds, point stamped at the bucket start), while the oracle
+  re-evaluates a sliding `[range]` window at every request-aligned step
+  timestamp. Point timestamps therefore differ by alignment (bucket
+  start, epoch-aligned vs evaluation instant, request-`start`-aligned)
+  and window membership differs at the edges — the two point sets are
+  disjoint-by-construction for an unaligned request `start`. This is the
+  documented M1 tumbling contract (docs/architecture.md §5.3 /
+  `logql::params::QuerySpec::Range`), not a bug; sliding-window parity
+  is a scheduled later milestone.
+- **Gating:** the oracle comparison is informational for this case ONLY;
+  PulsusDB remains hard-gated against the tumbling by-construction
+  corpus expectation, and anti-rot applies (if the oracle ever matches
+  exactly, the run fails so the case is re-gated). INSTANT metric
+  queries have identical window semantics on both stores (`(t - range,
+  t]` at one evaluation instant) — every other M6-10 metric case is
+  instant-shaped and stays fully gated.

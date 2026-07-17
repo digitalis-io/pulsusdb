@@ -82,6 +82,22 @@ pub enum TooBroadReason {
     /// `metrics::exec`'s multi-metric resolution — never from a
     /// ClickHouse error code. Operator-scale tuning routes to issue #25.
     MetricFanout { matched: usize, cap: u64 },
+    /// Issue M6-10 (review round 1): a client-aggregated LogQL metric
+    /// query's `(end - start) / step` bucket grid exceeded
+    /// [`crate::logql::exec::MAX_CLIENT_AGG_BUCKETS`] — rejected BEFORE
+    /// any grid/accumulator materialization (an `absent_over_time` over
+    /// a huge range with a tiny step must never allocate an
+    /// attacker-sized grid outside the scan budget). A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    MetricBuckets { buckets: u64, cap: u64 },
+    /// Issue M6-10 (review round 1): a `quantile_over_time` evaluation
+    /// retained more exact sample values than
+    /// [`crate::logql::exec::MAX_QUANTILE_VALUES`] across its buckets —
+    /// the one client-side reducer whose state grows with surviving
+    /// rows rather than with `buckets × series`. Complete-or-error: the
+    /// query aborts with this named error, never an OOM and never a
+    /// silently approximated quantile.
+    QuantileValues { count: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -110,6 +126,20 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
+                )
+            }
+            TooBroadReason::MetricBuckets { buckets, cap } => {
+                write!(
+                    f,
+                    "range/step resolves {buckets} evaluation buckets, exceeding the \
+                     {cap}-bucket cap — use a larger step or a narrower window"
+                )
+            }
+            TooBroadReason::QuantileValues { count, cap } => {
+                write!(
+                    f,
+                    "quantile_over_time retained {count} sample values, exceeding the \
+                     {cap}-value cap — narrow the window or filter the pipeline"
                 )
             }
             // Lower-bound wording (code review round 1, finding 2):
@@ -198,9 +228,27 @@ pub enum ReadError {
     /// planned — a bad `regexp`/`pattern` expression, an unsupported
     /// template function, an invalid `json` extraction path, an
     /// uninterpretable numeric literal, or `unwrap` outside a range
-    /// aggregation. Always a 400-class client error.
+    /// aggregation. Issue M6-10 adds the metric-language semantic
+    /// rejections in the same family (unwrap-required/-forbidden ops,
+    /// bad aggregation parameters, set operations against scalars).
+    /// Always a 400-class client error.
     #[error("invalid pipeline: {reason}")]
     PipelineInvalid { reason: String },
+
+    /// Issue M6-10 (adjudication #1): a metric-query line retained a
+    /// nonempty `__error__` after the FULL pipeline — no downstream
+    /// `__error__` filter consumed it — so the aggregation would be
+    /// silently wrong. The message is the live-probed oracle template
+    /// verbatim (`pipeline error: '<class>' for series: ...`, HTTP 400
+    /// on the oracle; mapped 400 by the API layers). `series` is the
+    /// failed line's sorted final label set rendered `{k="v", ...}`.
+    #[error(
+        "pipeline error: '{error_type}' for series: '{series}'.\n\
+         Use a label filter to intentionally skip this error. (e.g | __error__!=\"{error_type}\").\n\
+         To skip all potential errors you can match empty errors.(e.g __error__=\"\")\n\
+         The label filter can also be specified after unwrap. (e.g | unwrap latency | __error__=\"\" )"
+    )]
+    MetricPipelineError { error_type: String, series: String },
 
     /// A `Range` metric query's `step_ns` was zero. `0.is_multiple_of(_)`
     /// is trivially `true`, which would otherwise let the routing decision
@@ -291,6 +339,30 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("150000"));
         assert!(msg.contains("100000"));
+    }
+
+    /// Issue M6-10 review round 1: the two client-aggregation breadth
+    /// guards are named, actionable too-broad reasons.
+    #[test]
+    fn metric_buckets_display_names_count_and_cap() {
+        let msg = TooBroadReason::MetricBuckets {
+            buckets: 3_600_000,
+            cap: 11_000,
+        }
+        .to_string();
+        assert!(msg.contains("3600000"), "{msg}");
+        assert!(msg.contains("11000-bucket cap"), "{msg}");
+    }
+
+    #[test]
+    fn quantile_values_display_names_count_and_cap() {
+        let msg = TooBroadReason::QuantileValues {
+            count: 4_000_001,
+            cap: 4_000_000,
+        }
+        .to_string();
+        assert!(msg.contains("4000001"), "{msg}");
+        assert!(msg.contains("4000000-value cap"), "{msg}");
     }
 
     #[test]

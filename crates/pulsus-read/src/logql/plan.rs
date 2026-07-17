@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use pulsus_logql::{
-    Expr, Grouping, LineFilter, LineFilterOp, LogExpr, MatchOp, Matcher, MetricExpr, RangeAggOp,
-    Stage, StreamSelector, VectorAggOp,
+    BinModifier, BinOp, Expr, Grouping, LineFilter, LineFilterOp, LogExpr, MatchOp, Matcher,
+    MetricExpr, RangeAggOp, Stage, StreamSelector, VectorAggOp,
 };
 
 use super::error::ReadError;
@@ -23,11 +23,16 @@ use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
 
 /// A pure fetch plan for either query shape. See the module docs for why
-/// stage 2/3 aren't pre-rendered here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
+/// the plan for a metric expression containing binary operations or
+/// scalar literals — a tree whose leaves are ordinary [`MetricPlan`]s;
+/// plain single-aggregation metric queries keep planning to
+/// [`Plan::Metric`] byte-identically.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     Streams(StreamsPlan),
     Metric(MetricPlan),
+    MetricBinary(MetricNode),
 }
 
 /// The static (runtime-fingerprint-independent) part of a stream-selector
@@ -73,6 +78,15 @@ pub enum RouteChoice {
     Raw,
 }
 
+/// One vector-aggregation layer: `(op, grouping, parsed topk/bottomk k)`
+/// — the parsed-parameter shape [`MetricPlan::vector_aggs`] and
+/// [`MetricNode::VectorAgg`] carry (issue M6-10).
+pub type VectorAggSpec = (VectorAggOp, Option<Grouping>, Option<f64>);
+
+/// The raw-parameter shape straight off the AST (parameter still the
+/// raw literal text), before [`parse_vector_agg_params`] validates it.
+type RawVectorAggSpec = (VectorAggOp, Option<Grouping>, Option<String>);
+
 /// The rollup-vs-raw routing decision for one metric query, computed once
 /// in [`metric_plan`] and carried on both [`MetricPlan`] (for [`super::exec`]
 /// to act on) and [`super::explain::PlanExplain`] (for #13's
@@ -89,7 +103,7 @@ pub struct RoutingDecision {
 /// encode the rollup-vs-raw routing decision (docs/schemas.md §3.2);
 /// `rate_window_ns` is `Some` only for `rate`/`bytes_rate` (the divisor
 /// [`super::exec`] applies), never for the `*_over_time` count ops.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MetricPlan {
     pub stage1_sql: String,
     pub streams_table: String,
@@ -117,8 +131,93 @@ pub struct MetricPlan {
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
     /// nests outer-first); finished in Rust over the per-fingerprint series
     /// (docs/schemas.md §3.2: "the engine ... finishes the `sum by`").
-    pub vector_aggs: Vec<(VectorAggOp, Option<Grouping>)>,
+    /// The third element is the parsed `topk`/`bottomk` `k` (issue
+    /// M6-10), `None` for every other aggregation.
+    pub vector_aggs: Vec<VectorAggSpec>,
+    /// `Some` = client-aggregated (issue M6-10): raw-scan + in-engine
+    /// pipeline/unwrap/reduce over `metric_raw_samples` (no `LIMIT` —
+    /// complete-or-error). `None` = the existing SQL-aggregated
+    /// (rollup-or-raw) path, byte-identical to pre-M6-10 plans.
+    pub client: Option<ClientAgg>,
     pub probes: Vec<ProbePlan>,
+}
+
+/// The client-aggregated execution spec (issue M6-10): what
+/// [`super::exec`] runs per surviving line after the full-window raw
+/// scan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientAgg {
+    /// The full ordered pipeline (compiled once in exec via
+    /// [`super::pipeline::CompiledPipeline`]); the line-filter prefix
+    /// before the first `line_format` is ALSO pushed down as
+    /// `extra_predicates` (plan v2 D3 — the pushdown-order invariant
+    /// lives in [`compile_line_filters`]).
+    pub pipeline: Vec<Stage>,
+    /// Per-surviving-line sample value source.
+    pub value: ClientValue,
+    /// The over-time reducer.
+    pub range_op: RangeAggOp,
+    /// The `quantile_over_time` q, parsed from the AST's raw parameter.
+    pub param: Option<f64>,
+    /// `absent_over_time` only: the selector's `Eq`-matcher labels — the
+    /// synthetic-absence series labels (oracle-probed; plan v2 D2).
+    pub absent_labels: Vec<(String, String)>,
+}
+
+/// Where a client-aggregated sample's value comes from. `Unwrap` carries
+/// no fields (plan v2 D1): the label/conversion live in the compiled
+/// unwrap stage inside the pipeline; this is just the marker telling
+/// exec to read the pipeline's extracted value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientValue {
+    Count,
+    Bytes,
+    Unwrap,
+}
+
+/// One node of a binary-operation metric plan (issue M6-10): leaves are
+/// ordinary [`MetricPlan`]s (each planned exactly as if it were the
+/// whole query), scalars come from literal operands, and `VectorAgg`
+/// covers a vector aggregation over a *binary* operand (`sum(a + b)`) —
+/// a thin post-combination layer reusing the same reducer code as
+/// [`MetricPlan::vector_aggs`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetricNode {
+    Leaf(Box<MetricPlan>),
+    Scalar(f64),
+    Binary {
+        op: BinOp,
+        /// The `bool` comparison modifier (0/1 instead of filtering).
+        return_bool: bool,
+        lhs: Box<MetricNode>,
+        rhs: Box<MetricNode>,
+    },
+    VectorAgg {
+        aggs: Vec<VectorAggSpec>,
+        inner: Box<MetricNode>,
+    },
+}
+
+impl MetricNode {
+    /// Every [`MetricPlan`] leaf in the tree, left-to-right — the
+    /// stage-1 resolution surface (`series`/explain walk these).
+    pub fn leaves(&self) -> Vec<&MetricPlan> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a MetricPlan>) {
+        match self {
+            MetricNode::Leaf(mp) => out.push(mp),
+            MetricNode::Scalar(_) => {}
+            MetricNode::Binary { lhs, rhs, .. } => {
+                lhs.collect_leaves(out);
+                rhs.collect_leaves(out);
+            }
+            MetricNode::VectorAgg { inner, .. } => inner.collect_leaves(out),
+        }
+    }
 }
 
 /// A selectivity `count()` probe over one matcher key's index prefix.
@@ -150,8 +249,123 @@ pub struct ProbePlan {
 pub fn plan(expr: &Expr, p: &QueryParams, ctx: &PlanCtx<'_>) -> Result<Plan, ReadError> {
     match expr {
         Expr::Log(log_expr) => Ok(Plan::Streams(streams_plan(log_expr, p, ctx)?)),
-        Expr::Metric(metric_expr) => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx)?)),
+        Expr::Metric(metric_expr) => plan_metric_expr(metric_expr, p, ctx),
     }
+}
+
+/// Dispatches a metric expression: a (vector-agg-wrapped) range
+/// aggregation keeps today's [`Plan::Metric`] shape byte-identically;
+/// anything containing a binary operation or scalar literal plans to the
+/// [`Plan::MetricBinary`] tree whose leaves are ordinary [`MetricPlan`]s
+/// (issue M6-10).
+fn plan_metric_expr(
+    metric_expr: &MetricExpr,
+    p: &QueryParams,
+    ctx: &PlanCtx<'_>,
+) -> Result<Plan, ReadError> {
+    let (base, _) = unwrap_vector_aggs(metric_expr);
+    match base {
+        MetricExpr::Range { .. } => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx)?)),
+        _ => {
+            // The zero-step guard normally lives in `metric_plan` (run
+            // per leaf); a leaf-less tree (`2 + 2`) must still reject a
+            // zero step for request-shape consistency.
+            if let QuerySpec::Range { step_ns: 0, .. } = p.spec {
+                return Err(ReadError::InvalidStep);
+            }
+            Ok(Plan::MetricBinary(build_metric_node(metric_expr, p, ctx)?))
+        }
+    }
+}
+
+/// Recursively plans a binary/literal metric expression into a
+/// [`MetricNode`] tree. Every (vector-agg-wrapped) range-aggregation
+/// operand becomes a [`MetricNode::Leaf`] via the ordinary
+/// [`metric_plan`] path, so per-leaf routing/rollup decisions are exactly
+/// what the same expression would get standalone.
+fn build_metric_node(
+    metric_expr: &MetricExpr,
+    p: &QueryParams,
+    ctx: &PlanCtx<'_>,
+) -> Result<MetricNode, ReadError> {
+    match metric_expr {
+        MetricExpr::Literal(raw) => Ok(MetricNode::Scalar(parse_plan_number(
+            raw,
+            "scalar literal",
+        )?)),
+        MetricExpr::Binary {
+            op,
+            modifier,
+            lhs,
+            rhs,
+        } => Ok(MetricNode::Binary {
+            op: *op,
+            return_bool: matches!(modifier, Some(BinModifier { return_bool: true })),
+            lhs: Box::new(build_metric_node(lhs, p, ctx)?),
+            rhs: Box::new(build_metric_node(rhs, p, ctx)?),
+        }),
+        MetricExpr::Range { .. } => Ok(MetricNode::Leaf(Box::new(metric_plan(
+            metric_expr,
+            p,
+            ctx,
+        )?))),
+        MetricExpr::Vector { .. } => {
+            let (base, raw_aggs) = unwrap_vector_aggs(metric_expr);
+            match base {
+                MetricExpr::Range { .. } => Ok(MetricNode::Leaf(Box::new(metric_plan(
+                    metric_expr,
+                    p,
+                    ctx,
+                )?))),
+                MetricExpr::Literal(_) => Err(ReadError::PipelineInvalid {
+                    reason: "a vector aggregation cannot aggregate a bare scalar literal"
+                        .to_string(),
+                }),
+                inner => Ok(MetricNode::VectorAgg {
+                    aggs: parse_vector_agg_params(&raw_aggs)?,
+                    inner: Box::new(build_metric_node(inner, p, ctx)?),
+                }),
+            }
+        }
+    }
+}
+
+/// Parses a raw AST number the parser guaranteed to be `Number`-token
+/// shaped; a non-finite/unparseable value is a named 400, never a NaN
+/// smuggled into evaluation.
+fn parse_plan_number(raw: &str, what: &str) -> Result<f64, ReadError> {
+    match raw.parse::<f64>() {
+        Ok(v) if v.is_finite() => Ok(v),
+        _ => Err(ReadError::PipelineInvalid {
+            reason: format!("invalid {what} {raw:?}"),
+        }),
+    }
+}
+
+/// Validates and parses each vector aggregation's parameter:
+/// `topk`/`bottomk` require `k`; the parameterless aggregations must not
+/// carry one (the parser already enforces both — planner re-checks for
+/// defense in depth on programmatically-built ASTs).
+fn parse_vector_agg_params(raw: &[RawVectorAggSpec]) -> Result<Vec<VectorAggSpec>, ReadError> {
+    raw.iter()
+        .map(|(op, grouping, param)| {
+            let parsed = match (op.takes_param(), param) {
+                (true, Some(raw)) => Some(parse_plan_number(raw, &format!("{op} parameter"))?),
+                (true, None) => {
+                    return Err(ReadError::PipelineInvalid {
+                        reason: format!("`{op}` requires a k parameter (e.g. {op}(5, ...))"),
+                    });
+                }
+                (false, Some(_)) => {
+                    return Err(ReadError::PipelineInvalid {
+                        reason: format!("`{op}` takes no parameter"),
+                    });
+                }
+                (false, None) => None,
+            };
+            Ok((*op, grouping.clone(), parsed))
+        })
+        .collect()
 }
 
 fn streams_plan(
@@ -227,8 +441,11 @@ fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
     false
 }
 
-/// The construct name a metric-pipeline rejection reports — the first
-/// beyond-line-filter stage in pipeline order.
+/// The first beyond-line-filter stage in pipeline order. Pre-M6-10 this
+/// named the `PipelineUnsupportedInMetric` rejection; since M6-10 its
+/// `Some` is the client-aggregation mode trigger — any beyond-line-filter
+/// stage means the columnar store cannot express the aggregation and the
+/// pipeline evaluates in-engine over the raw scan.
 fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     use pulsus_logql::ParserStage;
     pipeline.iter().find_map(|stage| match stage {
@@ -261,29 +478,102 @@ fn metric_plan(
         return Err(ReadError::InvalidStep);
     }
 
-    let (base, vector_aggs) = unwrap_vector_aggs(metric_expr);
-    let MetricExpr::Range { op, range, .. } = base else {
-        // `unwrap_vector_aggs` strips every `Vector` layer, so the base is
-        // structurally always `Range` — the AST has no third variant.
-        unreachable!("unwrap_vector_aggs always bottoms out at MetricExpr::Range")
+    let (base, raw_vector_aggs) = unwrap_vector_aggs(metric_expr);
+    let MetricExpr::Range { op, range, param } = base else {
+        // `plan_metric_expr`/`build_metric_node` route every
+        // `Literal`/`Binary`-bottomed expression to the node tree, so the
+        // base reaching `metric_plan` is structurally always `Range`.
+        unreachable!("metric_plan is only called on Vector-chains bottoming at MetricExpr::Range")
     };
-    // M6-09 → M6-10 seam: executing a parser/label-filter/format/unwrap
-    // pipeline *inside* a range aggregation (correct in-engine counting
-    // over the filtered/parsed line set) is the metric-pipeline
-    // milestone's scope. Rejected by name here — never a silently-wrong
-    // `count_over_time({...} | json | x="y" [5m])` counting unfiltered
-    // lines. `range.unwrap` is checked too for defense in depth, though
-    // the parser only ever emits the pipeline `Stage::Unwrap` form.
-    if let Some(construct) = metric_pipeline_construct(&range.selector.pipeline) {
-        return Err(ReadError::PipelineUnsupportedInMetric {
-            construct: construct.to_string(),
+    let vector_aggs = parse_vector_agg_params(&raw_vector_aggs)?;
+
+    // Issue M6-10: metric pipelines now execute in-engine. Classify the
+    // query into the SQL-aggregated mode (the four count/bytes ops,
+    // un-piped beyond line filters — byte-identical plans, rollup
+    // auto-routing preserved) vs the client-aggregated mode (any
+    // beyond-line-filter pipeline stage, any unwrap, or any of the new
+    // over-time ops — full-window raw scan, complete-or-error).
+    let pipeline = &range.selector.pipeline;
+    let has_beyond_line_filter = metric_pipeline_construct(pipeline).is_some();
+    let has_unwrap = pipeline.iter().any(|s| matches!(s, Stage::Unwrap(_))) ||
+        // Defense in depth: the parser only emits the pipeline
+        // `Stage::Unwrap` form and always leaves `LogRange::unwrap`
+        // `None`.
+        range.unwrap.is_some();
+
+    // Unwrap arity — mirrors the oracle's parse errors verbatim
+    // ("invalid aggregation X with/without unwrap", probed live).
+    let requires_unwrap = matches!(
+        op,
+        RangeAggOp::SumOverTime
+            | RangeAggOp::AvgOverTime
+            | RangeAggOp::MinOverTime
+            | RangeAggOp::MaxOverTime
+            | RangeAggOp::StddevOverTime
+            | RangeAggOp::StdvarOverTime
+            | RangeAggOp::QuantileOverTime
+            | RangeAggOp::FirstOverTime
+            | RangeAggOp::LastOverTime
+    );
+    let forbids_unwrap = matches!(
+        op,
+        RangeAggOp::CountOverTime | RangeAggOp::BytesRate | RangeAggOp::BytesOverTime
+    );
+    if requires_unwrap && !has_unwrap {
+        return Err(ReadError::PipelineInvalid {
+            reason: format!("invalid aggregation {op} without unwrap"),
         });
     }
-    if range.unwrap.is_some() {
-        return Err(ReadError::PipelineUnsupportedInMetric {
-            construct: "unwrap".to_string(),
+    if forbids_unwrap && has_unwrap {
+        return Err(ReadError::PipelineInvalid {
+            reason: format!("invalid aggregation {op} with unwrap"),
         });
     }
+    let quantile = match (op, param) {
+        (RangeAggOp::QuantileOverTime, Some(raw)) => {
+            Some(parse_plan_number(raw, "quantile parameter")?)
+        }
+        (RangeAggOp::QuantileOverTime, None) => {
+            // The parser requires the parameter; re-checked for
+            // programmatically-built ASTs.
+            return Err(ReadError::PipelineInvalid {
+                reason: "quantile_over_time requires a quantile parameter".to_string(),
+            });
+        }
+        _ => None,
+    };
+
+    let client_only_op = requires_unwrap || matches!(op, RangeAggOp::AbsentOverTime);
+    let client = if has_beyond_line_filter || has_unwrap || client_only_op {
+        let value = if has_unwrap {
+            ClientValue::Unwrap
+        } else if matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime) {
+            ClientValue::Bytes
+        } else {
+            ClientValue::Count
+        };
+        let absent_labels = if matches!(op, RangeAggOp::AbsentOverTime) {
+            range
+                .selector
+                .selector
+                .matchers
+                .iter()
+                .filter(|m| m.op == MatchOp::Eq)
+                .map(|m| (m.name.clone(), m.value.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some(ClientAgg {
+            pipeline: pipeline.clone(),
+            value,
+            range_op: *op,
+            param: quantile,
+            absent_labels,
+        })
+    } else {
+        None
+    };
 
     let range_ns = range.range.as_nanos();
 
@@ -317,15 +607,13 @@ fn metric_plan(
     // guarantee only holds when there is nothing left for `log_samples` to
     // filter).
     //
-    // This routing decision assumes every `RangeAggOp` reaching here is
-    // count-only (M1's four: `Rate`/`CountOverTime`/`BytesRate`/
-    // `BytesOverTime`, `ast.rs`) — a future non-count op (M6-10) must
-    // gate eligibility on `op` too, not just line-filter/step shape.
-    // Likewise, "pipeline-created label dependencies" (a pipeline stage
-    // that derives a label the query then groups/filters on) cannot reach
-    // this point: `metric_pipeline_construct` above rejects every metric
-    // pipeline beyond plain line filters until M6-10 executes them
-    // in-engine. Both are guard comments only — nothing to gate on yet.
+    // Rollup eligibility is additionally gated on `client.is_none()`
+    // (issue M6-10, removing the former guard-comment TODO): every
+    // non-count op and every beyond-line-filter pipeline is client-
+    // aggregated, always routed raw with its own named reason — the
+    // rollup table can neither re-filter bodies nor produce unwrapped
+    // values. `client.is_none()` count/bytes ops keep the pre-M6-10
+    // routing and reasons byte-identically (the perf regression gate).
     // `Instant` is matched *first*, ahead of the line-filter/resolution
     // checks below: an instant window ([at - range, at]) has no step to
     // test against the resolution regardless of what else is true about
@@ -338,35 +626,42 @@ fn metric_plan(
     // ties eligibility strictly to "the query step is a multiple of the
     // resolution", and an unaligned window would silently diverge from raw
     // at bucket edges (task-manager resolution #1 on issue #12).
-    let routing = match p.spec {
-        QuerySpec::Instant { .. } => RoutingDecision {
+    let routing = if client.is_some() {
+        RoutingDecision {
             chosen: RouteChoice::Raw,
-            reason: "raw: instant query".to_string(),
-        },
-        QuerySpec::Range { step_ns, .. } if !extra_predicates.is_empty() => RoutingDecision {
-            chosen: RouteChoice::Raw,
-            reason: "raw: line filter present".to_string(),
-        },
-        QuerySpec::Range { .. } if ctx.rollup_res_ns == 0 => RoutingDecision {
-            chosen: RouteChoice::Raw,
-            reason: "raw: rollup resolution not configured".to_string(),
-        },
-        QuerySpec::Range { step_ns, .. } if step_ns.is_multiple_of(ctx.rollup_res_ns) => {
-            RoutingDecision {
-                chosen: RouteChoice::Rollup,
+            reason: "raw: client-side pipeline/unwrap aggregation".to_string(),
+        }
+    } else {
+        match p.spec {
+            QuerySpec::Instant { .. } => RoutingDecision {
+                chosen: RouteChoice::Raw,
+                reason: "raw: instant query".to_string(),
+            },
+            QuerySpec::Range { .. } if !extra_predicates.is_empty() => RoutingDecision {
+                chosen: RouteChoice::Raw,
+                reason: "raw: line filter present".to_string(),
+            },
+            QuerySpec::Range { .. } if ctx.rollup_res_ns == 0 => RoutingDecision {
+                chosen: RouteChoice::Raw,
+                reason: "raw: rollup resolution not configured".to_string(),
+            },
+            QuerySpec::Range { step_ns, .. } if step_ns.is_multiple_of(ctx.rollup_res_ns) => {
+                RoutingDecision {
+                    chosen: RouteChoice::Rollup,
+                    reason: format!(
+                        "rollup: step {step_ns} ns divisible by resolution {} ns",
+                        ctx.rollup_res_ns
+                    ),
+                }
+            }
+            QuerySpec::Range { step_ns, .. } => RoutingDecision {
+                chosen: RouteChoice::Raw,
                 reason: format!(
-                    "rollup: step {step_ns} ns divisible by resolution {} ns",
+                    "raw: step {step_ns} ns not a multiple of resolution {} ns",
                     ctx.rollup_res_ns
                 ),
-            }
+            },
         }
-        QuerySpec::Range { step_ns, .. } => RoutingDecision {
-            chosen: RouteChoice::Raw,
-            reason: format!(
-                "raw: step {step_ns} ns not a multiple of resolution {} ns",
-                ctx.rollup_res_ns
-            ),
-        },
     };
     let rollup_eligible = matches!(routing.chosen, RouteChoice::Rollup);
 
@@ -406,24 +701,26 @@ fn metric_plan(
         rate_window_ns: if is_rate { rate_window_ns } else { None },
         op: *op,
         vector_aggs,
+        client,
         probes,
     })
 }
 
-/// Unwraps every outer `MetricExpr::Vector` layer, returning the innermost
-/// `Range` and the aggregation chain in outer-to-inner order (`sum by
-/// (svc) (avg(...))` yields `[(Sum, Some(by(svc)))]` first, then deeper
-/// wrappers after).
-fn unwrap_vector_aggs(expr: &MetricExpr) -> (&MetricExpr, Vec<(VectorAggOp, Option<Grouping>)>) {
+/// Unwraps every outer `MetricExpr::Vector` layer, returning the
+/// innermost non-`Vector` expression and the aggregation chain (with raw
+/// parameters) in outer-to-inner order (`sum by (svc) (avg(...))` yields
+/// `[(Sum, Some(by(svc)), None)]` first, then deeper wrappers after).
+fn unwrap_vector_aggs(expr: &MetricExpr) -> (&MetricExpr, Vec<RawVectorAggSpec>) {
     let mut aggs = Vec::new();
     let mut cur = expr;
     while let MetricExpr::Vector {
         op,
         grouping,
+        param,
         inner,
     } = cur
     {
-        aggs.push((*op, grouping.clone()));
+        aggs.push((*op, grouping.clone(), param.clone()));
         cur = inner;
     }
     (cur, aggs)
@@ -743,7 +1040,7 @@ mod tests {
         let expr = parse(query).expect("parse");
         match plan(&expr, &params, &test_ctx())? {
             Plan::Metric(mp) => Ok(mp),
-            Plan::Streams(_) => panic!("expected a Metric plan"),
+            Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         }
     }
 
@@ -848,7 +1145,7 @@ mod tests {
         let expr = parse(r#"rate({env="prod"}[5m])"#).expect("parse");
         let mp = match plan(&expr, &params, &ctx).unwrap() {
             Plan::Metric(mp) => mp,
-            Plan::Streams(_) => panic!("expected a Metric plan"),
+            Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         };
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
         assert_eq!(mp.routing.reason, "raw: rollup resolution not configured");
@@ -888,7 +1185,7 @@ mod tests {
         let expr = parse(r#"rate({env="prod"}[5m])"#).expect("parse");
         let mp = match plan(&expr, &params, &ctx).unwrap() {
             Plan::Metric(mp) => mp,
-            Plan::Streams(_) => panic!("expected a Metric plan"),
+            Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         };
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
         assert_eq!(mp.routing.reason, "raw: instant query");
@@ -995,7 +1292,7 @@ mod tests {
         let expr = parse(query).expect("parse");
         match plan(&expr, &params, &test_ctx()).expect("plan") {
             Plan::Streams(sp) => sp,
-            Plan::Metric(_) => panic!("expected a Streams plan"),
+            Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
         }
     }
 
@@ -1056,64 +1353,305 @@ mod tests {
         assert_eq!(sp.scan_limit, u32::MAX);
     }
 
-    // --- AC6, issue M6-09: metric-pipeline deferral to M6-10. ---
+    // --- AC6, issue M6-10: the former M6-09 deferral seam is REMOVED —
+    // --- every parseable metric pipeline now plans successfully in
+    // --- client mode (the exact query list the M6-09 rejection test
+    // --- covered, flipped to success).
+
+    fn range_spec() -> QuerySpec {
+        QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 1_000_000_000_000,
+            step_ns: 60_000_000_000,
+        }
+    }
 
     #[test]
-    fn every_beyond_line_filter_stage_in_a_metric_query_is_rejected_by_name() {
-        for (query, construct) in [
-            (r#"count_over_time({env="prod"} | json [5m])"#, "json"),
-            (r#"count_over_time({env="prod"} | logfmt [5m])"#, "logfmt"),
+    fn every_formerly_deferred_metric_pipeline_now_plans_in_client_mode() {
+        for query in [
+            r#"count_over_time({env="prod"} | json [5m])"#,
+            r#"count_over_time({env="prod"} | logfmt [5m])"#,
+            r#"count_over_time({env="prod"} | regexp "(?P<x>.*)" [5m])"#,
+            r#"count_over_time({env="prod"} | pattern "<x> y" [5m])"#,
+            r#"count_over_time({env="prod"} | json | status = "500" [5m])"#,
+            r#"rate({env="prod"} | level = "error" [5m])"#,
+            r#"rate({env="prod"} | line_format "{{.x}}" [5m])"#,
+            r#"rate({env="prod"} | label_format a=b [5m])"#,
+            r#"rate({env="prod"} | json | unwrap latency [5m])"#,
+            r#"rate({env="prod"} | unwrap latency [5m])"#,
+        ] {
+            let mp = metric_mp(query, range_spec())
+                .unwrap_or_else(|e| panic!("expected {query:?} to plan in client mode, got {e}"));
+            let client = mp
+                .client
+                .as_ref()
+                .unwrap_or_else(|| panic!("expected {query:?} to carry a client-aggregation spec"));
+            assert!(!mp.rollup, "client mode always routes raw: {query}");
+            assert_eq!(
+                mp.routing.reason, "raw: client-side pipeline/unwrap aggregation",
+                "{query}"
+            );
+            assert_eq!(
+                client.pipeline.len(),
+                mp.client.as_ref().unwrap().pipeline.len()
+            );
+        }
+    }
+
+    #[test]
+    fn client_value_source_follows_op_and_unwrap_presence() {
+        let count = metric_mp(
+            r#"count_over_time({env="prod"} | json | status = "500" [5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        assert_eq!(count.client.as_ref().unwrap().value, ClientValue::Count);
+
+        let bytes =
+            metric_mp(r#"bytes_over_time({env="prod"} | json [5m])"#, range_spec()).unwrap();
+        assert_eq!(bytes.client.as_ref().unwrap().value, ClientValue::Bytes);
+
+        let unwrap = metric_mp(
+            r#"sum_over_time({env="prod"} | logfmt | unwrap took [5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        assert_eq!(unwrap.client.as_ref().unwrap().value, ClientValue::Unwrap);
+        assert_eq!(
+            unwrap.client.as_ref().unwrap().range_op,
+            pulsus_logql::RangeAggOp::SumOverTime
+        );
+    }
+
+    #[test]
+    fn every_new_over_time_op_plans_in_client_mode_with_unwrap() {
+        for (query, op) in [
             (
-                r#"count_over_time({env="prod"} | regexp "(?P<x>.*)" [5m])"#,
-                "regexp",
+                r#"sum_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::SumOverTime,
             ),
             (
-                r#"count_over_time({env="prod"} | pattern "<x> y" [5m])"#,
-                "pattern",
+                r#"avg_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::AvgOverTime,
             ),
             (
-                r#"count_over_time({env="prod"} | json | status = "500" [5m])"#,
-                "json",
+                r#"min_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::MinOverTime,
             ),
             (
-                r#"rate({env="prod"} | level = "error" [5m])"#,
-                "label filter",
+                r#"max_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::MaxOverTime,
             ),
             (
-                r#"rate({env="prod"} | line_format "{{.x}}" [5m])"#,
-                "line_format",
+                r#"stddev_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::StddevOverTime,
             ),
             (
-                r#"rate({env="prod"} | label_format a=b [5m])"#,
-                "label_format",
+                r#"stdvar_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::StdvarOverTime,
             ),
             (
-                r#"count_over_time({env="prod"} | json | unwrap latency [5m])"#,
-                "json",
+                r#"quantile_over_time(0.9, {e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::QuantileOverTime,
             ),
             (
-                r#"count_over_time({env="prod"} | unwrap latency [5m])"#,
-                "unwrap",
+                r#"first_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::FirstOverTime,
+            ),
+            (
+                r#"last_over_time({e="p"} | logfmt | unwrap v [5m])"#,
+                pulsus_logql::RangeAggOp::LastOverTime,
             ),
         ] {
-            let err = metric_mp(
-                query,
-                QuerySpec::Range {
-                    start_ns: 0,
-                    end_ns: 1_000_000_000_000,
-                    step_ns: 60_000_000_000,
-                },
-            )
-            .unwrap_err();
-            match err {
-                ReadError::PipelineUnsupportedInMetric { construct: got } => {
-                    assert_eq!(got, construct, "query: {query}");
+            let mp = metric_mp(query, range_spec()).unwrap_or_else(|e| panic!("{query}: {e}"));
+            let client = mp.client.as_ref().expect("client mode");
+            assert_eq!(client.range_op, op, "{query}");
+            assert_eq!(client.value, ClientValue::Unwrap, "{query}");
+        }
+    }
+
+    #[test]
+    fn quantile_over_time_param_is_parsed_onto_the_client_spec() {
+        let mp = metric_mp(
+            r#"quantile_over_time(0.95, {e="p"} | logfmt | unwrap v [5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        assert_eq!(mp.client.as_ref().unwrap().param, Some(0.95));
+    }
+
+    /// AC6: unwrap-required ops without `unwrap` are a NAMED
+    /// `PipelineInvalid` (message mirrors the oracle's parse error).
+    #[test]
+    fn unwrap_required_ops_without_unwrap_are_named_pipeline_invalid() {
+        for op in [
+            "sum_over_time",
+            "avg_over_time",
+            "min_over_time",
+            "max_over_time",
+            "stddev_over_time",
+            "stdvar_over_time",
+            "first_over_time",
+            "last_over_time",
+        ] {
+            let query = format!(r#"{op}({{e="p"}} | logfmt [5m])"#);
+            match metric_mp(&query, range_spec()).unwrap_err() {
+                ReadError::PipelineInvalid { reason } => {
+                    assert_eq!(reason, format!("invalid aggregation {op} without unwrap"));
                 }
-                other => {
-                    panic!("expected {query:?} to be PipelineUnsupportedInMetric, got {other:?}")
-                }
+                other => panic!("expected {query:?} to be PipelineInvalid, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn unwrap_forbidding_ops_with_unwrap_are_named_pipeline_invalid() {
+        for op in ["count_over_time", "bytes_rate", "bytes_over_time"] {
+            let query = format!(r#"{op}({{e="p"}} | logfmt | unwrap v [5m])"#);
+            match metric_mp(&query, range_spec()).unwrap_err() {
+                ReadError::PipelineInvalid { reason } => {
+                    assert_eq!(reason, format!("invalid aggregation {op} with unwrap"));
+                }
+                other => panic!("expected {query:?} to be PipelineInvalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_over_time_plans_selector_wide_with_eq_matcher_labels() {
+        let mp = metric_mp(
+            r#"absent_over_time({env="prod", team=~"a|b", region="eu"}[5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        let client = mp.client.as_ref().expect("client mode");
+        assert_eq!(client.range_op, pulsus_logql::RangeAggOp::AbsentOverTime);
+        assert_eq!(
+            client.absent_labels,
+            vec![
+                ("env".to_string(), "prod".to_string()),
+                ("region".to_string(), "eu".to_string()),
+            ],
+            "only Eq matchers become the synthetic-absence labels"
+        );
+    }
+
+    /// D3 (plan v2): only the line-filter prefix BEFORE the first
+    /// `line_format` pushes to SQL; a post-`line_format` filter evaluates
+    /// in-engine (it references the rewritten line).
+    #[test]
+    fn a_post_line_format_metric_line_filter_is_not_pushed_down() {
+        let mp = metric_mp(
+            r#"count_over_time({env="prod"} |= "a" | line_format "{{.x}}" |= "b" [5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        assert_eq!(
+            mp.extra_predicates.len(),
+            1,
+            "only the pre-line_format filter pushes down"
+        );
+        assert!(mp.extra_predicates[0].contains("'a'"));
+        assert!(!mp.extra_predicates[0].contains("'b'"));
+        // The full ordered pipeline (including the unpushed filter) rides
+        // the client spec for in-engine evaluation.
+        assert_eq!(mp.client.as_ref().unwrap().pipeline.len(), 3);
+    }
+
+    // --- Binary-op planning (issue M6-10). ---
+
+    fn plan_of(query: &str, spec: QuerySpec) -> Result<Plan, ReadError> {
+        let params = QueryParams {
+            spec,
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        let expr = parse(query).expect("parse");
+        plan(&expr, &params, &test_ctx())
+    }
+
+    #[test]
+    fn a_binary_metric_expression_plans_to_a_node_tree_with_ordinary_leaves() {
+        let p = plan_of(
+            r#"rate({env="prod"}[5m]) + rate({env="staging"}[5m])"#,
+            range_spec(),
+        )
+        .unwrap();
+        let Plan::MetricBinary(node) = p else {
+            panic!("expected a MetricBinary plan, got {p:?}");
+        };
+        let MetricNode::Binary {
+            op, return_bool, ..
+        } = &node
+        else {
+            panic!("expected a Binary root");
+        };
+        assert_eq!(*op, BinOp::Add);
+        assert!(!return_bool);
+        let leaves = node.leaves();
+        assert_eq!(leaves.len(), 2);
+        // Each leaf routes exactly as it would standalone (rollup here).
+        for leaf in leaves {
+            assert!(leaf.rollup);
+            assert!(leaf.client.is_none());
+        }
+    }
+
+    #[test]
+    fn a_scalar_only_binary_expression_plans_leafless() {
+        let p = plan_of("2 ^ 2 ^ 3", range_spec()).unwrap();
+        let Plan::MetricBinary(node) = p else {
+            panic!("expected a MetricBinary plan");
+        };
+        assert!(node.leaves().is_empty());
+    }
+
+    #[test]
+    fn a_zero_step_range_is_rejected_even_for_a_leafless_binary_expression() {
+        let err = plan_of(
+            "2 + 2",
+            QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000,
+                step_ns: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ReadError::InvalidStep));
+    }
+
+    #[test]
+    fn a_vector_aggregation_over_a_binary_operand_plans_as_a_vector_agg_node() {
+        let p = plan_of(
+            r#"sum by (service_name) (rate({a="b"}[5m]) + rate({a="c"}[5m]))"#,
+            range_spec(),
+        )
+        .unwrap();
+        let Plan::MetricBinary(node) = p else {
+            panic!("expected a MetricBinary plan");
+        };
+        let MetricNode::VectorAgg { aggs, inner } = &node else {
+            panic!("expected a VectorAgg root, got {node:?}");
+        };
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(aggs[0].0, VectorAggOp::Sum);
+        assert!(matches!(&**inner, MetricNode::Binary { .. }));
+    }
+
+    #[test]
+    fn a_vector_aggregation_over_a_bare_scalar_is_rejected() {
+        let err = plan_of("sum(2)", range_spec()).unwrap_err();
+        assert!(matches!(err, ReadError::PipelineInvalid { .. }));
+    }
+
+    #[test]
+    fn topk_k_is_parsed_onto_the_vector_agg_chain() {
+        let mp = metric_mp(r#"topk(5, rate({env="prod"}[5m]))"#, range_spec()).unwrap();
+        assert_eq!(mp.vector_aggs.len(), 1);
+        assert_eq!(mp.vector_aggs[0].0, VectorAggOp::Topk);
+        assert_eq!(mp.vector_aggs[0].2, Some(5.0));
+        // topk/bottomk never disturb the inner query's routing.
+        assert!(mp.rollup);
     }
 
     #[test]

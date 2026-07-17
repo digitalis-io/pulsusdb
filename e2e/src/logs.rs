@@ -35,7 +35,9 @@ use serde::Deserialize;
 
 use crate::corpus::Scale;
 use crate::harness::poll_until;
-use crate::logs_corpus::{self, ExpectedResult, LogCorpus, LogCorpusSpec};
+use crate::logs_corpus::{
+    self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector,
+};
 use crate::metrics::write_artifact;
 use crate::scenarios::Ctx;
 
@@ -73,7 +75,23 @@ struct CaseRaw {
     mode: String,
     #[serde(default)]
     ledger: Option<String>,
+    /// Case shape (issue M6-10): absent/`"streams"` = the M6-09 streams
+    /// comparison; `"metric_instant"` = `/query` vector comparison
+    /// (instant windows are semantically identical on both stores);
+    /// `"metric_range"` = `/query_range` matrix comparison (the tumbling
+    /// divergence surface — see the ledger).
+    #[serde(default)]
+    kind: Option<String>,
+    /// `metric_range` only: the request step in seconds.
+    #[serde(default)]
+    step_s: Option<u64>,
     query: String,
+}
+
+impl CaseRaw {
+    fn kind(&self) -> &str {
+        self.kind.as_deref().unwrap_or("streams")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,7 +115,9 @@ fn load_fixture(ctx: &Ctx) -> Result<LogsFixture> {
     let fixture: LogsFixture = serde_json::from_str(&raw)
         .with_context(|| format!("fixture {} was not valid JSON", path.display()))?;
     for case in &fixture.cases {
-        if !logs_corpus::CASE_IDS.contains(&case.case_id.as_str()) {
+        if !logs_corpus::CASE_IDS.contains(&case.case_id.as_str())
+            && !logs_corpus::METRIC_CASE_IDS.contains(&case.case_id.as_str())
+        {
             bail!(
                 "fixture {} names case {:?}, which the corpus does not project",
                 path.display(),
@@ -321,6 +341,101 @@ fn set_entry_count(set: &ExpectedResult) -> usize {
 }
 
 // ---------------------------------------------------------------------
+// Metric-case normalization + comparison (issue M6-10)
+// ---------------------------------------------------------------------
+
+fn labels_of(sample: &serde_json::Value) -> Result<std::collections::BTreeMap<String, String>> {
+    Ok(sample["metric"]
+        .as_object()
+        .with_context(|| format!("sample missing a metric labels object: {sample}"))?
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+        .collect())
+}
+
+fn parse_value_str(v: &serde_json::Value) -> Result<f64> {
+    v.as_str()
+        .with_context(|| format!("metric value was not a string: {v}"))?
+        .parse::<f64>()
+        .with_context(|| format!("metric value was not a float: {v}"))
+}
+
+/// Normalizes either store's INSTANT metric response (`resultType:
+/// "vector"`, `value: [<unix seconds>, "<float>"]`). Duplicate label
+/// sets are a hard comparison-validity failure (they would collapse in
+/// the map).
+fn vector_result_set(body: &serde_json::Value) -> Result<MetricVector> {
+    let result_type = body["data"]["resultType"].as_str().unwrap_or_default();
+    if result_type != "vector" {
+        bail!("expected a vector result, got {result_type:?}: {body}");
+    }
+    let mut out = MetricVector::new();
+    for sample in body["data"]["result"].as_array().into_iter().flatten() {
+        let labels = labels_of(sample)?;
+        let value = parse_value_str(&sample["value"][1])?;
+        if out.insert(labels.clone(), value).is_some() {
+            bail!("duplicate label set in a vector result: {labels:?}");
+        }
+    }
+    Ok(out)
+}
+
+/// Normalizes either store's RANGE metric response (`resultType:
+/// "matrix"`, `values: [[<unix seconds>, "<float>"], ...]`), timestamps
+/// converted to nanoseconds.
+fn matrix_result_set(body: &serde_json::Value) -> Result<MetricMatrix> {
+    let result_type = body["data"]["resultType"].as_str().unwrap_or_default();
+    if result_type != "matrix" {
+        bail!("expected a matrix result, got {result_type:?}: {body}");
+    }
+    let mut out = MetricMatrix::new();
+    for series in body["data"]["result"].as_array().into_iter().flatten() {
+        let labels = labels_of(series)?;
+        let mut points = std::collections::BTreeMap::new();
+        for value in series["values"].as_array().into_iter().flatten() {
+            let ts_s = value[0]
+                .as_f64()
+                .with_context(|| format!("matrix timestamp was not a number: {value}"))?;
+            let ts_ns = (ts_s * 1e9).round() as i64;
+            points.insert(ts_ns, parse_value_str(&value[1])?);
+        }
+        if out.insert(labels.clone(), points).is_some() {
+            bail!("duplicate label set in a matrix result: {labels:?}");
+        }
+    }
+    Ok(out)
+}
+
+/// Tight relative tolerance: both stores execute the same f64
+/// operations over identical inputs; this only absorbs
+/// summation-order/last-ulp noise, never a semantic delta.
+fn approx_eq(a: f64, b: f64) -> bool {
+    if a == b {
+        return true;
+    }
+    (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1e-300)
+}
+
+fn vectors_match(got: &MetricVector, expected: &MetricVector) -> bool {
+    got.len() == expected.len()
+        && expected
+            .iter()
+            .all(|(labels, v)| got.get(labels).is_some_and(|g| approx_eq(*g, *v)))
+}
+
+fn matrices_match(got: &MetricMatrix, expected: &MetricMatrix) -> bool {
+    got.len() == expected.len()
+        && expected.iter().all(|(labels, points)| {
+            got.get(labels).is_some_and(|g| {
+                g.len() == points.len()
+                    && points
+                        .iter()
+                        .all(|(ts, v)| g.get(ts).is_some_and(|gv| approx_eq(*gv, *v)))
+            })
+        })
+}
+
+// ---------------------------------------------------------------------
 // The scenario
 // ---------------------------------------------------------------------
 
@@ -462,11 +577,362 @@ async fn wait_for_completeness(
     verdict
 }
 
-/// One committed case: validity gates first (raw counts strictly below
-/// the limit on both stores; no duplicate entries), then PulsusDB ==
-/// corpus (ALWAYS hard) == oracle (hard for `gated`, recorded for
-/// `informational`).
+/// One committed case, dispatched by shape (issue M6-10): the M6-09
+/// streams comparison, or a metric vector/matrix comparison.
 async fn run_case(
+    ctx: &Ctx,
+    corpus: &LogCorpus,
+    fixture: &LogsFixture,
+    case: &CaseRaw,
+    window: QueryWindow,
+) -> Result<()> {
+    match case.kind() {
+        "streams" => run_streams_case(ctx, corpus, fixture, case, window).await,
+        "metric_instant" => run_metric_instant_case(ctx, corpus, case).await,
+        "metric_range" => run_metric_range_case(ctx, corpus, case, window).await,
+        "metric_error" => run_metric_error_case(ctx, corpus, case).await,
+        other => bail!("case {:?} has unknown kind {other:?}", case.case_id),
+    }
+}
+
+/// The M6-10 D1 witness (adjudication #1): a GENUINE unwrap conversion
+/// failure surviving the pipeline must FAIL the metric query on BOTH
+/// stores — HTTP 400 carrying the `SampleExtractionErr` class — never a
+/// silently reduced/empty success. Oracle-verified live during plan D1's
+/// mandated probe; this pins it in the nightly differential.
+async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) -> Result<()> {
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let eval_ns = metric_eval_ns(corpus);
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: expecting HTTP 400 + SampleExtractionErr on both \
+         stores",
+        case.case_id, case.mode, case.construct,
+    );
+
+    let fetch = |url: String| {
+        let q = q.clone();
+        async move {
+            let time = eval_ns.to_string();
+            let res = ctx
+                .http
+                .get(&url)
+                .query(&[("query", q.as_str()), ("time", time.as_str())])
+                .send()
+                .await
+                .with_context(|| format!("GET {url} failed"))?;
+            let status = res.status().as_u16();
+            let body = res.text().await.unwrap_or_default();
+            Ok::<(u16, String), anyhow::Error>((status, body))
+        }
+    };
+    let (pulsus_status, pulsus_body) = fetch(ctx.url("/api/logs/v1/query")).await?;
+    let (oracle_status, oracle_body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+
+    let dump = |detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_metric_pipeline",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": "unwrap_error_witness",
+            "query": q,
+            "eval_ns": eval_ns,
+            "pulsusdb_status": pulsus_status,
+            "pulsusdb_body": pulsus_body,
+            "oracle_status": oracle_status,
+            "oracle_body": oracle_body,
+            "detail": detail,
+        });
+        write_artifact(ctx, ARTIFACT_AREA, "metric-error-witness", &artifact)
+    };
+
+    for (store, status, body) in [
+        ("pulsusdb", pulsus_status, &pulsus_body),
+        ("oracle", oracle_status, &oracle_body),
+    ] {
+        if status != 400 {
+            let path = dump(&format!("{store} returned {status}, expected 400"))?;
+            bail!(
+                "case {:?}: {store} returned {status} instead of 400 for a surviving unwrap \
+                 conversion error (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        if !body.contains("SampleExtractionErr") {
+            let path = dump(&format!("{store} 400 body lacks SampleExtractionErr"))?;
+            bail!(
+                "case {:?}: {store} error does not carry the SampleExtractionErr class (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The eval instant for the metric-instant cases: just past the last
+/// record, so every fixture query's `[30m]` window covers the whole
+/// corpus on both tiers (record spans are <= ~5m + margins).
+fn metric_eval_ns(corpus: &LogCorpus) -> i64 {
+    corpus.last_ts_ns + CORPUS_NOW_MARGIN_NS
+}
+
+async fn query_instant(
+    ctx: &Ctx,
+    url: &str,
+    query: &str,
+    time_ns: i64,
+) -> Result<serde_json::Value> {
+    let time = time_ns.to_string();
+    let res = ctx
+        .http
+        .get(url)
+        .query(&[("query", query), ("time", time.as_str())])
+        .send()
+        .await
+        .with_context(|| format!("GET {url} failed"))?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        bail!("{url} for {query:?} returned {status}: {body}");
+    }
+    res.json()
+        .await
+        .with_context(|| format!("{url} body was not JSON"))
+}
+
+/// Instant metric case: both stores answer `/query` for the identical
+/// expression and evaluation instant — instant windows `(t - range, t]`
+/// are semantically identical on both stores, so every instant case is
+/// fully gated. Values compare with a tight relative tolerance; label
+/// sets compare exactly.
+async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) -> Result<()> {
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let expected = corpus.expected_metric_vector(&case.case_id);
+    let gated = case.mode == "gated";
+    let eval_ns = metric_eval_ns(corpus);
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: {} expected series",
+        case.case_id,
+        case.mode,
+        case.construct,
+        expected.len(),
+    );
+
+    let pulsus_body = query_instant(ctx, &ctx.url("/api/logs/v1/query"), &q, eval_ns).await?;
+    let oracle_body = query_instant(
+        ctx,
+        &format!("{}/loki/api/v1/query", ctx.loki_url),
+        &q,
+        eval_ns,
+    )
+    .await?;
+    // `vector_result_set` hard-fails on duplicate label sets (validity
+    // gate; a truncation gate is not applicable — metric vectors carry
+    // no request limit).
+    let pulsus_set = vector_result_set(&pulsus_body)?;
+    let oracle_set = vector_result_set(&oracle_body)?;
+
+    let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_metric_pipeline",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": kind,
+            "query": q,
+            "eval_ns": eval_ns,
+            "expected": expected.iter().map(|(l, v)| serde_json::json!({"labels": l, "value": v})).collect::<Vec<_>>(),
+            "pulsusdb_result": pulsus_body,
+            "oracle_result": oracle_body,
+            "detail": detail,
+        });
+        write_artifact(
+            ctx,
+            ARTIFACT_AREA,
+            if gated {
+                "metric-case-mismatch"
+            } else {
+                "informational-case"
+            },
+            &artifact,
+        )
+    };
+
+    if !vectors_match(&pulsus_set, &expected) {
+        let path = dump(
+            "pulsus_vs_corpus",
+            &format!("pulsusdb vector diverged: got {pulsus_set:?}, expected {expected:?}"),
+        )?;
+        bail!(
+            "case {:?}: pulsusdb diverged from the corpus expectation (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    if !vectors_match(&oracle_set, &expected) {
+        let path = dump(
+            "oracle_vs_corpus",
+            &format!("oracle vector diverged: got {oracle_set:?}, expected {expected:?}"),
+        )?;
+        if gated {
+            bail!(
+                "case {:?}: oracle diverged from the corpus expectation (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        println!(
+            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+             (dumped to {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    } else if !gated {
+        let path = dump(
+            "stale_exclusion",
+            "informational metric case matched the oracle",
+        )?;
+        bail!(
+            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Range metric case: both stores answer `/query_range`. PulsusDB is
+/// hard-gated against the tumbling by-construction expectation; the
+/// oracle comparison is informational for the ledgered
+/// tumbling-vs-sliding case, with the standard anti-rot.
+async fn run_metric_range_case(
+    ctx: &Ctx,
+    corpus: &LogCorpus,
+    case: &CaseRaw,
+    window: QueryWindow,
+) -> Result<()> {
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let step_s = case
+        .step_s
+        .with_context(|| format!("case {:?} is metric_range but has no step_s", case.case_id))?;
+    let step_ns = step_s as i64 * 1_000_000_000;
+    let expected = corpus.expected_metric_matrix(&case.case_id, step_ns);
+    let gated = case.mode == "gated";
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: {} expected series",
+        case.case_id,
+        case.mode,
+        case.construct,
+        expected.len(),
+    );
+
+    let query_range = |url: String| {
+        let q = q.clone();
+        async move {
+            let start = window.start_ns.to_string();
+            let end = window.end_ns.to_string();
+            let step = step_s.to_string();
+            let res = ctx
+                .http
+                .get(&url)
+                .query(&[
+                    ("query", q.as_str()),
+                    ("start", start.as_str()),
+                    ("end", end.as_str()),
+                    ("step", step.as_str()),
+                ])
+                .send()
+                .await
+                .with_context(|| format!("GET {url} failed"))?;
+            if !res.status().is_success() {
+                let status = res.status();
+                let body = res.text().await.unwrap_or_default();
+                bail!("{url} for {q:?} returned {status}: {body}");
+            }
+            res.json::<serde_json::Value>()
+                .await
+                .with_context(|| format!("{url} body was not JSON"))
+        }
+    };
+    let pulsus_body = query_range(ctx.url("/api/logs/v1/query_range")).await?;
+    let oracle_body = query_range(format!("{}/loki/api/v1/query_range", ctx.loki_url)).await?;
+    let pulsus_set = matrix_result_set(&pulsus_body)?;
+    let oracle_set = matrix_result_set(&oracle_body)?;
+
+    let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_metric_pipeline",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": kind,
+            "query": q,
+            "window": { "start_ns": window.start_ns, "end_ns": window.end_ns, "step_s": step_s },
+            "pulsusdb_result": pulsus_body,
+            "oracle_result": oracle_body,
+            "detail": detail,
+        });
+        write_artifact(
+            ctx,
+            ARTIFACT_AREA,
+            if gated {
+                "metric-case-mismatch"
+            } else {
+                "informational-case"
+            },
+            &artifact,
+        )
+    };
+
+    // PulsusDB vs the tumbling by-construction expectation: ALWAYS hard.
+    if !matrices_match(&pulsus_set, &expected) {
+        let path = dump(
+            "pulsus_vs_corpus",
+            &format!("pulsusdb matrix diverged: got {pulsus_set:?}, expected {expected:?}"),
+        )?;
+        bail!(
+            "case {:?}: pulsusdb diverged from the tumbling corpus expectation (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    if !matrices_match(&oracle_set, &expected) {
+        let path = dump("oracle_vs_corpus", "oracle sliding-window result diverged")?;
+        if gated {
+            bail!(
+                "case {:?}: oracle diverged from the corpus expectation (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        println!(
+            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+             (dumped to {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    } else if !gated {
+        let path = dump(
+            "stale_exclusion",
+            "informational metric case matched the oracle",
+        )?;
+        bail!(
+            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The M6-09 streams comparison: validity gates first (raw counts
+/// strictly below the limit on both stores; no duplicate entries), then
+/// PulsusDB == corpus (ALWAYS hard) == oracle (hard for `gated`,
+/// recorded for `informational`).
+async fn run_streams_case(
     ctx: &Ctx,
     corpus: &LogCorpus,
     fixture: &LogsFixture,
@@ -627,14 +1093,18 @@ fn describe_diff(store: &str, got: &ExpectedResult, expected: &ExpectedResult) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logs_corpus::CASE_IDS;
+    use crate::logs_corpus::{CASE_IDS, METRIC_CASE_IDS};
 
     /// The committed exclusion list (plan v3 delta 5): every case starts
-    /// gated; a case id appears here ONLY after an observed live
-    /// divergence was triaged and recorded in
-    /// docs/benchmarks/logs-differential-ledger.md. Update deliberately,
-    /// with the ledger entry, never as a quick fix for a red run.
-    const INFORMATIONAL_CASE_IDS: &[&str] = &[];
+    /// gated; a case id appears here ONLY after a triaged divergence is
+    /// recorded in docs/benchmarks/logs-differential-ledger.md. Update
+    /// deliberately, with the ledger entry, never as a quick fix for a
+    /// red run. `metric_rate_tumbling` is the issue-M6-10 SEEDED entry:
+    /// the tumbling-vs-sliding range-window divergence is documented
+    /// by-construction (the M1 tumbling contract), classified in the
+    /// ledger at introduction per the M6-10 plan — PulsusDB stays
+    /// hard-gated against the tumbling corpus expectation.
+    const INFORMATIONAL_CASE_IDS: &[&str] = &["metric_rate_tumbling"];
 
     fn shipped_fixture() -> LogsFixture {
         let root = crate::engine::workspace_root();
@@ -659,7 +1129,29 @@ mod tests {
     fn shipped_fixture_cases_match_the_corpus_case_ids_exactly() {
         let fixture = shipped_fixture();
         let fixture_ids: Vec<&str> = fixture.cases.iter().map(|c| c.case_id.as_str()).collect();
-        assert_eq!(fixture_ids, CASE_IDS.to_vec());
+        // Issue M6-10: the id-set lock covers the streams cases followed
+        // by the metric cases, in committed order.
+        let mut all_ids: Vec<&str> = CASE_IDS.to_vec();
+        all_ids.extend_from_slice(METRIC_CASE_IDS);
+        assert_eq!(fixture_ids, all_ids);
+    }
+
+    #[test]
+    fn shipped_metric_cases_carry_the_right_kinds_and_step() {
+        let fixture = shipped_fixture();
+        for case in &fixture.cases {
+            if !METRIC_CASE_IDS.contains(&case.case_id.as_str()) {
+                assert_eq!(case.kind(), "streams", "{}", case.case_id);
+                continue;
+            }
+            match case.kind() {
+                "metric_instant" | "metric_error" => {
+                    assert!(case.step_s.is_none(), "{}", case.case_id)
+                }
+                "metric_range" => assert!(case.step_s.is_some(), "{}", case.case_id),
+                other => panic!("metric case {:?} has kind {other:?}", case.case_id),
+            }
+        }
     }
 
     /// The pinned exclusion list: every case is gated unless it appears
@@ -733,22 +1225,91 @@ mod tests {
         }
     }
 
+    fn hermetic_plan_ctx() -> pulsus_read::logql::PlanCtx<'static> {
+        pulsus_read::logql::PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        }
+    }
+
+    fn hermetic_params(case: &CaseRaw, corpus: &LogCorpus) -> pulsus_read::logql::QueryParams {
+        let spec = match case.kind() {
+            "metric_instant" => pulsus_read::logql::QuerySpec::Instant {
+                at_ns: metric_eval_ns(corpus),
+            },
+            _ => pulsus_read::logql::QuerySpec::Range {
+                start_ns: corpus.first_ts_ns - WINDOW_SLACK_NS,
+                end_ns: corpus.last_ts_ns + WINDOW_SLACK_NS,
+                step_ns: case.step_s.unwrap_or(60) * 1_000_000_000,
+            },
+        };
+        pulsus_read::logql::QueryParams {
+            spec,
+            limit: 1000,
+            direction: pulsus_read::logql::Direction::Forward,
+        }
+    }
+
     /// Every committed case query PARSES under the shipped grammar and
-    /// its pipeline COMPILES under the shipped evaluator — a fixture
-    /// typo fails hermetically, not at nightly runtime.
+    /// its pipeline COMPILES under the shipped evaluator (streams cases)
+    /// / PLANS under the shipped planner with every leaf pipeline
+    /// compiling (metric cases) — a fixture typo fails hermetically, not
+    /// at nightly runtime.
     #[test]
     fn shipped_fixture_queries_parse_and_their_pipelines_compile() {
         let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
         for case in &fixture.cases {
             let rendered = case.query.replace("{R}", "e2e-logs-test");
             let expr = pulsus_logql::parse(&rendered)
                 .unwrap_or_else(|e| panic!("case {:?} query does not parse: {e}", case.case_id));
-            let pulsus_logql::Expr::Log(log) = expr else {
-                panic!("case {:?} must be a log (streams) query", case.case_id);
-            };
-            pulsus_read::logql::pipeline::CompiledPipeline::compile(&log.pipeline).unwrap_or_else(
-                |e| panic!("case {:?} pipeline does not compile: {e}", case.case_id),
+            if case.kind() == "streams" {
+                let pulsus_logql::Expr::Log(log) = expr else {
+                    panic!("case {:?} must be a log (streams) query", case.case_id);
+                };
+                pulsus_read::logql::pipeline::CompiledPipeline::compile(&log.pipeline)
+                    .unwrap_or_else(|e| {
+                        panic!("case {:?} pipeline does not compile: {e}", case.case_id)
+                    });
+                continue;
+            }
+            assert!(
+                matches!(expr, pulsus_logql::Expr::Metric(_)),
+                "case {:?} must be a metric query",
+                case.case_id
             );
+            let plan = pulsus_read::logql::plan(
+                &expr,
+                &hermetic_params(case, &corpus),
+                &hermetic_plan_ctx(),
+            )
+            .unwrap_or_else(|e| panic!("case {:?} does not plan: {e}", case.case_id));
+            let leaves: Vec<&pulsus_read::logql::MetricPlan> = match &plan {
+                pulsus_read::logql::Plan::Metric(mp) => vec![mp],
+                pulsus_read::logql::Plan::MetricBinary(node) => node.leaves(),
+                pulsus_read::logql::Plan::Streams(_) => {
+                    panic!("case {:?} planned as streams", case.case_id)
+                }
+            };
+            for leaf in leaves {
+                if let Some(client) = &leaf.client {
+                    pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).unwrap_or_else(
+                        |e| {
+                            panic!(
+                                "case {:?} client pipeline does not compile: {e}",
+                                case.case_id
+                            )
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -760,7 +1321,7 @@ mod tests {
         let fixture = shipped_fixture();
         for count in [fixture.ci.record_count, fixture.full.record_count] {
             let corpus = shipped_corpus(&fixture, count);
-            for case in &fixture.cases {
+            for case in fixture.cases.iter().filter(|c| c.kind() == "streams") {
                 let expected = corpus.expected_case_result(&case.case_id);
                 let entries = set_entry_count(&expected);
                 assert!(
@@ -779,6 +1340,277 @@ mod tests {
         }
     }
 
+    /// The metric cases' by-construction expectations are non-vacuous at
+    /// both tiers (a vacuous expectation would gate nothing).
+    #[test]
+    fn shipped_metric_expectations_are_non_vacuous() {
+        let fixture = shipped_fixture();
+        for count in [fixture.ci.record_count, fixture.full.record_count] {
+            let corpus = shipped_corpus(&fixture, count);
+            for case in &fixture.cases {
+                match case.kind() {
+                    "metric_instant" => {
+                        let expected = corpus.expected_metric_vector(&case.case_id);
+                        assert!(
+                            !expected.is_empty(),
+                            "case {:?} is vacuous at record_count {count}",
+                            case.case_id
+                        );
+                    }
+                    "metric_range" => {
+                        let step_ns = case.step_s.unwrap() as i64 * 1_000_000_000;
+                        let expected = corpus.expected_metric_matrix(&case.case_id, step_ns);
+                        let points: usize = expected.values().map(|p| p.len()).sum();
+                        assert!(
+                            points > 0,
+                            "case {:?} is vacuous at record_count {count}",
+                            case.case_id
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The metric-instant expectations agree with running the SHIPPED
+    /// client-aggregation path over the generated bodies — corpus
+    /// projection, fixture query, planner mode split, and the engine's
+    /// own reducers cannot drift apart (hermetic anti-drift, mirroring
+    /// the streams test below; the live lane then compares both stores).
+    #[test]
+    fn shipped_metric_expectations_agree_with_the_shipped_evaluator() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        for case in fixture
+            .cases
+            .iter()
+            .filter(|c| c.kind() == "metric_instant")
+        {
+            let rendered = case.query.replace("{R}", &corpus.run_id);
+            let expr = pulsus_logql::parse(&rendered).expect("parse");
+            let service = first_selector_service(&expr);
+            let params = hermetic_params(case, &corpus);
+            let plan =
+                pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+            let result = match &plan {
+                pulsus_read::logql::Plan::Metric(mp) => {
+                    evaluate_leaf_hermetically(&corpus, mp, &service)
+                }
+                pulsus_read::logql::Plan::MetricBinary(node) => {
+                    evaluate_node_hermetically(&corpus, node, &service)
+                }
+                pulsus_read::logql::Plan::Streams(_) => panic!("metric case planned as streams"),
+            };
+            let pulsus_read::logql::QueryResult::Vector(samples) = result else {
+                panic!("case {:?} did not evaluate to a vector", case.case_id);
+            };
+            let mut evaluated = MetricVector::new();
+            for s in samples {
+                let labels: std::collections::BTreeMap<String, String> =
+                    s.labels.into_iter().collect();
+                assert!(
+                    evaluated.insert(labels, s.value).is_none(),
+                    "duplicate label set in the evaluated vector"
+                );
+            }
+            let expected = corpus.expected_metric_vector(&case.case_id);
+            assert_eq!(
+                evaluated.keys().collect::<Vec<_>>(),
+                expected.keys().collect::<Vec<_>>(),
+                "case {:?}: label sets diverged",
+                case.case_id
+            );
+            for (labels, v) in &expected {
+                assert!(
+                    approx_eq(evaluated[labels], *v),
+                    "case {:?}: value diverged for {labels:?}: {} vs {v}",
+                    case.case_id,
+                    evaluated[labels]
+                );
+            }
+        }
+    }
+
+    /// The D1 witness, hermetic half: the SHIPPED evaluator FAILS the
+    /// `metric_unwrap_error` case over the generated witness record with
+    /// the named surviving-`__error__` error — the same 400 the live
+    /// lane asserts on both stores.
+    #[test]
+    fn shipped_unwrap_error_witness_fails_the_shipped_evaluator_by_name() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        let case = fixture
+            .cases
+            .iter()
+            .find(|c| c.kind() == "metric_error")
+            .expect("the witness case is committed");
+        let rendered = case.query.replace("{R}", &corpus.run_id);
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let service = first_selector_service(&expr);
+        let params = pulsus_read::logql::QueryParams {
+            spec: pulsus_read::logql::QuerySpec::Instant {
+                at_ns: metric_eval_ns(&corpus),
+            },
+            limit: 1000,
+            direction: pulsus_read::logql::Direction::Forward,
+        };
+        let plan = pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+        let pulsus_read::logql::Plan::Metric(mp) = &plan else {
+            panic!("witness case must plan as a single metric leaf");
+        };
+        let client = mp.client.as_ref().expect("client-aggregated");
+        let compiled =
+            pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).expect("compile");
+        let meta = std::collections::HashMap::from([(
+            1u64,
+            pulsus_read::logql::rows::StreamMetaRow {
+                fingerprint: 1,
+                service: service.clone(),
+                labels: format!(
+                    r#"{{"run_id":"{}","service_name":"{service}"}}"#,
+                    corpus.run_id
+                ),
+            },
+        )]);
+        let rows: Vec<pulsus_read::logql::rows::SampleRow> = corpus
+            .records
+            .iter()
+            .filter(|r| r.service == service)
+            .map(|r| pulsus_read::logql::rows::SampleRow {
+                fingerprint: 1,
+                timestamp_ns: r.ts_ns,
+                body: r.body.clone(),
+            })
+            .collect();
+        assert!(!rows.is_empty(), "the witness record must exist");
+        let err = pulsus_read::logql::run_client_agg_rows(
+            &rows,
+            &compiled,
+            &meta,
+            client,
+            pulsus_read::logql::ClientWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+                step_ns: mp.step_ns,
+            },
+            mp.rate_window_ns,
+        )
+        .expect_err("a surviving conversion failure must fail the query");
+        let pulsus_read::logql::ReadError::MetricPipelineError { error_type, .. } = &err else {
+            panic!("expected MetricPipelineError, got {err:?}");
+        };
+        assert_eq!(error_type, pulsus_read::logql::SAMPLE_EXTRACTION_ERROR);
+    }
+
+    /// The `service_name` the case's (single) selector pins.
+    fn first_selector_service(expr: &pulsus_logql::Expr) -> String {
+        fn walk(me: &pulsus_logql::MetricExpr) -> Option<String> {
+            match me {
+                pulsus_logql::MetricExpr::Range { range, .. } => range
+                    .selector
+                    .selector
+                    .matchers
+                    .iter()
+                    .find(|m| m.name == "service_name")
+                    .map(|m| m.value.clone()),
+                pulsus_logql::MetricExpr::Vector { inner, .. } => walk(inner),
+                pulsus_logql::MetricExpr::Binary { lhs, rhs, .. } => {
+                    walk(lhs).or_else(|| walk(rhs))
+                }
+                pulsus_logql::MetricExpr::Literal(_) => None,
+            }
+        }
+        let pulsus_logql::Expr::Metric(me) = expr else {
+            panic!("metric expr expected");
+        };
+        walk(me).expect("metric case selectors pin a service")
+    }
+
+    /// Runs one leaf `MetricPlan`'s client-aggregation over the corpus
+    /// records the leaf's selector matches — the same pure sequence the
+    /// engine executes post-fetch.
+    fn evaluate_leaf_hermetically(
+        corpus: &LogCorpus,
+        mp: &pulsus_read::logql::MetricPlan,
+        service: &str,
+    ) -> pulsus_read::logql::QueryResult {
+        let client = mp
+            .client
+            .as_ref()
+            .expect("fixture metric leaves are client-aggregated");
+        let compiled =
+            pulsus_read::logql::CompiledPipeline::compile(&client.pipeline).expect("compile");
+        let meta = std::collections::HashMap::from([(
+            1u64,
+            pulsus_read::logql::rows::StreamMetaRow {
+                fingerprint: 1,
+                service: service.to_string(),
+                labels: format!(
+                    r#"{{"run_id":"{}","service_name":"{service}"}}"#,
+                    corpus.run_id
+                ),
+            },
+        )]);
+        let rows: Vec<pulsus_read::logql::rows::SampleRow> = corpus
+            .records
+            .iter()
+            .filter(|r| r.service == service)
+            .map(|r| pulsus_read::logql::rows::SampleRow {
+                fingerprint: 1,
+                timestamp_ns: r.ts_ns,
+                body: r.body.clone(),
+            })
+            .collect();
+        let result = pulsus_read::logql::run_client_agg_rows(
+            &rows,
+            &compiled,
+            &meta,
+            client,
+            pulsus_read::logql::ClientWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+                step_ns: mp.step_ns,
+            },
+            mp.rate_window_ns,
+        )
+        .expect("client aggregation");
+        pulsus_read::logql::apply_vector_aggs(result, &mp.vector_aggs)
+    }
+
+    fn evaluate_node_hermetically(
+        corpus: &LogCorpus,
+        node: &pulsus_read::logql::MetricNode,
+        service: &str,
+    ) -> pulsus_read::logql::QueryResult {
+        match node {
+            pulsus_read::logql::MetricNode::Leaf(mp) => {
+                evaluate_leaf_hermetically(corpus, mp, service)
+            }
+            pulsus_read::logql::MetricNode::Scalar(v) => {
+                pulsus_read::logql::QueryResult::Scalar(*v)
+            }
+            pulsus_read::logql::MetricNode::VectorAgg { aggs, inner } => {
+                pulsus_read::logql::apply_vector_aggs(
+                    evaluate_node_hermetically(corpus, inner, service),
+                    aggs,
+                )
+            }
+            pulsus_read::logql::MetricNode::Binary {
+                op,
+                return_bool,
+                lhs,
+                rhs,
+            } => pulsus_read::logql::combine_binary(
+                *op,
+                *return_bool,
+                evaluate_node_hermetically(corpus, lhs, service),
+                evaluate_node_hermetically(corpus, rhs, service),
+            )
+            .expect("combine"),
+        }
+    }
+
     /// The corpus's expected sets agree with running the SHIPPED
     /// evaluator over the generated bodies — the projection, the fixture
     /// query, and `pulsus-read`'s own pipeline cannot drift apart
@@ -787,7 +1619,7 @@ mod tests {
     fn shipped_fixture_expected_sets_agree_with_the_shipped_evaluator() {
         let fixture = shipped_fixture();
         let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
-        for case in &fixture.cases {
+        for case in fixture.cases.iter().filter(|c| c.kind() == "streams") {
             let rendered = case.query.replace("{R}", &corpus.run_id);
             let expr = pulsus_logql::parse(&rendered).expect("parse");
             let pulsus_logql::Expr::Log(log) = expr else {

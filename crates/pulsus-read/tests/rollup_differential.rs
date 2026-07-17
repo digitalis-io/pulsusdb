@@ -255,7 +255,7 @@ fn metric_plan(query: &str, params: &QueryParams, db: &str) -> pulsus_read::logq
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &plan_ctx(db)).expect("plan") {
         Plan::Metric(mp) => mp,
-        Plan::Streams(_) => panic!("expected a Metric plan"),
+        Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
     }
 }
 
@@ -524,4 +524,179 @@ async fn engine_query_on_the_rollup_path_matches_independently_computed_raw_coun
     let MatrixSeries { points, .. } = &series[0];
     let actual: BTreeMap<i64, f64> = points.iter().copied().collect();
     assert_eq!(actual, expected);
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-10 end-to-end: `LogQlEngine::query` on the CLIENT-AGGREGATED
+// path (a beyond-line-filter pipeline) against a live ClickHouse — the
+// full-window `metric_raw_samples` fetch executes, the in-engine
+// pipeline/bucket/reduce runs, and for a count query the result matches
+// the SQL-aggregated answer for the identical filter, computed
+// independently through the raw `sql` builder.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn engine_query_on_the_client_agg_path_matches_the_sql_aggregated_count() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_diff_client_agg";
+    let (client, base_ns) = setup(db).await;
+    let w = window(base_ns);
+    let step_ns = 12 * RES_NS as u64;
+
+    // Independent SQL-aggregated truth: count of `FP_A` rows whose body
+    // contains "longer", bucketed by step — the same predicate the
+    // engine's pushed-down line filter renders.
+    let raw_table = format!("{db}.log_samples");
+    let raw_sql = sql::metric_range(
+        sql::MetricSource {
+            table: &raw_table,
+            bucket_col: "timestamp_ns",
+            agg_expr: "count()",
+        },
+        &["'checkout'".to_string()],
+        &[FP_A],
+        w,
+        step_ns,
+        &["position(body, 'longer') > 0".to_string()],
+    );
+    let raw_map = query_bucket_map(&client, &raw_sql).await;
+    assert!(!raw_map.is_empty(), "fixture produced no raw truth data");
+    let expected: BTreeMap<i64, f64> = raw_map
+        .into_iter()
+        .map(|((_fp, step), n)| (step, n as f64))
+        .collect();
+
+    let engine_cfg = ChConnConfig {
+        database: db.to_string(),
+        ..test_config()
+    };
+    let engine_client = ChClient::new(engine_cfg)
+        .await
+        .expect("connect (engine client)");
+    let engine = LogQlEngine::new(
+        engine_client,
+        EngineConfig {
+            db: db.to_string(),
+            streams_idx: "log_streams_idx".to_string(),
+            streams: "log_streams".to_string(),
+            samples: "log_samples".to_string(),
+            rollup_table: "log_metrics_5s".to_string(),
+            rollup_res_ns: RES_NS as u64,
+            scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        },
+    );
+
+    // The base-label filter `env = "prod"` is a beyond-line-filter stage:
+    // it forces the client-aggregated mode (asserted below) without
+    // changing which rows survive — so the in-engine count must equal
+    // the SQL-aggregated truth exactly.
+    let query = r#"count_over_time({env="prod"} |= "longer" | env = "prod" [1m])"#;
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: w.start_ns,
+            end_ns: w.end_ns,
+            step_ns,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let mp = metric_plan(query, &params, db);
+    assert!(
+        mp.client.is_some(),
+        "the label filter must force client aggregation"
+    );
+
+    let expr = parse(query).expect("parse");
+    let result = engine.query(&expr, &params).await.expect("engine query");
+    let QueryResult::Matrix(series) = result else {
+        panic!("expected a Matrix result");
+    };
+    assert_eq!(series.len(), 1, "one fixture stream matches");
+    let actual: BTreeMap<i64, f64> = series[0].points.iter().copied().collect();
+    assert_eq!(
+        actual, expected,
+        "client-aggregated count must equal the SQL-aggregated count for the identical filter"
+    );
+}
+
+/// Issue M6-10 review round 1, gap (a): the client-aggregated raw scan
+/// carries no `LIMIT`, so the complete-or-error contract rests entirely
+/// on `max_bytes_to_read` — this test BREACHES that budget for real and
+/// asserts the named `QueryTooBroad(ScanBudgetBytes)` error (never a
+/// truncated aggregate, never an unmapped 307).
+#[tokio::test]
+async fn engine_client_agg_scan_past_the_byte_budget_is_a_named_query_too_broad() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_diff_budget";
+    let (client, base_ns) = setup(db).await;
+    // Bulk-seed enough body bytes that the samples scan must read far
+    // past the budget below, while the stage-1/stage-2 index reads (a
+    // handful of tiny rows) stay well under it.
+    let filler = "x".repeat(200);
+    let mut values = Vec::new();
+    for i in 0..4_000i64 {
+        let ts = base_ns + RES_NS + i * 1_000_000; // 1ms apart inside the window
+        values.push(format!(
+            "('checkout', {FP_A}, {ts}, 0, 'bulk {i} {filler}')"
+        ));
+    }
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, \
+                 body) VALUES {}",
+                values.join(", ")
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("bulk seed");
+
+    let engine_cfg = ChConnConfig {
+        database: db.to_string(),
+        ..test_config()
+    };
+    let engine_client = ChClient::new(engine_cfg)
+        .await
+        .expect("connect (engine client)");
+    const TIGHT_BUDGET: u64 = 64 * 1024;
+    let engine = LogQlEngine::new(
+        engine_client,
+        EngineConfig {
+            db: db.to_string(),
+            streams_idx: "log_streams_idx".to_string(),
+            streams: "log_streams".to_string(),
+            samples: "log_samples".to_string(),
+            rollup_table: "log_metrics_5s".to_string(),
+            rollup_res_ns: RES_NS as u64,
+            scan_budget_bytes: TIGHT_BUDGET,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        },
+    );
+
+    let w = window(base_ns);
+    let expr = parse(r#"count_over_time({env="prod"} | env = "prod" [1m])"#).expect("parse");
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: w.start_ns,
+            end_ns: w.end_ns,
+            step_ns: 12 * RES_NS as u64,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    let err = engine
+        .query(&expr, &params)
+        .await
+        .expect_err("the raw scan must breach the byte budget");
+    match err {
+        pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::ScanBudgetBytes { budget_bytes, .. },
+        ) => assert_eq!(budget_bytes, TIGHT_BUDGET),
+        other => panic!("expected QueryTooBroad(ScanBudgetBytes), got {other:?}"),
+    }
 }

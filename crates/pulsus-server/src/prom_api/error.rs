@@ -147,6 +147,7 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::ContradictoryMatchers
         | ReadError::InvalidStep
         | ReadError::PipelineInvalid { .. }
+        | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
         }
@@ -193,6 +194,29 @@ mod tests {
         assert!(obj.contains_key("errorType"));
         assert!(obj.contains_key("error"));
         assert!(!obj.contains_key("position"));
+    }
+
+    /// Issue M6-10 review round 1, gap (d): the surviving-metric-
+    /// pipeline-error variant maps to 400 `bad_data` here too (this
+    /// mapper matches `ReadError` exhaustively — a LogQL-only variant
+    /// must still carry a correct mapping, mirroring the
+    /// unreachable-today `Parse` arm's precedent).
+    #[tokio::test]
+    async fn read_error_metric_pipeline_error_maps_to_400_bad_data() {
+        let err = pulsus_read::logql::ReadError::MetricPipelineError {
+            error_type: "SampleExtractionErr".to_string(),
+            series: r#"{__error__="SampleExtractionErr", app="x"}"#.to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("pipeline error: 'SampleExtractionErr'"),
+            "{json}"
+        );
     }
 
     #[tokio::test]

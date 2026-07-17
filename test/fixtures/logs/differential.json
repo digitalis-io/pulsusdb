@@ -65,6 +65,50 @@
       "construct": "label_format rename (dst=src moves the value, removes the source label)",
       "mode": "gated",
       "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | level = \"error\" | label_format lvl=level"
+    },
+    {
+      "case_id": "metric_filtered_count",
+      "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores — no tumbling divergence)",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" [30m])"
+    },
+    {
+      "case_id": "metric_unwrap_sum",
+      "construct": "M6-10 sum_over_time over unwrap duration(...) with a targeted logfmt extraction (unwrap deletes the unwrapped label; conversion at the unwrap stage)",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum_over_time({run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt took | unwrap duration(took) [30m])"
+    },
+    {
+      "case_id": "metric_vector_agg",
+      "construct": "M6-10 vector aggregation sum by(level) over a client-aggregated count_over_time",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "sum by (level) (count_over_time({run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt [30m]))"
+    },
+    {
+      "case_id": "metric_binary_scalar",
+      "construct": "M6-10 vector-scalar binary operation over a client-aggregated metric result",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"500\" [30m]) * 2"
+    },
+    {
+      "case_id": "metric_rate_tumbling",
+      "construct": "M6-10 seeded ledger entry: range-query rate — PulsusDB's epoch-aligned tumbling buckets vs the oracle's request-aligned sliding windows (PulsusDB stays hard-gated against the tumbling by-construction expectation)",
+      "mode": "informational",
+      "kind": "metric_range",
+      "step_s": 60,
+      "ledger": "tumbling-vs-sliding-rate",
+      "query": "rate({run_id=\"{R}\", service_name=\"svc-json\"}[1m])"
+    },
+    {
+      "case_id": "metric_unwrap_error",
+      "construct": "M6-10 D1 witness: a GENUINE unwrap conversion failure surviving the pipeline (svc-badunit's took=abc) fails the metric query on BOTH stores — HTTP 400 carrying SampleExtractionErr, never silent exclusion",
+      "mode": "gated",
+      "kind": "metric_error",
+      "query": "sum_over_time({run_id=\"{R}\", service_name=\"svc-badunit\"} | logfmt | unwrap duration(took) [30m])"
     }
   ]
 }

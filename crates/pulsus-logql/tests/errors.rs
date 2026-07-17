@@ -15,81 +15,67 @@ fn assert_not_yet_supported(query: &str, construct: &str) {
     }
 }
 
-// --- All ten `*_over_time` range aggregations (amendment 1 §3) ---
+// --- Vector-matching modifiers: the M6-10 adjudicated deferral —
+// --- individually enumerated by name, no catch-all. ---
 
 #[test]
-fn sum_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"sum_over_time({a="b"}[5m])"#, "sum_over_time");
+fn every_vector_matching_modifier_is_named_not_yet_supported() {
+    for modifier in ["on", "ignoring", "group_left", "group_right"] {
+        let query = format!(r#"rate({{a="b"}}[5m]) + {modifier}(x) rate({{a="c"}}[5m])"#);
+        assert_not_yet_supported(&query, modifier);
+    }
 }
 
 #[test]
-fn avg_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"avg_over_time({a="b"}[5m])"#, "avg_over_time");
+fn a_matching_modifier_after_bool_is_still_named_not_yet_supported() {
+    assert_not_yet_supported(r#"rate({a="b"}[5m]) > bool on(x) rate({a="c"}[5m])"#, "on");
+}
+
+// --- Aggregation parameter arity (issue M6-10) ---
+
+#[test]
+fn quantile_over_time_without_a_parameter_is_rejected() {
+    match parse(r#"quantile_over_time({a="b"}[5m])"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("quantile parameter"), "{expected}");
+        }
+        other => panic!("expected the missing quantile parameter to be rejected, got {other:?}"),
+    }
 }
 
 #[test]
-fn min_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"min_over_time({a="b"}[5m])"#, "min_over_time");
+fn a_parameter_on_a_parameterless_range_aggregation_is_rejected() {
+    match parse(r#"count_over_time(0.5, {a="b"}[5m])"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("'{'"), "{expected}");
+        }
+        other => panic!("expected a stray count_over_time parameter to be rejected, got {other:?}"),
+    }
 }
 
 #[test]
-fn max_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"max_over_time({a="b"}[5m])"#, "max_over_time");
+fn topk_without_a_parameter_is_rejected() {
+    match parse(r#"topk(rate({a="b"}[5m]))"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("k parameter"), "{expected}");
+        }
+        other => panic!("expected the missing topk k to be rejected, got {other:?}"),
+    }
 }
 
 #[test]
-fn stddev_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"stddev_over_time({a="b"}[5m])"#, "stddev_over_time");
-}
-
-#[test]
-fn stdvar_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"stdvar_over_time({a="b"}[5m])"#, "stdvar_over_time");
-}
-
-#[test]
-fn quantile_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(
-        r#"quantile_over_time(0.95, {a="b"}[5m])"#,
-        "quantile_over_time",
-    );
-}
-
-#[test]
-fn first_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"first_over_time({a="b"}[5m])"#, "first_over_time");
-}
-
-#[test]
-fn last_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"last_over_time({a="b"}[5m])"#, "last_over_time");
-}
-
-#[test]
-fn absent_over_time_is_not_yet_supported() {
-    assert_not_yet_supported(r#"absent_over_time({a="b"}[5m])"#, "absent_over_time");
-}
-
-// --- Vector aggregations: stddev, stdvar, topk, bottomk ---
-
-#[test]
-fn stddev_is_not_yet_supported() {
-    assert_not_yet_supported(r#"stddev(rate({a="b"}[5m]))"#, "stddev");
-}
-
-#[test]
-fn stdvar_is_not_yet_supported() {
-    assert_not_yet_supported(r#"stdvar(rate({a="b"}[5m]))"#, "stdvar");
-}
-
-#[test]
-fn topk_is_not_yet_supported() {
-    assert_not_yet_supported(r#"topk(5, rate({a="b"}[5m]))"#, "topk");
-}
-
-#[test]
-fn bottomk_is_not_yet_supported() {
-    assert_not_yet_supported(r#"bottomk(5, rate({a="b"}[5m]))"#, "bottomk");
+fn a_parameter_on_a_parameterless_vector_aggregation_is_rejected() {
+    // `sum(0.5, ...)`: the `0.5` parses as a scalar-literal operand, so
+    // the stray `,` is the offending token (expected `)`).
+    match parse(r#"sum(0.5, rate({a="b"}[5m]))"#) {
+        Err(LogQlError::UnexpectedToken {
+            found, expected, ..
+        }) => {
+            assert!(found.contains(','), "{found}");
+            assert!(expected.contains(')'), "{expected}");
+        }
+        other => panic!("expected a stray sum parameter to be rejected, got {other:?}"),
+    }
 }
 
 // --- Remaining unsupported pipeline stage keywords (issue M6-09: the
@@ -195,32 +181,6 @@ fn a_label_format_with_a_numeric_rhs_is_rejected() {
     }
 }
 
-// --- Binary operations: the exact recognition table ---
-
-#[test]
-fn arithmetic_binary_operators_are_not_yet_supported() {
-    for op in ["+", "-", "*", "/", "%", "^"] {
-        let query = format!(r#"rate({{a="b"}}[5m]) {op} rate({{a="c"}}[5m])"#);
-        assert_not_yet_supported(&query, "binary operation");
-    }
-}
-
-#[test]
-fn comparison_binary_operators_are_not_yet_supported() {
-    for op in ["==", "!=", ">", "<", ">=", "<="] {
-        let query = format!(r#"rate({{a="b"}}[5m]) {op} rate({{a="c"}}[5m])"#);
-        assert_not_yet_supported(&query, "binary operation");
-    }
-}
-
-#[test]
-fn set_binary_operators_are_not_yet_supported() {
-    for op in ["and", "or", "unless"] {
-        let query = format!(r#"rate({{a="b"}}[5m]) {op} rate({{a="c"}}[5m])"#);
-        assert_not_yet_supported(&query, "binary operation");
-    }
-}
-
 // --- `!=`/`!~` disambiguation, both directions (amendments 1-3) ---
 
 #[test]
@@ -237,11 +197,14 @@ fn neq_after_a_log_expr_is_a_line_filter_not_a_binary_operation() {
 }
 
 #[test]
-fn neq_between_two_metric_exprs_is_a_named_binary_operation() {
-    assert_not_yet_supported(
-        r#"rate({a="b"}[5m]) != rate({a="c"}[5m])"#,
-        "binary operation",
-    );
+fn neq_between_two_metric_exprs_is_a_binary_comparison() {
+    // Issue M6-10: `!=` at binary position now PARSES as a comparison —
+    // the other half of the `!=` disambiguation contract.
+    let expr = parse(r#"rate({a="b"}[5m]) != rate({a="c"}[5m])"#).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Binary { op, .. }) = &expr else {
+        panic!("expected a binary metric expr, got {expr:?}");
+    };
+    assert_eq!(*op, pulsus_logql::BinOp::Neq);
 }
 
 #[test]

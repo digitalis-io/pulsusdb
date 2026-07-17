@@ -5,15 +5,17 @@
 //! instead of overflowing the call stack.
 //!
 //! Disambiguation of the overloaded `!=`/`!~` tokens (selector matcher,
-//! line filter, or — `!=` only — an M6 binary comparison) is purely
+//! line filter, or — `!=` only — a binary comparison) is purely
 //! positional: the selector-matcher loop, the pipeline-stage loop, and
-//! the post-`MetricExpr` binary-op check each own their token set, and
-//! none of them overlap in when they run (architect plan amendments 1-3).
+//! the binary-operator loop ([`peek_binop`], which runs only after a
+//! complete metric primary) each own their token set, and none of them
+//! overlap in when they run (architect plan amendments 1-3).
 
 use crate::ast::{
-    self, CompareOp, Expr, Grouping, GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt,
-    LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher, MetricExpr, NumericLiteral,
-    ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap, VectorAggOp,
+    self, BinModifier, BinOp, CompareOp, Expr, Grouping, GroupingKind, LabelExtraction,
+    LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher,
+    MetricExpr, NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap,
+    VectorAggOp,
 };
 use crate::duration;
 use crate::error::{LogQlError, MAX_DEPTH};
@@ -159,6 +161,28 @@ impl<'a> Cursor<'a> {
             }),
         }
     }
+
+    fn expect_number(
+        &mut self,
+        expected: &str,
+    ) -> Result<(String, crate::token::Span), LogQlError> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Number(raw) => {
+                self.advance();
+                Ok((raw, tok.span))
+            }
+            TokenKind::Eof => Err(LogQlError::UnexpectedEof {
+                expected: expected.to_string(),
+                span: tok.span,
+            }),
+            _ => Err(LogQlError::UnexpectedToken {
+                found: describe(&tok.kind),
+                expected: expected.to_string(),
+                span: tok.span,
+            }),
+        }
+    }
 }
 
 /// A short human-readable description of a token for error messages.
@@ -197,15 +221,17 @@ fn describe(kind: &TokenKind) -> String {
     }
 }
 
-/// `Expr := LogExpr | MetricExpr`. A query starting with `{` is always a
-/// log expression; a query starting with an identifier is always a
-/// metric expression (a call to a range or vector aggregation function).
+/// `Expr := LogExpr | MetricBinaryExpr`. A query starting with `{` is
+/// always a log expression; a query starting with an identifier, a
+/// number, or `(` is always a metric expression — an aggregation call, a
+/// scalar literal, or a parenthesized/binary combination of those (issue
+/// M6-10).
 fn parse_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<Expr, LogQlError> {
     match &cursor.peek().kind {
         TokenKind::LBrace => Ok(Expr::Log(parse_log_expr(cursor)?)),
-        TokenKind::Ident(_) => {
-            let metric = parse_metric_expr(cursor, depth)?;
-            check_no_binary_op(cursor)?;
+        TokenKind::Ident(_) | TokenKind::Number(_) | TokenKind::LParen => {
+            let metric = parse_binary_expr(cursor, depth, 0)?;
+            check_no_stray_filter_op(cursor)?;
             Ok(Expr::Metric(metric))
         }
         TokenKind::Eof => Err(LogQlError::UnexpectedEof {
@@ -223,35 +249,13 @@ fn parse_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<Expr, LogQlError>
     }
 }
 
-/// After a complete top-level `MetricExpr`, checks whether the next token
-/// starts an M6 binary operation (`+ - * / % ^ == != > < >= <= and or
-/// unless`) and names it if so. `!~`/`|=`/`|~` are never binary operators
-/// in any LogQL milestone (amendment 3) — those, if found here, are a
-/// plain position-bearing `UnexpectedToken`, not `NotYetSupported`.
-fn check_no_binary_op(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
+/// After a complete top-level metric expression, names a stray `!~` /
+/// `|=` / `|~`: those are never binary operators in any LogQL milestone
+/// (amendment 3) — a plain position-bearing `UnexpectedToken`, never
+/// `NotYetSupported`.
+fn check_no_stray_filter_op(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
     let tok = cursor.peek();
     match &tok.kind {
-        TokenKind::Plus
-        | TokenKind::Minus
-        | TokenKind::Star
-        | TokenKind::Slash
-        | TokenKind::Percent
-        | TokenKind::Caret
-        | TokenKind::EqEq
-        | TokenKind::Neq
-        | TokenKind::Gt
-        | TokenKind::Lt
-        | TokenKind::Gte
-        | TokenKind::Lte => Err(LogQlError::NotYetSupported {
-            construct: "binary operation".to_string(),
-            span: tok.span,
-        }),
-        TokenKind::Ident(name) if ast::BINARY_OP_KEYWORDS.contains(&name.as_str()) => {
-            Err(LogQlError::NotYetSupported {
-                construct: "binary operation".to_string(),
-                span: tok.span,
-            })
-        }
         TokenKind::Nre | TokenKind::PipeExact | TokenKind::PipeMatch => {
             Err(LogQlError::UnexpectedToken {
                 found: describe(&tok.kind),
@@ -260,6 +264,136 @@ fn check_no_binary_op(cursor: &Cursor<'_>) -> Result<(), LogQlError> {
             })
         }
         _ => Ok(()),
+    }
+}
+
+/// Binary-operator recognition: `(op, precedence, right_assoc)` for the
+/// token at cursor position, `None` when the token does not start a
+/// binary operation. Precedence mirrors the upstream grammar: `or` <
+/// `and`/`unless` < comparisons < `+ -` < `* / %` < `^` (right-
+/// associative).
+fn peek_binop(cursor: &Cursor<'_>) -> Option<(BinOp, u8, bool)> {
+    let op = match &cursor.peek().kind {
+        // The identifier-shaped operators come from the one recognition
+        // table (`ast::BINARY_OP_KEYWORDS`) so the documented operator
+        // inventory and the parser cannot drift.
+        TokenKind::Ident(name) if ast::BINARY_OP_KEYWORDS.contains(&name.as_str()) => {
+            match name.as_str() {
+                "or" => BinOp::Or,
+                "and" => BinOp::And,
+                "unless" => BinOp::Unless,
+                _ => return None,
+            }
+        }
+        TokenKind::Ident(_) => return None,
+        TokenKind::EqEq => BinOp::Eq,
+        TokenKind::Neq => BinOp::Neq,
+        TokenKind::Gt => BinOp::Gt,
+        TokenKind::Gte => BinOp::Gte,
+        TokenKind::Lt => BinOp::Lt,
+        TokenKind::Lte => BinOp::Lte,
+        TokenKind::Plus => BinOp::Add,
+        TokenKind::Minus => BinOp::Sub,
+        TokenKind::Star => BinOp::Mul,
+        TokenKind::Slash => BinOp::Div,
+        TokenKind::Percent => BinOp::Mod,
+        TokenKind::Caret => BinOp::Pow,
+        _ => return None,
+    };
+    let (prec, right_assoc) = match op {
+        BinOp::Or => (1, false),
+        BinOp::And | BinOp::Unless => (2, false),
+        BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte => (3, false),
+        BinOp::Add | BinOp::Sub => (4, false),
+        BinOp::Mul | BinOp::Div | BinOp::Mod => (5, false),
+        BinOp::Pow => (6, true),
+    };
+    Some((op, prec, right_assoc))
+}
+
+/// Precedence-climbing binary-operation layer over metric primaries
+/// (issue M6-10). After each operator, the `bool` modifier is accepted on
+/// comparisons only, and the deferred vector-matching modifiers
+/// (`on`/`ignoring`/`group_left`/`group_right`) are individually named
+/// `NotYetSupported` (adjudication: enumerated, no catch-all).
+fn parse_binary_expr(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    min_prec: u8,
+) -> Result<MetricExpr, LogQlError> {
+    if depth >= MAX_DEPTH {
+        return Err(LogQlError::RecursionLimitExceeded {
+            span: cursor.peek().span,
+        });
+    }
+    let mut lhs = parse_metric_primary(cursor, depth)?;
+    while let Some((op, prec, right_assoc)) = peek_binop(cursor) {
+        if prec < min_prec {
+            break;
+        }
+        cursor.advance();
+        let modifier = parse_bin_modifier(cursor, op)?;
+        let next_min = if right_assoc { prec } else { prec + 1 };
+        let rhs = parse_binary_expr(cursor, depth + 1, next_min)?;
+        lhs = MetricExpr::Binary {
+            op,
+            modifier,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+    }
+    Ok(lhs)
+}
+
+/// Parses the optional modifier(s) after a binary operator: `bool` on a
+/// comparison builds a [`BinModifier`]; the deferred matching modifiers
+/// are enumerated `NotYetSupported`.
+fn parse_bin_modifier(
+    cursor: &mut Cursor<'_>,
+    op: BinOp,
+) -> Result<Option<BinModifier>, LogQlError> {
+    let tok = cursor.peek().clone();
+    if let TokenKind::Ident(name) = &tok.kind {
+        if ast::VECTOR_MATCHING_KEYWORDS.contains(&name.as_str()) {
+            return Err(LogQlError::NotYetSupported {
+                construct: name.clone(),
+                span: tok.span,
+            });
+        }
+        if name == "bool" && op.is_comparison() {
+            cursor.advance();
+            // A matching modifier may also follow `bool` — still deferred.
+            let after = cursor.peek().clone();
+            if let TokenKind::Ident(next) = &after.kind
+                && ast::VECTOR_MATCHING_KEYWORDS.contains(&next.as_str())
+            {
+                return Err(LogQlError::NotYetSupported {
+                    construct: next.clone(),
+                    span: after.span,
+                });
+            }
+            return Ok(Some(BinModifier { return_bool: true }));
+        }
+    }
+    Ok(None)
+}
+
+/// A metric-expression primary: a parenthesized binary expression, a bare
+/// scalar number literal, or an aggregation call.
+fn parse_metric_primary(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr, LogQlError> {
+    match &cursor.peek().kind {
+        TokenKind::LParen => {
+            cursor.advance();
+            let inner = parse_binary_expr(cursor, depth + 1, 0)?;
+            cursor.expect(&TokenKind::RParen, "')'")?;
+            Ok(inner)
+        }
+        TokenKind::Number(raw) => {
+            let raw = raw.clone();
+            cursor.advance();
+            Ok(MetricExpr::Literal(raw))
+        }
+        _ => parse_metric_expr(cursor, depth),
     }
 }
 
@@ -670,12 +804,12 @@ fn parse_stream_selector(cursor: &mut Cursor<'_>) -> Result<StreamSelector, LogQ
     Ok(StreamSelector { matchers })
 }
 
-/// `MetricExpr := <range-agg-name> "(" LogRange ")" | <vector-agg-name>
-/// Grouping? "(" MetricExpr ")" Grouping?` — dispatches on the leading
-/// identifier: implemented range/vector aggregation names build the
-/// corresponding node; every documented-but-unimplemented M6 aggregation
-/// name resolves to a named `NotYetSupported`; anything else is an
-/// `UnexpectedToken`.
+/// `MetricExpr := <range-agg-name> "(" (Number ",")? LogRange ")" |
+/// <vector-agg-name> Grouping? "(" (Number ",")? BinaryExpr ")"
+/// Grouping?` — dispatches on the leading identifier: implemented
+/// range/vector aggregation names build the corresponding node; anything
+/// else is an `UnexpectedToken` (the M6-10 aggregation set is complete —
+/// no future-aggregation keyword table remains).
 fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr, LogQlError> {
     if depth >= MAX_DEPTH {
         return Err(LogQlError::RecursionLimitExceeded {
@@ -708,14 +842,6 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
         cursor.advance();
         return parse_vector_agg_call(cursor, depth, op);
     }
-    if ast::FUTURE_RANGE_AGG.contains(&name.as_str())
-        || ast::FUTURE_VECTOR_AGG.contains(&name.as_str())
-    {
-        return Err(LogQlError::NotYetSupported {
-            construct: name,
-            span: tok.span,
-        });
-    }
     Err(LogQlError::UnexpectedToken {
         found: describe(&tok.kind),
         expected: "an aggregation function".to_string(),
@@ -725,13 +851,20 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
 
 fn parse_range_agg_call(cursor: &mut Cursor<'_>, op: RangeAggOp) -> Result<MetricExpr, LogQlError> {
     cursor.expect(&TokenKind::LParen, "'('")?;
+    // `quantile_over_time` is the only range aggregation with a leading
+    // parameter (`quantile_over_time(0.95, {...}[5m])`); for every other
+    // op the call opens directly with the log range, so a stray number
+    // there fails as an `UnexpectedToken` from the selector parser.
+    let param = if matches!(op, RangeAggOp::QuantileOverTime) {
+        let (raw, _) = cursor.expect_number("the quantile parameter (e.g. 0.95)")?;
+        cursor.expect(&TokenKind::Comma, "','")?;
+        Some(raw)
+    } else {
+        None
+    };
     let range = parse_log_range(cursor)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
-    Ok(MetricExpr::Range {
-        op,
-        range,
-        param: None, // M1 never populates the M6 quantile_over_time parameter
-    })
+    Ok(MetricExpr::Range { op, range, param })
 }
 
 /// `LogRange := LogExpr "[" Duration "]"`.
@@ -755,7 +888,21 @@ fn parse_vector_agg_call(
 ) -> Result<MetricExpr, LogQlError> {
     let mut grouping = maybe_grouping(cursor)?;
     cursor.expect(&TokenKind::LParen, "'('")?;
-    let inner = parse_metric_expr(cursor, depth + 1)?;
+    // `topk`/`bottomk` require a leading `k` parameter (`topk(5, ...)`);
+    // for the parameterless aggregations the inner expression may itself
+    // begin with a number (`sum(2 * rate(...))`), so no-param ops go
+    // straight to the inner parse — a misplaced `0.5,` there fails on the
+    // `,` as an `UnexpectedToken` (expected `')'`).
+    let param = if op.takes_param() {
+        let (raw, _) = cursor.expect_number("the k parameter (e.g. topk(5, ...))")?;
+        cursor.expect(&TokenKind::Comma, "','")?;
+        Some(raw)
+    } else {
+        None
+    };
+    // The aggregated operand is a full binary-capable metric expression
+    // (`sum(rate(a) + rate(b))` — issue M6-10).
+    let inner = parse_binary_expr(cursor, depth + 1, 0)?;
     cursor.expect(&TokenKind::RParen, "')'")?;
     if grouping.is_none() {
         grouping = maybe_grouping(cursor)?;
@@ -763,6 +910,7 @@ fn parse_vector_agg_call(
     Ok(MetricExpr::Vector {
         op,
         grouping,
+        param,
         inner: Box::new(inner),
     })
 }

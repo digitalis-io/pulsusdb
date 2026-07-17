@@ -220,7 +220,9 @@ pub fn build_plan(
     };
     match plan(&expr, &params, &tables.plan_ctx(db))? {
         Plan::Streams(sp) => Ok(sp),
-        Plan::Metric(_) => anyhow::bail!("expected a Streams plan for {query}"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => {
+            anyhow::bail!("expected a Streams plan for {query}")
+        }
     }
 }
 

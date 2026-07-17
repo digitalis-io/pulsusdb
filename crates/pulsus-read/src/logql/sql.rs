@@ -233,6 +233,42 @@ pub fn metric_instant(
     sql
 }
 
+/// The client-aggregated metric fetch (issue M6-10): a stage-3-shaped raw
+/// scan of `(fingerprint, timestamp_ns, body)` over the **full** window,
+/// with the line-filter prefix pushed down — and deliberately **no
+/// `LIMIT`**: an aggregation must see every matching line or abort on the
+/// byte scan budget (`max_bytes_to_read` → `QueryTooBroad`), never
+/// silently truncate (complete-or-error, the adjudicated design). The
+/// `PREWHERE service ...` contract matches [`stage3`]/[`metric_range`]
+/// (the `log_samples` primary-key prefix stays engaged).
+///
+/// **Stable total order (review round 2, finding 2):** `ORDER BY`
+/// carries `fingerprint, body` as secondary keys — the projection's only
+/// other columns — so equal-timestamp rows arrive in one reproducible
+/// order across runs/merges/replicas (float accumulation order, and
+/// therefore bit-level sums, stay stable; the first/last reducers are
+/// additionally order-independent via their own value tie-break).
+pub fn metric_raw_samples(
+    samples_table: &str,
+    services: &[String],
+    fingerprints: &[u64],
+    window: TimeWindow,
+    extra_predicates: &[String],
+) -> String {
+    let service_pred = service_predicate(services);
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    let mut sql = format!(
+        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+    );
+    for clause in extra_predicates {
+        sql.push_str("\n  AND ");
+        sql.push_str(clause);
+    }
+    sql.push_str("\nORDER BY timestamp_ns ASC, fingerprint ASC, body ASC");
+    sql
+}
+
 /// Renders the metric-read `PREWHERE service ...\n` line, or an empty
 /// string when `services` is empty (the rollup path — no `service` column
 /// to filter on).

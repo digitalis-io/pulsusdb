@@ -106,10 +106,15 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         // metric-pipeline deferral are both client-caused query-shape
         // rejections — 400 `bad_data`, alongside the other planner
         // validation variants.
+        // `MetricPipelineError` (issue M6-10 adjudication #1: a metric
+        // line retained a nonempty `__error__` after the full pipeline)
+        // is likewise 400 — the status the oracle returns for the same
+        // failure, live-probed.
         ReadError::EmptyMatcherSet
         | ReadError::ContradictoryMatchers
         | ReadError::InvalidStep
         | ReadError::PipelineInvalid { .. }
+        | ReadError::MetricPipelineError { .. }
         | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None)
         }
@@ -212,6 +217,25 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("invalid pipeline")
+        );
+    }
+
+    /// Issue M6-10 adjudication #1: a surviving metric-pipeline
+    /// `__error__` maps to 400 (the oracle's status for the same
+    /// failure, live-probed) with the oracle's message shape intact.
+    #[tokio::test]
+    async fn read_error_metric_pipeline_error_maps_to_400_bad_data() {
+        let err = ReadError::MetricPipelineError {
+            error_type: "SampleExtractionErr".to_string(),
+            series: r#"{__error__="SampleExtractionErr", app="x"}"#.to_string(),
+        };
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        let msg = json["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.starts_with("pipeline error: 'SampleExtractionErr' for series:"),
+            "{msg}"
         );
     }
 

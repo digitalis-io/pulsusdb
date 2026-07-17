@@ -304,7 +304,7 @@ fn streams_plan(query: &str, params: &QueryParams, db: &str) -> pulsus_read::log
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &plan_ctx(db)).expect("plan") {
         Plan::Streams(sp) => sp,
-        Plan::Metric(_) => panic!("expected a Streams plan"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
     }
 }
 
@@ -312,7 +312,7 @@ fn metric_plan(query: &str, params: &QueryParams, db: &str) -> pulsus_read::logq
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &plan_ctx(db)).expect("plan") {
         Plan::Metric(mp) => mp,
-        Plan::Streams(_) => panic!("expected a Metric plan"),
+        Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
     }
 }
 
@@ -985,6 +985,89 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     let single_sql = promql_sample_fetch_sql("mq", params, db);
     let single_usage = explain(&client, &single_sql).await;
     assert_eq!(single_usage, expected_metric_samples_fetch_usage());
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-10 (AC3, the launch's named rollup-vs-raw gate): an un-piped
+// `count_over_time` stays rollup-served (`log_metrics_<res>`); an
+// unwrapped `sum_over_time` is client-aggregated and reads `log_samples`
+// raw — two distinct table targets, both index-served.
+// ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn m6_10_unpiped_count_over_time_is_still_rollup_served() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_m610_rollup";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let mp = metric_plan(
+        r#"count_over_time({env="prod"}[5m])"#,
+        &range_params(ts_ns),
+        db,
+    );
+    assert!(
+        mp.rollup,
+        "un-piped count_over_time must stay rollup-served"
+    );
+    assert!(mp.client.is_none(), "and must stay SQL-aggregated");
+    assert_eq!(mp.table, "log_metrics_5s");
+    let table = format!("{db}.log_metrics_5s");
+    let sql = sql::metric_range(
+        sql::MetricSource {
+            table: &table,
+            bucket_col: mp.bucket_col,
+            agg_expr: mp.agg_expr,
+        },
+        &[],
+        &[FP_PROD],
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        mp.step_ns.expect("range spec"),
+        &mp.extra_predicates,
+    );
+    let usage = explain(&client, &sql).await;
+    assert_eq!(usage, expected_metric_rollup_usage());
+}
+
+#[tokio::test]
+async fn m6_10_unwrapped_sum_over_time_reads_log_samples_raw_on_the_primary_key() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_m610_client_raw";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let mp = metric_plan(
+        r#"sum_over_time({env="prod"} | logfmt | unwrap duration(took) [5m])"#,
+        &range_params(ts_ns),
+        db,
+    );
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some(), "unwrap forces the client-agg mode");
+    assert_eq!(mp.table, "log_samples");
+    assert_eq!(
+        mp.routing.reason,
+        "raw: client-side pipeline/unwrap aggregation"
+    );
+    let table = format!("{db}.log_samples");
+    let sql = sql::metric_raw_samples(
+        &table,
+        &["'checkout'".to_string()],
+        &[FP_PROD],
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        &mp.extra_predicates,
+    );
+    assert!(!sql.contains("LIMIT"), "aggregations never truncate: {sql}");
+    let usage = explain(&client, &sql).await;
+    // Same `(service, fingerprint, timestamp_ns)` primary-key engagement
+    // as every raw log_samples read; no body predicate, so no Skip
+    // blocks are consulted.
+    assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
 #[tokio::test]

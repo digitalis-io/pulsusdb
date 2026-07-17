@@ -93,12 +93,39 @@ pub struct EntryOut<'a> {
 /// Which unit family a numeric label filter compares in — decided at
 /// compile time from the RHS literal (plan v1 contract: duration units →
 /// f64 seconds, bytes units → f64 bytes, plain number → f64), then
-/// applied symmetrically to the label value at run time.
+/// applied symmetrically to the label value at run time. Issue M6-10
+/// reuses the same families for `unwrap` conversions (`unwrap x` →
+/// `Number`, `unwrap duration(x)`/`duration_seconds(x)` → `Duration`,
+/// `unwrap bytes(x)` → `Bytes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnitKind {
     Number,
     Duration,
     Bytes,
+}
+
+/// The pinned `__error__` value for a failed `unwrap` conversion on the
+/// metric path — oracle-probed (issue M6-10 plan v2 D1: live probe
+/// against the pinned reference, which reports `pipeline error:
+/// 'SampleExtractionErr' ...` and tags the failed line's label set with
+/// `__error__="SampleExtractionErr"`).
+pub const SAMPLE_EXTRACTION_ERROR: &str = "SampleExtractionErr";
+
+/// One line's metric-mode pipeline outcome (issue M6-10 plan v2 D1).
+#[derive(Debug)]
+pub enum MetricRun<'a> {
+    /// A stage dropped the line (a filter miss, or the unwrap label was
+    /// absent — the oracle silently skips label-less lines, probed live).
+    Dropped,
+    /// The line survived the full pipeline. `value` is `Some` when an
+    /// unwrap conversion succeeded, `None` when the pipeline has no
+    /// unwrap stage or the conversion failed (in which case `__error__`
+    /// was set in time for downstream filters to consume — a SURVIVING
+    /// nonempty `__error__` must fail the metric query, adjudication #1).
+    Kept {
+        line: Cow<'a, str>,
+        value: Option<f64>,
+    },
 }
 
 #[derive(Debug)]
@@ -166,6 +193,15 @@ enum CompiledStage {
     LabelFilter(CompiledLabelFilter),
     LineFormat(Vec<TmplPart>),
     LabelFormat(Vec<CompiledLabelFmt>),
+    /// `| unwrap <label>` / `| unwrap <conversion>(<label>)` — evaluated
+    /// **only** on the metric path ([`CompiledPipeline::run_metric_into`]);
+    /// inert for stream execution (issue M6-10 adjudication #2: the
+    /// non-metric path must not execute the conversion or mutate
+    /// `__error__`).
+    Unwrap {
+        label: String,
+        kind: UnitKind,
+    },
 }
 
 #[derive(Debug)]
@@ -182,6 +218,7 @@ pub struct CompiledPipeline {
     mutates_labels: bool,
     rewrites_line: bool,
     line_filter_only: bool,
+    has_unwrap: bool,
 }
 
 impl CompiledPipeline {
@@ -189,16 +226,18 @@ impl CompiledPipeline {
     /// paths, and numeric RHS literals are all validated/compiled here so
     /// [`CompiledPipeline::run`] never parses anything but the log line.
     ///
-    /// `Stage::Unwrap` is skipped: parse-only in M6-09 — the planner
-    /// rejects it on every executable path (bare log queries via
-    /// `PipelineInvalid`, metric queries via `PipelineUnsupportedInMetric`)
-    /// before a pipeline containing one can reach `run`; M6-10 adds its
-    /// value extraction.
+    /// `Stage::Unwrap` compiles to a stage that only the metric-mode
+    /// entrypoint ([`CompiledPipeline::run_metric_into`]) evaluates
+    /// (issue M6-10 plan v2 D1); the streams path keeps it inert
+    /// (adjudication #2) — and the planner still rejects `unwrap` on
+    /// bare log queries via `PipelineInvalid` before it could reach
+    /// `run` anyway.
     pub fn compile(stages: &[Stage]) -> Result<Self, PipelineError> {
         let mut compiled = Vec::new();
         let mut seen_line_format = false;
         let mut mutates_labels = false;
         let mut rewrites_line = false;
+        let mut has_unwrap = false;
 
         for stage in stages {
             match stage {
@@ -245,7 +284,31 @@ impl CompiledPipeline {
                     mutates_labels = true;
                     compiled.push(CompiledStage::LabelFormat(compile_label_format(fmts)?));
                 }
-                Stage::Unwrap(_) => {}
+                Stage::Unwrap(u) => {
+                    has_unwrap = true;
+                    let kind = match u.conversion.as_deref() {
+                        None => UnitKind::Number,
+                        Some("duration") | Some("duration_seconds") => UnitKind::Duration,
+                        Some("bytes") => UnitKind::Bytes,
+                        // The parser only emits the three conversions in
+                        // `UNWRAP_CONVERSIONS`; anything else is a named
+                        // defensive rejection, never a silent Number.
+                        Some(other) => {
+                            return Err(PipelineError::BadParserExpr(format!(
+                                "unknown unwrap conversion {other:?}"
+                            )));
+                        }
+                    };
+                    // Deliberately does NOT set `mutates_labels`: the
+                    // streams path never executes unwrap (it stays
+                    // byte-identical with/without a trailing unwrap —
+                    // adjudication #2); the metric path's grouping keys
+                    // off `metric_mutates_labels()` instead.
+                    compiled.push(CompiledStage::Unwrap {
+                        label: u.label.clone(),
+                        kind,
+                    });
+                }
             }
         }
 
@@ -254,6 +317,7 @@ impl CompiledPipeline {
             mutates_labels,
             rewrites_line,
             line_filter_only: stages.iter().all(|s| matches!(s, Stage::LineFilter(_))),
+            has_unwrap,
         })
     }
 
@@ -275,6 +339,20 @@ impl CompiledPipeline {
         self.line_filter_only
     }
 
+    /// The pipeline contains an `unwrap` stage (issue M6-10).
+    pub fn has_unwrap(&self) -> bool {
+        self.has_unwrap
+    }
+
+    /// The METRIC-mode fan-out gate: on the metric path a successful
+    /// unwrap also changes the label set (the unwrapped label is deleted
+    /// from the series — oracle-probed), so client-side aggregation must
+    /// group by final label set whenever the pipeline mutates labels OR
+    /// unwraps.
+    pub fn metric_mutates_labels(&self) -> bool {
+        self.mutates_labels || self.has_unwrap
+    }
+
     /// Runs one line through the pipeline, allocating a fresh label
     /// vector — the plan-contract convenience shape. Hot loops use
     /// [`CompiledPipeline::run_into`] with a reused scratch instead
@@ -292,13 +370,50 @@ impl CompiledPipeline {
     /// when a stage drops it; on `Some`, `labels` holds the final label
     /// set. Values borrow from `body`/`base`/the compiled stages
     /// wherever no rewrite/unescape is needed.
+    ///
+    /// **Streams-path contract (issue M6-10 adjudication #2):** `unwrap`
+    /// stages are inert here — no conversion runs, no `__error__` is
+    /// set, no label is removed. Output is byte-identical with and
+    /// without a trailing `| unwrap x` (regression-tested below).
     pub fn run_into<'a>(
         &'a self,
         body: &'a str,
         base: &'a [(String, String)],
         labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     ) -> Option<Cow<'a, str>> {
+        match self.run_mode_into(body, base, labels, false) {
+            MetricRun::Dropped => None,
+            MetricRun::Kept { line, .. } => Some(line),
+        }
+    }
+
+    /// The metric-path entrypoint (issue M6-10 plan v2 D1): identical to
+    /// [`CompiledPipeline::run_into`] except `unwrap` stages EXECUTE — a
+    /// successful conversion yields `value = Some(v)` and deletes the
+    /// unwrapped label from the set (oracle-probed); a failed conversion
+    /// sets `__error__="SampleExtractionErr"` (and keeps the raw label,
+    /// matching the oracle's failed-series shape) and continues, so
+    /// post-unwrap `__error__` filters process it in pipeline order; a
+    /// MISSING unwrap label drops the line (the oracle silently skips
+    /// those, never erroring — probed live).
+    pub fn run_metric_into<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    ) -> MetricRun<'a> {
+        self.run_mode_into(body, base, labels, true)
+    }
+
+    fn run_mode_into<'a>(
+        &'a self,
+        body: &'a str,
+        base: &'a [(String, String)],
+        labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+        metric: bool,
+    ) -> MetricRun<'a> {
         let mut line: Cow<'a, str> = Cow::Borrowed(body);
+        let mut value: Option<f64> = None;
         labels.clear();
         labels.extend(
             base.iter()
@@ -317,7 +432,7 @@ impl CompiledPipeline {
                         LineFilterOp::NotContains | LineFilterOp::NotRegex => !hit,
                     };
                     if !keep {
-                        return None;
+                        return MetricRun::Dropped;
                     }
                 }
                 CompiledStage::Json { extractions } => run_json(&line, extractions, labels),
@@ -397,7 +512,7 @@ impl CompiledPipeline {
                 }
                 CompiledStage::LabelFilter(filter) => match eval_label_filter(filter, labels) {
                     Some(true) => {}
-                    Some(false) => return None,
+                    Some(false) => return MetricRun::Dropped,
                     // Conversion failure: keep the line, tag the error
                     // class (pinned semantics, oracle-verified; a later
                     // `__error__=""` filter drops it).
@@ -424,10 +539,43 @@ impl CompiledPipeline {
                         }
                     }
                 }
+                CompiledStage::Unwrap { label, kind } => {
+                    if !metric {
+                        // Streams path: inert by contract (issue M6-10
+                        // adjudication #2) — no conversion, no
+                        // `__error__`, no label removal.
+                        continue;
+                    }
+                    let Some(raw) = get_label(labels, label) else {
+                        // Oracle-probed: a line without the unwrap label
+                        // is silently skipped, never an error.
+                        return MetricRun::Dropped;
+                    };
+                    match convert_label_value(*kind, raw) {
+                        Some(v) => {
+                            // Oracle-probed: a successful unwrap DELETES
+                            // the unwrapped label from the series.
+                            remove_label(labels, label);
+                            value = Some(v);
+                        }
+                        None => {
+                            // Oracle-probed failed-series shape: the raw
+                            // label stays, `__error__` is tagged, and the
+                            // line continues so a post-unwrap
+                            // `__error__` filter sees it in order.
+                            set_label(
+                                labels,
+                                Cow::Borrowed(ERROR_LABEL),
+                                Cow::Borrowed(SAMPLE_EXTRACTION_ERROR),
+                            );
+                            value = None;
+                        }
+                    }
+                }
             }
         }
 
-        Some(line)
+        MetricRun::Kept { line, value }
     }
 }
 
@@ -1371,6 +1519,166 @@ mod tests {
             Err(PipelineError::BadParserExpr(_))
         ));
         assert!(compile_pattern("<a> <b>").is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue M6-10: unwrap evaluation — metric-mode only.
+    // -----------------------------------------------------------------
+
+    fn stages_of(query: &str) -> Vec<Stage> {
+        let expr = pulsus_logql::parse(query).expect("parse");
+        match expr {
+            pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => {
+                range.selector.pipeline
+            }
+            pulsus_logql::Expr::Log(log) => log.pipeline,
+            other => panic!("unexpected expr shape: {other:?}"),
+        }
+    }
+
+    /// Adjudication #2 regression: the STREAMS path is byte-identical
+    /// with and without a trailing `| unwrap x` — no conversion, no
+    /// `__error__`, no label removal.
+    #[test]
+    fn streams_run_is_byte_identical_with_and_without_a_trailing_unwrap() {
+        let without =
+            CompiledPipeline::compile(&stages_of(r#"sum_over_time({a="b"} | logfmt [5m])"#))
+                .unwrap();
+        let with = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        for body in [
+            "took=250ms level=info",
+            "took=abc level=warn", // would FAIL conversion on the metric path
+            "level=error",         // unwrap label missing entirely
+        ] {
+            let a = without.run(body, &base).expect("kept");
+            let b = with.run(body, &base).expect("kept");
+            assert_eq!(a.line, b.line, "body {body:?}");
+            assert_eq!(a.labels, b.labels, "body {body:?}");
+            assert!(
+                !b.labels.iter().any(|(k, _)| k == ERROR_LABEL),
+                "streams path must never tag an unwrap error: {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn metric_run_extracts_the_converted_value_and_deletes_the_unwrapped_label() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        let mut labels = Vec::new();
+        let MetricRun::Kept { value, .. } =
+            compiled.run_metric_into("took=250ms level=info", &base, &mut labels)
+        else {
+            panic!("expected the line to be kept");
+        };
+        assert_eq!(value, Some(0.25));
+        assert!(
+            !labels.iter().any(|(k, _)| k == "took"),
+            "successful unwrap must delete the unwrapped label (oracle-probed): {labels:?}"
+        );
+        assert!(labels.iter().any(|(k, v)| k == "level" && v == "info"));
+    }
+
+    #[test]
+    fn metric_run_tags_sample_extraction_err_on_a_failed_conversion_and_keeps_the_line() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        let mut labels = Vec::new();
+        let MetricRun::Kept { value, .. } =
+            compiled.run_metric_into("took=abc level=warn", &base, &mut labels)
+        else {
+            panic!("a failed conversion keeps the line (a later __error__ filter may drop it)");
+        };
+        assert_eq!(value, None);
+        assert!(
+            labels
+                .iter()
+                .any(|(k, v)| k == ERROR_LABEL && v == SAMPLE_EXTRACTION_ERROR),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|(k, v)| k == "took" && v == "abc"),
+            "the raw label stays on the failed line (oracle failed-series shape): {labels:?}"
+        );
+    }
+
+    #[test]
+    fn metric_run_drops_a_line_whose_unwrap_label_is_missing() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        let mut labels = Vec::new();
+        assert!(matches!(
+            compiled.run_metric_into("level=error", &base, &mut labels),
+            MetricRun::Dropped
+        ));
+    }
+
+    /// A post-unwrap `| __error__ = ""` filter consumes the failed line
+    /// in pipeline order (plan v2 D1) — the exact oracle-probed shape.
+    #[test]
+    fn a_post_unwrap_error_filter_drops_the_failed_line_and_keeps_the_good_one() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | unwrap duration(took) | __error__ = "" [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("app".to_string(), "x".to_string())];
+        let mut labels = Vec::new();
+        assert!(matches!(
+            compiled.run_metric_into("took=abc", &base, &mut labels),
+            MetricRun::Dropped
+        ));
+        assert!(matches!(
+            compiled.run_metric_into("took=100ms", &base, &mut labels),
+            MetricRun::Kept {
+                value: Some(v),
+                ..
+            } if v == 0.1
+        ));
+    }
+
+    #[test]
+    fn unwrap_conversion_families_match_the_label_filter_unit_parser() {
+        let base = vec![("a".to_string(), "b".to_string())];
+        for (query, body, expected) in [
+            // Bare unwrap: plain float parse.
+            (
+                r#"sum_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+                "v=42",
+                42.0,
+            ),
+            // duration_seconds is an alias of duration.
+            (
+                r#"sum_over_time({a="b"} | logfmt | unwrap duration_seconds(v) [5m])"#,
+                "v=1h30m",
+                5_400.0,
+            ),
+            (
+                r#"sum_over_time({a="b"} | logfmt | unwrap bytes(v) [5m])"#,
+                "v=5KB",
+                5_000.0,
+            ),
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
+            let mut labels = Vec::new();
+            let MetricRun::Kept { value, .. } = compiled.run_metric_into(body, &base, &mut labels)
+            else {
+                panic!("expected {query} over {body:?} to keep the line");
+            };
+            assert_eq!(value, Some(expected), "{query} over {body:?}");
+        }
     }
 
     #[test]

@@ -988,7 +988,9 @@ async fn run_streams_once(
     let expr = pulsus_logql::parse(query)?;
     let sp = match plan(&expr, params, &tables.plan_ctx(db))? {
         Plan::Streams(sp) => sp,
-        Plan::Metric(_) => anyhow::bail!("expected a Streams plan for {query}"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => {
+            anyhow::bail!("expected a Streams plan for {query}")
+        }
     };
 
     let s1_id = format!("{base_id}-s1");
@@ -1399,7 +1401,9 @@ async fn run_metric_shape(
         let expr = pulsus_logql::parse(query)?;
         let mp = match plan(&expr, params, &tables.plan_ctx(db))? {
             Plan::Metric(mp) => mp,
-            Plan::Streams(_) => anyhow::bail!("expected a Metric plan for {query}"),
+            Plan::Streams(_) | Plan::MetricBinary(_) => {
+                anyhow::bail!("expected a Metric plan for {query}")
+            }
         };
 
         let s1_id = format!("{query_id}-s1");
@@ -1530,7 +1534,9 @@ async fn run_metric_shape(
     let expr = pulsus_logql::parse(&query)?;
     let mp = match plan(&expr, &params, &tables.plan_ctx(db))? {
         Plan::Metric(mp) => mp,
-        Plan::Streams(_) => anyhow::bail!("expected a Metric plan for {query}"),
+        Plan::Streams(_) | Plan::MetricBinary(_) => {
+            anyhow::bail!("expected a Metric plan for {query}")
+        }
     };
     let target_table = if mp.rollup {
         &tables.rollup

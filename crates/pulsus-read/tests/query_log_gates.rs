@@ -227,7 +227,7 @@ fn streams_plan(query: &str, params: &QueryParams, db: &str) -> pulsus_read::log
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &plan_ctx(db)).expect("plan") {
         Plan::Streams(sp) => sp,
-        Plan::Metric(_) => panic!("expected a Streams plan"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
     }
 }
 

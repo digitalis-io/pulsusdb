@@ -44,9 +44,10 @@ static ALLOCATOR: CountingAlloc = CountingAlloc;
 
 use std::borrow::Cow;
 
-use pulsus_read::logql::exec::run_pipeline_rows;
+use pulsus_read::logql::exec::{run_client_agg_rows, run_pipeline_rows};
 use pulsus_read::logql::pipeline::CompiledPipeline;
 use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+use pulsus_read::logql::{ClientWindow, Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 const ROWS: u64 = 20_000;
 /// The "zero per row" residue budget: 20 stray allocations over 20k rows
@@ -226,5 +227,91 @@ fn per_row_allocation_bounds_hold() {
         total <= 4 * n + n / 2 + ZERO_RESIDUE,
         "high-cardinality fan-out assembly: {total} allocations over {n} rows — must stay \
          <= 4.5 per row (a per-new-group key clone would push this past 5)"
+    );
+
+    // --- Issue M6-10: the client-aggregated metric path. A
+    // --- filter+count reducer over a non-label-mutating pipeline
+    // --- (fingerprint grouping) runs the per-line loop at ZERO
+    // --- allocations per row: run_metric_into reuses the scratch, the
+    // --- bucket accumulators are per-(group, bucket) — bounded by the
+    // --- fixture's 1 stream x few buckets, never by row count.
+    let plan_ctx = PlanCtx {
+        db: "pulsus",
+        streams_idx: "log_streams_idx",
+        streams: "log_streams",
+        samples: "log_samples",
+        rollup_table: "log_metrics_5s",
+        rollup_res_ns: 5_000_000_000,
+        scan_budget_bytes: 50 * 1024 * 1024 * 1024,
+        max_streams: 100_000,
+        pipeline_scan_factor: 10,
+    };
+    let agg_rows: Vec<SampleRow> = (0..20_000)
+        .map(|i| SampleRow {
+            fingerprint: 1,
+            timestamp_ns: (i as i64) * 1_000_000, // 20s of 1ms-spaced rows
+            body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+        })
+        .collect();
+    let params = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: 5_000_000_000,
+        },
+        limit: 100,
+        direction: Direction::Backward,
+    };
+    // A string label filter over a BASE label: non-mutating (fingerprint
+    // grouping) and in-engine — the client-mode trigger. The dropped-row
+    // filter path's zero-alloc bound is pinned by the `run_into` cases
+    // above; here every row survives so the accumulate path is measured.
+    let expr = pulsus_logql::parse(r#"count_over_time({a="b"} |= "info" | env = "prod" [5s])"#)
+        .expect("parse");
+    let Plan::Metric(mp) = plan(&expr, &params, &plan_ctx).expect("plan") else {
+        panic!("expected a Metric plan");
+    };
+    let client = mp.client.as_ref().expect("client-aggregated");
+    let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+    let window = ClientWindow {
+        start_ns: mp.start_ns,
+        end_ns: mp.end_ns,
+        step_ns: mp.step_ns,
+    };
+    // Warm-up run (also proves survivors exist).
+    let warm = run_client_agg_rows(
+        &agg_rows,
+        &compiled,
+        &meta,
+        client,
+        window,
+        mp.rate_window_ns,
+    )
+    .expect("client agg");
+    assert!(
+        matches!(&warm, pulsus_read::logql::QueryResult::Matrix(m) if !m.is_empty()),
+        "fixture must produce buckets"
+    );
+    let rows_n = agg_rows.len() as u64;
+    let start = ALLOCS.load(Ordering::Relaxed);
+    let out = run_client_agg_rows(
+        &agg_rows,
+        &compiled,
+        &meta,
+        client,
+        window,
+        mp.rate_window_ns,
+    )
+    .expect("client agg");
+    let total = ALLOCS.load(Ordering::Relaxed) - start;
+    std::hint::black_box(&out);
+    // Flat budget: base-label setup + a handful of buckets + the output
+    // series — never a per-row term. A real 1-per-row regression would
+    // measure >= 20_000.
+    const CLIENT_AGG_FLAT_BUDGET: u64 = 256;
+    assert!(
+        total <= CLIENT_AGG_FLAT_BUDGET + ZERO_RESIDUE,
+        "client-agg filter+count: {total} allocations over {rows_n} rows — the zero-per-row \
+         aggregation loop regressed"
     );
 }

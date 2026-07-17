@@ -7,7 +7,15 @@
 //! `Stage` (M1: only `LineFilter`), `RangeAggOp`, and `VectorAggOp` are
 //! the designated M6 growth points — parity lands as additive variants,
 //! never a reshape of these types or their fields (architect plan: "AST
-//! contract stability").
+//! contract stability"). Issue M6-10 exercised those growth points (the
+//! full over-time set on `RangeAggOp`; `stddev`/`stdvar`/`topk`/`bottomk`
+//! on `VectorAggOp`) and added the adjudicated M6-10 growth points, all
+//! additive: the `param` field on [`MetricExpr::Vector`] (the raw
+//! `topk`/`bottomk` `k`), the [`MetricExpr::Literal`] variant (a bare
+//! scalar number), and the [`MetricExpr::Binary`] variant with [`BinOp`]/
+//! [`BinModifier`] (binary operations; `on`/`ignoring`/`group_left`/
+//! `group_right` matching modifiers stay enumerated-`NotYetSupported`).
+//! No existing field changed shape.
 
 use std::fmt;
 
@@ -360,10 +368,13 @@ impl fmt::Display for LineFilterOp {
 }
 
 /// A metric query: a range aggregation over a [`LogRange`], optionally
-/// wrapped in one or more vector aggregations. The M6-complete shape
-/// (`param`, `LogRange::unwrap`) is reserved now so non-counting range
-/// aggregations and `unwrap` are additive — M1 always leaves them `None`
-/// (architect plan amendment 1 §2).
+/// wrapped in vector aggregations, combined with other metric
+/// expressions and scalar literals via binary operations (issue M6-10).
+/// The M6-complete shape (`param`, `LogRange::unwrap`) was reserved in M1
+/// so non-counting range aggregations and `unwrap` stayed additive
+/// (architect plan amendment 1 §2); `Literal`/`Binary` and
+/// `Vector::param` are the adjudicated M6-10 additive growth points (see
+/// the module doc).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetricExpr {
     Range {
@@ -371,15 +382,44 @@ pub enum MetricExpr {
         range: LogRange,
         /// Raw numeric literal (e.g. `"0.95"`), never parsed to `f64` here
         /// so the AST keeps its `Eq`/`Hash` derive (amendment 2 §1). Only
-        /// `quantile_over_time` (M6) populates this; M1 always sets
-        /// `None`.
+        /// `quantile_over_time` populates this.
         param: Option<String>,
     },
     Vector {
         op: VectorAggOp,
         grouping: Option<Grouping>,
+        /// Raw numeric literal — the `topk`/`bottomk` `k` (issue M6-10),
+        /// kept as raw text for the same `Eq`/`Hash` reason as
+        /// `Range::param`. `None` for every other vector aggregation.
+        param: Option<String>,
         inner: Box<MetricExpr>,
     },
+    /// A bare scalar number (`2`, `0.95`) as a metric-expression operand
+    /// (issue M6-10), raw text — parsed to `f64` by the planner.
+    Literal(String),
+    /// A binary operation between metric expressions (issue M6-10).
+    /// `on()`/`ignoring()`/`group_left()`/`group_right()` matching
+    /// modifiers are deferred (enumerated `NotYetSupported`); `modifier`
+    /// carries only the `bool` comparison modifier.
+    Binary {
+        op: BinOp,
+        modifier: Option<BinModifier>,
+        lhs: Box<MetricExpr>,
+        rhs: Box<MetricExpr>,
+    },
+}
+
+impl MetricExpr {
+    /// Renders a binary operand, parenthesizing nested binary children so
+    /// `Display` round-trips the exact tree shape (same convention as
+    /// [`LabelFilterExpr::fmt_child`]: precedence/associativity would
+    /// otherwise re-associate on reparse).
+    fn fmt_operand(child: &MetricExpr, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match child {
+            MetricExpr::Binary { .. } => write!(f, "({child})"),
+            other => write!(f, "{other}"),
+        }
+    }
 }
 
 impl fmt::Display for MetricExpr {
@@ -392,13 +432,97 @@ impl fmt::Display for MetricExpr {
             MetricExpr::Vector {
                 op,
                 grouping,
+                param,
                 inner,
-            } => match grouping {
-                Some(g) => write!(f, "{op} {g}({inner})"),
-                None => write!(f, "{op}({inner})"),
-            },
+            } => {
+                match grouping {
+                    Some(g) => write!(f, "{op} {g}(")?,
+                    None => write!(f, "{op}(")?,
+                }
+                if let Some(p) = param {
+                    write!(f, "{p}, ")?;
+                }
+                write!(f, "{inner})")
+            }
+            MetricExpr::Literal(raw) => write!(f, "{raw}"),
+            MetricExpr::Binary {
+                op,
+                modifier,
+                lhs,
+                rhs,
+            } => {
+                Self::fmt_operand(lhs, f)?;
+                write!(f, " {op} ")?;
+                if matches!(modifier, Some(BinModifier { return_bool: true })) {
+                    write!(f, "bool ")?;
+                }
+                Self::fmt_operand(rhs, f)
+            }
         }
     }
+}
+
+/// The M6-10 binary operators: arithmetic, comparison, and the
+/// `and`/`or`/`unless` set operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Eq,
+    Neq,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    And,
+    Or,
+    Unless,
+}
+
+impl BinOp {
+    /// `true` for the six comparison operators — the only ones that
+    /// accept the `bool` modifier.
+    pub fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Gte | BinOp::Lt | BinOp::Lte
+        )
+    }
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "^",
+            BinOp::Eq => "==",
+            BinOp::Neq => "!=",
+            BinOp::Gt => ">",
+            BinOp::Gte => ">=",
+            BinOp::Lt => "<",
+            BinOp::Lte => "<=",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::Unless => "unless",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Binary-operation modifier. Only `bool` (comparison 0/1 instead of
+/// filtering) in M6-10; `on`/`ignoring`/`group_left`/`group_right` extend
+/// this struct when the matching-modifier follow-up lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BinModifier {
+    pub return_bool: bool,
 }
 
 /// `LogExpr [duration]` — the operand of every range aggregation.
@@ -431,15 +555,26 @@ pub struct Unwrap {
     pub conversion: Option<String>,
 }
 
-/// Range aggregation functions. M1 implements the four count/bytes-only
+/// Range aggregation functions. M1 implemented the four count/bytes-only
 /// operations that the log rollup table can serve (docs/architecture.md
-/// §5.3, §3.2); M6 adds the full over-time set as new variants only.
+/// §5.3, §3.2); issue M6-10 added the full over-time set as new variants
+/// only (the designated growth-point contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RangeAggOp {
     Rate,
     CountOverTime,
     BytesRate,
     BytesOverTime,
+    SumOverTime,
+    AvgOverTime,
+    MinOverTime,
+    MaxOverTime,
+    StddevOverTime,
+    StdvarOverTime,
+    QuantileOverTime,
+    FirstOverTime,
+    LastOverTime,
+    AbsentOverTime,
 }
 
 impl RangeAggOp {
@@ -449,6 +584,16 @@ impl RangeAggOp {
             "count_over_time" => Some(Self::CountOverTime),
             "bytes_rate" => Some(Self::BytesRate),
             "bytes_over_time" => Some(Self::BytesOverTime),
+            "sum_over_time" => Some(Self::SumOverTime),
+            "avg_over_time" => Some(Self::AvgOverTime),
+            "min_over_time" => Some(Self::MinOverTime),
+            "max_over_time" => Some(Self::MaxOverTime),
+            "stddev_over_time" => Some(Self::StddevOverTime),
+            "stdvar_over_time" => Some(Self::StdvarOverTime),
+            "quantile_over_time" => Some(Self::QuantileOverTime),
+            "first_over_time" => Some(Self::FirstOverTime),
+            "last_over_time" => Some(Self::LastOverTime),
+            "absent_over_time" => Some(Self::AbsentOverTime),
             _ => None,
         }
     }
@@ -459,6 +604,16 @@ impl RangeAggOp {
             RangeAggOp::CountOverTime => "count_over_time",
             RangeAggOp::BytesRate => "bytes_rate",
             RangeAggOp::BytesOverTime => "bytes_over_time",
+            RangeAggOp::SumOverTime => "sum_over_time",
+            RangeAggOp::AvgOverTime => "avg_over_time",
+            RangeAggOp::MinOverTime => "min_over_time",
+            RangeAggOp::MaxOverTime => "max_over_time",
+            RangeAggOp::StddevOverTime => "stddev_over_time",
+            RangeAggOp::StdvarOverTime => "stdvar_over_time",
+            RangeAggOp::QuantileOverTime => "quantile_over_time",
+            RangeAggOp::FirstOverTime => "first_over_time",
+            RangeAggOp::LastOverTime => "last_over_time",
+            RangeAggOp::AbsentOverTime => "absent_over_time",
         }
     }
 }
@@ -469,8 +624,10 @@ impl fmt::Display for RangeAggOp {
     }
 }
 
-/// Vector aggregations. M1 implements the five that need no extra
-/// parameter; M6 adds `stddev`/`stdvar`/`topk`/`bottomk` as new variants.
+/// Vector aggregations. M1 implemented the five that need no extra
+/// parameter; issue M6-10 added `stddev`/`stdvar` (reductions) and
+/// `topk`/`bottomk` (per-step selections carrying a `k` parameter on
+/// [`MetricExpr::Vector::param`]) as new variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VectorAggOp {
     Sum,
@@ -478,6 +635,10 @@ pub enum VectorAggOp {
     Min,
     Max,
     Count,
+    Stddev,
+    Stdvar,
+    Topk,
+    Bottomk,
 }
 
 impl VectorAggOp {
@@ -488,8 +649,18 @@ impl VectorAggOp {
             "min" => Some(Self::Min),
             "max" => Some(Self::Max),
             "count" => Some(Self::Count),
+            "stddev" => Some(Self::Stddev),
+            "stdvar" => Some(Self::Stdvar),
+            "topk" => Some(Self::Topk),
+            "bottomk" => Some(Self::Bottomk),
             _ => None,
         }
+    }
+
+    /// `true` for `topk`/`bottomk` — the two aggregations that require a
+    /// leading `k` parameter (`topk(5, ...)`).
+    pub fn takes_param(self) -> bool {
+        matches!(self, VectorAggOp::Topk | VectorAggOp::Bottomk)
     }
 
     fn as_str(self) -> &'static str {
@@ -499,6 +670,10 @@ impl VectorAggOp {
             VectorAggOp::Min => "min",
             VectorAggOp::Max => "max",
             VectorAggOp::Count => "count",
+            VectorAggOp::Stddev => "stddev",
+            VectorAggOp::Stdvar => "stdvar",
+            VectorAggOp::Topk => "topk",
+            VectorAggOp::Bottomk => "bottomk",
         }
     }
 }
@@ -621,23 +796,6 @@ fn quote(value: &str) -> String {
 // §3). `offset` is deliberately absent — it is a PromQL-ism with no LogQL
 // grammar (amendment 1 §3 note).
 
-/// The remaining `*_over_time` range aggregations.
-pub(crate) const FUTURE_RANGE_AGG: &[&str] = &[
-    "sum_over_time",
-    "avg_over_time",
-    "min_over_time",
-    "max_over_time",
-    "stddev_over_time",
-    "stdvar_over_time",
-    "quantile_over_time",
-    "first_over_time",
-    "last_over_time",
-    "absent_over_time",
-];
-
-/// The remaining vector aggregations.
-pub(crate) const FUTURE_VECTOR_AGG: &[&str] = &["stddev", "stdvar", "topk", "bottomk"];
-
 /// Pipeline stage keywords still outside the implemented set after
 /// M6-09 (which emptied the former `FUTURE_PARSERS`/
 /// `FUTURE_STAGE_KEYWORDS` tables): recognized after a bare `|` and named
@@ -648,11 +806,18 @@ pub(crate) const REMAINING_UNSUPPORTED_STAGES: &[&str] =
 /// The conversion functions `unwrap` accepts in its wrapped form.
 pub(crate) const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];
 
-/// The exact expression-level binary-op recognition table (architect plan
-/// amendment 2 §2, corrected by amendment 3): `+ - * / % ^ == != > < >=
-/// <= and or unless`. `!~`/`|=`/`|~` are deliberately excluded — they are
-/// never binary operators in any LogQL milestone.
+/// The identifier-shaped binary operators (`and`/`or`/`unless`) — since
+/// M6-10 consumed by the precedence-climbing binary-op parser (the
+/// symbolic operators `+ - * / % ^ == != > < >= <=` are their own token
+/// kinds). `!~`/`|=`/`|~` are deliberately excluded — they are never
+/// binary operators in any LogQL milestone.
 pub(crate) const BINARY_OP_KEYWORDS: &[&str] = &["and", "or", "unless"];
+
+/// The vector-matching modifier keywords deferred out of M6-10
+/// (adjudication: individually enumerated `NotYetSupported`, no
+/// catch-all) — recognized after a binary operator and named one by one.
+pub(crate) const VECTOR_MATCHING_KEYWORDS: &[&str] =
+    &["on", "ignoring", "group_left", "group_right"];
 
 #[cfg(test)]
 mod tests {
@@ -692,6 +857,16 @@ mod tests {
             ("count_over_time", RangeAggOp::CountOverTime),
             ("bytes_rate", RangeAggOp::BytesRate),
             ("bytes_over_time", RangeAggOp::BytesOverTime),
+            ("sum_over_time", RangeAggOp::SumOverTime),
+            ("avg_over_time", RangeAggOp::AvgOverTime),
+            ("min_over_time", RangeAggOp::MinOverTime),
+            ("max_over_time", RangeAggOp::MaxOverTime),
+            ("stddev_over_time", RangeAggOp::StddevOverTime),
+            ("stdvar_over_time", RangeAggOp::StdvarOverTime),
+            ("quantile_over_time", RangeAggOp::QuantileOverTime),
+            ("first_over_time", RangeAggOp::FirstOverTime),
+            ("last_over_time", RangeAggOp::LastOverTime),
+            ("absent_over_time", RangeAggOp::AbsentOverTime),
         ] {
             assert_eq!(RangeAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
@@ -706,6 +881,10 @@ mod tests {
             ("min", VectorAggOp::Min),
             ("max", VectorAggOp::Max),
             ("count", VectorAggOp::Count),
+            ("stddev", VectorAggOp::Stddev),
+            ("stdvar", VectorAggOp::Stdvar),
+            ("topk", VectorAggOp::Topk),
+            ("bottomk", VectorAggOp::Bottomk),
         ] {
             assert_eq!(VectorAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
@@ -714,7 +893,51 @@ mod tests {
 
     #[test]
     fn unknown_identifiers_are_not_recognized_as_implemented_aggregations() {
-        assert_eq!(RangeAggOp::from_ident("sum_over_time"), None);
-        assert_eq!(VectorAggOp::from_ident("topk"), None);
+        assert_eq!(RangeAggOp::from_ident("rate_counter"), None);
+        assert_eq!(VectorAggOp::from_ident("sort"), None);
+    }
+
+    #[test]
+    fn only_topk_and_bottomk_take_a_parameter() {
+        for op in [
+            VectorAggOp::Sum,
+            VectorAggOp::Avg,
+            VectorAggOp::Min,
+            VectorAggOp::Max,
+            VectorAggOp::Count,
+            VectorAggOp::Stddev,
+            VectorAggOp::Stdvar,
+        ] {
+            assert!(!op.takes_param());
+        }
+        assert!(VectorAggOp::Topk.takes_param());
+        assert!(VectorAggOp::Bottomk.takes_param());
+    }
+
+    #[test]
+    fn only_the_six_comparison_binops_accept_bool() {
+        for op in [
+            BinOp::Eq,
+            BinOp::Neq,
+            BinOp::Gt,
+            BinOp::Gte,
+            BinOp::Lt,
+            BinOp::Lte,
+        ] {
+            assert!(op.is_comparison());
+        }
+        for op in [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::Mul,
+            BinOp::Div,
+            BinOp::Mod,
+            BinOp::Pow,
+            BinOp::And,
+            BinOp::Or,
+            BinOp::Unless,
+        ] {
+            assert!(!op.is_comparison());
+        }
     }
 }

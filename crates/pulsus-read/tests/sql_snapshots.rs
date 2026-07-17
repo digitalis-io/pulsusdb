@@ -46,7 +46,7 @@ fn streams_plan(query: &str, params: &QueryParams) -> pulsus_read::logql::Stream
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &ctx()).expect("plan") {
         Plan::Streams(sp) => sp,
-        Plan::Metric(_) => panic!("expected a Streams plan"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected a Streams plan"),
     }
 }
 
@@ -54,7 +54,7 @@ fn metric_plan(query: &str, params: &QueryParams) -> pulsus_read::logql::MetricP
     let expr = parse(query).expect("parse");
     match plan(&expr, params, &ctx()).expect("plan") {
         Plan::Metric(mp) => mp,
-        Plan::Streams(_) => panic!("expected a Metric plan"),
+        Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
     }
 }
 
@@ -697,7 +697,7 @@ fn vector_agg_sum_by_captures_the_grouping_labels() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(mp.vector_aggs.len(), 1);
-    let (op, grouping) = &mp.vector_aggs[0];
+    let (op, grouping, _) = &mp.vector_aggs[0];
     assert_eq!(*op, pulsus_logql::VectorAggOp::Sum);
     let grouping = grouping.as_ref().expect("by grouping");
     assert_eq!(grouping.kind, pulsus_logql::GroupingKind::By);
@@ -717,7 +717,7 @@ fn vector_agg_without_captures_the_excluded_labels() {
         r#"avg without (service_name) (count_over_time({env="prod"}[5m]))"#,
         &range_params(100, Direction::Backward),
     );
-    let (op, grouping) = &mp.vector_aggs[0];
+    let (op, grouping, _) = &mp.vector_aggs[0];
     assert_eq!(*op, pulsus_logql::VectorAggOp::Avg);
     assert_eq!(
         grouping.as_ref().unwrap().kind,
@@ -738,6 +738,108 @@ fn every_vector_agg_op_is_captured_in_the_plan() {
         let mp = metric_plan(&query, &range_params(100, Direction::Backward));
         assert_eq!(mp.vector_aggs[0].0, expected, "op {src_op}");
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-10 (AC2): the client-aggregated fetch. Un-piped metric
+// snapshots above are the byte-identity perf gate and must stay
+// untouched; a piped/unwrapped metric query renders `metric_raw_samples`
+// — no SQL aggregate, and deliberately NO `LIMIT` (complete-or-error).
+// ---------------------------------------------------------------------
+
+fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
+    assert!(mp.client.is_some(), "expected a client-aggregated plan");
+    pulsus_read::logql::sql::metric_raw_samples(
+        &mp.table,
+        &["'checkout'".to_string()],
+        &[18374, 99120],
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        &mp.extra_predicates,
+    )
+}
+
+#[test]
+fn an_unwrapped_sum_over_time_renders_a_raw_scan_with_no_aggregate_and_no_limit() {
+    let mp = metric_plan(
+        r#"sum_over_time({service_name="checkout"} | logfmt | unwrap duration(took) [5m])"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert!(!mp.rollup, "client mode never selects the rollup");
+    assert_eq!(
+        mp.routing.reason,
+        "raw: client-side pipeline/unwrap aggregation"
+    );
+    let sql = client_metric_sql(&mp);
+    assert_eq!(
+        sql,
+        "SELECT fingerprint, timestamp_ns, body\n\
+         FROM log_samples\n\
+         PREWHERE service = 'checkout'\n\
+         WHERE fingerprint IN (18374, 99120)\n\
+         \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
+         ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"
+    );
+    assert!(!sql.contains("sum(count)"), "{sql}");
+    assert!(!sql.contains("LIMIT"), "aggregations never truncate: {sql}");
+}
+
+#[test]
+fn a_piped_count_over_time_renders_the_raw_scan_with_the_line_filter_pushed_down() {
+    let mp = metric_plan(
+        r#"count_over_time({service_name="checkout"} |= "err" | json | status = "500" [5m])"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert!(!mp.rollup);
+    let sql = client_metric_sql(&mp);
+    assert!(
+        sql.contains("hasToken(body, 'err') AND position(body, 'err') > 0"),
+        "the pre-parser line filter still pushes down: {sql}"
+    );
+    assert!(!sql.contains("count()"), "{sql}");
+    assert!(!sql.contains("LIMIT"), "{sql}");
+    assert!(!sql.contains("GROUP BY"), "{sql}");
+}
+
+/// AC4b (plan v2 D3): the ordered-pipeline pushdown invariant on the
+/// metric path — a line filter AFTER `line_format` references the
+/// rewritten line and must be ABSENT from the SQL predicate (evaluated
+/// in-engine), while the filter BEFORE it still pushes down.
+#[test]
+fn a_post_line_format_metric_line_filter_is_absent_from_the_raw_scan_sql() {
+    let mp = metric_plan(
+        r#"count_over_time({service_name="checkout"} |= "a" | line_format "{{.x}}" |= "b" [5m])"#,
+        &range_params(100, Direction::Backward),
+    );
+    let sql = client_metric_sql(&mp);
+    assert!(
+        sql.contains("position(body, 'a') > 0"),
+        "the pre-line_format filter pushes down: {sql}"
+    );
+    assert!(
+        !sql.contains("'b'"),
+        "the post-line_format filter must NOT reach SQL: {sql}"
+    );
+}
+
+/// The other half of the AC2 byte-identity gate: adding M6-10 must not
+/// have disturbed the un-piped rollup routing — a rollup-eligible
+/// count_over_time still targets the rollup table with `sum(count)`
+/// (asserted again here, adjacent to the client-mode cases, so a
+/// routing regression cannot hide behind the older tests moving).
+#[test]
+fn un_piped_count_over_time_still_routes_to_the_rollup_after_m6_10() {
+    let mp = metric_plan(
+        r#"count_over_time({service_name="checkout"}[5m])"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert!(mp.rollup);
+    assert!(mp.client.is_none());
+    assert_eq!(mp.table, "log_metrics_5s");
+    assert_eq!(mp.agg_expr, "sum(count)");
+    assert_eq!(mp.routing.reason, expected_rollup_reason());
 }
 
 // ---------------------------------------------------------------------

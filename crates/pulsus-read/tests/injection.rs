@@ -227,7 +227,7 @@ fn plan_streams(selector: StreamSelector) -> pulsus_read::logql::StreamsPlan {
     });
     match plan(&expr, &params(), &ctx()).expect("plan") {
         Plan::Streams(sp) => sp,
-        Plan::Metric(_) => panic!("expected Streams"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected Streams"),
     }
 }
 
@@ -245,6 +245,6 @@ fn compile_line_filters(pipeline: &[pulsus_logql::Stage]) -> Vec<String> {
     });
     match plan(&expr, &params(), &ctx()).expect("plan") {
         Plan::Streams(sp) => sp.line_filters,
-        Plan::Metric(_) => panic!("expected Streams"),
+        Plan::Metric(_) | Plan::MetricBinary(_) => panic!("expected Streams"),
     }
 }

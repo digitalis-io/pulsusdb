@@ -437,6 +437,7 @@ Metric(
     Vector {
         op: Sum,
         grouping: None,
+        param: None,
         inner: Range {
             op: Rate,
             range: LogRange {
@@ -481,6 +482,7 @@ Metric(
                 ],
             },
         ),
+        param: None,
         inner: Range {
             op: Rate,
             range: LogRange {
@@ -533,6 +535,7 @@ Metric(
                 ],
             },
         ),
+        param: None,
         inner: Range {
             op: CountOverTime,
             range: LogRange {
@@ -785,6 +788,194 @@ fn an_eq_label_filter_with_a_numeric_rhs_canonicalizes_to_double_eq() {
     let expr = parse(r#"{a="b"} | status = 500"#).unwrap();
     assert_eq!(expr.to_string(), r#"{a="b"} | status == 500"#);
     assert_round_trip(r#"{a="b"} | status = 500"#);
+}
+
+// ---------------------------------------------------------------------
+// M6-10: the full over-time set, parameterized aggregations, and binary
+// operations. Round-trip oracle (`parse(ast.to_string()) == ast`) for
+// every construct that moved out of `errors.rs`'s NotYetSupported set
+// (AC1), plus tree-shape pins for precedence/associativity (AC4c's
+// parser half).
+// ---------------------------------------------------------------------
+
+#[test]
+fn every_over_time_aggregation_round_trips() {
+    let queries = [
+        r#"sum_over_time({a="b"} | logfmt | unwrap took [5m])"#,
+        r#"avg_over_time({a="b"} | logfmt | unwrap duration(took) [5m])"#,
+        r#"min_over_time({a="b"} | json | unwrap latency [5m])"#,
+        r#"max_over_time({a="b"} | json | unwrap latency [5m])"#,
+        r#"stddev_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        r#"stdvar_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        r#"quantile_over_time(0.95, {a="b"} | logfmt | unwrap v [5m])"#,
+        r#"first_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        r#"last_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        r#"absent_over_time({a="b"}[5m])"#,
+        r#"absent_over_time({a="b"} | logfmt | unwrap v [5m])"#,
+        r#"rate({a="b"} | logfmt | unwrap bytes(sz) [1m])"#,
+    ];
+    for q in queries {
+        assert_round_trip(q);
+    }
+}
+
+#[test]
+fn quantile_over_time_carries_its_raw_parameter() {
+    let expr = parse(r#"quantile_over_time(0.95, {a="b"} | logfmt | unwrap v [5m])"#).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Range { op, param, .. }) = &expr
+    else {
+        panic!("expected a range aggregation");
+    };
+    assert_eq!(*op, pulsus_logql::RangeAggOp::QuantileOverTime);
+    assert_eq!(param.as_deref(), Some("0.95"));
+}
+
+#[test]
+fn new_vector_aggregations_round_trip_with_grouping_and_params() {
+    let queries = [
+        r#"stddev(rate({a="b"}[5m]))"#,
+        r#"stdvar by(app)(rate({a="b"}[5m]))"#,
+        r#"topk(5, rate({a="b"}[5m]))"#,
+        r#"bottomk(3, rate({a="b"}[5m]))"#,
+        r#"topk by(app)(5, rate({a="b"}[5m]))"#,
+        r#"sum by(app)(topk(2, count_over_time({a="b"}[5m])))"#,
+    ];
+    for q in queries {
+        assert_round_trip(q);
+    }
+}
+
+#[test]
+fn topk_carries_its_raw_k_parameter_and_grouping() {
+    let expr = parse(r#"topk by(app)(5, rate({a="b"}[5m]))"#).unwrap();
+    let pulsus_logql::Expr::Metric(pulsus_logql::MetricExpr::Vector {
+        op,
+        grouping,
+        param,
+        ..
+    }) = &expr
+    else {
+        panic!("expected a vector aggregation");
+    };
+    assert_eq!(*op, pulsus_logql::VectorAggOp::Topk);
+    assert_eq!(param.as_deref(), Some("5"));
+    assert_eq!(grouping.as_ref().unwrap().labels, vec!["app".to_string()]);
+}
+
+#[test]
+fn every_binary_operator_round_trips() {
+    for op in [
+        "+", "-", "*", "/", "%", "^", "==", "!=", ">", "<", ">=", "<=", "and", "or", "unless",
+    ] {
+        let query = format!(r#"rate({{a="b"}}[5m]) {op} rate({{a="c"}}[5m])"#);
+        assert_round_trip(&query);
+    }
+}
+
+#[test]
+fn scalar_literals_and_both_orientations_round_trip() {
+    let queries = [
+        "2",
+        "0.95",
+        r#"rate({a="b"}[5m]) * 2"#,
+        r#"2 - rate({a="b"}[5m])"#,
+        r#"2 ^ 2 ^ 3"#,
+        r#"(rate({a="b"}[5m]) + rate({a="c"}[5m])) * 2"#,
+        r#"rate({a="b"}[5m]) > bool 0.5"#,
+        r#"sum(rate({a="b"}[5m]) + rate({a="c"}[5m]))"#,
+    ];
+    for q in queries {
+        assert_round_trip(q);
+    }
+}
+
+/// AC4c (parser half): `^` is right-associative — `2 ^ 2 ^ 3` must parse
+/// as `2 ^ (2 ^ 3)`, never `(2 ^ 2) ^ 3`.
+#[test]
+fn caret_is_right_associative() {
+    use pulsus_logql::{BinOp, MetricExpr};
+    let expr = parse("2 ^ 2 ^ 3").unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, rhs, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(*op, BinOp::Pow);
+    assert_eq!(**lhs, MetricExpr::Literal("2".to_string()));
+    let MetricExpr::Binary {
+        op: inner_op,
+        lhs: inner_lhs,
+        rhs: inner_rhs,
+        ..
+    } = &**rhs
+    else {
+        panic!("expected the RIGHT side to nest: {rhs:?}");
+    };
+    assert_eq!(*inner_op, BinOp::Pow);
+    assert_eq!(**inner_lhs, MetricExpr::Literal("2".to_string()));
+    assert_eq!(**inner_rhs, MetricExpr::Literal("3".to_string()));
+}
+
+/// AC4c (parser half): `*` binds tighter than `+` — `a + b * c` parses
+/// as `a + (b * c)`.
+#[test]
+fn multiplication_binds_tighter_than_addition() {
+    use pulsus_logql::{BinOp, MetricExpr};
+    let expr = parse("1 + 2 * 3").unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, rhs, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(*op, BinOp::Add);
+    assert_eq!(**lhs, MetricExpr::Literal("1".to_string()));
+    assert!(matches!(&**rhs, MetricExpr::Binary { op: BinOp::Mul, .. }));
+}
+
+/// Comparisons bind looser than arithmetic and `and` looser still:
+/// `a > b + c and d` parses as `(a > (b + c)) and d`.
+#[test]
+fn comparison_and_set_operator_precedence_nests_correctly() {
+    use pulsus_logql::{BinOp, MetricExpr};
+    let expr = parse("1 > 2 + 3 and 4").unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(*op, BinOp::And);
+    let MetricExpr::Binary {
+        op: cmp_op,
+        rhs: cmp_rhs,
+        ..
+    } = &**lhs
+    else {
+        panic!("expected the left side to be the comparison: {lhs:?}");
+    };
+    assert_eq!(*cmp_op, BinOp::Gt);
+    assert!(matches!(
+        &**cmp_rhs,
+        MetricExpr::Binary { op: BinOp::Add, .. }
+    ));
+}
+
+#[test]
+fn bool_modifier_is_captured_and_rendered() {
+    use pulsus_logql::{BinModifier, MetricExpr};
+    let expr = parse(r#"rate({a="b"}[5m]) > bool 0.5"#).unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { modifier, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(*modifier, Some(BinModifier { return_bool: true }));
+    assert_eq!(expr.to_string(), r#"rate({a="b"}[5m]) > bool 0.5"#);
+}
+
+/// Parenthesized grouping overrides precedence and the tree shape
+/// round-trips through the paren-preserving `Display`.
+#[test]
+fn explicit_parens_override_precedence() {
+    use pulsus_logql::{BinOp, MetricExpr};
+    let expr = parse("(1 + 2) * 3").unwrap();
+    let pulsus_logql::Expr::Metric(MetricExpr::Binary { op, lhs, .. }) = &expr else {
+        panic!("expected a binary expr");
+    };
+    assert_eq!(*op, BinOp::Mul);
+    assert!(matches!(&**lhs, MetricExpr::Binary { op: BinOp::Add, .. }));
+    assert_eq!(expr.to_string(), "(1 + 2) * 3");
 }
 
 #[test]

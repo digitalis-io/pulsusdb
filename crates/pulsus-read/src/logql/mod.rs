@@ -40,6 +40,16 @@
 //! top-up) is a named follow-up. The scan stays bounded either way:
 //! `max_bytes_to_read` is untouched and aborts first.
 //!
+//! **Client-aggregated metric queries never truncate (issue M6-10):** a
+//! metric query whose range carries a beyond-line-filter pipeline, an
+//! `unwrap`, or a non-count over-time op raw-scans `(fingerprint,
+//! timestamp_ns, body)` over the FULL window with **no `LIMIT`** — an
+//! aggregation is either complete or aborts on the byte scan budget as
+//! `QueryTooBroad` (complete-or-error, the adjudicated design; distinct
+//! from the streams path's scan-bound `LIMIT` above). Un-piped
+//! count/bytes aggregations keep the SQL-aggregated rollup-or-raw path
+//! byte-identically.
+//!
 //! **Selectivity probes are plan-only in M1.** [`plan::ProbePlan`] SQL is
 //! generated and surfaced in [`PlanExplain`], but never *executed* to
 //! reorder matchers or produce a pre-flight budget estimate — see
@@ -57,11 +67,17 @@ pub mod rows;
 pub mod sql;
 
 pub use error::{ReadError, TooBroadReason};
-pub use exec::{EngineConfig, LogQlEngine, MatrixSeries, QueryResult, StreamResult, VectorSample};
+pub use exec::{
+    ClientWindow, EngineConfig, LogQlEngine, MatrixSeries, QueryResult, StreamResult, VectorSample,
+    apply_vector_aggs, combine_binary, run_client_agg_rows,
+};
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
-pub use pipeline::{CompiledPipeline, EntryOut, PipelineError};
-pub use plan::{MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision, StreamsPlan, plan};
+pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
+pub use plan::{
+    ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision,
+    StreamsPlan, plan,
+};
 
 #[cfg(test)]
 mod tests {

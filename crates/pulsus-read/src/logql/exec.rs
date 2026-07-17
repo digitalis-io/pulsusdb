@@ -12,12 +12,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, ChRowStream, QuerySettings};
-use pulsus_logql::{Expr, Grouping, GroupingKind, VectorAggOp};
+use pulsus_logql::{BinOp, Expr, Grouping, GroupingKind, RangeAggOp, VectorAggOp};
 
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
-use super::plan::{self, MetricPlan, Plan, StreamsPlan};
+use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
+use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
     LabelNameRow, LabelValueRow, MetricBucketRow, MetricInstantRow, SampleRow, StreamMetaRow,
     StreamRow,
@@ -136,6 +137,7 @@ impl LogQlEngine {
                 .await
                 .map(QueryResult::Streams),
             Plan::Metric(mp) => self.run_metric_inner(&mp, None).await,
+            Plan::MetricBinary(node) => self.run_metric_node(&node, None).await,
         }
     }
 
@@ -166,6 +168,11 @@ impl LogQlEngine {
                 };
                 let mut explain = PlanExplain::new(result_type);
                 let result = self.run_metric_inner(&mp, Some(&mut explain)).await?;
+                Ok((result, explain))
+            }
+            Plan::MetricBinary(node) => {
+                let mut explain = PlanExplain::new(binary_result_type(&node, params));
+                let result = self.run_metric_node(&node, Some(&mut explain)).await?;
                 Ok((result, explain))
             }
         }
@@ -308,16 +315,25 @@ impl LogQlEngine {
         let mut fingerprints: Vec<u64> = Vec::new();
         let mut streams_table = self.config.streams.clone();
         for expr in selectors {
-            let (stage1_sql, table) = match plan::plan(expr, &qp, &ctx)? {
-                Plan::Streams(sp) => (sp.stage1_sql, sp.streams_table),
-                Plan::Metric(mp) => (mp.stage1_sql, mp.streams_table),
+            // A binary metric expression carries one stage-1 resolution
+            // per leaf selector; the other plan shapes carry exactly one.
+            let stage1s: Vec<(String, String)> = match plan::plan(expr, &qp, &ctx)? {
+                Plan::Streams(sp) => vec![(sp.stage1_sql, sp.streams_table)],
+                Plan::Metric(mp) => vec![(mp.stage1_sql, mp.streams_table)],
+                Plan::MetricBinary(node) => node
+                    .leaves()
+                    .into_iter()
+                    .map(|mp| (mp.stage1_sql.clone(), mp.streams_table.clone()))
+                    .collect(),
             };
-            if let Some(e) = explain.as_mut() {
-                e.push("stage1_stream_resolution", stage1_sql.clone(), None);
+            for (stage1_sql, table) in stage1s {
+                if let Some(e) = explain.as_mut() {
+                    e.push("stage1_stream_resolution", stage1_sql.clone(), None);
+                }
+                let fps = self.resolve_fingerprints(&stage1_sql).await?;
+                fingerprints.extend(fps);
+                streams_table = table;
             }
-            let fps = self.resolve_fingerprints(&stage1_sql).await?;
-            fingerprints.extend(fps);
-            streams_table = table;
         }
         fingerprints.sort_unstable();
         fingerprints.dedup();
@@ -356,6 +372,13 @@ impl LogQlEngine {
         match plan::plan(expr, params, &ctx)? {
             Plan::Streams(sp) => self.explain_streams(&sp).await,
             Plan::Metric(mp) => self.explain_metric(&mp).await,
+            Plan::MetricBinary(node) => {
+                let mut explain = PlanExplain::new(binary_result_type(&node, params));
+                for leaf in node.leaves() {
+                    self.explain_metric_into(leaf, &mut explain).await?;
+                }
+                Ok(explain)
+            }
         }
     }
 
@@ -535,12 +558,22 @@ impl LogQlEngine {
     }
 
     /// Executes a [`MetricPlan`] end to end. Same single-pass explain
-    /// contract as [`LogQlEngine::run_streams_inner`].
+    /// contract as [`LogQlEngine::run_streams_inner`]. A plan carrying
+    /// [`MetricPlan::client`] takes the client-aggregated path (issue
+    /// M6-10): a full-window `metric_raw_samples` scan (no `LIMIT`,
+    /// budget-abort only) evaluated per line in-engine.
     async fn run_metric_inner(
         &self,
         mp: &MetricPlan,
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<QueryResult, ReadError> {
+        // Compile the client pipeline before any I/O (a bad regex is a
+        // 400, never a wasted scan) — and before the empty-fingerprint
+        // early-outs below for the same reason.
+        let compiled = match &mp.client {
+            Some(client) => Some(CompiledPipeline::compile(&client.pipeline)?),
+            None => None,
+        };
         if let Some(e) = explain.as_mut() {
             e.set_routing(mp.routing.clone());
             e.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
@@ -555,11 +588,34 @@ impl LogQlEngine {
         let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         let is_instant = mp.step_ns.is_none();
         if fingerprints.is_empty() {
+            // `absent_over_time` must still report absence when the
+            // selector resolves NO streams at all.
+            if let (Some(client), Some(compiled)) = (&mp.client, &compiled)
+                && matches!(client.range_op, RangeAggOp::AbsentOverTime)
+            {
+                return run_client_agg_rows(
+                    &[],
+                    compiled,
+                    &HashMap::new(),
+                    client,
+                    ClientWindow {
+                        start_ns: mp.start_ns,
+                        end_ns: mp.end_ns,
+                        step_ns: mp.step_ns,
+                    },
+                    mp.rate_window_ns,
+                );
+            }
             return Ok(if is_instant {
                 QueryResult::Vector(Vec::new())
             } else {
                 QueryResult::Matrix(Vec::new())
             });
+        }
+        if let (Some(client), Some(compiled)) = (&mp.client, &compiled) {
+            return self
+                .run_metric_client(mp, client, compiled, &fingerprints, explain)
+                .await;
         }
         if let Some(e) = explain.as_mut() {
             e.push(
@@ -614,8 +670,8 @@ impl LogQlEngine {
                     value,
                 });
             }
-            for (op, grouping) in mp.vector_aggs.iter().rev() {
-                series = group_instant(series, *op, grouping.as_ref());
+            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
+                series = group_instant(series, *op, grouping.as_ref(), *param);
             }
             Ok(QueryResult::Vector(
                 series
@@ -664,8 +720,8 @@ impl LogQlEngine {
                     })
                 })
                 .collect();
-            for (op, grouping) in mp.vector_aggs.iter().rev() {
-                series = group_range(series, *op, grouping.as_ref());
+            for (op, grouping, param) in mp.vector_aggs.iter().rev() {
+                series = group_range(series, *op, grouping.as_ref(), *param);
             }
             Ok(QueryResult::Matrix(
                 series
@@ -677,6 +733,115 @@ impl LogQlEngine {
                     .collect(),
             ))
         }
+    }
+
+    /// The client-aggregated metric path (issue M6-10): fetch every
+    /// matching `(fingerprint, timestamp_ns, body)` row in the window —
+    /// **no `LIMIT`**; the scan is complete or aborts on the byte budget
+    /// (`QueryTooBroad`), never silently truncated — then run the
+    /// compiled pipeline per line, bucket by step in-engine, reduce per
+    /// `(final-label-set, bucket)`, and finish the vector aggregations.
+    async fn run_metric_client(
+        &self,
+        mp: &MetricPlan,
+        client: &ClientAgg,
+        compiled: &CompiledPipeline,
+        fingerprints: &[u64],
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<QueryResult, ReadError> {
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "stage2_hydration",
+                super::sql::stage2(&mp.streams_table, fingerprints),
+                None,
+            );
+        }
+        let meta = self.hydrate(&mp.streams_table, fingerprints).await?;
+        let services = distinct_escaped_services(&meta);
+        let sql = super::sql::metric_raw_samples(
+            &mp.table,
+            &services,
+            fingerprints,
+            super::sql::TimeWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+            },
+            &mp.extra_predicates,
+        );
+        if let Some(e) = explain.as_mut() {
+            e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
+        }
+        // Stream the raw scan into reducer state (review round 1,
+        // finding 1): rows fold into `ClientAggState` in bounded chunks,
+        // so process memory is O(buckets × series) + one chunk — never
+        // the whole scan. The ClickHouse byte budget
+        // (`max_bytes_to_read`, `budget_settings`) is charged server-
+        // side AS the scan streams and aborts mid-stream as
+        // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
+        // without buffering-driven OOM risk.
+        let mut state = ClientAggState::new(
+            compiled,
+            &meta,
+            client,
+            ClientWindow {
+                start_ns: mp.start_ns,
+                end_ns: mp.end_ns,
+                step_ns: mp.step_ns,
+            },
+            mp.rate_window_ns,
+        )?;
+        let mut chunk: Vec<SampleRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
+        {
+            // Scoped: the row stream holds its pooled connection until
+            // dropped (the `ChRowStream` lease rule) — no other query
+            // runs inside this block, and the lease ends at the brace.
+            let mut stream = self
+                .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                .await
+                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            while let Some(row) = stream.next().await {
+                chunk.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                if chunk.len() >= CLIENT_AGG_CHUNK_ROWS {
+                    state.push_rows(&chunk)?;
+                    chunk.clear();
+                }
+            }
+        }
+        state.push_rows(&chunk)?;
+        Ok(apply_vector_aggs(state.finish(), &mp.vector_aggs))
+    }
+
+    /// Evaluates a [`MetricNode`] tree (issue M6-10): leaves execute the
+    /// ordinary metric path; `Binary`/`Scalar`/`VectorAgg` combine the
+    /// results in-engine. Boxed recursion (async).
+    fn run_metric_node<'a>(
+        &'a self,
+        node: &'a MetricNode,
+        explain: Option<&'a mut PlanExplain>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<QueryResult, ReadError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let mut explain = explain;
+            match node {
+                MetricNode::Leaf(mp) => self.run_metric_inner(mp, explain.as_deref_mut()).await,
+                MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
+                MetricNode::VectorAgg { aggs, inner } => {
+                    let result = self.run_metric_node(inner, explain.as_deref_mut()).await?;
+                    Ok(apply_vector_aggs(result, aggs))
+                }
+                MetricNode::Binary {
+                    op,
+                    return_bool,
+                    lhs,
+                    rhs,
+                } => {
+                    let l = self.run_metric_node(lhs, explain.as_deref_mut()).await?;
+                    let r = self.run_metric_node(rhs, explain).await?;
+                    combine_binary(*op, *return_bool, l, r)
+                }
+            }
+        })
     }
 
     async fn explain_streams(&self, sp: &StreamsPlan) -> Result<PlanExplain, ReadError> {
@@ -720,6 +885,19 @@ impl LogQlEngine {
             "matrix"
         };
         let mut explain = PlanExplain::new(result_type);
+        self.explain_metric_into(mp, &mut explain).await?;
+        Ok(explain)
+    }
+
+    /// Pushes one [`MetricPlan`]'s stages into an existing explain — the
+    /// shared body of [`LogQlEngine::explain_metric`] and the per-leaf
+    /// walk of a binary plan (where `set_routing` reflects the LAST
+    /// leaf; each `metric_read` entry carries its own reason).
+    async fn explain_metric_into(
+        &self,
+        mp: &MetricPlan,
+        explain: &mut PlanExplain,
+    ) -> Result<(), ReadError> {
         explain.set_routing(mp.routing.clone());
         explain.push("stage1_stream_resolution", mp.stage1_sql.clone(), None);
         for probe in &mp.probes {
@@ -731,7 +909,7 @@ impl LogQlEngine {
         }
         let fingerprints = self.resolve_fingerprints(&mp.stage1_sql).await?;
         if fingerprints.is_empty() {
-            return Ok(explain);
+            return Ok(());
         }
         explain.push(
             "stage2_hydration",
@@ -744,36 +922,59 @@ impl LogQlEngine {
         } else {
             distinct_escaped_services(&meta)
         };
-        let source = super::sql::MetricSource {
-            table: &mp.table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
+        let window = super::sql::TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
         };
-        let metric_sql = match mp.step_ns {
-            Some(step_ns) => super::sql::metric_range(
-                source,
+        let metric_sql = if mp.client.is_some() {
+            // Client-aggregated (issue M6-10): the raw full-window fetch,
+            // not a SQL aggregate.
+            super::sql::metric_raw_samples(
+                &mp.table,
                 &services,
                 &fingerprints,
-                super::sql::TimeWindow {
-                    start_ns: mp.start_ns,
-                    end_ns: mp.end_ns,
-                },
-                step_ns,
+                window,
                 &mp.extra_predicates,
-            ),
-            None => super::sql::metric_instant(
-                source,
-                &services,
-                &fingerprints,
-                super::sql::TimeWindow {
-                    start_ns: mp.start_ns,
-                    end_ns: mp.end_ns,
-                },
-                &mp.extra_predicates,
-            ),
+            )
+        } else {
+            let source = super::sql::MetricSource {
+                table: &mp.table,
+                bucket_col: mp.bucket_col,
+                agg_expr: mp.agg_expr,
+            };
+            match mp.step_ns {
+                Some(step_ns) => super::sql::metric_range(
+                    source,
+                    &services,
+                    &fingerprints,
+                    window,
+                    step_ns,
+                    &mp.extra_predicates,
+                ),
+                None => super::sql::metric_instant(
+                    source,
+                    &services,
+                    &fingerprints,
+                    window,
+                    &mp.extra_predicates,
+                ),
+            }
         };
         explain.push("metric_read", metric_sql, Some(mp.routing.reason.clone()));
-        Ok(explain)
+        Ok(())
+    }
+}
+
+/// The `resultType` a binary metric plan produces: `scalar` for a
+/// leaf-less (pure-literal) tree, otherwise vector/matrix per the query
+/// spec — the same rule the encoder applies to the evaluated result.
+fn binary_result_type(node: &MetricNode, params: &QueryParams) -> &'static str {
+    if node.leaves().is_empty() {
+        "scalar"
+    } else if matches!(params.spec, QuerySpec::Instant { .. }) {
+        "vector"
+    } else {
+        "matrix"
     }
 }
 
@@ -923,6 +1124,886 @@ pub fn run_pipeline_rows(
                     entries: g.entries,
                 }),
         )
+        .collect()
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-10: the client-aggregated metric core — pure over fetched
+// rows, `pub` like `run_pipeline_rows` so the hermetic golden suite
+// (`tests/logql_metric_agg_golden.rs`) and the allocation gate
+// (`tests/logql_pipeline_alloc.rs`) pin it from outside the crate.
+// ---------------------------------------------------------------------
+
+/// The evaluation window for one client-aggregated metric query.
+/// `step_ns: None` = instant (one bucket over the whole window);
+/// `Some(step)` = the M1 tumbling bucket contract (`floor(ts/step) *
+/// step`, matching the SQL path's `intDiv` bucketing byte-for-byte).
+#[derive(Debug, Clone, Copy)]
+pub struct ClientWindow {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub step_ns: Option<u64>,
+}
+
+/// The instant-mode bucket key (any constant works — there is exactly
+/// one bucket).
+const INSTANT_BUCKET: i64 = 0;
+
+/// How many rows the streaming client-aggregation fetch buffers between
+/// folds into [`ClientAggState`] — bounds transient memory without
+/// per-row fold overhead (review round 1, finding 1).
+const CLIENT_AGG_CHUNK_ROWS: usize = 8_192;
+
+fn bucket_of(ts_ns: i64, step_ns: Option<u64>) -> i64 {
+    match step_ns {
+        Some(step) => {
+            // i128 intermediates (review round 3): for a timestamp near
+            // `i64::MIN` with a non-dividing step, the FLOORED quotient
+            // re-multiplied by step lands up to one step below the
+            // timestamp — which can sit just below `i64::MIN` (e.g.
+            // `i64::MIN + 1` at step 3 floors to `i64::MIN - 1`), a
+            // debug panic / release wrap in i64. `step_ns > 0` and
+            // `<= i64::MAX` are guaranteed by `ClientAggState::new`'s
+            // grid guard before any row is bucketed.
+            let step = step as i128;
+            clamp_bucket((ts_ns as i128).div_euclid(step) * step)
+        }
+        None => INSTANT_BUCKET,
+    }
+}
+
+/// Converts an i128 bucket start back to the i64 point-timestamp domain.
+/// Only the sliver within one step below `i64::MIN` (or, symmetrically,
+/// above `i64::MAX`) can fall outside — centuries beyond any real
+/// nanosecond timestamp — and it clamps deterministically; both
+/// [`bucket_of`] and [`bucket_grid`] clamp IDENTICALLY, so data-driven
+/// buckets and the `absent_over_time` grid stay membership-consistent.
+fn clamp_bucket(bucket: i128) -> i64 {
+    i64::try_from(bucket).unwrap_or(if bucket < 0 { i64::MIN } else { i64::MAX })
+}
+
+/// Streaming per-bucket accumulator for every over-time reducer except
+/// `quantile_over_time` (which needs the full value set). Welford's
+/// algorithm for mean/M2 (population stddev/stdvar); first/last are
+/// timestamp-anchored, order-independent.
+#[derive(Debug, Clone)]
+struct SimpleAcc {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    m2: f64,
+    first_ts: i64,
+    first_v: f64,
+    last_ts: i64,
+    last_v: f64,
+}
+
+impl SimpleAcc {
+    fn new(ts_ns: i64, v: f64) -> Self {
+        SimpleAcc {
+            count: 1,
+            sum: v,
+            min: v,
+            max: v,
+            mean: v,
+            m2: 0.0,
+            first_ts: ts_ns,
+            first_v: v,
+            last_ts: ts_ns,
+            last_v: v,
+        }
+    }
+
+    fn add(&mut self, ts_ns: i64, v: f64) {
+        self.count += 1;
+        self.sum += v;
+        self.min = self.min.min(v);
+        self.max = self.max.max(v);
+        let delta = v - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (v - self.mean);
+        // Equal-timestamp tie-break (review round 2, finding 2): the
+        // pinned PulsusDB rule — `first` takes the SMALLEST value among
+        // samples tied at the minimum timestamp, `last` the LARGEST at
+        // the maximum (`total_cmp` so NaN ties cannot flap). Fully
+        // input-order-independent, so the reducer is deterministic even
+        // if the scan's stable ordering ever changed. The reference's
+        // own tie order for identical timestamps is unspecified; ours is
+        // pinned here and documented (features.md §2).
+        if ts_ns < self.first_ts || (ts_ns == self.first_ts && v.total_cmp(&self.first_v).is_lt()) {
+            self.first_ts = ts_ns;
+            self.first_v = v;
+        }
+        if ts_ns > self.last_ts || (ts_ns == self.last_ts && v.total_cmp(&self.last_v).is_gt()) {
+            self.last_ts = ts_ns;
+            self.last_v = v;
+        }
+    }
+}
+
+/// One bucket's state: streaming stats, or the full value set for
+/// `quantile_over_time`.
+#[derive(Debug, Clone)]
+enum BucketAcc {
+    Simple(SimpleAcc),
+    Values(Vec<f64>),
+}
+
+impl BucketAcc {
+    fn new(op: RangeAggOp, ts_ns: i64, v: f64) -> Self {
+        if matches!(op, RangeAggOp::QuantileOverTime) {
+            BucketAcc::Values(vec![v])
+        } else {
+            BucketAcc::Simple(SimpleAcc::new(ts_ns, v))
+        }
+    }
+
+    fn add(&mut self, ts_ns: i64, v: f64) {
+        match self {
+            BucketAcc::Simple(acc) => acc.add(ts_ns, v),
+            BucketAcc::Values(vals) => vals.push(v),
+        }
+    }
+
+    /// Finishes the bucket into its reducer value.
+    fn finish(self, op: RangeAggOp, rate_window_ns: Option<u64>, quantile: Option<f64>) -> f64 {
+        match self {
+            BucketAcc::Values(mut vals) => quantile_of(&mut vals, quantile.unwrap_or(f64::NAN)),
+            BucketAcc::Simple(acc) => match op {
+                // Oracle-probed: `rate` over an unwrapped range is the
+                // per-second SUM of values (count-shaped inputs
+                // contribute 1.0 each, so the un-piped semantic is
+                // unchanged); `bytes_rate` likewise.
+                RangeAggOp::Rate | RangeAggOp::BytesRate => apply_rate(acc.sum, rate_window_ns),
+                RangeAggOp::CountOverTime => acc.count as f64,
+                RangeAggOp::BytesOverTime | RangeAggOp::SumOverTime => acc.sum,
+                RangeAggOp::AvgOverTime => acc.mean,
+                RangeAggOp::MinOverTime => acc.min,
+                RangeAggOp::MaxOverTime => acc.max,
+                RangeAggOp::StddevOverTime => (acc.m2 / acc.count as f64).sqrt(),
+                RangeAggOp::StdvarOverTime => acc.m2 / acc.count as f64,
+                RangeAggOp::FirstOverTime => acc.first_v,
+                RangeAggOp::LastOverTime => acc.last_v,
+                // Absent is the dedicated presence branch in
+                // `run_client_agg_rows`; quantile is `Values`-backed.
+                RangeAggOp::QuantileOverTime | RangeAggOp::AbsentOverTime => {
+                    unreachable!("dispatched before BucketAcc::finish")
+                }
+            },
+        }
+    }
+}
+
+/// The reference oracle's quantile semantics (live-probed: `q=0.9` over
+/// `1,2,3,4` is `3.7` — linear interpolation on the sorted values):
+/// `q < 0` → `-Inf`, `q > 1` → `+Inf`, NaN propagates.
+fn quantile_of(values: &mut [f64], q: f64) -> f64 {
+    if values.is_empty() || q.is_nan() {
+        return f64::NAN;
+    }
+    if q < 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if q > 1.0 {
+        return f64::INFINITY;
+    }
+    values.sort_by(f64::total_cmp);
+    let rank = q * (values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let weight = rank - rank.floor();
+    values[lower] * (1.0 - weight) + values[upper] * weight
+}
+
+/// Renders a SORTED label set as the oracle's series shape
+/// (`{a="b", c="d"}`) for the surviving-`__error__` query failure.
+/// Values are escaped with the same mandatory-set escaper the canonical
+/// labels JSON uses ([`push_json_string`] — quotes, backslashes, and
+/// control characters; the shape the reference renders with Go-style
+/// quoting), so hostile parsed label values can never produce malformed
+/// `{k="v"}` text (review round 1, finding 4).
+fn render_series_labels(sorted: &[(String, String)]) -> String {
+    let mut out = String::from("{");
+    for (i, (k, v)) in sorted.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(k);
+        out.push('=');
+        push_json_string(&mut out, v);
+    }
+    out.push('}');
+    out
+}
+
+/// The full step-bucket grid over `(start, end]` — `absent_over_time`
+/// must emit `1.0` for EMPTY buckets, which the data-driven accumulators
+/// never see.
+fn bucket_grid(start_ns: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
+    if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns <= start_ns {
+        return Vec::new();
+    }
+    // i128 intermediates + the shared clamp, exactly like [`bucket_of`]
+    // (review round 3): `k * step` for the lowest grid bucket can sit
+    // one sliver below `i64::MIN`. Buckets containing any ts in
+    // `(start, end]`: floor((start+1)/step) through floor(end/step).
+    // The grid size passed `MAX_CLIENT_AGG_BUCKETS` before this runs.
+    let step = step_ns as i128;
+    let first = (start_ns as i128 + 1).div_euclid(step);
+    let last = (end_ns as i128).div_euclid(step);
+    (first..=last).map(|k| clamp_bucket(k * step)).collect()
+}
+
+/// The evaluation-bucket cap for client-aggregated range queries: a
+/// `(end - start) / step` grid larger than this is rejected as
+/// `QueryTooBroad(MetricBuckets)` BEFORE any grid or accumulator
+/// materialization (review round 1, finding 2 — an `absent_over_time`
+/// over a huge range with a tiny step must never allocate an
+/// attacker-sized grid). 11 000 matches the ecosystem-standard
+/// points-per-range-query ceiling. A documented constant, not a config
+/// field (the `DEFAULT_MAX_STREAMS` precedent).
+pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
+
+/// The exact-quantile retention cap: `quantile_over_time` is the one
+/// reducer whose state grows with surviving rows (every value is kept
+/// for the interpolation sort) rather than with `buckets x series`.
+/// Past this many retained values (~32 MB of f64) the query aborts as
+/// `QueryTooBroad(QuantileValues)` — complete-or-error, never OOM
+/// (review round 1, finding 1's quantile bound).
+pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
+
+/// Streaming client-aggregation state (issue M6-10, review round 1
+/// finding 1): rows fold into reducer state as they arrive so process
+/// memory stays `O(buckets x series)` (+ the caller's bounded chunk)
+/// instead of retaining the whole raw scan. The pure
+/// [`run_client_agg_rows`] wrapper drives it over a slice for the
+/// hermetic golden/allocation suites; the engine drives it chunk-wise
+/// off the live row stream.
+struct ClientAggState<'q> {
+    compiled: &'q super::pipeline::CompiledPipeline,
+    client: &'q ClientAgg,
+    window: ClientWindow,
+    rate_window_ns: Option<u64>,
+    /// Base labels once per fingerprint, in the same shape the SQL
+    /// metric path exposes (`series_labels`: canonical JSON labels +
+    /// the physical `service` column re-injected as `service_name`,
+    /// sorted).
+    base_labels: HashMap<u64, Vec<(String, String)>>,
+    fan_out: bool,
+    /// `absent_over_time`'s selector-wide presence set (plan v2 D2).
+    present: BTreeSet<i64>,
+    /// Non-mutating pipelines group by fingerprint (zero per-row
+    /// allocations — the alloc-gate path).
+    fp_groups: HashMap<u64, BTreeMap<i64, BucketAcc>>,
+    /// Label-mutating/unwrapping pipelines group by the rendered final
+    /// label set.
+    label_groups: HashMap<String, (LabelSet, BTreeMap<i64, BucketAcc>)>,
+    /// Total values retained across every quantile accumulator, charged
+    /// against [`MAX_QUANTILE_VALUES`].
+    quantile_values: u64,
+}
+
+impl<'q> ClientAggState<'q> {
+    /// Validates the bucket grid BEFORE any accumulation (finding 2) and
+    /// snapshots the per-fingerprint base labels.
+    fn new(
+        compiled: &'q super::pipeline::CompiledPipeline,
+        meta: &HashMap<u64, StreamMetaRow>,
+        client: &'q ClientAgg,
+        window: ClientWindow,
+        rate_window_ns: Option<u64>,
+    ) -> Result<Self, ReadError> {
+        if let Some(step) = window.step_ns {
+            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
+            if buckets > MAX_CLIENT_AGG_BUCKETS {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                    buckets,
+                    cap: MAX_CLIENT_AGG_BUCKETS,
+                }));
+            }
+        }
+        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        for (fp, m) in meta {
+            base_labels.insert(*fp, series_labels(m));
+        }
+        Ok(ClientAggState {
+            compiled,
+            client,
+            window,
+            rate_window_ns,
+            base_labels,
+            fan_out: compiled.metric_mutates_labels(),
+            present: BTreeSet::new(),
+            fp_groups: HashMap::new(),
+            label_groups: HashMap::new(),
+            quantile_values: 0,
+        })
+    }
+
+    /// Folds one batch of rows into the reducer state: each row runs the
+    /// compiled pipeline (`run_metric_into` — unwrap executes,
+    /// `__error__` annotates in stage order), FAILS the query on any
+    /// surviving nonempty `__error__` (adjudication #1, oracle-matched
+    /// message), and accumulates per `(final-label-set, bucket)`. One
+    /// label scratch is reused across the whole batch (the #72
+    /// allocation discipline).
+    fn push_rows(&mut self, rows: &[SampleRow]) -> Result<(), ReadError> {
+        let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
+        for row in rows {
+            let Some(base) = self.base_labels.get(&row.fingerprint) else {
+                continue;
+            };
+            let (line, value) = match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
+                MetricRun::Dropped => continue,
+                MetricRun::Kept { line, value } => (line, value),
+            };
+            check_surviving_error(&scratch)?;
+            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns);
+            if is_absent {
+                // Selector-wide presence (plan v2 D2): count surviving
+                // lines per bucket across ALL fingerprints/label sets.
+                self.present.insert(bucket);
+                continue;
+            }
+            let v = match self.client.value {
+                ClientValue::Count => 1.0,
+                ClientValue::Bytes => line.len() as f64,
+                ClientValue::Unwrap => match value {
+                    Some(v) => v,
+                    // Defensive: a `None` unwrap value always carries a
+                    // nonempty `__error__` (checked above) unless a
+                    // filter dropped the line — unreachable, but never a
+                    // silent 0.
+                    None => continue,
+                },
+            };
+            let op = self.client.range_op;
+            if matches!(op, RangeAggOp::QuantileOverTime) {
+                self.quantile_values += 1;
+                if self.quantile_values > MAX_QUANTILE_VALUES {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::QuantileValues {
+                        count: self.quantile_values,
+                        cap: MAX_QUANTILE_VALUES,
+                    }));
+                }
+            }
+            let buckets = if self.fan_out {
+                scratch.sort_unstable();
+                let key = render_labels_json_sorted(&scratch);
+                match self.label_groups.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let labels: LabelSet = scratch
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                        &mut e.insert((labels, BTreeMap::new())).1
+                    }
+                }
+            } else {
+                self.fp_groups.entry(row.fingerprint).or_default()
+            };
+            match buckets.entry(bucket) {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
+                    e.get_mut().add(row.timestamp_ns, v)
+                }
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(BucketAcc::new(op, row.timestamp_ns, v));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes every accumulator into the metric result.
+    /// `absent_over_time` emits at most ONE series over the (pre-capped)
+    /// bucket grid; the other reducers emit per surviving group.
+    fn finish(self) -> QueryResult {
+        let is_instant = self.window.step_ns.is_none();
+        if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
+            let labels: LabelSet = self.client.absent_labels.clone();
+            return if is_instant {
+                if self.present.is_empty() {
+                    QueryResult::Vector(vec![VectorSample { labels, value: 1.0 }])
+                } else {
+                    QueryResult::Vector(Vec::new())
+                }
+            } else {
+                let step = self.window.step_ns.unwrap_or(0);
+                let points: Vec<(i64, f64)> =
+                    bucket_grid(self.window.start_ns, self.window.end_ns, step)
+                        .into_iter()
+                        .filter(|b| !self.present.contains(b))
+                        .map(|b| (b, 1.0))
+                        .collect();
+                if points.is_empty() {
+                    QueryResult::Matrix(Vec::new())
+                } else {
+                    QueryResult::Matrix(vec![MatrixSeries { labels, points }])
+                }
+            };
+        }
+
+        let base_labels = self.base_labels;
+        let groups: Vec<(LabelSet, BTreeMap<i64, BucketAcc>)> = if self.fan_out {
+            self.label_groups.into_values().collect()
+        } else {
+            self.fp_groups
+                .into_iter()
+                .filter_map(|(fp, buckets)| base_labels.get(&fp).map(|l| (l.clone(), buckets)))
+                .collect()
+        };
+        let op = self.client.range_op;
+        let rate_window_ns = self.rate_window_ns;
+        let param = self.client.param;
+        if is_instant {
+            QueryResult::Vector(
+                groups
+                    .into_iter()
+                    .filter_map(|(labels, mut buckets)| {
+                        buckets.remove(&INSTANT_BUCKET).map(|acc| VectorSample {
+                            labels,
+                            value: acc.finish(op, rate_window_ns, param),
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            QueryResult::Matrix(
+                groups
+                    .into_iter()
+                    .map(|(labels, buckets)| MatrixSeries {
+                        labels,
+                        points: buckets
+                            .into_iter()
+                            .map(|(b, acc)| (b, acc.finish(op, rate_window_ns, param)))
+                            .collect(),
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// The bucket count the grid guard charges: how many step buckets the
+/// `(start, end]` window touches (0 for an empty/inverted window).
+/// Checked `i128` arithmetic throughout (review round 2, finding 1): the
+/// full `i64` timestamp range at `step = 1` is ~2^64 buckets — a plain
+/// `i64` count would panic/wrap PAST the cap. Anything unrepresentable
+/// or degenerate (a zero step, a step wider than `i64` — both also
+/// structurally rejected upstream) saturates to `u64::MAX`, which the
+/// caller's cap comparison turns into the same named too-broad error.
+fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
+    if end_ns <= start_ns {
+        return 0;
+    }
+    if step_ns == 0 || step_ns > i64::MAX as u64 {
+        // Defensive: a zero step is `InvalidStep` at the planner and a
+        // >i64 step never comes out of `parse_step`; saturate so the
+        // guard rejects rather than ever reaching `bucket_of`'s
+        // `div_euclid`.
+        return u64::MAX;
+    }
+    let step = step_ns as i128;
+    // Buckets containing any ts in (start, end]: floor((start+1)/step)
+    // through floor(end/step). i128 makes `start + 1` and the span
+    // arithmetic overflow-free for every i64 input; `checked_*` is
+    // belt-and-braces per the review disposition.
+    let first = (start_ns as i128 + 1).div_euclid(step);
+    let last = (end_ns as i128).div_euclid(step);
+    match last.checked_sub(first).and_then(|d| d.checked_add(1)) {
+        Some(count) if count <= 0 => 0,
+        Some(count) => u64::try_from(count).unwrap_or(u64::MAX),
+        None => u64::MAX,
+    }
+}
+
+/// The pure client-aggregated evaluation (issue M6-10): the slice-driven
+/// wrapper over [`ClientAggState`] the hermetic golden/allocation suites
+/// pin (the engine streams rows into the same state chunk-wise instead
+/// of buffering the scan — review round 1, finding 1).
+///
+/// Vector aggregations are NOT applied here — the caller finishes them
+/// (`apply_vector_aggs`), mirroring the SQL path.
+pub fn run_client_agg_rows(
+    rows: &[SampleRow],
+    compiled: &super::pipeline::CompiledPipeline,
+    meta: &HashMap<u64, StreamMetaRow>,
+    client: &ClientAgg,
+    window: ClientWindow,
+    rate_window_ns: Option<u64>,
+) -> Result<QueryResult, ReadError> {
+    let mut state = ClientAggState::new(compiled, meta, client, window, rate_window_ns)?;
+    state.push_rows(rows)?;
+    Ok(state.finish())
+}
+
+/// Adjudication #1: a line whose `__error__` is nonempty after the FULL
+/// pipeline fails the metric query with the oracle-matched named error —
+/// never silent exclusion.
+fn check_surviving_error(labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> Result<(), ReadError> {
+    let Some((_, err)) = labels
+        .iter()
+        .find(|(k, v)| k == ERROR_LABEL && !v.is_empty())
+    else {
+        return Ok(());
+    };
+    let mut sorted: Vec<(String, String)> = labels
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    sorted.sort();
+    Err(ReadError::MetricPipelineError {
+        error_type: err.to_string(),
+        series: render_series_labels(&sorted),
+    })
+}
+
+// ---------------------------------------------------------------------
+// Issue M6-10: binary operations over metric results.
+// ---------------------------------------------------------------------
+
+/// Applies one binary operator to a pair of numbers, operand order
+/// preserved (noncommutative ops are never reordered — plan v2 D4).
+fn arith(op: BinOp, l: f64, r: f64) -> f64 {
+    match op {
+        BinOp::Add => l + r,
+        BinOp::Sub => l - r,
+        BinOp::Mul => l * r,
+        BinOp::Div => l / r,
+        BinOp::Mod => l % r,
+        BinOp::Pow => l.powf(r),
+        // Comparisons/set ops never reach `arith` (dispatched below).
+        _ => unreachable!("arith called with a non-arithmetic operator"),
+    }
+}
+
+fn compare(op: BinOp, l: f64, r: f64) -> bool {
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Neq => l != r,
+        BinOp::Gt => l > r,
+        BinOp::Gte => l >= r,
+        BinOp::Lt => l < r,
+        BinOp::Lte => l <= r,
+        _ => unreachable!("compare called with a non-comparison operator"),
+    }
+}
+
+fn is_set_op(op: BinOp) -> bool {
+    matches!(op, BinOp::And | BinOp::Or | BinOp::Unless)
+}
+
+/// One scalar-side application preserving orientation:
+/// `scalar_on_left = false` → `vector_value OP scalar`;
+/// `true` → `scalar OP vector_value`. For comparisons the VECTOR value
+/// is kept on a filter match (oracle-probed: `5 < vec(10)` keeps `10`);
+/// under `bool` every sample stays with value 0/1.
+fn scalar_apply(
+    op: BinOp,
+    return_bool: bool,
+    scalar: f64,
+    v: f64,
+    scalar_on_left: bool,
+) -> Option<f64> {
+    let (l, r) = if scalar_on_left {
+        (scalar, v)
+    } else {
+        (v, scalar)
+    };
+    if op.is_comparison() {
+        let hit = compare(op, l, r);
+        if return_bool {
+            Some(if hit { 1.0 } else { 0.0 })
+        } else {
+            hit.then_some(v)
+        }
+    } else {
+        Some(arith(op, l, r))
+    }
+}
+
+/// Combines two evaluated metric results (issue M6-10). Scope per the
+/// adjudication: vector⊗scalar in BOTH orientations, identical-full-
+/// label-set one-to-one vector⊗vector, `bool`, and the `and`/`or`/
+/// `unless` set operations; matrices align per shared step. `pub` for
+/// the hermetic golden suite.
+pub fn combine_binary(
+    op: BinOp,
+    return_bool: bool,
+    lhs: QueryResult,
+    rhs: QueryResult,
+) -> Result<QueryResult, ReadError> {
+    match (lhs, rhs) {
+        (QueryResult::Scalar(l), QueryResult::Scalar(r)) => {
+            if is_set_op(op) {
+                // Oracle-probed: a set operation against a scalar is a
+                // named 400 ("unexpected literal for ... logical/set
+                // binary operation").
+                return Err(set_op_scalar_error(op));
+            }
+            // Oracle-probed: scalar⊗scalar comparison yields 0/1 with or
+            // without `bool`.
+            let v = if op.is_comparison() {
+                if compare(op, l, r) { 1.0 } else { 0.0 }
+            } else {
+                arith(op, l, r)
+            };
+            Ok(QueryResult::Scalar(v))
+        }
+        (
+            QueryResult::Scalar(s),
+            vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
+        ) => {
+            if is_set_op(op) {
+                return Err(set_op_scalar_error(op));
+            }
+            Ok(map_samples(vector_side, |v| {
+                scalar_apply(op, return_bool, s, v, true)
+            }))
+        }
+        (
+            vector_side @ (QueryResult::Vector(_) | QueryResult::Matrix(_)),
+            QueryResult::Scalar(s),
+        ) => {
+            if is_set_op(op) {
+                return Err(set_op_scalar_error(op));
+            }
+            Ok(map_samples(vector_side, |v| {
+                scalar_apply(op, return_bool, s, v, false)
+            }))
+        }
+        (QueryResult::Vector(l), QueryResult::Vector(r)) => {
+            Ok(QueryResult::Vector(combine_vectors(op, return_bool, l, r)))
+        }
+        (QueryResult::Matrix(l), QueryResult::Matrix(r)) => {
+            Ok(QueryResult::Matrix(combine_matrices(op, return_bool, l, r)))
+        }
+        // Both operands evaluate under the same QuerySpec, so a
+        // vector/matrix mix (or a streams/string operand) is structurally
+        // impossible — defensive named error, never a panic.
+        _ => Err(ReadError::PipelineInvalid {
+            reason: "binary operation over incompatible result types".to_string(),
+        }),
+    }
+}
+
+fn set_op_scalar_error(op: BinOp) -> ReadError {
+    ReadError::PipelineInvalid {
+        reason: format!(
+            "unexpected literal for a leg of logical/set binary operation ({op}): set \
+             operations are defined between vectors only"
+        ),
+    }
+}
+
+/// Maps every sample of a vector/matrix result through `f` (`None`
+/// drops the sample — the comparison-filter path), dropping series left
+/// empty.
+fn map_samples(result: QueryResult, f: impl Fn(f64) -> Option<f64>) -> QueryResult {
+    match result {
+        QueryResult::Vector(items) => QueryResult::Vector(
+            items
+                .into_iter()
+                .filter_map(|s| {
+                    f(s.value).map(|value| VectorSample {
+                        labels: s.labels,
+                        value,
+                    })
+                })
+                .collect(),
+        ),
+        QueryResult::Matrix(items) => QueryResult::Matrix(
+            items
+                .into_iter()
+                .filter_map(|s| {
+                    let points: Vec<(i64, f64)> = s
+                        .points
+                        .into_iter()
+                        .filter_map(|(ts, v)| f(v).map(|nv| (ts, nv)))
+                        .collect();
+                    (!points.is_empty()).then_some(MatrixSeries {
+                        labels: s.labels,
+                        points,
+                    })
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Identical-full-label-set one-to-one vector matching (the adjudicated
+/// M6-10 scope; `on`/`ignoring` grouping is the deferred follow-up).
+fn combine_vectors(
+    op: BinOp,
+    return_bool: bool,
+    lhs: Vec<VectorSample>,
+    rhs: Vec<VectorSample>,
+) -> Vec<VectorSample> {
+    let rhs_by_labels: HashMap<LabelSet, f64> =
+        rhs.iter().map(|s| (s.labels.clone(), s.value)).collect();
+    if is_set_op(op) {
+        return match op {
+            BinOp::And => lhs
+                .into_iter()
+                .filter(|s| rhs_by_labels.contains_key(&s.labels))
+                .collect(),
+            BinOp::Unless => lhs
+                .into_iter()
+                .filter(|s| !rhs_by_labels.contains_key(&s.labels))
+                .collect(),
+            BinOp::Or => {
+                let lhs_labels: std::collections::HashSet<LabelSet> =
+                    lhs.iter().map(|s| s.labels.clone()).collect();
+                let mut out = lhs;
+                out.extend(rhs.into_iter().filter(|s| !lhs_labels.contains(&s.labels)));
+                out
+            }
+            _ => unreachable!("is_set_op gates the arm"),
+        };
+    }
+    lhs.into_iter()
+        .filter_map(|s| {
+            let r = *rhs_by_labels.get(&s.labels)?;
+            let value = if op.is_comparison() {
+                let hit = compare(op, s.value, r);
+                if return_bool {
+                    if hit { 1.0 } else { 0.0 }
+                } else if hit {
+                    s.value
+                } else {
+                    return None;
+                }
+            } else {
+                arith(op, s.value, r)
+            };
+            Some(VectorSample {
+                labels: s.labels,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// Matrix⊗matrix: the vector semantics applied per shared step (plan v1:
+/// "Range (matrix) binary ops align per shared step").
+fn combine_matrices(
+    op: BinOp,
+    return_bool: bool,
+    lhs: Vec<MatrixSeries>,
+    rhs: Vec<MatrixSeries>,
+) -> Vec<MatrixSeries> {
+    let rhs_by_labels: HashMap<LabelSet, BTreeMap<i64, f64>> = rhs
+        .iter()
+        .map(|s| (s.labels.clone(), s.points.iter().copied().collect()))
+        .collect();
+    if is_set_op(op) {
+        return match op {
+            // `a and b`: an lhs point survives iff rhs has a same-labels
+            // point at the same step.
+            BinOp::And => lhs
+                .into_iter()
+                .filter_map(|s| {
+                    let r = rhs_by_labels.get(&s.labels)?;
+                    let points: Vec<(i64, f64)> = s
+                        .points
+                        .into_iter()
+                        .filter(|(ts, _)| r.contains_key(ts))
+                        .collect();
+                    (!points.is_empty()).then_some(MatrixSeries {
+                        labels: s.labels,
+                        points,
+                    })
+                })
+                .collect(),
+            // `a unless b`: an lhs point survives iff rhs has NO
+            // same-labels point at that step.
+            BinOp::Unless => lhs
+                .into_iter()
+                .filter_map(|s| {
+                    let points: Vec<(i64, f64)> = match rhs_by_labels.get(&s.labels) {
+                        None => s.points,
+                        Some(r) => s
+                            .points
+                            .into_iter()
+                            .filter(|(ts, _)| !r.contains_key(ts))
+                            .collect(),
+                    };
+                    (!points.is_empty()).then_some(MatrixSeries {
+                        labels: s.labels,
+                        points,
+                    })
+                })
+                .collect(),
+            // `a or b`: all lhs points, plus rhs points at steps where
+            // no same-labels lhs point exists.
+            BinOp::Or => {
+                let lhs_by_labels: HashMap<LabelSet, BTreeSet<i64>> = lhs
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.labels.clone(),
+                            s.points.iter().map(|(ts, _)| *ts).collect(),
+                        )
+                    })
+                    .collect();
+                let mut out = lhs;
+                for s in rhs {
+                    let extra: Vec<(i64, f64)> = match lhs_by_labels.get(&s.labels) {
+                        None => s.points,
+                        Some(l) => s
+                            .points
+                            .into_iter()
+                            .filter(|(ts, _)| !l.contains(ts))
+                            .collect(),
+                    };
+                    if extra.is_empty() {
+                        continue;
+                    }
+                    if let Some(existing) = out.iter_mut().find(|o| o.labels == s.labels) {
+                        existing.points.extend(extra);
+                        existing.points.sort_by_key(|(ts, _)| *ts);
+                    } else {
+                        out.push(MatrixSeries {
+                            labels: s.labels,
+                            points: extra,
+                        });
+                    }
+                }
+                out
+            }
+            _ => unreachable!("is_set_op gates the arm"),
+        };
+    }
+    lhs.into_iter()
+        .filter_map(|s| {
+            let r = rhs_by_labels.get(&s.labels)?;
+            let points: Vec<(i64, f64)> = s
+                .points
+                .into_iter()
+                .filter_map(|(ts, lv)| {
+                    let rv = *r.get(&ts)?;
+                    if op.is_comparison() {
+                        let hit = compare(op, lv, rv);
+                        if return_bool {
+                            Some((ts, if hit { 1.0 } else { 0.0 }))
+                        } else {
+                            hit.then_some((ts, lv))
+                        }
+                    } else {
+                        Some((ts, arith(op, lv, rv)))
+                    }
+                })
+                .collect();
+            (!points.is_empty()).then_some(MatrixSeries {
+                labels: s.labels,
+                points,
+            })
+        })
         .collect()
 }
 
@@ -1191,6 +2272,15 @@ fn group_key(labels: &[(String, String)], grouping: Option<&Grouping>) -> LabelS
     kv
 }
 
+/// Population variance (the reference oracle's `stdvar` semantics —
+/// live-probed: `stdvar` of `1,2,3,4` is `1.25`, i.e. `/n`, not the
+/// sample `/(n-1)`).
+fn population_variance(vals: &[f64]) -> f64 {
+    let n = vals.len() as f64;
+    let mean = vals.iter().sum::<f64>() / n;
+    vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n
+}
+
 fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
     match op {
         VectorAggOp::Sum => vals.iter().sum(),
@@ -1198,14 +2288,150 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
         VectorAggOp::Min => vals.iter().cloned().fold(f64::INFINITY, f64::min),
         VectorAggOp::Max => vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
         VectorAggOp::Count => vals.len() as f64,
+        VectorAggOp::Stddev => population_variance(vals).sqrt(),
+        VectorAggOp::Stdvar => population_variance(vals),
+        // Documented invariant: topk/bottomk are per-step SELECTIONS, not
+        // reductions — `group_range`/`group_instant` branch to
+        // `select_k_*` before ever calling `reduce`.
+        VectorAggOp::Topk | VectorAggOp::Bottomk => {
+            unreachable!("topk/bottomk are selections, dispatched before reduce")
+        }
     }
+}
+
+/// The `topk`/`bottomk` `k`: the parameter floored to a count; a missing
+/// or non-positive parameter selects nothing (the planner already
+/// rejects a missing `k` — defensive here).
+fn k_of(param: Option<f64>) -> usize {
+    match param {
+        Some(p) if p >= 1.0 => p.floor() as usize,
+        _ => 0,
+    }
+}
+
+/// Deterministic candidate ordering for `topk`/`bottomk` (pinned by
+/// golden, plan edge case 7): NaN candidates rank LAST for BOTH
+/// directions (oracle-probed: `topk(2)` over `{NaN, 5, 1}` selects
+/// `{5, 1}` and `bottomk(2)` selects `{1, 5}` — a NaN is never
+/// preferred over a finite value); among non-NaN values, descending for
+/// topk / ascending for bottomk; ties broken by the series' label set
+/// ascending.
+fn sort_candidates(candidates: &mut [(usize, f64)], labels_of: &[LabelSet], largest: bool) {
+    candidates.sort_by(|(ai, av), (bi, bv)| {
+        av.is_nan()
+            .cmp(&bv.is_nan())
+            .then_with(|| {
+                if av.is_nan() {
+                    // Both NaN: value order is meaningless; fall through
+                    // to the label tie-break.
+                    std::cmp::Ordering::Equal
+                } else if largest {
+                    bv.total_cmp(av)
+                } else {
+                    av.total_cmp(bv)
+                }
+            })
+            .then_with(|| labels_of[*ai].cmp(&labels_of[*bi]))
+    });
+}
+
+/// `topk`/`bottomk` over a range result: within each group, at each step,
+/// keep the k highest/lowest samples — preserving each survivor's
+/// ORIGINAL series labels (selection, not reduction).
+fn select_k_range(
+    series: Vec<RangeSeries>,
+    op: VectorAggOp,
+    grouping: Option<&Grouping>,
+    param: Option<f64>,
+) -> Vec<RangeSeries> {
+    let k = k_of(param);
+    if k == 0 {
+        return Vec::new();
+    }
+    let largest = matches!(op, VectorAggOp::Topk);
+    let labels_of: Vec<LabelSet> = series.iter().map(|s| s.labels.clone()).collect();
+    let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
+    for (idx, s) in series.iter().enumerate() {
+        groups
+            .entry(group_key(&s.labels, grouping))
+            .or_default()
+            .push(idx);
+    }
+    let mut keep: Vec<BTreeMap<i64, f64>> = series.iter().map(|_| BTreeMap::new()).collect();
+    for members in groups.values() {
+        let steps: BTreeSet<i64> = members
+            .iter()
+            .flat_map(|&i| series[i].points.keys().copied())
+            .collect();
+        for step in steps {
+            let mut candidates: Vec<(usize, f64)> = members
+                .iter()
+                .filter_map(|&i| series[i].points.get(&step).map(|v| (i, *v)))
+                .collect();
+            sort_candidates(&mut candidates, &labels_of, largest);
+            for (idx, v) in candidates.into_iter().take(k) {
+                keep[idx].insert(step, v);
+            }
+        }
+    }
+    series
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, points)| {
+            (!points.is_empty()).then_some(RangeSeries {
+                labels: s.labels,
+                points,
+            })
+        })
+        .collect()
+}
+
+/// `topk`/`bottomk` over an instant result: keep the k highest/lowest
+/// samples per group, original labels preserved.
+fn select_k_instant(
+    series: Vec<InstantSeries>,
+    op: VectorAggOp,
+    grouping: Option<&Grouping>,
+    param: Option<f64>,
+) -> Vec<InstantSeries> {
+    let k = k_of(param);
+    if k == 0 {
+        return Vec::new();
+    }
+    let largest = matches!(op, VectorAggOp::Topk);
+    let labels_of: Vec<LabelSet> = series.iter().map(|s| s.labels.clone()).collect();
+    let mut groups: HashMap<LabelSet, Vec<usize>> = HashMap::new();
+    for (idx, s) in series.iter().enumerate() {
+        groups
+            .entry(group_key(&s.labels, grouping))
+            .or_default()
+            .push(idx);
+    }
+    let mut keep: Vec<bool> = vec![false; series.len()];
+    for members in groups.values() {
+        let mut candidates: Vec<(usize, f64)> =
+            members.iter().map(|&i| (i, series[i].value)).collect();
+        sort_candidates(&mut candidates, &labels_of, largest);
+        for (idx, _) in candidates.into_iter().take(k) {
+            keep[idx] = true;
+        }
+    }
+    series
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, kept)| kept.then_some(s))
+        .collect()
 }
 
 fn group_range(
     series: Vec<RangeSeries>,
     op: VectorAggOp,
     grouping: Option<&Grouping>,
+    param: Option<f64>,
 ) -> Vec<RangeSeries> {
+    if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
+        return select_k_range(series, op, grouping, param);
+    }
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -1240,7 +2466,11 @@ fn group_instant(
     series: Vec<InstantSeries>,
     op: VectorAggOp,
     grouping: Option<&Grouping>,
+    param: Option<f64>,
 ) -> Vec<InstantSeries> {
+    if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
+        return select_k_instant(series, op, grouping, param);
+    }
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {
         groups
@@ -1255,6 +2485,61 @@ fn group_instant(
             value: reduce(op, &vals),
         })
         .collect()
+}
+
+/// Applies an outer-to-inner vector-aggregation chain to a metric result
+/// (innermost applied first — the `.rev()` matching `MetricPlan.
+/// vector_aggs`' outer-first order). `pub` like [`run_pipeline_rows`]:
+/// the hermetic golden suite (`tests/logql_metric_agg_golden.rs`) pins
+/// the reducer/selection semantics from outside the crate.
+pub fn apply_vector_aggs(result: QueryResult, aggs: &[plan::VectorAggSpec]) -> QueryResult {
+    match result {
+        QueryResult::Matrix(items) => {
+            let mut series: Vec<RangeSeries> = items
+                .into_iter()
+                .map(|s| RangeSeries {
+                    labels: s.labels,
+                    points: s.points.into_iter().collect(),
+                })
+                .collect();
+            for (op, grouping, param) in aggs.iter().rev() {
+                series = group_range(series, *op, grouping.as_ref(), *param);
+            }
+            QueryResult::Matrix(
+                series
+                    .into_iter()
+                    .map(|s| MatrixSeries {
+                        labels: s.labels,
+                        points: s.points.into_iter().collect(),
+                    })
+                    .collect(),
+            )
+        }
+        QueryResult::Vector(items) => {
+            let mut series: Vec<InstantSeries> = items
+                .into_iter()
+                .map(|s| InstantSeries {
+                    labels: s.labels,
+                    value: s.value,
+                })
+                .collect();
+            for (op, grouping, param) in aggs.iter().rev() {
+                series = group_instant(series, *op, grouping.as_ref(), *param);
+            }
+            QueryResult::Vector(
+                series
+                    .into_iter()
+                    .map(|s| VectorSample {
+                        labels: s.labels,
+                        value: s.value,
+                    })
+                    .collect(),
+            )
+        }
+        // A vector aggregation over a scalar is rejected at plan time
+        // (`build_metric_node`); passthrough is defensive only.
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -1619,10 +2904,103 @@ mod tests {
             kind: GroupingKind::By,
             labels: vec!["service_name".to_string()],
         };
-        let grouped = group_range(series, VectorAggOp::Sum, Some(&grouping));
+        let grouped = group_range(series, VectorAggOp::Sum, Some(&grouping), None);
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].points.get(&0), Some(&4.0));
         assert_eq!(grouped[0].points.get(&60), Some(&2.0));
+    }
+
+    /// Review round 2, finding 1: the grid count uses checked i128
+    /// arithmetic — the extreme/degenerate shapes below must saturate or
+    /// zero out, never panic or wrap past the cap.
+    #[test]
+    fn grid_bucket_count_is_overflow_safe_at_extreme_bounds() {
+        // Full i64 range at step 1: ~2^64 buckets, saturates cleanly.
+        assert_eq!(grid_bucket_count(i64::MIN, i64::MAX, 1), u64::MAX);
+        // Deep-negative window at step 1: ~2^62 buckets, exact.
+        assert_eq!(
+            grid_bucket_count(i64::MIN, i64::MIN / 2, 1),
+            (i64::MIN / 2).abs_diff(i64::MIN)
+        );
+        // Inverted/empty windows are zero buckets, never an underflow.
+        assert_eq!(grid_bucket_count(i64::MAX, i64::MIN, 1), 0);
+        assert_eq!(grid_bucket_count(0, 0, 1), 0);
+        // A zero step (structurally `InvalidStep` upstream) and a step
+        // wider than i64 (never produced by `parse_step`) both saturate
+        // so the cap guard rejects them by name instead of `bucket_of`
+        // ever dividing by a degenerate step.
+        assert_eq!(grid_bucket_count(0, 1_000, 0), u64::MAX);
+        assert_eq!(grid_bucket_count(0, 1_000, u64::MAX), u64::MAX);
+        // Ordinary shapes stay exact (the 11k-boundary golden covers the
+        // cap itself): (0, 120] at step 60 touches buckets 0, 60, and
+        // the end-edge bucket 120.
+        assert_eq!(grid_bucket_count(0, 120, 60), 3);
+        // Full i64 range at a half-range step: floor((MIN+1)/s) = -3
+        // through floor(MAX/s) = 2 — six buckets.
+        assert_eq!(
+            grid_bucket_count(i64::MIN, i64::MAX, (i64::MAX / 2) as u64),
+            6
+        );
+    }
+
+    /// Review round 1, finding 1 (quantile bound): the exact-quantile
+    /// retention cap trips as a NAMED too-broad error the moment the
+    /// value count crosses [`MAX_QUANTILE_VALUES`] — driven through the
+    /// real `push_rows` fold with the counter pre-charged to the
+    /// boundary (a 4M-row fixture would be pure waste).
+    #[test]
+    fn quantile_value_retention_past_the_cap_is_a_named_too_broad_error() {
+        let stages = match pulsus_logql::parse(
+            r#"quantile_over_time(0.5, {a="b"} | logfmt | unwrap v [1m])"#,
+        )
+        .expect("parse")
+        {
+            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => range.selector.pipeline,
+            other => panic!("unexpected expr: {other:?}"),
+        };
+        let compiled = super::super::pipeline::CompiledPipeline::compile(&stages).expect("compile");
+        let client = plan::ClientAgg {
+            pipeline: stages,
+            value: plan::ClientValue::Unwrap,
+            range_op: RangeAggOp::QuantileOverTime,
+            param: Some(0.5),
+            absent_labels: Vec::new(),
+        };
+        let meta = HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        )]);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: None,
+        };
+        let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
+        state.quantile_values = MAX_QUANTILE_VALUES - 1;
+        let rows = [
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 1,
+                body: "v=1".to_string(),
+            },
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 2,
+                body: "v=2".to_string(),
+            },
+        ];
+        let err = state.push_rows(&rows).unwrap_err();
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::QuantileValues { count, cap }) => {
+                assert_eq!(cap, MAX_QUANTILE_VALUES);
+                assert_eq!(count, MAX_QUANTILE_VALUES + 1);
+            }
+            other => panic!("expected QueryTooBroad(QuantileValues), got {other:?}"),
+        }
     }
 
     #[test]
