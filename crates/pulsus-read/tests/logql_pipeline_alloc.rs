@@ -162,6 +162,21 @@ fn per_row_allocation_bounds_hold() {
         "regexp: {total} allocations over {ROWS} rows — must stay <= 1 per row"
     );
 
+    // --- Issue #99: the streams ERROR branch (__error_details__). The
+    // --- NO-ERROR fast paths above stay at ZERO per row (the detail is
+    // --- only set on the post-scan error branch — the happy path is
+    // --- bit-identical). Every body here fails the duration conversion,
+    // --- so the LabelFilterErr + __error_details__ branch runs per row;
+    // --- its cost is bounded — the captured offending value + the
+    // --- rendered detail String (~2/row) — never a per-row growth series.
+    let bad_dur_bodies: Vec<String> = (0..64).map(|i| format!("level=info took=bad{i}")).collect();
+    let total = count_run_into(r#"{a="b"} | logfmt | took > 250ms"#, &bad_dur_bodies, &base);
+    assert!(
+        total <= 3 * ROWS + ZERO_RESIDUE,
+        "errored-line detail path: {total} allocations over {ROWS} rows — must stay bounded \
+         (the captured value + the detail string), not a per-row growth series"
+    );
+
     // --- Assembly paths (`run_pipeline_rows` end to end). Output
     // --- materialization is inherent (owned `StreamResult`s), so these
     // --- pin small per-surviving-row constants, not zero.

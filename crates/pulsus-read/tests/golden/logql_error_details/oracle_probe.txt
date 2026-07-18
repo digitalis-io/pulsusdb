@@ -1,0 +1,143 @@
+LogQL __error__ / __error_details__ oracle probe transcript (issue #99)
+========================================================================
+
+Oracle: grafana/loki:3.4.2 (docker.io/grafana/loki@sha256 via tag 3.4.2,
+image id 428173b122b4), single-node filesystem config, HTTP :3100.
+
+This file is byte-frozen evidence: the hermetic goldens in
+`logql_pipeline_golden.rs` pin the exact `(__error__, __error_details__)`
+pairs recorded here. It is a one-time manual capture — NOT run in CI.
+
+Reproduce:
+  podman run -d --name loki-probe -p 3199:3100 \
+    -v ./config.yaml:/etc/loki/local-config.yaml:Z \
+    docker.io/grafana/loki:3.4.2 -config.file=/etc/loki/local-config.yaml
+  # push each INPUT under stream {probe="<name>"} via /loki/api/v1/push
+  # streams: GET /loki/api/v1/query_range?query=<QUERY>
+  # metric : GET /loki/api/v1/query?query=<QUERY>
+
+------------------------------------------------------------------------
+STREAMS PATH — the three error classes (issue #99 scope)
+------------------------------------------------------------------------
+
+[1] JSONParserErr  (query: {probe="..."} | json)
+
+  INPUT `not json at all`   (representative: top-level non-object line)
+    __error__         = JSONParserErr
+    __error_details__ = Value looks like object, but can't find closing '}' symbol
+
+  INPUT `[1,2,3]`           (top-level array)
+    __error__         = JSONParserErr
+    __error_details__ = Value looks like object, but can't find closing '}' symbol
+
+  INPUT `12345` / `hello world` / `x`  (scalar / plain text)
+    __error__         = JSONParserErr
+    __error_details__ = Value looks like object, but can't find closing '}' symbol
+
+  INPUT `{"a":1`            (LEDGERED off-corpus: partial object)
+    __error__         = JSONParserErr
+    __error_details__ = Value is array, but can't find closing ']' symbol
+    (buger/jsonparser internal-scanner-state message; Loki ALSO extracts
+     a="1" here. Our engine treats any non-parseable/non-object line as
+     one malformed class, no partial extraction — see ledger.)
+
+  => PINNED byte-exact: the representative top-level-non-object detail
+     "Value looks like object, but can't find closing '}' symbol".
+     LEDGERED: partial-object/array inputs whose buger/jsonparser message
+     is internal-state-dependent (and where Loki partially extracts).
+
+[2] LogfmtParserErr (query: {probe="..."} | logfmt --strict)
+
+  NOTE: Loki sets LogfmtParserErr ONLY with `--strict`. Default `| logfmt`
+  is lenient (no error on an unterminated quote). Our engine has no
+  `--strict` flag and its `| logfmt` errors on an unterminated quote
+  (pre-existing #72 semantics) — so the TRIGGER condition already diverges
+  from Loki's default; that is out of #99 scope (this issue only adds the
+  detail label at the existing error site). Detail string captured under
+  --strict to obtain Loki's message for the unterminated-quote class:
+
+  INPUT `foo="bar" baz="qux`   (len 18, unterminated quote at EOF)
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 19 : unterminated quoted value
+
+  INPUT `level=info msg="unterminated`  (len 28, unterminated quote at EOF)
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 29 : unterminated quoted value
+
+  INPUT `a=1=2`               (LEDGERED off-corpus: unexpected '=')
+    __error_details__ = logfmt syntax error at pos 4 : unexpected '='
+    (not an error site in our engine — our logfmt only errors on the
+     unterminated quote.)
+
+  => pos = (rune length of the line) + 1 for the unterminated-quote-at-EOF
+     class — reproduced byte-exact. LEDGERED: every other Loki logfmt
+     syntax-error class (unexpected '=', invalid key, ...) is not an error
+     site in our parser.
+
+[3] LabelFilterErr (query: {probe="..."} | logfmt | <field> <op> <lit>)
+
+  number family (RHS a plain number; Go strconv.ParseFloat):
+    INPUT n=abc  , `| n > 5`  -> strconv.ParseFloat: parsing "abc": invalid syntax
+    INPUT n=5abc , `| n > 5`  -> strconv.ParseFloat: parsing "5abc": invalid syntax
+    INPUT (label absent)      -> NO error (line dropped)
+    => PINNED byte-exact: strconv.ParseFloat: parsing "<value>": invalid syntax
+       (value is Go-quoted; plain ASCII values match `"<value>"` exactly).
+
+  duration family (RHS a duration literal; Go time.ParseDuration):
+    INPUT took=abc , `| took > 5s` -> time: invalid duration "abc"
+    INPUT took=5   , `| took > 5s` -> time: missing unit in duration "5"
+    INPUT took=5xyz, `| took > 5s` -> time: unknown unit "xyz" in duration "5xyz"
+    INPUT took=1d  , `| took > 5s` -> time: unknown unit "d" in duration "1d"
+    INPUT took=-5s , `| took > 5s` -> NO error (valid)
+    => PINNED byte-exact: the `invalid duration` and `missing unit`
+       branches (our corpus inputs "abc"/"5"). LEDGERED: the
+       `unknown unit "<u>"` branch (Go time.ParseDuration only supports
+       ns..h; d/w and trailing junk take this branch — and our
+       parse_duration_seconds accepts d/w, so the TRIGGER already diverges,
+       #72 scope).
+
+  bytes family (RHS a bytes literal; humanize.ParseBytes):
+    INPUT size=xyz , `| size > 5B` -> strconv.ParseFloat: parsing "": invalid syntax
+    INPUT size=5xyz, `| size > 5B` -> unhandled size name: xyz
+    INPUT size=-3  , `| size > 5B` -> strconv.ParseFloat: parsing "": invalid syntax
+    => LEDGERED entirely: humanize.ParseBytes splits a leading numeric run
+       from the unit and its message interpolates that internal split
+       ("" when there is no leading number, `unhandled size name: <unit>`
+       when there is). Disproportionate to reproduce; a faithful-format
+       detail is emitted instead.
+
+------------------------------------------------------------------------
+METRIC PATH — OQ2 (issue #99 adjudication comment 5009214557 / 5009238034)
+------------------------------------------------------------------------
+
+Question: does Loki 3.4.2's metric pipeline-error message
+`pipeline error: '<TYPE>' for series: '{...}'` include __error_details__?
+
+Captured with GET /loki/api/v1/query (HTTP 400 body):
+
+  QUERY count_over_time({probe="json"} | json [1h])
+    pipeline error: 'JSONParserErr' for series: '{__error__="JSONParserErr",
+      __error_details__="Value looks like object, but can't find closing '}' symbol",
+      detected_level="unknown", probe="json", service_name="unknown_service"}'.
+    Use a label filter to intentionally skip this error. ...
+
+  QUERY count_over_time({probe="lfdur"} | logfmt | took > 5s [1h])
+    pipeline error: 'LabelFilterErr' for series: '{__error__="LabelFilterErr",
+      __error_details__="time: invalid duration \"abc\"", detected_level="unknown",
+      probe="lfdur", service_name="unknown_service", took="abc"}'. ...
+
+  QUERY count_over_time({probe="logfmt"} | logfmt --strict [1h])
+    pipeline error: 'LogfmtParserErr' for series: '{__error__="LogfmtParserErr",
+      __error_details__="logfmt syntax error at pos 29 : unterminated quoted value",
+      detected_level="info", level="info", probe="logfmt", service_name="unknown_service"}'. ...
+
+RESULT: YES — Loki 3.4.2 DOES include __error_details__ in the metric
+pipeline-error series string. This CONTRADICTS the #91 deferral premise
+("the metric path has nowhere to surface it") and the plan's expected
+"if it does NOT (expected)" branch. Per adjudication Q2 this is a
+STOP-and-escalate condition: the coder does NOT touch the frozen metric
+goldens (logs_api/error.rs, prom_api/error.rs, logql_metric_agg_golden.rs)
+and escalates the finding to the task-manager. Under the streams-only
+(!metric) gate those goldens stay byte-identical; the metric-path
+message therefore KNOWINGLY omits __error_details__ vs Loki pending an
+adjudication of the expanded scope.

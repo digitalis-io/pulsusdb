@@ -71,6 +71,24 @@
       "query": "{run_id=\"{R}\", service_name=\"svc-logfmt\"} | logfmt | level = \"error\" | label_format lvl=level"
     },
     {
+      "case_id": "json_error_details",
+      "construct": "issue #99: a `| json` over a non-object line errors — the stream carries __error__=JSONParserErr plus the byte-exact __error_details__, compared set-equal against grafana/loki:3.4.2",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-badjson\"} | json"
+    },
+    {
+      "case_id": "json_error_kept_by_error_filter",
+      "construct": "issue #99: `| __error__ != \"\"` keeps the errored stream, carrying BOTH __error__ and __error_details__ (the drop side `| __error__ = \"\"` is a Tier-1 hermetic golden — an empty differential set is not a valid set comparison)",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-badjson\"} | json | __error__ != \"\""
+    },
+    {
+      "case_id": "labelfilter_number_error_details",
+      "construct": "issue #99: `| logfmt | n > 5` fails the numeric conversion — LabelFilterErr plus the byte-exact Go strconv.ParseFloat detail",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-badnum\"} | logfmt | n > 5"
+    },
+    {
       "case_id": "metric_filtered_count",
       "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 no tumbling divergence)",
       "mode": "gated",

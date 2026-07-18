@@ -1,5 +1,14 @@
 //! Go `strconv.Quote`/`strconv.IsPrint` port (issue #70 code-review
-//! rounds 1–2): the binop duplicate-match error text must be
+//! rounds 1–2) plus the Go `time.quote` port (issue #99): shared
+//! Go-stdlib string-quoting helpers used wherever an error message must
+//! be byte-identical to upstream. [`go_quote`] mirrors Go stdlib
+//! `strconv.Quote`; [`go_time_quote`] mirrors Go stdlib `time`'s
+//! internal `quote` (a *different* function — see its doc). Consumers:
+//! the promql binop duplicate-match error text and the logql streams
+//! `__error_details__` for `LabelFilterErr` (number branch →
+//! `strconv.Quote`, duration branch → `time.quote`).
+//!
+//! The binop duplicate-match error text must be
 //! byte-identical to upstream Prometheus's, whose label rendering uses
 //! Go `strconv.Quote` — and Go's printability decision is
 //! `strconv.IsPrint` (a Latin-1 fast path plus generated Unicode
@@ -50,7 +59,7 @@ fn is_print(c: char) -> bool {
 /// escapes first, then [`is_print`] verbatim, then the seven named
 /// escapes, `\xNN` for the remaining C0 controls and DEL, and the
 /// `\uNNNN`/`\UNNNNNNNN` forms for everything else.
-pub(crate) fn go_quote(s: &str) -> String {
+pub fn go_quote(s: &str) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -75,6 +84,40 @@ pub(crate) fn go_quote(s: &str) -> String {
             c => {
                 let _ = write!(out, "\\U{:08x}", c as u32);
             }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Go stdlib `time`'s internal `quote` (go1.25.5 `src/time/format.go`) —
+/// a deliberately simpler function than [`go_quote`]/`strconv.Quote`,
+/// used by `time.ParseDuration`'s error messages. Surrounding double
+/// quotes; every rune `>= 0x80` (all non-ASCII, i.e. every byte of a
+/// multi-byte UTF-8 sequence) OR `< 0x20` (C0 controls) is escaped
+/// per-byte as lowercase `\xNN` with NO named escapes (so `\t`→`\x09`,
+/// `\a`→`\x07`) and NO UTF-8 passthrough; `"` and `\` are backslash-
+/// escaped; every other byte (printable ASCII incl. DEL `0x7f`) passes
+/// through verbatim. Verified byte-for-byte against go1.25.5
+/// `time.ParseDuration(...).Error()`.
+pub fn go_time_quote(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut buf = [0u8; 4];
+    for c in s.chars() {
+        let r = c as u32;
+        // Go's `c >= utf8.RuneSelf || c < ' '` — escape non-ASCII and
+        // C0 controls; printable ASCII (incl. DEL 0x7f) passes through.
+        if !(0x20..0x80).contains(&r) {
+            for &b in c.encode_utf8(&mut buf).as_bytes() {
+                let _ = write!(out, "\\x{b:02x}");
+            }
+        } else {
+            if c == '"' || c == '\\' {
+                out.push('\\');
+            }
+            out.push(c);
         }
     }
     out.push('"');
@@ -323,5 +366,26 @@ mod tests {
             "\"\u{1F600}\\U000e0001\"",
             "emoji printable verbatim; tag char takes \\U"
         );
+    }
+
+    /// Byte-for-byte against go1.25.5 `time`'s internal `quote` (as
+    /// surfaced by `time.ParseDuration(...).Error()`): NO named escapes,
+    /// per-byte `\xNN` for C0 controls AND every byte of a non-ASCII
+    /// rune, `\"`/`\\` for quote/backslash, DEL `0x7f` verbatim.
+    #[test]
+    fn go_time_quote_matches_go_time_quote_across_the_branches() {
+        assert_eq!(go_time_quote("plain"), r#""plain""#);
+        assert_eq!(go_time_quote(r#"ab"cd"#), r#""ab\"cd""#);
+        assert_eq!(go_time_quote(r"a\b"), r#""a\\b""#);
+        // C0 controls: NO named escapes (tab is \x09, not \t; bell \x07).
+        assert_eq!(go_time_quote("a\x01cd"), r#""a\x01cd""#);
+        assert_eq!(go_time_quote("a\tb\nc"), r#""a\x09b\x0ac""#);
+        assert_eq!(go_time_quote("a\x07b"), r#""a\x07b""#);
+        // Non-ASCII: EVERY UTF-8 byte escaped (no passthrough).
+        assert_eq!(go_time_quote("1中2"), r#""1\xe4\xb8\xad2""#);
+        assert_eq!(go_time_quote("café"), r#""caf\xc3\xa9""#);
+        assert_eq!(go_time_quote("a\u{a0}b"), r#""a\xc2\xa0b""#, "NBSP");
+        // DEL (0x7f) is neither <0x20 nor >=0x80: passes through raw.
+        assert_eq!(go_time_quote("a\x7fb"), "\"a\x7fb\"");
     }
 }

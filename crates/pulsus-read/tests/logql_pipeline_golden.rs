@@ -8,7 +8,9 @@
 //! container is the separate e2e parity lane; these goldens pin OUR
 //! semantics byte-exactly with no infrastructure.
 
-use pulsus_read::logql::pipeline::{CompiledPipeline, PipelineError};
+use std::borrow::Cow;
+
+use pulsus_read::logql::pipeline::{CompiledPipeline, MetricRun, PipelineError};
 
 /// Compiles the pipeline of a parsed log query.
 fn compiled(query: &str) -> CompiledPipeline {
@@ -97,6 +99,12 @@ fn json_malformed_line_is_kept_with_the_exact_error_label() {
             ("app", "checkout"),
             ("env", "prod"),
             ("__error__", "JSONParserErr"),
+            // issue #99: the streams-path detail label, byte-exact vs
+            // grafana/loki:3.4.2 for a top-level non-object line.
+            (
+                "__error_details__",
+                "Value looks like object, but can't find closing '}' symbol",
+            ),
         ])
     );
     assert_eq!(line, "not json at all");
@@ -219,6 +227,13 @@ fn logfmt_unterminated_quote_is_kept_with_the_exact_error_label() {
             ("app", "checkout"),
             ("env", "prod"),
             ("__error__", "LogfmtParserErr"),
+            // issue #99: `level="unterminated` is 19 runes; Loki's 1-based
+            // position for the unterminated quote at EOF is one past the
+            // final rune (oracle_probe.txt [2]).
+            (
+                "__error_details__",
+                "logfmt syntax error at pos 20 : unterminated quoted value",
+            ),
         ])
     );
     assert_eq!(line, r#"level="unterminated"#);
@@ -439,6 +454,9 @@ fn numeric_filter_conversion_failure_keeps_the_line_with_the_exact_error_label()
             ("env", "prod"),
             ("took", "banana"),
             ("__error__", "LabelFilterErr"),
+            // issue #99: Go time.ParseDuration's `invalid duration` branch
+            // (no leading numeric char), value verbatim.
+            ("__error_details__", r#"time: invalid duration "banana""#),
         ])
     );
     assert_eq!(line, "took=banana");
@@ -468,6 +486,12 @@ fn unit_family_mismatches_match_the_oracle_semantics() {
                 ("env", "prod"),
                 ("took", "300"),
                 ("__error__", "LabelFilterErr"),
+                // issue #99: Go time.ParseDuration's `missing unit` branch
+                // (all-numeric value, no unit).
+                (
+                    "__error_details__",
+                    r#"time: missing unit in duration "300""#
+                ),
             ]),
             "query: {q}"
         );
@@ -597,5 +621,169 @@ fn pushed_down_line_filters_are_not_re_evaluated_in_engine() {
     assert!(
         pipeline.run(r#"{"clean":"1"}"#, &base).is_some(),
         "pre-line_format line filters are SQL's job, not the evaluator's"
+    );
+}
+
+// ---------------------------------------------------------------------
+// __error_details__ (issue #99): the streams-path companion label to
+// __error__, byte-exact vs grafana/loki:3.4.2 where feasible and
+// faithful-format/ledgered for the value-interpolated long tail (see
+// tests/golden/logql_error_details/oracle_probe.txt for the probe).
+// ---------------------------------------------------------------------
+
+/// The `__error_details__` value a streams run produced (or `None`).
+fn detail(query: &str, body: &str) -> Option<String> {
+    let (got, _) = run(query, body)?;
+    got.iter()
+        .find(|(k, _)| k == "__error_details__")
+        .map(|(_, v)| v.clone())
+}
+
+#[test]
+fn json_error_details_is_the_probed_fixed_string_regardless_of_the_body() {
+    // Every top-level non-object line takes the one representative
+    // buger/jsonparser message (oracle_probe.txt [1]).
+    for body in ["not json at all", "[1,2,3]", "12345", "hello world"] {
+        assert_eq!(
+            detail(r#"{a="b"} | json"#, body).as_deref(),
+            Some("Value looks like object, but can't find closing '}' symbol"),
+            "body: {body:?}"
+        );
+    }
+}
+
+#[test]
+fn label_filter_number_family_detail_is_the_probed_parsefloat_message() {
+    // RHS `100` is a plain number -> Number family -> Go strconv.ParseFloat.
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=abc").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "abc": invalid syntax"#),
+    );
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=5abc").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "5abc": invalid syntax"#),
+    );
+}
+
+#[test]
+fn label_filter_duration_family_detail_covers_the_three_probed_branches() {
+    // invalid duration (no leading numeric), missing unit (bare number) —
+    // both pinned byte-exact; unknown unit — faithful-format (matches Loki
+    // for a single number+unit, ledgered for compound values).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=abc").as_deref(),
+        Some(r#"time: invalid duration "abc""#),
+    );
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=5").as_deref(),
+        Some(r#"time: missing unit in duration "5""#),
+    );
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=5xyz").as_deref(),
+        Some(r#"time: unknown unit "xyz" in duration "5xyz""#),
+    );
+}
+
+#[test]
+fn label_filter_number_family_detail_is_byte_exact_for_nonascii_values() {
+    // issue #99 finding 1: the offending value is rendered through Go
+    // `strconv.Quote` (not raw between literal quotes), so the message is
+    // byte-exact for ALL values, not just plain ASCII. Expected strings
+    // captured from go1.25.5 `strconv.ParseFloat(v, 64).Error()` (== the
+    // Loki 3.4.2 oracle). Reverting the quoting makes every case fail
+    // (embedded `"` stays raw, `\x01` becomes a literal control byte,
+    // etc.).
+    // (a) embedded double-quote (logfmt `\"` unescapes to `"`).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=\"ab\\\"cd\"").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "ab\"cd": invalid syntax"#),
+    );
+    // (b) C0 control byte 0x01 -> `\x01`.
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=ab\u{1}cd").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "ab\x01cd": invalid syntax"#),
+    );
+    // (c) multi-byte UTF-8 rune (printable -> passes through under
+    // strconv.Quote's IsPrint).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | status > 100"#, "status=1中2").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "1中2": invalid syntax"#),
+    );
+}
+
+#[test]
+fn label_filter_duration_family_detail_is_byte_exact_for_nonascii_values() {
+    // issue #99 finding 1: the value/unit are rendered through Go
+    // `time`'s internal `quote` (per-byte `\xNN` for controls AND every
+    // byte of a non-ASCII rune, `\"`/`\\` for quote/backslash). Expected
+    // strings captured from go1.25.5 `time.ParseDuration(v).Error()`.
+    // (a) embedded double-quote -> invalid-duration branch.
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=\"ab\\\"cd\"").as_deref(),
+        Some(r#"time: invalid duration "ab\"cd""#),
+    );
+    // (b) C0 control byte 0x01 -> `\x01` (time.quote has NO named escapes).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=ab\u{1}cd").as_deref(),
+        Some(r#"time: invalid duration "ab\x01cd""#),
+    );
+    // (c) multi-byte UTF-8 rune -> unknown-unit branch; BOTH the unit and
+    // the whole value are per-byte `\xNN` escaped (中 == e4 b8 ad).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | took > 5s"#, "took=1中2").as_deref(),
+        Some(r#"time: unknown unit "\xe4\xb8\xad" in duration "1\xe4\xb8\xad2""#),
+    );
+}
+
+#[test]
+fn label_filter_bytes_family_detail_is_faithful_format_ledgered() {
+    // Ledgered: Loki's humanize.ParseBytes interpolates an internal
+    // numeric split; a fully non-numeric value yields the empty prefix
+    // Loki reports byte-exact (oracle_probe.txt [3]).
+    assert_eq!(
+        detail(r#"{a="b"} | logfmt | size > 5B"#, "size=xyz").as_deref(),
+        Some(r#"strconv.ParseFloat: parsing "": invalid syntax"#),
+    );
+}
+
+#[test]
+fn error_detail_label_survives_and_drops_with_its_error_partner() {
+    // `__error__ = ""` drops the errored line entirely (both labels gone).
+    assert!(run(r#"{a="b"} | json | __error__ = """#, "not json").is_none());
+    // `__error__ != ""` keeps it, carrying BOTH the error and its detail.
+    let (got, _) = run(r#"{a="b"} | json | __error__ != """#, "not json").unwrap();
+    assert!(
+        got.contains(&("__error__".to_string(), "JSONParserErr".to_string())),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&(
+            "__error_details__".to_string(),
+            "Value looks like object, but can't find closing '}' symbol".to_string(),
+        )),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn metric_path_sets_error_but_never_the_detail_label() {
+    // Streams-only gate (issue #99): the metric path still tags __error__
+    // (which fails the query downstream) but sets NO __error_details__, so
+    // the frozen metric error-series goldens stay byte-identical. (Loki
+    // 3.4.2 DOES include the detail in its metric pipeline-error message —
+    // recorded as the OQ2 escalation in oracle_probe.txt, not adopted
+    // here pending adjudication.)
+    let pipeline = compiled(r#"{a="b"} | json"#);
+    let base = base();
+    let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+    let out = pipeline.run_metric_into("not json", &base, &mut labels);
+    assert!(matches!(out, MetricRun::Kept { .. }));
+    assert!(
+        labels.iter().any(|(k, _)| k == "__error__"),
+        "metric path still tags __error__: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|(k, _)| k == "__error_details__"),
+        "metric path must not set __error_details__: {labels:?}"
     );
 }

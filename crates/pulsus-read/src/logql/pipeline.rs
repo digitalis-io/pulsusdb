@@ -51,11 +51,34 @@ use std::fmt;
 use pulsus_logql::{
     CompareOp, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, NumericLiteral, ParserStage, Stage,
 };
+// Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
+// Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
+// stdlib `time`'s internal `quote` (duration branch) — reused here so the
+// `__error_details__` value is byte-exact for ALL label values, not just
+// plain ASCII.
+use pulsus_promql::eval::quote::{go_quote, go_time_quote};
 
 /// The label carrying parser/filter failure classes (pinned values:
 /// `JSONParserErr`, `LogfmtParserErr`, `LabelFilterErr`), filterable like
 /// any other label — `| __error__ = ""` drops errored lines.
 pub const ERROR_LABEL: &str = "__error__";
+
+/// The streams-path companion to [`ERROR_LABEL`]: Loki's human-readable
+/// per-error detail (`__error_details__`), set alongside `__error__` at
+/// the STREAMS-reachable error sites only (issue #99). Gated on `!metric`
+/// so the metric error-series stays byte-identical (the metric path fails
+/// the whole query on any surviving `__error__`; see the OQ2 escalation in
+/// `tests/golden/logql_error_details/oracle_probe.txt`). Sorts AFTER
+/// `__error__` lexically (`"__error__" < "__error_details__"`), so the
+/// emitted sorted `labels_json` stays canonical with no plumbing.
+pub const ERROR_DETAILS_LABEL: &str = "__error_details__";
+
+/// Loki (grafana/loki:3.4.2, buger/jsonparser) reports this fixed detail
+/// for a top-level non-object line — the representative `JSONParserErr`
+/// class (oracle_probe.txt [1]). Partial-object inputs take an
+/// internal-scanner-state-dependent message (and Loki partially extracts
+/// them); those are ledgered off-corpus, not reproduced.
+const JSON_ERROR_DETAILS: &str = "Value looks like object, but can't find closing '}' symbol";
 
 /// Errors from compiling a pipeline — all client-caused, surfaced as
 /// [`super::error::ReadError::PipelineInvalid`] (400-class).
@@ -435,17 +458,25 @@ impl CompiledPipeline {
                         return MetricRun::Dropped;
                     }
                 }
-                CompiledStage::Json { extractions } => run_json(&line, extractions, labels),
+                CompiledStage::Json { extractions } => {
+                    run_json(&line, extractions, labels, !metric)
+                }
                 CompiledStage::Logfmt { extractions } => {
                     // Borrow captures from the body slice when the line
                     // is still the original body; a rewritten
                     // (`line_format`-owned) line cannot be borrowed past
                     // its own reassignment, so its captures are copied.
                     match &line {
-                        Cow::Borrowed(text) => run_logfmt(text, extractions, labels, |c| c),
-                        Cow::Owned(text) => {
-                            run_logfmt(text, extractions, labels, |c| Cow::Owned(c.into_owned()))
+                        Cow::Borrowed(text) => {
+                            run_logfmt(text, extractions, labels, |c| c, !metric)
                         }
+                        Cow::Owned(text) => run_logfmt(
+                            text,
+                            extractions,
+                            labels,
+                            |c| Cow::Owned(c.into_owned()),
+                            !metric,
+                        ),
                     }
                 }
                 CompiledStage::Regexp(re) => {
@@ -510,18 +541,34 @@ impl CompiledPipeline {
                         }
                     }
                 }
-                CompiledStage::LabelFilter(filter) => match eval_label_filter(filter, labels) {
-                    Some(true) => {}
-                    Some(false) => return MetricRun::Dropped,
-                    // Conversion failure: keep the line, tag the error
-                    // class (pinned semantics, oracle-verified; a later
-                    // `__error__=""` filter drops it).
-                    None => set_label(
-                        labels,
-                        Cow::Borrowed(ERROR_LABEL),
-                        Cow::Borrowed("LabelFilterErr"),
-                    ),
-                },
+                CompiledStage::LabelFilter(filter) => {
+                    // `record_details = !metric`: the streams path captures
+                    // the first offending `(kind, value)` for the detail
+                    // string; the metric path records nothing (zero extra
+                    // allocation, series stays byte-identical).
+                    let mut failed: Option<(UnitKind, String)> = None;
+                    match eval_label_filter(filter, labels, !metric, &mut failed) {
+                        Some(true) => {}
+                        Some(false) => return MetricRun::Dropped,
+                        // Conversion failure: keep the line, tag the error
+                        // class (pinned semantics, oracle-verified; a later
+                        // `__error__=""` filter drops it).
+                        None => {
+                            set_label(
+                                labels,
+                                Cow::Borrowed(ERROR_LABEL),
+                                Cow::Borrowed("LabelFilterErr"),
+                            );
+                            if let Some((kind, value)) = failed {
+                                set_label(
+                                    labels,
+                                    Cow::Borrowed(ERROR_DETAILS_LABEL),
+                                    Cow::Owned(label_filter_error_details(kind, &value)),
+                                );
+                            }
+                        }
+                    }
+                }
                 CompiledStage::LineFormat(tmpl) => {
                     line = Cow::Owned(render_template(tmpl, labels));
                 }
@@ -890,6 +937,86 @@ fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
     }
 }
 
+/// Streams-path `__error_details__` for a failed numeric label-filter
+/// conversion (issue #99, oracle_probe.txt [3]). Byte-exact against
+/// grafana/loki:3.4.2 for ALL label values (the offending value is
+/// rendered through the same Go-stdlib quoter Loki's error carries):
+/// - `Number`: Go `strconv.ParseFloat`'s `NumError`, value wrapped with
+///   [`go_quote`] (`strconv.Quote` semantics: named escapes, `\xNN` for
+///   C0/DEL, `\uNNNN`/`\UNNNNNNNN` for non-printable runes).
+/// - `Duration`: Go `time.ParseDuration`'s `invalid duration` /
+///   `missing unit` branches (pinned); the `unknown unit` branch is
+///   faithful-format (ledgered — Go consumes valid leading components
+///   first, which we do not reproduce) but its interpolated value/unit
+///   are quoted byte-exactly via [`go_time_quote`].
+/// - `Bytes`: LEDGERED — Loki's `humanize.ParseBytes` interpolates an
+///   internal numeric split; we emit the `ParseFloat` shape over the
+///   leading numeric run (byte-exact for a fully non-numeric value, which
+///   yields the empty prefix Loki reports).
+fn label_filter_error_details(kind: UnitKind, value: &str) -> String {
+    match kind {
+        UnitKind::Number => {
+            format!(
+                "strconv.ParseFloat: parsing {}: invalid syntax",
+                go_quote(value)
+            )
+        }
+        UnitKind::Duration => go_duration_parse_error(value),
+        UnitKind::Bytes => {
+            let prefix_end = value
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(value.len());
+            // The prefix is a leading `[0-9.]*` run — no quote/control/
+            // non-ASCII byte is reachable, so no Go-quoting is needed
+            // here (out of finding-1 scope; Bytes stays ledgered).
+            let prefix = &value[..prefix_end];
+            format!("strconv.ParseFloat: parsing \"{prefix}\": invalid syntax")
+        }
+    }
+}
+
+/// Reproduces Go `time.ParseDuration`'s error classification for the two
+/// pinned branches (oracle_probe.txt [3]): a value with no leading numeric
+/// character is `invalid duration`; an all-numeric value with no unit is
+/// `missing unit`. Anything else falls to the faithful-format
+/// `unknown unit` branch (ledgered).
+fn go_duration_parse_error(value: &str) -> String {
+    // Every interpolated value/unit is wrapped with `go_time_quote`
+    // (Go stdlib `time`'s internal `quote`, which INCLUDES the
+    // surrounding double quotes) — byte-exact for ALL values, not just
+    // plain ASCII.
+    let body = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if body.is_empty() || !body.starts_with(|c: char| c.is_ascii_digit() || c == '.') {
+        return format!("time: invalid duration {}", go_time_quote(value));
+    }
+    let num_end = body
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(body.len());
+    let unit = &body[num_end..];
+    if unit.is_empty() {
+        return format!("time: missing unit in duration {}", go_time_quote(value));
+    }
+    let unit_end = unit
+        .find(|c: char| c.is_ascii_digit() || c == '.')
+        .unwrap_or(unit.len());
+    format!(
+        "time: unknown unit {} in duration {}",
+        go_time_quote(&unit[..unit_end]),
+        go_time_quote(value),
+    )
+}
+
+/// Streams-path `__error_details__` for a `LogfmtParserErr` (issue #99,
+/// oracle_probe.txt [2]). Our only logfmt error site is an unterminated
+/// quoted value, which always runs to EOF, so Loki's 1-based position is
+/// one past the line's final rune. Loki sets `LogfmtParserErr` only under
+/// `| logfmt --strict` (we have no such flag; the trigger already diverges
+/// per #72) — this reproduces the detail string for that class.
+fn logfmt_error_details(text: &str) -> String {
+    let pos = text.chars().count() + 1;
+    format!("logfmt syntax error at pos {pos} : unterminated quoted value")
+}
+
 // ---------------------------------------------------------------------
 // Templates: the `{{.label}}` + literal-text subset. Every Go-template
 // function outside the subset is individually enumerated so the
@@ -1149,6 +1276,8 @@ fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) 
 fn eval_label_filter(
     f: &CompiledLabelFilter,
     labels: &[(Cow<'_, str>, Cow<'_, str>)],
+    record: bool,
+    failed: &mut Option<(UnitKind, String)>,
 ) -> Option<bool> {
     match f {
         CompiledLabelFilter::Match {
@@ -1179,7 +1308,15 @@ fn eval_label_filter(
             let Some(raw) = get_label(labels, name) else {
                 return Some(false);
             };
-            let v = convert_label_value(*kind, raw)?;
+            let Some(v) = convert_label_value(*kind, raw) else {
+                // Record the leftmost conversion failure for the streams
+                // detail string (`record` false on the metric path — no
+                // allocation, the None outcome is unchanged).
+                if record && failed.is_none() {
+                    *failed = Some((*kind, raw.to_string()));
+                }
+                return None;
+            };
             Some(match op {
                 CompareOp::Eq => v == *threshold,
                 CompareOp::Neq => v != *threshold,
@@ -1190,14 +1327,20 @@ fn eval_label_filter(
             })
         }
         CompiledLabelFilter::And(a, b) => {
-            match (eval_label_filter(a, labels), eval_label_filter(b, labels)) {
+            match (
+                eval_label_filter(a, labels, record, failed),
+                eval_label_filter(b, labels, record, failed),
+            ) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
                 (Some(true), Some(true)) => Some(true),
                 _ => None,
             }
         }
         CompiledLabelFilter::Or(a, b) => {
-            match (eval_label_filter(a, labels), eval_label_filter(b, labels)) {
+            match (
+                eval_label_filter(a, labels, record, failed),
+                eval_label_filter(b, labels, record, failed),
+            ) {
                 (Some(true), _) | (_, Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
@@ -1218,6 +1361,7 @@ fn run_json<'a>(
     line: &str,
     extractions: &'a [(String, Vec<JsonPathSeg>)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
+    set_details: bool,
 ) {
     let parsed: serde_json::Value = match serde_json::from_str(line) {
         Ok(v @ serde_json::Value::Object(_)) => v,
@@ -1229,6 +1373,13 @@ fn run_json<'a>(
                 Cow::Borrowed(ERROR_LABEL),
                 Cow::Borrowed("JSONParserErr"),
             );
+            if set_details {
+                set_label(
+                    labels,
+                    Cow::Borrowed(ERROR_DETAILS_LABEL),
+                    Cow::Borrowed(JSON_ERROR_DETAILS),
+                );
+            }
             return;
         }
     };
@@ -1306,6 +1457,7 @@ fn run_logfmt<'a, 't>(
     extractions: &'a [(String, String)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     to_cow: impl Fn(Cow<'t, str>) -> Cow<'a, str>,
+    set_details: bool,
 ) {
     if walk_logfmt(text, &mut |_, _| {}).is_err() {
         set_label(
@@ -1313,6 +1465,13 @@ fn run_logfmt<'a, 't>(
             Cow::Borrowed(ERROR_LABEL),
             Cow::Borrowed("LogfmtParserErr"),
         );
+        if set_details {
+            set_label(
+                labels,
+                Cow::Borrowed(ERROR_DETAILS_LABEL),
+                Cow::Owned(logfmt_error_details(text)),
+            );
+        }
         return;
     }
     if extractions.is_empty() {

@@ -23,7 +23,7 @@ pub mod elementwise;
 pub mod functions;
 pub(crate) mod info;
 pub mod labels;
-mod quote;
+pub mod quote;
 pub mod staleness;
 
 use std::cell::Cell;

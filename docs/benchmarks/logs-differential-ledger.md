@@ -41,6 +41,54 @@ Out of this ledger's scope by design:
   PulsusDB-only contract with no Loki equivalent and stays out of oracle
   scope.
 
+- **`__error_details__` off-corpus detail classes (issue #99,
+  informational).** The streams-path `__error_details__` companion to
+  `__error__` is matched **byte-exact** against `grafana/loki:3.4.2` for
+  the differential corpus and the hermetic goldens: the representative
+  `JSONParserErr` message (a top-level non-object line), the
+  unterminated-quote-at-EOF `LogfmtParserErr` position message, and the
+  `LabelFilterErr` number/duration families (Go `strconv.ParseFloat` and
+  `time.ParseDuration`'s `invalid duration` / `missing unit` branches).
+  The offending value is interpolated through the SAME Go-stdlib quoter
+  Loki's error carries — `strconv.Quote` for the number/bytes families,
+  Go `time`'s internal `quote` for the duration family — so the rendered
+  value is **byte-exact for ALL label values** (embedded quotes, control
+  bytes, and multi-byte UTF-8 included), not merely plain ASCII. What
+  remains deliberately faithful-format (not byte-exact) is the CLASS
+  selection / component extraction for a handful of off-corpus inputs —
+  reproducing each Go library's internal state there is disproportionate
+  for a diagnostic label clients rarely filter on byte-exact (unlike
+  `__error__`, which IS byte-exact). The ledgered off-corpus classes:
+  - `JSONParserErr` on a **partial** object/array (`{"a":1`): buger/
+    jsonparser emits an internal-scanner-state message and Loki partially
+    extracts; our engine reports the one representative message and does
+    not partially extract.
+  - `LogfmtParserErr` classes **other than** the unterminated quote
+    (`unexpected '='`, invalid key, …): not error sites in our parser, and
+    Loki only raises `LogfmtParserErr` under `| logfmt --strict` (which
+    our grammar does not carry — a pre-existing #72 trigger delta).
+  - `LabelFilterErr` **bytes** family (`humanize.ParseBytes` interpolates
+    an internal numeric split) and the duration **`unknown unit`** branch
+    (Go consumes valid leading components first for compound values, so
+    the identified unit *component* may differ) — the interpolated value
+    and unit are nonetheless `time.quote`-rendered byte-exactly.
+
+  These classes are NOT exercised by the differential (the committed
+  error cases use the byte-exact corpus); the probe transcript
+  (`crates/pulsus-read/tests/golden/logql_error_details/oracle_probe.txt`)
+  records the exact Loki strings for each. This is a documented fidelity
+  note, not a gated-case downgrade — every committed `__error_details__`
+  differential case stays hard-gated.
+
+- **`__error_details__` on the METRIC pipeline-error message (issue #99
+  OQ2, escalated).** The `grafana/loki:3.4.2` probe found that Loki DOES
+  include `__error_details__` in its metric `pipeline error: '…' for
+  series: '{…}'` message — contradicting the #91 deferral premise. Per
+  the #99 adjudication this is a STOP-and-escalate condition: PulsusDB's
+  metric path stays streams-only (no `__error_details__`, frozen metric
+  goldens byte-identical) pending a task-manager decision. Not a fixture
+  case; recorded here and in the probe transcript for history.
+
 ## Entries
 
 ### tumbling-vs-sliding-rate

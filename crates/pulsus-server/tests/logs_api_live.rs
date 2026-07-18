@@ -1430,6 +1430,144 @@ async fn query_range_fan_out_pipeline_filters_reformats_and_relabels_streams() {
     drop(guard);
 }
 
+/// Issue #99 end-to-end: a stage-erroring pipeline surfaces BOTH
+/// `__error__` and its byte-exact `__error_details__` companion label in
+/// the streams response `labels_json` over the wire, and the
+/// `| __error__ != ""` / `| __error__ = ""` filters interact with the new
+/// label (keep both / drop the errored stream). Streams-path only — the
+/// detail is set solely on the streams branch (the metric path stays
+/// byte-identical; hermetic goldens pin that). Seeds two dedicated streams
+/// (a non-JSON line and a `n=oops` logfmt line) so each query scopes to its
+/// own error class.
+#[tokio::test]
+async fn query_range_surfaces_error_details_label_end_to_end() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1 (see module docs)");
+        return;
+    }
+    let db = "pulsus_logs_api_it_error_details";
+    let port = 31_119;
+    drop_database(db).await;
+    let guard = spawn_ready_server(port, db);
+    let client = ChClient::new(data_client_config(db))
+        .await
+        .expect("connect data client");
+    let base_ns = now_ns();
+
+    // Two streams: `errjson` carries a top-level non-object line (fails
+    // `| json`); `errnum` carries a logfmt line whose `n` cannot convert
+    // (fails a numeric label filter).
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) VALUES \
+                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_A}, 'errsvc', \
+                 '{{\"service_name\":\"errjson\"}}', 0), \
+                 (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({base_ns}))), {FP_B}, 'errsvc', \
+                 '{{\"service_name\":\"errnum\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+    let ts = base_ns - 1_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) VALUES \
+                 ('errsvc', {FP_A}, {ts}, 0, 'not a json line'), \
+                 ('errsvc', {FP_B}, {ts}, 0, 'n=oops')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_samples");
+
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let start_s = start.to_string();
+    let end_s = end.to_string();
+
+    // The single stream a streams `query_range` response carries.
+    let one_stream = |query: &str| -> serde_json::Value {
+        let res = http_get(
+            port,
+            &q(
+                "/api/logs/v1/query_range",
+                &[
+                    ("query", query),
+                    ("start", start_s.as_str()),
+                    ("end", end_s.as_str()),
+                    ("limit", "100"),
+                ],
+            ),
+        )
+        .expect("query_range reachable");
+        assert_eq!(res.status, 200, "body: {}", res.body);
+        let body = json(&res);
+        assert_eq!(body["data"]["resultType"], "streams");
+        let streams = body["data"]["result"].as_array().expect("streams array");
+        assert_eq!(streams.len(), 1, "expected exactly one stream: {streams:?}");
+        streams[0]["stream"].clone()
+    };
+
+    // JSONParserErr: both labels present, detail byte-exact.
+    let labels = one_stream(r#"{service_name="errjson"} | json"#);
+    assert_eq!(labels["__error__"], "JSONParserErr");
+    assert_eq!(
+        labels["__error_details__"],
+        "Value looks like object, but can't find closing '}' symbol",
+    );
+
+    // LabelFilterErr: the byte-exact Go strconv.ParseFloat detail.
+    let labels = one_stream(r#"{service_name="errnum"} | logfmt | n > 5"#);
+    assert_eq!(labels["__error__"], "LabelFilterErr");
+    assert_eq!(
+        labels["__error_details__"],
+        r#"strconv.ParseFloat: parsing "oops": invalid syntax"#,
+    );
+
+    // `| __error__ != ""` keeps the errored stream, both labels intact.
+    let labels = one_stream(r#"{service_name="errjson"} | json | __error__ != """#);
+    assert_eq!(labels["__error__"], "JSONParserErr");
+    assert_eq!(
+        labels["__error_details__"],
+        "Value looks like object, but can't find closing '}' symbol",
+    );
+
+    // `| __error__ = ""` drops it — no streams at all.
+    let res = http_get(
+        port,
+        &q(
+            "/api/logs/v1/query_range",
+            &[
+                (
+                    "query",
+                    r#"{service_name="errjson"} | json | __error__ = """#,
+                ),
+                ("start", start_s.as_str()),
+                ("end", end_s.as_str()),
+                ("limit", "100"),
+            ],
+        ),
+    )
+    .expect("query_range reachable");
+    assert_eq!(res.status, 200);
+    let body = json(&res);
+    assert_eq!(body["data"]["resultType"], "streams");
+    assert!(
+        body["data"]["result"]
+            .as_array()
+            .is_some_and(|s| s.is_empty()),
+        "| __error__ = \"\" must drop the errored stream: {}",
+        res.body
+    );
+
+    drop(guard);
+}
+
 fn read_rss_kb(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in status.lines() {

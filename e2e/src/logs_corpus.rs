@@ -49,6 +49,12 @@ pub const CASE_IDS: &[&str] = &[
     "numeric_bytes_filter",
     "line_format_rewrite",
     "label_format_rename",
+    // Issue #99 streams error-detail cases (append-only): each errored
+    // pipeline returns a stream carrying both __error__ and the byte-exact
+    // __error_details__, compared set-equal against grafana/loki:3.4.2.
+    "json_error_details",
+    "json_error_kept_by_error_filter",
+    "labelfilter_number_error_details",
 ];
 
 /// The committed METRIC differential case ids (issue M6-10), in fixture
@@ -92,6 +98,16 @@ pub const SVC_BADUNIT: &str = "svc-badunit";
 
 /// The witness record's body — `took=abc` fails `duration(took)`.
 pub const BADUNIT_BODY: &str = "took=abc x=1";
+
+/// Issue #99 streams error-detail witness services, each isolating a
+/// single synthetic record whose pipeline errors a distinct stage, so no
+/// regular case's projection ever touches them.
+pub const SVC_BADJSON: &str = "svc-badjson";
+/// A top-level non-object line — `| json` is a `JSONParserErr`.
+pub const BADJSON_BODY: &str = "not a json line";
+pub const SVC_BADNUM: &str = "svc-badnum";
+/// `| logfmt | n > 5` fails the numeric conversion (`LabelFilterErr`).
+pub const BADNUM_BODY: &str = "n=oops";
 
 /// Generation parameters for one corpus.
 #[derive(Debug, Clone)]
@@ -203,7 +219,7 @@ fn render_body(r: &GeneratedRecord) -> String {
 /// regular records; its dedicated service keeps every other case's
 /// projection untouched.
 pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
-    let mut records = Vec::with_capacity(spec.record_count + 1);
+    let mut records = Vec::with_capacity(spec.record_count + 3);
     for i in 0..spec.record_count {
         let mut r = GeneratedRecord {
             service: service_of(i),
@@ -220,21 +236,25 @@ pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
         r.body = render_body(&r);
         records.push(r);
     }
-    records.push(GeneratedRecord {
-        service: SVC_BADUNIT,
-        ts_ns: spec.base_ns + spec.step_ns * spec.record_count as i64,
-        body: BADUNIT_BODY.to_string(),
-        // Feature fields are unused for this record — every case's
-        // projection is service-guarded and no case projects
-        // `svc-badunit` (the witness case asserts a query FAILURE).
+    // Witness records: one per synthetic-error service, feature fields
+    // unused (each case's projection is service-guarded). `svc-badunit`
+    // stays LAST so `last_ts_ns` (the metric-witness window margin) pins to
+    // it, unchanged by the issue #99 additions appended before it.
+    let witness = |offset: usize, service: &'static str, body: &str| GeneratedRecord {
+        service,
+        ts_ns: spec.base_ns + spec.step_ns * (spec.record_count + offset) as i64,
+        body: body.to_string(),
         method: "GET",
         status: 0,
         req_path: "/",
         level: "info",
         took_ms: 0,
         size_kb: 0,
-        msg_idx: spec.record_count,
-    });
+        msg_idx: spec.record_count + offset,
+    };
+    records.push(witness(0, SVC_BADJSON, BADJSON_BODY));
+    records.push(witness(1, SVC_BADNUM, BADNUM_BODY));
+    records.push(witness(2, SVC_BADUNIT, BADUNIT_BODY));
     let last_ts_ns = records.last().map_or(spec.base_ns, |r| r.ts_ns);
     LogCorpus {
         run_id: spec.run_id.clone(),
@@ -732,6 +752,35 @@ pub fn case_projection(
             labels.insert("lvl".to_string(), level);
             (labels, r.body.clone())
         }),
+        // Issue #99: a `| json` over a non-object line errors — no
+        // extracted labels, just the error class + its byte-exact detail
+        // (the `!= ""` variant keeps the same errored stream). Both
+        // grafana/loki:3.4.2 and PulsusDB produce this pair.
+        "json_error_details" | "json_error_kept_by_error_filter" => (r.service == SVC_BADJSON)
+            .then(|| {
+                let labels = BTreeMap::from([
+                    ("__error__".to_string(), "JSONParserErr".to_string()),
+                    (
+                        "__error_details__".to_string(),
+                        "Value looks like object, but can't find closing '}' symbol".to_string(),
+                    ),
+                ]);
+                (labels, r.body.clone())
+            }),
+        // Issue #99: `| logfmt | n > 5` fails the numeric conversion —
+        // logfmt still extracts `n`, then LabelFilterErr + the Go
+        // strconv.ParseFloat detail (value verbatim).
+        "labelfilter_number_error_details" => (r.service == SVC_BADNUM).then(|| {
+            let labels = BTreeMap::from([
+                ("n".to_string(), "oops".to_string()),
+                ("__error__".to_string(), "LabelFilterErr".to_string()),
+                (
+                    "__error_details__".to_string(),
+                    r#"strconv.ParseFloat: parsing "oops": invalid syntax"#.to_string(),
+                ),
+            ]);
+            (labels, r.body.clone())
+        }),
         other => panic!("case_projection: unknown case id {other:?}"),
     }
 }
@@ -865,6 +914,17 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
                     .and_then(|v| v.strip_suffix("kb").and_then(|n| n.parse::<f64>().ok()))
                     .is_some_and(|kb| kb * 1000.0 > 5_000.0)
         }
+        // Issue #99: the errored-line membership (the detail STRING is the
+        // projection's, not tested here — this only re-derives survival).
+        "json_error_details" | "json_error_kept_by_error_filter" => {
+            r.service == SVC_BADJSON && body_json(r).is_none()
+        }
+        "labelfilter_number_error_details" => {
+            r.service == SVC_BADNUM
+                && body_logfmt(r)
+                    .get("n")
+                    .is_some_and(|v| v.parse::<f64>().is_err())
+        }
         other => panic!("naive_matches: unknown case id {other:?}"),
     }
 }
@@ -995,8 +1055,9 @@ mod tests {
         let resources = req["resourceLogs"].as_array().unwrap();
         assert_eq!(
             resources.len(),
-            4,
-            "one resource group per service (incl. the M6-10 svc-badunit witness)"
+            6,
+            "one resource group per service (svc-json/logfmt/plain + the \
+             issue #99 svc-badjson/svc-badnum and the M6-10 svc-badunit witnesses)"
         );
         for res in resources {
             let attrs = res["resource"]["attributes"].as_array().unwrap();
