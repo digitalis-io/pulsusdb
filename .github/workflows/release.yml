@@ -15,13 +15,16 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Least-privilege: `packages: write` is the only extra permission this job
-# needs to push to GHCR via the ambient `GITHUB_TOKEN` (no PAT). `contents:
-# read` is enough to check out the tag. (Keyless cosign in #44 adds
-# `id-token: write` here — that line is #44's to add, not #42's.)
+# Least-privilege via the ambient `GITHUB_TOKEN` (no PAT). `contents: read`
+# checks out the tag; `packages: write` pushes to GHCR (issue #42). Supply
+# chain (issue #44): `id-token: write` mints the OIDC token keyless cosign
+# exchanges for a Fulcio signing cert, and `attestations: write` lets
+# `actions/attest-build-provenance` record the SLSA provenance attestation.
 permissions:
   contents: read
   packages: write
+  id-token: write
+  attestations: write
 
 jobs:
   publish:
@@ -185,12 +188,15 @@ jobs:
       #    so this rebuild reuses those layers rather than recompiling arm64.
       #
       #    #44 (cosign) seam — do not remove/rename: `id: push` exposes
-      #    `steps.push.outputs.digest`, the OCI *index* digest #44 signs
-      #    (signing the index transitively covers both child manifests, so no
-      #    per-arch signing). `provenance: false` pins the index to exactly
-      #    the two platform manifests (deterministic for the verify step
-      #    below); #44 re-enables `provenance:`/`sbom:` on THIS step and adds
-      #    the cosign attest step.
+      #    `steps.push.outputs.digest`, the OCI *index* digest #44 signs and
+      #    attests (signing the index transitively covers both child
+      #    manifests, so no per-arch signing). `provenance: false` STAYS: it
+      #    pins the index to exactly the two platform manifests, keeping the
+      #    deterministic 2-entry shape the `Verify multi-arch manifest` grep
+      #    below relies on. #44 does NOT re-enable buildx `provenance:`/`sbom:`
+      #    on THIS step — provenance and SBOM are delivered as SEPARATE,
+      #    Rekor-backed attestations keyed to this index digest in the steps
+      #    after the verify (attest-build-provenance + cosign attest).
       - id: push
         if: github.event_name == 'push'
         uses: docker/build-push-action@v7
@@ -222,3 +228,98 @@ jobs:
             || { echo "::error::amd64 missing from published index"; exit 1; }
           echo "$RAW" | grep -q '"architecture": *"arm64"' \
             || { echo "::error::arm64 missing from published index"; exit 1; }
+
+      # --- Supply chain: keyless cosign sign + attestations (issue #44) ---
+      #
+      # Every step below is tag-path only (`if: github.event_name == 'push'`):
+      # the build-only `workflow_dispatch` dry-run runs no `push` step, so
+      # `steps.push.outputs.digest` is empty there and an ungated step would
+      # sign/attest/verify nothing (or fail). Everything keys off the exact
+      # pushed OCI *index* digest (never a mutable tag). We are already logged
+      # in to ghcr.io (docker/login-action above), so cosign reuses that
+      # credential. Keyless: the workflow's OIDC token -> Fulcio short-lived
+      # cert -> Rekor transparency log; no private key material anywhere.
+      - name: Install cosign
+        if: github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the index by digest. Signing the index transitively covers both
+      # child (amd64 + arm64) manifests via their content-addressed digests,
+      # so there is no `--recursive` / per-arch signing.
+      - name: Sign image index (keyless)
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "ghcr.io/digitalis-io/pulsusdb@${DIGEST}"
+
+      # SLSA v1.0 build provenance keyed to the index digest, delivered as a
+      # Rekor-backed attestation (NOT buildx `provenance: true` — that stays
+      # false above to keep the deterministic index the arch grep relies on).
+      # `push-to-registry` attaches it to the digest in GHCR; its native
+      # verifier is `gh attestation verify` (used in the self-check below —
+      # NOT `cosign verify-attestation --type slsaprovenance`, whose type
+      # maps to the older v0.2 predicate URI and would silently mismatch).
+      - name: Attest build provenance (SLSA v1.0)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/digitalis-io/pulsusdb
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # SBOM for the index in SPDX-JSON, generated with syft (anchore), then
+      # attached as a keyless cosign attestation keyed to the same digest.
+      # syft on an index resolves to a single platform (amd64) for v1;
+      # per-arch SBOMs are a follow-up (out of scope, noted in docs).
+      - name: Generate SBOM (SPDX-JSON)
+        if: github.event_name == 'push'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/digitalis-io/pulsusdb@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Attest SBOM (keyless)
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type spdxjson \
+            --predicate sbom.spdx.json \
+            "ghcr.io/digitalis-io/pulsusdb@${DIGEST}"
+
+      # Post-publish self-check (AC #6): fail the release unless every
+      # artifact verifies with the RIGHT verifier for its kind, each pinned
+      # to this workflow's issuer + identity. `gh attestation verify` for the
+      # SLSA v1.0 provenance (its native verifier); `cosign verify` for the
+      # signature; `cosign verify-attestation --type spdxjson` for the SBOM.
+      - name: Self-verify provenance (gh attestation verify)
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh attestation verify "oci://ghcr.io/digitalis-io/pulsusdb@${DIGEST}" \
+            --repo digitalis-io/pulsusdb \
+            --signer-workflow digitalis-io/pulsusdb/.github/workflows/release.yml
+
+      - name: Self-verify signature + SBOM (cosign)
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IDENTITY: https://github.com/digitalis-io/pulsusdb/.github/workflows/release.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          REF="ghcr.io/digitalis-io/pulsusdb@${DIGEST}"
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            "$REF"
+          cosign verify-attestation --type spdxjson \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            "$REF"

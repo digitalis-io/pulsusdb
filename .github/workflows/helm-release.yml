@@ -30,13 +30,16 @@ on:
   push:
     tags: ["helm-v*"]
 
-# Least-privilege: `packages: write` is the only extra permission this job
-# needs to push to GHCR via the ambient `GITHUB_TOKEN` (no PAT). `contents:
-# read` is enough to check out the tag. Mirrors release.yml's permissions
-# block.
+# Least-privilege via the ambient `GITHUB_TOKEN` (no PAT). `contents: read`
+# checks out the tag; `packages: write` pushes to GHCR. `id-token: write`
+# (issue #44) mints the OIDC token keyless cosign exchanges for a Fulcio
+# signing cert to sign the pushed chart. Mirrors release.yml's block (the
+# chart is signature-only for v1; chart provenance is a follow-up, so no
+# `attestations: write` here).
 permissions:
   contents: read
   packages: write
+  id-token: write
 
 env:
   HELM_VERSION: "v3.18.4"
@@ -140,10 +143,10 @@ jobs:
             exit 1
           fi
 
-      # Label/provenance parity with release.yml's image labels, minus
-      # signing (deferred to a follow-up filed at close — task-manager
-      # plan round-2 amendment §4: cosign/provenance needs its own scoped
-      # OIDC-identity + verification-policy decision to be worth doing).
+      # Label/provenance parity with release.yml's image labels. Keyless
+      # cosign signing of the pushed chart is now implemented (issue #44),
+      # after `helm push` below — signature-only for v1; chart provenance/
+      # SBOM attestations are a follow-up.
       - name: helm package (with source/revision/license annotations)
         run: |
           helm package "$CHART_DIR" \
@@ -184,3 +187,37 @@ jobs:
             exit 1
           fi
           echo "Verified oci://ghcr.io/digitalis-io/charts/${{ steps.chart.outputs.name }}@${{ steps.push.outputs.digest }} round-trips to Chart.yaml name/version ${pulled_name}/${pulled_version}"
+
+      # --- Supply chain: keyless cosign signing (issue #44) ---
+      #
+      # Sign the pushed OCI chart by its immutable `helm push` digest (reuse
+      # steps.push.outputs.digest — do NOT re-parse it). cosign takes the
+      # BARE registry path with NO `oci://` prefix (that scheme is helm-only;
+      # a copy-paste of the helm ref would fail). Keyless: the workflow's
+      # OIDC token -> Fulcio short-lived cert -> Rekor log; we are already
+      # logged in to ghcr.io above, so cosign reuses that credential.
+      # Signature-only for v1 — chart provenance/SBOM attestations are a
+      # follow-up. This workflow triggers on `helm-v*` tag pushes only, so
+      # there is no build-only dispatch path with an empty digest to gate.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign chart (keyless)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "ghcr.io/digitalis-io/charts/pulsusdb@${DIGEST}"
+
+      # Post-publish self-check: fail the job unless the signature verifies
+      # against this workflow's issuer + identity.
+      - name: Self-verify chart signature (cosign verify)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IDENTITY: https://github.com/digitalis-io/pulsusdb/.github/workflows/helm-release.yml@${{ github.ref }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            "ghcr.io/digitalis-io/charts/pulsusdb@${DIGEST}"

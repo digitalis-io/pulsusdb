@@ -99,6 +99,12 @@ package's GHCR settings page and:
 Every subsequent tag push reuses the same (now public, linked) package —
 this step never needs repeating.
 
+cosign attaches the signature and attestations (`*.sig`, `*.att`) as extra
+OCI tags on this **same** package, so making the package Public also makes
+them anonymously pullable — a consumer's `cosign verify` / `gh attestation
+verify` (§5) would otherwise return 401/404 while the package is still
+private. No separate visibility step is needed for the signature artifacts.
+
 ## 5. Verifying a release
 
 ```sh
@@ -126,6 +132,55 @@ docker buildx imagetools inspect ghcr.io/digitalis-io/pulsusdb:1.2.3
 `PULSUS_BUILD_VERSION`/`PULSUS_BUILD_REVISION` build-args the image was
 built with, so `--version`, `/status/buildinfo`, and the image's
 `org.opencontainers.image.version`/`.revision` labels always agree.
+
+### Verifying signatures and attestations (image)
+
+Each release is signed and attested with **keyless cosign** (Sigstore): the
+release workflow's OIDC identity → a short-lived Fulcio certificate → the
+Rekor public transparency log. There is no long-lived signing key to manage
+or trust — verification checks that the artifact was produced by *this
+repository's release workflow at a `v*` tag*. Every artifact is bound to the
+immutable image **index digest** (which transitively covers both the amd64
+and arm64 child manifests), never a mutable tag.
+
+Install [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)
+and (for provenance) the [GitHub CLI](https://cli.github.com/). Resolve the
+tag to its index digest, then verify each artifact with the verifier that
+owns it:
+
+```sh
+DIGEST=$(docker buildx imagetools inspect \
+  ghcr.io/digitalis-io/pulsusdb:1.2.3 --format '{{.Manifest.Digest}}')
+REF="ghcr.io/digitalis-io/pulsusdb@${DIGEST}"
+
+# 1. Signature (cosign):
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/digitalis-io/pulsusdb/\.github/workflows/release\.yml@refs/tags/v' \
+  "$REF"
+
+# 2. SBOM attestation, SPDX-JSON (cosign):
+cosign verify-attestation --type spdxjson \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/digitalis-io/pulsusdb/\.github/workflows/release\.yml@refs/tags/v' \
+  "$REF"
+
+# 3. SLSA build provenance (SLSA v1.0). Verify with its NATIVE verifier,
+#    `gh attestation verify` — NOT `cosign verify-attestation --type
+#    slsaprovenance`, whose type maps to the older SLSA v0.2 predicate URI
+#    and would silently fail to match this v1.0 attestation:
+gh attestation verify "oci://${REF}" \
+  --repo digitalis-io/pulsusdb \
+  --signer-workflow digitalis-io/pulsusdb/.github/workflows/release.yml
+```
+
+The `--certificate-identity-regexp` pins any `v*` tag of this workflow; to
+lock verification to one exact release, swap it for
+`--certificate-identity https://github.com/digitalis-io/pulsusdb/.github/workflows/release.yml@refs/tags/v1.2.3`.
+The SBOM is generated for a single platform (amd64) for now; per-arch SBOMs
+are a possible follow-up. The release workflow runs these same three checks
+against the freshly pushed digest as a post-publish self-check, so a release
+that would not verify fails the job instead of shipping.
 
 ## 6. Releasing the Helm chart
 
@@ -161,11 +216,31 @@ Chart `version` must be bumped in `Chart.yaml` as part of the release PR —
 the workflow's already-exists guard is what enforces this is not
 forgotten, not a human process alone.
 
-**Not yet implemented: chart signing/provenance attestation** (keyless
-cosign). Deferred to a follow-up issue filed alongside #38's closure — it
-needs its own scoped OIDC-identity and consumer-side verification-policy
-decision to be worth doing; what ships today is integrity (digest-verified
-push/pull round trip), not authenticity/provenance.
+### Verifying the chart signature
+
+The pushed OCI chart is signed with **keyless cosign** (issue #44), by its
+immutable `helm push` digest, using the same Sigstore flow as the image
+(OIDC → Fulcio → Rekor; no key material). The chart is **signature-only**
+for v1 — a provenance/SBOM attestation for the chart is a follow-up. The
+release workflow self-verifies the signature post-publish, so a chart that
+would not verify fails the job.
+
+Note cosign takes the **bare** registry path (no `oci://` prefix, which is a
+Helm-only scheme):
+
+```sh
+CHART_DIGEST=$(docker buildx imagetools inspect \
+  ghcr.io/digitalis-io/charts/pulsusdb:0.2.0 --format '{{.Manifest.Digest}}')
+
+cosign verify \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/digitalis-io/pulsusdb/\.github/workflows/helm-release\.yml@refs/tags/helm-v' \
+  "ghcr.io/digitalis-io/charts/pulsusdb@${CHART_DIGEST}"
+```
+
+As with the image (§4/§5), the chart's `*.sig` artifact is an extra OCI tag
+on the same package, so making the chart package Public (below) is also what
+lets a consumer's `cosign verify` pull it anonymously.
 
 ### One-time: make the GHCR chart package public, and protect `main`
 
