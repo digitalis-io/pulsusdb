@@ -8,7 +8,7 @@ pub mod writer;
 
 pub use error::LogsIngestError;
 pub use ingest::http::{
-    ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces,
+    ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces, ingest_zipkin,
 };
 pub use ingest::metrics::{MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef};
 pub use ingest::traces::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
@@ -22,6 +22,10 @@ pub use protocols::otlp_metrics::{decode as decode_metrics, parse as parse_metri
 pub use protocols::otlp_traces::{decode as decode_traces, parse as parse_traces};
 pub use protocols::remote_write::{
     WriteRequest, decode as decode_remote_write, parse as parse_remote_write,
+};
+pub use protocols::zipkin::{
+    Annotation as ZipkinAnnotation, Endpoint as ZipkinEndpoint, ZipkinSpan,
+    decode as decode_zipkin, to_otlp as zipkin_to_otlp,
 };
 pub use writer::{
     LogWriter, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, MetricWriter,

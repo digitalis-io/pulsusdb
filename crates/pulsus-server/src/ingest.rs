@@ -195,6 +195,31 @@ pub(crate) fn loki_push_compat_router() -> Router<AppState> {
     Router::new().route("/loki/api/v1/push", post(ingest_loki_push))
 }
 
+/// `POST /api/v2/spans` (+ `/tempo/spans`) (docs/api.md §8.2, issue #75):
+/// the flag-gated Zipkin v2 JSON trace receiver. Pulls `AppState`'s
+/// `TraceWriterSink` — the same instance `ingest_traces` uses (a Zipkin
+/// span adapts to OTLP and feeds the *existing* trace-storage path) — and
+/// hands straight into `pulsus_write::ingest_zipkin`'s reused core; no logic
+/// of its own beyond that seam.
+pub(crate) async fn ingest_zipkin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    pulsus_write::ingest_zipkin(state.trace_writer.as_ref(), headers, body).await
+}
+
+/// The Zipkin v2 JSON compat surface (issue #75): both documented ingest
+/// paths bind to the same handler, merged by `compat::apply_aliases` iff
+/// `PULSUS_COMPAT_ENDPOINTS` **and** the Writer subsystem is mounted
+/// (`Gate::CompatAndWriter`, the Loki push precedent). Kept here beside the
+/// handler.
+pub(crate) fn zipkin_compat_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/v2/spans", post(ingest_zipkin))
+        .route("/tempo/spans", post(ingest_zipkin))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

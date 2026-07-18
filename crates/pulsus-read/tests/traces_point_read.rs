@@ -64,7 +64,7 @@ fn test_ctx(db: &str) -> SchemaParams {
 fn point_read_sql_byte_equals_schemas_md_4_2() {
     assert_eq!(
         point_read_sql("trace_spans", "4bf92f3577b34da6a3ce929d0e0e4736"),
-        "SELECT trace_id, span_id, parent_id, payload_type, payload\n\
+        "SELECT trace_id, span_id, parent_id, payload_type, kind, payload\n\
          FROM trace_spans\n\
          WHERE trace_id = unhex('4bf92f3577b34da6a3ce929d0e0e4736')"
     );
@@ -256,6 +256,9 @@ async fn point_read_is_a_primary_index_read_with_pruned_granules() {
     assert_eq!(spans.len(), 1, "exactly one stored span for {hex32}");
     assert_eq!(spans[0].span_id, TARGET.to_be_bytes());
     assert_eq!(spans[0].payload_type, 1);
+    // Issue #75 projection: `kind` reads back off the new SELECT column
+    // (the corpus seeds `kind = 1`).
+    assert_eq!(spans[0].kind, 1);
     assert_eq!(spans[0].payload, b"p".to_vec());
 
     // An absent id (outside the corpus) is an empty fetch, never an error.

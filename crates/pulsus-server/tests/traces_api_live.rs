@@ -40,6 +40,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 
 fn should_run() -> bool {
@@ -51,6 +52,8 @@ const PORT: u16 = 31_130;
 /// this binary may run concurrently — distinct ports, distinct
 /// throwaway databases).
 const ALIAS_PORT: u16 = 31_135;
+/// The issue #75 Zipkin shared-span round-trip suite's own spawn.
+const ZIPKIN_PORT: u16 = 31_136;
 
 // ---------------------------------------------------------------------
 // Bare-`TcpStream` HTTP/1.1 helper (the `api_conformance.rs` idiom,
@@ -736,4 +739,120 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
              {value}, body {json}"
         );
     }
+}
+
+/// Issue #75 (the adjudicated Q1 shared-span correctness gate): a Zipkin v2
+/// JSON shared RPC span — the SAME `(traceId, id)` reported from both ends
+/// with different `kind` (CLIENT vs SERVER) — round-trips end-to-end
+/// through the real product path: `POST /api/v2/spans` (the Zipkin compat
+/// receiver) -> adapt to OTLP -> `TraceWriter` -> ClickHouse -> trace-by-ID
+/// assembly. The gate is that **both** sides come back: `GET
+/// /api/traces/v1/trace/{id}` returns two spans (SERVER + CLIENT), proving
+/// the `(span_id, kind)` de-dup key keeps them distinct, and TraceQL search
+/// finds the trace.
+#[tokio::test]
+async fn zipkin_shared_span_trace_by_id_returns_both_the_server_and_client_sides() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-server/tests/traces_api_live.rs for setup)"
+        );
+        return;
+    }
+
+    let _guard = spawn_ready(ZIPKIN_PORT, "pulsus_traces_api_it_zipkin_shared");
+
+    // Recent timestamp so the 7-day delete-TTL never drops the part; micros
+    // on the wire, seconds for the search window.
+    let now_secs = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs(),
+    )
+    .expect("fits i64");
+    let ts_micros = now_secs * 1_000_000;
+
+    // A 128-bit trace id (verbatim) + one span id, reported from both RPC
+    // ends: CLIENT (frontend) and shared SERVER (backend).
+    let trace_hex = "0102030405060708090a0b0c0d0e0f10";
+    let body = format!(
+        r#"[
+          {{"traceId":"{trace_hex}","id":"00000000000000aa",
+            "name":"rpc","kind":"CLIENT","timestamp":{ts_micros},"duration":2000,
+            "localEndpoint":{{"serviceName":"frontend"}}}},
+          {{"traceId":"{trace_hex}","id":"00000000000000aa",
+            "name":"rpc","kind":"SERVER","timestamp":{ts_micros},"duration":1800,"shared":true,
+            "localEndpoint":{{"serviceName":"backend"}}}}
+        ]"#
+    );
+
+    let ctx = "POST /api/v2/spans (Zipkin shared pair)";
+    let res = request(
+        ZIPKIN_PORT,
+        "POST",
+        "/api/v2/spans",
+        &[],
+        Some(("application/json", body.as_bytes())),
+    )
+    .unwrap_or_else(|| panic!("{ctx}: must be reachable"));
+    assert_eq!(
+        res.status,
+        202,
+        "{ctx}: Zipkin success is 202 Accepted, body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+
+    // Trace-by-ID returns BOTH sides — the correctness gate.
+    let ctx = "GET trace-by-ID (shared span)";
+    let res = get(ZIPKIN_PORT, &fetch_path(trace_hex), &[], ctx);
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let decoded: TracesData = serde_json::from_slice(&res.body)
+        .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize as TracesData: {e}"));
+    let spans = spans_of(&decoded);
+    assert_eq!(
+        spans.len(),
+        2,
+        "{ctx}: both the SERVER and CLIENT sides of the shared span must be returned"
+    );
+    // Same span id on both, distinct kind (SERVER=2, CLIENT=3).
+    assert_eq!(
+        spans[0].span_id, spans[1].span_id,
+        "{ctx}: the two sides share one span_id"
+    );
+    let mut kinds: Vec<i32> = spans.iter().map(|s| s.kind).collect();
+    kinds.sort_unstable();
+    assert_eq!(
+        kinds,
+        vec![SpanKind::Server as i32, SpanKind::Client as i32],
+        "{ctx}: the two sides are SERVER and CLIENT"
+    );
+
+    // TraceQL search sees the trace too.
+    let window = format!("start={}&end={}", now_secs - 10, now_secs + 10);
+    let ctx = "TraceQL search (shared span)";
+    let res = get(
+        ZIPKIN_PORT,
+        &format!("/api/traces/v1/search?q=%7B%7D&{window}"),
+        &[],
+        ctx,
+    );
+    assert_eq!(
+        res.status,
+        200,
+        "{ctx}: body {:?}",
+        String::from_utf8_lossy(&res.body)
+    );
+    let json = res.json(ctx);
+    assert!(
+        json["traces"]
+            .as_array()
+            .is_some_and(|t| t.iter().any(|tr| tr["traceID"] == trace_hex)),
+        "{ctx}: the shared-span trace must appear in search results, body {json}"
+    );
 }

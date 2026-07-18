@@ -201,6 +201,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test trace_ingest_roundtrip
 
+      # Issue #75: the Zipkin v2 JSON ingest round-trip — ingest_zipkin ->
+      # zipkin::to_otlp -> otlp_traces::parse -> TraceWriter (sync) ->
+      # ClickHouse. Proves fingerprint identity (Zipkin summary columns
+      # byte-identical to the equivalent OTLP ingest) and shared-span
+      # storage (a shared RPC span stores both the SERVER and CLIENT sides).
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Zipkin v2 JSON ingest round-trip (fingerprint identity + shared span)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test zipkin_ingest_roundtrip
+
       # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
       # step — reproducibility + a committed CI-scale evidence artifact
       # only (task-manager resolution #2: no asserted `system.query_log`

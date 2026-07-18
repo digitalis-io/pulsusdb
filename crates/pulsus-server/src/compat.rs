@@ -29,14 +29,15 @@ pub(crate) fn apply_aliases(router: Router<AppState>, cfg: &Config) -> Router<Ap
         router = router.merge(crate::logs_api::compat_router());
         router = router.merge(crate::traces_api::compat_router());
     }
-    // The §8.2 Loki push receiver (issue #77) is the first WRITER-side
-    // compat surface: it mounts iff the flag is on (guarded by the early
-    // return above) AND the Writer subsystem is mounted — never on the
-    // Reader compat flag alone (`Gate::CompatAndWriter`). Kept a separate
-    // block from the Reader one so each surface 404s exactly where its
-    // native twin does.
+    // The §8.2 WRITER-side compat receivers — the Loki push receiver
+    // (issue #77) and the Zipkin v2 JSON trace receiver (issue #75) — mount
+    // iff the flag is on (guarded by the early return above) AND the Writer
+    // subsystem is mounted — never on the Reader compat flag alone
+    // (`Gate::CompatAndWriter`). Kept a separate block from the Reader one so
+    // each surface 404s exactly where its native twin does.
     if modes::mounted(cfg).contains(&Subsystem::Writer) {
         router = router.merge(crate::ingest::loki_push_compat_router());
+        router = router.merge(crate::ingest::zipkin_compat_router());
     }
     router
 }
@@ -174,6 +175,54 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(push_status(&cfg).await, StatusCode::NOT_FOUND);
+    }
+
+    /// The Zipkin v2 JSON receiver (issue #75) shares the Loki push
+    /// receiver's `Gate::CompatAndWriter` isolation — a POST probe on one of
+    /// its two paths distinguishes mounted (not 404) from unmounted (404).
+    async fn zipkin_status(cfg: &Config) -> StatusCode {
+        let router = apply_aliases(Router::new(), cfg);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v2/spans")
+            .body(Body::empty())
+            .expect("build request");
+        router
+            .with_state(test_state())
+            .oneshot(request)
+            .await
+            .expect("router does not fail the request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn zipkin_mounts_with_flag_on_and_writer_subsystem() {
+        let cfg = Config {
+            compat_endpoints: true,
+            mode: Mode::Writer,
+            ..Config::default()
+        };
+        assert_ne!(zipkin_status(&cfg).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn zipkin_404s_with_flag_on_but_reader_only_mode() {
+        let cfg = Config {
+            compat_endpoints: true,
+            mode: Mode::Reader,
+            ..Config::default()
+        };
+        assert_eq!(zipkin_status(&cfg).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn zipkin_404s_with_flag_off_even_in_all_mode() {
+        let cfg = Config {
+            compat_endpoints: false,
+            mode: Mode::All,
+            ..Config::default()
+        };
+        assert_eq!(zipkin_status(&cfg).await, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

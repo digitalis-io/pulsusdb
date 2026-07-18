@@ -6,17 +6,26 @@ use pulsus_clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 /// One `trace_spans` row of the §4.2 point read. Field order matches the
-/// documented `SELECT trace_id, span_id, parent_id, payload_type, payload`
-/// column order exactly — RowBinary decoding is positional. `trace_id`/
-/// `parent_id` are read only for that column alignment (the caller already
-/// knows the trace id, and the stored payload carries the parent link);
-/// assembly consumes `span_id`/`payload_type`/`payload` via [`StoredSpan`].
+/// documented `SELECT trace_id, span_id, parent_id, payload_type, kind,
+/// payload` column order exactly — RowBinary decoding is positional.
+/// `trace_id`/`parent_id` are read only for that column alignment (the
+/// caller already knows the trace id, and the stored payload carries the
+/// parent link); assembly consumes `span_id`/`payload_type`/`kind`/`payload`
+/// via [`StoredSpan`]. `kind` is the projected-only column (issue #75): the
+/// trace-by-ID response renders `kind` from each winner's decoded OTLP
+/// payload, never from this column — this projection serves solely as the
+/// assembler's `(span_id, kind)` dedup key, so a Zipkin shared span's SERVER
+/// and CLIENT sides (identical `(trace_id, span_id)`, different `kind`) are
+/// not collapsed into one on retrieval.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct StoredSpanRow {
     pub trace_id: [u8; 16],
     pub span_id: [u8; 8],
     pub parent_id: [u8; 8],
     pub payload_type: i8,
+    /// `trace_spans.kind Int8` (`catalog.rs`), already stored by the writer
+    /// — a read-path projection, not a schema change.
+    pub kind: i8,
     /// The stored per-span payload blob (`String CODEC(ZSTD(3))` column) —
     /// `serde_bytes` routes the `Vec<u8>` through RowBinary's
     /// length-prefixed byte-string encoding, not serde's default
@@ -134,6 +143,10 @@ pub struct TagValueRow {
 pub struct StoredSpan {
     pub span_id: [u8; 8],
     pub payload_type: i8,
+    /// The span's stored `kind` (issue #75) — the assembler's
+    /// `(span_id, kind)` dedup key only; never rendered into the response
+    /// (that comes from the decoded payload). See [`StoredSpanRow::kind`].
+    pub kind: i8,
     pub payload: Vec<u8>,
 }
 
@@ -142,6 +155,7 @@ impl From<StoredSpanRow> for StoredSpan {
         StoredSpan {
             span_id: row.span_id,
             payload_type: row.payload_type,
+            kind: row.kind,
             payload: row.payload,
         }
     }
@@ -158,11 +172,13 @@ mod tests {
             span_id: [2; 8],
             parent_id: [3; 8],
             payload_type: 1,
+            kind: 2,
             payload: vec![0xde, 0xad],
         };
         let span = StoredSpan::from(row.clone());
         assert_eq!(span.span_id, row.span_id);
         assert_eq!(span.payload_type, 1);
+        assert_eq!(span.kind, 2);
         assert_eq!(span.payload, vec![0xde, 0xad]);
     }
 }

@@ -411,10 +411,12 @@ ORDER BY (scope, key, val);
 **Trace by ID** — pure primary-index point read (plus partition pruning when a time hint is present):
 
 ```sql
-SELECT trace_id, span_id, parent_id, payload_type, payload
+SELECT trace_id, span_id, parent_id, payload_type, kind, payload
 FROM trace_spans
 WHERE trace_id = unhex('4bf92f3577b34da6a3ce929d0e0e4736')
 ```
+
+`kind` is projected (issue #75) solely as the trace-by-ID assembler's `(span_id, kind)` de-duplication key — the response renders `kind` from each winner's decoded OTLP payload, never from this column. This keeps a Zipkin shared span's SERVER and CLIENT sides (identical `(trace_id, span_id)`, different `kind`) as two distinct spans on retrieval, while remaining a genuine no-op for OTLP (span ids are unique per trace) and still de-duplicating identical at-least-once replays (same `(span_id, kind)` + bytes).
 
 **TraceQL search is two-phase** (issue #57): Phase 1 produces a bounded, recency-ranked candidate trace-id set from indexed sources (false positives are harmless — Phase 2 filters; false negatives exist only past the cap and are reported via the response's `partial` flag); Phase 2 hydrates candidates in small batches and evaluates the full query **exactly** in the engine.
 

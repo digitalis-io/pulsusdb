@@ -58,7 +58,7 @@ use crate::ingest::decompress::{self, Encoding};
 use crate::ingest::metrics::MetricSink;
 use crate::ingest::traces::TraceSink;
 use crate::ingest::{Backpressure, LogSink};
-use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write};
+use crate::protocols::{loki_push, otlp_logs, otlp_metrics, otlp_traces, remote_write, zipkin};
 
 /// `X-Pulsus-Async` request header (docs/api.md "Request headers"): `1`
 /// selects async-mode (enqueue, `202`); absent or any other value selects
@@ -377,6 +377,77 @@ fn decode_loki_push(
     }
 }
 
+/// `POST /api/v2/spans` (+ `/tempo/spans`) (issue #75, docs/api.md §8.2):
+/// the flag-gated Zipkin v2 JSON trace receiver. A **decoder + model
+/// adapter** feeding the *existing* trace-storage path — it decodes the
+/// Zipkin span array, adapts each span into one self-contained OTLP
+/// `ResourceSpans` (`zipkin::to_otlp`), and hands the batch to the same
+/// `otlp_traces::parse` the native `/v1/traces` receiver uses (so
+/// `payload_type = 1`, the id/attr/expansion contracts, and the whole read
+/// path are byte-identical). Structurally the analog of [`ingest_loki_push`]
+/// (empty-body success, plain-text errors, the shared 64 MiB
+/// [`read_capped_body`] cap), with two Zipkin-specific choices:
+///
+/// - **Success is 202 Accepted both sync and async** (oracle-pinned to
+///   OpenZipkin's `POST /api/v2/spans`, which answers 202 on accept), unlike
+///   the OTLP 200-sync / Loki 204-sync conventions — each compat endpoint
+///   matches ITS oracle.
+/// - **v2 JSON only, all-or-nothing** (Zipkin has no partial-success
+///   channel): the body is always decoded as a Zipkin v2 JSON span array
+///   (`Content-Type` is not a fork discriminator — v2 JSON is the sole
+///   supported encoding; v1/protobuf/thrift are out of scope), decompressed
+///   per `Content-Encoding` for gzip; a malformed array or any span with a
+///   bad id/timestamp is a whole-request `ZipkinDecode` 400 plain-text.
+///   `parsed.rejected` is therefore always 0 here.
+pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
+    let now_ns = now_unix_nanos();
+
+    let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
+        Ok(body) => body,
+        // Reuses the signal-neutral empty-body/plain-text response family
+        // (the `rw_*` helpers), like the Loki push receiver.
+        Err(err) => return rw_error_response(&err),
+    };
+
+    let parsed = match decode_zipkin(&headers, &body, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return rw_error_response(&err),
+    };
+
+    if is_async(&headers) {
+        return match sink.admit(parsed) {
+            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Err(Backpressure) => rw_backpressure_response(),
+        };
+    }
+
+    match sink.admit_flush(parsed) {
+        Ok(wait) => match wait.await {
+            // 202 (not 200) on sync success too — the Zipkin oracle answers
+            // 202 Accepted regardless of the async header.
+            Ok(()) => rw_success_response(StatusCode::ACCEPTED),
+            Err(err) => rw_error_response(&err),
+        },
+        Err(Backpressure) => rw_backpressure_response(),
+    }
+}
+
+/// Decompresses (honoring `Content-Encoding` for gzip), decodes the Zipkin
+/// v2 JSON span array, adapts it to OTLP, and runs the shared
+/// `otlp_traces::parse`. See [`ingest_zipkin`] for why `Content-Type` is
+/// not consulted.
+fn decode_zipkin(
+    headers: &HeaderMap,
+    body: &[u8],
+    now_ns: i64,
+) -> Result<crate::ingest::traces::ParsedTraces, LogsIngestError> {
+    let encoding = content_encoding(headers)?;
+    let decompressed = decompress::decompress(encoding, body)?;
+    let spans = zipkin::decode(&decompressed)?;
+    let request = zipkin::to_otlp(spans)?;
+    otlp_traces::parse(&request, now_ns)
+}
+
 /// `true` when the request's `Content-Type` selects a JSON body — the Loki
 /// JSON push path (issue #77) and the OTLP/JSON encoding on `/v1/logs`,
 /// `/v1/metrics`, `/v1/traces` (issue #76) share this one predicate (contains
@@ -527,6 +598,7 @@ fn classify(err: &LogsIngestError) -> (StatusCode, i32) {
         | LogsIngestError::OversizeBody { .. }
         | LogsIngestError::OversizeMessage { .. }
         | LogsIngestError::LokiDecode(_)
+        | LogsIngestError::ZipkinDecode(_)
         | LogsIngestError::Decode(_)
         | LogsIngestError::DecodeJson(_) => (StatusCode::BAD_REQUEST, 3),
         LogsIngestError::BodyRead(_) | LogsIngestError::FlushFailed(_) => {

@@ -19,7 +19,7 @@ pub fn point_read_sql(spans_table: &str, hex32: &str) -> String {
         "hex32 must be caller-validated 32-char hex, got {hex32:?}"
     );
     format!(
-        "SELECT trace_id, span_id, parent_id, payload_type, payload\n\
+        "SELECT trace_id, span_id, parent_id, payload_type, kind, payload\n\
          FROM {spans_table}\n\
          WHERE trace_id = unhex('{hex32}')"
     )
@@ -34,7 +34,7 @@ mod tests {
     fn point_read_sql_is_byte_exact_to_schemas_md_4_2() {
         assert_eq!(
             point_read_sql("trace_spans", "4bf92f3577b34da6a3ce929d0e0e4736"),
-            "SELECT trace_id, span_id, parent_id, payload_type, payload\n\
+            "SELECT trace_id, span_id, parent_id, payload_type, kind, payload\n\
              FROM trace_spans\n\
              WHERE trace_id = unhex('4bf92f3577b34da6a3ce929d0e0e4736')"
         );

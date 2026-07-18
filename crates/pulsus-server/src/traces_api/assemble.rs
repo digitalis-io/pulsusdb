@@ -1,22 +1,33 @@
 //! Trace assembly (issue #55): decode each stored per-span payload as the
 //! pinned issue #54 contract type (a self-contained single-`ResourceSpans`
 //! `TracesData` — `pulsus-write/src/protocols/otlp_traces.rs::build_payload`),
-//! de-duplicate at-least-once replays by `span_id`, and concatenate every
-//! surviving `ResourceSpans` into one valid `TracesData`. Pure functions,
-//! unit-tested — the OTLP layer lives here so `pulsus-read` stays
+//! de-duplicate at-least-once replays by `(span_id, kind)`, and concatenate
+//! every surviving `ResourceSpans` into one valid `TracesData`. Pure
+//! functions, unit-tested — the OTLP layer lives here so `pulsus-read` stays
 //! OTLP-agnostic (task-manager adjudication, open question 1).
 //!
-//! **Dedup is a total order, evaluated per `span_id`** (plan v3 §1):
-//! `trace_spans` is a plain `MergeTree` (no dedup engine, no ingest-order/
-//! version column), so at-least-once duplicates are physically retained
-//! and row order carries no tiebreak information. The winner per `span_id`
-//! is the row maximal by
+//! **Dedup is a total order, evaluated per `(span_id, kind)`** (plan v3 §1;
+//! `kind` added for issue #75): `trace_spans` is a plain `MergeTree` (no
+//! dedup engine, no ingest-order/version column), so at-least-once
+//! duplicates are physically retained and row order carries no tiebreak
+//! information. The winner per `(span_id, kind)` is the row maximal by
 //! `((payload_type == 1) as u8, payload.len(), payload_bytes, payload_type)`:
 //! a supported row always beats an unsupported duplicate (serving the
 //! supported copy is honest — the unsupported duplicate is version-skew
 //! noise), and the remaining components break every tie deterministically,
 //! including identical bytes under different `payload_type`s. The same
 //! winner emerges regardless of the order ClickHouse returned rows in.
+//!
+//! **`kind` in the dedup key is the Zipkin shared-span fix** (issue #75):
+//! a Zipkin shared span reports the SAME `(trace_id, span_id)` from both
+//! sides of an RPC with different `kind` (SERVER vs CLIENT) — a single
+//! logical span. Keying only on `span_id` would silently drop one side on
+//! retrieval; keying on `(span_id, kind)` keeps both. It is a genuine no-op
+//! for native OTLP (span ids are unique per trace, so `kind` never
+//! disambiguates a real dedup) and still collapses identical at-least-once
+//! replays (same `(span_id, kind)` + bytes). The response's rendered `kind`
+//! comes from each winner's decoded payload, never from the projected
+//! column — so OTLP trace-by-ID responses are byte-identical to before.
 //!
 //! **Unsupported `payload_type` ⇒ explicit 500, never a partial 200**
 //! (plan v2 §3 / v3 §1): the rule is evaluated on POST-dedup *winners*
@@ -25,10 +36,11 @@
 //! whole fetch — a silent partial trace would lie to the caller.
 //!
 //! **Canonical output order** (plan v3 §2): retained spans are sorted by
-//! `(start_time_unix_nano, span_id)` before concatenation — deterministic
-//! response bytes/JSON regardless of ClickHouse read order or map
-//! iteration order (`span_id` totalizes equal-start ties, since span ids
-//! are unique post-dedup). Documented in docs/api.md §4.1.
+//! `(start_time_unix_nano, span_id, kind)` before concatenation —
+//! deterministic response bytes/JSON regardless of ClickHouse read order or
+//! map iteration order. `kind` is the final tiebreak (issue #75): once two
+//! kinds can share a `span_id`, `span_id` alone no longer totalizes
+//! equal-start ties. Documented in docs/api.md §4.1.
 
 use std::collections::HashMap;
 
@@ -100,11 +112,12 @@ fn start_time_ns(data: &TracesData) -> u64 {
 /// *fetch* to `404` before ever calling this, so the empty case only
 /// matters for the unit-level contract.
 pub(crate) fn assemble(spans: Vec<StoredSpan>) -> Result<TracesData, AssembleError> {
-    // Order-independent dedup: reduce into a map keyed by span_id, keeping
-    // the row maximal under the total-order key.
-    let mut winners: HashMap<[u8; 8], StoredSpan> = HashMap::with_capacity(spans.len());
+    // Order-independent dedup: reduce into a map keyed by (span_id, kind)
+    // (issue #75 — see the module doc), keeping the row maximal under the
+    // total-order key.
+    let mut winners: HashMap<([u8; 8], i8), StoredSpan> = HashMap::with_capacity(spans.len());
     for span in spans {
-        match winners.entry(span.span_id) {
+        match winners.entry((span.span_id, span.kind)) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(span);
             }
@@ -127,19 +140,21 @@ pub(crate) fn assemble(spans: Vec<StoredSpan>) -> Result<TracesData, AssembleErr
         return Err(AssembleError::UnsupportedPayloadType { count: unsupported });
     }
 
-    let mut decoded: Vec<([u8; 8], TracesData)> = Vec::with_capacity(winners.len());
-    for (span_id, span) in winners {
+    let mut decoded: Vec<(([u8; 8], i8), TracesData)> = Vec::with_capacity(winners.len());
+    for (key, span) in winners {
         let data = TracesData::decode(span.payload.as_slice()).map_err(|source| {
             AssembleError::Decode {
-                span_id_hex: hex(&span_id),
+                span_id_hex: hex(&key.0),
                 source,
             }
         })?;
-        decoded.push((span_id, data));
+        decoded.push((key, data));
     }
 
-    // Canonical output order (plan v3 §2).
-    decoded.sort_by(|(a_id, a), (b_id, b)| (start_time_ns(a), a_id).cmp(&(start_time_ns(b), b_id)));
+    // Canonical output order (plan v3 §2; `kind` tiebreak for issue #75).
+    decoded.sort_by(|(a_key, a), (b_key, b)| {
+        (start_time_ns(a), *a_key).cmp(&(start_time_ns(b), *b_key))
+    });
 
     Ok(TracesData {
         resource_spans: decoded
@@ -216,9 +231,14 @@ mod tests {
     }
 
     fn stored(span_id: [u8; 8], payload_type: i8, payload: Vec<u8>) -> StoredSpan {
+        stored_kind(span_id, payload_type, 0, payload)
+    }
+
+    fn stored_kind(span_id: [u8; 8], payload_type: i8, kind: i8, payload: Vec<u8>) -> StoredSpan {
         StoredSpan {
             span_id,
             payload_type,
+            kind,
             payload,
         }
     }
@@ -250,6 +270,43 @@ mod tests {
         assert_eq!(out.resource_spans.len(), 2);
         assert_eq!(span_ids(&out), vec![vec![1u8; 8], vec![2u8; 8]]);
         assert_eq!(span_names(&out), vec!["span-a", "span-b"]);
+    }
+
+    /// Issue #75 shared-span fix: a Zipkin shared span's SERVER and CLIENT
+    /// sides carry the SAME `span_id` with different `kind` — keying on
+    /// `(span_id, kind)` keeps BOTH (they are one logical RPC span,
+    /// reported from both ends), rather than collapsing to one as a
+    /// `span_id`-only key would. Order-independent.
+    #[test]
+    fn a_zipkin_shared_span_returns_both_the_server_and_client_sides() {
+        let server = stored_kind([7; 8], 1, 2, payload([7; 8], "server-side", 10));
+        let client = stored_kind([7; 8], 1, 3, payload([7; 8], "client-side", 10));
+        for input in [
+            vec![server.clone(), client.clone()],
+            vec![client.clone(), server.clone()],
+        ] {
+            let out = assemble(input).expect("assemble");
+            assert_eq!(
+                out.resource_spans.len(),
+                2,
+                "both shared-span sides must survive dedup"
+            );
+            let mut names = span_names(&out);
+            names.sort();
+            assert_eq!(names, vec!["client-side", "server-side"]);
+        }
+    }
+
+    /// Issue #75: an identical at-least-once replay of the SAME
+    /// `(span_id, kind)` still de-duplicates to one span — the shared-span
+    /// fix widens the key, it does not disable replay dedup.
+    #[test]
+    fn an_identical_span_id_kind_replay_still_dedups_to_one() {
+        let a = stored_kind([7; 8], 1, 2, payload([7; 8], "server-side", 10));
+        let replay = stored_kind([7; 8], 1, 2, payload([7; 8], "server-side", 10));
+        let out = assemble(vec![a, replay]).expect("assemble");
+        assert_eq!(out.resource_spans.len(), 1);
+        assert_eq!(span_names(&out), vec!["server-side"]);
     }
 
     #[test]

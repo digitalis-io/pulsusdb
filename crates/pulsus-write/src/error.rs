@@ -96,6 +96,19 @@ pub enum LogsIngestError {
     #[error("malformed Loki push request: {0}")]
     LokiDecode(String),
 
+    /// A Zipkin v2 JSON span array (issue #75, `POST /api/v2/spans`) was not
+    /// decodable into the span model: malformed JSON, or a span carrying a
+    /// non-hex / wrong-length `traceId`/`id`/`parentId` or an
+    /// unrepresentable (i64-overflowing) microsecond timestamp. A
+    /// whole-request 400-class failure (Zipkin has no partial-success
+    /// channel — the whole span list is accepted or rejected) — same
+    /// `(400, code = 3)` group as the structural/decode variants above,
+    /// added to [`classify`]'s 400 arm (`ingest/http.rs`).
+    ///
+    /// [`classify`]: crate::ingest::http
+    #[error("malformed Zipkin v2 request: {0}")]
+    ZipkinDecode(String),
+
     /// A sync-mode ([`crate::ingest::LogSink::admit_flush`]) request's
     /// completion future resolved with an error the writer core did not
     /// classify further (e.g. the writer shut down mid-flush without

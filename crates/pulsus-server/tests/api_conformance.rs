@@ -487,6 +487,19 @@ fn valid_loki_push_body() -> Vec<u8> {
         .expect("snappy-compress a valid Loki PushRequest")
 }
 
+/// A valid Zipkin v2 JSON span array (issue #75): one span with a 64-bit
+/// trace id and micros timing — the wire form a Zipkin agent POSTs to
+/// `/api/v2/spans`. Deliberately carries NO `localEndpoint`/`tags` (so it
+/// indexes zero attributes) and uses the same 2023 era as
+/// [`valid_otlp_traces_body`] — the empty-DB read assertions in the full
+/// conformance matrix ingest this on the success path and must still see an
+/// empty tags catalog / empty search window afterwards (the OTLP traces
+/// body is attribute-less for the same reason).
+fn valid_zipkin_body() -> Vec<u8> {
+    br#"[{"traceId":"0000000000000001","id":"0000000000000002","name":"conformance","timestamp":1700000000000000,"duration":1000}]"#
+        .to_vec()
+}
+
 /// The ingest handlers' hand-rolled `google.rpc.Status { code, message }`
 /// protobuf (mirrors `pulsus-write/src/ingest/http.rs`'s private `Status`
 /// type — not exported, so this test binary defines its own decode-only
@@ -1337,17 +1350,19 @@ fn run_case(port: u16, spec: &RouteSpec, case: &CaseClass, spawn: &str) {
 /// (round-9 finding: failures name the exact cell, including header/
 /// credential variant, not just the path).
 fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
-    // The empty-204 family (remote-write `/api/v1/write` + the Loki push
-    // receiver `/loki/api/v1/push`, issue #77): a 204/202 success carries no
-    // Content-Type and an empty body.
-    if spec.success_status == 204 {
+    // The empty-body family (remote-write `/api/v1/write` + the Loki push
+    // receiver `/loki/api/v1/push` at 204, issue #77; the Zipkin v2 JSON
+    // receiver `/api/v2/spans` + `/tempo/spans` at 202, issue #75): the sync
+    // success carries no Content-Type and an empty body, whatever its exact
+    // 2xx status.
+    if matches!(spec.success_status, 202 | 204) {
         assert!(
             res.content_type().is_none(),
-            "{ctx}: a 204/202 empty-body ingest success must carry no Content-Type header"
+            "{ctx}: an empty-body ingest success must carry no Content-Type header"
         );
         assert!(
             res.body.is_empty(),
-            "{ctx}: a 204/202 empty-body ingest success must have an empty body"
+            "{ctx}: an empty-body ingest success must have an empty body"
         );
         return;
     }
@@ -1381,11 +1396,12 @@ fn assert_ingest_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str
 /// and every `CaseClass` in the manifest.
 fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     let is_remote_write = spec.path == "/api/v1/write";
-    // Both remote-write and the Loki push receiver (issue #77) have the
-    // empty-`204`/plain-text response family — distinguished from the OTLP
-    // routes' `200` + `Export*ServiceResponse` protobuf by their documented
-    // 204 success status.
-    let is_empty_204 = spec.success_status == 204;
+    // The empty-body family: remote-write and the Loki push receiver (204,
+    // issue #77) plus the Zipkin v2 JSON receiver (202, issue #75) — all
+    // distinguished from the OTLP routes' `200` + `Export*ServiceResponse`
+    // protobuf by an empty-body success at their documented 2xx status
+    // (`spec.success_status` drives the sync cells; async always 202).
+    let is_empty_body = matches!(spec.success_status, 202 | 204);
     let body_for = |path: &str| -> Vec<u8> {
         match path {
             "/v1/logs" => valid_otlp_logs_body(),
@@ -1393,12 +1409,14 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
             "/v1/traces" => valid_otlp_traces_body(),
             "/api/v1/write" => valid_remote_write_body(),
             "/loki/api/v1/push" => valid_loki_push_body(),
+            "/api/v2/spans" | "/tempo/spans" => valid_zipkin_body(),
             other => panic!("no valid-body builder registered for ingest route {other}"),
         }
     };
 
-    let async_cases: &[(Option<&str>, u16)] = if is_empty_204 {
-        &[(None, 204), (Some("0"), 204), (Some("1"), 202)]
+    let sync = spec.success_status;
+    let async_cases: &[(Option<&str>, u16)] = if is_empty_body {
+        &[(None, sync), (Some("0"), sync), (Some("1"), 202)]
     } else {
         &[(None, 200), (Some("0"), 200), (Some("1"), 202)]
     };
@@ -1437,11 +1455,13 @@ fn assert_ingest_route(port: u16, spec: &RouteSpec, spawn: &str) {
     //   (b) a protobuf body + `application/json` → 400 / google.rpc.Status.code
     //       == 3 (now undecodable as JSON — negotiation is real, not ignored).
     //
-    // Skipped for the empty-204 family: remote-write ignores Content-Type
-    // entirely (its own always-snappy path), and the Loki push receiver
-    // (issue #77) negotiates on it with its own JSON grammar — both pinned by
-    // the `ingest/http.rs` handler tests + `LOKI_PUSH_CASES` instead.
-    if !is_empty_204 {
+    // Skipped for the empty-body family: remote-write ignores Content-Type
+    // entirely (its own always-snappy path), the Loki push receiver (issue
+    // #77) negotiates on it with its own JSON grammar, and the Zipkin v2 JSON
+    // receiver (issue #75) always decodes JSON (Content-Type is not a fork
+    // discriminator) — all pinned by the `ingest/http.rs` handler tests +
+    // `LOKI_PUSH_CASES`/`ZIPKIN_CASES` instead.
+    if !is_empty_body {
         let json_body_for = |path: &str| -> Vec<u8> {
             match path {
                 "/v1/logs" => valid_otlp_logs_json_body(),
@@ -1741,6 +1761,7 @@ async fn all_mode_auth_on_perimeter() {
                 "/v1/traces" => valid_otlp_traces_body(),
                 "/api/v1/write" => valid_remote_write_body(),
                 "/loki/api/v1/push" => valid_loki_push_body(),
+                "/api/v2/spans" | "/tempo/spans" => valid_zipkin_body(),
                 other => panic!("no valid-body builder for {other}"),
             };
             r

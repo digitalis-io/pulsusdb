@@ -346,15 +346,15 @@ fn parse_span(
     // rejected without ever paying for the expansion it describes.
     // (`ctx.service` is already-rendered here, charged pre-render by
     // `parse` — its `.len()` below is the exact per-span clone cost.)
-    let mut span_expansion = SPAN_ROW_OVERHEAD
-        + span.name.len()
-        + ctx.service.len()
-        + ctx.payload_base_estimate
-        + span.encoded_len();
-    for kv in resource_attrs.iter().chain(&span.attributes) {
-        span_expansion += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
-    }
-    charge_budget(expanded_bytes, span_expansion)?;
+    charge_budget(
+        expanded_bytes,
+        span_expansion_charge(
+            span,
+            ctx.resource,
+            ctx.service.len(),
+            ctx.payload_base_estimate,
+        ),
+    )?;
 
     let date = Date::start_of_day_utc(timestamp_ns).days_since_epoch();
     for (scope, attrs) in [
@@ -463,6 +463,86 @@ fn find_service_kv(resource: Option<&Resource>) -> Option<&KeyValue> {
         .unwrap_or(&[])
         .iter()
         .find(|kv| kv.key == "service.name")
+}
+
+/// The estimated expanded-output byte charge for one span's rows +
+/// payload: the fixed per-span floor, its name/service clone cost, the
+/// per-span payload duplication (`payload_base` = resource + scope +
+/// schema-URL wire lengths, precomputed once per scope), the span's own
+/// wire length, and every resource ⊕ span attribute row (fixed overhead +
+/// [`attr_budget_charge`], which multiplies the kinds whose stored
+/// rendering can outgrow their wire bytes). Allocation-free: `encoded_len`
+/// never allocates. Extracted from [`parse_span`] so the identical measure
+/// is reachable from [`resource_spans_expansion_charge`].
+fn span_expansion_charge(
+    span: &Span,
+    resource: Option<&Resource>,
+    service_len: usize,
+    payload_base: usize,
+) -> usize {
+    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+    let mut charge =
+        SPAN_ROW_OVERHEAD + span.name.len() + service_len + payload_base + span.encoded_len();
+    for kv in resource_attrs.iter().chain(&span.attributes) {
+        charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+    }
+    charge
+}
+
+/// The estimated expanded-output byte charge [`parse`] accumulates for one
+/// `ResourceSpans` block: the promoted-`service` rendering charge (once per
+/// block, escape-multiplied like any rendered attribute) plus every span's
+/// [`span_expansion_charge`]. Byte-identical to what `parse` sums over the
+/// same block (it factors through the same two helpers), so an upstream
+/// adapter can charge the SAME budget against an adapted block and reach
+/// the identical accept/reject verdict. Allocation-free except the one
+/// per-block `service` render `parse` itself performs.
+fn resource_spans_expansion_charge(rs: &ResourceSpans) -> usize {
+    let resource = rs.resource.as_ref();
+    let service_kv = find_service_kv(resource);
+    let mut charge = service_kv.map(attr_budget_charge).unwrap_or(0);
+    let service_len = service_kv
+        .map(|kv| any_value_to_string(kv.value.as_ref()).len())
+        .unwrap_or(0);
+    let resource_wire_len = resource.map(Message::encoded_len).unwrap_or(0);
+    for scope_spans in &rs.scope_spans {
+        let payload_base = resource_wire_len
+            + scope_spans
+                .scope
+                .as_ref()
+                .map(Message::encoded_len)
+                .unwrap_or(0)
+            + rs.schema_url.len()
+            + scope_spans.schema_url.len()
+            + PAYLOAD_ENVELOPE_OVERHEAD;
+        for span in &scope_spans.spans {
+            charge = charge.saturating_add(span_expansion_charge(
+                span,
+                resource,
+                service_len,
+                payload_base,
+            ));
+        }
+    }
+    charge
+}
+
+/// Charges one already-adapted `ResourceSpans` block against a running
+/// [`MAX_EXPANDED_BYTES`] budget, failing the whole request the moment the
+/// running total exceeds it. The reserve-before-materialize hook for an
+/// upstream model adapter (the Zipkin receiver, issue #75) that produces
+/// self-contained single-`ResourceSpans` blocks: charging each block as it
+/// is adapted — BEFORE the full batch is materialized — makes an
+/// over-budget foreign request abort mid-adaptation rather than exhaust
+/// memory ahead of [`parse`]'s post-materialization check, and (because the
+/// measure is [`resource_spans_expansion_charge`], the exact per-block sum
+/// `parse` uses) rejects it byte-identically to the equivalent native OTLP
+/// request.
+pub(crate) fn charge_resource_spans_expansion(
+    expanded_bytes: &mut usize,
+    rs: &ResourceSpans,
+) -> Result<(), LogsIngestError> {
+    charge_budget(expanded_bytes, resource_spans_expansion_charge(rs))
 }
 
 /// Adds `amount` to the running expansion estimate and fails the whole

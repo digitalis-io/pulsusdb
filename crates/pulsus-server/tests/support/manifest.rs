@@ -1099,6 +1099,48 @@ const LOKI_PUSH_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- Zipkin v2 JSON receiver (issue #75, docs/api.md §8.2) --------------
+// Oracle-pinned against openzipkin/zipkin:3 (`POST /api/v2/spans`): success
+// is an empty 202 (both sync and async — the Zipkin oracle answers 202
+// Accepted regardless of the async header, unlike Loki's 204 or OTLP's 200
+// sync); a malformed span array is a whole-request 400 plain-text (Zipkin
+// has no partial-success channel), and an unsupported `Content-Encoding` is
+// likewise a 400. The success/async cells are exercised in
+// `assert_ingest_route`; these generic cases cover the two 400 plain-text
+// rows.
+
+/// A body that is not a decodable Zipkin v2 JSON span array — a
+/// whole-request `ZipkinDecode` 400 plain-text (oracle: 400 "Expected a
+/// JSON_V2 encoded list").
+fn zipkin_malformed_json(req: &mut Req) {
+    req.content_type = Some("application/json");
+    req.body = b"not a json span array".to_vec();
+}
+
+/// An unsupported `Content-Encoding` (`br`) — the decompression seam
+/// rejects it as a whole-request 400 plain-text, exactly like the other
+/// writer-side receivers.
+fn zipkin_unsupported_content_encoding(req: &mut Req) {
+    req.content_type = Some("application/json");
+    req.headers.push(("content-encoding", "br".to_string()));
+    req.body = br#"[{"traceId":"0000000000000001","id":"0000000000000002"}]"#.to_vec();
+}
+
+const ZIPKIN_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_json",
+        build: zipkin_malformed_json,
+        expect_status: 400,
+        expect: ExpectedError::PlainText,
+    },
+    CaseClass {
+        name: "unsupported_content_encoding",
+        build: zipkin_unsupported_content_encoding,
+        expect_status: 400,
+        expect: ExpectedError::PlainText,
+    },
+];
+
 // ---------------------------------------------------------------------
 // RouteSpec — the manifest itself
 // ---------------------------------------------------------------------
@@ -1413,6 +1455,37 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 204,
         base_query: "",
         cases: LOKI_PUSH_CASES,
+    },
+    // -- Zipkin v2 JSON receiver, `/api/v2/spans` + `/tempo/spans`
+    //    (CompatAndWriter, issue #75) ---------------------------------------
+    // The second writer-side compat surface (docs/api.md §8.2): a Zipkin v2
+    // JSON decoder adapting each span to OTLP and feeding the existing
+    // trace-storage path. Both documented paths bind to the same handler.
+    // `success_status` is 202 (empty-body, both sync and async — oracle-
+    // pinned against openzipkin/zipkin:3), so `assert_ingest_route` treats
+    // them in the empty-body family with 202 sync cells. `DocRef::Verbatim`:
+    // the §8.2 table spells both paths out.
+    RouteSpec {
+        path: "/api/v2/spans",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 202,
+        base_query: "",
+        cases: ZIPKIN_CASES,
+    },
+    RouteSpec {
+        path: "/tempo/spans",
+        methods: &[Method::Post],
+        surface: Surface::Ingest,
+        gate: Gate::CompatAndWriter,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 202,
+        base_query: "",
+        cases: ZIPKIN_CASES,
     },
     // -- Prom API (ReaderMode, no compat aliases) ------------------------
     RouteSpec {
@@ -1973,11 +2046,11 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/compat.rs",
         function: "apply_aliases",
-        // Re-pinned for issue #77 (M6-14): a second, Writer-gated branch
-        // joins the Reader one — the Loki push receiver's `CompatAndWriter`
-        // mount. (Previously re-pinned for issue #61's Tempo trace-alias
-        // merge inside the Reader block.)
-        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router());} router",
+        // Re-pinned for issue #75 (M6-12): the Zipkin v2 JSON receiver's
+        // `CompatAndWriter` merge joins the Loki push receiver in the
+        // Writer-gated branch. (Previously re-pinned for issue #77's Loki
+        // push mount, and #61's Tempo trace-alias merge in the Reader block.)
+        body: "if !cfg.compat_endpoints {return router;} let mut router = router; if modes::mounted(cfg).contains(&Subsystem::Reader) {router = router.merge(crate::logs_api::compat_router()); router = router.merge(crate::traces_api::compat_router());} if modes::mounted(cfg).contains(&Subsystem::Writer) {router = router.merge(crate::ingest::loki_push_compat_router()); router = router.merge(crate::ingest::zipkin_compat_router());} router",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/subsystems.rs",
