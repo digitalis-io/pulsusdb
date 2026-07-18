@@ -27,14 +27,15 @@
 //! (set by ci.yml's existing nightly full-tier job; no per-PR gate, no
 //! new job).
 
-use std::collections::BTreeSet;
-use std::time::Duration;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
+use crate::harness::{completeness_poll_timeout, poll_until, query_request_timeout};
 use crate::logs_corpus::{
     self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
 };
@@ -47,8 +48,14 @@ const ARTIFACT_AREA: &str = "logs-diff";
 
 const COLLECTOR_READY_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 const COLLECTOR_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const COMPLETENESS_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+// The completeness-poll deadline is tier-aware (issue #106,
+// `harness::completeness_poll_timeout`): 600s full / 180s ci.
 const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Progress-log rate limit (issue #106): between unchanged
+/// `pulsusdb=X oracle=Y` counts, emit at most one completeness line per
+/// this interval so a long full-tier poll stays diagnosable without
+/// flooding CI logs.
+const COMPLETENESS_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Margin between the corpus's last record and "now" at generation time,
 /// and the query-window slack on each side (both stores get identical
@@ -250,6 +257,7 @@ async fn query_store(
     query: &str,
     window: QueryWindow,
     limit: u32,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let start = window.start_ns.to_string();
     let end = window.end_ns.to_string();
@@ -266,9 +274,9 @@ async fn query_store(
         ])
         // Issue #92 (all four GET chokepoints in this module): a
         // request-level timeout replaces the shared client's 5s
-        // readiness budget for scenario queries (see
-        // `harness::QUERY_REQUEST_TIMEOUT`).
-        .timeout(QUERY_REQUEST_TIMEOUT)
+        // readiness budget for scenario queries. Tier-aware (issue #106,
+        // `harness::query_request_timeout`): 120s full / 60s ci.
+        .timeout(query_timeout)
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -287,6 +295,7 @@ async fn query_pulsus(
     query: &str,
     window: QueryWindow,
     limit: u32,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     query_store(
         ctx,
@@ -294,6 +303,7 @@ async fn query_pulsus(
         query,
         window,
         limit,
+        query_timeout,
     )
     .await
 }
@@ -303,6 +313,7 @@ async fn query_loki(
     query: &str,
     window: QueryWindow,
     limit: u32,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     query_store(
         ctx,
@@ -310,6 +321,7 @@ async fn query_loki(
         query,
         window,
         limit,
+        query_timeout,
     )
     .await
 }
@@ -578,6 +590,175 @@ pub async fn logs_pipeline_differential(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
+/// A single `(labels, ts_ns, line)` record — the granularity the
+/// completeness diagnostic reports missing/extra shortfalls at (issue
+/// #106).
+type LabeledEntry = (BTreeMap<String, String>, i64, String);
+
+/// One store's completeness shortfall against the corpus expectation
+/// (issue #106): how many expected entries it currently carries, and the
+/// symmetric difference vs `expected` at `(labels, ts, line)` granularity.
+struct CompletenessSetDiff {
+    matched: usize,
+    /// In `expected`, absent from the store — the records CI needs to see.
+    missing: Vec<LabeledEntry>,
+    /// In the store, absent from `expected` — an unexpected delivery.
+    extra: Vec<LabeledEntry>,
+}
+
+/// The pure symmetric-difference of a store's result set against the
+/// corpus expectation (issue #106 completeness diagnostic core). Unit-
+/// tested, so the on-timeout artifact's missing/extra sets are known
+/// correct before the nightly next fails.
+fn completeness_set_diff(store: &ExpectedResult, expected: &ExpectedResult) -> CompletenessSetDiff {
+    let mut matched = 0usize;
+    let mut missing = Vec::new();
+    for (labels, entries) in expected {
+        let store_entries = store.get(labels);
+        for (ts, line) in entries {
+            if store_entries.is_some_and(|s| s.contains(&(*ts, line.clone()))) {
+                matched += 1;
+            } else {
+                missing.push((labels.clone(), *ts, line.clone()));
+            }
+        }
+    }
+    let mut extra = Vec::new();
+    for (labels, entries) in store {
+        let exp_entries = expected.get(labels);
+        for (ts, line) in entries {
+            if !exp_entries.is_some_and(|e| e.contains(&(*ts, line.clone()))) {
+                extra.push((labels.clone(), *ts, line.clone()));
+            }
+        }
+    }
+    CompletenessSetDiff {
+        matched,
+        missing,
+        extra,
+    }
+}
+
+fn labeled_entries_json(entries: &[LabeledEntry]) -> Vec<serde_json::Value> {
+    entries
+        .iter()
+        .map(|(labels, ts, line)| serde_json::json!({ "labels": labels, "ts": ts, "line": line }))
+        .collect()
+}
+
+/// Per-attempt progress line (issue #106), rate-limited to at most one
+/// unchanged line per [`COMPLETENESS_PROGRESS_LOG_INTERVAL`]: without it
+/// the "still filling / set mismatch" path was silent every poll, so CI
+/// could not tell a real convergence bug (plateaued low) from budget
+/// (climbing steadily toward the total).
+fn log_completeness_progress(
+    last: &Cell<(usize, usize)>,
+    last_log_at: &Cell<Instant>,
+    label: &str,
+    total: usize,
+    pulsus: usize,
+    oracle: usize,
+) {
+    let now = Instant::now();
+    let changed = last.get() != (pulsus, oracle);
+    if changed || now.duration_since(last_log_at.get()) >= COMPLETENESS_PROGRESS_LOG_INTERVAL {
+        let reached = pulsus.min(oracle);
+        println!(
+            "pulsus-e2e:   {label} completeness: reached {reached}/{total}: pulsusdb={pulsus} \
+             oracle={oracle}"
+        );
+        last.set((pulsus, oracle));
+        last_log_at.set(now);
+    }
+}
+
+/// The run-scoped completeness probe both logs gates re-run on timeout —
+/// bundled so the diagnostic fn stays within clippy's argument threshold.
+struct CompletenessProbe<'a> {
+    q: &'a str,
+    window: QueryWindow,
+    limit: u32,
+    query_timeout: Duration,
+}
+
+/// On the FINAL completeness timeout (issue #106): re-query both stores
+/// once, compute each store's raw/distinct counts and the missing/extra
+/// symmetric difference vs `expected`, and write the artifact CI needs to
+/// diagnose the next nightly. Best-effort — a failed final query is
+/// recorded rather than swallowing the diagnostic. Returns the timeout
+/// error enriched with the artifact path so a wider full-tier budget can
+/// never mask a real convergence bug.
+async fn completeness_timeout_diagnostic(
+    ctx: &Ctx,
+    surface: &str,
+    prefix: &str,
+    probe: &CompletenessProbe<'_>,
+    expected: &ExpectedResult,
+    timeout_err: anyhow::Error,
+) -> anyhow::Error {
+    let CompletenessProbe {
+        q,
+        window,
+        limit,
+        query_timeout,
+    } = *probe;
+    let mut stores = serde_json::Map::new();
+    for (store, body) in [
+        (
+            "pulsusdb",
+            query_pulsus(ctx, q, window, limit, query_timeout).await,
+        ),
+        (
+            "oracle",
+            query_loki(ctx, q, window, limit, query_timeout).await,
+        ),
+    ] {
+        let entry = match body {
+            Ok(body) => {
+                let raw = raw_entry_count(&body);
+                match result_set(&body) {
+                    Ok(set) => {
+                        let distinct = set_entry_count(&set);
+                        let diff = completeness_set_diff(&set, expected);
+                        serde_json::json!({
+                            "raw_entries": raw,
+                            "distinct_entries": distinct,
+                            "matched": diff.matched,
+                            "missing_count": diff.missing.len(),
+                            "extra_count": diff.extra.len(),
+                            "missing": labeled_entries_json(&diff.missing),
+                            "extra": labeled_entries_json(&diff.extra),
+                        })
+                    }
+                    Err(err) => serde_json::json!({
+                        "raw_entries": raw,
+                        "error": format!("could not normalize result set: {err:#}"),
+                    }),
+                }
+            }
+            Err(err) => serde_json::json!({ "error": format!("final query failed: {err:#}") }),
+        };
+        stores.insert(store.to_string(), entry);
+    }
+    let artifact = serde_json::json!({
+        "surface": surface,
+        "kind": "completeness_timeout",
+        "query": q,
+        "limit": limit,
+        "expected_total": set_entry_count(expected),
+        "stores": stores,
+    });
+    match write_artifact(ctx, ARTIFACT_AREA, prefix, &artifact) {
+        Ok(path) => timeout_err.context(format!(
+            "completeness timed out; per-store counts + missing/extra records written to {}",
+            path.display()
+        )),
+        Err(werr) => timeout_err.context(format!(
+            "completeness timed out; ALSO failed to write the missing-record diagnostic: {werr:#}"
+        )),
+    }
+}
+
 /// Bounded completeness poll (validity gate (a)): the run-scoped bare
 /// query returns exactly the corpus's full record set on BOTH stores —
 /// absorbs collector-export and store-visibility lag without fixed
@@ -600,12 +781,19 @@ async fn wait_for_completeness(
 ) -> Result<()> {
     let q = run_scope_query(&corpus.run_id);
     let expected = corpus.expected_all_records();
+    let expected_total = set_entry_count(&expected);
+    let query_timeout = query_request_timeout(corpus.scale);
+    // Rate-limit state for the per-attempt progress line (issue #106):
+    // interior-mutability so the poll closure stays `Fn` (no `&mut`
+    // capture across the awaited future).
+    let progress = Cell::new((usize::MAX, usize::MAX));
+    let last_log_at = Cell::new(Instant::now());
     // `poll_until` retries a closure `Err` — so permanent invalidity
     // (truncation / duplicate delivery, which never self-heal) is
     // yielded as `Ok(Some(Err(...)))` to stop polling immediately, and
     // propagated after the poll.
-    let verdict: Result<()> = poll_until(
-        COMPLETENESS_POLL_TIMEOUT,
+    let poll_result: Result<Result<()>> = poll_until(
+        completeness_poll_timeout(corpus.scale),
         COMPLETENESS_POLL_INTERVAL,
         || async {
             // Pass 1 — validity gates on BOTH stores' responses, before
@@ -613,8 +801,14 @@ async fn wait_for_completeness(
             // first would keep retrying while the OTHER store's response
             // is already permanently invalid).
             let bodies = [
-                ("pulsusdb", query_pulsus(ctx, &q, window, limit).await?),
-                ("oracle", query_loki(ctx, &q, window, limit).await?),
+                (
+                    "pulsusdb",
+                    query_pulsus(ctx, &q, window, limit, query_timeout).await?,
+                ),
+                (
+                    "oracle",
+                    query_loki(ctx, &q, window, limit, query_timeout).await?,
+                ),
             ];
             let mut sets = Vec::with_capacity(bodies.len());
             for (store, body) in &bodies {
@@ -660,22 +854,49 @@ async fn wait_for_completeness(
                 sets.push(set);
             }
             // Pass 2 — set comparisons, only once both stores passed
-            // every gate.
+            // every gate. On the still-filling path emit a rate-limited
+            // progress line so the "set mismatch" case is no longer silent
+            // (issue #106).
+            let pulsus_matched = completeness_set_diff(&sets[0], &expected).matched;
+            let oracle_matched = completeness_set_diff(&sets[1], &expected).matched;
+            log_completeness_progress(
+                &progress,
+                &last_log_at,
+                "logs",
+                expected_total,
+                pulsus_matched,
+                oracle_matched,
+            );
             if sets.iter().any(|set| *set != expected) {
                 return Ok(None); // still filling — keep polling
             }
             Ok(Some(Ok(())))
         },
     )
-    .await
-    .with_context(|| {
-        format!(
-            "run {:?} never reached completeness ({} records) on both stores",
-            corpus.run_id,
-            corpus.total_records()
+    .await;
+    match poll_result {
+        Ok(verdict) => verdict,
+        // The `Ok(None)` deadline branch (issue #106): compute + write the
+        // missing-record diagnostic right before surfacing the timeout.
+        Err(timeout_err) => Err(completeness_timeout_diagnostic(
+            ctx,
+            "logs_pipeline_completeness",
+            "completeness-timeout",
+            &CompletenessProbe {
+                q: &q,
+                window,
+                limit,
+                query_timeout,
+            },
+            &expected,
+            timeout_err.context(format!(
+                "run {:?} never reached completeness ({} records) on both stores",
+                corpus.run_id,
+                corpus.total_records()
+            )),
         )
-    })?;
-    verdict
+        .await),
+    }
 }
 
 /// One committed case, dispatched by shape (issue M6-10): the M6-09
@@ -706,6 +927,7 @@ async fn run_case(
 async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) -> Result<()> {
     let q = case.query.replace("{R}", &corpus.run_id);
     let eval_ns = metric_eval_ns(corpus);
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {}: expecting HTTP 400 + SampleExtractionErr on both \
          stores",
@@ -720,7 +942,7 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
                 .http
                 .get(&url)
                 .query(&[("query", q.as_str()), ("time", time.as_str())])
-                .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
+                .timeout(query_timeout) // issue #92/#106, see query_store
                 .send()
                 .await
                 .with_context(|| format!("GET {url} failed"))?;
@@ -795,6 +1017,7 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
 async fn run_metric_match_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) -> Result<()> {
     let q = case.query.replace("{R}", &corpus.run_id);
     let eval_ns = metric_eval_ns(corpus);
+    let query_timeout = query_request_timeout(corpus.scale);
     let substr = case.expect_error_substr.as_deref().with_context(|| {
         format!(
             "case {:?} is metric_match_error but carries no expect_error_substr",
@@ -815,7 +1038,7 @@ async fn run_metric_match_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseR
                 .http
                 .get(&url)
                 .query(&[("query", q.as_str()), ("time", time.as_str())])
-                .timeout(QUERY_REQUEST_TIMEOUT)
+                .timeout(query_timeout) // issue #92/#106, see query_store
                 .send()
                 .await
                 .with_context(|| format!("GET {url} failed"))?;
@@ -889,13 +1112,14 @@ async fn query_instant(
     url: &str,
     query: &str,
     time_ns: i64,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let time = time_ns.to_string();
     let res = ctx
         .http
         .get(url)
         .query(&[("query", query), ("time", time.as_str())])
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
+        .timeout(query_timeout) // issue #92/#106, see query_store
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -919,6 +1143,7 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
     let expected = corpus.expected_metric_vector(&case.case_id);
     let gated = case.mode == "gated";
     let eval_ns = metric_eval_ns(corpus);
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {}: {} expected series",
         case.case_id,
@@ -928,7 +1153,14 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
     );
 
     let pulsus_started = std::time::Instant::now();
-    let pulsus_body = query_instant(ctx, &ctx.url("/api/logs/v1/query"), &q, eval_ns).await?;
+    let pulsus_body = query_instant(
+        ctx,
+        &ctx.url("/api/logs/v1/query"),
+        &q,
+        eval_ns,
+        query_timeout,
+    )
+    .await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let oracle_started = std::time::Instant::now();
     let oracle_body = query_instant(
@@ -936,6 +1168,7 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
         &format!("{}/loki/api/v1/query", ctx.loki_url),
         &q,
         eval_ns,
+        query_timeout,
     )
     .await?;
     let oracle_elapsed = oracle_started.elapsed();
@@ -1039,6 +1272,7 @@ async fn run_metric_range_case(
     let step_ns = step_s as i64 * 1_000_000_000;
     let expected = corpus.expected_metric_matrix(&case.case_id, step_ns);
     let gated = case.mode == "gated";
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {}: {} expected series",
         case.case_id,
@@ -1062,7 +1296,7 @@ async fn run_metric_range_case(
                     ("end", end.as_str()),
                     ("step", step.as_str()),
                 ])
-                .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see query_store
+                .timeout(query_timeout) // issue #92/#106, see query_store
                 .send()
                 .await
                 .with_context(|| format!("GET {url} failed"))?;
@@ -1173,6 +1407,7 @@ async fn run_streams_case(
     let q = case.query.replace("{R}", &corpus.run_id);
     let expected = corpus.expected_case_result(&case.case_id);
     let gated = case.mode == "gated";
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {}: {} expected entry(ies) across {} stream(s)",
         case.case_id,
@@ -1183,14 +1418,14 @@ async fn run_streams_case(
     );
 
     // One elapsed line per case (issue #92, the metrics-differential
-    // precedent): budget breaches against `QUERY_REQUEST_TIMEOUT` stay
-    // diagnosable from CI logs alone. Elapsed only — these helpers
+    // precedent): budget breaches against the tier-aware query timeout
+    // stay diagnosable from CI logs alone. Elapsed only — these helpers
     // return parsed JSON, so no raw byte count is in hand.
     let pulsus_started = std::time::Instant::now();
-    let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let loki_started = std::time::Instant::now();
-    let loki_body = query_loki(ctx, &q, window, fixture.limit).await?;
+    let loki_body = query_loki(ctx, &q, window, fixture.limit, query_timeout).await?;
     let loki_elapsed = loki_started.elapsed();
     println!(
         "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
@@ -1362,6 +1597,7 @@ async fn run_streams_limited_case(
     let q = case.query.replace("{R}", &corpus.run_id);
     let expected = corpus.expected_ordered_limited(&case.case_id, limit);
     let gated = case.mode == "gated";
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {}: expecting exactly {} ordered entry(ies) across {} \
          page(s)",
@@ -1373,10 +1609,10 @@ async fn run_streams_limited_case(
     );
 
     let pulsus_started = std::time::Instant::now();
-    let pulsus_body = query_pulsus(ctx, &q, window, limit).await?;
+    let pulsus_body = query_pulsus(ctx, &q, window, limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let loki_started = std::time::Instant::now();
-    let loki_body = query_loki(ctx, &q, window, limit).await?;
+    let loki_body = query_loki(ctx, &q, window, limit, query_timeout).await?;
     let loki_elapsed = loki_started.elapsed();
     println!(
         "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
@@ -1619,6 +1855,12 @@ pub async fn logs_structured_metadata_differential(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let fixture = load_sm_fixture(ctx)?;
+    // The SM corpus is a fixed, non-tiered size, but the lane runs in the
+    // same saturated nightly full-tier job (issue #106): resolve the same
+    // `PULSUS_E2E_LOGS_SCALE` the main logs lane does, purely to select the
+    // tier-aware completeness/query budgets (the corpus itself is
+    // unchanged).
+    let scale = resolve_scale()?;
     let corpus = build_sm_corpus()?;
     let window = sm_query_window(&corpus);
     println!(
@@ -1633,10 +1875,10 @@ pub async fn logs_structured_metadata_differential(ctx: &Ctx) -> Result<()> {
         .await
         .context("dual-pushing the SM corpus to both stores failed")?;
 
-    wait_for_sm_completeness(ctx, &corpus, window, fixture.limit).await?;
+    wait_for_sm_completeness(ctx, &corpus, window, fixture.limit, scale).await?;
 
     for case in &fixture.cases {
-        run_sm_case(ctx, &corpus, &fixture, case, window)
+        run_sm_case(ctx, &corpus, &fixture, case, window, scale)
             .await
             .with_context(|| format!("SM differential case {:?}", case.case_id))?;
     }
@@ -1699,16 +1941,27 @@ async fn wait_for_sm_completeness(
     corpus: &logs_sm_corpus::SmCorpus,
     window: QueryWindow,
     limit: u32,
+    scale: Scale,
 ) -> Result<()> {
     let q = run_scope_query(&corpus.run_id);
     let expected = logs_sm_corpus::expected_all_records(corpus);
-    let verdict: Result<()> = poll_until(
-        COMPLETENESS_POLL_TIMEOUT,
+    let expected_total = set_entry_count(&expected);
+    let query_timeout = query_request_timeout(scale);
+    let progress = Cell::new((usize::MAX, usize::MAX));
+    let last_log_at = Cell::new(Instant::now());
+    let poll_result: Result<Result<()>> = poll_until(
+        completeness_poll_timeout(scale),
         COMPLETENESS_POLL_INTERVAL,
         || async {
             let bodies = [
-                ("pulsusdb", query_pulsus(ctx, &q, window, limit).await?),
-                ("oracle", query_loki(ctx, &q, window, limit).await?),
+                (
+                    "pulsusdb",
+                    query_pulsus(ctx, &q, window, limit, query_timeout).await?,
+                ),
+                (
+                    "oracle",
+                    query_loki(ctx, &q, window, limit, query_timeout).await?,
+                ),
             ];
             let mut sets = Vec::with_capacity(bodies.len());
             for (store, body) in &bodies {
@@ -1761,21 +2014,44 @@ async fn wait_for_sm_completeness(
                 }
                 sets.push(set);
             }
+            let pulsus_matched = completeness_set_diff(&sets[0], &expected).matched;
+            let oracle_matched = completeness_set_diff(&sets[1], &expected).matched;
+            log_completeness_progress(
+                &progress,
+                &last_log_at,
+                "sm logs",
+                expected_total,
+                pulsus_matched,
+                oracle_matched,
+            );
             if sets.iter().any(|set| *set != expected) {
                 return Ok(None); // still filling — keep polling
             }
             Ok(Some(Ok(())))
         },
     )
-    .await
-    .with_context(|| {
-        format!(
-            "SM run {:?} never reached completeness ({} records) on both stores",
-            corpus.run_id,
-            corpus.entries.len()
+    .await;
+    match poll_result {
+        Ok(verdict) => verdict,
+        Err(timeout_err) => Err(completeness_timeout_diagnostic(
+            ctx,
+            "logs_sm_completeness",
+            "sm-completeness-timeout",
+            &CompletenessProbe {
+                q: &q,
+                window,
+                limit,
+                query_timeout,
+            },
+            &expected,
+            timeout_err.context(format!(
+                "SM run {:?} never reached completeness ({} records) on both stores",
+                corpus.run_id,
+                corpus.entries.len()
+            )),
         )
-    })?;
-    verdict
+        .await),
+    }
 }
 
 /// One SM case: validity gates first (raw counts strictly below the limit on
@@ -1788,6 +2064,7 @@ async fn run_sm_case(
     fixture: &SmFixture,
     case: &SmCaseRaw,
     window: QueryWindow,
+    scale: Scale,
 ) -> Result<()> {
     if case.mode != "gated" {
         bail!(
@@ -1798,6 +2075,7 @@ async fn run_sm_case(
     }
     let q = case.query.replace("{R}", &corpus.run_id);
     let expected = logs_sm_corpus::expected_case_result(corpus, &case.case_id);
+    let query_timeout = query_request_timeout(scale);
     println!(
         "pulsus-e2e:     SM case {:?} [{}] — {}: {} expected entry(ies) across {} stream(s)",
         case.case_id,
@@ -1808,10 +2086,10 @@ async fn run_sm_case(
     );
 
     let pulsus_started = std::time::Instant::now();
-    let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let loki_started = std::time::Instant::now();
-    let loki_body = query_loki(ctx, &q, window, fixture.limit).await?;
+    let loki_body = query_loki(ctx, &q, window, fixture.limit, query_timeout).await?;
     let loki_elapsed = loki_started.elapsed();
     println!(
         "pulsus-e2e: query {q:?} (SM case {:?}) pulsusdb {}ms oracle {}ms",
@@ -2862,5 +3140,76 @@ mod tests {
                 fixture.limit
             );
         }
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn expected_set() -> ExpectedResult {
+        let mut set = ExpectedResult::new();
+        set.insert(
+            labels(&[("stream", "a")]),
+            BTreeSet::from([(1_i64, "one".to_string()), (2, "two".to_string())]),
+        );
+        set.insert(
+            labels(&[("stream", "b")]),
+            BTreeSet::from([(3, "three".to_string())]),
+        );
+        set
+    }
+
+    /// Issue #106: the on-timeout completeness diagnostic's core computes
+    /// the correct per-store matched count and missing/extra symmetric
+    /// difference from a partial store result — so the artifact CI reads
+    /// when the nightly next fails is known to be right.
+    #[test]
+    fn completeness_set_diff_reports_matched_and_missing_and_extra() {
+        let expected = expected_set();
+
+        // pulsusdb: missing (b,3,"three"); carries an extra (a,9,"nine").
+        let mut pulsus = ExpectedResult::new();
+        pulsus.insert(
+            labels(&[("stream", "a")]),
+            BTreeSet::from([
+                (1_i64, "one".to_string()),
+                (2, "two".to_string()),
+                (9, "nine".to_string()),
+            ]),
+        );
+        let diff = completeness_set_diff(&pulsus, &expected);
+        assert_eq!(diff.matched, 2, "two of the three expected entries present");
+        assert_eq!(
+            diff.missing,
+            vec![(labels(&[("stream", "b")]), 3, "three".to_string())]
+        );
+        assert_eq!(
+            diff.extra,
+            vec![(labels(&[("stream", "a")]), 9, "nine".to_string())]
+        );
+
+        // oracle: still filling — only the first entry landed.
+        let mut oracle = ExpectedResult::new();
+        oracle.insert(
+            labels(&[("stream", "a")]),
+            BTreeSet::from([(1_i64, "one".to_string())]),
+        );
+        let odiff = completeness_set_diff(&oracle, &expected);
+        assert_eq!(odiff.matched, 1);
+        assert_eq!(odiff.missing.len(), 2, "(a,2,two) and (b,3,three) missing");
+        assert!(odiff.extra.is_empty());
+    }
+
+    /// The fully-converged store has zero shortfall and matches the total.
+    #[test]
+    fn completeness_set_diff_is_empty_when_the_store_equals_expected() {
+        let expected = expected_set();
+        let diff = completeness_set_diff(&expected, &expected);
+        assert_eq!(diff.matched, set_entry_count(&expected));
+        assert!(diff.missing.is_empty());
+        assert!(diff.extra.is_empty());
     }
 }

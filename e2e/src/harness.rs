@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::corpus::Scale;
 use crate::engine::{Compose, ComposeGuard, EngineKind, workspace_root};
 use crate::scenarios::{Ctx, SCENARIOS, Variant};
 
@@ -31,6 +32,48 @@ const READY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// timeout for that request (reqwest semantics), so readiness polling
 /// keeps its tight 5s budget untouched.
 pub const QUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The full-tier per-request query budget (issue #106). The nightly
+/// full-tier lane saturates a single 2-vCPU runner (7 heavy containers +
+/// ~10k series), where a heavy range query (e.g. `count_values` over the
+/// full corpus) can exceed the strict [`QUERY_REQUEST_TIMEOUT`] client
+/// timeout and abort mid-body — the 07-17 `count_values` symptom. Full
+/// tier only; per-PR/ci tiers stay strict on the 60s budget.
+const QUERY_REQUEST_TIMEOUT_FULL: Duration = Duration::from_secs(120);
+
+/// Tier-aware per-request query timeout (issue #106): the strict 60s
+/// [`QUERY_REQUEST_TIMEOUT`] on `Scale::Ci`, the relaxed
+/// [`QUERY_REQUEST_TIMEOUT_FULL`] on `Scale::Full`. Resolved at the query
+/// call site from the corpus/scenario `Scale` (the shared reqwest client
+/// is built before any scenario resolves its scale, so the budget is
+/// applied per request via `RequestBuilder::timeout`, not the client
+/// default).
+pub fn query_request_timeout(scale: Scale) -> Duration {
+    match scale {
+        Scale::Ci => QUERY_REQUEST_TIMEOUT,
+        Scale::Full => QUERY_REQUEST_TIMEOUT_FULL,
+    }
+}
+
+/// The ci-tier bounded-completeness poll deadline (issue #15 precedent):
+/// absorbs collector-export and store-visibility lag without fixed sleeps.
+const COMPLETENESS_POLL_TIMEOUT_CI: Duration = Duration::from_secs(180);
+/// The full-tier bounded-completeness poll deadline (issue #106): the same
+/// single-node saturation that stretches query latency also stretches
+/// export/flush convergence, so the full tier gets a wider budget while
+/// per-PR/ci stays strict at [`COMPLETENESS_POLL_TIMEOUT_CI`]. The paired
+/// on-timeout diagnostic (per-store counts + missing/extra records) means a
+/// wider budget can never mask a real convergence bug — the run either goes
+/// green or emits the exact shortfall.
+const COMPLETENESS_POLL_TIMEOUT_FULL: Duration = Duration::from_secs(600);
+
+/// Tier-aware completeness-poll deadline (issue #106), shared by the logs
+/// and traces completeness gates.
+pub fn completeness_poll_timeout(scale: Scale) -> Duration {
+    match scale {
+        Scale::Ci => COMPLETENESS_POLL_TIMEOUT_CI,
+        Scale::Full => COMPLETENESS_POLL_TIMEOUT_FULL,
+    }
+}
 
 /// Service names dumped on failure — present under these exact names in
 /// both variants' overlays. `prometheus` (issue #33): the reference
@@ -264,6 +307,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_request_timeout_is_strict_on_ci_and_relaxed_on_full() {
+        // Issue #106: full tier gets 120s (the count_values saturation
+        // fix), ci stays strict at 60s.
+        assert_eq!(query_request_timeout(Scale::Ci), Duration::from_secs(60));
+        assert_eq!(query_request_timeout(Scale::Full), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn completeness_poll_timeout_is_strict_on_ci_and_relaxed_on_full() {
+        // Issue #106: full tier gets 600s, ci stays strict at 180s.
+        assert_eq!(
+            completeness_poll_timeout(Scale::Ci),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            completeness_poll_timeout(Scale::Full),
+            Duration::from_secs(600)
+        );
+    }
 
     #[test]
     fn compose_for_covers_both_variants_with_distinct_projects() {

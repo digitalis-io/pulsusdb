@@ -45,14 +45,15 @@
 //! `target/e2e-artifacts/traces-diff/<variant>/` (the #33 pattern) and
 //! fails the scenario.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
+use crate::harness::{completeness_poll_timeout, poll_until, query_request_timeout};
 use crate::metrics::write_artifact;
 use crate::scenarios::{Ctx, Variant};
 use crate::traces_corpus::{self, TraceCorpus, TraceCorpusSpec, hex};
@@ -71,9 +72,13 @@ const COLLECTOR_READY_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Completeness pre-check poll bounds — generous enough to absorb the
 /// cluster leg's `_dist` fan-out lag and Tempo's live-store search
 /// visibility lag (`poll_until` returns the instant the condition is
-/// met, so the long deadline costs nothing on a healthy run).
-const COMPLETENESS_POLL_TIMEOUT: Duration = Duration::from_secs(180);
+/// met, so the long deadline costs nothing on a healthy run). The
+/// deadline is tier-aware (issue #106,
+/// `harness::completeness_poll_timeout`): 600s full / 180s ci.
 const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Progress-log rate limit (issue #106): between unchanged reached-counts,
+/// emit at most one completeness line per this interval.
+const COMPLETENESS_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Margin between the corpus's last span end and "now" at generation
 /// time, and the search-window slack on each side (both stores get the
@@ -364,6 +369,25 @@ fn fetch_span_ids(body: &serde_json::Value) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 
+/// The span-id set shortfall of one fetched trace against its corpus
+/// expectation (issue #106 fetch-completeness diagnostic core): which
+/// expected span-ids are absent from the store and which unexpected ones
+/// are present. Unit-tested so the on-timeout artifact's missing/extra
+/// span sets are known correct before the nightly next fails.
+struct SpanIdSetDiff {
+    /// Expected span-ids absent from the store — the records CI needs.
+    missing: Vec<String>,
+    /// Span-ids in the store but not expected — an unexpected delivery.
+    extra: Vec<String>,
+}
+
+fn span_id_set_diff(expected: &BTreeSet<String>, actual: &BTreeSet<String>) -> SpanIdSetDiff {
+    SpanIdSetDiff {
+        missing: expected.difference(actual).cloned().collect(),
+        extra: actual.difference(expected).cloned().collect(),
+    }
+}
+
 /// OTEL SpanKind normalization: PulsusDB's protojson emits the enum
 /// number, Tempo's jsonpb emits `SPAN_KIND_*` names.
 fn normalize_kind(v: &serde_json::Value) -> i64 {
@@ -450,15 +474,19 @@ fn pulsus_search_is_partial(body: &serde_json::Value) -> Result<bool> {
 /// One PulsusDB trace fetch attempt: `Ok(Some(body))` on 200,
 /// `Ok(None)` on 404 (not visible yet — the poll-until condition),
 /// `Err` on anything else.
-async fn fetch_pulsus_trace(ctx: &Ctx, trace_hex: &str) -> Result<Option<serde_json::Value>> {
+async fn fetch_pulsus_trace(
+    ctx: &Ctx,
+    trace_hex: &str,
+    query_timeout: Duration,
+) -> Result<Option<serde_json::Value>> {
     let res = ctx
         .http
         .get(ctx.url(&format!("/api/traces/v1/trace/{trace_hex}/json")))
         // Issue #92 (every GET query chokepoint in this module): a
         // request-level timeout replaces the shared client's 5s
-        // readiness budget for scenario queries (see
-        // `harness::QUERY_REQUEST_TIMEOUT`).
-        .timeout(QUERY_REQUEST_TIMEOUT)
+        // readiness budget for scenario queries. Tier-aware (issue #106,
+        // `harness::query_request_timeout`): 120s full / 60s ci.
+        .timeout(query_timeout)
         .send()
         .await
         .context("GET /api/traces/v1/trace/{id}/json failed")?;
@@ -475,11 +503,15 @@ async fn fetch_pulsus_trace(ctx: &Ctx, trace_hex: &str) -> Result<Option<serde_j
 /// [`fetch_pulsus_trace`]; transport errors are surfaced as `Err`
 /// (tolerated and retried by `poll_until` while Tempo finishes
 /// booting).
-async fn fetch_tempo_trace(ctx: &Ctx, trace_hex: &str) -> Result<Option<serde_json::Value>> {
+async fn fetch_tempo_trace(
+    ctx: &Ctx,
+    trace_hex: &str,
+    query_timeout: Duration,
+) -> Result<Option<serde_json::Value>> {
     let res = ctx
         .http
         .get(format!("{}/api/traces/{trace_hex}", ctx.tempo_url))
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tempo /api/traces/{id} failed")?;
@@ -497,6 +529,7 @@ async fn search_pulsus(
     q: &str,
     window: SearchWindow,
     limit: u32,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let start = window.start_s.to_string();
     let end = window.end_s.to_string();
@@ -510,7 +543,7 @@ async fn search_pulsus(
             ("end", end.as_str()),
             ("limit", limit_s.as_str()),
         ])
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET /api/traces/v1/search failed")?;
@@ -527,6 +560,7 @@ async fn search_tempo(
     q: &str,
     window: SearchWindow,
     limit: u32,
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let start = window.start_s.to_string();
     let end = window.end_s.to_string();
@@ -540,7 +574,7 @@ async fn search_tempo(
             ("end", end.as_str()),
             ("limit", limit_s.as_str()),
         ])
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tempo /api/search failed")?;
@@ -563,6 +597,46 @@ enum Stores {
     PulsusAndTempo,
 }
 
+impl Stores {
+    fn covers_tempo(self) -> bool {
+        matches!(self, Stores::PulsusAndTempo)
+    }
+}
+
+/// Per-attempt trace-completeness progress line (issue #106), rate-limited
+/// like the logs gate: the "still filling" path was silent every poll, so
+/// CI could not tell a real convergence bug from budget. `tempo` is
+/// `None` on the PulsusOnly leg.
+fn log_trace_completeness_progress(
+    last: &Cell<(usize, usize)>,
+    last_log_at: &Cell<Instant>,
+    label: &str,
+    total: usize,
+    pulsus: usize,
+    tempo: Option<usize>,
+) {
+    let now = Instant::now();
+    let key = (pulsus, tempo.unwrap_or(usize::MAX));
+    if last.get() != key
+        || now.duration_since(last_log_at.get()) >= COMPLETENESS_PROGRESS_LOG_INTERVAL
+    {
+        match tempo {
+            Some(t) => {
+                let reached = pulsus.min(t);
+                println!(
+                    "pulsus-e2e:   {label} completeness: reached {reached}/{total}: \
+                     pulsusdb={pulsus} tempo={t}"
+                );
+            }
+            None => println!(
+                "pulsus-e2e:   {label} completeness: reached {pulsus}/{total}: pulsusdb={pulsus}"
+            ),
+        }
+        last.set(key);
+        last_log_at.set(now);
+    }
+}
+
 /// Polls until every seeded trace is fetchable by id with the expected
 /// **span count** on every covered store (count, not set: the set
 /// equality itself is the gate, asserted once, with an artifact on
@@ -572,46 +646,173 @@ async fn wait_for_fetch_completeness(
     corpus: &TraceCorpus,
     stores: Stores,
 ) -> Result<()> {
-    poll_until(
-        COMPLETENESS_POLL_TIMEOUT,
+    let total = corpus.traces.len();
+    let query_timeout = query_request_timeout(corpus.scale);
+    let last_reached = Cell::new(usize::MAX);
+    let last_log_at = Cell::new(Instant::now());
+    let poll_result = poll_until(
+        completeness_poll_timeout(corpus.scale),
         COMPLETENESS_POLL_INTERVAL,
-        || fetch_completeness_attempt(ctx, corpus, stores),
+        || async {
+            let reached = fetch_completeness_attempt(ctx, corpus, stores, query_timeout).await?;
+            // Rate-limited joint progress (issue #106): the "still filling"
+            // path was silent every poll. `reached` is the leading prefix
+            // complete on every covered store (interleaved short-circuit,
+            // kept cheap — the on-timeout diagnostic does the full per-store
+            // scan once).
+            let now = Instant::now();
+            if last_reached.get() != reached
+                || now.duration_since(last_log_at.get()) >= COMPLETENESS_PROGRESS_LOG_INTERVAL
+            {
+                println!(
+                    "pulsus-e2e:   traces fetch completeness: reached {reached}/{total} \
+                     (traces complete on {stores:?}, up to the first gap)"
+                );
+                last_reached.set(reached);
+                last_log_at.set(now);
+            }
+            Ok((reached == total).then_some(()))
+        },
     )
-    .await
-    .with_context(|| {
-        format!(
-            "run {:?} never reached trace-by-ID completeness ({} traces) on {stores:?}",
-            corpus.run_id,
-            corpus.traces.len()
+    .await;
+    match poll_result {
+        Ok(()) => Ok(()),
+        Err(timeout_err) => Err(fetch_completeness_timeout_diagnostic(
+            ctx,
+            corpus,
+            stores,
+            query_timeout,
+            timeout_err.context(format!(
+                "run {:?} never reached trace-by-ID completeness ({total} traces) on {stores:?}",
+                corpus.run_id,
+            )),
         )
-    })?;
-    Ok(())
+        .await),
+    }
 }
 
+/// One cheap completeness attempt: the count of leading traces present
+/// with the expected span count on EVERY covered store (interleaved
+/// short-circuit — stops at the first gap on either store). A cheap
+/// progress proxy that never fans an all-traces scan out per poll; the
+/// on-timeout diagnostic does the full per-store scan once.
 async fn fetch_completeness_attempt(
     ctx: &Ctx,
     corpus: &TraceCorpus,
     stores: Stores,
-) -> Result<Option<()>> {
+    query_timeout: Duration,
+) -> Result<usize> {
+    let mut reached = 0usize;
     for trace in &corpus.traces {
         let trace_hex = hex(&trace.trace_id);
-        let expected = trace.spans.len();
-        let Some(body) = fetch_pulsus_trace(ctx, &trace_hex).await? else {
-            return Ok(None);
+        let Some(body) = fetch_pulsus_trace(ctx, &trace_hex, query_timeout).await? else {
+            break;
         };
-        if each_span(&body).count() != expected {
-            return Ok(None);
+        if each_span(&body).count() != trace.spans.len() {
+            break;
         }
-        if stores == Stores::PulsusAndTempo {
-            let Some(body) = fetch_tempo_trace(ctx, &trace_hex).await? else {
-                return Ok(None);
+        if stores.covers_tempo() {
+            let Some(body) = fetch_tempo_trace(ctx, &trace_hex, query_timeout).await? else {
+                break;
             };
-            if each_span(&body).count() != expected {
-                return Ok(None);
+            if each_span(&body).count() != trace.spans.len() {
+                break;
             }
         }
+        reached += 1;
     }
-    Ok(Some(()))
+    Ok(reached)
+}
+
+/// On the trace-by-ID completeness timeout (issue #106): full per-store
+/// scan recording, for each covered store, how many traces are present
+/// with the right span count and which are missing / short — the artifact
+/// CI needs to tell a visibility bug from budget.
+async fn fetch_completeness_timeout_diagnostic(
+    ctx: &Ctx,
+    corpus: &TraceCorpus,
+    stores: Stores,
+    query_timeout: Duration,
+    timeout_err: anyhow::Error,
+) -> anyhow::Error {
+    let mut store_reports = serde_json::Map::new();
+    store_reports.insert(
+        "pulsusdb".to_string(),
+        fetch_store_report(ctx, corpus, false, query_timeout).await,
+    );
+    if stores.covers_tempo() {
+        store_reports.insert(
+            "tempo".to_string(),
+            fetch_store_report(ctx, corpus, true, query_timeout).await,
+        );
+    }
+    let artifact = serde_json::json!({
+        "surface": "traces_fetch_completeness",
+        "kind": "completeness_timeout",
+        "run_id": corpus.run_id,
+        "expected_traces": corpus.traces.len(),
+        "stores": store_reports,
+    });
+    match write_artifact(ctx, ARTIFACT_AREA, "fetch-completeness-timeout", &artifact) {
+        Ok(path) => timeout_err.context(format!(
+            "trace-by-ID completeness timed out; per-store present/missing/short scan written to {}",
+            path.display()
+        )),
+        Err(werr) => timeout_err.context(format!(
+            "trace-by-ID completeness timed out; ALSO failed to write the diagnostic: {werr:#}"
+        )),
+    }
+}
+
+async fn fetch_store_report(
+    ctx: &Ctx,
+    corpus: &TraceCorpus,
+    tempo: bool,
+    query_timeout: Duration,
+) -> serde_json::Value {
+    let mut present = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    let mut short: Vec<serde_json::Value> = Vec::new();
+    for trace in &corpus.traces {
+        let trace_hex = hex(&trace.trace_id);
+        let expected_ids = corpus.expected_span_ids(&trace_hex).unwrap_or_default();
+        let fetched = if tempo {
+            fetch_tempo_trace(ctx, &trace_hex, query_timeout).await
+        } else {
+            fetch_pulsus_trace(ctx, &trace_hex, query_timeout).await
+        };
+        match fetched {
+            Ok(Some(body)) => match fetch_span_ids(&body) {
+                Ok(actual_ids) => {
+                    if actual_ids == expected_ids {
+                        present += 1;
+                    } else {
+                        // Set-diff granularity (issue #106): the missing/extra
+                        // span-ID sets distinguish a systematically dropped span
+                        // from generic lag, matching the logs gate's set-diff.
+                        let diff = span_id_set_diff(&expected_ids, &actual_ids);
+                        short.push(serde_json::json!({
+                            "trace_id": trace_hex,
+                            "expected_spans": expected_ids.len(),
+                            "got_spans": actual_ids.len(),
+                            "missing_span_ids": diff.missing,
+                            "extra_span_ids": diff.extra,
+                        }));
+                    }
+                }
+                Err(err) => missing.push(format!("{trace_hex} (span parse error: {err:#})")),
+            },
+            Ok(None) => missing.push(trace_hex),
+            Err(err) => missing.push(format!("{trace_hex} (fetch error: {err:#})")),
+        }
+    }
+    serde_json::json!({
+        "present_count": present,
+        "missing_count": missing.len(),
+        "short_span_count": short.len(),
+        "missing": missing,
+        "short_span": short,
+    })
 }
 
 /// Polls until the run-scoped search (`{ resource.run_id = "R" }`)
@@ -628,32 +829,147 @@ async fn wait_for_search_completeness(
 ) -> Result<()> {
     let q = run_scope_query(&corpus.run_id);
     let all = corpus.trace_id_hexes();
-    poll_until(
-        COMPLETENESS_POLL_TIMEOUT,
+    let total = all.len();
+    let query_timeout = query_request_timeout(corpus.scale);
+    let progress = Cell::new((usize::MAX, usize::MAX));
+    let last_log_at = Cell::new(Instant::now());
+    let poll_result = poll_until(
+        completeness_poll_timeout(corpus.scale),
         COMPLETENESS_POLL_INTERVAL,
         || async {
-            let body = search_pulsus(ctx, &q, window, limit).await?;
-            if search_trace_ids(&body)? != all {
-                return Ok(None);
+            let pulsus_ids =
+                search_trace_ids(&search_pulsus(ctx, &q, window, limit, query_timeout).await?)?;
+            let pulsus_matched = pulsus_ids.intersection(&all).count();
+            let pulsus_complete = pulsus_ids == all;
+            // Short-circuit (issue #106): don't query Tempo every tick during
+            // the saturated "still filling" phase — that doubles load on the
+            // single node this fix exists to relieve. Only consult the oracle
+            // once PulsusDB has already converged; the on-timeout diagnostic
+            // re-queries both stores once for the artifact.
+            let mut tempo_matched = None;
+            let mut complete = pulsus_complete;
+            if pulsus_complete && stores.covers_tempo() {
+                let tempo_ids =
+                    search_trace_ids(&search_tempo(ctx, &q, window, limit, query_timeout).await?)?;
+                tempo_matched = Some(tempo_ids.intersection(&all).count());
+                complete = tempo_ids == all;
             }
-            if stores == Stores::PulsusAndTempo {
-                let body = search_tempo(ctx, &q, window, limit).await?;
-                if search_trace_ids(&body)? != all {
-                    return Ok(None);
-                }
-            }
-            Ok(Some(()))
+            log_trace_completeness_progress(
+                &progress,
+                &last_log_at,
+                "traces search",
+                total,
+                pulsus_matched,
+                tempo_matched,
+            );
+            Ok(complete.then_some(()))
         },
     )
-    .await
-    .with_context(|| {
-        format!(
-            "run {:?} never reached search completeness ({} traces) on {stores:?}",
-            corpus.run_id,
-            corpus.traces.len()
+    .await;
+    match poll_result {
+        Ok(()) => Ok(()),
+        Err(timeout_err) => Err(search_completeness_timeout_diagnostic(
+            ctx,
+            corpus,
+            &SearchProbe {
+                q: &q,
+                window,
+                limit,
+                stores,
+                query_timeout,
+            },
+            &all,
+            timeout_err.context(format!(
+                "run {:?} never reached search completeness ({total} traces) on {stores:?}",
+                corpus.run_id,
+            )),
         )
-    })?;
-    Ok(())
+        .await),
+    }
+}
+
+/// The run-scoped search probe re-run on a search-completeness timeout —
+/// bundled so the diagnostic fn stays within clippy's argument threshold.
+struct SearchProbe<'a> {
+    q: &'a str,
+    window: SearchWindow,
+    limit: u32,
+    stores: Stores,
+    query_timeout: Duration,
+}
+
+/// On the search completeness timeout (issue #106): re-query each covered
+/// store once and record its trace-id count plus the missing/extra
+/// symmetric difference vs the corpus set — the set-parity analog of the
+/// logs completeness diagnostic.
+async fn search_completeness_timeout_diagnostic(
+    ctx: &Ctx,
+    corpus: &TraceCorpus,
+    probe: &SearchProbe<'_>,
+    all: &BTreeSet<String>,
+    timeout_err: anyhow::Error,
+) -> anyhow::Error {
+    let SearchProbe {
+        q,
+        window,
+        limit,
+        stores,
+        query_timeout,
+    } = *probe;
+    let mut store_reports = serde_json::Map::new();
+    store_reports.insert(
+        "pulsusdb".to_string(),
+        search_store_report(
+            search_pulsus(ctx, q, window, limit, query_timeout).await,
+            all,
+        ),
+    );
+    if stores.covers_tempo() {
+        store_reports.insert(
+            "tempo".to_string(),
+            search_store_report(
+                search_tempo(ctx, q, window, limit, query_timeout).await,
+                all,
+            ),
+        );
+    }
+    let artifact = serde_json::json!({
+        "surface": "traces_search_completeness",
+        "kind": "completeness_timeout",
+        "run_id": corpus.run_id,
+        "query": q,
+        "expected_traces": all.len(),
+        "stores": store_reports,
+    });
+    match write_artifact(ctx, ARTIFACT_AREA, "search-completeness-timeout", &artifact) {
+        Ok(path) => timeout_err.context(format!(
+            "search completeness timed out; per-store counts + missing/extra trace ids written to {}",
+            path.display()
+        )),
+        Err(werr) => timeout_err.context(format!(
+            "search completeness timed out; ALSO failed to write the diagnostic: {werr:#}"
+        )),
+    }
+}
+
+fn search_store_report(
+    body: Result<serde_json::Value>,
+    all: &BTreeSet<String>,
+) -> serde_json::Value {
+    let ids = match body.and_then(|b| search_trace_ids(&b)) {
+        Ok(ids) => ids,
+        Err(err) => return serde_json::json!({ "error": format!("search failed: {err:#}") }),
+    };
+    let missing: Vec<&String> = all.difference(&ids).collect();
+    let extra: Vec<&String> = ids.difference(all).collect();
+    serde_json::json!({
+        "returned_count": ids.len(),
+        "matched": ids.intersection(all).count(),
+        "missing_count": missing.len(),
+        "extra_count": extra.len(),
+        "missing": missing,
+        "extra": extra,
+    })
 }
 
 fn run_scope_query(run_id: &str) -> String {
@@ -683,6 +999,7 @@ fn informational_result(delta: Option<&str>) -> Result<()> {
 pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
     let fixture = load_fixture(ctx)?;
     let scale = resolve_scale()?;
+    let query_timeout = query_request_timeout(scale);
     let corpus = build_corpus(&fixture, scale, "e2e-traces-rt")?;
     let window = search_window(&corpus);
     println!(
@@ -705,7 +1022,7 @@ pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
     // Trace-by-ID: exact span-ID set equality against the corpus.
     for trace in &corpus.traces {
         let trace_hex = hex(&trace.trace_id);
-        let body = fetch_pulsus_trace(ctx, &trace_hex)
+        let body = fetch_pulsus_trace(ctx, &trace_hex, query_timeout)
             .await?
             .with_context(|| format!("trace {trace_hex} vanished after completeness"))?;
         let actual = fetch_span_ids(&body)?;
@@ -724,7 +1041,14 @@ pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
         .context("traces corpus never became searchable")?;
 
     // Search: the run-scoped query returns exactly the corpus, complete.
-    let body = search_pulsus(ctx, &run_scope_query(&corpus.run_id), window, fixture.limit).await?;
+    let body = search_pulsus(
+        ctx,
+        &run_scope_query(&corpus.run_id),
+        window,
+        fixture.limit,
+        query_timeout,
+    )
+    .await?;
     if pulsus_search_is_partial(&body)? {
         bail!("run-scoped search reported metrics.partial=true: {body}");
     }
@@ -736,7 +1060,7 @@ pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
         );
     }
 
-    assert_tags_roundtrip(ctx).await?;
+    assert_tags_roundtrip(ctx, query_timeout).await?;
     assert_metrics_roundtrip(ctx, &corpus, window).await?;
 
     if ctx.variant == Variant::Cluster {
@@ -748,11 +1072,11 @@ pub async fn traces_roundtrip(ctx: &Ctx) -> Result<()> {
 /// Tags/tag-values (docs/api.md §4.3): the catalog is global and
 /// time-less, so this asserts *containment* of the corpus's known
 /// keys/values, never set equality.
-async fn assert_tags_roundtrip(ctx: &Ctx) -> Result<()> {
+async fn assert_tags_roundtrip(ctx: &Ctx, query_timeout: Duration) -> Result<()> {
     let res = ctx
         .http
         .get(ctx.url("/api/traces/v1/tags"))
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET /api/traces/v1/tags failed")?;
@@ -788,7 +1112,7 @@ async fn assert_tags_roundtrip(ctx: &Ctx) -> Result<()> {
     let res = ctx
         .http
         .get(ctx.url("/api/traces/v1/tag/resource.region/values"))
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET tag values failed")?;
@@ -823,6 +1147,7 @@ async fn assert_metrics_roundtrip(
     let start = window.start_s.to_string();
     let end = window.end_s.to_string();
     let expected = corpus.total_spans() as f64;
+    let query_timeout = query_request_timeout(corpus.scale);
 
     let res = ctx
         .http
@@ -833,7 +1158,7 @@ async fn assert_metrics_roundtrip(
             ("end", end.as_str()),
             ("step", "60s"),
         ])
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET metrics/query_range failed")?;
@@ -868,7 +1193,7 @@ async fn assert_metrics_roundtrip(
             ("start", start.as_str()),
             ("end", end.as_str()),
         ])
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .context("GET metrics/query failed")?;
@@ -917,7 +1242,7 @@ async fn assert_shard_local_span_counts(ctx: &Ctx, corpus: &TraceCorpus) -> Resu
     let sql = scoped_span_count_sql(corpus);
     let compose = ctx.compose.clone();
     poll_until(
-        COMPLETENESS_POLL_TIMEOUT,
+        completeness_poll_timeout(corpus.scale),
         COMPLETENESS_POLL_INTERVAL,
         move || {
             let compose = compose.clone();
@@ -1024,16 +1349,17 @@ pub async fn traces_differential(ctx: &Ctx) -> Result<()> {
 async fn assert_trace_by_id_gate(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
     let mut structural_deltas: Vec<String> = Vec::new();
     let mut structural_bodies: Vec<serde_json::Value> = Vec::new();
+    let query_timeout = query_request_timeout(corpus.scale);
 
     for trace in &corpus.traces {
         let trace_hex = hex(&trace.trace_id);
         let expected = corpus
             .expected_span_ids(&trace_hex)
             .context("corpus is missing its own trace")?;
-        let pulsus_body = fetch_pulsus_trace(ctx, &trace_hex)
+        let pulsus_body = fetch_pulsus_trace(ctx, &trace_hex, query_timeout)
             .await?
             .with_context(|| format!("pulsus lost trace {trace_hex} after completeness"))?;
-        let tempo_body = fetch_tempo_trace(ctx, &trace_hex)
+        let tempo_body = fetch_tempo_trace(ctx, &trace_hex, query_timeout)
             .await?
             .with_context(|| format!("tempo lost trace {trace_hex} after completeness"))?;
 
@@ -1113,6 +1439,7 @@ async fn run_search_case(
     let q = case.q.replace("{R}", &corpus.run_id);
     let expected = corpus.expected_case_trace_ids(&case.case_id);
     let gated = case.mode == "gated";
+    let query_timeout = query_request_timeout(corpus.scale);
     println!(
         "pulsus-e2e:     case {:?} [{}] — {} ({}): {} expected trace(s)",
         case.case_id,
@@ -1123,14 +1450,14 @@ async fn run_search_case(
     );
 
     // One elapsed line per case (issue #92, the metrics-differential
-    // precedent): budget breaches against `QUERY_REQUEST_TIMEOUT` stay
-    // diagnosable from CI logs alone. Elapsed only — these helpers
+    // precedent): budget breaches against the tier-aware query timeout
+    // stay diagnosable from CI logs alone. Elapsed only — these helpers
     // return parsed JSON, so no raw byte count is in hand.
     let pulsus_started = std::time::Instant::now();
-    let pulsus_body = search_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_body = search_pulsus(ctx, &q, window, fixture.limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let tempo_started = std::time::Instant::now();
-    let tempo_body = search_tempo(ctx, &q, window, fixture.limit).await?;
+    let tempo_body = search_tempo(ctx, &q, window, fixture.limit, query_timeout).await?;
     let tempo_elapsed = tempo_started.elapsed();
     println!(
         "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms tempo {}ms",
@@ -1413,11 +1740,17 @@ async fn run_informational_comparisons(
 ) -> Result<()> {
     let mut deltas: Vec<String> = Vec::new();
     let mut sections: Vec<serde_json::Value> = Vec::new();
+    let query_timeout = query_request_timeout(corpus.scale);
 
     // Tags: our scoped shape vs Tempo's `/api/search/tags` (structurally
     // divergent by design — scope/intrinsic handling differs).
-    let pulsus_tags = get_json(ctx, &ctx.url("/api/traces/v1/tags")).await;
-    let tempo_tags = get_json(ctx, &format!("{}/api/search/tags", ctx.tempo_url)).await;
+    let pulsus_tags = get_json(ctx, &ctx.url("/api/traces/v1/tags"), query_timeout).await;
+    let tempo_tags = get_json(
+        ctx,
+        &format!("{}/api/search/tags", ctx.tempo_url),
+        query_timeout,
+    )
+    .await;
     match (&pulsus_tags, &tempo_tags) {
         (Ok(p), Ok(t)) => {
             let ours: BTreeSet<String> = p["scopes"]
@@ -1469,12 +1802,18 @@ async fn run_informational_comparisons(
             ("end", window.end_s.to_string()),
             ("step", "60s".to_string()),
         ];
-        let pulsus =
-            get_json_with(ctx, &ctx.url("/api/traces/v1/metrics/query_range"), &params).await;
+        let pulsus = get_json_with(
+            ctx,
+            &ctx.url("/api/traces/v1/metrics/query_range"),
+            &params,
+            query_timeout,
+        )
+        .await;
         let tempo = get_json_with(
             ctx,
             &format!("{}/api/metrics/query_range", ctx.tempo_url),
             &params,
+            query_timeout,
         )
         .await;
         let mut delta_json = serde_json::Value::Null;
@@ -1516,11 +1855,11 @@ async fn run_informational_comparisons(
     )))
 }
 
-async fn get_json(ctx: &Ctx, url: &str) -> Result<serde_json::Value> {
+async fn get_json(ctx: &Ctx, url: &str, query_timeout: Duration) -> Result<serde_json::Value> {
     let res = ctx
         .http
         .get(url)
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -1536,12 +1875,13 @@ async fn get_json_with(
     ctx: &Ctx,
     url: &str,
     params: &[(&str, String)],
+    query_timeout: Duration,
 ) -> Result<serde_json::Value> {
     let res = ctx
         .http
         .get(url)
         .query(params)
-        .timeout(QUERY_REQUEST_TIMEOUT) // issue #92, see fetch_pulsus_trace
+        .timeout(query_timeout) // issue #92/#106, see fetch_pulsus_trace
         .send()
         .await
         .with_context(|| format!("GET {url} failed"))?;
@@ -1761,6 +2101,26 @@ mod tests {
             fetch_span_ids(&pulsus).unwrap(),
             fetch_span_ids(&tempo).unwrap()
         );
+    }
+
+    /// Issue #106: the fetch-completeness diagnostic's core reports the
+    /// exact missing/extra span-id sets from a partial store result — so a
+    /// systematically dropped span is distinguishable from generic lag in
+    /// the artifact CI reads when the nightly next fails.
+    #[test]
+    fn span_id_set_diff_reports_missing_and_extra() {
+        let expected: BTreeSet<String> = ["aa", "bb", "cc"].into_iter().map(String::from).collect();
+
+        // Store dropped "cc" and carries an unexpected "zz".
+        let actual: BTreeSet<String> = ["aa", "bb", "zz"].into_iter().map(String::from).collect();
+        let diff = span_id_set_diff(&expected, &actual);
+        assert_eq!(diff.missing, vec!["cc".to_string()]);
+        assert_eq!(diff.extra, vec!["zz".to_string()]);
+
+        // Fully converged: no shortfall either way.
+        let same = span_id_set_diff(&expected, &expected);
+        assert!(same.missing.is_empty());
+        assert!(same.extra.is_empty());
     }
 
     #[test]

@@ -56,7 +56,7 @@ use prost::Message;
 use serde::Deserialize;
 
 use crate::corpus::{self, Corpus, CorpusSpec, FamilyCounts, Scale};
-use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
+use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until, query_request_timeout};
 use crate::scenarios::{Ctx, Variant};
 
 const FIXTURE_PATH: &str = "metrics/differential.json";
@@ -256,7 +256,7 @@ pub async fn metrics_differential(ctx: &Ctx) -> Result<()> {
     run_query_matrix(ctx, &corpus, &fixture).await?;
     assert_info_enrichment(ctx, &corpus).await?;
     assert_label_resolution(ctx, &corpus).await?;
-    stalenan_micro_case(ctx).await?;
+    stalenan_micro_case(ctx, scale).await?;
 
     Ok(())
 }
@@ -494,11 +494,15 @@ async fn run_query_matrix(ctx: &Ctx, corpus: &Corpus, fixture: &DifferentialFixt
         end_ms: corpus.last_ts_ms,
         step_ms: corpus.step_ms,
     };
+    // Tier-aware per-request budget (issue #106): the full-tier matrix
+    // includes the heavy `count_values` range that hit the strict 60s
+    // client timeout under single-node saturation.
+    let query_timeout = query_request_timeout(corpus.scale);
     for raw in &fixture.query_matrix {
         let expr = raw.expr.replace("{R}", &corpus.run_id);
         for mode_raw in &raw.modes {
             let mode = parse_mode(mode_raw)?;
-            compare_query(ctx, "mismatch", &expr, mode, window)
+            compare_query(ctx, "mismatch", &expr, mode, window, query_timeout)
                 .await
                 .with_context(|| format!("query {expr:?} ({mode:?})"))?;
         }
@@ -574,15 +578,18 @@ async fn query_get_raw(
     base_url: &str,
     path: &str,
     params: &[(&str, &str)],
+    query_timeout: Duration,
 ) -> Result<String> {
     let res = http
         .get(format!("{base_url}{path}"))
         .query(params)
         // Issue #92: a *request*-level timeout replaces the shared
         // client's 5s readiness budget for this request (reqwest
-        // semantics) — matrix queries get a realistic 60s ceiling
-        // instead of failing mid-body on a slow shared CI runner.
-        .timeout(QUERY_REQUEST_TIMEOUT)
+        // semantics). Tier-aware (issue #106): the query matrix passes the
+        // full-tier 120s budget so a heavy `count_values` range over ~10k
+        // series does not abort mid-body on the saturated single-node
+        // runner; light instant queries keep the strict 60s ceiling.
+        .timeout(query_timeout)
         .send()
         .await
         .with_context(|| format!("GET {base_url}{path} failed"))?;
@@ -600,7 +607,11 @@ async fn query_get(
     path: &str,
     params: &[(&str, &str)],
 ) -> Result<serde_json::Value> {
-    let raw = query_get_raw(http, base_url, path, params).await?;
+    // These are light instant queries (completeness manifest counts,
+    // discovery endpoints, info enrichment) — kept on the strict 60s
+    // budget; only the heavy `compare_query` matrix path is tier-relaxed
+    // (issue #106).
+    let raw = query_get_raw(http, base_url, path, params, QUERY_REQUEST_TIMEOUT).await?;
     serde_json::from_str(&raw)
         .with_context(|| format!("GET {base_url}{path} body was not JSON: {raw}"))
 }
@@ -617,6 +628,7 @@ async fn compare_query(
     expr: &str,
     mode: Mode,
     window: QueryWindow,
+    query_timeout: Duration,
 ) -> Result<()> {
     // Owned strings throughout (not `&str` borrows of a match arm's own
     // locals): the params vec must outlive both awaited requests below,
@@ -658,10 +670,18 @@ async fn compare_query(
     // re-extracted byte-exact ([`extract_raw_timestamps`]) rather than
     // only through `serde_json`'s lossy `f64` number representation.
     let pulsus_started = std::time::Instant::now();
-    let pulsus_raw = query_get_raw(&ctx.http, &ctx.base_url, path, &params_ref).await?;
+    let pulsus_raw =
+        query_get_raw(&ctx.http, &ctx.base_url, path, &params_ref, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
     let prom_started = std::time::Instant::now();
-    let prom_raw = query_get_raw(&ctx.http, &ctx.prometheus_url, path, &params_ref).await?;
+    let prom_raw = query_get_raw(
+        &ctx.http,
+        &ctx.prometheus_url,
+        path,
+        &params_ref,
+        query_timeout,
+    )
+    .await?;
     let prom_elapsed = prom_started.elapsed();
     // One elapsed line per matrix entry (issue #92): the nightly's only
     // per-query diagnostic. A future budget breach (or creeping slowdown
@@ -1433,7 +1453,8 @@ async fn post_remote_write(http: &reqwest::Client, base_url: &str, body: Vec<u8>
 /// (dropped from every query surface, per `pulsus-promql::eval::staleness`
 /// — the same behavior real Prometheus's storage layer implements), a
 /// representation OTLP itself cannot carry.
-async fn stalenan_micro_case(ctx: &Ctx) -> Result<()> {
+async fn stalenan_micro_case(ctx: &Ctx, scale: Scale) -> Result<()> {
+    let query_timeout = query_request_timeout(scale);
     let run_id = format!("e2e-metrics-stalenan-{:x}", unique_id()?);
     let now_ms = now_unix_millis()?;
     let step_ms: i64 = 15_000;
@@ -1471,9 +1492,16 @@ async fn stalenan_micro_case(ctx: &Ctx) -> Result<()> {
         end_ms: marker_ts,
         step_ms,
     };
-    compare_query(ctx, "stalenan", &expr, Mode::Instant, instant_window)
-        .await
-        .context("StaleNaN micro-case: instant query at the marker timestamp")?;
+    compare_query(
+        ctx,
+        "stalenan",
+        &expr,
+        Mode::Instant,
+        instant_window,
+        query_timeout,
+    )
+    .await
+    .context("StaleNaN micro-case: instant query at the marker timestamp")?;
 
     let range_window = QueryWindow {
         eval_ms: marker_ts,
@@ -1481,9 +1509,16 @@ async fn stalenan_micro_case(ctx: &Ctx) -> Result<()> {
         end_ms: marker_ts + step_ms,
         step_ms,
     };
-    compare_query(ctx, "stalenan", &expr, Mode::Range, range_window)
-        .await
-        .context("StaleNaN micro-case: range query spanning the marker timestamp")?;
+    compare_query(
+        ctx,
+        "stalenan",
+        &expr,
+        Mode::Range,
+        range_window,
+        query_timeout,
+    )
+    .await
+    .context("StaleNaN micro-case: range query spanning the marker timestamp")?;
 
     Ok(())
 }
@@ -1543,9 +1578,15 @@ mod tests {
 
         // Fixed path: `query_get_raw`'s per-request timeout wins and the
         // full body arrives intact.
-        let body = query_get_raw(&http, &base, "/api/v1/query", &[("query", "up")])
-            .await
-            .expect("the per-request query timeout should override the client budget");
+        let body = query_get_raw(
+            &http,
+            &base,
+            "/api/v1/query",
+            &[("query", "up")],
+            QUERY_REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("the per-request query timeout should override the client budget");
         assert_eq!(body, "ok");
 
         server.abort();
@@ -1608,9 +1649,16 @@ mod tests {
             end_ms: 0,
             step_ms: 0,
         };
-        compare_query(&ctx, "mismatch", "up", Mode::Instant, window)
-            .await
-            .expect("byte-identical stub responses must compare equal");
+        compare_query(
+            &ctx,
+            "mismatch",
+            "up",
+            Mode::Instant,
+            window,
+            QUERY_REQUEST_TIMEOUT,
+        )
+        .await
+        .expect("byte-identical stub responses must compare equal");
     }
 
     /// Issue #33 code review, [medium]: a per-metric-family compensating
