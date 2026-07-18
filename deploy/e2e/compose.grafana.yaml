@@ -1,0 +1,119 @@
+# Local-only Grafana exploration stack: layers on top of the base
+# `docker-compose.yaml` + `deploy/e2e/compose.single.yaml` (which already
+# builds `pulsusdb` from source and provisions a `grafana` service with a
+# Loki-compat datasource). This overlay adds the Tempo-compat and native
+# Prometheus datasources (`deploy/e2e/grafana/provisioning/datasources/
+# {tempo,prometheus}.yaml`) plus a synthetic-traffic load generator
+# (`firehose`, vendored under `deploy/e2e/firehose/` from the
+# `terraform-google-monitoring` repo's `traffic-gen/loaders/firehose` —
+# copied, not a submodule, so this overlay has no external checkout
+# dependency) so all three signals have real data to browse in Grafana.
+#
+# NOT wired into `cargo run -p pulsus-e2e` / CI: this is a manual local
+# demo stack, not a pinned, scenario-asserted fixture like the rest of
+# this directory's compose files.
+#
+# `PULSUS_E2E_ROOT` must be exported first (compose.single.yaml's own
+# convention, normally set by the `pulsus-e2e` harness — this overlay is
+# driven by hand instead, so it isn't set for you): both `pulsusdb`'s and
+# `firehose`'s `build.context` resolve to it, and an unset/empty value
+# fails compose's `config` step with "please specify build context".
+#
+# `pulsusdb:e2e` is never published, so a plain `up -d` tries to pull it
+# and fails ("pull access denied") — pass `--build` (firehose forces its
+# own build via `pull_policy: build` below, so it doesn't need the flag,
+# but passing it for both is simplest).
+#
+# `WINDOW_START` must also be exported, to the current time (RFC3339) —
+# see `firehose`'s `WINDOW_START` comment below for why. `make grafana-up`
+# (repo-root Makefile) sets both env vars for you; that's the recommended
+# way to bring this stack up. Driven by hand:
+#
+#   export PULSUS_E2E_ROOT=/path/to/pulsusdb   # this repo's root
+#   export WINDOW_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+#   podman-compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -f deploy/e2e/compose.grafana.yaml -p pulsus-e2e-grafana up -d --build
+#   # or: docker compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -f deploy/e2e/compose.grafana.yaml -p pulsus-e2e-grafana up -d --build
+#
+# Grafana: http://127.0.0.1:3000 (anonymous Editor, per compose.single.yaml)
+# Tear down: swap `up -d` for `down -v` in the command above.
+
+services:
+  firehose:
+    build:
+      context: ${PULSUS_E2E_ROOT}/deploy/e2e/firehose
+    image: pulsusdb-firehose:e2e
+    # No such image was ever published — `docker compose up` defaults to
+    # pulling when both `build` and `image` are set and the image tag
+    # isn't already present locally, which fails against this
+    # never-published tag ("pull access denied"). `pull_policy: build`
+    # forces the local build every time, same fix `pulsusdb`'s own
+    # `pulsusdb:e2e` tag needs (compose.single.yaml relies on a `--build`
+    # invocation instead; pinning it here means a plain `up -d` works).
+    pull_policy: build
+    environment:
+      # otel-collector's OTLP/gRPC receiver, same static-IP/no-DNS
+      # convention as every other service on this network
+      # (deploy/e2e/compose.single.yaml's `otel-collector`, 172.29.0.12).
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://172.29.0.12:4317"
+      OTEL_EXPORTER_OTLP_INSECURE: "true"
+      OTEL_SERVICE_NAME: "firehose"
+      # Scaled down from firehose's production-envelope defaults (600
+      # hosts / 30 APM hosts / 6000 containers / 6100 custom series) to a
+      # size a laptop-local single-node stack can comfortably ingest and
+      # a person can browse in Grafana without the fleet/catalog drowning
+      # out individual series.
+      HOSTS: "20"
+      APM_HOSTS: "5"
+      CONTAINERS: "50"
+      CUSTOM_METRIC_SERIES: "100"
+      METRIC_INTERVAL_SEC: "15"
+      SPANS_PER_TRACE: "5"
+      # LOGS_PER_MONTH/SPANS_PER_MONTH are absolute fleet-wide totals, not
+      # per-host — firehose's defaults (3.2e9 / 6.9e8) are sized for the
+      # 600-host production envelope. Left at their defaults against this
+      # 20-host demo fleet, the per-second rate (total / period) is the
+      # same regardless of fleet size, so the scaled-down fleet was still
+      # asked to emit production volume — the otel-collector's "sending
+      # queue is full" / pulsusdb backpressure seen during testing.
+      # Scaled by the same ~1/30 factor as HOSTS (20 vs. the 600 default).
+      LOGS_PER_MONTH: "1.07e8"
+      SPANS_PER_MONTH: "2.3e7"
+      # Real-time pace, no time compression (firehose/profile.go:
+      # "Speedup=1 emits at the true production pace") — this demo ships
+      # current data, not a replayed backdated month.
+      SPEEDUP: "1"
+      # Pins firehose's simulated window to "now" (RFC3339, computed by
+      # `make grafana-up` at invocation time — see Makefile) rather than
+      # its default `now - MONTH_DAYS` at container-start time. Without
+      # this, firehose *always* backdates its starting timestamp by a
+      # full month regardless of SPEEDUP (SPEEDUP only changes how fast
+      # the sim clock advances *from* that backdated point, never removes
+      # the initial backdate) — every log/span/datapoint would arrive
+      # timestamped ~30 (simulated) days in the past until the sim clock
+      # caught up, which also risks landing outside `pulsusdb`'s
+      # `PULSUS_RETENTION_DAYS: 7` (root docker-compose.yaml).
+      WINDOW_START: "${WINDOW_START:?run via \\`make grafana-up\\`, which sets this to the current time}"
+      # Uncapped by default; set to bound the demo's ClickHouse disk
+      # usage on a long-running local stack, e.g. MAX_LOG_BYTES=500MB.
+      MAX_LOG_BYTES: ""
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.17
+    depends_on: [ otel-collector ]
+    # Self-observability metrics (firehose/main.go's `METRICS_ADDR`,
+    # default `:2112`) — published for ad-hoc `curl` during a local run;
+    # not scraped by anything in this stack.
+    ports: [ "2112:2112" ]
+
+  # Overrides compose.single.yaml's config mount with
+  # otel-config.grafana.yaml (raises the `otlp` receiver's gRPC
+  # max-recv-message-size to 16MiB — firehose's metric exporter sends one
+  # full-catalog batch per export tick, and even this demo's scaled-down
+  # fleet/catalog size (`firehose`'s env above) exceeds gRPC's 4MiB
+  # default on its own). A dedicated file, not an edit to otel-config.single.yaml,
+  # because that file is shared with CI's pinned differential scenarios
+  # and this overlay must not change collector behavior for the
+  # harness's own compose stack.
+  otel-collector:
+    volumes:
+      - ${PULSUS_E2E_ROOT}/deploy/e2e/otel-config.grafana.yaml:/etc/otelcol-contrib/config.yaml:ro

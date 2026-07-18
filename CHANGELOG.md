@@ -34,3 +34,15 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   tags, gated on an already-exists preflight guard and a digest-verified
   `helm pull` round trip.
 - `CHANGELOG.md` (this file).
+- Local-only Grafana demo stack (`make grafana-up`/`grafana-down`/
+  `grafana-logs`): a `deploy/e2e/compose.grafana.yaml` overlay on the
+  existing single-node e2e fixture adding Tempo-compat and native
+  Prometheus Grafana datasources against pulsusdb (alongside the existing
+  Loki-compat one), a vendored copy of the `firehose` synthetic
+  logs/metrics/traces generator (`deploy/e2e/firehose/`, real-time
+  `SPEEDUP=1` against a scaled-down 20-host fleet), a dedicated
+  otel-collector config (`deploy/e2e/otel-config.grafana.yaml`, kept
+  separate from the CI-shared `otel-config.single.yaml`), and a
+  provisioned dashboard (`deploy/e2e/grafana/provisioning/dashboards/`)
+  covering log rate/stream, host/region metrics, and a Tempo traces
+  panel. Not wired into CI or the `pulsus-e2e` harness.
