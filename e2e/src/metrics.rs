@@ -56,7 +56,9 @@ use prost::Message;
 use serde::Deserialize;
 
 use crate::corpus::{self, Corpus, CorpusSpec, FamilyCounts, Scale};
-use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until, query_request_timeout};
+use crate::harness::{
+    QUERY_REQUEST_TIMEOUT, classify_push_send, poll_until, query_request_timeout,
+};
 use crate::scenarios::{Ctx, Variant};
 
 const FIXTURE_PATH: &str = "metrics/differential.json";
@@ -265,21 +267,23 @@ pub async fn metrics_differential(ctx: &Ctx) -> Result<()> {
 // Corpus push (through the collector)
 // ---------------------------------------------------------------------
 
-/// One `POST {collector_url}/v1/metrics` attempt — same transport-failure-
-/// tolerant shape as `scenarios::post_otlp_logs` (issue #15 precedent):
-/// `Ok(Some(response))` once the request reaches the collector at all,
-/// `Ok(None)` only on a transport-level failure (not yet listening).
+/// One `POST {collector_url}/v1/metrics` attempt — same shape as
+/// `scenarios::post_otlp_logs`, routed through [`classify_push_send`] (issue
+/// #105): `Ok(Some(Ok(response)))` once the request reaches the collector at
+/// all, a connect-phase `Err` retried by [`poll_until`] (not yet listening),
+/// and `Ok(Some(Err(_)))` on a post-connect failure (fail fast — the body
+/// may have been ingested).
 async fn post_otlp_metrics(
     ctx: &Ctx,
     payload: &serde_json::Value,
-) -> Result<Option<reqwest::Response>> {
-    let res = ctx
-        .http
-        .post(format!("{}/v1/metrics", ctx.collector_url))
-        .json(payload)
-        .send()
-        .await?;
-    Ok(Some(res))
+) -> Result<Option<Result<reqwest::Response>>> {
+    classify_push_send(
+        ctx.http
+            .post(format!("{}/v1/metrics", ctx.collector_url))
+            .json(payload)
+            .send()
+            .await,
+    )
 }
 
 /// Pushes every per-timestamp OTLP export request in ascending order
@@ -299,7 +303,7 @@ async fn push_corpus(ctx: &Ctx, corpus: &Corpus) -> Result<()> {
         || post_otlp_metrics(ctx, first),
     )
     .await
-    .context("collector otlp/v1/metrics endpoint never accepted a connection")?;
+    .context("collector otlp/v1/metrics endpoint never accepted a connection")??;
     if !res.status().is_success() {
         bail!(
             "collector otlp/v1/metrics export (ts 0) returned {}",
@@ -308,12 +312,18 @@ async fn push_corpus(ctx: &Ctx, corpus: &Corpus) -> Result<()> {
     }
 
     for (i, req) in rest.iter().enumerate() {
-        let res = post_otlp_metrics(ctx, req).await?.with_context(|| {
-            format!(
-                "collector connection dropped while pushing ts index {}",
-                i + 1
-            )
-        })?;
+        // Non-retrying (single `.await`): a connect `Err` propagates, and a
+        // post-connect failure surfaces via the inner `Result` — neither
+        // resends. `classify_push_send` never yields `Ok(None)`.
+        let res = post_otlp_metrics(ctx, req)
+            .await?
+            .expect("classify_push_send never yields Ok(None)")
+            .with_context(|| {
+                format!(
+                    "collector otlp/v1/metrics export (ts index {}) failed",
+                    i + 1
+                )
+            })?;
         if !res.status().is_success() {
             bail!(
                 "collector otlp/v1/metrics export (ts index {}) returned {}",

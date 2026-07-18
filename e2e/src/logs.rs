@@ -35,7 +35,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::{completeness_poll_timeout, poll_until, query_request_timeout};
+use crate::harness::{
+    classify_push_send, completeness_poll_timeout, poll_until, query_request_timeout,
+};
 use crate::logs_corpus::{
     self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
 };
@@ -226,14 +228,14 @@ fn query_window(corpus: &LogCorpus) -> QueryWindow {
 async fn post_otlp_logs(
     ctx: &Ctx,
     payload: &serde_json::Value,
-) -> Result<Option<reqwest::Response>> {
-    let res = ctx
-        .http
-        .post(format!("{}/v1/logs", ctx.collector_url))
-        .json(payload)
-        .send()
-        .await?;
-    Ok(Some(res))
+) -> Result<Option<Result<reqwest::Response>>> {
+    classify_push_send(
+        ctx.http
+            .post(format!("{}/v1/logs", ctx.collector_url))
+            .json(payload)
+            .send()
+            .await,
+    )
 }
 
 async fn push_log_corpus(ctx: &Ctx, corpus: &LogCorpus) -> Result<()> {
@@ -244,7 +246,7 @@ async fn push_log_corpus(ctx: &Ctx, corpus: &LogCorpus) -> Result<()> {
         || post_otlp_logs(ctx, &request),
     )
     .await
-    .context("collector otlp/v1/logs endpoint never accepted a connection")?;
+    .context("collector otlp/v1/logs endpoint never accepted a connection")??;
     if !res.status().is_success() {
         bail!("collector otlp/v1/logs export returned {}", res.status());
     }
@@ -1885,23 +1887,20 @@ pub async fn logs_structured_metadata_differential(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// One `POST {url}` of one Loki JSON push body: `Ok(Some(response))` once the
+/// One `POST {url}` of one Loki JSON push body, routed through
+/// [`classify_push_send`] (issue #105): `Ok(Some(Ok(response)))` once the
 /// request reaches the store at all (any HTTP response — the caller checks
-/// the status), the [`poll_until`]-on-transport-failure shape
-/// [`logs_roundtrip`](crate::scenarios)'s `post_otlp_logs` uses. A transport
-/// `Err` triggers a retry of the identical body; a connect-time failure is
-/// safe (zero bytes reached the server), but a response-read failure *after*
-/// the server ingested the body would double-ingest on retry. That is not
-/// silent: it trips the `raw > distinct` duplicate-delivery validity gate in
-/// [`run_sm_case`] as a loud, diagnosable failure. Retry idempotency across
-/// this and `post_otlp_logs` is tracked as a follow-up.
+/// the status). A connect-phase `Err` triggers a [`poll_until`] retry of the
+/// identical body (safe: zero bytes reached the server), but a post-connect
+/// failure *after* the server may have ingested the body maps to
+/// `Ok(Some(Err(_)))` and fails fast, so the idempotency guard is in place —
+/// the identical body is never resent once the connection was established.
 async fn push_loki_json(
     ctx: &Ctx,
     url: &str,
     body: &serde_json::Value,
-) -> Result<Option<reqwest::Response>> {
-    let res = ctx.http.post(url).json(body).send().await?;
-    Ok(Some(res))
+) -> Result<Option<Result<reqwest::Response>>> {
+    classify_push_send(ctx.http.post(url).json(body).send().await)
 }
 
 /// Fans the SM corpus's per-stream push bodies to BOTH stores' native
@@ -1920,7 +1919,7 @@ async fn push_sm_corpus(ctx: &Ctx, corpus: &logs_sm_corpus::SmCorpus) -> Result<
                 || push_loki_json(ctx, url, body),
             )
             .await
-            .with_context(|| format!("{store} loki push endpoint never accepted a connection"))?;
+            .with_context(|| format!("{store} loki push endpoint never accepted a connection"))??;
             if !res.status().is_success() {
                 let status = res.status();
                 let text = res.text().await.unwrap_or_default();

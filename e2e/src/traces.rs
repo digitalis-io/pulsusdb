@@ -53,7 +53,9 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::corpus::Scale;
-use crate::harness::{completeness_poll_timeout, poll_until, query_request_timeout};
+use crate::harness::{
+    classify_push_send, completeness_poll_timeout, poll_until, query_request_timeout,
+};
 use crate::metrics::write_artifact;
 use crate::scenarios::{Ctx, Variant};
 use crate::traces_corpus::{self, TraceCorpus, TraceCorpusSpec, hex};
@@ -217,19 +219,23 @@ fn search_window(corpus: &TraceCorpus) -> SearchWindow {
 // Corpus push (through the collector — the real wire path)
 // ---------------------------------------------------------------------
 
-/// One `POST {collector_url}/v1/traces` attempt — the transport-failure-
-/// tolerant shape `scenarios::post_otlp_logs` established (issue #15).
+/// One `POST {collector_url}/v1/traces` attempt — the shape
+/// `scenarios::post_otlp_logs` established (issue #15), routed through
+/// [`classify_push_send`] (issue #105): `Ok(Some(Ok(response)))` once the
+/// request reaches the collector, a connect-phase `Err` retried by
+/// [`poll_until`], and `Ok(Some(Err(_)))` on a post-connect failure (fail
+/// fast — the body may have been ingested).
 async fn post_otlp_traces(
     ctx: &Ctx,
     payload: &serde_json::Value,
-) -> Result<Option<reqwest::Response>> {
-    let res = ctx
-        .http
-        .post(format!("{}/v1/traces", ctx.collector_url))
-        .json(payload)
-        .send()
-        .await?;
-    Ok(Some(res))
+) -> Result<Option<Result<reqwest::Response>>> {
+    classify_push_send(
+        ctx.http
+            .post(format!("{}/v1/traces", ctx.collector_url))
+            .json(payload)
+            .send()
+            .await,
+    )
 }
 
 /// Pushes one export request per trace; only the first request polls
@@ -246,7 +252,7 @@ async fn push_trace_corpus(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
         || post_otlp_traces(ctx, first),
     )
     .await
-    .context("collector otlp/v1/traces endpoint never accepted a connection")?;
+    .context("collector otlp/v1/traces endpoint never accepted a connection")??;
     if !res.status().is_success() {
         bail!(
             "collector otlp/v1/traces export (trace 0) returned {}",
@@ -254,12 +260,18 @@ async fn push_trace_corpus(ctx: &Ctx, corpus: &TraceCorpus) -> Result<()> {
         );
     }
     for (i, req) in rest.iter().enumerate() {
-        let res = post_otlp_traces(ctx, req).await?.with_context(|| {
-            format!(
-                "collector connection dropped while pushing trace index {}",
-                i + 1
-            )
-        })?;
+        // Non-retrying (single `.await`): a connect `Err` propagates, and a
+        // post-connect failure surfaces via the inner `Result` — neither
+        // resends. `classify_push_send` never yields `Ok(None)`.
+        let res = post_otlp_traces(ctx, req)
+            .await?
+            .expect("classify_push_send never yields Ok(None)")
+            .with_context(|| {
+                format!(
+                    "collector otlp/v1/traces export (trace index {}) failed",
+                    i + 1
+                )
+            })?;
         if !res.status().is_success() {
             bail!(
                 "collector otlp/v1/traces export (trace index {}) returned {}",

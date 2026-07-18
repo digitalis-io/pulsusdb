@@ -17,7 +17,7 @@ use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::engine::Compose;
-use crate::harness::poll_until;
+use crate::harness::{classify_push_send, poll_until};
 
 /// Which compose variant a [`Scenario`] runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -289,22 +289,22 @@ async fn logs_roundtrip(ctx: &Ctx) -> Result<()> {
     let marker = run_marker(base_ns);
 
     let payload = build_otlp_export_request(&fixture, base_ns, &marker);
-    // Poll-until-listening (CI regression fix, issue #15): retries on
-    // transport-level failures only (connection refused/reset — the
-    // collector's OTLP/HTTP receiver isn't listening yet), stopping the
-    // instant *any* HTTP response comes back, success or not. Safe to
-    // resend the identical payload on a transport failure: a connection
-    // that was never established processed zero bytes server-side, so
-    // this can never double-ingest. `res.status()` is still checked below
-    // exactly as before — reaching the collector at all doesn't imply the
-    // export itself succeeded.
+    // Poll-until-listening (CI regression fix, issue #15): retries only on
+    // connection-phase failures (connection refused/reset — the collector's
+    // OTLP/HTTP receiver isn't listening yet), where zero bytes reached the
+    // server so resending the identical payload cannot double-ingest. A
+    // post-connect failure fails fast via the idempotency guard (issue #105,
+    // `classify_push_send`) rather than resending a possibly-ingested body.
+    // Stops the instant *any* HTTP response comes back, success or not;
+    // `res.status()` is still checked below exactly as before — reaching the
+    // collector at all doesn't imply the export itself succeeded.
     let res = poll_until(
         COLLECTOR_READY_POLL_TIMEOUT,
         COLLECTOR_READY_POLL_INTERVAL,
         || post_otlp_logs(ctx, &payload),
     )
     .await
-    .context("collector otlp/v1/logs endpoint never accepted a connection")?;
+    .context("collector otlp/v1/logs endpoint never accepted a connection")??;
     if !res.status().is_success() {
         bail!("collector otlp/v1/logs export returned {}", res.status());
     }
@@ -357,31 +357,28 @@ fn now_unix_nanos() -> Result<i64> {
 }
 
 /// One `POST {collector_url}/v1/logs` attempt (CI regression fix, issue
-/// #15): `Ok(Some(response))` once the request reaches the collector at
-/// all (any HTTP response, success or not — the caller still checks
-/// `response.status()`), `Ok(None)` on a transport-level failure (the
-/// collector's OTLP/HTTP receiver isn't listening yet) — the [`poll_until`]
-/// condition [`logs_roundtrip`] polls on. Neither `deploy/e2e/otel-config
-/// .single.yaml` nor `.cluster.yaml` wires the `health_check` extension
-/// (checked: no `extensions:`/`service.extensions` block in either), so
-/// there is no cheaper dedicated readiness endpoint to poll instead — the
-/// real OTLP endpoint is the correct, only signal available.
+/// #15), routed through [`classify_push_send`] (issue #105):
+/// `Ok(Some(Ok(response)))` once the request reaches the collector at all
+/// (any HTTP response, success or not — the caller still checks
+/// `response.status()`), a connect-phase `Err` retried by [`poll_until`]
+/// (the receiver isn't listening yet), and `Ok(Some(Err(_)))` on a
+/// post-connect failure (fail fast — the body may have been ingested).
+/// Neither `deploy/e2e/otel-config.single.yaml` nor `.cluster.yaml` wires
+/// the `health_check` extension (checked: no `extensions:`/
+/// `service.extensions` block in either), so there is no cheaper dedicated
+/// readiness endpoint to poll instead — the real OTLP endpoint is the
+/// correct, only signal available.
 async fn post_otlp_logs(
     ctx: &Ctx,
     payload: &serde_json::Value,
-) -> Result<Option<reqwest::Response>> {
-    // `?` (not `.ok()`-and-discard): `poll_until` tolerates an `Err` return
-    // exactly like `Ok(None)` (retried until the deadline), but surfaces
-    // the underlying `reqwest::Error` in the final failure's context if
-    // the collector never comes up — preserves the transport-failure
-    // detail rather than collapsing it to a generic timeout message.
-    let res = ctx
-        .http
-        .post(format!("{}/v1/logs", ctx.collector_url))
-        .json(payload)
-        .send()
-        .await?;
-    Ok(Some(res))
+) -> Result<Option<Result<reqwest::Response>>> {
+    classify_push_send(
+        ctx.http
+            .post(format!("{}/v1/logs", ctx.collector_url))
+            .json(payload)
+            .send()
+            .await,
+    )
 }
 
 fn otlp_key_value(key: &str, value: &str) -> serde_json::Value {

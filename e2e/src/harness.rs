@@ -304,6 +304,39 @@ where
     }
 }
 
+/// True iff a reqwest transport error is a connection-establishment
+/// failure — zero request bytes were processed server-side, so resending
+/// the identical body cannot double-ingest. Delegates to
+/// [`reqwest::Error::is_connect`] (0.12: walks the source chain for a hyper
+/// connect error). A post-connect failure (request-write, post-send
+/// timeout, response-read) returns false and MUST NOT be retried.
+pub fn push_retry_is_safe(err: &reqwest::Error) -> bool {
+    err.is_connect()
+}
+
+/// Maps one non-idempotent POST `send()` outcome to the [`poll_until`]
+/// producer contract shared by every harness push helper (issue #105):
+///  * `Ok(Some(Ok(res)))` — an HTTP response arrived; stop polling (the
+///    caller checks `res.status()`).
+///  * `Err(e)`            — connection-phase failure; `poll_until` retries
+///    the identical body (the endpoint-not-listening readiness signal these
+///    polls exist for) and surfaces `e` on the deadline.
+///  * `Ok(Some(Err(e)))`  — post-connect failure; stop polling and fail
+///    fast — the server may have ingested the body, so resending would
+///    double-ingest.
+pub fn classify_push_send(
+    outcome: reqwest::Result<reqwest::Response>,
+) -> Result<Option<Result<reqwest::Response>>> {
+    match outcome {
+        Ok(res) => Ok(Some(Ok(res))),
+        Err(e) if push_retry_is_safe(&e) => Err(e.into()),
+        Err(e) => Ok(Some(Err(anyhow::Error::new(e).context(
+            "POST failed after the connection was established — the request may have reached \
+             the server; the identical body is NOT retried (idempotency guard, issue #105)",
+        )))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +409,83 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "wait_ready took {elapsed:?}, expected to be bounded by the {deadline:?} deadline"
+        );
+    }
+
+    /// Issue #105: a connection that never established (nothing listening on
+    /// `127.0.0.1:1`) is a `is_connect()` failure — zero bytes reached the
+    /// server, so it is safe to resend. `classify_push_send` maps it to
+    /// `Err` so `poll_until` keeps polling (readiness signal) and surfaces
+    /// the reqwest detail on the deadline.
+    #[tokio::test]
+    async fn classify_push_send_retries_a_connect_refused_failure() {
+        let http = reqwest::Client::new();
+        let outcome = http
+            .post("http://127.0.0.1:1/x")
+            .json(&serde_json::json!({ "probe": true }))
+            .send()
+            .await;
+
+        let err = outcome
+            .as_ref()
+            .expect_err("POST to 127.0.0.1:1 must fail — nothing is listening");
+        assert!(
+            err.is_connect(),
+            "expected a connect-phase error, got: {err:?}"
+        );
+
+        // Err arm -> poll_until retries the identical body.
+        assert!(
+            classify_push_send(outcome).is_err(),
+            "a connect-refused failure must classify as the retry (Err) arm"
+        );
+    }
+
+    /// Issue #105 (load-bearing proof): a POST that connects, is read, then
+    /// has its connection dropped mid-response yields a genuine post-connect
+    /// (`!is_connect()`) error — the server may have ingested the body.
+    /// `classify_push_send` maps it to `Ok(Some(Err(_)))` so `poll_until`
+    /// STOPS and does NOT resend. A classifier that retried post-connect
+    /// errors would fail this test's `matches!` assertion.
+    #[tokio::test]
+    async fn classify_push_send_does_not_retry_a_post_connect_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let accept_task = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Read the request bytes off the wire (so the client's
+                // request-write completes and the connection is fully
+                // established), then drop the socket without answering —
+                // the client's response-read then fails post-connect.
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+
+        let http = reqwest::Client::new();
+        let outcome = http
+            .post(format!("http://{addr}/x"))
+            .json(&serde_json::json!({ "probe": true }))
+            .send()
+            .await;
+
+        accept_task.abort();
+
+        let err = outcome
+            .as_ref()
+            .expect_err("the dropped connection must surface as a send() error");
+        assert!(
+            !err.is_connect(),
+            "expected a post-connect error (connection was established), got: {err:?}"
+        );
+
+        // Ok(Some(Err(_))) arm -> poll_until stops, no resend.
+        assert!(
+            matches!(classify_push_send(outcome), Ok(Some(Err(_)))),
+            "a post-connect failure must classify as the terminal (fail-fast) arm"
         );
     }
 }
