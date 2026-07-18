@@ -172,16 +172,28 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
 /// resolves by `from_normalized`'s frozen deterministic rule (issue #4)
 /// and is counted, never swapped. `otel_scope_name`/`otel_scope_version`
 /// are emitted only when `scope_logs.scope` is present (task-manager
-/// resolution: "absent scopes emit nothing").
+/// resolution: "absent scopes emit nothing") **and the respective value is
+/// non-empty** — a present-but-empty `InstrumentationScope` (`name`/
+/// `version` `""`) adds NO scope labels, exactly as an absent scope does.
+/// The OTel Collector materializes an empty `scope` on every re-export
+/// (even for records that carried none), so without this an empty
+/// `otel_scope_name`/`otel_scope_version` would attach to every
+/// collector-ingested stream — growing its label set past what a
+/// Prometheus/Loki store produces (both treat an empty label value as
+/// absent and never promote an empty OTLP scope), which silently breaks
+/// stream-label-set parity for the standard collector ingest path.
 fn build_scope_labels(resource: Option<&Resource>, scope_logs: &ScopeLogs) -> (LabelSet, usize) {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
     let scope = scope_logs.scope.as_ref();
-    let scope_identity = scope.into_iter().flat_map(|s| {
-        [
-            ("otel_scope_name".to_string(), s.name.clone()),
-            ("otel_scope_version".to_string(), s.version.clone()),
-        ]
-    });
+    let scope_identity = scope
+        .into_iter()
+        .flat_map(|s| {
+            [
+                ("otel_scope_name".to_string(), s.name.clone()),
+                ("otel_scope_version".to_string(), s.version.clone()),
+            ]
+        })
+        .filter(|(_, value)| !value.is_empty());
     let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
 
     let pairs = attr_pairs(resource_attrs)
@@ -453,6 +465,87 @@ mod tests {
             out.streams[0].labels.get("otel_scope_version"),
             Some("1.0.0")
         );
+    }
+
+    #[test]
+    fn parse_emits_no_scope_labels_when_scope_is_present_but_empty() {
+        // The OTel Collector materializes a present-but-empty
+        // `InstrumentationScope` (name/version `""`) on every re-export,
+        // even for records that carried no scope. That must add NO stream
+        // labels — otherwise every collector-ingested stream grows
+        // `otel_scope_name=""`/`otel_scope_version=""`, diverging from a
+        // Prometheus/Loki reference store (empty label value == absent) and
+        // silently breaking stream-label-set parity.
+        let record = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body("x"),
+            ..Default::default()
+        };
+        let scope_logs = ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: String::new(),
+                version: String::new(),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            }),
+            log_records: vec![record],
+            schema_url: String::new(),
+        };
+        let out = parse(
+            &request(vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![kv(
+                        "service.name",
+                        Value::StringValue("checkout".to_string()),
+                    )],
+                    dropped_attributes_count: 0,
+                    entity_refs: vec![],
+                }),
+                scope_logs: vec![scope_logs],
+                schema_url: String::new(),
+            }]),
+            0,
+        );
+        assert_eq!(out.streams[0].labels.get("otel_scope_name"), None);
+        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
+        // The real resource attribute is unaffected — only the empty scope
+        // identity is suppressed.
+        assert_eq!(out.streams[0].labels.get("service_name"), Some("checkout"));
+    }
+
+    #[test]
+    fn parse_emits_only_the_non_empty_scope_identity_field() {
+        // A scope with a name but no version emits `otel_scope_name` only —
+        // the empty `otel_scope_version` is suppressed independently (Loki's
+        // per-field OTLP scope behaviour).
+        let record = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body("x"),
+            ..Default::default()
+        };
+        let scope_logs = ScopeLogs {
+            scope: Some(InstrumentationScope {
+                name: "my-scope".to_string(),
+                version: String::new(),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            }),
+            log_records: vec![record],
+            schema_url: String::new(),
+        };
+        let out = parse(
+            &request(vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![scope_logs],
+                schema_url: String::new(),
+            }]),
+            0,
+        );
+        assert_eq!(
+            out.streams[0].labels.get("otel_scope_name"),
+            Some("my-scope")
+        );
+        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
     }
 
     #[test]
