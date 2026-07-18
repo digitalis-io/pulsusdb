@@ -164,6 +164,10 @@ struct SampleRow {
     timestamp_ns: i64,
     #[allow(dead_code)]
     body: String,
+    // Must mirror `pulsus_read::logql::sql::stage3`'s SELECT (fingerprint,
+    // timestamp_ns, body, structured_metadata) — the column added by #97.
+    #[allow(dead_code)]
+    structured_metadata: String,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
