@@ -60,3 +60,6 @@ tracing.workspace = true
 [dev-dependencies]
 pulsus-schema = { path = "../pulsus-schema" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Unique per-invocation run-database naming for the #90 query_log gates
+# (strict `CREATE DATABASE`), so concurrent/repeat live runs never collide.
+uuid = { version = "1", features = ["v4"] }

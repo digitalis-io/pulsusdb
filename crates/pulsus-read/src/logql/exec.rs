@@ -459,16 +459,22 @@ impl LogQlEngine {
     }
 
     /// Per-page settings for the fetch-until-limit paging loop (issue
-    /// #90). `remaining` is the decrementing `budget − spent` cap so
-    /// cumulative scan across pages never exceeds the budget (see
-    /// [`LogQlEngine::run_streams_paged`]). `wait_end_of_query = 1` forces
-    /// ClickHouse to emit the FINAL `read_bytes` in the summary — the
-    /// clickhouse 0.15.1 crate captures the summary from the initial
-    /// response header and never updates it, so without this the
-    /// per-page `read_bytes` used to decrement the budget would be
-    /// understated and the cumulative ceiling unsound. Each page is
-    /// `LIMIT page_size`-bounded, so `wait_end_of_query` buffers only the
-    /// (small) result, not the scan.
+    /// #90). `remaining` is the decrementing `budget − spent` cap, an
+    /// approximate best-effort scan guard (NOT a hard byte ceiling) that
+    /// bounds runaway paging (see [`LogQlEngine::run_streams_paged`]): if
+    /// the FIRST page alone overflows this cap the query fails
+    /// `QueryTooBroad`, but once a page has returned a later page tripping
+    /// its positive cap returns partial survivors instead. Because
+    /// ClickHouse enforces the cap per read block per concurrent reader
+    /// (per thread, and per shard on a cluster), actual bytes can exceed
+    /// the budget, growing with parallelism and shard count.
+    /// `wait_end_of_query = 1` forces ClickHouse to emit the FINAL
+    /// `read_bytes` in the summary — the clickhouse 0.15.1 crate captures
+    /// the summary from the initial response header and never updates it,
+    /// so without this the per-page `read_bytes` used to decrement the
+    /// remaining cap would be understated and the guard would leak scan.
+    /// Each page is `LIMIT page_size`-bounded, so `wait_end_of_query`
+    /// buffers only the (small) result, not the scan.
     ///
     /// `pub` for introspection: the AC5 gate asserts `wait_end_of_query = 1`
     /// is present here. That guard cannot live on `system.query_log` —
@@ -633,20 +639,28 @@ impl LogQlEngine {
     /// survivors are collected, the window is exhausted, or the byte scan
     /// budget is spent, returning `(streams, partial)`.
     ///
-    /// **Cumulative byte ceiling — by construction (adjudication
-    /// issuecomment-5006041978).** Every page, page 1 included (`spent ==
-    /// 0` ⇒ `cap == budget`), runs with `max_bytes_to_read = budget −
-    /// spent` and `read_overflow_mode = throw`, so ClickHouse aborts any
-    /// page that would exceed its own cap. Hence for the terminal overflow
-    /// page `actual ≤ cap = budget − spent_prev`, so cumulative =
-    /// `spent_prev + actual ≤ budget` — the identical hard ceiling as the
-    /// old single scan, regardless of the aborted page's own read_bytes.
-    /// `wait_end_of_query = 1` (see [`LogQlEngine::paging_settings`]) makes
-    /// each page's `read_bytes` the FINAL scanned total (the clickhouse
-    /// 0.15.1 crate otherwise captures an understated header-time value),
-    /// so `spent` bounds cumulative scan soundly; an unknown (`None`)
-    /// read_bytes charges the full cap (conservative), keeping the bound
-    /// without server cooperation.
+    /// **Approximate best-effort scan guard — NOT a hard byte ceiling.**
+    /// Each page is issued with a decrementing `max_bytes_to_read = budget −
+    /// (bytes already scanned by prior pages)` and `read_overflow_mode =
+    /// throw`. If the **first** page alone exceeds the budget the query
+    /// fails with `QueryTooBroad` (a genuinely too-broad query), exactly as
+    /// the pre-paging single-scan path did. Once at least one page has
+    /// returned, the loop is best-effort: before issuing each further page
+    /// the top-of-loop guard returns the survivors so far with
+    /// `pulsus_partial = true` if the budget is already spent (it never
+    /// issues a zero cap, which ClickHouse would treat as *unlimited*), and
+    /// likewise a later page whose scan trips its positive cap returns the
+    /// partial survivors. The loop always terminates and never scans
+    /// `pages × window` unbounded. Because ClickHouse enforces the cap per
+    /// read block per concurrent reader (per thread, and per shard on a
+    /// cluster), the actual bytes scanned can exceed the budget by an
+    /// amount that grows with query parallelism and shard count — the
+    /// budget bounds runaway paging, not exact bytes. `wait_end_of_query =
+    /// 1` (see [`LogQlEngine::paging_settings`]) makes each page's
+    /// `read_bytes` the FINAL scanned total (the clickhouse 0.15.1 crate
+    /// otherwise captures an understated header-time value), so `spent`
+    /// tracks scan progress soundly; an unknown (`None`) read_bytes charges
+    /// the full cap (conservative).
     ///
     /// **Termination.** The cursor advances past every *fetched* row
     /// (`advance_tail_cursor` over the raw page, not survivors — so a page
@@ -657,10 +671,11 @@ impl LogQlEngine {
     /// (window exhausted) or spend the budget.
     ///
     /// **Terminal branches.** limit filled / window exhausted → `partial =
-    /// false`; budget spent mid-paging → `partial = true`; first-page
-    /// budget overflow (`spent == 0`) → propagate `QueryTooBroad` (a
-    /// genuinely too-broad query, preserving today's error); mid-paging
-    /// overflow → signaled partial.
+    /// false`; budget spent before issuing a later page → `partial = true`
+    /// (top-of-loop guard); first-page budget overflow (`spent == 0`) →
+    /// propagate `QueryTooBroad` (a genuinely too-broad query, preserving
+    /// today's error); a later page (`spent > 0`) tripping its positive cap
+    /// → signaled partial.
     async fn run_streams_paged(
         &self,
         sp: &StreamsPlan,
@@ -681,7 +696,16 @@ impl LogQlEngine {
         let mut spent: u64 = 0;
 
         loop {
-            let page_cap = budget.saturating_sub(spent);
+            // Terminate before issuing: `max_bytes_to_read = 0` is
+            // ClickHouse's *unlimited* sentinel, so a zero cap must never be
+            // issued. Once the budget is spent, return the survivors so far
+            // as a partial result (a later page's positive-cap overflow is
+            // handled below; the first-page `spent == 0` case never reaches
+            // here). This makes `page_cap` always > 0.
+            if spent >= budget {
+                return Ok((acc.into_streams(), true));
+            }
+            let page_cap = budget.saturating_sub(spent); // now always > 0
             let ks_lower = match cursor {
                 None => super::sql::KeysetLower::First,
                 Some(c) => super::sql::KeysetLower::After {
@@ -724,15 +748,19 @@ impl LogQlEngine {
                         mapped,
                         ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
                     ) {
+                        // Branch split on this positive-cap overflow:
+                        // `spent == 0` (first page) overflows the FULL budget
+                        // ⇒ propagate `QueryTooBroad` (a genuinely too-broad
+                        // query) — preserve the error the old single-scan
+                        // path raised; `spent > 0` (a
+                        // later page) ⇒ keep the survivors and signal partial
+                        // (best-effort, not a hard byte ceiling). The
+                        // budget-already-spent-before-issuing case is covered
+                        // by the top-of-loop guard, which never issues a zero
+                        // cap.
                         if spent == 0 {
-                            // First page overflows the FULL budget: this is
-                            // a genuinely too-broad query — preserve the
-                            // error the old single-scan path raised.
                             return Err(mapped);
                         }
-                        // Mid-paging overflow: the aborted page scanned ≤
-                        // page_cap = budget − spent, so cumulative ≤ budget
-                        // still holds — keep the survivors, signal partial.
                         return Ok((acc.into_streams(), true));
                     }
                     return Err(mapped);
@@ -762,10 +790,8 @@ impl LogQlEngine {
                 // complete result over the whole window, never partial.
                 return Ok((acc.into_streams(), false));
             }
-            if budget.saturating_sub(spent) == 0 {
-                // Budget spent with more window to scan: signaled partial.
-                return Ok((acc.into_streams(), true));
-            }
+            // Budget-spent-before-issuing is handled by the top-of-loop guard
+            // (which never issues a zero/unlimited cap); loop back to it.
         }
     }
 

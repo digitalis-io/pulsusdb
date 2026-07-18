@@ -256,10 +256,16 @@ pub struct ReaderConfig {
     /// under-return) and never over-return. This is no longer an
     /// oversample-and-truncate ceiling; a larger factor only sizes the
     /// first page (fewer round-trips), it does not change the result.
-    /// `logql_scan_budget_bytes` is the hard cumulative scan ceiling and
-    /// aborts first (a budget-truncated result is signaled via
-    /// `stats.pulsus_partial`). Must be >= 1 (validated at startup); the
-    /// container `Default` (not a field-level serde default, which would
+    /// `logql_scan_budget_bytes` is an approximate best-effort scan guard,
+    /// not a hard byte ceiling: if the first page alone exceeds the budget
+    /// the query fails `QueryTooBroad`, but once at least one page has
+    /// returned a spent budget (or a later page tripping its positive cap)
+    /// returns the survivors so far signaled via `stats.pulsus_partial` —
+    /// never issuing a zero/unlimited cap. Because ClickHouse enforces the
+    /// cap per block per reader (per thread, per shard), actual bytes can
+    /// exceed the budget, growing with parallelism and shard count. Must be
+    /// `>= 1` (validated at startup); the container `Default` (not a
+    /// field-level serde default, which would
     /// resolve a partial YAML object to 0) supplies 10.
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,

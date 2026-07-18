@@ -158,12 +158,9 @@ struct SeedSampleRow {
     body: String,
 }
 
-/// Prepares a fresh database and bulk-loads [`CORPUS_ROWS`] rows for one
-/// stream via direct RowBinary insert (`ChClient::insert_block`) — the
-/// same bulk-load mechanism `xtask bench logs-read`'s dataset generator
-/// uses, licensed for fidelity by `crates/pulsus-write/tests/
-/// ingest_fidelity.rs`. Returns `(client, ts_ns)`: `client` is bound to
-/// the fresh database, `ts_ns` is the corpus's start timestamp.
+/// Drops `db` if it exists, then delegates to [`seed_corpus`]. Used by the
+/// scale-invariant ratio gates, which reuse a fixed database name across
+/// runs and so must clear stale state first. Returns `(client, ts_ns)`.
 async fn setup_corpus(db: &str) -> (ChClient, i64) {
     let admin = ChClient::new(test_config()).await.expect("connect admin");
     admin
@@ -174,6 +171,20 @@ async fn setup_corpus(db: &str) -> (ChClient, i64) {
         )
         .await
         .expect("drop test database");
+    seed_corpus(db).await
+}
+
+/// Initializes the schema in `db` (`run_init`) and bulk-loads
+/// [`CORPUS_ROWS`] rows for one stream via direct RowBinary insert
+/// (`ChClient::insert_block`) — the same bulk-load mechanism `xtask bench
+/// logs-read`'s dataset generator uses, licensed for fidelity by
+/// `crates/pulsus-write/tests/ingest_fidelity.rs`. Does NOT drop `db`, so a
+/// caller that created a fresh unique database with a strict `CREATE
+/// DATABASE` (the #90 query_log gates) keeps that create as the sole
+/// database creation. Returns `(client, ts_ns)`: `client` is bound to `db`,
+/// `ts_ns` is the corpus's start timestamp.
+async fn seed_corpus(db: &str) -> (ChClient, i64) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
     run_init(&admin, &test_ctx(db)).await.expect("run_init");
 
     let mut data_cfg = test_config();
@@ -471,15 +482,44 @@ async fn body_search_skip_index_prunes_most_granules() {
 }
 
 // ---------------------------------------------------------------------
-// Issue #90 AC5 — the fetch-until-limit paging loop's cumulative byte
-// ceiling. Every keyset page runs with a decrementing
-// `max_bytes_to_read = scan_budget_bytes − spent`, so ClickHouse aborts
-// any page that would exceed its own cap and the cumulative scan is
-// `≤ scan_budget_bytes` BY CONSTRUCTION (adjudication
-// issuecomment-5006041978). This gate proves it empirically against
-// `system.query_log` — including when the terminal page overflows.
-// Scale-dependent multi-TB page-count/latency claims are routed to #25.
+// Issue #90 AC5 — the fetch-until-limit paging loop's approximate
+// best-effort scan guard (NOT a hard byte ceiling). Each keyset page is
+// issued with a decrementing `max_bytes_to_read = scan_budget_bytes −
+// (bytes already scanned by prior pages)`; the guard never issues a page
+// with a zero cap (ClickHouse's *unlimited* sentinel), so every issued
+// page carries a positive, strictly-decreasing cap. This gate proves
+// those two properties empirically against `system.query_log`
+// (`Settings['max_bytes_to_read']` per page): every page has a cap, all
+// caps are positive, they strictly decrease, and each cap equals
+// `budget − Σ prior read_bytes` — which also detects accidental one-row-
+// per-page duplication. The single-shard topology (base `log_samples`,
+// no `_dist`) makes each keyset page yield exactly one finalized
+// query_log row. Actual bytes can exceed the budget (per-block /
+// per-reader / per-shard enforcement); the budget bounds runaway paging,
+// not exact bytes. Clustered attribution/behaviour is derived-and-untested,
+// routed to #25.
 // ---------------------------------------------------------------------
+
+/// Creates a fresh, uniquely-named run database with a **strict**
+/// `CREATE DATABASE` (no `IF NOT EXISTS`; asserts success), then seeds the
+/// corpus into it. Because the name is unique per invocation, the #90
+/// gates below can scope their `system.query_log` reads with a plain
+/// `current_database = '{db}'` filter (no time marker) and `seed_corpus`
+/// can skip the drop-if-exists. Returns `(admin, run_db, ts_ns)`.
+async fn fresh_run_db() -> (ChClient, String, i64) {
+    let run_db = format!("pulsus_read_it_qlg_{}", uuid::Uuid::new_v4().simple());
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("CREATE DATABASE {run_db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("strict CREATE DATABASE for unique run db");
+    let (_client, ts_ns) = seed_corpus(&run_db).await;
+    (admin, run_db, ts_ns)
+}
 
 fn engine_config(db: &str, scan_budget_bytes: u64) -> EngineConfig {
     EngineConfig {
@@ -501,14 +541,31 @@ async fn data_client(db: &str) -> ChClient {
     ChClient::new(cfg).await.expect("connect data client")
 }
 
-/// Sums `read_bytes` over every FINALIZED `system.query_log` row for this
-/// test's keyset PAGE queries — identified by the `AS body_hash`
-/// projection unique to `stage3_keyset` — scoped to `db` and to queries
-/// started at/after `marker_us`. `type != 'QueryStart'` keeps exactly one
-/// finalized row per page, INCLUDING the terminal `ExceptionWhileProcessing`
-/// row of a page aborted by its `max_bytes_to_read` cap (whose recorded
-/// read_bytes is `≤` that cap). Returns `(sum_read_bytes, page_count)`.
-async fn keyset_page_scan(admin: &ChClient, db: &str, marker_us: i64) -> (u64, u64) {
+/// One finalized `system.query_log` row per keyset PAGE query for this
+/// test's run database, in issue order.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct KeysetPageRow {
+    /// The per-page `max_bytes_to_read` cap, from `Settings` — 0 if the
+    /// setting was absent (see `has_cap`).
+    cap: u64,
+    /// The page's FINAL scanned `read_bytes` (accurate under
+    /// `wait_end_of_query = 1`).
+    read: u64,
+    /// Whether the page was issued with a `max_bytes_to_read` cap at all
+    /// (1 = present). A page issued without a cap would scan unbounded.
+    has_cap: u8,
+}
+
+/// Returns every FINALIZED `system.query_log` row for this test's keyset
+/// PAGE queries — identified by the `AS body_hash` projection unique to
+/// `stage3_keyset` — scoped to the unique run database `db` via
+/// `current_database` (the run db is created per invocation, so no time
+/// marker is needed) and ordered by issue time. `type != 'QueryStart'`
+/// keeps exactly one finalized row per page (single-shard topology),
+/// INCLUDING the terminal `ExceptionWhileProcessing` row of a page aborted
+/// by its `max_bytes_to_read` cap. The row count doubles as the page
+/// count (the zero-budget guard test asserts it is 0).
+async fn keyset_page_rows(admin: &ChClient, db: &str) -> Vec<KeysetPageRow> {
     admin
         .execute(
             "SYSTEM FLUSH LOGS",
@@ -517,27 +574,24 @@ async fn keyset_page_scan(admin: &ChClient, db: &str, marker_us: i64) -> (u64, u
         )
         .await
         .expect("flush logs");
-    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
-    struct SumRow {
-        total: u64,
-        pages: u64,
-    }
     let sql = format!(
-        "SELECT sum(read_bytes) AS total, count() AS pages FROM system.query_log \
+        "SELECT toUInt64OrZero(Settings['max_bytes_to_read']) AS cap, \
+         read_bytes AS read, \
+         toUInt8(mapContains(Settings, 'max_bytes_to_read')) AS has_cap \
+         FROM system.query_log \
          WHERE current_database = '{db}' AND type != 'QueryStart' \
          AND query LIKE '%AS body_hash%' \
-         AND event_time_microseconds >= fromUnixTimestamp64Micro({marker_us})"
+         ORDER BY query_start_time_microseconds ASC, event_time_microseconds ASC"
     );
     let mut stream = admin
-        .query_stream::<SumRow>(&sql, &QuerySettings::new())
+        .query_stream::<KeysetPageRow>(&sql, &QuerySettings::new())
         .await
         .expect("query system.query_log");
-    let row = stream
-        .next()
-        .await
-        .expect("one aggregate row")
-        .expect("decode sum row");
-    (row.total, row.pages)
+    let mut pages = Vec::new();
+    while let Some(row) = stream.next().await {
+        pages.push(row.expect("decode keyset page row"));
+    }
+    pages
 }
 
 fn dropping_query() -> String {
@@ -561,21 +615,10 @@ fn full_window_params(ts_ns: i64, limit: u32) -> QueryParams {
     }
 }
 
-/// ClickHouse enforces `max_bytes_to_read` per processed block, so a
-/// page aborted at its cap records `read_bytes` a fraction of one block
-/// ABOVE the cap (measured ~37 KiB overshoot on this corpus). At most the
-/// single TERMINAL page aborts (the loop stops after), so cumulative
-/// read_bytes is bounded by `budget + one block`. This granule-scale slack
-/// is generous over that (8192 rows × a 512-byte/row ceiling ≈ 4 MiB) and
-/// stays FAR below a broken implementation's `pages × full-window` blowup
-/// (~2× the ~19 MiB corpus here), so the gate still catches a regression.
-const OVERSHOOT_SLACK: u64 = INDEX_GRANULARITY * 512;
-
 #[tokio::test]
-async fn fetch_until_limit_cumulative_read_bytes_never_exceeds_the_scan_budget() {
+async fn fetch_until_limit_pages_issue_strictly_decrementing_positive_scan_caps() {
     skip_unless_live!();
-    let db = "pulsus_read_it_qlg_budget";
-    let (admin, ts_ns) = setup_corpus(db).await;
+    let (admin, run_db, ts_ns) = fresh_run_db().await;
 
     // Sized to this ~19 MiB single-stream corpus so the FIRST keyset page
     // (whole-window scan — its lower bound is the full window; the 4-column
@@ -583,17 +626,17 @@ async fn fetch_until_limit_cumulative_read_bytes_never_exceeds_the_scan_budget()
     // tie-correct OFFSET, defeat `optimize_read_in_order` so the LIMIT does
     // not short-circuit) fits, but the loop must abort on a LATER page.
     let budget: u64 = 24 * 1024 * 1024;
-    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, budget));
+    let engine = LogQlEngine::new(data_client(&run_db).await, engine_config(&run_db, budget));
 
-    // The `read_bytes`-accuracy mechanism the cumulative ceiling below relies
-    // on: every keyset PAGE must run with `wait_end_of_query = 1`, which is
-    // what makes the CLIENT-side per-page `read_bytes` (used to decrement the
-    // budget) the FINAL scanned total rather than the clickhouse crate's
-    // understated initial-header value (plan v2, issuecomment-5005919929).
-    // This is asserted on the engine's settings object, NOT on
-    // `system.query_log`: `wait_end_of_query` is an HTTP-interface-only
-    // parameter — it never appears in `system.settings` nor in
-    // `query_log.Settings`, and the SERVER-side summed `read_bytes` is
+    // The `read_bytes`-accuracy mechanism the per-page cap accounting below
+    // relies on: every keyset PAGE must run with `wait_end_of_query = 1`,
+    // which is what makes the CLIENT-side per-page `read_bytes` (used to
+    // decrement the remaining cap) the FINAL scanned total rather than the
+    // clickhouse crate's understated initial-header value (plan v2,
+    // issuecomment-5005919929). This is asserted on the engine's settings
+    // object, NOT on `system.query_log`: `wait_end_of_query` is an
+    // HTTP-interface-only parameter — it never appears in `system.settings`
+    // nor in `query_log.Settings`, and the SERVER-side `read_bytes` is
     // byte-identical with or without it — so the wiring is observable only
     // here. Remove `.set("wait_end_of_query", 1)` from
     // `LogQlEngine::paging_settings` and this assertion trips.
@@ -601,7 +644,7 @@ async fn fetch_until_limit_cumulative_read_bytes_never_exceeds_the_scan_budget()
         engine.paging_settings(budget).get("wait_end_of_query"),
         Some("1"),
         "fetch-until-limit paging queries must set wait_end_of_query=1 so per-page \
-         read_bytes is the final scanned total, keeping the AC5 budget accounting sound \
+         read_bytes is the final scanned total, keeping the AC5 cap accounting sound \
          (issue #90)"
     );
 
@@ -611,7 +654,6 @@ async fn fetch_until_limit_cumulative_read_bytes_never_exceeds_the_scan_budget()
     let params = full_window_params(ts_ns, 5_000);
     let expr = parse(&dropping_query()).expect("parse");
 
-    let marker_us = now_ns() / 1_000 - 1_000_000; // 1s slack
     let result = engine
         .query(&expr, &params)
         .await
@@ -628,20 +670,88 @@ async fn fetch_until_limit_cumulative_read_bytes_never_exceeds_the_scan_budget()
         "budget exhaustion mid-paging MUST signal a partial result (stats.pulsus_partial)"
     );
 
-    let (sum, pages) = keyset_page_scan(&admin, db, marker_us).await;
+    // Single-shard topology (base `log_samples`, no `_dist`): exactly one
+    // finalized query_log row per keyset page, in issue order.
+    let pages = keyset_page_rows(&admin, &run_db).await;
     assert!(
-        pages > 1,
-        "the fetch-until-limit loop must actually PAGE (got {pages} page(s))"
+        pages.len() > 1,
+        "the fetch-until-limit loop must actually PAGE (got {} page(s))",
+        pages.len()
     );
-    // The cumulative ceiling: bounded by budget (+ one terminal-page block),
-    // NOT by pages × full-window. This is the AC5 gate — remove the
-    // per-page `max_bytes_to_read` cap in `run_streams_paged` and this sum
-    // balloons past `budget + OVERSHOOT_SLACK`.
+    // No page is ever issued with the unlimited (zero) cap: every page
+    // carries a `max_bytes_to_read` setting, and every cap is positive.
+    // Remove the top-of-loop `spent >= budget` guard and a zero-cap
+    // (unlimited) page can be issued — this trips.
     assert!(
-        sum <= budget + OVERSHOOT_SLACK,
-        "cumulative keyset-page read_bytes ({sum}) exceeded budget ({budget}) + one-block slack \
-         ({OVERSHOOT_SLACK}) over {pages} pages — the decrementing per-page max_bytes_to_read \
-         failed to hold the ceiling (issue #90 AC5)"
+        pages.iter().all(|p| p.has_cap == 1),
+        "every keyset page must be issued with a max_bytes_to_read cap"
+    );
+    assert!(
+        pages.iter().all(|p| p.cap > 0),
+        "no page may be issued with max_bytes_to_read=0 (ClickHouse's unlimited sentinel)"
+    );
+    // Strictly-decreasing caps: `cap_{i+1} == cap_i − read_i`, and every
+    // page that scanned rows has `read_i > 0`, so caps strictly shrink. A
+    // duplicated coordinator/remote row for the same page would repeat a cap
+    // and break this — so the property also guards one-row-per-page.
+    for w in pages.windows(2) {
+        assert!(
+            w[1].cap < w[0].cap,
+            "per-page caps must strictly decrease (got {} then {})",
+            w[0].cap,
+            w[1].cap
+        );
+    }
+    // Decrementing-cap identity: `cap_i == budget − Σ_{j<i} read_j`. Holds
+    // for every page including the terminal aborted one (whose own
+    // read_bytes is never folded into a later cap). Also detects accidental
+    // page duplication (a repeated cap breaks the running sum).
+    let mut running: u64 = 0;
+    for (i, p) in pages.iter().enumerate() {
+        assert_eq!(
+            p.cap,
+            budget - running,
+            "page {i} cap ({}) must equal budget − Σ prior read_bytes ({})",
+            p.cap,
+            budget - running
+        );
+        running += p.read;
+    }
+}
+
+#[tokio::test]
+async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page() {
+    skip_unless_live!();
+    // Direct `EngineConfig` with `scan_budget_bytes = 0` (production config
+    // rejects 0 via `positive_bytes`; this drives the loop's top-of-loop
+    // `spent >= budget` guard deterministically — a mid-paging exact hit is
+    // data-dependent and not reproducible).
+    let (admin, run_db, ts_ns) = fresh_run_db().await;
+    let engine = LogQlEngine::new(data_client(&run_db).await, engine_config(&run_db, 0));
+    let params = full_window_params(ts_ns, 5_000);
+    let expr = parse(&dropping_query()).expect("parse");
+
+    let result = engine
+        .query(&expr, &params)
+        .await
+        .unwrap_or_else(|e| panic!("query err: {e:?}"));
+    let QueryResult::Streams { items, partial } = result else {
+        panic!("a stream selector must return Streams");
+    };
+    assert!(partial, "a spent budget must terminate with partial");
+    assert!(
+        items.iter().all(|s| s.entries.is_empty()),
+        "no survivors when the guard returns before any page"
+    );
+
+    // Prove NO keyset page was issued: the guard must return before issuance
+    // (a zero cap = ClickHouse's *unlimited* sentinel must never be issued).
+    let pages = keyset_page_rows(&admin, &run_db).await;
+    assert_eq!(
+        pages.len(),
+        0,
+        "the zero-budget guard must return before issuing any keyset page (got {} page(s))",
+        pages.len()
     );
 }
 
