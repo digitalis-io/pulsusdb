@@ -29,10 +29,14 @@
 //! `EntryAdapter` tag 3 (`repeated LabelPairAdapter structuredMetadata`) is
 //! **declared and decoded** (issue #97): per-entry structured metadata is now
 //! stored in `log_samples.structured_metadata` (a canonical JSON String) and
-//! surfaced in the LogQL read/tail label set. A per-entry cardinality bound
-//! ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) is charged before the canonical
-//! JSON is built (charge-before-allocate). Structured metadata is per-ENTRY
-//! and never enters `stream_fingerprint` / `StreamRow`.
+//! surfaced in the LogQL read/tail label set. Two per-entry bounds guard it:
+//! a cardinality bound ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) enforced
+//! **during decode** by `EntryAdapter`'s hand-written [`prost::Message`] impl
+//! (which caps tag-3 materialization at `MAX + 1` and drains the rest without
+//! allocating — charge-before-allocate), and a total byte budget
+//! ([`MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY`]) charged on borrowed data
+//! before any clone / canonical-JSON construction. Structured metadata is
+//! per-ENTRY and never enters `stream_fingerprint` / `StreamRow`.
 //!
 //! Tag layout is cross-checked against a real capture from the
 //! OpenTelemetry Collector's `loki` exporter (`tests/fixtures/loki-push/
@@ -69,14 +73,96 @@ pub struct StreamAdapter {
 /// `logproto.EntryAdapter`: `timestamp` (`google.protobuf.Timestamp`) at tag
 /// 1, `line` at tag 2, `structuredMetadata` (`repeated LabelPairAdapter`) at
 /// tag 3 (issue #97 — decoded into `log_samples.structured_metadata`).
-#[derive(Clone, PartialEq, ::prost::Message)]
+///
+/// Unlike its sibling adapters, `EntryAdapter` does **not** derive
+/// `::prost::Message`; it carries a hand-written [`prost::Message`] impl (below)
+/// so tag-3 (`structured_metadata`) materialization is capped **inside the
+/// decoder** at [`MAX_STRUCTURED_METADATA_PER_ENTRY`]` + 1` (issue #97): a
+/// derived impl fully materializes the wire `Vec` before any cardinality check
+/// runs, so an attacker's many-empty-submessage tag-3 payload could unpack far
+/// past the cap before rejection. The manual impl drains excess tag-3 records
+/// without allocating (charge-before-allocate), matching the JSON path's
+/// [`BoundedStructuredMetadata`]. Because the derive is gone, the field-level
+/// `#[prost(...)]` helper attributes are removed too (they have no registering
+/// derive macro) — tags 1/2/3 and their wire kinds are hardcoded in the impl.
+#[derive(Clone, PartialEq, Default, Debug)]
 pub struct EntryAdapter {
-    #[prost(message, optional, tag = "1")]
     pub timestamp: Option<Timestamp>,
-    #[prost(string, tag = "2")]
     pub line: String,
-    #[prost(message, repeated, tag = "3")]
     pub structured_metadata: Vec<LabelPairAdapter>,
+}
+
+impl prost::Message for EntryAdapter {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        // proto3 encoding, byte-identical to the derived impl (skips defaults):
+        // `None` timestamp and empty `line` emit nothing; tag-3 is repeated.
+        if let Some(ts) = &self.timestamp {
+            prost::encoding::message::encode(1u32, ts, buf);
+        }
+        if !self.line.is_empty() {
+            prost::encoding::string::encode(2u32, &self.line, buf);
+        }
+        prost::encoding::message::encode_repeated(3u32, &self.structured_metadata, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => prost::encoding::message::merge(
+                wire_type,
+                self.timestamp.get_or_insert_with(Default::default),
+                buf,
+                ctx,
+            ),
+            2u32 => prost::encoding::string::merge(wire_type, &mut self.line, buf, ctx),
+            3u32 => {
+                if self.structured_metadata.len() > MAX_STRUCTURED_METADATA_PER_ENTRY {
+                    // Cap reached: drain the excess record WITHOUT materializing,
+                    // but still enforce the wire-type contract the derived
+                    // `merge_repeated` would — a non-length-delimited tag-3 is a
+                    // malformed submessage and must FAIL the decode (a
+                    // `DecodeError`), never be silently skipped. The vec is
+                    // allowed to reach `MAX + 1` (not capped at `MAX`) so the
+                    // unchanged `canonical_structured_metadata(len > MAX)` check
+                    // still rejects an over-limit entry as `OversizeMessage`.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.structured_metadata,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.timestamp
+            .as_ref()
+            .map_or(0, |ts| prost::encoding::message::encoded_len(1u32, ts))
+            + if self.line.is_empty() {
+                0
+            } else {
+                prost::encoding::string::encoded_len(2u32, &self.line)
+            }
+            + prost::encoding::message::encoded_len_repeated(3u32, &self.structured_metadata)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// `logproto.LabelPairAdapter`: one structured-metadata `name`/`value` pair
@@ -122,11 +208,28 @@ pub const MAX_LABELS_PER_STREAM: usize = 256;
 /// construction.
 pub const MAX_TOTAL_ENTRIES_PER_REQUEST: usize = 5_000_000;
 /// Per-entry structured-metadata cardinality bound (issue #97), mirroring
-/// [`MAX_LABELS_PER_STREAM`]. Charged **before** the canonical JSON String is
-/// built (charge-before-allocate) — an entry carrying more than this is a
-/// whole-request [`LogsIngestError::OversizeMessage`] (Loki is all-or-
-/// nothing), never a silent truncation.
+/// [`MAX_LABELS_PER_STREAM`]. Enforced during decode by `EntryAdapter`'s
+/// hand-written [`prost::Message`] impl (protobuf) and by
+/// [`BoundedStructuredMetadata`] (JSON) — both charge-before-allocate — so an
+/// entry carrying more than this is rejected before the excess is materialized.
+/// The protobuf decoder lets the vec reach `MAX + 1` so the unchanged
+/// [`canonical_structured_metadata`] cardinality check still fires a
+/// whole-request [`LogsIngestError::OversizeMessage`] (Loki is all-or-nothing),
+/// never a silent truncation.
 pub const MAX_STRUCTURED_METADATA_PER_ENTRY: usize = 256;
+/// Per-entry structured-metadata *byte* budget (issue #97): the sum of
+/// `name.len() + value.len()` across an entry's SM pairs, charged on borrowed
+/// data **before** any clone / canonical-JSON construction so an oversize
+/// name/value cannot be cloned and JSON-escaped (up to ~6× for `\uXXXX`
+/// escaping) into hundreds of MiB — a single body-cap-sized string would
+/// otherwise amplify one 64 MiB request accordingly. 64 KiB is orders of
+/// magnitude above any legitimate per-entry metadata (trace/span/user IDs) yet
+/// caps worst-case canonical expansion to a few hundred KiB per entry. An entry
+/// exceeding it is a whole-request [`LogsIngestError::OversizeMessage`] with
+/// field `structured_metadata_bytes`, applied to both the protobuf and JSON
+/// paths (the amplification is identical once strings are materialized 1:1 from
+/// the wire/JSON).
+pub const MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY: usize = 64 * 1024;
 
 /// The infallible canonicalization/serialization core shared by every
 /// structured-metadata producer — the Loki-push receiver
@@ -165,13 +268,18 @@ pub(crate) fn structured_metadata_json(
 
 /// Canonicalizes one Loki-push entry's structured-metadata pairs into the
 /// stored `log_samples.structured_metadata` JSON String (issue #97). Charges
-/// the [`MAX_STRUCTURED_METADATA_PER_ENTRY`] per-entry cardinality bound
-/// **before** the `LabelSet`/JSON is built (charge-before-allocate) — an entry
-/// carrying more than that is a whole-request [`LogsIngestError::OversizeMessage`]
-/// (Loki is all-or-nothing), never a silent truncation — then delegates to the
-/// shared [`structured_metadata_json`] core.
+/// two per-entry bounds **before** the `LabelSet`/JSON is built
+/// (charge-before-allocate) — the [`MAX_STRUCTURED_METADATA_PER_ENTRY`]
+/// cardinality bound and the [`MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY`] total
+/// byte budget (`byte_count`, computed by the caller with `.len()` on borrowed
+/// strings, so the reject path performs zero clones) — an entry breaching
+/// either is a whole-request [`LogsIngestError::OversizeMessage`] (Loki is
+/// all-or-nothing), never a silent truncation — then delegates to the shared
+/// [`structured_metadata_json`] core (where the clone/escape happens, past both
+/// checks).
 fn canonical_structured_metadata(
     pair_count: usize,
+    byte_count: usize,
     pairs: impl IntoIterator<Item = (String, String)>,
 ) -> Result<String, LogsIngestError> {
     if pair_count == 0 {
@@ -182,6 +290,13 @@ fn canonical_structured_metadata(
             field: "structured_metadata",
             limit: MAX_STRUCTURED_METADATA_PER_ENTRY,
             actual: pair_count,
+        });
+    }
+    if byte_count > MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "structured_metadata_bytes",
+            limit: MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY,
+            actual: byte_count,
         });
     }
     Ok(structured_metadata_json(pairs))
@@ -256,12 +371,14 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
                 Some(ts) => resolve_pb_timestamp(ts)?,
                 None => now_ns,
             };
+            let sm = &entry.structured_metadata;
+            // Byte budget charged on borrowed data before the cloning iterator
+            // below is consumed — the reject path performs zero clones.
+            let byte_count = sm.iter().map(|p| p.name.len() + p.value.len()).sum();
             let structured_metadata = canonical_structured_metadata(
-                entry.structured_metadata.len(),
-                entry
-                    .structured_metadata
-                    .iter()
-                    .map(|p| (p.name.clone(), p.value.clone())),
+                sm.len(),
+                byte_count,
+                sm.iter().map(|p| (p.name.clone(), p.value.clone())),
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
@@ -318,12 +435,16 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
                     entry.timestamp
                 ))
             })?;
+            let sm = &entry.structured_metadata;
+            // Byte budget charged on borrowed data before the cloning iterator
+            // below is consumed — the reject path performs zero clones. Both
+            // paths get the budget: amplification is identical once strings are
+            // materialized 1:1 from the wire/JSON.
+            let byte_count = sm.iter().map(|(k, v)| k.len() + v.len()).sum();
             let structured_metadata = canonical_structured_metadata(
-                entry.structured_metadata.len(),
-                entry
-                    .structured_metadata
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
+                sm.len(),
+                byte_count,
+                sm.iter().map(|(k, v)| (k.clone(), v.clone())),
             )?;
             Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
@@ -1022,6 +1143,191 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parse_protobuf_accepts_exactly_max_structured_metadata_pairs() {
+        // Count boundary (AC3): exactly MAX (256) pairs is the largest accepted
+        // cardinality — no off-by-one regression against the 257-rejection test.
+        let sm: Vec<LabelPairAdapter> = (0..MAX_STRUCTURED_METADATA_PER_ENTRY)
+            .map(|i| label_pair(&format!("k{i:03}"), "v"))
+            .collect();
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="b"}"#.to_string(),
+                entries: vec![entry_with_sm(1_700_000_000, "x", sm)],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        // All 256 pairs are canonicalized (distinct keys, so no collision drop).
+        let json = &out.rows[0].structured_metadata;
+        assert!(json.starts_with('{') && json.ends_with('}'));
+        assert_eq!(
+            json.matches(':').count(),
+            MAX_STRUCTURED_METADATA_PER_ENTRY,
+            "all 256 pairs must be present in the canonical JSON"
+        );
+    }
+
+    /// A minimal length-delimited protobuf field: key byte `(tag << 3) | 2`
+    /// followed by a base-128 varint length and the payload. Used to hand-build
+    /// wire bytes the derived encoder cannot produce (an over-cap malformed
+    /// tag-3), so the decoder's post-cap wire-type check is exercised directly.
+    fn field_ld(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(tag << 3) | 2];
+        let mut len = payload.len();
+        loop {
+            let mut b = (len & 0x7f) as u8;
+            len >>= 7;
+            if len != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if len == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn decode_protobuf_caps_structured_metadata_materialization() {
+        // AC2: an entry carrying a million empty tag-3 submessages must NOT
+        // materialize all N — the hand-written decoder caps the vec at MAX+1
+        // (257) and drains the rest without allocating. Decode succeeds (the
+        // excess is length-delimited, drained cleanly); the deferred
+        // canonical_structured_metadata(len > MAX) check then rejects in parse.
+        let n = 1_000_000usize;
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="b"}"#.to_string(),
+                entries: vec![EntryAdapter {
+                    timestamp: Some(ts(1_700_000_000, 0)),
+                    line: "x".to_string(),
+                    structured_metadata: vec![LabelPairAdapter::default(); n],
+                }],
+            }],
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = decode_protobuf(&bytes).unwrap();
+        assert_eq!(
+            decoded.streams[0].entries[0].structured_metadata.len(),
+            MAX_STRUCTURED_METADATA_PER_ENTRY + 1,
+            "the decoder must cap materialization at MAX + 1, not materialize all N"
+        );
+        let err = parse_protobuf(&decoded, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "structured_metadata",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_protobuf_rejects_non_length_delimited_tag3_after_cap() {
+        // AC4 (finding 1): after the 257th pair the decoder drains excess tag-3
+        // records WITHOUT materializing, but must still enforce the wire-type
+        // contract the derived merge_repeated would — a non-length-delimited
+        // tag-3 (varint wire type) after the cap must FAIL decode, never be
+        // silently skipped. With an unconditional skip_field (the pre-fix shape)
+        // decode would succeed and this unwrap_err would panic.
+        let mut entry_bytes = Vec::new();
+        // 257 valid empty tag-3 records: `0x1a 0x00` (tag 3, length-delimited,
+        // zero-length submessage). 0..=MAX == 257 records → drives the vec to
+        // MAX + 1 so the next record hits the drain path.
+        for _ in 0..=MAX_STRUCTURED_METADATA_PER_ENTRY {
+            entry_bytes.extend_from_slice(&[0x1a, 0x00]);
+        }
+        // A malformed 258th tag-3 with varint wire type: `0x18 0x01`
+        // ((3 << 3) | 0 = 0x18, value 1).
+        entry_bytes.extend_from_slice(&[0x18, 0x01]);
+        // Wrap: StreamAdapter.entries (tag 2) -> PushRequest.streams (tag 1).
+        let stream_bytes = field_ld(2, &entry_bytes);
+        let request_bytes = field_ld(1, &stream_bytes);
+        let err = decode_protobuf(&request_bytes).unwrap_err();
+        assert!(
+            matches!(err, LogsIngestError::Decode(_)),
+            "a non-length-delimited tag-3 after the cap must fail decode, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_protobuf_rejects_oversize_structured_metadata_bytes() {
+        // AC5 (finding 2): a single over-budget pair must reject on the byte
+        // budget BEFORE any clone/canonical-JSON construction.
+        let big = "a".repeat(MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY + 1);
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="b"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "x",
+                    vec![label_pair("k", &big)],
+                )],
+            }],
+        };
+        let err = parse_protobuf(&req, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "structured_metadata_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_protobuf_accepts_at_budget_structured_metadata_bytes() {
+        // AC5: a payload whose Σ(name.len()+value.len()) is exactly the budget
+        // is accepted — no behaviour change for legitimate at-budget input.
+        let value = "a".repeat(MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY - 1);
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="b"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "x",
+                    vec![label_pair("k", &value)],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert!(!out.rows[0].structured_metadata.is_empty());
+    }
+
+    #[test]
+    fn parse_json_rejects_oversize_structured_metadata_bytes() {
+        // AC5: the byte budget applies to the JSON path too (amplification is
+        // identical once strings are materialized 1:1 from the JSON).
+        let big = "a".repeat(MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY + 1);
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{"k":"{big}"}}]]}}]}}"#
+        );
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "structured_metadata_bytes",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_json_accepts_at_budget_structured_metadata_bytes() {
+        // AC5: an at-budget JSON payload is accepted (no behaviour change).
+        let value = "a".repeat(MAX_STRUCTURED_METADATA_BYTES_PER_ENTRY - 1);
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{{"k":"{value}"}}]]}}]}}"#
+        );
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert!(!out.rows[0].structured_metadata.is_empty());
     }
 
     #[test]
