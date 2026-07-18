@@ -185,6 +185,176 @@ pub(crate) mod serializers {
         }
     }
 
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): non-swallowing oneof
+    // deserialize for the three `metrics.v1` `#[serde(flatten)] Option<Enum>`
+    // data oneofs (`Metric.data`, `NumberDataPoint.value`, `Exemplar.value`).
+    // serde's `flatten` + `Option<Enum>` combo SWALLOWS a present-but-malformed
+    // inner payload to `None` instead of erroring, so an OTLP/JSON metric with a
+    // bad field decoded to a silently-DROPPED metric (202, data loss) rather than
+    // the 400 it deserves. Each `deserialize` below routes the flattened content
+    // through a private per-variant `Option` helper struct — a normal `Option<T>`
+    // field propagates a present-but-malformed value as `Err` rather than
+    // swallowing it: absent variant key -> `Ok(None)` (unchanged); exactly one
+    // valid key -> `Ok(Some(variant))`; a present-but-malformed value -> `Err`
+    // (propagated -> `DecodeJson` -> 400); more than one variant key -> `Err`
+    // (canonical proto3/protojson rejects multiple oneof members set).
+    // Deserialize-only: serialization stays derived `flatten`, so the prost wire
+    // codec and PulsusDB's protojson RESPONSE emit are byte-for-byte identical.
+    // The `asInt` arms route through `deserialize_string_to_i64` and the
+    // `asDouble` arms through `f64_special_opt`, so canonical string-encoded
+    // 64-bit ints (`{"asInt":"42"}`) and non-finite doubles both decode.
+
+    /// Sets `slot` to `value`, erroring if a oneof member was already set
+    /// (canonical proto3 "at most one member" — a multi-member JSON oneof is a
+    /// named decode error, not a silent last-wins).
+    fn set_oneof<T, E: de::Error>(
+        slot: &mut Option<T>,
+        value: T,
+        multiple_msg: &'static str,
+    ) -> Result<(), E> {
+        if slot.is_some() {
+            return Err(E::custom(multiple_msg));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
+    // `Option<i64>` field adapter accepting BOTH the JSON-number and the
+    // canonical proto3/OTLP-JSON string form of an int64 (`{"asInt":"42"}`),
+    // delegating to the crate's existing `deserialize_string_to_i64`. Mirrors
+    // `f64_special_opt` for the `asDouble` arms: `None` when the field is
+    // absent, a present-but-malformed value propagates as `Err`.
+    pub mod i64_string_opt {
+        use super::deserialize_string_to_i64;
+        use serde::{Deserialize, Deserializer};
+
+        struct I64Str(i64);
+
+        impl<'de> Deserialize<'de> for I64Str {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                deserialize_string_to_i64(deserializer).map(I64Str)
+            }
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<i64>, D::Error> {
+            Ok(Option::<I64Str>::deserialize(deserializer)?.map(|w| w.0))
+        }
+    }
+
+    pub mod oneof_metric_data {
+        use crate::tonic::metrics::v1::metric::Data;
+        use crate::tonic::metrics::v1::{ExponentialHistogram, Gauge, Histogram, Sum, Summary};
+        use serde::{Deserialize, Deserializer};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Flat {
+            #[serde(default)]
+            gauge: Option<Gauge>,
+            #[serde(default)]
+            sum: Option<Sum>,
+            #[serde(default)]
+            histogram: Option<Histogram>,
+            #[serde(default)]
+            exponential_histogram: Option<ExponentialHistogram>,
+            #[serde(default)]
+            summary: Option<Summary>,
+        }
+
+        const MULTI: &str = "multiple metric data oneof members set";
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Data>, D::Error> {
+            let f = Flat::deserialize(d)?;
+            let mut out = None;
+            if let Some(v) = f.gauge {
+                super::set_oneof(&mut out, Data::Gauge(v), MULTI)?;
+            }
+            if let Some(v) = f.sum {
+                super::set_oneof(&mut out, Data::Sum(v), MULTI)?;
+            }
+            if let Some(v) = f.histogram {
+                super::set_oneof(&mut out, Data::Histogram(v), MULTI)?;
+            }
+            if let Some(v) = f.exponential_histogram {
+                super::set_oneof(&mut out, Data::ExponentialHistogram(v), MULTI)?;
+            }
+            if let Some(v) = f.summary {
+                super::set_oneof(&mut out, Data::Summary(v), MULTI)?;
+            }
+            Ok(out)
+        }
+    }
+
+    pub mod oneof_number_value {
+        use crate::tonic::metrics::v1::number_data_point::Value;
+        use serde::{Deserialize, Deserializer};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Flat {
+            #[serde(
+                default,
+                deserialize_with = "crate::proto::serializers::f64_special_opt::deserialize"
+            )]
+            as_double: Option<f64>,
+            #[serde(
+                default,
+                deserialize_with = "crate::proto::serializers::i64_string_opt::deserialize"
+            )]
+            as_int: Option<i64>,
+        }
+
+        const MULTI: &str = "multiple number data point value oneof members set";
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+            let f = Flat::deserialize(d)?;
+            let mut out = None;
+            if let Some(v) = f.as_double {
+                super::set_oneof(&mut out, Value::AsDouble(v), MULTI)?;
+            }
+            if let Some(v) = f.as_int {
+                super::set_oneof(&mut out, Value::AsInt(v), MULTI)?;
+            }
+            Ok(out)
+        }
+    }
+
+    pub mod oneof_exemplar_value {
+        use crate::tonic::metrics::v1::exemplar::Value;
+        use serde::{Deserialize, Deserializer};
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Flat {
+            #[serde(
+                default,
+                deserialize_with = "crate::proto::serializers::f64_special_opt::deserialize"
+            )]
+            as_double: Option<f64>,
+            #[serde(
+                default,
+                deserialize_with = "crate::proto::serializers::i64_string_opt::deserialize"
+            )]
+            as_int: Option<i64>,
+        }
+
+        const MULTI: &str = "multiple exemplar value oneof members set";
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+            let f = Flat::deserialize(d)?;
+            let mut out = None;
+            if let Some(v) = f.as_double {
+                super::set_oneof(&mut out, Value::AsDouble(v), MULTI)?;
+            }
+            if let Some(v) = f.as_int {
+                super::set_oneof(&mut out, Value::AsInt(v), MULTI)?;
+            }
+            Ok(out)
+        }
+    }
+
     // hex string <-> bytes conversion
 
     pub fn serialize_to_hex_string<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>

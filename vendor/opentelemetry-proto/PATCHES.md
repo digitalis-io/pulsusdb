@@ -156,10 +156,60 @@ generated `from_str_name`.
   behavior gate (each of the 6 fields, name-vs-integer) and the
   `otlp_json_equivalence.rs` differential (string-enum JSON per signal).
 
+### P6. Non-swallowing oneof deserialize + `serde(default)` parity — `metrics.v1` (#103)
+
+Upstream models each `metrics.v1` data-oneof as `#[serde(flatten)] Option<Enum>`.
+serde's `flatten` + `Option` combo SWALLOWS a present-but-malformed inner payload
+to `None` instead of erroring, so an OTLP/JSON metric with a bad field decoded to
+a silently-DROPPED metric (202, data loss) rather than the 400 it deserves.
+`Metric.data` is the master swallow (any decode error inside a metric's data
+subtree collapses to `data: None`, and `serde_json::from_slice` returns `Ok`); the
+`*.value` oneofs are the finer, deeper swallow (a bad scalar decodes the data
+point to `value: None`).
+
+Fix — **deserialize-only** (serialize stays derived `flatten`; wire + protojson
+RESPONSE emit byte-identical): a `deserialize_with` on each of the **three**
+vulnerable flatten oneofs — `Metric.data`, `NumberDataPoint.value`,
+`Exemplar.value` — routes the flattened content through a private per-variant
+`Option` helper struct (`crate::proto::serializers::oneof_{metric_data,
+number_value,exemplar_value}`). A normal `Option<T>` field propagates a
+present-but-malformed value as `Err`; absent variant key → `Ok(None)`. Each
+helper also rejects **more than one** oneof member set (canonical proto3/protojson
+"at most one member" — a named 400, not silent last-wins).
+
+Flatten-site count correction: there are **four** `serde(flatten)` sites in the
+vendored tonic files, not three — `AnyValue.value`
+(`opentelemetry.proto.common.v1.rs`, multi-line) is the fourth, but it routes
+through the P2 hand-written visitor and does NOT swallow (a malformed inner value
+already errors, verified). Only the three plain-`Option` metrics oneofs are fixed
+here.
+
+`asInt` acceptance (adjudication #103, OVERRIDE of the P5 out-of-scope note):
+both `AsInt` arms (`NumberDataPoint::Value::AsInt`, `Exemplar::Value::AsInt`)
+route through the crate's existing `deserialize_string_to_i64` (via the
+`i64_string_opt` `Option` adapter), so the canonical proto3/OTLP-JSON
+string-encoded int64 (`{"asInt":"42"}`) and the JSON-number form both decode
+identically — mirroring the `deserialize_string_to_u64` already wired on the
+message-level int64 fields (`time_unix_nano`, `count`, `bucket_counts`). Because
+`otlp_metrics::decode_json` is whole-request atomic, a number-only decoder would
+400 an entire batch on one canonically-encoded counter. A genuinely malformed
+value (`{"asInt":{}}`, a non-numeric string, a bad `asDouble`) still 400s.
+
+Companion: added `#[serde(default)]` to the four `metrics.v1` messages upstream
+inconsistently left without it — `ExponentialHistogramDataPoint`,
+`exponential_histogram_data_point::Buckets`,
+`summary_data_point::ValueAtQuantile`, `Exemplar` — so spec-valid SPARSE points
+(proto3-JSON omits default-valued fields; real exporters do this) still decode
+to 202 instead of 400-ing on a missing required field once the swallow is
+removed. `serde(default)` affects only ABSENT fields, so it re-introduces no
+swallow. Guarded by `otlp_json_vendor_patch.rs`.
+
 ## Out of scope (pre-existing upstream behavior, NOT introduced here)
 
-- `asInt`/`asDouble` **integer** oneof arms decode only as JSON numbers (not
-  int64-as-string). Unrelated to non-finite doubles.
+- `asDouble`'s **integer** representation and other non-`asInt` int64 fields are
+  unchanged. (The `asInt` oneof arms now dual-mode accept string-or-number per
+  P6; the P5-era "int64-as-string unsupported" note is superseded for those two
+  arms only.)
 
 ## Upstream status
 

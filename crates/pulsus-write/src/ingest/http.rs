@@ -1344,6 +1344,92 @@ mod tests {
         assert!(!partial.error_message.is_empty());
     }
 
+    // -- OTLP/JSON decode surfacing (issue #103, docs/decisions/0004 P6) -----
+    // The vendored serde flatten oneofs used to SWALLOW a malformed inner field
+    // to `None`, so a bad OTLP/JSON metric returned 202 with the metric silently
+    // dropped instead of the 400 it deserves. These end-to-end tests prove the
+    // decode error now reaches the handler (400/code 3), that spec-valid sparse
+    // points and canonical string-encoded `asInt` still ingest (202), and that
+    // decode never regresses to a silent drop.
+
+    const JSON_CT: (&str, &str) = ("content-type", "application/json");
+
+    #[tokio::test]
+    async fn metrics_json_malformed_exphist_value_returns_400_with_status_code_3() {
+        // A bad `count` deep inside the exphist data subtree used to collapse
+        // `Metric.data` to `None` (Ok -> 202, metric dropped). It must now be a
+        // named 400 (mirrors `metrics_malformed_body_returns_400_with_status_code_3`).
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let body = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+            {"name":"m","exponentialHistogram":{"dataPoints":[{"count":"nope"}]}}]}]}]}"#
+            .to_vec();
+        let res = post_metrics_body(metrics_router(sink.clone()), body, &[JSON_CT]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        // Nothing admitted — the malformed body never reached the sink.
+        assert!(sink.admitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_json_multiple_data_oneof_members_returns_400() {
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let body = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+            {"name":"m","gauge":{"dataPoints":[]},"sum":{"dataPoints":[]}}]}]}]}"#
+            .to_vec();
+        let res = post_metrics_body(metrics_router(sink), body, &[JSON_CT]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+    }
+
+    #[tokio::test]
+    async fn metrics_json_sparse_exphist_point_is_accepted() {
+        // proto3-JSON omits default-valued fields; P6's `serde(default)` lets a
+        // sparse-but-valid exphist point decode (was a spurious 400 once decode
+        // errors became visible). Async mode => 202.
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let body = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+            {"name":"eh","exponentialHistogram":{"aggregationTemporality":2,
+             "dataPoints":[{"timeUnixNano":"1700000000000000000","count":"0"}]}}]}]}]}"#
+            .to_vec();
+        let res = post_metrics_body(
+            metrics_router(sink.clone()),
+            body,
+            &[JSON_CT, ("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        assert_eq!(sink.admitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_json_string_encoded_int_counter_ingests() {
+        // Canonical OTLP/JSON string-encodes `asInt`; because decode is
+        // whole-request atomic, a number-only decoder would 400 the whole batch.
+        // The batch must be accepted (202) and the counter admitted as a sample.
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let body = br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+            {"name":"requests_total","sum":{"aggregationTemporality":2,"isMonotonic":true,
+             "dataPoints":[{"timeUnixNano":"1700000000000000000","asInt":"42"}]}}]}]}]}"#
+            .to_vec();
+        let res = post_metrics_body(
+            metrics_router(sink.clone()),
+            body,
+            &[JSON_CT, ("x-pulsus-async", "1")],
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        // The string-encoded counter is queryable: it decoded to a sample with
+        // the value 42, not silently dropped.
+        let batch = &admitted[0];
+        assert_eq!(batch.rejected, 0, "no data point should be rejected");
+        assert_eq!(batch.samples.len(), 1, "the asInt counter must ingest");
+        assert_eq!(batch.samples[0].value, 42.0);
+    }
+
     // -- `/v1/traces` (issue #54) ------------------------------------------
     // Mirrors the `/v1/logs`/`/v1/metrics` suites above exactly — same
     // shared helpers, only the sink/request/response types differ.

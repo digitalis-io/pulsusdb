@@ -205,7 +205,18 @@ pub struct Metric {
     /// reported value type for the data points, as well as the relatationship to
     /// the time interval over which they are reported.
     #[prost(oneof = "metric::Data", tags = "5, 7, 9, 10, 11")]
-    #[cfg_attr(feature = "with-serde", serde(flatten))]
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): non-swallowing oneof
+    // deserialize. Plain `flatten` + `Option<Enum>` decodes ANY malformed field
+    // inside the data subtree to `data: None` silently (metric dropped, 202 —
+    // data loss); the `deserialize_with` surfaces it as a decode error (-> 400)
+    // and rejects a JSON body with more than one data oneof member set.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            flatten,
+            deserialize_with = "crate::proto::serializers::oneof_metric_data::deserialize"
+        )
+    )]
     pub data: ::core::option::Option<metric::Data>,
 }
 /// Nested message and enum types in `Metric`.
@@ -395,7 +406,18 @@ pub struct NumberDataPoint {
     /// The value itself.  A point is considered invalid when one of the recognized
     /// value fields is not present inside this oneof.
     #[prost(oneof = "number_data_point::Value", tags = "4, 6")]
-    #[cfg_attr(feature = "with-serde", serde(flatten))]
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): non-swallowing oneof
+    // deserialize (see `Metric.data`) — a malformed scalar value here decoded
+    // the data point to `value: None` silently. The `deserialize_with` also
+    // accepts the canonical string-encoded `asInt` (`{"asInt":"42"}`) and
+    // rejects more than one value oneof member set.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            flatten,
+            deserialize_with = "crate::proto::serializers::oneof_number_value::deserialize"
+        )
+    )]
     pub value: ::core::option::Option<number_data_point::Value>,
 }
 /// Nested message and enum types in `NumberDataPoint`.
@@ -582,6 +604,11 @@ pub struct HistogramDataPoint {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P6): `serde(default)` parity — the
+// sibling data-point types carry it but this one does not; without it a
+// spec-valid SPARSE point (proto3-JSON omits default-valued fields) 400s once
+// the P6 swallow-fix makes decode errors visible.
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ExponentialHistogramDataPoint {
     /// The set of key/value pairs that uniquely identify the timeseries from
@@ -738,6 +765,10 @@ pub mod exponential_histogram_data_point {
     #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
     #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
     #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): `serde(default)` parity —
+    // a sparse `Buckets` (proto3-JSON omits default-valued fields) must still
+    // decode once P6 makes decode errors visible.
+    #[cfg_attr(feature = "with-serde", serde(default))]
     #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
     pub struct Buckets {
         /// The bucket index of the first entry in the bucket_counts array.
@@ -858,6 +889,10 @@ pub mod summary_data_point {
     #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
     #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
     #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): `serde(default)` parity —
+    // a sparse `ValueAtQuantile` (proto3-JSON omits default-valued fields) must
+    // still decode once P6 makes decode errors visible.
+    #[cfg_attr(feature = "with-serde", serde(default))]
     #[derive(Clone, Copy, PartialEq, ::prost::Message)]
     pub struct ValueAtQuantile {
         /// The quantile of a distribution. Must be in the interval
@@ -892,6 +927,11 @@ pub mod summary_data_point {
 #[cfg_attr(feature = "with-schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "with-serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "with-serde", serde(rename_all = "camelCase"))]
+// PATCH (PulsusDB, docs/decisions/0004, item P6): `serde(default)` parity — a
+// sparse `Exemplar` (proto3-JSON omits default-valued fields) must still decode
+// once P6 makes decode errors visible. The flatten `value` oneof itself is not
+// affected (its `deserialize_with` yields `None` for an absent oneof).
+#[cfg_attr(feature = "with-serde", serde(default))]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Exemplar {
     /// The set of key/value pairs that were filtered out by the aggregator, but
@@ -946,7 +986,17 @@ pub struct Exemplar {
     // on `Exemplar.value` (unlike `NumberDataPoint.value`), so without it the
     // oneof serializes nested (`{"value":{"asDouble":..}}`) instead of the
     // spec-required flat `{"asDouble":..}` and its NaN emits `null`.
-    #[cfg_attr(feature = "with-serde", serde(flatten))]
+    // PATCH (PulsusDB, docs/decisions/0004, item P6): non-swallowing oneof
+    // deserialize (see `Metric.data`) — a malformed exemplar value decoded to
+    // `value: None` silently. The `deserialize_with` also accepts the canonical
+    // string-encoded `asInt` and rejects more than one value oneof member set.
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            flatten,
+            deserialize_with = "crate::proto::serializers::oneof_exemplar_value::deserialize"
+        )
+    )]
     pub value: ::core::option::Option<exemplar::Value>,
 }
 /// Nested message and enum types in `Exemplar`.

@@ -14,10 +14,12 @@
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
 use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use opentelemetry_proto::tonic::metrics::v1::{
-    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Histogram, HistogramDataPoint,
-    NumberDataPoint, Sum, SummaryDataPoint, exemplar, number_data_point,
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+    HistogramDataPoint, Metric, NumberDataPoint, Sum, SummaryDataPoint, exemplar,
+    exponential_histogram_data_point::Buckets, metric, number_data_point,
 };
 use opentelemetry_proto::tonic::trace::v1::{Span, Status};
+use prost::Message as _;
 
 /// Bit-exact equality that treats any two NaNs as equal (the #33/#65
 /// precedent): `NaN != NaN` under `==`, so a raw comparison would spuriously
@@ -296,4 +298,222 @@ fn unknown_enum_integer_is_preserved_open_enum() {
     // value and must survive decode (matching the pre-patch bare-i32 path).
     let span: Span = serde_json::from_str(r#"{"kind":99}"#).expect("unknown int decodes");
     assert_eq!(span.kind, 99);
+}
+
+// ---- P6: non-swallowing oneof deserialize + serde(default) parity (#103) ------
+//
+// Upstream models each `metrics.v1` data oneof as `#[serde(flatten)]
+// Option<Enum>`. serde's flatten+Option combo SWALLOWS a present-but-malformed
+// inner payload to `None` instead of erroring, so an OTLP/JSON metric with a bad
+// field decoded to a silently-DROPPED metric (202, data loss) rather than a 400.
+// P6 replaces the swallow with a `deserialize_with` per flatten oneof (Metric.data,
+// NumberDataPoint.value, Exemplar.value) that (a) propagates a present-but-malformed
+// value as a decode error, (b) rejects >1 oneof member set, and (c) accepts the
+// canonical string-encoded `asInt`. Companion: `serde(default)` on the 4 messages
+// upstream left without it, so spec-valid SPARSE points still decode. These gates
+// fail loudly if a re-vendor drops the patch (swallow returns, or asInt-as-string
+// reverts to reject).
+
+/// A fully-populated `ExponentialHistogram` exercising every P6-touched message
+/// (`ExponentialHistogramDataPoint`, `Buckets`, `Exemplar`) with finite values,
+/// so equality after a round-trip is exact (no NaN handling needed here).
+fn full_exponential_histogram() -> ExponentialHistogram {
+    ExponentialHistogram {
+        data_points: vec![ExponentialHistogramDataPoint {
+            attributes: vec![],
+            start_time_unix_nano: 1,
+            time_unix_nano: 2,
+            count: 6,
+            sum: Some(3.5),
+            scale: 2,
+            zero_count: 1,
+            positive: Some(Buckets {
+                offset: 1,
+                bucket_counts: vec![1, 2],
+            }),
+            negative: Some(Buckets {
+                offset: -1,
+                bucket_counts: vec![3],
+            }),
+            flags: 0,
+            exemplars: vec![Exemplar {
+                filtered_attributes: vec![],
+                time_unix_nano: 5,
+                span_id: vec![],
+                trace_id: vec![],
+                value: Some(exemplar::Value::AsInt(7)),
+            }],
+            min: Some(0.5),
+            max: Some(9.0),
+            zero_threshold: 0.0,
+        }],
+        aggregation_temporality: 2,
+    }
+}
+
+#[test]
+fn malformed_metric_data_is_a_decode_error_not_a_swallow() {
+    // A bad `count` deep inside the data subtree used to collapse the whole
+    // `Metric.data` to `None` (Ok), silently dropping the metric. It must now be
+    // a decode error.
+    let err = serde_json::from_str::<Metric>(
+        r#"{"name":"m","exponentialHistogram":{"dataPoints":[{"count":"nope"}]}}"#,
+    );
+    assert!(
+        err.is_err(),
+        "malformed inner field must surface as a decode error, got: {err:?}"
+    );
+}
+
+#[test]
+fn malformed_number_data_point_value_is_a_decode_error() {
+    // A malformed scalar `asDouble` used to decode the data point to
+    // `value: None` (Ok). It must now error at each of NumberDataPoint and the
+    // enclosing Metric.
+    let err = serde_json::from_str::<NumberDataPoint>(r#"{"asDouble":{"bad":1}}"#);
+    assert!(err.is_err(), "malformed asDouble must error, got: {err:?}");
+
+    let via_metric = serde_json::from_str::<Metric>(
+        r#"{"name":"m","gauge":{"dataPoints":[{"asDouble":{"bad":1}}]}}"#,
+    );
+    assert!(via_metric.is_err(), "must propagate through Metric.data");
+}
+
+#[test]
+fn malformed_exemplar_value_is_a_decode_error() {
+    let err = serde_json::from_str::<Exemplar>(r#"{"asDouble":{"bad":1}}"#);
+    assert!(
+        err.is_err(),
+        "malformed exemplar asDouble must error, got: {err:?}"
+    );
+}
+
+#[test]
+fn multiple_metric_data_oneof_members_is_a_decode_error() {
+    // Canonical proto3/protojson rejects more than one oneof member set; this
+    // used to silently decode to `None` (last-wins/first-wins ambiguity).
+    let err = serde_json::from_str::<Metric>(
+        r#"{"name":"m","gauge":{"dataPoints":[]},"sum":{"dataPoints":[]}}"#,
+    );
+    assert!(
+        err.is_err(),
+        "two data oneof members must be a decode error, got: {err:?}"
+    );
+}
+
+#[test]
+fn multiple_value_oneof_members_is_a_decode_error() {
+    let ndp = serde_json::from_str::<NumberDataPoint>(r#"{"asDouble":1.0,"asInt":"2"}"#);
+    assert!(ndp.is_err(), "two value members must error, got: {ndp:?}");
+
+    let ex = serde_json::from_str::<Exemplar>(r#"{"asDouble":1.0,"asInt":"2"}"#);
+    assert!(ex.is_err(), "two exemplar members must error, got: {ex:?}");
+}
+
+#[test]
+fn empty_metric_data_oneof_decodes_to_none() {
+    // No data key => absent oneof => `data: None`, Ok (unchanged from upstream).
+    let m: Metric = serde_json::from_str(r#"{"name":"m"}"#).expect("no data key decodes");
+    assert!(m.data.is_none());
+}
+
+#[test]
+fn number_data_point_accepts_asint_string_and_number() {
+    // Canonical proto3/OTLP-JSON string-encodes 64-bit ints incl. asInt; both
+    // the string and the number form must decode identically (adjudication #103
+    // OVERRIDE — in scope).
+    let by_string: NumberDataPoint =
+        serde_json::from_str(r#"{"asInt":"42"}"#).expect("string form");
+    let by_number: NumberDataPoint = serde_json::from_str(r#"{"asInt":42}"#).expect("number form");
+    assert_eq!(by_string.value, Some(number_data_point::Value::AsInt(42)));
+    assert_eq!(by_string.value, by_number.value);
+}
+
+#[test]
+fn exemplar_accepts_asint_string_and_number() {
+    let by_string: Exemplar = serde_json::from_str(r#"{"asInt":"42"}"#).expect("string form");
+    let by_number: Exemplar = serde_json::from_str(r#"{"asInt":42}"#).expect("number form");
+    assert_eq!(by_string.value, Some(exemplar::Value::AsInt(42)));
+    assert_eq!(by_string.value, by_number.value);
+}
+
+#[test]
+fn malformed_asint_is_a_decode_error() {
+    // A non-numeric string or a non-scalar must 400, not silently swallow.
+    assert!(serde_json::from_str::<NumberDataPoint>(r#"{"asInt":{}}"#).is_err());
+    assert!(serde_json::from_str::<NumberDataPoint>(r#"{"asInt":"abc"}"#).is_err());
+    assert!(serde_json::from_str::<Exemplar>(r#"{"asInt":{}}"#).is_err());
+}
+
+#[test]
+fn sparse_exponential_histogram_point_decodes_via_serde_default() {
+    // proto3-JSON omits default-valued fields; without P6's `serde(default)` a
+    // sparse point 400s on a missing required field. Both an empty object and a
+    // single-field object must decode to defaulted structs.
+    let empty: ExponentialHistogramDataPoint =
+        serde_json::from_str(r#"{}"#).expect("empty sparse point decodes");
+    assert_eq!(empty, ExponentialHistogramDataPoint::default());
+
+    let sparse: ExponentialHistogramDataPoint =
+        serde_json::from_str(r#"{"count":"3"}"#).expect("sparse point decodes");
+    assert_eq!(sparse.count, 3);
+
+    // The three sibling messages that also gained `serde(default)`.
+    let _: Buckets = serde_json::from_str(r#"{}"#).expect("sparse Buckets decodes");
+    let _: Exemplar = serde_json::from_str(r#"{}"#).expect("sparse Exemplar decodes");
+    let _: opentelemetry_proto::tonic::metrics::v1::summary_data_point::ValueAtQuantile =
+        serde_json::from_str(r#"{}"#).expect("sparse ValueAtQuantile decodes");
+}
+
+#[test]
+fn full_exponential_histogram_round_trips_byte_identically_through_json() {
+    let metric = Metric {
+        name: "eh".to_string(),
+        data: Some(metric::Data::ExponentialHistogram(
+            full_exponential_histogram(),
+        )),
+        ..Default::default()
+    };
+    let back = round_trip(&metric);
+    assert_eq!(
+        metric, back,
+        "full exphist metric must survive JSON round-trip"
+    );
+}
+
+#[test]
+fn protobuf_wire_round_trip_is_unaffected() {
+    // The P6 patch is deserialize-only + cfg_attr(with-serde)-gated; the prost
+    // wire codec must be untouched. This backstops the byte-neutrality argument.
+    let metric = Metric {
+        name: "eh".to_string(),
+        data: Some(metric::Data::ExponentialHistogram(
+            full_exponential_histogram(),
+        )),
+        ..Default::default()
+    };
+    let bytes = metric.encode_to_vec();
+    let decoded = Metric::decode(bytes.as_slice()).expect("wire decode");
+    assert_eq!(metric, decoded, "prost wire round-trip must be exact");
+}
+
+#[test]
+fn valid_number_and_metric_data_still_decode() {
+    // No-regression: a valid double gauge point still decodes to Some(variant).
+    let ndp: NumberDataPoint = serde_json::from_str(r#"{"asDouble":1.5}"#).expect("valid asDouble");
+    assert_eq!(ndp.value, Some(number_data_point::Value::AsDouble(1.5)));
+
+    let m: Metric =
+        serde_json::from_str(r#"{"name":"g","gauge":{"dataPoints":[{"asDouble":1.5}]}}"#)
+            .expect("valid gauge metric");
+    match m.data {
+        Some(metric::Data::Gauge(Gauge { data_points })) => {
+            assert_eq!(data_points.len(), 1);
+            assert_eq!(
+                data_points[0].value,
+                Some(number_data_point::Value::AsDouble(1.5))
+            );
+        }
+        other => panic!("expected Gauge, got {other:?}"),
+    }
 }

@@ -88,8 +88,8 @@ those tests fail loudly.
   (what real OTLP/JSON emitters send); the string-name form was rejected with a
   named 400. Now accepted (see Update (#98)).
 - `asInt` / `asDouble` **integer** oneof arms decode only as JSON numbers
-  (not int64-as-string). Pre-existing upstream behavior, unrelated to non-finite
-  doubles; out of scope, noted in PATCHES.md.
+  (not int64-as-string). *Superseded for the two `asInt` arms by Update (#103)
+  below.* Pre-existing upstream behavior, unrelated to non-finite doubles.
 
 ### Update (#98, 2026-07-18) — string-enum names now accepted
 
@@ -104,6 +104,40 @@ An unknown enum *name* is still a clean, named 400 (`LogsIngestError::DecodeJson
 never a silent 0); an unknown *integer* is preserved (proto open-enum). Proven
 by the `otlp_json_vendor_patch.rs` behavior gate (each of the 6 fields,
 name-vs-integer) and the `otlp_json_equivalence.rs` string-enum differential.
+
+### Update (#103, 2026-07-18) — flatten oneofs no longer swallow malformed input; `asInt`-as-string accepted
+
+Patch item **P6** (PATCHES.md) closes a silent-data-loss path found during #98.
+Upstream models each `metrics.v1` data-oneof as `#[serde(flatten)] Option<Enum>`;
+serde's `flatten` + `Option` combo SWALLOWS a present-but-malformed inner payload
+to `None`, so an OTLP/JSON metric with a bad field decoded to a silently-dropped
+metric (202, data loss) rather than a 400. A `deserialize_with` on each of the
+**three** vulnerable flatten oneofs (`Metric.data`, `NumberDataPoint.value`,
+`Exemplar.value`) routes the flattened content through a private per-variant
+`Option` helper struct that propagates a malformed value as `Err` (→
+`LogsIngestError::DecodeJson` → 400) and rejects more than one oneof member set
+(canonical proto3 "at most one member"). Flatten-site count correction: there are
+**four** `serde(flatten)` sites total, not three — `AnyValue.value`
+(`common.v1.rs`) is the fourth, but it uses the P2 hand-written visitor and does
+NOT swallow, so only the three plain-`Option` metrics oneofs are fixed.
+
+The two `AsInt` arms additionally lift the int64-as-string limitation noted above
+(adjudication #103, override): both route through the crate's existing
+`deserialize_string_to_i64`, so `{"asInt":"42"}` (canonical string) and
+`{"asInt":42}` (number) decode identically — matching the `deserialize_string_to_u64`
+already wired on the message-level int64 fields. Because `decode_json` is
+whole-request atomic, a number-only decoder would 400 an entire batch on one
+canonically-encoded counter.
+
+Companion: `#[serde(default)]` added to the four `metrics.v1` messages upstream
+left without it (`ExponentialHistogramDataPoint`, `Buckets`, `ValueAtQuantile`,
+`Exemplar`), so spec-valid SPARSE points (proto3-JSON omits default-valued fields)
+still decode instead of 400-ing once the swallow is removed; `serde(default)`
+touches only absent fields and re-introduces no swallow. Deserialize-only + prost
+wire byte-identical. Proven by the `otlp_json_vendor_patch.rs` behavior gate
+(malformed → error at each site, multiple-members → error, `asInt`-as-string
+accepted, sparse point accepted, full point + prost wire round-trip) and the
+end-to-end `ingest/http.rs` 400/202 tests.
 
 ## Consequences
 
