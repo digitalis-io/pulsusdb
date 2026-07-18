@@ -648,6 +648,15 @@ fn a_surviving_unwrap_conversion_failure_fails_the_query_with_the_oracle_message
         series.contains(r#"took="abc""#),
         "the failed line keeps its raw label in the series (oracle shape): {series}"
     );
+    // Byte-exact metric-path `__error_details__` (issue #104): a
+    // `unwrap duration(took)` conversion failure over `took=abc` renders
+    // Go `time.ParseDuration`'s `invalid duration` string, inner-quoted by
+    // `render_series_labels` — identical to the label-filter duration
+    // family (oracle-confirmed vs grafana/loki:3.4.2).
+    assert!(
+        series.contains(r#"__error_details__="time: invalid duration \"abc\"""#),
+        "metric path must carry the byte-exact SampleExtractionErr detail: {series}"
+    );
     // The full oracle template (pinned reference oracle — the compose
     // digest — live-probe transcript, 2026-07-17; HTTP 400):
     //   pipeline error: 'SampleExtractionErr' for series: '{...}'.
@@ -750,6 +759,13 @@ fn error_series_labels_escape_quotes_backslashes_and_control_chars() {
         series.contains(r#"msg="a\"b\\c\td""#),
         "quote/backslash/control escaping must hold: {series}"
     );
+    // The metric-path `__error_details__` (issue #104) itself carries
+    // inner double quotes (`time: invalid duration "abc"`), which
+    // `render_series_labels` re-escapes byte-exactly — no raw quotes leak.
+    assert!(
+        series.contains(r#"__error_details__="time: invalid duration \"abc\"""#),
+        "detail label must render with escaped inner quotes: {series}"
+    );
     // The rendered text stays structurally parseable: every `"` inside
     // a value is escaped, so the quote count is even and no raw control
     // characters leak.
@@ -812,10 +828,19 @@ fn a_surviving_parser_error_also_fails_a_metric_query() {
         &meta_one(),
     )
     .unwrap_err();
-    let ReadError::MetricPipelineError { error_type, .. } = &err else {
+    let ReadError::MetricPipelineError { error_type, series } = &err else {
         panic!("expected MetricPipelineError, got {err:?}");
     };
     assert_eq!(error_type, "JSONParserErr");
+    // Byte-exact metric-path `__error_details__` (issue #104): the
+    // JSONParserErr detail is the pinned buger/jsonparser message
+    // (oracle_probe.txt [1]), rendered as a series label.
+    assert!(
+        series.contains(
+            r#"__error_details__="Value looks like object, but can't find closing '}' symbol""#
+        ),
+        "metric path must carry the byte-exact JSONParserErr detail: {series}"
+    );
 }
 
 // ---------------------------------------------------------------------

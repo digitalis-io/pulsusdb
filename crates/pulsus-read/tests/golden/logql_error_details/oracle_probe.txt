@@ -141,3 +141,43 @@ and escalates the finding to the task-manager. Under the streams-only
 (!metric) gate those goldens stay byte-identical; the metric-path
 message therefore KNOWINGLY omits __error_details__ vs Loki pending an
 adjudication of the expanded scope.
+
+[SUPERSEDED by the RESOLVED section below — issue #104 flipped the
+metric-path detail gate to always-record, so the "knowingly omits" state
+above no longer holds.]
+
+
+METRIC PATH — SampleExtractionErr — RESOLVED (issue #104)
+------------------------------------------------------------------------
+
+Question: does the metric-specific SampleExtractionErr (an `unwrap`
+conversion failure, inert on the streams path) carry the same byte-exact
+__error_details__, and does it match label_filter_error_details?
+
+Captured with GET /loki/api/v1/query_range (HTTP 400 body),
+grafana/loki:3.4.2 under deploy/e2e/loki.yaml limits:
+
+  QUERY sum_over_time({probe="unwrap_duration"} | logfmt | unwrap duration(took) [5m])   (took=abc)
+    pipeline error: 'SampleExtractionErr' for series: '{__error__="SampleExtractionErr",
+      __error_details__="time: invalid duration \"abc\"", probe="unwrap_duration",
+      service_name="unknown_service", took="abc", x="1"}'.
+
+  QUERY sum_over_time({probe="unwrap_number"} | logfmt | unwrap x [5m])   (x=abc)
+    pipeline error: 'SampleExtractionErr' for series: '{__error__="SampleExtractionErr",
+      __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax", probe="unwrap_number",
+      service_name="unknown_service", x="abc", y="1"}'.
+
+  QUERY sum_over_time({probe="unwrap_bytes"} | logfmt | unwrap bytes(sz) [5m])   (sz=abc)
+    pipeline error: 'SampleExtractionErr' for series: '{__error__="SampleExtractionErr",
+      __error_details__="strconv.ParseFloat: parsing \"\": invalid syntax", probe="unwrap_bytes",
+      service_name="unknown_service", sz="abc", y="1"}'.
+
+RESULT: byte-exact reuse of label_filter_error_details confirmed for the
+metric SampleExtractionErr path (Number -> go_quote; Duration ->
+go_duration_parse_error; Bytes -> the empty-leading-numeric-prefix quirk).
+Issue #104 flips the metric-path detail gate to always-record, so the
+metric pipeline-error series now carries byte-exact __error_details__
+matching Loki 3.4.2 — RESOLVING the OQ2 deferral above. Only
+logql_metric_agg_golden.rs gates the metric detail bytes; the server
+goldens (logs_api/error.rs, prom_api/error.rs) are synthetic prefix-only
+asserts and stay byte-identical.

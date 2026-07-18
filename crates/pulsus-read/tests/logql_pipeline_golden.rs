@@ -766,24 +766,26 @@ fn error_detail_label_survives_and_drops_with_its_error_partner() {
 }
 
 #[test]
-fn metric_path_sets_error_but_never_the_detail_label() {
-    // Streams-only gate (issue #99): the metric path still tags __error__
-    // (which fails the query downstream) but sets NO __error_details__, so
-    // the frozen metric error-series goldens stay byte-identical. (Loki
-    // 3.4.2 DOES include the detail in its metric pipeline-error message —
-    // recorded as the OQ2 escalation in oracle_probe.txt, not adopted
-    // here pending adjudication.)
+fn metric_path_sets_both_error_and_the_detail_label() {
+    // Parity flip (issue #104): the metric path now tags __error__ AND the
+    // byte-exact __error_details__ — the same detail the streams path emits
+    // (grafana/loki:3.4.2 DOES include it in its metric pipeline-error
+    // message; oracle-confirmed). __error_details__ sorts immediately after
+    // __error__.
     let pipeline = compiled(r#"{a="b"} | json"#);
     let base = base();
     let mut labels: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
     let out = pipeline.run_metric_into("not json", &base, &mut labels);
     assert!(matches!(out, MetricRun::Kept { .. }));
     assert!(
-        labels.iter().any(|(k, _)| k == "__error__"),
+        labels
+            .iter()
+            .any(|(k, v)| k == "__error__" && v == "JSONParserErr"),
         "metric path still tags __error__: {labels:?}"
     );
     assert!(
-        !labels.iter().any(|(k, _)| k == "__error_details__"),
-        "metric path must not set __error_details__: {labels:?}"
+        labels.iter().any(|(k, v)| k == "__error_details__"
+            && v == "Value looks like object, but can't find closing '}' symbol"),
+        "metric path must now carry the byte-exact __error_details__: {labels:?}"
     );
 }

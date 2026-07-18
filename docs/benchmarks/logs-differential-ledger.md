@@ -117,13 +117,33 @@ Out of this ledger's scope by design:
   adds no read-path SQL and cannot regress the Tier-1 SQL/alloc goldens.
 
 - **`__error_details__` on the METRIC pipeline-error message (issue #99
-  OQ2, escalated).** The `grafana/loki:3.4.2` probe found that Loki DOES
-  include `__error_details__` in its metric `pipeline error: '…' for
-  series: '{…}'` message — contradicting the #91 deferral premise. Per
-  the #99 adjudication this is a STOP-and-escalate condition: PulsusDB's
-  metric path stays streams-only (no `__error_details__`, frozen metric
-  goldens byte-identical) pending a task-manager decision. Not a fixture
-  case; recorded here and in the probe transcript for history.
+  OQ2 → RESOLVED, issue #104).** The `grafana/loki:3.4.2` probe found
+  that Loki DOES include `__error_details__` in its metric `pipeline
+  error: '…' for series: '{…}'` message — contradicting the #91 deferral
+  premise. #99 stayed streams-only and escalated; issue #104 brought the
+  metric path to parity by reusing #99's machinery verbatim (the same
+  `label_filter_error_details` / `logfmt_error_details` / `JSON_ERROR_DETAILS`
+  formatters, now recorded on both paths). Parity is byte-exact for the
+  classes reachable on the metric path: `JSONParserErr` (the pinned
+  buger/jsonparser message), the `SampleExtractionErr` unwrap-conversion
+  failure (`unwrap duration/number/bytes` share the label-filter
+  conversion — Number → Go `strconv.ParseFloat`, Duration → Go
+  `time.ParseDuration`'s `invalid duration` / `missing unit` branches,
+  Bytes → the empty-prefix `ParseFloat` quirk — oracle-confirmed live
+  byte-exact against `grafana/loki:3.4.2`, so NO dedicated
+  `sample_extraction_error_details` fallback is needed), and the
+  `LabelFilterErr` families already ledgered above. The off-corpus
+  faithful-format classes enumerated in the `__error_details__` note
+  above (Bytes internal split, duration `unknown unit`, partial-object
+  JSON) apply identically on the metric path and are unchanged. The ONLY
+  hermetic golden that gates the metric detail BYTES is
+  `crates/pulsus-read/tests/logql_metric_agg_golden.rs` — the server
+  error-mapping goldens (`logs_api/error.rs`, `prom_api/error.rs`)
+  construct SYNTHETIC `MetricPipelineError`s and assert status + message
+  PREFIX only, so they do not gate detail bytes and are untouched. The
+  live cross-check is the existing nightly `metric_unwrap_error`
+  differential (unchanged: it asserts both stores carry the
+  `SampleExtractionErr` class, a substring the flip does not remove).
 
 ## Entries
 
