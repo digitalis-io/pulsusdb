@@ -178,6 +178,14 @@ pub struct MetricsEngine {
     client: ChClient,
     resolver: std::sync::Arc<super::labels::LabelCache>,
     config: MetricsConfig,
+    /// Issue #101: the process-wide eval-concurrency permit bounding the
+    /// one CPU-bound offload below (`evaluate_offloaded`). `new` seeds a
+    /// throwaway default gate so the ~28 in-crate/live-test call sites need
+    /// no change; production overrides it via [`MetricsEngine::with_eval_gate`]
+    /// with the `AppState`-owned shared gate (an engine-local gate would
+    /// reset every request — the engine is rebuilt per query — and bound
+    /// nothing).
+    eval_gate: std::sync::Arc<crate::eval_gate::EvalGate>,
 }
 
 impl MetricsEngine {
@@ -190,7 +198,21 @@ impl MetricsEngine {
             client,
             resolver,
             config,
+            eval_gate: std::sync::Arc::new(crate::eval_gate::EvalGate::new(
+                crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
+            )),
         }
+    }
+
+    /// Issue #101: installs the shared process-wide eval-concurrency gate
+    /// (owned by `AppState`, so the bound survives this engine's
+    /// per-request rebuild). Not a `new` parameter — that would churn ~28
+    /// test call sites for no behavioural gain (the throwaway default gate
+    /// `new` seeds is a single negligible `Arc` alloc, dwarfed by the CH
+    /// query).
+    pub fn with_eval_gate(mut self, gate: std::sync::Arc<crate::eval_gate::EvalGate>) -> Self {
+        self.eval_gate = gate;
+        self
     }
 
     pub async fn query(
@@ -399,28 +421,27 @@ impl MetricsEngine {
         // before `join_all` completed above, so NO pooled-connection lease
         // is held across this offload.
         //
-        // Cancellation/concurrency bound (plan v3 Δ2, adjudicated): tokio
-        // does NOT cancel a `spawn_blocking` task when its awaiter is
-        // dropped, but that changes nothing here. Concurrently EXECUTING
-        // evals are bounded by `max_blocking_threads` (default 512) — a
-        // bounded constant, the offloaded analogue of today's synchronous
-        // ceiling of `worker_threads`. QUEUED (not-yet-started) evals are
-        // bounded only by request arrival rate / the upstream `TimeoutLayer`
-        // — which is ALREADY true of the pre-#93 synchronous path (pending
-        // query tasks queue on the tokio scheduler identically). A request
-        // future can only be dropped BETWEEN polls, and the synchronous
-        // `evaluate` ran inside a single await-free poll, so on client
-        // disconnect or the 408 timeout it ALREADY ran to completion before
-        // the drop was observed — `spawn_blocking` does not introduce that.
-        // A tight eval-concurrency permit is deferred to its own hardening
-        // issue (not smuggled into this perf change).
+        // Cancellation/concurrency bound (issue #101, hardening #93's Δ2):
+        // tokio does NOT cancel a `spawn_blocking` task when its awaiter is
+        // dropped, so a disconnected/timed-out client's eval still runs to
+        // completion on the blocking pool. `self.eval_gate` (the shared
+        // `AppState`-owned `EvalGate`) now bounds BOTH in-flight and queued
+        // evals: the permit is acquired here — AFTER the `join_all` fetch
+        // above fully drained every `ChRowStream`, so no pooled-connection
+        // lease is ever held across the offload — and released only when the
+        // blocking eval finishes (the owned permit lives inside the
+        // `spawn_blocking` closure). Exhaustion is a bounded wait
+        // (`acquire().await`), bounded by the upstream `TimeoutLayer` (408,
+        // `query_timeout`); a timed-out/disconnected waiter releases its
+        // queued reservation cleanly. No 429/503 and no new timeout knob.
         //
         // The only reachable `JoinError` is a PANIC in `evaluate`: we own
         // the handle and `.await` it directly (never `abort`, never drop it
         // early), so cancellation is unreachable. Re-raising the panic
         // preserves today's panic-on-bug behavior exactly (no new
         // `ReadError` variant — a panic is not a domain error).
-        let value = evaluate_offloaded(plan, data).await?;
+        let value =
+            evaluate_offloaded(&self.eval_gate, plan, data, pulsus_promql::evaluate).await?;
         Ok(value_to_query_result(value))
     }
 
@@ -1054,11 +1075,36 @@ fn concrete_name(sel: &SelectorSpec) -> Result<&str, ReadError> {
 /// panic-on-bug behavior — no new `ReadError` variant. Extracted so the
 /// reactor-non-starvation gate (`tests::offloaded_evaluate_does_not_starve_
 /// the_reactor`) exercises this exact code path.
-async fn evaluate_offloaded(
+///
+/// Issue #101: the offload runs through `gate.run_blocking`, so the eval
+/// holds an [`crate::eval_gate::EvalGate`] permit for the whole blocking
+/// closure — bounding concurrent CPU-bound evals (including disconnected-
+/// client evals tokio will not cancel).
+///
+/// The eval body is a closure parameter (`eval`), not hard-wired: production
+/// passes [`pulsus_promql::evaluate`] (a zero-sized fn item — no runtime
+/// cost, no hot-path instrumentation), while tests can inject an
+/// eval-equivalent closure that observes concurrency *inside* the offloaded
+/// blocking task. This is the only deterministic way to gate the "permit is
+/// held for the DURATION of the blocking eval" property through this exact
+/// function (the gate view alone cannot see it: a regression that dropped
+/// the permit before `spawn_blocking` would make the gate look *idle* while
+/// N+k evals ran, so the over-admission must be counted at the eval itself).
+async fn evaluate_offloaded<F>(
+    gate: &crate::eval_gate::EvalGate,
     plan: pulsus_promql::QueryPlan,
     data: pulsus_promql::SeriesData,
-) -> Result<pulsus_promql::QueryValue, ReadError> {
-    match tokio::task::spawn_blocking(move || pulsus_promql::evaluate(&plan, &data)).await {
+    eval: F,
+) -> Result<pulsus_promql::QueryValue, ReadError>
+where
+    F: FnOnce(
+            &pulsus_promql::QueryPlan,
+            &pulsus_promql::SeriesData,
+        ) -> Result<pulsus_promql::QueryValue, pulsus_promql::PromqlError>
+        + Send
+        + 'static,
+{
+    match gate.run_blocking(move || eval(&plan, &data)).await {
         Ok(res) => Ok(res?),
         Err(join) => std::panic::resume_unwind(join.into_panic()),
     }
@@ -1603,7 +1649,10 @@ mod tests {
             !progressed.load(Ordering::SeqCst),
             "sanity: the spawned task must not run before the driver yields"
         );
-        let out = evaluate_offloaded(plan, data).await.unwrap();
+        let gate = crate::eval_gate::EvalGate::new(crate::eval_gate::DEFAULT_EVAL_CONCURRENCY);
+        let out = evaluate_offloaded(&gate, plan, data, pulsus_promql::evaluate)
+            .await
+            .unwrap();
         assert!(
             progressed.load(Ordering::SeqCst),
             "the concurrent task made progress during the offloaded eval — the reactor stayed live"
@@ -1625,6 +1674,153 @@ mod tests {
             "inline (non-offloaded) eval starves the reactor: the concurrent task must NOT have run"
         );
         std::hint::black_box(&inline);
+    }
+
+    /// Issue #101 (AC6 — production wiring, made deterministic per the plan
+    /// review): `evaluate_offloaded` takes an eval permit for the whole
+    /// eval and releases it after. Proven without any wall-time race by
+    /// holding the sole permit of an `EvalGate::new(1)` first, starting
+    /// `evaluate_offloaded` (which must therefore QUEUE — `waiting == 1`),
+    /// then releasing the held permit and asserting the eval completes and
+    /// the permit is returned (`available == 1`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offloaded_evaluate_holds_a_permit_for_the_eval_and_releases_it() {
+        use std::sync::Arc;
+
+        let gate = Arc::new(crate::eval_gate::EvalGate::new(1));
+        // Hold the sole permit so the eval below is forced to queue.
+        let held = gate.acquire().await;
+
+        let (plan, data) = heavy_eval_fixture();
+        let g = Arc::clone(&gate);
+        let handle = tokio::spawn(async move {
+            evaluate_offloaded(&g, plan, data, pulsus_promql::evaluate)
+                .await
+                .unwrap()
+        });
+
+        // The eval cannot start while we hold the permit: it is queued.
+        loop {
+            if gate.snapshot().waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.snapshot().available,
+            0,
+            "the held permit blocks the eval from starting"
+        );
+
+        // Release the permit; the eval now runs to completion.
+        drop(held);
+        let out = handle.await.unwrap();
+        assert!(
+            matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+            "the heavy fixture must produce a non-empty matrix"
+        );
+        assert_eq!(
+            gate.snapshot().available,
+            1,
+            "the eval permit is returned after the blocking eval finishes"
+        );
+    }
+
+    /// Issue #101 (AC6, strengthened per code-review round 1): proves the
+    /// permit is held for the WHOLE DURATION of the blocking eval *inside*
+    /// `evaluate_offloaded`, not merely queued-before / released-after. The
+    /// prior AC6 assertion could not see mid-eval state, so an
+    /// acquire-release-before-`spawn_blocking` regression in
+    /// `evaluate_offloaded` would pass it. This is AC2's counting-gate shape
+    /// driven THROUGH `evaluate_offloaded`: `N + K` concurrent calls share an
+    /// `EvalGate::new(N)`, and each injected eval closure counts the evals
+    /// concurrently in flight *inside the offloaded blocking task* via a
+    /// `fetch_max` (read only after every task joins — no race, no wall-time
+    /// assert). If the permit were dropped before the spawn, all `N + K`
+    /// eval closures would run at once and `max_seen` would exceed `N`. The
+    /// closure ends by running the real `pulsus_promql::evaluate`, so the
+    /// integration still exercises actual eval work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn offloaded_evaluate_holds_its_permit_for_the_whole_eval_bounding_concurrency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio::sync::Semaphore as TokioSemaphore;
+
+        const N: usize = 2;
+        const K: usize = 3;
+
+        let gate = Arc::new(crate::eval_gate::EvalGate::new(N));
+        let release = Arc::new(AtomicBool::new(false));
+        // Counts eval closures that have started running (i.e. hold a permit).
+        let entered = Arc::new(TokioSemaphore::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..(N + K) {
+            let gate = Arc::clone(&gate);
+            let release = Arc::clone(&release);
+            let entered = Arc::clone(&entered);
+            let in_flight = Arc::clone(&in_flight);
+            let max_seen = Arc::clone(&max_seen);
+            let (plan, data) = heavy_eval_fixture();
+            handles.push(tokio::spawn(async move {
+                evaluate_offloaded(&gate, plan, data, move |plan, data| {
+                    // Runs on the blocking pool while the permit is held.
+                    let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_seen.fetch_max(cur, Ordering::SeqCst);
+                    entered.add_permits(1);
+                    while !release.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    pulsus_promql::evaluate(plan, data)
+                })
+                .await
+                .unwrap()
+            }));
+        }
+
+        // Wait until exactly N eval closures are running (parked on the
+        // release flag); the K extra provably queue at the gate.
+        let admitted = entered.acquire_many(N as u32).await.unwrap();
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "only N eval closures may run inside evaluate_offloaded while the gate is full"
+        );
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= N,
+            "evaluate_offloaded must never run more than N eval closures concurrently"
+        );
+        assert_eq!(
+            gate.snapshot().available,
+            0,
+            "the gate is fully occupied by the in-flight evals"
+        );
+
+        // Release everyone and let all N+K run to completion.
+        drop(admitted);
+        release.store(true, Ordering::SeqCst);
+        for h in handles {
+            let out = h.await.unwrap();
+            assert!(
+                matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+                "each offloaded eval must produce the heavy fixture's non-empty matrix"
+            );
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            N,
+            "the bound is tight: exactly N evals ran concurrently inside evaluate_offloaded"
+        );
+        assert_eq!(
+            gate.snapshot().available,
+            N,
+            "every eval permit is returned after evaluate_offloaded completes"
+        );
     }
 
     #[test]

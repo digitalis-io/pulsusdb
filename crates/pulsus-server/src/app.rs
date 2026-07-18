@@ -49,6 +49,12 @@ pub(crate) struct AppState {
     pub(crate) metric_writer: Arc<MetricWriterSink>,
     pub(crate) trace_writer: Arc<TraceWriterSink>,
     pub(crate) label_cache: Arc<OnceLock<Arc<LabelCache>>>,
+    /// Issue #101: the process-wide eval-concurrency permit gating the read
+    /// path's one CPU-bound PromQL offload. Lives here (not in
+    /// `MetricsEngine`) because the engine is rebuilt per request via
+    /// `engine_for`→`chconfig::metrics_engine`, so an engine-local gate
+    /// would reset every query and bound nothing.
+    pub(crate) eval_gate: Arc<pulsus_read::EvalGate>,
     pub(crate) started_at: std::time::SystemTime,
     /// The live-tail runtime bundle (issue #74): the process shutdown
     /// signal every tail loop races its awaits against, plus the
@@ -182,6 +188,11 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            eval_gate: Arc::new(pulsus_read::EvalGate::new(
+                pulsus_config::Config::default()
+                    .reader
+                    .query_eval_concurrency,
+            )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }

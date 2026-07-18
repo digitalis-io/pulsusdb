@@ -82,6 +82,7 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` | `10` | LogQL pipeline first-page fetch-size hint (must be >= 1): when a query pipeline contains an in-engine dropping stage that cannot push down to SQL (a label filter, or a line filter placed after `line_format`), the engine keyset-pages `limit × factor` rows at a time through the pipeline until the true `limit` fills, the window is exhausted, or the byte scan budget is spent — responses fill exactly to `limit` (no under-return) and never over-return. This is no longer an oversample-and-truncate ceiling; a larger factor only sizes the first page (fewer round-trips). `PULSUS_LOGQL_SCAN_BUDGET_BYTES` is the hard cumulative scan ceiling and aborts first; a budget-truncated result returns the survivors so far and sets `data.stats.pulsus_partial` |
 | `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
+| `PULSUS_QUERY_EVAL_CONCURRENCY` | `256` | process-wide bound on concurrent CPU-bound PromQL evaluations offloaded onto the blocking pool (the read path's one `spawn_blocking(evaluate)` site); a query past the limit waits (bounded by `PULSUS_QUERY_TIMEOUT`, `408`), never a hard rejection. Default sits below tokio's 512 blocking-pool ceiling yet above realistic heavy-query fan-in, so the uncontended fast path is the norm (must be >= 1) |
 | `PULSUS_TAIL_POLL_INTERVAL` | `1s` | how often an idle (caught-up) live-tail connection re-polls for new rows (must be > 0) |
 | `PULSUS_TAIL_MAX_DELAY` | `5s` | ceiling on a tail client's `delay_for` param (docs/api.md §2.4); larger requests are clamped |
 | `PULSUS_TAIL_MAX_CONNECTIONS` | `100` | process-wide cap on concurrent tail WebSocket connections; the next one is rejected `429` before the upgrade (must be >= 1) |
@@ -181,6 +182,7 @@ reader:
   logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
+  query_eval_concurrency: 256
   tail_poll_interval: 1s
   tail_max_delay: 5s
   tail_max_connections: 100

@@ -193,6 +193,15 @@ pub struct ReaderConfig {
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
+    /// evaluations offloaded onto tokio's blocking pool (the read path's
+    /// one `spawn_blocking(evaluate)` site). A query past the limit waits
+    /// (bounded by `query_timeout`, 408), never a hard rejection. Default
+    /// 256 — below tokio's 512 blocking-pool ceiling (so evals cannot
+    /// monopolize the pool) yet above realistic heavy-query fan-in (so the
+    /// uncontended fast path is the norm). Must be >= 1 (validated at
+    /// startup).
+    pub query_eval_concurrency: usize,
     /// Issue #74 (M6-11) live tail: how often an idle (caught-up) tail
     /// connection re-polls ClickHouse for new rows. Must be > 0
     /// (validated at startup) — a zero interval would busy-spin the poll
@@ -249,6 +258,7 @@ impl Default for ReaderConfig {
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            query_eval_concurrency: 256,
             tail_poll_interval: HumanDuration(Duration::from_secs(1)),
             tail_max_delay: HumanDuration(Duration::from_secs(5)),
             tail_max_connections: 100,

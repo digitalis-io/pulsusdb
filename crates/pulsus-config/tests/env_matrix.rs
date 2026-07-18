@@ -232,6 +232,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.traceql_scan_budget_rows == 12_345,
     },
     Row {
+        var: "PULSUS_QUERY_EVAL_CONCURRENCY",
+        value: "64",
+        check: |c| c.reader.query_eval_concurrency == 64,
+    },
+    Row {
         var: "PULSUS_TAIL_POLL_INTERVAL",
         value: "250ms",
         check: |c| c.reader.tail_poll_interval.0 == Duration::from_millis(250),
@@ -306,8 +311,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        53,
-        "docs/configuration.md §§1-8 document exactly 53 variables"
+        54,
+        "docs/configuration.md §§1-8 document exactly 54 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

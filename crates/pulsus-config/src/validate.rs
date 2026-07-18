@@ -147,6 +147,13 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.traceql_max_candidates",
         cfg.reader.traceql_max_candidates,
     )?;
+    // Issue #101: a zero eval-concurrency bound would admit no eval at all
+    // (the semaphore starts with 0 permits — every query would queue
+    // forever until the 408 timeout).
+    positive_u64(
+        "reader.query_eval_concurrency",
+        cfg.reader.query_eval_concurrency as u64,
+    )?;
     // Issue #74 (M6-11) plan v3 delta 6 (+ v4's slice floor): the live-tail
     // floors. A zero poll interval busy-spins the poll loop; a zero
     // connection cap makes every tail a 429; a zero channel depth is a
@@ -436,6 +443,23 @@ mod tests {
         let mut cfg = Config::default();
         cfg.reader.promql_max_metric_fanout = 0;
         assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #101: the eval-concurrency bound follows the sibling u64 caps'
+    /// validation shape — zero is rejected at config load as
+    /// `ConfigError::Value` naming the field (a zero bound admits no eval),
+    /// and the documented container default is 256.
+    #[test]
+    fn zero_query_eval_concurrency_is_rejected_and_the_default_is_256() {
+        assert_eq!(Config::default().reader.query_eval_concurrency, 256);
+        let mut cfg = Config::default();
+        cfg.reader.query_eval_concurrency = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.query_eval_concurrency");
+            }
+            other => panic!("expected a Value error for the zero bound, got {other:?}"),
+        }
     }
 
     /// Issue #74 (M6-11) plan v3 delta 6 + v4: each live-tail floor is

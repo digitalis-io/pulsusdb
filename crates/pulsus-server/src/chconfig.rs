@@ -240,9 +240,10 @@ pub(crate) fn metrics_engine(
     pool: Arc<ChPool>,
     label_cache: Arc<LabelCache>,
     config: &Config,
+    eval_gate: Arc<pulsus_read::EvalGate>,
 ) -> MetricsEngine {
     let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
-    MetricsEngine::new(client, label_cache, metrics_config_from(config))
+    MetricsEngine::new(client, label_cache, metrics_config_from(config)).with_eval_gate(eval_gate)
 }
 
 /// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issues #55/#57):

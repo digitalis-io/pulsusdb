@@ -138,6 +138,9 @@ pub async fn run(config: Config) -> ExitCode {
         metric_writer: Arc::new(MetricWriterSink::new(Arc::clone(&metric_writer_slot))),
         trace_writer: Arc::new(TraceWriterSink::new(Arc::clone(&trace_writer_slot))),
         label_cache: Arc::clone(&label_cache_slot),
+        eval_gate: Arc::new(pulsus_read::EvalGate::new(
+            config.reader.query_eval_concurrency,
+        )),
         started_at: std::time::SystemTime::now(),
         tail: Arc::new(crate::app::TailRuntime::new(
             tail_shutdown_rx,

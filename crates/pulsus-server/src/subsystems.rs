@@ -84,6 +84,11 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
             label_cache: Arc::new(OnceLock::new()),
+            eval_gate: Arc::new(pulsus_read::EvalGate::new(
+                pulsus_config::Config::default()
+                    .reader
+                    .query_eval_concurrency,
+            )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         };

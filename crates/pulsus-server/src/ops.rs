@@ -111,6 +111,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(cache) = state.label_cache.get() {
         record_label_cache_metrics(cache);
     }
+    record_eval_gate_metrics(&state.eval_gate);
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -148,6 +149,23 @@ fn record_label_cache_metrics(cache: &LabelCache) {
     metrics::counter!("pulsus_label_cache_refreshes_total").absolute(snap.refreshes_total);
     metrics::counter!("pulsus_label_cache_refresh_failures_total")
         .absolute(snap.refresh_failures_total);
+}
+
+/// Issue #101: bridges the read path's [`pulsus_read::EvalGateSnapshot`]
+/// through the `metrics` facade on scrape (same snapshot→pull model as
+/// [`record_label_cache_metrics`], so the read path never touches the
+/// `metrics` facade in its hot loop). Gauges use `.set()`; the two
+/// monotonic counters use `.absolute()` (this crate mirrors the gate's own
+/// atomics, it does not own the exporter's running total).
+fn record_eval_gate_metrics(gate: &pulsus_read::EvalGate) {
+    let snap = gate.snapshot();
+    metrics::gauge!("pulsus_query_eval_permits_limit").set(snap.limit as f64);
+    metrics::gauge!("pulsus_query_eval_permits_available").set(snap.available as f64);
+    metrics::gauge!("pulsus_query_eval_in_flight").set(snap.in_flight as f64);
+    metrics::gauge!("pulsus_query_eval_waiting").set(snap.waiting as f64);
+    metrics::counter!("pulsus_query_eval_contended_total").absolute(snap.contended_total);
+    metrics::counter!("pulsus_query_eval_wait_seconds_total")
+        .absolute(snap.wait_nanos_total / 1_000_000_000);
 }
 
 /// `GET /config`: effective configuration, secrets redacted
@@ -194,6 +212,11 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            eval_gate: Arc::new(pulsus_read::EvalGate::new(
+                pulsus_config::Config::default()
+                    .reader
+                    .query_eval_concurrency,
+            )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         }
@@ -261,6 +284,11 @@ mod tests {
             metric_writer: Arc::new(MetricWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             trace_writer: Arc::new(TraceWriterSink::new(Arc::new(std::sync::OnceLock::new()))),
             label_cache: Arc::new(std::sync::OnceLock::new()),
+            eval_gate: Arc::new(pulsus_read::EvalGate::new(
+                pulsus_config::Config::default()
+                    .reader
+                    .query_eval_concurrency,
+            )),
             started_at: std::time::SystemTime::now(),
             tail: std::sync::Arc::new(crate::app::TailRuntime::for_tests()),
         };

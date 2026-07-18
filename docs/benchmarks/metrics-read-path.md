@@ -183,13 +183,32 @@ dropped — but this changes nothing versus the pre-#93 synchronous path:
 `spawn_blocking`'s only genuine deltas are (i) evals no longer pin a
 reactor worker (the latency win) and (ii) the executing ceiling rises from
 `worker_threads` to `max_blocking_threads` — a larger constant, still
-bounded. The read path has **no** admission/eval-concurrency permit today
-(only a `TimeoutLayer`; the sole server semaphore gates WebSocket tail
-connections). Adding one would inject backpressure into the hot read path
-and mutate the ratified concurrency contract, so it is deliberately **not**
-done here; a bounded `reader.query_eval_concurrency` owned-permit-in-closure
-(the `logs_api/tail.rs` topology) is filed as a hardening follow-up in
-[issue #101](https://github.com/digitalis-io/pulsusdb/issues/101).
+bounded.
+
+Issue #101 tightened this: the read path now carries a process-wide
+eval-concurrency permit (`EvalGate`, an owned `Arc<Semaphore>` in
+`AppState`, sized by `reader.query_eval_concurrency`, **default 256**).
+`evaluate_offloaded` acquires the permit **after** the ClickHouse fetch has
+fully drained into owned `SeriesData` and moves the owned permit **into**
+the `spawn_blocking` closure, so it is released only when the blocking eval
+actually finishes — bounding both in-flight and queued evals, including
+evals for already-disconnected clients (which tokio will not cancel). The
+uncontended path is a single lock-free `try_acquire_owned` (no clock, no
+atomic, no waker), so a query that fits under the limit is never serialized
+or slowed; the default 256 sits below tokio's 512 blocking-pool ceiling so
+evals can never monopolize the pool, yet above realistic heavy-query
+fan-in. Exhaustion is a bounded wait (`acquire().await`) bounded by the
+existing per-request `TimeoutLayer` (`408`, `query_timeout`) — no new
+429/503 status and no new timeout knob (this deliberately differs from the
+tail slot's fail-fast `429`, which holds a slot for a connection's whole
+lifetime). The gate exports six `pulsus_query_eval_*` metrics on
+`/metrics`: gauges `pulsus_query_eval_permits_limit`,
+`pulsus_query_eval_permits_available`, `pulsus_query_eval_in_flight`,
+`pulsus_query_eval_waiting`; counters `pulsus_query_eval_contended_total`,
+`pulsus_query_eval_wait_seconds_total`. Hermetic counting/identity gates
+(`crates/pulsus-read/src/eval_gate.rs`, plus AC6 in `metrics/exec.rs`)
+prove the bound is tight, the fast path is uninstrumented, and the permit
+spans the whole blocking closure without any wall-time assert.
 
 The only reachable `JoinError` is a **panic** in `evaluate` (we own and
 directly await the handle, never cancel); it is re-raised via

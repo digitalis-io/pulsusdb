@@ -1,10 +1,12 @@
 //! Query HTTP APIs, response encoders, and live tail. See
 //! docs/architecture.md §5.
 
+pub mod eval_gate;
 pub mod logql;
 pub mod metrics;
 pub mod traces;
 
+pub use eval_gate::{DEFAULT_EVAL_CONCURRENCY, EvalGate, EvalGateSnapshot};
 pub use logql::{
     DEFAULT_MAX_STREAMS, Direction, EngineConfig, ExplainStage, LogQlEngine, LogStats,
     MatrixSeries, PlanCtx, PlanExplain, QueryParams, QueryResult, QuerySpec, ReadError,
