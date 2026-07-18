@@ -117,6 +117,12 @@ pub struct LogRecord {
     /// Numerical value of the severity, normalized to values described in Log Data Model.
     /// \[Optional\].
     #[prost(enumeration = "SeverityNumber", tag = "2")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_severity_number::deserialize"
+        )
+    )]
     pub severity_number: i32,
     /// The severity text (also known as log level). The original string representation as
     /// it is known at the source. \[Optional\].

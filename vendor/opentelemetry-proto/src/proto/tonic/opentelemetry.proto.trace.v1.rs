@@ -164,6 +164,12 @@ pub struct Span {
     /// two spans with the same name may be distinguished using `CLIENT` (caller)
     /// and `SERVER` (callee) to identify queueing latency associated with the span.
     #[prost(enumeration = "span::SpanKind", tag = "6")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_span_kind::deserialize"
+        )
+    )]
     pub kind: i32,
     /// The start time of the span. On the client side, this is the time
     /// kept by the local machine where the span execution starts. On the server side, this
@@ -419,6 +425,12 @@ pub struct Status {
     pub message: ::prost::alloc::string::String,
     /// The status code.
     #[prost(enumeration = "status::StatusCode", tag = "3")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_status_code::deserialize"
+        )
+    )]
     pub code: i32,
 }
 /// Nested message and enum types in `Status`.

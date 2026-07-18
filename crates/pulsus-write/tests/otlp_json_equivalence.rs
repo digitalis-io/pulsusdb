@@ -440,46 +440,108 @@ fn non_finite_metric_json_decodes_and_preserves_values() {
 }
 
 // -------------------------------------------------------------------------
-// String-enum names: the ONE documented protojson gap. Real OTLP/JSON emitters
-// (OTel SDK exporters, the collector's pdata JSON marshaler) emit enums as
-// INTEGERS — verified against the goldens above (`"kind": 2`, `"severityNumber":
-// 9`), which is why integer-only support is correct for interop. proto3-JSON
-// also PERMITS the string name form; `with-serde` types enums as bare `i32`
-// with no string deserializer, so a string-name enum is REJECTED. Per the
-// 5004660170 adjudication the rejection must be LOUD and specific (a named
-// 400 / `DecodeJson`), never a silent mis-decode or a corrupted row. Deferred
-// string-enum support is tracked as follow-up #98.
+// #98 — proto3-JSON enum string-NAME acceptance. proto3-JSON permits enum
+// fields as EITHER the integer value OR the string name. #76 accepted only the
+// integer form (what real emitters send); the vendored patch item P5
+// (docs/decisions/0004) now also accepts the string name, deserialize-only, so
+// both forms decode identically while serialize/the wire codec stay integer.
+// This differential asserts the string-name form decodes to the SAME request
+// as the integer form on every signal — traces (`kind` + `status.code`), logs
+// (`severityNumber`), metrics (all three `aggregationTemporality` sites: Sum,
+// Histogram, ExponentialHistogram) — and that the decoded enum is the expected
+// NON-ZERO value (guards against both forms silently decoding to 0). Payloads
+// carry no non-finite doubles, so the derived `PartialEq` on the request is a
+// sound comparator here. Replaces the #76 rejection test (now lifted).
 // -------------------------------------------------------------------------
 
 #[test]
-fn string_enum_name_is_cleanly_rejected_not_silently_misdecoded() {
-    // A spec-permitted-but-unsupported `"kind": "SPAN_KIND_SERVER"` (string
-    // name instead of the integer `2`). Must fail decode as a named error, not
-    // decode to a wrong/zero kind.
-    let json = br#"{
-        "resourceSpans": [{
-            "scopeSpans": [{
-                "spans": [{
-                    "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-                    "spanId": "00f067aa0ba902b7",
-                    "name": "s",
-                    "kind": "SPAN_KIND_SERVER",
-                    "startTimeUnixNano": "1700000000000000000",
-                    "endTimeUnixNano": "1700000001000000000"
-                }]
-            }]
-        }]
-    }"#;
-    let err = otlp_traces::decode_json(json).expect_err("string enum name must be rejected");
-    // The named 400-class variant (`classify` maps it to 400 / code 3).
-    assert!(
-        matches!(err, pulsus_write::LogsIngestError::DecodeJson(_)),
-        "expected a named DecodeJson error, got {err:?}"
+fn string_enum_name_decodes_identically_to_integer_form() {
+    // Traces: `kind` (SpanKind) + `status.code` (StatusCode).
+    let traces = |kind: &str, code: &str| {
+        format!(
+            r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{{
+                "traceId":"4bf92f3577b34da6a3ce929d0e0e4736",
+                "spanId":"00f067aa0ba902b7","name":"s","kind":{kind},
+                "startTimeUnixNano":"1700000000000000000",
+                "endTimeUnixNano":"1700000001000000000",
+                "status":{{"code":{code}}}
+            }}]}}]}}]}}"#
+        )
+    };
+    let by_name =
+        otlp_traces::decode_json(traces("\"SPAN_KIND_SERVER\"", "\"STATUS_CODE_OK\"").as_bytes())
+            .expect("traces name form decodes");
+    let by_int =
+        otlp_traces::decode_json(traces("2", "1").as_bytes()).expect("traces integer form decodes");
+    assert_eq!(
+        by_name, by_int,
+        "trace enum name form must decode like the integer form"
     );
-    assert!(
-        err.to_string().contains("malformed OTLP/JSON request body"),
-        "error message must be actionable: {err}"
+    let span = &by_name.resource_spans[0].scope_spans[0].spans[0];
+    assert_eq!(span.kind, 2, "SPAN_KIND_SERVER");
+    assert_eq!(
+        span.status.as_ref().expect("status present").code,
+        1,
+        "STATUS_CODE_OK"
     );
+
+    // Logs: `severityNumber` (SeverityNumber).
+    let logs = |sev: &str| {
+        format!(
+            r#"{{"resourceLogs":[{{"scopeLogs":[{{"logRecords":[{{
+                "timeUnixNano":"1700000000000000000","severityNumber":{sev},
+                "body":{{"stringValue":"hi"}}
+            }}]}}]}}]}}"#
+        )
+    };
+    let by_name = otlp_logs::decode_json(logs("\"SEVERITY_NUMBER_INFO\"").as_bytes())
+        .expect("logs name form");
+    let by_int = otlp_logs::decode_json(logs("9").as_bytes()).expect("logs integer form");
+    assert_eq!(
+        by_name, by_int,
+        "log severity name form must decode like the integer form"
+    );
+    assert_eq!(
+        by_name.resource_logs[0].scope_logs[0].log_records[0].severity_number, 9,
+        "SEVERITY_NUMBER_INFO"
+    );
+
+    // Metrics: all three `aggregationTemporality` sites (Sum, Histogram,
+    // ExponentialHistogram) — each a distinct `#[serde(with=...)]` wiring.
+    // `aggregationTemporality` lives on the Sum/Histogram/ExponentialHistogram
+    // struct itself (not the data points), so no data points are needed to
+    // exercise the three deserializers.
+    let metrics = |t: &str| {
+        format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[
+                {{"name":"s","sum":{{"aggregationTemporality":{t}}}}},
+                {{"name":"h","histogram":{{"aggregationTemporality":{t}}}}},
+                {{"name":"e","exponentialHistogram":{{"aggregationTemporality":{t}}}}}
+            ]}}]}}]}}"#
+        )
+    };
+    let by_name =
+        otlp_metrics::decode_json(metrics("\"AGGREGATION_TEMPORALITY_CUMULATIVE\"").as_bytes())
+            .expect("metrics name form");
+    let by_int = otlp_metrics::decode_json(metrics("2").as_bytes()).expect("metrics integer form");
+    assert_eq!(
+        by_name, by_int,
+        "metric aggregationTemporality name form must decode like the integer form"
+    );
+    let metrics_out = &by_name.resource_metrics[0].scope_metrics[0].metrics;
+    for m in metrics_out {
+        let temporality = match m.data.as_ref().expect("metric data") {
+            metric::Data::Sum(s) => s.aggregation_temporality,
+            metric::Data::Histogram(h) => h.aggregation_temporality,
+            metric::Data::ExponentialHistogram(e) => e.aggregation_temporality,
+            other => panic!("unexpected metric data: {other:?}"),
+        };
+        assert_eq!(
+            temporality, 2,
+            "AGGREGATION_TEMPORALITY_CUMULATIVE on {}",
+            m.name
+        );
+    }
 }
 
 // -------------------------------------------------------------------------

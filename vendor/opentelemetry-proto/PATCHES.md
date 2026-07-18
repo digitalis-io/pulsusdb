@@ -121,12 +121,43 @@ round-trip. Flatten audit of every oneof holding a double (complete):
 `any_value::Value` (has flatten + the visitor path from P2). No other oneof
 holds a double.
 
+### P5. proto3-JSON enum string-NAME acceptance — `src/proto.rs` + the three signal `.rs` files (#98)
+
+proto3-JSON permits an enum field as EITHER its integer value OR its string
+name. Upstream models every `#[prost(enumeration = ...)]` field as a bare
+`i32`, so the derived `Deserialize` accepts ONLY the integer form; the
+string-name form (`"kind":"SPAN_KIND_SERVER"`) is rejected. This item adds a
+`deserialize_with` that accepts BOTH forms, mapping the name via prost's
+generated `from_str_name`.
+
+- **`src/proto.rs`** (`mod serializers`): `deserialize_enum_int_or_name` (a
+  `deserialize_any` engine — `visit_i64`/`visit_u64` for the integer form,
+  `visit_str` for the name) plus four thin per-enum wrapper modules
+  (`enum_span_kind`, `enum_status_code`, `enum_severity_number`,
+  `enum_aggregation_temporality`), each coercing that enum's `from_str_name`.
+- Wired (deserialize-only) to the **6** enum-typed fields across **4** enums:
+
+  | Field | Enum | File |
+  |-------|------|------|
+  | `Span.kind` | `span::SpanKind` | `opentelemetry.proto.trace.v1.rs` |
+  | `Status.code` | `status::StatusCode` | `opentelemetry.proto.trace.v1.rs` |
+  | `LogRecord.severity_number` | `SeverityNumber` | `opentelemetry.proto.logs.v1.rs` |
+  | `Sum.aggregation_temporality` | `AggregationTemporality` | `opentelemetry.proto.metrics.v1.rs` |
+  | `Histogram.aggregation_temporality` | `AggregationTemporality` | `opentelemetry.proto.metrics.v1.rs` |
+  | `ExponentialHistogram.aggregation_temporality` | `AggregationTemporality` | `opentelemetry.proto.metrics.v1.rs` |
+
+  The `flags` fields (`SpanFlags`/`LogRecordFlags`/`DataPointFlags`) are plain
+  `fixed32`/`uint32` scalars, NOT enum-typed — excluded by design.
+- **Deserialize-only** (no `serialize_with`): serialization stays derived
+  (integer emit), so the prost wire codec and PulsusDB's protojson RESPONSE
+  emit are byte-for-byte identical. Open-enum semantics: an unknown INTEGER is
+  preserved (matching the pre-patch bare-i32 path); an unknown NAME is a hard
+  decode error (a clean, named 400 — never a silent 0). Covered by the
+  behavior gate (each of the 6 fields, name-vs-integer) and the
+  `otlp_json_equivalence.rs` differential (string-enum JSON per signal).
+
 ## Out of scope (pre-existing upstream behavior, NOT introduced here)
 
-- **String enum names** (`"kind":"SPAN_KIND_SERVER"` etc.): enums are typed as
-  bare `i32` with no string deserializer, so only integer enums decode. Real
-  OTLP/JSON emitters send integers; the string-name form is rejected with a
-  named 400. Deferred string-enum support is tracked as follow-up #98.
 - `asInt`/`asDouble` **integer** oneof arms decode only as JSON numbers (not
   int64-as-string). Unrelated to non-finite doubles.
 

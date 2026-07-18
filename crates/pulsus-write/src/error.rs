@@ -57,8 +57,9 @@ pub enum LogsIngestError {
     /// The (decompressed) request body was sent with `Content-Type:
     /// application/json` but is not a valid OTLP/JSON (proto3-JSON) encoding
     /// of the signal's `Export*ServiceRequest` — malformed JSON, a wrong
-    /// field shape, or a value form this receiver does not accept (e.g. a
-    /// string enum name; OTLP/JSON emitters send integer enums — issue #76).
+    /// field shape, or a value form this receiver cannot resolve (e.g. an
+    /// unknown enum name; both the integer and the proto3-JSON string-name
+    /// enum forms are accepted — issues #76, #98).
     /// Same whole-request 400-class as [`Self::Decode`]: OTLP/JSON is a second
     /// wire encoding of the identical message, so a decode failure is the same
     /// structural error, never a partial apply.

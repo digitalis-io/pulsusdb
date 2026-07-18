@@ -265,6 +265,12 @@ pub struct Sum {
     /// aggregation_temporality describes if the aggregator reports delta changes
     /// since last report time, or cumulative changes since a fixed start time.
     #[prost(enumeration = "AggregationTemporality", tag = "2")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_aggregation_temporality::deserialize"
+        )
+    )]
     pub aggregation_temporality: i32,
     /// Represents whether the sum is monotonic.
     #[prost(bool, tag = "3")]
@@ -285,6 +291,12 @@ pub struct Histogram {
     /// aggregation_temporality describes if the aggregator reports delta changes
     /// since last report time, or cumulative changes since a fixed start time.
     #[prost(enumeration = "AggregationTemporality", tag = "2")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_aggregation_temporality::deserialize"
+        )
+    )]
     pub aggregation_temporality: i32,
 }
 /// ExponentialHistogram represents the type of a metric that is calculated by aggregating
@@ -302,6 +314,12 @@ pub struct ExponentialHistogram {
     /// aggregation_temporality describes if the aggregator reports delta changes
     /// since last report time, or cumulative changes since a fixed start time.
     #[prost(enumeration = "AggregationTemporality", tag = "2")]
+    #[cfg_attr(
+        feature = "with-serde",
+        serde(
+            deserialize_with = "crate::proto::serializers::enum_aggregation_temporality::deserialize"
+        )
+    )]
     pub aggregation_temporality: i32,
 }
 /// Summary metric data are used to convey quantile summaries,

@@ -103,6 +103,88 @@ pub(crate) mod serializers {
         }
     }
 
+    // PATCH (PulsusDB, docs/decisions/0004, item P5): proto3-JSON enum
+    // string-NAME acceptance on OTLP/JSON decode. The upstream generated types
+    // model every `#[prost(enumeration = ...)]` field as a bare `i32`, so the
+    // derived `Deserialize` accepts ONLY the JSON-number form; a spec-valid
+    // OTLP/JSON body carrying the enum NAME string (e.g. `"kind":
+    // "SPAN_KIND_SERVER"`) is rejected. This engine + the per-enum wrapper
+    // modules below add a `deserialize_with` that accepts BOTH the integer form
+    // (unchanged) AND the proto NAME string, mapped via prost's generated
+    // `from_str_name`. Deserialize-only: serialization stays derived (integer
+    // emit), so the prost wire codec and PulsusDB's protojson RESPONSE emit are
+    // byte-for-byte identical. Additive only.
+    //
+    // Open-enum semantics: an unknown INTEGER is preserved as-is (matching the
+    // pre-patch bare-i32 path); an unknown NAME has no value and is a hard
+    // error (a clean, named decode failure — never a silent 0).
+    pub fn deserialize_enum_int_or_name<'de, D>(
+        deserializer: D,
+        from_str_name: fn(&str) -> Option<i32>,
+    ) -> Result<i32, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EnumVisitor(fn(&str) -> Option<i32>);
+        impl<'de> Visitor<'de> for EnumVisitor {
+            type Value = i32;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an enum as its integer value or proto3-JSON name string")
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
+                i32::try_from(v).map_err(|_| E::custom("enum integer out of i32 range"))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
+                i32::try_from(v).map_err(|_| E::custom("enum integer out of i32 range"))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
+                (self.0)(v).ok_or_else(|| E::custom(format!("unknown enum name: {v}")))
+            }
+        }
+        deserializer.deserialize_any(EnumVisitor(from_str_name))
+    }
+
+    // Per-enum `deserialize_with` wrappers. Each coerces prost's generated
+    // `from_str_name` (which yields the enum, not the i32) into the
+    // `fn(&str) -> Option<i32>` the engine expects.
+    pub mod enum_span_kind {
+        use crate::tonic::trace::v1::span::SpanKind;
+        use serde::Deserializer;
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+            super::deserialize_enum_int_or_name(d, |s| SpanKind::from_str_name(s).map(|e| e as i32))
+        }
+    }
+
+    pub mod enum_status_code {
+        use crate::tonic::trace::v1::status::StatusCode;
+        use serde::Deserializer;
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+            super::deserialize_enum_int_or_name(d, |s| {
+                StatusCode::from_str_name(s).map(|e| e as i32)
+            })
+        }
+    }
+
+    pub mod enum_severity_number {
+        use crate::tonic::logs::v1::SeverityNumber;
+        use serde::Deserializer;
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+            super::deserialize_enum_int_or_name(d, |s| {
+                SeverityNumber::from_str_name(s).map(|e| e as i32)
+            })
+        }
+    }
+
+    pub mod enum_aggregation_temporality {
+        use crate::tonic::metrics::v1::AggregationTemporality;
+        use serde::Deserializer;
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+            super::deserialize_enum_int_or_name(d, |s| {
+                AggregationTemporality::from_str_name(s).map(|e| e as i32)
+            })
+        }
+    }
+
     // hex string <-> bytes conversion
 
     pub fn serialize_to_hex_string<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>

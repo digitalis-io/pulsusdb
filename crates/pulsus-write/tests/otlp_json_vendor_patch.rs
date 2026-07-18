@@ -12,10 +12,12 @@
 //! PATCHES.md's re-vendor rule). Everything here is hermetic.
 
 use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+use opentelemetry_proto::tonic::logs::v1::LogRecord;
 use opentelemetry_proto::tonic::metrics::v1::{
-    Exemplar, ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
-    exemplar, number_data_point,
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Histogram, HistogramDataPoint,
+    NumberDataPoint, Sum, SummaryDataPoint, exemplar, number_data_point,
 };
+use opentelemetry_proto::tonic::trace::v1::{Span, Status};
 
 /// Bit-exact equality that treats any two NaNs as equal (the #33/#65
 /// precedent): `NaN != NaN` under `==`, so a raw comparison would spuriously
@@ -200,4 +202,98 @@ fn any_value_double_round_trips_non_finite() {
         Some(any_value::Value::DoubleValue(v)) => assert!(v.is_nan()),
         other => panic!("expected DoubleValue(NaN), got {other:?}"),
     }
+}
+
+// ---- P5: proto3-JSON enum string-NAME acceptance on OTLP/JSON decode ---------
+//
+// The vendored types model every `#[prost(enumeration = ...)]` field as a bare
+// `i32`, so upstream's derived deserialize accepts only the JSON-number form.
+// Patch item P5 adds a `deserialize_with` that accepts BOTH the integer form
+// (unchanged) AND the proto NAME string, mapped via prost's `from_str_name`.
+// Deserialize-only: serialize stays derived (integer emit), so the wire codec
+// and the protojson RESPONSE emit are byte-identical. These tests assert each
+// of the 6 enum FIELDS (across 4 enums; all three aggregation_temporality sites
+// verified separately since each is a distinct `#[serde(with=...)]` wiring)
+// decodes its NAME form and its integer form to the same non-zero value, plus
+// the open-enum error posture (unknown name → hard error; unknown int → kept).
+
+#[test]
+fn span_kind_decodes_name_and_integer_to_same_value() {
+    let by_name: Span = serde_json::from_str(r#"{"kind":"SPAN_KIND_SERVER"}"#).expect("name form");
+    let by_int: Span = serde_json::from_str(r#"{"kind":2}"#).expect("integer form");
+    assert_eq!(by_name.kind, 2);
+    assert_eq!(by_name.kind, by_int.kind);
+}
+
+#[test]
+fn status_code_decodes_name_and_integer_to_same_value() {
+    let by_name: Status = serde_json::from_str(r#"{"code":"STATUS_CODE_OK"}"#).expect("name form");
+    let by_int: Status = serde_json::from_str(r#"{"code":1}"#).expect("integer form");
+    assert_eq!(by_name.code, 1);
+    assert_eq!(by_name.code, by_int.code);
+}
+
+#[test]
+fn severity_number_decodes_name_and_integer_to_same_value() {
+    let by_name: LogRecord =
+        serde_json::from_str(r#"{"severityNumber":"SEVERITY_NUMBER_INFO"}"#).expect("name form");
+    let by_int: LogRecord = serde_json::from_str(r#"{"severityNumber":9}"#).expect("integer form");
+    assert_eq!(by_name.severity_number, 9);
+    assert_eq!(by_name.severity_number, by_int.severity_number);
+}
+
+#[test]
+fn sum_aggregation_temporality_decodes_name_and_integer_to_same_value() {
+    let by_name: Sum =
+        serde_json::from_str(r#"{"aggregationTemporality":"AGGREGATION_TEMPORALITY_CUMULATIVE"}"#)
+            .expect("name form");
+    let by_int: Sum =
+        serde_json::from_str(r#"{"aggregationTemporality":2}"#).expect("integer form");
+    assert_eq!(by_name.aggregation_temporality, 2);
+    assert_eq!(
+        by_name.aggregation_temporality,
+        by_int.aggregation_temporality
+    );
+}
+
+#[test]
+fn histogram_aggregation_temporality_decodes_name_and_integer_to_same_value() {
+    let by_name: Histogram =
+        serde_json::from_str(r#"{"aggregationTemporality":"AGGREGATION_TEMPORALITY_CUMULATIVE"}"#)
+            .expect("name form");
+    let by_int: Histogram =
+        serde_json::from_str(r#"{"aggregationTemporality":2}"#).expect("integer form");
+    assert_eq!(by_name.aggregation_temporality, 2);
+    assert_eq!(
+        by_name.aggregation_temporality,
+        by_int.aggregation_temporality
+    );
+}
+
+#[test]
+fn exponential_histogram_aggregation_temporality_decodes_name_and_integer_to_same_value() {
+    let by_name: ExponentialHistogram =
+        serde_json::from_str(r#"{"aggregationTemporality":"AGGREGATION_TEMPORALITY_DELTA"}"#)
+            .expect("name form");
+    let by_int: ExponentialHistogram =
+        serde_json::from_str(r#"{"aggregationTemporality":1}"#).expect("integer form");
+    assert_eq!(by_name.aggregation_temporality, 1);
+    assert_eq!(
+        by_name.aggregation_temporality,
+        by_int.aggregation_temporality
+    );
+}
+
+#[test]
+fn unknown_enum_name_is_a_loud_error_not_a_silent_zero() {
+    let err = serde_json::from_str::<Span>(r#"{"kind":"SPAN_KIND_BOGUS"}"#);
+    assert!(err.is_err(), "unknown enum name must be a decode error");
+}
+
+#[test]
+fn unknown_enum_integer_is_preserved_open_enum() {
+    // Proto open-enum semantics: an unknown integer has no name but is a valid
+    // value and must survive decode (matching the pre-patch bare-i32 path).
+    let span: Span = serde_json::from_str(r#"{"kind":99}"#).expect("unknown int decodes");
+    assert_eq!(span.kind, 99);
 }

@@ -83,16 +83,27 @@ those tests fail loudly.
 
 ### Scope / limitations
 
-- **String enum names** (e.g. `"kind":"SPAN_KIND_SERVER"`) remain the one
-  documented protojson gap. Real OTLP/JSON emitters (OTel SDK exporters, the
-  collector's pdata JSON marshaler) emit enums as **integers**, which
-  `with-serde` accepts; the string-name form is rejected with a named 400
-  (`LogsIngestError::DecodeJson`), never a silent mis-decode (proven by
-  `otlp_json_equivalence.rs::string_enum_name_is_cleanly_rejected_...`). Deferred
-  string-enum support is tracked as follow-up #98.
+- **String enum names** (e.g. `"kind":"SPAN_KIND_SERVER"`) — *superseded by the
+  Update below.* As originally shipped, enums decoded only in their integer form
+  (what real OTLP/JSON emitters send); the string-name form was rejected with a
+  named 400. Now accepted (see Update (#98)).
 - `asInt` / `asDouble` **integer** oneof arms decode only as JSON numbers
   (not int64-as-string). Pre-existing upstream behavior, unrelated to non-finite
   doubles; out of scope, noted in PATCHES.md.
+
+### Update (#98, 2026-07-18) — string-enum names now accepted
+
+Patch item **P5** (PATCHES.md) lifts the string-enum limitation above: a
+`deserialize_with` on the 6 enum-typed fields (across `SpanKind`, `StatusCode`,
+`SeverityNumber`, `AggregationTemporality`) accepts **both** the integer form
+and the proto3-JSON string name, mapped via prost's generated `from_str_name`.
+The patch is **deserialize-only** — serialization stays derived (integer emit),
+so the prost wire codec and the protojson RESPONSE emit are byte-identical (the
+#55 trace-fetch response and the e2e `normalize_kind` contract are unaffected).
+An unknown enum *name* is still a clean, named 400 (`LogsIngestError::DecodeJson`,
+never a silent 0); an unknown *integer* is preserved (proto open-enum). Proven
+by the `otlp_json_vendor_patch.rs` behavior gate (each of the 6 fields,
+name-vs-integer) and the `otlp_json_equivalence.rs` string-enum differential.
 
 ## Consequences
 
