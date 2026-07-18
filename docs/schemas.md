@@ -220,6 +220,46 @@ The engine computes reset-adjusted increases over the bucket sequence (§2.2), s
 
 **`count by (job) (up)`** — answered entirely from the label cache, zero ClickHouse queries, **when the evaluation window lies inside the cache window**; historical evaluations resolve through `metric_series` like any other query.
 
+### 2.4 Native histogram samples
+
+The M7 extension foreshadowed in §2 lands as a **separate, dedicated samples table** — `metric_hist_samples` — storing Prometheus native (sparse) histograms in their integer wire form. Float samples in `metric_samples` (§2.1) are untouched: the float fetch hot path, its EXPLAIN gate, and its migration checksum cannot regress. The two tables share the same identity, ordering, partitioning, TTL, and — in clustered mode — sharding key, so a series' float and histogram samples always co-reside (see co-sharding note below).
+
+```sql
+CREATE TABLE metric_hist_samples (
+    metric_name        LowCardinality(String),
+    fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),
+    unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),
+    schema             Int8     CODEC(ZSTD(1)),   -- exponential schema (−4..8); −53 = NHCB
+    zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),
+    zero_count         UInt64   CODEC(T64, ZSTD(1)),
+    count              UInt64   CODEC(T64, ZSTD(1)),
+    sum                Float64  CODEC(Gorilla, ZSTD(1)),
+    pos_span_offsets   Array(Int32)   CODEC(ZSTD(1)),
+    pos_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),
+    pos_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),
+    neg_span_offsets   Array(Int32)   CODEC(ZSTD(1)),
+    neg_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),
+    neg_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),
+    custom_values      Array(Float64) CODEC(ZSTD(1))
+) ENGINE = MergeTree
+PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))
+ORDER BY (metric_name, fingerprint, unix_milli)
+TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1;
+```
+
+- **Identity and access shape are byte-identical to `metric_samples`** (§2.1): `metric_name` leads the key, `fingerprint` clusters each series, `unix_milli` orders within it — same PK/ordering key `(metric_name, fingerprint, unix_milli)`, same daily partitioning, same `ttl_only_drop_parts` retention. Per-series reads are the same sequential granule scans; the codecs on `fingerprint`/`unix_milli` match §2.1 exactly. Timestamps are stored **verbatim at millisecond precision** (§2.1's resolution-agnostic rule).
+- **Sparse wire form, lossless for both schemas.** The `schema`, `zero_threshold`, `zero_count`, `count`, `sum` scalars plus the positive/negative span-and-delta arrays are the integer sparse-histogram encoding (`Array(Int32)`/`Array(UInt32)` span offsets/lengths, `Array(Int64)` delta-encoded bucket counts). This is lossless for the standard exponential schema (−4..8) and for NHCB (schema −53, which populates `custom_values` and leaves the negative/zero fields empty). Each array carries `CODEC(ZSTD(1))` (§8's "everything wrapped in `ZSTD(1)` minimum").
+- **Co-sharded with floats.** In clustered mode `metric_hist_samples` reuses the Metrics family sharding key `cityHash64(metric_name, fingerprint)` (§7) — the byte-identical expression `metric_samples`, its tiers, and `metric_series` use. Its `_dist` wrapper is `CREATE TABLE metric_hist_samples_dist AS metric_hist_samples ENGINE = Distributed('{cluster}', pulsus, metric_hist_samples, cityHash64(metric_name, fingerprint))`. Consequence: a series' float samples, histogram samples, and `metric_series` metadata land on the **same shard**, so the read path's co-load of both sample types for one series stays shard-local.
+
+**Per-series value type on `metric_series`.** `metric_series` (§2.1) gains a discriminator column, added by additive `ALTER` (the §3.1 `structured_metadata` precedent — never a mutation of the frozen initial `CREATE`, so fresh and upgraded deployments converge byte-identically):
+
+```sql
+ALTER TABLE metric_series ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;
+```
+
+`value_type` is the per-series float/histogram routing signal: `0 = float`, `1 = histogram`. Pre-M7 rows read back `0` (the `DEFAULT`), so no data migration is required. The writer sets it per series and the read path uses it to decide which sample table(s) to touch for a resolved fingerprint set. Correctness under a series that changes or mixes types within a window is a read-path concern, not a storage one — see [ADR 0005](decisions/0005-native-histogram-storage.md).
+
 ---
 
 ## 3. Logs

@@ -461,6 +461,95 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- native-histogram samples (M7-A2, issue #113; A1 design #112) ---
+    // A new, dedicated Metrics-family table storing native-histogram samples
+    // in the Prometheus integer sparse wire form (spans + delta buckets,
+    // `UInt64` counts) — lossless for BOTH the standard exponential schema
+    // (−4..8) and NHCB (schema −53; NHCB populates `custom_values` and leaves
+    // the negative/zero fields empty). It carries the same identity/ordering/
+    // partition/TTL contract as `metric_samples` (id 5) and reuses
+    // `Family::Metrics`, so its `_dist` wrapper (id 24) co-shards byte-
+    // identically (`cityHash64(metric_name, fingerprint)`) with float samples
+    // and `metric_series`. `metric_samples` (id 5) is NOT altered — the float
+    // read path (SQL, EXPLAIN gate, id-5 checksum) cannot regress. Array
+    // columns carry `CODEC(ZSTD(1))` (accepted + round-tripped on live CH
+    // 24.8.14 per the A1 review; no fallback). The engine value model, OTLP
+    // ingest, and histogram functions/routing are downstream (A3/A4/A5).
+    Migration {
+        id: 23,
+        name: "metric_hist_samples",
+        family: Some(Family::Metrics),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.metric_hist_samples{{on_cluster}} (\n\
+                 metric_name        LowCardinality(String),\n\
+                 fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),\n\
+                 unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),\n\
+                 schema             Int8     CODEC(ZSTD(1)),\n\
+                 zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),\n\
+                 zero_count         UInt64   CODEC(T64, ZSTD(1)),\n\
+                 count              UInt64   CODEC(T64, ZSTD(1)),\n\
+                 sum                Float64  CODEC(Gorilla, ZSTD(1)),\n\
+                 pos_span_offsets   Array(Int32)   CODEC(ZSTD(1)),\n\
+                 pos_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),\n\
+                 pos_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),\n\
+                 neg_span_offsets   Array(Int32)   CODEC(ZSTD(1)),\n\
+                 neg_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),\n\
+                 neg_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),\n\
+                 custom_values      Array(Float64) CODEC(ZSTD(1))\n\
+             ) ENGINE = MergeTree\n\
+             PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))\n\
+             ORDER BY (metric_name, fingerprint, unix_milli)\n\
+             TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    Migration {
+        id: 24,
+        name: "metric_hist_samples",
+        family: Some(Family::Metrics),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // --- metric_series per-series value-type routing signal (M7-A2, #113) ---
+    // Additive ALTERs (the id 21/22 `structured_metadata` precedent), never a
+    // mutation of id 4's frozen `metric_series` CREATE. `value_type`: 0 =
+    // float, 1 = histogram; pre-M7 rows read back 0 (float) — no data
+    // migration. This is the per-series float/histogram/mixed routing signal:
+    // A4 writes it (LRU key gains `value_type`), A5 reads it (the type-mask
+    // co-load) — A2 only adds the column. An ALTER carries no `ENGINE =`
+    // clause, so it passes through `render` unchanged in cluster mode.
+    Migration {
+        id: 25,
+        name: "metric_series",
+        family: Some(Family::Metrics),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.metric_series{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper is a `CREATE ... AS metric_series` that copies
+    // columns at creation and does NOT inherit id 25's base ALTER; in cluster
+    // mode all reads/writes go through `metric_series_dist`, so it must gain
+    // the column too. Cluster-gated (`StaticClusterOnly`) — skipped and
+    // unrecorded on a single node, applied the first time clustering is
+    // enabled. Not runnable locally (rootless podman, no cluster); CI's
+    // clustered leg is authoritative. Mirrors id 22.
+    Migration {
+        id: 26,
+        name: "metric_series",
+        family: Some(Family::Metrics),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.metric_series{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -758,6 +847,137 @@ mod tests {
             assert_eq!(m.scope, MigrationScope::Checksum);
             assert_eq!(m.replication, Replication::PerShard);
             assert_eq!(m.family, Some(Family::Logs));
+        }
+    }
+
+    /// Issue #113 (M7-A2): `metric_hist_samples` (id 23) carries the same
+    /// identity/ordering/partition/TTL contract as `metric_samples` (id 5) and
+    /// stores the Prometheus integer sparse wire form (spans + delta buckets,
+    /// `UInt64` counts, `custom_values` for NHCB). The array columns carry
+    /// `CODEC(ZSTD(1))`. Tokenized retention (mutable, excluded from identity).
+    #[test]
+    fn metric_hist_samples_ddl_stores_the_integer_wire_form_with_metric_samples_contract() {
+        let ddl = rendered_static(23);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.metric_hist_samples"));
+        // Scalars: identity + the Prometheus integer histogram head.
+        assert!(ddl.contains("metric_name        LowCardinality(String),"));
+        assert!(ddl.contains("fingerprint        UInt64   CODEC(Delta(8), ZSTD(1)),"));
+        assert!(ddl.contains("unix_milli         Int64    CODEC(DoubleDelta, ZSTD(1)),"));
+        assert!(ddl.contains("schema             Int8     CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("zero_threshold     Float64  CODEC(Gorilla, ZSTD(1)),"));
+        assert!(ddl.contains("zero_count         UInt64   CODEC(T64, ZSTD(1)),"));
+        assert!(ddl.contains("count              UInt64   CODEC(T64, ZSTD(1)),"));
+        assert!(ddl.contains("sum                Float64  CODEC(Gorilla, ZSTD(1)),"));
+        // Sparse spans + delta buckets (positive, negative) + NHCB bounds,
+        // every array column ZSTD-coded (A1 review confirmed on live 24.8.14).
+        assert!(ddl.contains("pos_span_offsets   Array(Int32)   CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("pos_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("pos_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("neg_span_offsets   Array(Int32)   CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("neg_span_lengths   Array(UInt32)  CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("neg_bucket_deltas  Array(Int64)   CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("custom_values      Array(Float64) CODEC(ZSTD(1))"));
+        // Same identity/ordering/partition/TTL contract as metric_samples.
+        assert!(ddl.contains("ENGINE = MergeTree"));
+        assert!(ddl.contains("PARTITION BY toDate(fromUnixTimestamp64Milli(unix_milli))"));
+        assert!(ddl.contains("ORDER BY (metric_name, fingerprint, unix_milli)"));
+        assert!(ddl.contains(
+            "TTL toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE"
+        ));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1;"));
+        // Retention stays mutable operational config, excluded from identity.
+        assert!(static_tmpl(23).contains("INTERVAL {{retention_days}} DAY DELETE"));
+    }
+
+    /// Issue #113: the `metric_hist_samples` `_dist` wrapper (id 24) carries
+    /// the Metrics family, so `dist_ddl_template` renders the byte-identical
+    /// `cityHash64(metric_name, fingerprint)` co-shard expression it shares
+    /// with `metric_samples`/`metric_series`.
+    #[test]
+    fn metric_hist_samples_dist_wrapper_reuses_the_metrics_family_co_shard() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 24).expect("id 24");
+        assert_eq!(m.name, "metric_hist_samples");
+        assert!(matches!(m.ddl, Ddl::Dist));
+        assert_eq!(m.family, Some(Family::Metrics));
+        let tmpl = render::dist_ddl_template("metric_hist_samples", Family::Metrics);
+        let out = render::render(&tmpl, "metric_hist_samples", &ctx(), false);
+        assert!(out.contains("pulsus.metric_hist_samples_dist"));
+        assert!(out.contains(
+            "Distributed('', pulsus, metric_hist_samples, cityHash64(metric_name, fingerprint))"
+        ));
+    }
+
+    /// Issue #113: the `value_type` routing signal is added to `metric_series`
+    /// via an additive `ADD COLUMN IF NOT EXISTS` (id 25) — never a mutation
+    /// of id 4's frozen CREATE — as `UInt8 DEFAULT 0` (0 = float; pre-M7 rows
+    /// read back 0, no data migration). An ALTER carries no `ENGINE =` clause,
+    /// so it passes through `render` unchanged even in cluster mode.
+    #[test]
+    fn metric_series_value_type_base_alter_is_additive_uint8_default_zero() {
+        let ddl = rendered_static(25);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.metric_series\n\
+             ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;",
+        );
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered = render::render(static_tmpl(25), "metric_series", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+    }
+
+    /// Issue #113: the `value_type` `_dist` ALTER (id 26) is
+    /// `StaticClusterOnly` — it targets `metric_series_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Mirrors id 22.
+    #[test]
+    fn metric_series_value_type_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 26).expect("id 26");
+        assert_eq!(m.name, "metric_series");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 26 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "metric_series", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.metric_series_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;",
+        );
+    }
+
+    /// Issue #113: the frozen `metric_series` (id 4) and `metric_samples`
+    /// (id 5) base CREATEs are NOT mutated by A2 — `value_type` arrives only
+    /// via the additive ALTER (id 25), and no histogram column touches the
+    /// float samples table. Guards the read-perf-neutrality basis (id-4/id-5
+    /// checksums stay byte-frozen; the live `MigrationDrift` guard enforces it
+    /// end-to-end).
+    #[test]
+    fn frozen_metric_base_creates_are_not_mutated_by_a2() {
+        assert!(
+            !static_tmpl(4).contains("value_type"),
+            "value_type must arrive via the additive ALTER (id 25), not id 4's CREATE"
+        );
+        assert!(
+            !static_tmpl(5).contains("schema") && !static_tmpl(5).contains("bucket"),
+            "metric_samples (id 5) must not gain any histogram column"
+        );
+    }
+
+    /// Issue #113: the M7-A2 migrations inherit the same identity/replication
+    /// scope as every other Metrics-family DDL — checksum-gated, per-shard
+    /// replicated (never config-named, never global).
+    #[test]
+    fn native_histogram_migrations_are_checksum_scoped_per_shard_metrics() {
+        for id in [23, 24, 25, 26] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
+            assert_eq!(m.scope, MigrationScope::Checksum);
+            assert_eq!(m.replication, Replication::PerShard);
+            assert_eq!(m.family, Some(Family::Metrics));
         }
     }
 

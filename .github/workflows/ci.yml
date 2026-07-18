@@ -142,6 +142,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-schema --test live_schema
 
+      # Issue #113 (M7-A2): native-histogram storage schema — migrations 23–26
+      # apply + idempotent (no MigrationDrift), metric_hist_samples +
+      # metric_series.value_type exist, an EXPLAIN indexes=1 metric_name-led PK
+      # prune on metric_hist_samples matching the metric_samples gate, and a
+      # native-histogram row round-trips losslessly for both an exponential and
+      # an NHCB sample. Reuses this job's 24.8 container.
+      - name: Live native-histogram schema tests (migrations + EXPLAIN + round-trip)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-schema --test live_hist_schema
+
       # Issue #53: traces-family tables + tag-catalog MV, retention-change
       # propagation, and the two docs/schemas.md §4.2 EXPLAIN gates on a
       # seeded ≥100k-row corpus (EXPLAIN indexes=1 + query_log.projections —
