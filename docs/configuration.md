@@ -167,6 +167,9 @@ log_rollup_resolution: 5s
 cluster: null                    # ClickHouse cluster name; enables distributed DDL
 dist_suffix: _dist
 skip_unavailable_shards: false
+availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches (§4)
+az_detect: off                   # off | aws | gcp | azure | auto — detect zone from cloud instance
+                                 # metadata at startup when availability_zone is unset (fail-soft)
 
 clickhouse:
   server: localhost
@@ -177,6 +180,13 @@ clickhouse:
   proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
   pool_size: 8
+  servers: []                    # multi-endpoint spreading (overrides `server` when non-empty).
+                                 # Each entry: {host, http_port?, zone?}; http_port falls back to
+                                 # clickhouse.http_port. IPv6 literal hosts must use this object form,
+                                 # not CLICKHOUSE_SERVERS. e.g.:
+                                 #   servers:
+                                 #     - {host: ch1, zone: az-a}
+                                 #     - {host: ch2, http_port: 8123, zone: az-b}
 
 writer:
   batch_bytes: 16MiB
