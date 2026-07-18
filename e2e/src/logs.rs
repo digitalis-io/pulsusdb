@@ -36,7 +36,7 @@ use serde::Deserialize;
 use crate::corpus::Scale;
 use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
 use crate::logs_corpus::{
-    self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector,
+    self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
 };
 use crate::metrics::write_artifact;
 use crate::scenarios::Ctx;
@@ -54,6 +54,16 @@ const COMPLETENESS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// nanosecond bounds).
 const CORPUS_NOW_MARGIN_NS: i64 = 5_000_000_000;
 const WINDOW_SLACK_NS: i64 = 3_600_000_000_000;
+
+/// The `reader.logql_pipeline_scan_factor` the deployed e2e server runs
+/// with (issue #100): the config default 10 (pinned by the
+/// `pulsus-config` golden tests), which `deploy/e2e/compose.single.yaml`
+/// overrides with neither the config key nor its
+/// `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` env var (asserted hermetically).
+/// The fetch-until-limit page size is `result_limit × this factor`, so
+/// the `streams_limited` case's page-1 arithmetic (survivors on the
+/// first `limit × factor` rows < `limit`) holds against the live server.
+const E2E_DEPLOYED_SCAN_FACTOR: u32 = 10;
 
 // ---------------------------------------------------------------------
 // Fixture
@@ -91,6 +101,11 @@ struct CaseRaw {
     /// for these runtime matching errors, PulsusDB 400 — see the ledger).
     #[serde(default)]
     expect_error_substr: Option<String>,
+    /// `streams_limited` only (issue #100): the per-case request limit,
+    /// overriding the global fixture `limit`. The fetch-until-limit
+    /// ordered case requires exactly this many entries on both stores.
+    #[serde(default)]
+    limit: Option<u32>,
     query: String,
 }
 
@@ -351,6 +366,80 @@ fn set_entry_count(set: &ExpectedResult) -> usize {
     set.values().map(BTreeSet::len).sum()
 }
 
+/// Flattens a streams response to `(labels, ts_ns, line)` in global
+/// ascending-ts order (issue #100), preserving ORDER (and duplicates) so
+/// the fetch-until-limit case can compare an ordered earliest-`limit`
+/// prefix. Unlike [`result_set`]'s set-collapse this VERIFIES response
+/// order rather than assuming it:
+///
+///  1. Each stream's `values` are parsed in RECEIVED order and asserted
+///     ascending by timestamp — the forward-direction contract
+///     (`docs/api.md` §2.1). A within-stream descending pair is a
+///     response-order regression and fails HARD (a blind global sort
+///     would silently launder it, plan v2 item 5).
+///  2. The verified-ascending per-stream sequences are k-way MERGED into
+///     the global order. This RELIES on the per-stream ordering just
+///     verified — it does not re-sort the flattened list.
+///
+/// The corpus assigns globally-distinct timestamps, so the merge is a
+/// total order with no tie (`run_streams_limited_case` additionally gates
+/// distinct timestamps across the merged result).
+fn ordered_entries(body: &serde_json::Value) -> Result<OrderedEntries> {
+    let result_type = body["data"]["resultType"].as_str().unwrap_or_default();
+    if result_type != "streams" {
+        bail!("expected a streams result, got {result_type:?}: {body}");
+    }
+    let mut streams: Vec<OrderedEntries> = Vec::new();
+    for stream in body["data"]["result"].as_array().into_iter().flatten() {
+        let labels: std::collections::BTreeMap<String, String> = stream["stream"]
+            .as_object()
+            .with_context(|| format!("stream missing a labels object: {stream}"))?
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+            .collect();
+        let mut entries: OrderedEntries = Vec::new();
+        for value in stream["values"].as_array().into_iter().flatten() {
+            let ts: i64 = value[0]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .with_context(|| format!("entry timestamp was not a ns string: {value}"))?;
+            let line = value[1]
+                .as_str()
+                .with_context(|| format!("entry line was not a string: {value}"))?
+                .to_string();
+            if let Some((_, prev_ts, _)) = entries.last()
+                && ts < *prev_ts
+            {
+                bail!(
+                    "stream {labels:?} returned entries out of forward order: ts {ts} follows \
+                     {prev_ts} — a within-stream descending pair violates the ascending \
+                     forward-direction contract"
+                );
+            }
+            entries.push((labels.clone(), ts, line));
+        }
+        streams.push(entries);
+    }
+    // k-way merge the verified-ascending per-stream sequences.
+    let total: usize = streams.iter().map(Vec::len).sum();
+    let mut heads: Vec<usize> = vec![0; streams.len()];
+    let mut out: OrderedEntries = Vec::with_capacity(total);
+    for _ in 0..total {
+        let mut pick: Option<(usize, i64)> = None;
+        for (si, s) in streams.iter().enumerate() {
+            if let Some(entry) = s.get(heads[si])
+                && pick.is_none_or(|(_, best)| entry.1 < best)
+            {
+                pick = Some((si, entry.1));
+            }
+        }
+        let (si, _) = pick.expect("every remaining entry is counted by `total`");
+        out.push(streams[si][heads[si]].clone());
+        heads[si] += 1;
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------
 // Metric-case normalization + comparison (issue M6-10)
 // ---------------------------------------------------------------------
@@ -599,6 +688,7 @@ async fn run_case(
 ) -> Result<()> {
     match case.kind() {
         "streams" => run_streams_case(ctx, corpus, fixture, case, window).await,
+        "streams_limited" => run_streams_limited_case(ctx, corpus, case, window).await,
         "metric_instant" => run_metric_instant_case(ctx, corpus, case).await,
         "metric_range" => run_metric_range_case(ctx, corpus, case, window).await,
         "metric_error" => run_metric_error_case(ctx, corpus, case).await,
@@ -1225,6 +1315,211 @@ async fn run_streams_case(
     Ok(())
 }
 
+/// The fetch-until-limit ordered-limited comparison (issue #100): a
+/// heavily-dropping pipeline (`| json | status = "503" | took_ms =
+/// "500"` — two dropping label filters ⇒ `fetch_until_limit`) whose
+/// earliest-`limit` survivors span >= 2 keyset pages. Unlike
+/// [`run_streams_case`] this REQUIRES exactly `limit` raw entries on both
+/// stores and compares an ORDERED `Vec<(labels, ts, line)>` (earliest-
+/// `limit` by ascending ts) against the corpus prefix, not a set.
+///
+/// **Full tier only.** At CI scale the page-1 window (`limit × factor`
+/// records) exceeds the whole svc-json corpus, so the case cannot page;
+/// it skips with a printed reason (the nightly lane always runs full).
+///
+/// **`raw == limit` IS the page-2 proof (plan v2 delta 3, no engine
+/// change).** A single page yields at most `S1 < limit` survivors
+/// (asserted hermetically), so returning exactly `limit` is physically
+/// impossible without a second fetch — a paging-removal regression
+/// (revert to the old oversample-and-truncate) returns `S1 != limit` and
+/// fails the gate.
+async fn run_streams_limited_case(
+    ctx: &Ctx,
+    corpus: &LogCorpus,
+    case: &CaseRaw,
+    window: QueryWindow,
+) -> Result<()> {
+    let limit = case.limit.with_context(|| {
+        format!(
+            "case {:?} is streams_limited but carries no per-case limit",
+            case.case_id
+        )
+    })?;
+    // Full-tier self-gate (plan v2 delta 2): a multi-page phenomenon needs
+    // a corpus larger than one page. Skip cleanly at CI scale.
+    if corpus.scale != Scale::Full {
+        println!(
+            "pulsus-e2e:     case {:?} [{}] — skipped: streams_limited needs the full tier (the \
+             page-1 window of {} svc-json records exceeds the CI-tier corpus, so it cannot page)",
+            case.case_id,
+            case.mode,
+            limit * E2E_DEPLOYED_SCAN_FACTOR,
+        );
+        return Ok(());
+    }
+
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let expected = corpus.expected_ordered_limited(&case.case_id, limit);
+    let gated = case.mode == "gated";
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: expecting exactly {} ordered entry(ies) across {} \
+         page(s)",
+        case.case_id,
+        case.mode,
+        case.construct,
+        expected.len(),
+        2, // >= 2 by construction (see AC3′); logged for CI diagnosis
+    );
+
+    let pulsus_started = std::time::Instant::now();
+    let pulsus_body = query_pulsus(ctx, &q, window, limit).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let loki_started = std::time::Instant::now();
+    let loki_body = query_loki(ctx, &q, window, limit).await?;
+    let loki_elapsed = loki_started.elapsed();
+    println!(
+        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        loki_elapsed.as_millis(),
+    );
+
+    let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_pipeline_limited",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": kind,
+            "query": q,
+            "window": { "start_ns": window.start_ns, "end_ns": window.end_ns, "limit": limit },
+            "expected_ordered": expected
+                .iter()
+                .map(|(l, ts, line)| serde_json::json!({"labels": l, "ts": ts, "line": line}))
+                .collect::<Vec<_>>(),
+            "pulsusdb_result": pulsus_body,
+            "oracle_result": loki_body,
+            "detail": detail,
+        });
+        write_artifact(
+            ctx,
+            ARTIFACT_AREA,
+            if gated {
+                "limited-case-mismatch"
+            } else {
+                "informational-case"
+            },
+            &artifact,
+        )
+    };
+
+    // Validity gates, HARD on both stores (they invalidate the comparison
+    // regardless of gated/informational):
+    //   1. raw == limit — raw < limit is the #90 fetch-until-limit
+    //      under-return regression (a single-page stop); raw > limit
+    //      breaks the response cap. Also the page-2 proof (plan v2 delta 3).
+    //   2. no duplicate entries (they would collapse and mask a bug).
+    //   3. strictly distinct timestamps — the ordered comparison must not
+    //      depend on tie-breaking (a duplicate ts signals ambiguity and
+    //      invalidates the comparison rather than passing silently).
+    for (store, body) in [("pulsusdb", &pulsus_body), ("oracle", &loki_body)] {
+        let raw = raw_entry_count(body);
+        if raw as u32 != limit {
+            let path = dump(
+                "limit_mismatch",
+                &format!("{store} returned {raw} raw entries, expected exactly {limit}"),
+            )?;
+            bail!(
+                "case {:?}: {store} returned {raw} raw entries, expected exactly {limit} — a \
+                 count below the limit is the #90 fetch-until-limit under-return (single-page \
+                 stop); above breaks the cap (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        let entries = ordered_entries(body)?;
+        let distinct: BTreeSet<_> = entries.iter().cloned().collect();
+        if distinct.len() != entries.len() {
+            let path = dump(
+                "duplicate_entries",
+                &format!(
+                    "{store} returned {} entries but only {} distinct",
+                    entries.len(),
+                    distinct.len()
+                ),
+            )?;
+            bail!(
+                "case {:?}: {store} response carried duplicate entries (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        if entries.windows(2).any(|w| w[0].1 == w[1].1) {
+            let path = dump(
+                "ambiguous_order",
+                &format!("{store} response carried a duplicate timestamp"),
+            )?;
+            bail!(
+                "case {:?}: {store} response has a duplicate timestamp — the ordered comparison \
+                 is ambiguous (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+    }
+
+    // PulsusDB vs the corpus ordered prefix: ALWAYS hard.
+    let pulsus_entries = ordered_entries(&pulsus_body)?;
+    if pulsus_entries != expected {
+        let path = dump(
+            "pulsus_vs_corpus",
+            &format!("pulsusdb ordered result {pulsus_entries:?} != expected {expected:?}"),
+        )?;
+        bail!(
+            "case {:?}: pulsusdb ordered result diverged from the corpus earliest-{limit} prefix \
+             (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+
+    // Oracle vs the corpus ordered prefix (== vs PulsusDB, transitively).
+    let loki_entries = ordered_entries(&loki_body)?;
+    if loki_entries != expected {
+        let path = dump(
+            "oracle_vs_corpus",
+            &format!("oracle ordered result {loki_entries:?} != expected {expected:?}"),
+        )?;
+        if gated {
+            bail!(
+                "case {:?}: oracle ordered result diverged from the corpus earliest-{limit} \
+                 prefix (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+        println!(
+            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+             (dumped to {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    } else if !gated {
+        // Anti-rot, mirroring `run_streams_case`.
+        let path = dump(
+            "stale_exclusion",
+            "informational case matched the oracle — the ledgered divergence no longer exists",
+        )?;
+        bail!(
+            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+            case.case_id,
+            case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn describe_diff(store: &str, got: &ExpectedResult, expected: &ExpectedResult) -> String {
     let got_streams: BTreeSet<String> = got.keys().map(|k| format!("{k:?}")).collect();
     let expected_streams: BTreeSet<String> = expected.keys().map(|k| format!("{k:?}")).collect();
@@ -1304,7 +1599,14 @@ mod tests {
         let fixture = shipped_fixture();
         for case in &fixture.cases {
             if !METRIC_CASE_IDS.contains(&case.case_id.as_str()) {
-                assert_eq!(case.kind(), "streams", "{}", case.case_id);
+                // Issue #100: the fetch-until-limit case is `streams_limited`
+                // and carries a per-case `limit`; every other streams case is
+                // plain `streams` with no limit override.
+                match case.kind() {
+                    "streams" => assert!(case.limit.is_none(), "{}", case.case_id),
+                    "streams_limited" => assert!(case.limit.is_some(), "{}", case.case_id),
+                    other => panic!("streams case {:?} has kind {other:?}", case.case_id),
+                }
                 continue;
             }
             match case.kind() {
@@ -1435,7 +1737,8 @@ mod tests {
             let rendered = case.query.replace("{R}", "e2e-logs-test");
             let expr = pulsus_logql::parse(&rendered)
                 .unwrap_or_else(|e| panic!("case {:?} query does not parse: {e}", case.case_id));
-            if case.kind() == "streams" {
+            // Issue #100: `streams_limited` compiles as a log pipeline too.
+            if matches!(case.kind(), "streams" | "streams_limited") {
                 let pulsus_logql::Expr::Log(log) = expr else {
                     panic!("case {:?} must be a log (streams) query", case.case_id);
                 };
@@ -1863,5 +2166,254 @@ mod tests {
         ]}});
         assert_eq!(raw_entry_count(&body), 2);
         assert_eq!(set_entry_count(&result_set(&body).unwrap()), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #100: the fetch-until-limit ordered-limited case.
+    // ---------------------------------------------------------------
+
+    fn fetch_until_limit_case(fixture: &LogsFixture) -> &CaseRaw {
+        fixture
+            .cases
+            .iter()
+            .find(|c| c.kind() == "streams_limited")
+            .expect("the issue #100 fetch-until-limit case is committed")
+    }
+
+    /// AC-plan (hermetic): the case plans as a paged dropping streams
+    /// scan — `fetch_until_limit`, `scan_limit == limit × factor`,
+    /// `result_limit == limit`. Proves the engaged read path is the
+    /// fetch-until-limit paging (not a single truncated scan).
+    #[test]
+    fn fetch_until_limit_case_plans_as_a_paged_dropping_scan() {
+        let fixture = shipped_fixture();
+        let case = fetch_until_limit_case(&fixture);
+        let limit = case.limit.expect("streams_limited carries a limit");
+        let corpus = shipped_corpus(&fixture, fixture.full.record_count);
+        let rendered = case.query.replace("{R}", &corpus.run_id);
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let params = pulsus_read::logql::QueryParams {
+            spec: pulsus_read::logql::QuerySpec::Range {
+                start_ns: corpus.first_ts_ns - WINDOW_SLACK_NS,
+                end_ns: corpus.last_ts_ns + WINDOW_SLACK_NS,
+                step_ns: 0,
+            },
+            limit,
+            direction: pulsus_read::logql::Direction::Forward,
+        };
+        let plan = pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+        let pulsus_read::logql::Plan::Streams(sp) = &plan else {
+            panic!("case {:?} must plan as streams", case.case_id);
+        };
+        assert!(
+            sp.fetch_until_limit,
+            "two dropping label filters must engage fetch-until-limit"
+        );
+        assert_eq!(sp.result_limit, limit);
+        assert_eq!(
+            sp.scan_limit,
+            limit * E2E_DEPLOYED_SCAN_FACTOR,
+            "scan_limit must be the first-page size (limit × factor)"
+        );
+    }
+
+    /// AC3′ (hermetic, full tier): the earliest-`limit` survivors
+    /// provably span >= 2 pages — the survivors among the first
+    /// `limit × factor` svc-json records (page 1) are strictly fewer than
+    /// `limit`, forcing a second fetch, and total matches are >= `limit`.
+    /// A corpus change that makes page 1 self-sufficient fails here.
+    #[test]
+    fn fetch_until_limit_case_provably_pages_at_full_tier() {
+        let fixture = shipped_fixture();
+        let case = fetch_until_limit_case(&fixture);
+        let limit = case.limit.expect("streams_limited carries a limit") as usize;
+        let corpus = shipped_corpus(&fixture, fixture.full.record_count);
+        let page_size = limit * E2E_DEPLOYED_SCAN_FACTOR as usize;
+        let svc_json: Vec<&logs_corpus::GeneratedRecord> = corpus
+            .records
+            .iter()
+            .filter(|r| r.service == logs_corpus::SVC_JSON)
+            .collect();
+        let matches = |r: &logs_corpus::GeneratedRecord| {
+            logs_corpus::case_projection(&case.case_id, r).is_some()
+        };
+        let s1 = svc_json
+            .iter()
+            .take(page_size)
+            .filter(|r| matches(r))
+            .count();
+        let total = svc_json.iter().filter(|r| matches(r)).count();
+        assert!(
+            s1 < limit,
+            "page-1 survivors {s1} must be < limit {limit} to force a second fetch"
+        );
+        assert!(
+            limit <= total,
+            "limit {limit} must be <= total matches {total}"
+        );
+        // At least one of the earliest-`limit` survivors is beyond page 1.
+        let earliest_positions: Vec<usize> = svc_json
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches(r))
+            .map(|(pos, _)| pos)
+            .take(limit)
+            .collect();
+        assert!(
+            earliest_positions.iter().any(|&pos| pos >= page_size),
+            "at least one earliest-{limit} survivor must sit beyond the first page ({page_size} \
+             svc-json records) — got positions {earliest_positions:?}"
+        );
+    }
+
+    /// Tie-freedom (hermetic): the expected earliest-`limit` prefix has
+    /// exactly `limit` entries with strictly increasing (distinct)
+    /// timestamps, so the ordered comparison never depends on tie-breaking.
+    #[test]
+    fn fetch_until_limit_expected_prefix_has_strictly_increasing_distinct_ts() {
+        let fixture = shipped_fixture();
+        let case = fetch_until_limit_case(&fixture);
+        let limit = case.limit.expect("streams_limited carries a limit");
+        let corpus = shipped_corpus(&fixture, fixture.full.record_count);
+        let expected = corpus.expected_ordered_limited(&case.case_id, limit);
+        assert_eq!(expected.len(), limit as usize);
+        for w in expected.windows(2) {
+            assert!(
+                w[0].1 < w[1].1,
+                "expected prefix timestamps must be strictly increasing: {expected:?}"
+            );
+        }
+    }
+
+    /// Ordered-prefix anti-drift (hermetic): `expected_ordered_limited`
+    /// equals the earliest-`limit` output of running the SHIPPED
+    /// `CompiledPipeline` over the corpus in index (== ascending-ts)
+    /// order. The corpus projection, the fixture query, and the engine's
+    /// pipeline cannot drift apart. (`naive_matches` vs `case_projection`
+    /// for this id is covered by the corpus circularity-breaker test.)
+    #[test]
+    fn fetch_until_limit_expected_prefix_agrees_with_the_shipped_evaluator() {
+        let fixture = shipped_fixture();
+        let case = fetch_until_limit_case(&fixture);
+        let limit = case.limit.expect("streams_limited carries a limit") as usize;
+        let corpus = shipped_corpus(&fixture, fixture.full.record_count);
+        let rendered = case.query.replace("{R}", &corpus.run_id);
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let pulsus_logql::Expr::Log(log) = expr else {
+            panic!("streams query expected");
+        };
+        let service = log
+            .selector
+            .matchers
+            .iter()
+            .find(|m| m.name == "service_name")
+            .map(|m| m.value.clone())
+            .expect("case selectors pin a service");
+        let compiled = pulsus_read::logql::pipeline::CompiledPipeline::compile(&log.pipeline)
+            .expect("compile");
+        let mut evaluated: OrderedEntries = Vec::new();
+        for r in corpus.records.iter().filter(|r| r.service == service) {
+            let base = vec![
+                ("run_id".to_string(), corpus.run_id.clone()),
+                ("service_name".to_string(), r.service.to_string()),
+            ];
+            let Some(out) = compiled.run(&r.body, &base) else {
+                continue;
+            };
+            let labels: std::collections::BTreeMap<String, String> = out
+                .labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            evaluated.push((labels, r.ts_ns, out.line.into_owned()));
+            if evaluated.len() == limit {
+                break;
+            }
+        }
+        assert_eq!(
+            evaluated,
+            corpus.expected_ordered_limited(&case.case_id, limit as u32),
+            "shipped evaluator disagrees with the corpus ordered prefix"
+        );
+    }
+
+    /// AC-deploy (hermetic): `deploy/e2e/compose.single.yaml` overrides
+    /// neither `logql_pipeline_scan_factor` nor its env var, so the
+    /// deployed factor is the config default (`E2E_DEPLOYED_SCAN_FACTOR`)
+    /// and the page-1 arithmetic stays valid against the live server.
+    #[test]
+    fn deployed_compose_does_not_override_the_scan_factor() {
+        let compose = crate::engine::workspace_root().join("deploy/e2e/compose.single.yaml");
+        let raw = std::fs::read_to_string(&compose)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", compose.display()));
+        assert!(
+            !raw.contains("logql_pipeline_scan_factor"),
+            "compose must not override reader.logql_pipeline_scan_factor"
+        );
+        assert!(
+            !raw.contains("PULSUS_LOGQL_PIPELINE_SCAN_FACTOR"),
+            "compose must not override the scan-factor env var"
+        );
+    }
+
+    /// The deployed factor constant matches the hermetic plan context's
+    /// factor (both are the config default 10) — the plan-time and
+    /// live-time page sizes agree.
+    #[test]
+    fn deployed_scan_factor_matches_the_hermetic_plan_ctx() {
+        assert_eq!(
+            E2E_DEPLOYED_SCAN_FACTOR,
+            hermetic_plan_ctx().pipeline_scan_factor
+        );
+    }
+
+    /// Response-order trip (hermetic, issue #100 fix, plan v2 item 5):
+    /// the ordered comparison must CATCH a within-stream descending pair
+    /// as received, not launder it with a blind global sort. Models the
+    /// `limit=4` case's GET stream, which carries two entries (j9 & j69,
+    /// both `GET /api/users 503 500`): returning them out of order
+    /// (j69 before j9) must fail HARD; the correct ascending order passes
+    /// and k-way merges into the global ascending sequence.
+    #[test]
+    fn ordered_entries_rejects_a_within_stream_descending_pair() {
+        let get = serde_json::json!({"method": "GET", "status": "503", "took_ms": "500"});
+        let delete = serde_json::json!({"method": "DELETE", "status": "503", "took_ms": "500"});
+        let put = serde_json::json!({"method": "PUT", "status": "503", "took_ms": "500"});
+        // Two single-entry streams (DELETE j29, PUT j49) interleave the
+        // GET stream's two entries (j9 ts=100, j69 ts=400) in global order.
+        let mk = |get_values: serde_json::Value| {
+            serde_json::json!({
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {"stream": get.clone(), "values": get_values},
+                        {"stream": delete.clone(), "values": [["200", "c"]]},
+                        {"stream": put.clone(), "values": [["300", "d"]]},
+                    ]
+                }
+            })
+        };
+
+        // Correct forward order within the GET stream (ascending ts).
+        let ok_body = mk(serde_json::json!([["100", "a"], ["400", "b"]]));
+        let merged = ordered_entries(&ok_body).expect("ascending streams must merge");
+        let ts_order: Vec<i64> = merged.iter().map(|(_, ts, _)| *ts).collect();
+        assert_eq!(
+            ts_order,
+            vec![100, 200, 300, 400],
+            "k-way merge must yield the global ascending order"
+        );
+        // The GET stream (two entries) bookends the merged sequence.
+        assert_eq!(merged[0].2, "a");
+        assert_eq!(merged[3].2, "b");
+
+        // Descending pair within the GET stream (j69 arrives before j9):
+        // a blind global sort would launder this; the fix must reject it.
+        let tripped = mk(serde_json::json!([["400", "b"], ["100", "a"]]));
+        let err = ordered_entries(&tripped).expect_err("a within-stream descending pair must fail");
+        assert!(
+            err.to_string().contains("out of forward order"),
+            "expected a forward-order violation, got: {err}"
+        );
     }
 }

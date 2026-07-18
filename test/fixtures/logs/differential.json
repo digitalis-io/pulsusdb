@@ -89,6 +89,14 @@
       "query": "{run_id=\"{R}\", service_name=\"svc-badnum\"} | logfmt | n > 5"
     },
     {
+      "case_id": "fetch_until_limit_paged",
+      "construct": "issue #100: fetch-until-limit ordered-limited case. `| json | status = \"503\" | took_ms = \"500\"` is two dropping label filters (fetch_until_limit, scan_limit = limit*factor = 40) whose earliest-limit=4 svc-json survivors (j=9,29,49,69) span >= 2 keyset pages: page 1 (earliest 40 svc-json rows, j in [0,39]) yields only 2 survivors (j=9,29) < 4, forcing a second fetch; page 2 (j in [40,79]) adds j=49,69 to fill at exactly 4. j=9 and j=69 are both GET /api/users 503 500 => the SAME stream carrying two entries, so their arrival order is a real per-stream ordering property. Compared as an ORDERED earliest-4 Vec<(labels,ts,line)> (per-stream ascending verified as received, then k-way merged) against grafana/loki:3.4.2; raw==limit==4 is the page-2 proof. Full tier only (self-gated in run_streams_limited_case).",
+      "mode": "gated",
+      "kind": "streams_limited",
+      "limit": 4,
+      "query": "{run_id=\"{R}\", service_name=\"svc-json\"} | json | status = \"503\" | took_ms = \"500\""
+    },
+    {
       "case_id": "metric_filtered_count",
       "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 no tumbling divergence)",
       "mode": "gated",

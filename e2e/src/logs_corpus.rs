@@ -55,6 +55,11 @@ pub const CASE_IDS: &[&str] = &[
     "json_error_details",
     "json_error_kept_by_error_filter",
     "labelfilter_number_error_details",
+    // Issue #100 fetch-until-limit ordered-limited case (append-only):
+    // a heavily-dropping json + double numeric-filter pipeline whose
+    // earliest-`limit` survivors span >= 2 keyset pages, compared as an
+    // ORDERED prefix (not set-equal) at full tier. See `run_streams_limited_case`.
+    "fetch_until_limit_paged",
 ];
 
 /// The committed METRIC differential case ids (issue M6-10), in fixture
@@ -150,6 +155,11 @@ pub struct LogCorpus {
 /// `(timestamp_ns, line)` entry set — exactly what both stores'
 /// `query_range` responses normalize to in `logs.rs`.
 pub type ExpectedResult = BTreeMap<BTreeMap<String, String>, BTreeSet<(i64, String)>>;
+
+/// One case's earliest-`limit` ordered entries: `(labels, ts_ns, line)`
+/// in ascending-ts order — the fetch-until-limit ordered comparison shape
+/// (issue #100), distinct from [`ExpectedResult`]'s set-collapsed form.
+pub type OrderedEntries = Vec<(BTreeMap<String, String>, i64, String)>;
 
 /// An instant metric case's expected shape: series label set → value
 /// (issue M6-10; values compared with a tight relative tolerance in
@@ -285,6 +295,31 @@ impl LogCorpus {
             let mut labels = self.base_labels(r);
             labels.extend(extracted);
             out.entry(labels).or_default().insert((r.ts_ns, line));
+        }
+        out
+    }
+
+    /// The earliest-`limit` matching `(labels, ts_ns, line)` for one
+    /// committed case, in ascending-ts order (issue #100). Records are
+    /// generated in index order and `ts_ns = base_ns + step_ns · i` is
+    /// injective in the record index (`generate`), so iterating in index
+    /// order IS ascending-ts order and the first `limit` matches are the
+    /// earliest `limit` by timestamp — a UNIQUE ordered prefix with no
+    /// boundary tie (every timestamp is globally distinct). Used by the
+    /// fetch-until-limit ordered comparison, which requires exactly
+    /// `limit` entries on both stores.
+    pub fn expected_ordered_limited(&self, case_id: &str, limit: u32) -> OrderedEntries {
+        let mut out = Vec::new();
+        for r in &self.records {
+            let Some((extracted, line)) = case_projection(case_id, r) else {
+                continue;
+            };
+            let mut labels = self.base_labels(r);
+            labels.extend(extracted);
+            out.push((labels, r.ts_ns, line));
+            if out.len() == limit as usize {
+                break;
+            }
         }
         out
     }
@@ -739,6 +774,13 @@ pub fn case_projection(
         "numeric_number_filter" => {
             (r.service == SVC_JSON && r.status >= 500).then(|| (json_labels(r), r.body.clone()))
         }
+        // Issue #100: `| json | status = "503" | took_ms = "500"` — two
+        // dropping string label filters after `| json`. Matches svc-json
+        // records at `j%4==1` (status 503) AND `j%5==4` (took_ms 500),
+        // i.e. `j ≡ 9 (mod 20)` (j = record_index/3). No extra labels vs
+        // the json parser (both filtered keys are already json labels).
+        "fetch_until_limit_paged" => (r.service == SVC_JSON && r.status == 503 && r.took_ms == 500)
+            .then(|| (json_labels(r), r.body.clone())),
         "numeric_duration_filter" => {
             (r.service == SVC_LOGFMT && r.took_ms > 250).then(|| (logfmt_labels(r), r.body.clone()))
         }
@@ -899,6 +941,14 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
         "numeric_number_filter" => {
             r.service == SVC_JSON
                 && body_json(r).is_some_and(|v| v["status"].as_i64().is_some_and(|s| s >= 500))
+        }
+        // Issue #100: independent body-text re-derivation of the double
+        // string filter (status 503 AND took_ms 500).
+        "fetch_until_limit_paged" => {
+            r.service == SVC_JSON
+                && body_json(r).is_some_and(|v| {
+                    v["status"].as_i64() == Some(503) && v["took_ms"].as_i64() == Some(500)
+                })
         }
         "numeric_duration_filter" => {
             r.service == SVC_LOGFMT

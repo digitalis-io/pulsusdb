@@ -34,9 +34,21 @@ Out of this ledger's scope by design:
   heavily-dropping pipeline over a corpus sized ABOVE `limit × factor`
   matching lines returns exactly `limit`, asserted by construction — no
   oracle store involved). A nightly-Loki (`grafana/loki:3.4.2`)
-  differential case for the same property was found infeasible in the
-  current set-equality diff harness and is **deferred to follow-up issue
-  #100**; it is NOT part of this ledger's diff today. The
+  differential case for the same property now exists (issue #100,
+  `fetch_until_limit_paged`, `kind: "streams_limited"`): the shared
+  set-equality harness could not express "exactly `limit` entries with
+  ordered truncation," so #100 added a per-case `limit` + an **ordered
+  earliest-`limit` `Vec<(labels, ts, line)>`** comparison (each store's
+  per-stream `values` are asserted ascending as received — the forward
+  contract — then k-way merged, so a response-order regression fails
+  rather than being sorted away) and a heavily-dropping pipeline
+  (`| json | status = "503" | took_ms = "500"`) whose earliest-`limit=4`
+  survivors span >= 2 keyset pages at the full tier — with j9 & j69 both
+  `GET /api/users 503 500` sharing one stream, giving a real intra-stream
+  order to verify (`raw == limit` is the page-2 proof). It is **`gated`**
+  — parity holds
+  against the oracle, so it needs no informational entry and no ledger id
+  — and rides the existing nightly `e2e-metrics-full` lane. The
   byte-budget-truncated partial (`data.stats.pulsus_partial`) is a
   PulsusDB-only contract with no Loki equivalent and stays out of oracle
   scope.
