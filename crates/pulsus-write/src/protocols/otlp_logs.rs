@@ -31,6 +31,14 @@ pub struct LogRow {
     pub timestamp_ns: UnixNano,
     pub severity: i8,
     pub body: String,
+    /// Per-entry structured metadata (issue #97), stored as a canonical
+    /// sorted-key JSON String — the same representation as
+    /// `log_streams.labels` (`LabelSet::to_canonical_json`; docs/schemas.md
+    /// §1 rejects `Map(String,String)` for label-shaped data). Empty string
+    /// = no structured metadata. The OTLP path always leaves this empty
+    /// (OTLP record attributes are out of scope — Loki-only); only the Loki
+    /// push receiver populates it.
+    pub structured_metadata: String,
 }
 
 /// One `log_streams` row (docs/schemas.md §3.1) for a single
@@ -146,6 +154,9 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
                     timestamp_ns: UnixNano(timestamp_ns),
                     severity: resolve_severity(record.severity_number),
                     body: any_value_to_string(record.body.as_ref()),
+                    // OTLP record attributes are out of scope (issue #97) —
+                    // structured metadata is a Loki-push-only concept here.
+                    structured_metadata: String::new(),
                 });
             }
         }

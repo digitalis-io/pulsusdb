@@ -478,6 +478,7 @@ fn valid_loki_push_body() -> Vec<u8> {
                     nanos: 0,
                 }),
                 line: "conformance".to_string(),
+                structured_metadata: Vec::new(),
             }],
         }],
     };

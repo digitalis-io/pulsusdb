@@ -210,6 +210,7 @@ mod tests {
                 timestamp_ns: UnixNano(1),
                 severity: 0,
                 body: "hello".to_string(),
+                structured_metadata: String::new(),
             }],
             ..Default::default()
         }

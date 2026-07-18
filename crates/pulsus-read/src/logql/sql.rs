@@ -152,7 +152,7 @@ pub fn stage3(
     let TimeWindow { start_ns, end_ns } = window;
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})\n  AND timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns}"
     );
     for clause in line_filters {
         sql.push_str("\n  AND ");
@@ -233,7 +233,7 @@ pub fn stage3_keyset(
     let TimeWindow { start_ns, end_ns } = window;
 
     let mut sql = format!(
-        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
+        "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\nFROM {samples_table}\nPREWHERE {service_pred}\nWHERE fingerprint IN ({fp_list})"
     );
     match (direction, lower) {
         (_, KeysetLower::First) => {
@@ -599,7 +599,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
              WHERE fingerprint IN (18374)\n\
@@ -633,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
              WHERE fingerprint IN (1, 2)\n\
@@ -667,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service = 'checkout'\n\
              WHERE fingerprint IN (18374)\n\
@@ -702,7 +702,7 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash\n\
+            "SELECT fingerprint, timestamp_ns, body, cityHash64(body) AS body_hash, structured_metadata\n\
              FROM log_samples\n\
              PREWHERE service IN ('checkout', 'billing')\n\
              WHERE fingerprint IN (1, 2)\n\

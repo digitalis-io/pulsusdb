@@ -436,6 +436,7 @@ async fn run_path_b(db: &str, f: &Fixture) {
         timestamp_ns,
         severity,
         body: f.file.body.clone(),
+        structured_metadata: String::new(),
     };
     let stream = LogStreamRow {
         month: Date::start_of_month_utc(timestamp_ns).days_since_epoch(),

@@ -49,6 +49,16 @@ pub struct Migration {
 pub enum Ddl {
     /// A literal DDL template, rendered as-is by `render::render`.
     Static(&'static str),
+    /// A literal DDL template with `Ddl::Static` rendering semantics, but
+    /// cluster-gated exactly like `Ddl::Dist`: only applied when clustering
+    /// is enabled, skipped (not recorded) otherwise. Used to `ALTER` a
+    /// `_dist` `Distributed` wrapper (which only exists in clustered mode)
+    /// additively — the wrapper copies columns at creation and does not
+    /// inherit a base-table `ALTER`, so a column added to a family table's
+    /// base must also be added to its `_dist` object. Chosen over a
+    /// `cluster_only: bool` field on `Migration` so no existing `Migration`
+    /// literal changes shape (issue #97).
+    StaticClusterOnly(&'static str),
     /// The `_dist` `Distributed` wrapper for this migration's `name` +
     /// `family`, generated (never hand-duplicated) from
     /// `render::dist_ddl_template`. Only applied when clustering is
@@ -411,6 +421,46 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- log_samples per-entry structured metadata (issue #97) ---
+    // Additive ALTERs, never a mutation of id 8's frozen CREATE (which would
+    // trip `MigrationDrift` on every already-initialized deployment). A fresh
+    // DB runs CREATE(id 8) then ADD COLUMN(id 21) and converges byte-
+    // identically to an upgraded DB; `ADD COLUMN IF NOT EXISTS` is SQL-
+    // idempotent and the recorded id prevents re-run. Pre-existing rows read
+    // back the empty string (`DEFAULT ''`), which the reader treats as "no
+    // structured metadata" — no data migration. The column is a canonical
+    // sorted-key JSON String (the `log_streams.labels` convention,
+    // docs/schemas.md §1: Map(String,String) is rejected for label-shaped
+    // data), NOT a Map.
+    Migration {
+        id: 21,
+        name: "log_samples",
+        family: Some(Family::Logs),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.log_samples{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS structured_metadata String DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper is a `CREATE ... AS log_samples` that copies columns
+    // at creation and does NOT inherit id 21's base ALTER; in cluster mode all
+    // reads/writes go through `log_samples_dist`, so it must gain the column
+    // too. Cluster-gated (`StaticClusterOnly`) — skipped and unrecorded on a
+    // single node, applied the first time clustering is enabled. Not runnable
+    // locally (rootless podman, no cluster); CI's clustered leg is
+    // authoritative.
+    Migration {
+        id: 22,
+        name: "log_samples",
+        family: Some(Family::Logs),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.log_samples{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS structured_metadata String DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -649,6 +699,65 @@ mod tests {
             assert_eq!(m.name, name);
             assert!(matches!(m.ddl, Ddl::Dist));
             assert_eq!(m.family, Some(Family::Traces));
+        }
+    }
+
+    /// Issue #97: the base `log_samples` structured-metadata ALTER (id 21) is
+    /// an additive `ADD COLUMN IF NOT EXISTS` — never a mutation of id 8's
+    /// frozen CREATE — and stores a canonical JSON String (docs/schemas.md §1
+    /// convention), not a `Map`. An ALTER carries no `ENGINE = ` clause, so it
+    /// passes through `render` unchanged even in cluster mode (no engine swap,
+    /// no storage-policy injection).
+    #[test]
+    fn log_samples_structured_metadata_base_alter_is_additive_json_string() {
+        let ddl = rendered_static(21);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.log_samples\n\
+             ADD COLUMN IF NOT EXISTS structured_metadata String DEFAULT '';",
+        );
+        assert!(!ddl.contains("Map("), "must be a JSON String, not a Map");
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered = render::render(static_tmpl(21), "log_samples", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+    }
+
+    /// Issue #97: the `_dist` structured-metadata ALTER (id 22) is
+    /// `StaticClusterOnly` — it targets `log_samples_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Rendered here directly since
+    /// `rendered_static` only handles `Ddl::Static`.
+    #[test]
+    fn log_samples_structured_metadata_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 22).expect("id 22");
+        assert_eq!(m.name, "log_samples");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 22 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "log_samples", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.log_samples_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS structured_metadata String DEFAULT '';",
+        );
+    }
+
+    /// Issue #97: the structured-metadata ALTERs are checksum-gated and
+    /// per-shard replicated (not config-named, not global) — they inherit the
+    /// same identity/replication scope as every other logs-family DDL.
+    #[test]
+    fn structured_metadata_alters_are_checksum_scoped_per_shard() {
+        for id in [21, 22] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
+            assert_eq!(m.scope, MigrationScope::Checksum);
+            assert_eq!(m.replication, Replication::PerShard);
+            assert_eq!(m.family, Some(Family::Logs));
         }
     }
 

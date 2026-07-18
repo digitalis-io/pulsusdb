@@ -1727,6 +1727,7 @@ mod tests {
                         nanos: 0,
                     }),
                     line: "hello".to_string(),
+                    structured_metadata: Vec::new(),
                 }],
             }],
         };
@@ -1867,6 +1868,7 @@ mod tests {
                         nanos: 0,
                     }),
                     line: "x".to_string(),
+                    structured_metadata: Vec::new(),
                 }],
             }],
         };

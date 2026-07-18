@@ -143,6 +143,7 @@ fn batch_for(fingerprint: u64, service: &str, timestamp_ns: i64, new_stream: boo
             timestamp_ns: UnixNano(timestamp_ns),
             severity: 0,
             body: "hello".to_string(),
+            structured_metadata: String::new(),
         }],
         ..Default::default()
     };
@@ -178,6 +179,7 @@ async fn concurrent_admit_never_exceeds_the_queue_bytes_limit() {
         timestamp_ns: 0,
         severity: 0,
         body: "hello".to_string(),
+        structured_metadata: String::new(),
     }
     .est_bytes();
 
@@ -533,6 +535,7 @@ async fn retryable_pre_send_failure_resends_the_whole_multi_row_batch_before_suc
         timestamp_ns: 0,
         severity: 0,
         body: "hello".to_string(),
+        structured_metadata: String::new(),
     }
     .est_bytes();
 

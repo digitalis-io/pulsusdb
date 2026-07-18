@@ -26,23 +26,45 @@ pub struct StreamMetaRow {
 }
 
 /// Stage 3 — samples (`log_samples`): one matching log line.
+/// `structured_metadata` is the per-entry canonical JSON String (issue #97),
+/// the LAST projected column (append-only, aligning with the additive
+/// `ADD COLUMN` migration). Empty string = no structured metadata (also what
+/// pre-#97 rows read back via the column's `DEFAULT ''`).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct SampleRow {
     pub fingerprint: u64,
     pub timestamp_ns: i64,
     pub body: String,
+    pub structured_metadata: String,
 }
 
 /// A live-tail keyset page row (issue #74): stage 3's sample columns plus
 /// the ClickHouse-computed `cityHash64(body)` the composite cursor is
 /// keyed on (projected server-side so the cursor can never diverge from
-/// the SQL predicate's own hash).
+/// the SQL predicate's own hash). `structured_metadata` (issue #97) is the
+/// per-entry JSON String; the cursor keys on `(timestamp_ns, fingerprint,
+/// body_hash)` only — structured metadata never enters it.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct TailSampleRow {
     pub fingerprint: u64,
     pub timestamp_ns: i64,
     pub body: String,
     pub body_hash: u64,
+    pub structured_metadata: String,
+}
+
+/// The client-aggregated LogQL metric raw scan (`metric_raw_samples`): the
+/// same three columns stage 3 projected before issue #97, WITHOUT
+/// `structured_metadata`. A metric aggregation never reads structured
+/// metadata (it is surfaced only in the streams/tail label set, not in metric
+/// grouping — issue #97 is scoped to those paths), so this lean row keeps the
+/// unbounded metric scan from reading a column it never uses (the query-
+/// performance mandate) and leaves `metric_raw_samples`'s SQL byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricScanRow {
+    pub fingerprint: u64,
+    pub timestamp_ns: i64,
+    pub body: String,
 }
 
 /// The single `/api/logs/v1/stats` aggregation row (issue #74): both the

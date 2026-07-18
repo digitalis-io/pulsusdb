@@ -24,8 +24,8 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use pulsus_write::ingest::decompress::{Encoding, decompress};
 use pulsus_write::protocols::loki_push::{
-    EntryAdapter, PushRequest, StreamAdapter, Timestamp, decode_protobuf, parse_json,
-    parse_protobuf,
+    EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp, decode_protobuf,
+    parse_json, parse_protobuf,
 };
 use pulsus_write::protocols::otlp_logs;
 
@@ -154,6 +154,7 @@ fn loki_stream_fingerprints_identically_to_the_equivalent_otlp_log_stream() {
                     nanos: 0,
                 }),
                 line: "hello".to_string(),
+                structured_metadata: Vec::new(),
             }],
         }],
     };
@@ -222,6 +223,7 @@ fn scope_present_otlp_diverges_from_loki_by_the_injected_otel_scope_labels() {
                     nanos: 0,
                 }),
                 line: "x".to_string(),
+                structured_metadata: Vec::new(),
             }],
         }],
     };
@@ -287,6 +289,7 @@ fn json_and_protobuf_bodies_parse_identically() {
                         nanos: 0,
                     }),
                     line: "a".to_string(),
+                    structured_metadata: Vec::new(),
                 },
                 EntryAdapter {
                     timestamp: Some(Timestamp {
@@ -294,6 +297,7 @@ fn json_and_protobuf_bodies_parse_identically() {
                         nanos: 0,
                     }),
                     line: "b".to_string(),
+                    structured_metadata: Vec::new(),
                 },
             ],
         }],
@@ -301,5 +305,66 @@ fn json_and_protobuf_bodies_parse_identically() {
     assert_eq!(
         parse_json(json, 5).unwrap(),
         parse_protobuf(&proto, 5).unwrap()
+    );
+}
+
+/// Issue #97 (AC-4): a protobuf tag-3 body and a JSON third-element body of
+/// one logical entry carrying structured metadata parse to byte-identical
+/// `ParsedLogs` through the public receiver parsers — the canonical JSON
+/// String is stored per entry, and the stream fingerprint is unchanged.
+#[test]
+fn structured_metadata_parses_identically_across_transports() {
+    let json = br#"{"streams":[{"stream":{"service_name":"checkout","env":"prod"},
+        "values":[["1700000000000000000","boom",{"user_id":"42","trace_id":"abc"}]]}]}"#;
+    let proto = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: r#"{service_name="checkout", env="prod"}"#.to_string(),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                line: "boom".to_string(),
+                structured_metadata: vec![
+                    LabelPairAdapter {
+                        name: "user_id".to_string(),
+                        value: "42".to_string(),
+                    },
+                    LabelPairAdapter {
+                        name: "trace_id".to_string(),
+                        value: "abc".to_string(),
+                    },
+                ],
+            }],
+        }],
+    };
+    let from_json = parse_json(json, 5).unwrap();
+    let from_proto = parse_protobuf(&proto, 5).unwrap();
+    assert_eq!(from_json, from_proto);
+    // Canonical sorted-key JSON String (the log_streams.labels shape).
+    assert_eq!(
+        from_json.rows[0].structured_metadata,
+        r#"{"trace_id":"abc","user_id":"42"}"#
+    );
+    // A structureless push of the same stream fingerprints identically —
+    // structured metadata is per-entry, never in the stream label set.
+    let plain = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: r#"{service_name="checkout", env="prod"}"#.to_string(),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: 1_700_000_000,
+                    nanos: 0,
+                }),
+                line: "boom".to_string(),
+                structured_metadata: Vec::new(),
+            }],
+        }],
+    };
+    let from_plain = parse_protobuf(&plain, 5).unwrap();
+    assert_eq!(from_plain.streams, from_proto.streams);
+    assert_eq!(
+        from_plain.rows[0].fingerprint,
+        from_proto.rows[0].fingerprint
     );
 }

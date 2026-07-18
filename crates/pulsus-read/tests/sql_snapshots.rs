@@ -232,7 +232,7 @@ fn stage3_renders_the_canonical_shape_with_a_single_service() {
     );
     assert_eq!(
         sql,
-        "SELECT fingerprint, timestamp_ns, body\n\
+        "SELECT fingerprint, timestamp_ns, body, structured_metadata\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
          WHERE fingerprint IN (18374, 99120)\n\
@@ -372,13 +372,14 @@ fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
         sp.direction,
         sp.scan_limit,
     );
+    // No body PREDICATE may appear in stage-3 SQL (issue #97: `body,` now
+    // legitimately appears in the SELECT projection alongside
+    // `structured_metadata`, so match the predicate forms directly instead).
     assert!(
-        !sql.contains("body,"),
+        !sql.contains("hasToken(body")
+            && !sql.contains("position(body")
+            && !sql.contains("match(body"),
         "no body predicate may appear in stage-3 SQL: {sql}"
-    );
-    assert!(
-        !sql.contains("hasToken") && !sql.contains("position(body"),
-        "{sql}"
     );
     // The unpushed dropping filter triggers the oversample.
     assert!(sql.ends_with("LIMIT 1000"), "{sql}");

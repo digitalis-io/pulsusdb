@@ -13,7 +13,12 @@ use crate::ingest::traces::{AttrRecord, SpanRecord};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::spool::SpoolEncode;
 
-/// One `log_samples` row (docs/schemas.md §3.1).
+/// One `log_samples` row (docs/schemas.md §3.1). `structured_metadata` is a
+/// canonical sorted-key JSON String (issue #97), the LAST field so the
+/// clickhouse-0.15.1 explicit-column INSERT column list stays append-only and
+/// aligns with the additive `ADD COLUMN` migration (catalog id 21). Empty
+/// string = no structured metadata (matches the column's `DEFAULT ''`, so
+/// pre-column rows read back identically).
 #[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
 pub struct LogSampleRow {
     pub service: String,
@@ -21,6 +26,7 @@ pub struct LogSampleRow {
     pub timestamp_ns: i64,
     pub severity: i8,
     pub body: String,
+    pub structured_metadata: String,
 }
 
 impl From<&LogRow> for LogSampleRow {
@@ -31,6 +37,7 @@ impl From<&LogRow> for LogSampleRow {
             timestamp_ns: row.timestamp_ns.0,
             severity: row.severity,
             body: row.body.clone(),
+            structured_metadata: row.structured_metadata.clone(),
         }
     }
 }
@@ -42,7 +49,7 @@ impl LogSampleRow {
     /// memory for both the flush-size threshold and the queue-bytes
     /// admission gate without modelling RowBinary encoding exactly.
     pub fn est_bytes(&self) -> u64 {
-        Self::estimate(&self.service, &self.body)
+        Self::estimate(&self.service, &self.body, self.structured_metadata.len())
     }
 
     /// Estimates a `LogRow`'s footprint *before* it is materialized into a
@@ -52,12 +59,12 @@ impl LogSampleRow {
     /// `writer::LogWriter::admit_batch`'s `fetch_add` reservation can
     /// happen before the clone that builds the target row.
     pub fn est_source_bytes(row: &LogRow) -> u64 {
-        Self::estimate(&row.service, &row.body)
+        Self::estimate(&row.service, &row.body, row.structured_metadata.len())
     }
 
-    fn estimate(service: &str, body: &str) -> u64 {
-        (service.len() + body.len() + 8 /* fingerprint */ + 8 /* timestamp_ns */ + 1/* severity */)
-            as u64
+    fn estimate(service: &str, body: &str, structured_metadata_len: usize) -> u64 {
+        (service.len() + body.len() + structured_metadata_len
+            + 8 /* fingerprint */ + 8 /* timestamp_ns */ + 1/* severity */) as u64
     }
 }
 
@@ -539,6 +546,7 @@ mod tests {
             timestamp_ns: UnixNano(1_700_000_000_000_000_000),
             severity: 9,
             body: "hello".to_string(),
+            structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
         };
         let mapped = LogSampleRow::from(&row);
         assert_eq!(mapped.service, "checkout");
@@ -546,6 +554,7 @@ mod tests {
         assert_eq!(mapped.timestamp_ns, 1_700_000_000_000_000_000);
         assert_eq!(mapped.severity, 9);
         assert_eq!(mapped.body, "hello");
+        assert_eq!(mapped.structured_metadata, r#"{"trace_id":"abc"}"#);
     }
 
     #[test]
@@ -556,12 +565,19 @@ mod tests {
             timestamp_ns: 0,
             severity: 0,
             body: "a".to_string(),
+            structured_metadata: String::new(),
         };
         let long = LogSampleRow {
             body: "a".repeat(100),
             ..short.clone()
         };
         assert!(long.est_bytes() > short.est_bytes());
+        // Structured metadata contributes to the estimate too (issue #97).
+        let with_sm = LogSampleRow {
+            structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
+            ..short.clone()
+        };
+        assert!(with_sm.est_bytes() > short.est_bytes());
     }
 
     #[test]
@@ -572,6 +588,7 @@ mod tests {
             timestamp_ns: UnixNano(1_700_000_000_000_000_000),
             severity: 9,
             body: "hello world".to_string(),
+            structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
         };
         let mapped = LogSampleRow::from(&row);
         assert_eq!(LogSampleRow::est_source_bytes(&row), mapped.est_bytes());
@@ -591,6 +608,7 @@ mod tests {
             timestamp_ns: 1_700_000_000_000_000_000,
             severity: 9,
             body: "hello".to_string(),
+            structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
         };
         let spooled = row.to_spool_value();
         assert_eq!(
@@ -601,6 +619,7 @@ mod tests {
                 "timestamp_ns": 1_700_000_000_000_000_000i64,
                 "severity": 9,
                 "body": "hello",
+                "structured_metadata": r#"{"trace_id":"abc"}"#,
             }),
             "LogSampleRow's spool shape must be exactly its plain field set, unchanged \
              by the SpoolEncode generalization"

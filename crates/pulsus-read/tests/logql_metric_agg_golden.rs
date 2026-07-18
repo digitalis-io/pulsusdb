@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use pulsus_logql::{BinOp, parse};
-use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
     QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, VectorSample, apply_vector_aggs,
@@ -86,8 +86,8 @@ fn meta_two() -> HashMap<u64, StreamMetaRow> {
     m
 }
 
-fn row(fp: u64, ts_ns: i64, body: &str) -> SampleRow {
-    SampleRow {
+fn row(fp: u64, ts_ns: i64, body: &str) -> MetricScanRow {
+    MetricScanRow {
         fingerprint: fp,
         timestamp_ns: ts_ns,
         body: body.to_string(),
@@ -100,7 +100,7 @@ fn row(fp: u64, ts_ns: i64, body: &str) -> SampleRow {
 fn run_client(
     query: &str,
     params: &QueryParams,
-    rows: &[SampleRow],
+    rows: &[MetricScanRow],
     meta: &HashMap<u64, StreamMetaRow>,
 ) -> Result<QueryResult, ReadError> {
     let mp = metric_plan_of(query, params);
@@ -144,7 +144,7 @@ fn single_vector_value(result: QueryResult) -> f64 {
 // one series; bucket 0 holds {1,2}, bucket 60s holds {3,4}.
 // ---------------------------------------------------------------------
 
-fn unwrap_rows() -> Vec<SampleRow> {
+fn unwrap_rows() -> Vec<MetricScanRow> {
     vec![
         row(1, 10 * NS, "v=1"),
         row(1, 20 * NS, "v=2"),
@@ -263,7 +263,7 @@ fn first_and_last_tie_break_identically_for_reordered_equal_timestamp_inputs() {
         row(1, 30 * NS, "v=3"),
         row(1, 30 * NS, "v=4"), // ties the max timestamp
     ];
-    let reversed: Vec<SampleRow> = natural.iter().rev().cloned().collect();
+    let reversed: Vec<MetricScanRow> = natural.iter().rev().cloned().collect();
     let params = instant_params(60 * NS);
     for rows in [&natural, &reversed] {
         let first = single_vector_value(

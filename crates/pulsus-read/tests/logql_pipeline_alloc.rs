@@ -46,7 +46,7 @@ use std::borrow::Cow;
 
 use pulsus_read::logql::exec::{run_client_agg_rows, run_pipeline_rows};
 use pulsus_read::logql::pipeline::CompiledPipeline;
-use pulsus_read::logql::rows::{SampleRow, StreamMetaRow};
+use pulsus_read::logql::rows::{MetricScanRow, SampleRow, StreamMetaRow};
 use pulsus_read::logql::{ClientWindow, Direction, Plan, PlanCtx, QueryParams, QuerySpec, plan};
 
 const ROWS: u64 = 20_000;
@@ -178,6 +178,7 @@ fn per_row_allocation_bounds_hold() {
             fingerprint: 1,
             timestamp_ns: i as i64,
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            structured_metadata: String::new(),
         })
         .collect();
 
@@ -219,6 +220,7 @@ fn per_row_allocation_bounds_hold() {
             fingerprint: 1,
             timestamp_ns: i as i64,
             body: format!("id=r{i} level=info"),
+            structured_metadata: String::new(),
         })
         .collect();
     let n = high_card_rows.len() as u64;
@@ -227,6 +229,66 @@ fn per_row_allocation_bounds_hold() {
         total <= 4 * n + n / 2 + ZERO_RESIDUE,
         "high-cardinality fan-out assembly: {total} allocations over {n} rows — must stay \
          <= 4.5 per row (a per-new-group key clone would push this past 5)"
+    );
+
+    // --- Issue #97 (AC-12): structured-metadata merge path.
+    //
+    // (a) SM-ABSENT byte-identity: rows with an empty `structured_metadata`
+    //     take the UNCHANGED zero-structured-metadata branch. This identity
+    //     query over empty-SM rows must stay on the by-fingerprint transform
+    //     shape at <= 2 per row (the owned output line + amortized entries
+    //     growth) — the same profile as before #97.
+    let sm_absent_rows: Vec<SampleRow> = (0..4096)
+        .map(|i| SampleRow {
+            fingerprint: 1,
+            timestamp_ns: i as i64,
+            body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    let n = sm_absent_rows.len() as u64;
+    let total = count_assembly(r#"{a="b"} |= "level""#, &sm_absent_rows, &meta);
+    assert!(
+        total <= 2 * n + ZERO_RESIDUE,
+        "SM-absent assembly: {total} allocations over {n} rows — the empty-SM branch must keep \
+         its pre-#97 <= 2 per row profile"
+    );
+
+    // (b) SM-PRESENT bounded merge: every row carries DISTINCT structured
+    //     metadata, so each fans out (worst case). Per row the cost is
+    //     bounded (no per-row GROWTH): the reused merge buffer copies the
+    //     cached base labels + parses the SM pairs, one per-SM-row Cow
+    //     scratch, the owned output line, the rendered labels_json (the group
+    //     key), the group's service + entry vec — a fixed constant for a
+    //     fixed base/SM cardinality. A per-row-GROWING merge (e.g. a merge
+    //     buffer reallocated per row, or accidental quadratic regrouping)
+    //     would blow past a linear bound by orders of magnitude.
+    let sm_present_rows: Vec<SampleRow> = (0..4096)
+        .map(|i| SampleRow {
+            fingerprint: 1,
+            timestamp_ns: i as i64,
+            body: logfmt_bodies[i % logfmt_bodies.len()].clone(),
+            structured_metadata: format!(r#"{{"trace_id":"t{i}","user_id":"u{}"}}"#, i % 97),
+        })
+        .collect();
+    let n = sm_present_rows.len() as u64;
+    let total = count_assembly(r#"{a="b"} |= "level""#, &sm_present_rows, &meta);
+    // Base = 2 labels (env, service_name), SM = 2 pairs: the merge copies +
+    // parses a fixed ~4 pairs, plus a small constant of output/group allocs —
+    // measured at ~12.0 allocations/row with the REUSED Cow scratch (issue #97
+    // review round 1, finding 2). The bound is tightened to 12.5/row (the
+    // `n / 2` slack term) precisely so it TRIPS on a regression that un-hoists
+    // the scratch: a fresh per-row `Vec` adds exactly one allocation/row
+    // (~13.0/row = `13 * n`), which exceeds `12 * n + n / 2`. A loose linear
+    // threshold (e.g. 20/row) would NOT prove reuse. Strictly LINEAR — no
+    // per-row growth term (a reallocated-per-row merge or quadratic regrouping
+    // would blow past this by orders of magnitude).
+    const SM_MERGE_PER_ROW: u64 = 12;
+    assert!(
+        total <= SM_MERGE_PER_ROW * n + n / 2 + ZERO_RESIDUE,
+        "SM-present merge assembly: {total} allocations over {n} rows — the structured-metadata \
+         merge must stay bounded per row at the reused-scratch profile (~12/row); an un-hoisted \
+         per-row scratch (~13/row) must trip this gate"
     );
 
     // --- Issue M6-10: the client-aggregated metric path. A
@@ -246,8 +308,8 @@ fn per_row_allocation_bounds_hold() {
         max_streams: 100_000,
         pipeline_scan_factor: 10,
     };
-    let agg_rows: Vec<SampleRow> = (0..20_000)
-        .map(|i| SampleRow {
+    let agg_rows: Vec<MetricScanRow> = (0..20_000)
+        .map(|i| MetricScanRow {
             fingerprint: 1,
             timestamp_ns: (i as i64) * 1_000_000, // 20s of 1ms-spaced rows
             body: logfmt_bodies[i % logfmt_bodies.len()].clone(),

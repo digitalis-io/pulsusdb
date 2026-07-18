@@ -18,7 +18,7 @@
   "queries": [
     {
       "name": "label_scoped_stream_read_6h",
-      "sql": "SELECT fingerprint, timestamp_ns, body\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 554447573062157008, 9358662146628073629, 12001626415738664362)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\nORDER BY timestamp_ns DESC\nLIMIT 100",
+      "sql": "SELECT fingerprint, timestamp_ns, body, structured_metadata\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 554447573062157008, 9358662146628073629, 12001626415738664362)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\nORDER BY timestamp_ns DESC\nLIMIT 100",
       "wall_ms_p50": 77.699486,
       "wall_ms_p95": 117.44993600000001,
       "wall_ms_p99": 117.44993600000001,
@@ -235,7 +235,7 @@
     },
     {
       "name": "body_search_24h",
-      "sql": "SELECT fingerprint, timestamp_ns, body\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 146776743113873368, 554447573062157008, 4822384909159605784, 12001626415738664362, 17259846748231831022, 2922370082508368009, 16688373275999325849, 10540492116184247601, 9358662146628073629)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\n  AND hasToken(body, 'xtaskneedle7c91a') AND position(body, 'xtaskneedle7c91a') > 0\nORDER BY timestamp_ns DESC\nLIMIT 1000",
+      "sql": "SELECT fingerprint, timestamp_ns, body, structured_metadata\nFROM log_samples_dist\nPREWHERE service = 'svc-000'\nWHERE fingerprint IN (18151876074155682148, 146776743113873368, 554447573062157008, 4822384909159605784, 12001626415738664362, 17259846748231831022, 2922370082508368009, 16688373275999325849, 10540492116184247601, 9358662146628073629)\n  AND timestamp_ns > 1784021436057699271 AND timestamp_ns <= 1784025036057699271\n  AND hasToken(body, 'xtaskneedle7c91a') AND position(body, 'xtaskneedle7c91a') > 0\nORDER BY timestamp_ns DESC\nLIMIT 1000",
       "wall_ms_p50": 69.298845,
       "wall_ms_p95": 72.466842,
       "wall_ms_p99": 72.466842,

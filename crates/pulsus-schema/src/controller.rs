@@ -112,21 +112,30 @@ pub async fn reconcile(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
     reconcile_mvs(client, ctx).await
 }
 
+/// True for DDL that only exists in clustered mode — the `_dist`
+/// `Distributed` wrapper (`Ddl::Dist`) and cluster-only `_dist` ALTERs
+/// (`Ddl::StaticClusterOnly`, issue #97). Such a migration is skipped
+/// entirely (never attempted, never recorded) on a single node.
+fn is_cluster_only(ddl: &Ddl) -> bool {
+    matches!(ddl, Ddl::Dist | Ddl::StaticClusterOnly(_))
+}
+
 async fn apply_migration(
     client: &ChClient,
     ctx: &RenderCtx,
     m: &crate::catalog::Migration,
 ) -> Result<(), SchemaError> {
-    // `_dist` wrappers only exist in clustered mode; skip entirely (never
-    // attempted, never recorded) when no cluster is configured — the id
-    // stays reserved and gets applied the first time clustering is enabled.
-    if matches!(m.ddl, Ddl::Dist) && ctx.cluster.is_none() {
+    // `_dist` wrappers (and cluster-only `_dist` ALTERs) only exist in
+    // clustered mode; skip entirely (never attempted, never recorded) when no
+    // cluster is configured — the id stays reserved and gets applied the first
+    // time clustering is enabled.
+    if is_cluster_only(&m.ddl) && ctx.cluster.is_none() {
         return Ok(());
     }
 
     let name = render::render_name(m.name, ctx);
     let tmpl = match &m.ddl {
-        Ddl::Static(tmpl) => (*tmpl).to_string(),
+        Ddl::Static(tmpl) | Ddl::StaticClusterOnly(tmpl) => (*tmpl).to_string(),
         Ddl::Dist => {
             let family = m
                 .family
@@ -144,7 +153,11 @@ async fn apply_migration(
     // rollup entry, is the *base* table's name and would already exist from
     // its own migration, silently no-op-ing the wrapper's creation).
     let object_name = match &m.ddl {
-        Ddl::Static(_) => name.clone(),
+        // `StaticClusterOnly` ALTERs a `_dist` object, but under
+        // `MigrationScope::Checksum` `object_name` is only consumed by the
+        // `Ddl::Dist` orphan/existence scans — never for a Checksum ALTER —
+        // so its value is inert here (issue #97 plan v2 delta 3).
+        Ddl::Static(_) | Ddl::StaticClusterOnly(_) => name.clone(),
         Ddl::Dist => format!("{name}{}", ctx.dist_suffix),
     };
 
@@ -506,6 +519,16 @@ mod tests {
             orphaned_rollup_siblings(&siblings, "log_metrics_5s", RollupObjectKind::Table)
                 .is_empty()
         );
+    }
+
+    /// Issue #97: `StaticClusterOnly` (the `_dist` structured-metadata ALTER,
+    /// id 22) and `Dist` are the only cluster-only DDL — both skipped on a
+    /// single node — while a plain `Static` ALTER (id 21) always applies.
+    #[test]
+    fn is_cluster_only_matches_dist_and_static_cluster_only() {
+        assert!(is_cluster_only(&Ddl::Dist));
+        assert!(is_cluster_only(&Ddl::StaticClusterOnly("ALTER ...")));
+        assert!(!is_cluster_only(&Ddl::Static("ALTER ...")));
     }
 
     #[test]

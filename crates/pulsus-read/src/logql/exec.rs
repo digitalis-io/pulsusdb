@@ -22,8 +22,8 @@ use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
-    LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow, SampleRow,
-    StreamMetaRow, StreamRow, TailSampleRow,
+    LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow, MetricScanRow,
+    SampleRow, StreamMetaRow, StreamRow, TailSampleRow,
 };
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
@@ -559,33 +559,42 @@ impl LogQlEngine {
         if compiled.is_line_filter_only() {
             // Fast path: today's per-fingerprint shape, `labels_json`
             // verbatim (`scan_limit == result_limit` by construction).
+            // Zero-structured-metadata rows stay on this UNCHANGED path (AC-8
+            // byte-identity); rows carrying structured metadata (issue #97)
+            // fan out into their own merged-label-set streams below.
             let mut by_fp: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
+            let mut sm_rows: Vec<SampleRow> = Vec::new();
             let mut stream = self
                 .query_stream::<SampleRow>(&sql, &self.budget_settings())
                 .await
                 .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
-                by_fp
-                    .entry(row.fingerprint)
-                    .or_default()
-                    .push((row.timestamp_ns, row.body));
+                if row.structured_metadata.is_empty() {
+                    by_fp
+                        .entry(row.fingerprint)
+                        .or_default()
+                        .push((row.timestamp_ns, row.body));
+                } else {
+                    sm_rows.push(row);
+                }
             }
 
-            return Ok((
-                by_fp
-                    .into_iter()
-                    .filter_map(|(fp, entries)| {
-                        meta.get(&fp).map(|m| StreamResult {
-                            fingerprint: fp,
-                            service: m.service.clone(),
-                            labels_json: m.labels.clone(),
-                            entries,
-                        })
+            let mut streams: Vec<StreamResult> = by_fp
+                .into_iter()
+                .filter_map(|(fp, entries)| {
+                    meta.get(&fp).map(|m| StreamResult {
+                        fingerprint: fp,
+                        service: m.service.clone(),
+                        labels_json: m.labels.clone(),
+                        entries,
                     })
-                    .collect(),
-                false,
-            ));
+                })
+                .collect();
+            if !sm_rows.is_empty() {
+                streams.extend(fan_out_sm_fast_path(&sm_rows, &meta));
+            }
+            return Ok((streams, false));
         }
 
         // Dropping sub-case (issue #90): a label filter, or a line filter
@@ -739,6 +748,7 @@ impl LogQlEngine {
                     fingerprint: r.fingerprint,
                     timestamp_ns: r.timestamp_ns,
                     body: r.body,
+                    structured_metadata: r.structured_metadata,
                 })
                 .collect();
             let filled = acc.feed(&sample_rows, compiled);
@@ -992,13 +1002,13 @@ impl LogQlEngine {
             },
             mp.rate_window_ns,
         )?;
-        let mut chunk: Vec<SampleRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
+        let mut chunk: Vec<MetricScanRow> = Vec::with_capacity(CLIENT_AGG_CHUNK_ROWS);
         {
             // Scoped: the row stream holds its pooled connection until
             // dropped (the `ChRowStream` lease rule) — no other query
             // runs inside this block, and the lease ends at the brace.
             let mut stream = self
-                .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                .query_stream::<MetricScanRow>(&sql, &self.budget_settings())
                 .await
                 .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             while let Some(row) = stream.next().await {
@@ -1526,6 +1536,7 @@ impl LogQlEngine {
                 fingerprint: r.fingerprint,
                 timestamp_ns: r.timestamp_ns,
                 body: r.body,
+                structured_metadata: r.structured_metadata,
             })
             .collect();
         let streams = run_pipeline_rows(sample_rows, compiled, &meta, fetch_limit);
@@ -1740,8 +1751,22 @@ impl<'m> StreamAccumulator<'m> {
         // One label scratch reused across every row of this page (issue
         // #72 review round 1, finding 3): `run_into` clears and refills the
         // same vector — zero per-row label-vector allocations on the
-        // dropped-row path.
+        // dropped-row (zero-structured-metadata) path.
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        // The structured-metadata merge buffers (issue #97): reused across SM-
+        // bearing rows (clear + refill, capacity-amortized), never a fresh
+        // per-row allocation of the label vector itself. `merge_buf` holds the
+        // merged result; `sm_buf` is the SM-pair parse scratch. Only SM-bearing
+        // rows touch them — the empty-SM path never allocates or clears them.
+        let mut merge_buf: Vec<(String, String)> = Vec::new();
+        let mut sm_buf: Vec<(String, String)> = Vec::new();
+        // The Cow label scratch `run_into` fills for SM-bearing rows. Held
+        // `'static`-tagged (always empty) between rows and re-tagged per row so
+        // its allocation is reused across the page — never a fresh per-row
+        // allocation (issue #97 review round 1, finding 2 / AC-12). See
+        // `eval_structured_metadata_row` for why the reuse goes through a
+        // by-value helper rather than a hoisted `&mut` binding.
+        let mut sm_scratch: LabelScratch<'static> = Vec::new();
 
         for row in rows {
             if *survivors >= *result_limit {
@@ -1751,51 +1776,72 @@ impl<'m> StreamAccumulator<'m> {
                 continue;
             };
             let base = &base_labels[&row.fingerprint];
-            let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
-                continue;
-            };
-            *survivors += 1;
 
-            if fan_out {
-                // Render the canonical JSON DIRECTLY from the sorted
-                // borrowed scratch (round-2 finding 1: no owned
-                // intermediate label vector, no second clone at render
-                // time). Per surviving row this costs exactly the
-                // `labels_json` string (needed as the group key either way)
-                // + the owned output line; the `StreamResult` fields
-                // materialize once per NEW group only.
-                scratch.sort_unstable();
-                let labels_json = render_labels_json_sorted(&scratch);
-                let entry = (row.timestamp_ns, line.into_owned());
-                match label_groups.entry(labels_json) {
-                    std::collections::hash_map::Entry::Occupied(e) => {
-                        e.into_mut().entries.push(entry);
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let service = scratch
-                            .iter()
-                            .find(|(k, _)| k == "service_name")
-                            .map(|(_, v)| v.to_string())
-                            .unwrap_or_else(|| m.service.clone());
-                        let fingerprint = fnv1a64(e.key().as_bytes());
-                        e.insert(FanOutGroup {
-                            fingerprint,
-                            service,
-                            entries: vec![entry],
-                        });
-                    }
+            if row.structured_metadata.is_empty() {
+                // Zero-structured-metadata fast path — UNCHANGED (the
+                // `logql_pipeline_alloc` golden pins its zero-per-row
+                // profile; AC-8 byte-identity for pre-#97 data).
+                let Some(line) = compiled.run_into(&row.body, base, &mut scratch) else {
+                    continue;
+                };
+                *survivors += 1;
+                if fan_out {
+                    // Render the canonical JSON DIRECTLY from the sorted
+                    // borrowed scratch (round-2 finding 1: no owned
+                    // intermediate label vector, no second clone at render
+                    // time). Per surviving row this costs exactly the
+                    // `labels_json` string (needed as the group key either
+                    // way) + the owned output line; the `StreamResult` fields
+                    // materialize once per NEW group only.
+                    scratch.sort_unstable();
+                    push_fanout_entry(
+                        label_groups,
+                        &scratch,
+                        row.timestamp_ns,
+                        line.into_owned(),
+                        &m.service,
+                    );
+                } else {
+                    fp_groups
+                        .entry(row.fingerprint)
+                        .or_insert_with(|| StreamResult {
+                            fingerprint: row.fingerprint,
+                            service: m.service.clone(),
+                            labels_json: m.labels.clone(),
+                            entries: Vec::new(),
+                        })
+                        .entries
+                        .push((row.timestamp_ns, line.into_owned()));
                 }
             } else {
-                fp_groups
-                    .entry(row.fingerprint)
-                    .or_insert_with(|| StreamResult {
-                        fingerprint: row.fingerprint,
-                        service: m.service.clone(),
-                        labels_json: m.labels.clone(),
-                        entries: Vec::new(),
-                    })
-                    .entries
-                    .push((row.timestamp_ns, line.into_owned()));
+                // Structured-metadata-bearing row (issue #97): merge the
+                // cached base labels + parsed SM into the reused owned buffer
+                // (colliding SM keys renamed `_extracted`, per the oracle),
+                // then run the pipeline over that contiguous base. SM changes
+                // the label set, so these rows ALWAYS fan out (matching Loki's
+                // per-entry SM fan-out). Only SM-bearing rows pay this cost.
+                merge_labels_with_structured_metadata(
+                    base,
+                    &row.structured_metadata,
+                    &mut merge_buf,
+                    &mut sm_buf,
+                );
+                // Reuse `sm_scratch`'s allocation across rows: the helper takes
+                // it by value (fresh per-row lifetime for the `merge_buf`
+                // borrow), `recycle_label_scratch` returns the same allocation.
+                let (survived, used) = eval_structured_metadata_row(
+                    compiled,
+                    &row.body,
+                    &merge_buf,
+                    label_groups,
+                    row.timestamp_ns,
+                    &m.service,
+                    sm_scratch,
+                );
+                sm_scratch = recycle_label_scratch(used);
+                if survived {
+                    *survivors += 1;
+                }
             }
         }
 
@@ -2141,7 +2187,7 @@ impl<'q> ClientAggState<'q> {
     /// message), and accumulates per `(final-label-set, bucket)`. One
     /// label scratch is reused across the whole batch (the #72
     /// allocation discipline).
-    fn push_rows(&mut self, rows: &[SampleRow]) -> Result<(), ReadError> {
+    fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
         let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
         let is_absent = matches!(self.client.range_op, RangeAggOp::AbsentOverTime);
         for row in rows {
@@ -2321,7 +2367,7 @@ fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
 /// Vector aggregations are NOT applied here — the caller finishes them
 /// (`apply_vector_aggs`), mirroring the SQL path.
 pub fn run_client_agg_rows(
-    rows: &[SampleRow],
+    rows: &[MetricScanRow],
     compiled: &super::pipeline::CompiledPipeline,
     meta: &HashMap<u64, StreamMetaRow>,
     client: &ClientAgg,
@@ -2894,6 +2940,154 @@ struct FanOutGroup {
     entries: Vec<(i64, String)>,
 }
 
+/// Inserts one surviving fan-out entry (its `sorted_scratch` label set already
+/// sorted) into the label-set-keyed group map — shared by the label-mutating
+/// pipeline path and the structured-metadata merge path (issue #97), which both
+/// group by the final rendered label set. The rendered `labels_json` is the map
+/// key (one owned copy, moved into [`StreamResult`] at drain — no per-new-group
+/// key clone); the group's `fingerprint` is a deterministic content hash of it;
+/// `service` is the merged set's `service_name` or `fallback_service`.
+fn push_fanout_entry(
+    label_groups: &mut HashMap<String, FanOutGroup>,
+    sorted_scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+    timestamp_ns: i64,
+    line: String,
+    fallback_service: &str,
+) {
+    let labels_json = render_labels_json_sorted(sorted_scratch);
+    let entry = (timestamp_ns, line);
+    match label_groups.entry(labels_json) {
+        std::collections::hash_map::Entry::Occupied(e) => {
+            e.into_mut().entries.push(entry);
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let service = sorted_scratch
+                .iter()
+                .find(|(k, _)| k == "service_name")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_else(|| fallback_service.to_string());
+            let fingerprint = fnv1a64(e.key().as_bytes());
+            e.insert(FanOutGroup {
+                fingerprint,
+                service,
+                entries: vec![entry],
+            });
+        }
+    }
+}
+
+/// A reusable label scratch whose `Cow` entries borrow from the row's merged
+/// base labels (lifetime `'a`) or own rewritten values — the buffer
+/// `run_into` fills for structured-metadata-bearing rows (issue #97).
+type LabelScratch<'a> = Vec<(Cow<'a, str>, Cow<'a, str>)>;
+
+/// Runs one structured-metadata-bearing row through the pipeline over `merged`
+/// (base + SM labels) and fans its surviving line into `label_groups`, reusing
+/// `scratch`'s heap allocation across rows. `scratch` is taken BY VALUE and
+/// returned (cleared) rather than borrowed `&mut`, because `run_into`'s output
+/// labels borrow `merged` — whose contents are rewritten every row — so the
+/// Cow scratch needs a FRESH lifetime per call; a hoisted `&mut Vec<Cow<'a>>`
+/// binding cannot provide that (the merge buffer's `.clear()` would conflict
+/// with an outstanding borrow). Passing by value gives each call its own
+/// lifetime while [`recycle_label_scratch`] hands the same allocation back for
+/// the next row (issue #97 review round 1, finding 2 / AC-12).
+fn eval_structured_metadata_row<'a>(
+    compiled: &'a super::pipeline::CompiledPipeline,
+    body: &'a str,
+    merged: &'a [(String, String)],
+    label_groups: &mut HashMap<String, FanOutGroup>,
+    timestamp_ns: i64,
+    service: &str,
+    mut scratch: LabelScratch<'a>,
+) -> (bool, LabelScratch<'a>) {
+    let survived = if let Some(line) = compiled.run_into(body, merged, &mut scratch) {
+        let line = line.into_owned();
+        scratch.sort_unstable();
+        push_fanout_entry(label_groups, &scratch, timestamp_ns, line, service);
+        true
+    } else {
+        false
+    };
+    // Drop every borrow of `merged` before the buffer is recycled for reuse.
+    scratch.clear();
+    (survived, scratch)
+}
+
+/// Re-tags a cleared borrowed-label scratch's (now empty) heap allocation as
+/// `'static` so it can be reused by the next SM row, whose `merged` base labels
+/// live for only one iteration. Safe: the vector is emptied first, so no borrow
+/// survives the re-tag; the allocation is preserved by the in-place
+/// `into_iter().map().collect()` (identical element layout). If that reuse ever
+/// regressed it would only reallocate — never misbehave — and AC-12 gates the
+/// reuse from outside the crate.
+fn recycle_label_scratch(mut scratch: LabelScratch<'_>) -> LabelScratch<'static> {
+    scratch.clear();
+    scratch
+        .into_iter()
+        .map(|(k, v)| (Cow::Owned(k.into_owned()), Cow::Owned(v.into_owned())))
+        .collect()
+}
+
+/// Fan-out for structured-metadata-bearing rows on the line-filter-only fast
+/// path (issue #97). All filtering is already applied in SQL and no pipeline
+/// runs, so each SM row's response label set is its stream's base labels merged
+/// with its parsed structured metadata; each distinct merged set is its own
+/// stream (Loki's per-entry structured-metadata fan-out — see the #97 oracle
+/// probe). Grouping/fingerprinting matches the [`StreamAccumulator`] SM branch
+/// so fast- and transform-path results are byte-consistent. **No-SM rows never
+/// reach here** — they stay on the unchanged by-fingerprint fast path, so its
+/// zero-per-row profile and byte-identity hold (AC-8).
+fn fan_out_sm_fast_path(
+    sm_rows: &[SampleRow],
+    meta: &HashMap<u64, StreamMetaRow>,
+) -> Vec<StreamResult> {
+    let mut base_cache: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    let mut groups: HashMap<String, FanOutGroup> = HashMap::new();
+    // Reused across rows (clear + refill, capacity-amortized) — never a fresh
+    // per-row allocation of the label vector itself. `sm_buf` is the SM-pair
+    // parse scratch (see `merge_labels_with_structured_metadata`).
+    let mut merge_buf: Vec<(String, String)> = Vec::new();
+    let mut sm_buf: Vec<(String, String)> = Vec::new();
+    for row in sm_rows {
+        let Some(m) = meta.get(&row.fingerprint) else {
+            continue;
+        };
+        let base = base_cache
+            .entry(row.fingerprint)
+            .or_insert_with(|| parse_flat_labels(&m.labels));
+        // Merge base + SM (colliding SM keys renamed `_extracted`, per the
+        // oracle — no duplicate keys under any collision pattern), then sort for
+        // canonical rendering.
+        merge_labels_with_structured_metadata(
+            base,
+            &row.structured_metadata,
+            &mut merge_buf,
+            &mut sm_buf,
+        );
+        merge_buf.sort_unstable();
+        let sorted: Vec<(Cow<'_, str>, Cow<'_, str>)> = merge_buf
+            .iter()
+            .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+            .collect();
+        push_fanout_entry(
+            &mut groups,
+            &sorted,
+            row.timestamp_ns,
+            row.body.clone(),
+            &m.service,
+        );
+    }
+    groups
+        .into_iter()
+        .map(|(labels_json, g)| StreamResult {
+            fingerprint: g.fingerprint,
+            service: g.service,
+            labels_json,
+            entries: g.entries,
+        })
+        .collect()
+}
+
 /// Renders a **sorted** label set to the canonical flat-label JSON shape
 /// (`{"key":"value",...}`, sorted keys, no nesting — docs/architecture.md
 /// §2.3), matching what the writer produces for base streams so the
@@ -3031,8 +3225,17 @@ fn series_labels(meta: &StreamMetaRow) -> Vec<(String, String)> {
 /// what the writer produced — yields whatever pairs were parsed so far
 /// rather than panicking.
 fn parse_flat_labels(json: &str) -> Vec<(String, String)> {
-    let mut chars = json.chars().peekable();
     let mut out = Vec::new();
+    parse_flat_labels_into(json, &mut out);
+    out
+}
+
+/// [`parse_flat_labels`] that APPENDS into a caller-owned buffer instead of
+/// allocating a fresh `Vec` (issue #97): the structured-metadata merge reuses
+/// one buffer across rows (clear + refill), so the parse must not allocate its
+/// own return vector per row.
+fn parse_flat_labels_into(json: &str, out: &mut Vec<(String, String)>) {
+    let mut chars = json.chars().peekable();
     while let Some(&c) = chars.peek() {
         chars.next();
         if c == '{' {
@@ -3063,7 +3266,57 @@ fn parse_flat_labels(json: &str) -> Vec<(String, String)> {
         };
         out.push((key, value));
     }
-    out
+}
+
+/// Merges a stream's cached base (stream/parsed) labels with one row's
+/// structured metadata into `merge_buf` (cleared first — its heap allocation
+/// is reused across rows; `sm_buf` is a second reused scratch the SM pairs are
+/// parsed into). A structured-metadata key that collides with a base label key
+/// is renamed to `<key>_extracted`; the resolved key is then UPSERTED into the
+/// merged set (last-write-wins) so BOTH the base label and the renamed SM value
+/// survive as distinct entries in the ordinary case. This matches
+/// grafana/loki:3.4.2's DEFAULT query response (probed for issue #97): the
+/// stream/parsed label keeps the original key and value, while the colliding
+/// structured-metadata value surfaces under the `_extracted` suffix (and is
+/// filterable there — `| key_extracted="v"` matches, `| key="v"` matches the
+/// stream label).
+///
+/// DOUBLE collision: when the renamed `<key>_extracted` ALSO already exists —
+/// e.g. base carries both `env` AND `env_extracted`, or the SM object itself
+/// supplies `env_extracted` alongside a colliding `env` — the upsert OVERWRITES
+/// that existing slot rather than emitting a second `<key>_extracted` entry.
+/// grafana/loki:3.4.2 renders exactly one `env_extracted`, last-write-wins
+/// (probed for issue #97: base `env`+`env_extracted` + SM `env` → the SM value
+/// wins the `env_extracted` slot; no `env_extracted_extracted`, no numeric
+/// suffix, no drop). This is the same collision precedence the `| json`
+/// parser's `add_extracted` already pins, and it preserves the
+/// no-duplicate-label-entries invariant under ANY collision pattern. The rename
+/// decision consults only the base region; the upsert consults the FULL evolving
+/// merged set (base + already-merged SM keys). The result is left UNSORTED;
+/// callers sort before rendering/grouping.
+fn merge_labels_with_structured_metadata(
+    base: &[(String, String)],
+    structured_metadata: &str,
+    merge_buf: &mut Vec<(String, String)>,
+    sm_buf: &mut Vec<(String, String)>,
+) {
+    merge_buf.clear();
+    merge_buf.extend(base.iter().cloned());
+    let base_len = merge_buf.len();
+    sm_buf.clear();
+    parse_flat_labels_into(structured_metadata, sm_buf);
+    // `base_len` is small (a stream's label count), so these scans are bounded
+    // by the fixed label cardinality, not by row count. `drain` moves the owned
+    // key/value Strings out of the reused scratch without cloning.
+    for (mut key, value) in sm_buf.drain(..) {
+        if merge_buf[..base_len].iter().any(|(bk, _)| *bk == key) {
+            key.push_str("_extracted");
+        }
+        match merge_buf.iter_mut().find(|(k, _)| *k == key) {
+            Some(slot) => slot.1 = value,
+            None => merge_buf.push((key, value)),
+        }
+    }
 }
 
 fn skip_ws<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
@@ -3605,6 +3858,7 @@ mod tests {
             timestamp_ns: ts,
             body: format!("b{hash}"),
             body_hash: hash,
+            structured_metadata: String::new(),
         }
     }
 
@@ -3676,12 +3930,14 @@ mod tests {
             timestamp_ns: 10,
             body: "alpha".to_string(),
             body_hash: 42,
+            structured_metadata: String::new(),
         };
         let second = TailSampleRow {
             fingerprint: 7,
             timestamp_ns: 10,
             body: "beta".to_string(),
             body_hash: 42, // injected collision: distinct body, same hash
+            structured_metadata: String::new(),
         };
         let c1 = advance_tail_cursor(None, std::slice::from_ref(&first)).expect("cursor");
         assert_eq!(c1.tuple, (10, 7, 42));
@@ -3760,11 +4016,13 @@ mod tests {
                     fingerprint: 1,
                     timestamp_ns: 10,
                     body: "keep y=z msg=a".to_string(),
+                    structured_metadata: String::new(),
                 },
                 SampleRow {
                     fingerprint: 1,
                     timestamp_ns: 11,
                     body: "keep y=other".to_string(),
+                    structured_metadata: String::new(),
                 },
             ]
         };
@@ -3857,7 +4115,108 @@ mod tests {
             fingerprint: fp,
             timestamp_ns: ts,
             body: body.to_string(),
+            structured_metadata: String::new(),
         }
+    }
+
+    /// Issue #97 review round 1, finding 3 (+ oracle probe against
+    /// grafana/loki:3.4.2's default query response): a structured-metadata key
+    /// that collides with a stream label key is renamed `<key>_extracted`; the
+    /// stream label keeps the original key/value, both appear exactly once (no
+    /// duplicate key entries), and the non-colliding SM key merges verbatim.
+    /// Same `_extracted` precedence the `| json` parser already uses for
+    /// parsed-label collisions.
+    #[test]
+    fn structured_metadata_key_colliding_with_base_label_lands_under_extracted_suffix() {
+        // fp 1 base labels: env=prod, service_name=checkout.
+        let meta = meta_two_streams();
+        let compiled = pipeline_of(r#"{a="b"}"#);
+        let rows = vec![SampleRow {
+            fingerprint: 1,
+            timestamp_ns: 10,
+            body: "line".to_string(),
+            structured_metadata: r#"{"env":"SMVAL","trace_id":"abc"}"#.to_string(),
+        }];
+        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        assert_eq!(results.len(), 1);
+        // Canonical sorted JSON: the stream `env` keeps "prod"; the colliding
+        // SM `env` surfaces as `env_extracted`; `trace_id` merges as-is.
+        assert_eq!(
+            results[0].labels_json,
+            r#"{"env":"prod","env_extracted":"SMVAL","service_name":"checkout","trace_id":"abc"}"#
+        );
+    }
+
+    /// Issue #97 review round 2, finding 1 (+ grafana/loki:3.4.2 oracle probe):
+    /// a DOUBLE collision must still not emit a duplicate label entry. Base
+    /// labels already carry both `env` AND `env_extracted`; the SM `env` renames
+    /// to `env_extracted`, which ALSO exists — so it overwrites that slot
+    /// (last-write-wins) rather than producing two `env_extracted` entries.
+    /// Probed against grafana/loki:3.4.2's default query response: base
+    /// `env=prod`+`env_extracted=baseval` + SM `env=smval` renders exactly one
+    /// `env_extracted`, and the SM value wins it (no `env_extracted_extracted`,
+    /// no numeric suffix, no drop).
+    #[test]
+    fn structured_metadata_double_collision_overwrites_the_extracted_slot_once() {
+        // A stream whose base labels include both `env` and `env_extracted`.
+        let meta: HashMap<u64, StreamMetaRow> = [(
+            7u64,
+            StreamMetaRow {
+                fingerprint: 7,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","env_extracted":"baseval","service_name":"checkout"}"#
+                    .to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let compiled = pipeline_of(r#"{a="b"}"#);
+        let rows = vec![SampleRow {
+            fingerprint: 7,
+            timestamp_ns: 10,
+            body: "line".to_string(),
+            structured_metadata: r#"{"env":"smval"}"#.to_string(),
+        }];
+        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        assert_eq!(results.len(), 1);
+        // Exactly one `env_extracted`, carrying the SM value (last-write-wins);
+        // the stream `env` keeps "prod"; no duplicate key entries.
+        assert_eq!(
+            results[0].labels_json,
+            r#"{"env":"prod","env_extracted":"smval","service_name":"checkout"}"#
+        );
+    }
+
+    /// Companion double-collision case: the SM object ITSELF supplies both the
+    /// colliding key and its `_extracted` form. Base `env=prod`; SM
+    /// `env=smval`,`env_extracted=smextra`. The renamed `env` and the literal
+    /// `env_extracted` land in the same slot — last-write-wins, one entry.
+    /// Matches the grafana/loki:3.4.2 oracle probe (`env_extracted=smextra`).
+    #[test]
+    fn structured_metadata_supplying_its_own_extracted_key_collapses_to_one_entry() {
+        let meta: HashMap<u64, StreamMetaRow> = [(
+            7u64,
+            StreamMetaRow {
+                fingerprint: 7,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let compiled = pipeline_of(r#"{a="b"}"#);
+        let rows = vec![SampleRow {
+            fingerprint: 7,
+            timestamp_ns: 10,
+            body: "line".to_string(),
+            structured_metadata: r#"{"env":"smval","env_extracted":"smextra"}"#.to_string(),
+        }];
+        let results = run_pipeline_rows(rows, &compiled, &meta, 100);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].labels_json,
+            r#"{"env":"prod","env_extracted":"smextra","service_name":"checkout"}"#
+        );
     }
 
     /// Backward-direction arrival order (newest first), interleaved
@@ -4236,12 +4595,12 @@ mod tests {
         let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
         let rows = [
-            SampleRow {
+            MetricScanRow {
                 fingerprint: 1,
                 timestamp_ns: 1,
                 body: "v=1".to_string(),
             },
-            SampleRow {
+            MetricScanRow {
                 fingerprint: 1,
                 timestamp_ns: 2,
                 body: "v=2".to_string(),

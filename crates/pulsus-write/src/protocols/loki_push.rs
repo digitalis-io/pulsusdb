@@ -18,20 +18,21 @@
 //! build-dep approach as [`crate::protocols::remote_write`] and the hand-
 //! rolled `google.rpc.Status` in `ingest/http.rs`.
 //!
-//! Two wire fields are **intentionally undeclared** — `prost` silently skips
+//! One wire field is **intentionally undeclared** — `prost` silently skips
 //! unknown fields on decode (the remote-write exemplars/native-histogram
 //! precedent, `remote_write.rs:16-20`), so an undeclared field is never
 //! materialized, never allocated:
 //!
 //! - `StreamAdapter` tag 3 (`uint64 hash`) — an intra-Loki routing hash, of
 //!   no interest to a receiver.
-//! - `EntryAdapter` tag 3 (`repeated LabelPairAdapter structuredMetadata`) —
-//!   structured metadata (issue #77 delta 1 / task-manager Q1 adjudication:
-//!   accept-and-drop, `log_samples` has no per-entry column and no LogQL read
-//!   path surfaces it; a follow-up is filed for the schema column). Not
-//!   declaring the tag is the *skip-without-allocate* implementation: the
-//!   field costs only prost's byte-skip, never a `Vec<LabelPairAdapter>`
-//!   materialized-then-dropped.
+//!
+//! `EntryAdapter` tag 3 (`repeated LabelPairAdapter structuredMetadata`) is
+//! **declared and decoded** (issue #97): per-entry structured metadata is now
+//! stored in `log_samples.structured_metadata` (a canonical JSON String) and
+//! surfaced in the LogQL read/tail label set. A per-entry cardinality bound
+//! ([`MAX_STRUCTURED_METADATA_PER_ENTRY`]) is charged before the canonical
+//! JSON is built (charge-before-allocate). Structured metadata is per-ENTRY
+//! and never enters `stream_fingerprint` / `StreamRow`.
 //!
 //! Tag layout is cross-checked against a real capture from the
 //! OpenTelemetry Collector's `loki` exporter (`tests/fixtures/loki-push/
@@ -66,16 +67,26 @@ pub struct StreamAdapter {
 }
 
 /// `logproto.EntryAdapter`: `timestamp` (`google.protobuf.Timestamp`) at tag
-/// 1, `line` at tag 2. Tag 3 (`repeated LabelPairAdapter
-/// structuredMetadata`) is intentionally undeclared — the skip-without-
-/// allocate accept-and-drop of structured metadata (this module's doc
-/// comment).
+/// 1, `line` at tag 2, `structuredMetadata` (`repeated LabelPairAdapter`) at
+/// tag 3 (issue #97 — decoded into `log_samples.structured_metadata`).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EntryAdapter {
     #[prost(message, optional, tag = "1")]
     pub timestamp: Option<Timestamp>,
     #[prost(string, tag = "2")]
     pub line: String,
+    #[prost(message, repeated, tag = "3")]
+    pub structured_metadata: Vec<LabelPairAdapter>,
+}
+
+/// `logproto.LabelPairAdapter`: one structured-metadata `name`/`value` pair
+/// (`name` at tag 1, `value` at tag 2). Issue #97.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LabelPairAdapter {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub value: String,
 }
 
 /// `google.protobuf.Timestamp`: `seconds` at tag 1, `nanos` at tag 2.
@@ -110,6 +121,44 @@ pub const MAX_LABELS_PER_STREAM: usize = 256;
 /// separate budget: Σ line lengths ≤ the decompressed body ≤ 64 MiB by
 /// construction.
 pub const MAX_TOTAL_ENTRIES_PER_REQUEST: usize = 5_000_000;
+/// Per-entry structured-metadata cardinality bound (issue #97), mirroring
+/// [`MAX_LABELS_PER_STREAM`]. Charged **before** the canonical JSON String is
+/// built (charge-before-allocate) — an entry carrying more than this is a
+/// whole-request [`LogsIngestError::OversizeMessage`] (Loki is all-or-
+/// nothing), never a silent truncation.
+pub const MAX_STRUCTURED_METADATA_PER_ENTRY: usize = 256;
+
+/// Canonicalizes one entry's structured-metadata pairs into the stored
+/// `log_samples.structured_metadata` JSON String (issue #97).
+///
+/// - The **empty** set yields `""` (an empty string, NOT `"{}"`) so the read
+///   path's `structured_metadata.is_empty()` fast-path branch stays on the
+///   zero-structured-metadata path for entries that carry none — the common
+///   case, and the byte-identity invariant for pre-#97 data.
+/// - A non-empty set is charged against [`MAX_STRUCTURED_METADATA_PER_ENTRY`]
+///   **before** the `LabelSet`/JSON is built (charge-before-allocate), then
+///   normalized through the same [`LabelSet::from_normalized`] +
+///   `to_canonical_json` seam stream labels use, so a structured-metadata JSON
+///   string is byte-identical in shape to a stream-labels JSON string.
+fn canonical_structured_metadata(
+    pair_count: usize,
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> Result<String, LogsIngestError> {
+    if pair_count == 0 {
+        return Ok(String::new());
+    }
+    if pair_count > MAX_STRUCTURED_METADATA_PER_ENTRY {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "structured_metadata",
+            limit: MAX_STRUCTURED_METADATA_PER_ENTRY,
+            actual: pair_count,
+        });
+    }
+    // The normalization collision count is intentionally discarded: SM is
+    // per-entry and never contributes to the stream-label collision metric.
+    let (labels, _collisions) = LabelSet::from_normalized(pairs);
+    Ok(labels.to_canonical_json())
+}
 
 /// Decodes a (decompressed) snappy-protobuf `POST /loki/api/v1/push` body,
 /// then applies the [`MAX_STREAMS_PER_REQUEST`]-family structural bounds.
@@ -180,7 +229,14 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
                 Some(ts) => resolve_pb_timestamp(ts)?,
                 None => now_ns,
             };
-            Ok((timestamp_ns, entry.line.clone()))
+            let structured_metadata = canonical_structured_metadata(
+                entry.structured_metadata.len(),
+                entry
+                    .structured_metadata
+                    .iter()
+                    .map(|p| (p.name.clone(), p.value.clone())),
+            )?;
+            Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
         append_stream(
             &mut out,
@@ -234,7 +290,14 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
                     entry.timestamp
                 ))
             })?;
-            Ok((timestamp_ns, entry.line.clone()))
+            let structured_metadata = canonical_structured_metadata(
+                entry.structured_metadata.len(),
+                entry
+                    .structured_metadata
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            )?;
+            Ok((timestamp_ns, entry.line.clone(), structured_metadata))
         });
         append_stream(
             &mut out,
@@ -260,14 +323,14 @@ fn append_stream(
     seen_streams: &mut HashSet<(Fingerprint, Date)>,
     labels: LabelSet,
     collisions: usize,
-    entries: impl Iterator<Item = Result<(i64, String), LogsIngestError>>,
+    entries: impl Iterator<Item = Result<(i64, String, String), LogsIngestError>>,
     now_ns: i64,
 ) -> Result<(), LogsIngestError> {
     out.collisions += collisions as u64;
     let fingerprint = stream_fingerprint(&labels);
     let service = labels.service().to_string();
     for entry in entries {
-        let (timestamp_ns, line) = entry?;
+        let (timestamp_ns, line, structured_metadata) = entry?;
         let month = Date::start_of_month_utc(timestamp_ns);
         if seen_streams.insert((fingerprint, month)) {
             out.streams.push(StreamRow {
@@ -284,6 +347,7 @@ fn append_stream(
             timestamp_ns: UnixNano(timestamp_ns),
             severity: 0,
             body: line,
+            structured_metadata,
         });
     }
     Ok(())
@@ -478,13 +542,69 @@ struct JsonStream {
     values: Vec<JsonEntry>,
 }
 
-/// One `values` array entry: `["<unix_nano_string>", "<line>"]`. A trailing
-/// third element (structured metadata) is **skipped without allocating**
-/// (issue #77 delta 1) — `serde::de::IgnoredAny` discards any remaining
-/// sequence elements rather than deserializing them into an owned value.
+/// One `values` array entry: `["<unix_nano_string>", "<line>"]` or, with
+/// per-entry structured metadata, `["<ts>", "<line>", {"k":"v", ...}]` (issue
+/// #97). The optional third element is decoded into `structured_metadata` as
+/// RAW `(key, value)` pairs (pre-dedup) by [`BoundedStructuredMetadata`],
+/// whose visitor charges [`MAX_STRUCTURED_METADATA_PER_ENTRY`] DURING decode
+/// and aborts before the object is fully materialized — mirroring the protobuf
+/// path, which charges `entry.structured_metadata.len()` (prost's already-raw
+/// repeated field) in [`canonical_structured_metadata`] *before*
+/// `LabelSet::from_normalized` allocates. Counting RAW pairs (not a
+/// dedup-collapsing `BTreeMap`) means duplicate JSON keys cannot evade the
+/// bound. A present-but-non-object third element is a deserialization error (a
+/// whole-request 400 — Loki is all-or-nothing), never a silent drop. Any
+/// fourth+ element is drained without materializing.
 struct JsonEntry {
     timestamp: String,
     line: String,
+    structured_metadata: Vec<(String, String)>,
+}
+
+/// The optional third `values` element (`{"k":"v", ...}`), decoded into RAW
+/// `(key, value)` pairs with the [`MAX_STRUCTURED_METADATA_PER_ENTRY`] bound
+/// enforced DURING deserialization (charge-before-allocate): the visitor
+/// aborts at pair 257 before materializing the rest of the object. A dedup-
+/// collapsing `BTreeMap` would (a) allocate every key before any bound check
+/// and (b) fold duplicate keys, letting a duplicate-key object evade the
+/// per-entry cardinality bound — so raw pairs are counted instead. Downstream
+/// dedup/canonicalization is left to [`canonical_structured_metadata`]'s
+/// `LabelSet::from_normalized`, exactly as the protobuf path does.
+struct BoundedStructuredMetadata(Vec<(String, String)>);
+
+impl<'de> serde::Deserialize<'de> for BoundedStructuredMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MapVisitor;
+        impl<'de> serde::de::Visitor<'de> for MapVisitor {
+            type Value = Vec<(String, String)>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a structured-metadata object of string values")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if pairs.len() >= MAX_STRUCTURED_METADATA_PER_ENTRY {
+                        // Charge-before-allocate: reject at the 257th raw pair
+                        // (pre-dedup) without materializing the remainder.
+                        return Err(serde::de::Error::custom(format!(
+                            "structured_metadata exceeds the {MAX_STRUCTURED_METADATA_PER_ENTRY}-pair per-entry bound"
+                        )));
+                    }
+                    pairs.push((key, value));
+                }
+                Ok(pairs)
+            }
+        }
+        deserializer.deserialize_map(MapVisitor).map(Self)
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for JsonEntry {
@@ -510,10 +630,18 @@ impl<'de> serde::Deserialize<'de> for JsonEntry {
                 let line: String = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
-                // Drain any trailing element (structured metadata) without
+                let structured_metadata: Vec<(String, String)> = seq
+                    .next_element::<BoundedStructuredMetadata>()?
+                    .map(|b| b.0)
+                    .unwrap_or_default();
+                // Drain any trailing element beyond the third without
                 // materializing it.
                 while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(JsonEntry { timestamp, line })
+                Ok(JsonEntry {
+                    timestamp,
+                    line,
+                    structured_metadata,
+                })
             }
         }
         deserializer.deserialize_seq(EntryVisitor)
@@ -532,6 +660,22 @@ mod tests {
         EntryAdapter {
             timestamp: Some(ts(seconds, nanos)),
             line: line.to_string(),
+            structured_metadata: Vec::new(),
+        }
+    }
+
+    fn label_pair(name: &str, value: &str) -> LabelPairAdapter {
+        LabelPairAdapter {
+            name: name.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    fn entry_with_sm(seconds: i64, line: &str, sm: Vec<LabelPairAdapter>) -> EntryAdapter {
+        EntryAdapter {
+            timestamp: Some(ts(seconds, 0)),
+            line: line.to_string(),
+            structured_metadata: sm,
         }
     }
 
@@ -680,6 +824,7 @@ mod tests {
                 entries: vec![EntryAdapter {
                     timestamp: None,
                     line: "x".to_string(),
+                    structured_metadata: Vec::new(),
                 }],
             }],
         };
@@ -778,14 +923,165 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_ignores_trailing_structured_metadata_without_erroring() {
+    fn parse_json_captures_structured_metadata_as_canonical_json() {
         // A 3-element values entry: ts, line, metadata object — the third
-        // element is accepted and dropped (never materialized).
+        // element is decoded into the canonical JSON String column (issue #97).
         let body = br#"{"streams":[{"stream":{"a":"b"},
-            "values":[["1700000000000000000","hello",{"trace_id":"abc"}]]}]}"#;
+            "values":[["1700000000000000000","hello",{"user_id":"42","trace_id":"abc"}]]}]}"#;
         let out = parse_json(body, 0).unwrap();
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0].body, "hello");
+        // Sorted keys, byte-identical shape to a stream-labels JSON string.
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"trace_id":"abc","user_id":"42"}"#
+        );
+    }
+
+    #[test]
+    fn parse_json_two_element_entry_has_empty_structured_metadata() {
+        let body = br#"{"streams":[{"stream":{"a":"b"},
+            "values":[["1700000000000000000","hello"]]}]}"#;
+        let out = parse_json(body, 0).unwrap();
+        // Empty string (NOT "{}") keeps the read path on the zero-SM fast path.
+        assert_eq!(out.rows[0].structured_metadata, "");
+    }
+
+    #[test]
+    fn parse_json_non_object_structured_metadata_is_a_whole_request_error() {
+        // A present-but-non-object third element is a 400, not a silent drop.
+        let body = br#"{"streams":[{"stream":{"a":"b"},
+            "values":[["1700000000000000000","hello","not-an-object"]]}]}"#;
+        let err = parse_json(body, 0).unwrap_err();
+        assert!(matches!(err, LogsIngestError::LokiDecode(_)));
+    }
+
+    #[test]
+    fn parse_protobuf_decodes_structured_metadata_into_canonical_json() {
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "hello",
+                    vec![label_pair("user_id", "42"), label_pair("trace_id", "abc")],
+                )],
+            }],
+        };
+        let out = parse_protobuf(&req, 0).unwrap();
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"trace_id":"abc","user_id":"42"}"#
+        );
+    }
+
+    #[test]
+    fn structured_metadata_out_of_range_is_a_whole_request_error_before_allocation() {
+        let sm: Vec<LabelPairAdapter> = (0..=MAX_STRUCTURED_METADATA_PER_ENTRY)
+            .map(|i| label_pair(&format!("k{i}"), "v"))
+            .collect();
+        let req = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{a="b"}"#.to_string(),
+                entries: vec![entry_with_sm(1_700_000_000, "x", sm)],
+            }],
+        };
+        let err = parse_protobuf(&req, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "structured_metadata",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_json_structured_metadata_out_of_range_is_a_whole_request_error() {
+        // The JSON path enforces the per-entry bound DURING serde decode (the
+        // `BoundedStructuredMetadata` visitor aborts at pair 257 via
+        // `serde::de::Error::custom`), which `parse_json` maps to a whole-request
+        // `LokiDecode` — NOT the `OversizeMessage` the protobuf path raises from
+        // `canonical_structured_metadata`, which the 257th-pair decode abort
+        // never reaches. Asserting the exact variant AND that the message names
+        // the per-entry bound proves it was the bound that fired, not an
+        // incidental decode error.
+        let mut obj = String::from("{");
+        for i in 0..=MAX_STRUCTURED_METADATA_PER_ENTRY {
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(&format!(r#""k{i}":"v""#));
+        }
+        obj.push('}');
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{obj}]]}}]}}"#
+        );
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        let LogsIngestError::LokiDecode(msg) = err else {
+            panic!("expected LokiDecode, got {err:?}");
+        };
+        assert!(
+            msg.contains("structured_metadata exceeds") && msg.contains("per-entry bound"),
+            "the decode error must name the per-entry bound: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_duplicate_structured_metadata_keys_cannot_evade_the_bound() {
+        // A duplicate-key object would collapse to ONE entry in a `BTreeMap`,
+        // evading the cardinality bound; counting RAW pairs during decode
+        // rejects it. 257 repetitions of one key abort at pair 257 with the same
+        // whole-request `LokiDecode` (the serde visitor's per-entry-bound custom
+        // error) the distinct-key case raises — asserted precisely so the test
+        // names what it checks.
+        let mut obj = String::from("{");
+        for i in 0..=MAX_STRUCTURED_METADATA_PER_ENTRY {
+            if i > 0 {
+                obj.push(',');
+            }
+            obj.push_str(r#""dup":"v""#);
+        }
+        obj.push('}');
+        let body = format!(
+            r#"{{"streams":[{{"stream":{{"a":"b"}},"values":[["1700000000000000000","x",{obj}]]}}]}}"#
+        );
+        let err = parse_json(body.as_bytes(), 0).unwrap_err();
+        let LogsIngestError::LokiDecode(msg) = err else {
+            panic!("expected LokiDecode, got {err:?}");
+        };
+        assert!(
+            msg.contains("structured_metadata exceeds") && msg.contains("per-entry bound"),
+            "the decode error must name the per-entry bound: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn structured_metadata_does_not_change_the_stream_fingerprint() {
+        // AC-5: SM is per-entry — the stream fingerprint and StreamRow are
+        // identical with and without it.
+        let without = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry(1_700_000_000, 0, "x")],
+            }],
+        };
+        let with = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "x",
+                    vec![label_pair("trace_id", "abc")],
+                )],
+            }],
+        };
+        let a = parse_protobuf(&without, 7).unwrap();
+        let b = parse_protobuf(&with, 7).unwrap();
+        assert_eq!(a.rows[0].fingerprint, b.rows[0].fingerprint);
+        assert_eq!(a.streams, b.streams);
+        assert_eq!(a.rows[0].structured_metadata, "");
+        assert_eq!(b.rows[0].structured_metadata, r#"{"trace_id":"abc"}"#);
     }
 
     #[test]
@@ -820,5 +1116,30 @@ mod tests {
         let from_json = parse_json(json, 7).unwrap();
         let from_proto = parse_protobuf(&proto, 7).unwrap();
         assert_eq!(from_json, from_proto);
+    }
+
+    /// AC-4: a protobuf tag-3 body and a JSON third-element body of one
+    /// logical entry produce byte-identical `structured_metadata`.
+    #[test]
+    fn json_and_protobuf_structured_metadata_are_byte_identical() {
+        let json = br#"{"streams":[{"stream":{"service_name":"checkout"},
+            "values":[["1700000000000000000","line",{"user_id":"42","trace_id":"abc"}]]}]}"#;
+        let proto = PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry_with_sm(
+                    1_700_000_000,
+                    "line",
+                    vec![label_pair("user_id", "42"), label_pair("trace_id", "abc")],
+                )],
+            }],
+        };
+        let from_json = parse_json(json, 7).unwrap();
+        let from_proto = parse_protobuf(&proto, 7).unwrap();
+        assert_eq!(from_json, from_proto);
+        assert_eq!(
+            from_json.rows[0].structured_metadata,
+            r#"{"trace_id":"abc","user_id":"42"}"#
+        );
     }
 }

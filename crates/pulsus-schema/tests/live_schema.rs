@@ -151,6 +151,28 @@ struct LogSampleRow {
     timestamp_ns: i64,
     severity: i8,
     body: String,
+    /// Issue #97: the additive per-entry structured-metadata column
+    /// (canonical JSON String, `DEFAULT ''`), migration ids 21/22.
+    structured_metadata: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct DescribeRow {
+    name: String,
+    #[serde(rename = "type")]
+    ty: String,
+}
+
+/// The pre-#97 `log_samples` row shape, WITHOUT `structured_metadata` — used
+/// to prove the column is backward-compatible (a row inserted with the old
+/// explicit column list reads back the empty-string default).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct LegacyLogSampleRow {
+    service: String,
+    fingerprint: u64,
+    timestamp_ns: i64,
+    severity: i8,
+    body: String,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -247,6 +269,7 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
         timestamp_ns,
         severity: 9,
         body: "connection refused".to_string(),
+        structured_metadata: r#"{"trace_id":"abc"}"#.to_string(),
     }];
     data_client
         .insert_block("log_samples", &log_rows)
@@ -266,7 +289,8 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
     let mut ls = client
         .query_stream::<LogSampleRow>(
             &format!(
-                "SELECT service, fingerprint, timestamp_ns, severity, body FROM {db}.log_samples"
+                "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
+                 FROM {db}.log_samples"
             ),
             &QuerySettings::new(),
         )
@@ -296,6 +320,117 @@ async fn run_init_creates_every_m0_table_and_mv_and_is_idempotent() {
         plan.contains("metric_name"),
         "EXPLAIN output must show metric_name driving the primary key read, got:\n{plan}"
     );
+}
+
+/// Issue #97 (AC-1/AC-2): the additive `structured_metadata` ALTER (migration
+/// id 21) lands the canonical JSON String column on `log_samples`, existing
+/// rows read back the empty-string default (backward compatible — no data
+/// migration), and a second `run_init` no-ops ids 21/22 with no
+/// `MigrationDrift`.
+#[tokio::test]
+async fn structured_metadata_column_is_additive_and_backward_compatible() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_sm";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+
+    run_init(&client, &ctx).await.expect("run_init (first run)");
+
+    // AC-1: the catalog shows `structured_metadata String` after reconcile.
+    let mut desc = client
+        .query_stream::<DescribeRow>(
+            &format!(
+                "SELECT name, type FROM system.columns \
+                 WHERE database = '{db}' AND table = 'log_samples' \
+                 AND name = 'structured_metadata'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("describe log_samples");
+    let mut sm_type: Option<String> = None;
+    while let Some(row) = desc.next().await {
+        let row = row.expect("decode describe row");
+        if row.name == "structured_metadata" {
+            sm_type = Some(row.ty);
+        }
+    }
+    assert_eq!(
+        sm_type.as_deref(),
+        Some("String"),
+        "structured_metadata must be a String column after reconcile"
+    );
+
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg)
+        .await
+        .expect("connect (data client)");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    let timestamp_ns = i64::try_from(now.as_nanos()).expect("fits i64");
+
+    // AC-1 backward compat: a row inserted with the PRE-#97 explicit column
+    // list (no structured_metadata) reads back the empty-string default —
+    // proving existing/old-writer data needs no migration.
+    let legacy = vec![LegacyLogSampleRow {
+        service: "legacy".to_string(),
+        fingerprint: 111,
+        timestamp_ns,
+        severity: 0,
+        body: "no structured metadata".to_string(),
+    }];
+    data_client
+        .insert_block("log_samples", &legacy)
+        .await
+        .expect("insert legacy log_samples");
+
+    // A row WITH structured metadata (the #97 writer shape) round-trips.
+    let with_sm = vec![LogSampleRow {
+        service: "modern".to_string(),
+        fingerprint: 222,
+        timestamp_ns,
+        severity: 0,
+        body: "has structured metadata".to_string(),
+        structured_metadata: r#"{"trace_id":"abc","user_id":"42"}"#.to_string(),
+    }];
+    data_client
+        .insert_block("log_samples", &with_sm)
+        .await
+        .expect("insert log_samples with structured metadata");
+
+    let mut ls = client
+        .query_stream::<LogSampleRow>(
+            &format!(
+                "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
+                 FROM {db}.log_samples ORDER BY fingerprint"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("select log_samples");
+    let mut got = Vec::new();
+    while let Some(row) = ls.next().await {
+        got.push(row.expect("decode"));
+    }
+    assert_eq!(got.len(), 2, "both rows present");
+    assert_eq!(
+        got[0].structured_metadata, "",
+        "the legacy row reads back the empty-string default"
+    );
+    assert_eq!(
+        got[1].structured_metadata, r#"{"trace_id":"abc","user_id":"42"}"#,
+        "the modern row round-trips its structured metadata verbatim"
+    );
+
+    // AC-2: a second run_init no-ops ids 21/22 — no MigrationDrift.
+    run_init(&client, &ctx)
+        .await
+        .expect("run_init (second run, no-op — ids 21/22 must not drift)");
+
+    drop_database(&client, db).await;
 }
 
 /// MV crash-safety (issue #5 plan amendment 1): the view being physically

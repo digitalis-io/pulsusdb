@@ -258,6 +258,7 @@ CREATE TABLE log_samples (
     timestamp_ns  Int64   CODEC(DoubleDelta, ZSTD(1)),
     severity      Int8    DEFAULT 0,             -- OTel SeverityNumber (0 = unset)
     body          String  CODEC(ZSTD(1)),
+    structured_metadata String DEFAULT '',        -- per-entry Loki structured metadata (issue #97); added by additive ALTER, see note below
     INDEX idx_body_tokens body TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 1,
     INDEX idx_body_ngrams body TYPE ngrambf_v1(4, 32768, 3, 0) GRANULARITY 1,
     INDEX idx_severity severity TYPE minmax GRANULARITY 4
@@ -289,6 +290,7 @@ Raw log timestamps in `log_samples` are stored verbatim at nanosecond precision 
 - **`(service, fingerprint, timestamp_ns)` is fixed** (finding #4). Per-stream time reads are sequential; multi-stream reads within one service are near-sequential.
 - **Body skip indexes** (finding #3): the token bloom serves word-boundary terms, the 4-gram bloom serves substrings and anchored regex literals. The planner extracts index-friendly prefilters from every line filter and applies the exact predicate afterward — granule skipping plus correctness.
 - **Monthly stream/index partitions** (finding #6): one row per stream per month; a 30-day label query touches ≤ 2 partitions.
+- **`structured_metadata` is per-entry, not per-stream** (issue #97): Loki push carries optional per-entry structured metadata (protobuf `EntryAdapter.structuredMetadata` or a JSON `values` third element), stored here as a canonical sorted-key JSON String — the `log_streams.labels` representation, not `Map(String,String)` (§1 rejects Map for label-shaped data). Empty string = none, which is what pre-#97 rows and every OTLP-logs row read back. It is added by **additive ALTER** (migration ids 21/22) rather than by mutating the frozen initial `CREATE`, so upgraded and fresh deployments converge byte-identically; a fresh DB runs `CREATE` (no column) then `ADD COLUMN IF NOT EXISTS`. Structured metadata never enters `stream_fingerprint` (a stream pushed with vs. without it fingerprints identically); on the read path it fans into the response stream label set alongside the base labels (grafana/loki 3.4.2 default, `categorize_labels` off), so an entry carrying distinct metadata forms its own result stream and a `| key="value"` pipeline filter selects on it.
 
 ### 3.2 Read paths (generated SQL)
 

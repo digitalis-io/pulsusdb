@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use prost::Message;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
-use pulsus_write::protocols::loki_push::{EntryAdapter, PushRequest, StreamAdapter, Timestamp};
+use pulsus_write::protocols::loki_push::{
+    EntryAdapter, LabelPairAdapter, PushRequest, StreamAdapter, Timestamp,
+};
 
 fn should_run() -> bool {
     std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
@@ -224,6 +226,7 @@ fn protobuf_body(service: &str, ts_ns: i64, line: &str) -> Vec<u8> {
                     nanos: (ts_ns % 1_000_000_000) as i32,
                 }),
                 line: line.to_string(),
+                structured_metadata: Vec::new(),
             }],
         }],
     };
@@ -237,6 +240,84 @@ fn json_body(service: &str, ts_ns: i64, line: &str) -> String {
     format!(
         r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod"}},"values":[["{ts_ns}","{line}"]]}}]}}"#
     )
+}
+
+/// A snappy-protobuf push body for one stream / one line, carrying per-entry
+/// structured metadata (issue #97).
+fn protobuf_body_with_sm(service: &str, ts_ns: i64, line: &str, sm: &[(&str, &str)]) -> Vec<u8> {
+    let req = PushRequest {
+        streams: vec![StreamAdapter {
+            labels: format!(r#"{{service_name="{service}", env="prod"}}"#),
+            entries: vec![EntryAdapter {
+                timestamp: Some(Timestamp {
+                    seconds: ts_ns / 1_000_000_000,
+                    nanos: (ts_ns % 1_000_000_000) as i32,
+                }),
+                line: line.to_string(),
+                structured_metadata: sm
+                    .iter()
+                    .map(|(k, v)| LabelPairAdapter {
+                        name: k.to_string(),
+                        value: v.to_string(),
+                    })
+                    .collect(),
+            }],
+        }],
+    };
+    snap::raw::Encoder::new()
+        .compress_vec(&req.encode_to_vec())
+        .expect("snappy compress")
+}
+
+/// A JSON push body for one stream / one line, carrying per-entry structured
+/// metadata as the values array's third element (issue #97).
+fn json_body_with_sm(service: &str, ts_ns: i64, line: &str, sm: &[(&str, &str)]) -> String {
+    let sm_obj: String = sm
+        .iter()
+        .map(|(k, v)| format!(r#""{k}":"{v}""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod"}},"values":[["{ts_ns}","{line}",{{{sm_obj}}}]]}}]}}"#
+    )
+}
+
+/// Runs `query` (a raw LogQL query, url-encoded here) over a wide window and
+/// returns each result stream's COMPLETE label map paired with its lines.
+fn query_streams_raw(
+    port: u16,
+    path_prefix: &str,
+    query: &str,
+    base_ns: i64,
+) -> Vec<(std::collections::BTreeMap<String, String>, Vec<String>)> {
+    let encoded = urlencode(query);
+    let start = base_ns - 3_600_000_000_000;
+    let end = base_ns + 3_600_000_000_000;
+    let path =
+        format!("{path_prefix}/query_range?query={encoded}&start={start}&end={end}&limit=100");
+    let res = http_get(port, &path).expect("query reachable");
+    assert_eq!(res.status, 200, "query_range status (body: {})", res.body);
+    let json: serde_json::Value =
+        serde_json::from_str(&res.body).unwrap_or_else(|e| panic!("json: {e}: {}", res.body));
+    let mut out = Vec::new();
+    for stream in json["data"]["result"].as_array().unwrap_or(&Vec::new()) {
+        let labels = stream["stream"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let lines = stream["values"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|value| value[1].as_str().unwrap_or_default().to_string())
+            .collect();
+        out.push((labels, lines));
+    }
+    out
 }
 
 fn push(port: u16, content_type: &str, body: &[u8]) -> HttpResponse {
@@ -442,6 +523,238 @@ async fn push_both_encodings_then_query_range_returns_the_exact_entries() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #97 (AC-7): per-entry structured metadata fans into the response
+// stream labels (the oracle-probed Loki 3.4.2 default), is byte-identical
+// across encodings (AC-4), and is filterable via a `| key="value"` label
+// filter in the pipeline.
+// ---------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_structured_metadata_surfaces_in_query_range_and_is_filterable() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_152;
+    let db = "pulsus_loki_push_sm_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let sm = [("trace_id", "abc123"), ("user_id", "42")];
+
+    // Push the SAME logical entry (line + SM) over both encodings.
+    let proto_line = "sm over protobuf";
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &protobuf_body_with_sm("sm-proto", base_ns, proto_line, &sm),
+    );
+    assert_eq!(res.status, 204, "protobuf SM push (body {})", res.body);
+
+    let json_line = "sm over json";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm("sm-json", base_ns, json_line, &sm).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "json SM push (body {})", res.body);
+
+    // AC-7: the SM keys fan into the response stream labels alongside the
+    // base labels (matching the oracle-probed Loki 3.4.2 default).
+    wait_for_line(port, "sm-proto", base_ns, proto_line);
+    let proto_labels =
+        labels_of_stream_carrying(port, "/api/logs/v1", "sm-proto", base_ns, proto_line);
+    let mut expected_proto = expected_pushed_labels("sm-proto");
+    expected_proto.insert("trace_id".to_string(), "abc123".to_string());
+    expected_proto.insert("user_id".to_string(), "42".to_string());
+    assert_eq!(
+        proto_labels, expected_proto,
+        "structured metadata must fan into the protobuf-pushed stream's labels"
+    );
+
+    // AC-4: the JSON encoding yields the byte-identical merged label set.
+    wait_for_line(port, "sm-json", base_ns, json_line);
+    let json_labels =
+        labels_of_stream_carrying(port, "/api/logs/v1", "sm-json", base_ns, json_line);
+    let mut expected_json = expected_pushed_labels("sm-json");
+    expected_json.insert("trace_id".to_string(), "abc123".to_string());
+    expected_json.insert("user_id".to_string(), "42".to_string());
+    assert_eq!(
+        json_labels, expected_json,
+        "the JSON encoding must produce the same merged SM label set as protobuf"
+    );
+
+    // AC-7: a `| key="value"` SM label filter selects the entry.
+    let matching = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        r#"{service_name="sm-proto"} | trace_id="abc123""#,
+        base_ns,
+    );
+    let matched_lines: Vec<String> = matching.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        matched_lines.contains(&proto_line.to_string()),
+        "an SM label filter matching the entry must return it: {matched_lines:?}"
+    );
+
+    // And a non-matching SM filter rejects it.
+    let rejecting = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        r#"{service_name="sm-proto"} | trace_id="nope""#,
+        base_ns,
+    );
+    let rejected_lines: Vec<String> = rejecting.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        !rejected_lines.contains(&proto_line.to_string()),
+        "an SM label filter that does not match must exclude the entry: {rejected_lines:?}"
+    );
+}
+
+/// Issue #97 review round 1, finding 3 (+ grafana/loki:3.4.2 oracle probe):
+/// a structured-metadata key that collides with a stream label key surfaces
+/// under the `<key>_extracted` suffix; the stream label keeps the original key
+/// and value, both appear exactly once (no duplicate key entries), and the
+/// `_extracted` label is filterable. Non-colliding SM merges verbatim.
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_metadata_colliding_with_a_stream_label_lands_under_extracted_suffix() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_153;
+    let db = "pulsus_loki_push_sm_collision_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    // Base stream labels are service_name=<service>, env=prod. `env` collides;
+    // `region` does not.
+    let sm = [("env", "smval"), ("region", "us-east")];
+    let line = "sm collides with stream label";
+    let res = push(
+        port,
+        "application/json",
+        json_body_with_sm("sm-collide", base_ns, line, &sm).as_bytes(),
+    );
+    assert_eq!(res.status, 204, "collision SM push (body {})", res.body);
+
+    wait_for_line(port, "sm-collide", base_ns, line);
+    let got = labels_of_stream_carrying(port, "/api/logs/v1", "sm-collide", base_ns, line);
+    let mut expected = expected_pushed_labels("sm-collide"); // env=prod, service_name=...
+    expected.insert("env_extracted".to_string(), "smval".to_string());
+    expected.insert("region".to_string(), "us-east".to_string());
+    assert_eq!(
+        got, expected,
+        "colliding SM key `env` must surface as `env_extracted` (stream `env` keeps `prod`), \
+         non-colliding `region` merges verbatim, and each key appears exactly once"
+    );
+
+    // The renamed label is filterable under its `_extracted` name.
+    let matching = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        r#"{service_name="sm-collide"} | env_extracted="smval""#,
+        base_ns,
+    );
+    let matched: Vec<String> = matching.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        matched.contains(&line.to_string()),
+        "the `_extracted` SM label must be filterable: {matched:?}"
+    );
+
+    // Filtering on the original key value keeps matching the STREAM label.
+    let stream_label = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        r#"{service_name="sm-collide"} | env="prod""#,
+        base_ns,
+    );
+    let stream_matched: Vec<String> = stream_label.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        stream_matched.contains(&line.to_string()),
+        "the stream label `env=prod` must still match under its original key: {stream_matched:?}"
+    );
+}
+
+/// Issue #97 review round 2, finding 1 (+ grafana/loki:3.4.2 oracle probe):
+/// a DOUBLE collision must not emit a duplicate label entry. The stream's base
+/// labels already carry BOTH `env` AND `env_extracted`; the colliding SM `env`
+/// renames to `env_extracted`, which also exists — so it overwrites that slot
+/// (last-write-wins), leaving exactly one `env_extracted` (the SM value). Probed
+/// against grafana/loki:3.4.2's default query response: base
+/// `env=prod`+`env_extracted=baseval` + SM `env=smval` renders one
+/// `env_extracted=smval`; no `env_extracted_extracted`, no numeric suffix, no
+/// drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn structured_metadata_double_collision_overwrites_the_extracted_slot_once() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    let port = 31_154;
+    let db = "pulsus_loki_push_sm_double_collision_it";
+    drop_db(db).await;
+    let _guard = spawn_ready(port, db, &[("PULSUS_COMPAT_ENDPOINTS", "1")]);
+
+    let base_ns = now_ns();
+    let service = "sm-double";
+    let line = "sm double-collides with a base _extracted label";
+    // Base stream labels carry both `env` AND `env_extracted`; SM `env` collides
+    // twice.
+    let body = format!(
+        r#"{{"streams":[{{"stream":{{"service_name":"{service}","env":"prod","env_extracted":"baseval"}},"values":[["{base_ns}","{line}",{{"env":"smval"}}]]}}]}}"#
+    );
+    let res = push(port, "application/json", body.as_bytes());
+    assert_eq!(
+        res.status, 204,
+        "double-collision SM push (body {})",
+        res.body
+    );
+
+    wait_for_line(port, service, base_ns, line);
+    let got = labels_of_stream_carrying(port, "/api/logs/v1", service, base_ns, line);
+    let expected: std::collections::BTreeMap<String, String> = [
+        ("service_name", service),
+        ("env", "prod"),
+        ("env_extracted", "smval"), // SM value wins the single _extracted slot
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert_eq!(
+        got, expected,
+        "double collision must yield exactly one `env_extracted` (SM value wins), \
+         `env=prod` kept, no duplicate key entries"
+    );
+
+    // The surviving `env_extracted` filters on the SM value, not the base value.
+    let hit = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        &format!(r#"{{service_name="{service}"}} | env_extracted="smval""#),
+        base_ns,
+    );
+    let hit_lines: Vec<String> = hit.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        hit_lines.contains(&line.to_string()),
+        "the winning `env_extracted=smval` must be filterable: {hit_lines:?}"
+    );
+    let miss = query_streams_raw(
+        port,
+        "/api/logs/v1",
+        &format!(r#"{{service_name="{service}"}} | env_extracted="baseval""#),
+        base_ns,
+    );
+    let miss_lines: Vec<String> = miss.into_iter().flat_map(|(_, l)| l).collect();
+    assert!(
+        !miss_lines.contains(&line.to_string()),
+        "the overwritten base `env_extracted=baseval` must NOT match: {miss_lines:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
 // AC-7b: a pushed stream appears in /api/logs/v1/tail (WebSocket).
 // ---------------------------------------------------------------------
 
@@ -633,11 +946,22 @@ async fn pushed_stream_appears_in_tail() {
     );
     assert_eq!(res.status, 204, "push -> 204 (body {})", res.body);
 
-    // The pushed line arrives on the tail stream carrying its COMPLETE label
-    // set (not just service_name) — captured here for an exact assertion.
+    // AC-9: a second entry WITH structured metadata — the tail frame must
+    // carry the SM fanned into its stream labels, just like query_range.
+    let sm_line = "tailed loki push line with sm";
+    let res = push(
+        port,
+        "application/x-protobuf",
+        &protobuf_body_with_sm(service, now_ns(), sm_line, &[("trace_id", "tail-abc")]),
+    );
+    assert_eq!(res.status, 204, "sm push -> 204 (body {})", res.body);
+
+    // Each pushed line arrives on the tail stream carrying its COMPLETE label
+    // set — captured here per line for an exact assertion.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut found_labels: Option<std::collections::BTreeMap<String, String>> = None;
-    while Instant::now() < deadline && found_labels.is_none() {
+    let mut base_labels: Option<std::collections::BTreeMap<String, String>> = None;
+    let mut sm_labels: Option<std::collections::BTreeMap<String, String>> = None;
+    while Instant::now() < deadline && (base_labels.is_none() || sm_labels.is_none()) {
         let Some(text) = ws.next_text(deadline) else {
             continue;
         };
@@ -660,16 +984,26 @@ async fn pushed_stream_appears_in_tail() {
                 .unwrap_or_default();
             for value in stream["values"].as_array().unwrap_or(&Vec::new()) {
                 if svc == service && value[1].as_str() == Some(line) {
-                    found_labels = Some(labels.clone());
+                    base_labels = Some(labels.clone());
+                }
+                if svc == service && value[1].as_str() == Some(sm_line) {
+                    sm_labels = Some(labels.clone());
                 }
             }
         }
     }
     ws.close();
-    let labels = found_labels.expect("the #77-pushed line must arrive on /api/logs/v1/tail");
+    let labels = base_labels.expect("the #77-pushed line must arrive on /api/logs/v1/tail");
     assert_eq!(
         labels,
         expected_pushed_labels(service),
         "the tailed frame's pushed stream must carry its full label set (service_name AND env)"
+    );
+    let sm = sm_labels.expect("the SM-bearing pushed line must arrive on /api/logs/v1/tail");
+    let mut expected_sm = expected_pushed_labels(service);
+    expected_sm.insert("trace_id".to_string(), "tail-abc".to_string());
+    assert_eq!(
+        sm, expected_sm,
+        "the tailed SM-bearing frame must fan structured metadata into its stream labels (AC-9)"
     );
 }

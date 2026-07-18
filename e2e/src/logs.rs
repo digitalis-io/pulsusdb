@@ -1638,11 +1638,11 @@ mod tests {
                 ),
             },
         )]);
-        let rows: Vec<pulsus_read::logql::rows::SampleRow> = corpus
+        let rows: Vec<pulsus_read::logql::rows::MetricScanRow> = corpus
             .records
             .iter()
             .filter(|r| r.service == service)
-            .map(|r| pulsus_read::logql::rows::SampleRow {
+            .map(|r| pulsus_read::logql::rows::MetricScanRow {
                 fingerprint: 1,
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
@@ -1717,11 +1717,11 @@ mod tests {
                 ),
             },
         )]);
-        let rows: Vec<pulsus_read::logql::rows::SampleRow> = corpus
+        let rows: Vec<pulsus_read::logql::rows::MetricScanRow> = corpus
             .records
             .iter()
             .filter(|r| r.service == service)
-            .map(|r| pulsus_read::logql::rows::SampleRow {
+            .map(|r| pulsus_read::logql::rows::MetricScanRow {
                 fingerprint: 1,
                 timestamp_ns: r.ts_ns,
                 body: r.body.clone(),
