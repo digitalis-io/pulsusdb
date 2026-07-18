@@ -57,6 +57,12 @@ pub struct Config {
     /// explicitly, how to determine this node's zone from cloud instance
     /// metadata at startup (`off` — the default — leaves it unset).
     pub az_detect: AzDetect,
+    /// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (M7-A4, issue #120): how OTLP
+    /// exponential-histogram data points are stored. `classic` (default,
+    /// current behavior unchanged) flattens to `_bucket`/`_sum`/`_count`
+    /// float series; `native` stores the sparse native histogram in
+    /// `metric_hist_samples`; `dual` emits both (disjoint fingerprints).
+    pub exp_histogram_mode: ExpHistogramMode,
     // Nested subsystem objects
     pub clickhouse: ClickHouseConfig,
     pub writer: WriterConfig,
@@ -87,6 +93,7 @@ impl Default for Config {
             skip_unavailable_shards: false,
             availability_zone: None,
             az_detect: AzDetect::default(),
+            exp_histogram_mode: ExpHistogramMode::default(),
             clickhouse: ClickHouseConfig::default(),
             writer: WriterConfig::default(),
             reader: ReaderConfig::default(),
@@ -534,6 +541,49 @@ impl std::str::FromStr for InsertMode {
     }
 }
 
+/// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (docs/configuration.md §5, M7-A4
+/// issue #120): how OTLP exponential-histogram data points are stored.
+/// `Classic` (default) keeps the current flatten-to-`_bucket`/`_sum`/
+/// `_count` behavior byte-unchanged; `Native` stores the sparse native
+/// histogram in `metric_hist_samples`; `Dual` emits both (the classic
+/// float series under suffixed names AND one base-name native row — their
+/// fingerprints are disjoint, so they never collide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpHistogramMode {
+    #[default]
+    Classic,
+    Native,
+    Dual,
+}
+
+impl std::str::FromStr for ExpHistogramMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "classic" => Ok(ExpHistogramMode::Classic),
+            "native" => Ok(ExpHistogramMode::Native),
+            "dual" => Ok(ExpHistogramMode::Dual),
+            _ => Err("one of: classic, native, dual".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ExpHistogramMode {
+    /// Canonical lowercase rendering, round-tripping with [`FromStr`]
+    /// (`FromStr::from_str(&mode.to_string()) == Ok(mode)`).
+    ///
+    /// [`FromStr`]: std::str::FromStr
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExpHistogramMode::Classic => "classic",
+            ExpHistogramMode::Native => "native",
+            ExpHistogramMode::Dual => "dual",
+        })
+    }
+}
+
 /// `PULSUS_TIER_POLICY` (docs/configuration.md §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -696,6 +746,29 @@ mod tests {
         assert_eq!("off".parse::<AzDetect>().unwrap(), AzDetect::Off);
         let err = "bogus".parse::<AzDetect>().unwrap_err();
         assert!(err.contains("off, aws, gcp, azure, auto"), "{err}");
+    }
+
+    #[test]
+    fn exp_histogram_mode_defaults_to_classic_and_parses_each_value() {
+        assert_eq!(ExpHistogramMode::default(), ExpHistogramMode::Classic);
+        assert_eq!(
+            Config::default().exp_histogram_mode,
+            ExpHistogramMode::Classic
+        );
+        assert_eq!(
+            "classic".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Classic
+        );
+        assert_eq!(
+            "native".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Native
+        );
+        assert_eq!(
+            "dual".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Dual
+        );
+        let err = "bogus".parse::<ExpHistogramMode>().unwrap_err();
+        assert!(err.contains("classic, native, dual"), "{err}");
     }
 
     #[test]

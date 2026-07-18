@@ -14,7 +14,9 @@ mod support;
 
 use std::time::Duration;
 
-use pulsus_config::{ByteSize, ChProto, Config, InsertMode, LogLevel, Mode, TierPolicy};
+use pulsus_config::{
+    ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode, TierPolicy,
+};
 
 struct Row {
     var: &'static str,
@@ -195,6 +197,11 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.ingest_queue_bytes == ByteSize(8 * 1024 * 1024),
     },
     Row {
+        var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
+        value: "native",
+        check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
+    },
+    Row {
         var: "PULSUS_CACHE_TTL",
         value: "90s",
         check: |c| c.reader.cache_ttl.0 == Duration::from_secs(90),
@@ -334,8 +341,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        57,
-        "docs/configuration.md §§1-8 document exactly 57 variables"
+        58,
+        "docs/configuration.md §§1-8 document exactly 58 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
@@ -363,6 +370,45 @@ fn each_documented_env_var_parses_in_isolation() {
             row.value
         );
     }
+
+    support::clear_all();
+}
+
+/// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` has three valid variants; the ROWS
+/// matrix only exercises `native` (one row per variable, by set equality).
+/// This covers the remaining `classic`/`dual` variants and asserts an
+/// unknown value is a parse error (not a silent default), matching env.rs'
+/// `parse_enum` contract for every config enum.
+#[test]
+fn exp_histogram_mode_accepts_every_variant_and_rejects_unknown() {
+    let _guard = support::lock_env();
+
+    for (value, expected) in [
+        ("classic", ExpHistogramMode::Classic),
+        ("native", ExpHistogramMode::Native),
+        ("dual", ExpHistogramMode::Dual),
+    ] {
+        support::clear_all();
+        support::set("PULSUS_METRICS_EXP_HISTOGRAM_MODE", value);
+        let cfg = pulsus_config::parse(None, None)
+            .unwrap_or_else(|e| panic!("exp-histogram mode {value:?}: parse() failed: {e}"));
+        assert_eq!(
+            cfg.exp_histogram_mode, expected,
+            "exp-histogram mode {value:?} did not map to the expected variant"
+        );
+        // Round-trips through Display back to the same variant.
+        assert_eq!(cfg.exp_histogram_mode.to_string(), value);
+    }
+
+    support::clear_all();
+    support::set("PULSUS_METRICS_EXP_HISTOGRAM_MODE", "quantile");
+    let err = pulsus_config::parse(None, None)
+        .expect_err("an unknown exp-histogram mode must be a parse error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("PULSUS_METRICS_EXP_HISTOGRAM_MODE") && msg.contains("classic, native, dual"),
+        "the rejection must name the variable and the accepted values: {msg}"
+    );
 
     support::clear_all();
 }

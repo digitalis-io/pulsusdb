@@ -42,6 +42,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use prost::Message;
+use pulsus_config::ExpHistogramMode;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -147,7 +148,12 @@ where
 /// shared helper below verbatim. See this module's doc comment for why
 /// `pulsus-server` mounts this `&dyn MetricSink` core directly rather than
 /// [`metrics`]'s generic-`State` form.
-pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Body) -> Response {
+pub async fn ingest_metrics(
+    sink: &dyn MetricSink,
+    headers: HeaderMap,
+    body: Body,
+    mode: ExpHistogramMode,
+) -> Response {
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -163,8 +169,9 @@ pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Bod
     // Fallible, unlike the logs parse: the metrics parser's expansion
     // budget (`otlp_metrics::MAX_EXPANDED_BYTES`, a structural whole-request
     // bound, issue #62) surfaces here as the same 400/`code = 3`
-    // classification a decode failure gets.
-    let parsed = match otlp_metrics::parse(&request, now_ns) {
+    // classification a decode failure gets. `mode` (issue #120) selects the
+    // OTLP exponential-histogram storage path.
+    let parsed = match otlp_metrics::parse(&request, now_ns, mode) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
@@ -193,7 +200,10 @@ pub async fn metrics<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Bo
 where
     S: MetricSink + 'static,
 {
-    ingest_metrics(sink.as_ref(), headers, body).await
+    // This crate's own generic mount point carries no `Config`; it defaults
+    // to `Classic` (current behavior). The server threads the configured
+    // mode through `pulsus_write::ingest_metrics` directly.
+    ingest_metrics(sink.as_ref(), headers, body, ExpHistogramMode::Classic).await
 }
 
 /// `POST /v1/traces` (issue #54): the traces analog of [`ingest`] —

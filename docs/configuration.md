@@ -78,6 +78,9 @@ Deployment topologies:
 | `PULSUS_BATCH_MS` | `200` | flush a table buffer at this age |
 | `PULSUS_INSERT_MODE` | `sync` | `sync` \| `async` default when `X-Pulsus-Async` absent |
 | `PULSUS_INGEST_QUEUE_BYTES` | `256MiB` | total buffered bytes before `429` backpressure |
+| `PULSUS_METRICS_EXP_HISTOGRAM_MODE` | `classic` | `classic` \| `native` \| `dual` — how OTLP exponential histograms are stored (see below) |
+
+`PULSUS_METRICS_EXP_HISTOGRAM_MODE` selects how OTLP **exponential-histogram** data points are ingested (M7-A4). `classic` (default) keeps the existing behavior byte-for-byte: each data point is flattened to cumulative `<name>_bucket{le}`/`<name>_sum`/`<name>_count` float series. `native` instead stores the sparse native histogram (schema, spans, delta-encoded buckets) in `metric_hist_samples` under the base metric name, and stamps `metric_series.value_type = 1` for that series. `dual` emits **both** — the classic float series (suffixed names) and one base-name native row; their fingerprints are disjoint so they never collide. Flipping the mode mid-stream leaves a series' pre-flip classic history and post-flip native history as disjoint series (a visible gap), which is expected, not a defect.
 
 A batch that exhausts its insert retry budget is spooled to `./spool/{poison,uncertain}/<table>/` (relative to the process's working directory — a documented constant, not yet a `PULSUS_*` variable). In the published container image (§10), the working directory is `/var/lib/pulsusdb`, owned by the non-root `pulsus` user, so this resolves to `/var/lib/pulsusdb/spool/`; mount a volume over that path if spooled batches need to survive a container restart.
 

@@ -10,7 +10,9 @@ pub use error::LogsIngestError;
 pub use ingest::http::{
     ingest, ingest_loki_push, ingest_metrics, ingest_remote_write, ingest_traces, ingest_zipkin,
 };
-pub use ingest::metrics::{MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef};
+pub use ingest::metrics::{
+    HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
+};
 pub use ingest::traces::{AttrRecord, ParsedTraces, SpanRecord, TraceSink};
 pub use ingest::{Backpressure, FlushWait, LogSink};
 pub use protocols::loki_push::{
@@ -28,9 +30,9 @@ pub use protocols::zipkin::{
     decode as decode_zipkin, to_otlp as zipkin_to_otlp,
 };
 pub use writer::{
-    LogWriter, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, MetricWriter,
-    MetricWriterTables, TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables, WriteError,
-    WriterTables,
+    LogWriter, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
+    MetricWriter, MetricWriterTables, TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables,
+    WriteError, WriterTables,
 };
 
 #[cfg(test)]

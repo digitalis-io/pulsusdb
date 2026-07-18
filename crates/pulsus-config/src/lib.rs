@@ -26,7 +26,8 @@ pub use error::ConfigError;
 pub use load::{load, parse};
 pub use model::{
     AzDetect, ChAuth, ChProto, ChServerEntry, ClickHouseConfig, Config, DownsamplingConfig,
-    InsertMode, LogLevel, Mode, ReaderConfig, RulerConfig, Tier, TierPolicy, WriterConfig,
+    ExpHistogramMode, InsertMode, LogLevel, Mode, ReaderConfig, RulerConfig, Tier, TierPolicy,
+    WriterConfig,
 };
 pub use secret::Secret;
 pub use units::{ByteSize, HumanDuration, UnitError};

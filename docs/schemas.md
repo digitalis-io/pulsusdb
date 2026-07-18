@@ -258,7 +258,9 @@ SETTINGS ttl_only_drop_parts = 1;
 ALTER TABLE metric_series ADD COLUMN IF NOT EXISTS value_type UInt8 DEFAULT 0;
 ```
 
-`value_type` is the per-series float/histogram routing signal: `0 = float`, `1 = histogram`. Pre-M7 rows read back `0` (the `DEFAULT`), so no data migration is required. The writer sets it per series and the read path uses it to decide which sample table(s) to touch for a resolved fingerprint set. Correctness under a series that changes or mixes types within a window is a read-path concern, not a storage one — see [ADR 0005](decisions/0005-native-histogram-storage.md).
+`value_type` is the per-series float/histogram discriminator: `0 = float`, `1 = histogram`. Pre-M7 rows read back `0` (the `DEFAULT`), so no data migration is required.
+
+**Writer contract (M7-A4).** `value_type` is a *per-row* discriminator on `metric_series`, and it is part of the writer's registration key `(metric_name, fingerprint, activity-bucket, value_type)`. Registration is driven from **both** float samples (`value_type = 0`) and native-histogram samples (`value_type = 1`), so a series that carries both a float and a histogram sample in one activity bucket registers **two** `metric_series` rows — a "mixed" series is the `groupBitOr(bitShiftLeft(1, value_type))` rollup over those rows (`3` = mixed), computed at read time, never stored. Within a single ingest request the writer never emits a float and a native histogram at the same `(metric_name, fingerprint, unix_milli)` — the histogram wins and the colliding float is dropped. Across independent requests both a `metric_samples` and a `metric_hist_samples` row may coexist at one key by design; that is the read path's deterministic-merge concern (it dual-reads both tables and does **not** consult `value_type` for routing). See [ADR 0005](decisions/0005-native-histogram-storage.md).
 
 ---
 

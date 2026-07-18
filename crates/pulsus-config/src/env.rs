@@ -46,6 +46,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_BATCH_MS",
     "PULSUS_INSERT_MODE",
     "PULSUS_INGEST_QUEUE_BYTES",
+    "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_CACHE_TTL",
     "PULSUS_CACHE_MAX_SERIES",
     "PULSUS_SERIES_ACTIVITY_BUCKET",
@@ -247,6 +248,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_INGEST_QUEUE_BYTES") {
         cfg.writer.ingest_queue_bytes = parse_size("PULSUS_INGEST_QUEUE_BYTES", &v)?;
     }
+    if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
+        cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;
+    }
     if let Some(v) = read("PULSUS_CACHE_TTL") {
         cfg.reader.cache_ttl = parse_dur("PULSUS_CACHE_TTL", &v)?;
     }
@@ -340,8 +344,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            57,
-            "docs/configuration.md §§1-8 document exactly 57 variables"
+            58,
+            "docs/configuration.md §§1-8 document exactly 58 variables"
         );
     }
 

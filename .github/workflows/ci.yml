@@ -239,6 +239,21 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test zipkin_ingest_roundtrip
 
+      # Issue #120 (M7-A4): the native-histogram write path — MetricWriter ->
+      # metric_hist_samples. Deciding ClickHouse-NaN gate (finite/stale-NaN/
+      # absent-NaN `sum` bit patterns survive Float64 RowBinary round-trip
+      # distinctly — also the first live proof of the landed float-stale
+      # assumption), an OTLP parse(Native) -> writer -> SELECT absolute-count
+      # round-trip incl. an internal zero bucket, and the value_type
+      # discriminator mask (a cross-request float+histogram at one series
+      # registers both metric_series rows, groupBitOr == 3). Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Native histogram writer round-trip (NaN gate + value_type)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_metric_hist_writer
+
       # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
       # step — reproducibility + a committed CI-scale evidence artifact
       # only (task-manager resolution #2: no asserted `system.query_log`

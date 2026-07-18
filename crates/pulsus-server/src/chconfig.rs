@@ -160,6 +160,9 @@ pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
         samples: Arc::from(format!("metric_samples{dist}")),
         series: Arc::from(format!("metric_series{dist}")),
         metadata: Arc::from("metric_metadata"),
+        // `metric_hist_samples` (M7-A4, issue #120) is a co-sharded
+        // Metrics-family table, `_dist`-aware exactly like `metric_samples`.
+        hist_samples: Arc::from(format!("metric_hist_samples{dist}")),
     }
 }
 
@@ -464,6 +467,7 @@ mod tests {
         assert_eq!(&*tables.samples, "metric_samples");
         assert_eq!(&*tables.series, "metric_series");
         assert_eq!(&*tables.metadata, "metric_metadata");
+        assert_eq!(&*tables.hist_samples, "metric_hist_samples");
     }
 
     #[test]
@@ -479,6 +483,7 @@ mod tests {
             &*tables.metadata, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+        assert_eq!(&*tables.hist_samples, "metric_hist_samples_dist");
     }
 
     #[test]

@@ -47,7 +47,13 @@ pub type StreamLru = LruSet<StreamKey>;
 /// `String`): the admission hot path already holds an `Arc<str>` metric
 /// name (from `MetricPoint`/`SeriesRef`), so building this key per sample
 /// is a cheap `Arc` clone, not a fresh heap allocation.
-pub type SeriesKey = (Arc<str>, u64, i64);
+///
+/// The trailing `u8` is `value_type` (M7-A4, issue #120: `0` = float, `1` =
+/// histogram). It is part of the key so a series that carries BOTH a float
+/// and a histogram sample in the same activity bucket registers **both**
+/// `metric_series` rows (the per-series float/histogram discriminator) —
+/// they are distinct keys, not a false LRU hit that would suppress one.
+pub type SeriesKey = (Arc<str>, u64, i64, u8);
 pub type SeriesLru = LruSet<SeriesKey>;
 
 struct Slot<K> {
@@ -323,9 +329,21 @@ mod tests {
         let mut lru: SeriesLru = LruSet::new(10);
         let a: Arc<str> = Arc::from("http_requests_total");
         let b: Arc<str> = Arc::from("http_errors_total");
-        lru.insert((a.clone(), 42, 0));
-        assert!(lru.contains(&(a, 42, 0)));
-        assert!(!lru.contains(&(b, 42, 0)));
+        lru.insert((a.clone(), 42, 0, 0));
+        assert!(lru.contains(&(a, 42, 0, 0)));
+        assert!(!lru.contains(&(b, 42, 0, 0)));
+    }
+
+    #[test]
+    fn series_key_value_type_distinguishes_float_from_histogram() {
+        // Issue #120: the same (name, fp, bucket) with value_type 0 (float)
+        // and 1 (histogram) are distinct keys — both metric_series rows must
+        // register, never one suppressing the other.
+        let mut lru: SeriesLru = LruSet::new(10);
+        let name: Arc<str> = Arc::from("http_request_duration");
+        lru.insert((name.clone(), 7, 0, 0));
+        assert!(lru.contains(&(name.clone(), 7, 0, 0)));
+        assert!(!lru.contains(&(name, 7, 0, 1)));
     }
 
     #[test]
