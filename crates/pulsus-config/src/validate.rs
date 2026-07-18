@@ -64,6 +64,26 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         return Err(value_err("clickhouse.pool_size", "must be >= 1", ">= 1"));
     }
 
+    // Issue #43: each multi-endpoint entry must name a non-empty host and,
+    // when it pins its own port, a non-zero one (an omitted port inherits
+    // clickhouse.http_port, already validated above).
+    for (i, entry) in cfg.clickhouse.servers.iter().enumerate() {
+        if entry.host.trim().is_empty() {
+            return Err(value_err(
+                &format!("clickhouse.servers[{i}].host"),
+                "must not be empty",
+                "a non-empty host",
+            ));
+        }
+        if entry.http_port == Some(0) {
+            return Err(value_err(
+                &format!("clickhouse.servers[{i}].http_port"),
+                "must not be 0",
+                "1-65535",
+            ));
+        }
+    }
+
     // Rule 11: `native` is a reserved variant, not an accepted transport —
     // the M0 spike selected the HTTP-only `clickhouse` crate
     // (docs/decisions/0001-clickhouse-client.md, "ADR 0001"), which
@@ -514,6 +534,49 @@ mod tests {
                 other => panic!("{field}: expected a Value error, got {other:?}"),
             }
         }
+    }
+
+    /// Issue #43: a multi-endpoint entry with an empty host is rejected at
+    /// load, naming the indexed field.
+    #[test]
+    fn empty_server_entry_host_is_rejected() {
+        use crate::model::ChServerEntry;
+        let mut cfg = Config::default();
+        cfg.clickhouse.servers = vec![ChServerEntry {
+            host: "  ".to_string(),
+            http_port: Some(8123),
+            zone: None,
+        }];
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.servers[0].host");
+            }
+            other => panic!("expected a Value error, got {other:?}"),
+        }
+    }
+
+    /// Issue #43: an entry that pins a zero port is rejected; an entry that
+    /// omits its port (inheriting clickhouse.http_port) is valid.
+    #[test]
+    fn zero_server_entry_port_is_rejected_but_omitted_port_is_ok() {
+        use crate::model::ChServerEntry;
+        let mut cfg = Config::default();
+        cfg.clickhouse.servers = vec![ChServerEntry {
+            host: "ch1".to_string(),
+            http_port: Some(0),
+            zone: None,
+        }];
+        assert!(matches!(
+            validate(&cfg),
+            Err(ConfigError::Value { field, .. }) if field == "clickhouse.servers[0].http_port"
+        ));
+
+        cfg.clickhouse.servers = vec![ChServerEntry {
+            host: "ch1".to_string(),
+            http_port: None,
+            zone: Some("az-a".to_string()),
+        }];
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]

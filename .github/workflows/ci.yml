@@ -172,6 +172,20 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test traces_point_read
 
+      # Issue #43: multi-endpoint connection spreading + transport-failure
+      # failover on ONE node — both SHARD endpoints point at this job's
+      # 19123 server (spreading observable via per-endpoint selection
+      # counts), and the failover case adds a dead port to prove demotion.
+      # The cross-node proof runs on the schema-it-cluster leg below.
+      - name: Connection spreading + failover (single-node)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_SHARD1_HOST: "localhost"
+          PULSUS_TEST_CH_SHARD1_HTTP_PORT: "19123"
+          PULSUS_TEST_CH_SHARD2_HOST: "localhost"
+          PULSUS_TEST_CH_SHARD2_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-clickhouse --test live_spreading
+
       # Issue #16, docs/schemas.md §9's two-tier model, Tier 1: the
       # scale-invariant system.query_log ratio gate for the logs read path
       # (CI-scale corpus). Reuses this job's ClickHouse 24.8 container.
@@ -596,6 +610,18 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
+
+      # Issue #43: cross-node connection spreading over the two DISTINCT real
+      # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
+      # proving the pool selects both nodes and fails over off a dead port,
+      # plus AC7's SERVER-side proof (run-unique log_comment read back from
+      # each node's system.query_log) that marked queries actually landed on
+      # both — the authoritative multi-node proof the single-node schema-it
+      # leg cannot give.
+      - name: Cross-node connection spreading (two real nodes)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-clickhouse --test live_spreading
 
       # Issue #57 AC4: per-stage per-shard shard-locality verdicts for the
       # two-phase TraceQL search + trace-by-ID, against a client-computed

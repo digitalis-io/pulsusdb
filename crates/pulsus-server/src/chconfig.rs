@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChPool, ChProto};
+use pulsus_clickhouse::{ChClient, ChConnConfig, ChEndpoint, ChPool, ChProto};
 use pulsus_config::Config;
 use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
@@ -39,6 +39,24 @@ pub(crate) fn conn_config_from(config: &Config) -> ChConnConfig {
         tls_skip_verify: config.clickhouse.tls_skip_verify,
         pool_size: config.clickhouse.pool_size as usize,
         query_timeout: config.query_timeout.0,
+        // Issue #43: multi-endpoint connection spreading. An empty
+        // `clickhouse.servers` maps to an empty `endpoints`, which the pool
+        // resolves to the single `server`/`http_port` endpoint — byte-for-byte
+        // the pre-#43 behavior. A per-entry port defaults to
+        // `clickhouse.http_port`. `local_zone` is the already-resolved
+        // availability zone (operator-set or auto-detected — see
+        // `azdetect::resolve_local_zone`).
+        endpoints: config
+            .clickhouse
+            .servers
+            .iter()
+            .map(|s| ChEndpoint {
+                host: s.host.clone(),
+                http_port: s.http_port.unwrap_or(config.clickhouse.http_port),
+                zone: s.zone.clone(),
+            })
+            .collect(),
+        local_zone: config.availability_zone.clone(),
     }
 }
 
@@ -293,6 +311,65 @@ mod tests {
         config.clickhouse.database = "pulsus".to_string();
         let ch_cfg = conn_config_from(&config);
         assert_eq!(ch_cfg.database, "pulsus");
+    }
+
+    #[test]
+    fn conn_config_from_defaults_to_no_endpoints_and_no_zone() {
+        // Backward-compat (issue #43 AC1): no configured servers -> empty
+        // `endpoints` (the pool falls back to the single server/http_port
+        // endpoint), no `local_zone`.
+        let ch_cfg = conn_config_from(&Config::default());
+        assert!(ch_cfg.endpoints.is_empty());
+        assert_eq!(ch_cfg.local_zone, None);
+    }
+
+    #[test]
+    fn conn_config_from_maps_servers_with_port_fallback_and_zone() {
+        use pulsus_config::ChServerEntry;
+        let mut config = Config::default();
+        config.clickhouse.http_port = 8123;
+        config.clickhouse.servers = vec![
+            ChServerEntry {
+                host: "ch1".to_string(),
+                http_port: Some(9123),
+                zone: Some("az-a".to_string()),
+            },
+            ChServerEntry {
+                host: "ch2".to_string(),
+                http_port: None, // inherits clickhouse.http_port
+                zone: Some("az-b".to_string()),
+            },
+        ];
+        config.availability_zone = Some("az-a".to_string());
+
+        let ch_cfg = conn_config_from(&config);
+        assert_eq!(ch_cfg.local_zone.as_deref(), Some("az-a"));
+        assert_eq!(ch_cfg.endpoints.len(), 2);
+        assert_eq!(ch_cfg.endpoints[0].host, "ch1");
+        assert_eq!(ch_cfg.endpoints[0].http_port, 9123);
+        assert_eq!(ch_cfg.endpoints[0].zone.as_deref(), Some("az-a"));
+        assert_eq!(ch_cfg.endpoints[1].host, "ch2");
+        assert_eq!(
+            ch_cfg.endpoints[1].http_port, 8123,
+            "an entry omitting its port inherits clickhouse.http_port"
+        );
+        assert_eq!(ch_cfg.endpoints[1].zone.as_deref(), Some("az-b"));
+    }
+
+    #[test]
+    fn bootstrap_conn_config_from_inherits_endpoints_and_zone() {
+        use pulsus_config::ChServerEntry;
+        let mut config = Config::default();
+        config.clickhouse.servers = vec![ChServerEntry {
+            host: "ch1".to_string(),
+            http_port: Some(8123),
+            zone: Some("az-a".to_string()),
+        }];
+        config.availability_zone = Some("az-a".to_string());
+        let ch_cfg = bootstrap_conn_config_from(&config);
+        assert_eq!(ch_cfg.database, "default");
+        assert_eq!(ch_cfg.endpoints.len(), 1);
+        assert_eq!(ch_cfg.local_zone.as_deref(), Some("az-a"));
     }
 
     #[test]

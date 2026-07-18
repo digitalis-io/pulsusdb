@@ -123,11 +123,20 @@ impl ChClient {
 
         match result {
             Ok(()) => Ok(()),
-            // Uncertain-fate downgrade: any retryable failure during an
-            // insert must NOT reach a caller as retryable (would duplicate
-            // the block on replay).
-            Err(e) if e.is_retryable() => Err(ChError::InsertUncertain(e.to_string())),
-            Err(e) => Err(e), // genuine pre-commit poison, surfaced precisely
+            Err(e) => {
+                // Transport-class failure demotes this endpoint so the next
+                // insert steers to a healthy one (no-op for logic errors —
+                // the guard lives in `report_transport_failure`).
+                conn.report_transport_failure(&e);
+                // Uncertain-fate downgrade: any retryable failure during an
+                // insert must NOT reach a caller as retryable (would
+                // duplicate the block on replay).
+                if e.is_retryable() {
+                    Err(ChError::InsertUncertain(e.to_string()))
+                } else {
+                    Err(e) // genuine pre-commit poison, surfaced precisely
+                }
+            }
         }
     }
 
@@ -156,7 +165,7 @@ impl ChClient {
             deadline: Box::pin(tokio::time::sleep(self.default_timeout)),
             done: false,
             timeout: self.default_timeout,
-            _conn: conn,
+            conn,
         })
     }
 
@@ -188,6 +197,13 @@ impl ChClient {
                     ChError::Timeout(format!("execute exceeded {:?}", self.default_timeout))
                 })
                 .and_then(|inner| inner.map_err(ChError::from));
+
+            // Demote this endpoint on a transport-class failure before
+            // deciding whether to retry, so the retry's `get()` re-lands on a
+            // healthy endpoint (no-op for logic errors — guarded inside).
+            if let Err(ref e) = result {
+                conn.report_transport_failure(e);
+            }
 
             match result {
                 Ok(()) => return Ok(()),
@@ -233,7 +249,7 @@ pub struct ChRowStream<'a, R> {
     deadline: Pin<Box<tokio::time::Sleep>>,
     done: bool,
     timeout: Duration,
-    _conn: PooledConn<'a>,
+    conn: PooledConn<'a>,
 }
 
 impl<R> ChRowStream<'_, R> {
@@ -284,7 +300,14 @@ where
             Poll::Ready(Some(Ok(row))) => Poll::Ready(Some(Ok(row))),
             Poll::Ready(Some(Err(e))) => {
                 this.done = true;
-                Poll::Ready(Some(Err(ChError::from(e))))
+                let err = ChError::from(e);
+                // A transport-class failure mid-stream demotes this endpoint
+                // so the next query fails over (no-op for decode/logic errors
+                // — guarded in `report_transport_failure`). The deadline arm
+                // above is intentionally excluded: a self-imposed client
+                // timeout does not mean the endpoint is unhealthy.
+                this.conn.report_transport_failure(&err);
+                Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
                 this.done = true;

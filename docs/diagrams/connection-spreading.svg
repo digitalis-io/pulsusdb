@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="720" viewBox="0 0 1120 720" role="img" aria-labelledby="title desc">
+  <title id="title">PulsusDB availability-zone-aware ClickHouse connection spreading</title>
+  <desc id="desc">A PulsusDB node in availability zone A resolves its own zone (from PULSUS_AVAILABILITY_ZONE or cloud instance metadata), then its ClickHouse connection pool holds one client per configured endpoint. A single semaphore bounds total concurrency. The zone-preferring round-robin policy selects endpoints in zone A first, failing over to zones B and C only when no local endpoint answers; a transport failure demotes an endpoint for a cooldown.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #0f172a; stroke-width: 2; }
+      .zoneA { fill: #eef6ff; stroke: #2563eb; stroke-width: 1.5; }
+      .zoneB { fill: #f0fdf4; stroke: #16a34a; stroke-width: 1.5; }
+      .zoneC { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.5; }
+      .meta { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; }
+      .client { fill: #ffffff; stroke: #64748b; stroke-width: 1.2; }
+      .store { fill: #ecfeff; stroke: #0891b2; stroke-width: 2; }
+      .down { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; }
+      .title { font: 700 18px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 600 14px Arial, sans-serif; fill: #0f172a; }
+      .small { font: 12px Arial, sans-serif; fill: #334155; }
+      .tiny { font: 11px Arial, sans-serif; fill: #475569; }
+      .preferred { stroke: #2563eb; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .failover { stroke: #64748b; stroke-width: 1.6; fill: none; marker-end: url(#arrow); stroke-dasharray: 6 5; }
+      .arrow { stroke: #334155; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 6 5; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1120" height="720"/>
+
+  <!-- Zone resolution -->
+  <text class="title" x="48" y="40">Zone resolution (startup, once)</text>
+  <rect class="meta" x="40" y="56" width="360" height="128" rx="8"/>
+  <text class="label" x="60" y="84">local_zone: Option&lt;String&gt;</text>
+  <text class="small" x="60" y="108">1. PULSUS_AVAILABILITY_ZONE (operator) — wins</text>
+  <text class="small" x="60" y="128">2. PULSUS_AZ_DETECT = aws | gcp | azure | auto</text>
+  <text class="tiny" x="76" y="146">IMDSv2 / metadata.google.internal / Azure IMDS</text>
+  <text class="tiny" x="76" y="162">one-time, time-bounded, fail-soft → unset</text>
+  <text class="small" x="60" y="180">3. off (default) → unset → spread evenly</text>
+
+  <!-- PulsusDB node -->
+  <text class="title" x="48" y="232">PulsusDB node (availability zone A)</text>
+  <rect class="panel" x="40" y="248" width="360" height="292" rx="8"/>
+  <text class="label" x="60" y="278">ChPool</text>
+  <rect class="zoneA" x="60" y="294" width="320" height="52" rx="6"/>
+  <text class="small" x="76" y="316">Semaphore(pool_size)</text>
+  <text class="tiny" x="76" y="334">total concurrency bound — independent of endpoint count</text>
+
+  <rect class="zoneA" x="60" y="358" width="320" height="70" rx="6"/>
+  <text class="small" x="76" y="380">candidate_order (pure, lock-free)</text>
+  <text class="tiny" x="76" y="398">zone-preferring round-robin; zero pings on hot path</text>
+  <text class="tiny" x="76" y="414">local zone → other zones → cooldown-expired → rest</text>
+
+  <rect class="client" x="60" y="440" width="96" height="40" rx="6"/>
+  <text class="tiny" x="74" y="464">client → ch1</text>
+  <rect class="client" x="164" y="440" width="96" height="40" rx="6"/>
+  <text class="tiny" x="178" y="464">client → ch3</text>
+  <rect class="client" x="268" y="440" width="96" height="40" rx="6"/>
+  <text class="tiny" x="282" y="464">client → ch5</text>
+  <text class="tiny" x="76" y="504">one clickhouse::Client per endpoint;</text>
+  <text class="tiny" x="76" y="520">a streaming cursor stays pinned to its endpoint (RAII lease)</text>
+
+  <!-- Zone A endpoints -->
+  <text class="title" x="620" y="120">ClickHouse — zone A (preferred)</text>
+  <rect class="zoneA" x="612" y="136" width="440" height="112" rx="8"/>
+  <rect class="store" x="632" y="160" width="180" height="64" rx="6"/>
+  <text class="label" x="652" y="188">ch1  (_dist)</text>
+  <text class="tiny" x="652" y="208">az-a</text>
+  <rect class="store" x="852" y="160" width="180" height="64" rx="6"/>
+  <text class="label" x="872" y="188">ch2  (_dist)</text>
+  <text class="tiny" x="872" y="208">az-a</text>
+
+  <!-- Zone B endpoints -->
+  <text class="title" x="620" y="300">ClickHouse — zone B (failover)</text>
+  <rect class="zoneB" x="612" y="316" width="440" height="112" rx="8"/>
+  <rect class="store" x="632" y="340" width="180" height="64" rx="6"/>
+  <text class="label" x="652" y="368">ch3  (_dist)</text>
+  <text class="tiny" x="652" y="388">az-b</text>
+  <rect class="down" x="852" y="340" width="180" height="64" rx="6"/>
+  <text class="label" x="872" y="368">ch4  (_dist)</text>
+  <text class="tiny" x="872" y="388">az-b — demoted (cooldown)</text>
+
+  <!-- Zone C endpoints -->
+  <text class="title" x="620" y="480">ClickHouse — zone C (failover)</text>
+  <rect class="zoneC" x="612" y="496" width="440" height="112" rx="8"/>
+  <rect class="store" x="632" y="520" width="180" height="64" rx="6"/>
+  <text class="label" x="652" y="548">ch5  (_dist)</text>
+  <text class="tiny" x="652" y="568">az-c</text>
+  <rect class="store" x="852" y="520" width="180" height="64" rx="6"/>
+  <text class="label" x="872" y="548">ch6  (_dist)</text>
+  <text class="tiny" x="872" y="568">az-c</text>
+
+  <!-- Arrows: preferred (zone A) -->
+  <path class="preferred" d="M 400 452 C 500 400, 540 220, 630 192"/>
+  <path class="preferred" d="M 400 456 C 520 430, 700 300, 850 192"/>
+
+  <!-- Arrows: failover (dashed to other zones) -->
+  <path class="failover" d="M 400 462 C 500 470, 540 400, 630 372"/>
+  <path class="failover" d="M 400 470 C 520 560, 540 560, 630 552"/>
+
+  <!-- zone resolution feeds the pool -->
+  <path class="arrow dashed" d="M 220 184 L 220 248"/>
+
+  <!-- Legend -->
+  <rect class="panel" x="40" y="616" width="1012" height="80" rx="8"/>
+  <text class="label" x="60" y="642">Legend</text>
+  <line class="preferred" x1="150" y1="662" x2="210" y2="662"/>
+  <text class="small" x="220" y="666">local-zone selection (preferred, round-robin)</text>
+  <line class="failover" x1="560" y1="662" x2="620" y2="662"/>
+  <text class="small" x="630" y="666">failover to another zone (only when no local endpoint answers)</text>
+  <text class="tiny" x="60" y="686">Every endpoint hosts the _dist wrapper tables: a _dist query/insert is correct from any node (docs/schemas.md §7), so spreading only changes which node coordinates the identical query.</text>
+</svg>

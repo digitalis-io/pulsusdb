@@ -5,7 +5,7 @@
 //! YAML/default value in place.
 
 use crate::error::ConfigError;
-use crate::model::{ChAuth, Config};
+use crate::model::{ChAuth, ChServerEntry, Config};
 use crate::secret::Secret;
 use crate::units::{ByteSize, HumanDuration, parse_bytes, parse_duration};
 
@@ -24,6 +24,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_CORS_ORIGIN",
     "PULSUS_QUERY_TIMEOUT",
     "CLICKHOUSE_SERVER",
+    "CLICKHOUSE_SERVERS",
     "CLICKHOUSE_PORT",
     "CLICKHOUSE_HTTP_PORT",
     "CLICKHOUSE_DB",
@@ -39,6 +40,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_CLUSTER",
     "PULSUS_DIST_SUFFIX",
     "PULSUS_SKIP_UNAVAILABLE_SHARDS",
+    "PULSUS_AVAILABILITY_ZONE",
+    "PULSUS_AZ_DETECT",
     "PULSUS_BATCH_BYTES",
     "PULSUS_BATCH_MS",
     "PULSUS_INSERT_MODE",
@@ -163,6 +166,22 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("CLICKHOUSE_SERVER") {
         cfg.clickhouse.server = v;
     }
+    if let Some(v) = read("CLICKHOUSE_SERVERS") {
+        // Comma-separated `host[:port][=zone]`; empty items (e.g. a trailing
+        // comma) are skipped so a stray separator is not a parse error.
+        let mut servers = Vec::new();
+        for part in v.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            servers.push(
+                part.parse::<ChServerEntry>()
+                    .map_err(|msg| env_err("CLICKHOUSE_SERVERS", msg))?,
+            );
+        }
+        cfg.clickhouse.servers = servers;
+    }
     if let Some(v) = read("CLICKHOUSE_PORT") {
         cfg.clickhouse.port = parse_int("CLICKHOUSE_PORT", &v)?;
     }
@@ -209,6 +228,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_SKIP_UNAVAILABLE_SHARDS") {
         cfg.skip_unavailable_shards = parse_bool("PULSUS_SKIP_UNAVAILABLE_SHARDS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_AVAILABILITY_ZONE") {
+        cfg.availability_zone = Some(v);
+    }
+    if let Some(v) = read("PULSUS_AZ_DETECT") {
+        cfg.az_detect = parse_enum("PULSUS_AZ_DETECT", &v)?;
     }
     if let Some(v) = read("PULSUS_BATCH_BYTES") {
         cfg.writer.batch_bytes = parse_size("PULSUS_BATCH_BYTES", &v)?;
@@ -315,8 +340,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            54,
-            "docs/configuration.md §§1-8 document exactly 54 variables"
+            57,
+            "docs/configuration.md §§1-8 document exactly 57 variables"
         );
     }
 

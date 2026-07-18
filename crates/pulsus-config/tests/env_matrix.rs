@@ -74,6 +74,19 @@ const ROWS: &[Row] = &[
         check: |c| c.clickhouse.server == "row-ch",
     },
     Row {
+        var: "CLICKHOUSE_SERVERS",
+        value: "ch1:8123=az-a,ch2=az-b",
+        check: |c| {
+            c.clickhouse.servers.len() == 2
+                && c.clickhouse.servers[0].host == "ch1"
+                && c.clickhouse.servers[0].http_port == Some(8123)
+                && c.clickhouse.servers[0].zone.as_deref() == Some("az-a")
+                && c.clickhouse.servers[1].host == "ch2"
+                && c.clickhouse.servers[1].http_port.is_none()
+                && c.clickhouse.servers[1].zone.as_deref() == Some("az-b")
+        },
+    },
+    Row {
         var: "CLICKHOUSE_PORT",
         value: "9111",
         check: |c| c.clickhouse.port == 9111,
@@ -150,6 +163,16 @@ const ROWS: &[Row] = &[
         var: "PULSUS_SKIP_UNAVAILABLE_SHARDS",
         value: "true",
         check: |c| c.skip_unavailable_shards,
+    },
+    Row {
+        var: "PULSUS_AVAILABILITY_ZONE",
+        value: "az-a",
+        check: |c| c.availability_zone.as_deref() == Some("az-a"),
+    },
+    Row {
+        var: "PULSUS_AZ_DETECT",
+        value: "auto",
+        check: |c| c.az_detect == pulsus_config::AzDetect::Auto,
     },
     Row {
         var: "PULSUS_BATCH_BYTES",
@@ -311,8 +334,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        54,
-        "docs/configuration.md §§1-8 document exactly 54 variables"
+        57,
+        "docs/configuration.md §§1-8 document exactly 57 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

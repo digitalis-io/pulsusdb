@@ -19,8 +19,9 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CLICKHOUSE_SERVER` | `localhost` | host |
-| `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)) |
+| `CLICKHOUSE_SERVER` | `localhost` | host (single-endpoint deployments; superseded by `CLICKHOUSE_SERVERS` when that is set) |
+| `CLICKHOUSE_SERVERS` | unset | comma-separated multi-endpoint list `host[:port][=zone]` for connection spreading — e.g. `ch1:8123=az-a,ch2:8123=az-a,ch3:8123=az-b`. Omitted port ⇒ `CLICKHOUSE_HTTP_PORT`; omitted zone ⇒ unzoned. See [Connection spreading & AZ affinity](#connection-spreading--az-affinity). IPv6 literals (which contain `:`) must use the YAML `clickhouse.servers:` objects, not this flat form |
+| `CLICKHOUSE_HTTP_PORT` | `8123` | HTTP-interface port — the port the chosen transport uses ([ADR 0001](decisions/0001-clickhouse-client.md)); also the per-endpoint port fallback for `CLICKHOUSE_SERVERS` entries that omit one |
 | `CLICKHOUSE_PORT` | `9000` | native-protocol port; reserved for the documented fallback client, unused by the current transport |
 | `CLICKHOUSE_DB` | `pulsus` | database (created by `init`/startup unless `PULSUS_SKIP_DDL=1`) |
 | `CLICKHOUSE_PROTO` | `http` | `http` \| `https` (TLS to ClickHouse). `native` is reserved for the fallback client and rejected at startup with an error citing ADR 0001 |
@@ -47,6 +48,20 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 | `PULSUS_CLUSTER` | unset | ClickHouse cluster name; enables `ON CLUSTER` DDL, `Replicated*` engines, and `_dist` tables |
 | `PULSUS_DIST_SUFFIX` | `_dist` | suffix of Distributed tables targeted by readers (set differently for cross-cluster read topologies) |
 | `PULSUS_SKIP_UNAVAILABLE_SHARDS` | `false` | serve degraded reads when a shard is down |
+| `PULSUS_AVAILABILITY_ZONE` | unset | this node's own availability zone; when set, the connection pool prefers `CLICKHOUSE_SERVERS` endpoints whose zone matches (see below). An explicit value always wins over `PULSUS_AZ_DETECT` |
+| `PULSUS_AZ_DETECT` | `off` | when `PULSUS_AVAILABILITY_ZONE` is unset, auto-detect this node's zone from cloud instance metadata at startup: `off` \| `aws` \| `gcp` \| `azure` \| `auto` (tries each). Detection is fail-soft (any failure/timeout ⇒ unzoned) |
+
+### Connection spreading & AZ affinity
+
+By default PulsusDB dials one ClickHouse endpoint (`CLICKHOUSE_SERVER`/`CLICKHOUSE_HTTP_PORT`) and relies on the `_dist` tables for cross-shard fan-out. Setting `CLICKHOUSE_SERVERS` instead makes the connection pool hold one client **per endpoint** and spread separate queries across them (a single streaming cursor stays pinned to one endpoint for its whole life). The concurrency bound (`PULSUS_CH_POOL_SIZE`) is unchanged — it is a total, not per-endpoint, limit.
+
+Selection is **zone-preferring round-robin**: endpoints whose `zone` matches this node's `PULSUS_AVAILABILITY_ZONE` are used first (round-robin among them), saving cross-AZ network cost; when none is configured or reachable the pool spreads evenly across all endpoints. On a transport failure (connection/timeout/IO or a retryable server code — never a bad-SQL/logic error) the failing endpoint is demoted for a short cooldown and the next request fails over to another zone, returning to local endpoints once one recovers. There is no health ping on the healthy hot path.
+
+`PULSUS_AZ_DETECT` populates this node's zone from the provider metadata service when you have not set `PULSUS_AVAILABILITY_ZONE` explicitly: AWS uses IMDSv2 (token-required), GCP `metadata.google.internal`, Azure the instance-metadata endpoint. It is a one-time startup probe, individually time-bounded, and fail-soft — off-cloud or when IMDS is blocked it simply leaves the zone unset. The zone strings it returns (e.g. `us-east-1a`, `us-central1-a`) must match the `=zone` labels you give `CLICKHOUSE_SERVERS` for affinity to take effect.
+
+**Topology requirement:** every endpoint listed in `CLICKHOUSE_SERVERS` must be a cluster member that hosts the `_dist` wrapper tables, because a `_dist` query/insert is correct from any node (docs/schemas.md §7) — spreading only changes which node coordinates the identical query, never the result.
+
+See [docs/connection-spreading.md](connection-spreading.md) for the pool architecture, the failover model, and the AZ auto-detection flow (with a diagram).
 
 Deployment topologies:
 

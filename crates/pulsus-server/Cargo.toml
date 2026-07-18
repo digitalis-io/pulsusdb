@@ -39,6 +39,15 @@ pulsus-read = { path = "../pulsus-read" }
 pulsus-traceql = { path = "../pulsus-traceql" }
 pulsus-schema = { path = "../pulsus-schema" }
 pulsus-write = { path = "../pulsus-write" }
+# Issue #43: one-time cloud instance-metadata probe for availability-zone
+# auto-detection at startup (`azdetect.rs`). This crate itself needs no TLS —
+# it only talks plain HTTP to a link-local endpoint — so it requests reqwest
+# with default features off (a whole-workspace build may still resolve a
+# TLS-enabled reqwest for another crate, e.g. `pulsus-e2e`; the point here is
+# that azdetect does not depend on it). The client disables proxies (a
+# configured HTTP proxy must never intercept a link-local metadata call —
+# SSRF hardening).
+reqwest = { version = "0.12", default-features = false }
 # `traces_api` (issue #55) decodes the stored per-span payloads as OTLP
 # `TracesData` and encodes the assembled trace as protobuf
 # (`prost::Message`) or OTLP-canonical protojson (the crate's `with-serde`

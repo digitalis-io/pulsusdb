@@ -25,8 +25,8 @@ pub use env::ALL_ENV_VARS;
 pub use error::ConfigError;
 pub use load::{load, parse};
 pub use model::{
-    ChAuth, ChProto, ClickHouseConfig, Config, DownsamplingConfig, InsertMode, LogLevel, Mode,
-    ReaderConfig, RulerConfig, Tier, TierPolicy, WriterConfig,
+    AzDetect, ChAuth, ChProto, ChServerEntry, ClickHouseConfig, Config, DownsamplingConfig,
+    InsertMode, LogLevel, Mode, ReaderConfig, RulerConfig, Tier, TierPolicy, WriterConfig,
 };
 pub use secret::Secret;
 pub use units::{ByteSize, HumanDuration, UnitError};

@@ -1805,6 +1805,7 @@ dependencies = [
  "pulsus-schema",
  "pulsus-traceql",
  "pulsus-write",
+ "reqwest",
  "serde",
  "serde_json",
  "snap",

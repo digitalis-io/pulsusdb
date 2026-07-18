@@ -11,6 +11,7 @@ use clap::Parser;
 use pulsus_config::Mode;
 
 mod app;
+mod azdetect;
 mod chconfig;
 mod compat;
 mod ingest;
@@ -49,8 +50,18 @@ async fn main() -> ExitCode {
     let cli = Cli::parse(); // clap handles --version/--help and exits.
 
     match pulsus_config::load(cli.config.as_deref(), cli.mode.as_deref()) {
-        Ok(config) if config.mode == Mode::Init => schema_init::run(&config).await,
-        Ok(config) => serve::run(config).await,
+        Ok(mut config) => {
+            // Issue #43: resolve this node's availability zone before any
+            // ClickHouse connection is built. No-op unless the operator
+            // opted into auto-detection and did not hard-set the zone; the
+            // resolved `local_zone` then flows through `conn_config_from`.
+            azdetect::resolve_local_zone(&mut config).await;
+            if config.mode == Mode::Init {
+                schema_init::run(&config).await
+            } else {
+                serve::run(config).await
+            }
+        }
         Err(err) => {
             eprintln!("pulsusdb: {err}");
             ExitCode::FAILURE

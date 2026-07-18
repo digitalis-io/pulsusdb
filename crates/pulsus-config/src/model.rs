@@ -47,6 +47,16 @@ pub struct Config {
     pub cluster: Option<String>,
     pub dist_suffix: String,
     pub skip_unavailable_shards: bool,
+    /// This PulsusDB node's own availability zone (issue #43). When set,
+    /// the ClickHouse connection pool prefers endpoints (see
+    /// `clickhouse.servers`) whose `zone` matches, failing over to other
+    /// zones only when no local endpoint answers. Left unset (and
+    /// `az_detect: off`), the pool spreads evenly across all endpoints.
+    pub availability_zone: Option<String>,
+    /// `PULSUS_AZ_DETECT` (issue #43): when `availability_zone` is not set
+    /// explicitly, how to determine this node's zone from cloud instance
+    /// metadata at startup (`off` — the default — leaves it unset).
+    pub az_detect: AzDetect,
     // Nested subsystem objects
     pub clickhouse: ClickHouseConfig,
     pub writer: WriterConfig,
@@ -75,6 +85,8 @@ impl Default for Config {
             cluster: None,
             dist_suffix: "_dist".to_string(),
             skip_unavailable_shards: false,
+            availability_zone: None,
+            az_detect: AzDetect::default(),
             clickhouse: ClickHouseConfig::default(),
             writer: WriterConfig::default(),
             reader: ReaderConfig::default(),
@@ -109,6 +121,12 @@ pub struct ClickHouseConfig {
     pub proto: ChProto,
     pub tls_skip_verify: bool,
     pub pool_size: u32,
+    /// Multi-endpoint connection list (issue #43). **Empty** (the default)
+    /// keeps the single-endpoint behavior driven by `server`/`http_port`.
+    /// When populated, the connection pool holds one client per entry and
+    /// spreads requests across them (availability-zone aware). An entry that
+    /// omits `http_port` inherits `clickhouse.http_port`.
+    pub servers: Vec<ChServerEntry>,
 }
 
 impl Default for ClickHouseConfig {
@@ -122,7 +140,60 @@ impl Default for ClickHouseConfig {
             proto: ChProto::default(),
             tls_skip_verify: false,
             pool_size: 8,
+            servers: Vec::new(),
         }
+    }
+}
+
+/// One entry in `clickhouse.servers` / `CLICKHOUSE_SERVERS` (issue #43): a
+/// ClickHouse endpoint the connection pool may dial. `http_port` falls back
+/// to `clickhouse.http_port` when omitted; `zone` names the endpoint's
+/// availability zone for the pool's zone-preferring selection policy.
+///
+/// The flat env form parses `host[:port][=zone]` via [`FromStr`] (e.g.
+/// `ch1:8123=az-a`); YAML uses object entries. IPv6 literals (which contain
+/// `:`) are only expressible via the YAML `servers:` objects, not the flat
+/// env string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChServerEntry {
+    pub host: String,
+    #[serde(default)]
+    pub http_port: Option<u16>,
+    #[serde(default)]
+    pub zone: Option<String>,
+}
+
+impl std::str::FromStr for ChServerEntry {
+    type Err = String;
+
+    /// Parses `host[:port][=zone]`. The zone (after `=`) is split off first,
+    /// then an optional `:port` from the right of the host (so a bare host,
+    /// `host:port`, `host=zone`, and `host:port=zone` all parse). An empty
+    /// zone (`host=`) is treated as no zone.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (hostport, zone) = match s.split_once('=') {
+            Some((hp, z)) if !z.is_empty() => (hp, Some(z.to_string())),
+            Some((hp, _)) => (hp, None),
+            None => (s, None),
+        };
+        let (host, http_port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => {
+                let port = p
+                    .parse::<u16>()
+                    .map_err(|e| format!("invalid port {p:?} in server entry {s:?}: {e}"))?;
+                (h.to_string(), Some(port))
+            }
+            None => (hostport.to_string(), None),
+        };
+        if host.trim().is_empty() {
+            return Err(format!("empty host in server entry {s:?}"));
+        }
+        Ok(ChServerEntry {
+            host,
+            http_port,
+            zone,
+        })
     }
 }
 
@@ -404,6 +475,38 @@ impl std::str::FromStr for ChProto {
     }
 }
 
+/// `PULSUS_AZ_DETECT` (docs/configuration.md §4, issue #43): how this node's
+/// own availability zone is determined when `availability_zone` is not set
+/// explicitly. `off` (default) leaves it unset (spread evenly); the cloud
+/// variants read the provider's instance-metadata service at startup; `auto`
+/// tries each provider in turn. An explicitly-set `availability_zone` always
+/// wins over any detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AzDetect {
+    #[default]
+    Off,
+    Aws,
+    Gcp,
+    Azure,
+    Auto,
+}
+
+impl std::str::FromStr for AzDetect {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(AzDetect::Off),
+            "aws" => Ok(AzDetect::Aws),
+            "gcp" => Ok(AzDetect::Gcp),
+            "azure" => Ok(AzDetect::Azure),
+            "auto" => Ok(AzDetect::Auto),
+            _ => Err("one of: off, aws, gcp, azure, auto".to_string()),
+        }
+    }
+}
+
 /// `PULSUS_INSERT_MODE` (docs/configuration.md §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -535,6 +638,58 @@ mod tests {
     #[test]
     fn ch_auth_without_colon_is_a_parse_error() {
         assert!("no-colon-here".parse::<ChAuth>().is_err());
+    }
+
+    #[test]
+    fn ch_server_entry_parses_host_port_and_zone() {
+        let e: ChServerEntry = "ch1:8123=az-a".parse().unwrap();
+        assert_eq!(e.host, "ch1");
+        assert_eq!(e.http_port, Some(8123));
+        assert_eq!(e.zone.as_deref(), Some("az-a"));
+    }
+
+    #[test]
+    fn ch_server_entry_bare_host_has_no_port_or_zone() {
+        let e: ChServerEntry = "ch2".parse().unwrap();
+        assert_eq!(e.host, "ch2");
+        assert_eq!(e.http_port, None);
+        assert_eq!(e.zone, None);
+    }
+
+    #[test]
+    fn ch_server_entry_host_with_zone_only() {
+        let e: ChServerEntry = "ch3=az-b".parse().unwrap();
+        assert_eq!(e.host, "ch3");
+        assert_eq!(e.http_port, None);
+        assert_eq!(e.zone.as_deref(), Some("az-b"));
+    }
+
+    #[test]
+    fn ch_server_entry_host_with_port_only() {
+        let e: ChServerEntry = "ch4:9000".parse().unwrap();
+        assert_eq!(e.host, "ch4");
+        assert_eq!(e.http_port, Some(9000));
+        assert_eq!(e.zone, None);
+    }
+
+    #[test]
+    fn ch_server_entry_empty_zone_is_none() {
+        let e: ChServerEntry = "ch5:8123=".parse().unwrap();
+        assert_eq!(e.zone, None);
+    }
+
+    #[test]
+    fn ch_server_entry_rejects_bad_port_and_empty_host() {
+        assert!("ch:notaport".parse::<ChServerEntry>().is_err());
+        assert!(":8123".parse::<ChServerEntry>().is_err());
+    }
+
+    #[test]
+    fn az_detect_from_str_rejects_unknown_with_valid_set() {
+        assert_eq!("auto".parse::<AzDetect>().unwrap(), AzDetect::Auto);
+        assert_eq!("off".parse::<AzDetect>().unwrap(), AzDetect::Off);
+        let err = "bogus".parse::<AzDetect>().unwrap_err();
+        assert!(err.contains("off, aws, gcp, azure, auto"), "{err}");
     }
 
     #[test]
