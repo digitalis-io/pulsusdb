@@ -25,8 +25,10 @@ scenario registered for `<v>` automatically.
   (issue #15, `e2e/src/scenarios.rs`'s `logs_roundtrip` scenario): an array
   of `streams`, each `{ service, scope_name?, scope_version?,
   resource_attrs{}, scope_attrs{}, lines: [{ ts_offset_ns, body }] }`.
-  Covers 4 services, otel scope identity labels, a `resource_attrs`/
-  `scope_attrs` key collision (`billing`'s `env`), and a non-ASCII/
+  Covers 4 services, scope identity in per-entry structured metadata
+  (`scope_name`/`scope_version` — issue #109, Loki 3.4.2 parity, not stream
+  labels), a resource-label vs. scope-attribute key collision (`billing`'s
+  `env`, surfacing as `env_extracted` via the #97 SM merge), and a non-ASCII/
   JSON-ish body (`checkout`'s `café ☕` line). Timestamps are
   `base_ns + ts_offset_ns`, with `base_ns` computed at scenario run time —
   never a fixed past date, so the fixture stays inside

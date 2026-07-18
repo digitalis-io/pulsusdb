@@ -128,18 +128,48 @@ pub const MAX_TOTAL_ENTRIES_PER_REQUEST: usize = 5_000_000;
 /// nothing), never a silent truncation.
 pub const MAX_STRUCTURED_METADATA_PER_ENTRY: usize = 256;
 
-/// Canonicalizes one entry's structured-metadata pairs into the stored
-/// `log_samples.structured_metadata` JSON String (issue #97).
+/// The infallible canonicalization/serialization core shared by every
+/// structured-metadata producer — the Loki-push receiver
+/// ([`canonical_structured_metadata`]) and the OTLP-logs scope path
+/// (`otlp_logs::build_scope_structured_metadata`, issue #109). Both funnel
+/// through this one seam so the stored `log_samples.structured_metadata`
+/// String is byte-identical across transports by construction.
 ///
 /// - The **empty** set yields `""` (an empty string, NOT `"{}"`) so the read
 ///   path's `structured_metadata.is_empty()` fast-path branch stays on the
 ///   zero-structured-metadata path for entries that carry none — the common
 ///   case, and the byte-identity invariant for pre-#97 data.
-/// - A non-empty set is charged against [`MAX_STRUCTURED_METADATA_PER_ENTRY`]
-///   **before** the `LabelSet`/JSON is built (charge-before-allocate), then
-///   normalized through the same [`LabelSet::from_normalized`] +
-///   `to_canonical_json` seam stream labels use, so a structured-metadata JSON
-///   string is byte-identical in shape to a stream-labels JSON string.
+/// - A non-empty set is normalized through the same `LabelSet::from_normalized`
+///   then `to_canonical_json` seam stream labels use, so a structured-metadata
+///   JSON string is byte-identical in shape to a stream-labels JSON string.
+///   The normalization collision count is intentionally discarded: SM is
+///   per-entry and never contributes to the stream-label collision metric.
+///
+/// This core carries **no** cardinality cap — the Loki-push cap check lives in
+/// [`canonical_structured_metadata`] (charge-before-allocate, before this is
+/// reached), and the OTLP path is intentionally uncapped (matching OTLP
+/// `parse`'s existing unbounded-label, infallible behaviour). The OTLP path
+/// pre-resolves its own last-write-wins collisions (Loki's rule) *before*
+/// calling this, so `from_normalized` here only ever sees already-unique
+/// sanitized keys and its own collision path is not exercised there.
+pub(crate) fn structured_metadata_json(
+    pairs: impl IntoIterator<Item = (String, String)>,
+) -> String {
+    let mut iter = pairs.into_iter().peekable();
+    if iter.peek().is_none() {
+        return String::new();
+    }
+    let (labels, _collisions) = LabelSet::from_normalized(iter);
+    labels.to_canonical_json()
+}
+
+/// Canonicalizes one Loki-push entry's structured-metadata pairs into the
+/// stored `log_samples.structured_metadata` JSON String (issue #97). Charges
+/// the [`MAX_STRUCTURED_METADATA_PER_ENTRY`] per-entry cardinality bound
+/// **before** the `LabelSet`/JSON is built (charge-before-allocate) — an entry
+/// carrying more than that is a whole-request [`LogsIngestError::OversizeMessage`]
+/// (Loki is all-or-nothing), never a silent truncation — then delegates to the
+/// shared [`structured_metadata_json`] core.
 fn canonical_structured_metadata(
     pair_count: usize,
     pairs: impl IntoIterator<Item = (String, String)>,
@@ -154,10 +184,7 @@ fn canonical_structured_metadata(
             actual: pair_count,
         });
     }
-    // The normalization collision count is intentionally discarded: SM is
-    // per-entry and never contributes to the stream-label collision metric.
-    let (labels, _collisions) = LabelSet::from_normalized(pairs);
-    Ok(labels.to_canonical_json())
+    Ok(structured_metadata_json(pairs))
 }
 
 /// Decodes a (decompressed) snappy-protobuf `POST /loki/api/v1/push` body,

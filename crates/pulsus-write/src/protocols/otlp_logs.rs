@@ -1,9 +1,12 @@
 //! OTLP logs parser (issue #8 architect plan, docs/architecture.md §4): a
 //! pure `bytes -> ExportLogsServiceRequest -> ParsedLogs` pipeline with no
-//! I/O. Resource + scope attributes flatten through the frozen canonical
-//! label model (`pulsus_model::LabelSet::from_normalized` ->
-//! `stream_fingerprint`, issue #4) — fingerprints and the `service` column
-//! derive *only* via `pulsus-model`, never re-derived here.
+//! I/O. **Resource** attributes flatten through the frozen canonical label
+//! model (`pulsus_model::LabelSet::from_normalized` -> `stream_fingerprint`,
+//! issue #4) as stream labels; the log record's `InstrumentationScope`
+//! (name, version, and attributes) lands in per-entry **structured
+//! metadata**, never stream labels (issue #109 — Loki 3.4.2 parity), so
+//! scope leaves the stream fingerprint. Fingerprints and the `service`
+//! column derive *only* via `pulsus-model`, never re-derived here.
 
 use std::collections::HashSet;
 
@@ -13,9 +16,12 @@ use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano, stream_fingerprint};
+use pulsus_model::{
+    Date, Fingerprint, LabelSet, UnixNano, canonicalize_label_key, stream_fingerprint,
+};
 
 use crate::error::LogsIngestError;
+use crate::protocols::loki_push::structured_metadata_json;
 
 /// A `SeverityNumber` outside this range (including the `0`/unset default)
 /// resolves to severity `0` (architect plan: `severity = severity_number`
@@ -35,9 +41,13 @@ pub struct LogRow {
     /// sorted-key JSON String — the same representation as
     /// `log_streams.labels` (`LabelSet::to_canonical_json`; docs/schemas.md
     /// §1 rejects `Map(String,String)` for label-shaped data). Empty string
-    /// = no structured metadata. The OTLP path always leaves this empty
-    /// (OTLP record attributes are out of scope — Loki-only); only the Loki
-    /// push receiver populates it.
+    /// = no structured metadata. On the OTLP path this carries the log
+    /// record's `InstrumentationScope` — `scope_name`/`scope_version` (each
+    /// empty-suppressed) plus scope attributes under sanitized keys (issue
+    /// #109, Loki 3.4.2 parity); on the Loki-push path it carries the
+    /// entry's `structuredMetadata` pairs. Both funnel through the identical
+    /// [`structured_metadata_json`] seam, so the stored String is
+    /// byte-identical in shape across transports.
     pub structured_metadata: String,
 }
 
@@ -116,14 +126,17 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
 
     for resource_logs in &req.resource_logs {
         for scope_logs in &resource_logs.scope_logs {
-            // Label set + fingerprint computed once per ScopeLogs
-            // (resource ⊕ scope), reused across every record in it —
+            // Stream labels + fingerprint computed once per ScopeLogs
+            // (resource attributes ONLY — scope is structured metadata, not
+            // a stream label; issue #109), reused across every record in it —
             // never re-derived per record.
-            let (labels, collisions) =
-                build_scope_labels(resource_logs.resource.as_ref(), scope_logs);
+            let (labels, collisions) = build_stream_labels(resource_logs.resource.as_ref());
             out.collisions += collisions as u64;
             let fingerprint = stream_fingerprint(&labels);
             let service = labels.service().to_string();
+            // The scope's per-entry structured metadata, computed once per
+            // ScopeLogs and cloned onto every record it contains.
+            let structured_metadata = build_scope_structured_metadata(scope_logs);
 
             for record in &scope_logs.log_records {
                 let timestamp_ns = match resolve_timestamp_ns(record, now_ns) {
@@ -154,9 +167,9 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
                     timestamp_ns: UnixNano(timestamp_ns),
                     severity: resolve_severity(record.severity_number),
                     body: any_value_to_string(record.body.as_ref()),
-                    // OTLP record attributes are out of scope (issue #97) —
-                    // structured metadata is a Loki-push-only concept here.
-                    structured_metadata: String::new(),
+                    // The scope's structured metadata (issue #109), shared by
+                    // every record in this ScopeLogs.
+                    structured_metadata: structured_metadata.clone(),
                 });
             }
         }
@@ -165,41 +178,71 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
     out
 }
 
-/// Flattens `resource.attributes ⊕ otel_scope_name/version ⊕
-/// scope.attributes` as ONE iterator into
-/// [`LabelSet::from_normalized`] — no source precedence override, a
-/// collision between e.g. a resource attribute and a scope attribute
-/// resolves by `from_normalized`'s frozen deterministic rule (issue #4)
-/// and is counted, never swapped. `otel_scope_name`/`otel_scope_version`
-/// are emitted only when `scope_logs.scope` is present (task-manager
-/// resolution: "absent scopes emit nothing") **and the respective value is
-/// non-empty** — a present-but-empty `InstrumentationScope` (`name`/
-/// `version` `""`) adds NO scope labels, exactly as an absent scope does.
-/// The OTel Collector materializes an empty `scope` on every re-export
-/// (even for records that carried none), so without this an empty
-/// `otel_scope_name`/`otel_scope_version` would attach to every
-/// collector-ingested stream — growing its label set past what a
-/// Prometheus/Loki store produces (both treat an empty label value as
-/// absent and never promote an empty OTLP scope), which silently breaks
-/// stream-label-set parity for the standard collector ingest path.
-fn build_scope_labels(resource: Option<&Resource>, scope_logs: &ScopeLogs) -> (LabelSet, usize) {
+/// Flattens `resource.attributes` — and ONLY those — into the stream
+/// [`LabelSet`] via [`LabelSet::from_normalized`] (issue #109: scope name/
+/// version/attributes are structured metadata, not stream labels — Loki
+/// 3.4.2 parity). A collision between two resource attributes resolves by
+/// `from_normalized`'s frozen deterministic rule (issue #4) and is counted,
+/// never swapped. Because scope no longer enters this set, `stream_fingerprint`
+/// is a pure function of the resource labels — a stream pushed with vs.
+/// without scope fingerprints identically, exactly as Loki does.
+fn build_stream_labels(resource: Option<&Resource>) -> (LabelSet, usize) {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let scope = scope_logs.scope.as_ref();
-    let scope_identity = scope
-        .into_iter()
-        .flat_map(|s| {
-            [
-                ("otel_scope_name".to_string(), s.name.clone()),
-                ("otel_scope_version".to_string(), s.version.clone()),
-            ]
-        })
-        .filter(|(_, value)| !value.is_empty());
-    let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
+    LabelSet::from_normalized(attr_pairs(resource_attrs))
+}
 
-    let pairs = attr_pairs(resource_attrs)
-        .chain(scope_identity)
-        .chain(attr_pairs(scope_attrs));
-    LabelSet::from_normalized(pairs)
+/// Builds the per-entry structured-metadata JSON String carrying a log
+/// record's `InstrumentationScope` (issue #109 — Loki 3.4.2 parity, live-
+/// probe-pinned). Absent scope -> `""`.
+///
+/// Loki's placement rule is an ordered list `[scope attributes in wire order …,
+/// scope_name (iff non-empty), scope_version (iff non-empty)]`, resolved to
+/// unique sanitized keys by **last-write-wins per sanitized key**:
+///
+/// - **(a)** a scope attribute whose sanitized key collides with
+///   `scope_name`/`scope_version` LOSES — identity is appended last, so it
+///   overwrites the attribute regardless of the attribute's value or list
+///   position.
+/// - **(b)** two attributes sanitizing to the same key resolve to the LAST in
+///   wire order (NOT by key/value — the property `LabelSet::from_normalized`'s
+///   order-independent greatest-key/greatest-value rule cannot satisfy).
+/// - **(c)** an empty-valued scope *attribute* is KEPT; only scope
+///   *name*/*version* are empty-suppressed (#108).
+///
+/// The resolution is done explicitly HERE, before the [`structured_metadata_json`]
+/// seam, because `from_normalized` mis-resolves (a)/(b). Keys are sanitized with
+/// the same [`canonicalize_label_key`] primitive `from_normalized` uses, so the
+/// post-resolution pairs are unique canonicalize fixed points — the seam then
+/// re-canonicalizes idempotently, finds no collision, and only sorts +
+/// JSON-encodes (byte-identical to the Loki-push SM representation).
+fn build_scope_structured_metadata(scope_logs: &ScopeLogs) -> String {
+    let Some(scope) = scope_logs.scope.as_ref() else {
+        return String::new();
+    };
+    // Ordered (sanitized_key, value): attributes in wire order (no empty-value
+    // filter — rule (c)), then identity appended last so it overwrites any
+    // colliding attribute (rule (a)); each identity field empty-suppressed (#108).
+    let mut ordered: Vec<(String, String)> = attr_pairs(&scope.attributes)
+        .map(|(key, value)| (canonicalize_label_key(&key), value))
+        .collect();
+    if !scope.name.is_empty() {
+        // `scope_name`/`scope_version` are already canonicalize fixed points.
+        ordered.push(("scope_name".to_string(), scope.name.clone()));
+    }
+    if !scope.version.is_empty() {
+        ordered.push(("scope_version".to_string(), scope.version.clone()));
+    }
+    // Last-write-wins per sanitized key (Loki's rule). Cardinality is tiny;
+    // a linear replace-in-place over insertion order needs no new dependency.
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
+    for (key, value) in ordered {
+        if let Some(slot) = resolved.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+        } else {
+            resolved.push((key, value));
+        }
+    }
+    structured_metadata_json(resolved)
 }
 
 /// Renders a `KeyValue` list to `(key, value)` label pairs, using the same
@@ -442,8 +485,43 @@ mod tests {
         assert_eq!(out.rows[0].service, "");
     }
 
+    /// Helper: builds a single-record request from a `ScopeLogs` and reads
+    /// back the resolved structured-metadata JSON on its one row.
+    fn scope_sm(scope: Option<InstrumentationScope>) -> String {
+        let record = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body("x"),
+            ..Default::default()
+        };
+        let out = parse(
+            &request(vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    scope,
+                    log_records: vec![record],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }]),
+            0,
+        );
+        out.rows[0].structured_metadata.clone()
+    }
+
+    fn scope(name: &str, version: &str, attributes: Vec<KeyValue>) -> InstrumentationScope {
+        InstrumentationScope {
+            name: name.to_string(),
+            version: version.to_string(),
+            attributes,
+            dropped_attributes_count: 0,
+        }
+    }
+
     #[test]
-    fn parse_emits_scope_identity_labels_when_scope_is_present() {
+    fn parse_places_scope_identity_in_structured_metadata_not_stream_labels() {
+        // AC-1 (issue #109): a non-empty scope yields per-entry structured
+        // metadata keyed `scope_name`/`scope_version`, and the scope keys are
+        // absent from the stream label set.
         let record = LogRecord {
             time_unix_nano: 1_700_000_000_000_000_000,
             body: string_body("x"),
@@ -458,38 +536,41 @@ mod tests {
             0,
         );
         assert_eq!(
-            out.streams[0].labels.get("otel_scope_name"),
-            Some("my-scope")
+            out.rows[0].structured_metadata,
+            r#"{"scope_name":"my-scope","scope_version":"1.0.0"}"#
         );
+        // Scope is NOT a stream label (neither the new nor the old key names).
+        assert_eq!(out.streams[0].labels.get("scope_name"), None);
+        assert_eq!(out.streams[0].labels.get("scope_version"), None);
+        assert_eq!(out.streams[0].labels.get("otel_scope_name"), None);
+        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
+    }
+
+    #[test]
+    fn parse_places_scope_attributes_in_structured_metadata_under_sanitized_keys() {
+        // Scope attributes -> SM under their sanitized attribute key
+        // (`scope.attr.foo` -> `scope_attr_foo`), alongside identity.
+        let sm = scope_sm(Some(scope(
+            "my-scope",
+            "1.0.0",
+            vec![kv("scope.attr.foo", Value::StringValue("bar".to_string()))],
+        )));
         assert_eq!(
-            out.streams[0].labels.get("otel_scope_version"),
-            Some("1.0.0")
+            sm,
+            r#"{"scope_attr_foo":"bar","scope_name":"my-scope","scope_version":"1.0.0"}"#
         );
     }
 
     #[test]
-    fn parse_emits_no_scope_labels_when_scope_is_present_but_empty() {
-        // The OTel Collector materializes a present-but-empty
-        // `InstrumentationScope` (name/version `""`) on every re-export,
-        // even for records that carried no scope. That must add NO stream
-        // labels — otherwise every collector-ingested stream grows
-        // `otel_scope_name=""`/`otel_scope_version=""`, diverging from a
-        // Prometheus/Loki reference store (empty label value == absent) and
-        // silently breaking stream-label-set parity.
+    fn parse_emits_no_scope_metadata_when_scope_is_present_but_empty() {
+        // AC-2 (issue #109): the OTel Collector materializes a present-but-
+        // empty `InstrumentationScope` (name/version `""`) on every re-export.
+        // That must add NO structured metadata — matching Loki's per-field
+        // empty-suppression (#108 parity, now in the SM surface).
         let record = LogRecord {
             time_unix_nano: 1_700_000_000_000_000_000,
             body: string_body("x"),
             ..Default::default()
-        };
-        let scope_logs = ScopeLogs {
-            scope: Some(InstrumentationScope {
-                name: String::new(),
-                version: String::new(),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            }),
-            log_records: vec![record],
-            schema_url: String::new(),
         };
         let out = parse(
             &request(vec![ResourceLogs {
@@ -501,75 +582,179 @@ mod tests {
                     dropped_attributes_count: 0,
                     entity_refs: vec![],
                 }),
-                scope_logs: vec![scope_logs],
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(scope("", "", vec![])),
+                    log_records: vec![record],
+                    schema_url: String::new(),
+                }],
                 schema_url: String::new(),
             }]),
             0,
         );
-        assert_eq!(out.streams[0].labels.get("otel_scope_name"), None);
-        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
-        // The real resource attribute is unaffected — only the empty scope
-        // identity is suppressed.
+        // Empty string (NOT "{}") keeps the read path on the zero-SM fast path.
+        assert_eq!(out.rows[0].structured_metadata, "");
+        // The real resource attribute remains a stream label.
         assert_eq!(out.streams[0].labels.get("service_name"), Some("checkout"));
     }
 
     #[test]
     fn parse_emits_only_the_non_empty_scope_identity_field() {
-        // A scope with a name but no version emits `otel_scope_name` only —
-        // the empty `otel_scope_version` is suppressed independently (Loki's
-        // per-field OTLP scope behaviour).
-        let record = LogRecord {
-            time_unix_nano: 1_700_000_000_000_000_000,
-            body: string_body("x"),
-            ..Default::default()
-        };
-        let scope_logs = ScopeLogs {
-            scope: Some(InstrumentationScope {
-                name: "my-scope".to_string(),
-                version: String::new(),
-                attributes: vec![],
-                dropped_attributes_count: 0,
-            }),
-            log_records: vec![record],
-            schema_url: String::new(),
-        };
-        let out = parse(
-            &request(vec![ResourceLogs {
-                resource: None,
-                scope_logs: vec![scope_logs],
-                schema_url: String::new(),
-            }]),
-            0,
-        );
-        assert_eq!(
-            out.streams[0].labels.get("otel_scope_name"),
-            Some("my-scope")
-        );
-        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
+        // AC-2: a scope with a name but no version emits `scope_name` only —
+        // the empty `scope_version` is suppressed independently.
+        let sm = scope_sm(Some(scope("my-scope", "", vec![])));
+        assert_eq!(sm, r#"{"scope_name":"my-scope"}"#);
     }
 
     #[test]
-    fn parse_emits_no_scope_labels_when_scope_is_absent() {
-        let record = LogRecord {
-            time_unix_nano: 1_700_000_000_000_000_000,
-            body: string_body("x"),
-            ..Default::default()
+    fn parse_emits_no_scope_metadata_when_scope_is_absent() {
+        assert_eq!(scope_sm(None), "");
+    }
+
+    // -- collision resolution (issue #109 v2, live-Loki-3.4.2-pinned) --------
+
+    #[test]
+    fn parse_scope_identity_wins_over_a_colliding_attribute_regardless_of_value_or_order() {
+        // Rule (a): an attribute sanitizing onto a scope-identity key LOSES —
+        // identity is appended last, so it wins irrespective of the
+        // attribute's value or list position. Probed both dotted and literal,
+        // with the attribute value lexically GREATER than the identity.
+        let dotted = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv(
+                "scope.name",
+                Value::StringValue("ZZZ_greater".to_string()),
+            )],
+        )));
+        assert_eq!(dotted, r#"{"scope_name":"N","scope_version":"1.0"}"#);
+        assert!(!dotted.contains("ZZZ_greater"));
+
+        let literal = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv(
+                "scope_name",
+                Value::StringValue("ZZZ_greater".to_string()),
+            )],
+        )));
+        assert_eq!(literal, r#"{"scope_name":"N","scope_version":"1.0"}"#);
+
+        let version_collision = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("scope.version", Value::StringValue("9.9.9".to_string()))],
+        )));
+        assert_eq!(
+            version_collision,
+            r#"{"scope_name":"N","scope_version":"1.0"}"#
+        );
+    }
+
+    #[test]
+    fn parse_two_attributes_sanitizing_to_one_key_resolve_by_last_write_wins() {
+        // Rule (b): two attributes sanitizing to the same key resolve to the
+        // LAST in wire order — NOT key-based, NOT value-based. Order-flipping
+        // flips the winner, the property `from_normalized`'s order-independent
+        // rule CANNOT satisfy (the regression guard against reverting to it).
+        let order1 = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![
+                kv("a.b", Value::StringValue("Z_first".to_string())),
+                kv("a_b", Value::StringValue("A_second".to_string())),
+            ],
+        )));
+        assert_eq!(
+            order1,
+            r#"{"a_b":"A_second","scope_name":"N","scope_version":"1.0"}"#
+        );
+
+        let flipped = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![
+                kv("a_b", Value::StringValue("A_first".to_string())),
+                kv("a.b", Value::StringValue("Z_second".to_string())),
+            ],
+        )));
+        assert_eq!(
+            flipped,
+            r#"{"a_b":"Z_second","scope_name":"N","scope_version":"1.0"}"#
+        );
+    }
+
+    #[test]
+    fn parse_keeps_empty_valued_scope_attribute_while_suppressing_empty_identity() {
+        // Rule (c): an empty-valued scope ATTRIBUTE is retained, while empty
+        // scope name/version stay suppressed — the deliberate asymmetry.
+        let kept = scope_sm(Some(scope(
+            "N",
+            "1.0",
+            vec![kv("emptyattr", Value::StringValue(String::new()))],
+        )));
+        assert_eq!(
+            kept,
+            r#"{"emptyattr":"","scope_name":"N","scope_version":"1.0"}"#
+        );
+
+        let empty_version = scope_sm(Some(scope(
+            "N",
+            "",
+            vec![kv("emptyattr", Value::StringValue(String::new()))],
+        )));
+        // `scope_version` absent (suppressed), `emptyattr` present (kept).
+        assert_eq!(empty_version, r#"{"emptyattr":"","scope_name":"N"}"#);
+    }
+
+    #[test]
+    fn parse_fingerprint_is_invariant_to_scope() {
+        // AC-3: two ScopeLogs with identical resource but different-or-absent
+        // scope produce the SAME fingerprint and one deduped StreamRow, with
+        // per-row SM differing — scope has left the stream fingerprint.
+        let resource = || {
+            Some(Resource {
+                attributes: vec![kv(
+                    "service.name",
+                    Value::StringValue("checkout".to_string()),
+                )],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            })
         };
-        let scope_logs = ScopeLogs {
-            scope: None,
-            log_records: vec![record],
-            schema_url: String::new(),
+        let record = |body: &str| LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body(body),
+            ..Default::default()
         };
         let out = parse(
             &request(vec![ResourceLogs {
-                resource: None,
-                scope_logs: vec![scope_logs],
+                resource: resource(),
+                scope_logs: vec![
+                    ScopeLogs {
+                        scope: Some(scope("my-scope", "1.0.0", vec![])),
+                        log_records: vec![record("with-scope")],
+                        schema_url: String::new(),
+                    },
+                    ScopeLogs {
+                        scope: None,
+                        log_records: vec![record("no-scope")],
+                        schema_url: String::new(),
+                    },
+                ],
                 schema_url: String::new(),
             }]),
-            0,
+            7,
         );
-        assert_eq!(out.streams[0].labels.get("otel_scope_name"), None);
-        assert_eq!(out.streams[0].labels.get("otel_scope_version"), None);
+        assert_eq!(out.rows.len(), 2);
+        // Both records share one fingerprint / one deduped stream row.
+        assert_eq!(out.rows[0].fingerprint, out.rows[1].fingerprint);
+        assert_eq!(out.streams.len(), 1);
+        // Per-row SM differs: scoped row carries scope metadata, the other none.
+        assert_eq!(
+            out.rows[0].structured_metadata,
+            r#"{"scope_name":"my-scope","scope_version":"1.0.0"}"#
+        );
+        assert_eq!(out.rows[1].structured_metadata, "");
     }
 
     #[test]
@@ -596,9 +781,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_counts_resource_scope_label_collisions() {
+    fn parse_counts_resource_label_collisions() {
+        // Only RESOURCE attributes are stream labels now (issue #109), so the
+        // collision metric counts collisions WITHIN the resource attribute set
+        // (two keys sanitizing to `a_b`). A scope-attribute collision is a
+        // structured-metadata concern and is NOT counted here.
         let resource = Resource {
-            attributes: vec![kv("env", Value::StringValue("from_resource".to_string()))],
+            attributes: vec![
+                kv("a.b", Value::StringValue("from_dot".to_string())),
+                kv("a_b", Value::StringValue("from_underscore".to_string())),
+            ],
             dropped_attributes_count: 0,
             entity_refs: vec![],
         };
@@ -611,7 +803,11 @@ mod tests {
             scope: Some(InstrumentationScope {
                 name: String::new(),
                 version: String::new(),
-                attributes: vec![kv("env", Value::StringValue("from_scope".to_string()))],
+                // A scope-attribute collision must NOT bump `collisions`.
+                attributes: vec![
+                    kv("s.k", Value::StringValue("one".to_string())),
+                    kv("s_k", Value::StringValue("two".to_string())),
+                ],
                 dropped_attributes_count: 0,
             }),
             log_records: vec![record],

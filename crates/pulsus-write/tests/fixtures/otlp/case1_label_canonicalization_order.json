@@ -13,16 +13,15 @@
   "body": "order placed",
   "golden": {
     "service": "orders",
-    "labels_json": "{\"deployment_environment\":\"prod\",\"k8s_pod_name\":\"pod-9\",\"otel_scope_name\":\"orders-scope\",\"otel_scope_version\":\"2.1.0\",\"service_name\":\"orders\"}",
-    "fingerprint": 11637247895724104092,
+    "labels_json": "{\"deployment_environment\":\"prod\",\"k8s_pod_name\":\"pod-9\",\"service_name\":\"orders\"}",
+    "structured_metadata_json": "{\"scope_name\":\"orders-scope\",\"scope_version\":\"2.1.0\"}",
+    "fingerprint": 5747284062854669674,
     "body": "order placed",
     "severity": 9,
     "timestamp_source": "time_unix_nano",
     "idx_pairs": [
       ["deployment_environment", "prod"],
       ["k8s_pod_name", "pod-9"],
-      ["otel_scope_name", "orders-scope"],
-      ["otel_scope_version", "2.1.0"],
       ["service_name", "orders"]
     ]
   }

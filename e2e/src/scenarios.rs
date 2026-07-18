@@ -629,25 +629,25 @@ async fn assert_stream_roundtrip(
             stream.service
         );
     }
+    // Scope name/version surface in `query_range`'s flattened `stream` object
+    // via the #97 structured-metadata merge — keyed `scope_name`/`scope_version`
+    // (issue #109, Loki 3.4.2 parity), NOT the former `otel_scope_*` stream
+    // labels (which no longer exist — scope is per-entry SM, not a stream
+    // label).
     if let Some(name) = &stream.scope_name
-        && labels.get("otel_scope_name").and_then(|v| v.as_str()) != Some(name.as_str())
+        && labels.get("scope_name").and_then(|v| v.as_str()) != Some(name.as_str())
     {
         bail!(
-            "stream for service {:?}: otel_scope_name label missing/mismatched: {labels:?}",
+            "stream for service {:?}: scope_name (structured metadata) missing/mismatched: \
+             {labels:?}",
             stream.service
         );
     }
-    // otel scope *version* (code review finding, issue #15 re-review):
-    // previously only `otel_scope_name` was asserted, leaving
-    // `otel_scope_version` — a distinct label `pulsus-write` emits
-    // whenever a scope is present — unverified.
     if stream.scope_name.is_some() {
         let expected_version = stream.scope_version.clone().unwrap_or_default();
-        if labels.get("otel_scope_version").and_then(|v| v.as_str())
-            != Some(expected_version.as_str())
-        {
+        if labels.get("scope_version").and_then(|v| v.as_str()) != Some(expected_version.as_str()) {
             bail!(
-                "stream for service {:?}: otel_scope_version label missing/mismatched \
+                "stream for service {:?}: scope_version (structured metadata) missing/mismatched \
                  (expected {expected_version:?}): {labels:?}",
                 stream.service
             );
@@ -663,15 +663,19 @@ async fn assert_stream_roundtrip(
             );
         }
     }
-    // scope-attribute normalization (code review finding, issue #15
-    // re-review): the fixture's `scope_attrs` (e.g. `payments`'s `team`)
-    // were never previously checked — only `resource_attrs` were.
+    // Scope attributes (e.g. `payments`'s `team`) surface in the flattened
+    // `query_range` labels via the #97 structured-metadata merge under their
+    // sanitized key (issue #109). A scope attribute whose key also exists as a
+    // resource stream label (`billing`'s `env`) surfaces under `<key>_extracted`
+    // by the merge's collision rule, while the base key stays present — so the
+    // presence check holds for both the colliding and non-colliding cases.
     for key in stream.scope_attrs.keys() {
         let normalized = normalize_label_key(key);
-        if !labels.contains_key(&normalized) {
+        let extracted = format!("{normalized}_extracted");
+        if !labels.contains_key(&normalized) && !labels.contains_key(&extracted) {
             bail!(
-                "stream for service {:?}: expected normalized scope-attr label {normalized:?} \
-                 missing from {labels:?}",
+                "stream for service {:?}: expected structured-metadata scope-attr label \
+                 {normalized:?} (or {extracted:?}) missing from {labels:?}",
                 stream.service
             );
         }
@@ -804,12 +808,14 @@ async fn assert_labels_and_series(
         );
     }
 
-    // otel scope name/version + scope-attr normalization, via `series`
-    // (code review finding, issue #15 re-review): `assert_stream_roundtrip`
-    // already checks these on `query_range`'s per-stream labels; this
-    // covers the same fixture facts through the `series` endpoint too,
-    // against a stream that actually carries `scope_attrs`
-    // (`representative`/`checkout` carries none).
+    // Scope PLACEMENT parity (issue #109, Loki 3.4.2): scope is per-entry
+    // structured metadata, NOT an indexed stream label — so `/series`
+    // (indexed labels only) must NOT surface any scope key. This asserts the
+    // absence, then proves scope is still selectable via a `| scope_name=`
+    // structured-metadata pipeline filter on `query_range` (the surface the
+    // #97 read path exposes, exactly as Loki does). Uses a stream that
+    // actually carries `scope_attrs` (`representative`/`checkout` carries
+    // none).
     if let Some(scope_stream) = fixture
         .streams
         .iter()
@@ -849,29 +855,69 @@ async fn assert_labels_and_series(
                 series.len()
             );
         }
-        let expected_version = scope_stream.scope_version.clone().unwrap_or_default();
-        if series[0].get("otel_scope_name").and_then(|v| v.as_str())
-            != scope_stream.scope_name.as_deref()
-            || series[0].get("otel_scope_version").and_then(|v| v.as_str())
-                != Some(expected_version.as_str())
-        {
-            bail!(
-                "series result for {:?} missing/mismatched otel scope labels: {:?}",
-                scope_stream.service,
-                series[0]
-            );
-        }
-        for key in scope_stream.scope_attrs.keys() {
-            let normalized = normalize_label_key(key);
-            if series[0].get(&normalized).is_none() {
+        // Scope keys must be ABSENT from the indexed `/series` result — this is
+        // exactly what fails against the pre-#109 (scope-as-stream-label)
+        // behaviour. Scope attribute keys are checked too, unless they collide
+        // with an actual resource label (which IS indexed and legitimately
+        // present — `billing`'s `env`, though `representative` selection lands
+        // on the first `scope_attrs`-bearing stream, `payments`/`team`).
+        for scope_key in [
+            "scope_name",
+            "scope_version",
+            "otel_scope_name",
+            "otel_scope_version",
+        ] {
+            if series[0].get(scope_key).is_some() {
                 bail!(
-                    "series result for {:?}: expected normalized scope-attr label \
-                     {normalized:?} missing from {:?}",
+                    "series result for {:?} must NOT index scope key {scope_key:?} (scope is \
+                     structured metadata now): {:?}",
                     scope_stream.service,
                     series[0]
                 );
             }
         }
+        for key in scope_stream.scope_attrs.keys() {
+            let normalized = normalize_label_key(key);
+            // A scope attribute that does NOT shadow a resource label must be
+            // absent from `/series` (structured metadata, not indexed).
+            if !scope_stream.resource_attrs.contains_key(key)
+                && series[0].get(&normalized).is_some()
+            {
+                bail!(
+                    "series result for {:?} must NOT index scope-attr key {normalized:?} \
+                     (structured metadata, not a stream label): {:?}",
+                    scope_stream.service,
+                    series[0]
+                );
+            }
+        }
+
+        // Selection parity: a `| scope_name="…"` structured-metadata pipeline
+        // filter selects the scoped stream's entries on `query_range`.
+        let expected_name = scope_stream.scope_name.clone().unwrap_or_default();
+        let sm_selector = format!(
+            r#"{{service_name="{}", {RUN_ID_LABEL}="{marker}"}} | scope_name="{expected_name}""#,
+            scope_stream.service
+        );
+        poll_until(ROUNDTRIP_POLL_TIMEOUT, ROUNDTRIP_POLL_INTERVAL, || {
+            query_range_entries(
+                ctx,
+                &sm_selector,
+                marker,
+                start_ns,
+                end_ns,
+                scope_stream.lines.len(),
+            )
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "scope structured-metadata filter `| scope_name=\"{expected_name}\"` never \
+                 selected {} entries for {:?}",
+                scope_stream.lines.len(),
+                scope_stream.service
+            )
+        })?;
     }
 
     // The metric selector is scoped by `run_id` too (code review finding,
@@ -1257,8 +1303,11 @@ mod tests {
         let fixture = shipped_roundtrip_fixture();
         assert!(fixture.streams.len() >= 3);
         assert!(fixture.streams.iter().any(|s| s.scope_name.is_some()));
-        // The `billing` stream's `env` collides between resource_attrs and
-        // scope_attrs by design (normalized-key collision coverage).
+        // The `billing` stream's `env` collides between resource_attrs (a
+        // stream label) and scope_attrs (structured metadata now, issue #109),
+        // exercising the #97 base-label-vs-SM `_extracted` merge collision at
+        // read time — resource `env` stays the indexed label; scope `env`
+        // surfaces as `env_extracted` in the flattened response.
         let billing = fixture
             .streams
             .iter()

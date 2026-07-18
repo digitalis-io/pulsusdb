@@ -41,10 +41,11 @@
 //!
 //! against a live ClickHouse 24.8 server, substituting that fixture's own
 //! `golden.labels_json` keys/values in sorted order — e.g. case 1's
-//! `deployment_environment`/`k8s_pod_name`/`otel_scope_name`/
-//! `otel_scope_version`/`service_name` pairs, in that order. `unhex('FF')`
-//! avoids any ambiguity from client-side string-escaping rules for the
-//! `0xFF` separator byte. This test itself never calls `stream_fingerprint`
+//! `deployment_environment`/`k8s_pod_name`/`service_name` pairs, in that
+//! order (resource attributes only — scope is structured metadata now, not a
+//! stream label; issue #109). `unhex('FF')` avoids any ambiguity from
+//! client-side string-escaping rules for the `0xFF` separator byte. This test
+//! itself never calls `stream_fingerprint`
 //! (or any other `pulsus-model`/`pulsus-write` function) to produce an
 //! expectation. Path B's own write (below) uses the *identical* live
 //! `cityHash64` SQL derivation — [`ch_stream_fingerprint`] — rather than
@@ -52,16 +53,15 @@
 //! path being validated either; only Path A (the real product ingest path)
 //! exercises `pulsus_model::stream_fingerprint`.
 //!
-//! **Scope note (deviation from the architect plan's case list).** The
-//! plan's case 2 names "resource-level and log-record-level attrs"; this
-//! crate's `otlp_logs::parse` (issue #8, `build_scope_labels`) only ever
-//! promotes **resource** and **scope** (`ScopeLogs`) attributes into the
-//! label set — a `LogRecord`'s own `attributes` field is never read for
-//! labels, confirmed by `protocols/otlp_logs.rs`'s exhaustive unit tests.
-//! Adding per-record attribute promotion would be a parser behavior change,
-//! out of scope for a read-path benchmark issue. Case 2 here instead
-//! exercises **resource vs. scope** attribute flattening (the two sources
-//! that actually exist), which is what this crate implements today.
+//! **Scope note (issue #109).** Stream labels are now **resource** attributes
+//! only; a log record's `InstrumentationScope` (name/version/attributes) lands
+//! in per-entry **structured metadata** (`log_samples.structured_metadata`),
+//! not the label set — Loki 3.4.2 parity, live-probe-pinned. Case 2 exercises
+//! a scope with an attribute (`team`) flowing to SM; case 3 exercises the
+//! collision-resolution rules (a)/(b)/(c) — a scope attribute colliding onto
+//! `scope_name`, two attributes sanitizing to one key (last-write-wins), and
+//! an empty-valued attribute retained — with the resolved SM golden asserted
+//! byte-identical on both paths.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`, reusing the harness pattern
 //! from `crates/pulsus-schema/tests/live_schema.rs` /
@@ -93,7 +93,7 @@ use tower::ServiceExt;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_config::WriterConfig;
-use pulsus_model::{Date, LabelSet};
+use pulsus_model::{Date, LabelSet, canonicalize_label_key};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 use pulsus_write::ingest::http::logs;
 use pulsus_write::writer::{LogSampleRow, LogStreamRow};
@@ -205,6 +205,11 @@ struct FixtureFile {
 struct GoldenFile {
     service: String,
     labels_json: String,
+    /// Canonical sorted-key JSON of the scope's per-entry structured metadata
+    /// (issue #109): `scope_name`/`scope_version` (each empty-suppressed) plus
+    /// scope attributes under sanitized keys, with Loki's last-write-wins
+    /// collision resolution applied. `""` when the scope is absent/empty.
+    structured_metadata_json: String,
     fingerprint: u64,
     body: String,
     severity: i8,
@@ -407,21 +412,62 @@ fn sql_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// Path B's independent reconstruction of the scope structured-metadata JSON
+/// (issue #109 AC-12 path independence): its OWN last-write-wins loop over the
+/// fixture's raw scope fields, never calling `otlp_logs`. Sanitizes attribute
+/// keys with `canonicalize_label_key` (the same primitive
+/// `LabelSet::from_normalized` uses, so the resolved keys are its fixed
+/// points), resolves collisions by last-write-wins in the ordered list
+/// `[attributes …, scope_name?, scope_version?]`, then serializes through the
+/// same `LabelSet::from_normalized` + `to_canonical_json` seam — which, over
+/// already-unique keys, only sorts + JSON-encodes. Empty set -> `""`.
+fn path_b_scope_structured_metadata(f: &Fixture) -> String {
+    let mut ordered: Vec<(String, String)> = f
+        .file
+        .scope_attributes
+        .iter()
+        .map(|(k, v)| (canonicalize_label_key(k), v.clone()))
+        .collect();
+    if !f.file.scope_name.is_empty() {
+        ordered.push(("scope_name".to_string(), f.file.scope_name.clone()));
+    }
+    if !f.file.scope_version.is_empty() {
+        ordered.push(("scope_version".to_string(), f.file.scope_version.clone()));
+    }
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
+    for (key, value) in ordered {
+        if let Some(slot) = resolved.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+        } else {
+            resolved.push((key, value));
+        }
+    }
+    if resolved.is_empty() {
+        return String::new();
+    }
+    let (labels, _collisions) = LabelSet::from_normalized(resolved);
+    labels.to_canonical_json()
+}
+
 async fn run_path_b(db: &str, f: &Fixture) {
     let client = fresh_db(db).await;
 
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    pairs.extend(f.file.resource_attributes.iter().cloned());
-    pairs.push(("otel_scope_name".to_string(), f.file.scope_name.clone()));
-    pairs.push((
-        "otel_scope_version".to_string(),
-        f.file.scope_version.clone(),
-    ));
-    pairs.extend(f.file.scope_attributes.iter().cloned());
-
-    let (labels, _collisions) = LabelSet::from_normalized(pairs);
+    // Stream labels are RESOURCE attributes only (issue #109) — scope is
+    // structured metadata, not a stream label. Its own flattener, not
+    // `otlp_logs::build_stream_labels`.
+    let (labels, _collisions) =
+        LabelSet::from_normalized(f.file.resource_attributes.iter().cloned());
     let fingerprint = ch_stream_fingerprint(&client, &labels).await;
     let service = labels.service().to_string();
+
+    // Scope structured metadata via Path B's OWN independent last-write-wins
+    // pre-resolution (NOT calling `otlp_logs`), so the golden stays an
+    // independent oracle: ordered list = [scope attributes in wire order …,
+    // scope_name (iff non-empty), scope_version (iff non-empty)], resolved by
+    // last-write-wins per sanitized key (Loki 3.4.2's rule), then canonical
+    // JSON. No empty-value filter on attributes (rule c); identity appended
+    // last so it overrides a colliding attribute (rule a).
+    let structured_metadata = path_b_scope_structured_metadata(f);
 
     let timestamp_ns = f.expected_timestamp_ns;
     let severity = if (1..=24).contains(&f.file.severity_number) {
@@ -436,7 +482,7 @@ async fn run_path_b(db: &str, f: &Fixture) {
         timestamp_ns,
         severity,
         body: f.file.body.clone(),
-        structured_metadata: String::new(),
+        structured_metadata,
     };
     let stream = LogStreamRow {
         month: Date::start_of_month_utc(timestamp_ns).days_since_epoch(),
@@ -467,6 +513,7 @@ struct SampleReadRow {
     timestamp_ns: i64,
     severity: i8,
     body: String,
+    structured_metadata: String,
 }
 
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -483,7 +530,8 @@ struct IdxReadRow {
 
 async fn fetch_sample(client: &ChClient, db: &str, fingerprint: u64) -> Option<SampleReadRow> {
     let sql = format!(
-        "SELECT service, fingerprint, timestamp_ns, severity, body FROM {db}.log_samples \
+        "SELECT service, fingerprint, timestamp_ns, severity, body, structured_metadata \
+         FROM {db}.log_samples \
          WHERE fingerprint = {fingerprint} ORDER BY timestamp_ns LIMIT 1"
     );
     let mut stream = client
@@ -593,6 +641,12 @@ async fn assert_fidelity(case: &str) {
         assert_eq!(
             sample.body, fixture.file.golden.body,
             "{case} path {label}: body"
+        );
+        // Scope structured metadata (issue #109) — byte-identical across both
+        // paths and the hand-derived golden.
+        assert_eq!(
+            sample.structured_metadata, fixture.file.golden.structured_metadata_json,
+            "{case} path {label}: structured_metadata"
         );
     }
 

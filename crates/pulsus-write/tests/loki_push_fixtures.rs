@@ -133,15 +133,13 @@ fn parse_of_the_real_capture_is_pure() {
 /// The load-bearing correctness gate (issue #77 delta 2 / adjudication): a
 /// Loki stream `{service_name="checkout", env="prod"}` and the equivalent
 /// **scope-absent, resource-only** OTLP log payload produce the SAME
-/// `fingerprint` and `service`.
-///
-/// The exact condition matters (delta 2): `otlp_logs::build_scope_labels`
-/// injects `otel_scope_name`/`otel_scope_version` whenever `ScopeLogs.scope`
-/// is `Some`, which would split the fingerprints. With `scope = None`
-/// ("absent scopes emit nothing") and resource attributes whose
-/// `canonicalize_label_key` images equal the Loki label keys, both inputs
-/// feed `LabelSet::from_normalized` over an identical pair set — so
-/// `stream_fingerprint` and `service()` are identical by construction.
+/// `fingerprint` and `service`. With resource attributes whose
+/// `canonicalize_label_key` images equal the Loki label keys, both inputs feed
+/// `LabelSet::from_normalized` over an identical pair set — so
+/// `stream_fingerprint` and `service()` are identical by construction. Since
+/// issue #109 the scope-PRESENT case also converges (scope is structured
+/// metadata, not a stream label — see the convergence test below); this test
+/// keeps the scope-absent path pinned independently.
 #[test]
 fn loki_stream_fingerprints_identically_to_the_equivalent_otlp_log_stream() {
     // Loki side: `{service_name="checkout", env="prod"}`.
@@ -208,12 +206,15 @@ fn loki_stream_fingerprints_identically_to_the_equivalent_otlp_log_stream() {
     assert_eq!(loki_out.streams[0].labels, otlp_out.streams[0].labels);
 }
 
-/// The scope-present caveat delta 2 documents: with `scope = Some`, OTLP
-/// injects `otel_scope_*` labels, so the fingerprints legitimately DIFFER —
-/// pinned here so the narrow scope-absent condition of the AC above is not
-/// mistaken for an unconditional equivalence.
+/// Convergence proof (issue #109 — inverts the former divergence test): with
+/// `scope = Some`, OTLP now routes the scope's name/version/attributes into
+/// per-entry **structured metadata**, NOT stream labels (Loki 3.4.2 parity),
+/// so a scope-present OTLP payload fingerprints IDENTICALLY to the equivalent
+/// scope-absent Loki stream — scope has left `stream_fingerprint`. The scope
+/// data still surfaces, but on the per-row SM surface a Loki `| scope_name=`
+/// pipeline filter selects, exactly as Loki does.
 #[test]
-fn scope_present_otlp_diverges_from_loki_by_the_injected_otel_scope_labels() {
+fn scope_present_otlp_converges_with_loki_scope_leaves_the_fingerprint() {
     let loki = PushRequest {
         streams: vec![StreamAdapter {
             labels: r#"{service_name="checkout"}"#.to_string(),
@@ -265,10 +266,19 @@ fn scope_present_otlp_diverges_from_loki_by_the_injected_otel_scope_labels() {
     };
     let otlp_out = otlp_logs::parse(&otlp, 0);
 
-    assert_ne!(
+    // Scope is out of the fingerprint: identical stream identity + labels.
+    assert_eq!(
         loki_out.streams[0].fingerprint, otlp_out.streams[0].fingerprint,
-        "a scope-present OTLP payload carries otel_scope_* labels a Loki stream does not"
+        "a scope-present OTLP payload must fingerprint identically to the scope-absent Loki \
+         stream — scope is structured metadata, not a stream label (Loki 3.4.2 parity)"
     );
+    assert_eq!(loki_out.streams[0].labels, otlp_out.streams[0].labels);
+    // The scope data lives on the per-row SM surface instead.
+    assert_eq!(
+        otlp_out.rows[0].structured_metadata,
+        r#"{"scope_name":"my-scope","scope_version":"1.0.0"}"#
+    );
+    assert_eq!(loki_out.rows[0].structured_metadata, "");
 }
 
 // ---------------------------------------------------------------------

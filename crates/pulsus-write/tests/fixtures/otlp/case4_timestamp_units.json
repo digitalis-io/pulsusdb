@@ -11,14 +11,13 @@
   "body": "checkout completed",
   "golden": {
     "service": "checkout-api",
-    "labels_json": "{\"otel_scope_name\":\"checkout-scope\",\"otel_scope_version\":\"3.2.1\",\"service_name\":\"checkout-api\"}",
-    "fingerprint": 8448177558824480864,
+    "labels_json": "{\"service_name\":\"checkout-api\"}",
+    "structured_metadata_json": "{\"scope_name\":\"checkout-scope\",\"scope_version\":\"3.2.1\"}",
+    "fingerprint": 15015674171264045977,
     "body": "checkout completed",
     "severity": 12,
     "timestamp_source": "observed_time_unix_nano",
     "idx_pairs": [
-      ["otel_scope_name", "checkout-scope"],
-      ["otel_scope_version", "3.2.1"],
       ["service_name", "checkout-api"]
     ]
   }

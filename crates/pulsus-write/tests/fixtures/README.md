@@ -38,7 +38,7 @@ change.
 
 | File | Covers |
 |------|--------|
-| `attributes_labels_body_severity_timestamp.bin` | resource + scope attribute flattening into normalized labels (including `service.name` -> `service` column + `service_name` label), `otel_scope_name`/`otel_scope_version` labels, string body verbatim, severity preserved, `time_unix_nano` preserved exactly. |
+| `attributes_labels_body_severity_timestamp.bin` | RESOURCE attribute flattening into normalized stream labels (including `service.name` -> `service` column + `service_name` label); the record's `InstrumentationScope` (name/version + a `team` attribute) routed into per-entry STRUCTURED METADATA — `scope_name`/`scope_version`/`team`, NOT stream labels (issue #109, Loki 3.4.2 parity); string body verbatim, severity preserved, `time_unix_nano` preserved exactly. |
 | `malformed.bin` | truncated protobuf -> whole-request decode error (maps to HTTP 400 / `google.rpc.Status.code = 3` at the handler). |
 | `partial_success.bin` | one record with an unrepresentable timestamp (`time_unix_nano = u64::MAX`) alongside two valid records -> `rejected = 1`, `rejected_message` set, the two valid rows still parsed (OTLP partial success, HTTP 200). |
 | `cross_month.bin` | one stream, two records straddling the 2024-01-31/2024-02-01 UTC boundary -> two `StreamRow`s with distinct months, both records present as samples. |

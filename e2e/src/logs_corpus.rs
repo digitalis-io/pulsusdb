@@ -14,10 +14,13 @@
 //! Resource attributes are exactly `service.name` + `run_id` — both
 //! promoted to stream labels by both stores (PulsusDB flattens all
 //! resource attrs; the oracle promotes `service.name` by default and
-//! `run_id` via its OTLP config) — and no scope/severity/record
-//! attributes are emitted, so neither store grows extra stream labels
-//! or structured metadata and stream-label-set equality is mechanically
-//! valid (plan v3 delta 3).
+//! `run_id` via its OTLP config). No severity/record attributes are
+//! emitted. The regular corpus carries no scope; a single [`SVC_SCOPE`]
+//! witness (issue #109) carries a collision-bearing `InstrumentationScope`
+//! that BOTH stores route into per-entry structured metadata (Loki 3.4.2
+//! parity, live-probe-pinned) — never indexed stream labels — so
+//! stream-label-set equality stays mechanically valid and the flattened
+//! structured-metadata output is asserted identical across stores.
 //!
 //! **Two independent oracles (the circularity breaker):**
 //! [`case_projection`] derives each case's verdict + final
@@ -60,6 +63,12 @@ pub const CASE_IDS: &[&str] = &[
     // earliest-`limit` survivors span >= 2 keyset pages, compared as an
     // ORDERED prefix (not set-equal) at full tier. See `run_streams_limited_case`.
     "fetch_until_limit_paged",
+    // Issue #109 scope-in-structured-metadata case (append-only): a
+    // `| scope_name="…"` structured-metadata pipeline filter selects the
+    // collision-bearing SVC_SCOPE witness; the flattened response (last-write-
+    // wins-resolved SM) is set-equal PulsusDB==Loki, and the `{scope_name="…"}`
+    // STREAM selector returns empty on both stores (scope is not indexed).
+    "scope_structured_metadata",
 ];
 
 /// The committed METRIC differential case ids (issue M6-10), in fixture
@@ -113,6 +122,79 @@ pub const BADJSON_BODY: &str = "not a json line";
 pub const SVC_BADNUM: &str = "svc-badnum";
 /// `| logfmt | n > 5` fails the numeric conversion (`LabelFilterErr`).
 pub const BADNUM_BODY: &str = "n=oops";
+
+/// The issue #109 scope witness service: exactly ONE synthetic record
+/// carrying a collision-bearing `InstrumentationScope`, isolated under its
+/// own service so no other case touches it. BOTH stores route its scope
+/// into per-entry structured metadata (never indexed labels), so the
+/// `scope_structured_metadata` case can assert PulsusDB==Loki on the
+/// last-write-wins-resolved SM output and prove placement via an empty
+/// `{scope_name="…"}` stream selector.
+pub const SVC_SCOPE: &str = "svc-scope";
+/// The witness record's body (no scope signal — the scope is metadata).
+pub const SCOPE_WITNESS_BODY: &str = "scope collision witness";
+/// The witness scope name — non-empty, so it appears as `scope_name` and
+/// (via last-write-wins identity precedence) overrides a colliding
+/// `scope.name` attribute.
+pub const SCOPE_WITNESS_NAME: &str = "coll-scope";
+/// The witness scope version — non-empty, so it appears as `scope_version`.
+pub const SCOPE_WITNESS_VERSION: &str = "1.0";
+/// The witness scope attributes, in wire order — exercising Loki's
+/// collision rules (live-probe-pinned): `dup.key`/`dup_key` both sanitize
+/// to `dup_key` (last wins -> `v_us`), `scope.name` sanitizes onto the
+/// identity key (dropped -> identity `coll-scope` wins), `emptyattr` is an
+/// empty-valued attribute (kept verbatim).
+pub const SCOPE_WITNESS_ATTRS: &[(&str, &str)] = &[
+    ("dup.key", "v_dot"),
+    ("dup_key", "v_us"),
+    ("scope.name", "LOSE"),
+    ("emptyattr", ""),
+];
+
+/// Sanitizes a label key the way `pulsus_model::canonicalize_label_key` /
+/// `LabelSet::from_normalized` does (`[^a-zA-Z0-9_]` -> `_`) — the corpus's
+/// own independent copy, never calling the crate under test.
+fn sanitize_label_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The witness scope's flattened structured-metadata labels, resolved by
+/// Loki's last-write-wins rule over the ordered list
+/// `[attributes in wire order …, scope_name, scope_version]` (issue #109):
+/// `dup_key="v_us"` (last write), `scope_name="coll-scope"` (identity
+/// precedence — `scope.name="LOSE"` dropped), `scope_version="1.0"`,
+/// `emptyattr=""` (kept). The corpus's independent oracle, computed here
+/// with its own loop — never by calling `pulsus-write`.
+pub fn scope_witness_sm_labels() -> BTreeMap<String, String> {
+    let mut ordered: Vec<(String, String)> = SCOPE_WITNESS_ATTRS
+        .iter()
+        .map(|(k, v)| (sanitize_label_key(k), (*v).to_string()))
+        .collect();
+    // Identity appended last (both non-empty) so it overrides a colliding
+    // attribute.
+    ordered.push(("scope_name".to_string(), SCOPE_WITNESS_NAME.to_string()));
+    ordered.push((
+        "scope_version".to_string(),
+        SCOPE_WITNESS_VERSION.to_string(),
+    ));
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(ordered.len());
+    for (key, value) in ordered {
+        if let Some(slot) = resolved.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = value;
+        } else {
+            resolved.push((key, value));
+        }
+    }
+    resolved.into_iter().collect()
+}
 
 /// Generation parameters for one corpus.
 #[derive(Debug, Clone)]
@@ -229,7 +311,7 @@ fn render_body(r: &GeneratedRecord) -> String {
 /// regular records; its dedicated service keeps every other case's
 /// projection untouched.
 pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
-    let mut records = Vec::with_capacity(spec.record_count + 3);
+    let mut records = Vec::with_capacity(spec.record_count + 4);
     for i in 0..spec.record_count {
         let mut r = GeneratedRecord {
             service: service_of(i),
@@ -264,7 +346,12 @@ pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
     };
     records.push(witness(0, SVC_BADJSON, BADJSON_BODY));
     records.push(witness(1, SVC_BADNUM, BADNUM_BODY));
-    records.push(witness(2, SVC_BADUNIT, BADUNIT_BODY));
+    // Issue #109 scope witness — appended BEFORE `svc-badunit` so the latter
+    // stays LAST and `last_ts_ns` keeps pinning to it. Its scope identity is
+    // implied by `service == SVC_SCOPE` (see `to_otlp_export_request` /
+    // `base_labels`), so it needs no extra `GeneratedRecord` fields.
+    records.push(witness(2, SVC_SCOPE, SCOPE_WITNESS_BODY));
+    records.push(witness(3, SVC_BADUNIT, BADUNIT_BODY));
     let last_ts_ns = records.last().map_or(spec.base_ns, |r| r.ts_ns);
     LogCorpus {
         run_id: spec.run_id.clone(),
@@ -279,10 +366,19 @@ impl LogCorpus {
     /// Base stream labels both stores expose for `record` (plan v3 delta
     /// 3: resource attrs promoted identically on both sides).
     fn base_labels(&self, r: &GeneratedRecord) -> BTreeMap<String, String> {
-        BTreeMap::from([
+        let mut labels = BTreeMap::from([
             ("service_name".to_string(), r.service.to_string()),
             (RUN_ATTR.to_string(), self.run_id.clone()),
-        ])
+        ]);
+        // The scope witness (issue #109) carries per-entry structured metadata
+        // that BOTH stores flatten into the response label set (the #97 SM
+        // merge — no key here collides with `service_name`/`run_id`). Every
+        // flattened response for this record — bare `{run_id}` completeness or a
+        // `| scope_name=` pipeline — therefore carries these keys.
+        if r.service == SVC_SCOPE {
+            labels.extend(scope_witness_sm_labels());
+        }
+        labels
     }
 
     /// The by-construction expected result set for one committed case.
@@ -823,6 +919,15 @@ pub fn case_projection(
             ]);
             (labels, r.body.clone())
         }),
+        // Issue #109: `{run_id="R"} | scope_name="coll-scope"` selects the
+        // scope witness by its structured-metadata `scope_name` label. The
+        // pipeline extracts no NEW labels (the SM keys are already in
+        // `base_labels` for this record via the #97 flatten), so the extracted
+        // map is empty; the response entry is the witness body under its full
+        // flattened label set.
+        "scope_structured_metadata" => {
+            (r.service == SVC_SCOPE).then(|| (BTreeMap::new(), r.body.clone()))
+        }
         other => panic!("case_projection: unknown case id {other:?}"),
     }
 }
@@ -853,12 +958,28 @@ pub fn to_otlp_export_request(c: &LogCorpus) -> serde_json::Value {
                     })
                 })
                 .collect();
+            let mut scope_logs = serde_json::json!({ "logRecords": log_records });
+            // Issue #109: the scope witness group carries a collision-bearing
+            // `InstrumentationScope`; every other group omits scope entirely.
+            if service == SVC_SCOPE {
+                let attributes: Vec<serde_json::Value> = SCOPE_WITNESS_ATTRS
+                    .iter()
+                    .map(|(key, value)| {
+                        serde_json::json!({ "key": key, "value": { "stringValue": value } })
+                    })
+                    .collect();
+                scope_logs["scope"] = serde_json::json!({
+                    "name": SCOPE_WITNESS_NAME,
+                    "version": SCOPE_WITNESS_VERSION,
+                    "attributes": attributes,
+                });
+            }
             serde_json::json!({
                 "resource": { "attributes": [
                     { "key": "service.name", "value": { "stringValue": service } },
                     { "key": RUN_ATTR, "value": { "stringValue": c.run_id } },
                 ]},
-                "scopeLogs": [{ "logRecords": log_records }],
+                "scopeLogs": [scope_logs],
             })
         })
         .collect();
@@ -975,6 +1096,12 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
                     .get("n")
                     .is_some_and(|v| v.parse::<f64>().is_err())
         }
+        // Issue #109: the scope witness carries no body signal (scope is
+        // metadata), so the independent oracle re-derives survival purely from
+        // the service isolation — every SVC_SCOPE record has `scope_name` =
+        // `coll-scope` by construction, so `| scope_name="coll-scope"` selects
+        // exactly it.
+        "scope_structured_metadata" => r.service == SVC_SCOPE,
         other => panic!("naive_matches: unknown case id {other:?}"),
     }
 }
@@ -1105,17 +1232,86 @@ mod tests {
         let resources = req["resourceLogs"].as_array().unwrap();
         assert_eq!(
             resources.len(),
-            6,
+            7,
             "one resource group per service (svc-json/logfmt/plain + the \
-             issue #99 svc-badjson/svc-badnum and the M6-10 svc-badunit witnesses)"
+             issue #99 svc-badjson/svc-badnum, the issue #109 svc-scope, and the \
+             M6-10 svc-badunit witnesses)"
         );
         for res in resources {
             let attrs = res["resource"]["attributes"].as_array().unwrap();
             let keys: Vec<&str> = attrs.iter().filter_map(|a| a["key"].as_str()).collect();
+            // Resource attributes are still exactly the two isolation labels on
+            // every group — scope is a separate `scopeLogs.scope` object.
             assert_eq!(keys, vec!["service.name", RUN_ATTR]);
-            // Scope deliberately absent: no otel_scope_name label on
-            // either store.
-            assert!(res["scopeLogs"][0].get("scope").is_none());
+            let service = attrs[0]["value"]["stringValue"].as_str().unwrap();
+            let scope = res["scopeLogs"][0].get("scope");
+            if service == SVC_SCOPE {
+                // The scope witness group carries the collision-bearing scope.
+                let scope = scope.expect("svc-scope group carries a scope");
+                assert_eq!(scope["name"], SCOPE_WITNESS_NAME);
+                assert_eq!(scope["version"], SCOPE_WITNESS_VERSION);
+                let attrs = scope["attributes"].as_array().unwrap();
+                assert_eq!(attrs.len(), SCOPE_WITNESS_ATTRS.len());
+            } else {
+                // Every other group omits scope (routes to no SM on either store).
+                assert!(scope.is_none());
+            }
+        }
+    }
+
+    /// The issue #109 scope witness: exactly one `svc-scope` record whose
+    /// collision-bearing scope resolves (last-write-wins) to the pinned
+    /// structured-metadata label set on both stores, and which no OTHER
+    /// committed case projects.
+    #[test]
+    fn the_scope_witness_record_resolves_its_collisions_and_is_isolated() {
+        let corpus = generate(&spec(60));
+        let witnesses: Vec<&GeneratedRecord> = corpus
+            .records
+            .iter()
+            .filter(|r| r.service == SVC_SCOPE)
+            .collect();
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].body, SCOPE_WITNESS_BODY);
+        // svc-badunit is still LAST (the scope witness was inserted before it).
+        assert_eq!(corpus.records.last().unwrap().service, SVC_BADUNIT);
+
+        // Last-write-wins collision resolution, live-Loki-3.4.2-pinned:
+        // dup_key=v_us (last write), scope_name=coll-scope (identity beats the
+        // colliding scope.name=LOSE), scope_version=1.0, emptyattr="" (kept).
+        let sm = scope_witness_sm_labels();
+        assert_eq!(
+            sm,
+            BTreeMap::from([
+                ("dup_key".to_string(), "v_us".to_string()),
+                ("emptyattr".to_string(), String::new()),
+                ("scope_name".to_string(), "coll-scope".to_string()),
+                ("scope_version".to_string(), "1.0".to_string()),
+            ])
+        );
+
+        // The witness's completeness labels include the resolved SM.
+        let expected = corpus.expected_case_result("scope_structured_metadata");
+        assert_eq!(expected.len(), 1, "one flattened stream for the witness");
+        let (labels, entries) = expected.iter().next().unwrap();
+        assert_eq!(
+            labels.get("scope_name").map(String::as_str),
+            Some("coll-scope")
+        );
+        assert_eq!(labels.get("dup_key").map(String::as_str), Some("v_us"));
+        assert_eq!(labels.get("emptyattr").map(String::as_str), Some(""));
+        assert!(!labels.contains_key("scope.name"));
+        assert_eq!(entries.len(), 1);
+
+        // No other committed case projects the scope witness.
+        for case in CASE_IDS
+            .iter()
+            .filter(|c| **c != "scope_structured_metadata")
+        {
+            assert!(
+                case_projection(case, witnesses[0]).is_none(),
+                "case {case:?} must not project the scope witness record"
+            );
         }
     }
 }

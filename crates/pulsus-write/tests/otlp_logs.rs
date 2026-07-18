@@ -214,6 +214,13 @@ fn attributes_flatten_into_normalized_labels_body_severity_and_timestamp_are_pre
     assert_eq!(row.severity, 17);
     assert_eq!(row.body, "payment processed");
     assert_eq!(row.timestamp_ns.0, 1_700_000_000_123_456_789);
+    // Scope name/version/attributes land in per-entry structured metadata
+    // (issue #109, Loki 3.4.2 parity), keyed `scope_name`/`scope_version`/
+    // sanitized-attr-key — NOT stream labels.
+    assert_eq!(
+        row.structured_metadata,
+        r#"{"scope_name":"my-lib","scope_version":"2.3.1","team":"payments"}"#
+    );
 
     assert_eq!(out.streams.len(), 1);
     let labels = &out.streams[0].labels;
@@ -222,9 +229,12 @@ fn attributes_flatten_into_normalized_labels_body_severity_and_timestamp_are_pre
     assert_eq!(labels.get("service_name"), Some("checkout"));
     assert_eq!(labels.get("k8s_pod_name"), Some("pod-7"));
     assert_eq!(labels.get("env"), Some("prod"));
-    assert_eq!(labels.get("otel_scope_name"), Some("my-lib"));
-    assert_eq!(labels.get("otel_scope_version"), Some("2.3.1"));
-    assert_eq!(labels.get("team"), Some("payments"));
+    // Scope is structured metadata now — never a stream label.
+    assert_eq!(labels.get("scope_name"), None);
+    assert_eq!(labels.get("scope_version"), None);
+    assert_eq!(labels.get("otel_scope_name"), None);
+    assert_eq!(labels.get("otel_scope_version"), None);
+    assert_eq!(labels.get("team"), None);
     assert_eq!(out.collisions, 0);
     assert_eq!(out.rejected, 0);
 }

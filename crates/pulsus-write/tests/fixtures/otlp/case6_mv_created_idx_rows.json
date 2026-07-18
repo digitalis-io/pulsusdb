@@ -14,15 +14,14 @@
   "body": "query executed",
   "golden": {
     "service": "search-api",
-    "labels_json": "{\"k8s_namespace_name\":\"prod\",\"otel_scope_name\":\"search-scope\",\"otel_scope_version\":\"4.0.0\",\"region\":\"us-east-1\",\"service_name\":\"search-api\",\"tier\":\"hot\"}",
-    "fingerprint": 1457146420289849181,
+    "labels_json": "{\"k8s_namespace_name\":\"prod\",\"region\":\"us-east-1\",\"service_name\":\"search-api\",\"tier\":\"hot\"}",
+    "structured_metadata_json": "{\"scope_name\":\"search-scope\",\"scope_version\":\"4.0.0\"}",
+    "fingerprint": 13623528276042915041,
     "body": "query executed",
     "severity": 1,
     "timestamp_source": "time_unix_nano",
     "idx_pairs": [
       ["k8s_namespace_name", "prod"],
-      ["otel_scope_name", "search-scope"],
-      ["otel_scope_version", "4.0.0"],
       ["region", "us-east-1"],
       ["service_name", "search-api"],
       ["tier", "hot"]

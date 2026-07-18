@@ -1550,6 +1550,40 @@ async fn run_streams_case(
             path.display()
         );
     }
+
+    // Placement discriminator (issue #109): scope is per-entry structured
+    // metadata, NOT an indexed stream label — so a `{scope_name="…"}` STREAM
+    // selector (not the `| scope_name=` pipeline filter compared above) matches
+    // no stream on EITHER store. This is exactly what fails against the pre-#109
+    // scope-as-stream-label behaviour; asserted on both stores so the
+    // placement, not just the value, is proven identical.
+    if case.case_id == "scope_structured_metadata" {
+        let selector = format!(
+            r#"{{scope_name="{}", {}="{}"}}"#,
+            logs_corpus::SCOPE_WITNESS_NAME,
+            logs_corpus::RUN_ATTR,
+            corpus.run_id,
+        );
+        let pulsus_sel = query_pulsus(ctx, &selector, window, fixture.limit, query_timeout).await?;
+        let loki_sel = query_loki(ctx, &selector, window, fixture.limit, query_timeout).await?;
+        for (store, body) in [("pulsusdb", &pulsus_sel), ("oracle", &loki_sel)] {
+            let matched = raw_entry_count(body);
+            if matched != 0 {
+                let path = dump(
+                    "scope_placement",
+                    &format!(
+                        "{store} matched {matched} entries for the {selector:?} STREAM selector — \
+                         scope must be structured metadata, never an indexed label"
+                    ),
+                )?;
+                bail!(
+                    "case {:?}: {store} indexed a scope key as a stream label (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2726,6 +2760,16 @@ mod tests {
         let fixture = shipped_fixture();
         let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
         for case in fixture.cases.iter().filter(|c| c.kind() == "streams") {
+            // The issue #109 scope case selects on per-entry STRUCTURED
+            // METADATA (`| scope_name="…"`), not body text — this evaluator
+            // compiles the pipeline against `[run_id, service_name]` base labels
+            // only and cannot model SM injection, so it is validated instead by
+            // the corpus projection + the `scope_witness_sm_labels` collision
+            // test + the live differential (set-equal PulsusDB==Loki) and its
+            // stream-selector-empty placement discriminator.
+            if case.case_id == "scope_structured_metadata" {
+                continue;
+            }
             let rendered = case.query.replace("{R}", &corpus.run_id);
             let expr = pulsus_logql::parse(&rendered).expect("parse");
             let pulsus_logql::Expr::Log(log) = expr else {

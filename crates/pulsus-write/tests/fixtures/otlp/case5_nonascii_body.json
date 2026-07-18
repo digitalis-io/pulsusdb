@@ -11,14 +11,13 @@
   "body": "café ✅ 日本語 — \"quoted\"\nnewline",
   "golden": {
     "service": "notify-svc",
-    "labels_json": "{\"otel_scope_name\":\"notify-scope\",\"otel_scope_version\":\"0.9.0\",\"service_name\":\"notify-svc\"}",
-    "fingerprint": 2449534802712869363,
+    "labels_json": "{\"service_name\":\"notify-svc\"}",
+    "structured_metadata_json": "{\"scope_name\":\"notify-scope\",\"scope_version\":\"0.9.0\"}",
+    "fingerprint": 5282372178617206305,
     "body": "café ✅ 日本語 — \"quoted\"\nnewline",
     "severity": 9,
     "timestamp_source": "time_unix_nano",
     "idx_pairs": [
-      ["otel_scope_name", "notify-scope"],
-      ["otel_scope_version", "0.9.0"],
       ["service_name", "notify-svc"]
     ]
   }
