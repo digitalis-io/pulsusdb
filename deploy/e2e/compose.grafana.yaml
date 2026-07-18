@@ -59,25 +59,28 @@ services:
       OTEL_SERVICE_NAME: "firehose"
       # Scaled down from firehose's production-envelope defaults (600
       # hosts / 30 APM hosts / 6000 containers / 6100 custom series) to a
-      # size a laptop-local single-node stack can comfortably ingest and
-      # a person can browse in Grafana without the fleet/catalog drowning
-      # out individual series.
-      HOSTS: "20"
-      APM_HOSTS: "5"
-      CONTAINERS: "50"
-      CUSTOM_METRIC_SERIES: "100"
+      # size a laptop-local single-node stack can comfortably ingest —
+      # tuned down further from an initial 20/5/50/100 pass, which still
+      # produced a 4300-series-per-tick metrics burst (every
+      # `METRIC_INTERVAL_SEC`) too heavy for sustained laptop ingest
+      # alongside the rest of this project's `compose.tier.yaml` overlay.
+      HOSTS: "5"
+      APM_HOSTS: "2"
+      CONTAINERS: "10"
+      CUSTOM_METRIC_SERIES: "20"
       METRIC_INTERVAL_SEC: "15"
       SPANS_PER_TRACE: "5"
       # LOGS_PER_MONTH/SPANS_PER_MONTH are absolute fleet-wide totals, not
       # per-host — firehose's defaults (3.2e9 / 6.9e8) are sized for the
       # 600-host production envelope. Left at their defaults against this
-      # 20-host demo fleet, the per-second rate (total / period) is the
-      # same regardless of fleet size, so the scaled-down fleet was still
-      # asked to emit production volume — the otel-collector's "sending
-      # queue is full" / pulsusdb backpressure seen during testing.
-      # Scaled by the same ~1/30 factor as HOSTS (20 vs. the 600 default).
-      LOGS_PER_MONTH: "1.07e8"
-      SPANS_PER_MONTH: "2.3e7"
+      # scaled-down demo fleet, the per-second rate (total / period) is
+      # the same regardless of fleet size, so the scaled-down fleet was
+      # still asked to emit production volume — the otel-collector's
+      # "sending queue is full" / pulsusdb backpressure seen during
+      # testing. Scaled by the same ~1/120 factor as HOSTS (5 vs. the 600
+      # default).
+      LOGS_PER_MONTH: "2.67e7"
+      SPANS_PER_MONTH: "5.75e6"
       # Real-time pace, no time compression (firehose/profile.go:
       # "Speedup=1 emits at the true production pace") — this demo ships
       # current data, not a replayed backdated month.
