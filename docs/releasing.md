@@ -25,9 +25,29 @@ The workflow builds the repo's `Dockerfile` (the same one CI's `e2e-single`/
 output and `/status/buildinfo` response are stamped with the exact tag and
 commit — not the `0.0.0`/local-git-SHA dev-build fallback. It is pushed to
 `ghcr.io/digitalis-io/pulsusdb` **only after** a smoke test (`--version`
-exact-match, `--help`, non-root `id`) passes against the freshly built
-image; a failing smoke test aborts the job before anything is pushed, so a
-tag can never end up pointing at a broken image on GHCR.
+exact-match, `--help`, non-root `id`, spool write probe) passes against the
+freshly built image; a failing smoke test aborts the job before anything is
+pushed, so a tag can never end up pointing at a broken image on GHCR.
+
+**Multi-arch (`linux/amd64` + `linux/arm64`).** The tag now resolves to a
+multi-arch **manifest list (OCI image index)** with one child manifest per
+arch, so `docker pull` picks the right image for the host automatically. Both
+arches are built via buildx: amd64 natively, arm64 under QEMU emulation
+(`docker/setup-qemu-action`) — the `Dockerfile` compiles the binary inside
+the build stage unmodified, so its C-backed dependencies build natively in
+the emulated arm64 stage with no cross-toolchain. Because `load: true` cannot
+load a manifest list, each arch is first built, loaded, and smoke-tested
+separately (arm64's smoke runs the same assertion set under
+`docker run --platform linux/arm64`), and only then is a single cache-warm
+multi-platform image pushed. The tag/label scheme is unchanged; only the
+digest a tag points to is now an image **index** rather than a single image
+manifest (pull-by-tag and pull-by-child-digest both still work).
+
+A build-only dry-run is available via the workflow's `workflow_dispatch`
+trigger (Actions → Release → Run workflow): it compiles both arches under
+QEMU with no push and no load, so you can prove the arm64 build works before
+merging a change to the release path — the tag-only trigger otherwise gives
+no pre-merge signal.
 
 The runtime stage runs as the non-root `pulsus` user (uid/gid `10001`) with
 its working directory set to `/var/lib/pulsusdb`, owned by that user — so
@@ -36,11 +56,9 @@ docs/configuration.md §5) resolves to `/var/lib/pulsusdb/spool/` and is
 writable. Mount a volume over `/var/lib/pulsusdb` if you need spooled
 batches to survive a container restart.
 
-**amd64-only for now.** The build does not (yet) produce an `arm64`
-manifest — `linux/amd64` only. A multi-arch (arm64 via buildx/QEMU) build is
-a tracked follow-up, not implemented here; tag/label/digest shape does not
-change when it lands; if you need arm64 today, build the `Dockerfile`
-yourself with `docker buildx build --platform linux/arm64 ...`.
+See "Multi-arch" above: the published tag is a two-arch (`linux/amd64` +
+`linux/arm64`) manifest list, so no separate per-arch build is needed to run
+PulsusDB on arm64 — `docker pull` resolves the matching image automatically.
 
 ## 3. Tag → published-tags policy
 
@@ -87,6 +105,20 @@ this step never needs repeating.
 docker pull ghcr.io/digitalis-io/pulsusdb:1.2.3
 docker run --rm ghcr.io/digitalis-io/pulsusdb:1.2.3 --version
 # pulsusdb 1.2.3 (<40-char commit sha>)
+```
+
+Confirm the tag is a two-arch index (the release job's own **Verify
+multi-arch manifest** step asserts this and fails the release if an arch is
+missing, but you can re-check by hand):
+
+```sh
+docker buildx imagetools inspect ghcr.io/digitalis-io/pulsusdb:1.2.3
+# ...
+# Manifests:
+#   ... Platform: linux/amd64
+#   ... Platform: linux/arm64
+# (or `docker manifest inspect ghcr.io/digitalis-io/pulsusdb:1.2.3` to see
+#  the raw index with an amd64 and an arm64 entry)
 ```
 
 `/status/buildinfo` on a running container reports the same `version`/
