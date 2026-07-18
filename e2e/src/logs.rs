@@ -38,6 +38,7 @@ use crate::harness::{QUERY_REQUEST_TIMEOUT, poll_until};
 use crate::logs_corpus::{
     self, ExpectedResult, LogCorpus, LogCorpusSpec, MetricMatrix, MetricVector, OrderedEntries,
 };
+use crate::logs_sm_corpus;
 use crate::metrics::write_artifact;
 use crate::scenarios::Ctx;
 
@@ -1539,6 +1540,364 @@ fn describe_diff(store: &str, got: &ExpectedResult, expected: &ExpectedResult) -
     )
 }
 
+// ---------------------------------------------------------------------
+// Issue #102: the Loki-push structured-metadata (SM) differential.
+//
+// A NEW scenario, own `run_id`/fixture/completeness gate. The M6-09 OTLP
+// corpus carries NO per-entry structured metadata (OTLP has no SM on the
+// collector path), so this lane instead pushes identical native Loki JSON
+// `[ts, line, {sm}]` bodies DIRECTLY to both stores' `/loki/api/v1/push`
+// endpoints and asserts the SM surfacing/collision behavior #97 shipped is
+// byte-parity against `grafana/loki:3.4.2`. No SM pushdown: label filters on
+// SM keys are the #97 client-side baseline (no new read-path SQL).
+// ---------------------------------------------------------------------
+
+const SM_FIXTURE_PATH: &str = "logs/sm_differential.json";
+
+#[derive(Debug, Deserialize)]
+struct SmCaseRaw {
+    case_id: String,
+    /// Which SM behavior this case covers — documentation, unit-tested
+    /// non-empty.
+    construct: String,
+    /// Always `"gated"` for the SM lane (every SM behavior is byte-exact
+    /// against the oracle; no informational downgrade, no ledger id).
+    mode: String,
+    query: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SmFixture {
+    limit: u32,
+    cases: Vec<SmCaseRaw>,
+}
+
+fn load_sm_fixture(ctx: &Ctx) -> Result<SmFixture> {
+    let path = ctx.fixtures_dir.join(SM_FIXTURE_PATH);
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read fixture {}", path.display()))?;
+    let fixture: SmFixture = serde_json::from_str(&raw)
+        .with_context(|| format!("fixture {} was not valid JSON", path.display()))?;
+    for case in &fixture.cases {
+        if !logs_sm_corpus::SM_CASE_IDS.contains(&case.case_id.as_str()) {
+            bail!(
+                "fixture {} names SM case {:?}, which the corpus does not project",
+                path.display(),
+                case.case_id
+            );
+        }
+    }
+    Ok(fixture)
+}
+
+fn build_sm_corpus() -> Result<logs_sm_corpus::SmCorpus> {
+    let run_id = format!("e2e-logs-sm-diff-{:x}", crate::metrics::unique_id()?);
+    let now_ns = now_unix_nanos()?;
+    // Anchor the last record near "now" (avoids Loki's reject_old_samples /
+    // creation_grace_period), like `build_corpus`.
+    let span_ns = logs_sm_corpus::STEP_NS * (logs_sm_corpus::ENTRY_COUNT as i64 - 1);
+    let base_ns = now_ns - span_ns - CORPUS_NOW_MARGIN_NS;
+    Ok(logs_sm_corpus::generate(&logs_sm_corpus::SmCorpusSpec {
+        base_ns,
+        run_id,
+    }))
+}
+
+fn sm_query_window(corpus: &logs_sm_corpus::SmCorpus) -> QueryWindow {
+    QueryWindow {
+        start_ns: corpus.first_ts_ns - WINDOW_SLACK_NS,
+        end_ns: corpus.last_ts_ns + WINDOW_SLACK_NS,
+    }
+}
+
+pub async fn logs_structured_metadata_differential(ctx: &Ctx) -> Result<()> {
+    if !differential_enabled() {
+        println!(
+            "pulsus-e2e:   logs_structured_metadata_differential: skipped (set \
+             PULSUS_E2E_LOGS_DIFFERENTIAL=1 — nightly/dispatch tier only, issue #102)"
+        );
+        return Ok(());
+    }
+    let fixture = load_sm_fixture(ctx)?;
+    let corpus = build_sm_corpus()?;
+    let window = sm_query_window(&corpus);
+    println!(
+        "pulsus-e2e:   logs_structured_metadata_differential [{:?}]: dual-pushing {} SM records \
+         (run_id={:?})",
+        ctx.variant,
+        corpus.entries.len(),
+        corpus.run_id
+    );
+
+    push_sm_corpus(ctx, &corpus)
+        .await
+        .context("dual-pushing the SM corpus to both stores failed")?;
+
+    wait_for_sm_completeness(ctx, &corpus, window, fixture.limit).await?;
+
+    for case in &fixture.cases {
+        run_sm_case(ctx, &corpus, &fixture, case, window)
+            .await
+            .with_context(|| format!("SM differential case {:?}", case.case_id))?;
+    }
+    Ok(())
+}
+
+/// One `POST {url}` of one Loki JSON push body: `Ok(Some(response))` once the
+/// request reaches the store at all (any HTTP response — the caller checks
+/// the status), the [`poll_until`]-on-transport-failure shape
+/// [`logs_roundtrip`](crate::scenarios)'s `post_otlp_logs` uses. A transport
+/// `Err` triggers a retry of the identical body; a connect-time failure is
+/// safe (zero bytes reached the server), but a response-read failure *after*
+/// the server ingested the body would double-ingest on retry. That is not
+/// silent: it trips the `raw > distinct` duplicate-delivery validity gate in
+/// [`run_sm_case`] as a loud, diagnosable failure. Retry idempotency across
+/// this and `post_otlp_logs` is tracked as a follow-up.
+async fn push_loki_json(
+    ctx: &Ctx,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<Option<reqwest::Response>> {
+    let res = ctx.http.post(url).json(body).send().await?;
+    Ok(Some(res))
+}
+
+/// Fans the SM corpus's per-stream push bodies to BOTH stores' native
+/// `/loki/api/v1/push` (identical wire bytes — stronger than the OTLP
+/// fan-out, no collector transform between the two), each expecting a 204.
+/// Every body polls-until-listening (absorbs slow container start).
+async fn push_sm_corpus(ctx: &Ctx, corpus: &logs_sm_corpus::SmCorpus) -> Result<()> {
+    let bodies = logs_sm_corpus::to_loki_push_json(corpus);
+    let pulsus_url = ctx.url("/loki/api/v1/push");
+    let loki_url = format!("{}/loki/api/v1/push", ctx.loki_url);
+    for (store, url) in [("pulsusdb", &pulsus_url), ("oracle", &loki_url)] {
+        for body in &bodies {
+            let res = poll_until(
+                COLLECTOR_READY_POLL_TIMEOUT,
+                COLLECTOR_READY_POLL_INTERVAL,
+                || push_loki_json(ctx, url, body),
+            )
+            .await
+            .with_context(|| format!("{store} loki push endpoint never accepted a connection"))?;
+            if !res.status().is_success() {
+                let status = res.status();
+                let text = res.text().await.unwrap_or_default();
+                bail!("{store} loki push returned {status}: {text}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bounded completeness poll for the SM lane (validity gate (a)), the same
+/// two-pass shape as [`wait_for_completeness`] scoped to the SM `run_id`: raw
+/// counts checked on BOTH stores before any set comparison, then the merged
+/// expected set on both. Absorbs PulsusDB sync-flush + Loki ingester-flush
+/// lag.
+async fn wait_for_sm_completeness(
+    ctx: &Ctx,
+    corpus: &logs_sm_corpus::SmCorpus,
+    window: QueryWindow,
+    limit: u32,
+) -> Result<()> {
+    let q = run_scope_query(&corpus.run_id);
+    let expected = logs_sm_corpus::expected_all_records(corpus);
+    let verdict: Result<()> = poll_until(
+        COMPLETENESS_POLL_TIMEOUT,
+        COMPLETENESS_POLL_INTERVAL,
+        || async {
+            let bodies = [
+                ("pulsusdb", query_pulsus(ctx, &q, window, limit).await?),
+                ("oracle", query_loki(ctx, &q, window, limit).await?),
+            ];
+            let mut sets = Vec::with_capacity(bodies.len());
+            for (store, body) in &bodies {
+                let raw = raw_entry_count(body);
+                if raw as u32 >= limit {
+                    let artifact = serde_json::json!({
+                        "surface": "logs_sm_completeness",
+                        "kind": "truncation",
+                        "store": store,
+                        "query": q,
+                        "raw_entries": raw,
+                        "limit": limit,
+                        "result": body,
+                    });
+                    let path = write_artifact(
+                        ctx,
+                        ARTIFACT_AREA,
+                        "sm-completeness-truncation",
+                        &artifact,
+                    )?;
+                    return Ok(Some(Err(anyhow::anyhow!(
+                        "sm completeness: {store} returned {raw} raw entries at limit {limit} — \
+                         corpus/limit sizing invalid (repro {})",
+                        path.display()
+                    ))));
+                }
+                let set = result_set(body)?;
+                let distinct = set_entry_count(&set);
+                if raw > distinct {
+                    let artifact = serde_json::json!({
+                        "surface": "logs_sm_completeness",
+                        "kind": "duplicate_delivery",
+                        "store": store,
+                        "query": q,
+                        "raw_entries": raw,
+                        "distinct_entries": distinct,
+                        "result": body,
+                    });
+                    let path = write_artifact(
+                        ctx,
+                        ARTIFACT_AREA,
+                        "sm-completeness-duplicates",
+                        &artifact,
+                    )?;
+                    return Ok(Some(Err(anyhow::anyhow!(
+                        "sm completeness: {store} returned {raw} raw entries but only {distinct} \
+                         distinct — duplicate delivery, comparison invalid (repro {})",
+                        path.display()
+                    ))));
+                }
+                sets.push(set);
+            }
+            if sets.iter().any(|set| *set != expected) {
+                return Ok(None); // still filling — keep polling
+            }
+            Ok(Some(Ok(())))
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "SM run {:?} never reached completeness ({} records) on both stores",
+            corpus.run_id,
+            corpus.entries.len()
+        )
+    })?;
+    verdict
+}
+
+/// One SM case: validity gates first (raw counts strictly below the limit on
+/// both stores; no duplicate entries), then PulsusDB == corpus (ALWAYS hard)
+/// == oracle (hard — every SM case is `gated`). The comparison key is the
+/// FULL merged label set, so a silent SM drop on either store is caught.
+async fn run_sm_case(
+    ctx: &Ctx,
+    corpus: &logs_sm_corpus::SmCorpus,
+    fixture: &SmFixture,
+    case: &SmCaseRaw,
+    window: QueryWindow,
+) -> Result<()> {
+    if case.mode != "gated" {
+        bail!(
+            "SM case {:?} has mode {:?}; every SM case is byte-exact and stays gated",
+            case.case_id,
+            case.mode
+        );
+    }
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let expected = logs_sm_corpus::expected_case_result(corpus, &case.case_id);
+    println!(
+        "pulsus-e2e:     SM case {:?} [{}] — {}: {} expected entry(ies) across {} stream(s)",
+        case.case_id,
+        case.mode,
+        case.construct,
+        set_entry_count(&expected),
+        expected.len(),
+    );
+
+    let pulsus_started = std::time::Instant::now();
+    let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit).await?;
+    let pulsus_elapsed = pulsus_started.elapsed();
+    let loki_started = std::time::Instant::now();
+    let loki_body = query_loki(ctx, &q, window, fixture.limit).await?;
+    let loki_elapsed = loki_started.elapsed();
+    println!(
+        "pulsus-e2e: query {q:?} (SM case {:?}) pulsusdb {}ms oracle {}ms",
+        case.case_id,
+        pulsus_elapsed.as_millis(),
+        loki_elapsed.as_millis(),
+    );
+    let pulsus_set = result_set(&pulsus_body)?;
+    let loki_set = result_set(&loki_body)?;
+
+    let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_sm_pipeline",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": kind,
+            "query": q,
+            "window": { "start_ns": window.start_ns, "end_ns": window.end_ns, "limit": fixture.limit },
+            "expected_entry_count": set_entry_count(&expected),
+            "pulsusdb_result": pulsus_body,
+            "oracle_result": loki_body,
+            "detail": detail,
+        });
+        write_artifact(ctx, ARTIFACT_AREA, "sm-case-mismatch", &artifact)
+    };
+
+    // Validity gates, HARD on both stores (they invalidate the comparison).
+    for (store, body) in [("pulsusdb", &pulsus_body), ("oracle", &loki_body)] {
+        let raw = raw_entry_count(body);
+        if raw as u32 >= fixture.limit {
+            let path = dump(
+                "truncation",
+                &format!("{store} raw entry count reached the limit"),
+            )?;
+            bail!(
+                "SM case {:?}: {store} returned {raw} raw entries at limit {} — comparison invalid \
+                 (repro {})",
+                case.case_id,
+                fixture.limit,
+                path.display()
+            );
+        }
+    }
+    for (store, body, set) in [
+        ("pulsusdb", &pulsus_body, &pulsus_set),
+        ("oracle", &loki_body, &loki_set),
+    ] {
+        let raw = raw_entry_count(body);
+        let distinct = set_entry_count(set);
+        if raw != distinct {
+            let path = dump(
+                "duplicate_entries",
+                &format!("{store} returned {raw} raw entries but only {distinct} distinct"),
+            )?;
+            bail!(
+                "SM case {:?}: {store} response carried duplicate entries (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
+    }
+
+    // PulsusDB vs the corpus expectation: ALWAYS hard.
+    if pulsus_set != expected {
+        let detail = describe_diff("pulsusdb", &pulsus_set, &expected);
+        let path = dump("pulsus_vs_corpus", &detail)?;
+        bail!(
+            "SM case {:?}: {detail} (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    // Oracle vs the corpus expectation (== vs PulsusDB, transitively) — hard,
+    // every SM case is gated.
+    if loki_set != expected {
+        let detail = describe_diff("oracle", &loki_set, &expected);
+        let path = dump("oracle_vs_corpus", &detail)?;
+        bail!(
+            "SM case {:?}: {detail} (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2415,5 +2774,93 @@ mod tests {
             err.to_string().contains("out of forward order"),
             "expected a forward-order violation, got: {err}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #102: the Loki-push structured-metadata differential.
+    // ---------------------------------------------------------------
+
+    fn shipped_sm_fixture() -> SmFixture {
+        let root = crate::engine::workspace_root();
+        let raw =
+            std::fs::read_to_string(root.join("test/fixtures").join(SM_FIXTURE_PATH)).unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn shipped_sm_corpus() -> logs_sm_corpus::SmCorpus {
+        logs_sm_corpus::generate(&logs_sm_corpus::SmCorpusSpec {
+            base_ns: 1_700_000_000_000_000_000,
+            run_id: "sm-fixture-check".to_string(),
+        })
+    }
+
+    /// AC3 (id-lock, append-only): the SM fixture's case ids are exactly
+    /// `SM_CASE_IDS`, in order. Mirrors the OTLP lock; independent of it.
+    #[test]
+    fn sm_fixture_cases_match_the_sm_case_ids_exactly() {
+        let fixture = shipped_sm_fixture();
+        let ids: Vec<&str> = fixture.cases.iter().map(|c| c.case_id.as_str()).collect();
+        assert_eq!(ids, logs_sm_corpus::SM_CASE_IDS.to_vec());
+    }
+
+    /// Every SM case is `gated` (byte-exact, no informational downgrade) and
+    /// run-scoped/substitutable.
+    #[test]
+    fn sm_fixture_cases_are_gated_and_run_scoped() {
+        let fixture = shipped_sm_fixture();
+        for case in &fixture.cases {
+            assert_eq!(
+                case.mode, "gated",
+                "SM case {:?} must be gated",
+                case.case_id
+            );
+            assert!(!case.construct.is_empty());
+            assert!(
+                case.query.contains(r#"run_id="{R}""#),
+                "SM case {:?} is not run-scoped: {}",
+                case.case_id,
+                case.query
+            );
+            let rendered = case.query.replace("{R}", "e2e-sm-test");
+            assert!(!rendered.contains("{R}"));
+        }
+    }
+
+    /// Every SM case query PARSES as a log (streams) query and its pipeline
+    /// COMPILES under the shipped evaluator — a fixture typo fails
+    /// hermetically, not at nightly runtime.
+    #[test]
+    fn sm_fixture_queries_parse_and_their_pipelines_compile() {
+        let fixture = shipped_sm_fixture();
+        for case in &fixture.cases {
+            let rendered = case.query.replace("{R}", "e2e-sm-test");
+            let expr = pulsus_logql::parse(&rendered)
+                .unwrap_or_else(|e| panic!("SM case {:?} does not parse: {e}", case.case_id));
+            let pulsus_logql::Expr::Log(log) = expr else {
+                panic!("SM case {:?} must be a log (streams) query", case.case_id);
+            };
+            pulsus_read::logql::pipeline::CompiledPipeline::compile(&log.pipeline).unwrap_or_else(
+                |e| panic!("SM case {:?} pipeline does not compile: {e}", case.case_id),
+            );
+        }
+    }
+
+    /// Set comparisons are only well-defined unclipped: every SM case's
+    /// expected set is non-empty and strictly below the fixture limit.
+    #[test]
+    fn sm_fixture_expected_sets_are_non_vacuous_and_below_the_limit() {
+        let fixture = shipped_sm_fixture();
+        let corpus = shipped_sm_corpus();
+        for case in &fixture.cases {
+            let expected = logs_sm_corpus::expected_case_result(&corpus, &case.case_id);
+            let entries = set_entry_count(&expected);
+            assert!(entries > 0, "SM case {:?} is vacuous", case.case_id);
+            assert!(
+                (entries as u32) < fixture.limit,
+                "SM case {:?} has {entries} entries — not below limit {}",
+                case.case_id,
+                fixture.limit
+            );
+        }
     }
 }

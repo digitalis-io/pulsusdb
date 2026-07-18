@@ -254,9 +254,10 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// line],...]}]}`) into normalized rows — the JSON analog of
 /// [`parse_protobuf`], funneling through the same [`append_stream`] seam so
 /// a JSON stream and its equivalent protobuf stream produce byte-identical
-/// `ParsedLogs`. Each `values` entry deserializes as exactly `(ts, line)`;
-/// any trailing array element (the optional structured-metadata object) is
-/// discarded without being materialized ([`JsonEntry`]'s `Deserialize`).
+/// `ParsedLogs`. Each `values` entry deserializes as `(ts, line)` plus an
+/// optional third structured-metadata object, decoded into
+/// `structured_metadata` ([`JsonEntry`]'s `Deserialize`, issue #97); only a
+/// fourth+ element is drained without being materialized.
 pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     let push: JsonPush =
         serde_json::from_slice(body).map_err(|e| LogsIngestError::LokiDecode(e.to_string()))?;

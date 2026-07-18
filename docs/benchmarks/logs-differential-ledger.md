@@ -92,6 +92,30 @@ Out of this ledger's scope by design:
   note, not a gated-case downgrade — every committed `__error_details__`
   differential case stays hard-gated.
 
+- **The Loki-push structured-metadata (SM) differential is a separate
+  lane (issue #102).** OTLP carries no per-entry structured metadata on the
+  collector path, so the SM surfacing/collision behavior #97 shipped is
+  proven by a NEW scenario (`logs_structured_metadata_differential`,
+  `e2e/src/logs_sm_corpus.rs`) that dual-pushes identical native Loki JSON
+  `[ts, line, {sm}]` bodies to both stores' `/loki/api/v1/push` and compares
+  the SM-derived response label sets (surfacing, a `| key="value"` filter on a
+  non-colliding SM key, and a `| key_extracted="value"` filter on a collided
+  key). It has its OWN `run_id`, `sm_differential.json` fixture, and
+  completeness gate — the OTLP `differential.json` / `CASE_IDS` id-lock above
+  is untouched. Every SM case is **`gated`** (SM behavior is byte-exact vs
+  `grafana/loki:3.4.2` under this file's `allow_structured_metadata: true` /
+  `discover_log_levels: false` — no informational entry, no ledger id) and
+  rides the existing nightly `e2e-metrics-full` lane. **Stream-fingerprint
+  invariance stays hermetic-only:** a `query_range` response is label-driven
+  and SM fans into response labels, so an SM entry and a non-SM entry on the
+  same base labels return under different response label sets on both stores —
+  the physical stream identity is not black-box-observable, and Loki exposes
+  no comparable fingerprint. #97 pins that storage semantics hermetically
+  (`protocols/loki_push.rs`, `writer/rows.rs`); this lane does not fabricate a
+  cross-store fingerprint assertion. There is **no SM predicate pushdown** —
+  SM label filters are evaluated client-side (the #97 baseline), so this lane
+  adds no read-path SQL and cannot regress the Tier-1 SQL/alloc goldens.
+
 - **`__error_details__` on the METRIC pipeline-error message (issue #99
   OQ2, escalated).** The `grafana/loki:3.4.2` probe found that Loki DOES
   include `__error_details__` in its metric `pipeline error: '…' for

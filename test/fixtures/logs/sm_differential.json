@@ -1,0 +1,24 @@
+{
+  "_comment": "issue #102 Loki-push structured-metadata (SM) differential (e2e/src/logs_sm_corpus.rs + e2e/src/logs.rs::logs_structured_metadata_differential). A NEW scenario, own run_id/fixture/completeness gate — the OTLP differential.json and its CASE_IDS id-lock are UNTOUCHED. `{R}` in every case's `query` is replaced with this run's run_id; every case conjoins run_id=\"{R}\" plus service_name=\"svc-sm\". The corpus is pushed as identical native Loki JSON `[ts, line, {sm}]` bodies to BOTH stores' /loki/api/v1/push, then queried back: SM fans into response stream labels, a colliding SM key surfaces as <key>_extracted (last-write-wins), and a double collision overwrites the single _extracted slot. Every case is `gated` (byte-exact vs grafana/loki:3.4.2 — no informational downgrade, no ledger id). `limit` is the query_range cap on both stores; every case's expected set is sized strictly below it (validity gates in logs.rs). No SM pushdown: label filters on SM keys are the #97 client-side baseline.",
+  "limit": 1000,
+  "cases": [
+    {
+      "case_id": "sm_surfacing",
+      "construct": "non-colliding SM keys (trace_id/user_id) fan verbatim into response stream labels",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-sm\"}"
+    },
+    {
+      "case_id": "sm_label_filter",
+      "construct": "pipeline label filter on a non-colliding SM key selects the keep subset",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-sm\"} | trace_id = \"keep\""
+    },
+    {
+      "case_id": "sm_collision_extracted",
+      "construct": "pipeline label filter on a collided SM key's _extracted slot selects identically",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-sm\"} | env_extracted = \"stg\""
+    }
+  ]
+}

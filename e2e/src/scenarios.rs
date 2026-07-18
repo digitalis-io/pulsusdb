@@ -136,6 +136,17 @@ pub const SCENARIOS: &[Scenario] = &[
         run: |ctx| Box::pin(crate::logs::logs_pipeline_differential(ctx)),
     },
     Scenario {
+        name: "logs_structured_metadata_differential",
+        // Single-variant only (issue #102): the direct dual Loki-push
+        // producer needs PulsusDB's `/loki/api/v1/push` compat endpoint,
+        // mounted only under the single overlay's `PULSUS_COMPAT_ENDPOINTS`
+        // — the cluster overlay ships neither it nor a reference log store.
+        // Self-gated on PULSUS_E2E_LOGS_DIFFERENTIAL=1 (same nightly lane as
+        // `logs_pipeline_differential`); a per-PR run prints a skip.
+        variants: &[Variant::Single],
+        run: |ctx| Box::pin(crate::logs::logs_structured_metadata_differential(ctx)),
+    },
+    Scenario {
         name: "traces_differential",
         // Single-variant only (issue #60 task-manager adjudication 1):
         // set-equivalence correctness is topology-invariant, multi-shard

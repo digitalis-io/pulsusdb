@@ -13,6 +13,7 @@ mod engine;
 mod harness;
 mod logs;
 mod logs_corpus;
+mod logs_sm_corpus;
 mod metrics;
 mod scenarios;
 mod traces;
