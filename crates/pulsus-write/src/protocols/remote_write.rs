@@ -112,6 +112,51 @@ pub const MAX_SAMPLES_PER_SERIES: usize = 100_000;
 /// See [`MAX_TIMESERIES_PER_REQUEST`]'s doc comment.
 pub const MAX_METADATA_PER_REQUEST: usize = 10_000;
 
+/// The per-request cap on [`parse`]'s **estimated expanded output bytes**
+/// (issue #62). Own constant, same value and derivation as
+/// `otlp_metrics::MAX_EXPANDED_BYTES` / `otlp_traces::MAX_EXPANDED_BYTES`
+/// (4× the 64 MiB decompressed body cap = 256 MiB). The
+/// [`MAX_TIMESERIES_PER_REQUEST`]-family caps bound each *dimension*
+/// (series × labels × samples-per-series) but NOT aggregate output: a
+/// minimal wire `Sample` is 2 bytes (empty body — `value`/`timestamp` are
+/// proto3 defaults) yet decodes to one ~40-byte `MetricPoint`, so a 64 MiB
+/// body of ~33.5M such samples packs into ≈ 336 series (each ≤ 100k) —
+/// far under the 1M-timeseries cap — while materializing ≈ 1.25 GiB of
+/// output. This byte budget bounds the total: it admits ≤
+/// `MAX_EXPANDED_BYTES / SAMPLE_ROW_OVERHEAD` ≈ 4.2M samples (≈ 256 MiB),
+/// far above Prometheus's `max_samples_per_send` default of 2,000 — an
+/// order-of-magnitude DoS guard, not a tight quota.
+pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES;
+
+/// Estimated fixed heap cost of one emitted [`MetricPoint`]: `metric_name`
+/// `Arc<str>` (shared per series, not per sample) + fingerprint +
+/// `unix_milli` + `value` ≈ 40 bytes, floored to a round constant. The
+/// dominant multiplicative term (one per wire sample).
+const SAMPLE_ROW_OVERHEAD: usize = 64;
+/// Estimated fixed heap cost of one [`SeriesRef`] beyond its label bytes.
+const SERIES_ROW_OVERHEAD: usize = 64;
+/// Estimated fixed heap cost of one [`MetricMetadata`] beyond its
+/// name/help/unit bytes.
+const META_ROW_OVERHEAD: usize = 64;
+
+/// Adds `amount` to the running expansion estimate and fails the whole
+/// request the moment it exceeds [`MAX_EXPANDED_BYTES`] (issue #62) — the
+/// single charge/check point every materialization site reserves through
+/// before allocating. Identical body to `otlp_metrics::charge_budget`
+/// (remote-write labels are already `String`s, charged 1× — no `AnyValue`
+/// expansion factors).
+fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIngestError> {
+    *expanded_bytes = expanded_bytes.saturating_add(amount);
+    if *expanded_bytes > MAX_EXPANDED_BYTES {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "expanded metric row bytes (estimated)",
+            limit: MAX_EXPANDED_BYTES,
+            actual: *expanded_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Decodes a (decompressed) `POST /api/v1/write` request body, then applies
 /// the [`MAX_TIMESERIES_PER_REQUEST`]-family structural bounds. The sole
 /// decode boundary: a malformed/truncated protobuf, or a message exceeding
@@ -187,15 +232,22 @@ fn metric_type_name(t: i32) -> &'static str {
 /// ingest handler) is the only clock/IO boundary. `now_ns` becomes every
 /// metadata row's `updated_ns` (the `ReplacingMergeTree` version column,
 /// issue #26 amendment).
-pub fn parse(req: &WriteRequest, now_ns: i64) -> ParsedMetrics {
+///
+/// `Err` iff the request's estimated expanded output exceeds
+/// [`MAX_EXPANDED_BYTES`] (issue #62) — a whole-request, atomic structural
+/// failure, exactly like a decode/bounds error; everything else (a series
+/// missing `__name__`) stays a per-series drop counted in `rejected` inside
+/// the `Ok`.
+pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsIngestError> {
     let mut out = ParsedMetrics::default();
+    let mut expanded_bytes: usize = 0;
     // Dedups `SeriesRef` registration within this request by `(metric_name,
     // fingerprint)` — a labels carrier, not a per-sample registration
     // (mirrors `otlp_metrics::parse`).
     let mut seen_series: HashSet<(Arc<str>, Fingerprint)> = HashSet::new();
 
     for ts in &req.timeseries {
-        parse_time_series(&mut out, &mut seen_series, ts);
+        parse_time_series(&mut out, &mut expanded_bytes, &mut seen_series, ts)?;
     }
 
     // Metadata dedup within-request by family name, last-wins (architect
@@ -206,6 +258,11 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> ParsedMetrics {
     // no suffix to strip here).
     let mut by_name: std::collections::HashMap<Arc<str>, usize> = std::collections::HashMap::new();
     for meta in &req.metadata {
+        // Charge the metadata row BEFORE building it (issue #62).
+        charge_budget(
+            &mut expanded_bytes,
+            META_ROW_OVERHEAD + meta.metric_family_name.len() + meta.help.len() + meta.unit.len(),
+        )?;
         let name: Arc<str> = Arc::from(meta.metric_family_name.as_str());
         let row = MetricMetadata {
             metric_name: Arc::clone(&name),
@@ -223,7 +280,7 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> ParsedMetrics {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Parses one `TimeSeries`: extracts `__name__` (missing/empty -> drop the
@@ -234,9 +291,19 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> ParsedMetrics {
 /// [`SeriesRef`] for the series.
 fn parse_time_series(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     ts: &TimeSeries,
-) {
+) -> Result<(), LogsIngestError> {
+    // Charge this series' label/`SeriesRef` materialization BEFORE building
+    // `rest`/`from_normalized` (issue #62). Allocation-free: sums wire
+    // string lengths only.
+    let label_charge = ts.labels.iter().fold(SERIES_ROW_OVERHEAD, |acc, l| {
+        acc.saturating_add(l.name.len())
+            .saturating_add(l.value.len())
+    });
+    charge_budget(expanded_bytes, label_charge)?;
+
     let mut name: Option<&str> = None;
     let mut rest: Vec<(String, String)> = Vec::with_capacity(ts.labels.len());
     for label in &ts.labels {
@@ -254,7 +321,7 @@ fn parse_time_series(
                 "time series has no __name__ label (or it is empty): series dropped".to_string(),
             );
         }
-        return;
+        return Ok(());
     };
     let metric_name: Arc<str> = Arc::from(name);
 
@@ -275,6 +342,11 @@ fn parse_time_series(
     }
 
     for sample in &ts.samples {
+        // Charge each sample BEFORE pushing it (issue #62): the dominant
+        // multiplicative term (a 2-byte wire sample → one ~40-byte
+        // `MetricPoint`), so a 33.5M-sample fan-out aborts here before mass
+        // materialization.
+        charge_budget(expanded_bytes, SAMPLE_ROW_OVERHEAD)?;
         out.samples.push(MetricPoint {
             metric_name: Arc::clone(&metric_name),
             fingerprint,
@@ -286,6 +358,7 @@ fn parse_time_series(
             value: sample.value,
         });
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -460,7 +533,8 @@ mod tests {
                 metadata: vec![],
             },
             1_000,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(out, ParsedMetrics::default());
     }
 
@@ -473,8 +547,8 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let a = parse(&req, 42);
-        let b = parse(&req, 42);
+        let a = parse(&req, 42).expect("within the expansion budget");
+        let b = parse(&req, 42).expect("within the expansion budget");
         assert_eq!(a, b);
     }
 
@@ -491,7 +565,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.samples.len(), 1);
         assert_eq!(&*out.samples[0].metric_name, "http_requests_total");
         assert_eq!(out.samples[0].value, 42.0);
@@ -512,7 +586,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.samples.len(), 3);
         assert_eq!(out.series.len(), 1);
     }
@@ -526,7 +600,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert!(out.samples.is_empty());
         assert!(out.series.is_empty());
     }
@@ -542,7 +616,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 2);
         assert!(out.samples.is_empty());
         assert!(out.series.is_empty());
@@ -558,7 +632,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -578,7 +652,7 @@ mod tests {
             ],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert_eq!(out.samples.len(), 1);
         assert_eq!(&*out.samples[0].metric_name, "up");
@@ -595,7 +669,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
         assert_eq!(out.samples[0].unix_milli, 0);
     }
@@ -609,7 +683,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
         assert_eq!(out.samples[0].unix_milli, -1_000);
     }
@@ -625,7 +699,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.samples[0].value.to_bits(), STALE_NAN_BITS);
     }
 
@@ -655,8 +729,8 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out_a = parse(&req_a, 0);
-        let out_b = parse(&req_b, 0);
+        let out_a = parse(&req_a, 0).expect("within the expansion budget");
+        let out_b = parse(&req_b, 0).expect("within the expansion budget");
         assert_eq!(out_a.samples[0].fingerprint, out_b.samples[0].fingerprint);
         assert_eq!(
             out_a.series[0].labels.iter().collect::<Vec<_>>(),
@@ -680,8 +754,8 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out_dot = parse(&req_dot, 0);
-        let out_underscore = parse(&req_underscore, 0);
+        let out_dot = parse(&req_dot, 0).expect("within the expansion budget");
+        let out_underscore = parse(&req_underscore, 0).expect("within the expansion budget");
         assert_eq!(
             out_dot.samples[0].fingerprint,
             out_underscore.samples[0].fingerprint
@@ -697,7 +771,7 @@ mod tests {
             }],
             metadata: vec![],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.series[0].labels.get("le"), Some("0.5"));
     }
 
@@ -732,7 +806,7 @@ mod tests {
                 unit: "".to_string(),
             }],
         };
-        let out = parse(&req, 123);
+        let out = parse(&req, 123).expect("within the expansion budget");
         assert_eq!(out.metadata.len(), 1);
         assert_eq!(&*out.metadata[0].metric_name, "http_requests_total");
         assert_eq!(out.metadata[0].metric_type, "counter");
@@ -751,7 +825,7 @@ mod tests {
                 unit: String::new(),
             }],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(&*out.metadata[0].metric_name, "latency");
         assert_eq!(out.metadata[0].metric_type, "histogram");
     }
@@ -775,8 +849,71 @@ mod tests {
                 },
             ],
         };
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.metadata.len(), 1);
         assert_eq!(out.metadata[0].help, "second");
+    }
+
+    // -- expansion budget (issue #62) -------------------------------------
+
+    /// A single named series carrying more than the admissible ~4.2M-sample
+    /// ceiling trips [`MAX_EXPANDED_BYTES`] (issue #62 Δ1) — the per-sample
+    /// caps (per-series bounds) do not stop it, only this cumulative byte
+    /// budget does. The `actual <= limit + SAMPLE_ROW_OVERHEAD` bound proves
+    /// charge-before-materialize: each sample is charged (and the abort
+    /// fires) BEFORE its `MetricPoint` is pushed, so materialization stops at
+    /// the tipping sample rather than after the whole fan-out. Sample count
+    /// derives from the constants so a retune cannot silently weaken it.
+    #[test]
+    fn expansion_budget_rejects_sample_fan_out() {
+        let sample_count = MAX_EXPANDED_BYTES / SAMPLE_ROW_OVERHEAD + 2;
+        let samples: Vec<Sample> = (0..sample_count as i64).map(|i| sample(0.0, i)).collect();
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "up")],
+                samples,
+            }],
+            metadata: vec![],
+        };
+
+        let err = parse(&req, 0).expect_err("sample fan-out must trip the expansion budget");
+        let LogsIngestError::OversizeMessage { limit, actual, .. } = err else {
+            panic!("unexpected error: {err}");
+        };
+        assert_eq!(limit, MAX_EXPANDED_BYTES);
+        assert!(actual > MAX_EXPANDED_BYTES);
+        assert!(
+            actual <= MAX_EXPANDED_BYTES + SAMPLE_ROW_OVERHEAD,
+            "abort must fire at the tipping sample charge (charge-before-materialize): \
+             actual={actual}"
+        );
+    }
+
+    /// The budget is a whole-request bound, not a per-series truncation: an
+    /// ordinary request (multiple series, samples, metadata) parses `Ok`.
+    #[test]
+    fn expansion_budget_admits_ordinary_request() {
+        let req = WriteRequest {
+            timeseries: vec![
+                TimeSeries {
+                    labels: vec![label("__name__", "up"), label("job", "checkout")],
+                    samples: vec![sample(1.0, 1), sample(2.0, 2)],
+                },
+                TimeSeries {
+                    labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
+                    samples: vec![sample(3.0, 1)],
+                },
+            ],
+            metadata: vec![MetricMetadataProto {
+                r#type: 1,
+                metric_family_name: "up".to_string(),
+                help: "total".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let out = parse(&req, 0).expect("ordinary request is within the budget");
+        assert_eq!(out.samples.len(), 3);
+        assert_eq!(out.series.len(), 2);
+        assert_eq!(out.metadata.len(), 1);
     }
 }

@@ -15,7 +15,26 @@
 //! `_count`); Summary flattens to `<name>{quantile}`/`_sum`/`_count`. See
 //! each `emit_*` function's doc comment for the per-type mapping pinned by
 //! the architect plan.
+//!
+//! **Expansion budget (issue #62):** the per-`ScopeMetrics` base label pairs
+//! (resource ⊕ scope identity ⊕ scope attrs) are cloned into a fresh owned
+//! `LabelSet` for every emitted sample — gauge/sum one per data point,
+//! histogram/summary one per bucket/quantile — so a body inside the 64 MiB
+//! decompressed cap can fan a small resource out to gigabytes of label-pair
+//! materialization. [`parse`] guards this with [`MAX_EXPANDED_BYTES`]: an
+//! allocation-free, wire-length-based estimate accumulated and checked
+//! **before** each materialization site (per-scope before
+//! [`build_scope_pairs`], per-exponential-histogram before
+//! [`exponential_bucket_pairs`], per-sample before [`LabelSet::from_normalized`]),
+//! failing the whole request atomically with
+//! [`LogsIngestError::OversizeMessage`] (HTTP 400 / `google.rpc.Status.code =
+//! 3`) the moment the running total exceeds the budget — never a partial
+//! write. Mirrors `otlp_traces`' budget mechanism verbatim. Reject-path
+//! diagnostics are bounded by [`diag_snippet`]'s hard truncation instead
+//! (they are not payload); the success-path `{name}_bucket`/`_count`/`_sum`
+//! output-name construction is fingerprint-critical and never truncated.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -32,6 +51,132 @@ use pulsus_model::{Fingerprint, LabelSet, STALE_NAN_BITS, metric_fingerprint};
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef};
+
+/// The per-request cap on [`parse`]'s **estimated expanded output bytes**
+/// (see the module doc's "Expansion budget" section). Own constant, same
+/// value and derivation as `otlp_traces::MAX_EXPANDED_BYTES`: the
+/// decompressed body is already capped at 64 MiB
+/// (`crate::ingest::decompress::MAX_DECOMPRESSED_BYTES`); the metrics
+/// multiplicative shape is base × datapoints × buckets, so 4× the body cap
+/// (256 MiB) accommodates every legitimate batch with headroom while a
+/// pathological fan-out trips within a bounded prefix. Byte-denominated
+/// rather than sample-counted because each estimated sample carries a fixed
+/// [`SAMPLE_ROW_OVERHEAD`]-byte floor at minimum, so the byte budget bounds
+/// the sample count for free (≤ ~4M samples). An order-of-magnitude admission
+/// DoS guard, deliberately distinct from the writer's exact `est_bytes`
+/// queue reservation, which still runs at sink admission.
+pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES;
+
+/// Estimated fixed heap cost of one emitted sample beyond its label bytes:
+/// the `MetricPoint` fixed columns (`metric_name` `Arc<str>` + fingerprint +
+/// `unix_milli` + `value`) plus the optional per-distinct-series `SeriesRef`
+/// containers, floored to a round constant (mirrors
+/// `otlp_traces::ATTR_ROW_OVERHEAD`'s per-row floor).
+const SAMPLE_ROW_OVERHEAD: usize = 64;
+
+/// Estimated per-`(bound, count)` heap cost of the intermediate Vec
+/// [`exponential_bucket_pairs`] builds: `(f64, u64)` = 16 bytes. Bounded and
+/// non-multiplicative (one entry per wire bucket count), charged before that
+/// Vec is materialized so no site allocates uncharged.
+const EXP_BUCKET_PAIR_BYTES: usize = 16;
+
+/// The maximum per-byte expansion `serde_json` string escaping can produce
+/// (a control byte renders as its 6-byte `\uXXXX` escape) — the worst-case
+/// multiplier for an array/kvlist-kind attribute whose stored `val` goes
+/// through [`any_value_to_string`] → `serde_json::to_string`. Mirrors
+/// `otlp_traces::MAX_JSON_ESCAPE_FACTOR`.
+const MAX_JSON_ESCAPE_FACTOR: usize = 6;
+
+/// The (ceiled) base64 expansion factor for a bytes-kind attribute's stored
+/// `val` ([`base64_encode`] emits 4 output bytes per 3 input bytes) — same
+/// undercharge class as [`MAX_JSON_ESCAPE_FACTOR`], smaller bound. Mirrors
+/// `otlp_traces::BASE64_EXPANSION_FACTOR`.
+const BASE64_EXPANSION_FACTOR: usize = 2;
+
+/// Byte cap on any untrusted wire-derived string embedded in a rejection
+/// message via [`diag_snippet`] — mirrors
+/// `otlp_traces::DIAG_SNIPPET_MAX_BYTES`.
+const DIAG_SNIPPET_MAX_BYTES: usize = 128;
+
+/// Truncates untrusted wire-derived text for embedding in a rejection
+/// message (issue #62): reject-path message construction happens BEFORE any
+/// [`charge_budget`] reservation, so it must never materialize unbounded
+/// attacker-controlled content — a near-body-cap metric name would otherwise
+/// expand into `rejected_message`, uncharged. Truncation lands on a `char`
+/// boundary and names the elided byte count. Scoped to reject-path
+/// diagnostics ONLY — never the success-path `{name}_bucket`/`_count`/`_sum`
+/// output-name construction, whose bytes are fingerprint/identity critical.
+/// Mirrors `otlp_traces::diag_snippet`.
+fn diag_snippet(s: &str, max: usize) -> Cow<'_, str> {
+    if s.len() <= max {
+        return Cow::Borrowed(s);
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}…[{} bytes truncated]", &s[..end], s.len() - end))
+}
+
+/// One attribute's budget charge: its wire length, multiplied up to the
+/// worst-case expansion its stored rendering can reach (array/kvlist at
+/// [`MAX_JSON_ESCAPE_FACTOR`]×, bytes at [`BASE64_EXPANSION_FACTOR`]×,
+/// strings/scalars at 1×). Allocation-free — `encoded_len` never allocates —
+/// so the estimate can guard the render it describes. Mirrors
+/// `otlp_traces::attr_budget_charge` byte-for-byte.
+fn attr_budget_charge(kv: &KeyValue) -> usize {
+    let wire = kv.encoded_len();
+    match kv.value.as_ref().and_then(|v| v.value.as_ref()) {
+        Some(Value::ArrayValue(_) | Value::KvlistValue(_)) => {
+            wire.saturating_mul(MAX_JSON_ESCAPE_FACTOR)
+        }
+        Some(Value::BytesValue(_)) => wire.saturating_mul(BASE64_EXPANSION_FACTOR),
+        _ => wire,
+    }
+}
+
+/// `Σ attr_budget_charge` over an attribute slice (allocation-free).
+fn attrs_budget_charge(attrs: &[KeyValue]) -> usize {
+    attrs
+        .iter()
+        .fold(0usize, |acc, kv| acc.saturating_add(attr_budget_charge(kv)))
+}
+
+/// The per-scope base label charge: `Σ attr_budget_charge(resource attrs)`
+/// plus the scope-identity key/value lengths (only when the scope is
+/// present) plus `Σ attr_budget_charge(scope attrs)` — the byte cost of the
+/// base pairs [`build_scope_pairs`] materializes once per scope and every
+/// sample in it clones. Allocation-free; identical inputs to
+/// [`build_scope_pairs`].
+fn scope_base_charge(resource: Option<&Resource>, scope_metrics: &ScopeMetrics) -> usize {
+    let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+    let mut charge = attrs_budget_charge(resource_attrs);
+    if let Some(scope) = scope_metrics.scope.as_ref() {
+        charge = charge
+            .saturating_add("otel_scope_name".len())
+            .saturating_add(scope.name.len())
+            .saturating_add("otel_scope_version".len())
+            .saturating_add(scope.version.len())
+            .saturating_add(attrs_budget_charge(&scope.attributes));
+    }
+    charge
+}
+
+/// Adds `amount` to the running expansion estimate and fails the whole
+/// request the moment it exceeds [`MAX_EXPANDED_BYTES`] — the single
+/// charge/check point every materialization site reserves through before
+/// allocating. Mirrors `otlp_traces::charge_budget`.
+fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIngestError> {
+    *expanded_bytes = expanded_bytes.saturating_add(amount);
+    if *expanded_bytes > MAX_EXPANDED_BYTES {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "expanded metric row bytes (estimated)",
+            limit: MAX_EXPANDED_BYTES,
+            actual: *expanded_bytes,
+        });
+    }
+    Ok(())
+}
 
 /// Decodes a (decompressed) OTLP `/v1/metrics` request body. The sole
 /// decode boundary: a malformed/truncated protobuf is a whole-request,
@@ -56,8 +201,19 @@ pub fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsInges
 /// the caller (the ingest handler) is the only clock/IO boundary. `now_ns`
 /// becomes every metadata row's `updated_ns` (the `ReplacingMergeTree`
 /// version column, issue #26 amendment).
-pub fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> ParsedMetrics {
+///
+/// `Err` iff the request's estimated expanded output exceeds
+/// [`MAX_EXPANDED_BYTES`] (see the module doc's "Expansion budget" section)
+/// — a whole-request, atomic structural failure, exactly like a decode
+/// error; everything else (bad timestamps, count mismatches, delta
+/// temporality) stays a per-point/per-metric partial-success rejection
+/// inside the `Ok`.
+pub fn parse(
+    req: &ExportMetricsServiceRequest,
+    now_ns: i64,
+) -> Result<ParsedMetrics, LogsIngestError> {
     let mut out = ParsedMetrics::default();
+    let mut expanded_bytes: usize = 0;
     // Dedups `SeriesRef` registration within this request by `(metric_name,
     // fingerprint)` (architect plan: "a labels carrier, not a per-sample
     // registration").
@@ -69,6 +225,14 @@ pub fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> ParsedMetrics {
 
     for resource_metrics in &req.resource_metrics {
         for scope_metrics in &resource_metrics.scope_metrics {
+            // Charge the per-scope base rendering BEFORE materializing it
+            // (`build_scope_pairs`' once-per-scope allocation, incl.
+            // zero-data-point scopes) — mirrors otlp_traces' pre-render
+            // service charge. The same `base_charge` is threaded down and
+            // re-charged per sample (each sample clones the base pairs).
+            let base_charge = scope_base_charge(resource_metrics.resource.as_ref(), scope_metrics);
+            charge_budget(&mut expanded_bytes, base_charge)?;
+
             // Base label pairs (resource ⊕ scope identity ⊕ scope attrs),
             // computed once per `ScopeMetrics` (architect plan) and reused,
             // unresolved, across every data point in it — the actual
@@ -76,21 +240,26 @@ pub fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> ParsedMetrics {
             // final per-data-point pair set (base ⊕ dp attrs ⊕ synthetic
             // le/quantile) is known, in `emit_sample`.
             let base_pairs = build_scope_pairs(resource_metrics.resource.as_ref(), scope_metrics);
+            let base = ScopeBase {
+                pairs: &base_pairs,
+                charge: base_charge,
+            };
 
             for metric in &scope_metrics.metrics {
                 parse_metric(
                     &mut out,
+                    &mut expanded_bytes,
                     &mut seen_series,
                     &mut seen_metadata,
                     metric,
-                    &base_pairs,
+                    &base,
                     now_ns,
-                );
+                )?;
             }
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Dispatches one `Metric` descriptor to its type-specific handler
@@ -101,14 +270,15 @@ pub fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> ParsedMetrics {
 /// not a meaningful export.
 fn parse_metric(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     seen_metadata: &mut HashSet<Arc<str>>,
     metric: &Metric,
-    base_pairs: &[(String, String)],
+    base: &ScopeBase<'_>,
     now_ns: i64,
-) {
+) -> Result<(), LogsIngestError> {
     let Some(data) = metric.data.as_ref() else {
-        return;
+        return Ok(());
     };
     let name: Arc<str> = Arc::from(metric.name.as_str());
 
@@ -138,42 +308,64 @@ fn parse_metric(
     match data {
         metric::Data::Gauge(gauge) => {
             for dp in &gauge.data_points {
-                emit_number_point(out, seen_series, Arc::clone(&name), base_pairs, dp);
+                emit_number_point(
+                    out,
+                    expanded_bytes,
+                    seen_series,
+                    Arc::clone(&name),
+                    base,
+                    dp,
+                )?;
             }
         }
         metric::Data::Sum(sum) => {
             if is_delta(sum.aggregation_temporality) {
                 reject_whole_metric(out, &metric.name, sum.data_points.len());
-                return;
+                return Ok(());
             }
             for dp in &sum.data_points {
-                emit_number_point(out, seen_series, Arc::clone(&name), base_pairs, dp);
+                emit_number_point(
+                    out,
+                    expanded_bytes,
+                    seen_series,
+                    Arc::clone(&name),
+                    base,
+                    dp,
+                )?;
             }
         }
         metric::Data::Histogram(hist) => {
             if is_delta(hist.aggregation_temporality) {
                 reject_whole_metric(out, &metric.name, hist.data_points.len());
-                return;
+                return Ok(());
             }
             for dp in &hist.data_points {
-                emit_histogram_point(out, seen_series, &name, base_pairs, dp);
+                emit_histogram_point(out, expanded_bytes, seen_series, &name, base, dp)?;
             }
         }
         metric::Data::ExponentialHistogram(exp) => {
             if is_delta(exp.aggregation_temporality) {
                 reject_whole_metric(out, &metric.name, exp.data_points.len());
-                return;
+                return Ok(());
             }
             for dp in &exp.data_points {
-                emit_exponential_histogram_point(out, seen_series, &name, base_pairs, dp);
+                emit_exponential_histogram_point(
+                    out,
+                    expanded_bytes,
+                    seen_series,
+                    &name,
+                    base,
+                    dp,
+                )?;
             }
         }
         metric::Data::Summary(summary) => {
             for dp in &summary.data_points {
-                emit_summary_point(out, seen_series, &name, base_pairs, dp);
+                emit_summary_point(out, expanded_bytes, seen_series, &name, base, dp)?;
             }
         }
     }
+    Ok(())
 }
 
 /// `true` when `temporality` is `AGGREGATION_TEMPORALITY_DELTA` (architect
@@ -191,18 +383,33 @@ fn is_delta(temporality: i32) -> bool {
 fn reject_whole_metric(out: &mut ParsedMetrics, metric_name: &str, data_point_count: usize) {
     out.rejected += data_point_count as u64;
     if out.rejected_message.is_none() {
+        // Lazy + truncated (issue #62): the embedded name is untrusted
+        // wire content, kept only for the first rejection.
         out.rejected_message = Some(format!(
-            "metric {metric_name}: delta temporality unsupported until M7"
+            "metric {}: delta temporality unsupported until M7",
+            diag_snippet(metric_name, DIAG_SNIPPET_MAX_BYTES)
         ));
     }
 }
 
-/// Rejects a single data point into partial success, naming `metric_name`.
-fn reject_point(out: &mut ParsedMetrics, message: String) {
+/// Rejects a single data point into partial success. `message` is a lazy
+/// closure (issue #62): a pathological all-reject request must not format
+/// (and, for an untrusted metric name, amplify) one discarded message per
+/// point — the closure runs only for the first rejection kept.
+fn reject_point(out: &mut ParsedMetrics, message: impl FnOnce() -> String) {
     out.rejected += 1;
     if out.rejected_message.is_none() {
-        out.rejected_message = Some(message);
+        out.rejected_message = Some(message());
     }
+}
+
+/// The per-`ScopeMetrics` base label pairs plus their [`MAX_EXPANDED_BYTES`]
+/// charge, threaded together (issue #62) — bundled into one borrowed struct
+/// so the per-type handlers stay within clippy's default argument threshold,
+/// mirroring [`DataPointContext`]'s own bundling rationale.
+struct ScopeBase<'a> {
+    pairs: &'a [(String, String)],
+    charge: usize,
 }
 
 /// The per-data-point context every `emit_sample` call within one data
@@ -215,6 +422,28 @@ struct DataPointContext<'a> {
     base_pairs: &'a [(String, String)],
     dp_attributes: &'a [KeyValue],
     unix_milli: i64,
+    /// The per-scope base label charge (issue #62), re-charged per sample
+    /// (each sample clones the base pairs into its own `LabelSet`). O(1) to
+    /// read — never re-walks the base attrs per sample.
+    base_charge: usize,
+    /// This data point's own attribute charge (`Σ attr_budget_charge`),
+    /// computed once per data point (issue #62).
+    dp_attr_charge: usize,
+}
+
+impl<'a> DataPointContext<'a> {
+    /// Builds the per-data-point context from the scope's [`ScopeBase`] and
+    /// this data point's attributes/timestamp, charging the data point's own
+    /// attributes once here (issue #62) rather than per sample.
+    fn new(base: &ScopeBase<'a>, dp_attributes: &'a [KeyValue], unix_milli: i64) -> Self {
+        DataPointContext {
+            base_pairs: base.pairs,
+            dp_attributes,
+            unix_milli,
+            base_charge: base.charge,
+            dp_attr_charge: attrs_budget_charge(dp_attributes),
+        }
+    }
 }
 
 /// Gauge/Sum mapping (architect plan table): one sample named `{name}`,
@@ -222,32 +451,36 @@ struct DataPointContext<'a> {
 /// base pairs) — no derived series.
 fn emit_number_point(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     name: Arc<str>,
-    base_pairs: &[(String, String)],
+    base: &ScopeBase<'_>,
     dp: &NumberDataPoint,
-) {
+) -> Result<(), LogsIngestError> {
     let unix_milli = match resolve_timestamp_ms(dp.time_unix_nano) {
         Ok(ms) => ms,
         Err(message) => {
-            reject_point(out, format!("metric {name}: {message}"));
-            return;
+            reject_point(out, || {
+                format!(
+                    "metric {}: {message}",
+                    diag_snippet(&name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
         }
     };
     let Some(raw_value) = resolve_number_value(dp.value.as_ref()) else {
-        reject_point(
-            out,
-            format!("metric {name}: data point has no recognized value field"),
-        );
-        return;
+        reject_point(out, || {
+            format!(
+                "metric {}: data point has no recognized value field",
+                diag_snippet(&name, DIAG_SNIPPET_MAX_BYTES)
+            )
+        });
+        return Ok(());
     };
     let value = stale_or(dp.flags, raw_value);
-    let ctx = DataPointContext {
-        base_pairs,
-        dp_attributes: &dp.attributes,
-        unix_milli,
-    };
-    emit_sample(out, seen_series, name, &ctx, None, value);
+    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+    emit_sample(out, expanded_bytes, seen_series, name, &ctx, None, value)
 }
 
 /// Histogram mapping (architect plan + amendment): `{name}_bucket{le}` per
@@ -270,23 +503,25 @@ fn emit_number_point(
 /// bucket is emitted directly from the reported `count`.
 fn emit_histogram_point(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     name: &Arc<str>,
-    base_pairs: &[(String, String)],
+    base: &ScopeBase<'_>,
     dp: &HistogramDataPoint,
-) {
+) -> Result<(), LogsIngestError> {
     let unix_milli = match resolve_timestamp_ms(dp.time_unix_nano) {
         Ok(ms) => ms,
         Err(message) => {
-            reject_point(out, format!("metric {name}: {message}"));
-            return;
+            reject_point(out, || {
+                format!(
+                    "metric {}: {message}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
         }
     };
-    let ctx = DataPointContext {
-        base_pairs,
-        dp_attributes: &dp.attributes,
-        unix_milli,
-    };
+    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
     let bucket_name: Arc<str> = Arc::from(format!("{name}_bucket").as_str());
 
     if dp.bucket_counts.is_empty() {
@@ -294,32 +529,33 @@ fn emit_histogram_point(
         // still equal `_count` (review finding 2, AC).
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             Arc::clone(&bucket_name),
             &ctx,
             Some(("le", "+Inf".to_string())),
             stale_or(dp.flags, dp.count as f64),
-        );
+        )?;
     } else {
         let Some(derived_count) = checked_sum(dp.bucket_counts.iter().copied()) else {
-            reject_point(
-                out,
+            reject_point(out, || {
                 format!(
-                    "histogram {name}: bucket counts overflow u64 while summing (rejected \
-                     rather than silently wrapping/panicking)"
-                ),
-            );
-            return;
+                    "histogram {}: bucket counts overflow u64 while summing (rejected \
+                     rather than silently wrapping/panicking)",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
         };
         if derived_count != dp.count {
-            reject_point(
-                out,
+            reject_point(out, || {
                 format!(
-                    "histogram {name}: bucket counts sum to {derived_count} but count={reported}",
+                    "histogram {}: bucket counts sum to {derived_count} but count={reported}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES),
                     reported = dp.count
-                ),
-            );
-            return;
+                )
+            });
+            return Ok(());
         }
 
         let mut running: u64 = 0;
@@ -334,35 +570,39 @@ fn emit_histogram_point(
             let value = stale_or(dp.flags, running as f64);
             emit_sample(
                 out,
+                expanded_bytes,
                 seen_series,
                 Arc::clone(&bucket_name),
                 &ctx,
                 Some(("le", render_bound(le))),
                 value,
-            );
+            )?;
         }
     }
 
     let count_name: Arc<str> = Arc::from(format!("{name}_count").as_str());
     emit_sample(
         out,
+        expanded_bytes,
         seen_series,
         count_name,
         &ctx,
         None,
         stale_or(dp.flags, dp.count as f64),
-    );
+    )?;
     if let Some(sum) = dp.sum {
         let sum_name: Arc<str> = Arc::from(format!("{name}_sum").as_str());
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             sum_name,
             &ctx,
             None,
             stale_or(dp.flags, sum),
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Sums `counts`, checked: an overflowing sum (only reachable via a
@@ -395,44 +635,64 @@ fn checked_sum(counts: impl IntoIterator<Item = u64>) -> Option<u64> {
 /// samples emitted.
 fn emit_exponential_histogram_point(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     name: &Arc<str>,
-    base_pairs: &[(String, String)],
+    base: &ScopeBase<'_>,
     dp: &ExponentialHistogramDataPoint,
-) {
+) -> Result<(), LogsIngestError> {
     let unix_milli = match resolve_timestamp_ms(dp.time_unix_nano) {
         Ok(ms) => ms,
         Err(message) => {
-            reject_point(out, format!("metric {name}: {message}"));
-            return;
+            reject_point(out, || {
+                format!(
+                    "metric {}: {message}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
         }
     };
-    let ctx = DataPointContext {
-        base_pairs,
-        dp_attributes: &dp.attributes,
-        unix_milli,
-    };
+    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
+
+    // Charge the intermediate `(bound, count)` Vec BEFORE building it
+    // (issue #62). Bounded/non-multiplicative (one entry per wire bucket
+    // count), but charged for completeness so no site allocates uncharged.
+    let exp_bucket_charge = dp
+        .positive
+        .as_ref()
+        .map(|b| b.bucket_counts.len())
+        .unwrap_or(0)
+        .saturating_add(
+            dp.negative
+                .as_ref()
+                .map(|b| b.bucket_counts.len())
+                .unwrap_or(0),
+        )
+        .saturating_add(1)
+        .saturating_mul(EXP_BUCKET_PAIR_BYTES);
+    charge_budget(expanded_bytes, exp_bucket_charge)?;
 
     let mut pairs = exponential_bucket_pairs(dp);
     let Some(derived_count) = checked_sum(pairs.iter().map(|(_, count)| *count)) else {
-        reject_point(
-            out,
+        reject_point(out, || {
             format!(
-                "histogram {name}: bucket counts overflow u64 while summing (rejected rather \
-                 than silently wrapping/panicking)"
-            ),
-        );
-        return;
+                "histogram {}: bucket counts overflow u64 while summing (rejected rather \
+                 than silently wrapping/panicking)",
+                diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+            )
+        });
+        return Ok(());
     };
     if derived_count != dp.count {
-        reject_point(
-            out,
+        reject_point(out, || {
             format!(
-                "histogram {name}: bucket counts sum to {derived_count} but count={reported}",
+                "histogram {}: bucket counts sum to {derived_count} but count={reported}",
+                diag_snippet(name, DIAG_SNIPPET_MAX_BYTES),
                 reported = dp.count
-            ),
-        );
-        return;
+            )
+        });
+        return Ok(());
     }
 
     // Non-finite bounds (scale/index overflow) fold into the `+Inf`
@@ -481,12 +741,13 @@ fn emit_exponential_histogram_point(
         emitted_inf = label == "+Inf";
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             Arc::clone(&bucket_name),
             &ctx,
             Some(("le", label.clone())),
             value,
-        );
+        )?;
     }
     if !emitted_inf {
         // `running` already equals `derived_count` (every positive/
@@ -496,34 +757,38 @@ fn emit_exponential_histogram_point(
         let value = stale_or(dp.flags, running as f64);
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             Arc::clone(&bucket_name),
             &ctx,
             Some(("le", "+Inf".to_string())),
             value,
-        );
+        )?;
     }
 
     let count_name: Arc<str> = Arc::from(format!("{name}_count").as_str());
     emit_sample(
         out,
+        expanded_bytes,
         seen_series,
         count_name,
         &ctx,
         None,
         stale_or(dp.flags, dp.count as f64),
-    );
+    )?;
     if let Some(sum) = dp.sum {
         let sum_name: Arc<str> = Arc::from(format!("{name}_sum").as_str());
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             sum_name,
             &ctx,
             None,
             stale_or(dp.flags, sum),
-        );
+        )?;
     }
+    Ok(())
 }
 
 /// Builds the raw `(bound, count)` pairs for one exponential-histogram data
@@ -615,53 +880,59 @@ fn exponential_lower_bound_negated(k: i64, scale: i32) -> f64 {
 /// `count` are non-optional on the wire, unlike a histogram's `sum`).
 fn emit_summary_point(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     name: &Arc<str>,
-    base_pairs: &[(String, String)],
+    base: &ScopeBase<'_>,
     dp: &SummaryDataPoint,
-) {
+) -> Result<(), LogsIngestError> {
     let unix_milli = match resolve_timestamp_ms(dp.time_unix_nano) {
         Ok(ms) => ms,
         Err(message) => {
-            reject_point(out, format!("metric {name}: {message}"));
-            return;
+            reject_point(out, || {
+                format!(
+                    "metric {}: {message}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
         }
     };
-    let ctx = DataPointContext {
-        base_pairs,
-        dp_attributes: &dp.attributes,
-        unix_milli,
-    };
+    let ctx = DataPointContext::new(base, &dp.attributes, unix_milli);
 
     for qv in &dp.quantile_values {
         emit_sample(
             out,
+            expanded_bytes,
             seen_series,
             Arc::clone(name),
             &ctx,
             Some(("quantile", render_bound(qv.quantile))),
             stale_or(dp.flags, qv.value),
-        );
+        )?;
     }
 
     let sum_name: Arc<str> = Arc::from(format!("{name}_sum").as_str());
     emit_sample(
         out,
+        expanded_bytes,
         seen_series,
         sum_name,
         &ctx,
         None,
         stale_or(dp.flags, dp.sum),
-    );
+    )?;
     let count_name: Arc<str> = Arc::from(format!("{name}_count").as_str());
     emit_sample(
         out,
+        expanded_bytes,
         seen_series,
         count_name,
         &ctx,
         None,
         stale_or(dp.flags, dp.count as f64),
-    );
+    )?;
+    Ok(())
 }
 
 /// Builds one sample's final `LabelSet` (base pairs ⊕ this data point's
@@ -671,12 +942,25 @@ fn emit_summary_point(
 /// fingerprint)` series (deduped) and pushes the sample.
 fn emit_sample(
     out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
     seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
     metric_name: Arc<str>,
     ctx: &DataPointContext<'_>,
     extra: Option<(&str, String)>,
     value: f64,
-) {
+) -> Result<(), LogsIngestError> {
+    // Charge this sample's expanded output BEFORE materializing its
+    // `LabelSet` (issue #62): the fixed row floor, the per-scope base
+    // pairs it clones (`base_charge`, O(1) read — no re-walk), its own
+    // attributes (`dp_attr_charge`), and the optional synthetic
+    // `le`/`quantile` pair. Allocation-free; a pathological fan-out aborts
+    // here before `from_normalized` clones a single pair set.
+    let extra_len = extra.as_ref().map(|(k, v)| k.len() + v.len()).unwrap_or(0);
+    charge_budget(
+        expanded_bytes,
+        SAMPLE_ROW_OVERHEAD + ctx.base_charge + ctx.dp_attr_charge + extra_len,
+    )?;
+
     let pairs = ctx
         .base_pairs
         .iter()
@@ -700,6 +984,7 @@ fn emit_sample(
         unix_milli: ctx.unix_milli,
         value,
     });
+    Ok(())
 }
 
 /// Flattens `resource.attributes ⊕ otel_scope_name/version ⊕
@@ -917,7 +1202,7 @@ fn render_bound(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+    use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::metrics::v1::exponential_histogram_data_point::Buckets;
     use opentelemetry_proto::tonic::metrics::v1::{
         ExponentialHistogram, Gauge, Histogram, ResourceMetrics, Sum, Summary,
@@ -983,7 +1268,7 @@ mod tests {
 
     #[test]
     fn parse_of_empty_request_returns_empty_output() {
-        let out = parse(&request(vec![]), 1_000);
+        let out = parse(&request(vec![]), 1_000).expect("within the expansion budget");
         assert_eq!(out, ParsedMetrics::default());
     }
 
@@ -993,8 +1278,8 @@ mod tests {
             None,
             gauge_metric("up", number_dp(1_700_000_000_000_000_000, 1.0, vec![])),
         );
-        let a = parse(&req, 42);
-        let b = parse(&req, 42);
+        let a = parse(&req, 42).expect("within the expansion budget");
+        let b = parse(&req, 42).expect("within the expansion budget");
         assert_eq!(a, b);
     }
 
@@ -1029,7 +1314,7 @@ mod tests {
                 ),
             ),
         );
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.samples.len(), 1);
         assert_eq!(&*out.samples[0].metric_name, "cpu_usage");
         assert_eq!(out.samples[0].value, 0.5);
@@ -1055,7 +1340,7 @@ mod tests {
                 is_monotonic: true,
             })),
         };
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.metadata[0].metric_type, "counter");
     }
 
@@ -1072,7 +1357,7 @@ mod tests {
                 is_monotonic: false,
             })),
         };
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.metadata[0].metric_type, "gauge");
     }
 
@@ -1089,7 +1374,7 @@ mod tests {
                 is_monotonic: true,
             })),
         };
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 2);
         assert!(
             out.rejected_message
@@ -1106,7 +1391,7 @@ mod tests {
     #[test]
     fn number_data_point_with_zero_timestamp_is_rejected_as_partial_success() {
         let req = one_metric_request(None, gauge_metric("up", number_dp(0, 1.0, vec![])));
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -1122,7 +1407,7 @@ mod tests {
             value: None,
         };
         let req = one_metric_request(None, gauge_metric("up", dp));
-        let out = parse(&req, 0);
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -1137,7 +1422,8 @@ mod tests {
             flags: 0,
             value: Some(number_data_point::Value::AsInt(42)),
         };
-        let out = parse(&one_metric_request(None, gauge_metric("up", dp)), 0);
+        let out = parse(&one_metric_request(None, gauge_metric("up", dp)), 0)
+            .expect("within the expansion budget");
         assert_eq!(out.samples[0].value, 42.0);
     }
 
@@ -1151,7 +1437,8 @@ mod tests {
             flags: DataPointFlags::NoRecordedValueMask as u32,
             value: Some(number_data_point::Value::AsDouble(1.0)),
         };
-        let out = parse(&one_metric_request(None, gauge_metric("up", dp)), 0);
+        let out = parse(&one_metric_request(None, gauge_metric("up", dp)), 0)
+            .expect("within the expansion budget");
         assert_eq!(out.samples[0].value.to_bits(), STALE_NAN_BITS);
     }
 
@@ -1175,14 +1462,16 @@ mod tests {
                 gauge_metric("up", number_dp(1, 1.0, vec![])),
             ),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         let out_underscore = parse(
             &one_metric_request(
                 Some(resource_underscore),
                 gauge_metric("up", number_dp(1, 1.0, vec![])),
             ),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(
             out_dot.samples[0].fingerprint,
             out_underscore.samples[0].fingerprint
@@ -1197,7 +1486,8 @@ mod tests {
                 gauge_metric("http_requests_total", number_dp(1, 1.0, vec![])),
             ),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(out.series[0].labels.get("__name__"), None);
     }
 
@@ -1220,7 +1510,8 @@ mod tests {
                 schema_url: String::new(),
             }]),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(
             out.series[0].labels.get("otel_scope_name"),
             Some("my-scope")
@@ -1283,7 +1574,7 @@ mod tests {
             vec![1.0, 2.5],
         );
         let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
 
         let buckets: Vec<_> = out
             .samples
@@ -1332,7 +1623,7 @@ mod tests {
         // bucket_counts sum to 10, but reported count is 99 -> mismatch.
         let dp = histogram_dp(1, 99, Some(1.0), vec![2, 3, 5], vec![1.0, 2.5]);
         let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.rejected_message.as_ref().unwrap().contains("latency"));
         assert!(out.samples.is_empty());
@@ -1345,7 +1636,7 @@ mod tests {
     fn histogram_with_no_bucket_distribution_still_emits_inf_bucket_equal_to_count() {
         let dp = histogram_dp(1, 5, Some(12.5), vec![], vec![]);
         let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.samples.len(), 3);
 
         let bucket = out
@@ -1374,7 +1665,7 @@ mod tests {
     fn histogram_delta_temporality_rejects_the_whole_metric() {
         let dp = histogram_dp(1, 10, Some(1.0), vec![10], vec![]);
         let metric = histogram_metric("latency", AggregationTemporality::Delta, dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -1427,7 +1718,7 @@ mod tests {
             ..exp_histogram_dp()
         };
         let metric = exp_histogram_metric("size", dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
 
         let count = out
             .samples
@@ -1462,7 +1753,7 @@ mod tests {
             ..exp_histogram_dp()
         };
         let metric = exp_histogram_metric("size", dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -1484,7 +1775,7 @@ mod tests {
                 aggregation_temporality: AggregationTemporality::Delta as i32,
             })),
         };
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
     }
@@ -1521,7 +1812,7 @@ mod tests {
         // builds) or silently wrap to an under-count (release builds).
         let dp = histogram_dp(1, 5, None, vec![u64::MAX, 1], vec![1.0]);
         let metric = histogram_metric("latency", AggregationTemporality::Cumulative, dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
         assert!(out.rejected_message.as_ref().unwrap().contains("overflow"));
@@ -1539,7 +1830,7 @@ mod tests {
             ..exp_histogram_dp()
         };
         let metric = exp_histogram_metric("size", dp);
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
         assert!(out.rejected_message.as_ref().unwrap().contains("overflow"));
@@ -1668,7 +1959,7 @@ mod tests {
                 data_points: vec![dp],
             })),
         };
-        let out = parse(&one_metric_request(None, metric), 0);
+        let out = parse(&one_metric_request(None, metric), 0).expect("within the expansion budget");
         assert_eq!(out.samples.len(), 4); // 2 quantiles + sum + count
         assert_eq!(out.metadata[0].metric_type, "summary");
 
@@ -1738,7 +2029,8 @@ mod tests {
                 schema_url: String::new(),
             }]),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(out.metadata.len(), 1);
         assert_eq!(out.samples.len(), 2);
     }
@@ -1758,7 +2050,215 @@ mod tests {
         let out = parse(
             &one_metric_request(Some(resource), gauge_metric("up", dp)),
             0,
-        );
+        )
+        .expect("within the expansion budget");
         assert_eq!(out.collisions, 1);
+    }
+
+    // -- expansion budget (issue #62) -------------------------------------
+
+    /// A body inside the wire cap whose base × data-point fan-out describes
+    /// an over-budget expansion is rejected as a whole-request structural
+    /// failure BEFORE the expansion is materialized (the `OversizeMessage`
+    /// class the handler maps to 400/code 3). The `actual <= limit + one
+    /// sample charge` bound proves charge-before-allocate: the abort fires
+    /// at the tipping sample, not after summing all data points.
+    #[test]
+    fn expansion_budget_rejects_pathological_fan_out() {
+        const MIB: usize = 1024 * 1024;
+        // One ~1 MiB resource attribute, cloned into every data point's
+        // LabelSet — the per-sample charge (~1 MiB) trips the budget within
+        // a few hundred data points. Derived from the constant so a retune
+        // cannot silently weaken this.
+        let resource = Resource {
+            attributes: vec![kv("big.attr", Value::StringValue("v".repeat(MIB)))],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        };
+        let dp_count = MAX_EXPANDED_BYTES / MIB + 2;
+        let data_points: Vec<NumberDataPoint> = (0..dp_count)
+            .map(|i| number_dp(1, i as f64, vec![]))
+            .collect();
+        let metric = Metric {
+            name: "cpu".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![],
+            data: Some(metric::Data::Gauge(Gauge { data_points })),
+        };
+
+        let err = parse(&one_metric_request(Some(resource), metric), 0)
+            .expect_err("pathological fan-out must trip the expansion budget");
+        let LogsIngestError::OversizeMessage { limit, actual, .. } = err else {
+            panic!("unexpected error: {err}");
+        };
+        assert_eq!(limit, MAX_EXPANDED_BYTES);
+        assert!(actual > MAX_EXPANDED_BYTES);
+        // One tipping sample's charge is ~1 MiB (base clone) + a small
+        // fixed floor; 2 MiB is a generous one-sample bound. Materializing
+        // all `dp_count` samples would instead reach ~hundreds of GiB.
+        assert!(
+            actual <= MAX_EXPANDED_BYTES + 2 * MIB,
+            "abort must fire at the tipping sample charge, not after summing all {dp_count} \
+             data points: actual={actual}"
+        );
+    }
+
+    /// The per-scope base rendering is charged BEFORE `build_scope_pairs`
+    /// (issue #62), so a request with many big-resource scopes and ZERO data
+    /// points — no per-sample charge site anywhere — still trips on the
+    /// accumulated per-scope base charges alone.
+    #[test]
+    fn expansion_budget_charges_base_rendering_before_scope_pairs() {
+        const MIB: usize = 1024 * 1024;
+        let resource = Resource {
+            attributes: vec![kv("big.attr", Value::StringValue("v".repeat(MIB)))],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        };
+        let scope_count = MAX_EXPANDED_BYTES / MIB + 2;
+        let req = request(
+            (0..scope_count)
+                .map(|_| ResourceMetrics {
+                    resource: Some(resource.clone()),
+                    // Deliberately data-point-less: the only materialization
+                    // is the per-scope base rendering.
+                    scope_metrics: vec![scope_metrics(vec![])],
+                    schema_url: String::new(),
+                })
+                .collect(),
+        );
+
+        let err = parse(&req, 0)
+            .expect_err("per-scope base charge must trip before any data point exists");
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage { limit, actual, .. }
+                    if limit == MAX_EXPANDED_BYTES && actual > MAX_EXPANDED_BYTES
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The budget is a whole-request bound, not a per-point truncation: a
+    /// mixed gauge/histogram/summary request comfortably inside it parses
+    /// `Ok` with samples/series/metadata intact.
+    #[test]
+    fn expansion_budget_admits_ordinary_request() {
+        let gauge = gauge_metric("cpu", number_dp(1, 0.5, vec![]));
+        let hist = histogram_metric(
+            "latency",
+            AggregationTemporality::Cumulative,
+            histogram_dp(1, 10, Some(42.0), vec![2, 3, 5], vec![1.0, 2.5]),
+        );
+        let summary = Metric {
+            name: "req_duration".to_string(),
+            description: String::new(),
+            unit: String::new(),
+            metadata: vec![],
+            data: Some(metric::Data::Summary(
+                opentelemetry_proto::tonic::metrics::v1::Summary {
+                    data_points: vec![summary_dp(1, 3, 6.0, vec![(0.5, 1.5)])],
+                },
+            )),
+        };
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scope_metrics(vec![gauge, hist, summary])],
+            schema_url: String::new(),
+        }]);
+
+        let out = parse(&req, 0).expect("ordinary request is within the budget");
+        // gauge(1) + hist buckets(3) + hist count/sum(2) + summary q(1)/sum/count(2)
+        assert_eq!(out.samples.len(), 1 + 3 + 2 + 1 + 2);
+        assert_eq!(out.metadata.len(), 3);
+    }
+
+    /// [`attr_budget_charge`]'s per-kind multipliers, pinned directly:
+    /// array/kvlist at [`MAX_JSON_ESCAPE_FACTOR`]×, bytes at
+    /// [`BASE64_EXPANSION_FACTOR`]×, strings/scalars at 1×.
+    #[test]
+    fn attr_budget_charge_multiplies_rendered_expanding_kinds_only() {
+        let string_kv = kv("k", Value::StringValue("plain".to_string()));
+        assert_eq!(attr_budget_charge(&string_kv), string_kv.encoded_len());
+
+        let int_kv = kv("k", Value::IntValue(42));
+        assert_eq!(attr_budget_charge(&int_kv), int_kv.encoded_len());
+
+        let array_kv = kv(
+            "k",
+            Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::StringValue("x".to_string())),
+                }],
+            }),
+        );
+        assert_eq!(
+            attr_budget_charge(&array_kv),
+            array_kv.encoded_len() * MAX_JSON_ESCAPE_FACTOR
+        );
+
+        let kvlist_kv = kv(
+            "k",
+            Value::KvlistValue(KeyValueList {
+                values: vec![kv("nested", Value::StringValue("v".to_string()))],
+            }),
+        );
+        assert_eq!(
+            attr_budget_charge(&kvlist_kv),
+            kvlist_kv.encoded_len() * MAX_JSON_ESCAPE_FACTOR
+        );
+
+        let bytes_kv = kv("k", Value::BytesValue(vec![0xFF; 9]));
+        assert_eq!(
+            attr_budget_charge(&bytes_kv),
+            bytes_kv.encoded_len() * BASE64_EXPANSION_FACTOR
+        );
+    }
+
+    /// [`diag_snippet`]'s contract: short input passes through borrowed (no
+    /// allocation); over-cap input truncates on a `char` boundary (never
+    /// splits a code point) and names the elided count.
+    #[test]
+    fn diag_snippet_truncates_on_char_boundaries_and_borrows_short_input() {
+        let short = "ordinary-metric-name";
+        assert!(matches!(
+            diag_snippet(short, DIAG_SNIPPET_MAX_BYTES),
+            Cow::Borrowed(s) if s == short
+        ));
+
+        let emoji = "\u{1F600}".repeat(64); // 256 bytes, 4-byte code points
+        let snipped = diag_snippet(&emoji, 127);
+        assert!(snipped.len() < emoji.len());
+        assert!(snipped.contains("bytes truncated"));
+        // Truncated at 124 (the last 4-byte boundary <= 127).
+        assert!(snipped.starts_with(&"\u{1F600}".repeat(31)));
+    }
+
+    /// Reject-path amplifier fix (issue #62): a rejected data point on a
+    /// metric with a near-body-cap name must NOT materialize the whole name
+    /// into `rejected_message` — the embedded name is truncated via
+    /// [`diag_snippet`]. Only the first rejection's (lazy) message is kept.
+    #[test]
+    fn reject_message_is_bounded_for_an_escape_dense_metric_name() {
+        let big_name = "n".repeat(32 * 1024 * 1024); // near-body-cap
+        // Zero timestamp rejects the data point (partial success).
+        let req = one_metric_request(None, gauge_metric(&big_name, number_dp(0, 1.0, vec![])));
+        let out = parse(&req, 0)
+            .expect("a rejected data point is partial success, not a whole-request error");
+
+        assert_eq!(out.rejected, 1);
+        assert!(out.samples.is_empty());
+        let msg = out.rejected_message.expect("rejection message present");
+        assert!(
+            msg.len() <= DIAG_SNIPPET_MAX_BYTES + 256,
+            "rejection message must be bounded by the snippet cap, got {} bytes",
+            msg.len()
+        );
+        assert!(
+            msg.contains("bytes truncated"),
+            "over-cap name must be visibly truncated: {msg:?}"
+        );
     }
 }

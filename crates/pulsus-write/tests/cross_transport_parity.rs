@@ -103,10 +103,10 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
 #[test]
 fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
     let otlp_req = otlp_gauge_request("up", "node-a", "checkout");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0);
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0).expect("within the expansion budget");
 
     let rw_req = rw_request("up", "node-a", "checkout");
-    let rw_out = rw_parse(&rw_req, 0);
+    let rw_out = rw_parse(&rw_req, 0).expect("within the expansion budget");
 
     assert_eq!(otlp_out.samples.len(), 1);
     assert_eq!(rw_out.samples.len(), 1);
@@ -137,10 +137,10 @@ fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
 #[test]
 fn dotted_otlp_attribute_and_underscored_remote_write_label_fingerprint_identically() {
     let otlp_req = otlp_gauge_request("cpu_usage_ratio", "node-b", "billing");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0);
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0).expect("within the expansion budget");
 
     let rw_req = rw_request("cpu_usage_ratio", "node-b", "billing");
-    let rw_out = rw_parse(&rw_req, 0);
+    let rw_out = rw_parse(&rw_req, 0).expect("within the expansion budget");
 
     assert_eq!(
         otlp_out.samples[0].fingerprint,
@@ -183,7 +183,7 @@ fn rw_metadata_type_string(prompb_type: i32, name: &str) -> String {
             unit: String::new(),
         }],
     };
-    let out = rw_parse(&req, 0);
+    let out = rw_parse(&req, 0).expect("within the expansion budget");
     out.metadata[0].metric_type.clone()
 }
 
@@ -209,7 +209,9 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_gauge",
     );
-    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0).metadata[0]
+    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0)
+        .expect("within the expansion budget")
+        .metadata[0]
         .metric_type
         .clone();
     assert_eq!(otlp_gauge_type, rw_metadata_type_string(2, "a_gauge"));
@@ -230,7 +232,9 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_counter",
     );
-    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0).metadata[0]
+    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0)
+        .expect("within the expansion budget")
+        .metadata[0]
         .metric_type
         .clone();
     assert_eq!(otlp_counter_type, rw_metadata_type_string(1, "a_counter"));
@@ -255,7 +259,9 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_histogram",
     );
-    let otlp_histogram_type = otlp_metrics::parse(&histogram_req, 0).metadata[0]
+    let otlp_histogram_type = otlp_metrics::parse(&histogram_req, 0)
+        .expect("within the expansion budget")
+        .metadata[0]
         .metric_type
         .clone();
     assert_eq!(
@@ -281,7 +287,9 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_summary",
     );
-    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0).metadata[0]
+    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0)
+        .expect("within the expansion budget")
+        .metadata[0]
         .metric_type
         .clone();
     assert_eq!(otlp_summary_type, rw_metadata_type_string(5, "a_summary"));

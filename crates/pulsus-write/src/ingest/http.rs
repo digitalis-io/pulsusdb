@@ -160,7 +160,14 @@ pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Bod
         Err(err) => return error_response(err),
     };
 
-    let parsed = otlp_metrics::parse(&request, now_ns);
+    // Fallible, unlike the logs parse: the metrics parser's expansion
+    // budget (`otlp_metrics::MAX_EXPANDED_BYTES`, a structural whole-request
+    // bound, issue #62) surfaces here as the same 400/`code = 3`
+    // classification a decode failure gets.
+    let parsed = match otlp_metrics::parse(&request, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return error_response(err),
+    };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
 
@@ -279,7 +286,14 @@ pub async fn ingest_remote_write(
         Err(err) => return rw_error_response(&err),
     };
 
-    let parsed = remote_write::parse(&request, now_ns);
+    // Fallible, unlike the logs parse: the remote-write parser's expansion
+    // budget (`remote_write::MAX_EXPANDED_BYTES`, a structural whole-request
+    // bound, issue #62) surfaces here as the same plain-text 400 a decode
+    // failure gets.
+    let parsed = match remote_write::parse(&request, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return rw_error_response(&err),
+    };
 
     if is_async(&headers) {
         return match sink.admit(parsed) {
@@ -1293,6 +1307,73 @@ mod tests {
         assert_eq!(status.code, 13);
     }
 
+    /// Issue #62, at the route level: a body well inside the 64 MiB cap
+    /// whose base × data-point fan-out exceeds
+    /// `otlp_metrics::MAX_EXPANDED_BYTES` is a whole-request 400/code 3 (the
+    /// structural-oversize class), and the sink is never admitted to.
+    #[tokio::test]
+    async fn metrics_expansion_budget_overflow_returns_400_with_status_code_3() {
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+        use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        // One ~1 MiB resource attribute is cloned into every data point's
+        // LabelSet, so the per-sample charge (~1 MiB) trips the 256 MiB
+        // budget within a few hundred of the many data points. Derived from
+        // the constant so a budget retune cannot silently weaken this.
+        let big_value = "v".repeat(1024 * 1024);
+        let resource = Resource {
+            attributes: vec![KeyValue {
+                key: "big.attr".to_string(),
+                value: Some(AnyValue {
+                    value: Some(Value::StringValue(big_value)),
+                }),
+                key_strindex: 0,
+            }],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        };
+        let dp_count = otlp_metrics::MAX_EXPANDED_BYTES / (1024 * 1024) + 2;
+        let data_points: Vec<NumberDataPoint> = (0..dp_count)
+            .map(|i| NumberDataPoint {
+                attributes: vec![],
+                start_time_unix_nano: 0,
+                time_unix_nano: 1_700_000_000_000_000_000,
+                exemplars: vec![],
+                flags: 0,
+                value: Some(number_data_point::Value::AsDouble(i as f64)),
+            })
+            .collect();
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(resource),
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "cpu".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge { data_points })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(metrics_router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(
+            sink.admitted.lock().unwrap().is_empty(),
+            "an over-budget request must never reach the sink (no partial write)"
+        );
+    }
+
     #[tokio::test]
     async fn metrics_success_response_reports_partial_success_when_points_were_rejected() {
         let req = ExportMetricsServiceRequest {
@@ -1834,6 +1915,55 @@ mod tests {
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = plain_text_body(res).await;
         assert!(!body.is_empty());
+    }
+
+    /// Issue #62 (Δ1): a snappy-prompb body well inside the 64 MiB cap
+    /// carrying more than the admissible ~4.2M-sample ceiling — ~4.3M
+    /// minimal 2-byte samples (`value`/`timestamp` both proto3 defaults,
+    /// ≈ 8 MiB on the wire) spread across the fewest series the per-series
+    /// cap allows — trips `remote_write::MAX_EXPANDED_BYTES` and is a
+    /// whole-request plain-text 400; the sink is never admitted to (proving
+    /// the abort fires before the ~33.5M-sample-class output materializes).
+    /// Sample count derives from the constants so a retune cannot silently
+    /// weaken it.
+    #[tokio::test]
+    async fn remote_write_expansion_budget_overflow_returns_400() {
+        use crate::protocols::remote_write::{MAX_EXPANDED_BYTES, MAX_SAMPLES_PER_SERIES};
+
+        // `MAX_EXPANDED_BYTES / 64` is the sample ceiling (SAMPLE_ROW_OVERHEAD
+        // = 64); one extra full series guarantees the budget trips.
+        let total = MAX_EXPANDED_BYTES / 64 + MAX_SAMPLES_PER_SERIES;
+        let series_count = total.div_ceil(MAX_SAMPLES_PER_SERIES);
+        let timeseries: Vec<TimeSeries> = (0..series_count)
+            .map(|s| TimeSeries {
+                labels: vec![Label {
+                    name: "__name__".to_string(),
+                    value: format!("m{s}"),
+                }],
+                samples: vec![
+                    Sample {
+                        value: 0.0,
+                        timestamp: 0,
+                    };
+                    MAX_SAMPLES_PER_SERIES
+                ],
+            })
+            .collect();
+        let req = WriteRequest {
+            timeseries,
+            metadata: vec![],
+        };
+        let body = snappy_compress(&req.encode_to_vec());
+
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = call_remote_write(&sink, body, &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = plain_text_body(res).await;
+        assert!(!text.is_empty());
+        assert!(
+            sink.admitted.lock().unwrap().is_empty(),
+            "an over-budget request must never reach the sink (no partial write)"
+        );
     }
 
     /// Architect plan reject boundary: a series missing `__name__` is

@@ -506,7 +506,7 @@ fn regenerate_fixtures() {
 fn gauge_flattens_to_one_sample_named_verbatim() {
     let bytes = read_fixture("gauge.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.samples.len(), 1);
     assert_eq!(&*out.samples[0].metric_name, "cpu_usage_ratio");
@@ -523,7 +523,7 @@ fn gauge_flattens_to_one_sample_named_verbatim() {
 fn sum_monotonic_flattens_to_one_sample_typed_counter() {
     let bytes = read_fixture("sum_counter.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.samples.len(), 1);
     assert_eq!(&*out.samples[0].metric_name, "http_requests_total");
@@ -535,7 +535,7 @@ fn sum_monotonic_flattens_to_one_sample_typed_counter() {
 fn histogram_flattens_to_documented_series_with_exact_le_labels_and_monotonic_buckets() {
     let bytes = read_fixture("histogram.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     let mut buckets: Vec<(String, f64)> = out
@@ -593,7 +593,7 @@ fn histogram_flattens_to_documented_series_with_exact_le_labels_and_monotonic_bu
 fn histogram_count_mismatch_rejects_the_data_point_with_no_samples() {
     let bytes = read_fixture("histogram_count_mismatch.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 1);
     assert!(
@@ -615,7 +615,7 @@ fn histogram_count_mismatch_rejects_the_data_point_with_no_samples() {
 fn histogram_bucket_count_overflow_rejects_without_panicking() {
     let bytes = read_fixture("histogram_bucket_overflow.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 1);
     assert!(out.samples.is_empty());
@@ -628,7 +628,7 @@ fn histogram_bucket_count_overflow_rejects_without_panicking() {
 fn histogram_bucketless_still_emits_inf_bucket_equal_to_count() {
     let bytes = read_fixture("histogram_bucketless.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     let bucket = out
@@ -658,7 +658,7 @@ fn histogram_bucketless_still_emits_inf_bucket_equal_to_count() {
 fn exponential_histogram_extreme_offset_folds_to_inf_without_panicking() {
     let bytes = read_fixture("exponential_histogram_extreme_offset.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     let bucket_series_labels: Vec<Option<&str>> = out
@@ -689,7 +689,7 @@ fn exponential_histogram_extreme_offset_folds_to_inf_without_panicking() {
 fn exponential_histogram_flattens_with_negative_zero_and_positive_buckets_and_inf_equals_count() {
     let bytes = read_fixture("exponential_histogram.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     let count = out
@@ -748,7 +748,7 @@ fn exponential_histogram_flattens_with_negative_zero_and_positive_buckets_and_in
 fn summary_flattens_to_quantile_sum_and_count_series() {
     let bytes = read_fixture("summary.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 0);
     let q = |quantile: &str| {
@@ -784,7 +784,7 @@ fn summary_flattens_to_quantile_sum_and_count_series() {
 fn delta_temporality_rejects_the_whole_metric_naming_it() {
     let bytes = read_fixture("delta_temporality.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 1);
     assert!(
@@ -800,7 +800,7 @@ fn delta_temporality_rejects_the_whole_metric_naming_it() {
 fn zero_timestamp_data_point_is_rejected_as_partial_success_the_other_point_still_parses() {
     let bytes = read_fixture("zero_timestamp.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.rejected, 1);
     assert_eq!(out.samples.len(), 1);
@@ -811,7 +811,7 @@ fn zero_timestamp_data_point_is_rejected_as_partial_success_the_other_point_stil
 fn no_recorded_value_flag_emits_the_canonical_stale_nan_bit_pattern() {
     let bytes = read_fixture("stale_nan.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.samples.len(), 1);
     // Load-bearing: exact bit pattern via `.to_bits()`, never `is_nan()`
@@ -827,8 +827,8 @@ fn dotted_and_underscored_service_name_fingerprint_identically() {
     let dot_req = decode(&dot_bytes).expect("valid request");
     let underscore_req = decode(&underscore_bytes).expect("valid request");
 
-    let dot_out = parse(&dot_req, 0);
-    let underscore_out = parse(&underscore_req, 0);
+    let dot_out = parse(&dot_req, 0).expect("within the expansion budget");
+    let underscore_out = parse(&underscore_req, 0).expect("within the expansion budget");
 
     assert_eq!(
         dot_out.samples[0].fingerprint, underscore_out.samples[0].fingerprint,
@@ -847,7 +847,7 @@ fn malformed_protobuf_is_a_whole_request_decode_error() {
 fn parse_is_pure_repeated_calls_on_the_same_fixture_are_identical() {
     let bytes = read_fixture("exponential_histogram.bin");
     let req = decode(&bytes).expect("fixture is a valid ExportMetricsServiceRequest");
-    let a = parse(&req, 123);
-    let b = parse(&req, 123);
+    let a = parse(&req, 123).expect("within the expansion budget");
+    let b = parse(&req, 123).expect("within the expansion budget");
     assert_eq!(a, b);
 }

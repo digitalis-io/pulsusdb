@@ -57,7 +57,7 @@ fn snappy_compress(data: &[u8]) -> Vec<u8> {
 #[test]
 fn basic_series_fixture_produces_exact_rows_matching_independently_recomputed_fingerprints() {
     let req = decode_fixture("basic_series.bin");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     assert_eq!(out.samples.len(), 3);
     assert_eq!(out.series.len(), 3);
@@ -108,7 +108,7 @@ fn basic_series_fixture_produces_exact_rows_matching_independently_recomputed_fi
 #[test]
 fn stale_marker_sample_in_the_real_capture_survives_bit_exact() {
     let req = decode_fixture("basic_series.bin");
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
 
     let stale = out
         .samples
@@ -129,7 +129,7 @@ fn stale_marker_sample_in_the_real_capture_survives_bit_exact() {
 #[test]
 fn metadata_fixture_decodes_every_record_with_type_string_parity() {
     let req = decode_fixture("metadata.bin");
-    let out = parse(&req, 999);
+    let out = parse(&req, 999).expect("within the expansion budget");
 
     assert_eq!(out.metadata.len(), 3);
 
@@ -168,8 +168,8 @@ fn metadata_fixture_decodes_every_record_with_type_string_parity() {
 #[test]
 fn parse_of_the_real_capture_is_pure_repeated_calls_are_identical() {
     let req = decode_fixture("basic_series.bin");
-    let a = parse(&req, 123);
-    let b = parse(&req, 123);
+    let a = parse(&req, 123).expect("within the expansion budget");
+    let b = parse(&req, 123).expect("within the expansion budget");
 
     assert_eq!(a.samples.len(), b.samples.len());
     for (sa, sb) in a.samples.iter().zip(&b.samples) {
@@ -210,7 +210,7 @@ fn missing_name_label_drops_the_series_request_still_succeeds_as_partial() {
         ],
         metadata: vec![],
     };
-    let out = parse(&req, 0);
+    let out = parse(&req, 0).expect("within the expansion budget");
     assert_eq!(out.rejected, 1);
     assert_eq!(out.samples.len(), 1);
     assert_eq!(&*out.samples[0].metric_name, "up");
@@ -250,8 +250,8 @@ fn out_of_order_wire_labels_are_accepted_and_fingerprint_identically_to_sorted()
         }],
         metadata: vec![],
     };
-    let sorted_out = parse(&sorted, 0);
-    let unsorted_out = parse(&unsorted, 0);
+    let sorted_out = parse(&sorted, 0).expect("within the expansion budget");
+    let unsorted_out = parse(&unsorted, 0).expect("within the expansion budget");
     assert_eq!(
         sorted_out.samples[0].fingerprint,
         unsorted_out.samples[0].fingerprint

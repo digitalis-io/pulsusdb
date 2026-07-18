@@ -367,8 +367,8 @@ fn metrics_self_round_trip_is_row_identical() {
     let via_json = otlp_metrics::decode_json(&json).expect("decode_json metrics");
     let via_pb = metrics_via_protobuf(&req);
     assert_parsed_metrics_eq(
-        &otlp_metrics::parse(&via_json, NOW_NS),
-        &otlp_metrics::parse(&via_pb, NOW_NS),
+        &otlp_metrics::parse(&via_json, NOW_NS).expect("within the expansion budget"),
+        &otlp_metrics::parse(&via_pb, NOW_NS).expect("within the expansion budget"),
     );
 }
 
@@ -404,8 +404,8 @@ fn metrics_golden_json_is_row_identical_to_protobuf() {
         otlp_metrics::decode_json(&read_golden("metrics.json")).expect("decode metrics golden");
     let via_pb = metrics_via_protobuf(&metrics_request());
     assert_parsed_metrics_eq(
-        &otlp_metrics::parse(&via_json, NOW_NS),
-        &otlp_metrics::parse(&via_pb, NOW_NS),
+        &otlp_metrics::parse(&via_json, NOW_NS).expect("within the expansion budget"),
+        &otlp_metrics::parse(&via_pb, NOW_NS).expect("within the expansion budget"),
     );
 }
 
@@ -429,7 +429,7 @@ fn traces_golden_json_is_row_identical_to_protobuf() {
 fn non_finite_metric_json_decodes_and_preserves_values() {
     let via_json = otlp_metrics::decode_json(&read_golden("metrics.json"))
         .expect("non-finite JSON must decode");
-    let out = otlp_metrics::parse(&via_json, NOW_NS);
+    let out = otlp_metrics::parse(&via_json, NOW_NS).expect("within the expansion budget");
     let values: Vec<f64> = out.samples.iter().map(|s| s.value).collect();
     assert!(values.iter().any(|v| v.is_nan()), "expected a NaN sample");
     assert!(values.contains(&f64::INFINITY), "expected a +Inf sample");
