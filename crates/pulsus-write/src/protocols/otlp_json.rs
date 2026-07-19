@@ -99,14 +99,15 @@ pub(crate) struct JsonAggregates {
     pub(crate) links: Cell<usize>,
     pub(crate) attributes: Cell<usize>,
     pub(crate) anyvalue_elements: Cell<usize>,
-    // Reserved for the metrics-JSON (6c) sub-track, which reuses this carrier:
-    // `data_points`/`exemplars`. Declared here so the shared carrier mirrors
-    // the protobuf path's full aggregate set in ONE place and 6c need not
-    // re-shape it (avoiding concurrent churn on a shared struct); unused by
-    // tracks 6a/6b.
-    #[allow(dead_code)]
+    /// Cross-request data-point count (issue #115 track 6c), the JSON analog
+    /// of the protobuf pre-scan's `AggKind::DataPoints` — charged once per
+    /// accumulated data point across all five `Metric.data` oneof arms,
+    /// capped at `MAX_TOTAL_DATA_POINTS`.
     pub(crate) data_points: Cell<usize>,
-    #[allow(dead_code)]
+    /// Cross-request metric-exemplar count (issue #115 track 6c), the JSON
+    /// analog of `AggKind::Exemplars` — charged once per accumulated
+    /// `Exemplar` across every data-point shape, capped at
+    /// `MAX_TOTAL_EXEMPLARS`.
     pub(crate) exemplars: Cell<usize>,
     /// Cross-request log-record count (issue #115 track 6b), the JSON analog
     /// of the protobuf pre-scan's `AggKind::LogRecords` — charged once per
@@ -1667,6 +1668,8 @@ impl<'de> Visitor<'de> for LogRecordSeed<'_> {
         Ok(record)
     }
 }
+
+pub(crate) mod metrics;
 
 #[cfg(test)]
 mod tests;
