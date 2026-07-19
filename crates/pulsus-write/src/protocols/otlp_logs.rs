@@ -113,7 +113,12 @@ pub fn decode(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> 
 /// impls; a malformed body is the same whole-request atomic failure as a bad
 /// protobuf, mapped to 400/code 3 via [`LogsIngestError::DecodeJson`].
 pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> {
-    Ok(serde_json::from_slice(body)?)
+    // Issue #115 track 6b: bounded proto3-JSON building wrappers replace the
+    // vendored derive's UNBOUNDED repeated-field decode, rejecting a DoS-shaped
+    // body DURING deserialization at the SAME per-level / aggregate / depth
+    // thresholds the protobuf wire pre-scan (`otlp_prescan`) enforces (mirrors
+    // `otlp_traces::decode_json`, track 6a).
+    crate::protocols::otlp_json::decode_logs(body)
 }
 
 /// Parses a decoded `ExportLogsServiceRequest` into normalized rows. Pure:

@@ -61,11 +61,13 @@ use std::fmt;
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{
     AnyValue, ArrayValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
 };
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
@@ -73,8 +75,9 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_prescan::{
     MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_ENTITY_REF_KEYS,
-    MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN, MAX_RESOURCE_SPANS, MAX_SCOPE_SPANS,
-    MAX_SPANS, MAX_TOTAL_ATTRIBUTES, MAX_TOTAL_EVENTS, MAX_TOTAL_LINKS, MAX_TOTAL_SPANS,
+    MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN, MAX_LOG_RECORDS, MAX_RESOURCE_LOGS,
+    MAX_RESOURCE_SPANS, MAX_SCOPE_LOGS, MAX_SCOPE_SPANS, MAX_SPANS, MAX_TOTAL_ATTRIBUTES,
+    MAX_TOTAL_EVENTS, MAX_TOTAL_LINKS, MAX_TOTAL_LOG_RECORDS, MAX_TOTAL_SPANS,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,16 +99,18 @@ pub(crate) struct JsonAggregates {
     pub(crate) links: Cell<usize>,
     pub(crate) attributes: Cell<usize>,
     pub(crate) anyvalue_elements: Cell<usize>,
-    // Reserved for the logs-JSON (6b) and metrics-JSON (6c) sub-tracks, which
-    // reuse this carrier: `log_records` (6b) and `data_points`/`exemplars` (6c).
-    // Declared here so the shared carrier mirrors the protobuf path's full
-    // aggregate set in ONE place and the dependent sub-tracks need not re-shape
-    // it (avoiding concurrent churn on a shared struct); unused by track 6a.
+    // Reserved for the metrics-JSON (6c) sub-track, which reuses this carrier:
+    // `data_points`/`exemplars`. Declared here so the shared carrier mirrors
+    // the protobuf path's full aggregate set in ONE place and 6c need not
+    // re-shape it (avoiding concurrent churn on a shared struct); unused by
+    // tracks 6a/6b.
     #[allow(dead_code)]
     pub(crate) data_points: Cell<usize>,
     #[allow(dead_code)]
     pub(crate) exemplars: Cell<usize>,
-    #[allow(dead_code)]
+    /// Cross-request log-record count (issue #115 track 6b), the JSON analog
+    /// of the protobuf pre-scan's `AggKind::LogRecords` — charged once per
+    /// accumulated `LogRecord`, capped at [`MAX_TOTAL_LOG_RECORDS`].
     pub(crate) log_records: Cell<usize>,
 }
 
@@ -233,6 +238,27 @@ const LINK_SCALARS: &[&str] = &[
     "droppedAttributesCount",
 ];
 const SPANS_ENVELOPE_SCALARS: &[&str] = &["schemaUrl"];
+// `ResourceLogs`/`ScopeLogs` carry the same sole scalar leaf (`schemaUrl`) as
+// `ResourceSpans`/`ScopeSpans` above — named separately per signal so the
+// per-type scalar-list audit (issue #115 track-6a round-4 lesson) stays
+// explicit rather than relying on cross-signal reuse of a same-shaped list.
+const RESOURCE_LOGS_SCALARS: &[&str] = &["schemaUrl"];
+const SCOPE_LOGS_SCALARS: &[&str] = &["schemaUrl"];
+// `LogRecord`'s scalar leaves: `attributes` (repeated `KeyValue`) and `body`
+// (a MESSAGE `AnyValue`) are intercepted by bounded seeds — neither appears
+// here (issue #115 track-6a round-3 lesson: a message in a scalar list is the
+// status-DoS class).
+const LOG_RECORD_SCALARS: &[&str] = &[
+    "timeUnixNano",
+    "observedTimeUnixNano",
+    "severityNumber",
+    "severityText",
+    "droppedAttributesCount",
+    "flags",
+    "traceId",
+    "spanId",
+    "eventName",
+];
 
 // ---------------------------------------------------------------------------
 // Bounded-sequence combinator
@@ -1378,5 +1404,272 @@ impl<'de> Visitor<'de> for LinkSeed<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Logs roots
+// ---------------------------------------------------------------------------
+
+/// Decodes a proto3-JSON `ExportLogsServiceRequest` with every reachable
+/// repeated/container field bounded DURING deserialization (issue #115 track
+/// 6b), mirroring [`decode_traces`] at the SAME thresholds (single-sourced
+/// `MAX_*` constants from [`crate::protocols::otlp_prescan`]). A cap/depth
+/// violation is a whole-request `serde` error -> [`LogsIngestError::DecodeJson`]
+/// (HTTP 400 / `google.rpc.Status.code = 3`).
+pub(crate) fn decode_logs(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> {
+    let agg = JsonAggregates::default();
+    let mut de = serde_json::Deserializer::from_slice(body);
+    let req = ExportLogsServiceRequestSeed { agg: &agg }.deserialize(&mut de)?;
+    // Reject trailing garbage exactly as `serde_json::from_slice` would.
+    de.end()?;
+    Ok(req)
+}
+
+struct ExportLogsServiceRequestSeed<'a> {
+    agg: &'a JsonAggregates,
+}
+
+impl<'de> DeserializeSeed<'de> for ExportLogsServiceRequestSeed<'_> {
+    type Value = ExportLogsServiceRequest;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<ExportLogsServiceRequest, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ExportLogsServiceRequestSeed<'_> {
+    type Value = ExportLogsServiceRequest;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a proto3-JSON ExportLogsServiceRequest object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<ExportLogsServiceRequest, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let agg = self.agg;
+        let mut resource_logs: Vec<ResourceLogs> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "resourceLogs" | "resource_logs" => accumulate_msgs(
+                    &mut map,
+                    &mut resource_logs,
+                    (MAX_RESOURCE_LOGS, "resourceLogs"),
+                    None,
+                    || ResourceLogsSeed { agg },
+                )?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(ExportLogsServiceRequest { resource_logs })
+    }
+}
+
+struct ResourceLogsSeed<'a> {
+    agg: &'a JsonAggregates,
+}
+
+impl<'de> DeserializeSeed<'de> for ResourceLogsSeed<'_> {
+    type Value = ResourceLogs;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<ResourceLogs, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ResourceLogsSeed<'_> {
+    type Value = ResourceLogs;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a proto3-JSON ResourceLogs object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<ResourceLogs, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        // Same buffer-and-delegate contract as `ResourceSpansSeed`: intercept
+        // the singular `resource` (dup-guarded) and repeated `scopeLogs`
+        // (bounded); BUFFER the scalar `schemaUrl` and finish through the
+        // vendored `ResourceLogs` derive so a duplicate `schemaUrl` rejects
+        // exactly as the `serde(default)` derive does (issue #115 finding 1).
+        let agg = self.agg;
+        let mut resource: Option<Resource> = None;
+        let mut resource_seen = false;
+        let mut scope_logs: Vec<ScopeLogs> = Vec::new();
+        let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "resource" => {
+                    if resource_seen {
+                        return Err(de::Error::duplicate_field("resource"));
+                    }
+                    resource_seen = true;
+                    resource = map.next_value_seed(OptionSeed(ResourceSeed { agg }))?;
+                }
+                "scopeLogs" | "scope_logs" => accumulate_msgs(
+                    &mut map,
+                    &mut scope_logs,
+                    (MAX_SCOPE_LOGS, "scopeLogs"),
+                    None,
+                    || ScopeLogsSeed { agg },
+                )?,
+                _ => buffer_scalar_or_skip(key, RESOURCE_LOGS_SCALARS, &mut map, &mut pairs)?,
+            }
+        }
+        let mut resource_logs: ResourceLogs = finish_via_derive(&pairs)?;
+        resource_logs.resource = resource;
+        resource_logs.scope_logs = scope_logs;
+        Ok(resource_logs)
+    }
+}
+
+struct ScopeLogsSeed<'a> {
+    agg: &'a JsonAggregates,
+}
+
+impl<'de> DeserializeSeed<'de> for ScopeLogsSeed<'_> {
+    type Value = ScopeLogs;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<ScopeLogs, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ScopeLogsSeed<'_> {
+    type Value = ScopeLogs;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a proto3-JSON ScopeLogs object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<ScopeLogs, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        // Same buffer-and-delegate contract as `ScopeSpansSeed`: intercept the
+        // singular `scope` (dup-guarded) and repeated `logRecords` (bounded,
+        // charged into the shared `log_records` aggregate); BUFFER the scalar
+        // `schemaUrl` and finish through the vendored `ScopeLogs` derive so a
+        // duplicate `schemaUrl` rejects exactly as the derive does.
+        let agg = self.agg;
+        let mut scope: Option<InstrumentationScope> = None;
+        let mut scope_seen = false;
+        let mut log_records: Vec<LogRecord> = Vec::new();
+        let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "scope" => {
+                    if scope_seen {
+                        return Err(de::Error::duplicate_field("scope"));
+                    }
+                    scope_seen = true;
+                    scope = map.next_value_seed(OptionSeed(InstrumentationScopeSeed { agg }))?;
+                }
+                "logRecords" | "log_records" => accumulate_msgs(
+                    &mut map,
+                    &mut log_records,
+                    (MAX_LOG_RECORDS, "logRecords"),
+                    Some(AggCharge {
+                        cell: &agg.log_records,
+                        cap: MAX_TOTAL_LOG_RECORDS,
+                        field: "total log records",
+                    }),
+                    || LogRecordSeed { agg },
+                )?,
+                _ => buffer_scalar_or_skip(key, SCOPE_LOGS_SCALARS, &mut map, &mut pairs)?,
+            }
+        }
+        let mut scope_logs: ScopeLogs = finish_via_derive(&pairs)?;
+        scope_logs.scope = scope;
+        scope_logs.log_records = log_records;
+        Ok(scope_logs)
+    }
+}
+
+/// Bounded seed for a `LogRecord`. Routes `attributes` through the shared
+/// attribute accumulator and `body` (a MESSAGE `AnyValue`, never a scalar
+/// list entry — issue #115 track-6a round-3 lesson) through the depth-bounded
+/// [`AnyValueSeed`]; BUFFERS every other key (hex `traceId`/`spanId`, the
+/// u64-as-string timestamps, the `severityNumber` enum, `severityText`,
+/// dropped-count, `flags`, `eventName`) and finishes through the vendored
+/// derive so ADR-0004 hex/u64-string/P5-enum decode stays byte-identical.
+struct LogRecordSeed<'a> {
+    agg: &'a JsonAggregates,
+}
+
+impl<'de> DeserializeSeed<'de> for LogRecordSeed<'_> {
+    type Value = LogRecord;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<LogRecord, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for LogRecordSeed<'_> {
+    type Value = LogRecord;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a proto3-JSON LogRecord object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<LogRecord, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let agg = self.agg;
+        let mut attributes: Vec<KeyValue> = Vec::new();
+        let mut body: Option<AnyValue> = None;
+        let mut body_seen = false;
+        let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "attributes" => accumulate_attributes(&mut map, &mut attributes, agg)?,
+                "body" => {
+                    // A MESSAGE, not a scalar: intercept via the depth-bounded
+                    // `AnyValueSeed` (dup-guarded like the derive) so an
+                    // attacker cannot recurse or widen it past the shared
+                    // AnyValue bounds (issue #115).
+                    if body_seen {
+                        return Err(de::Error::duplicate_field("body"));
+                    }
+                    body_seen = true;
+                    body = map.next_value_seed(OptionSeed(AnyValueSeed { agg, depth: 1 }))?;
+                }
+                _ => buffer_scalar_or_skip(key, LOG_RECORD_SCALARS, &mut map, &mut pairs)?,
+            }
+        }
+        // Empty scalar buffer -> `LogRecord::default()` (byte-identical to the
+        // `serde(default)` derive on an empty object), skipping a per-record
+        // delegate on the common all-repeated-fields shape; a non-empty buffer
+        // is finished through the vendored derive so duplicate scalar keys
+        // reject.
+        let mut record = if pairs.is_empty() {
+            LogRecord::default()
+        } else {
+            finish_via_derive(&pairs)?
+        };
+        record.attributes = attributes;
+        record.body = body;
+        Ok(record)
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod logs_tests;
