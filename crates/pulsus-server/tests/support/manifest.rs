@@ -2071,6 +2071,19 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "compat_router",
         body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats))",
     },
+    // NOT a router-composition function — this is the Loki-push `PushRequest`'s
+    // hand-written `prost::Message::merge` (issue #115 round 2), which routes the
+    // raw merge entry point through the aggregate-bounded twin. Its body contains
+    // a `bounded.merge(buf)` call, so the textual `.merge(` scan pins it here even
+    // though it mounts no routes; re-derive if that decode-bounds body changes.
+    // Re-derived for issue #115 round 3: the error-path restoration (assign the
+    // twin's streams back on both Ok and Err rather than early-`?`) changed the
+    // last three statements of this body.
+    PinnedFunctionBody {
+        file: "crates/pulsus-write/src/protocols/loki_push.rs",
+        function: "merge",
+        body: "let mut bounded = BoundedPushRequest {total_entries: self.streams.iter().map(|s| s.entries.len()).sum(), streams: std::mem::take(&mut self.streams),}; let result = bounded.merge(buf); self.streams = bounded.streams; result",
+    },
 ];
 
 pub fn pinned_function_bodies() -> &'static [PinnedFunctionBody] {

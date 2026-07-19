@@ -53,21 +53,316 @@ use crate::error::LogsIngestError;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
 
 /// `logproto.PushRequest`: `streams` at tag 1.
-#[derive(Clone, PartialEq, ::prost::Message)]
+///
+/// This is the **domain / value** type: encode + a byte-identical round-trip
+/// with derived [`PartialEq`], so a hand-built request and its encode/decode
+/// round-trip compare equal by construction. It deliberately does **not**
+/// derive `::prost::Message`: a derived decoder exposes a `pub`
+/// `PushRequest::decode` that would materialize an unbounded stream/aggregate
+/// fan-out when called directly — bypassing the ingest path's
+/// [`BoundedPushRequest`] caps entirely (issue #115). Instead a hand-written
+/// [`prost::Message`] impl (below) bounds **every** decode entry:
+///
+/// - `merge_field` caps `streams` (tag 1) at [`MAX_STREAMS_PER_REQUEST`]` + 1`
+///   during merge (draining the excess, wire-type-checked, without allocating)
+///   and delegates per-stream entry caps to [`StreamAdapter`].
+/// - **Every** public decode/merge entry point — `decode`,
+///   `decode_length_delimited`, `merge` AND `merge_length_delimited` — routes
+///   through [`BoundedPushRequest`], whose `merge_field` is the single enforcing
+///   chokepoint: it additionally drains streams once the cross-stream aggregate
+///   exceeds [`MAX_TOTAL_ENTRIES_PER_REQUEST`], giving identical materialization
+///   bounds to [`decode_protobuf`]. `prost`'s default `Message::merge` /
+///   `merge_length_delimited` call `PushRequest::merge_field` directly (which
+///   caps stream *count* only), so a raw `PushRequest::default().merge(buf)`
+///   would otherwise bypass the aggregate cap (issue #115 round 2) — these two
+///   overrides close that last gap so no public entry is an uncapped bypass.
+///
+/// The whole-request [`LogsIngestError::OversizeMessage`] reject still lives in
+/// [`decode_protobuf`]'s [`validate_bounds`] (Loki is all-or-nothing). `encode`
+/// and the derived [`PartialEq`] are unchanged, and no decode-scratch field is
+/// added to the value type, so the struct literals and cross-crate encoders
+/// keep working.
+#[derive(Clone, PartialEq, Default, Debug)]
 pub struct PushRequest {
-    #[prost(message, repeated, tag = "1")]
     pub streams: Vec<StreamAdapter>,
+}
+
+impl prost::Message for PushRequest {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        prost::encoding::message::encode_repeated(1u32, &self.streams, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.streams.len() > MAX_STREAMS_PER_REQUEST {
+                    // Cap reached: drain the excess stream WITHOUT materializing
+                    // it, wire-type-checked exactly as `BoundedPushRequest`'s
+                    // tag-1 drain — a non-length-delimited tag-1 is a malformed
+                    // submessage and must FAIL the decode, never be silently
+                    // skipped. This is belt-and-suspenders: every public
+                    // decode/merge entry point below routes through
+                    // [`BoundedPushRequest`], whose `merge_field` adds the
+                    // cross-stream aggregate drain this one lacks.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(wire_type, &mut self.streams, buf, ctx)
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.streams)
+    }
+
+    fn clear(&mut self) {
+        self.streams.clear();
+    }
+
+    fn decode(buf: impl bytes::Buf) -> Result<Self, prost::DecodeError>
+    where
+        Self: Default,
+    {
+        // The most-direct public decode entry (issue #115): route through the
+        // fully-bounded twin so stream-count, per-stream entry AND cross-stream
+        // aggregate fan-out are all bounded DURING decode — a direct
+        // `PushRequest::decode` is no longer an uncapped bypass of the caps the
+        // ingest path enforces.
+        let bounded = BoundedPushRequest::decode(buf)?;
+        Ok(Self {
+            streams: bounded.streams,
+        })
+    }
+
+    fn decode_length_delimited(buf: impl bytes::Buf) -> Result<Self, prost::DecodeError>
+    where
+        Self: Default,
+    {
+        let bounded = BoundedPushRequest::decode_length_delimited(buf)?;
+        Ok(Self {
+            streams: bounded.streams,
+        })
+    }
+
+    fn merge(&mut self, buf: impl bytes::Buf) -> Result<(), prost::DecodeError>
+    where
+        Self: Sized,
+    {
+        // Issue #115 round 2: `prost`'s default `Message::merge` calls
+        // `PushRequest::merge_field` directly, which caps only stream COUNT — so
+        // a raw `PushRequest::default().merge(buf)` would fan out past the
+        // cross-stream aggregate cap. Route the merge through the fully-bounded
+        // twin (the single enforcing chokepoint) instead. Seed the twin with
+        // self's current streams so merge-INTO-existing semantics are preserved,
+        // then move the aggregate-bounded result back. The one-shot re-sum is
+        // O(existing streams) (zero for the common fresh-default `decode` path).
+        //
+        // Issue #115 round 3: restore `bounded.streams` into `self` on BOTH the
+        // Ok AND Err paths — do NOT `?` while self's streams are moved out. A
+        // decode error otherwise returns with `self.streams` left empty, dropping
+        // the caller's pre-existing streams (data loss). Restoring first gives
+        // prost-consistent partial-merge semantics: on error, self keeps its
+        // pre-existing streams plus whatever decoded before the failure point.
+        let mut bounded = BoundedPushRequest {
+            total_entries: self.streams.iter().map(|s| s.entries.len()).sum(),
+            streams: std::mem::take(&mut self.streams),
+        };
+        let result = bounded.merge(buf);
+        self.streams = bounded.streams;
+        result
+    }
+
+    fn merge_length_delimited(&mut self, buf: impl bytes::Buf) -> Result<(), prost::DecodeError>
+    where
+        Self: Sized,
+    {
+        // `merge_length_delimited` likewise loops through `merge_field` directly
+        // (it does not funnel through `merge`), so it needs the same bounded-twin
+        // routing as `merge` above to enforce the cross-stream aggregate cap, and
+        // the same round-3 error-path restoration: restore `bounded.streams` into
+        // `self` on BOTH Ok and Err before propagating, so a decode error never
+        // empties the caller's pre-existing streams (prost partial-merge
+        // semantics).
+        let mut bounded = BoundedPushRequest {
+            total_entries: self.streams.iter().map(|s| s.entries.len()).sum(),
+            streams: std::mem::take(&mut self.streams),
+        };
+        let result = bounded.merge_length_delimited(buf);
+        self.streams = bounded.streams;
+        result
+    }
+}
+
+/// The **decode-time twin** of [`PushRequest`] (issue #77): a hand-written
+/// [`prost::Message`] that bounds materialization **during** `decode` so a body
+/// within the 64 MiB decompressed cap cannot unpack into a far larger in-memory
+/// fan-out before the count checks run. Two decode-time guards, both mirroring
+/// [`EntryAdapter`]'s landed #97 drain-past-cap-then-reject pattern:
+///
+/// 1. `streams` (tag 1) is capped at [`MAX_STREAMS_PER_REQUEST`]` + 1` — once
+///    the vec would exceed the cap, the excess tag-1 record is drained (wire-
+///    type-checked, no allocation) rather than materialized.
+/// 2. A **transient, non-wire** `total_entries` accumulator sums every merged
+///    stream's `entries.len()`. prost 0.14's `DecodeError::new` is deprecated,
+///    so `merge_field` cannot abort mid-decode with a custom error; instead,
+///    once the running total exceeds [`MAX_TOTAL_ENTRIES_PER_REQUEST`], further
+///    streams are drained without materializing (bounding the aggregate fan-out
+///    to `≤ MAX_TOTAL + one stream's cap`), and the deferred [`validate_bounds`]
+///    re-sum in [`decode_protobuf`] then rejects the whole request. This closes
+///    the second-amplification the per-dimension caps cannot catch: many streams
+///    each under [`MAX_ENTRIES_PER_STREAM`] but collectively over the aggregate.
+///
+/// Kept separate from [`PushRequest`] so the value type carries no decode-scratch
+/// field and preserves derived round-trip equality — the sanctioned alternative
+/// to a transient field + manual `PartialEq` on the value type.
+#[derive(Default)]
+struct BoundedPushRequest {
+    streams: Vec<StreamAdapter>,
+    total_entries: usize,
+}
+
+impl prost::Message for BoundedPushRequest {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        // Decode-only helper, but a complete impl is required by the trait; the
+        // transient counter is never encoded, so this is byte-identical to
+        // `PushRequest`'s wire form.
+        prost::encoding::message::encode_repeated(1u32, &self.streams, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.streams.len() > MAX_STREAMS_PER_REQUEST
+                    || self.total_entries > MAX_TOTAL_ENTRIES_PER_REQUEST
+                {
+                    // Cap reached (stream count OR aggregate entries): drain the
+                    // excess stream WITHOUT materializing it, while still
+                    // enforcing the wire-type contract the derived
+                    // `merge_repeated` would — a non-length-delimited tag-1 is a
+                    // malformed submessage and must FAIL the decode, never be
+                    // silently skipped. The vec is allowed to reach `MAX + 1`
+                    // (not capped at `MAX`) so the deferred `validate_bounds`
+                    // stream-count check still rejects an over-limit request.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.streams,
+                        buf,
+                        ctx,
+                    )?;
+                    // Charge the just-merged stream's entries into the aggregate.
+                    // Its own entry vec is already capped at `MAX_ENTRIES + 1` by
+                    // `StreamAdapter::merge_field`, so one over-aggregate step
+                    // grows the fan-out by at most one stream's cap.
+                    if let Some(last) = self.streams.last() {
+                        self.total_entries = self.total_entries.saturating_add(last.entries.len());
+                    }
+                    Ok(())
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.streams)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// `logproto.StreamAdapter`: `labels` (a Prometheus label-set literal
 /// `{k="v",...}`) at tag 1, `entries` at tag 2. Tag 3 (`uint64 hash`) is
 /// intentionally undeclared — see this module's doc comment.
-#[derive(Clone, PartialEq, ::prost::Message)]
+///
+/// Like [`EntryAdapter`] (and [`PushRequest`]) it does **not** derive
+/// `::prost::Message`; a hand-written impl (below) caps the repeated `entries`
+/// field **inside the decoder** at [`MAX_ENTRIES_PER_STREAM`]` + 1` (issue #77),
+/// draining excess tag-2 records without allocating — so a single stream
+/// carrying millions of minimal entries cannot unpack past the cap. The cap
+/// therefore holds whether a stream decodes via [`BoundedPushRequest`] (the
+/// ingest path) or via [`PushRequest`]'s hand-written `merge` (both call this
+/// impl per stream).
+#[derive(Clone, PartialEq, Default, Debug)]
 pub struct StreamAdapter {
-    #[prost(string, tag = "1")]
     pub labels: String,
-    #[prost(message, repeated, tag = "2")]
     pub entries: Vec<EntryAdapter>,
+}
+
+impl prost::Message for StreamAdapter {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        // proto3 encoding, byte-identical to the derived impl (skips defaults):
+        // empty `labels` emits nothing; `entries` is a repeated message.
+        if !self.labels.is_empty() {
+            prost::encoding::string::encode(1u32, &self.labels, buf);
+        }
+        prost::encoding::message::encode_repeated(2u32, &self.entries, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => prost::encoding::string::merge(wire_type, &mut self.labels, buf, ctx),
+            2u32 => {
+                if self.entries.len() > MAX_ENTRIES_PER_STREAM {
+                    // Cap reached: drain the excess entry without materializing,
+                    // wire-type-checked exactly as `PushRequest`'s tag-1 drain
+                    // (mirrors `EntryAdapter`'s tag-3 handling). Reaches `MAX + 1`
+                    // so the deferred `validate_bounds` entries check rejects.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(wire_type, &mut self.entries, buf, ctx)
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        (if self.labels.is_empty() {
+            0
+        } else {
+            prost::encoding::string::encoded_len(1u32, &self.labels)
+        }) + prost::encoding::message::encoded_len_repeated(2u32, &self.entries)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// `logproto.EntryAdapter`: `timestamp` (`google.protobuf.Timestamp`) at tag
@@ -304,17 +599,27 @@ fn canonical_structured_metadata(
 
 /// Decodes a (decompressed) snappy-protobuf `POST /loki/api/v1/push` body,
 /// then applies the [`MAX_STREAMS_PER_REQUEST`]-family structural bounds.
-/// The sole decode boundary: a malformed/truncated protobuf, or a message
-/// exceeding one of those bounds, is a whole-request atomic failure — Loki
-/// has no partial-success channel (all-or-nothing), so this never partially
-/// applies.
+///
+/// Decode goes through [`BoundedPushRequest`], whose hand-written
+/// [`prost::Message`] (with [`StreamAdapter`]'s) bounds materialization
+/// **during** `decode` — streams cap at `MAX_STREAMS_PER_REQUEST + 1`,
+/// per-stream entries at `MAX_ENTRIES_PER_STREAM + 1`, and the transient
+/// cross-stream accumulator drains streams once the aggregate exceeds
+/// [`MAX_TOTAL_ENTRIES_PER_REQUEST`] (so the fan-out never grows unbounded
+/// before this reject). This [`validate_bounds`] re-sum then converts those
+/// `+1` over-cap sentinels into the whole-request
+/// [`LogsIngestError::OversizeMessage`] failure — Loki has no partial-success
+/// channel (all-or-nothing), so this never partially applies. A
+/// malformed/truncated protobuf is likewise a whole-request atomic failure.
 pub fn decode_protobuf(body: &[u8]) -> Result<PushRequest, LogsIngestError> {
-    let req = PushRequest::decode(body)?;
+    let bounded = BoundedPushRequest::decode(body)?;
     validate_bounds(
-        req.streams.len(),
-        req.streams.iter().map(|s| s.entries.len()),
+        bounded.streams.len(),
+        bounded.streams.iter().map(|s| s.entries.len()),
     )?;
-    Ok(req)
+    Ok(PushRequest {
+        streams: bounded.streams,
+    })
 }
 
 /// Enforces the [`MAX_STREAMS_PER_REQUEST`]-family bounds over a request's
@@ -402,11 +707,29 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// optional third structured-metadata object, decoded into
 /// `structured_metadata` ([`JsonEntry`]'s `Deserialize`, issue #97); only a
 /// fourth+ element is drained without being materialized.
+///
+/// [`JsonPush`]/[`JsonStream`] use bounded [`serde::de::DeserializeSeed`]
+/// visitors (issue #77) that cap the `streams` array
+/// ([`MAX_STREAMS_PER_REQUEST`]), each stream's `values` array
+/// ([`MAX_ENTRIES_PER_STREAM`]) plus a **shared cross-stream** aggregate
+/// ([`MAX_TOTAL_ENTRIES_PER_REQUEST`], threaded through a single
+/// [`Cell`](std::cell::Cell) counter), and the per-stream `stream` label map
+/// ([`MAX_LABELS_PER_STREAM`]) — all **during** deserialization, so
+/// `serde_json` cannot grow those `Vec`s/map unbounded before the count checks.
+/// The excess is rejected as [`LogsIngestError::LokiDecode`] mid-parse; the
+/// post-decode [`validate_bounds`] re-sum below is a harmless secondary guard
+/// for in-bounds input. Each stream's label **names** are validated against the
+/// same strict [`is_valid_label_name`] grammar the protobuf path enforces
+/// (issue #115) before canonicalization, so an invalid name (`9bad`, `a.b`,
+/// non-ASCII) is a whole-request reject on both transports, not a silent
+/// canonicalization on the JSON one.
 pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
     let push: JsonPush =
         serde_json::from_slice(body).map_err(|e| LogsIngestError::LokiDecode(e.to_string()))?;
     // Aggregate-budget charge at the same seam as the protobuf path, before
-    // any `LogRow` is materialized (issue #77 delta 1).
+    // any `LogRow` is materialized (issue #77 delta 1). Redundant with the
+    // bounded seed above (which rejects during deserialize) but kept as a cheap
+    // secondary guard.
     validate_bounds(
         push.streams.len(),
         push.streams.iter().map(|s| s.values.len()),
@@ -415,12 +738,17 @@ pub fn parse_json(body: &[u8], now_ns: i64) -> Result<ParsedLogs, LogsIngestErro
     let mut out = ParsedLogs::default();
     let mut seen_streams: HashSet<(Fingerprint, Date)> = HashSet::new();
     for stream in &push.streams {
-        if stream.stream.len() > MAX_LABELS_PER_STREAM {
-            return Err(LogsIngestError::OversizeMessage {
-                field: "labels",
-                limit: MAX_LABELS_PER_STREAM,
-                actual: stream.stream.len(),
-            });
+        // Route JSON label keys through the SAME strict label-name grammar the
+        // protobuf literal path enforces (issue #115) — before the infallible
+        // `from_normalized` canonicalizes them — so a name that is invalid on
+        // the wire (`9bad`, `a.b`, non-ASCII) is rejected here too rather than
+        // silently reinterpreted. Whole-request reject (Loki all-or-nothing).
+        for name in stream.stream.keys() {
+            if !is_valid_label_name(name.as_bytes()) {
+                return Err(LogsIngestError::LokiDecode(format!(
+                    "stream label name {name:?} is invalid (must match [a-zA-Z_][a-zA-Z0-9_]*)"
+                )));
+            }
         }
         let pairs = stream
             .stream
@@ -632,9 +960,35 @@ fn expect_byte(bytes: &[u8], i: &mut usize, want: u8, input: &str) -> Result<(),
     }
 }
 
-/// Reads a Prometheus label name: `[a-zA-Z_][a-zA-Z0-9_]*`. `from_normalized`
-/// canonicalizes it afterward regardless, but a genuinely empty/absent key
-/// is a malformed literal.
+/// The strict Prometheus/Loki label-name grammar predicate
+/// `[a-zA-Z_][a-zA-Z0-9_]*` (issue #77): the first byte must be `[A-Za-z_]` and
+/// every subsequent byte `[A-Za-z0-9_]`; an empty name is invalid. This is the
+/// **single** grammar check shared by both receiver paths — the protobuf
+/// label-set literal ([`read_key`]) and the JSON `stream` label map
+/// ([`parse_json`]) — so a name that is rejected on one transport is rejected
+/// identically on the other (issue #115): a name starting with a digit
+/// (`9bad`), containing a non-identifier byte (`a.b`), or carrying a non-ASCII
+/// byte (`naïve`) fails on both.
+fn is_valid_label_name(name: &[u8]) -> bool {
+    let Some((first, rest)) = name.split_first() else {
+        return false;
+    };
+    matches!(first, b'A'..=b'Z' | b'a'..=b'z' | b'_')
+        && rest
+            .iter()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+/// Reads and **strictly validates** a Prometheus label name against the
+/// documented grammar `[a-zA-Z_][a-zA-Z0-9_]*` (issue #77), via the shared
+/// [`is_valid_label_name`] predicate the JSON path uses too (issue #115). A
+/// genuinely empty/absent key, a name starting with a digit (`9bad`), a name
+/// containing a non-identifier byte (`a.b`), or a non-ASCII name (`naïve`) is a
+/// malformed literal — rejected as [`LogsIngestError::LokiDecode`] (a
+/// whole-request 400). Prior behaviour was lenient (accepted any run of bytes
+/// up to the delimiter and let `from_normalized` canonicalize), contradicting
+/// this doc-comment; the receiver now enforces the grammar it documents rather
+/// than silently reinterpreting malformed untrusted input.
 fn read_key(bytes: &[u8], i: &mut usize, input: &str) -> Result<String, LogsIngestError> {
     let start = *i;
     while *i < bytes.len() {
@@ -644,19 +998,32 @@ fn read_key(bytes: &[u8], i: &mut usize, input: &str) -> Result<String, LogsInge
         }
         *i += 1;
     }
-    if *i == start {
+    let name = &bytes[start..*i];
+    if name.is_empty() {
         return Err(LogsIngestError::LokiDecode(format!(
             "stream labels {input:?}: empty label name at byte {start}"
         )));
     }
-    // `inner` is a `&str` slice of `input`; a key byte range never splits a
-    // UTF-8 codepoint (the delimiters are all ASCII), so this is safe UTF-8.
-    Ok(String::from_utf8_lossy(&bytes[start..*i]).into_owned())
+    if !is_valid_label_name(name) {
+        return Err(LogsIngestError::LokiDecode(format!(
+            "stream labels {input:?}: invalid label name {:?} at byte {start} \
+             (must match [a-zA-Z_][a-zA-Z0-9_]*)",
+            String::from_utf8_lossy(name)
+        )));
+    }
+    // Every byte is now validated ASCII `[A-Za-z0-9_]`, so this is exact UTF-8
+    // (no replacement characters are possible).
+    Ok(String::from_utf8_lossy(name).into_owned())
 }
 
 /// Reads a double-quoted, Prometheus-escaped value starting at `bytes[*i]`
-/// (which must be `"`), consuming through the closing quote. Rejects an
-/// unterminated quote or a dangling escape.
+/// (which must be `"`), consuming through the closing quote. **Strictly**
+/// validates the escape grammar (issue #77): only `\\`, `\"`, `\n`, `\t`, `\r`
+/// are recognized; an unterminated quote, a dangling escape at end of value, or
+/// an unknown escape (`\q`) is rejected as [`LogsIngestError::LokiDecode`] (a
+/// whole-request 400). Prior behaviour kept an unknown escape's byte verbatim —
+/// lenient, contradicting the surrounding doc-comments; the receiver now
+/// rejects malformed escapes rather than silently reinterpreting them.
 fn read_quoted(bytes: &[u8], i: &mut usize, input: &str) -> Result<String, LogsIngestError> {
     expect_byte(bytes, i, b'"', input)?;
     let mut value: Vec<u8> = Vec::new();
@@ -683,9 +1050,11 @@ fn read_quoted(bytes: &[u8], i: &mut usize, input: &str) -> Result<String, LogsI
                     b'\\' => value.push(b'\\'),
                     b'"' => value.push(b'"'),
                     other => {
-                        // Unknown escape: keep the byte verbatim (lenient,
-                        // matching Loki's tolerant label parsing).
-                        value.push(other);
+                        return Err(LogsIngestError::LokiDecode(format!(
+                            "stream labels {input:?}: invalid escape sequence \\{} in value \
+                             (only \\\\, \\\", \\n, \\t, \\r are recognized)",
+                            other as char
+                        )));
                     }
                 }
             }
@@ -699,18 +1068,289 @@ fn read_quoted(bytes: &[u8], i: &mut usize, input: &str) -> Result<String, LogsI
 // JSON body deserialization
 // ---------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
+/// The Loki JSON push envelope (`{"streams":[...]}`). Hand-written
+/// [`serde::Deserialize`] (issue #77): the `streams` array is bounded at
+/// [`MAX_STREAMS_PER_REQUEST`] **during** deserialization, and every stream is
+/// seeded with one **shared** cross-stream [`Cell`](std::cell::Cell) entry
+/// counter so the per-stream `values` arrays cannot collectively exceed
+/// [`MAX_TOTAL_ENTRIES_PER_REQUEST`] before the count check runs — the JSON
+/// analog of [`PushRequest`]'s transient `total_entries` accumulator, closing
+/// the same decode-before-limit amplification. A missing `streams` key yields
+/// an empty request (the prior `#[serde(default)]` behaviour).
 struct JsonPush {
-    #[serde(default)]
     streams: Vec<JsonStream>,
 }
 
-#[derive(serde::Deserialize)]
+/// One Loki stream: a `stream` label map (bounded at [`MAX_LABELS_PER_STREAM`]
+/// **during** deserialization by [`BoundedLabelMap`], counting RAW pairs so a
+/// duplicate JSON key cannot evade the cap — the same anti-evasion posture as
+/// [`BoundedStructuredMetadata`]) and a `values` array (bounded per-stream at
+/// [`MAX_ENTRIES_PER_STREAM`] and across streams via the shared aggregate
+/// counter). Deserialized only through [`StreamSeed`], which threads that
+/// shared counter in; a missing key yields the prior `#[serde(default)]` empty.
 struct JsonStream {
-    #[serde(default)]
     stream: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
     values: Vec<JsonEntry>,
+}
+
+impl<'de> serde::Deserialize<'de> for JsonPush {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use std::cell::Cell;
+
+        struct PushVisitor;
+        impl<'de> serde::de::Visitor<'de> for PushVisitor {
+            type Value = JsonPush;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Loki push object with a `streams` array")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<JsonPush, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                // One shared counter for the whole request — every stream's
+                // `values` visitor increments it, so the aggregate is enforced
+                // across streams, not merely per stream.
+                let total_entries = Cell::new(0usize);
+                let mut streams: Option<Vec<JsonStream>> = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
+                    if key == "streams" {
+                        if streams.is_some() {
+                            return Err(serde::de::Error::duplicate_field("streams"));
+                        }
+                        streams = Some(map.next_value_seed(StreamsSeed {
+                            total_entries: &total_entries,
+                        })?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(JsonPush {
+                    streams: streams.unwrap_or_default(),
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PushVisitor)
+    }
+}
+
+/// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for the `streams`
+/// array: caps element count at [`MAX_STREAMS_PER_REQUEST`] and seeds each
+/// element with the shared aggregate counter. Mirrors
+/// [`BoundedStructuredMetadata`]'s abort-before-materializing-the-remainder.
+struct StreamsSeed<'c> {
+    total_entries: &'c std::cell::Cell<usize>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
+    type Value = Vec<JsonStream>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StreamsVisitor<'c> {
+            total_entries: &'c std::cell::Cell<usize>,
+        }
+        impl<'de> serde::de::Visitor<'de> for StreamsVisitor<'_> {
+            type Value = Vec<JsonStream>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of Loki streams")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut streams: Vec<JsonStream> = Vec::new();
+                while let Some(stream) = seq.next_element_seed(StreamSeed {
+                    total_entries: self.total_entries,
+                })? {
+                    if streams.len() >= MAX_STREAMS_PER_REQUEST {
+                        // Charge-before-allocate: reject the over-cap stream
+                        // without retaining the remainder of the array.
+                        return Err(serde::de::Error::custom(format!(
+                            "streams exceeds the {MAX_STREAMS_PER_REQUEST} per-request bound"
+                        )));
+                    }
+                    streams.push(stream);
+                }
+                Ok(streams)
+            }
+        }
+        deserializer.deserialize_seq(StreamsVisitor {
+            total_entries: self.total_entries,
+        })
+    }
+}
+
+/// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for one
+/// [`JsonStream`], threading the shared cross-stream aggregate counter into its
+/// `values` visitor.
+struct StreamSeed<'c> {
+    total_entries: &'c std::cell::Cell<usize>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
+    type Value = JsonStream;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StreamVisitor<'c> {
+            total_entries: &'c std::cell::Cell<usize>,
+        }
+        impl<'de> serde::de::Visitor<'de> for StreamVisitor<'_> {
+            type Value = JsonStream;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Loki stream object with `stream` and `values`")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<JsonStream, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut stream: Option<std::collections::BTreeMap<String, String>> = None;
+                let mut values: Option<Vec<JsonEntry>> = None;
+                while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
+                    match key.as_ref() {
+                        "stream" => {
+                            if stream.is_some() {
+                                return Err(serde::de::Error::duplicate_field("stream"));
+                            }
+                            stream = Some(map.next_value::<BoundedLabelMap>()?.0);
+                        }
+                        "values" => {
+                            if values.is_some() {
+                                return Err(serde::de::Error::duplicate_field("values"));
+                            }
+                            values = Some(map.next_value_seed(ValuesSeed {
+                                total_entries: self.total_entries,
+                            })?);
+                        }
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(JsonStream {
+                    stream: stream.unwrap_or_default(),
+                    values: values.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(StreamVisitor {
+            total_entries: self.total_entries,
+        })
+    }
+}
+
+/// The per-stream `stream` label map, bounded at [`MAX_LABELS_PER_STREAM`]
+/// **during** deserialization. Counts RAW `next_entry` pairs (not the
+/// dedup-collapsing `BTreeMap` length) so a duplicate JSON key cannot evade the
+/// cap — the same rationale as [`BoundedStructuredMetadata`]. Last-write-wins
+/// dedup (the prior `BTreeMap` semantics) is preserved for the retained value.
+struct BoundedLabelMap(std::collections::BTreeMap<String, String>);
+
+impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LabelMapVisitor;
+        impl<'de> serde::de::Visitor<'de> for LabelMapVisitor {
+            type Value = std::collections::BTreeMap<String, String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a Loki stream label map of string values")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut labels = std::collections::BTreeMap::new();
+                let mut seen = 0usize;
+                while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    if seen >= MAX_LABELS_PER_STREAM {
+                        // Charge-before-allocate on RAW pair count, so duplicate
+                        // keys cannot collapse under the cap.
+                        return Err(serde::de::Error::custom(format!(
+                            "stream labels exceed the {MAX_LABELS_PER_STREAM} per-stream bound"
+                        )));
+                    }
+                    seen += 1;
+                    labels.insert(k, v);
+                }
+                Ok(labels)
+            }
+        }
+        deserializer.deserialize_map(LabelMapVisitor).map(Self)
+    }
+}
+
+/// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for a stream's
+/// `values` array: caps element count per stream at [`MAX_ENTRIES_PER_STREAM`]
+/// and charges each entry into the shared cross-stream aggregate counter,
+/// rejecting once it exceeds [`MAX_TOTAL_ENTRIES_PER_REQUEST`] — both **during**
+/// deserialization, before the `Vec<JsonEntry>` grows past the cap.
+struct ValuesSeed<'c> {
+    total_entries: &'c std::cell::Cell<usize>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
+    type Value = Vec<JsonEntry>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ValuesVisitor<'c> {
+            total_entries: &'c std::cell::Cell<usize>,
+        }
+        impl<'de> serde::de::Visitor<'de> for ValuesVisitor<'_> {
+            type Value = Vec<JsonEntry>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of Loki log entries")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values: Vec<JsonEntry> = Vec::new();
+                while let Some(entry) = seq.next_element::<JsonEntry>()? {
+                    if values.len() >= MAX_ENTRIES_PER_STREAM {
+                        return Err(serde::de::Error::custom(format!(
+                            "entries exceeds the {MAX_ENTRIES_PER_STREAM} per-stream bound"
+                        )));
+                    }
+                    let new_total = self.total_entries.get().saturating_add(1);
+                    if new_total > MAX_TOTAL_ENTRIES_PER_REQUEST {
+                        return Err(serde::de::Error::custom(format!(
+                            "total_entries exceeds the {MAX_TOTAL_ENTRIES_PER_REQUEST} \
+                             per-request aggregate bound"
+                        )));
+                    }
+                    self.total_entries.set(new_total);
+                    values.push(entry);
+                }
+                Ok(values)
+            }
+        }
+        deserializer.deserialize_seq(ValuesVisitor {
+            total_entries: self.total_entries,
+        })
+    }
 }
 
 /// One `values` array entry: `["<unix_nano_string>", "<line>"]` or, with
@@ -966,6 +1606,552 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- decode-time DoS bounds (issue #77) --------------------------------
+    //
+    // These prove rejection happens BEFORE full materialization, not merely
+    // that the request is rejected. The protobuf arms decode into the bounded
+    // decode struct and inspect the materialized length (a length-cap the
+    // derived decode would blow past — the non-vacuity property); the JSON arms
+    // assert the bounded serde visitor's own `LokiDecode` message fired, which
+    // the derived-then-`validate_bounds` path (an `OversizeMessage` AFTER full
+    // materialization) never produces.
+
+    /// One empty `StreamAdapter` wire record (`PushRequest.streams`, tag 1,
+    /// length-delimited, zero-length payload): `0x0a 0x00`.
+    fn empty_stream_record() -> [u8; 2] {
+        [0x0a, 0x00]
+    }
+
+    /// One empty `EntryAdapter` wire record (`StreamAdapter.entries`, tag 2,
+    /// length-delimited, zero-length payload): `0x12 0x00`.
+    fn empty_entry_record() -> [u8; 2] {
+        [0x12, 0x00]
+    }
+
+    #[test]
+    fn decode_caps_stream_materialization_and_rejects_too_many_streams() {
+        // AC (too many streams / protobuf): a body encoding more than
+        // MAX_STREAMS_PER_REQUEST streams must NOT materialize them all — the
+        // hand-written decoder caps the vec at MAX + 1 and drains the rest
+        // without allocating. Non-vacuous: the derived decode would materialize
+        // every encoded stream, so this length assertion would fail against it.
+        let encoded = MAX_STREAMS_PER_REQUEST + 8;
+        let mut body = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            body.extend_from_slice(&empty_stream_record());
+        }
+        let bounded = BoundedPushRequest::decode(body.as_slice()).expect("empty streams decode");
+        assert_eq!(
+            bounded.streams.len(),
+            MAX_STREAMS_PER_REQUEST + 1,
+            "the decoder must cap materialization at MAX + 1, not materialize all encoded streams"
+        );
+        let err = decode_protobuf(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "streams",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_entry_materialization_and_rejects_too_many_entries() {
+        // AC (too many entries-per-stream / protobuf): one stream carrying more
+        // than MAX_ENTRIES_PER_STREAM entries caps at MAX + 1 during decode.
+        let encoded = MAX_ENTRIES_PER_STREAM + 8;
+        let mut stream_payload = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            stream_payload.extend_from_slice(&empty_entry_record());
+        }
+        let body = field_ld(1, &stream_payload);
+        let bounded = BoundedPushRequest::decode(body.as_slice()).expect("one-stream decode");
+        assert_eq!(bounded.streams.len(), 1);
+        assert_eq!(
+            bounded.streams[0].entries.len(),
+            MAX_ENTRIES_PER_STREAM + 1,
+            "the decoder must cap per-stream entry materialization at MAX + 1"
+        );
+        let err = decode_protobuf(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "entries",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_drains_streams_once_the_cross_stream_aggregate_is_exceeded() {
+        // AC-9 anti-evasion (aggregate / protobuf): every stream stays UNDER
+        // MAX_ENTRIES_PER_STREAM, but their entry counts SUM past
+        // MAX_TOTAL_ENTRIES_PER_REQUEST. The transient cross-stream accumulator
+        // stops materializing streams once the running total exceeds the
+        // aggregate, so fewer streams are materialized than encoded (the derived
+        // decode would materialize them all — the non-vacuity property).
+        let per = MAX_ENTRIES_PER_STREAM; // 100_000, each stream in-bounds
+        let encoded_streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 2; // 52 -> 5.2M > 5M
+        let mut stream_payload = Vec::with_capacity(per * 2);
+        for _ in 0..per {
+            stream_payload.extend_from_slice(&empty_entry_record());
+        }
+        let stream_record = field_ld(1, &stream_payload);
+        let mut body = Vec::with_capacity(stream_record.len() * encoded_streams);
+        for _ in 0..encoded_streams {
+            body.extend_from_slice(&stream_record);
+        }
+
+        let bounded = BoundedPushRequest::decode(body.as_slice()).expect("aggregate decode");
+        let materialized: usize = bounded.streams.iter().map(|s| s.entries.len()).sum();
+        assert!(
+            bounded.streams.len() < encoded_streams,
+            "the decoder must drain streams once the aggregate is exceeded \
+             (materialized {} of {encoded_streams} encoded streams)",
+            bounded.streams.len()
+        );
+        assert!(
+            materialized <= MAX_TOTAL_ENTRIES_PER_REQUEST + MAX_ENTRIES_PER_STREAM,
+            "aggregate fan-out must be bounded to MAX_TOTAL + one stream's cap, got {materialized}"
+        );
+
+        let err = decode_protobuf(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_entries",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_request_decode_is_no_longer_an_uncapped_bypass() {
+        // Finding #115: a direct `PushRequest::decode` (the public wire type's
+        // own decoder) must NOT materialize an unbounded stream fan-out the
+        // ingest path's caps would reject. The hand-written impl (no derive)
+        // routes decode through the bounded twin, capping `streams` at MAX + 1
+        // — the derived decoder would materialize every encoded stream (the
+        // non-vacuity property: this length assertion would fail against it).
+        let encoded = MAX_STREAMS_PER_REQUEST + 8;
+        let mut body = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            body.extend_from_slice(&empty_stream_record());
+        }
+        let decoded = PushRequest::decode(body.as_slice()).expect("bounded PushRequest::decode");
+        assert_eq!(
+            decoded.streams.len(),
+            MAX_STREAMS_PER_REQUEST + 1,
+            "PushRequest::decode must cap materialization at MAX + 1, not materialize all \
+             encoded streams"
+        );
+        // The public Loki-push decode entry still converts the +1 sentinel into
+        // a whole-request reject (Loki all-or-nothing).
+        let err = decode_protobuf(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "streams",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn push_request_decode_drains_the_cross_stream_aggregate() {
+        // Finding #115: `PushRequest::decode` routes through the bounded twin,
+        // so it also drains streams once the cross-stream aggregate exceeds
+        // MAX_TOTAL_ENTRIES_PER_REQUEST — the derived decoder would materialize
+        // every encoded stream (non-vacuity).
+        let per = MAX_ENTRIES_PER_STREAM; // each stream in-bounds
+        let encoded_streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 2; // sum > aggregate
+        let mut stream_payload = Vec::with_capacity(per * 2);
+        for _ in 0..per {
+            stream_payload.extend_from_slice(&empty_entry_record());
+        }
+        let stream_record = field_ld(1, &stream_payload);
+        let mut body = Vec::with_capacity(stream_record.len() * encoded_streams);
+        for _ in 0..encoded_streams {
+            body.extend_from_slice(&stream_record);
+        }
+        let decoded = PushRequest::decode(body.as_slice()).expect("bounded PushRequest::decode");
+        assert!(
+            decoded.streams.len() < encoded_streams,
+            "PushRequest::decode must drain streams once the aggregate is exceeded \
+             (materialized {} of {encoded_streams} encoded)",
+            decoded.streams.len()
+        );
+    }
+
+    /// A bare protobuf length-delimited prefix (a message-length varint, no tag)
+    /// followed by the payload — the framing `Message::merge_length_delimited`
+    /// consumes.
+    fn length_delimited(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 5);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Encodes `encoded_streams` in-bounds streams (each `per` empty entries)
+    /// whose entry counts SUM past MAX_TOTAL_ENTRIES_PER_REQUEST — the raw-merge
+    /// analog of the aggregate-drain decode fixtures.
+    fn cross_stream_aggregate_body(per: usize, encoded_streams: usize) -> Vec<u8> {
+        let mut stream_payload = Vec::with_capacity(per * 2);
+        for _ in 0..per {
+            stream_payload.extend_from_slice(&empty_entry_record());
+        }
+        let stream_record = field_ld(1, &stream_payload);
+        let mut body = Vec::with_capacity(stream_record.len() * encoded_streams);
+        for _ in 0..encoded_streams {
+            body.extend_from_slice(&stream_record);
+        }
+        body
+    }
+
+    /// Asserts that a raw-`merge`-decoded request bounded its cross-stream fan-out
+    /// (drained streams once the aggregate was exceeded) rather than retaining the
+    /// full encoded set. Non-vacuous: the pre-fix `PushRequest::merge_field`
+    /// capped only stream count, so it would retain all `encoded_streams` (here
+    /// `52 * 100_000 = 5.2M > 5M + 100k`), failing this bound.
+    fn assert_aggregate_bounded(streams: &[StreamAdapter], encoded_streams: usize) {
+        let materialized: usize = streams.iter().map(|s| s.entries.len()).sum();
+        assert!(
+            streams.len() < encoded_streams,
+            "the raw merge path must drain streams once the aggregate is exceeded \
+             (retained {} of {encoded_streams} encoded)",
+            streams.len()
+        );
+        assert!(
+            materialized <= MAX_TOTAL_ENTRIES_PER_REQUEST + MAX_ENTRIES_PER_STREAM,
+            "the raw merge path must bound aggregate fan-out to MAX_TOTAL + one \
+             stream's cap, got {materialized}"
+        );
+    }
+
+    #[test]
+    fn push_request_merge_enforces_the_cross_stream_aggregate() {
+        // Finding #115 round 2: `prost`'s default `Message::merge` calls
+        // `PushRequest::merge_field` directly (stream-count cap only), so a raw
+        // `PushRequest::default().merge(buf)` must NOT retain a > MAX_TOTAL
+        // fan-out the ingest path would reject. The override routes it through
+        // the bounded twin, draining streams once the aggregate is exceeded.
+        let per = MAX_ENTRIES_PER_STREAM; // each stream in-bounds
+        let encoded_streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 2; // sum > aggregate
+        let body = cross_stream_aggregate_body(per, encoded_streams);
+
+        let mut req = PushRequest::default();
+        req.merge(body.as_slice()).expect("bounded raw merge");
+        assert_aggregate_bounded(&req.streams, encoded_streams);
+    }
+
+    #[test]
+    fn push_request_merge_length_delimited_enforces_the_cross_stream_aggregate() {
+        // The `merge_length_delimited` sibling entry point loops through
+        // `merge_field` directly too, so it gets the identical bounded-twin
+        // routing — a length-delimited over-aggregate payload is bounded, never
+        // retained in full.
+        let per = MAX_ENTRIES_PER_STREAM;
+        let encoded_streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 2;
+        let framed = length_delimited(&cross_stream_aggregate_body(per, encoded_streams));
+
+        let mut req = PushRequest::default();
+        req.merge_length_delimited(framed.as_slice())
+            .expect("bounded raw merge_length_delimited");
+        assert_aggregate_bounded(&req.streams, encoded_streams);
+    }
+
+    /// A pre-existing request to merge malformed input INTO — one real stream,
+    /// so the retention assertions below have something to lose.
+    fn request_with_one_stream() -> PushRequest {
+        PushRequest {
+            streams: vec![StreamAdapter {
+                labels: r#"{service_name="checkout"}"#.to_string(),
+                entries: vec![entry(1, 0, "hello")],
+            }],
+        }
+    }
+
+    #[test]
+    fn merge_of_malformed_bytes_retains_pre_existing_streams() {
+        // Finding #115 round 3: a failed raw `merge` must NOT drop the caller's
+        // pre-existing streams. The override moves self's streams into the
+        // bounded twin, so an early `?` on decode error would leave self EMPTY
+        // (data loss). The fix restores the twin's streams on BOTH paths, giving
+        // prost partial-merge semantics. Non-vacuous: against the pre-fix
+        // `mem::take(...); bounded.merge(buf)?` code, `req.streams` is empty here.
+        let original = request_with_one_stream();
+        let mut req = original.clone();
+        // The returned error is statically a `prost::DecodeError` (the merge
+        // signature), so `expect_err` alone proves the decode failed.
+        req.merge(b"\xff\xff\xff not a protobuf message".as_slice())
+            .expect_err("malformed merge must fail");
+        assert_eq!(
+            req, original,
+            "a failed merge must retain the pre-existing streams, not empty them"
+        );
+    }
+
+    #[test]
+    fn merge_length_delimited_of_malformed_bytes_retains_pre_existing_streams() {
+        // The `merge_length_delimited` sibling gets the identical round-3
+        // error-path restoration — a malformed framed payload leaves the
+        // caller's pre-existing streams intact.
+        let original = request_with_one_stream();
+        let mut req = original.clone();
+        let framed = length_delimited(b"\xff\xff\xff not a protobuf message");
+        req.merge_length_delimited(framed.as_slice())
+            .expect_err("malformed merge_length_delimited must fail");
+        assert_eq!(
+            req, original,
+            "a failed merge_length_delimited must retain the pre-existing streams"
+        );
+    }
+
+    #[test]
+    fn parse_label_set_rejects_too_many_labels() {
+        // AC (too many labels / protobuf label-set literal): more than
+        // MAX_LABELS_PER_STREAM pairs in the `{...}` literal is an OversizeMessage.
+        let mut lit = String::from("{");
+        for i in 0..=MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                lit.push(',');
+            }
+            lit.push_str(&format!(r#"k{i}="v""#));
+        }
+        lit.push('}');
+        let err = parse_label_set(&lit).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "labels",
+                ..
+            }
+        ));
+    }
+
+    // -- strict label grammar (issue #77) ----------------------------------
+
+    #[test]
+    fn read_key_rejects_invalid_label_names() {
+        // A leading digit, a dot, and a non-ASCII byte each violate
+        // [a-zA-Z_][a-zA-Z0-9_]* and must reject (previously silently accepted).
+        for bad in [r#"{9bad="v"}"#, r#"{a.b="v"}"#, "{naïve=\"v\"}"] {
+            let err = parse_label_set(bad).unwrap_err();
+            let LogsIngestError::LokiDecode(msg) = err else {
+                panic!("expected LokiDecode for {bad:?}, got a different variant");
+            };
+            assert!(
+                msg.contains("invalid label name"),
+                "the reject must name the invalid-label-name grammar for {bad:?}: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_quoted_rejects_unknown_escape() {
+        // `\q` is not one of \\ \" \n \t \r — previously kept verbatim, now a
+        // whole-request reject.
+        let err = parse_label_set(r#"{a="x\q"}"#).unwrap_err();
+        let LogsIngestError::LokiDecode(msg) = err else {
+            panic!("expected LokiDecode, got a different variant");
+        };
+        assert!(
+            msg.contains("invalid escape sequence"),
+            "the reject must name the invalid escape: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn strict_grammar_still_accepts_valid_names_and_escapes() {
+        // Positive (no false reject): a valid name with digits/underscore and a
+        // recognized escape still parse unchanged.
+        let (labels, _) = parse_label_set(r#"{a_1="x\n"}"#).unwrap();
+        assert_eq!(labels.get("a_1"), Some("x\n"));
+    }
+
+    // -- JSON decode-time DoS bounds (issue #77) ---------------------------
+
+    fn json_loki_decode_message(body: &str) -> String {
+        match parse_json(body.as_bytes(), 0).unwrap_err() {
+            LogsIngestError::LokiDecode(msg) => msg,
+            other => panic!("expected LokiDecode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_json_rejects_too_many_streams_during_deserialize() {
+        // AC (too many streams / JSON): more than MAX_STREAMS_PER_REQUEST empty
+        // stream objects. The bounded seed rejects DURING deserialize with its
+        // own message — the non-vacuity signal vs. the derived + validate_bounds
+        // `OversizeMessage`.
+        let mut body = String::with_capacity(4 * MAX_STREAMS_PER_REQUEST);
+        body.push_str(r#"{"streams":["#);
+        for i in 0..=MAX_STREAMS_PER_REQUEST {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str("{}");
+        }
+        body.push_str("]}");
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("streams exceeds"),
+            "the reject must be the bounded-seed streams message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_rejects_too_many_entries_per_stream_during_deserialize() {
+        // AC (too many entries-per-stream / JSON).
+        let mut body = String::new();
+        body.push_str(r#"{"streams":[{"stream":{"a":"b"},"values":["#);
+        for i in 0..=MAX_ENTRIES_PER_STREAM {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#"["1700000000000000000","x"]"#);
+        }
+        body.push_str("]}]}");
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("entries exceeds"),
+            "the reject must be the bounded-seed entries message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_rejects_cross_stream_aggregate_during_deserialize() {
+        // AC-9 anti-evasion (aggregate / JSON): each stream carries exactly
+        // MAX_ENTRIES_PER_STREAM values (individually in-bounds) but the shared
+        // cross-stream counter trips MAX_TOTAL_ENTRIES_PER_REQUEST.
+        let per = MAX_ENTRIES_PER_STREAM;
+        let streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 1; // 51 -> 5.1M
+        let one_stream = {
+            let mut s = String::from(r#"{"stream":{"a":"b"},"values":["#);
+            for i in 0..per {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(r#"["1700000000000000000","x"]"#);
+            }
+            s.push_str("]}");
+            s
+        };
+        let mut body = String::from(r#"{"streams":["#);
+        for i in 0..streams {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&one_stream);
+        }
+        body.push_str("]}");
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("total_entries exceeds"),
+            "the reject must be the shared cross-stream aggregate message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_rejects_oversized_label_map_during_deserialize() {
+        // AC (oversized label map / JSON): more than MAX_LABELS_PER_STREAM keys
+        // in one stream's `stream` map, rejected during the MapAccess visit.
+        let mut map = String::from("{");
+        for i in 0..=MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                map.push(',');
+            }
+            map.push_str(&format!(r#""k{i}":"v""#));
+        }
+        map.push('}');
+        let body =
+            format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","x"]]}}]}}"#);
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("stream labels exceed"),
+            "the reject must be the bounded label-map message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_duplicate_label_keys_cannot_evade_the_map_cap() {
+        // AC-9 anti-evasion (labels / JSON): a label map whose keys are all the
+        // SAME string would collapse to one entry in a BTreeMap, evading the
+        // cap; counting RAW pairs during the visit rejects it.
+        let mut map = String::from("{");
+        for i in 0..=MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                map.push(',');
+            }
+            map.push_str(r#""dup":"v""#);
+        }
+        map.push('}');
+        let body =
+            format!(r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","x"]]}}]}}"#);
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("stream labels exceed"),
+            "duplicate keys must still trip the RAW-pair label-map cap: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn parse_json_accepts_at_cap_labels_and_entries() {
+        // Positive (no false reject): exactly MAX_LABELS_PER_STREAM distinct
+        // labels and a small in-bounds values array still parse.
+        let mut map = String::from("{");
+        for i in 0..MAX_LABELS_PER_STREAM {
+            if i > 0 {
+                map.push(',');
+            }
+            map.push_str(&format!(r#""k{i}":"v{i}""#));
+        }
+        map.push('}');
+        let body = format!(
+            r#"{{"streams":[{{"stream":{map},"values":[["1700000000000000000","hello"]]}}]}}"#
+        );
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "hello");
+    }
+
+    #[test]
+    fn parse_json_rejects_invalid_label_names() {
+        // Finding #115: JSON label keys must be validated against the SAME
+        // strict grammar as the protobuf path. A leading digit, a dot, and a
+        // non-ASCII byte each violate [a-zA-Z_][a-zA-Z0-9_]* and must reject —
+        // previously they were silently canonicalized by `from_normalized`.
+        // Non-vacuous: the reject must be the grammar message (not some other
+        // JSON error), and the same body shape with a valid key parses (see
+        // `parse_json_accepts_valid_label_names`).
+        for bad_key in ["9bad", "a.b", "naïve"] {
+            let body = format!(
+                r#"{{"streams":[{{"stream":{{"{bad_key}":"v"}},"values":[["1700000000000000000","x"]]}}]}}"#
+            );
+            let err = parse_json(body.as_bytes(), 0).unwrap_err();
+            let LogsIngestError::LokiDecode(msg) = err else {
+                panic!("expected LokiDecode for key {bad_key:?}, got a different variant");
+            };
+            assert!(
+                msg.contains("is invalid") && msg.contains("must match"),
+                "the reject must name the invalid-label-name grammar for {bad_key:?}: {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_json_accepts_valid_label_names() {
+        // Positive (no false reject): valid names with a leading underscore,
+        // digits, and underscores still parse on the JSON path — the non-vacuity
+        // counterpart to `parse_json_rejects_invalid_label_names`.
+        let body = r#"{"streams":[{"stream":{"_a1":"x","service_name":"checkout"},"values":[["1700000000000000000","hello"]]}]}"#;
+        let out = parse_json(body.as_bytes(), 0).unwrap();
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "hello");
     }
 
     // -- parse -------------------------------------------------------------
