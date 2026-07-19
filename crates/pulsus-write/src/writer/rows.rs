@@ -790,7 +790,7 @@ mod tests {
         let (labels, _) =
             LabelSet::from_normalized([("service_name".to_string(), "checkout".to_string())]);
         let row = StreamRow {
-            month: Date::start_of_month_utc(1_700_000_000_000_000_000),
+            month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
             fingerprint: 7,
             service: "checkout".to_string(),
             labels,
@@ -811,7 +811,7 @@ mod tests {
             ("env".to_string(), "prod".to_string()),
         ]);
         let row = StreamRow {
-            month: Date::start_of_month_utc(1_700_000_000_000_000_000),
+            month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
             fingerprint: 7,
             service: "checkout".to_string(),
             labels,

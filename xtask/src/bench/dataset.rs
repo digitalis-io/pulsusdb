@@ -275,7 +275,12 @@ pub async fn load(client: &ChClient, spec: &DatasetSpec) -> anyhow::Result<Datas
 
     let end_ns = now_ns();
     let start_ns = end_ns - (spec.duration_secs as i64) * 1_000_000_000;
-    let month = Date::start_of_month_utc(end_ns).days_since_epoch();
+    // `end_ns` is the current wall clock, always inside the ClickHouse `Date`
+    // range — representability is an invariant of the seed timestamp, not
+    // untrusted input.
+    let month = Date::start_of_month_utc(end_ns)
+        .expect("current wall-clock month is representable as a ClickHouse Date")
+        .days_since_epoch();
 
     let stream_rows: Vec<SeedStreamRow> = streams
         .iter()
@@ -602,7 +607,16 @@ pub async fn load_broad_tier(
     // — see this function's doc comment.
     let start_ns = end_ns - HYDRATION_WINDOW_NS;
     let t_split_ns = start_ns + HYDRATION_WINDOW_NS / 2;
-    let month = Date::start_of_month_utc(end_ns).days_since_epoch();
+    // `end_ns` is the caller-supplied `spec.ref_ns`; reject (rather than
+    // panic) if it resolves to a month-start outside the ClickHouse `Date`
+    // range instead of assuming it is a representable wall-clock instant.
+    let month = Date::start_of_month_utc(end_ns)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "broad-tier ref_ns {end_ns} resolves to a month-start outside the ClickHouse Date range"
+            )
+        })?
+        .days_since_epoch();
 
     let stream_rows: Vec<SeedStreamRow> = streams
         .iter()

@@ -149,7 +149,7 @@ fn batch_for(fingerprint: u64, service: &str, timestamp_ns: i64, new_stream: boo
     };
     if new_stream {
         out.streams.push(StreamRow {
-            month: Date::start_of_month_utc(timestamp_ns),
+            month: Date::start_of_month_utc(timestamp_ns).unwrap(),
             fingerprint,
             service: service.to_string(),
             labels: labels_with_service(service),

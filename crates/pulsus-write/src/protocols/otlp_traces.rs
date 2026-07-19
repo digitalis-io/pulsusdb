@@ -356,7 +356,26 @@ fn parse_span(
         ),
     )?;
 
-    let date = Date::start_of_day_utc(timestamp_ns).days_since_epoch();
+    let date = match Date::start_of_day_utc(timestamp_ns) {
+        Some(date) => date.days_since_epoch(),
+        None => {
+            // The timestamp is representable as `i64` ns but its day falls
+            // outside the ClickHouse `Date` range (before 1970-01-01 or
+            // after 2149-06-06). Saturating `trace_attrs_idx.date` would
+            // orphan the span into the wrong daily partition, so the span is
+            // rejected wholesale into partial success.
+            reject_span(
+                out,
+                format!(
+                    "span {:?}: start_time_unix_nano {} is outside the representable \
+                     ClickHouse Date range",
+                    diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                    span.start_time_unix_nano
+                ),
+            );
+            return Ok(());
+        }
+    };
     for (scope, attrs) in [
         (SCOPE_RESOURCE, resource_attrs),
         (SCOPE_SPAN, &span.attributes),
@@ -862,6 +881,32 @@ mod tests {
         assert_eq!(out.spans.len(), 1);
         // The rejected span contributes no attr rows either.
         assert!(out.attrs.is_empty());
+    }
+
+    #[test]
+    fn parse_rejects_a_far_future_span_instead_of_orphaning_it_into_the_max_date_partition() {
+        // Representable as i64 ns but ~year 2200 — past the 2149-06-06
+        // ClickHouse `Date` cutoff. Before #8's fix `trace_attrs_idx.date`
+        // saturated to day 65535, silently orphaning the span; now it is a
+        // clean per-span rejection (partial success), with no span/attr rows.
+        let far_future_ns: u64 = 86_400_000_000_000 * 84_000;
+        let mut bad = valid_span();
+        bad.start_time_unix_nano = far_future_ns;
+        bad.end_time_unix_nano = far_future_ns;
+        bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
+        let good = valid_span();
+        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+            .expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+        assert_eq!(out.spans.len(), 1);
+        // No attr row registered at the max-`Date` boundary.
+        assert!(out.attrs.iter().all(|a| a.date != u16::MAX));
     }
 
     #[test]
