@@ -158,6 +158,12 @@ fn attr_budget_charge(kv: &KeyValue) -> usize {
 /// decode boundary: a malformed/truncated protobuf is a whole-request,
 /// atomic failure (mirrors `otlp_logs::decode`) — never partially applied.
 pub fn decode(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError> {
+    // Wire pre-scan (issue #115, track 5): reject an over-cap / over-deep
+    // request by walking the raw protobuf bytes BEFORE `decode` materializes
+    // the amplified structure. `Ok` for an in-bounds or malformed body — a
+    // malformed body is deferred to `decode` below for identical
+    // classification.
+    crate::protocols::otlp_prescan::prescan_traces(body)?;
     Ok(ExportTraceServiceRequest::decode(body)?)
 }
 

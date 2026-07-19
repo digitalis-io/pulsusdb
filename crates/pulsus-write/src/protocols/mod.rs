@@ -8,6 +8,7 @@ pub mod otlp_depth;
 pub mod otlp_exp_histogram;
 pub mod otlp_logs;
 pub mod otlp_metrics;
+pub mod otlp_prescan;
 pub mod otlp_traces;
 pub mod remote_write;
 pub mod zipkin;
