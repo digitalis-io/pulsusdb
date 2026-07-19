@@ -356,8 +356,8 @@ fn logs_self_round_trip_is_row_identical() {
     let via_json = otlp_logs::decode_json(&json).expect("decode_json logs");
     let via_pb = logs_via_protobuf(&req);
     assert_eq!(
-        otlp_logs::parse(&via_json, NOW_NS),
-        otlp_logs::parse(&via_pb, NOW_NS)
+        otlp_logs::parse(&via_json, NOW_NS).expect("json within the depth cap"),
+        otlp_logs::parse(&via_pb, NOW_NS).expect("pb within the depth cap")
     );
 }
 
@@ -396,8 +396,8 @@ fn logs_golden_json_is_row_identical_to_protobuf() {
     let via_json = otlp_logs::decode_json(&read_golden("logs.json")).expect("decode logs golden");
     let via_pb = logs_via_protobuf(&logs_request());
     assert_eq!(
-        otlp_logs::parse(&via_json, NOW_NS),
-        otlp_logs::parse(&via_pb, NOW_NS),
+        otlp_logs::parse(&via_json, NOW_NS).expect("json within the depth cap"),
+        otlp_logs::parse(&via_pb, NOW_NS).expect("pb within the depth cap"),
     );
 }
 

@@ -117,7 +117,21 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// caller (the ingest handler) is the only clock/IO boundary, so `parse`
 /// itself is trivially unit-testable and deterministic across calls with
 /// identical arguments.
-pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
+///
+/// `Err` iff a body/attribute `AnyValue` tree nests deeper than
+/// [`otlp_depth::MAX_ANYVALUE_DEPTH`](crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH)
+/// — a whole-request, atomic structural failure (400 / `code = 3`), exactly
+/// like a decode error; malformed per-record timestamps stay per-record
+/// partial-success rejections inside the `Ok`.
+pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep body/attribute tree before any value is rendered or a
+    // row materialized, so the recursive `any_value_to_string` render below
+    // can never overflow the stack. This makes `parse` fallible (it was
+    // previously infallible) — a whole-request, atomic 400/`code = 3` reject,
+    // the same class as a decode failure.
+    crate::protocols::otlp_depth::ensure_logs_anyvalue_depth(req)?;
+
     let mut out = ParsedLogs::default();
     // Dedups stream registration within this request by `(fingerprint,
     // month)` (architect plan amendment) — a fingerprint-only key would
@@ -202,7 +216,7 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Flattens `resource.attributes` — and ONLY those — into the stream
@@ -426,6 +440,15 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+
+    /// The `AnyValue` depth guard (finding #54) made `super::parse` fallible.
+    /// Every legacy assertion below constructs shallow, in-bounds requests, so
+    /// this shim unwraps the whole-request result to keep those cases reading
+    /// against `ParsedLogs` unchanged; the dedicated depth tests call
+    /// `super::parse` directly to observe the `Err`.
+    fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
+        super::parse(req, now_ns).expect("test request is within the AnyValue depth cap")
+    }
 
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -1341,5 +1364,91 @@ mod tests {
         assert_eq!(base64_encode(b"a"), "YQ==");
         assert_eq!(base64_encode(b"ab"), "YWI=");
         assert_eq!(base64_encode(b"abc"), "YWJj");
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// A log record `body` nested `levels` `AnyValue` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). Built
+    /// iteratively; `levels <= MAX_ANYVALUE_DEPTH + 1` here, so its `Drop`
+    /// recursion is trivially safe.
+    fn nested_body(levels: usize) -> AnyValue {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value
+    }
+
+    fn request_with_body(body: AnyValue) -> ExportLogsServiceRequest {
+        request(vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(body),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }])
+    }
+
+    #[test]
+    fn parse_accepts_body_anyvalue_nesting_at_the_depth_cap() {
+        let req = request_with_body(nested_body(
+            crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH,
+        ));
+        // Calls the real fallible `parse` (not the unwrap shim): an at-cap
+        // body renders and yields exactly one row, unchanged by the guard.
+        let out = super::parse(&req, 0).expect("at-cap body is within the depth guard");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_body_anyvalue_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders to a JSON string and
+        // yields one row); the guard makes it a whole-request reject before
+        // any row is materialized, proving the reject is non-vacuous.
+        let req = request_with_body(nested_body(
+            crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+        ));
+        let err = super::parse(&req, 0).expect_err("over-depth body is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
+    }
+
+    #[test]
+    fn parse_rejects_attribute_anyvalue_nesting_past_the_depth_cap() {
+        // The reject also covers resource attribute values, not just bodies.
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "deep".to_string(),
+                    value: Some(nested_body(
+                        crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+                    )),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("x"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }]);
+        let err = super::parse(&req, 0).expect_err("over-depth resource attribute is rejected");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }

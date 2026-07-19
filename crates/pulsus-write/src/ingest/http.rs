@@ -110,7 +110,14 @@ pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Respo
         Err(err) => return error_response(err),
     };
 
-    let parsed = otlp_logs::parse(&request, now_ns);
+    // Fallible since the `AnyValue` recursion-depth guard (finding #54): a
+    // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
+    // reject, the same classification a decode failure gets. `ingest` returns
+    // `Response` (not `Result`), so this matches rather than `?`-propagates.
+    let parsed = match otlp_logs::parse(&request, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return error_response(err),
+    };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
 
@@ -1730,6 +1737,48 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let status = decode_status_body(res).await;
         assert_eq!(status.code, 3);
+    }
+
+    /// AC-15 (finding #54 scalar backstop): a *structurally valid* single-span
+    /// request — one resource_span / scope_span / span / attribute, under every
+    /// element cap — whose lone `AnyValue.bytes_value` scalar ALONE exceeds
+    /// `MAX_DECOMPRESSED_BYTES`. `read_capped_body` must reject the raw encoded
+    /// body on the `OversizeBody` path (400 / `code = 3`) BEFORE
+    /// `decode_traces_request`/`parse` ever runs, so the oversized scalar never
+    /// materializes into the vendored struct and no row is admitted. This is
+    /// the pre-decode backstop for scalar `bytes`/`string` fields (which carry
+    /// no per-field cap of their own — they are bounded by the shared body cap).
+    #[tokio::test]
+    async fn traces_giant_scalar_bytes_value_is_rejected_pre_decode_by_the_body_cap() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+
+        let mut span = trace_span(vec![1; 16], vec![2; 8]);
+        span.attributes = vec![KeyValue {
+            key: "blob".to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::BytesValue(vec![
+                    0u8;
+                    decompress::MAX_DECOMPRESSED_BYTES
+                        + 1
+                ])),
+            }),
+            key_strindex: 0,
+        }];
+        let body = traces_request(vec![span]).encode_to_vec();
+        assert!(
+            body.len() > decompress::MAX_DECOMPRESSED_BYTES,
+            "the single scalar must push the raw body past the 64 MiB cap"
+        );
+
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(traces_router(sink.clone()), body, &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(
+            sink.admitted.lock().unwrap().is_empty(),
+            "rejected pre-decode: the oversized scalar never reached the sink"
+        );
     }
 
     #[tokio::test]

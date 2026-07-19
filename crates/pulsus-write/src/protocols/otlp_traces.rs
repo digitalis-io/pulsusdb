@@ -187,6 +187,12 @@ pub fn parse(
     req: &ExportTraceServiceRequest,
     now_ns: i64,
 ) -> Result<ParsedTraces, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep attribute tree before any value is rendered or a row
+    // materialized, so the recursive `any_value_to_string` render below can
+    // never overflow the stack.
+    crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
+
     let mut out = ParsedTraces::default();
     let mut expanded_bytes: usize = 0;
 
@@ -1398,5 +1404,63 @@ mod tests {
             payload_b.resource_spans[0].scope_spans[0].spans,
             vec![second]
         );
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// The inner `Value` of an `AnyValue` tree `levels` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). The `kv` helper
+    /// wraps it back into the depth-1 root `AnyValue`, so the resulting
+    /// attribute value tree is exactly `levels` `AnyValue` nodes deep. Built
+    /// iteratively; used only at `levels <= MAX_ANYVALUE_DEPTH + 1`, so its
+    /// `Drop` recursion is trivially safe.
+    fn deep_value(levels: usize) -> Value {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value.value.expect("nested value is present")
+    }
+
+    fn span_with_deep_attr(levels: usize) -> Span {
+        let mut span = valid_span();
+        span.attributes = vec![kv("deep", deep_value(levels))];
+        span
+    }
+
+    #[test]
+    fn parse_accepts_span_attribute_nesting_at_the_depth_cap() {
+        let req = request_with(
+            None,
+            None,
+            vec![span_with_deep_attr(
+                crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH,
+            )],
+        );
+        let out = parse(&req, 0).expect("at-cap span attribute is within the depth guard");
+        assert_eq!(out.spans.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_span_attribute_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders and yields one span);
+        // the guard makes it a whole-request reject before any row is
+        // materialized, proving the reject is non-vacuous.
+        let req = request_with(
+            None,
+            None,
+            vec![span_with_deep_attr(
+                crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+            )],
+        );
+        let err = parse(&req, 0).expect_err("over-depth span attribute is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }

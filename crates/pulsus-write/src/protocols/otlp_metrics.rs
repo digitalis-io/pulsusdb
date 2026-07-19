@@ -227,6 +227,12 @@ pub fn parse(
     now_ns: i64,
     mode: ExpHistogramMode,
 ) -> Result<ParsedMetrics, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep attribute tree before any value is rendered or a
+    // sample materialized, so the recursive `any_value_to_string` render
+    // below can never overflow the stack.
+    crate::protocols::otlp_depth::ensure_metrics_anyvalue_depth(req)?;
+
     let mut out = ParsedMetrics::default();
     let mut expanded_bytes: usize = 0;
     // Dedups `SeriesRef` registration within this request by `(metric_name,
@@ -2737,5 +2743,55 @@ mod tests {
         assert_eq!(h.count, 0, "stale marker carries no observations");
         assert_eq!(h.sum.to_bits(), STALE_NAN_BITS);
         assert!(h.positive_spans.is_empty());
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// The inner `Value` of an `AnyValue` tree `levels` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). The `kv` helper
+    /// wraps it back into the depth-1 root `AnyValue`, so the resulting
+    /// attribute value tree is exactly `levels` `AnyValue` nodes deep. Built
+    /// iteratively; used only at `levels <= MAX_ANYVALUE_DEPTH + 1`, so its
+    /// `Drop` recursion is trivially safe.
+    fn deep_value(levels: usize) -> Value {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value.value.expect("nested value is present")
+    }
+
+    fn gauge_with_deep_attr(levels: usize) -> ExportMetricsServiceRequest {
+        let dp = number_dp(
+            1_700_000_000_000_000_000,
+            1.0,
+            vec![kv("deep", deep_value(levels))],
+        );
+        one_metric_request(None, gauge_metric("g", dp))
+    }
+
+    #[test]
+    fn parse_accepts_data_point_attribute_nesting_at_the_depth_cap() {
+        let req = gauge_with_deep_attr(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH);
+        let out = parse(&req, 0).expect("at-cap data-point attribute is within the depth guard");
+        assert_eq!(out.samples.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_data_point_attribute_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders and yields one sample);
+        // the guard makes it a whole-request reject before any sample is
+        // materialized, proving the reject is non-vacuous.
+        let req = gauge_with_deep_attr(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1);
+        let err =
+            parse(&req, 0).expect_err("over-depth data-point attribute is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }
