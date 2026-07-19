@@ -429,7 +429,10 @@ fn decode_loki_push(
 ///   supported encoding; v1/protobuf/thrift are out of scope), decompressed
 ///   per `Content-Encoding` for gzip; a malformed array or any span with a
 ///   bad id/timestamp is a whole-request `ZipkinDecode` 400 plain-text.
-///   `parsed.rejected` is therefore always 0 here.
+///   Any per-span rejection surfaced by `otlp_traces::parse` (an
+///   out-of-`Date`-range timestamp, issue #8) is likewise promoted to a
+///   whole-request 400 in [`decode_zipkin`], so no partially-accepted batch
+///   is ever admitted here.
 pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
@@ -467,6 +470,15 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
 /// v2 JSON span array, adapts it to OTLP, and runs the shared
 /// `otlp_traces::parse`. See [`ingest_zipkin`] for why `Content-Type` is
 /// not consulted.
+///
+/// **All-or-nothing promotion (issue #8):** `otlp_traces::parse` keeps
+/// per-span partial-success for the native `/v1/traces` path, but Zipkin has
+/// no partial-success channel — a span rejected by `parse` (e.g. a timestamp
+/// whose UTC day is outside the ClickHouse `Date` range, `start_of_day_utc`
+/// ⇒ `None`) must fail the WHOLE request rather than be silently dropped. So
+/// any `parsed.rejected > 0` is promoted here to a whole-request
+/// [`LogsIngestError::ZipkinDecode`] (400/code 3) before returning — no batch
+/// is admitted, since [`ingest_zipkin`] only admits on `Ok`.
 fn decode_zipkin(
     headers: &HeaderMap,
     body: &[u8],
@@ -476,7 +488,15 @@ fn decode_zipkin(
     let decompressed = decompress::decompress(encoding, body)?;
     let spans = zipkin::decode(&decompressed)?;
     let request = zipkin::to_otlp(spans)?;
-    otlp_traces::parse(&request, now_ns)
+    let parsed = otlp_traces::parse(&request, now_ns)?;
+    if parsed.rejected > 0 {
+        return Err(LogsIngestError::ZipkinDecode(
+            parsed
+                .rejected_message
+                .unwrap_or_else(|| "a span was rejected during parsing".to_string()),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// `true` when the request's `Content-Type` selects a JSON body — the Loki
@@ -1830,6 +1850,46 @@ mod tests {
         let partial = response.partial_success.expect("partial success is set");
         assert_eq!(partial.rejected_spans, 1);
         assert!(!partial.error_message.is_empty());
+    }
+
+    // -- `/api/v2/spans` Zipkin all-or-nothing (issue #8) -----------------
+
+    /// Issue #8 (deferred Zipkin reject): a Zipkin span whose `timestamp`
+    /// (microseconds) resolves to a UTC day outside the ClickHouse `Date`
+    /// range (`70_000` days ⇒ `start_of_day_utc` returns `None`) is a per-span
+    /// rejection inside `otlp_traces::parse`. Because Zipkin is all-or-nothing,
+    /// `decode_zipkin` must promote that `parsed.rejected > 0` to a
+    /// whole-request [`LogsIngestError::ZipkinDecode`] (400/code 3) — NOT a
+    /// silent partial drop. The `Err` structurally precludes admission
+    /// ([`ingest_zipkin`] admits only on `Ok`).
+    #[test]
+    fn zipkin_out_of_date_range_timestamp_rejects_the_whole_request() {
+        // 70_000 days in microseconds — well past 2149-06-06 (day 65535).
+        let far_future_micros: i64 = 70_000 * 86_400_000_000;
+        let body = format!(
+            r#"[{{"traceId":"0000000000000001","id":"0000000000000002","timestamp":{far_future_micros}}}]"#
+        );
+        let err = decode_zipkin(
+            &HeaderMap::new(),
+            body.as_bytes(),
+            1_700_000_000_000_000_000,
+        )
+        .expect_err("out-of-Date-range span must reject the whole request");
+        assert!(
+            matches!(err, LogsIngestError::ZipkinDecode(_)),
+            "expected a whole-request ZipkinDecode, got {err:?}"
+        );
+    }
+
+    /// Positive (no false reject): an in-range Zipkin span decodes, adapts,
+    /// and parses with `rejected == 0` — the #8 promotion does not fire on
+    /// legitimate traffic.
+    #[test]
+    fn zipkin_in_range_timestamp_parses_without_rejection() {
+        let body = br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
+        let parsed = decode_zipkin(&HeaderMap::new(), body, 1_700_000_000_000_000_000)
+            .expect("in-range span parses");
+        assert_eq!(parsed.rejected, 0);
     }
 
     // -- `/api/v1/write` (issue #28) --------------------------------------

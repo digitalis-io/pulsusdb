@@ -42,14 +42,31 @@ use crate::error::LogsIngestError;
 use crate::protocols::otlp_traces;
 
 /// Decode-time cap on the number of spans in one request's array — the
-/// structural DoS bound checked post-decode, pre-adapt (matches
-/// `loki_push::MAX_STREAMS_PER_REQUEST`: generous, far above anything a
-/// 64 MiB body can encode, so it never bounds a legitimate batch; it only
-/// rejects a pathological count before the multiplicative OTLP adaptation
-/// runs). An over-count array is a whole-request 400
-/// ([`LogsIngestError::OversizeMessage`], the same structural-oversize
-/// class the `MAX_EXPANDED_BYTES` budget uses).
+/// structural DoS bound enforced **during** deserialization by
+/// [`BoundedSpans`] (issue #75: the span `Vec` cannot grow past the cap
+/// before the count is checked, so an over-cap array is rejected before it is
+/// fully materialized). Matches `loki_push::MAX_STREAMS_PER_REQUEST`:
+/// generous, far above anything a 64 MiB body can encode, so it never bounds
+/// a legitimate batch; it only rejects a pathological count before the
+/// multiplicative OTLP adaptation runs. An over-count array is a whole-request
+/// 400 ([`LogsIngestError::ZipkinDecode`], the same structural-reject class a
+/// malformed body uses).
 pub const MAX_SPANS_PER_REQUEST: usize = 1_000_000;
+
+/// Decode-time cap on the number of `tags` on ONE span, enforced **during**
+/// deserialization (issue #75) counting RAW key/value pairs so a duplicate
+/// JSON key cannot evade it — the same anti-evasion posture as
+/// `loki_push::BoundedLabelMap`. Generous (2^16, far above any real span,
+/// which carries a handful of tags): it only bounds the single-huge-span clone
+/// that the per-block expansion charge would otherwise have to materialize
+/// before it could reject. Over-cap ⇒ whole-request
+/// [`LogsIngestError::ZipkinDecode`] (400/code 3).
+pub const MAX_TAGS_PER_SPAN: usize = 65_536;
+
+/// Decode-time cap on the number of `annotations` on ONE span, enforced
+/// **during** deserialization (issue #75). Generous (2^16); over-cap ⇒
+/// whole-request [`LogsIngestError::ZipkinDecode`]. See [`MAX_TAGS_PER_SPAN`].
+pub const MAX_ANNOTATIONS_PER_SPAN: usize = 65_536;
 
 /// One OpenZipkin v2 span (zipkin.io/zipkin-api, `zipkin2.Span`). Only the
 /// v2 JSON fields this receiver maps are modeled; unknown fields are
@@ -81,10 +98,13 @@ pub struct ZipkinSpan {
     pub remote_endpoint: Option<Endpoint>,
     /// `BTreeMap` so the adapted span-attribute order is deterministic
     /// (sorted by key) — the adaptation golden and the payload bytes depend
-    /// on a stable order.
-    #[serde(default)]
+    /// on a stable order. Bounded at [`MAX_TAGS_PER_SPAN`] **during**
+    /// deserialization (issue #75).
+    #[serde(default, deserialize_with = "deserialize_bounded_tags")]
     pub tags: BTreeMap<String, String>,
-    #[serde(default)]
+    /// Bounded at [`MAX_ANNOTATIONS_PER_SPAN`] **during** deserialization
+    /// (issue #75).
+    #[serde(default, deserialize_with = "deserialize_bounded_annotations")]
     pub annotations: Vec<Annotation>,
     #[serde(default)]
     pub debug: bool,
@@ -114,28 +134,132 @@ pub struct Annotation {
 }
 
 /// Decodes a (decompressed) Zipkin v2 JSON request body — a JSON array of
-/// spans — and enforces [`MAX_SPANS_PER_REQUEST`]. A malformed body is a
-/// whole-request [`LogsIngestError::ZipkinDecode`] (400/code 3); an
-/// over-count array is [`LogsIngestError::OversizeMessage`] (same class).
+/// spans — through [`BoundedSpans`], which enforces [`MAX_SPANS_PER_REQUEST`]
+/// (span count), [`MAX_TAGS_PER_SPAN`] and [`MAX_ANNOTATIONS_PER_SPAN`]
+/// (per-span fan-out) **during** deserialization, so an over-cap payload is
+/// rejected before the span `Vec` (or a single span's tags/annotations) is
+/// fully materialized (issue #75). Any structural violation — malformed body
+/// or an over-cap count — is a whole-request [`LogsIngestError::ZipkinDecode`]
+/// (400/code 3).
 pub fn decode(body: &[u8]) -> Result<Vec<ZipkinSpan>, LogsIngestError> {
-    let spans: Vec<ZipkinSpan> =
+    let BoundedSpans(spans) =
         serde_json::from_slice(body).map_err(|e| LogsIngestError::ZipkinDecode(e.to_string()))?;
-    check_span_count(spans.len())?;
     Ok(spans)
 }
 
-/// The [`MAX_SPANS_PER_REQUEST`] structural bound, isolated so it is
-/// testable without materializing a million-span body: an over-count array
-/// is a whole-request [`LogsIngestError::OversizeMessage`] (400/code 3).
-fn check_span_count(count: usize) -> Result<(), LogsIngestError> {
-    if count > MAX_SPANS_PER_REQUEST {
-        return Err(LogsIngestError::OversizeMessage {
-            field: "zipkin spans",
-            limit: MAX_SPANS_PER_REQUEST,
-            actual: count,
-        });
+/// The top-level span array with its element count bounded at
+/// [`MAX_SPANS_PER_REQUEST`] **during** deserialization: the `SeqAccess`
+/// visitor rejects the moment the accumulated count would exceed the cap, so
+/// the `Vec<ZipkinSpan>` never grows past it (the DoS bound the derived
+/// `Vec<ZipkinSpan>` deserialize lacked). Mirrors `loki_push::StreamsSeed`.
+struct BoundedSpans(Vec<ZipkinSpan>);
+
+impl<'de> serde::Deserialize<'de> for BoundedSpans {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SpansVisitor;
+        impl<'de> serde::de::Visitor<'de> for SpansVisitor {
+            type Value = Vec<ZipkinSpan>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of Zipkin v2 spans")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut spans: Vec<ZipkinSpan> = Vec::new();
+                while let Some(span) = seq.next_element::<ZipkinSpan>()? {
+                    if spans.len() >= MAX_SPANS_PER_REQUEST {
+                        // Charge-before-allocate: reject the over-cap span
+                        // without retaining the remainder of the array.
+                        return Err(serde::de::Error::custom(format!(
+                            "spans exceeds the {MAX_SPANS_PER_REQUEST} per-request bound"
+                        )));
+                    }
+                    spans.push(span);
+                }
+                Ok(spans)
+            }
+        }
+        deserializer.deserialize_seq(SpansVisitor).map(Self)
     }
-    Ok(())
+}
+
+/// Bounded `deserialize_with` for [`ZipkinSpan::tags`]: caps the map at
+/// [`MAX_TAGS_PER_SPAN`] **during** deserialization, counting RAW pairs so a
+/// duplicate JSON key cannot evade the cap (last-write-wins dedup is preserved
+/// for the retained value, as with the prior `BTreeMap` deserialize). Mirrors
+/// `loki_push::BoundedLabelMap`.
+fn deserialize_bounded_tags<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct TagsVisitor;
+    impl<'de> serde::de::Visitor<'de> for TagsVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a Zipkin span tag map of string values")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut tags = BTreeMap::new();
+            let mut seen = 0usize;
+            while let Some((k, v)) = map.next_entry::<String, String>()? {
+                if seen >= MAX_TAGS_PER_SPAN {
+                    return Err(serde::de::Error::custom(format!(
+                        "tags exceeds the {MAX_TAGS_PER_SPAN} per-span bound"
+                    )));
+                }
+                seen += 1;
+                tags.insert(k, v);
+            }
+            Ok(tags)
+        }
+    }
+    deserializer.deserialize_map(TagsVisitor)
+}
+
+/// Bounded `deserialize_with` for [`ZipkinSpan::annotations`]: caps the array
+/// at [`MAX_ANNOTATIONS_PER_SPAN`] **during** deserialization, rejecting the
+/// moment the count would exceed the cap so the `Vec<Annotation>` never grows
+/// past it.
+fn deserialize_bounded_annotations<'de, D>(deserializer: D) -> Result<Vec<Annotation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AnnotationsVisitor;
+    impl<'de> serde::de::Visitor<'de> for AnnotationsVisitor {
+        type Value = Vec<Annotation>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an array of Zipkin span annotations")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut annotations: Vec<Annotation> = Vec::new();
+            while let Some(annotation) = seq.next_element::<Annotation>()? {
+                if annotations.len() >= MAX_ANNOTATIONS_PER_SPAN {
+                    return Err(serde::de::Error::custom(format!(
+                        "annotations exceeds the {MAX_ANNOTATIONS_PER_SPAN} per-span bound"
+                    )));
+                }
+                annotations.push(annotation);
+            }
+            Ok(annotations)
+        }
+    }
+    deserializer.deserialize_seq(AnnotationsVisitor)
 }
 
 /// Adapts a decoded Zipkin v2 span array into one OTLP
@@ -158,7 +282,11 @@ fn check_span_count(count: usize) -> Result<(), LogsIngestError> {
 /// equivalent native OTLP request gets from `parse` (the charge is
 /// `otlp_traces`' own per-block measure).
 pub fn to_otlp(spans: Vec<ZipkinSpan>) -> Result<ExportTraceServiceRequest, LogsIngestError> {
-    let mut resource_spans = Vec::with_capacity(spans.len());
+    // Never reserve output capacity for the (attacker-influenced, up to
+    // `MAX_SPANS_PER_REQUEST`) decoded span count — the per-block
+    // `charge_resource_spans_expansion` below is the single expansion charge
+    // (issue #75 [high] fix: no allocation-before-limit, no double-count).
+    let mut resource_spans = Vec::new();
     let mut expanded_bytes: usize = 0;
     for span in spans {
         let block = adapt_span(span)?;
@@ -219,8 +347,11 @@ fn adapt_span(zs: ZipkinSpan) -> Result<ResourceSpans, LogsIngestError> {
     }
 
     // Annotations → span events (carried in the payload only, never
-    // indexed — same as native OTLP events).
-    let mut events = Vec::with_capacity(zs.annotations.len());
+    // indexed — same as native OTLP events). No `with_capacity` on the
+    // per-span annotation count (issue #75: never preallocate to an
+    // untrusted length; the count is bounded by `MAX_ANNOTATIONS_PER_SPAN`
+    // during decode, and the events grow lazily).
+    let mut events = Vec::new();
     for annotation in &zs.annotations {
         events.push(Event {
             time_unix_nano: micros_to_nanos(annotation.timestamp)?,
@@ -567,30 +698,141 @@ mod tests {
         assert!(matches!(err, LogsIngestError::ZipkinDecode(_)));
     }
 
-    /// AC6: an over-count span array is rejected as a whole-request 400
-    /// (`OversizeMessage`) at decode time, before any adaptation — proven
-    /// against the real [`MAX_SPANS_PER_REQUEST`] bound (isolated in
-    /// `check_span_count` so a million-span body need not be materialized),
-    /// so a retune cannot silently weaken it. A count at the bound is
-    /// admitted; one past it is the structural-oversize class.
-    #[test]
-    fn over_count_array_is_rejected_before_adaptation() {
-        assert!(check_span_count(MAX_SPANS_PER_REQUEST).is_ok());
-        match check_span_count(MAX_SPANS_PER_REQUEST + 1) {
-            Err(LogsIngestError::OversizeMessage {
-                field,
-                limit,
-                actual,
-            }) => {
-                assert_eq!(field, "zipkin spans");
-                assert_eq!(limit, MAX_SPANS_PER_REQUEST);
-                assert_eq!(actual, MAX_SPANS_PER_REQUEST + 1);
-            }
-            other => panic!("expected OversizeMessage, got {other:?}"),
+    /// Runs [`decode`] on a body expected to be rejected and returns the
+    /// [`LogsIngestError::ZipkinDecode`] message (the bounded-visitor's
+    /// `serde::de::Error::custom` text) — the non-vacuity signal that the
+    /// reject fired inside the bounded deserialize, not some later gate.
+    fn zipkin_decode_message(body: &[u8]) -> String {
+        match decode(body) {
+            Err(LogsIngestError::ZipkinDecode(msg)) => msg,
+            other => panic!("expected ZipkinDecode, got {other:?}"),
         }
-        // A small valid array still decodes fine.
+    }
+
+    /// Issue #75 (span count): an array of more than
+    /// [`MAX_SPANS_PER_REQUEST`] spans is rejected **during** deserialization
+    /// by [`BoundedSpans`] — the `Vec<ZipkinSpan>` is never grown past the cap
+    /// before the count is checked. Minimal empty-id spans (id/hex validation
+    /// happens later in `adapt_span`, not at deserialize) keep the body small
+    /// while still forcing the count cap. The bounded-seed message is the
+    /// non-vacuity proxy vs. the derived `Vec<ZipkinSpan>` (which accepted any
+    /// count).
+    #[test]
+    fn too_many_spans_rejected_during_deserialize() {
+        let mut body = String::with_capacity(24 * MAX_SPANS_PER_REQUEST);
+        body.push('[');
+        for i in 0..=MAX_SPANS_PER_REQUEST {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#"{"traceId":"","id":""}"#);
+        }
+        body.push(']');
+        let msg = zipkin_decode_message(body.as_bytes());
+        assert!(
+            msg.contains("spans exceeds"),
+            "the reject must be the bounded-seed spans message: {msg:?}"
+        );
+    }
+
+    /// Issue #75 (tags/span): one span carrying more than
+    /// [`MAX_TAGS_PER_SPAN`] tags is rejected **during** deserialization by
+    /// [`deserialize_bounded_tags`], before the `BTreeMap` (and later the
+    /// adapted span attributes) fully materialize.
+    #[test]
+    fn too_many_tags_per_span_rejected_during_deserialize() {
+        let mut body =
+            String::from(r#"[{"traceId":"0000000000000001","id":"0000000000000002","tags":{"#);
+        for i in 0..=MAX_TAGS_PER_SPAN {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(r#""k{i}":"v""#));
+        }
+        body.push_str("}}]");
+        let msg = zipkin_decode_message(body.as_bytes());
+        assert!(
+            msg.contains("tags exceeds"),
+            "the reject must be the bounded tag-map message: {msg:?}"
+        );
+    }
+
+    /// Issue #75 anti-evasion (tags/span): a tag map whose keys are all the
+    /// SAME string would collapse to one entry in a `BTreeMap`, evading the
+    /// cap; counting RAW pairs during the visit rejects it.
+    #[test]
+    fn duplicate_tag_keys_cannot_evade_the_tag_cap() {
+        let mut body =
+            String::from(r#"[{"traceId":"0000000000000001","id":"0000000000000002","tags":{"#);
+        for i in 0..=MAX_TAGS_PER_SPAN {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#""dup":"v""#);
+        }
+        body.push_str("}}]");
+        let msg = zipkin_decode_message(body.as_bytes());
+        assert!(
+            msg.contains("tags exceeds"),
+            "duplicate keys must still trip the RAW-pair tag cap: {msg:?}"
+        );
+    }
+
+    /// Issue #75 (annotations/span): one span carrying more than
+    /// [`MAX_ANNOTATIONS_PER_SPAN`] annotations is rejected **during**
+    /// deserialization by [`deserialize_bounded_annotations`].
+    #[test]
+    fn too_many_annotations_per_span_rejected_during_deserialize() {
+        let mut body = String::from(
+            r#"[{"traceId":"0000000000000001","id":"0000000000000002","annotations":["#,
+        );
+        for i in 0..=MAX_ANNOTATIONS_PER_SPAN {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#"{"timestamp":1,"value":"x"}"#);
+        }
+        body.push_str("]}]");
+        let msg = zipkin_decode_message(body.as_bytes());
+        assert!(
+            msg.contains("annotations exceeds"),
+            "the reject must be the bounded annotations message: {msg:?}"
+        );
+    }
+
+    /// Positive (no false reject): a span with exactly [`MAX_TAGS_PER_SPAN`]
+    /// distinct tags and [`MAX_ANNOTATIONS_PER_SPAN`] annotations — at the
+    /// boundary — still decodes, and a small valid array round-trips through
+    /// `to_otlp`. Confirms the caps admit at-cap input and never reject
+    /// legitimate traffic.
+    #[test]
+    fn at_cap_tags_and_annotations_still_decode() {
+        let mut body =
+            String::from(r#"[{"traceId":"0000000000000001","id":"0000000000000002","tags":{"#);
+        for i in 0..MAX_TAGS_PER_SPAN {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(r#""k{i}":"v""#));
+        }
+        body.push_str(r#"},"annotations":["#);
+        for i in 0..MAX_ANNOTATIONS_PER_SPAN {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(r#"{"timestamp":1,"value":"x"}"#);
+        }
+        body.push_str("]}]");
+        let spans = decode(body.as_bytes()).expect("at-cap span decodes");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].tags.len(), MAX_TAGS_PER_SPAN);
+        assert_eq!(spans[0].annotations.len(), MAX_ANNOTATIONS_PER_SPAN);
+
+        // A small, ordinary array still decodes and adapts fine.
         let ok = br#"[{"traceId":"0000000000000001","id":"0000000000000002"}]"#;
-        assert_eq!(decode(ok).expect("under bound").len(), 1);
+        let decoded = decode(ok).expect("under bound");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(to_otlp(decoded).expect("adapt").resource_spans.len(), 1);
     }
 
     /// Issue #75 code-review [high] fix: a request whose span COUNT is far
