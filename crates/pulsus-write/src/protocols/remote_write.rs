@@ -11,13 +11,18 @@
 //!
 //! ## Wire types: hand-rolled prompb structs
 //!
-//! The prompb message set below is the RW-1.0 stable schema, hand-rolled as
-//! `#[derive(::prost::Message)]` structs at their exact field tags —
-//! mirroring the hand-rolled `google.rpc.Status` in `ingest/http.rs` — no
-//! protoc/build-dep, no new crate dependency (`prost`/`snap` are already
-//! `pulsus-write` deps). `exemplars` (`TimeSeries` tag 3) and native/RW-2.0
-//! histograms (`TimeSeries` tag 4) are intentionally undeclared: `prost`
-//! silently skips unknown fields on decode, and both are out of scope (M7).
+//! The prompb message set below is the RW-1.0 stable schema, hand-rolled at
+//! its exact field tags — mirroring the hand-rolled `google.rpc.Status` in
+//! `ingest/http.rs` — no protoc/build-dep, no new crate dependency
+//! (`prost`/`snap` are already `pulsus-write` deps). The leaf messages
+//! (`Label`, `Sample`, `MetricMetadataProto`) carry no repeated field and keep
+//! their derived `#[derive(::prost::Message)]`. The two repeated-bearing
+//! messages (`WriteRequest`, `TimeSeries`) instead carry a **hand-written**
+//! `impl prost::Message` that caps their repeated fields **during**
+//! `merge_field` (issue #115, finding #62) — see their doc comments and the
+//! [`BoundedWriteRequest`] twin. `exemplars` (`TimeSeries` tag 3) and
+//! native/RW-2.0 histograms (`TimeSeries` tag 4) are intentionally undeclared:
+//! unknown fields are skipped on decode, and both are out of scope (M7).
 //!
 //! Tag layout is pinned by the architect plan and cross-checked against a
 //! real capture from the OpenTelemetry Collector's `prometheusremotewrite`
@@ -38,21 +43,372 @@ use crate::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesR
 /// `prompb.WriteRequest` (RW-1.0): `timeseries` at tag 1, `metadata` at tag
 /// 3 (tag 2 is reserved on the wire for a Cortex-specific source marker,
 /// never populated by a standard sender and never read here).
-#[derive(Clone, PartialEq, ::prost::Message)]
+///
+/// ## Why this does not derive `::prost::Message` (issue #115, finding #62)
+///
+/// A derived decoder exposes a `pub WriteRequest::decode` that materializes an
+/// unbounded `timeseries`/`metadata` fan-out — and, worse, an unbounded
+/// *aggregate* labels/samples fan-out across many individually-legal series —
+/// charging only wire bytes before any cap runs. The hand-written
+/// [`prost::Message`] impl (below) bounds **every** decode entry:
+///
+/// - `merge_field` caps `timeseries` (tag 1) at [`MAX_TIMESERIES_PER_REQUEST`]`
+///   + 1` and `metadata` (tag 3) at [`MAX_METADATA_PER_REQUEST`]` + 1` during
+///   merge (draining the excess, wire-type-checked, without allocating) and
+///   delegates per-series `labels`/`samples` caps to [`TimeSeries`]'s own
+///   hand-written `merge_field`.
+/// - **Every** public decode/merge entry point — `decode`,
+///   `decode_length_delimited`, `merge` AND `merge_length_delimited` — routes
+///   through [`BoundedWriteRequest`], whose `merge_field` is the single
+///   enforcing chokepoint: it additionally drains series once the cross-series
+///   aggregate `total_labels`/`total_samples` exceeds
+///   [`MAX_TOTAL_LABELS_PER_REQUEST`]/[`MAX_TOTAL_SAMPLES_PER_REQUEST`], so N
+///   series each just under the per-series caps cannot sum past the aggregate
+///   (the second-amplification the per-dimension caps alone cannot catch).
+///   `prost`'s default `Message::merge` / `merge_length_delimited` call
+///   `WriteRequest::merge_field` directly (which caps *counts* only), so a raw
+///   `WriteRequest::default().merge(buf)` would otherwise bypass the aggregate
+///   cap — these two overrides close that last gap so no public entry is an
+///   uncapped bypass.
+///
+/// The whole-request [`LogsIngestError::OversizeMessage`] reject still lives in
+/// [`decode`]'s [`validate_bounds`] (remote-write is all-or-nothing). `encode`
+/// and the derived [`PartialEq`] are unchanged, and no decode-scratch field is
+/// added to the value type, so the struct literals and cross-crate encoders
+/// keep working.
+#[derive(Clone, PartialEq, Default, Debug)]
 pub struct WriteRequest {
-    #[prost(message, repeated, tag = "1")]
     pub timeseries: Vec<TimeSeries>,
-    #[prost(message, repeated, tag = "3")]
     pub metadata: Vec<MetricMetadataProto>,
 }
 
+impl prost::Message for WriteRequest {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        // proto3 encoding, byte-identical to the derived impl: tag 1 then tag 3
+        // (declaration/tag order), tag 2 never emitted (no field).
+        prost::encoding::message::encode_repeated(1u32, &self.timeseries, buf);
+        prost::encoding::message::encode_repeated(3u32, &self.metadata, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.timeseries.len() > MAX_TIMESERIES_PER_REQUEST {
+                    // Cap reached: drain the excess series WITHOUT materializing
+                    // it, wire-type-checked exactly as `BoundedWriteRequest`'s
+                    // tag-1 drain — a non-length-delimited tag-1 is a malformed
+                    // submessage and must FAIL the decode, never be silently
+                    // skipped. This is belt-and-suspenders: every public
+                    // decode/merge entry point below routes through
+                    // [`BoundedWriteRequest`], whose `merge_field` adds the
+                    // cross-series aggregate drain this one lacks.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.timeseries,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            3u32 => {
+                if self.metadata.len() > MAX_METADATA_PER_REQUEST {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.metadata,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            // Tag 2 (reserved) and any unknown field: skipped, as the derived
+            // decoder would.
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.timeseries)
+            + prost::encoding::message::encoded_len_repeated(3u32, &self.metadata)
+    }
+
+    fn clear(&mut self) {
+        self.timeseries.clear();
+        self.metadata.clear();
+    }
+
+    fn decode(buf: impl bytes::Buf) -> Result<Self, prost::DecodeError>
+    where
+        Self: Default,
+    {
+        // The most-direct public decode entry (issue #115): route through the
+        // fully-bounded twin so series-count, metadata-count, per-series
+        // labels/samples AND cross-series aggregate fan-out are all bounded
+        // DURING decode — a direct `WriteRequest::decode` is no longer an
+        // uncapped bypass of the caps the ingest path enforces.
+        let bounded = BoundedWriteRequest::decode(buf)?;
+        Ok(Self {
+            timeseries: bounded.timeseries,
+            metadata: bounded.metadata,
+        })
+    }
+
+    fn decode_length_delimited(buf: impl bytes::Buf) -> Result<Self, prost::DecodeError>
+    where
+        Self: Default,
+    {
+        let bounded = BoundedWriteRequest::decode_length_delimited(buf)?;
+        Ok(Self {
+            timeseries: bounded.timeseries,
+            metadata: bounded.metadata,
+        })
+    }
+
+    fn merge(&mut self, buf: impl bytes::Buf) -> Result<(), prost::DecodeError>
+    where
+        Self: Sized,
+    {
+        // `prost`'s default `Message::merge` calls `WriteRequest::merge_field`
+        // directly, which caps only series/metadata COUNT — so a raw
+        // `WriteRequest::default().merge(buf)` would fan out past the
+        // cross-series aggregate caps. Route the merge through the fully-bounded
+        // twin (the single enforcing chokepoint). Seed the twin with self's
+        // current fields (and the aggregate re-sum) so merge-INTO-existing
+        // semantics are preserved, then move the aggregate-bounded result back
+        // on BOTH the Ok AND Err paths — do NOT `?` while self's fields are
+        // moved out, or a decode error would leave the caller's request empty
+        // (data-loss regression). Restoring first gives prost-consistent
+        // partial-merge semantics.
+        let mut bounded = BoundedWriteRequest {
+            total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(),
+            total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(),
+            timeseries: std::mem::take(&mut self.timeseries),
+            metadata: std::mem::take(&mut self.metadata),
+        };
+        let result = bounded.merge(buf);
+        self.timeseries = bounded.timeseries;
+        self.metadata = bounded.metadata;
+        result
+    }
+
+    fn merge_length_delimited(&mut self, buf: impl bytes::Buf) -> Result<(), prost::DecodeError>
+    where
+        Self: Sized,
+    {
+        // `merge_length_delimited` likewise loops through `merge_field` directly
+        // (it does not funnel through `merge`), so it needs the same bounded-twin
+        // routing and the same both-paths field restoration as `merge` above.
+        let mut bounded = BoundedWriteRequest {
+            total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(),
+            total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(),
+            timeseries: std::mem::take(&mut self.timeseries),
+            metadata: std::mem::take(&mut self.metadata),
+        };
+        let result = bounded.merge_length_delimited(buf);
+        self.timeseries = bounded.timeseries;
+        self.metadata = bounded.metadata;
+        result
+    }
+}
+
+/// The **decode-time twin** of [`WriteRequest`] (issue #115): a hand-written
+/// [`prost::Message`] that bounds materialization **during** `decode` so a body
+/// within the 64 MiB decompressed cap cannot unpack into a far larger in-memory
+/// fan-out before the count checks run. Guards, all mirroring the landed #97
+/// [`crate::protocols::loki_push`] drain-past-cap-then-reject pattern:
+///
+/// 1. `timeseries` (tag 1) is capped at [`MAX_TIMESERIES_PER_REQUEST`]` + 1`
+///    and `metadata` (tag 3) at [`MAX_METADATA_PER_REQUEST`]` + 1` — once a vec
+///    would exceed its cap, the excess record is drained (wire-type-checked, no
+///    allocation) rather than materialized.
+/// 2. Two **transient, non-wire** accumulators, `total_labels` and
+///    `total_samples`, sum every merged series' `labels.len()`/`samples.len()`.
+///    prost 0.14's `DecodeError::new` is deprecated, so `merge_field` cannot
+///    abort mid-decode with a custom error; instead, once either running total
+///    exceeds its aggregate cap, further series are drained without
+///    materializing (bounding the aggregate fan-out to `≤ aggregate cap + one
+///    series' per-series cap`), and the deferred [`validate_bounds`] re-sum in
+///    [`decode`] then rejects the whole request. This closes the
+///    second-amplification the per-dimension caps cannot catch: many series each
+///    under [`MAX_LABELS_PER_SERIES`]/[`MAX_SAMPLES_PER_SERIES`] but collectively
+///    over the aggregate.
+///
+/// Kept separate from [`WriteRequest`] so the value type carries no
+/// decode-scratch field and preserves derived round-trip equality — the
+/// sanctioned alternative to a transient field + manual `PartialEq` on the
+/// value type (the struct is constructed by literal across several crates).
+#[derive(Default)]
+struct BoundedWriteRequest {
+    timeseries: Vec<TimeSeries>,
+    metadata: Vec<MetricMetadataProto>,
+    total_labels: usize,
+    total_samples: usize,
+}
+
+impl prost::Message for BoundedWriteRequest {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        // Decode-only helper, but a complete impl is required by the trait; the
+        // transient counters are never encoded, so this is byte-identical to
+        // `WriteRequest`'s wire form.
+        prost::encoding::message::encode_repeated(1u32, &self.timeseries, buf);
+        prost::encoding::message::encode_repeated(3u32, &self.metadata, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.timeseries.len() > MAX_TIMESERIES_PER_REQUEST
+                    || self.total_labels > MAX_TOTAL_LABELS_PER_REQUEST
+                    || self.total_samples > MAX_TOTAL_SAMPLES_PER_REQUEST
+                {
+                    // Cap reached (series count OR aggregate labels/samples):
+                    // drain the excess series WITHOUT materializing it, while
+                    // still enforcing the wire-type contract `merge_repeated`
+                    // would. The vec is allowed to reach `MAX + 1` (not capped
+                    // at `MAX`) so the deferred `validate_bounds` still rejects
+                    // an over-limit request.
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.timeseries,
+                        buf,
+                        ctx,
+                    )?;
+                    // Charge the just-merged series' labels/samples into the
+                    // aggregates. Its own vecs are already capped at
+                    // `MAX_*_PER_SERIES + 1` by `TimeSeries::merge_field`, so one
+                    // over-aggregate step grows the fan-out by at most one
+                    // series' per-series cap.
+                    if let Some(last) = self.timeseries.last() {
+                        self.total_labels = self.total_labels.saturating_add(last.labels.len());
+                        self.total_samples = self.total_samples.saturating_add(last.samples.len());
+                    }
+                    Ok(())
+                }
+            }
+            3u32 => {
+                if self.metadata.len() > MAX_METADATA_PER_REQUEST {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.metadata,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.timeseries)
+            + prost::encoding::message::encoded_len_repeated(3u32, &self.metadata)
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// `prompb.TimeSeries`: `labels` at tag 1, `samples` at tag 2.
-#[derive(Clone, PartialEq, ::prost::Message)]
+///
+/// Like [`WriteRequest`] it does **not** derive `::prost::Message`; a
+/// hand-written impl (below) caps the repeated `labels` field at
+/// [`MAX_LABELS_PER_SERIES`]` + 1` and `samples` at [`MAX_SAMPLES_PER_SERIES`]`
+/// + 1` **inside the decoder** (issue #115), draining excess records without
+/// allocating — so a single series carrying millions of minimal labels/samples
+/// cannot unpack past the cap. The caps therefore hold whether a series decodes
+/// via [`BoundedWriteRequest`] (the ingest path) or via a direct
+/// `TimeSeries::decode`/`merge` (all route through this `merge_field`).
+#[derive(Clone, PartialEq, Default, Debug)]
 pub struct TimeSeries {
-    #[prost(message, repeated, tag = "1")]
     pub labels: Vec<Label>,
-    #[prost(message, repeated, tag = "2")]
     pub samples: Vec<Sample>,
+}
+
+impl prost::Message for TimeSeries {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        prost::encoding::message::encode_repeated(1u32, &self.labels, buf);
+        prost::encoding::message::encode_repeated(2u32, &self.samples, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            1u32 => {
+                if self.labels.len() > MAX_LABELS_PER_SERIES {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(wire_type, &mut self.labels, buf, ctx)
+                }
+            }
+            2u32 => {
+                if self.samples.len() > MAX_SAMPLES_PER_SERIES {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(wire_type, &mut self.samples, buf, ctx)
+                }
+            }
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        prost::encoding::message::encoded_len_repeated(1u32, &self.labels)
+            + prost::encoding::message::encoded_len_repeated(2u32, &self.samples)
+    }
+
+    fn clear(&mut self) {
+        self.labels.clear();
+        self.samples.clear();
+    }
 }
 
 /// `prompb.Label`: `name` at tag 1, `value` at tag 2.
@@ -92,18 +448,20 @@ pub struct MetricMetadataProto {
 }
 
 /// Decode-time structural DoS guards (issue #28 code review hardening
-/// finding): generous, documented per-request bounds on repeated-field
-/// counts, sized so no legitimate remote-write batch ever approaches them.
-/// A raw body is already capped at 64 MiB decompressed
+/// finding, extended to enforce **during** decode in issue #115 finding #62):
+/// generous, documented per-request bounds on repeated-field counts, sized so
+/// no legitimate remote-write batch ever approaches them. A raw body is
+/// already capped at 64 MiB decompressed
 /// (`crate::ingest::decompress::MAX_DECOMPRESSED_BYTES`), but that byte cap
 /// alone does not bound the *decoded* structure's size: many minimal-length
 /// repeated submessages (e.g. a `TimeSeries` with no labels/samples costs
 /// only a couple of wire bytes but ~50+ heap-adjacent bytes once decoded
 /// into a `Vec<TimeSeries>` entry) let a 64 MiB body unpack into a far
-/// larger in-memory structure. Checked in [`decode`] immediately after
-/// `WriteRequest::decode` succeeds — before [`parse`] performs any further
-/// per-element allocation (label-set construction, fingerprinting, output
-/// row materialization).
+/// larger in-memory structure. Enforced **during** decode by the hand-written
+/// [`WriteRequest`]/[`BoundedWriteRequest`]/[`TimeSeries`] decoders (drain past
+/// `MAX + 1` without materializing), then re-checked by [`validate_bounds`] in
+/// [`decode`] — before [`parse`] performs any further per-element allocation
+/// (label-set construction, fingerprinting, output row materialization).
 pub const MAX_TIMESERIES_PER_REQUEST: usize = 1_000_000;
 /// See [`MAX_TIMESERIES_PER_REQUEST`]'s doc comment.
 pub const MAX_LABELS_PER_SERIES: usize = 256;
@@ -111,6 +469,29 @@ pub const MAX_LABELS_PER_SERIES: usize = 256;
 pub const MAX_SAMPLES_PER_SERIES: usize = 100_000;
 /// See [`MAX_TIMESERIES_PER_REQUEST`]'s doc comment.
 pub const MAX_METADATA_PER_REQUEST: usize = 10_000;
+
+/// Cross-series **aggregate** cap on total decoded labels (issue #115, finding
+/// #62). The per-dimension caps bound each series in isolation
+/// ([`MAX_LABELS_PER_SERIES`]) and the series count
+/// ([`MAX_TIMESERIES_PER_REQUEST`]), but their *product* (1M × 256 = 256M
+/// `Label` structs) is a decode-time fan-out a 64 MiB body of minimal-length
+/// empty labels can reach — each empty label is ~2 wire bytes but ~48 heap
+/// bytes once decoded, and the parse-time expansion budget
+/// ([`MAX_EXPANDED_BYTES`]) charges only label *bytes* (zero for empty labels),
+/// so it does not catch this count-based fan-out. This aggregate bounds the
+/// total decoded labels across all series to a generous ceiling (≈ 240 MiB of
+/// `Label` structs worst case) — orders of magnitude above any legitimate
+/// remote-write batch. Enforced **during** decode by [`BoundedWriteRequest`]
+/// (drain past the cap) and re-checked by the deferred [`validate_bounds`].
+pub const MAX_TOTAL_LABELS_PER_REQUEST: usize = 5_000_000;
+/// Cross-series **aggregate** cap on total decoded samples (issue #115, finding
+/// #62), analogous to [`MAX_TOTAL_LABELS_PER_REQUEST`]: bounds the sum of every
+/// series' `samples.len()` so N series each just under
+/// [`MAX_SAMPLES_PER_SERIES`] cannot sum past this ceiling during decode. Sized
+/// like the Loki push analog's cross-stream aggregate; sits above the ≈ 4.2M
+/// samples the parse-time [`MAX_EXPANDED_BYTES`] byte budget admits, so that
+/// tighter output-expansion budget remains the effective secondary bound.
+pub const MAX_TOTAL_SAMPLES_PER_REQUEST: usize = 5_000_000;
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (issue #62). Own constant, same value and derivation as
@@ -135,6 +516,20 @@ pub const MAX_EXPANDED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPR
 const SAMPLE_ROW_OVERHEAD: usize = 64;
 /// Estimated fixed heap cost of one [`SeriesRef`] beyond its label bytes.
 const SERIES_ROW_OVERHEAD: usize = 64;
+/// Fixed per-label heap floor charged for every materialized `(name, value)`
+/// label pair (issue #115, finding #62). A wire label can be ~2 bytes (both
+/// strings empty) yet, once `parse_time_series` clones it into `rest` and
+/// `LabelSet::from_normalized` builds its sorted map, it costs two `String`
+/// headers (48 B) plus the normalized-map node/container overhead — a fixed
+/// heap cost the raw name+value byte charge undercounts to near zero. Without
+/// this floor an attacker fans ≤ [`MAX_TOTAL_LABELS_PER_REQUEST`] near-empty
+/// labels across many series (each under [`MAX_LABELS_PER_SERIES`]), staying
+/// far below [`MAX_EXPANDED_BYTES`] while forcing millions of real
+/// `(String, String)`/map allocations. Charging ≥128 B per label makes such a
+/// fan-out trip the byte budget at ~`MAX_EXPANDED_BYTES / 128` labels — before
+/// materialization — while legitimate few-labels-per-series batches stay well
+/// under budget. Mirrors `otlp_traces`/`otlp_metrics`'s `ATTR_ROW_OVERHEAD`.
+const LABEL_ROW_OVERHEAD: usize = 128;
 /// Estimated fixed heap cost of one [`MetricMetadata`] beyond its
 /// name/help/unit bytes.
 const META_ROW_OVERHEAD: usize = 64;
@@ -157,11 +552,15 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
     Ok(())
 }
 
-/// Decodes a (decompressed) `POST /api/v1/write` request body, then applies
-/// the [`MAX_TIMESERIES_PER_REQUEST`]-family structural bounds. The sole
-/// decode boundary: a malformed/truncated protobuf, or a message exceeding
-/// one of those bounds, is a whole-request, atomic failure (mirrors
-/// `otlp_metrics::decode`) — never partially applied.
+/// Decodes a (decompressed) `POST /api/v1/write` request body under the
+/// [`MAX_TIMESERIES_PER_REQUEST`]-family structural bounds. `WriteRequest::
+/// decode` routes through the [`BoundedWriteRequest`] twin, so the repeated
+/// fields and the cross-series aggregate are capped **during** decode (no
+/// over-cap materialization); [`validate_bounds`] then turns the drained
+/// `+ 1` over-cap into the whole-request error. The sole decode boundary: a
+/// malformed/truncated protobuf, or a message exceeding one of those bounds,
+/// is a whole-request, atomic failure (mirrors `otlp_metrics::decode`) — never
+/// partially applied.
 pub fn decode(body: &[u8]) -> Result<WriteRequest, LogsIngestError> {
     let req = WriteRequest::decode(body)?;
     validate_bounds(&req)?;
@@ -172,6 +571,13 @@ pub fn decode(body: &[u8]) -> Result<WriteRequest, LogsIngestError> {
 /// on the first field that exceeds its limit (message-level fields before
 /// per-series fields, so a request with too many series is rejected before
 /// this function ever inspects any individual series' labels/samples).
+///
+/// The hand-written decoders ([`WriteRequest`]/[`BoundedWriteRequest`]/
+/// [`TimeSeries`]) already cap each dimension at `MAX + 1` and drain the
+/// cross-series aggregate during decode, so this deferred re-check is where the
+/// `+ 1` over-cap (and the re-summed aggregate the transient twin counters do
+/// not survive into the value type) becomes a whole-request
+/// [`LogsIngestError::OversizeMessage`].
 fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
     if req.timeseries.len() > MAX_TIMESERIES_PER_REQUEST {
         return Err(LogsIngestError::OversizeMessage {
@@ -187,6 +593,8 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
             actual: req.metadata.len(),
         });
     }
+    let mut total_labels: usize = 0;
+    let mut total_samples: usize = 0;
     for ts in &req.timeseries {
         if ts.labels.len() > MAX_LABELS_PER_SERIES {
             return Err(LogsIngestError::OversizeMessage {
@@ -202,6 +610,25 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
                 actual: ts.samples.len(),
             });
         }
+        total_labels = total_labels.saturating_add(ts.labels.len());
+        total_samples = total_samples.saturating_add(ts.samples.len());
+    }
+    // Cross-series aggregates last: a request whose series are each individually
+    // in-bounds can still sum past these ceilings (the second-amplification the
+    // per-series caps cannot catch).
+    if total_labels > MAX_TOTAL_LABELS_PER_REQUEST {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "total_labels",
+            limit: MAX_TOTAL_LABELS_PER_REQUEST,
+            actual: total_labels,
+        });
+    }
+    if total_samples > MAX_TOTAL_SAMPLES_PER_REQUEST {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "total_samples",
+            limit: MAX_TOTAL_SAMPLES_PER_REQUEST,
+            actual: total_samples,
+        });
     }
     Ok(())
 }
@@ -297,9 +724,12 @@ fn parse_time_series(
 ) -> Result<(), LogsIngestError> {
     // Charge this series' label/`SeriesRef` materialization BEFORE building
     // `rest`/`from_normalized` (issue #62). Allocation-free: sums wire
-    // string lengths only.
+    // string lengths plus a fixed [`LABEL_ROW_OVERHEAD`] per label, so a
+    // near-empty-label fan-out trips [`MAX_EXPANDED_BYTES`] before any
+    // `(String, String)`/label-set materialization (issue #115, finding #62).
     let label_charge = ts.labels.iter().fold(SERIES_ROW_OVERHEAD, |acc, l| {
-        acc.saturating_add(l.name.len())
+        acc.saturating_add(LABEL_ROW_OVERHEAD)
+            .saturating_add(l.name.len())
             .saturating_add(l.value.len())
     });
     charge_budget(expanded_bytes, label_charge)?;
@@ -521,6 +951,376 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // -- decode-time DoS bounds (issue #115, finding #62) -----------------
+    //
+    // These prove rejection happens BEFORE full materialization, not merely
+    // that the request is rejected. Each arm decodes a hand-encoded body via
+    // the public `WriteRequest::decode` (which routes through the bounded twin)
+    // and inspects the materialized length — a length-cap the *derived* decode
+    // would blow past (materializing every encoded element). That length
+    // assertion is the non-vacuity property: it fails against the pre-fix
+    // derived decoder, and each arm additionally confirms the public [`decode`]
+    // turns the drained `+ 1` sentinel into a whole-request `OversizeMessage`.
+
+    /// One length-delimited protobuf field: key (tag, wire-type 2) + length
+    /// varint + payload. An empty payload (`&[]`) is a zero-length submessage.
+    fn field_ld(tag: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 6);
+        prost::encoding::encode_key(tag, prost::encoding::WireType::LengthDelimited, &mut out);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A bare length-delimited prefix (a message-length varint, no tag) +
+    /// payload — the framing `Message::merge_length_delimited` consumes.
+    fn length_delimited(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 5);
+        prost::encoding::encode_varint(payload.len() as u64, &mut out);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A body encoding `count` empty `TimeSeries` records (`WriteRequest`
+    /// tag 1). Each is two bytes: `0x0a 0x00`.
+    fn empty_timeseries_body(count: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(count * 2);
+        for _ in 0..count {
+            body.extend_from_slice(&field_ld(1, &[]));
+        }
+        body
+    }
+
+    #[test]
+    fn decode_caps_timeseries_materialization_and_rejects_too_many_timeseries() {
+        // AC (too many timeseries): a body encoding more than
+        // MAX_TIMESERIES_PER_REQUEST series must NOT materialize them all — the
+        // hand-written decoder caps the vec at MAX + 1 and drains the rest
+        // without allocating.
+        let encoded = MAX_TIMESERIES_PER_REQUEST + 8;
+        let body = empty_timeseries_body(encoded);
+        let decoded = WriteRequest::decode(body.as_slice()).expect("empty series decode");
+        assert_eq!(
+            decoded.timeseries.len(),
+            MAX_TIMESERIES_PER_REQUEST + 1,
+            "the decoder must cap materialization at MAX + 1, not materialize all encoded series"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "timeseries",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_label_materialization_and_rejects_too_many_labels() {
+        // AC (too many labels-per-series): one series carrying more than
+        // MAX_LABELS_PER_SERIES labels caps at MAX + 1 during decode.
+        let encoded = MAX_LABELS_PER_SERIES + 8;
+        let mut ts_payload = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            ts_payload.extend_from_slice(&field_ld(1, &[])); // empty Label
+        }
+        let body = field_ld(1, &ts_payload); // one TimeSeries
+        let decoded = WriteRequest::decode(body.as_slice()).expect("one-series decode");
+        assert_eq!(decoded.timeseries.len(), 1);
+        assert_eq!(
+            decoded.timeseries[0].labels.len(),
+            MAX_LABELS_PER_SERIES + 1,
+            "the decoder must cap per-series label materialization at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "labels",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_sample_materialization_and_rejects_too_many_samples() {
+        // AC (too many samples-per-series): one series carrying more than
+        // MAX_SAMPLES_PER_SERIES samples caps at MAX + 1 during decode.
+        let encoded = MAX_SAMPLES_PER_SERIES + 8;
+        let mut ts_payload = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            ts_payload.extend_from_slice(&field_ld(2, &[])); // empty Sample
+        }
+        let body = field_ld(1, &ts_payload);
+        let decoded = WriteRequest::decode(body.as_slice()).expect("one-series decode");
+        assert_eq!(decoded.timeseries.len(), 1);
+        assert_eq!(
+            decoded.timeseries[0].samples.len(),
+            MAX_SAMPLES_PER_SERIES + 1,
+            "the decoder must cap per-series sample materialization at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "samples",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_metadata_materialization_and_rejects_too_much_metadata() {
+        // AC (too much metadata): more than MAX_METADATA_PER_REQUEST metadata
+        // records cap at MAX + 1 during decode (WriteRequest tag 3).
+        let encoded = MAX_METADATA_PER_REQUEST + 8;
+        let mut body = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            body.extend_from_slice(&field_ld(3, &[])); // empty MetricMetadata
+        }
+        let decoded = WriteRequest::decode(body.as_slice()).expect("empty metadata decode");
+        assert_eq!(
+            decoded.metadata.len(),
+            MAX_METADATA_PER_REQUEST + 1,
+            "the decoder must cap metadata materialization at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "metadata",
+                ..
+            }
+        ));
+    }
+
+    /// A body of `series` in-bounds `TimeSeries`, each carrying `labels_each`
+    /// empty labels (tag 1) — used to drive the cross-series LABEL aggregate
+    /// past its cap while every series stays under [`MAX_LABELS_PER_SERIES`].
+    fn label_aggregate_body(series: usize, labels_each: usize) -> Vec<u8> {
+        let mut ts_payload = Vec::with_capacity(labels_each * 2);
+        for _ in 0..labels_each {
+            ts_payload.extend_from_slice(&field_ld(1, &[]));
+        }
+        let ts_record = field_ld(1, &ts_payload);
+        let mut body = Vec::with_capacity(ts_record.len() * series);
+        for _ in 0..series {
+            body.extend_from_slice(&ts_record);
+        }
+        body
+    }
+
+    /// A body of `series` in-bounds `TimeSeries`, each carrying `samples_each`
+    /// empty samples (tag 2) — drives the cross-series SAMPLE aggregate past its
+    /// cap while every series stays within [`MAX_SAMPLES_PER_SERIES`].
+    fn sample_aggregate_body(series: usize, samples_each: usize) -> Vec<u8> {
+        let mut ts_payload = Vec::with_capacity(samples_each * 2);
+        for _ in 0..samples_each {
+            ts_payload.extend_from_slice(&field_ld(2, &[]));
+        }
+        let ts_record = field_ld(1, &ts_payload);
+        let mut body = Vec::with_capacity(ts_record.len() * series);
+        for _ in 0..series {
+            body.extend_from_slice(&ts_record);
+        }
+        body
+    }
+
+    #[test]
+    fn decode_drains_series_once_the_cross_series_label_aggregate_is_exceeded() {
+        // AC (cross-series aggregate labels): every series stays UNDER
+        // MAX_LABELS_PER_SERIES, but their label counts SUM past
+        // MAX_TOTAL_LABELS_PER_REQUEST. The transient cross-series accumulator
+        // stops materializing series once the running total exceeds the
+        // aggregate, so fewer labels are materialized than encoded (the derived
+        // decode would materialize them all — the non-vacuity property).
+        let labels_each = MAX_LABELS_PER_SERIES; // 256, each series in-bounds
+        let series = MAX_TOTAL_LABELS_PER_REQUEST / labels_each + 2;
+        let body = label_aggregate_body(series, labels_each);
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("aggregate decode");
+        let materialized: usize = decoded.timeseries.iter().map(|ts| ts.labels.len()).sum();
+        assert!(
+            decoded.timeseries.len() < series,
+            "the decoder must drain series once the label aggregate is exceeded \
+             (materialized {} of {series} encoded series)",
+            decoded.timeseries.len()
+        );
+        assert!(
+            materialized <= MAX_TOTAL_LABELS_PER_REQUEST + MAX_LABELS_PER_SERIES,
+            "aggregate label fan-out must be bounded to MAX_TOTAL + one series' cap, got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_labels",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_drains_series_once_the_cross_series_sample_aggregate_is_exceeded() {
+        // AC (cross-series aggregate samples): every series stays WITHIN
+        // MAX_SAMPLES_PER_SERIES, but their sample counts SUM past
+        // MAX_TOTAL_SAMPLES_PER_REQUEST — drained during decode.
+        let samples_each = MAX_SAMPLES_PER_SERIES; // 100_000, each series in-bounds
+        let series = MAX_TOTAL_SAMPLES_PER_REQUEST / samples_each + 2;
+        let body = sample_aggregate_body(series, samples_each);
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("aggregate decode");
+        let materialized: usize = decoded.timeseries.iter().map(|ts| ts.samples.len()).sum();
+        assert!(
+            decoded.timeseries.len() < series,
+            "the decoder must drain series once the sample aggregate is exceeded \
+             (materialized {} of {series} encoded series)",
+            decoded.timeseries.len()
+        );
+        assert!(
+            materialized <= MAX_TOTAL_SAMPLES_PER_REQUEST + MAX_SAMPLES_PER_SERIES,
+            "aggregate sample fan-out must be bounded to MAX_TOTAL + one series' cap, got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_samples",
+                ..
+            }
+        ));
+    }
+
+    // -- raw merge / merge_length_delimited entry points are ALSO bounded --
+    //
+    // `prost`'s default `Message::merge`/`merge_length_delimited` call
+    // `WriteRequest::merge_field` directly (which caps only element COUNTS), so
+    // a raw `WriteRequest::default().merge(buf)` would otherwise bypass the
+    // cross-series aggregate cap. The hand-written overrides route both raw
+    // entry points through the bounded twin (issue #115 lesson 1).
+
+    fn assert_label_aggregate_bounded(req: &WriteRequest, encoded_series: usize) {
+        let materialized: usize = req.timeseries.iter().map(|ts| ts.labels.len()).sum();
+        assert!(
+            req.timeseries.len() < encoded_series,
+            "the raw merge path must drain series once the label aggregate is exceeded \
+             (retained {} of {encoded_series} encoded)",
+            req.timeseries.len()
+        );
+        assert!(
+            materialized <= MAX_TOTAL_LABELS_PER_REQUEST + MAX_LABELS_PER_SERIES,
+            "the raw merge path must bound aggregate label fan-out to MAX_TOTAL + one \
+             series' cap, got {materialized}"
+        );
+    }
+
+    #[test]
+    fn write_request_merge_enforces_the_cross_series_aggregate() {
+        let labels_each = MAX_LABELS_PER_SERIES;
+        let encoded_series = MAX_TOTAL_LABELS_PER_REQUEST / labels_each + 2;
+        let body = label_aggregate_body(encoded_series, labels_each);
+
+        let mut req = WriteRequest::default();
+        req.merge(body.as_slice()).expect("bounded raw merge");
+        assert_label_aggregate_bounded(&req, encoded_series);
+    }
+
+    #[test]
+    fn write_request_merge_length_delimited_enforces_the_cross_series_aggregate() {
+        let labels_each = MAX_LABELS_PER_SERIES;
+        let encoded_series = MAX_TOTAL_LABELS_PER_REQUEST / labels_each + 2;
+        let framed = length_delimited(&label_aggregate_body(encoded_series, labels_each));
+
+        let mut req = WriteRequest::default();
+        req.merge_length_delimited(framed.as_slice())
+            .expect("bounded raw merge_length_delimited");
+        assert_label_aggregate_bounded(&req, encoded_series);
+    }
+
+    // -- merge-into-existing preserves state on a decode error ------------
+
+    /// A pre-existing request to merge malformed input INTO — one real series
+    /// and one metadata entry, so the retention assertions have something to
+    /// lose.
+    fn request_with_one_series() -> WriteRequest {
+        WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "up")],
+                samples: vec![sample(1.0, 1)],
+            }],
+            metadata: vec![MetricMetadataProto {
+                r#type: 1,
+                metric_family_name: "up".to_string(),
+                help: "total".to_string(),
+                unit: String::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn merge_of_malformed_bytes_retains_pre_existing_state() {
+        // Issue #115 lesson 2: a failed raw `merge` must NOT drop the caller's
+        // pre-existing fields. The override moves self's fields into the bounded
+        // twin, so an early `?` on decode error would leave self EMPTY (data
+        // loss). The fix restores the twin's fields on BOTH paths, giving prost
+        // partial-merge semantics. Non-vacuous: against a `mem::take(...);
+        // bounded.merge(buf)?` shape, `req` would be empty here.
+        let original = request_with_one_series();
+        let mut req = original.clone();
+        req.merge(b"\xff\xff\xff not a protobuf message".as_slice())
+            .expect_err("malformed merge must fail");
+        assert_eq!(
+            req, original,
+            "a failed merge must retain the pre-existing timeseries/metadata, not empty them"
+        );
+    }
+
+    #[test]
+    fn merge_length_delimited_of_malformed_bytes_retains_pre_existing_state() {
+        let original = request_with_one_series();
+        let mut req = original.clone();
+        let framed = length_delimited(b"\xff\xff\xff not a protobuf message");
+        req.merge_length_delimited(framed.as_slice())
+            .expect_err("malformed merge_length_delimited must fail");
+        assert_eq!(
+            req, original,
+            "a failed merge_length_delimited must retain the pre-existing state"
+        );
+    }
+
+    // -- positive: legitimate in-bounds requests decode unchanged ---------
+
+    #[test]
+    fn decode_admits_an_ordinary_multi_series_request_unchanged() {
+        // A legitimate batch (multiple series, labels, samples, metadata) — all
+        // dimensions and both aggregates well under their caps — round-trips
+        // through real encode/decode byte-identically (the caps never reject
+        // real traffic).
+        let req = WriteRequest {
+            timeseries: vec![
+                TimeSeries {
+                    labels: vec![label("__name__", "up"), label("job", "checkout")],
+                    samples: vec![sample(1.0, 1), sample(2.0, 2)],
+                },
+                TimeSeries {
+                    labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
+                    samples: vec![sample(3.0, 1)],
+                },
+            ],
+            metadata: vec![MetricMetadataProto {
+                r#type: 1,
+                metric_family_name: "up".to_string(),
+                help: "total".to_string(),
+                unit: String::new(),
+            }],
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = decode(&bytes).expect("an ordinary in-bounds request decodes");
+        assert_eq!(decoded, req);
     }
 
     // -- parse: basic series ----------------------------------------------
@@ -886,6 +1686,61 @@ mod tests {
             actual <= MAX_EXPANDED_BYTES + SAMPLE_ROW_OVERHEAD,
             "abort must fire at the tipping sample charge (charge-before-materialize): \
              actual={actual}"
+        );
+    }
+
+    /// A near-empty-label fan-out trips [`MAX_EXPANDED_BYTES`] on the
+    /// [`LABEL_ROW_OVERHEAD`] floor alone (issue #115, finding #62) — the
+    /// undercharge the decode-time COUNT caps do not close. The construction
+    /// stays UNDER every count cap: each series holds exactly
+    /// [`MAX_LABELS_PER_SERIES`] labels, the ~2.1M total labels are under
+    /// [`MAX_TOTAL_LABELS_PER_REQUEST`] (5M), and ~8.2k series are under
+    /// [`MAX_TIMESERIES_PER_REQUEST`] — so [`validate_bounds`] (the count
+    /// caps) ADMITS it, and only `parse`'s cumulative byte budget rejects it.
+    ///
+    /// NON-VACUOUS by construction: every label is `("", "")` — zero raw wire
+    /// bytes — so the entire estimate comes from the per-label floor. Were
+    /// `LABEL_ROW_OVERHEAD` 0, the label charge would be 0 and the request
+    /// would stay ~0.5 MiB (series overhead only), well under the 256 MiB
+    /// budget, and `parse` would ACCEPT it. The rejection is therefore
+    /// attributable solely to the 128 B floor. Series count derives from the
+    /// constants so a retune cannot silently weaken it. Full-trip form (not a
+    /// focused charge probe) mirrors `expansion_budget_rejects_sample_fan_out`
+    /// and the established ~4M-element hermetic tier, exercising the real
+    /// top-level `parse` rejection with its exact `field`; ~2.1M empty-string
+    /// `Label`s cost only ~100 MiB of headers (empty `String`s never heap-
+    /// allocate), comparable to the sibling sample-fan-out test.
+    #[test]
+    fn expansion_budget_rejects_near_empty_label_fan_out() {
+        // Enough full-width (256-label) series that the per-label floor alone
+        // overshoots the budget: MAX_EXPANDED_BYTES / (128 * 256) series + 2.
+        let num_series = MAX_EXPANDED_BYTES / (LABEL_ROW_OVERHEAD * MAX_LABELS_PER_SERIES) + 2;
+        let timeseries: Vec<TimeSeries> = (0..num_series)
+            .map(|_| TimeSeries {
+                labels: vec![label("", ""); MAX_LABELS_PER_SERIES],
+                samples: vec![],
+            })
+            .collect();
+        let req = WriteRequest {
+            timeseries,
+            metadata: vec![],
+        };
+
+        // The count caps admit the fan-out: only the byte floor stops it.
+        validate_bounds(&req).expect("count caps admit the near-empty-label fan-out");
+
+        let err =
+            parse(&req, 0).expect_err("near-empty-label fan-out must trip the expansion budget");
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage {
+                    field: "expanded metric row bytes (estimated)",
+                    limit: MAX_EXPANDED_BYTES,
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
         );
     }
 

@@ -2084,6 +2084,20 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "merge",
         body: "let mut bounded = BoundedPushRequest {total_entries: self.streams.iter().map(|s| s.entries.len()).sum(), streams: std::mem::take(&mut self.streams),}; let result = bounded.merge(buf); self.streams = bounded.streams; result",
     },
+    // NOT a router-composition function — this is the remote-write
+    // `WriteRequest`'s hand-written `prost::Message::merge` (issue #115 track 3,
+    // finding #62), which routes the raw merge entry point through the
+    // aggregate-bounded `BoundedWriteRequest` twin. Its body contains a
+    // `bounded.merge(buf)` call, so the textual `.merge(` scan pins it here even
+    // though it mounts no routes; re-derive if that decode-bounds body changes.
+    // (The `merge_length_delimited` sibling needs no pin: its body's
+    // `bounded.merge_length_delimited(buf)` does not contain the `.merge(`
+    // scanner token.)
+    PinnedFunctionBody {
+        file: "crates/pulsus-write/src/protocols/remote_write.rs",
+        function: "merge",
+        body: "let mut bounded = BoundedWriteRequest {total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(), total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(), timeseries: std::mem::take(&mut self.timeseries), metadata: std::mem::take(&mut self.metadata),}; let result = bounded.merge(buf); self.timeseries = bounded.timeseries; self.metadata = bounded.metadata; result",
+    },
 ];
 
 pub fn pinned_function_bodies() -> &'static [PinnedFunctionBody] {
