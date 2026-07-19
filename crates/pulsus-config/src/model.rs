@@ -134,6 +134,27 @@ pub struct ClickHouseConfig {
     /// spreads requests across them (availability-zone aware). An entry that
     /// omits `http_port` inherits `clickhouse.http_port`.
     pub servers: Vec<ChServerEntry>,
+    /// `CLICKHOUSE_INSERT_QUORUM` (issue #114, default `0` = off): the
+    /// number of replicas that must confirm a block before the insert is
+    /// acknowledged. `0` = off, `1` = rejected at startup (a silent no-op in
+    /// ClickHouse, which disables quorum below 2 — use `0` to disable),
+    /// `>= 2` = active quorum. Integer-only — ClickHouse's `auto` (majority)
+    /// value is unsupported. Only meaningful on `Replicated*` engines; adds
+    /// latency, so it is off by default (strong consistency is opt-in).
+    pub insert_quorum: u64,
+    /// `CLICKHOUSE_INSERT_QUORUM_PARALLEL` (issue #114, default `true`).
+    /// Only emitted when `insert_quorum > 0`.
+    pub insert_quorum_parallel: bool,
+    /// `CLICKHOUSE_INSERT_QUORUM_TIMEOUT` (issue #114, default `120s` —
+    /// reconciled to equal the default `query_timeout`, which bounds the
+    /// whole insert). Must be `0 < timeout <= query_timeout` when
+    /// `insert_quorum > 0`, else the insert deadline preempts the quorum
+    /// wait. Only emitted when `insert_quorum > 0`.
+    pub insert_quorum_timeout: HumanDuration,
+    /// `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` (issue #114, default
+    /// `false`): when set, reads see all prior quorum-committed writes
+    /// (read-your-writes). Adds latency, so it is off by default.
+    pub select_sequential_consistency: bool,
 }
 
 impl Default for ClickHouseConfig {
@@ -148,6 +169,10 @@ impl Default for ClickHouseConfig {
             tls_skip_verify: false,
             pool_size: 8,
             servers: Vec::new(),
+            insert_quorum: 0,
+            insert_quorum_parallel: true,
+            insert_quorum_timeout: HumanDuration(Duration::from_secs(120)),
+            select_sequential_consistency: false,
         }
     }
 }

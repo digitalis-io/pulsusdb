@@ -30,8 +30,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    bootstrap_conn_config_from, build_label_cache, conn_config_from, metric_writer_tables_from,
-    schema_params_from, trace_writer_tables_from, writer_tables_from,
+    bootstrap_conn_config_from, build_label_cache, conn_config_from, consistency_from,
+    metric_writer_tables_from, schema_params_from, trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -305,10 +305,30 @@ fn spawn_reconnect_loop(
                     // on `pool_slot`) must imply the ingest route is live
                     // too, not just that the reader's pool exists.
                     if writer_enabled(&config) {
-                        let client = Arc::new(ChClient::from_shared_pool(
+                        // Issue #114: install the consistency policy on the
+                        // shared writer client (fallible — validates the
+                        // quorum/deadline invariant). A config-invariant
+                        // violation is non-self-healing (unlike the transient
+                        // connect/schema failures that log-and-backoff), so
+                        // it terminates the bootstrap task: the writer/cache
+                        // never publish and `/ready` stays 503. In the real
+                        // binary this is unreachable — `pulsus_config::load`
+                        // already rejected it — but the type enforces it.
+                        let client = match ChClient::from_shared_pool(
                             Arc::clone(&pool),
                             config.query_timeout.0,
-                        ));
+                        )
+                        .with_consistency(consistency_from(&config))
+                        {
+                            Ok(c) => Arc::new(c),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "invalid clickhouse consistency config"
+                                );
+                                return;
+                            }
+                        };
                         let writer = Arc::new(LogWriter::new_with_tables(
                             client.clone(),
                             &config.writer,
@@ -362,7 +382,19 @@ fn spawn_reconnect_loop(
                     // gate the rest (cold-cache "label cache warming" 503
                     // for the whole first sweep).
                     if reader_enabled(&config) {
-                        let cache = Arc::new(build_label_cache(Arc::clone(&pool), &config));
+                        // Issue #114: the label cache's shared client also
+                        // installs the consistency policy (fallible). Same
+                        // non-self-healing termination as the writer above.
+                        let cache = match build_label_cache(Arc::clone(&pool), &config) {
+                            Ok(c) => Arc::new(c),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "invalid clickhouse consistency config"
+                                );
+                                return;
+                            }
+                        };
                         let _ = label_cache_slot.set(Arc::clone(&cache));
                         let refresh_handle =
                             pulsus_read::spawn_refresh_loop(cache, config.reader.cache_ttl.0);

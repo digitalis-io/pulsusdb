@@ -7,6 +7,99 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::error::ChError;
+use crate::settings::QuerySettings;
+
+/// ClickHouse consistency policy (issue #114), carried on
+/// [`ChConnConfig`] and applied per-statement by [`crate::ChClient`]:
+/// the quorum trio rides the insert path, `select_sequential_consistency`
+/// the read path. Defaults are **all-off** (quorum disabled, sequential
+/// consistency disabled) — byte-for-byte the pre-#114 insert/select — so
+/// strong consistency is strictly opt-in (both add latency, and quorum is
+/// only meaningful on `Replicated*` engines).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsistencyConfig {
+    /// `clickhouse.insert_quorum` (default `0` = off). The number of
+    /// replicas that must confirm a block before the insert is
+    /// acknowledged. Integer-only (`auto`/majority is unsupported —
+    /// docs/configuration.md §2).
+    pub insert_quorum: u64,
+    /// `clickhouse.insert_quorum_parallel` (default `true`). Only emitted
+    /// when `insert_quorum > 0`.
+    pub insert_quorum_parallel: bool,
+    /// `clickhouse.insert_quorum_timeout` (default `120s`, reconciled to the
+    /// default `query_timeout`). The quorum wait bound; must not exceed the
+    /// insert deadline (`query_timeout`), which would preempt it. Only
+    /// emitted when `insert_quorum > 0`, rendered in milliseconds.
+    pub insert_quorum_timeout: Duration,
+    /// `clickhouse.select_sequential_consistency` (default `false`). When
+    /// set, reads see all prior quorum-committed writes (read-your-writes).
+    pub select_sequential_consistency: bool,
+}
+
+impl Default for ConsistencyConfig {
+    fn default() -> Self {
+        Self {
+            insert_quorum: 0,
+            insert_quorum_parallel: true,
+            insert_quorum_timeout: Duration::from_secs(120),
+            select_sequential_consistency: false,
+        }
+    }
+}
+
+impl ConsistencyConfig {
+    /// The per-statement settings the insert path emits: empty when
+    /// `insert_quorum == 0` (off), else the quorum trio (see
+    /// [`QuerySettings::with_insert_quorum`]).
+    pub fn insert_settings(&self) -> QuerySettings {
+        QuerySettings::new().with_insert_quorum(
+            self.insert_quorum,
+            self.insert_quorum_parallel,
+            self.insert_quorum_timeout,
+        )
+    }
+
+    /// Folds the read-side consistency setting onto a caller's `base`
+    /// settings: adds `select_sequential_consistency = 1` iff enabled,
+    /// leaving `base` otherwise untouched (engine budgets survive).
+    pub fn apply_read(&self, base: QuerySettings) -> QuerySettings {
+        base.with_select_sequential_consistency(self.select_sequential_consistency)
+    }
+
+    /// The single, pool-free source of the quorum/deadline invariant
+    /// (issue #114). When `insert_quorum > 0`, enforces
+    /// `0 < insert_quorum_timeout <= deadline`: a zero timeout means a
+    /// no/infinite wait, and a timeout above the insert deadline can never
+    /// be observed because the deadline (`query_timeout`) fires first
+    /// (`insert_block` bounds the whole insert by it). Inert when quorum is
+    /// off. Both authoritative construction gates
+    /// ([`ChConnConfig::validate`] against `query_timeout`, and the fallible
+    /// [`crate::ChClient::with_consistency`] against the client's
+    /// `default_timeout`) delegate here, so no construction path can install
+    /// a self-defeating quorum timeout.
+    ///
+    /// Ordering: zero is rejected before the `> deadline` check, so a zero
+    /// timeout always yields the zero-specific message.
+    pub fn validate_for_deadline(&self, deadline: Duration) -> Result<(), ChError> {
+        if self.insert_quorum > 0 {
+            if self.insert_quorum_timeout.is_zero() {
+                return Err(ChError::Config(
+                    "insert_quorum_timeout must be greater than zero when insert_quorum \
+                     is enabled (a zero quorum timeout means no/infinite wait)"
+                        .to_string(),
+                ));
+            }
+            if self.insert_quorum_timeout > deadline {
+                return Err(ChError::Config(
+                    "insert_quorum_timeout must not exceed query_timeout when insert_quorum \
+                     is enabled: the insert deadline (query_timeout) preempts the quorum wait"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Wraps a bare IPv6 literal in `[...]` so it forms a valid URL authority
 /// (`http://[::1]:8123`); hostnames and IPv4 literals pass through unchanged.
@@ -110,6 +203,11 @@ pub struct ChConnConfig {
     /// spreads evenly across all endpoints. A zone that matches no endpoint
     /// is not an error — the policy degrades to even spreading.
     pub local_zone: Option<String>,
+    /// ClickHouse consistency policy (issue #114): the quorum trio on the
+    /// insert path and `select_sequential_consistency` on the read path.
+    /// Default is all-off (strong consistency is opt-in), so this is
+    /// byte-for-byte the pre-#114 insert/select behaviour.
+    pub consistency: ConsistencyConfig,
 }
 
 impl Default for ChConnConfig {
@@ -127,6 +225,7 @@ impl Default for ChConnConfig {
             query_timeout: Duration::from_secs(120),
             endpoints: Vec::new(),
             local_zone: None,
+            consistency: ConsistencyConfig::default(),
         }
     }
 }
@@ -172,6 +271,12 @@ impl ChConnConfig {
                 )));
             }
         }
+        // Issue #114: authoritative quorum/deadline gate — the value
+        // `ChClient::new` installs as `default_timeout` is this
+        // `query_timeout`, which bounds the whole insert (client tokio
+        // deadline + server `max_execution_time`). Delegates to the single
+        // pool-free invariant the fallible `with_consistency` also enforces.
+        self.consistency.validate_for_deadline(self.query_timeout)?;
         Ok(())
     }
 
@@ -420,5 +525,104 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(cfg.validate(), Err(ChError::Config(_))));
+    }
+
+    /// AC13 (issue #114): the single-source invariant enforces the FULL
+    /// `0 < insert_quorum_timeout <= deadline` when quorum is enabled, and
+    /// is inert when it is off.
+    #[test]
+    fn validate_for_deadline_enforces_the_full_quorum_invariant() {
+        let deadline = Duration::from_secs(120);
+
+        // Zero timeout with quorum on -> rejected, zero-specific message.
+        let zero = ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::ZERO,
+            ..ConsistencyConfig::default()
+        };
+        let err = zero.validate_for_deadline(deadline).unwrap_err();
+        assert!(matches!(err, ChError::Config(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("insert_quorum_timeout") && msg.contains("greater than zero"),
+            "zero must yield the zero-specific message, got: {msg}"
+        );
+
+        // Timeout above the deadline with quorum on -> rejected (preempt).
+        let over = ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::from_secs(300),
+            ..ConsistencyConfig::default()
+        };
+        assert!(matches!(
+            over.validate_for_deadline(deadline),
+            Err(ChError::Config(_))
+        ));
+
+        // Equal timeout is allowed.
+        let equal = ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::from_secs(120),
+            ..ConsistencyConfig::default()
+        };
+        assert!(equal.validate_for_deadline(deadline).is_ok());
+
+        // Inert when quorum is off — a zero timeout is irrelevant.
+        let off = ConsistencyConfig {
+            insert_quorum: 0,
+            insert_quorum_timeout: Duration::ZERO,
+            ..ConsistencyConfig::default()
+        };
+        assert!(off.validate_for_deadline(deadline).is_ok());
+    }
+
+    /// AC12 (issue #114): `ChConnConfig::validate` (the `ChClient::new`
+    /// gate) delegates to the shared invariant, rejecting BOTH a zero and an
+    /// over-deadline quorum timeout; inert when quorum is off; the default
+    /// (120s == default query_timeout 120s) passes.
+    #[test]
+    fn validate_rejects_both_zero_and_over_deadline_quorum_timeout() {
+        let base = ChConnConfig {
+            query_timeout: Duration::from_secs(120),
+            ..Default::default()
+        };
+
+        let zero = ChConnConfig {
+            consistency: ConsistencyConfig {
+                insert_quorum: 2,
+                insert_quorum_timeout: Duration::ZERO,
+                ..ConsistencyConfig::default()
+            },
+            ..base.clone()
+        };
+        let err = zero.validate().unwrap_err();
+        assert!(matches!(err, ChError::Config(_)));
+        assert!(err.to_string().contains("insert_quorum_timeout"));
+
+        let over = ChConnConfig {
+            consistency: ConsistencyConfig {
+                insert_quorum: 2,
+                insert_quorum_timeout: Duration::from_secs(300),
+                ..ConsistencyConfig::default()
+            },
+            ..base.clone()
+        };
+        let err = over.validate().unwrap_err();
+        assert!(matches!(err, ChError::Config(_)));
+        assert!(err.to_string().contains("insert_quorum_timeout"));
+
+        // Inert when quorum is off (same over-deadline timeout).
+        let off = ChConnConfig {
+            consistency: ConsistencyConfig {
+                insert_quorum: 0,
+                insert_quorum_timeout: Duration::from_secs(300),
+                ..ConsistencyConfig::default()
+            },
+            ..base
+        };
+        assert!(off.validate().is_ok());
+
+        // Default is self-consistent (120s == 120s).
+        assert!(ChConnConfig::default().validate().is_ok());
     }
 }

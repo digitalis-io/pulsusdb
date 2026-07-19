@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures::Stream;
 
-use crate::config::ChConnConfig;
+use crate::config::{ChConnConfig, ConsistencyConfig};
 use crate::error::{ChError, Idempotency};
 use crate::pool::{ChPool, PooledConn};
 use crate::settings::QuerySettings;
@@ -41,6 +41,7 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 pub struct ChClient {
     pool: Arc<ChPool>,
     default_timeout: Duration,
+    consistency: ConsistencyConfig,
 }
 
 impl ChClient {
@@ -59,10 +60,15 @@ impl ChClient {
             );
         }
         let default_timeout = cfg.query_timeout;
+        // `cfg.consistency` is `Copy`; read it before the pool consumes `cfg`.
+        // `cfg.validate()` above already enforced the quorum/deadline
+        // invariant against `query_timeout`.
+        let consistency = cfg.consistency;
         let pool = ChPool::connect(cfg).await?;
         Ok(Self {
             pool: Arc::new(pool),
             default_timeout,
+            consistency,
         })
     }
 
@@ -75,7 +81,43 @@ impl ChClient {
         Self {
             pool,
             default_timeout: query_timeout,
+            consistency: ConsistencyConfig::default(),
         }
+    }
+
+    /// Installs a [`ConsistencyConfig`] onto a shared-pool client (issue
+    /// #114) — the additive builder the `from_shared_pool` read/write
+    /// callers use. **Fallible:** validates the quorum/deadline invariant
+    /// against the deadline this client was built with (`default_timeout`,
+    /// i.e. `query_timeout`), so no construction path can install a quorum
+    /// timeout the insert deadline would preempt (or a dangerous zero). The
+    /// `ChClient::new` path enforces the same invariant via
+    /// [`ChConnConfig::validate`].
+    pub fn with_consistency(mut self, c: ConsistencyConfig) -> Result<Self, ChError> {
+        c.validate_for_deadline(self.default_timeout)?;
+        self.consistency = c;
+        Ok(self)
+    }
+
+    /// The complete settings the insert path attaches (issue #114): the
+    /// server-side deadline (`max_execution_time`) plus — when quorum is
+    /// enabled — the quorum trio. Pool-free and pure, so
+    /// [`Self::insert_block`]'s exact injected set is unit-testable directly.
+    fn insert_settings_of(c: &ConsistencyConfig, timeout: Duration) -> QuerySettings {
+        c.insert_settings().with_max_execution_time(timeout)
+    }
+
+    /// The complete settings the read path attaches (issue #114): the
+    /// caller's `base` settings, plus — when enabled —
+    /// `select_sequential_consistency`, plus the stream deadline. Pool-free
+    /// and pure, so [`Self::query_stream`]'s exact injected set is
+    /// unit-testable directly.
+    fn read_settings_of(
+        c: &ConsistencyConfig,
+        base: &QuerySettings,
+        timeout: Duration,
+    ) -> QuerySettings {
+        c.apply_read(base.clone()).with_max_execution_time(timeout)
     }
 
     /// Columnar block insert into `table`.
@@ -102,13 +144,16 @@ impl ChClient {
     /// is not uncertain, merely wrong.
     pub async fn insert_block<R: ChRow>(&self, table: &str, rows: &[R]) -> Result<(), ChError> {
         let conn = self.pool.get().await?;
-        let secs = crate::settings::max_execution_time_secs(self.default_timeout);
+        // Issue #114: the whole attached set — the server deadline plus,
+        // when quorum is enabled, the quorum trio — is the single testable
+        // `insert_settings_of`, applied pair-by-pair (the `Insert` builder
+        // has no typed settings helper).
+        let settings = Self::insert_settings_of(&self.consistency, self.default_timeout);
         let fut = async {
-            let mut insert = conn
-                .client()
-                .insert::<R>(table)
-                .await?
-                .with_setting("max_execution_time", &secs);
+            let mut insert = conn.client().insert::<R>(table).await?;
+            for (k, v) in settings.iter() {
+                insert = insert.with_setting(k, v);
+            }
             for row in rows {
                 insert.write(row).await?;
             }
@@ -156,7 +201,10 @@ impl ChClient {
         s: &QuerySettings,
     ) -> Result<ChRowStream<'_, R>, ChError> {
         let conn = self.pool.get().await?;
-        let settings = s.clone().with_max_execution_time(self.default_timeout);
+        // Issue #114: caller settings + (when enabled)
+        // `select_sequential_consistency` + the stream deadline, as the
+        // single testable `read_settings_of`.
+        let settings = Self::read_settings_of(&self.consistency, s, self.default_timeout);
         let cursor = settings
             .apply_to_query(conn.client().query(sql))
             .fetch::<R>()?;
@@ -325,5 +373,58 @@ mod tests {
     #[test]
     fn max_idempotent_retries_is_bounded() {
         const { assert!(MAX_IDEMPOTENT_RETRIES > 0 && MAX_IDEMPOTENT_RETRIES <= 10) };
+    }
+
+    /// AC3 (issue #114): the default (quorum off) insert emits ONLY the
+    /// deadline — byte-for-byte the pre-#114 insert.
+    #[test]
+    fn insert_settings_of_default_emits_only_the_deadline() {
+        let s =
+            ChClient::insert_settings_of(&ConsistencyConfig::default(), Duration::from_secs(120));
+        assert_eq!(s.render_suffix(), " SETTINGS max_execution_time = 120.000");
+    }
+
+    /// AC4 (issue #114): the default (sequential consistency off) select
+    /// emits ONLY the deadline — byte-for-byte the pre-#114 select.
+    #[test]
+    fn read_settings_of_default_emits_only_the_deadline() {
+        let s = ChClient::read_settings_of(
+            &ConsistencyConfig::default(),
+            &QuerySettings::new(),
+            Duration::from_secs(120),
+        );
+        assert_eq!(s.render_suffix(), " SETTINGS max_execution_time = 120.000");
+    }
+
+    /// AC4a (issue #114): an enabled quorum insert emits the trio (timeout
+    /// in ms) alongside the deadline.
+    #[test]
+    fn insert_settings_of_emits_the_quorum_trio_when_enabled() {
+        let c = ConsistencyConfig {
+            insert_quorum: 3,
+            insert_quorum_parallel: false,
+            insert_quorum_timeout: Duration::from_secs(5),
+            select_sequential_consistency: false,
+        };
+        let s = ChClient::insert_settings_of(&c, Duration::from_secs(120));
+        assert_eq!(s.get("insert_quorum"), Some("3"));
+        assert_eq!(s.get("insert_quorum_parallel"), Some("0"));
+        assert_eq!(s.get("insert_quorum_timeout"), Some("5000"));
+        assert_eq!(s.get("max_execution_time"), Some("120.000"));
+    }
+
+    /// AC4b (issue #114): an enabled sequential-consistency read emits the
+    /// setting AND preserves the caller's engine budgets + deadline.
+    #[test]
+    fn read_settings_of_preserves_caller_settings_and_adds_sequential_consistency() {
+        let c = ConsistencyConfig {
+            select_sequential_consistency: true,
+            ..ConsistencyConfig::default()
+        };
+        let base = QuerySettings::new().set("max_bytes_to_read", 42u64);
+        let s = ChClient::read_settings_of(&c, &base, Duration::from_secs(120));
+        assert_eq!(s.get("select_sequential_consistency"), Some("1"));
+        assert_eq!(s.get("max_bytes_to_read"), Some("42"));
+        assert_eq!(s.get("max_execution_time"), Some("120.000"));
     }
 }

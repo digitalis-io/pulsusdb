@@ -32,6 +32,10 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "CLICKHOUSE_PROTO",
     "CLICKHOUSE_TLS_SKIP_VERIFY",
     "PULSUS_CH_POOL_SIZE",
+    "CLICKHOUSE_INSERT_QUORUM",
+    "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
+    "CLICKHOUSE_INSERT_QUORUM_TIMEOUT",
+    "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
     "PULSUS_SKIP_DDL",
     "PULSUS_RETENTION_DAYS",
     "PULSUS_STORAGE_POLICY",
@@ -206,6 +210,20 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_CH_POOL_SIZE") {
         cfg.clickhouse.pool_size = parse_int("PULSUS_CH_POOL_SIZE", &v)?;
     }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM") {
+        cfg.clickhouse.insert_quorum = parse_int("CLICKHOUSE_INSERT_QUORUM", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM_PARALLEL") {
+        cfg.clickhouse.insert_quorum_parallel =
+            parse_bool("CLICKHOUSE_INSERT_QUORUM_PARALLEL", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM_TIMEOUT") {
+        cfg.clickhouse.insert_quorum_timeout = parse_dur("CLICKHOUSE_INSERT_QUORUM_TIMEOUT", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY") {
+        cfg.clickhouse.select_sequential_consistency =
+            parse_bool("CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY", &v)?;
+    }
     if let Some(v) = read("PULSUS_SKIP_DDL") {
         cfg.skip_ddl = parse_bool("PULSUS_SKIP_DDL", &v)?;
     }
@@ -344,8 +362,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            58,
-            "docs/configuration.md §§1-8 document exactly 58 variables"
+            62,
+            "docs/configuration.md §§1-8 document exactly 62 variables"
         );
     }
 

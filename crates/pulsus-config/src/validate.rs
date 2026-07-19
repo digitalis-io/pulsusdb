@@ -200,6 +200,61 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
     positive_bytes("ruler.max_result_bytes", cfg.ruler.max_result_bytes)?;
 
+    // Issue #114: consistency guards. `insert_quorum_timeout` must be
+    // positive, and — when quorum is enabled — must not exceed
+    // `query_timeout`, which bounds the whole insert (both the client tokio
+    // deadline and the server `max_execution_time`); a larger quorum wait
+    // could never be observed, the insert deadline fires first. These
+    // config-layer guards are defense-in-depth with better-located
+    // `ConfigError::Value{field}` messages; authoritative enforcement lives
+    // in `pulsus_clickhouse::ConsistencyConfig::validate_for_deadline`. The
+    // cross-field rule is inert when `insert_quorum == 0` (off).
+    positive_duration(
+        "clickhouse.insert_quorum_timeout",
+        cfg.clickhouse.insert_quorum_timeout,
+    )?;
+    if cfg.clickhouse.insert_quorum > 0
+        && cfg.clickhouse.insert_quorum_timeout.0 > cfg.query_timeout.0
+    {
+        return Err(value_err(
+            "clickhouse.insert_quorum_timeout",
+            "must not exceed query_timeout when insert_quorum is enabled: the insert \
+             deadline (query_timeout) preempts the quorum wait",
+            "<= query_timeout",
+        ));
+    }
+
+    // Issue #114 (code review round 1, finding 2): `insert_quorum == 1` is a
+    // silent no-op in ClickHouse — quorum writes are disabled below 2, so a
+    // config asking for a 1-replica quorum promises a guarantee that is never
+    // applied. Reject it: `0` disables quorum, `>= 2` is an active quorum.
+    if cfg.clickhouse.insert_quorum == 1 {
+        return Err(value_err(
+            "clickhouse.insert_quorum",
+            "1 is a silent no-op in ClickHouse (quorum writes are disabled below \
+             2): use 0 to disable quorum, or >= 2 for an active quorum",
+            "0 (off) or >= 2",
+        ));
+    }
+
+    // Issue #114 (code review round 1, finding 1): `select_sequential_consistency`
+    // (read-your-writes) only holds when quorum inserts are enabled AND
+    // non-parallel — ClickHouse cannot deliver the guarantee with parallel
+    // quorum or quorum off. Reject the combination fail-fast rather than
+    // silently forcing `insert_quorum_parallel = false`, so the operator's
+    // stated intent and the delivered behaviour never diverge.
+    if cfg.clickhouse.select_sequential_consistency
+        && (cfg.clickhouse.insert_quorum == 0 || cfg.clickhouse.insert_quorum_parallel)
+    {
+        return Err(value_err(
+            "clickhouse.select_sequential_consistency",
+            "read-your-writes requires quorum inserts enabled and non-parallel: set \
+             clickhouse.insert_quorum >= 2 and clickhouse.insert_quorum_parallel = false, \
+             or disable clickhouse.select_sequential_consistency",
+            "insert_quorum >= 2 and insert_quorum_parallel = false",
+        ));
+    }
+
     // Rule 8: raw_retention, if set, must be > 0.
     if let Some(raw_retention) = cfg.downsampling.raw_retention {
         positive_duration("downsampling.raw_retention", raw_retention)?;
@@ -576,6 +631,137 @@ mod tests {
             http_port: None,
             zone: Some("az-a".to_string()),
         }];
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// AC11 (issue #114): the config-layer consistency guards. An enabled
+    /// quorum with `insert_quorum_timeout > query_timeout` is rejected as
+    /// `ConfigError::Value{field:"clickhouse.insert_quorum_timeout"}`; the
+    /// same values with quorum OFF pass (inert); a zero timeout is rejected;
+    /// the default (120s == default query_timeout 120s) passes.
+    #[test]
+    fn insert_quorum_timeout_guards_reject_over_deadline_and_zero_when_enabled() {
+        // > query_timeout with quorum enabled -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::from_secs(300));
+        cfg.query_timeout = HumanDuration(std::time::Duration::from_secs(120));
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum_timeout");
+            }
+            other => panic!("expected a Value error for the over-deadline timeout, got {other:?}"),
+        }
+
+        // Same values, quorum off -> inert, passes.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 0;
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::from_secs(300));
+        cfg.query_timeout = HumanDuration(std::time::Duration::from_secs(120));
+        assert!(validate(&cfg).is_ok());
+
+        // Zero timeout -> rejected by the positive-duration guard.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::ZERO);
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum_timeout");
+            }
+            other => panic!("expected a Value error for the zero timeout, got {other:?}"),
+        }
+
+        // Default is self-consistent (120s == 120s).
+        let d = Config::default();
+        assert_eq!(d.clickhouse.insert_quorum, 0);
+        assert!(d.clickhouse.insert_quorum_parallel);
+        assert_eq!(
+            d.clickhouse.insert_quorum_timeout.0,
+            std::time::Duration::from_secs(120)
+        );
+        assert!(!d.clickhouse.select_sequential_consistency);
+        assert!(validate(&d).is_ok());
+    }
+
+    /// Issue #114 (code review round 1, finding 2): `insert_quorum == 1` is a
+    /// silent no-op in ClickHouse and is rejected at startup naming the field;
+    /// `0` (off) and `2` (active quorum) are accepted.
+    #[test]
+    fn insert_quorum_of_one_is_rejected_as_a_no_op() {
+        // 0 = off -> OK.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 0;
+        assert!(validate(&cfg).is_ok());
+
+        // 1 = silent no-op -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 1;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum");
+            }
+            other => panic!("expected a Value error for insert_quorum == 1, got {other:?}"),
+        }
+
+        // 2 = active quorum -> OK (timeout 120s <= query_timeout 120s).
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 2;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// Issue #114 (code review round 1, finding 1): `select_sequential_consistency`
+    /// (read-your-writes) is only honoured by ClickHouse with quorum inserts
+    /// enabled AND non-parallel. Reject it with quorum off or parallel quorum;
+    /// accept it with `insert_quorum >= 2` and `insert_quorum_parallel = false`;
+    /// leave it untouched when disabled.
+    #[test]
+    fn select_sequential_consistency_requires_nonparallel_quorum() {
+        // seq-consistency on, quorum off -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.select_sequential_consistency");
+            }
+            other => {
+                panic!("expected a Value error for seq-consistency + quorum off, got {other:?}")
+            }
+        }
+
+        // seq-consistency on, quorum >= 2 but parallel -> rejected.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = true;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.select_sequential_consistency");
+            }
+            other => {
+                panic!(
+                    "expected a Value error for seq-consistency + parallel quorum, got {other:?}"
+                )
+            }
+        }
+
+        // seq-consistency on, quorum >= 2, non-parallel -> OK.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = false;
+        assert!(validate(&cfg).is_ok());
+
+        // seq-consistency off -> any quorum shape passes this rule.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = false;
+        cfg.clickhouse.insert_quorum = 0;
+        cfg.clickhouse.insert_quorum_parallel = true;
+        assert!(validate(&cfg).is_ok());
+
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = false;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = true;
         assert!(validate(&cfg).is_ok());
     }
 

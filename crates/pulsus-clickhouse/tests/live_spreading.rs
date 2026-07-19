@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{
-    ChClient, ChConnConfig, ChEndpoint, ChPool, Idempotency, QuerySettings, Row,
+    ChClient, ChConnConfig, ChEndpoint, ChPool, ConsistencyConfig, Idempotency, QuerySettings, Row,
 };
 
 fn should_run() -> bool {
@@ -215,6 +215,59 @@ async fn marked_queries_land_on_each_node_server_side() {
     assert!(
         n2 > 0,
         "shard2 system.query_log shows no marked queries landed (marker={marker})"
+    );
+}
+
+#[tokio::test]
+async fn with_consistency_validates_against_the_client_deadline() {
+    // AC14 (issue #114): the fallible `ChClient::with_consistency` wires
+    // `self.default_timeout` (the `from_shared_pool` `query_timeout` arg,
+    // 10s here) through the full quorum/deadline invariant on the ACTUAL
+    // shared-pool path. A `ChClient` cannot be built hermetically
+    // (`from_shared_pool` needs a connected `ChPool`), so this is the wiring
+    // proof; the invariant's own logic is proved hermetically in
+    // `config.rs`'s `validate_for_deadline` unit tests.
+    skip_unless_live!();
+    let pool = Arc::new(
+        ChPool::connect(base_config(vec![shard1()]))
+            .await
+            .expect("connect for with_consistency wiring proof"),
+    );
+    let deadline = Duration::from_secs(10);
+
+    // Zero quorum timeout with quorum enabled -> Err (dangerous no/infinite
+    // wait), before any I/O.
+    let zero = ChClient::from_shared_pool(Arc::clone(&pool), deadline).with_consistency(
+        ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::ZERO,
+            ..ConsistencyConfig::default()
+        },
+    );
+    assert!(
+        zero.is_err(),
+        "a zero quorum timeout must be rejected by with_consistency"
+    );
+
+    // Quorum timeout above the 10s client deadline -> Err (preempt).
+    let over = ChClient::from_shared_pool(Arc::clone(&pool), deadline).with_consistency(
+        ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::from_secs(300),
+            ..ConsistencyConfig::default()
+        },
+    );
+    assert!(
+        over.is_err(),
+        "a quorum timeout above the client deadline must be rejected"
+    );
+
+    // The default (quorum off) -> Ok.
+    let ok =
+        ChClient::from_shared_pool(pool, deadline).with_consistency(ConsistencyConfig::default());
+    assert!(
+        ok.is_ok(),
+        "the default consistency config must be accepted"
     );
 }
 

@@ -28,6 +28,19 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process |
+| `CLICKHOUSE_INSERT_QUORUM` | `0` | replicas that must confirm a block before an insert is acknowledged (`0` = off, `1` = rejected at startup — a silent no-op in ClickHouse — `>= 2` = active quorum). Integer-only — `auto`/majority is unsupported. Only meaningful on `Replicated*` engines; see [Consistency](#consistency) |
+| `CLICKHOUSE_INSERT_QUORUM_PARALLEL` | `true` | allow parallel quorum inserts; only applied when `CLICKHOUSE_INSERT_QUORUM > 0` |
+| `CLICKHOUSE_INSERT_QUORUM_TIMEOUT` | `120s` | quorum wait bound; must be `0 < timeout <=` `PULSUS_QUERY_TIMEOUT` when quorum is enabled (the insert deadline otherwise preempts the wait). Reconciled to the default `PULSUS_QUERY_TIMEOUT`; ClickHouse's own default is 600s |
+| `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` | `false` | reads see all prior quorum-committed writes (read-your-writes); off by default |
+
+### Consistency
+
+Defaults are all-off: writes are not quorum-committed and reads may hit a lagging replica. This preserves the lowest-latency behaviour on single-node and non-replicated deployments (quorum inserts *throw* on a plain `MergeTree`). On a `Replicated*` multi-replica cluster you can opt in to strong consistency — `CLICKHOUSE_INSERT_QUORUM > 0` makes an insert wait for that many replicas to confirm (so an ack survives a replica loss), and `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY=true` gives read-your-writes. Both add latency (a quorum write waits for replication; a sequential read waits for the replica to catch up), which is why they are opt-in — enable them only where the durability/read-your-writes guarantee is worth the round-trip cost. The quorum timeout is bounded by `PULSUS_QUERY_TIMEOUT` (the insert deadline that bounds the whole insert), so it is rejected at startup if it exceeds — or is zero while quorum is enabled.
+
+Two further constraints are enforced fail-fast at startup so a config never promises a guarantee ClickHouse will not honour:
+
+- **`CLICKHOUSE_INSERT_QUORUM = 1` is rejected.** ClickHouse disables quorum writes below 2, so `1` is a silent no-op. Use `0` to disable quorum, or `>= 2` for an active quorum.
+- **`CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY = true` requires non-parallel quorum inserts.** Read-your-writes only holds when quorum inserts are enabled *and* non-parallel, so seq-consistency is rejected unless `CLICKHOUSE_INSERT_QUORUM >= 2` **and** `CLICKHOUSE_INSERT_QUORUM_PARALLEL = false`. (The startup error names the exact keys and required values rather than silently forcing parallel off.)
 
 The hard requirements are columnar bulk-insert/fetch performance and reliable DDL + `INSERT ... SELECT` maintenance statements; which transport serves which statement class is an implementation detail settled by the M0 client benchmark (docs/decisions/0001). `CLICKHOUSE_PORT`/`CLICKHOUSE_HTTP_PORT` both remain configurable so either split works.
 
@@ -183,6 +196,10 @@ clickhouse:
   proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
   pool_size: 8
+  insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only). §Consistency
+  insert_quorum_parallel: true   # only applied when insert_quorum > 0
+  insert_quorum_timeout: 120s    # 0 < timeout <= query_timeout when insert_quorum > 0 (deadline preempts otherwise)
+  select_sequential_consistency: false  # read-your-writes; adds latency, off by default
   servers: []                    # multi-endpoint spreading (overrides `server` when non-empty).
                                  # Each entry: {host, http_port?, zone?}; http_port falls back to
                                  # clickhouse.http_port. IPv6 literal hosts must use this object form,

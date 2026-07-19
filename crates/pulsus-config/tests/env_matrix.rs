@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 44 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8, 62 variables) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -125,6 +125,26 @@ const ROWS: &[Row] = &[
         var: "PULSUS_CH_POOL_SIZE",
         value: "32",
         check: |c| c.clickhouse.pool_size == 32,
+    },
+    Row {
+        var: "CLICKHOUSE_INSERT_QUORUM",
+        value: "2",
+        check: |c| c.clickhouse.insert_quorum == 2,
+    },
+    Row {
+        var: "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
+        value: "false",
+        check: |c| !c.clickhouse.insert_quorum_parallel,
+    },
+    Row {
+        var: "CLICKHOUSE_INSERT_QUORUM_TIMEOUT",
+        value: "90s",
+        check: |c| c.clickhouse.insert_quorum_timeout.0 == Duration::from_secs(90),
+    },
+    Row {
+        var: "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
+        value: "true",
+        check: |c| c.clickhouse.select_sequential_consistency,
     },
     Row {
         var: "PULSUS_SKIP_DDL",
@@ -341,8 +361,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        58,
-        "docs/configuration.md §§1-8 document exactly 58 variables"
+        62,
+        "docs/configuration.md §§1-8 document exactly 62 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

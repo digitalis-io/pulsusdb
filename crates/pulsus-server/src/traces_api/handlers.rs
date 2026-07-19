@@ -31,7 +31,10 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
         guard.clone()
     };
     let pool = pool.ok_or(ApiError::PoolUnavailable)?;
-    Ok(chconfig::trace_engine(pool, &state.config))
+    // Issue #114: the consistency-config invariant is already enforced at
+    // config load, so this is unreachable in the real binary; a failure maps
+    // to the existing 503 "not serving" semantics.
+    chconfig::trace_engine(pool, &state.config).map_err(|_| ApiError::PoolUnavailable)
 }
 
 /// `GET /api/traces/v1/trace/{traceId}` — representation by `Accept`
