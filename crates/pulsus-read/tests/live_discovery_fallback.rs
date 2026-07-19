@@ -147,6 +147,7 @@ fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
     MetricsConfig {
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
+        hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,

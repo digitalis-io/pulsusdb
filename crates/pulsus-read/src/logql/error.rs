@@ -261,6 +261,30 @@ pub enum ReadError {
     #[error("range query step_ns must be greater than zero")]
     InvalidStep,
 
+    /// M7-A5a: the metrics dual-read decoded a `metric_hist_samples` row
+    /// whose value columns cannot rebuild a [`NativeHistogram`]
+    /// (`from_columns` structural failure — parallel span arrays of
+    /// unequal length). Structurally unreachable for writer-produced rows
+    /// (the A4 ingest seam validated before storing), so this is a
+    /// data-integrity defect surfaced defensively, never a client error.
+    /// `pulsus_model::NativeHistogram` is referenced only in this doc.
+    #[error("histogram decode: {0}")]
+    HistogramDecode(#[from] pulsus_model::HistogramError),
+
+    /// M7-A5a: a well-formed, executed query whose evaluated result is a
+    /// native-histogram vector/matrix element — a result type the current
+    /// (A5a) response encoder declines to render. The native-histogram
+    /// **function set and JSON encoder** land in **M7-A5b**; until then no
+    /// code path emits `0.0` for a histogram value — this is returned
+    /// instead. Maps like [`ReadError::QueryTooBroad`]: 422 `execution`
+    /// (the engine declines to render the result), never 400/5xx.
+    #[error(
+        "native-histogram query results are not yet renderable: the histogram function set and \
+         JSON encoding land with M7-A5b — until then a bare native-histogram selector result \
+         cannot be returned over the query API"
+    )]
+    HistogramResultUnsupported,
+
     /// An unclassified/passthrough ClickHouse error (network, decode,
     /// server exception not mapped to [`ReadError::QueryTooBroad`]).
     #[error("clickhouse: {0}")]

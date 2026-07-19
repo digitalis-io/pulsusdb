@@ -469,6 +469,32 @@ impl NativeHistogram {
     pub fn is_custom_buckets(&self) -> bool {
         is_custom_buckets_schema(self.schema)
     }
+
+    /// Bitwise equality: `sum`/`zero_threshold` and each `custom_values`
+    /// element by [`f64::to_bits`] (NaN-safe, deterministic); `schema`,
+    /// `zero_count`, `count`, spans ([`Span`] is `Eq`) and the integer
+    /// bucket `Vec`s by value. Two bit-identical histograms (including a
+    /// `STALE_NAN`-bit `sum`) are equal; a NaN-sum vs finite-sum pair is
+    /// unequal. No `PartialEq` derive exists ([`NativeHistogram`] carries
+    /// NaN-bearing f64s, histogram.rs:52–54), so query-side value types
+    /// (`pulsus-promql`) compare through this explicit bit contract.
+    pub fn bits_eq(&self, other: &NativeHistogram) -> bool {
+        self.schema == other.schema
+            && self.zero_threshold.to_bits() == other.zero_threshold.to_bits()
+            && self.zero_count == other.zero_count
+            && self.count == other.count
+            && self.sum.to_bits() == other.sum.to_bits()
+            && self.positive_spans == other.positive_spans
+            && self.negative_spans == other.negative_spans
+            && self.positive_buckets == other.positive_buckets
+            && self.negative_buckets == other.negative_buckets
+            && self.custom_values.len() == other.custom_values.len()
+            && self
+                .custom_values
+                .iter()
+                .zip(&other.custom_values)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
 }
 
 /// `metric_series.value_type` discriminator: 0 = float, 1 = histogram. The
@@ -525,29 +551,15 @@ mod tests {
     use crate::STALE_NAN_BITS;
 
     /// Compare two histograms with f64 fields by bit pattern (NaN-safe) and
-    /// everything else by value.
+    /// everything else by value — a thin wrapper over [`NativeHistogram::
+    /// bits_eq`] that names the mismatch (the value-model `PartialEq` in
+    /// `pulsus-promql` and the write-path spool encoder share the same bit
+    /// contract via that method).
     fn assert_hist_bits_eq(a: &NativeHistogram, b: &NativeHistogram) {
-        assert_eq!(a.schema, b.schema, "schema");
-        assert_eq!(
-            a.zero_threshold.to_bits(),
-            b.zero_threshold.to_bits(),
-            "zero_threshold"
+        assert!(
+            a.bits_eq(b),
+            "histograms differ by bits:\n a: {a:?}\n b: {b:?}"
         );
-        assert_eq!(a.zero_count, b.zero_count, "zero_count");
-        assert_eq!(a.count, b.count, "count");
-        assert_eq!(a.sum.to_bits(), b.sum.to_bits(), "sum");
-        assert_eq!(a.positive_spans, b.positive_spans, "positive_spans");
-        assert_eq!(a.negative_spans, b.negative_spans, "negative_spans");
-        assert_eq!(a.positive_buckets, b.positive_buckets, "positive_buckets");
-        assert_eq!(a.negative_buckets, b.negative_buckets, "negative_buckets");
-        assert_eq!(
-            a.custom_values.len(),
-            b.custom_values.len(),
-            "custom_values len"
-        );
-        for (i, (x, y)) in a.custom_values.iter().zip(&b.custom_values).enumerate() {
-            assert_eq!(x.to_bits(), y.to_bits(), "custom_values[{i}]");
-        }
     }
 
     fn assert_round_trip(h: &NativeHistogram) {
@@ -746,6 +758,44 @@ mod tests {
             .validate()
             .expect("empty_exponential valid");
         empty_nhcb().validate().expect("empty_nhcb valid");
+    }
+
+    // -- bits_eq (M7-A5a): NaN-safe value-model equality primitive --
+
+    #[test]
+    fn bits_eq_true_for_bit_identical_histograms() {
+        assert!(single_histogram().bits_eq(&single_histogram()));
+        assert!(custom_buckets_histogram().bits_eq(&custom_buckets_histogram()));
+    }
+
+    #[test]
+    fn bits_eq_false_for_one_bucket_difference() {
+        let mut b = single_histogram();
+        b.positive_buckets = vec![1, 1, 0];
+        assert!(!single_histogram().bits_eq(&b));
+    }
+
+    #[test]
+    fn bits_eq_true_for_two_identical_stale_nan_sums() {
+        let mut a = single_histogram();
+        a.sum = f64::from_bits(STALE_NAN_BITS);
+        let mut b = single_histogram();
+        b.sum = f64::from_bits(STALE_NAN_BITS);
+        assert!(a.bits_eq(&b), "identical STALE_NAN sum bits are equal");
+    }
+
+    #[test]
+    fn bits_eq_false_for_nan_sum_vs_finite_sum() {
+        let mut a = single_histogram();
+        a.sum = f64::from_bits(STALE_NAN_BITS);
+        assert!(!a.bits_eq(&single_histogram()));
+    }
+
+    #[test]
+    fn bits_eq_false_for_differing_custom_values_bits() {
+        let mut b = custom_buckets_histogram();
+        b.custom_values = vec![5.0, 10.000000000000002];
+        assert!(!custom_buckets_histogram().bits_eq(&b));
     }
 
     #[test]

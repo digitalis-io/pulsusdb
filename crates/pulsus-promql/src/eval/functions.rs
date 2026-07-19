@@ -59,8 +59,8 @@ fn eval_irate(samples: &[Sample]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
-    let last = samples[samples.len() - 1];
-    let prev = samples[samples.len() - 2];
+    let last = &samples[samples.len() - 1];
+    let prev = &samples[samples.len() - 2];
     let interval_ms = last.t_ms - prev.t_ms;
     if interval_ms == 0 {
         return None;
@@ -96,8 +96,8 @@ fn eval_extrapolated(
     if samples.len() < 2 {
         return None;
     }
-    let first = samples[0];
-    let last = samples[samples.len() - 1];
+    let first = &samples[0];
+    let last = &samples[samples.len() - 1];
     // Line 510: `resultFloat = samples.Floats[numSamplesMinusOne].F -
     // samples.Floats[0].F` (last - first).
     let mut result_value = last.v - first.v;
@@ -376,8 +376,8 @@ fn eval_idelta(samples: &[Sample]) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
-    let last = samples[samples.len() - 1];
-    let prev = samples[samples.len() - 2];
+    let last = &samples[samples.len() - 1];
+    let prev = &samples[samples.len() - 2];
     if last.t_ms - prev.t_ms == 0 {
         return None;
     }
@@ -733,7 +733,7 @@ mod tests {
     use super::*;
 
     fn s(t_ms: i64, v: f64) -> Sample {
-        Sample { t_ms, v }
+        Sample::float(t_ms, v)
     }
 
     // --- rate / increase / delta: edge case 2 (AC) ---

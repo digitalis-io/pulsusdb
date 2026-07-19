@@ -75,10 +75,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
     let qp = plan(&expr, params).expect("plan");
     let samples = |base: f64| -> Vec<Sample> {
         (0..STEPS)
-            .map(|k| Sample {
-                t_ms: k * STEP_MS,
-                v: base + k as f64,
-            })
+            .map(|k| Sample::float(k * STEP_MS, base + k as f64))
             .collect()
     };
     let mut data = SeriesData::new();

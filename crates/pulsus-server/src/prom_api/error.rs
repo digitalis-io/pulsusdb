@@ -151,13 +151,28 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
         }
+        // M7-A5a: a `metric_hist_samples` row that cannot rebuild a
+        // histogram is a storage/data-integrity defect (validated at
+        // ingest, so unreachable for writer-produced rows), not a client
+        // error — 500 `internal`, exactly like `ChError::Decode`.
+        ReadError::HistogramDecode(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
         // Issue #85 (M6-08c): the name-less-selector fan-out cap
         // (`TooBroadReason::MetricFanout`) rides the existing
         // QueryTooBroad -> 422 `execution` mapping; the degraded-cache
         // name-less failure is likewise a well-formed query the engine
         // declines to execute — 422 `execution`, never a 5xx (ClickHouse
         // is healthy; the in-process cache just cannot answer it).
-        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => {
+        //
+        // M7-A5a: `HistogramResultUnsupported` joins this arm (plan v3
+        // finding 1) — a well-formed, executed query whose result type the
+        // A5a encoder declines to render (the histogram JSON encoder is
+        // A5b), the same class as `QueryTooBroad`. NOT 400 `bad_data`
+        // (that is the LogQL parse/matcher arm) and NOT a 5xx.
+        ReadError::QueryTooBroad(_)
+        | ReadError::NamelessSelectorUnresolvable { .. }
+        | ReadError::HistogramResultUnsupported => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
     }
@@ -215,6 +230,24 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("pipeline error: 'SampleExtractionErr'"),
+            "{json}"
+        );
+    }
+
+    /// M7-A5a AC8c: a native-histogram-valued query result surfaces as
+    /// 422 `execution` (the well-formed-but-undeclinable class), NOT 400
+    /// `bad_data`, and the message names M7-A5b.
+    #[tokio::test]
+    async fn read_error_histogram_result_unsupported_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::HistogramResultUnsupported;
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("M7-A5b"),
             "{json}"
         );
     }

@@ -20,7 +20,7 @@ pub use plan::{
     SetOp, plan, series_selector,
 };
 pub use value::{
-    FetchedSeries, InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
 };
 
 /// True iff the (paren-stripped) root of `expr` is a call to one of the

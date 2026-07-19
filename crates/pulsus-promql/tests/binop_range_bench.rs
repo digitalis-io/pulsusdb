@@ -280,10 +280,7 @@ fn fs(fp: u64, name: &str, labels: Labels, base: f64) -> FetchedSeries {
         metric_name: Some(name.to_string()),
         labels,
         samples: (0..STEPS)
-            .map(|k| Sample {
-                t_ms: k * STEP_MS,
-                v: base + k as f64,
-            })
+            .map(|k| Sample::float(k * STEP_MS, base + k as f64))
             .collect(),
     }
 }

@@ -195,6 +195,7 @@ fn aggregate_reduce(
                 drop_name: acc.drop_name,
                 t_ms: acc.t_ms,
                 v,
+                h: None,
             }
         })
         .collect();
@@ -284,6 +285,7 @@ fn aggregate_quantile(
             drop_name,
             t_ms,
             v,
+            h: None,
         });
     }
     Ok(out)
@@ -400,6 +402,7 @@ pub fn count_values(
             drop_name: false,
             t_ms,
             v: count,
+            h: None,
         })
         .collect();
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
@@ -481,6 +484,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 
@@ -690,6 +694,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 

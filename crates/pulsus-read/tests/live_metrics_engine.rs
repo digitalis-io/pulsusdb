@@ -116,6 +116,34 @@ struct SeedSampleRow {
     value: f64,
 }
 
+/// M7-A5a: a `metric_hist_samples` seed row (column order matches the
+/// catalog CREATE, RowBinary is positional).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedHistRow {
+    metric_name: String,
+    fingerprint: u64,
+    unix_milli: i64,
+    schema: i8,
+    zero_threshold: f64,
+    zero_count: u64,
+    count: u64,
+    sum: f64,
+    pos_span_offsets: Vec<i32>,
+    pos_span_lengths: Vec<u32>,
+    pos_bucket_deltas: Vec<i64>,
+    neg_span_offsets: Vec<i32>,
+    neg_span_lengths: Vec<u32>,
+    neg_bucket_deltas: Vec<i64>,
+    custom_values: Vec<f64>,
+}
+
+async fn seed_hist_samples(client: &ChClient, rows: &[SeedHistRow]) {
+    client
+        .insert_block("metric_hist_samples", rows)
+        .await
+        .expect("seed metric_hist_samples");
+}
+
 async fn seed_series(client: &ChClient, rows: &[SeedSeriesRow]) {
     client
         .insert_block("metric_series", rows)
@@ -156,6 +184,7 @@ fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
+        hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
@@ -2271,6 +2300,158 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
         }
         other => panic!("expected Vector, got {other:?}"),
     }
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// M7-A5a end-to-end against real ClickHouse: the metrics read path
+/// UNCONDITIONALLY dual-reads `metric_samples` + `metric_hist_samples`,
+/// merges by `unix_milli`, and decodes histogram value columns into the
+/// value model. Proven by:
+///  - a **float** metric queried instant returns its float value unchanged
+///    (the dual-read leaves the float path byte-identical — its
+///    complementary histogram read is empty), and
+///  - a **histogram** metric queried instant AND range reaches the value
+///    model as a histogram-valued result (`h: Some`) — observable as the
+///    A5a `HistogramResultUnsupported` rejection, which is only reachable
+///    if the hist row was fetched, merged, and decoded (a fetch/merge/decode
+///    failure would instead yield an empty vector or a decode error).
+#[tokio::test]
+async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_dual_read_hist";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    // Two series: a float `up{job="api"}` (fp 1) and a native-histogram
+    // `req_seconds{job="api"}` (fp 2). Both registered in metric_series so
+    // the label cache resolves them; the float goes to metric_samples, the
+    // histogram to metric_hist_samples.
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "req_seconds".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            value: 42.0,
+        }],
+    )
+    .await;
+    seed_hist_samples(
+        &client,
+        &[SeedHistRow {
+            metric_name: "req_seconds".to_string(),
+            fingerprint: 2,
+            unix_milli: recent_bucket,
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0,
+            count: 4,
+            sum: 5.0,
+            pos_span_offsets: vec![0],
+            pos_span_lengths: vec![3],
+            pos_bucket_deltas: vec![1, 1, -1],
+            neg_span_offsets: vec![],
+            neg_span_lengths: vec![],
+            neg_bucket_deltas: vec![],
+            custom_values: vec![],
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+
+    // The float metric converts unchanged (dual-read's complementary hist
+    // read is empty for `up`).
+    let float = engine
+        .query(&parse("up").expect("parse"), &params)
+        .await
+        .expect("float query ok");
+    match float {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].value, 42.0);
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+
+    // The histogram metric was fetched from metric_hist_samples, merged,
+    // and decoded — reaching the value model as a histogram (rejected by
+    // the A5a encoder as `HistogramResultUnsupported`, never emitting 0.0).
+    let hist_instant = engine
+        .query(&parse("req_seconds").expect("parse"), &params)
+        .await;
+    assert!(
+        matches!(
+            hist_instant,
+            Err(pulsus_read::logql::ReadError::HistogramResultUnsupported)
+        ),
+        "instant histogram result must surface as HistogramResultUnsupported \
+         (proving the hist row was dual-read, merged, and decoded), got: {hist_instant:?}"
+    );
+
+    // The matrix path is detected independently (range query).
+    let range_params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket + 60_000,
+        step_ms: 60_000,
+    };
+    let hist_range = engine
+        .query(&parse("req_seconds").expect("parse"), &range_params)
+        .await;
+    assert!(
+        matches!(
+            hist_range,
+            Err(pulsus_read::logql::ReadError::HistogramResultUnsupported)
+        ),
+        "range histogram result must surface as HistogramResultUnsupported, got: {hist_range:?}"
+    );
 
     drop_database(&bootstrap, db).await;
 }

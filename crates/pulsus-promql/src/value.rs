@@ -5,15 +5,126 @@
 
 use std::collections::HashMap;
 
+use pulsus_model::{NativeHistogram, STALE_NAN_BITS};
+
 use crate::plan::SelectorId;
 
 /// One `(timestamp_ms, value)` point. `t_ms` is milliseconds since the
 /// Unix epoch (`metric_samples.unix_milli`, docs/schemas.md §2.3) —
 /// verbatim, never rounded.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// **Native-histogram channel (M7-A5a):** `h` carries a decoded
+/// [`NativeHistogram`] for a histogram sample (from `metric_hist_samples`,
+/// merged into the sample stream by the read path). It is `Some` only for
+/// a histogram value; a float sample leaves it `None` and reads `v`. The
+/// two are mutually exclusive by construction — `metric_samples` and
+/// `metric_hist_samples` never carry the same `(name, fp, unix_milli)`.
+/// `Box`ed so the float `Sample` stays small (a null pointer, no heap
+/// alloc for the `None` case). `Copy` is dropped for `Clone` because
+/// `NativeHistogram` owns `Vec`s.
+#[derive(Debug, Clone)]
 pub struct Sample {
     pub t_ms: i64,
     pub v: f64,
+    pub h: Option<Box<NativeHistogram>>,
+}
+
+impl Sample {
+    /// A float sample (`h: None`).
+    pub fn float(t_ms: i64, v: f64) -> Self {
+        Self { t_ms, v, h: None }
+    }
+
+    /// A native-histogram sample. `v` is unused for a histogram value and
+    /// set to `0.0` so the hand-written `PartialEq` float arm (`v == v`)
+    /// holds and `h` disambiguates.
+    pub fn hist(t_ms: i64, h: NativeHistogram) -> Self {
+        Self {
+            t_ms,
+            v: 0.0,
+            h: Some(Box::new(h)),
+        }
+    }
+
+    /// Whether this sample is Prometheus's stale marker: the float
+    /// `STALE_NAN` bit pattern, or (for a histogram) a `sum` carrying that
+    /// same pattern (A4 encodes histogram staleness as an empty histogram
+    /// with `sum = STALE_NAN_BITS`). An ordinary NaN is never stale — only
+    /// this exact bit pattern is (`value.IsStaleNaN`).
+    pub fn is_stale(&self) -> bool {
+        match &self.h {
+            Some(h) => h.sum.to_bits() == STALE_NAN_BITS,
+            None => self.v.to_bits() == STALE_NAN_BITS,
+        }
+    }
+}
+
+/// Bit-exact equality preserving the pre-M7 derived float semantics: the
+/// float value compares with native `f64::eq` (`self.v == o.v`, so
+/// `NaN != NaN`, exactly the old `#[derive(PartialEq)]`), and the
+/// histogram channel compares by [`NativeHistogram::bits_eq`]. A float
+/// sample (`h: None`) and a histogram sample (`h: Some`) are never equal.
+impl PartialEq for Sample {
+    fn eq(&self, o: &Self) -> bool {
+        self.t_ms == o.t_ms && self.v == o.v && hist_opt_eq(&self.h, &o.h)
+    }
+}
+
+/// One range-vector (matrix) point: a float or histogram value at `t_ms`.
+/// The histogram channel mirrors [`Sample::h`]. `PartialEq` is hand-written
+/// (same contract as [`Sample`]) because [`NativeHistogram`] lacks a
+/// derive.
+#[derive(Debug, Clone)]
+pub struct Point {
+    pub t_ms: i64,
+    pub v: f64,
+    pub h: Option<Box<NativeHistogram>>,
+}
+
+impl Point {
+    /// A float point (`h: None`).
+    pub fn float(t_ms: i64, v: f64) -> Self {
+        Self { t_ms, v, h: None }
+    }
+
+    /// A native-histogram point (`v` set to `0.0`, see [`Sample::hist`]).
+    pub fn hist(t_ms: i64, h: NativeHistogram) -> Self {
+        Self {
+            t_ms,
+            v: 0.0,
+            h: Some(Box::new(h)),
+        }
+    }
+}
+
+impl PartialEq for Point {
+    fn eq(&self, o: &Self) -> bool {
+        self.t_ms == o.t_ms && self.v == o.v && hist_opt_eq(&self.h, &o.h)
+    }
+}
+
+/// A float point compares equal to a `(t_ms, value)` tuple with the exact
+/// pre-M7 semantics (`v` via native `f64::eq`), so the `RangeSeries.points:
+/// Vec<(i64, f64)>` → `Vec<Point>` migration leaves every existing
+/// float-matrix `assert_eq!(series.points, vec![(t, v), …])` verdict
+/// unchanged (AC5, diff-gated). A histogram point (`h: Some`) is never
+/// equal to a bare float tuple — the tuple carries no histogram — so this
+/// can never mask a histogram-valued point as a float.
+impl PartialEq<(i64, f64)> for Point {
+    fn eq(&self, o: &(i64, f64)) -> bool {
+        self.h.is_none() && self.t_ms == o.0 && self.v == o.1
+    }
+}
+
+/// Shared histogram-channel equality for the hand-written `PartialEq`s
+/// ([`Sample`], [`Point`], [`InstantSample`], [`RangeSeries`]): both absent
+/// is equal, both present compares by bits, presence-mismatch is unequal.
+fn hist_opt_eq(a: &Option<Box<NativeHistogram>>, b: &Option<Box<NativeHistogram>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.bits_eq(y),
+        _ => false,
+    }
 }
 
 /// A thin, sorted `(key, value)` label vector — deliberately not
@@ -169,7 +280,7 @@ impl SeriesData {
 /// carries `None` for dropped series — the contract
 /// `pulsus-read::metrics::exec::with_metric_name` and the corpus judge
 /// consume (they read `metric_name` only, never `drop_name`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct InstantSample {
     pub labels: Labels,
     pub metric_name: Option<String>,
@@ -191,6 +302,24 @@ pub struct InstantSample {
     pub drop_name: bool,
     pub t_ms: i64,
     pub v: f64,
+    /// The native-histogram channel (M7-A5a) — mirrors [`Sample::h`].
+    /// `Some` only for a histogram-valued instant sample carried through
+    /// the evaluator's **selection** path; float samples leave it `None`.
+    pub h: Option<Box<NativeHistogram>>,
+}
+
+/// Bit-exact equality with the pre-M7 derived float semantics preserved
+/// (`v` via native `f64::eq`); the histogram channel compares by
+/// [`NativeHistogram::bits_eq`]. See [`Sample`]'s `PartialEq`.
+impl PartialEq for InstantSample {
+    fn eq(&self, o: &Self) -> bool {
+        self.labels == o.labels
+            && self.metric_name == o.metric_name
+            && self.drop_name == o.drop_name
+            && self.t_ms == o.t_ms
+            && self.v == o.v
+            && hist_opt_eq(&self.h, &o.h)
+    }
 }
 
 /// One range-vector (matrix) series: labels plus its ascending points. See
@@ -202,15 +331,28 @@ pub struct InstantSample {
 /// `seriess[h]` else-branch); later steps of the same identity never
 /// touch it — so `(m > 0) or (m + 1)`, whose per-step verdict alternates,
 /// is decided by whichever branch produced the identity's first step.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct RangeSeries {
     pub labels: Labels,
     pub metric_name: Option<String>,
     /// See [`InstantSample::drop_name`] — latched at the series' first
     /// evaluated step.
     pub drop_name: bool,
-    /// `(t_ms, value)`, ascending by `t_ms` — one point per evaluated step.
-    pub points: Vec<(i64, f64)>,
+    /// Ascending by `t_ms` — one [`Point`] per evaluated step. Each point
+    /// is float or (M7-A5a, selection path) native-histogram valued.
+    pub points: Vec<Point>,
+}
+
+/// Field-wise equality; `points` compares element-wise through [`Point`]'s
+/// hand-written `PartialEq` (bit-exact float arm + `bits_eq` histogram
+/// arm), preserving the pre-M7 derived verdict for float-only series.
+impl PartialEq for RangeSeries {
+    fn eq(&self, o: &Self) -> bool {
+        self.labels == o.labels
+            && self.metric_name == o.metric_name
+            && self.drop_name == o.drop_name
+            && self.points == o.points
+    }
 }
 
 /// The evaluator's result. An instant query ([`crate::plan::PlanParams`]
@@ -230,7 +372,121 @@ pub enum QueryValue {
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::{STALE_NAN_BITS, Span};
+
     use super::*;
+
+    /// `single_histogram` (`native_histograms.test:34`), the A3 corpus
+    /// fixture: `schema:0 sum:5 count:4 buckets:[1 2 1]` (deltas `[1 1 -1]`).
+    fn single_histogram() -> NativeHistogram {
+        NativeHistogram {
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0,
+            count: 4,
+            sum: 5.0,
+            positive_spans: vec![Span {
+                offset: 0,
+                length: 3,
+            }],
+            negative_spans: vec![],
+            positive_buckets: vec![1, 1, -1],
+            negative_buckets: vec![],
+            custom_values: vec![],
+        }
+    }
+
+    // -- M7-A5a: value-model equality (AC9) — float arm byte-identical,
+    //    histogram arm via NativeHistogram::bits_eq --
+
+    #[test]
+    fn two_equal_float_samples_are_eq_unchanged() {
+        assert_eq!(Sample::float(1000, 3.5), Sample::float(1000, 3.5));
+        assert_ne!(Sample::float(1000, 3.5), Sample::float(1000, 4.0));
+        // NaN != NaN preserved (native f64::eq), exactly the old derive.
+        assert_ne!(Sample::float(1000, f64::NAN), Sample::float(1000, f64::NAN));
+    }
+
+    #[test]
+    fn a_float_sample_and_a_histogram_sample_are_never_equal() {
+        assert_ne!(
+            Sample::float(1000, 0.0),
+            Sample::hist(1000, single_histogram())
+        );
+    }
+
+    #[test]
+    fn two_equal_histogram_samples_are_eq_by_bits() {
+        assert_eq!(
+            Sample::hist(1000, single_histogram()),
+            Sample::hist(1000, single_histogram())
+        );
+        let mut other = single_histogram();
+        other.count = 5;
+        assert_ne!(
+            Sample::hist(1000, single_histogram()),
+            Sample::hist(1000, other)
+        );
+    }
+
+    #[test]
+    fn stale_nan_sum_histogram_samples_are_eq_by_bits() {
+        let mut a = single_histogram();
+        a.sum = f64::from_bits(STALE_NAN_BITS);
+        let mut b = single_histogram();
+        b.sum = f64::from_bits(STALE_NAN_BITS);
+        assert_eq!(Sample::hist(1000, a), Sample::hist(1000, b));
+    }
+
+    #[test]
+    fn is_stale_covers_float_and_histogram_channels() {
+        assert!(Sample::float(0, f64::from_bits(STALE_NAN_BITS)).is_stale());
+        assert!(!Sample::float(0, 1.0).is_stale());
+        // An ordinary NaN is never stale (only the exact bit pattern is).
+        assert!(!Sample::float(0, f64::from_bits(0x7FF8_0000_0000_0001)).is_stale());
+        let mut stale = single_histogram();
+        stale.sum = f64::from_bits(STALE_NAN_BITS);
+        assert!(Sample::hist(0, stale).is_stale());
+        assert!(!Sample::hist(0, single_histogram()).is_stale());
+    }
+
+    #[test]
+    fn point_float_equals_the_tuple_form_for_the_migration() {
+        assert_eq!(Point::float(1000, 3.5), (1000i64, 3.5f64));
+        assert_ne!(Point::float(1000, 3.5), (1000i64, 4.0f64));
+        // A histogram point is never equal to a bare float tuple.
+        assert_ne!(Point::hist(1000, single_histogram()), (1000i64, 0.0f64));
+        // Vec<Point> == Vec<(i64, f64)> (the assertion-preserving path).
+        assert_eq!(
+            vec![Point::float(0, 1.0), Point::float(10, 2.0)],
+            vec![(0i64, 1.0f64), (10i64, 2.0f64)]
+        );
+    }
+
+    #[test]
+    fn instant_and_range_equality_thread_the_histogram_channel() {
+        let a = InstantSample {
+            labels: Labels::default(),
+            metric_name: None,
+            drop_name: false,
+            t_ms: 0,
+            v: 0.0,
+            h: Some(Box::new(single_histogram())),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let mut c = a.clone();
+        c.h = None;
+        assert_ne!(a, c); // presence mismatch
+        let r1 = RangeSeries {
+            labels: Labels::default(),
+            metric_name: None,
+            drop_name: false,
+            points: vec![Point::hist(0, single_histogram())],
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+    }
 
     #[test]
     fn labels_new_sorts_by_key_and_drops_dunder_name() {
@@ -288,7 +544,7 @@ mod tests {
             fingerprint: 1,
             metric_name: Some("up".to_string()),
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
-            samples: vec![Sample { t_ms: 0, v: 1.0 }],
+            samples: vec![Sample::float(0, 1.0)],
         }];
         data.insert(0, series.clone());
         assert_eq!(data.get(0), series.as_slice());

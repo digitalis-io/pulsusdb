@@ -133,9 +133,23 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         // exhaustiveness like `ReadError::Promql` below — mapped as a
         // too-broad-class client rejection, mirroring
         // `prom_api::error::read_error_parts`'s own 422 for it.
-        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => (
+        // M7-A5a: `HistogramResultUnsupported` is a metrics-only variant
+        // (the LogQL engine never produces it), matched here for
+        // exhaustiveness — mapped like the other 422 declines, mirroring
+        // `prom_api::error::read_error_parts`.
+        ReadError::QueryTooBroad(_)
+        | ReadError::NamelessSelectorUnresolvable { .. }
+        | ReadError::HistogramResultUnsupported => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
+            e.to_string(),
+            None,
+        ),
+        // M7-A5a: a histogram-decode failure is a metrics-only data-
+        // integrity defect (unreachable from LogQL), 500 `internal`.
+        ReadError::HistogramDecode(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
             e.to_string(),
             None,
         ),

@@ -130,6 +130,7 @@ pub fn vector_scalar(
                 drop_name,
                 t_ms: s.t_ms,
                 v,
+                h: None,
             })
         })
         .collect()
@@ -466,6 +467,7 @@ fn emit_pair(
             drop_name,
             t_ms: ls.t_ms,
             v: value,
+            h: None,
         });
     }
     Ok(())
@@ -540,6 +542,7 @@ fn synthetic_fill_sample(key: &MatchKey, other: &InstantSample, fill: f64) -> In
         drop_name: false,
         t_ms: other.t_ms,
         v: fill,
+        h: None,
     }
 }
 
@@ -675,6 +678,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 
@@ -688,6 +692,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 
@@ -2062,6 +2067,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v: 1.0,
+            h: None,
         }];
         let one = vec![
             InstantSample {
@@ -2070,6 +2076,7 @@ mod tests {
                 drop_name: false,
                 t_ms: 0,
                 v: 1.0,
+                h: None,
             },
             InstantSample {
                 labels: Labels::new(vec![("z".to_string(), "b".to_string())]),
@@ -2077,6 +2084,7 @@ mod tests {
                 drop_name: false,
                 t_ms: 0,
                 v: 2.0,
+                h: None,
             },
         ];
         let err = vv_group(

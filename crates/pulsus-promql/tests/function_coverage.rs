@@ -300,10 +300,7 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
     let mut data = SeriesData::new();
     for spec in &query_plan.selectors {
         let samples: Vec<Sample> = (1..=5)
-            .map(|k| Sample {
-                t_ms: k * 60_000,
-                v: k as f64,
-            })
+            .map(|k| Sample::float(k * 60_000, k as f64))
             .collect();
         data.insert(
             spec.id,

@@ -243,6 +243,9 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),
         metadata_table: "metric_metadata".to_string(),
+        // M7-A5a: the dual-read's complementary histogram table, `_dist`-
+        // aware exactly like `samples_table` (co-sharded Metrics family).
+        hist_samples_table: format!("metric_hist_samples{dist}"),
         // Issue #65 (M6-02): the experimental-function gate's production
         // carrier — `ReaderConfig -> MetricsConfig -> PlanParams`.
         experimental_functions: config.reader.promql_experimental_functions,

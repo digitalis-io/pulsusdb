@@ -601,7 +601,12 @@ fn compare_matrix(
     from_ms: i64,
     step_ms: i64,
 ) -> (bool, String) {
-    let actual_by_labels: Vec<(LabelsVec, &[(i64, f64)])> = actual
+    // M7-A5a: `RangeSeries.points` is now `Vec<Point>`; the float corpus
+    // differential projects each point to its `(t_ms, v)` tuple here (a
+    // histogram point would project its `v = 0.0`, but the native-histogram
+    // corpus is A6-wired and A5a's function set is still Unsupported, so
+    // every point the float corpus sees is float — byte-identical).
+    let actual_by_labels: Vec<(LabelsVec, Vec<(i64, f64)>)> = actual
         .iter()
         .map(|s| {
             let mut labels: LabelsVec = s.labels.0.clone();
@@ -609,7 +614,7 @@ fn compare_matrix(
                 labels.push(("__name__".to_string(), name.clone()));
             }
             labels.sort();
-            (labels, s.points.as_slice())
+            (labels, s.points.iter().map(|p| (p.t_ms, p.v)).collect())
         })
         .collect();
 
@@ -643,7 +648,7 @@ fn compare_matrix(
             );
         }
         matched_actual[idx] = true;
-        let got_points = actual_by_labels[idx].1;
+        let got_points = &actual_by_labels[idx].1;
         if got_points.len() != want_points.len() {
             return (
                 false,

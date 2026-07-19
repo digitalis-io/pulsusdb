@@ -51,11 +51,10 @@ impl TestStorage {
                 let t_ms = k as i64 * step_ms;
                 match v {
                     SeqValue::Gap => {}
-                    SeqValue::Stale => samples.push(Sample {
-                        t_ms,
-                        v: f64::from_bits(STALE_NAN_BITS),
-                    }),
-                    SeqValue::Value(v) => samples.push(Sample { t_ms, v: *v }),
+                    SeqValue::Stale => {
+                        samples.push(Sample::float(t_ms, f64::from_bits(STALE_NAN_BITS)))
+                    }
+                    SeqValue::Value(v) => samples.push(Sample::float(t_ms, *v)),
                 }
             }
             match self.series.iter_mut().find(|st| st.labels == s.labels) {
@@ -113,8 +112,8 @@ impl TestStorage {
                 let samples: Vec<Sample> = stored
                     .samples
                     .iter()
-                    .copied()
                     .filter(|s| s.t_ms > lower_excl && s.t_ms <= upper_incl)
+                    .cloned()
                     .collect();
                 fetched.push(FetchedSeries {
                     fingerprint: idx as u64,
