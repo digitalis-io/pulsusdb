@@ -527,6 +527,13 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // *function* as a whole (mirrors histogram_quantile's own
             // entry, whose native dispatch landed in the same sub-track).
             "histogram_fraction",
+            // M7-A6 (issue #124): the 5 native-histogram accessors, now
+            // corpus-witnessed via `native_histograms.test`.
+            "histogram_count",
+            "histogram_sum",
+            "histogram_avg",
+            "histogram_stddev",
+            "histogram_stdvar",
         ])
     );
 
@@ -538,22 +545,18 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
     // `grammar.rs`'s own doc; proof files must use none). Pinned exactly
     // so no other entry can quietly adopt the relaxed status: adding a
     // sixth name here must be as deliberate as flipping `implemented`.
+    // Issue #124 (M7-A6): the 5 native-histogram accessors flipped to
+    // `implemented` with a real `native_histograms.test` corpus witness
+    // now that the `{{...}}` load grammar lands — the pinned set is empty
+    // (not deleted): the drift guard stays live for any FUTURE entry that
+    // wants the relaxed status (it must still name an A6-style blocker).
     let unit_witnessed_fns: BTreeSet<&str> = manifest
         .functions
         .iter()
         .filter(|f| f.status == Status::ImplementedUnitWitnessed)
         .map(|f| f.name.as_str())
         .collect();
-    assert_eq!(
-        unit_witnessed_fns,
-        BTreeSet::from([
-            "histogram_count",
-            "histogram_sum",
-            "histogram_avg",
-            "histogram_stddev",
-            "histogram_stdvar",
-        ])
-    );
+    assert_eq!(unit_witnessed_fns, BTreeSet::new());
     assert!(
         manifest
             .aggregation_operators

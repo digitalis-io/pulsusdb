@@ -2373,21 +2373,41 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
         // arguments) routes through `plan_string_arg` — anything reaching
         // here (`"a" + 1`, `sum("x")`, …) is genuinely unplannable.
         Expr::StringLiteral(_) => Err(unsupported("string literal")),
-        // Issue #83 (adjudicated fold from the M6-08 split): unary minus
-        // desugars to `0 - operand` — upstream semantics exactly (unary
-        // minus is arithmetic-class: per-element negation, `__name__`
-        // dropped like every arithmetic operator; scalar operands negate
-        // through the same scalar-scalar path). The vendored parser folds
-        // unary over a bare number literal itself, so this arm only sees
-        // composite operands (`-metric`, `-10^3` ≡ `-(10^3)`, `---m`).
-        // Pinned by `at_modifier.test:61,65` (`-metric @ 100`,
-        // `---metric @ 100`).
+        // Issue #83 (adjudicated fold from the M6-08 split), reworked by
+        // issue #124 (M7-A6): unary minus desugars to `operand * -1` —
+        // upstream semantics exactly (unary minus is arithmetic-class:
+        // per-element negation, `__name__` dropped like every arithmetic
+        // operator; scalar operands negate through the same scalar-scalar
+        // path). The vendored parser folds unary over a bare number
+        // literal itself, so this arm only sees composite operands
+        // (`-metric`, `-10^3` ≡ `-(10^3)`, `---m`). Pinned by
+        // `at_modifier.test:61,65` (`-metric @ 100`, `---metric @ 100`).
+        //
+        // **`Mul`, not `Sub` (M7-A6 fix):** the ORIGINAL `0 - operand`
+        // desugaring was byte-identical to upstream for floats
+        // (`0.0 - x == -x`), but the pin does NOT actually evaluate
+        // `-metric` as a scalar-vector subtraction at all — `UnaryExpr`
+        // has its OWN dedicated engine case (`engine.go:2461-2480`) that
+        // negates floats and `Mul(-1)`s histograms directly. A `0 -
+        // histogram` genuinely has no disposal in the pin's own binop
+        // matrix (`vectorElemBinop`'s `hlhs==nil,hrhs!=nil` case supports
+        // only `MUL`; `SUB` there returns `IncompatibleTypesInBinOpInfo`
+        // and drops) — so the old desugaring silently dropped every
+        // histogram-valued unary-minus operand (`native_histograms.test`
+        // `-histogram_mul_div`/`-metric`). `operand * -1` uses the
+        // SYMMETRIC disposal the pin's matrix DOES support in both
+        // scalar-position arrangements (`hlhs!=nil,hrhs==nil,MUL` ⇒
+        // `hlhs.Copy().Mul(rhs)`), is bit-identical to `0 - x` for every
+        // float value (including signed zero and infinities), and
+        // preserves the same arithmetic-class `__name__`-drop semantics
+        // (`eval/binop.rs::vector_scalar` drops uniformly across every
+        // non-comparison operator, not `Sub`-specific).
         Expr::Unary(UnaryExpr { expr }) => {
             let operand = plan_expr(planner, expr)?;
             Ok(PlanExpr::Binary {
-                op: BinOp::Sub,
-                lhs: Box::new(PlanExpr::Scalar(0.0)),
-                rhs: Box::new(operand),
+                op: BinOp::Mul,
+                lhs: Box::new(operand),
+                rhs: Box::new(PlanExpr::Scalar(-1.0)),
                 bool_modifier: false,
                 matching: Matching::default_ignoring_none(),
                 group: Group::OneToOne,
@@ -3171,24 +3191,26 @@ mod tests {
         }
     }
 
-    /// Issue #83 (adjudicated unary fold): unary minus desugars to
-    /// `0 - operand` — arithmetic-class, so `__name__` drops and scalar
-    /// operands negate through the ordinary scalar path.
+    /// Issue #83 (adjudicated unary fold), reworked by issue #124
+    /// (M7-A6, `operand * -1` — the pin has no `0 - histogram` disposal):
+    /// unary minus desugars to `operand * -1` — arithmetic-class, so
+    /// `__name__` drops and scalar operands negate through the ordinary
+    /// scalar path.
     #[test]
-    fn unary_minus_desugars_to_zero_minus_operand() {
+    fn unary_minus_desugars_to_operand_times_minus_one() {
         let p = plan(&parse("-up").unwrap(), params()).unwrap();
         match &p.root {
             PlanExpr::Binary {
-                op: BinOp::Sub,
+                op: BinOp::Mul,
                 lhs,
                 rhs,
                 bool_modifier: false,
                 ..
             } => {
-                assert_eq!(**lhs, PlanExpr::Scalar(0.0));
-                assert_eq!(**rhs, PlanExpr::Selector(0));
+                assert_eq!(**lhs, PlanExpr::Selector(0));
+                assert_eq!(**rhs, PlanExpr::Scalar(-1.0));
             }
-            other => panic!("expected 0 - up, got {other:?}"),
+            other => panic!("expected up * -1, got {other:?}"),
         }
         // Stacked unaries nest (at_modifier.test:65's `---metric`).
         assert!(plan(&parse("---up").unwrap(), params()).is_ok());

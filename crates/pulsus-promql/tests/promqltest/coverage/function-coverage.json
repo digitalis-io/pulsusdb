@@ -271,14 +271,20 @@
     {
       "name": "histogram_avg",
       "experimental": false,
-      "status": "implemented_unit_witnessed",
-      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_avg(single_histogram)"
+      }
     },
     {
       "name": "histogram_count",
       "experimental": false,
-      "status": "implemented_unit_witnessed",
-      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_count(single_histogram)"
+      }
     },
     {
       "name": "histogram_fraction",
@@ -307,20 +313,29 @@
     {
       "name": "histogram_stddev",
       "experimental": false,
-      "status": "implemented_unit_witnessed",
-      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_stddev(histogram_stddev_stdvar_1)"
+      }
     },
     {
       "name": "histogram_stdvar",
       "experimental": false,
-      "status": "implemented_unit_witnessed",
-      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_stdvar(histogram_stddev_stdvar_1)"
+      }
     },
     {
       "name": "histogram_sum",
       "experimental": false,
-      "status": "implemented_unit_witnessed",
-      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_sum(single_histogram)"
+      }
     },
     {
       "name": "hour",

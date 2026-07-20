@@ -22,14 +22,37 @@
 
 use std::collections::BTreeMap;
 
+use pulsus_model::FloatHistogram;
+
+use super::histogram_literal::parse_histogram_series_item;
+
 /// One position in a series' value sequence.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum SeqValue {
     Value(f64),
     /// `_` — no sample at this position.
     Gap,
     /// `stale` — an explicit staleness marker sample.
     Stale,
+    /// A `{{...}}` native-histogram literal (issue #124, M7-A6).
+    Histogram(FloatHistogram),
+}
+
+/// Hand-written (mirrors [`pulsus_model::FloatHistogram::bits_eq`] for the
+/// `Histogram` arm, since `FloatHistogram` has no `PartialEq` derive —
+/// NaN-bearing fields). The only existing use site
+/// (`grammar.rs`'s `values.contains(&SeqValue::Stale)`) never compares two
+/// `Histogram` values against each other.
+impl PartialEq for SeqValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SeqValue::Value(a), SeqValue::Value(b)) => a == b,
+            (SeqValue::Gap, SeqValue::Gap) => true,
+            (SeqValue::Stale, SeqValue::Stale) => true,
+            (SeqValue::Histogram(a), SeqValue::Histogram(b)) => a.bits_eq(b),
+            _ => false,
+        }
+    }
 }
 
 /// Parses a full series-description line: metric part + value items.
@@ -215,10 +238,25 @@ fn scan_quoted_string(s: &str) -> Result<(String, &str), String> {
 }
 
 /// Parses the whitespace-separated value items of a series description.
+/// Not a plain `split_whitespace` (issue #124, M7-A6): a `{{...}}`
+/// histogram literal — and its optional `+{{...}}xN`/`-{{...}}xN`/`xN`
+/// combinator tail — legitimately contains internal whitespace
+/// (`buckets:[1 2 1]`), so histogram items are scanned by their own
+/// matching-`}}` grammar instead of being split on spaces first.
 pub fn parse_sequence(s: &str) -> Result<Vec<SeqValue>, String> {
     let mut out = Vec::new();
-    for item in s.split_whitespace() {
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        if rest.starts_with("{{") {
+            let (mut vals, r) = parse_histogram_series_item(rest)?;
+            out.append(&mut vals);
+            rest = r.trim_start();
+            continue;
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (item, r) = rest.split_at(end);
         out.extend(parse_sequence_item(item)?);
+        rest = r.trim_start();
     }
     Ok(out)
 }

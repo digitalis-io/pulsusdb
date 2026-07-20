@@ -211,9 +211,9 @@ fn upstream_corpus_replay_classifies_every_failure() {
                 entry.file
             ));
         }
-        if entry.blocking_directives.is_empty() {
+        if entry.blocking_directives.is_empty() && entry.manual_skip.is_none() {
             problems.push(format!(
-                "skip-manifest.json entry {:?} lists no blocking directives",
+                "skip-manifest.json entry {:?} lists no blocking directives and no manual_skip",
                 entry.file
             ));
         }
@@ -228,6 +228,20 @@ fn upstream_corpus_replay_classifies_every_failure() {
                 problems.push(format!(
                     "skip-manifest.json entry {:?} directive {:?} has no activation issue",
                     entry.file, d.directive
+                ));
+            }
+        }
+        if let Some(m) = &entry.manual_skip {
+            if m.reason.trim().is_empty() {
+                problems.push(format!(
+                    "skip-manifest.json entry {:?} manual_skip has an empty reason",
+                    entry.file
+                ));
+            }
+            if m.activation_issue.trim().is_empty() {
+                problems.push(format!(
+                    "skip-manifest.json entry {:?} manual_skip has no activation issue",
+                    entry.file
                 ));
             }
         }
@@ -267,14 +281,20 @@ fn upstream_corpus_replay_classifies_every_failure() {
                     continue;
                 }
                 skipped_files += 1;
+                let mut reasons: Vec<String> = entry
+                    .blocking_directives
+                    .iter()
+                    .map(|d| format!("{} (activates in {})", d.directive, d.activation_issue))
+                    .collect();
+                if let Some(m) = &entry.manual_skip {
+                    reasons.push(format!(
+                        "manual: {} (activates in {})",
+                        m.reason, m.activation_issue
+                    ));
+                }
                 println!(
                     "SKIPPED (loud, wholesale) {name}: blocked by {}",
-                    entry
-                        .blocking_directives
-                        .iter()
-                        .map(|d| format!("{} (activates in {})", d.directive, d.activation_issue))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    reasons.join(", ")
                 );
             }
             None => {

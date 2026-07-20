@@ -45,16 +45,31 @@ pub fn histogram_quantile(
     };
 
     // `bucket = it.At()` is assigned UNCONDITIONALLY every iteration in the
-    // pin (`quantile.go:253-261`) before the `Count == 0` skip — mirrored
-    // here via an `Option` seeded on the first visited bucket regardless of
-    // its count, not only the first *non-empty* one.
+    // pin (`quantile.go:253-261`), but `bucket` itself is declared OUTSIDE
+    // the loop (`var bucket histogram.Bucket[float64]`, `:236`) — so when
+    // `all` is EMPTY (a histogram with observations but zero populated
+    // buckets: `count > 0`, `sum` NaN, no zero/positive/negative bucket at
+    // all — the "100% NaN observations" shape), Go's `bucket` is left at
+    // its ZERO VALUE and execution falls through into the `count < rank`
+    // branch below, which is exactly how the NaN-result info fires for a
+    // bucket-less histogram (`native_histograms.test`'s `histogram_nan`
+    // cases). An early return here for the zero-iteration case would
+    // swallow that info — seed the Go zero value instead of treating
+    // "never visited" as absent.
     let mut count = 0.0f64;
     let mut idx = 0usize;
-    let mut bucket: Option<FloatBucket> = None;
+    let mut bucket = FloatBucket {
+        lower: 0.0,
+        upper: 0.0,
+        lower_inclusive: false,
+        upper_inclusive: false,
+        count: 0.0,
+        index: 0,
+    };
     while idx < all.len() {
         let b = all[idx];
         idx += 1;
-        bucket = Some(b);
+        bucket = b;
         if b.count == 0.0 {
             continue;
         }
@@ -63,9 +78,6 @@ pub fn histogram_quantile(
             break;
         }
     }
-    let Some(mut bucket) = bucket else {
-        return f64::NAN;
-    };
 
     if !h.uses_custom_buckets() && bucket.lower < 0.0 && bucket.upper > 0.0 {
         if h.negative_buckets.is_empty() && !h.positive_buckets.is_empty() {

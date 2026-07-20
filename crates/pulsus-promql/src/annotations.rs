@@ -39,12 +39,14 @@
 //! the position suffix (`annotations.go:333-341` — its own corpus
 //! comparison, query unset, sees the base message only; the HTTP wire,
 //! query set, sees the detail), while this port has no query-gated
-//! rendering mode and includes the detail on every `as_strings` render —
-//! per the `#124` review adjudication the detail is wire-visible message
-//! BODY content, and pulsus's only `as_strings` consumer IS the HTTP
-//! wire. No corpus check exercises this (the promqltest harness has no
-//! `expect warn`/`expect info` support yet — A6 scope; upstream's corpus
-//! comparison wouldn't see the detail anyway, per the gate above).
+//! rendering mode built into [`Self::as_strings`] and includes the
+//! detail on every call — per the `#124` review adjudication the detail
+//! is wire-visible message BODY content, and pulsus's only `as_strings`
+//! consumer IS the HTTP wire. Issue #124 (M7-A6) landed the promqltest
+//! `expect warn`/`expect info` harness, which needs the query-UNSET
+//! comparison instead — [`Self::base_messages`] is that second accessor
+//! (base message only, no cap, no detail), used exclusively by the
+//! corpus runner; `as_strings`/the HTTP wire are untouched.
 //!
 //! **Where the position omission is and is not observable (verified at
 //! the pin):**
@@ -53,8 +55,8 @@
 //!   1223-1226` — `checkAnnotations` iterates the raw `Annotations` map;
 //!   `SetQuery` never runs there), i.e. the **base message without any
 //!   position suffix** — byte-identical (module note above aside) to what
-//!   this module emits, so the A6 corpus comparison needs no position
-//!   tracking.
+//!   [`Self::base_messages`] emits, so the A6 corpus comparison needs no
+//!   position tracking.
 //! - The HTTP API envelope (`web/api/v1/api.go` `AsStrings(query, 10, 10)`)
 //!   DOES set the query, so upstream's wire `warnings`/`infos` strings end
 //!   in ` (<line>:<col>)` — pulsus's wire strings omit exactly that
@@ -250,6 +252,26 @@ impl Annotations {
         for item in other.items {
             self.add_item(item.kind, item.message, item.detail);
         }
+    }
+
+    /// Splits into `(warnings, infos)` of the BASE (query-unset) message
+    /// only — no cap, no detail-suffix rendering. Issue #124 (M7-A6): this
+    /// is what the promqltest corpus driver checks against, mirroring
+    /// upstream's `checkAnnotations` reading raw `err.Error()` with
+    /// `SetQuery` never called (this module's own doc — the corpus
+    /// comparison sees neither the position suffix nor the
+    /// forced-monotonicity detail, unlike [`Self::as_strings`], the
+    /// HTTP-wire renderer, which unconditionally appends the detail).
+    pub fn base_messages(&self) -> (Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut infos = Vec::new();
+        for item in &self.items {
+            match item.kind {
+                AnnotationKind::Info => infos.push(item.message.clone()),
+                AnnotationKind::Warning => warnings.push(item.message.clone()),
+            }
+        }
+        (warnings, infos)
     }
 
     /// Splits into `(warnings, infos)` with upstream's exact `AsStrings`

@@ -63,6 +63,11 @@
       "lines": 142
     },
     {
+      "name": "native_histograms.test",
+      "sha256": "7de7fd81f20544d5862b3953296a07aea7db5da8f39fc61fac86ca5f375365a8",
+      "lines": 2536
+    },
+    {
       "name": "operators.test",
       "sha256": "f1cdbbfee88b9f1f9a35f6ab3936d5b2e0170fb2f6f3f300cf0501074190f074",
       "lines": 1019
@@ -103,10 +108,5 @@
       "lines": 280
     }
   ],
-  "excluded": [
-    {
-      "name": "native_histograms.test",
-      "reason": "native histograms are M7 (#22) \u2014 the sole permitted M6 corpus exclusion (features.md section 7); vendored and activated by #22"
-    }
-  ]
+  "excluded": []
 }

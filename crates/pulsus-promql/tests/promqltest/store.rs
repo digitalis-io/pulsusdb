@@ -55,6 +55,7 @@ impl TestStorage {
                         samples.push(Sample::float(t_ms, f64::from_bits(STALE_NAN_BITS)))
                     }
                     SeqValue::Value(v) => samples.push(Sample::float(t_ms, *v)),
+                    SeqValue::Histogram(h) => samples.push(Sample::hist(t_ms, h.clone())),
                 }
             }
             match self.series.iter_mut().find(|st| st.labels == s.labels) {
