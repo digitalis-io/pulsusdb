@@ -353,7 +353,9 @@ impl MetricsEngine {
             };
 
             // A concrete-name selector may still carry non-Eq `__name__`
-            // matchers (`up{__name__!~"..."}`) — evaluated once, here,
+            // matchers (`up{__name__!~"..."}`), or a redundant/conflicting
+            // duplicate Eq `__name__` matcher (issue #85,
+            // `{__name__="a",__name__="b"}`) — evaluated once, here,
             // against the one concrete name.
             match super::labels::concrete_name_matches(&sel.name_matchers, metric_name) {
                 Ok(true) => {}

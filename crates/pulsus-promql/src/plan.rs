@@ -20,7 +20,12 @@
 //! against its name-keyed label cache (`pulsus-read`'s per-metric
 //! fan-out, capped) and carries each fetched series' own name on
 //! `FetchedSeries::metric_name`, so `__name__` still never enters the
-//! matcher list or the evaluator's `Labels`.
+//! matcher list or the evaluator's `Labels`. A second or later `Eq
+//! __name__` matcher inside braces (e.g. `{__name__="a",__name__="b"}`)
+//! also lands in `name_matchers` rather than erroring: the first `Eq`
+//! still sets `metric_name`, and the fetch layer's existing intersection
+//! resolves agreement to that name and conflict to an empty result with
+//! no query issued.
 
 use pulsus_model::{LabelMatcher, MatchOp};
 
@@ -91,11 +96,12 @@ pub struct SelectorSpec {
     /// `None` ⟺ a matcher-only or regex/negative-`__name__` selector —
     /// the fetch layer fans out over its name-keyed cache (issue #85).
     pub metric_name: Option<String>,
-    /// Non-`Eq` `__name__` matchers (`=~`/`!~`/`!=`), evaluated by the
-    /// fetch layer against candidate metric *names* (the single concrete
-    /// name when `metric_name` is `Some`, the cache's name key set when
-    /// `None`) — never against `Labels`, which excludes `__name__` by
-    /// construction.
+    /// Non-`Eq` `__name__` matchers (`=~`/`!~`/`!=`), plus any redundant or
+    /// conflicting duplicate `Eq __name__` matcher beyond the first
+    /// (issue #85), evaluated by the fetch layer against candidate metric
+    /// *names* (the single concrete name when `metric_name` is `Some`, the
+    /// cache's name key set when `None`) — never against `Labels`, which
+    /// excludes `__name__` by construction.
     pub name_matchers: Vec<LabelMatcher>,
     pub matchers: Vec<LabelMatcher>,
     /// `Some` for a matrix selector (the range-vector width); `None` for
@@ -1179,8 +1185,12 @@ fn or_matchers_rejection() -> PromqlError {
 /// from a [`VectorSelector`], per the module doc's metric-scoping rule
 /// (issue #85: matcher-only and regex/negative-`__name__` selectors now
 /// extract instead of erroring — `metric_name: None` plus the non-`Eq`
-/// `__name__` matchers in the dedicated name channel). Public because it
-/// is [`series_selector`]'s return type (issue #89).
+/// `__name__` matchers in the dedicated name channel). A second or later
+/// `Eq __name__` matcher (braces-only forms only — the parser still
+/// rejects a bare name combined with an explicit `__name__` matcher) also
+/// lands in the name channel rather than being rejected, so the fetch
+/// layer's intersection resolves agreement/conflict Prometheus-exactly.
+/// Public because it is [`series_selector`]'s return type (issue #89).
 pub type ExtractedSelector = (Option<String>, Vec<LabelMatcher>, Vec<LabelMatcher>);
 
 fn extract_name_and_matchers(vs: &VectorSelector) -> Result<ExtractedSelector, PromqlError> {
@@ -1197,13 +1207,15 @@ fn extract_name_and_matchers(vs: &VectorSelector) -> Result<ExtractedSelector, P
                 PLabelMatchOp::Equal if metric_name.is_none() => {
                     metric_name = Some(m.value.clone());
                 }
-                PLabelMatchOp::Equal => {
-                    // The parser rejects a bare name *and* an explicit
-                    // `__name__` matcher together before this is ever
-                    // reached, but this branch keeps the extraction total
-                    // rather than relying on that upstream invariant.
-                    return Err(unsupported("selector with a metric name set twice"));
-                }
+                // A second (or later) `Eq __name__` matcher — the parser
+                // rejects a bare name plus an explicit `__name__` matcher
+                // together (`metric name must not be set twice`), but
+                // braces-only forms like `{__name__="a",__name__="b"}` parse
+                // fine (issue #85: upstream only guards the bare-name case).
+                // Route it through `name_matchers`, which every consumer
+                // already intersects against the concrete name: agreement
+                // resolves to that name, conflict resolves to empty with no
+                // fetch issued.
                 _ => {
                     name_matchers.push(convert_matcher(m)?);
                 }
@@ -2786,6 +2798,79 @@ mod tests {
             ),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    // --- issue #85 combined/duplicate __name__ equality matchers: a
+    // second-or-later `Eq __name__` matcher (braces-only forms; a bare
+    // name plus an explicit matcher is still a parse-time reject) is now
+    // intersected via `name_matchers` instead of being rejected. ---
+
+    #[test]
+    fn a_conflicting_duplicate_name_matcher_intersects_instead_of_rejecting() {
+        let expr = parse(r#"{__name__="a",__name__="b"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "b".to_string(),
+            }]
+        );
+        assert!(p.selectors[0].matchers.is_empty());
+    }
+
+    #[test]
+    fn an_agreeing_duplicate_name_matcher_intersects_to_the_same_name() {
+        let expr = parse(r#"{__name__="a",__name__="a"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "a".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_quoted_leading_name_plus_a_name_matcher_intersects() {
+        let expr = parse(r#"{"bar", __name__="baz"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("bar"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "baz".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn three_or_more_duplicate_name_matchers_all_land_in_the_name_channel() {
+        let expr = parse(r#"{__name__="a",__name__="a",__name__="b"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Eq,
+                    value: "a".to_string(),
+                },
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Eq,
+                    value: "b".to_string(),
+                },
+            ]
+        );
     }
 
     // --- series_selector (issue #32 code-review round-1 fix) ---

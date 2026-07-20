@@ -43,15 +43,19 @@ pub struct DataWindow {
 /// which `MetricsEngine::discovery_series` resolves to candidate metric
 /// names through the label cache (bounded by the fan-out cap) before one
 /// flat `metric_name IN (…) AND fingerprint IN (…)` fetch. `metric_name`
-/// and `name_matchers` are never both meaningful for the same `__name__`
-/// matcher: an `Eq` name populates `metric_name`, anything else
-/// populates `name_matchers`.
+/// and `name_matchers` are never both meaningful for the *first*
+/// `__name__` matcher: the first `Eq` name populates `metric_name`,
+/// anything else populates `name_matchers`. Issue #85: a redundant or
+/// conflicting *duplicate* `Eq __name__` matcher beyond the first also
+/// lands in `name_matchers`, where it is intersected against the
+/// concrete name (agreement keeps it, conflict resolves to empty).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiscoveryFilter {
     pub metric_name: Option<String>,
-    /// Non-`Eq` (`Re`/`Nre`/`Neq`) `__name__` matchers — empty for the
-    /// common concrete-name and matcher-only cases, which keep their
-    /// existing single-query SQL paths untouched.
+    /// Non-`Eq` (`Re`/`Nre`/`Neq`) `__name__` matchers, plus any
+    /// duplicate `Eq __name__` matcher beyond the first (issue #85) —
+    /// empty for the common concrete-name and matcher-only cases, which
+    /// keep their existing single-query SQL paths untouched.
     pub name_matchers: Vec<LabelMatcher>,
     pub matchers: Vec<LabelMatcher>,
 }

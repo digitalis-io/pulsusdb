@@ -97,6 +97,15 @@ eval instant at 50m (http_requests_total{instance="0"} + 1) or http_requests_tot
 eval_fail instant at 50m {job="api" or instance="0"}
 	expected_fail_message label matchers must be comma-separated; "or" between matchers is not valid Prometheus selector syntax
 
+# --- Combined/duplicate __name__ equality matchers (issue #85): a
+# second `Eq __name__` matcher inside braces is no longer plan-rejected —
+# it intersects against the first via the existing name-matcher channel.
+# Agreement resolves to the named series; conflict resolves to empty.
+eval instant at 50m {__name__="other_requests_total",__name__="other_requests_total"}
+	other_requests_total{job="api", instance="0"} 300
+
+eval instant at 50m {__name__="http_requests_total",__name__="other_requests_total"}
+
 clear
 
 # --- Terminal metadata-collapse collision semantics (plan v4 Δ1), pinned
