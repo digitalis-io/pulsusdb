@@ -82,6 +82,20 @@ impl RawResponse {
     }
 }
 
+/// Token-matches `accept` in the (comma-joined) `Vary` header — never a
+/// substring check, since `accept-encoding` (the compression layer's own
+/// `Vary` contribution) contains `accept` as a substring but is a distinct
+/// token.
+fn has_vary_accept(res: &RawResponse) -> bool {
+    res.headers
+        .get("vary")
+        .map(|v| {
+            v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("accept"))
+        })
+        .unwrap_or(false)
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -152,12 +166,25 @@ fn request(
         .nth(1)?
         .parse::<u16>()
         .ok()?;
-    let headers: HashMap<String, String> = lines
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
-        })
-        .collect();
+    // Comma-join duplicate field lines (RFC 9110 §5.3) rather than
+    // last-wins: the response may legitimately carry two `Vary` lines
+    // (the handler's `accept` plus the compression layer's
+    // `accept-encoding`), and both must survive for a token-based match.
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let value = v.trim().to_string();
+        headers
+            .entry(key)
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
 
     let body = if headers
         .get("transfer-encoding")
@@ -386,6 +413,10 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let res = get(PORT, &fetch_path(&a_hex), &[], ctx);
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
+    assert!(
+        has_vary_accept(&res),
+        "{ctx}: negotiating route must Vary: accept"
+    );
     let default_json_body = res.body.clone();
     let decoded: TracesData = serde_json::from_slice(&res.body)
         .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize as TracesData: {e}"));
@@ -412,6 +443,10 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
     assert_eq!(res.body, default_json_body, "{ctx}: byte-identical JSON");
+    assert!(
+        !has_vary_accept(&res),
+        "{ctx}: the forcing route never consults Accept, so no Vary: accept"
+    );
 
     // -- /json with a protobuf Accept: still JSON (forcing ignores Accept).
     let ctx = "GET trace A /json with Accept: application/protobuf";
@@ -424,6 +459,7 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     assert_eq!(res.status, 200, "{ctx}");
     assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
     assert_eq!(res.body, default_json_body, "{ctx}: byte-identical JSON");
+    assert!(!has_vary_accept(&res), "{ctx}: still no Vary: accept");
 
     // -- Accept: application/protobuf and the x-protobuf request alias:
     // 200 application/protobuf, prost-decodes to the same spans.
@@ -435,6 +471,10 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
             res.content_type(),
             Some("application/protobuf"),
             "{ctx}: response content-type is always application/protobuf, never x-protobuf"
+        );
+        assert!(
+            has_vary_accept(&res),
+            "{ctx}: negotiating route must Vary: accept"
         );
         let decoded = TracesData::decode(res.body.as_slice())
             .unwrap_or_else(|e| panic!("{ctx}: body must prost-decode as TracesData: {e}"));
@@ -453,15 +493,18 @@ async fn trace_fetch_serves_negotiated_representations_against_real_clickhouse()
     let ctx = "GET trace A with Accept: text/plain";
     let res = get(PORT, &fetch_path(&a_hex), &[("accept", "text/plain")], ctx);
     assert_error_envelope(&res, 406, "not_acceptable", ctx);
+    assert!(has_vary_accept(&res), "{ctx}: 406 must Vary: accept");
 
     // -- Absent + malformed ids.
     let ctx = "GET absent trace";
     let res = get(PORT, &fetch_path(&"ee".repeat(16)), &[], ctx);
     assert_error_envelope(&res, 404, "not_found", ctx);
+    assert!(has_vary_accept(&res), "{ctx}: 404 must Vary: accept");
 
     let ctx = "GET malformed trace id";
     let res = get(PORT, &fetch_path("zzzz"), &[], ctx);
     assert_error_envelope(&res, 400, "bad_data", ctx);
+    assert!(has_vary_accept(&res), "{ctx}: 400 must Vary: accept");
 
     // -- Dedup: ingest the same span twice, fetch returns it once.
     let trace_b = [0xbb; 16];
@@ -616,6 +659,10 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
         let res = assert_alias_native_identity(port, &alias_fetch, &native_fetch, &[], &ctx);
         assert_eq!(res.status, 200, "{ctx}");
         assert_eq!(res.content_type(), Some("application/json"), "{ctx}");
+        assert!(
+            has_vary_accept(&res),
+            "{ctx}: negotiating alias must Vary: accept"
+        );
         let decoded: TracesData = serde_json::from_slice(&res.body)
             .unwrap_or_else(|e| panic!("{ctx}: protojson must deserialize: {e}"));
         assert_eq!(spans_of(&decoded).len(), 2, "{ctx}: non-empty seeded body");
@@ -631,6 +678,10 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
         );
         assert_eq!(res.status, 200, "{ctx}");
         assert_eq!(res.content_type(), Some("application/protobuf"), "{ctx}");
+        assert!(
+            has_vary_accept(&res),
+            "{ctx}: negotiating alias must Vary: accept"
+        );
         let decoded = TracesData::decode(res.body.as_slice())
             .unwrap_or_else(|e| panic!("{ctx}: body must prost-decode as TracesData: {e}"));
         assert_eq!(spans_of(&decoded).len(), 2, "{ctx}: non-empty seeded body");

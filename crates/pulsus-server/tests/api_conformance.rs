@@ -125,6 +125,20 @@ impl RawResponse {
         serde_json::from_slice(&self.body)
             .unwrap_or_else(|e| panic!("{ctx}: invalid JSON body: {e}\nbody: {:?}", self.body))
     }
+
+    /// Token-matches `accept` in the (comma-joined) `Vary` header — never a
+    /// substring check, since `accept-encoding` (the compression layer's
+    /// own `Vary` contribution) contains `accept` as a substring but is a
+    /// distinct token.
+    fn has_vary_accept(&self) -> bool {
+        self.headers
+            .get("vary")
+            .map(|v| {
+                v.split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("accept"))
+            })
+            .unwrap_or(false)
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -199,12 +213,25 @@ fn raw_request(port: u16, req: &manifest::Req) -> Option<RawResponse> {
         .nth(1)?
         .parse::<u16>()
         .ok()?;
-    let headers: HashMap<String, String> = lines
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
-        })
-        .collect();
+    // Comma-join duplicate field lines (RFC 9110 §5.3) rather than
+    // last-wins: a negotiating-route response may carry two `Vary` lines
+    // (the handler's `accept` plus the compression layer's
+    // `accept-encoding`), and both must survive for a token-based match.
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let value = v.trim().to_string();
+        headers
+            .entry(key)
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
 
     let dechunked = if headers
         .get("transfer-encoding")
@@ -1108,6 +1135,18 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
     };
     let path = resolve_path(spec.path);
 
+    // The negotiating route (`trace_by_id`) carries `Vary: accept` on
+    // every response it returns (issue #55 follow-up); the `/json` route
+    // (`trace_by_id_json`) never consults `Accept`, so it never does.
+    let negotiating = !spec.path.ends_with("/json");
+    let assert_vary = |res: &RawResponse, ctx: &str| {
+        if negotiating {
+            assert!(res.has_vary_accept(), "{ctx}: must Vary: accept");
+        } else {
+            assert!(!res.has_vary_accept(), "{ctx}: /json never Vary: accept");
+        }
+    };
+
     for &method in spec.methods {
         let ctx = format!(
             "[{spawn}] {} {} case=documented-method-absent-404",
@@ -1123,6 +1162,7 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
             String::from_utf8_lossy(&res.body)
         );
         assert_success_envelope(spec, &res, &ctx);
+        assert_vary(&res, &ctx);
     }
 
     // A 16-hex short id is *accepted* (left-padded to 32) and absent — 404
@@ -1138,6 +1178,7 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
         String::from_utf8_lossy(&res.body)
     );
     assert_case_envelope(&res, &absent_404, &ctx);
+    assert_vary(&res, &ctx);
 
     // Errors never switch representation: a protobuf-flavoured `Accept`
     // (both the canonical name and the x- request-side alias) still gets
@@ -1153,17 +1194,38 @@ fn assert_traces_fetch_route(port: u16, spec: &RouteSpec, spawn: &str) {
         let res = raw_request(port, &req).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
         assert_eq!(res.status, 404, "{ctx}: status");
         assert_case_envelope(&res, &absent_404, &ctx);
+        assert_vary(&res, &ctx);
     }
+
+    // Inline malformed-hex 400 cell (issue #55 follow-up; deliberately not
+    // routed through the manifest's shared `malformed_hex` `CaseClass` /
+    // `run_case` — those are shared with routes this fix does not touch).
+    let ctx = format!("[{spawn}] GET {} case=malformed-hex-400-vary", spec.path);
+    let malformed_path = path.replace(
+        manifest::ABSENT_TRACE_ID,
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    );
+    let res = get(port, &malformed_path, &ctx);
+    assert_eq!(res.status, 400, "{ctx}: status");
+    assert_vary(&res, &ctx);
 
     let ctx = format!("[{spawn}] POST {} case=undocumented-method-405", spec.path);
     let post = manifest::Req::new("POST", path.clone());
     let res = raw_request(port, &post).unwrap_or_else(|| panic!("{ctx}: must be reachable"));
     assert_405_with_allow(&res, &ctx, spec.methods);
+    assert!(
+        !res.has_vary_accept(),
+        "{ctx}: axum-generated 405 must not carry the handler's Vary"
+    );
 
     let ctx = format!("[{spawn}] GET {} case=extra-segment-sibling-404", spec.path);
     let sibling = format!("{path}/conformance-nonexistent");
     let res = get(port, &sibling, &ctx);
     assert_404_empty(&res, &ctx);
+    assert!(
+        !res.has_vary_accept(),
+        "{ctx}: axum-generated sibling-404 must not carry the handler's Vary"
+    );
 
     for case in spec.cases {
         run_case(port, spec, case, spawn);
