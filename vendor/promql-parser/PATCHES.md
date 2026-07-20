@@ -124,45 +124,92 @@ The patches fall into two classes:
 
 ## 6. `info()` second-argument empty-matcher bypass (issue #82, M6-05b)
 
-- **Files:** `src/parser/ast.rs` (`check_ast_for_vector_selector`, new
-  `check_no_empty_selectors`), `src/parser/parse.rs` (`parse`)
+- **Files:** `src/parser/ast.rs` (`check_ast`, `check_ast_for_vector_selector`,
+  `check_ast_for_unary`, `check_ast_for_binary_expr`,
+  `check_ast_for_subquery`, `check_ast_for_aggregate_expr`,
+  `check_ast_for_call`, new `reject_empty_operand`/
+  `is_bare_empty_selector`/`check_ast_for_matrix_selector`, existing
+  `check_no_empty_selectors`), `src/parser/parse.rs` (`parse`,
+  `test_issue_82_*`)
 - **Bug:** Prometheus v3.13.0 exempts exactly one context from the
   "vector selector must contain at least one non-empty matcher" rule —
   `info()`'s second argument (`VectorSelector.BypassEmptyMatcherCheck`,
-  `parse.go` checkAST), a label-selector-only position where an
-  all-empty-matching selector like `{data=~".*"}` or
-  `{__name__!="target_info"}` is legal (several `info.test` corpus cases
-  use exactly these). This crate ran the rejection at the selector's own
-  grammar reduction, before any enclosing call is known, so those
-  queries failed to parse.
-- **Fix:** the rejection for a selector *carrying* matchers moved to a
-  post-parse iterative walk (`check_no_empty_selectors`, run by
-  `parse()`) that skips `info()`'s second argument; a rejected tree is
-  then dismantled iteratively (`ast::dismantle`) so the deferred path
-  adds no stack use beyond the generated parser's own recursion. The
-  literal `{}` (zero matchers) keeps failing at reduction time: the
-  pinned deep fuzz-regression input (`(-{}-1…` ×10k) relies on that
-  first-reduction short-circuit — the generated LR parser's OWN
-  recursion (a pre-existing, patch-independent property) overflows a
-  2 MiB stack at ~9k `-{…}-1` units for *any* input it fully builds,
-  valid `-m-1` chains included (measured; instrumentation showed the
-  overflow fires inside the grammar before any patch code runs), so
-  deferring `{}` would turn that pinned `Err` into an abort. Within the
-  grammar's surviving depth (~8k units) the deferred rejection is
-  proven stack-safe by regression tests here (`test_corner_fail_cases`)
-  and in `pulsus-promql`
-  (`deep_all_empty_matcher_input_is_rejected_and_destroyed_without_overflow`,
-  which rides the workspace CI gauntlet — this vendored crate is its
-  own cargo workspace and is not exercised by `cargo test --workspace`).
-- **Deliberate divergence from upstream:** `info(m, {})` stays rejected
-  ("vector selector must contain at least one non-empty matcher") where
-  upstream's bypass admits it — the zero-matcher form appears in no
-  corpus case and semantically adds nothing over `info(m)`.
+  `parse.go:851-859`), a label-selector-only position where an
+  all-empty-matching selector like `{data=~".*"}`, or the literal `{}`
+  itself, is legal. This crate ran the rejection at the selector's own
+  grammar reduction, before any enclosing call is known, so `info(m,
+  {})` and several `info.test` corpus shapes failed to parse.
+- **First fix (superseded within this same patch):** the rejection
+  moved wholesale to a post-parse iterative walk
+  (`check_no_empty_selectors`) that skips `info()`'s second argument,
+  keeping the literal `{}` rejected at the selector's own reduction as a
+  load-bearing stack-overflow guard. A retroactive re-review (issue #82)
+  found this left `info(m, {})` itself rejected (the one case upstream's
+  bypass exists for) and — separately — left the per-step `info()` info-
+  family fetch unbounded before materialization (see the reader-side fix
+  tracked on issue #82, not part of this vendored patch).
+- **Current fix:** the eager reject is RELOCATED off the selector leaf
+  onto every depth-adding reduction one level up
+  (`reject_empty_operand`, called from `check_ast_for_unary`/
+  `check_ast_for_binary_expr`/`check_ast_for_subquery`/
+  `check_ast_for_aggregate_expr`/the `Expr::Paren` arm of `check_ast`;
+  plus a dedicated `check_ast_for_matrix_selector`, since a
+  `MatrixSelector` reduces through `check_ast` directly — `promql.y:194`
+  — with no operand-level check otherwise seeing it, letting a
+  range-wrapped empty selector like `rate({}[5m])` hide past every
+  `VectorSelector`-only guard). `check_ast_for_call` applies the same
+  guard to every call argument EXCEPT `info()`'s SECOND argument (index
+  1, 0-indexed — matching the existing deferred bypass's own
+  `bypass_second && i == 1`); `info()`'s own first argument is NOT
+  exempt (`info({})` still rejects). `check_no_empty_selectors` is
+  unchanged and stays the backstop for the one shape with no wrapping
+  reduction to be eager on: a bare top-level `{}` (which cannot
+  overflow — nothing nests it).
+  - **Measured, not assumed (debug, 2 MiB thread — the round-2/round-3
+    plan reviews required reproducible evidence before this landed):**
+    the pre-existing overflow bound is in the generated LR grammar
+    itself, not the empty-matcher check — fully VALID input (`(-m-1)×N`)
+    overflows at N=9000 regardless of this patch. The eager relocation
+    is *more* overflow-safe than both the original leaf check and the
+    deferred walk: `(-{}-1)×N` never overflows up to N=11000 (the
+    shallow leftmost `{}` short-circuits via `check_ast_for_unary`
+    before the outer nesting is ever built), and
+    `abs(×10000 rate({}[5m]) )×10000` returns a clean `Err` with no
+    overflow (the `MatrixSelector` arm fires at the innermost reduction,
+    long before the 10000 wrapping `abs()` calls could matter). The
+    pinned fuzz case (`parse.rs` `test_corner_fail_cases`,
+    `(-{}-1…`×10k + `[1m:]`×1000) is **unchanged** — same input, same
+    `Err` message, still stack-safe. Full vendored suite: 121→123/123
+    green in debug (0.24s total — the eager short-circuit is strictly
+    faster than either prior version, which had to build the deep tree
+    before rejecting).
+  - **Paren-wrapped empty selector in `info()`'s arg-1 stays rejected —
+    this is parity, not a regression.** `info(m, ({}))` REJECTS under
+    this patch (the eager `Expr::Paren` guard fires on the inner `{}`
+    before the enclosing `info()` call is known) — and this matches BOTH
+    the shipped deferred walk (`check_no_empty_selectors`'s `Expr::Paren`
+    arm resets `bypass` to `false` unconditionally, so a paren-wrapped
+    inner selector was never exempt even before this patch) AND upstream
+    Prometheus v3.13.0, whose bypass type-asserts arg 1 directly to
+    `*VectorSelector` (`parse.go:851-859`); a `*ParenExpr` fails that
+    assertion and errors `expected label selectors only` — parens are
+    not transparent for `info()`'s selector argument upstream either.
+    Propagating the exemption through parens would make this crate
+    ACCEPT `info(m, ({}))`, diverging FROM upstream rather than closing
+    a gap — not implemented. No divergence-ledger entry for this shape.
+- **Divergence from upstream (unrelated, pre-existing, out of scope):**
+  this crate has no analogue of upstream's "arg-1 must be a **direct**
+  label-selector" type assertion, so it accepts a paren-wrapped
+  **non-empty** `info(m, ({job="x"}))` where upstream rejects it
+  (`expected label selectors only`) — orthogonal to the empty-matcher
+  fix above; tracked on the reader-side issue, not fixed here.
 - **Corpus inputs fixed:** `info(metric, {data=~".*"})`,
   `info(metric, {non_existent=~".*"})`,
   `info(metric, {__name__!="target_info"})`,
   `info(metric, {__name__!~".+_info", data=~".*"})` (the vendored
-  `info.test` shapes, exercised by `proof/m6_05b_info.test`).
+  `info.test` shapes) plus, as of this revision, `info(metric, {})`
+  itself and its in-place `@`/`offset` field-modifier forms
+  (`info(m, {}@5)`, `info(m, {} offset 5m)`).
 - **Upstream PR:** not yet filed (targets v3.13 semantics past the
   crate's v2.45 baseline, like G1 — recorded here as the divergence
   ledger instead).

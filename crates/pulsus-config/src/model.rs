@@ -288,6 +288,18 @@ pub struct ReaderConfig {
     /// without tripping the fan-out or `cache_max_series` guards.
     /// Operator-scale tuning routes to issue #25.
     pub promql_max_cache_scan: u64,
+    /// Issue #82 (retroactive re-review): the pathological-cardinality
+    /// backstop on a PromQL `info()` node's synthetic `*_info`
+    /// metadata-family selector — how many series that family may
+    /// resolve to before the query is rejected as too broad (default
+    /// 100_000, above realistic scrape-target-count fleets — a backstop,
+    /// not the narrowing). Enforced BEFORE any sample fetch is issued.
+    /// Distinct from `promql_max_metric_fanout` (bounds distinct metric
+    /// *names*, not series) and `promql_max_cache_scan` (bounds
+    /// examined, not matched, cache entries). Identifying-label VALUE
+    /// narrowing of the fetch (closing the gap this cap merely
+    /// backstops) routes to issue #25.
+    pub promql_max_info_series: u64,
     pub logql_scan_budget_bytes: ByteSize,
     /// Issue M6-09 / #90 (LogQL pipelines): the **first-page fetch-size
     /// hint** for fetch-until-limit paging, applied when a query pipeline
@@ -375,6 +387,7 @@ impl Default for ReaderConfig {
             promql_experimental_functions: false,
             promql_max_metric_fanout: 1_000,
             promql_max_cache_scan: 200_000,
+            promql_max_info_series: 100_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,

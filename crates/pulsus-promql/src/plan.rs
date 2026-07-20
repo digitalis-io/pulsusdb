@@ -109,6 +109,13 @@ pub struct SelectorSpec {
     pub at_ms: Option<i64>,
     /// Accumulated fetch-window context. Fetch only; never affects eval.
     pub fetch: FetchExtent,
+    /// Issue #82 (retroactive re-review, v4 Δ1): `true` for the ONE
+    /// synthetic selector `plan_info` pushes per `info()` node — the
+    /// `*_info` metadata-family fetch. Fetch only; never affects eval.
+    /// Marks the selector for the reader's pre-materialization
+    /// `promql_max_info_series` cardinality cap (never applied to an
+    /// ordinary selector, which must always return complete results).
+    pub info_family: bool,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -805,6 +812,13 @@ struct Planner {
 }
 
 impl Planner {
+    /// `info_family` (issue #82, retroactive re-review v4 Δ1): `true`
+    /// only from `plan_info`'s single call site — marks the synthetic
+    /// `*_info` metadata-family selector for the reader's
+    /// pre-materialization cardinality cap. The
+    /// `gate_duration_expr`/`experimental` precedent for a plain `bool`
+    /// param on a narrow, internal, few-call-site helper.
+    #[allow(clippy::too_many_arguments)]
     fn push_selector(
         &mut self,
         metric_name: Option<String>,
@@ -813,6 +827,7 @@ impl Planner {
         range_ms: Option<i64>,
         offset_ms: i64,
         at_ms: Option<i64>,
+        info_family: bool,
     ) -> SelectorId {
         // Own `@` dominates and discards the accumulated subquery context
         // (the sub-tree is step-invariant at that fixed time); otherwise
@@ -840,6 +855,7 @@ impl Planner {
             offset_ms,
             at_ms,
             fetch,
+            info_family,
         });
         id
     }
@@ -1223,7 +1239,15 @@ fn plan_vector_selector(
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
     let offset = planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?;
-    let id = planner.push_selector(metric_name, name_matchers, matchers, None, offset, at_ms);
+    let id = planner.push_selector(
+        metric_name,
+        name_matchers,
+        matchers,
+        None,
+        offset,
+        at_ms,
+        false,
+    );
     Ok(PlanExpr::Selector(id))
 }
 
@@ -1249,6 +1273,7 @@ fn plan_matrix_selector_id(
         Some(range_ms),
         offset,
         at_ms,
+        false,
     ))
 }
 
@@ -1918,6 +1943,7 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             None,
             offset_ms,
             at_ms,
+            true,
         );
         Ok(PlanExpr::Info {
             base: Box::new(base),
@@ -4098,6 +4124,7 @@ mod tests {
                 extra_range_ms: 0,
                 total_offset_ms: 60_000,
             },
+            info_family: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -4983,7 +5010,16 @@ mod tests {
         let p = plan(&parse("info(m)").unwrap(), params_experimental()).unwrap();
         assert_eq!(p.selectors.len(), 2);
         assert_eq!(p.selectors[0].metric_name.as_deref(), Some("m"));
+        assert!(
+            !p.selectors[0].info_family,
+            "the base selector is an ordinary fetch, never info-family"
+        );
         assert_eq!(p.selectors[1].metric_name.as_deref(), Some("target_info"));
+        assert!(
+            p.selectors[1].info_family,
+            "issue #82 (retroactive re-review): the synthetic info-family \
+             selector must carry the pre-materialization cap marker"
+        );
         assert!(p.selectors[1].name_matchers.is_empty());
         assert!(p.selectors[1].matchers.is_empty());
         assert_eq!(p.selectors[1].range_ms, None);
@@ -5153,6 +5189,55 @@ mod tests {
                 .contains("vector selector must contain at least one non-empty matcher"),
             "{err}"
         );
+    }
+
+    /// Issue #82 v5/v6 AC2: `info(m, {})` — the literal empty matcher as
+    /// `info()`'s second argument, now accepted by the vendored parser —
+    /// plans IDENTICALLY to `info(m)` (no arg1 at all): empty
+    /// `info_name_matchers`/`data_matchers` fold to the same
+    /// `effective_info_name_matchers` default-`target_info` branch, so
+    /// the flattened selector set and the `PlanExpr::Info` node are
+    /// byte-equal.
+    #[test]
+    fn m6_05b_info_empty_matcher_second_arg_plans_identically_to_info_m() {
+        let with_empty = plan(&parse("info(m, {})").unwrap(), params_experimental()).unwrap();
+        let bare = plan(&parse("info(m)").unwrap(), params_experimental()).unwrap();
+        assert_eq!(with_empty.selectors, bare.selectors);
+        assert_eq!(with_empty.root, bare.root);
+    }
+
+    /// Issue #82 v6: field-modifier wrappers on the exempt direct
+    /// selector (`@`/`offset` are in-place `VectorSelector` fields, not
+    /// wrapper nodes) still parse and plan — `info(m, {}@5)` carries the
+    /// same empty-matcher arg1 as `info(m, {})`, just with an `@`
+    /// attached that upstream's bypass also accepts.
+    #[test]
+    fn m6_05b_info_empty_matcher_with_at_or_offset_modifier_still_plans() {
+        for query in ["info(m, {}@5)", "info(m, {} offset 5m)"] {
+            let p = plan(&parse(query).unwrap(), params_experimental());
+            assert!(p.is_ok(), "{query}: {p:?}");
+            match &p.unwrap().root {
+                PlanExpr::Info { .. } => {}
+                other => panic!("{query}: expected Info, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #82 v6: a paren-wrapped empty matcher in `info()`'s second
+    /// argument is REJECTED (Prometheus v3.13.0 parity — the bypass
+    /// type-asserts a direct `*VectorSelector`; a `*ParenExpr` fails
+    /// that assertion). Confirms the plan-time rejection surfaces the
+    /// parser's own message, not a plan-time panic.
+    #[test]
+    fn m6_05b_info_paren_wrapped_empty_matcher_second_arg_is_rejected() {
+        for query in ["info(m, ({}))", "info(m, (({})))"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("vector selector must contain at least one non-empty matcher"),
+                "{query}: {err}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

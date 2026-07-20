@@ -60,6 +60,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS",
     "PULSUS_PROMQL_MAX_METRIC_FANOUT",
     "PULSUS_PROMQL_MAX_CACHE_SCAN",
+    "PULSUS_PROMQL_MAX_INFO_SERIES",
     "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
     "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
@@ -298,6 +299,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_PROMQL_MAX_CACHE_SCAN") {
         cfg.reader.promql_max_cache_scan = parse_int("PULSUS_PROMQL_MAX_CACHE_SCAN", &v)?;
     }
+    if let Some(v) = read("PULSUS_PROMQL_MAX_INFO_SERIES") {
+        cfg.reader.promql_max_info_series = parse_int("PULSUS_PROMQL_MAX_INFO_SERIES", &v)?;
+    }
     if let Some(v) = read("PULSUS_LOGQL_SCAN_BUDGET_BYTES") {
         cfg.reader.logql_scan_budget_bytes = parse_size("PULSUS_LOGQL_SCAN_BUDGET_BYTES", &v)?;
     }
@@ -366,8 +370,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            63,
-            "docs/configuration.md §§1-8 document exactly 63 variables"
+            64,
+            "docs/configuration.md §§1-8 document exactly 64 variables"
         );
     }
 
@@ -399,5 +403,14 @@ mod tests {
     fn invalid_promql_max_cache_scan_is_rejected_at_load() {
         let err = parse_int::<u64>("PULSUS_PROMQL_MAX_CACHE_SCAN", "not-a-number").unwrap_err();
         assert!(err.to_string().contains("PULSUS_PROMQL_MAX_CACHE_SCAN"));
+    }
+
+    /// Issue #82 (retroactive re-review): a non-integer
+    /// `PULSUS_PROMQL_MAX_INFO_SERIES` is rejected at config load through
+    /// the shared `parse_int` path.
+    #[test]
+    fn invalid_promql_max_info_series_is_rejected_at_load() {
+        let err = parse_int::<u64>("PULSUS_PROMQL_MAX_INFO_SERIES", "not-a-number").unwrap_err();
+        assert!(err.to_string().contains("PULSUS_PROMQL_MAX_INFO_SERIES"));
     }
 }

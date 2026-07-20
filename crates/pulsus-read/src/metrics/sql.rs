@@ -97,6 +97,35 @@ pub fn historical_series_subquery(
     sql
 }
 
+/// Issue #82 (retroactive re-review, Finding 1): bounds an `info()`
+/// node's DEGRADED-path (cache-miss) series-selection subquery — the
+/// exact [`historical_series_subquery`] text
+/// `super::labels::LabelledResolution::SqlFallback` already returns —
+/// with a `LIMIT cap+1` (the group-B `distinct_metric_names_probe`
+/// shape below), so the caller can COUNT the returned rows and reject
+/// `> cap` BEFORE the unbounded subquery is ever inlined into the real
+/// sample fetch (`sample_fetch_subquery`) — the info-family fetch is
+/// bounded before materialization, never a post-fetch backstop.
+///
+/// **`DISTINCT` (#82 code-review round: the [high] over-count fix):**
+/// `metric_series` is written once per series PER activity bucket
+/// (docs/schemas.md §2.1), so one series active across a wide window
+/// yields multiple rows sharing a fingerprint. The inner
+/// [`historical_series_subquery`] deliberately does NOT dedup (safe for
+/// the sample fetch's `IN (...)` SET semantics — do not change it), so
+/// the probe deduplicates HERE: it must count DISTINCT series, or a
+/// legitimately-sized `info()` over a wide window would falsely 422 on
+/// activity-bucket row count. The `LIMIT cap+1` applies over the
+/// deduplicated set; `ORDER BY fingerprint` makes the probe's own row
+/// set deterministic (only the COUNT matters — membership doesn't, the
+/// real fetch below cap still uses the unbounded subquery verbatim).
+pub fn info_series_cardinality_probe(series_subquery_sql: &str, cap: u64) -> String {
+    format!(
+        "SELECT DISTINCT fingerprint\nFROM (\n{series_subquery_sql}\n)\nORDER BY fingerprint\nLIMIT {}",
+        cap.saturating_add(1)
+    )
+}
+
 /// The standalone, deduplicated `fingerprint, labels` form — docs/schemas.md
 /// §2.1's `LIMIT 1 BY metric_name, fingerprint` lookup SQL. Used by the
 /// live differential test (a materialized comparison set against the
@@ -384,6 +413,33 @@ mod tests {
         );
         assert!(!sql.contains("ORDER BY"));
         assert!(!sql.contains("LIMIT"));
+    }
+
+    /// #82 code-review round ([high] over-count fix): the probe wraps the
+    /// non-deduplicated inner subquery (verbatim, unchanged) in a
+    /// `SELECT DISTINCT fingerprint` so one series spanning many activity
+    /// buckets consumes exactly ONE cardinality slot, with the
+    /// `LIMIT cap+1` applied over the deduplicated set.
+    #[test]
+    fn info_series_cardinality_probe_dedups_fingerprints_before_the_cap_plus_one_limit() {
+        let base = historical_series_subquery("metric_series", "target_info", window(), 1, &[]);
+        let sql = info_series_cardinality_probe(&base, 999);
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT DISTINCT fingerprint\nFROM (\n{base}\n)\nORDER BY fingerprint\nLIMIT 1000"
+            )
+        );
+    }
+
+    /// Boundary value (the `distinct_metric_names_probe` precedent): at
+    /// the maximum accepted cap (`u64::MAX`) the `cap + 1` limit must NOT
+    /// overflow or panic — `saturating_add(1)` clamps to `u64::MAX`.
+    #[test]
+    fn info_series_cardinality_probe_does_not_overflow_at_max_cap() {
+        let base = historical_series_subquery("metric_series", "target_info", window(), 1, &[]);
+        let sql = info_series_cardinality_probe(&base, u64::MAX);
+        assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
     }
 
     #[test]

@@ -166,6 +166,48 @@ pub(crate) fn matches_all(
     Ok(true)
 }
 
+/// Steps 5+6 of the module doc's pipeline (the `:183` empty-`id_lbl_values`
+/// short-circuit is the CALLER's job — see both call sites — this is only
+/// the per-candidate eligibility test once that guard has already passed):
+/// `name` must match every effective `__name__` matcher, `labels` must
+/// satisfy every data matcher, and for every identifying label carrying a
+/// non-empty `id_lbl_values` entry the candidate must CARRY that label
+/// with an in-set value (absence is not a wildcard — round-2 finding 1).
+///
+/// Issue #82 (retroactive re-review, Option B perf fix): hoisted out of
+/// `combine`'s own loop so `eval::prepare_info` can apply the identical
+/// label-only half of this test ONCE per horizon, over the raw fetched
+/// series, before any per-step staleness resolution — `combine` keeps
+/// calling this too (now over an already-narrowed set), so there is one
+/// definition of "eligible," never two that could drift.
+pub(crate) fn is_eligible_info_candidate(
+    cache: &mut MatcherCache,
+    name: &str,
+    labels: &Labels,
+    id_lbl_values: &BTreeMap<String, BTreeSet<String>>,
+    name_matchers: &[LabelMatcher],
+    data_matchers: &[(String, Vec<LabelMatcher>)],
+) -> Result<bool, PromqlError> {
+    if !matches_all(cache, name_matchers, name)? {
+        return Ok(false);
+    }
+    for (key, ms) in data_matchers {
+        let value = labels.get(key).unwrap_or("");
+        if !matches_all(cache, ms, value)? {
+            return Ok(false);
+        }
+    }
+    for (label, allowed) in id_lbl_values {
+        match labels.get(label) {
+            Some(v) if allowed.contains(v) => {}
+            // Absent ≡ "" fails upstream's value regexp — absence is NOT
+            // a wildcard (round-2 finding 1).
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// Renders one info series as upstream `labels.Labels.String()` does for
 /// the duplicate-series error: `{name="value", ...}` sorted by name with
 /// the `__name__` signature component merged in, values Go-quoted
@@ -232,30 +274,25 @@ pub(crate) fn combine(
 
     // Steps 5+6: the :183 short-circuit, then the eligibility filter —
     // both BEFORE dedup, so an out-of-set or absent-ID info series can
-    // never raise a spurious duplicate/conflict. The name/data-matcher
-    // re-filter mirrors the fetch pushdown (belt-and-braces: the
-    // synthetic selector already carries both channels).
+    // never raise a spurious duplicate/conflict. Issue #82 (retroactive
+    // re-review, Option B): the SAME predicate now also runs once per
+    // horizon, over the raw fetched series, in `eval::prepare_info` —
+    // `is_eligible_info_candidate` is the single shared definition, so
+    // this loop is a no-op re-check on an already-narrowed `info` in the
+    // hot (live) path, never a second source of truth.
     let mut eligible: Vec<InfoSeriesAtStep> = Vec::new();
     if !id_lbl_values.is_empty() {
-        'candidates: for series in info {
-            if !matches_all(&mut cache, name_matchers, &series.metric_name)? {
-                continue;
+        for series in info {
+            if is_eligible_info_candidate(
+                &mut cache,
+                &series.metric_name,
+                &series.labels,
+                id_lbl_values,
+                name_matchers,
+                data_matchers,
+            )? {
+                eligible.push(series);
             }
-            for (key, ms) in data_matchers {
-                let value = series.labels.get(key).unwrap_or("");
-                if !matches_all(&mut cache, ms, value)? {
-                    continue 'candidates;
-                }
-            }
-            for (label, allowed) in id_lbl_values {
-                match series.labels.get(label) {
-                    Some(v) if allowed.contains(v) => {}
-                    // Absent ≡ "" fails upstream's value regexp —
-                    // absence is NOT a wildcard (round-2 finding 1).
-                    _ => continue 'candidates,
-                }
-            }
-            eligible.push(series);
         }
     }
 

@@ -153,6 +153,7 @@ fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
         experimental_functions: false,
         max_metric_fanout,
         max_cache_scan: u64::MAX,
+        max_info_series: u64::MAX,
     }
 }
 

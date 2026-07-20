@@ -1074,6 +1074,145 @@ async fn promql_multi_metric_fanout_prunes_on_both_metric_name_and_fingerprint_k
     assert_eq!(single_usage, expected_metric_samples_fetch_usage());
 }
 
+/// Issue #82 (retroactive re-review, Finding 1) — the Tier-1 "bounded
+/// info() fetch" gate: (a) `info(mq)`'s synthetic `target_info` selector
+/// PK-prunes on `metric_name` in the live plan exactly like any other
+/// concrete-name `metric_samples` fetch (no new/looser SQL shape — see
+/// `expected_metric_samples_fetch_usage`, same shape, `target_info`
+/// literal); (b) the degraded-path series-RESOLUTION probe
+/// (`info_series_cardinality_probe`, `metrics/sql.rs`) both carries a
+/// `LIMIT cap+1` in its rendered SQL text AND still PK-prunes on
+/// `metric_series`'s leading `metric_name` component in the live plan —
+/// the resolution stage is bounded BEFORE the sample fetch, not a
+/// looser scan.
+#[tokio::test]
+async fn info_selector_fetch_prunes_on_metric_name_and_its_resolution_probe_is_limit_bounded() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_promql_info";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+    let now_ms = ts_ns / 1_000_000;
+    seed_metric_samples(&client, db, now_ms).await;
+
+    const INFO_FP: u64 = 18_374_000_000_000_000_006;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
+                 VALUES ('target_info', {INFO_FP}, {now_ms}, 1.0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed target_info sample");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_series (metric_name, fingerprint, unix_milli, labels) \
+                 VALUES ('target_info', {INFO_FP}, {now_ms}, '{{\"instance\":\"a\",\"job\":\"1\"}}')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed target_info series");
+
+    // (a) The planned info() selector: `metric_name = Some("target_info")`
+    // (AC2's PK-pruned single-metric fast path), `info_family = true`.
+    let params = pulsus_promql::PlanParams {
+        experimental_functions: true,
+        ..promql_params(now_ms, now_ms, 0)
+    };
+    let expr = pulsus_promql::parse("info(mq)").expect("parse");
+    let plan = pulsus_promql::plan(&expr, params).expect("plan");
+    assert_eq!(plan.selectors.len(), 2);
+    let info_sel = &plan.selectors[1];
+    assert_eq!(info_sel.metric_name.as_deref(), Some("target_info"));
+    assert!(
+        info_sel.info_family,
+        "the synthetic selector must be marked info_family"
+    );
+
+    let (lower_excl, upper_incl) = info_sel.fetch_window(&params);
+    let samples_table = format!("{db}.metric_samples");
+    let fetch_sql = pulsus_read::metrics::sample_sql::sample_fetch(
+        &samples_table,
+        "target_info",
+        &[INFO_FP],
+        lower_excl,
+        upper_incl,
+    );
+    let usage = explain(&client, &fetch_sql).await;
+    assert_eq!(
+        usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "fingerprint",
+            "unix_milli",
+            "Condition: and(and((fingerprint in #-element set), and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))), (metric_name in ['target_info', 'target_info']))",
+        ]),
+        "the info() sample fetch must PK-prune on metric_name exactly like any concrete-name fetch"
+    );
+
+    // (b) The degraded-path resolution probe: a `LIMIT cap+1` bound in
+    // the rendered SQL text (the cardinality cap, checked BEFORE the
+    // sample fetch above ever runs), applied over a `SELECT DISTINCT
+    // fingerprint` (the #82 code-review over-count fix — the cap counts
+    // distinct SERIES, never per-activity-bucket `metric_series` rows),
+    // and the probe query itself still PK-prunes on `metric_series`'s
+    // leading `metric_name` component.
+    let series_table = format!("{db}.metric_series");
+    let window = pulsus_read::metrics::DataWindow {
+        start_ms: now_ms - 3_600_000,
+        end_ms: now_ms,
+    };
+    let series_sql = pulsus_read::metrics::sql::historical_series_subquery(
+        &series_table,
+        "target_info",
+        window,
+        1,
+        &[],
+    );
+    let cap = 100_000u64;
+    let probe_sql = pulsus_read::metrics::sql::info_series_cardinality_probe(&series_sql, cap);
+    assert!(
+        probe_sql.starts_with("SELECT DISTINCT fingerprint"),
+        "the probe must count DISTINCT series, not activity-bucket rows: {probe_sql}"
+    );
+    assert!(
+        probe_sql.ends_with("LIMIT 100001"),
+        "the probe must bound resolution at cap+1: {probe_sql}"
+    );
+
+    let probe_usage = explain(&client, &probe_sql).await;
+    assert_eq!(
+        probe_usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), (unix_milli in [#, +Inf)))",
+            "Partition",
+            "Condition: true",
+            "PrimaryKey",
+            "Keys:",
+            "metric_name",
+            "unix_milli",
+            "Condition: and((unix_milli in (-Inf, #]), and((unix_milli in [#, +Inf)), (metric_name in ['target_info', 'target_info'])))",
+        ]),
+        "the LIMIT-bounded resolution probe must still PK-prune on metric_name"
+    );
+}
+
 // A pair of `metric_series` rows across TWO metric names sharing one
 // activity bucket — the discovery-side fan-out shape is only meaningful
 // over >= 2 metric names, and the flat `IN`×`IN` prune needs genuine data

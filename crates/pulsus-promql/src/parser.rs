@@ -31,23 +31,20 @@ mod tests {
     }
 
     /// Issue #82 code review round 1 (finding 1): a deeply nested input
-    /// whose only defect is an all-empty-matching selector now parses to
-    /// a full AST before the deferred check (vendored PATCHES.md #6)
-    /// rejects it — the rejection AND the rejected tree's destruction
-    /// must be stack-safe. The vendored `parse()` walks iteratively and
-    /// dismantles the rejected tree iteratively (`ast::dismantle`), so
-    /// the deferred check adds no stack use beyond the generated LR
-    /// parser's own pre-existing recursion bound: on a 2 MiB test-thread
-    /// stack the GRAMMAR itself (instrumented, patch code never reached)
-    /// overflows at 9_000 repetitions of this unit for fully VALID input
-    /// (`-m-1`) exactly as for this rejected shape, and survives 8_000.
-    /// This test pins that the whole deferred path (parse → walk →
-    /// reject → dismantle) completes at 4_000 repetitions (~8k nested
-    /// `Expr` nodes — half the measured grammar bound, kept there
-    /// because the generated parser's runtime grows quadratically with
-    /// depth in debug builds: 8_000 reps ≈ 12 s, 4_000 ≈ 2.4 s). `!=`
-    /// rather than `=~` keeps the case fast (no per-matcher regex
-    /// compilation) while still matching the empty string.
+    /// whose only defect is an all-empty-matching selector must reject
+    /// AND unwind without overflowing the stack. **Issue #82 v5**
+    /// relocated the rejection from the post-parse deferred walk onto
+    /// the innermost `unary_expr` reduction wrapping this shape
+    /// (`reject_empty_operand`, vendored PATCHES.md #6) — strictly
+    /// faster (eager short-circuit, no full-tree build) and still
+    /// stack-safe: on a 2 MiB test-thread stack the GRAMMAR itself
+    /// (instrumented, independent of this check) overflows at 9_000
+    /// repetitions of this unit for fully VALID input (`-m-1`), and
+    /// survives 8_000. This test pins that the whole path (parse →
+    /// eager reject) completes at 4_000 repetitions (~8k nested `Expr`
+    /// nodes — half the measured grammar bound). `!=` rather than `=~`
+    /// keeps the case fast (no per-matcher regex compilation) while
+    /// still matching the empty string.
     #[test]
     fn deep_all_empty_matcher_input_is_rejected_and_destroyed_without_overflow() {
         let input = "(".to_string() + &r#"-{x!="a"}-1"#.repeat(4_000) + ")";
@@ -57,6 +54,53 @@ mod tests {
                 .contains("vector selector must contain at least one non-empty matcher"),
             "{err}"
         );
+    }
+
+    /// Issue #82 v5/v6 (retroactive re-review finding 2): the CI-visible
+    /// twin of the vendored `test_issue_82_info_empty_matcher_parity`
+    /// suite (this crate rides `cargo test --workspace`; the vendored
+    /// crate is its own cargo workspace and does not). `info(m, {})` —
+    /// an empty label-selector as `info()`'s SECOND argument — parses;
+    /// `info({})` (empty in the FIRST argument) and `info(m, ({}))`
+    /// (paren-wrapped, upstream-parity per plan v6) still reject.
+    #[test]
+    fn info_second_argument_empty_matcher_parses_but_first_argument_and_paren_wrapped_do_not() {
+        assert!(parse("info(m, {})").is_ok());
+        assert!(parse(r#"info(m, {x=~".*"})"#).is_ok());
+        assert!(parse("info(m, {}@5)").is_ok());
+        assert!(parse("info(m, {} offset 5m)").is_ok());
+
+        for q in [
+            "info({})",
+            r#"info({}, {foo="bar"})"#,
+            "info(m, ({}))",
+            "info(m, (({})))",
+        ] {
+            let err = parse(q).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("vector selector must contain at least one non-empty matcher"),
+                "{q}: {err}"
+            );
+        }
+    }
+
+    /// Issue #82 v5 (retroactive re-review finding 1): a range-wrapped
+    /// empty selector rejects without ever reaching the deferred
+    /// post-parse walk, even nested behind ordinary function calls —
+    /// the `check_ast_for_matrix_selector` eager check (vendored
+    /// PATCHES.md #6).
+    #[test]
+    fn matrix_wrapped_empty_matcher_rejects_without_overflow() {
+        let err = parse("rate({}[5m])").unwrap_err();
+        assert!(err.to_string().contains("non-empty matcher"), "{err}");
+
+        let err = parse("abs(rate({}[5m]))").unwrap_err();
+        assert!(err.to_string().contains("non-empty matcher"), "{err}");
+
+        let deep = "abs(".repeat(10_000) + "rate({}[5m])" + &")".repeat(10_000);
+        let err = parse(&deep).unwrap_err();
+        assert!(err.to_string().contains("non-empty matcher"), "{err}");
     }
 
     #[test]

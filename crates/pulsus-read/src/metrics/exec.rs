@@ -109,6 +109,18 @@ pub struct MetricsConfig {
     /// the query and discovery paths — the discovery path never routes
     /// this to the degraded-cache probe fallback.
     pub max_cache_scan: u64,
+    /// Issue #82 (retroactive re-review): `ReaderConfig::
+    /// promql_max_info_series` — the pathological-cardinality backstop
+    /// on a PromQL `info()` node's synthetic `*_info` metadata-family
+    /// selector (`SelectorSpec::info_family`, default 100_000). Enforced
+    /// BEFORE any sample fetch: the warm label-cache path caps the
+    /// resolved series count before building chunk SQL; the degraded/
+    /// regex paths bound the series-selection query itself. Above it,
+    /// [`crate::logql::error::TooBroadReason::InfoCardinality`]. Never
+    /// applied to an ordinary (non-`info_family`) selector, which must
+    /// always return complete results. Identifying-label VALUE
+    /// narrowing of the fetch routes to issue #25.
+    pub max_info_series: u64,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -123,6 +135,16 @@ pub struct MetricsConfig {
 struct HydratedLabelsRow {
     fingerprint: u64,
     labels: String,
+}
+
+/// Issue #82 (retroactive re-review, Finding 1): the info() degraded-path
+/// cardinality probe's result row
+/// ([`super::sql::info_series_cardinality_probe`]'s `SELECT fingerprint`).
+#[derive(
+    Debug, Clone, PartialEq, Eq, pulsus_clickhouse::Row, serde::Serialize, serde::Deserialize,
+)]
+struct FingerprintOnlyRow {
+    fingerprint: u64,
 }
 
 /// [`MetricsEngine::metadata`]'s `metric_metadata` result row
@@ -358,12 +380,39 @@ impl MetricsEngine {
             let resolution = self
                 .resolver
                 .resolve_labelled(metric_name, &sel.matchers, window);
+
+            // Issue #82 (retroactive re-review, Finding 1): the info()
+            // cardinality cap on the WARM path, enforced BEFORE
+            // `build_chunk_sqls` — the sample query is never issued for
+            // an over-cap info-family selector. The degraded (SqlFallback)
+            // path's cap is bounded further below, in its own probe.
+            if sel.info_family
+                && let LabelledResolution::Series(pairs) = &resolution
+            {
+                let cap = self.config.max_info_series;
+                if pairs.len() as u64 > cap {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
+                        matched: pairs.len(),
+                        cap,
+                    }));
+                }
+            }
+
             if let Some(e) = explain.as_mut() {
                 match &resolution {
                     LabelledResolution::Series(pairs) => e.push(
                         "series_resolution",
                         format!("label cache: {} matching series", pairs.len()),
                         None,
+                    ),
+                    LabelledResolution::SqlFallback { sql, reason } if sel.info_family => e.push(
+                        "series_resolution",
+                        super::sql::info_series_cardinality_probe(sql, self.config.max_info_series),
+                        Some(format!(
+                            "{reason:?}; issue #82 info() cardinality cap {} — probed \
+                             (LIMIT-bounded) before the sample fetch",
+                            self.config.max_info_series
+                        )),
                     ),
                     LabelledResolution::SqlFallback { sql, reason } => e.push(
                         "series_resolution",
@@ -443,6 +492,17 @@ impl MetricsEngine {
                     SelectorFetchPlan::Fallback {
                         sql: fetch_sql,
                         hist_sql,
+                        // Issue #82 (retroactive re-review, Finding 1):
+                        // the degraded-path cap probe, built now (a pure
+                        // function of the already-computed series-
+                        // selection `sql`) but executed in phase 2,
+                        // BEFORE the sample fetch above runs.
+                        info_series_probe: sel.info_family.then(|| {
+                            super::sql::info_series_cardinality_probe(
+                                &sql,
+                                self.config.max_info_series,
+                            )
+                        }),
                     }
                 }
             };
@@ -538,6 +598,24 @@ impl MetricsEngine {
         };
 
         let total_series: usize = groups.iter().map(|g| g.series.len()).sum();
+
+        // Issue #82 (retroactive re-review, Finding 1): the info()
+        // cardinality cap, enforced BEFORE the flat `sample_fetch_multi`
+        // SQL is ever built. This path is already fully cache-resolved
+        // in-memory (`groups`, no series-selection SQL to bound with a
+        // `LIMIT` probe — unlike the concrete-name `SqlFallback` path),
+        // so the cap is a plain in-memory count check, mirroring the
+        // warm labelled path's own `pairs.len()` check.
+        if sel.info_family {
+            let cap = self.config.max_info_series;
+            if total_series as u64 > cap {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
+                    matched: total_series,
+                    cap,
+                }));
+            }
+        }
+
         if let Some(e) = explain.as_mut() {
             e.push(
                 "series_resolution",
@@ -639,7 +717,26 @@ impl MetricsEngine {
                 .await?;
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
             }
-            SelectorFetchPlan::Fallback { sql, hist_sql } => {
+            SelectorFetchPlan::Fallback {
+                sql,
+                hist_sql,
+                info_series_probe,
+            } => {
+                // Issue #82 (retroactive re-review, Finding 1): run the
+                // bounded cardinality probe FIRST and reject over-cap
+                // BEFORE `sql`/`hist_sql` (the real, unbounded sample
+                // fetch) ever executes — bounded before materialization,
+                // not a post-fetch backstop.
+                if let Some(probe_sql) = info_series_probe {
+                    let cap = self.config.max_info_series;
+                    let rows: Vec<FingerprintOnlyRow> = self.fetch_rows(probe_sql).await?;
+                    if rows.len() as u64 > cap {
+                        return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
+                            matched: rows.len(),
+                            cap,
+                        }));
+                    }
+                }
                 let metric_name = concrete_name(sel)?;
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
                     fetch_dual_concurrently(self.fetch_rows(sql), self.fetch_rows(hist_sql))
@@ -1136,7 +1233,18 @@ enum SelectorFetchPlan {
     /// (M7-A5a) — labels are hydrated afterward from the UNION of
     /// fingerprints both reads return (a histogram-only fingerprint must
     /// still hydrate labels).
-    Fallback { sql: String, hist_sql: String },
+    Fallback {
+        sql: String,
+        hist_sql: String,
+        /// Issue #82 (retroactive re-review, Finding 1): `Some` only for
+        /// an `info_family` selector — the `LIMIT cap+1`-bounded
+        /// series-selection probe [`MetricsEngine::execute_fetch_plan`]
+        /// runs and counts BEFORE issuing `sql`/`hist_sql`, so an
+        /// over-cap `*_info` fetch never materializes a single sample
+        /// row. `None` for an ordinary selector, which always fetches
+        /// the complete (unbounded) result.
+        info_series_probe: Option<String>,
+    },
     /// Issue #85 (M6-08c): the name-less/regex-`__name__` fan-out — one
     /// flat `metric_name IN (…) AND fingerprint IN (…)` fetch, labels
     /// pre-resolved per `(metric_name, fingerprint)` (a fingerprint can

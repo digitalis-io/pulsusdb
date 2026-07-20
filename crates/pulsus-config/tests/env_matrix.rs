@@ -267,6 +267,11 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.promql_max_cache_scan == 500,
     },
     Row {
+        var: "PULSUS_PROMQL_MAX_INFO_SERIES",
+        value: "750",
+        check: |c| c.reader.promql_max_info_series == 750,
+    },
+    Row {
         var: "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
         value: "1GiB",
         check: |c| c.reader.logql_scan_budget_bytes == ByteSize(1024 * 1024 * 1024),
@@ -366,8 +371,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        63,
-        "docs/configuration.md §§1-8 document exactly 63 variables"
+        64,
+        "docs/configuration.md §§1-8 document exactly 64 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

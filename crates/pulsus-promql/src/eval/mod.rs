@@ -37,7 +37,9 @@ use crate::plan::{
     HistogramAccessorFn, MathFn, OverTimeFn, OverTimeParamFn, PlanExpr, QueryPlan, RangeSource,
     ScalarFn, SelectorSpec, SubqueryPlan,
 };
-use crate::value::{InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData};
+use crate::value::{
+    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
+};
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
 /// whole query (instant, or every range-query step) has been evaluated.
@@ -492,6 +494,22 @@ struct PreparedInfo {
     /// non-ignored base matrix. Empty ⇒ the `info.go:183` short-circuit
     /// (zero info participation for the whole horizon).
     id_lbl_values: BTreeMap<String, BTreeSet<String>>,
+    /// Issue #82 (retroactive re-review, Option B): the info-family
+    /// selector's OWN fetched series (`SeriesData::get`), narrowed ONCE
+    /// per horizon down to those passing
+    /// `info::is_eligible_info_candidate` — the label-only half of
+    /// `combine`'s steps 5+6 (name matchers, data matchers, and the
+    /// horizon-wide `id_lbl_values` membership test), which is step-
+    /// invariant (it never depends on a sample value or timestamp).
+    /// Every series here carries a resolved `metric_name` (`Some`) — a
+    /// genuinely nameless fetched series can never be an info source and
+    /// is dropped during this narrowing, not carried forward as `None`.
+    /// `eval_step`'s `PlanExpr::Info` arm resolves per-step staleness
+    /// over ONLY this set, so per-step work is `O(eligible)`, not
+    /// `O(fetched)` — fixing the retroactive re-review's [high] finding
+    /// (unbounded `O(fetched × steps)` re-scan of the whole info family
+    /// at every step).
+    eligible_info: Vec<FetchedSeries>,
 }
 
 /// Prepared `info()` nodes keyed by the [`PlanExpr::Info`] node's address
@@ -859,9 +877,13 @@ fn prepare_subqueries(
 /// `idLblValues` construction (`info.go:150-170`), which are both
 /// horizon-wide, never per-step (the #82 round-2 adjudication). Caches
 /// each step's base vector (reused verbatim by the stepping phase — the
-/// base is never evaluated twice) and the allowed identifying-label
-/// values of every NON-ignored base series (ignored ⟺ the retained name
-/// matches all effective name matchers; empty values never register).
+/// base is never evaluated twice), the allowed identifying-label values
+/// of every NON-ignored base series (ignored ⟺ the retained name matches
+/// all effective name matchers; empty values never register), and
+/// (issue #82 retroactive re-review, Option B) the info-family
+/// selector's fetched series narrowed to the eligible subset ONCE — see
+/// [`PreparedInfo::eligible_info`]'s doc for why this is sound (the
+/// eligibility predicate is purely label-based, never sample-dependent).
 fn prepare_info(
     node: &PlanExpr,
     selectors: &[SelectorSpec],
@@ -872,8 +894,9 @@ fn prepare_info(
 ) -> Result<(), PromqlError> {
     let PlanExpr::Info {
         base,
+        info_selector,
         name_matchers,
-        ..
+        data_matchers,
     } = node
     else {
         // Only ever called from the `PlanExpr::Info` arm above.
@@ -922,11 +945,48 @@ fn prepare_info(
         t += horizon.step_ms;
     }
 
+    // Issue #82 (retroactive re-review, Option B): narrow the
+    // info-family selector's OWN fetched series to the eligible subset
+    // exactly ONCE, over the whole horizon — the `:183` short-circuit
+    // (`id_lbl_values` empty ⇒ zero participation, `combine`'s own
+    // guard) applies here too, so a short-circuited horizon never even
+    // walks the fetched set. Every kept series' `metric_name` is
+    // resolved (concrete-name fallback, the `Selector` arm's own
+    // contract) — a genuinely nameless series can never be an info
+    // source and is dropped here rather than carried forward as `None`.
+    let sel = &selectors[*info_selector];
+    let mut eligible_info: Vec<FetchedSeries> = Vec::new();
+    if !id_lbl_values.is_empty() {
+        for series in data.get(*info_selector) {
+            let Some(metric_name) = series
+                .metric_name
+                .clone()
+                .or_else(|| sel.metric_name.clone())
+            else {
+                continue;
+            };
+            if info::is_eligible_info_candidate(
+                &mut matcher_cache,
+                &metric_name,
+                &series.labels,
+                &id_lbl_values,
+                name_matchers,
+                data_matchers,
+            )? {
+                eligible_info.push(FetchedSeries {
+                    metric_name: Some(metric_name),
+                    ..series.clone()
+                });
+            }
+        }
+    }
+
     caches.infos.insert(
         node as *const _,
         PreparedInfo {
             base_steps,
             id_lbl_values,
+            eligible_info,
         },
     );
     Ok(())
@@ -2646,14 +2706,18 @@ fn eval_step(
         // Issue #82 (M6-05b): `info()` — the metadata-join. The base
         // vector comes from this node's prepared horizon (`prepare_info`
         // evaluated arg0 exactly once per step); the info vector resolves
-        // from the synthetic selector's fetch at ITS own effective time
-        // (offset/@ copied from arg0's first selector at plan time),
-        // carrying each series' real metric name and the resolved
-        // sample's ORIGINAL timestamp (the newest-wins dedup key). All
-        // narrowing/dedup/join semantics live in `info::combine` —
-        // name-keeping with the delayed verdict CLEARED: the pin builds
-        // fresh DropName-less output samples, so a name-dropping arg0
-        // re-emerges with its retained name kept (see `combine`'s doc).
+        // from the ALREADY-ELIGIBILITY-NARROWED `eligible_info` set
+        // (retroactive re-review, Option B — `prepare_info` narrowed the
+        // info-family selector's fetch to this set once per horizon, so
+        // this loop is `O(eligible)`, never `O(fetched)`) at the
+        // selector's own effective time (offset/@ copied from arg0's
+        // first selector at plan time), carrying each series' real
+        // metric name and the resolved sample's ORIGINAL timestamp (the
+        // newest-wins dedup key). All narrowing/dedup/join semantics live
+        // in `info::combine` — name-keeping with the delayed verdict
+        // CLEARED: the pin builds fresh DropName-less output samples, so
+        // a name-dropping arg0 re-emerges with its retained name kept
+        // (see `combine`'s doc).
         PlanExpr::Info {
             base: _,
             info_selector,
@@ -2684,21 +2748,18 @@ fn eval_step(
             let sel = &selectors[*info_selector];
             let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
             let mut info_v = Vec::new();
-            for series in data.get(*info_selector) {
+            for series in &prepared.eligible_info {
                 if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
                 {
-                    // Per-series name with the concrete-name fallback
-                    // (the `Selector` arm's contract); a genuinely
-                    // nameless series can never be an info source.
-                    let Some(metric_name) = series
-                        .metric_name
-                        .clone()
-                        .or_else(|| sel.metric_name.clone())
-                    else {
-                        continue;
-                    };
                     info_v.push(info::InfoSeriesAtStep {
-                        metric_name,
+                        // `prepare_info` only ever keeps series whose
+                        // name it already resolved (concrete-name
+                        // fallback applied there) — documented invariant
+                        // of `eligible_info`.
+                        metric_name: series
+                            .metric_name
+                            .clone()
+                            .expect("eligible_info series carry a resolved metric_name"),
                         labels: series.labels.clone(),
                         orig_t_ms: sample.t_ms,
                     });
@@ -2724,7 +2785,6 @@ mod tests {
 
     use super::*;
     use crate::plan::{PlanParams, plan};
-    use crate::value::FetchedSeries;
 
     /// M7-A5b-i shim: the crate's public `evaluate` now returns
     /// `(QueryValue, Annotations)` (the annotations channel, plan v2

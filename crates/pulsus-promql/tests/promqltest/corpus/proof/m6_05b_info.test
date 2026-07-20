@@ -408,3 +408,19 @@ load 1m
 
 eval range from 0m to 2m step 1m info(metric, {__name__=~".+_info"})
 	expect fail regex: conflicting label: x
+
+clear
+
+# Empty-matcher parity (issue #82 v3-v6): `info(m, {})` — an empty
+# label-selector as info()'s SECOND argument — plans and evaluates
+# IDENTICALLY to `info(m)` (no arg1 at all): the effective name matchers
+# and data matchers are both empty either way
+# (`effective_info_name_matchers(vec![])` -> the default `target_info`
+# Eq branch). Golden output below is byte-identical to the "Include all
+# info metric data labels" case near the top of this file.
+load 5m
+	metric{instance="a", job="1", label="value"} 0 1 2
+	target_info{instance="a", job="1", data="info", another_data="another info"} 1 1 1
+
+eval range from 0m to 10m step 5m info(metric, {})
+	metric{data="info", instance="a", job="1", label="value", another_data="another info"} 0 1 2

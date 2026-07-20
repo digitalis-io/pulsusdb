@@ -122,6 +122,18 @@ pub enum TooBroadReason {
     /// bound is not degraded, it is genuinely too broad). A Rust-side
     /// structural limit, never from a ClickHouse error code.
     CacheScan { cap: u64 },
+    /// Issue #82 (retroactive re-review): a PromQL `info()` node's
+    /// synthetic `*_info` metadata-family selector (`SelectorSpec::
+    /// info_family`) resolved more series than
+    /// `reader.promql_max_info_series` — a pathological-cardinality
+    /// backstop, enforced BEFORE any sample fetch is issued (the warm
+    /// label-cache path caps `pairs.len()` before building chunk SQL; the
+    /// degraded/regex paths bound the series-selection query itself with
+    /// `LIMIT cap+1`, mirroring the `MetricFanout` probe shape). Produced
+    /// **only** by `metrics::exec`'s info-family resolution, never from a
+    /// ClickHouse error code. Identifying-label VALUE narrowing of the
+    /// fetch (closing the gap this cap merely backstops) routes to #25.
+    InfoCardinality { matched: usize, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -196,6 +208,17 @@ impl fmt::Display for TooBroadReason {
                     "regex/negated-name selector examined more than {cap} cache entries, \
                      exceeding the scan budget (reader.promql_max_cache_scan) — narrow the \
                      __name__ matcher or use a metric-scoped selector"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`: the resolution
+            // bails at the breach point (before or at the `cap+1`-th
+            // row), so `matched` is never presented as an exact final
+            // tally.
+            TooBroadReason::InfoCardinality { matched: _, cap } => {
+                write!(
+                    f,
+                    "info() metadata family matched more than {cap} series, exceeding the \
+                     cardinality cap (reader.promql_max_info_series)"
                 )
             }
         }

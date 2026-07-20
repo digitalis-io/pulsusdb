@@ -2611,12 +2611,12 @@ mod tests {
                 Case { input, expected }
             },
             // PATCHES.md #6: an all-empty-matching selector (matchers
-            // present, all matching "") is rejected by the DEFERRED
-            // post-parse walk — the full tree is built first, so the
-            // rejection and the rejected tree's destruction must both be
-            // stack-safe (iterative walk + `ast::dismantle`). 4_000 units
-            // (~8k nested nodes) sits well inside the generated parser's
-            // own measured recursion bound (~8k units on 2 MiB).
+            // present, all matching "") is rejected EAGERLY, at the
+            // innermost `unary_expr` reduction wrapping it
+            // (`reject_empty_operand`, issue #82 v5) — no longer the
+            // deferred post-parse walk. 4_000 units (~8k nested nodes)
+            // sits well inside the generated parser's own measured
+            // recursion bound (~8k units on 2 MiB).
             {
                 let input = "(".to_string() + &r#"-{x!="a"}-1"#.repeat(4_000) + ")";
                 let expected =
@@ -2625,6 +2625,111 @@ mod tests {
             },
         ];
         assert_cases(fail_cases);
+    }
+
+    /// Issue #82 (M6-05b) v5/v6: `info()`'s second argument is the ONE
+    /// context that exempts an empty (or all-empty-matching) selector
+    /// from the "vector selector must contain at least one non-empty
+    /// matcher" rule (upstream v3.13.0 `BypassEmptyMatcherCheck`,
+    /// `parse.go:851-859`), pinned to argument INDEX 1 (0-indexed) —
+    /// `info()`'s own first argument is NOT exempt. Its in-place
+    /// `@`/`offset` field-modifiers stay a direct `VectorSelector` (they
+    /// are fields, not wrapper nodes), so they parse too. A
+    /// paren-wrapped empty selector in that same position
+    /// (`info(m, ({}))`) still REJECTS — upstream's bypass type-asserts
+    /// a DIRECT `*VectorSelector`, and a `*ParenExpr` fails that
+    /// assertion (`expected label selectors only`) — so pulsus-promql's
+    /// eager `Expr::Paren` guard is parity-correct here, not a
+    /// regression (round-3/round-4 plan review, PATCHES.md #6).
+    #[test]
+    fn test_issue_82_info_empty_matcher_parity() {
+        for input in [
+            "info(m, {})",
+            "info(m, {}) + 1",
+            r#"info(m, {x=~".*"})"#,
+            "info(m, {}@5)",
+            "info(m, {} offset 5m)",
+        ] {
+            assert!(
+                crate::parser::parse(input).is_ok(),
+                "expected {input:?} to parse, got {:?}",
+                crate::parser::parse(input)
+            );
+        }
+
+        let fail_cases = vec![
+            ("{}", "vector selector must contain at least one non-empty matcher"),
+            (
+                "sum({})",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "abs({})",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "-{}",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "({})",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            // arg 0 is NOT exempt — only arg 1 (index 1) is.
+            (
+                "info({})",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                r#"info({}, {foo="bar"})"#,
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            // matrix-wrapped: the new `check_ast_for_matrix_selector` arm.
+            (
+                "rate({}[5m])",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "{}[5m:1m]",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            // paren-wrapped in info's arg 1 — matches upstream (Q1/Q2,
+            // plan v6): NOT transparent, stays rejected.
+            (
+                "info(m, ({}))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "info(m, (({})))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                r#"info(m, ({x=~".*"}))"#,
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "sum(({}))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+            (
+                "(({}))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+        ];
+        assert_cases(Case::new_fail_cases(fail_cases));
+    }
+
+    /// Issue #82 v5 AC3 (comment 5021682187): the `MatrixSelector` eager
+    /// check short-circuits a range-wrapped empty selector nested 10_000
+    /// units deep, exactly like the pinned fuzz case above — measured
+    /// evidence that relocating the guard onto the depth-adding
+    /// reductions (rather than deferring it) does not reopen the
+    /// stack-overflow hole it closes.
+    #[test]
+    fn test_issue_82_matrix_selector_nesting_does_not_overflow() {
+        let input = "abs(".repeat(10_000) + "rate({}[5m])" + &")".repeat(10_000);
+        let expected = Err("vector selector must contain at least one non-empty matcher".into());
+        assert_cases(vec![Case { input, expected }]);
     }
 
     #[test]

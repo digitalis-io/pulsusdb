@@ -159,6 +159,12 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.promql_max_cache_scan",
         cfg.reader.promql_max_cache_scan,
     )?;
+    // Issue #82 (retroactive re-review): a zero cap would reject every
+    // `info()` query before a single `*_info` series could resolve.
+    positive_u64(
+        "reader.promql_max_info_series",
+        cfg.reader.promql_max_info_series,
+    )?;
     positive_bytes(
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
@@ -535,6 +541,18 @@ mod tests {
         assert_eq!(Config::default().reader.promql_max_cache_scan, 200_000);
         let mut cfg = Config::default();
         cfg.reader.promql_max_cache_scan = 0;
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #82 (retroactive re-review): the info() cardinality cap
+    /// follows the sibling u64 caps' validation shape — zero is an
+    /// invalid value, rejected at config load, and the documented
+    /// default is 100_000.
+    #[test]
+    fn zero_promql_max_info_series_is_rejected_and_the_default_is_100_000() {
+        assert_eq!(Config::default().reader.promql_max_info_series, 100_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_info_series = 0;
         assert!(validate(&cfg).is_err());
     }
 

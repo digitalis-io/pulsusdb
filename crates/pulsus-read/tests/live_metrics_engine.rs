@@ -190,6 +190,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         experimental_functions: false,
         max_metric_fanout: 1_000,
         max_cache_scan: 200_000,
+        max_info_series: 100_000,
     }
 }
 
@@ -1207,6 +1208,340 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
         "max_of(1, 1) has no selectors and must fetch nothing: {:#?}",
         explain.stages
     );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 (retroactive re-review, Finding 1): the info() cardinality
+/// cap on the WARM label-cache path (`LabelledResolution::Series`)
+/// rejects BEFORE any sample fetch — the check runs on `pairs.len()`,
+/// in-memory, before `build_chunk_sqls` is ever called. Three
+/// `target_info` series over a configured cap of 2 must reject with the
+/// named `InfoCardinality` error (which `prom_api::error` maps to `422
+/// execution`), never attempt to fetch a single sample.
+#[tokio::test]
+async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality";
+    init_db(&bootstrap, db).await;
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    // Three distinct target_info series — one more than the cap below —
+    // plus one base series for `info(metric)` to (never get the chance
+    // to) enrich.
+    let info_series: Vec<SeedSeriesRow> = (0..3u64)
+        .map(|i| SeedSeriesRow {
+            metric_name: "target_info".to_string(),
+            fingerprint: 900_000_000_000_000_000 + i,
+            unix_milli: now,
+            labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
+        })
+        .collect();
+    seed_series(&cache_client, &info_series).await;
+    let info_samples: Vec<SeedSampleRow> = info_series
+        .iter()
+        .map(|s| SeedSampleRow {
+            metric_name: s.metric_name.clone(),
+            fingerprint: s.fingerprint,
+            unix_milli: now,
+            value: 1.0,
+        })
+        .collect();
+    seed_samples(&cache_client, &info_samples).await;
+
+    let base = SeedSeriesRow {
+        metric_name: "metric".to_string(),
+        fingerprint: 900_000_000_000_000_100,
+        unix_milli: now,
+        labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+    };
+    seed_series(&cache_client, std::slice::from_ref(&base)).await;
+    seed_samples(
+        &cache_client,
+        &[SeedSampleRow {
+            metric_name: base.metric_name.clone(),
+            fingerprint: base.fingerprint,
+            unix_milli: now,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: now,
+        end_ms: now,
+        step_ms: 0,
+    };
+    let err = engine
+        .query(&expr, &params)
+        .await
+        .expect_err("3 target_info series over a cap of 2 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("info()") && msg.contains("cardinality") && msg.contains('2'),
+        "named info() cardinality rejection naming the cap, got {msg:?}"
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 (retroactive re-review, Finding 1) — the DEGRADED-path twin
+/// of the warm-path cap test above: an out-of-cache-window query forces
+/// `LabelledResolution::SqlFallback`, so the cap is enforced by the
+/// `LIMIT cap+1` cardinality PROBE (`info_series_cardinality_probe`),
+/// run and counted BEFORE the real (unbounded) `sample_fetch_subquery`
+/// ever executes — never a post-fetch backstop.
+#[tokio::test]
+async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality_fallback";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days ago: outside the 24h cache window below (forcing
+    // `SqlFallback`), safely inside the 7-day raw retention TTL — the
+    // `count_by_job_up_historical_variant_routes_through_metric_series`
+    // precedent.
+    let two_days_ms = 2 * 24 * 3_600_000;
+    let last_week_bucket = ((now - two_days_ms) / bucket) * bucket;
+
+    let info_series: Vec<SeedSeriesRow> = (0..3u64)
+        .map(|i| SeedSeriesRow {
+            metric_name: "target_info".to_string(),
+            fingerprint: 900_000_000_000_001_000 + i,
+            unix_milli: last_week_bucket,
+            labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
+        })
+        .collect();
+    seed_series(&client, &info_series).await;
+    let info_samples: Vec<SeedSampleRow> = info_series
+        .iter()
+        .map(|s| SeedSampleRow {
+            metric_name: s.metric_name.clone(),
+            fingerprint: s.fingerprint,
+            unix_milli: last_week_bucket,
+            value: 1.0,
+        })
+        .collect();
+    seed_samples(&client, &info_samples).await;
+
+    let base = SeedSeriesRow {
+        metric_name: "metric".to_string(),
+        fingerprint: 900_000_000_000_001_100,
+        unix_milli: last_week_bucket,
+        labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+    };
+    seed_series(&client, std::slice::from_ref(&base)).await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: base.metric_name.clone(),
+            fingerprint: base.fingerprint,
+            unix_milli: last_week_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: last_week_bucket,
+        end_ms: last_week_bucket,
+        step_ms: 0,
+    };
+    let err = engine
+        .query(&expr, &params)
+        .await
+        .expect_err("3 target_info series over a cap of 2 must be rejected (degraded path)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("info()") && msg.contains("cardinality") && msg.contains('2'),
+        "named info() cardinality rejection naming the cap, got {msg:?}"
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 code-review round ([high] over-count fix): the degraded-path
+/// cardinality probe counts DISTINCT series, never per-activity-bucket
+/// `metric_series` rows. `metric_series` is written once per series PER
+/// activity bucket (docs/schemas.md §2.1), so 2 distinct `target_info`
+/// series active across 3 buckets yield 6 raw rows — over the cap of 2
+/// under the pre-fix raw-row count (`LIMIT 3` would return 3 rows → a
+/// FALSE 422), but exactly 2 under `SELECT DISTINCT fingerprint` → the
+/// query must SUCCEED and enrich. The genuinely-over-cap distinct count
+/// is covered by the sibling degraded-path test above (3 distinct > 2 →
+/// still 422).
+#[tokio::test]
+async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality_distinct";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days ago (outside the 24h cache window → `SqlFallback`, inside
+    // the 7-day retention), bucket-aligned; the range query below spans
+    // buckets [b0, b0+2*bucket] so all three activity buckets fall inside
+    // the probe's floored window.
+    let two_days_ms = 2 * 24 * 3_600_000;
+    let b0 = ((now - two_days_ms) / bucket) * bucket;
+    let buckets = [b0, b0 + bucket, b0 + 2 * bucket];
+
+    // 2 distinct target_info series × 3 activity buckets = 6 raw
+    // metric_series rows in-window.
+    let mut info_series: Vec<SeedSeriesRow> = Vec::new();
+    let mut samples: Vec<SeedSampleRow> = Vec::new();
+    for i in 0..2u64 {
+        let fp = 900_000_000_000_002_000 + i;
+        for &t in &buckets {
+            info_series.push(SeedSeriesRow {
+                metric_name: "target_info".to_string(),
+                fingerprint: fp,
+                unix_milli: t,
+                labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
+            });
+            samples.push(SeedSampleRow {
+                metric_name: "target_info".to_string(),
+                fingerprint: fp,
+                unix_milli: t,
+                value: 1.0,
+            });
+        }
+    }
+    seed_series(&client, &info_series).await;
+
+    let base_fp = 900_000_000_000_002_100;
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "metric".to_string(),
+            fingerprint: base_fp,
+            unix_milli: b0,
+            labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+        }],
+    )
+    .await;
+    for &t in &buckets {
+        samples.push(SeedSampleRow {
+            metric_name: "metric".to_string(),
+            fingerprint: base_fp,
+            unix_milli: t,
+            value: 1.0,
+        });
+    }
+    seed_samples(&client, &samples).await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    // Range query spanning all three activity buckets: 6 raw rows > cap,
+    // 2 distinct series == cap — must succeed and actually enrich.
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: b0,
+        end_ms: b0 + 2 * bucket,
+        step_ms: bucket,
+    };
+    let (result, _annotations) = engine.query(&expr, &params).await.expect(
+        "2 distinct series across 3 activity buckets (6 raw rows) must NOT trip the cap of 2",
+    );
+    match result {
+        QueryResult::Matrix(m) => {
+            assert_eq!(m.len(), 1, "one enriched base series, got {m:?}");
+            assert!(
+                m[0].labels.iter().any(|(k, v)| k == "data" && v == "d0"),
+                "the matching info series must actually enrich: {:?}",
+                m[0].labels
+            );
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
 
     drop_database(&bootstrap, db).await;
 }
