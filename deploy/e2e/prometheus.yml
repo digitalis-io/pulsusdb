@@ -25,3 +25,19 @@ global:
   scrape_interval: 15s
 
 scrape_configs: []
+
+# Issue #33 false-pass-guard + fallback-coverage follow-up: `e2e/src/
+# metrics.rs`'s `fallback_leg` direct-remote-writes a small historical
+# corpus at `now - 26h` to force PulsusDB's `metric_series` SqlFallback
+# read path (the cache window is 24h by default, `PULSUS_CACHE_WINDOW`).
+# By the time that leg runs, this same Prometheus's TSDB head has already
+# advanced to "now" from the main differential corpus, so the 26h-old
+# samples are out-of-order relative to the head and are rejected unless
+# out-of-order ingestion is enabled. 2 days comfortably covers the pinned
+# 26h offset (with the >1h safety margin `test/fixtures/metrics/
+# differential.json`'s `historical.offset_hours` keeps past the 24h
+# window boundary) while staying inside Prometheus's default 15d
+# retention — ingest-acceptance only, query semantics are untouched.
+storage:
+  tsdb:
+    out_of_order_time_window: 2d
