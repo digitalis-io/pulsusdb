@@ -1689,6 +1689,34 @@ fn duplicate_one_side_signature_is_many_to_many_error() {
     );
 }
 
+/// A duplicate ONE/RHS-side signature under a PLAIN one-to-one match (no
+/// group_left/group_right) is many-to-many — the one-side map is built
+/// unconditionally, so it errors even without a group modifier. Distinct
+/// from `duplicate_one_side_signature_is_many_to_many_error` (group_left)
+/// and from `one_to_one_second_many_side_match_is_multiple_matches_error`
+/// (LHS-side). Loki-verbatim wording (grafana/loki:3.4.2).
+#[test]
+fn plain_one_to_one_duplicate_rhs_signature_is_many_to_many_error() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 10.0)]);
+    // Two rhs series reduce to the same on(app) signature.
+    let rhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 2.0),
+        sample(&[("app", "p"), ("inst", "2")], 3.0),
+    ]);
+    // NOTE: on(app) with group = None — plain one-to-one, the missing AC3 case.
+    let err = combine_binary(BinOp::Div, false, Some(&on(&["app"], None)), lhs, rhs).unwrap_err();
+    let ReadError::PipelineInvalid { reason } = &err else {
+        panic!("expected PipelineInvalid, got {err:?}");
+    };
+    // Full byte-exact string (side = "right", not swapped) — anchors the
+    // whole message, catching side-label and wording drift.
+    assert_eq!(
+        reason,
+        "found duplicate series on the right hand-side;many-to-many matching \
+         not allowed: matching labels must be unique on one side"
+    );
+}
+
 /// The empty-operand short-circuit is scoped to arithmetic/comparison: a
 /// duplicate one-side signature that could never pair (empty other side)
 /// must NOT surface a spurious error.
