@@ -293,6 +293,16 @@ Tag names are ordered `(scope, key)` ascending; values are ordered ascending. Re
 
 **Typed values are best-effort inference** from the stored string (the catalog stores values type-lessly): exact `true`/`false` → `bool`; a valid §4.2 duration literal (by the normative parser — `.5s` yes, `0.1ns`/`1h30m`/`1d` no) → `duration`; optional-sign integers → `int`; `f64`-parseable → `float`; else `string`. Known limit: a numeric- or duration-*looking* string attribute infers as numeric/duration.
 
+**Scan bound.** A `scope`-confined `/tags` read and a scoped `/tag/{tag}/values` read prune to a `(scope)`/`(scope, key)` primary-key prefix; an unscoped `/tags` read or a bare-key (`{tag}` with no `resource.`/`span.` prefix) `/tag/{tag}/values` read cannot prune on `scope` and is a full catalog scan. That scan carries the same Layer-1 read-row budget the §4.2 search path uses (`PULSUS_TRACEQL_SCAN_BUDGET_ROWS`, `read_overflow_mode='throw'`): on a catalog large enough that the scan would exceed it, the request is rejected with `422 query_too_broad` rather than served as a slow unbounded scan. The `TAG_NAMES_MAX`/`TAG_VALUES_MAX` response caps above bound only a *successful* request's returned rows, not the rows a scan reads.
+
+| Cause | HTTP | `errorType` |
+|-------|------|-------------|
+| `scope` outside `{resource, span}` (incl. `intrinsic`/`none`) | `400` | `bad_data` |
+| Empty `{tag}` key | `400` | `bad_data` |
+| Discovery scan exceeded the reader row budget (unscoped `/tags`, or a bare-key `/values` on a high-cardinality key) | `422` | `query_too_broad` |
+| ClickHouse read timed out | `504` | `timeout` |
+| Unclassified failure | `500` | `internal` |
+
 ### 4.4 TraceQL metrics
 
 ```

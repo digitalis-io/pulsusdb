@@ -342,12 +342,14 @@ fn map_trace_metrics_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     map_trace_read_error(e, config)
 }
 
-/// Maps a ClickHouse error on the **trace search** path. Unlike the
-/// LogQL mapper, this one deliberately sets `max_rows_to_read`, so code
-/// 158 maps to [`TooBroadReason::TraceScanBudgetRows`]; the read/result
-/// byte ceilings (codes 307/396) map to the shared byte-budget reason.
-/// Everything else passes through unmapped (never reinterpreted as a
-/// timeout or vice versa).
+/// Maps a ClickHouse error on the **trace search** path, and (issue #58
+/// re-review) the two §4.3 catalog reads that carry the same budget via
+/// [`catalog_settings`]. Unlike the LogQL mapper, this one deliberately
+/// sets `max_rows_to_read`, so code 158 maps to
+/// [`TooBroadReason::TraceScanBudgetRows`]; the read/result byte ceilings
+/// (codes 307/396) map to the shared byte-budget reason. Everything else
+/// passes through unmapped (never reinterpreted as a timeout or vice
+/// versa).
 fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
     if let ChError::Server { code, .. } = &e {
         match *code {
@@ -536,7 +538,12 @@ impl TraceEngine {
     /// builder — the engine is the catalog reads' injection boundary.
     /// Bounded by the SQL `LIMIT` cap + 1 probe: at most
     /// [`TAG_NAMES_MAX`] rows return, and the probe row (row cap + 1)
-    /// flips `truncated` instead of shipping a silent subset.
+    /// flips `truncated` instead of shipping a silent subset. The `LIMIT`
+    /// bounds *returned* rows only — an unscoped read has no `WHERE`
+    /// predicate, so it is a full catalog scan; [`catalog_settings`]
+    /// (issue #58 re-review) bounds *scanned* rows: a breach maps through
+    /// [`map_trace_read_error`] to `422 query_too_broad` instead of
+    /// running unbounded.
     pub async fn list_tag_names(&self, scope: Option<&str>) -> Result<TagNames, ReadError> {
         let scope_literal = scope.map(crate::logql::escape::ch_string);
         let sql = super::tags_sql::tag_names_sql(
@@ -544,17 +551,18 @@ impl TraceEngine {
             scope_literal.as_deref(),
             TAG_NAMES_MAX + 1,
         );
+        let settings = catalog_settings(&self.config);
         let mut names = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption — the stream is always
         // drained (≤ cap + 1 rows by the SQL LIMIT).
         let mut stream = self
             .client
-            .query_stream::<TagNameRow>(&sql, &QuerySettings::new())
+            .query_stream::<TagNameRow>(&sql, &settings)
             .await
-            .map_err(ReadError::Clickhouse)?;
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(ReadError::Clickhouse)?;
+            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             names.push((row.scope, row.key));
         }
         let truncated = names.len() > TAG_NAMES_MAX;
@@ -564,8 +572,11 @@ impl TraceEngine {
 
     /// Streams the §4.3 tag-values read (issue #58): distinct values for
     /// one key, optionally scope-confined — same catalog-only,
-    /// escape-at-the-engine, `LIMIT` cap + 1 probe contract as
-    /// [`Self::list_tag_names`], capped at [`TAG_VALUES_MAX`].
+    /// escape-at-the-engine, `LIMIT` cap + 1 probe, and [`catalog_settings`]
+    /// read-budget contract as [`Self::list_tag_names`], capped at
+    /// [`TAG_VALUES_MAX`]. A bare-key lookup (no `scope`) cannot prune the
+    /// catalog's leading `(scope, key, val)` primary-key column, so it is
+    /// a full scan bounded only by the budget.
     pub async fn list_tag_values(
         &self,
         key: &str,
@@ -579,15 +590,16 @@ impl TraceEngine {
             scope_literal.as_deref(),
             TAG_VALUES_MAX + 1,
         );
+        let settings = catalog_settings(&self.config);
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
             .client
-            .query_stream::<TagValueRow>(&sql, &QuerySettings::new())
+            .query_stream::<TagValueRow>(&sql, &settings)
             .await
-            .map_err(ReadError::Clickhouse)?;
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(ReadError::Clickhouse)?;
+            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
             values.push(row.val);
         }
         let truncated = values.len() > TAG_VALUES_MAX;
@@ -1007,6 +1019,29 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("read_overflow_mode", "throw")
         .set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
         .set("result_overflow_mode", "throw")
+}
+
+/// The Layer-1 read budget the two §4.3 catalog reads carry (issue #58
+/// re-review): `max_rows_to_read` (reusing
+/// `reader.traceql_scan_budget_rows` — the same knob [`search_settings`]
+/// uses, one number, no dedicated catalog config surface) plus the
+/// read-side byte budget, both throw. The catalog is `Replication::Global`
+/// and never `_dist`-suffixed, so — unlike [`search_settings`] — this
+/// deliberately never adds the clustered-reader settings: there is no
+/// coordinator fan-out to bound. Result-side (`max_result_bytes`) is
+/// deliberately omitted: it does not reliably throw on a streamed
+/// `DISTINCT` shape (docs/schemas.md §7); the read-side row budget is the
+/// binding bound a breach maps through ([`map_trace_read_error`], code
+/// 158 → [`TooBroadReason::TraceScanBudgetRows`]). A breach means an
+/// over-broad discovery scan (unscoped `/tags`, or a bare-key `/values`
+/// lookup with no scope) aborts loud at `422` rather than serving a slow
+/// unbounded scan; scoped reads that prune to a small partition stay
+/// under budget and return `200` as before.
+fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
+    QuerySettings::new()
+        .set("max_rows_to_read", config.scan_budget_rows)
+        .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
+        .set("read_overflow_mode", "throw")
 }
 
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
@@ -1750,5 +1785,39 @@ mod tests {
                 "missing {expected} in {rendered}"
             );
         }
+    }
+
+    /// AC1 (issue #58 re-review): the catalog reads carry the same
+    /// row-budget/throw contract the search path pins above, but never
+    /// the clustered-reader settings — the catalog is a Global, un-`_dist`
+    /// table with no coordinator fan-out to bound.
+    #[test]
+    fn catalog_settings_pin_the_layer_1_read_budget_contract() {
+        let rendered = format!("{:?}", catalog_settings(&cfg()));
+        for expected in ["max_rows_to_read", "1000", "read_overflow_mode", "throw"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected} in {rendered}"
+            );
+        }
+        for absent in ["optimize_skip_unused_shards", "prefer_localhost_replica"] {
+            assert!(
+                !rendered.contains(absent),
+                "unexpected {absent} in {rendered} — catalog reads are never clustered"
+            );
+        }
+    }
+
+    /// Distributed config must not leak the clustered-reader settings into
+    /// the catalog read either — the catalog table itself is never
+    /// `_dist`, regardless of whether the *rest* of this engine's config
+    /// targets a clustered deployment.
+    #[test]
+    fn catalog_settings_stay_unclustered_even_when_the_engine_config_is_distributed() {
+        let mut config = cfg();
+        config.distributed = true;
+        let rendered = format!("{:?}", catalog_settings(&config));
+        assert!(!rendered.contains("optimize_skip_unused_shards"));
+        assert!(!rendered.contains("prefer_localhost_replica"));
     }
 }
