@@ -97,6 +97,7 @@ impl IntoResponse for ApiError {
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
+/// | `PromqlError::Cancelled` (issue #93, unreachable in practice) | 408 | `timeout` |
 fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
     match e {
         PromqlError::Parse(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
@@ -115,6 +116,14 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         | PromqlError::LabelSet { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
+        // Issue #93: a live `CancelToken` fired because the awaiting
+        // request future was already dropped (client disconnect, or the
+        // `TimeoutLayer` firing first — `middleware.rs`'s own 408
+        // `query_timeout`). Matched for exhaustiveness only — by the time
+        // this variant exists, the future that would encode this response
+        // is gone, so this arm is unreachable in practice. `408`/`timeout`
+        // mirrors the same convention rather than inventing a new status.
+        PromqlError::Cancelled => (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string()),
     }
 }
 
@@ -322,6 +331,18 @@ mod tests {
                 .unwrap()
                 .contains("invalid smoothing factor")
         );
+    }
+
+    /// Issue #93 (plan-review note 1): a cancelled offloaded eval maps to
+    /// 408, `errorType: "timeout"` — matching `middleware.rs`'s existing
+    /// `TimeoutLayer` 408 convention, not `503`/`unavailable` (the
+    /// `ChError::Timeout` mapping above) and not a made-up `499`.
+    #[tokio::test]
+    async fn promql_cancelled_error_maps_to_408_timeout() {
+        let err = PromqlError::Cancelled;
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(json["errorType"], "timeout");
     }
 
     #[tokio::test]

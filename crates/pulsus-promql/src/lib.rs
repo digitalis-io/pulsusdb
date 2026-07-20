@@ -13,7 +13,7 @@ pub mod value;
 
 pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
 pub use error::PromqlError;
-pub use eval::evaluate;
+pub use eval::{CancelToken, evaluate, evaluate_cancellable};
 pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{

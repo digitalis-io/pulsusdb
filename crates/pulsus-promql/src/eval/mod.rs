@@ -30,6 +30,8 @@ pub mod staleness;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::annotations::Annotations;
 use crate::error::PromqlError;
@@ -58,6 +60,39 @@ enum StepValue {
 /// set — upstream hashes the complete label set, `__name__` included.
 type SeriesIdentity = (Option<String>, Labels);
 
+/// Cooperative cancellation, checked at eval-loop checkpoints (issue #93):
+/// once per range step, once per subquery inner-grid point, and before the
+/// single instant `eval_step`. `None` (via [`CancelToken::never`]) means
+/// "never cancelled" — the shape [`evaluate`] uses, so every existing
+/// caller (corpus, benches, count-gates) observes byte-identical behavior.
+/// Carried by value on [`EvalCaches`], not a borrow: the flag is a fresh
+/// per-call `Arc` owned by the read path, cheap to clone.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Option<Arc<AtomicBool>>);
+
+impl CancelToken {
+    /// Wraps a caller-owned flag: the read path sets it when the awaiting
+    /// request future is dropped (client disconnect / timeout).
+    pub fn new(flag: Arc<AtomicBool>) -> Self {
+        Self(Some(flag))
+    }
+
+    /// A token that never fires — [`evaluate`]'s wrapper shape.
+    pub const fn never() -> Self {
+        Self(None)
+    }
+
+    /// `Relaxed` is sufficient: per-location atomic coherence guarantees
+    /// the blocking thread eventually observes the reactor thread's store;
+    /// no cross-location ordering is needed (matches [`crate`]'s sibling
+    /// `EvalGate` gauges). `None` (never-cancelled) short-circuits to
+    /// `false` without touching an atomic.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.as_deref().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+}
+
 /// Evaluates `plan` against `data` — pure, no I/O. Returns the value
 /// alongside the accumulated [`Annotations`] (M7-A5b-i): a generic sink —
 /// empty for every float-only query (byte-identical to the pre-A5b-i
@@ -67,7 +102,21 @@ pub fn evaluate(
     plan: &QueryPlan,
     data: &SeriesData,
 ) -> Result<(QueryValue, Annotations), PromqlError> {
-    evaluate_counted(plan, data).map(|(value, _counts, annotations)| (value, annotations))
+    evaluate_cancellable(plan, data, CancelToken::never())
+}
+
+/// [`evaluate`] with a live cancellation token (issue #93): the offloaded
+/// read path passes a token that fires when the awaiting request future is
+/// dropped (client disconnect / `TimeoutLayer` 408), so a still-running
+/// `spawn_blocking` eval bails at its next checkpoint instead of burning a
+/// full evaluation for a caller that is already gone.
+pub fn evaluate_cancellable(
+    plan: &QueryPlan,
+    data: &SeriesData,
+    cancel: CancelToken,
+) -> Result<(QueryValue, Annotations), PromqlError> {
+    evaluate_counted_with(plan, data, cancel)
+        .map(|(value, _counts, annotations)| (value, annotations))
 }
 
 /// The evaluation-count observables [`evaluate_counted`] returns
@@ -106,10 +155,22 @@ struct EvalCounts {
     finalize_matrix_merge_passes: u64,
 }
 
-/// [`evaluate`] plus [`EvalCounts`] and the drained [`Annotations`] sink.
+/// [`evaluate`] plus [`EvalCounts`] and the drained [`Annotations`] sink —
+/// the never-cancelled shape used by every existing caller (corpus, count-
+/// gate tests, benches).
+#[cfg(test)]
 fn evaluate_counted(
     plan: &QueryPlan,
     data: &SeriesData,
+) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
+    evaluate_counted_with(plan, data, CancelToken::never())
+}
+
+/// [`evaluate_counted`] with an explicit [`CancelToken`] (issue #93).
+fn evaluate_counted_with(
+    plan: &QueryPlan,
+    data: &SeriesData,
+    cancel: CancelToken,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
     let p = &plan.params;
 
@@ -119,7 +180,10 @@ fn evaluate_counted(
     // windows from the shared results. Issue #82 rides the same pass:
     // every `info()` node's arg0 horizon is walked once here to build
     // its horizon-wide identifying-label narrowing (`prepare_info`).
-    let mut caches = EvalCaches::default();
+    let mut caches = EvalCaches {
+        cancel,
+        ..EvalCaches::default()
+    };
     let mut counts = EvalCounts::default();
     // The classifier instance is per-call, like the caches (Δ4). It is
     // threaded through `prepare_subqueries` too (issue #95): each
@@ -157,6 +221,11 @@ fn evaluate_counted(
     )?;
 
     if p.step_ms == 0 {
+        // Issue #93: a single instant eval has no per-step loop to
+        // checkpoint inside, so the cancellation check sits just before it.
+        if caches.cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
         let value = match eval_step(
             &plan.root,
             &plan.selectors,
@@ -212,6 +281,11 @@ fn evaluate_counted(
 
     let mut t = p.start_ms;
     while t <= p.end_ms {
+        // Issue #93: one `Relaxed` load per step — O(1), no allocation, no
+        // per-sample work inside `eval_step`.
+        if caches.cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
         match eval_step(&plan.root, &plan.selectors, data, t, p.lookback_ms, &caches)? {
             StepValue::Vector(v) => {
                 saw_vector = true;
@@ -559,6 +633,10 @@ struct EvalCaches {
     /// (plan v2 OQ1(a): "thread a collector, do not widen every `Result`").
     /// Drained by [`evaluate_counted`] at both return points.
     annotations: RefCell<Annotations>,
+    /// Cooperative cancellation (issue #93): owned, not borrowed, so no
+    /// lifetime is added to `EvalCaches` or any `prepare_*` signature.
+    /// Defaults to [`CancelToken::never`] — the shape [`evaluate`] uses.
+    cancel: CancelToken,
 }
 
 /// The evaluation grid a node will be stepped over: the closed
@@ -1101,6 +1179,11 @@ fn prepare_subquery(
 
         let mut it = grid_start;
         while it <= maxt_max {
+            // Issue #93: one `Relaxed` load per grid point, mirroring the
+            // outer range-step checkpoint above.
+            if caches.cancel.is_cancelled() {
+                return Err(PromqlError::Cancelled);
+            }
             *inner_evals += 1;
             match eval_step(&sq.inner, selectors, data, it, lookback_ms, caches)? {
                 StepValue::Vector(v) => {
@@ -6129,6 +6212,96 @@ mod tests {
         assert!(
             err.to_string().contains("range query"),
             "string range queries are a plan-time rejection: {err}"
+        );
+    }
+
+    /// Issue #93 acceptance criteria 1-3: a pre-armed [`CancelToken`]
+    /// short-circuits evaluation with `Err(PromqlError::Cancelled)`, never
+    /// a partial/complete `Ok`. Non-vacuous: removing the range-step
+    /// checkpoint turns the first case's assertion into a failing `Ok(..)`
+    /// match. The `never()` token (what [`evaluate`] uses) is unaffected —
+    /// the same plans/data still complete normally, proving the default
+    /// path is unchanged.
+    #[test]
+    fn a_pre_armed_cancel_token_short_circuits_the_range_step_checkpoint() {
+        let armed = CancelToken::new(Arc::new(AtomicBool::new(true)));
+
+        let expr = crate::parser::parse("up").unwrap();
+        let range_plan = plan(&expr, params(0, 60_000, 10_000)).unwrap();
+        let mut range_data = SeriesData::new();
+        range_data.insert(
+            0,
+            vec![series(1, &[("job", "a")], vec![s(0, 1.0), s(60_000, 2.0)])],
+        );
+        assert!(
+            matches!(
+                evaluate_cancellable(&range_plan, &range_data, armed),
+                Err(PromqlError::Cancelled)
+            ),
+            "a pre-armed token must short-circuit the range-step loop"
+        );
+        assert!(
+            matches!(
+                evaluate(&range_plan, &range_data),
+                Ok(QueryValue::Matrix(_))
+            ),
+            "the never() token (evaluate's shape) must still complete the same plan"
+        );
+    }
+
+    /// Issue #93 acceptance criterion 2 — isolates the subquery
+    /// inner-grid checkpoint (`:1103`, inside `prepare_subquery`) from the
+    /// stepping-phase checkpoints (`:159-160`/`:214`): calling
+    /// `prepare_subqueries` directly (rather than through
+    /// `evaluate_cancellable`) means no downstream checkpoint can mask an
+    /// absent grid-loop check — the stepping phase this plan would
+    /// otherwise reach is never invoked here. `inner_evals == 0` on the
+    /// `Err` additionally proves the loop bailed on its FIRST grid point,
+    /// not after materializing some/all of the grid. Non-vacuous: with the
+    /// checkpoint removed, `prepare_subqueries` returns `Ok(())` and
+    /// `inner_evals == 12` (the full union grid), failing both assertions.
+    #[test]
+    fn a_pre_armed_cancel_token_short_circuits_the_subquery_grid_checkpoint() {
+        let armed = CancelToken::new(Arc::new(AtomicBool::new(true)));
+
+        let expr = crate::parser::parse("sum_over_time(up[60s:10s])").unwrap();
+        let sq_plan = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut sq_data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=12).map(|k| s(k * 10_000, 1.0)).collect();
+        sq_data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+
+        let mut caches = EvalCaches {
+            cancel: armed,
+            ..EvalCaches::default()
+        };
+        let mut inner_evals = 0u64;
+        let mut classifier = crate::plan::StepInvariance::new(&sq_plan.selectors);
+        let err = prepare_subqueries(
+            &sq_plan.root,
+            &sq_plan.selectors,
+            &sq_data,
+            Horizon {
+                start_ms: sq_plan.params.start_ms,
+                end_ms: sq_plan.params.end_ms,
+                step_ms: sq_plan.params.step_ms,
+            },
+            sq_plan.params.lookback_ms,
+            &mut caches,
+            &mut inner_evals,
+            &mut classifier,
+        )
+        .expect_err("a pre-armed token must short-circuit the subquery inner-grid loop");
+        assert!(matches!(err, PromqlError::Cancelled));
+        assert_eq!(
+            inner_evals, 0,
+            "the grid loop must bail on its first point, not after materializing the grid"
+        );
+
+        // The never() token (evaluate's shape) still completes the same
+        // plan end-to-end.
+        assert!(
+            evaluate(&sq_plan, &sq_data).is_ok(),
+            "the never() token must still complete the subquery plan"
         );
     }
 }

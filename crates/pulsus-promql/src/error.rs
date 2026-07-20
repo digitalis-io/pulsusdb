@@ -83,6 +83,14 @@ pub enum PromqlError {
     /// error.
     #[error("invalid function parameter: {detail}")]
     InvalidParameter { detail: String },
+
+    /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
+    /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
+    /// the awaiting request future was dropped (client disconnect, or the
+    /// server's `TimeoutLayer` firing first). `evaluate` (the `never()`
+    /// token) can never produce this variant.
+    #[error("query evaluation cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]

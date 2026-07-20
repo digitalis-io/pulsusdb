@@ -537,25 +537,36 @@ impl MetricsEngine {
         //
         // Cancellation/concurrency bound (issue #101, hardening #93's Δ2):
         // tokio does NOT cancel a `spawn_blocking` task when its awaiter is
-        // dropped, so a disconnected/timed-out client's eval still runs to
-        // completion on the blocking pool. `self.eval_gate` (the shared
-        // `AppState`-owned `EvalGate`) now bounds BOTH in-flight and queued
-        // evals: the permit is acquired here — AFTER the `join_all` fetch
-        // above fully drained every `ChRowStream`, so no pooled-connection
-        // lease is ever held across the offload — and released only when the
-        // blocking eval finishes (the owned permit lives inside the
-        // `spawn_blocking` closure). Exhaustion is a bounded wait
+        // dropped. `self.eval_gate` (the shared `AppState`-owned
+        // `EvalGate`) bounds BOTH in-flight and queued evals: the permit is
+        // acquired inside `run_blocking` — AFTER the `join_all` fetch above
+        // fully drained every `ChRowStream`, so no pooled-connection lease
+        // is ever held across the offload — and released only when the
+        // blocking eval finishes. Exhaustion is a bounded wait
         // (`acquire().await`), bounded by the upstream `TimeoutLayer` (408,
         // `query_timeout`); a timed-out/disconnected waiter releases its
         // queued reservation cleanly. No 429/503 and no new timeout knob.
         //
-        // The only reachable `JoinError` is a PANIC in `evaluate`: we own
-        // the handle and `.await` it directly (never `abort`, never drop it
-        // early), so cancellation is unreachable. Re-raising the panic
-        // preserves today's panic-on-bug behavior exactly (no new
+        // Cooperative cancellation (issue #93, follow-up): a disconnected/
+        // timed-out client's eval used to still run to completion once
+        // admitted (the gate only bounds concurrency, not duration).
+        // `evaluate_offloaded` now arms a [`CancelOnDrop`] guard that fires
+        // when this async frame is dropped, so an already-abandoned eval
+        // bails at its next `pulsus_promql` checkpoint instead of burning a
+        // full evaluation.
+        //
+        // The only reachable `JoinError` is a PANIC in `evaluate_cancellable`:
+        // we own the handle and `.await` it directly (never `abort`, never
+        // drop it early), so cancellation is unreachable. Re-raising the
+        // panic preserves today's panic-on-bug behavior exactly (no new
         // `ReadError` variant — a panic is not a domain error).
-        let (value, annotations) =
-            evaluate_offloaded(&self.eval_gate, plan, data, pulsus_promql::evaluate).await?;
+        let (value, annotations) = evaluate_offloaded(
+            &self.eval_gate,
+            plan,
+            data,
+            pulsus_promql::evaluate_cancellable,
+        )
+        .await?;
         Ok((value_to_query_result(value), annotations))
     }
 
@@ -1309,14 +1320,25 @@ fn concrete_name(sel: &SelectorSpec) -> Result<&str, ReadError> {
 /// client evals tokio will not cancel).
 ///
 /// The eval body is a closure parameter (`eval`), not hard-wired: production
-/// passes [`pulsus_promql::evaluate`] (a zero-sized fn item — no runtime
-/// cost, no hot-path instrumentation), while tests can inject an
+/// passes [`pulsus_promql::evaluate_cancellable`] (a zero-sized fn item — no
+/// runtime cost, no hot-path instrumentation), while tests can inject an
 /// eval-equivalent closure that observes concurrency *inside* the offloaded
 /// blocking task. This is the only deterministic way to gate the "permit is
 /// held for the DURATION of the blocking eval" property through this exact
 /// function (the gate view alone cannot see it: a regression that dropped
 /// the permit before `spawn_blocking` would make the gate look *idle* while
 /// N+k evals ran, so the over-admission must be counted at the eval itself).
+///
+/// Issue #93: tokio does not cancel a running `spawn_blocking` when its
+/// awaiter is dropped (client disconnect, or the server's `TimeoutLayer`
+/// firing first) — the CPU-bound eval would otherwise burn a full
+/// evaluation for a caller already gone. `flag`/`token` are a fresh
+/// per-call pair: `token` rides into the blocking closure via `eval`'s
+/// `CancelToken` parameter, and `_guard` — held in THIS async frame, across
+/// the `.await` — sets `flag` on drop, whether that drop is the normal
+/// return or the future being dropped mid-`.await`. Either way the
+/// blocking closure observes the flag at its next eval-loop checkpoint and
+/// bails with `PromqlError::Cancelled`.
 async fn evaluate_offloaded<F>(
     gate: &crate::eval_gate::EvalGate,
     plan: pulsus_promql::QueryPlan,
@@ -1327,15 +1349,34 @@ where
     F: FnOnce(
             &pulsus_promql::QueryPlan,
             &pulsus_promql::SeriesData,
+            pulsus_promql::CancelToken,
         ) -> Result<
             (pulsus_promql::QueryValue, pulsus_promql::Annotations),
             pulsus_promql::PromqlError,
         > + Send
         + 'static,
 {
-    match gate.run_blocking(move || eval(&plan, &data)).await {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let token = pulsus_promql::CancelToken::new(std::sync::Arc::clone(&flag));
+    let _guard = CancelOnDrop(flag);
+    match gate.run_blocking(move || eval(&plan, &data, token)).await {
         Ok(res) => Ok(res?),
         Err(join) => std::panic::resume_unwind(join.into_panic()),
+    }
+}
+
+/// Sets its flag on drop (issue #93) — armed in [`evaluate_offloaded`]'s
+/// async frame across the `.await`, so dropping that frame (client
+/// disconnect / request timeout) signals the still-running `spawn_blocking`
+/// closure to bail at its next [`pulsus_promql::CancelToken`] checkpoint.
+/// Fires on the happy path too: harmless, since the flag is a fresh
+/// per-call `Arc` the closure has already finished with by the time this
+/// drops, and `Relaxed` stores cost one atomic write, never inside a loop.
+struct CancelOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -2209,7 +2250,7 @@ mod tests {
             "sanity: the spawned task must not run before the driver yields"
         );
         let gate = crate::eval_gate::EvalGate::new(crate::eval_gate::DEFAULT_EVAL_CONCURRENCY);
-        let out = evaluate_offloaded(&gate, plan, data, pulsus_promql::evaluate)
+        let out = evaluate_offloaded(&gate, plan, data, pulsus_promql::evaluate_cancellable)
             .await
             .unwrap();
         assert!(
@@ -2253,7 +2294,7 @@ mod tests {
         let (plan, data) = heavy_eval_fixture();
         let g = Arc::clone(&gate);
         let handle = tokio::spawn(async move {
-            evaluate_offloaded(&g, plan, data, pulsus_promql::evaluate)
+            evaluate_offloaded(&g, plan, data, pulsus_promql::evaluate_cancellable)
                 .await
                 .unwrap()
         });
@@ -2325,7 +2366,7 @@ mod tests {
             let max_seen = Arc::clone(&max_seen);
             let (plan, data) = heavy_eval_fixture();
             handles.push(tokio::spawn(async move {
-                evaluate_offloaded(&gate, plan, data, move |plan, data| {
+                evaluate_offloaded(&gate, plan, data, move |plan, data, _cancel| {
                     // Runs on the blocking pool while the permit is held.
                     let cur = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(cur, Ordering::SeqCst);
@@ -2379,6 +2420,93 @@ mod tests {
             gate.snapshot().available,
             N,
             "every eval permit is returned after evaluate_offloaded completes"
+        );
+    }
+
+    /// Issue #93 — proves the `CancelOnDrop` guard: aborting the task that
+    /// is `.await`ing `evaluate_offloaded` drops its async frame, which
+    /// must set the token the still-running blocking closure observes.
+    ///
+    /// The injected closure loops checking `cancel.is_cancelled()`,
+    /// sleeping 1ms/iteration, up to a FINITE cap. Plan-review note 2: that
+    /// cap (`CAP_ITERS * SLEEP` = 10s) is deliberately built to EXCEED the
+    /// 5s liveness ceiling below — an uncancelled closure cannot finish
+    /// its cap inside that window, so a broken (non-cancelling) `evaluate_
+    /// offloaded` cannot pass this test by racing to completion; the
+    /// `.expect` on the timeout panics instead. The 5s bound is a generous
+    /// liveness ceiling on a boolean property (did cancellation get
+    /// observed), never a race — a correct implementation observes
+    /// cancellation within ~1ms of the abort and returns almost
+    /// immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_awaiter_mid_eval_is_observed_by_the_blocking_closure() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tokio::sync::Semaphore as TokioSemaphore;
+
+        // 10_000 * 1ms = 10s, deliberately > the 5s liveness ceiling below.
+        const CAP_ITERS: u64 = 10_000;
+        const SLEEP: Duration = Duration::from_millis(1);
+
+        let gate = Arc::new(crate::eval_gate::EvalGate::new(
+            crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
+        ));
+        let started = Arc::new(TokioSemaphore::new(0));
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+        let finished_uncancelled = Arc::new(AtomicBool::new(false));
+
+        let (plan, data) = heavy_eval_fixture();
+        let g = Arc::clone(&gate);
+        let s = Arc::clone(&started);
+        let oc = Arc::clone(&observed_cancel);
+        let fu = Arc::clone(&finished_uncancelled);
+        let awaiter = tokio::spawn(async move {
+            evaluate_offloaded(&g, plan, data, move |plan, data, cancel| {
+                // Signals the closure is running on the blocking pool
+                // (holds the eval-gate permit) before the abort below.
+                s.add_permits(1);
+                for _ in 0..CAP_ITERS {
+                    if cancel.is_cancelled() {
+                        oc.store(true, Ordering::SeqCst);
+                        return pulsus_promql::evaluate(plan, data);
+                    }
+                    std::thread::sleep(SLEEP);
+                }
+                // Only reachable if cancellation was never observed — the
+                // failure mode this test guards against.
+                fu.store(true, Ordering::SeqCst);
+                pulsus_promql::evaluate(plan, data)
+            })
+            .await
+        });
+
+        // Deterministically wait for the closure to start (no race on
+        // "did the blocking closure even begin running yet").
+        started.acquire().await.unwrap().forget();
+
+        // Drops `evaluate_offloaded`'s async frame mid-`.await`, firing
+        // the `CancelOnDrop` guard.
+        awaiter.abort();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !observed_cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect(
+            "the blocking closure must observe cancellation within the 5s liveness ceiling \
+             (a broken/uncancellable impl cannot finish its 10s finite cap in time)",
+        );
+
+        assert!(
+            observed_cancel.load(Ordering::SeqCst),
+            "the closure must have observed the cancel token"
+        );
+        assert!(
+            !finished_uncancelled.load(Ordering::SeqCst),
+            "the closure must bail via cancellation, never run its finite cap to completion"
         );
     }
 
