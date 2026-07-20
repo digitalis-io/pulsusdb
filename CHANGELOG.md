@@ -34,3 +34,12 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   tags, gated on an already-exists preflight guard and a digest-verified
   `helm pull` round trip.
 - `CHANGELOG.md` (this file).
+- Helm chart: a `pulsusdb.validateAuth` render-time guard rejects
+  partial/ambiguous `pulsusdb.auth` combinations (one-sided `user`,
+  one-sided password source, or `password`+`existingSecret` together);
+  `image.digest` (preferred over `image.tag`) and validated optional
+  `@sha256:` suffixes on `clickhouse.image`/`clickhouse.keeperImage`/
+  `otelCollector.image` make every chart-rendered image digest-pinnable;
+  `.github/workflows/helm-release.yml` and `.github/workflows/release.yml`
+  now mechanically enforce, as their first post-checkout step, that a
+  release tag is an ancestor of `origin/main`.

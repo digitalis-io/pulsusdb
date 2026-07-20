@@ -11,6 +11,7 @@ process by the CLI flag, which wins over the YAML file).
 {{- include "pulsusdb.validateClickhouseServer" . -}}
 {{- include "pulsusdb.validateClickhouseAuth" . -}}
 {{- include "pulsusdb.validateReplicasPerShard" . -}}
+{{- include "pulsusdb.validateAuth" . -}}
 {{- $cfg := deepCopy .Values.pulsusdb.config }}
 {{- $clusterName := "" }}
 {{- if and .Values.clickhouse.enabled (eq .Values.topology "cluster") }}

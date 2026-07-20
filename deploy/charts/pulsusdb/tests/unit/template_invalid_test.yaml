@@ -102,3 +102,54 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "oneOf"
+
+  - it: given pulsusdb.auth.user set with no password source, when rendering, then the pulsusdb.validateAuth fail guard rejects it (one-sided auth)
+    set:
+      pulsusdb.auth.user: "admin"
+    asserts:
+      # See the template attribution note above: the guard lives in
+      # configmap.yaml but fires first via deployment-all.yaml's checksum
+      # include.
+      - failedTemplate:
+          errorPattern: "no password source"
+        template: deployment-all.yaml
+
+  - it: given pulsusdb.auth.password set with no user, when rendering, then the pulsusdb.validateAuth fail guard rejects it (one-sided auth)
+    set:
+      pulsusdb.auth.password: "s3cret"
+    asserts:
+      - failedTemplate:
+          errorPattern: "pulsusdb.auth.user is not"
+        template: deployment-all.yaml
+
+  - it: given pulsusdb.auth.existingSecret set with no user, when rendering, then the pulsusdb.validateAuth fail guard rejects it (one-sided auth)
+    set:
+      pulsusdb.auth.existingSecret: "my-secret"
+    asserts:
+      - failedTemplate:
+          errorPattern: "pulsusdb.auth.user is not"
+        template: deployment-all.yaml
+
+  - it: given pulsusdb.auth.password and pulsusdb.auth.existingSecret both set, when rendering, then the pulsusdb.validateAuth fail guard rejects it (mutually exclusive)
+    set:
+      pulsusdb.auth.user: "admin"
+      pulsusdb.auth.password: "s3cret"
+      pulsusdb.auth.existingSecret: "my-secret"
+    asserts:
+      - failedTemplate:
+          errorPattern: "mutually exclusive"
+        template: deployment-all.yaml
+
+  - it: given a malformed image.digest, when rendering, then values.schema.json rejects it
+    set:
+      image.digest: "not-a-digest"
+    asserts:
+      - failedTemplate:
+          errorPattern: "digest|pattern"
+
+  - it: "given a malformed @sha256: suffix on otelCollector.image, when rendering, then values.schema.json rejects it"
+    set:
+      otelCollector.image: "docker.io/otel/opentelemetry-collector-contrib:0.110.0@sha256:not-hex"
+    asserts:
+      - failedTemplate:
+          errorPattern: "image|pattern"

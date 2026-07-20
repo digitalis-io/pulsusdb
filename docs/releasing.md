@@ -271,3 +271,11 @@ having already gated the `main` commit a `helm-v*` tag is cut from. If
 untested chart could be published. A `GITHUB_TOKEN` cannot modify
 repository branch-protection settings, so this is a manual, one-time
 action in the repository's Settings → Branches page.
+
+Both `.github/workflows/helm-release.yml` and `.github/workflows/release.yml`
+now mechanically enforce, as their first post-checkout step, that the
+tagged commit is an ancestor of `origin/main` (`git merge-base
+--is-ancestor`) — a tag on an unmerged commit fails at that step instead
+of publishing. Ancestry no longer rests on convention; branch protection
+is still required for the *behavioural test* gate (`chart-test-kind`),
+which no workflow step re-runs.

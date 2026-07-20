@@ -13,6 +13,11 @@
       "properties": {
         "repository": { "type": "string", "minLength": 1 },
         "tag": { "type": "string" },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[0-9a-f]{64})?$",
+          "description": "Immutable digest pin, preferred over `tag` when set (`_helpers.tpl`'s `pulsusdb.image` — issue #38 #115 group)."
+        },
         "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
       }
     },
@@ -49,6 +54,7 @@
         "auth": {
           "type": "object",
           "additionalProperties": false,
+          "description": "HTTP Basic auth. The pairing invariant (user+password source both-or-neither, password/existingSecret mutually exclusive) is guard-enforced at template time (`_helpers.tpl`'s `pulsusdb.validateAuth`, the `validateClickhouseAuth` precedent), not expressed here.",
           "properties": {
             "user": { "type": "string" },
             "password": { "type": "string" },
@@ -92,8 +98,8 @@
       "required": ["enabled", "shards", "replicasPerShard"],
       "properties": {
         "enabled": { "type": "boolean" },
-        "image": { "type": "string", "minLength": 1 },
-        "keeperImage": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1, "pattern": "^[^@]+(@sha256:[0-9a-f]{64})?$" },
+        "keeperImage": { "type": "string", "minLength": 1, "pattern": "^[^@]+(@sha256:[0-9a-f]{64})?$" },
         "shards": { "type": "integer", "minimum": 1 },
         "replicasPerShard": {
           "type": "integer",
@@ -135,7 +141,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
-        "image": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1, "pattern": "^[^@]+(@sha256:[0-9a-f]{64})?$" },
         "config": {
           "type": "object",
           "additionalProperties": true,

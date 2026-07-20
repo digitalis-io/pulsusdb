@@ -22,6 +22,12 @@ image:
   # `{{ .Chart.AppVersion }}` fallback convention, `_helpers.tpl`).
   tag: ""
   pullPolicy: IfNotPresent
+  # -- Immutable digest pin (`sha256:<64 hex>`, validated by
+  # values.schema.json), preferred over `tag` when set — `tag` is
+  # silently dropped rather than producing an invalid
+  # `repo@sha256:...:tag` ref (`_helpers.tpl`'s `pulsusdb.image`).
+  # Unset by default.
+  digest: ""
 
 imagePullSecrets: []
 
@@ -134,9 +140,12 @@ pulsusdb:
   # -- HTTP Basic auth (docs/configuration.md §1). `user` is non-secret and
   # rendered into the ConfigMap; `password` is chart-managed: set it
   # explicitly, or point `existingSecret` at a pre-created Secret carrying
-  # a `PULSUS_AUTH_PASSWORD` key. Both unset (default) => no auth (matches
-  # `pulsus-config`'s own "one-sided is a startup error" contract — do not
-  # set only `user`).
+  # a `PULSUS_AUTH_PASSWORD` key. Both unset (default) => no auth. The
+  # validity matrix is enforced at render time (`_helpers.tpl`'s
+  # `pulsusdb.validateAuth` fail guard, matching `pulsus-config`'s own
+  # "one-sided is a startup error" contract): `user`-only, a password
+  # source without `user`, and `password`+`existingSecret` together all
+  # fail the render with an actionable message.
   auth:
     user: ""
     password: ""
@@ -186,10 +195,12 @@ clickhouse:
   enabled: true
   # -- Pinned to a full patch tag, not a floating `24.8` minor (code
   # review round-1 [low] finding #12) — `24.8` can resolve to a different
-  # image over time as new patches land; digest-pinning is left to
-  # operators who want it (`--set clickhouse.image=...@sha256:...`).
-  # Re-verify this pin is still a published, non-EOL 24.8.x LTS patch
-  # before bumping the chart's own default.
+  # image over time as new patches land. Digest-pinning is available and
+  # schema-validated (issue #38 #115 group, `values.schema.json`):
+  # `--set clickhouse.image=...@sha256:<64 hex>` appends a validated
+  # digest suffix, rendered verbatim. Re-verify this pin is still a
+  # published, non-EOL 24.8.x LTS patch before bumping the chart's own
+  # default.
   image: docker.io/clickhouse/clickhouse-server:24.8.14
   keeperImage: docker.io/clickhouse/clickhouse-keeper:24.8.14
 

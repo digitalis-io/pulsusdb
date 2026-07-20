@@ -21,11 +21,12 @@ concurrency: helm-publish
 # read a *different* workflow run's PR check results anyway. Kind is
 # deliberately **not** re-run here: `chart-test-kind`
 # (.github/workflows/helm-chart.yml) is a required branch-protection check
-# on `main` (docs/releasing.md), and a `helm-v*` tag is only ever cut from
-# an already-merged `main` commit — the behavioural gate is the merge
-# barrier, not something this tag-triggered job needs to repeat. See
-# docs/releasing.md's branch-protection owner action, which lists
-# `chart-test-kind` among the required checks for exactly this reason.
+# on `main` (docs/releasing.md), and the ancestry gate below mechanically
+# enforces that a `helm-v*` tag is only ever cut from an already-merged
+# `main` commit — the behavioural gate is the merge barrier, not something
+# this tag-triggered job needs to repeat. See docs/releasing.md's
+# branch-protection owner action, which lists `chart-test-kind` among the
+# required checks for exactly this reason.
 on:
   push:
     tags: ["helm-v*"]
@@ -52,6 +53,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
+
+      # Mechanically enforce that this tag points at a commit that has
+      # actually been merged into main (issue #38 #115 group) — previously
+      # only a convention documented in the comment block above and
+      # docs/releasing.md, not something any step checked.
+      - name: Enforce tag ancestry — publish only from merged main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not an ancestor of origin/main — releases are published only from merged main commits"
+            exit 1
+          fi
 
       - uses: azure/setup-helm@v4
         with:
