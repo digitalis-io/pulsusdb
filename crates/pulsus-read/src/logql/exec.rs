@@ -1308,6 +1308,21 @@ pub struct TailPage {
     pub fetched: u32,
 }
 
+/// Registration-visibility grace at the live edge (issue #94 v6-v8): the
+/// hold/scan-gate keeps `TailSetup::scan_floor_ns` frozen (full-span
+/// stage-1) until the producer certifies a COMPLETED full-span poll whose
+/// start dwell at the live edge was >= this grace, and thereafter bounds
+/// how far the narrowed floor trails the live cursor
+/// (`lower_ns - TAIL_REGISTRATION_GRACE_NS`). POLICY, not a derived
+/// ceiling: covers the default `batch_ms` flush (200 ms), a ~1.5s pre-send
+/// retry tail, and generous headroom for distributed-send backlogs;
+/// visibility later than GRACE is issue #134's ingest-durability scope,
+/// not a read-path constant to inflate. Documented constant (same precedent as
+/// the writer's retry constants) — deliberately not an env/config/request
+/// knob (a knob would invite masking #134-class failures with unbounded
+/// read-side rescans; reconnect is the existing, no-knob remedy).
+pub const TAIL_REGISTRATION_GRACE_NS: i64 = 3_600_000_000_000;
+
 /// The per-connection tail setup (issue #74): the streams plan and the
 /// compiled pipeline, built ONCE before the WebSocket upgrade (a bad
 /// regex/template is a 400 rejection, never an upgraded-then-closed
@@ -1317,25 +1332,74 @@ pub struct TailPage {
 /// fetch ordering/cursor differ.
 ///
 /// Beyond the (public) `plan`/`compiled`, the setup carries crate-private
-/// state for the best-effort month-boundary refresh (issue #94 item 2):
-/// the original `expr` and `base_params` are replanned — with **no DB
-/// I/O** — into a fresh `plan` whose stage-1 month IN-list covers a newly
-/// crossed calendar month, and `month_horizon` is the highest month the
-/// current `plan` already covers (`year_month` of the setup end bound).
-/// These fields are only ever constructed by [`LogQlEngine::tail_setup`],
-/// so `TailSetup`'s public re-export surface is unchanged.
+/// state for the bounded, atomicity-safe, scan-gated month refresh (issue
+/// #94 v2/v3 + v6-v8's phase split): the original `expr` and
+/// `base_params` are replanned — with **no DB I/O** — whenever the scan
+/// window `[scan_floor_ns, upper_ns]` covers a different (lo_month,
+/// hi_month) pair than `covered_months`.
+///
+/// `scan_floor_ns` is monotone and starts at the connection's
+/// (retention-)clamped setup start `s`. During catch-up/fall-behind (the
+/// producer's `narrow == false`) it stays FROZEN, so stage-1 scans the
+/// FULL span `[scan_floor_ns, upper_ns]` — identical to the pre-#94-v6
+/// behaviour, request-bounded, never lifetime-growing. Only once the
+/// producer certifies a COMPLETED full-span live-edge poll whose start
+/// dwell was `>= TAIL_REGISTRATION_GRACE_NS` (`narrow == true`) does the
+/// floor advance, to `max(scan_floor_ns, lower_ns - GRACE)` — bounding the
+/// per-poll month scan to the live poll window's width instead of the
+/// connection's lifetime.
+///
+/// **Clamp-qualified dichotomy (issue #94 v8; the connection's scan
+/// universe `U = { M : M >= month(s) }`, identical to the landed
+/// pre-#94-v6 code):**
+/// - `M ∉ U` (a month strictly before the clamped start): never scanned
+///   by ANY scan of this connection, full-span included — pre-existing
+///   (issue #134 residual class (i)); the read path cannot recover it
+///   (reconnect with an earlier start, retention-permitting, or an
+///   ingest-side atomicity/backfill remedy).
+/// - `M ∈ U`: every registration into `M` visible by
+///   `end(M) + delay + GRACE` is caught by some full-span or in-band scan
+///   and cached permanently; every MISSED registration is provably later
+///   than that bound (issue #134 residual class (ii)). The floor's clamp
+///   arm (`scan_floor_ns` never drops below `s`) never excludes a
+///   universe month — only the `lower_ns - GRACE` arm can, and only once
+///   it has advanced past `s`.
+///
+/// Because narrowing the lower edge can prune a month whose
+/// `log_streams`/`log_streams_idx` registration is the ONLY record of a
+/// fingerprint whose sample now falls in a later, in-window month (writes
+/// to `log_samples` and the stream tables are non-atomic —
+/// `crates/pulsus-write/src/writer/mod.rs`), `resolved` is a cumulative,
+/// deduped cache of every fingerprint stage-1 has ever resolved on this
+/// connection: stage-2/3 read the cached union, not just the current
+/// poll's narrow result, so a fingerprint resolved once (in its
+/// registration month) stays resolvable for the rest of the connection.
+/// The cache is capped by the same `max_streams` ceiling stage-1 already
+/// obeys (reject, not silently truncate). These fields are only ever
+/// constructed by [`LogQlEngine::tail_setup`], so `TailSetup`'s public
+/// re-export surface is unchanged.
 #[derive(Debug)]
 pub struct TailSetup {
     pub plan: StreamsPlan,
     pub compiled: CompiledPipeline,
-    /// The original tail expression, replanned on a month crossing.
+    /// The original tail expression, replanned on a covered-window change.
     expr: Expr,
-    /// The setup `QueryParams` (`Copy`); its `end_ns` is bumped to the
-    /// crossing poll's `upper_ns` on refresh (the `start_ns` stays put so
-    /// older-month streams remain resolvable — issue #94 edge case 5).
+    /// The setup `QueryParams` (`Copy`); both `start_ns` and `end_ns` are
+    /// overridden to the scan window on refresh.
     base_params: QueryParams,
-    /// `year_month` of the highest month the current `plan` covers.
-    month_horizon: (i64, u32),
+    /// The monotone scan-set lower anchor (issue #94 v6-v8): frozen
+    /// during catch-up/fall-behind, advances to `max(self, lower_ns -
+    /// GRACE)` only on a scan-gated live-edge refresh. Starts at the
+    /// connection's clamped setup start.
+    scan_floor_ns: i64,
+    /// `(year_month(scan_floor_ns), year_month(upper))` the current
+    /// `plan` covers.
+    covered_months: ((i64, u32), (i64, u32)),
+    /// Cumulative, sorted+deduped union of every fingerprint stage-1 has
+    /// resolved on this connection — the orphan-cache that keeps a
+    /// partial-failure (older-month-registered) stream resolvable after
+    /// the stage-1 month window narrows past its registration month.
+    resolved: Vec<u64>,
 }
 
 impl LogQlEngine {
@@ -1494,7 +1558,12 @@ impl LogQlEngine {
                     compiled,
                     expr: expr.clone(),
                     base_params: *params,
-                    month_horizon: plan::year_month(spec_end_ns(&params.spec)),
+                    scan_floor_ns: spec_start_ns(&params.spec),
+                    covered_months: (
+                        plan::year_month(spec_start_ns(&params.spec)),
+                        plan::year_month(spec_end_ns(&params.spec)),
+                    ),
+                    resolved: Vec::new(),
                 })
             }
             Plan::Metric(_) | Plan::MetricBinary(_) => Err(ReadError::PipelineInvalid {
@@ -1504,18 +1573,26 @@ impl LogQlEngine {
         }
     }
 
-    /// Best-effort stage-1 month refresh (issue #94 item 2): the stage-1
-    /// month IN-list is baked into `setup.plan.stage1_sql` at setup, so a
-    /// stream born in a calendar month later than the setup window would
-    /// otherwise stay invisible until a reconnect. When a poll's
-    /// `upper_ns` crosses into a month the current plan doesn't cover,
-    /// this re-plans (reusing [`plan::plan`] — **no ClickHouse I/O**, a
-    /// pure `stage1_sql` string rebuild) and swaps in a fresh
-    /// [`StreamsPlan`] whose IN-list spans the setup month through the new
-    /// month (the `start_ns` is unchanged, so prior-month streams are
-    /// never dropped). A no-op within the current month, so it fires at
-    /// most once per calendar month per connection and adds no per-poll
-    /// round-trip.
+    /// Best-effort stage-1 month refresh (issue #94 v6-v8, scan-gated
+    /// phase split): the stage-1 month IN-list is anchored to
+    /// `[setup.scan_floor_ns, upper_ns]`, re-planning (reusing
+    /// [`plan::plan`] — **no ClickHouse I/O**, a pure `stage1_sql` string
+    /// rebuild) whenever that window's covered `(lo_month, hi_month)`
+    /// differs from what `setup.plan` already covers.
+    ///
+    /// `narrow` is the producer's certification (see
+    /// `logs_api/tail.rs::producer_loop`'s scan-gate rule, computed ONCE
+    /// per iteration from a single clock read — recomputing it downstream
+    /// from a fresh clock is a documented trap: it would misclassify
+    /// steady-state live polls as catch-up and silently reintroduce
+    /// lifetime-unbounded growth) that a COMPLETED full-span poll at the
+    /// live edge has already dwelt >= [`TAIL_REGISTRATION_GRACE_NS`]. Only
+    /// then does `scan_floor_ns` advance (monotonically, to
+    /// `max(scan_floor_ns, lower_ns - GRACE)`); otherwise (catch-up,
+    /// fall-behind, or still inside the hold) the floor stays frozen and
+    /// the scan set widens upper-only — full-span, request-bounded, never
+    /// lifetime-growing. See [`TailSetup`]'s doc for the full
+    /// clamp-qualified coverage argument and residual (issue #134).
     ///
     /// The caller invokes this best-effort (`let _ = …`): on a re-plan
     /// error `setup` is left untouched and the tail keeps running on the
@@ -1525,22 +1602,25 @@ impl LogQlEngine {
     pub fn tail_refresh_months(
         &self,
         setup: &mut TailSetup,
+        lower_ns: i64,
         upper_ns: i64,
+        narrow: bool,
     ) -> Result<(), ReadError> {
         let ctx = self.config.plan_ctx();
-        refresh_tail_months(&ctx, setup, upper_ns)
+        refresh_tail_months(&ctx, setup, lower_ns, upper_ns, narrow)
     }
 
-    /// One live-tail poll (issue #74): re-resolves fingerprints under
-    /// the stage-1 stream cap (new streams appear mid-tail), hydrates,
-    /// fetches one keyset page (`fetch_limit` is pre-clamped by the
-    /// caller — plan v3 D5), and runs the SAME `CompiledPipeline` the
-    /// query path runs. The cursor advances past every *fetched* row
-    /// (pipeline-dropped lines never re-fetch).
+    /// One live-tail poll (issue #74; issue #94 resolve-and-remember
+    /// revision): re-resolves stage-1 over the (now month-narrowed)
+    /// `setup.plan`, MERGES the result into `setup.resolved` (the
+    /// cumulative cache — see [`TailSetup`]'s doc for why this is
+    /// data-loss-free despite the narrowed month window), hydrates and
+    /// fetches one keyset page over the cached union, and runs the SAME
+    /// `CompiledPipeline` the query path runs. The cursor advances past
+    /// every *fetched* row (pipeline-dropped lines never re-fetch).
     pub async fn tail_poll(
         &self,
-        compiled: &CompiledPipeline,
-        sp: &StreamsPlan,
+        setup: &mut TailSetup,
         lower: TailLower,
         upper_ns: i64,
         fetch_limit: u32,
@@ -1549,15 +1629,24 @@ impl LogQlEngine {
             TailLower::After(c) => Some(c),
             TailLower::Start { .. } => None,
         };
-        let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
-        if fingerprints.is_empty() {
+        let new_fps = self.resolve_fingerprints(&setup.plan.stage1_sql).await?;
+        merge_resolved(&mut setup.resolved, &new_fps);
+        check_stream_cap(setup.resolved.len(), self.config.max_streams)?;
+        if setup.resolved.is_empty() {
             return Ok(TailPage {
                 streams: Vec::new(),
                 next: prev,
                 fetched: 0,
             });
         }
-        let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
+        // The full cumulative cache — not just this poll's narrow stage-1
+        // result — feeds stage-2 hydration and the stage-3 fetch (issue
+        // #94: the orphan-cache mechanism). A shared borrow, not a clone:
+        // `setup` is not mutated again before this borrow's last use.
+        let fingerprints = &setup.resolved;
+        let meta = self
+            .hydrate(&setup.plan.streams_table, fingerprints)
+            .await?;
         let services = distinct_escaped_services(&meta);
 
         // Tail is forward-only (oldest→newest); `KeysetLower::First`
@@ -1580,13 +1669,13 @@ impl LogQlEngine {
             },
         };
         let sql = super::sql::stage3_keyset(
-            &sp.samples_table,
+            &setup.plan.samples_table,
             &services,
-            &fingerprints,
+            fingerprints,
             window,
             ks_lower,
             Direction::Forward,
-            &sp.line_filters,
+            &setup.plan.line_filters,
             fetch_limit,
         );
 
@@ -1614,7 +1703,7 @@ impl LogQlEngine {
                 structured_metadata: r.structured_metadata,
             })
             .collect();
-        let streams = run_pipeline_rows(sample_rows, compiled, &meta, fetch_limit);
+        let streams = run_pipeline_rows(sample_rows, &setup.compiled, &meta, fetch_limit);
         Ok(TailPage {
             streams,
             next,
@@ -1623,8 +1712,19 @@ impl LogQlEngine {
     }
 }
 
+/// The `start` bound of a [`QuerySpec`] (the `at` instant for an instant
+/// query) — the initial covered-window lower anchor for [`TailSetup`]
+/// (issue #94).
+fn spec_start_ns(spec: &QuerySpec) -> i64 {
+    match *spec {
+        QuerySpec::Range { start_ns, .. } => start_ns,
+        QuerySpec::Instant { at_ns } => at_ns,
+    }
+}
+
 /// The `end` bound of a [`QuerySpec`] (the `at` instant for an instant
-/// query) — the month-horizon anchor for [`TailSetup`] (issue #94).
+/// query) — the initial covered-window upper anchor for [`TailSetup`]
+/// (issue #94).
 fn spec_end_ns(spec: &QuerySpec) -> i64 {
     match *spec {
         QuerySpec::Range { end_ns, .. } => end_ns,
@@ -1633,29 +1733,76 @@ fn spec_end_ns(spec: &QuerySpec) -> i64 {
 }
 
 /// Client-free core of [`LogQlEngine::tail_refresh_months`] (issue #94
-/// item 2), unit-testable with a [`PlanCtx`] literal. Re-plans only when
-/// `upper_ns` crosses into a later calendar month than `setup` covers;
-/// [`plan::plan`] here does **no** I/O (a pure `stage1_sql` rebuild). A
-/// non-`Streams` plan (unreachable — the setup expr already planned as
-/// `Streams`) or a re-plan error leaves `setup` untouched, so the caller
-/// can swallow the result and keep tailing on the prior month set.
+/// v6-v8, scan-gated phase split), unit-testable with a [`PlanCtx`]
+/// literal.
+///
+/// `narrow == true` is the producer's certification that a COMPLETED
+/// full-span live-edge poll has already dwelt at least
+/// [`TAIL_REGISTRATION_GRACE_NS`] (the scan gate — see
+/// `logs_api/tail.rs::producer_loop`); ONLY then does `scan_floor_ns`
+/// advance, monotonically, to `max(scan_floor_ns, lower_ns - GRACE)`.
+/// Otherwise (catch-up, fall-behind, or still inside the hold) the floor
+/// stays frozen and stage-1 re-plans (reusing [`plan::plan`] — **no
+/// ClickHouse I/O**, a pure `stage1_sql` rebuild) to
+/// `months_overlapping(scan_floor_ns, upper_ns)` whenever that window's
+/// covered `(lo_month, hi_month)` pair differs from
+/// `setup.covered_months` — widening upper-only, never narrowing, so a
+/// connection that never reaches the live edge keeps the full-span
+/// (request-bounded, not lifetime-growing) behaviour. Narrowing past a
+/// fingerprint's registration month is safe ONLY because
+/// [`TailSetup::resolved`] remembers it — this function alone does not
+/// decide correctness. A non-`Streams` plan (unreachable — the setup expr
+/// already planned as `Streams`) or a re-plan error leaves `setup`
+/// untouched, so the caller can swallow the result and keep tailing on
+/// the prior month set.
 fn refresh_tail_months(
     ctx: &PlanCtx<'_>,
     setup: &mut TailSetup,
+    lower_ns: i64,
     upper_ns: i64,
+    narrow: bool,
 ) -> Result<(), ReadError> {
-    if plan::year_month(upper_ns) <= setup.month_horizon {
+    if narrow {
+        // The ONLY place the floor advances: `narrow` certifies a
+        // completed full-span scan already dwelt >= GRACE at the live
+        // edge (the scan-gate rule), so this can never skip a boundary in
+        // compressed (catch-up) time.
+        setup.scan_floor_ns = setup
+            .scan_floor_ns
+            .max(lower_ns.saturating_sub(TAIL_REGISTRATION_GRACE_NS));
+    } // else: catch-up, fall-behind, or in-hold — floor frozen, set widens upper-only.
+    let hi = upper_ns.max(lower_ns);
+    let want = (plan::year_month(setup.scan_floor_ns), plan::year_month(hi));
+    if want == setup.covered_months {
         return Ok(());
     }
     let mut qp = setup.base_params; // QueryParams: Copy
-    if let QuerySpec::Range { end_ns, .. } = &mut qp.spec {
-        *end_ns = upper_ns;
+    if let QuerySpec::Range {
+        start_ns, end_ns, ..
+    } = &mut qp.spec
+    {
+        *start_ns = setup.scan_floor_ns;
+        *end_ns = hi;
     }
     if let Plan::Streams(sp) = plan::plan(&setup.expr, &qp, ctx)? {
         setup.plan = sp;
-        setup.month_horizon = plan::year_month(upper_ns);
+        setup.covered_months = want;
     }
     Ok(())
+}
+
+/// Unions `new` into the cumulative resolved-fingerprint cache, sorted
+/// and deduped (issue #94: the orphan-cache mechanism — a fingerprint
+/// present in an earlier batch survives a later batch that no longer
+/// resolves it, because its stage-1 month scrolled out of the current
+/// poll window).
+fn merge_resolved(cache: &mut Vec<u64>, new: &[u64]) {
+    if new.is_empty() {
+        return;
+    }
+    cache.extend_from_slice(new);
+    cache.sort_unstable();
+    cache.dedup();
 }
 
 /// The occurrence-count cursor update (round-4 adjudication #1): the new
@@ -3859,7 +4006,9 @@ mod tests {
                     compiled,
                     expr,
                     base_params: params,
-                    month_horizon: plan::year_month(end_ns),
+                    scan_floor_ns: start_ns,
+                    covered_months: (plan::year_month(start_ns), plan::year_month(end_ns)),
+                    resolved: Vec::new(),
                 }
             }
             _ => panic!("stream selector must plan to Plan::Streams"),
@@ -3871,69 +4020,515 @@ mod tests {
         format!("'{y:04}-{m:02}-01'")
     }
 
-    /// Item 2 AC: a refresh whose `upper_ns` stays inside the current
-    /// month leaves `stage1_sql` byte-identical and `month_horizon`
-    /// unchanged (no re-plan, no fire).
+    /// Counts occurrences of a quoted ClickHouse `Date` literal
+    /// (`'YYYY-MM-01'`) in a SQL string — the exact shape
+    /// `months_overlapping` emits (`plan.rs`).
+    fn count_month_literals(sql: &str) -> usize {
+        let bytes = sql.as_bytes();
+        let mut count = 0;
+        let mut i = 0;
+        while i + 12 <= bytes.len() {
+            let is_literal = bytes[i] == b'\''
+                && bytes[i + 1..i + 5].iter().all(u8::is_ascii_digit)
+                && bytes[i + 5] == b'-'
+                && bytes[i + 6..i + 8].iter().all(u8::is_ascii_digit)
+                && bytes[i + 8] == b'-'
+                && bytes[i + 9] == b'0'
+                && bytes[i + 10] == b'1'
+                && bytes[i + 11] == b'\'';
+            if is_literal {
+                count += 1;
+                i += 12;
+            } else {
+                i += 1;
+            }
+        }
+        count
+    }
+
+    /// Dec 1 2023 00:00:00 UTC, in ns — a fixed month-boundary instant
+    /// reused across the U1-U8 scan-gate tests.
+    const DEC_1_2023_NS: i64 = 1_701_388_800_000_000_000;
+    /// Nov 1 2023 00:00:00 UTC, in ns.
+    const NOV_1_2023_NS: i64 = 1_698_796_800_000_000_000;
+
+    /// AC3(c) (catch-up phase, `narrow=false`): a refresh whose
+    /// `[scan_floor_ns, upper_ns]` covers the SAME `(lo_month, hi_month)`
+    /// pair the plan already covers leaves `stage1_sql` byte-identical (no
+    /// re-plan, no fire).
     #[test]
-    fn tail_refresh_months_is_a_noop_within_the_current_month() {
+    fn tail_refresh_months_is_a_noop_when_the_covered_window_is_unchanged() {
         let ctx = tail_test_ctx();
         // 2023-11-14T22:13:20Z — comfortably mid-month.
         let setup_end = 1_700_000_000_000_000_000i64;
-        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_end - DAY_NS, setup_end);
+        let setup_start = setup_end - DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
         let sql0 = setup.plan.stage1_sql.clone();
-        let horizon0 = setup.month_horizon;
+        let covered0 = setup.covered_months;
 
         let same_month_upper = setup_end + 3_600_000_000_000; // +1h, still November
-        assert_eq!(plan::year_month(same_month_upper), horizon0, "same month");
-        refresh_tail_months(&ctx, &mut setup, same_month_upper).expect("no I/O, cannot fail");
+        assert_eq!(
+            (
+                plan::year_month(setup_start),
+                plan::year_month(same_month_upper)
+            ),
+            covered0,
+            "lower/upper stay within the setup's covered months"
+        );
+        refresh_tail_months(&ctx, &mut setup, setup_start, same_month_upper, false)
+            .expect("no I/O, cannot fail");
         assert_eq!(
             setup.plan.stage1_sql, sql0,
             "no-op keeps stage1_sql byte-identical"
         );
-        assert_eq!(setup.month_horizon, horizon0);
+        assert_eq!(setup.covered_months, covered0);
     }
 
-    /// Item 2 AC: crossing into a later calendar month rebuilds
-    /// `stage1_sql` so it covers BOTH the setup month and the new month
-    /// (a prior-month stream must not vanish), advances `month_horizon`,
-    /// and a second call at the same `upper` is a no-op.
+    /// AC3(a)+(b)+(c), adapted to the v6-v8 scan-gated phase split: (a) a
+    /// catch-up (`narrow=false`) window straddling a month boundary keeps
+    /// BOTH month literals (full-span from the frozen floor); (b) only
+    /// once the scan gate certifies narrowing (`narrow=true`) at a window
+    /// wholly in the later month is the STALE month dropped (the growth
+    /// bound); (c) a repeat refresh over the same covered window is a
+    /// byte-identical no-op.
     #[test]
-    fn tail_refresh_months_rebuilds_across_a_boundary_covering_both_months() {
+    fn tail_refresh_months_straddles_then_narrows_dropping_the_stale_month() {
         let ctx = tail_test_ctx();
-        let setup_end = 1_700_000_000_000_000_000i64; // November 2023
-        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_end - DAY_NS, setup_end);
-        let setup_month_lit = month_literal(setup_end);
+        let setup_start = 1_700_000_000_000_000_000i64; // November 2023
+        let setup_end = setup_start + 3_600_000_000_000; // +1h, same month
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+        let month_a_lit = month_literal(setup_start);
 
-        // +40 days lands in December (the next calendar month).
-        let next_month_upper = setup_end + 40 * DAY_NS;
-        let new_month_lit = month_literal(next_month_upper);
-        assert_ne!(setup_month_lit, new_month_lit, "the test crosses a month");
-
-        refresh_tail_months(&ctx, &mut setup, next_month_upper).expect("no I/O, cannot fail");
+        // (a) straddle, still catch-up (narrow=false): lower stays in
+        // November, upper crosses into December — both months must
+        // resolve or a prior-month stream vanishes mid-straddle.
+        let straddle_upper = setup_start + 40 * DAY_NS;
+        let month_b_lit = month_literal(straddle_upper);
+        assert_ne!(month_a_lit, month_b_lit, "the test crosses a month");
+        refresh_tail_months(&ctx, &mut setup, setup_start, straddle_upper, false)
+            .expect("no I/O, cannot fail");
         assert!(
-            setup.plan.stage1_sql.contains(&new_month_lit),
-            "rebuilt stage1_sql covers the new month {new_month_lit}: {}",
+            setup.plan.stage1_sql.contains(&month_a_lit)
+                && setup.plan.stage1_sql.contains(&month_b_lit),
+            "straddling catch-up window covers both months: {}",
+            setup.plan.stage1_sql
+        );
+
+        // (b) narrow (scan gate open, `narrow=true`): the poll window
+        // advances wholly into December, well past GRACE — the stale
+        // November month must be DROPPED (the growth bound).
+        let narrowed_lower = straddle_upper;
+        let narrowed_upper = straddle_upper + 3_600_000_000_000;
+        assert_eq!(
+            plan::year_month(narrowed_lower),
+            plan::year_month(narrowed_upper),
+            "the narrowed window stays within December"
+        );
+        refresh_tail_months(&ctx, &mut setup, narrowed_lower, narrowed_upper, true)
+            .expect("no I/O, cannot fail");
+        assert!(
+            setup.plan.stage1_sql.contains(&month_b_lit),
+            "narrowed stage1_sql still covers December: {}",
             setup.plan.stage1_sql
         );
         assert!(
-            setup.plan.stage1_sql.contains(&setup_month_lit),
-            "rebuilt stage1_sql still covers the setup month {setup_month_lit} \
-             (prior-month streams stay resolvable): {}",
+            !setup.plan.stage1_sql.contains(&month_a_lit),
+            "narrowed stage1_sql must DROP the stale November month: {}",
             setup.plan.stage1_sql
         );
         assert_eq!(
-            setup.month_horizon,
-            plan::year_month(next_month_upper),
-            "month_horizon advanced to the crossed month"
+            setup.covered_months,
+            (
+                plan::year_month(narrowed_lower),
+                plan::year_month(narrowed_upper)
+            )
         );
 
-        // A second call at the same later upper is a no-op (no double-fire).
+        // (c) a repeat call over the same covered window is a no-op.
         let sql_after = setup.plan.stage1_sql.clone();
-        refresh_tail_months(&ctx, &mut setup, next_month_upper).expect("no I/O");
+        refresh_tail_months(&ctx, &mut setup, narrowed_lower, narrowed_upper, true)
+            .expect("no I/O");
         assert_eq!(
             setup.plan.stage1_sql, sql_after,
-            "no double-fire within the month"
+            "no double-fire over an unchanged covered window"
         );
+    }
+
+    /// U1 (issue #94 v6-v8): during catch-up (`narrow=false`) the scan set
+    /// stays FULL-SPAN from the frozen `scan_floor_ns` no matter how many
+    /// month boundaries the poll window's upper edge crosses — the
+    /// pre-#94-v6 behaviour, request-bounded. Fails under a
+    /// floor-always-advances mutation (refresh ignoring `narrow`).
+    #[test]
+    fn tail_refresh_months_u1_catchup_stays_full_span_with_the_floor_frozen() {
+        let ctx = tail_test_ctx();
+        let setup_start = NOV_1_2023_NS;
+        let setup_end = setup_start + DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+        let setup_month_lit = month_literal(setup_start);
+
+        // Lowers jump forward 20 days/step, narrow=false throughout —
+        // crosses at least 3 month boundaries (Nov->Dec->Jan->Feb).
+        let mut lower = setup_start;
+        for step in 0..6 {
+            let upper = lower + 20 * DAY_NS;
+            refresh_tail_months(&ctx, &mut setup, lower, upper, false)
+                .expect("no I/O, cannot fail");
+            assert!(
+                setup.plan.stage1_sql.contains(&setup_month_lit),
+                "step {step}: catch-up (narrow=false) must stay full-span from the setup \
+                 floor: {}",
+                setup.plan.stage1_sql
+            );
+            let expected = plan::months_overlapping(setup_start, upper).len();
+            assert_eq!(
+                count_month_literals(&setup.plan.stage1_sql),
+                expected,
+                "step {step}: catch-up's full-span set == months_overlapping(setup_start, \
+                 upper)"
+            );
+            assert_eq!(
+                setup.scan_floor_ns, setup_start,
+                "step {step}: floor stays frozen throughout catch-up"
+            );
+            lower = upper;
+        }
+    }
+
+    /// U2 (issue #94 v6-v8): at the scan gate (`narrow=true`), a `lower`
+    /// within GRACE of a month start keeps the PREVIOUS month in the scan
+    /// set (the registration-lag band); once `lower` passes GRACE, the
+    /// previous month is dropped. A same-window repeat is a byte-identical
+    /// no-op. Fails under `TAIL_REGISTRATION_GRACE_NS = 0`.
+    #[test]
+    fn tail_refresh_months_u2_grace_band_keeps_the_previous_month_within_grace() {
+        let ctx = tail_test_ctx();
+        // The clamp arm (scan_floor_ns starts here) sits well over a year
+        // before December, so every narrow=true call below binds on the
+        // `lower - GRACE` arm, never the clamp.
+        let setup_start = DEC_1_2023_NS - 400 * DAY_NS;
+        let setup_end = setup_start + DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+
+        // Within GRACE: lower is 30min past the December boundary (<
+        // GRACE=1h) ⇒ lower-GRACE lands in November ⇒ both months.
+        let lower_in_band = DEC_1_2023_NS + 30 * 60_000_000_000; // +30min
+        let upper = lower_in_band + 60_000_000_000; // +60s
+        refresh_tail_months(&ctx, &mut setup, lower_in_band, upper, true)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            count_month_literals(&setup.plan.stage1_sql),
+            2,
+            "within GRACE: the previous month is retained: {}",
+            setup.plan.stage1_sql
+        );
+
+        // A same-window repeat is a byte-identical no-op.
+        let sql_after_band = setup.plan.stage1_sql.clone();
+        refresh_tail_months(&ctx, &mut setup, lower_in_band, upper, true)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            setup.plan.stage1_sql, sql_after_band,
+            "byte-identical no-op over an unchanged covered window"
+        );
+
+        // Past GRACE: lower advances beyond the boundary + GRACE ⇒ the
+        // previous month is dropped.
+        let lower_past_band = DEC_1_2023_NS + TAIL_REGISTRATION_GRACE_NS + 60_000_000_000;
+        let upper2 = lower_past_band + 60_000_000_000;
+        refresh_tail_months(&ctx, &mut setup, lower_past_band, upper2, true)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            count_month_literals(&setup.plan.stage1_sql),
+            1,
+            "past GRACE: the previous month is dropped: {}",
+            setup.plan.stage1_sql
+        );
+    }
+
+    /// U3 (issue #94 v6-v8): a live-advanced floor stays FROZEN through a
+    /// fall-behind episode (`narrow=false`, upper crossing a month — the
+    /// set widens upper-only, never narrows) and resumes advancing (stale
+    /// months dropping again) once the connection re-enters the scan gate
+    /// (`narrow=true`).
+    #[test]
+    fn tail_refresh_months_u3_fall_behind_freezes_the_floor_then_resumes_on_reentry() {
+        let ctx = tail_test_ctx();
+        let setup_start = NOV_1_2023_NS;
+        let setup_end = setup_start + DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+
+        // Live-advance the floor deep into December.
+        let live_lower = DEC_1_2023_NS + 2 * 3_600_000_000_000; // Dec 1 + 2h
+        refresh_tail_months(
+            &ctx,
+            &mut setup,
+            live_lower,
+            live_lower + 60_000_000_000,
+            true,
+        )
+        .expect("no I/O, cannot fail");
+        let floor_after_live = setup.scan_floor_ns;
+        assert!(
+            floor_after_live > setup_start,
+            "floor advanced off the setup start"
+        );
+        assert_eq!(
+            count_month_literals(&setup.plan.stage1_sql),
+            1,
+            "narrowed to December alone: {}",
+            setup.plan.stage1_sql
+        );
+
+        // Fall behind (narrow=false): upper crosses into January — the
+        // floor's month must be RETAINED (never reset to setup_start), the
+        // set widens upper-only.
+        let jan_1 = DEC_1_2023_NS + 31 * DAY_NS;
+        refresh_tail_months(&ctx, &mut setup, live_lower, jan_1 + DAY_NS, false)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            setup.scan_floor_ns, floor_after_live,
+            "floor frozen while fallen behind"
+        );
+        assert!(
+            setup
+                .plan
+                .stage1_sql
+                .contains(&month_literal(DEC_1_2023_NS))
+                && setup.plan.stage1_sql.contains(&month_literal(jan_1)),
+            "widened upper-only: keeps December AND adds January: {}",
+            setup.plan.stage1_sql
+        );
+
+        // Re-entry (narrow=true): the floor resumes advancing — stale
+        // December drops.
+        let live_lower2 = jan_1 + 2 * 3_600_000_000_000;
+        refresh_tail_months(
+            &ctx,
+            &mut setup,
+            live_lower2,
+            live_lower2 + 60_000_000_000,
+            true,
+        )
+        .expect("no I/O, cannot fail");
+        assert!(
+            setup.scan_floor_ns > floor_after_live,
+            "floor resumed advancing on re-entry"
+        );
+        assert!(
+            !setup
+                .plan
+                .stage1_sql
+                .contains(&month_literal(DEC_1_2023_NS)),
+            "stale December dropped once the floor resumes: {}",
+            setup.plan.stage1_sql
+        );
+    }
+
+    /// U4 (issue #94 AC2, updated for the v6-v8 scan-gated phase split,
+    /// "bound the tail month IN-list growth"): once the scan gate has
+    /// opened (`narrow=true`), the LIVE poll window's own width (not the
+    /// connection's elapsed lifetime) determines `stage1_sql`'s month
+    /// literal count. 36 steps span ~3 elapsed years; the count never
+    /// grows.
+    #[test]
+    fn tail_refresh_months_stays_bounded_over_a_long_lived_connection() {
+        let ctx = tail_test_ctx();
+        let setup_start = NOV_1_2023_NS;
+        let setup_end = setup_start + DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+
+        const STEP_NS: i64 = 30 * DAY_NS; // the connection's elapsed lifetime, per step
+        const WINDOW_NS: i64 = 60_000_000_000; // the live poll window itself (default slice)
+        const STEPS: u32 = 36;
+        let mut first_count = None;
+        let mut last_count = 0;
+        for step in 0..STEPS {
+            // Past the clamp arm + GRACE from step 0 on, so every step
+            // narrows on the `lower - GRACE` arm — a genuinely live poll.
+            let lower = setup_start
+                + i64::from(step) * STEP_NS
+                + TAIL_REGISTRATION_GRACE_NS
+                + 60_000_000_000;
+            let upper = lower + WINDOW_NS;
+            refresh_tail_months(&ctx, &mut setup, lower, upper, true).expect("no I/O, cannot fail");
+            let expected =
+                plan::months_overlapping(lower - TAIL_REGISTRATION_GRACE_NS, upper).len();
+            let count = count_month_literals(&setup.plan.stage1_sql);
+            assert_eq!(
+                count, expected,
+                "step {step}: stage1_sql's literal count must equal \
+                 months_overlapping(lower - GRACE, upper), never the connection's elapsed \
+                 month count"
+            );
+            assert!(
+                count <= 2,
+                "step {step}: bounded by the live poll window's width (60s window + GRACE \
+                 stays within 2 calendar months), got {count}"
+            );
+            if step == 0 {
+                first_count = Some(count);
+            }
+            last_count = count;
+        }
+        assert_eq!(
+            Some(last_count),
+            first_count,
+            "no growth across {STEPS} elapsed months — the connection-lifetime blow-up is fixed"
+        );
+    }
+
+    /// U5 (issue #94 v6-v8, codex test-gap 2): during catch-up
+    /// (`narrow=false`), the rebuilt scan set is a PURE function of the
+    /// `[scan_floor_ns, upper_ns]` window — 1000 refreshes at an identical
+    /// window are byte-identical after the first (poll count/elapsed
+    /// lifetime cannot grow it); advancing `upper` across exactly one
+    /// month boundary adds exactly one literal.
+    #[test]
+    fn tail_refresh_months_u5_identical_window_refreshes_are_pure_no_accretion() {
+        let ctx = tail_test_ctx();
+        let setup_start = NOV_1_2023_NS;
+        let setup_end = setup_start + DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, setup_start, setup_end);
+
+        let lower = setup_start + 5 * DAY_NS;
+        let upper = lower + DAY_NS;
+        refresh_tail_months(&ctx, &mut setup, lower, upper, false).expect("no I/O, cannot fail");
+        let sql_after_first = setup.plan.stage1_sql.clone();
+        let covered_after_first = setup.covered_months;
+        let floor_after_first = setup.scan_floor_ns;
+
+        for call in 0..1_000u32 {
+            refresh_tail_months(&ctx, &mut setup, lower, upper, false)
+                .expect("no I/O, cannot fail");
+            assert_eq!(
+                setup.plan.stage1_sql, sql_after_first,
+                "call {call}: byte-identical over 1000 same-window refreshes"
+            );
+            assert_eq!(setup.covered_months, covered_after_first);
+            assert_eq!(
+                setup.scan_floor_ns, floor_after_first,
+                "call {call}: floor unmoved by identical-window catch-up refreshes"
+            );
+        }
+
+        // Advance upper across exactly one month boundary: exactly one
+        // literal added.
+        let count_before = count_month_literals(&setup.plan.stage1_sql);
+        let crossed_upper = setup_start + 35 * DAY_NS; // crosses into December
+        refresh_tail_months(&ctx, &mut setup, lower, crossed_upper, false)
+            .expect("no I/O, cannot fail");
+        let count_after = count_month_literals(&setup.plan.stage1_sql);
+        assert_eq!(
+            count_after,
+            count_before + 1,
+            "exactly one literal added on the month crossing"
+        );
+        assert_eq!(
+            count_after,
+            plan::months_overlapping(setup.scan_floor_ns, crossed_upper).len()
+        );
+        assert_eq!(
+            setup.scan_floor_ns, floor_after_first,
+            "floor still unmoved (narrow=false throughout)"
+        );
+    }
+
+    /// U8 (issue #94 v8, "clamp-qualified dichotomy"): the codex
+    /// counterexample (a clamped start minutes after a month boundary),
+    /// committed as the DOCUMENTED class-(i) residual (issue #134) — the
+    /// prior month is never scanned by this connection, at setup, through
+    /// catch-up, or after the scan gate narrows. The floor's clamp arm can
+    /// only ever equal `s`, never fall below it — identical to the landed
+    /// pre-#94-v6 code (`refresh_tail_months` fixed `start_ns` at the
+    /// setup floor).
+    #[test]
+    fn tail_refresh_months_u8_boundary_start_never_scans_the_prior_month() {
+        let ctx = tail_test_ctx();
+        let s = DEC_1_2023_NS + 5 * 60_000_000_000; // 5 minutes past the boundary
+        // Setup spans into January so BOTH refresh calls below actually
+        // trigger a re-plan (`want != covered_months`) — a same-month-only
+        // construction would make every call a no-op and never exercise
+        // the clamp arm's `qp.spec.start_ns` assignment at all (the drill
+        // must actually rebuild `stage1_sql` to be non-vacuous).
+        let setup_end = s + 40 * DAY_NS;
+        let mut setup = build_tail_setup(&ctx, r#"{app="x"}"#, s, setup_end);
+        let dec_lit = month_literal(s);
+        let nov_lit = month_literal(DEC_1_2023_NS - DAY_NS);
+        assert_ne!(
+            dec_lit, nov_lit,
+            "construction sanity: s sits in a different month"
+        );
+
+        // (setup) at construction: December present, November absent.
+        assert!(setup.plan.stage1_sql.contains(&dec_lit));
+        assert!(!setup.plan.stage1_sql.contains(&nov_lit));
+
+        // (catch-up, narrow=false), upper wholly within December (a
+        // genuine re-plan: covered_months starts at (Dec,Jan)): the
+        // clamp arm floor == s exactly, never below — November stays out
+        // of the scan universe.
+        refresh_tail_months(&ctx, &mut setup, s, s + 10 * DAY_NS, false)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            setup.scan_floor_ns, s,
+            "clamp arm floor == s exactly, never below"
+        );
+        assert!(setup.plan.stage1_sql.contains(&dec_lit));
+        assert!(!setup.plan.stage1_sql.contains(&nov_lit));
+
+        // (post-gate, narrow=true) with `lower` still within GRACE of `s`
+        // but `upper` reaching into January (another genuine re-plan): the
+        // clamp arm still wins on the LOWER side (`lower - GRACE < s`),
+        // floor stays `s` — November must stay excluded even though the
+        // window's upper edge has moved on.
+        let narrow_lower = s + 30 * 60_000_000_000; // s + 30min, < s + GRACE
+        let narrow_upper = narrow_lower + 35 * DAY_NS; // reaches January
+        assert_ne!(
+            month_literal(narrow_upper),
+            dec_lit,
+            "construction sanity: narrow_upper reaches a later month"
+        );
+        refresh_tail_months(&ctx, &mut setup, narrow_lower, narrow_upper, true)
+            .expect("no I/O, cannot fail");
+        assert_eq!(
+            setup.scan_floor_ns, s,
+            "still pinned at s: lower - GRACE has not advanced past s"
+        );
+        assert!(setup.plan.stage1_sql.contains(&dec_lit));
+        assert!(
+            !setup.plan.stage1_sql.contains(&nov_lit),
+            "the prior month is never scanned by this connection, per the clamp-qualified \
+             dichotomy (issue #134 class (i)): {}",
+            setup.plan.stage1_sql
+        );
+    }
+
+    /// Issue #94 AC4 first bullet — the orphan-cache mechanism: a
+    /// fingerprint present in an EARLIER merge survives a LATER merge that
+    /// no longer includes it (its registration month scrolled out of the
+    /// narrowed stage-1 window, but the connection still remembers it).
+    #[test]
+    fn merge_resolved_preserves_a_fingerprint_absent_from_a_later_batch() {
+        let mut cache: Vec<u64> = Vec::new();
+        merge_resolved(&mut cache, &[5, 1, 3]);
+        assert_eq!(
+            cache,
+            vec![1, 3, 5],
+            "sorted + deduped after the first batch"
+        );
+
+        // The second (later, narrowed-window) batch no longer resolves
+        // fingerprint 1, repeats 3, and adds a new fingerprint 7.
+        merge_resolved(&mut cache, &[7, 3]);
+        assert_eq!(
+            cache,
+            vec![1, 3, 5, 7],
+            "fingerprint 1 (absent from the second batch) survives; 3 dedups; 7 is added"
+        );
+
+        merge_resolved(&mut cache, &[]);
+        assert_eq!(cache, vec![1, 3, 5, 7], "an empty batch changes nothing");
     }
 
     #[test]
