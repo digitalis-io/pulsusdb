@@ -1037,14 +1037,15 @@ impl MetricsEngine {
     /// label cache cannot ([`MultiMetricResolution::Unresolvable`]). Runs
     /// the bounded [`super::sql::distinct_metric_names_probe`] (`SELECT
     /// DISTINCT metric_name … LIMIT cap+1`), then enforces the fan-out
-    /// **bound** on the RETURNED rows: more than `cap` distinct names is
-    /// [`TooBroadReason::MetricFanout`] (a names-only superset cap — the
-    /// name regex is what bounds the scan; label matchers apply later in
-    /// the fetch). Never an unbounded `IN` set. Returns sorted, deduped
-    /// names; an empty set means no fetch at all. The probe is NOT
-    /// EXPLAIN-index-gated (a regex `metric_name` predicate can't
-    /// range-prune the leading primary-key column); its bound is the gate,
-    /// its scan rows are recorded (issue #25 for scale wall-time).
+    /// **bound** on the RETURNED rows via [`probe_fanout_bound`]: more than
+    /// `cap` distinct names is [`TooBroadReason::MetricFanout`] (a
+    /// names-only superset cap — the name regex is what bounds the scan;
+    /// label matchers apply later in the fetch). Never an unbounded `IN`
+    /// set. Returns sorted, deduped names; an empty set means no fetch at
+    /// all. The probe is NOT EXPLAIN-index-gated (a regex `metric_name`
+    /// predicate can't range-prune the leading primary-key column); its
+    /// bound is the gate, its scan rows are recorded (issue #25 for scale
+    /// wall-time).
     async fn probe_distinct_names(
         &self,
         name_matchers: &[super::matcher::LabelMatcher],
@@ -1060,15 +1061,8 @@ impl MetricsEngine {
             cap,
         );
         let rows: Vec<super::rows::MetricNameRow> = self.fetch_rows(sql).await?;
-        // `LIMIT cap+1` caps the returned rows: seeing more than `cap`
-        // means the name predicate matched more distinct names than the
-        // fan-out ceiling. `matched` is a lower bound (the probe stopped at
-        // cap+1), mirroring the warm path's `FanoutExceeded` reporting.
-        if rows.len() as u64 > cap {
-            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricFanout {
-                matched: rows.len(),
-                cap,
-            }));
+        if let Some(reason) = probe_fanout_bound(rows.len(), cap) {
+            return Err(ReadError::QueryTooBroad(reason));
         }
         let mut names: Vec<String> = rows.into_iter().map(|r| r.metric_name).collect();
         names.sort_unstable();
@@ -1186,6 +1180,22 @@ impl MetricsEngine {
             series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
         })
     }
+}
+
+/// Pure fan-out bound decision for the degraded-cache discovery probe
+/// (issue #96 retroactive re-review): `Some(reason)` when the probe
+/// returned more distinct names than `cap` admits, `None` otherwise.
+/// Extracted from [`MetricsEngine::probe_distinct_names`] so the
+/// returned-row bound — `rows.len() as u64 > cap` — is provable at the
+/// max config-accepted `promql_max_metric_fanout`
+/// (`pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING`) without a live
+/// ClickHouse. `matched` is a lower bound (the probe stopped at `cap+1`
+/// rows), mirroring the warm path's `FanoutExceeded` reporting.
+fn probe_fanout_bound(returned: usize, cap: u64) -> Option<TooBroadReason> {
+    (returned as u64 > cap).then_some(TooBroadReason::MetricFanout {
+        matched: returned,
+        cap,
+    })
 }
 
 /// One discovery filter's resolved plan (issue #89 + #96): either a ready
@@ -1943,6 +1953,27 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    // --- probe_fanout_bound: issue #96 (retroactive re-review) ---
+
+    /// Proves the too-broad guard still fires at the maximum config-
+    /// accepted `promql_max_metric_fanout`
+    /// (`pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING`) — the guard is
+    /// NOT disable-able by any value config load accepts. Hermetic (no
+    /// ClickHouse): exercises the exact `rows.len() as u64 > cap` decision
+    /// extracted from `probe_distinct_names`.
+    #[test]
+    fn probe_fanout_bound_still_trips_at_the_max_accepted_cap() {
+        let cap = pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING;
+        assert_eq!(
+            probe_fanout_bound(cap as usize + 1, cap),
+            Some(TooBroadReason::MetricFanout {
+                matched: cap as usize + 1,
+                cap,
+            })
+        );
+        assert_eq!(probe_fanout_bound(cap as usize, cap), None);
     }
 
     // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge

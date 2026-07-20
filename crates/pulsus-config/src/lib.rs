@@ -31,4 +31,4 @@ pub use model::{
 };
 pub use secret::Secret;
 pub use units::{ByteSize, HumanDuration, UnitError};
-pub use validate::validate;
+pub use validate::{PROMQL_MAX_METRIC_FANOUT_CEILING, validate};

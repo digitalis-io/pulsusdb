@@ -286,11 +286,15 @@ fn metric_name_predicate(m: &LabelMatcher) -> String {
 /// `LIMIT {fanout_cap + 1}` bounds the **returned** row count: the caller
 /// aborts to `QueryTooBroad(MetricFanout)` when it sees more than
 /// `fanout_cap` rows, never an unbounded `IN` set. The `+1` is computed
-/// with [`u64::saturating_add`] so a `fanout_cap` at `u64::MAX` (config
-/// only rejects zero) cannot overflow the limit. **NOT** EXPLAIN-index-
-/// gated: a regex/negated `metric_name` predicate cannot range-prune the
-/// leading primary-key column, so its bound (returned-rows) is the gate;
-/// its scan rows are recorded, not asserted (scale routes to issue #25).
+/// with [`u64::saturating_add`] as inert defense-in-depth for builder
+/// totality; config load caps `fanout_cap` at
+/// `pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING` (issue #96
+/// retroactive re-review — a value above the ceiling would otherwise make
+/// the returned-row bound unreachable), so at runtime `cap + 1` never
+/// actually saturates. **NOT** EXPLAIN-index-gated: a regex/negated
+/// `metric_name` predicate cannot range-prune the leading primary-key
+/// column, so its bound (returned-rows) is the gate; its scan rows are
+/// recorded, not asserted (scale routes to issue #25).
 pub fn distinct_metric_names_probe(
     series_table: &str,
     name_matchers: &[LabelMatcher],
@@ -777,14 +781,16 @@ mod tests {
         assert!(sql.ends_with("LIMIT 1000"), "got: {sql}");
     }
 
-    /// Boundary value (plan-review finding / adjudication): at the maximum
-    /// accepted `promql_max_metric_fanout` (`u64::MAX`) the `cap + 1` limit
-    /// must NOT overflow or panic — `saturating_add(1)` clamps to `u64::MAX`.
+    /// Boundary value (issue #96 retroactive re-review): at the maximum
+    /// config-accepted `promql_max_metric_fanout`
+    /// (`pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING`) the `cap + 1`
+    /// limit is finite — config load now rejects anything above the
+    /// ceiling, so `u64::MAX` is no longer a reachable `fanout_cap`.
     #[test]
     fn distinct_metric_names_probe_does_not_overflow_at_max_fanout() {
-        let sql =
-            distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, u64::MAX);
-        assert!(sql.ends_with(&format!("LIMIT {}", u64::MAX)), "got: {sql}");
+        let cap = pulsus_config::PROMQL_MAX_METRIC_FANOUT_CEILING;
+        let sql = distinct_metric_names_probe("metric_series", &[name_re("x")], window(), 1, cap);
+        assert!(sql.ends_with("LIMIT 1000001"), "got: {sql}");
     }
 
     #[test]

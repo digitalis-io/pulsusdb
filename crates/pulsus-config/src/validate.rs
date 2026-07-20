@@ -39,6 +39,18 @@ fn positive_u64(field: &str, v: u64) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Issue #96 (retroactive re-review): `reader.promql_max_metric_fanout`
+/// bounds a returned distinct-metric-name set (`metrics/exec.rs`'s
+/// `rows.len() as u64 > cap`) and a resolved-group count (`metrics/
+/// labels.rs`'s `groups.len() as u64 >= fanout_cap`). A value at/near
+/// `u64::MAX` makes both comparisons unreachable, silently DISABLING the
+/// too-broad guard. This is an explicit metrics-fanout policy ceiling
+/// (1000x the default of 1_000, above `cache_max_series` (50_000) and
+/// `promql_max_cache_scan` (200_000) so no legitimate warm/probe
+/// resolution false-rejects, and small enough that `cap + 1` is always
+/// representable) — not derived from any ClickHouse session setting.
+pub const PROMQL_MAX_METRIC_FANOUT_CEILING: u64 = 1_000_000;
+
 /// Validates cross-field startup invariants on an already-parsed [`Config`].
 /// Enum values are already rejected at parse time (invalid `--mode`,
 /// `PULSUS_LOG_LEVEL`, etc.); this only covers rules that need more than
@@ -152,6 +164,16 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.promql_max_metric_fanout",
         cfg.reader.promql_max_metric_fanout,
     )?;
+    // Issue #96 (retroactive re-review): reject values above the ceiling so
+    // the fan-out guard (metrics/exec.rs, metrics/labels.rs) can never be
+    // configured off.
+    if cfg.reader.promql_max_metric_fanout > PROMQL_MAX_METRIC_FANOUT_CEILING {
+        return Err(value_err(
+            "reader.promql_max_metric_fanout",
+            "exceeds the maximum fan-out ceiling (1_000_000): a larger value disables the too-broad guard",
+            "1..=1000000",
+        ));
+    }
     // Issue #89 (retroactive re-review): a zero scan budget would reject
     // every regex/negated-`__name__` selector's resolution before it could
     // examine a single cache entry.
@@ -531,6 +553,38 @@ mod tests {
         let mut cfg = Config::default();
         cfg.reader.promql_max_metric_fanout = 0;
         assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #96 (retroactive re-review): a `promql_max_metric_fanout` at
+    /// or near `u64::MAX` makes the returned-row/group-count fan-out
+    /// guards (`metrics/exec.rs`, `metrics/labels.rs`) unreachable —
+    /// silently disabling them. Config load must reject anything above
+    /// the ceiling while still accepting the ceiling itself and the
+    /// documented default.
+    #[test]
+    fn promql_max_metric_fanout_ceiling_rejects_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_metric_fanout = u64::MAX;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_max_metric_fanout");
+            }
+            other => panic!("expected a Value error for u64::MAX, got {other:?}"),
+        }
+
+        cfg.reader.promql_max_metric_fanout = PROMQL_MAX_METRIC_FANOUT_CEILING + 1;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_max_metric_fanout");
+            }
+            other => panic!("expected a Value error for ceiling+1, got {other:?}"),
+        }
+
+        cfg.reader.promql_max_metric_fanout = PROMQL_MAX_METRIC_FANOUT_CEILING;
+        assert!(validate(&cfg).is_ok());
+
+        cfg.reader.promql_max_metric_fanout = 1_000;
+        assert!(validate(&cfg).is_ok());
     }
 
     /// Issue #89 (retroactive re-review): the cache-scan budget follows the
