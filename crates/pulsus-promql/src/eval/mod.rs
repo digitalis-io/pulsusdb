@@ -5784,6 +5784,45 @@ mod tests {
         );
     }
 
+    /// Located regression pin for #69: `rate` retains each input series'
+    /// name with `drop_name: true` under the delayed-name-removal model
+    /// (#85/#86), so `sum by (__name__)` over two distinct-named `rate`
+    /// outputs partitions into two name-dropped groups that BOTH strip to
+    /// `{}` at finalization — the upstream duplicate-labelset error. This
+    /// drives the full `rate → aggregate by(__name__) → finalize` chain
+    /// through `evaluate()`: a bare `aggregate()`-only test would not be
+    /// discriminating, since `group_key` already read `metric_name`
+    /// correctly — the landed-#69 divergence lived in what `rate` used to
+    /// emit (`None`), not in the grouping itself.
+    #[test]
+    fn sum_by_dunder_name_over_rate_of_distinct_names_is_the_duplicate_labelset_error() {
+        let expr = crate::parser::parse("sum by (__name__) (rate({env=\"1\"}[10m]))").unwrap();
+        let p = plan(&expr, params(300_000, 300_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                named_series(
+                    "metric_total",
+                    1,
+                    &[("env", "1")],
+                    vec![s(1, 0.0), s(300_000, 30.0)],
+                ),
+                named_series(
+                    "another_metric_total",
+                    2,
+                    &[("env", "1")],
+                    vec![s(1, 0.0), s(300_000, 60.0)],
+                ),
+            ],
+        );
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "vector cannot contain metrics with the same labelset"
+        );
+    }
+
     /// Plan v4 Δ1 (range): post-strip same-identity series **merge** when
     /// their timestamps are disjoint (upstream
     /// `mergeSeriesWithSameLabelset`) and **error** with the same message

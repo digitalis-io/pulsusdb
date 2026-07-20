@@ -1589,14 +1589,21 @@ mod tests {
         assert!(out.iter().all(|s| s.labels.is_empty()));
     }
 
-    /// The documented, scoped divergence (plan v2 Δ1): `by (__name__)`
-    /// over name-DROPPED inputs (`metric_name: None`, e.g. `rate(…)`
-    /// output) merges into one anonymous group here, where upstream's
-    /// delayed-drop machinery would error with a duplicate labelset
-    /// (`name_label_dropping.test:84`) — pinned so the M6-07/M6-08 rework
-    /// flips this test deliberately.
+    /// These inputs are genuinely nameless (`metric_name: None,
+    /// drop_name: false`), not name-DROPPED (e.g. `rate(…)` output, which
+    /// retains `metric_name` with `drop_name: true` under the delayed-name-
+    /// removal model). Two genuinely-nameless series with distinct
+    /// non-name labels group under one absent-`__name__` key and merge
+    /// into a single anonymous group here, matching upstream: with no
+    /// retained name there is no `DropName` collision at cleanup
+    /// (`name_label_dropping.test:107-112`). The name-DROPPED case (e.g.
+    /// `sum by (__name__) (rate(...))` over distinct metrics) is a
+    /// different input shape and is pinned separately as the upstream
+    /// duplicate-labelset error — see
+    /// `sum_by_dunder_name_over_rate_of_distinct_names_is_the_duplicate_labelset_error`
+    /// in `eval/mod.rs`.
     #[test]
-    fn sum_by_dunder_name_over_name_dropped_inputs_merges_into_one_group() {
+    fn sum_by_dunder_name_over_genuinely_nameless_inputs_merges_like_upstream() {
         let vector = vec![
             named_sample(None, &[("env", "1")], 0.2),
             named_sample(None, &[("env", "2")], 0.2),
