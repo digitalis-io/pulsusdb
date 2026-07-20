@@ -18,6 +18,7 @@ pub use fingerprint::{
 };
 pub use float_histogram::{
     Bucket as FloatBucket, CombineOp, CombineOutcome, FloatHistogram, FloatHistogramOpError,
+    KahanAddOutcome,
 };
 pub use histogram::{
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MIN, HistogramColumns,

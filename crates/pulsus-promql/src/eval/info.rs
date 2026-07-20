@@ -327,7 +327,7 @@ pub(crate) fn combine(
                 drop_name: false,
                 t_ms,
                 v: bs.v,
-                h: None,
+                h: bs.h,
             });
             continue;
         }
@@ -387,7 +387,7 @@ pub(crate) fn combine(
             drop_name: false,
             t_ms,
             v: bs.v,
-            h: None,
+            h: bs.h,
         });
     }
     Ok(out)

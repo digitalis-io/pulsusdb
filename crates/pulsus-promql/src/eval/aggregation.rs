@@ -17,8 +17,10 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use pulsus_model::{FloatHistogram, FloatHistogramOpError};
 use xxhash_rust::xxh64::xxh64;
 
+use crate::annotations::{Annotations, go_float, messages};
 use crate::error::PromqlError;
 use crate::eval::functions::quantile_of;
 use crate::eval::labels::full_labels;
@@ -89,18 +91,37 @@ fn group_key(s: &InstantSample, grouping: Option<&Grouping>) -> GroupKey {
 /// Every `AggOp` aggregation. `param` is `topk`/`bottomk`/`limitk`'s `k`,
 /// `quantile`'s φ, or `limit_ratio`'s `r` (already evaluated to a scalar
 /// by the caller); `count_values` does not route through here (its
-/// parameter is a string — see [`count_values`]).
+/// parameter is a string — see [`count_values`]). `annos` collects the
+/// M7-A5b-iii native-histogram info/warning annotations (`engine.go`'s
+/// `aggregation`/`aggregationK`) — a no-op sink for a float-only vector.
 pub fn aggregate(
     op: AggOp,
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     match op {
-        AggOp::Topk | AggOp::Bottomk => aggregate_topk(op, vector, grouping, param),
+        AggOp::Topk | AggOp::Bottomk => aggregate_topk(op, vector, grouping, param, annos),
         AggOp::LimitK | AggOp::LimitRatio => aggregate_limit(op, vector, grouping, param),
-        AggOp::Quantile => aggregate_quantile(vector, grouping, param),
-        _ => Ok(aggregate_reduce(op, vector, grouping)),
+        AggOp::Quantile => aggregate_quantile(vector, grouping, param, annos),
+        _ => Ok(aggregate_reduce(op, vector, grouping, annos)),
+    }
+}
+
+/// The aggregation-op name upstream's `NewHistogramIgnoredInAggregationInfo`
+/// embeds (`engine.go`'s literal string arguments — `"min"`, `"max"`,
+/// `"stddev"`, `"stdvar"`, `"quantile"`, `"topk"`, `"bottomk"`).
+fn ignored_in_aggregation_name(op: AggOp) -> &'static str {
+    match op {
+        AggOp::Min => "min",
+        AggOp::Max => "max",
+        AggOp::Stddev => "stddev",
+        AggOp::Stdvar => "stdvar",
+        AggOp::Quantile => "quantile",
+        AggOp::Topk => "topk",
+        AggOp::Bottomk => "bottomk",
+        _ => unreachable!("only called for the histogram-ignoring aggregation ops"),
     }
 }
 
@@ -126,17 +147,44 @@ struct Acc {
     mean: f64,
     m2: f64,
     t_ms: i64,
+
+    // --- M7-A5b-iii: native-histogram `sum`/`avg`/`min`/`max`/`stddev`/
+    // `stdvar` state — mirrors `groupedAggregation`'s histogram fields
+    // (`engine.go:3559-3583`). `seen` mirrors `group.seen`: `false` means
+    // this group has not yet stabilized on a valid (non-histogram-only)
+    // member for an op that skips histograms — the group produces NO
+    // output (upstream's `if !aggr.seen { continue }`, `:3866`) unless a
+    // later float sample re-stabilizes it.
+    seen: bool,
+    has_float: bool,
+    has_histogram: bool,
+    incompatible_histograms: bool,
+    /// The running `sum`/`avg` histogram accumulator (upstream
+    /// `histogramValue`). For `avg` this holds the running SUM until
+    /// output-time division, exactly like the pin.
+    hist_value: Option<FloatHistogram>,
+    /// `avg`'s incremental-mean accumulator, populated only after a
+    /// `HasOverflow` switch (upstream `histogramMean`).
+    hist_mean: Option<FloatHistogram>,
+    hist_incremental_mean: bool,
+    /// The running FULL compensation histogram for `hist_value`/
+    /// `hist_mean` (upstream `histogramKahanC` — `None` until the first
+    /// `KahanAdd`, mirroring the pin's `nil`; every scalar AND bucket
+    /// carries its own Neumaier remainder, `float_histogram_kahan.rs`).
+    hist_kahan_c: Option<FloatHistogram>,
+    // NOT modeled: upstream's `counterResetSeen`/`notCounterResetSeen`
+    // (`groupedAggregation`, `engine.go:3577-3578`) drive
+    // `NewHistogramCounterResetCollisionWarning` — unreachable here for
+    // the same reason A5b-ii's OQ2 carve-out states: `CounterResetHint`
+    // is never stored (A3), so every decoded histogram is
+    // `UnknownCounterReset` and the collision condition (`CounterReset`
+    // AND `NotCounterReset` both seen) can never hold. No field, no dead
+    // tracking.
 }
 
-fn aggregate_reduce(
-    op: AggOp,
-    vector: &[InstantSample],
-    grouping: Option<&Grouping>,
-) -> Vec<InstantSample> {
-    let mut groups: HashMap<GroupKey, Acc> = HashMap::new();
-    for s in vector {
-        let key = group_key(s, grouping);
-        let acc = groups.entry(key).or_insert_with(|| Acc {
+impl Acc {
+    fn fresh(t_ms: i64) -> Self {
+        Acc {
             kahan: KahanSum::new(),
             min: f64::INFINITY,
             max: f64::NEG_INFINITY,
@@ -144,35 +192,327 @@ fn aggregate_reduce(
             drop_name: false,
             mean: 0.0,
             m2: 0.0,
-            t_ms: s.t_ms,
-        });
+            t_ms,
+            seen: true,
+            has_float: false,
+            has_histogram: false,
+            incompatible_histograms: false,
+            hist_value: None,
+            hist_mean: None,
+            hist_incremental_mean: false,
+            hist_kahan_c: None,
+        }
+    }
+}
+
+/// The pin's final compensation flush (`aggr.histogramValue.Add(aggr.
+/// histogramKahanC)`, `engine.go:3877-3899` — the returned error is
+/// asserted impossible upstream: "Add can theoretically return
+/// ErrHistogramsIncompatibleSchema, but at this stage errors should not
+/// occur if earlier KahanAdd calls succeeded"). Mirrored: the
+/// compensation always shares the value's schema family, so `Err` is a
+/// broken invariant — debug-asserted, falling back to the uncompensated
+/// value rather than panicking.
+fn flush_compensation(value: FloatHistogram, comp: &FloatHistogram) -> FloatHistogram {
+    match value.add(comp) {
+        Ok(outcome) => outcome.result,
+        Err(_) => {
+            debug_assert!(
+                false,
+                "the compensation histogram always shares the running sum's schema family"
+            );
+            value
+        }
+    }
+}
+
+/// Folds ONE histogram sample `h` into `acc` for `Sum`/`Avg` — the pin's
+/// `AVG`/`SUM` step-case histogram arm (`engine.go:3673-3703,3719-3762`),
+/// reached only when `acc.hist_value.is_some()` (i.e. this group's FIRST
+/// member was itself a histogram — a float-first group's histogram
+/// members are counted via `has_histogram` at the call site but never
+/// folded here, matching `group.histogramValue != nil`). `annos`/`op`
+/// only distinguish the two error/info sites' text (none differ by op
+/// today — both use `HistogramOperation::Agg` — but kept explicit for the
+/// reviewer).
+fn fold_histogram_into_sum(
+    acc: &mut Acc,
+    sample_metric_name: &str,
+    h: &FloatHistogram,
+    annos: &mut Annotations,
+) {
+    let Some(current) = acc.hist_value.clone() else {
+        return;
+    };
+    match current.kahan_add(h, acc.hist_kahan_c.as_ref()) {
+        Ok(outcome) => {
+            if outcome.nhcb_bounds_reconciled {
+                annos.info(messages::mismatched_custom_buckets_histograms_info(
+                    messages::HistogramOperation::Agg,
+                ));
+            }
+            acc.hist_value = Some(outcome.result);
+            acc.hist_kahan_c = Some(outcome.compensation);
+        }
+        Err(FloatHistogramOpError::IncompatibleSchema) => {
+            annos.warning(messages::mixed_exponential_custom_histograms_warning(
+                sample_metric_name,
+            ));
+            acc.incompatible_histograms = true;
+        }
+    }
+}
+
+/// `avg`'s histogram step (upstream's `AVG` case's histogram arm,
+/// `engine.go:3719-3762`): direct-mean Kahan accumulation with a switch to
+/// incremental-mean once the running sum overflows (`HasOverflow`), and
+/// the incremental-mean update every step thereafter. `acc.count` is the
+/// group's `groupCount` — the caller increments it BEFORE calling this
+/// (upstream's `group.groupCount++` precedes the `h != nil` branch,
+/// unconditionally, for every avg sample regardless of type).
+fn fold_histogram_into_avg(
+    acc: &mut Acc,
+    sample_metric_name: &str,
+    h: &FloatHistogram,
+    annos: &mut Annotations,
+) {
+    let Some(current) = acc.hist_value.clone() else {
+        return;
+    };
+    if !acc.hist_incremental_mean {
+        let outcome = match current.kahan_add(h, acc.hist_kahan_c.as_ref()) {
+            Ok(o) => o,
+            Err(FloatHistogramOpError::IncompatibleSchema) => {
+                annos.warning(messages::mixed_exponential_custom_histograms_warning(
+                    sample_metric_name,
+                ));
+                acc.incompatible_histograms = true;
+                return;
+            }
+        };
+        if outcome.nhcb_bounds_reconciled {
+            annos.info(messages::mismatched_custom_buckets_histograms_info(
+                messages::HistogramOperation::Agg,
+            ));
+        }
+        if !outcome.result.has_overflow() {
+            acc.hist_value = Some(outcome.result);
+            acc.hist_kahan_c = Some(outcome.compensation);
+            return;
+        }
+        // Overflow: switch to incremental mean, seeded from the
+        // PRE-overflow running sum/compensation (`group.histogramValue`/
+        // `group.histogramKahanC` — never mutated by the failed attempt
+        // above, mirroring the pin's `v := group.histogramValue.Copy()`
+        // local-copy discipline). The compensation is scaled as a WHOLE
+        // histogram (`group.histogramKahanC.Div(group.groupCount - 1)`,
+        // `engine.go:3746-3748` — full `Div`, buckets included).
+        acc.hist_incremental_mean = true;
+        let mut mean = current;
+        mean.div(acc.count - 1.0);
+        acc.hist_mean = Some(mean);
+        if let Some(c) = acc.hist_kahan_c.as_mut() {
+            c.div(acc.count - 1.0);
+        }
+    }
+    // Incremental-mean update (both freshly-switched and already-
+    // incremental paths share this tail — upstream has no `break` between
+    // them, `engine.go:3743-3762`). `kahanC.Mul(q)` is a full-histogram
+    // scale, guarded on presence like the pin's `!= nil`.
+    let q = (acc.count - 1.0) / acc.count;
+    if let Some(c) = acc.hist_kahan_c.as_mut() {
+        c.mul(q);
+    }
+    let mut to_add = h.clone();
+    to_add.div(acc.count);
+    let mut scaled_mean = acc
+        .hist_mean
+        .clone()
+        .expect("hist_incremental_mean implies hist_mean is Some");
+    scaled_mean.mul(q);
+    match scaled_mean.kahan_add(&to_add, acc.hist_kahan_c.as_ref()) {
+        Ok(outcome) => {
+            if outcome.nhcb_bounds_reconciled {
+                annos.info(messages::mismatched_custom_buckets_histograms_info(
+                    messages::HistogramOperation::Agg,
+                ));
+            }
+            acc.hist_mean = Some(outcome.result);
+            acc.hist_kahan_c = Some(outcome.compensation);
+        }
+        Err(FloatHistogramOpError::IncompatibleSchema) => {
+            annos.warning(messages::mixed_exponential_custom_histograms_warning(
+                sample_metric_name,
+            ));
+            acc.incompatible_histograms = true;
+        }
+    }
+}
+
+fn aggregate_reduce(
+    op: AggOp,
+    vector: &[InstantSample],
+    grouping: Option<&Grouping>,
+    annos: &mut Annotations,
+) -> Vec<InstantSample> {
+    let mut groups: HashMap<GroupKey, Acc> = HashMap::new();
+    for s in vector {
+        let key = group_key(s, grouping);
+        let is_new = !groups.contains_key(&key);
+        let acc = groups.entry(key).or_insert_with(|| Acc::fresh(s.t_ms));
+        // Upstream's `if !group.seen { *group = groupedAggregation{...};
+        // <op-specific init>; continue }` (`engine.go:3598-3660`): a group
+        // that has never stabilized (every member so far was a histogram,
+        // for an op that skips them) re-runs the SAME "first sample" logic
+        // on each new arrival.
+        let is_first = is_new || !acc.seen;
+        if is_first && !is_new {
+            *acc = Acc::fresh(s.t_ms);
+        }
+        // Upstream's `if group.incompatibleHistograms { continue }`
+        // (`engine.go:3663-3665`), checked right after the not-seen/reinit
+        // branch: once a group has hit an incompatible-schema fold, every
+        // further member is skipped outright (no further annotations, no
+        // further accumulation attempts).
+        if !is_first && acc.incompatible_histograms {
+            continue;
+        }
         acc.drop_name |= s.drop_name;
-        acc.kahan.add(s.v);
-        acc.min = acc.min.min(s.v);
-        acc.max = acc.max.max(s.v);
-        acc.count += 1.0;
-        // Welford: count is incremented BEFORE the mean update divides by
-        // it (the recurrence's own definition).
-        let d = s.v - acc.mean;
-        acc.mean += d / acc.count;
-        acc.m2 += d * (s.v - acc.mean);
+
+        match (op, &s.h) {
+            (AggOp::Sum, Some(h)) => {
+                acc.has_histogram = true;
+                if is_first {
+                    acc.hist_value = Some((**h).clone());
+                } else {
+                    fold_histogram_into_sum(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
+                }
+            }
+            (AggOp::Avg, Some(h)) => {
+                acc.count += 1.0;
+                acc.has_histogram = true;
+                if is_first {
+                    acc.hist_value = Some((**h).clone());
+                } else {
+                    fold_histogram_into_avg(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
+                }
+            }
+            (AggOp::Sum | AggOp::Avg, None) => {
+                acc.has_float = true;
+                if op == AggOp::Avg {
+                    acc.count += 1.0;
+                }
+                acc.kahan.add(s.v);
+            }
+            (AggOp::Min | AggOp::Max, Some(_)) => {
+                annos.info(messages::histogram_ignored_in_aggregation_info(
+                    ignored_in_aggregation_name(op),
+                ));
+                if is_first {
+                    acc.seen = false;
+                }
+                // Else: the group already stabilized on an earlier float
+                // member — this histogram is simply skipped.
+            }
+            (AggOp::Min | AggOp::Max, None) => {
+                acc.min = acc.min.min(s.v);
+                acc.max = acc.max.max(s.v);
+                acc.count += 1.0;
+            }
+            (AggOp::Stddev | AggOp::Stdvar, Some(_)) => {
+                annos.info(messages::histogram_ignored_in_aggregation_info(
+                    ignored_in_aggregation_name(op),
+                ));
+                if is_first {
+                    acc.seen = false;
+                }
+            }
+            (AggOp::Stddev | AggOp::Stdvar, None) => {
+                acc.count += 1.0;
+                // Welford: count is incremented BEFORE the mean update
+                // divides by it (the recurrence's own definition).
+                let d = s.v - acc.mean;
+                acc.mean += d / acc.count;
+                acc.m2 += d * (s.v - acc.mean);
+            }
+            (AggOp::Count, _) => {
+                acc.count += 1.0;
+            }
+            (AggOp::Group, _) => {}
+            _ => unreachable!("handled by aggregate_topk/aggregate_limit/aggregate_quantile"),
+        }
     }
 
     let mut out: Vec<InstantSample> = groups
         .into_iter()
-        .map(|(key, acc)| {
-            let v = match op {
-                AggOp::Sum => acc.kahan.value(),
-                AggOp::Avg => acc.kahan.value() / acc.count,
-                AggOp::Min => acc.min,
-                AggOp::Max => acc.max,
-                AggOp::Count => acc.count,
-                AggOp::Group => 1.0,
+        .filter(|(_, acc)| acc.seen)
+        .filter_map(|(key, acc)| {
+            // M7-A5b-iii: mixed float+histogram poisons the WHOLE group
+            // (`engine.go:3862-3865,3907-3910`) — checked before the
+            // incompatible-schema drop, matching the pin's order.
+            if (op == AggOp::Sum || op == AggOp::Avg) && acc.has_float && acc.has_histogram {
+                annos.warning(messages::mixed_floats_histograms_agg_warning());
+                return None;
+            }
+            if acc.incompatible_histograms {
+                return None;
+            }
+            let (v, h) = match op {
+                // The pin's SUM output arm (`engine.go:3893-3901`): flush
+                // the FULL compensation histogram via `Add` (skipped when
+                // it never materialized — the `!= nil` guard), then
+                // `Compact(0)`.
+                AggOp::Sum if acc.has_histogram => {
+                    let mut result = acc
+                        .hist_value
+                        .expect("has_histogram implies hist_value is Some for a stabilized group");
+                    if let Some(c) = &acc.hist_kahan_c {
+                        result = flush_compensation(result, c);
+                    }
+                    result.compact();
+                    (0.0, Some(Box::new(result)))
+                }
+                AggOp::Sum => (acc.kahan.value(), None),
+                // The pin's AVG output arm (`engine.go:3869-3891`):
+                // incremental → `histogramMean.Add(kahanC)`; direct →
+                // `histogramValue.Div(groupCount)` then
+                // `.Add(kahanC.Div(groupCount))` (the compensation scaled
+                // as a WHOLE histogram); then `Compact(0)`.
+                AggOp::Avg if acc.has_histogram => {
+                    let mut result = if acc.hist_incremental_mean {
+                        let result = acc
+                            .hist_mean
+                            .expect("hist_incremental_mean implies hist_mean is Some");
+                        match acc.hist_kahan_c {
+                            Some(ref c) => flush_compensation(result, c),
+                            None => result,
+                        }
+                    } else {
+                        let mut result = acc.hist_value.expect(
+                            "has_histogram implies hist_value is Some for a stabilized group",
+                        );
+                        result.div(acc.count);
+                        match acc.hist_kahan_c {
+                            Some(mut c) => {
+                                c.div(acc.count);
+                                flush_compensation(result, &c)
+                            }
+                            None => result,
+                        }
+                    };
+                    result.compact();
+                    (0.0, Some(Box::new(result)))
+                }
+                AggOp::Avg => (acc.kahan.value() / acc.count, None),
+                AggOp::Min => (acc.min, None),
+                AggOp::Max => (acc.max, None),
+                AggOp::Count => (acc.count, None),
+                AggOp::Group => (1.0, None),
                 // Population variance (upstream divides by count, not
                 // count−1): a single sample yields exactly 0 (or NaN via
                 // the Inf/NaN m2 edge, see `Acc::mean`'s doc).
-                AggOp::Stddev => (acc.m2 / acc.count).sqrt(),
-                AggOp::Stdvar => acc.m2 / acc.count,
+                AggOp::Stddev => ((acc.m2 / acc.count).sqrt(), None),
+                AggOp::Stdvar => (acc.m2 / acc.count, None),
                 AggOp::Topk | AggOp::Bottomk => unreachable!("handled by aggregate_topk"),
                 AggOp::LimitK | AggOp::LimitRatio => unreachable!("handled by aggregate_limit"),
                 AggOp::Quantile => unreachable!("handled by aggregate_quantile"),
@@ -189,14 +529,14 @@ fn aggregate_reduce(
             // `InstantSample` verbatim, so `metric_name` survives there
             // unmodified (they select existing series, never compute a
             // value — captured/verified: `topk(1, up)` keeps `__name__`).
-            InstantSample {
+            Some(InstantSample {
                 labels: key.labels,
                 metric_name: key.name,
                 drop_name: acc.drop_name,
                 t_ms: acc.t_ms,
                 v,
-                h: None,
-            }
+                h,
+            })
         })
         .collect();
     // Deterministic output order (HashMap iteration order is not stable) —
@@ -211,6 +551,7 @@ fn aggregate_topk(
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     let k = param.ok_or_else(|| PromqlError::BadMatching {
         detail: "topk/bottomk require a k parameter".to_string(),
@@ -220,8 +561,19 @@ fn aggregate_topk(
     }
     let k = k as usize;
 
+    // M7-A5b-iii: a histogram member is skipped + `HistogramIgnoredIn
+    // AggregationInfo` (`aggregationK`'s `TOPK`/`BOTTOMK` cases,
+    // `engine.go:4032-4083`) — it never enters the heap; a group whose
+    // members are ALL histograms therefore never appears in `groups`
+    // (equivalent to upstream's `!aggr.seen` output skip).
     let mut groups: HashMap<GroupKey, Vec<InstantSample>> = HashMap::new();
     for s in vector {
+        if s.h.is_some() {
+            annos.info(messages::histogram_ignored_in_aggregation_info(
+                ignored_in_aggregation_name(op),
+            ));
+            continue;
+        }
         let key = group_key(s, grouping);
         groups.entry(key).or_default().push(s.clone());
     }
@@ -254,15 +606,25 @@ fn aggregate_quantile(
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     let phi = param.ok_or_else(|| PromqlError::BadMatching {
         detail: "quantile requires a quantile parameter".to_string(),
     })?;
 
+    // M7-A5b-iii: a histogram member is skipped + `HistogramIgnoredIn
+    // AggregationInfo` (`engine.go:3648-3652,3860-3863`) — never pushed to
+    // the group's heap; a group whose members are ALL histograms never
+    // appears in `groups` (equivalent to upstream's `!aggr.seen` skip).
+    //
     // `(values, group drop_name OR — issue #86, the `Acc::drop_name`
     // rule, t_ms)` per group.
     let mut groups: HashMap<GroupKey, (Vec<f64>, bool, i64)> = HashMap::new();
     for s in vector {
+        if s.h.is_some() {
+            annos.info(messages::histogram_ignored_in_aggregation_info("quantile"));
+            continue;
+        }
         let key = group_key(s, grouping);
         let entry = groups
             .entry(key)
@@ -373,7 +735,9 @@ fn aggregate_limit(
 /// split-name invariant, docs/architecture.md §2.3 — the
 /// `eval::labels::set_or_delete` precedent), overwriting even a
 /// `by(__name__)`-injected name. Label-name validity was checked at plan
-/// time.
+/// time. M7-A5b-iii: a histogram sample's value-label text is its
+/// `String()` rendering (`engine.go:4188` — `aggregationCountValues`'s
+/// `s.H.String()` arm), via [`histogram_display_string`].
 pub fn count_values(
     vector: &[InstantSample],
     label: &str,
@@ -382,7 +746,10 @@ pub fn count_values(
     let mut groups: HashMap<GroupKey, (f64, i64)> = HashMap::new();
     for s in vector {
         let mut key = group_key(s, grouping);
-        let formatted = format_count_values_value(s.v);
+        let formatted = match &s.h {
+            Some(h) => histogram_display_string(h),
+            None => format_count_values_value(s.v),
+        };
         if label == "__name__" {
             key.name = Some(formatted);
         } else {
@@ -407,6 +774,38 @@ pub fn count_values(
         .collect();
     out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
     out
+}
+
+/// M7-A5b-iii. Upstream `FloatHistogram.String()` (`float_histogram.go:
+/// 176-203`): `{count:<g>, sum:<g>, <bucket>, <bucket>, …}` in ascending
+/// numeric order (negative buckets, the zero bucket, positive buckets),
+/// zero-count buckets omitted, each bucket rendered `[`/`(`+`<g>,<g>`+
+/// `]`/`)`+`:<g>` per its inclusivity (`generic.go`'s `Bucket.String`,
+/// `:148-159`). Reuses [`FloatHistogram::all_buckets`] — that method's own
+/// doc proves its sequence (negative-descending, zero, positive-ascending)
+/// is exactly the one `String()`'s reversed-negative-iterator walk
+/// produces, so no separate walk is needed here.
+fn histogram_display_string(h: &FloatHistogram) -> String {
+    let mut s = format!(
+        "{{count:{}, sum:{}",
+        go_float::format_g(h.count),
+        go_float::format_g(h.sum)
+    );
+    for b in h.all_buckets() {
+        if b.count == 0.0 {
+            continue;
+        }
+        s.push_str(&format!(
+            ", {}{},{}{}:{}",
+            if b.lower_inclusive { '[' } else { '(' },
+            go_float::format_g(b.lower),
+            go_float::format_g(b.upper),
+            if b.upper_inclusive { ']' } else { ')' },
+            go_float::format_g(b.count),
+        ));
+    }
+    s.push('}');
+    s
 }
 
 /// Go `strconv.FormatFloat(f, 'f', -1, 64)` — the value-label text
@@ -488,6 +887,58 @@ mod tests {
         }
     }
 
+    fn hist_sample(labels: &[(&str, &str)], h: FloatHistogram) -> InstantSample {
+        InstantSample {
+            labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
+            metric_name: Some("metric".to_string()),
+            drop_name: false,
+            t_ms: 0,
+            v: 0.0,
+            h: Some(Box::new(h)),
+        }
+    }
+
+    fn exp_hist(count: f64, sum: f64, buckets: Vec<f64>) -> FloatHistogram {
+        FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![pulsus_model::Span {
+                offset: 0,
+                length: buckets.len() as u32,
+            }],
+            negative_spans: vec![],
+            positive_buckets: buckets,
+            negative_buckets: vec![],
+            custom_values: vec![],
+        }
+    }
+
+    fn nhcb_hist(
+        count: f64,
+        sum: f64,
+        custom_values: Vec<f64>,
+        buckets: Vec<f64>,
+    ) -> FloatHistogram {
+        FloatHistogram {
+            schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count,
+            sum,
+            positive_spans: vec![pulsus_model::Span {
+                offset: 0,
+                length: buckets.len() as u32,
+            }],
+            negative_spans: vec![],
+            positive_buckets: buckets,
+            negative_buckets: vec![],
+            custom_values,
+        }
+    }
+
     fn grouping(without: bool, labels: &[&str]) -> Grouping {
         Grouping {
             without,
@@ -495,10 +946,259 @@ mod tests {
         }
     }
 
+    // --- M7-A5b-iii: native-histogram sum/avg, corpus-cited
+    // (`native_histograms.test`, "Test mixing exponential and custom
+    // buckets" / "Test mismatched custom bucket boundaries") ---
+
+    /// `native_histograms.test:1201-1213` T=0 column (exponential-only):
+    /// `sum(metric)` over `exponential{sum:4,count:3,buckets:[1,2,1]}` +
+    /// `other-exponential{sum:3,count:2,buckets:[1,1,1]}` ->
+    /// `{{sum:7 count:5 buckets:[2 3 2]}}`, no warning.
+    #[test]
+    fn sum_over_two_exponential_histograms_matches_the_pinned_corpus_value() {
+        let vector = vec![
+            hist_sample(
+                &[("series", "exponential")],
+                exp_hist(3.0, 4.0, vec![1.0, 2.0, 1.0]),
+            ),
+            hist_sample(
+                &[("series", "other-exponential")],
+                exp_hist(2.0, 3.0, vec![1.0, 1.0, 1.0]),
+            ),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        let h = out[0].h.as_ref().unwrap();
+        assert!(h.bits_eq(&exp_hist(5.0, 7.0, vec![2.0, 3.0, 2.0])));
+        assert!(annos.as_strings(0, 0).0.is_empty(), "no warning expected");
+    }
+
+    /// `native_histograms.test:1214-1216` T=12 column: the same group ALSO
+    /// receiving `custom`/`other-custom` NHCB samples (mismatched SCHEMA,
+    /// not just bounds) — `expect warn`, result `_` (the whole group is
+    /// dropped, `MixedExponentialCustomHistogramsWarning`, not the
+    /// binop-only `IncompatibleBucketLayoutInBinOpWarning`).
+    #[test]
+    fn sum_over_mixed_exponential_and_custom_bucket_histograms_warns_and_drops() {
+        let vector = vec![
+            hist_sample(
+                &[("series", "exponential")],
+                exp_hist(3.0, 4.0, vec![1.0, 2.0, 1.0]),
+            ),
+            hist_sample(
+                &[("series", "other-exponential")],
+                exp_hist(2.0, 3.0, vec![1.0, 1.0, 1.0]),
+            ),
+            hist_sample(
+                &[("series", "custom")],
+                nhcb_hist(1.0, 1.0, vec![5.0, 10.0], vec![1.0]),
+            ),
+            hist_sample(
+                &[("series", "other-custom")],
+                nhcb_hist(2.0, 15.0, vec![5.0, 10.0], vec![0.0, 2.0]),
+            ),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        assert!(out.is_empty(), "the mixed-schema group is dropped: {out:?}");
+        let (warnings, _) = annos.as_strings(0, 0);
+        assert_eq!(
+            warnings,
+            vec![messages::mixed_exponential_custom_histograms_warning(
+                "metric"
+            )]
+        );
+    }
+
+    /// `native_histograms.test:1222-1228` T=0 column ("Test mismatched
+    /// custom bucket boundaries"): `series="2"` (`custom_values:[10]
+    /// buckets:[1]`) + `series="3"` (`custom_values:[2,10] buckets:[1]`,
+    /// i.e. bucket 0 = `(-Inf,2]`) reconcile to the intersected bound
+    /// `[10]` -> both land in target index 0 ->
+    /// `{{schema:-53 count:2 sum:2 custom_values:[10] buckets:[2]}}`, no
+    /// warning (an info instead — reconciliation, not a hard mismatch).
+    #[test]
+    fn sum_over_nhcb_histograms_with_mismatched_bounds_reconciles_matching_the_pinned_corpus_value()
+    {
+        let vector = vec![
+            hist_sample(
+                &[("series", "2")],
+                nhcb_hist(1.0, 1.0, vec![10.0], vec![1.0]),
+            ),
+            hist_sample(
+                &[("series", "3")],
+                nhcb_hist(1.0, 1.0, vec![2.0, 10.0], vec![1.0]),
+            ),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        let h = out[0].h.as_ref().unwrap();
+        assert!(h.bits_eq(&nhcb_hist(2.0, 2.0, vec![10.0], vec![2.0])));
+        assert!(annos.as_strings(0, 0).0.is_empty(), "no warning expected");
+        assert_eq!(
+            annos.as_strings(0, 0).1,
+            vec![messages::mismatched_custom_buckets_histograms_info(
+                messages::HistogramOperation::Agg
+            )]
+        );
+    }
+
+    /// `count`/`group` are type-agnostic (`native_histograms.test:1234-
+    /// 1237`'s `count(metric)`/`group(metric)` rows) — a histogram sample
+    /// counts exactly like a float one.
+    #[test]
+    fn count_and_group_over_histogram_samples_are_unaffected() {
+        let vector = vec![
+            hist_sample(&[("series", "1")], exp_hist(1.0, 1.0, vec![1.0])),
+            hist_sample(&[("series", "2")], exp_hist(1.0, 1.0, vec![1.0])),
+        ];
+        let mut annos = Annotations::new();
+        assert_eq!(
+            aggregate(AggOp::Count, &vector, None, None, &mut annos).unwrap()[0].v,
+            2.0
+        );
+        assert_eq!(
+            aggregate(AggOp::Group, &vector, None, None, &mut annos).unwrap()[0].v,
+            1.0
+        );
+    }
+
+    /// `min`/`max`/`stddev`/`stdvar` skip a histogram sample and info once
+    /// (`engine.go`'s `HistogramIgnoredInAggregationInfo`); a PURE-
+    /// histogram group produces NO output series at all (never stabilizes
+    /// — `!aggr.seen`).
+    #[test]
+    fn min_over_a_pure_histogram_group_produces_no_output_and_infos() {
+        let vector = vec![hist_sample(&[("s", "1")], exp_hist(1.0, 1.0, vec![1.0]))];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Min, &vector, None, None, &mut annos).unwrap();
+        assert!(out.is_empty());
+        assert_eq!(
+            annos.as_strings(0, 0).1,
+            vec![messages::histogram_ignored_in_aggregation_info("min")]
+        );
+    }
+
+    /// A group with an EARLIER float baseline stays valid; a LATER
+    /// histogram member is skipped (info) but does not poison the group.
+    #[test]
+    fn max_over_a_float_then_histogram_group_keeps_the_float_result() {
+        let vector = vec![
+            sample(&[("s", "1")], 5.0),
+            hist_sample(&[("s", "1")], exp_hist(1.0, 1.0, vec![1.0])),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Max, &vector, None, None, &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].v, 5.0);
+        assert!(out[0].h.is_none());
+        assert_eq!(
+            annos.as_strings(0, 0).1,
+            vec![messages::histogram_ignored_in_aggregation_info("max")]
+        );
+    }
+
+    /// `topk`/`bottomk` skip a histogram member + info (`aggregationK`'s
+    /// `TOPK`/`BOTTOMK` cases) rather than sorting on the fabricated
+    /// `v: 0.0`.
+    #[test]
+    fn topk_skips_a_histogram_member_and_infos() {
+        let vector = vec![
+            sample(&[("s", "1")], 5.0),
+            hist_sample(&[("s", "2")], exp_hist(1.0, 1.0, vec![1.0])),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Topk, &vector, None, Some(2.0), &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].v, 5.0);
+        assert_eq!(
+            annos.as_strings(0, 0).1,
+            vec![messages::histogram_ignored_in_aggregation_info("topk")]
+        );
+    }
+
+    /// `count_values` over a histogram sample stamps its `String()`
+    /// rendering as the value label (`engine.go:4188`).
+    #[test]
+    fn count_values_over_a_histogram_sample_stamps_its_display_string() {
+        let vector = vec![hist_sample(
+            &[("s", "1")],
+            exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]),
+        )];
+        let out = count_values(&vector, "v", None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].labels.get("v"),
+            Some("{count:4, sum:5, (0.5,1]:1, (1,2]:2, (2,4]:1}")
+        );
+    }
+
+    /// ADVERSARIAL (codex round-1 [high], end-to-end through `sum()`):
+    /// the fold's BUCKET-level Kahan compensation recovers `+1.0`
+    /// contributions plain accumulation loses above 2^53 — the output
+    /// bucket (and count/sum/zero_count) is `2^53 + 2`, provably not the
+    /// plain-add plateau `2^53`.
+    #[test]
+    fn sum_aggregation_bucket_compensation_recovers_lost_low_order_adds() {
+        const BIG: f64 = 9007199254740992.0; // 2^53
+        const BIG_PLUS_2: f64 = 9007199254740994.0;
+        let mk = |label: &str, bucket: f64| {
+            let mut h = exp_hist(bucket, bucket, vec![bucket]);
+            h.zero_threshold = 0.001;
+            h.zero_count = bucket;
+            hist_sample(&[("s", label)], h)
+        };
+        let vector = vec![mk("1", BIG), mk("2", 1.0), mk("3", 1.0)];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        let h = out[0].h.as_ref().unwrap();
+        assert_eq!(h.positive_buckets, vec![BIG_PLUS_2]);
+        assert_ne!(
+            h.positive_buckets,
+            vec![BIG],
+            "plain bucket accumulation would plateau at 2^53"
+        );
+        assert_eq!(h.zero_count, BIG_PLUS_2);
+        assert_eq!(h.count, BIG_PLUS_2);
+        assert_eq!(h.sum, BIG_PLUS_2);
+        assert!(annos.is_empty());
+    }
+
+    /// ADVERSARIAL through `avg()` (direct mean): the flushed compensated
+    /// mean is `(2^53 + 2) / 3` computed as `(2^53)/3 + 2/3` via the
+    /// pin's `Div(count)` + `Add(kahanC.Div(count))` arithmetic — a plain
+    /// fold would yield exactly `2^53 / 3`.
+    #[test]
+    fn avg_aggregation_bucket_compensation_survives_the_mean_division() {
+        const BIG: f64 = 9007199254740992.0;
+        let vector = vec![
+            hist_sample(&[("s", "1")], exp_hist(BIG, BIG, vec![BIG])),
+            hist_sample(&[("s", "2")], exp_hist(1.0, 1.0, vec![1.0])),
+            hist_sample(&[("s", "3")], exp_hist(1.0, 1.0, vec![1.0])),
+        ];
+        let mut annos = Annotations::new();
+        let out = aggregate(AggOp::Avg, &vector, None, None, &mut annos).unwrap();
+        assert_eq!(out.len(), 1);
+        let h = out[0].h.as_ref().unwrap();
+        // The pin's exact arithmetic: value/3 + comp/3 (both compensations
+        // are exactly 2.0 here since the two +1.0s were lost whole).
+        let expected = BIG / 3.0 + 2.0 / 3.0;
+        assert_eq!(h.positive_buckets, vec![expected]);
+        assert_ne!(
+            h.positive_buckets,
+            vec![BIG / 3.0],
+            "compensation must do work"
+        );
+        assert_eq!(h.count, expected);
+    }
+
     #[test]
     fn sum_with_no_grouping_reduces_to_one_series() {
         let vector = vec![sample(&[("job", "a")], 1.0), sample(&[("job", "b")], 2.0)];
-        let out = aggregate(AggOp::Sum, &vector, None, None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 3.0);
         assert!(out[0].labels.is_empty());
@@ -512,7 +1212,7 @@ mod tests {
             sample(&[("job", "b"), ("inst", "1")], 5.0),
         ];
         let g = grouping(false, &["job"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].labels.get("job"), Some("a"));
         assert_eq!(out[0].v, 3.0);
@@ -527,7 +1227,7 @@ mod tests {
             sample(&[("s", "2")], 1.0),
             sample(&[("s", "3")], -1e100),
         ];
-        let out = aggregate(AggOp::Sum, &vector, None, None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -538,7 +1238,7 @@ mod tests {
             sample(&[("job", "a"), ("inst", "2")], 2.0),
         ];
         let g = grouping(true, &["inst"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 3.0);
     }
@@ -546,7 +1246,7 @@ mod tests {
     #[test]
     fn avg_divides_by_group_member_count() {
         let vector = vec![sample(&[("job", "a")], 2.0), sample(&[("job", "a")], 4.0)];
-        let out = aggregate(AggOp::Avg, &vector, None, None).unwrap();
+        let out = aggregate(AggOp::Avg, &vector, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(out[0].v, 3.0);
     }
 
@@ -558,11 +1258,11 @@ mod tests {
             sample(&[("job", "a")], 3.0),
         ];
         assert_eq!(
-            aggregate(AggOp::Min, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Min, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             1.0
         );
         assert_eq!(
-            aggregate(AggOp::Max, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Max, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             5.0
         );
     }
@@ -575,7 +1275,14 @@ mod tests {
             sample(&[("job", "b")], 1.0),
         ];
         let g = grouping(false, &["job"]);
-        let out = aggregate(AggOp::Count, &vector, Some(&g), None).unwrap();
+        let out = aggregate(
+            AggOp::Count,
+            &vector,
+            Some(&g),
+            None,
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].v, 2.0);
         assert_eq!(out[1].v, 1.0);
     }
@@ -583,7 +1290,7 @@ mod tests {
     #[test]
     fn group_always_yields_one() {
         let vector = vec![sample(&[("job", "a")], 42.0)];
-        let out = aggregate(AggOp::Group, &vector, None, None).unwrap();
+        let out = aggregate(AggOp::Group, &vector, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -594,7 +1301,14 @@ mod tests {
             sample(&[("s", "2")], 1.0),
             sample(&[("s", "3")], 3.0),
         ];
-        let out = aggregate(AggOp::Topk, &vector, None, Some(2.0)).unwrap();
+        let out = aggregate(
+            AggOp::Topk,
+            &vector,
+            None,
+            Some(2.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].v, 5.0);
         assert_eq!(out[1].v, 3.0);
@@ -607,7 +1321,14 @@ mod tests {
             sample(&[("s", "2")], 1.0),
             sample(&[("s", "3")], 3.0),
         ];
-        let out = aggregate(AggOp::Bottomk, &vector, None, Some(2.0)).unwrap();
+        let out = aggregate(
+            AggOp::Bottomk,
+            &vector,
+            None,
+            Some(2.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].v, 1.0);
         assert_eq!(out[1].v, 3.0);
@@ -616,7 +1337,14 @@ mod tests {
     #[test]
     fn topk_retains_full_original_labels_not_the_grouping_key() {
         let vector = vec![sample(&[("job", "a"), ("inst", "1")], 5.0)];
-        let out = aggregate(AggOp::Topk, &vector, None, Some(1.0)).unwrap();
+        let out = aggregate(
+            AggOp::Topk,
+            &vector,
+            None,
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].labels.get("inst"), Some("1"));
     }
 
@@ -625,7 +1353,7 @@ mod tests {
     #[test]
     fn sum_drops_metric_name() {
         let vector = vec![sample(&[("job", "a")], 1.0), sample(&[("job", "b")], 2.0)];
-        let out = aggregate(AggOp::Sum, &vector, None, None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(out[0].metric_name, None);
     }
 
@@ -641,7 +1369,7 @@ mod tests {
             AggOp::Stddev,
             AggOp::Stdvar,
         ] {
-            let out = aggregate(op, &vector, None, None).unwrap();
+            let out = aggregate(op, &vector, None, None, &mut Annotations::new()).unwrap();
             assert_eq!(out[0].metric_name, None, "{op:?} must drop __name__");
         }
     }
@@ -652,16 +1380,30 @@ mod tests {
     #[test]
     fn topk_and_bottomk_keep_metric_name() {
         let vector = vec![sample(&[("s", "1")], 5.0), sample(&[("s", "2")], 1.0)];
-        let topk = aggregate(AggOp::Topk, &vector, None, Some(1.0)).unwrap();
+        let topk = aggregate(
+            AggOp::Topk,
+            &vector,
+            None,
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(topk[0].metric_name.as_deref(), Some("test_metric"));
-        let bottomk = aggregate(AggOp::Bottomk, &vector, None, Some(1.0)).unwrap();
+        let bottomk = aggregate(
+            AggOp::Bottomk,
+            &vector,
+            None,
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(bottomk[0].metric_name.as_deref(), Some("test_metric"));
     }
 
     #[test]
     fn topk_without_a_k_parameter_is_bad_matching() {
         let vector = vec![sample(&[("s", "1")], 1.0)];
-        let err = aggregate(AggOp::Topk, &vector, None, None).unwrap_err();
+        let err = aggregate(AggOp::Topk, &vector, None, None, &mut Annotations::new()).unwrap_err();
         assert!(matches!(err, PromqlError::BadMatching { .. }));
     }
 
@@ -673,7 +1415,14 @@ mod tests {
             sample(&[("job", "b")], 9.0),
         ];
         let g = grouping(false, &["job"]);
-        let out = aggregate(AggOp::Topk, &vector, Some(&g), Some(1.0)).unwrap();
+        let out = aggregate(
+            AggOp::Topk,
+            &vector,
+            Some(&g),
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         let vals: Vec<f64> = out.iter().map(|s| s.v).collect();
         assert!(vals.contains(&2.0));
@@ -682,7 +1431,11 @@ mod tests {
 
     #[test]
     fn an_empty_vector_aggregates_to_an_empty_result() {
-        assert!(aggregate(AggOp::Sum, &[], None, None).unwrap().is_empty());
+        assert!(
+            aggregate(AggOp::Sum, &[], None, None, &mut Annotations::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- issue #69 (M6-06): stddev/stdvar (Welford, population) ---
@@ -707,11 +1460,11 @@ mod tests {
             sample(&[("label", "b")], 2.0),
         ];
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.25
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.5
         );
     }
@@ -722,11 +1475,11 @@ mod tests {
     fn stddev_and_stdvar_of_a_single_finite_sample_are_exactly_zero() {
         let vector = vec![sample(&[("label", "a")], 42.5)];
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.0
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.0
         );
     }
@@ -739,12 +1492,12 @@ mod tests {
         for v in [f64::INFINITY, f64::NEG_INFINITY] {
             let vector = vec![sample(&[("label", "a")], v)];
             assert!(
-                aggregate(AggOp::Stdvar, &vector, None, None).unwrap()[0]
+                aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0]
                     .v
                     .is_nan()
             );
             assert!(
-                aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0]
+                aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
                     .v
                     .is_nan()
             );
@@ -756,12 +1509,12 @@ mod tests {
     fn stddev_and_stdvar_of_a_single_nan_sample_are_nan() {
         let vector = vec![sample(&[("label", "a")], f64::NAN)];
         assert!(
-            aggregate(AggOp::Stdvar, &vector, None, None).unwrap()[0]
+            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0]
                 .v
                 .is_nan()
         );
         assert!(
-            aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0]
+            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
                 .v
                 .is_nan()
         );
@@ -776,11 +1529,11 @@ mod tests {
             .map(|i| sample(&[("s", &i.to_string())], 0.1 + 0.2))
             .collect();
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.0
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0].v,
+            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
             0.0
         );
     }
@@ -795,12 +1548,19 @@ mod tests {
             sample(&[("label", "c")], f64::NAN),
         ];
         assert!(
-            aggregate(AggOp::Stddev, &vector, None, None).unwrap()[0]
+            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
                 .v
                 .is_nan()
         );
         let g = grouping(false, &["label"]);
-        let out = aggregate(AggOp::Stddev, &vector, Some(&g), None).unwrap();
+        let out = aggregate(
+            AggOp::Stddev,
+            &vector,
+            Some(&g),
+            None,
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].v, 0.0);
         assert_eq!(out[1].v, 0.0);
@@ -820,7 +1580,7 @@ mod tests {
             named_sample(Some("metric_b"), &[("env", "1")], 32.0),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 2, "two names, two groups: {out:?}");
         assert_eq!(out[0].metric_name.as_deref(), Some("metric_a"));
         assert_eq!(out[0].v, 10.0);
@@ -842,7 +1602,7 @@ mod tests {
             named_sample(None, &[("env", "2")], 0.2),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].metric_name, None);
         assert_eq!(out[0].v, 0.4);
@@ -858,7 +1618,7 @@ mod tests {
             named_sample(Some("metric_b"), &[("job", "b")], 2.0),
         ];
         let g = grouping(true, &["job"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].metric_name, None);
         assert_eq!(out[0].v, 3.0);
@@ -874,7 +1634,14 @@ mod tests {
             named_sample(Some("metric_b"), &[("i", "1")], 5.0),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Topk, &vector, Some(&g), Some(1.0)).unwrap();
+        let out = aggregate(
+            AggOp::Topk,
+            &vector,
+            Some(&g),
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         let vals: Vec<(Option<&str>, f64)> = out
             .iter()
@@ -961,7 +1728,8 @@ mod tests {
         assert_eq!(seven.v, 1.0);
         // Downstream evaluation: count(count_values("__name__", v)) — the
         // synthesized names group away again without tripping anything.
-        let downstream = aggregate(AggOp::Count, &out, None, None).unwrap();
+        let downstream =
+            aggregate(AggOp::Count, &out, None, None, &mut Annotations::new()).unwrap();
         assert_eq!(downstream.len(), 1);
         assert_eq!(downstream[0].v, 2.0);
     }
@@ -1031,7 +1799,14 @@ mod tests {
                 .unwrap()
                 .v
         };
-        let p80 = aggregate(AggOp::Quantile, &vector, Some(&g), Some(0.8)).unwrap();
+        let p80 = aggregate(
+            AggOp::Quantile,
+            &vector,
+            Some(&g),
+            Some(0.8),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert!((by_test(&p80, "two") - 0.8).abs() < 1e-12);
         assert!((by_test(&p80, "three") - 1.6).abs() < 1e-12);
         assert!((by_test(&p80, "uneven") - 2.8).abs() < 1e-12);
@@ -1039,7 +1814,14 @@ mod tests {
         assert!((by_test(&p80, "nan") - 0.6).abs() < 1e-12);
         assert!(p80.iter().all(|s| s.metric_name.is_none()));
 
-        let p20 = aggregate(AggOp::Quantile, &vector, Some(&g), Some(0.2)).unwrap();
+        let p20 = aggregate(
+            AggOp::Quantile,
+            &vector,
+            Some(&g),
+            Some(0.2),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert!((by_test(&p20, "two") - 0.2).abs() < 1e-12);
         assert!((by_test(&p20, "three") - 0.4).abs() < 1e-12);
         assert!((by_test(&p20, "uneven") - 0.4).abs() < 1e-12);
@@ -1053,11 +1835,32 @@ mod tests {
     #[test]
     fn quantile_phi_out_of_range_clamps_and_never_errors() {
         let vector = vec![sample(&[("s", "1")], 1.0), sample(&[("s", "2")], 2.0)];
-        let low = aggregate(AggOp::Quantile, &vector, None, Some(-0.5)).unwrap();
+        let low = aggregate(
+            AggOp::Quantile,
+            &vector,
+            None,
+            Some(-0.5),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(low[0].v, f64::NEG_INFINITY);
-        let high = aggregate(AggOp::Quantile, &vector, None, Some(1.5)).unwrap();
+        let high = aggregate(
+            AggOp::Quantile,
+            &vector,
+            None,
+            Some(1.5),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(high[0].v, f64::INFINITY);
-        let nan = aggregate(AggOp::Quantile, &vector, None, Some(f64::NAN)).unwrap();
+        let nan = aggregate(
+            AggOp::Quantile,
+            &vector,
+            None,
+            Some(f64::NAN),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert!(nan[0].v.is_nan());
     }
 
@@ -1068,7 +1871,14 @@ mod tests {
             named_sample(Some("metric_a"), &[("i", "2")], 3.0),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Quantile, &vector, Some(&g), Some(0.5)).unwrap();
+        let out = aggregate(
+            AggOp::Quantile,
+            &vector,
+            Some(&g),
+            Some(0.5),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].metric_name.as_deref(), Some("metric_a"));
         assert_eq!(out[0].v, 2.0);
@@ -1077,7 +1887,14 @@ mod tests {
     #[test]
     fn quantile_without_a_parameter_is_bad_matching() {
         let vector = vec![sample(&[("s", "1")], 1.0)];
-        let err = aggregate(AggOp::Quantile, &vector, None, None).unwrap_err();
+        let err = aggregate(
+            AggOp::Quantile,
+            &vector,
+            None,
+            None,
+            &mut Annotations::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PromqlError::BadMatching { .. }));
     }
 
@@ -1099,12 +1916,26 @@ mod tests {
     fn limitk_count_is_min_of_k_and_group_size() {
         let vector = six_series();
         for (k, want) in [(1.0, 1), (2.0, 2), (5.0, 5), (6.0, 6), (100.0, 6)] {
-            let out = aggregate(AggOp::LimitK, &vector, None, Some(k)).unwrap();
+            let out = aggregate(
+                AggOp::LimitK,
+                &vector,
+                None,
+                Some(k),
+                &mut Annotations::new(),
+            )
+            .unwrap();
             assert_eq!(out.len(), want, "k={k}");
         }
         let g = grouping(false, &["group"]);
         // production has 2 members, canary 4: min(3,2)+min(3,4) = 5.
-        let out = aggregate(AggOp::LimitK, &vector, Some(&g), Some(3.0)).unwrap();
+        let out = aggregate(
+            AggOp::LimitK,
+            &vector,
+            Some(&g),
+            Some(3.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 5);
     }
 
@@ -1113,7 +1944,14 @@ mod tests {
     #[test]
     fn limitk_selects_a_verbatim_subset_of_the_input() {
         let vector = six_series();
-        let out = aggregate(AggOp::LimitK, &vector, None, Some(3.0)).unwrap();
+        let out = aggregate(
+            AggOp::LimitK,
+            &vector,
+            None,
+            Some(3.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 3);
         for s in &out {
             assert!(vector.contains(s), "not a verbatim input member: {s:?}");
@@ -1129,13 +1967,26 @@ mod tests {
         let vector = six_series();
         for k in [0.0, -1.0, 0.9, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
-                aggregate(AggOp::LimitK, &vector, None, Some(k))
-                    .unwrap()
-                    .is_empty(),
+                aggregate(
+                    AggOp::LimitK,
+                    &vector,
+                    None,
+                    Some(k),
+                    &mut Annotations::new()
+                )
+                .unwrap()
+                .is_empty(),
                 "k={k} must select nothing"
             );
         }
-        let out = aggregate(AggOp::LimitK, &vector, None, Some(2.9)).unwrap();
+        let out = aggregate(
+            AggOp::LimitK,
+            &vector,
+            None,
+            Some(2.9),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2, "fractional k truncates");
     }
 
@@ -1144,7 +1995,14 @@ mod tests {
     #[test]
     fn limitk_nan_parameter_is_a_query_error() {
         for vector in [six_series(), Vec::new()] {
-            let err = aggregate(AggOp::LimitK, &vector, None, Some(f64::NAN)).unwrap_err();
+            let err = aggregate(
+                AggOp::LimitK,
+                &vector,
+                None,
+                Some(f64::NAN),
+                &mut Annotations::new(),
+            )
+            .unwrap_err();
             match err {
                 PromqlError::InvalidParameter { ref detail } => {
                     assert_eq!(detail, "Parameter value is NaN")
@@ -1157,7 +2015,14 @@ mod tests {
 
     #[test]
     fn limitk_without_a_parameter_is_bad_matching() {
-        let err = aggregate(AggOp::LimitK, &six_series(), None, None).unwrap_err();
+        let err = aggregate(
+            AggOp::LimitK,
+            &six_series(),
+            None,
+            None,
+            &mut Annotations::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PromqlError::BadMatching { .. }));
     }
 
@@ -1175,16 +2040,28 @@ mod tests {
                 ..s.clone()
             })
             .collect();
-        let a: Vec<Labels> = aggregate(AggOp::LimitK, &vector, None, Some(3.0))
-            .unwrap()
-            .into_iter()
-            .map(|s| s.labels)
-            .collect();
-        let b: Vec<Labels> = aggregate(AggOp::LimitK, &later, None, Some(3.0))
-            .unwrap()
-            .into_iter()
-            .map(|s| s.labels)
-            .collect();
+        let a: Vec<Labels> = aggregate(
+            AggOp::LimitK,
+            &vector,
+            None,
+            Some(3.0),
+            &mut Annotations::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| s.labels)
+        .collect();
+        let b: Vec<Labels> = aggregate(
+            AggOp::LimitK,
+            &later,
+            None,
+            Some(3.0),
+            &mut Annotations::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| s.labels)
+        .collect();
         assert_eq!(a, b);
     }
 
@@ -1197,18 +2074,52 @@ mod tests {
     fn limit_ratio_boundaries() {
         let vector = six_series();
         assert!(
-            aggregate(AggOp::LimitRatio, &vector, None, Some(0.0))
-                .unwrap()
-                .is_empty()
+            aggregate(
+                AggOp::LimitRatio,
+                &vector,
+                None,
+                Some(0.0),
+                &mut Annotations::new()
+            )
+            .unwrap()
+            .is_empty()
         );
-        let all = aggregate(AggOp::LimitRatio, &vector, None, Some(-1.0)).unwrap();
+        let all = aggregate(
+            AggOp::LimitRatio,
+            &vector,
+            None,
+            Some(-1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(all, vector, "r = -1 selects everything, verbatim");
         // Caps: 1.1 → 1.0 and -1.1 → -1.0 (cap warn annotation deferred
         // to M6-08).
-        let capped_pos = aggregate(AggOp::LimitRatio, &vector, None, Some(1.1)).unwrap();
-        let at_one = aggregate(AggOp::LimitRatio, &vector, None, Some(1.0)).unwrap();
+        let capped_pos = aggregate(
+            AggOp::LimitRatio,
+            &vector,
+            None,
+            Some(1.1),
+            &mut Annotations::new(),
+        )
+        .unwrap();
+        let at_one = aggregate(
+            AggOp::LimitRatio,
+            &vector,
+            None,
+            Some(1.0),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(capped_pos, at_one);
-        let capped_neg = aggregate(AggOp::LimitRatio, &vector, None, Some(-1.1)).unwrap();
+        let capped_neg = aggregate(
+            AggOp::LimitRatio,
+            &vector,
+            None,
+            Some(-1.1),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(capped_neg, vector);
     }
 
@@ -1217,7 +2128,14 @@ mod tests {
     #[test]
     fn limit_ratio_nan_parameter_is_a_query_error() {
         for vector in [six_series(), Vec::new()] {
-            let err = aggregate(AggOp::LimitRatio, &vector, None, Some(f64::NAN)).unwrap_err();
+            let err = aggregate(
+                AggOp::LimitRatio,
+                &vector,
+                None,
+                Some(f64::NAN),
+                &mut Annotations::new(),
+            )
+            .unwrap_err();
             match err {
                 PromqlError::InvalidParameter { ref detail } => {
                     assert_eq!(detail, "Ratio value is NaN")
@@ -1230,7 +2148,14 @@ mod tests {
 
     #[test]
     fn limit_ratio_without_a_parameter_is_bad_matching() {
-        let err = aggregate(AggOp::LimitRatio, &six_series(), None, None).unwrap_err();
+        let err = aggregate(
+            AggOp::LimitRatio,
+            &six_series(),
+            None,
+            None,
+            &mut Annotations::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PromqlError::BadMatching { .. }));
     }
 
@@ -1244,8 +2169,22 @@ mod tests {
     fn limit_ratio_complements_partition_the_input() {
         let vector = six_series();
         for r in [0.2, 0.5, 0.8] {
-            let selected = aggregate(AggOp::LimitRatio, &vector, None, Some(r)).unwrap();
-            let complement = aggregate(AggOp::LimitRatio, &vector, None, Some(-(1.0 - r))).unwrap();
+            let selected = aggregate(
+                AggOp::LimitRatio,
+                &vector,
+                None,
+                Some(r),
+                &mut Annotations::new(),
+            )
+            .unwrap();
+            let complement = aggregate(
+                AggOp::LimitRatio,
+                &vector,
+                None,
+                Some(-(1.0 - r)),
+                &mut Annotations::new(),
+            )
+            .unwrap();
             assert_eq!(
                 selected.len() + complement.len(),
                 vector.len(),
@@ -1280,16 +2219,28 @@ mod tests {
                 ..s.clone()
             })
             .collect();
-        let a: Vec<Labels> = aggregate(AggOp::LimitRatio, &vector, None, Some(0.5))
-            .unwrap()
-            .into_iter()
-            .map(|s| s.labels)
-            .collect();
-        let b: Vec<Labels> = aggregate(AggOp::LimitRatio, &later, None, Some(0.5))
-            .unwrap()
-            .into_iter()
-            .map(|s| s.labels)
-            .collect();
+        let a: Vec<Labels> = aggregate(
+            AggOp::LimitRatio,
+            &vector,
+            None,
+            Some(0.5),
+            &mut Annotations::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| s.labels)
+        .collect();
+        let b: Vec<Labels> = aggregate(
+            AggOp::LimitRatio,
+            &later,
+            None,
+            Some(0.5),
+            &mut Annotations::new(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|s| s.labels)
+        .collect();
         assert_eq!(a, b);
     }
 

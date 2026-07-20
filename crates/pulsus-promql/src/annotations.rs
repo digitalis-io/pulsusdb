@@ -711,13 +711,16 @@ pub mod messages {
     }
 
     /// Which histogram operation reconciled mismatched NHCB custom bounds
-    /// — the A5b-ii subset of upstream's `HistogramOperation`
-    /// (`annotations.go:458-464`; `aggregation` joins with A5b-iii's
-    /// `sum`/`avg`).
+    /// — upstream's `HistogramOperation` (`annotations.go:458-464`): A5b-ii
+    /// ported `Add`/`Sub`; A5b-iii adds `Agg` (`sum`/`avg` aggregation AND
+    /// `sum_over_time`/`avg_over_time` — both fold through `KahanAdd`,
+    /// `engine.go:3608,3673`, `functions.go`'s `aggrHistOverTime` callers —
+    /// share the one `HistogramAgg` operation text).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum HistogramOperation {
         Add,
         Sub,
+        Agg,
     }
 
     impl HistogramOperation {
@@ -725,20 +728,78 @@ pub mod messages {
             match self {
                 HistogramOperation::Add => "addition",
                 HistogramOperation::Sub => "subtraction",
+                HistogramOperation::Agg => "aggregation",
             }
         }
     }
 
-    /// **Info** (M7-A5b-ii). Upstream
+    /// **Info** (M7-A5b-ii/iii). Upstream
     /// `NewMismatchedCustomBucketsHistogramsInfo` (`annotations.go:486`):
-    /// an `Add`/`Sub` between NHCB histograms with MISMATCHED custom
+    /// an `Add`/`Sub`/`Agg` between NHCB histograms with MISMATCHED custom
     /// bounds reconciled them to their intersection (`nhcbBoundsReconciled`
-    /// — `functions.go:672-674,689-691,863-865`). No metric-name suffix —
-    /// the pin renders only the operation.
+    /// — `functions.go:672-674,689-691,863-865`; the aggregation fold sites
+    /// — `engine.go:3620,3665,3697`, `funcSumOverTime`/`funcAvgOverTime`'s
+    /// `nhcbBoundsReconciledSeen` — all use `HistogramAgg`). No metric-name
+    /// suffix — the pin renders only the operation.
     pub fn mismatched_custom_buckets_histograms_info(op: HistogramOperation) -> String {
         format!(
             "PromQL info: mismatched custom buckets were reconciled during {}",
             op.as_str()
+        )
+    }
+
+    /// **Warning** (M7-A5b-iii). Upstream
+    /// `NewMixedFloatsHistogramsAggWarning` (`annotations.go:263-269`): an
+    /// aggregation group (`sum`/`avg`) — or a `sum_over_time`/
+    /// `avg_over_time` window — mixes float and histogram samples; the
+    /// WHOLE group/window is dropped (upstream's own doc: "used when the
+    /// queried series includes both float samples and histogram samples in
+    /// an aggregation"). Unlike [`mixed_floats_histograms_warning`] (the
+    /// per-metric-name range-function variant), this one carries NO
+    /// metric-name suffix — `base = MixedFloatsHistogramsWarning` (`"…for"`)
+    /// + `" aggregation"` (`annotations.go:265-269`), never `"for metric
+    /// name …"`.
+    pub fn mixed_floats_histograms_agg_warning() -> String {
+        "PromQL warning: encountered a mix of histograms and floats for aggregation".to_string()
+    }
+
+    /// **Info** (M7-A5b-iii). Upstream `NewHistogramIgnoredInAggregationInfo`
+    /// (`annotations.go:403-410`): `min`/`max`/`stddev`/`stdvar`/`quantile`/
+    /// `topk`/`bottomk` skip a histogram sample they cannot handle.
+    /// `aggregation` is the aggregation-op name verbatim (e.g. `"min"`,
+    /// `"stddev"`, `"topk"`), no metric name.
+    pub fn histogram_ignored_in_aggregation_info(aggregation: &str) -> String {
+        format!("PromQL info: ignored histogram in {aggregation} aggregation")
+    }
+
+    /// **Info** (M7-A5b-iii). Upstream `NewIncompatibleTypesInBinOpInfo`
+    /// (`annotations.go:394-401`): a binary operator's operand TYPES don't
+    /// support the requested op — a float/histogram or histogram/histogram
+    /// combination the op has no defined semantics for (e.g.
+    /// `histogram + float`, `histogram * histogram`). `operator` is the
+    /// operator's canonical text (`"+"`, `"*"`, `"=="`, …, `BinOp::
+    /// item_type_str`); `lhs_type`/`rhs_type` are `"float"`/`"histogram"`.
+    /// Sample dropped, not a hard error.
+    pub fn incompatible_types_in_binop_info(
+        lhs_type: &str,
+        operator: &str,
+        rhs_type: &str,
+    ) -> String {
+        format!(
+            "PromQL info: incompatible sample types encountered for binary operator {operator:?}: {lhs_type} {operator} {rhs_type}"
+        )
+    }
+
+    /// **Warning** (M7-A5b-iii). Upstream
+    /// `NewIncompatibleBucketLayoutInBinOpWarning` (`annotations.go:421-427`):
+    /// `histogram ± histogram` where one operand is exponential-schema and
+    /// the other NHCB (`FloatHistogramOpError::IncompatibleSchema` —
+    /// distinct from a MISMATCHED-bounds NHCB pair, which reconciles via
+    /// [`mismatched_custom_buckets_histograms_info`] instead). `operator`
+    /// is the canonical operator text (`"+"`/`"-"`).
+    pub fn incompatible_bucket_layout_in_binop_warning(operator: &str) -> String {
+        format!(
+            "PromQL warning: incompatible bucket layout encountered for binary operator {operator}"
         )
     }
 }
@@ -1095,6 +1156,47 @@ mod tests {
         assert_eq!(
             messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Add),
             "PromQL info: mismatched custom buckets were reconciled during addition"
+        );
+        assert_eq!(
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Agg),
+            "PromQL info: mismatched custom buckets were reconciled during aggregation",
+            "native_histograms.test:1300's sum_over_time(nhcb_metric[13m]) expect info"
+        );
+    }
+
+    #[test]
+    fn mixed_floats_histograms_agg_warning_message_text() {
+        assert_eq!(
+            messages::mixed_floats_histograms_agg_warning(),
+            "PromQL warning: encountered a mix of histograms and floats for aggregation"
+        );
+    }
+
+    #[test]
+    fn histogram_ignored_in_aggregation_info_message_text() {
+        assert_eq!(
+            messages::histogram_ignored_in_aggregation_info("min"),
+            "PromQL info: ignored histogram in min aggregation"
+        );
+        assert_eq!(
+            messages::histogram_ignored_in_aggregation_info("topk"),
+            "PromQL info: ignored histogram in topk aggregation"
+        );
+    }
+
+    #[test]
+    fn incompatible_types_in_binop_info_message_text() {
+        assert_eq!(
+            messages::incompatible_types_in_binop_info("histogram", "+", "float"),
+            "PromQL info: incompatible sample types encountered for binary operator \"+\": histogram + float"
+        );
+    }
+
+    #[test]
+    fn incompatible_bucket_layout_in_binop_warning_message_text() {
+        assert_eq!(
+            messages::incompatible_bucket_layout_in_binop_warning("+"),
+            "PromQL warning: incompatible bucket layout encountered for binary operator +"
         );
     }
 }

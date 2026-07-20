@@ -3,10 +3,12 @@
 // the pinned `model/histogram/float_histogram.go` (v3.13.0, `40af9c2`, via
 // `git show 40af9c2:model/histogram/float_histogram.go`) and
 // `model/histogram/generic.go`. `KahanAdd` (the compensated Add with a
-// caller-held compensation histogram) is out of scope (issue #124 plan v2
-// OQ3: only `sum`/`avg`(-`over_time`) aggregation uses it; `rate`/
-// `increase`/`delta`/`irate`/`idelta` and the binop arms use plain
-// `Add`/`Sub` — `functions.go:663,680`, `engine.go:3518,3532`).
+// caller-held compensation histogram — `sum`/`avg` aggregation and
+// `sum_over_time`/`avg_over_time`'s fold, plan v2 OQ3) lives in the
+// sibling `float_histogram_kahan.rs` (M7-A5b-iii), reusing this module's
+// helpers; `rate`/`increase`/`delta`/`irate`/`idelta` and the binop arms
+// use this module's plain `Add`/`Sub` — `functions.go:663,680`,
+// `engine.go:3518,3532`.
 // `CounterResetHint` is never modeled (`float_histogram.rs`'s own module
 // doc, OQ2): every decoded histogram is upstream's `UnknownCounterReset`,
 // so `adjustCounterReset`/the two `CounterReset`/`NotCounterReset`
@@ -308,12 +310,16 @@ impl FloatHistogram {
             }
             // Mismatched custom bounds: reconcile to the intersection
             // (`float_histogram.go:374-385`/`559-570` via
-            // `addCustomBucketsWithMismatches`, `:1812-1902`).
+            // `addCustomBucketsWithMismatches`, `:1812-1902`). No incoming
+            // compensation (the pin's `nil` `bucketsC` in the plain
+            // `Add`/`Sub` flow); the compensation output is discarded at
+            // the pin's own discard point (`:379,564`).
             let intersected =
                 intersect_custom_bucket_bounds(&self.custom_values, &other.custom_values);
-            let (positive_spans, positive_buckets) = add_custom_buckets_with_mismatches(
+            let (positive_spans, positive_buckets, _comps) = add_custom_buckets_with_mismatches(
                 sign,
                 &indexed_pairs(&self.positive_spans, &self.positive_buckets),
+                None,
                 &self.custom_values,
                 &indexed_pairs(&other.positive_spans, &other.positive_buckets),
                 &other.custom_values,
@@ -675,55 +681,95 @@ fn intersect_custom_bucket_bounds(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// buckets whose primary AND compensation are both exactly zero
 /// (`:1873`) and re-encodes minimally (the pin's own span construction
 /// here IS the minimal encoding — unlike `addBuckets`, this path strips
-/// its both-zero buckets itself). The compensation buckets are discarded
-/// by the plain `Add`/`Sub` caller (`:379,564` — the third return is
-/// `_`), but they participate in the both-zero exclusion test, so they
-/// are tracked.
+/// its both-zero buckets itself).
+///
+/// `a_comps` is A's incoming compensation-bucket array (parallel to
+/// `a_pairs`, the pin's `bucketsC` — `KahanAdd`'s NHCB-mismatch arm feeds
+/// its running compensation through, `withCompensation=true` for the A
+/// pass only, `:1849-1851`); pass `None` for the plain `Add`/`Sub` flow
+/// (the pin's `nil`). The third return is the resulting compensation
+/// array — the plain callers discard it (`:379,564`, the `_` third
+/// return), `kahan_add` keeps it.
 fn add_custom_buckets_with_mismatches(
     sign: f64,
     a_pairs: &[(i32, f64)],
+    a_comps: Option<&[f64]>,
     a_bounds: &[f64],
     b_pairs: &[(i32, f64)],
     b_bounds: &[f64],
     intersected: &[f64],
-) -> (Vec<Span>, Vec<f64>) {
+) -> (Vec<Span>, Vec<f64>, Vec<f64>) {
     let n = intersected.len() + 1;
     let mut target = vec![0.0f64; n];
     let mut c_target = vec![0.0f64; n];
 
-    let mut map_side = |pairs: &[(i32, f64)], bounds: &[f64], side_sign: f64| {
-        // `intersectIdx` persists across buckets within one side's pass
-        // (both bound lists ascend) and resets between the two passes —
-        // the pin's `mapBuckets`-local variable.
-        let mut intersect_idx = 0usize;
-        for &(src_idx, value) in pairs {
-            let mut target_idx = n - 1; // Default: the trailing +Inf bucket.
-            if src_idx >= 0 && (src_idx as usize) < bounds.len() {
-                let src_bound = bounds[src_idx as usize];
-                while intersect_idx < intersected.len() {
-                    if intersected[intersect_idx] >= src_bound {
-                        target_idx = intersect_idx;
-                        break;
+    let mut map_side =
+        |pairs: &[(i32, f64)], comps: Option<&[f64]>, bounds: &[f64], side_sign: f64| {
+            // `intersectIdx` persists across buckets within one side's pass
+            // (both bound lists ascend) and resets between the two passes —
+            // the pin's `mapBuckets`-local variable.
+            let mut intersect_idx = 0usize;
+            for (pos, &(src_idx, value)) in pairs.iter().enumerate() {
+                let mut target_idx = n - 1; // Default: the trailing +Inf bucket.
+                if src_idx >= 0 && (src_idx as usize) < bounds.len() {
+                    let src_bound = bounds[src_idx as usize];
+                    while intersect_idx < intersected.len() {
+                        if intersected[intersect_idx] >= src_bound {
+                            target_idx = intersect_idx;
+                            break;
+                        }
+                        intersect_idx += 1;
                     }
-                    intersect_idx += 1;
+                }
+                let (t, c) = kahan_inc(side_sign * value, target[target_idx], c_target[target_idx]);
+                target[target_idx] = t;
+                c_target[target_idx] = c;
+                // The pin's `withCompensation` arm (`:1849-1851`): A's own
+                // compensation bucket folds in right after A's value.
+                if let Some(comps) = comps {
+                    let (t, c) = kahan_inc(
+                        comps.get(pos).copied().unwrap_or(0.0),
+                        target[target_idx],
+                        c_target[target_idx],
+                    );
+                    target[target_idx] = t;
+                    c_target[target_idx] = c;
                 }
             }
-            let (t, c) = kahan_inc(side_sign * value, target[target_idx], c_target[target_idx]);
-            target[target_idx] = t;
-            c_target[target_idx] = c;
-        }
-    };
-    map_side(a_pairs, a_bounds, 1.0);
-    map_side(b_pairs, b_bounds, sign);
+        };
+    map_side(a_pairs, a_comps, a_bounds, 1.0);
+    map_side(b_pairs, None, b_bounds, sign);
 
-    rebuild_spans(
-        target
-            .iter()
-            .zip(&c_target)
-            .enumerate()
-            .filter(|(_, (t, c))| **t != 0.0 || **c != 0.0)
-            .map(|(i, (t, _))| (i as i32, *t)),
-    )
+    let mut spans: Vec<Span> = Vec::new();
+    let mut buckets: Vec<f64> = Vec::new();
+    let mut comps: Vec<f64> = Vec::new();
+    let mut last_idx: Option<i32> = None;
+    for (i, (&t, &c)) in target.iter().zip(&c_target).enumerate() {
+        if t == 0.0 && c == 0.0 {
+            continue;
+        }
+        let idx = i as i32;
+        match last_idx {
+            Some(last) if idx == last + 1 => {
+                spans
+                    .last_mut()
+                    .expect("last_idx is only Some once a span has been pushed")
+                    .length += 1;
+            }
+            Some(last) => spans.push(Span {
+                offset: idx - last - 1,
+                length: 1,
+            }),
+            None => spans.push(Span {
+                offset: idx,
+                length: 1,
+            }),
+        }
+        buckets.push(t);
+        comps.push(c);
+        last_idx = Some(idx);
+    }
+    (spans, buckets, comps)
 }
 
 /// `spansMatch`+`floatBucketsMatch` (`histogram.go:287`,

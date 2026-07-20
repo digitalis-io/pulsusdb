@@ -1930,6 +1930,7 @@ mod tests {
             &to_vector(&chunked_series),
             None,
             None,
+            &mut pulsus_promql::Annotations::new(),
         )
         .unwrap();
         let reference_sum = aggregation::aggregate(
@@ -1937,6 +1938,7 @@ mod tests {
             &to_vector(&reference_series),
             None,
             None,
+            &mut pulsus_promql::Annotations::new(),
         )
         .unwrap();
 

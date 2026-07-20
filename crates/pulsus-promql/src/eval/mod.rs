@@ -1413,15 +1413,11 @@ fn windowed_range_source(
             }
         }
     };
-    // M7-A5b-ii: the blanket "reject any histogram in the window" guard
-    // that used to live here (M7-A5a) is gone — `rate`/`increase`/`delta`/
-    // `irate`/`idelta`/`resets`/`changes`/the `OverTimeFn` disposition map
-    // now have real histogram semantics (`hist_range_fns`). What remains
-    // out of A5b-ii scope (`sum_over_time`/`avg_over_time`'s KahanAdd
-    // path, `predict_linear`, `double_exponential_smoothing`) keeps
-    // guarding itself explicitly at its own call site below, via
-    // [`reject_histogram_samples`] — this function no longer is a single
-    // shared chokepoint for that.
+    // M7-A5b-ii/iii: the blanket "reject any histogram in the window"
+    // guard that used to live here (M7-A5a) is gone — every `RangeFn`/
+    // `OverTimeFn`/`OverTimeParamFn` now has its real pinned histogram
+    // disposition (`hist_range_fns`); no 422 histogram guard remains
+    // anywhere in the evaluator.
     Ok(source_view)
 }
 
@@ -1465,45 +1461,12 @@ fn over_time_value_to_sample_fields(
     }
 }
 
-/// M7-A5a native-histogram guard error (surfaces as 422 `execution`).
-///
-/// A bare selector is the ONLY evaluation site that carries the
-/// native-histogram channel (`Sample::h`) through to output in A5a; every
-/// *derived* operation is float-only until the A5b function set lands.
-/// Without this guard such an operation would fold the input's `v` (which
-/// is `0.0` for a histogram sample by construction — `Sample::hist`) and
-/// emit `h: None`, fabricating a `0.0` float from a histogram input — the
-/// AC8 "no 0.0-for-histogram" defect. Instead we reject the histogram as
-/// an unsupported construct (naming A5b), which the read/API layers map to
-/// 422 `execution`, exactly like `pulsus-read`'s output-level
-/// `HistogramResultUnsupported` rejection of a bare histogram selector.
-fn histogram_unsupported(op: &str) -> PromqlError {
-    PromqlError::Unsupported {
-        construct: format!("native histogram input to {op} — supported in M7-A5b"),
-    }
-}
-
-/// Rejects any histogram-valued [`InstantSample`] reaching a derived
-/// operation that folds `v` (see [`histogram_unsupported`]). A no-op for a
-/// float-only vector (`h` is `None` everywhere), so float evaluation stays
-/// byte-identical.
-fn reject_histogram_vector(v: &[InstantSample], op: &str) -> Result<(), PromqlError> {
-    if v.iter().any(|s| s.h.is_some()) {
-        return Err(histogram_unsupported(op));
-    }
-    Ok(())
-}
-
-/// Rejects any histogram-valued [`Sample`] reaching a derived operation
-/// that reads raw fetched samples — range functions (via
-/// [`windowed_range_source`]) and the `timestamp()`/`info()` selector
-/// reads. A no-op for a float-only window.
-fn reject_histogram_samples(samples: &[Sample], op: &str) -> Result<(), PromqlError> {
-    if samples.iter().any(|s| s.h.is_some()) {
-        return Err(histogram_unsupported(op));
-    }
-    Ok(())
-}
+// M7-A5b-iii: the A5a `histogram_unsupported`/`reject_histogram_vector`/
+// `reject_histogram_samples` guard trio is fully retired — every derived
+// operation now carries its pinned native-histogram disposition
+// (compute / drop+info / passthrough), `predict_linear`/
+// `double_exponential_smoothing` included
+// (`hist_range_fns::eval_over_time_param_hist`, the last holdout).
 
 /// M7-A5b-i port of upstream `EvalNodeHelper.resetHistograms`
 /// (`engine.go:1311-1373`, pinned `40af9c2`): partitions
@@ -1739,25 +1702,10 @@ fn eval_step(
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
             for series in src.series {
-                // M7-A5b-ii: `sum_over_time`/`avg_over_time` histogram
-                // (KahanAdd) accumulation is deferred out of this item's
-                // scope — kept explicitly 422-guarded, exactly the A5a
-                // behavior, rather than silently dispatching through the
-                // hist-aware map (which asserts unreachable for these two).
-                if matches!(func, OverTimeFn::Sum | OverTimeFn::Avg) {
-                    reject_histogram_samples(&series.samples, "sum_over_time/avg_over_time")?;
-                    if let Some(v) = functions::eval_over_time(*func, &series.samples) {
-                        out.push(InstantSample {
-                            labels: series.labels,
-                            metric_name: series.metric_name,
-                            drop_name: !keeps_name || series.drop_name,
-                            t_ms,
-                            v,
-                            h: None,
-                        });
-                    }
-                    continue;
-                }
+                // M7-A5b-iii: `sum_over_time`/`avg_over_time`'s histogram
+                // (KahanAdd) path lands in `hist_range_fns::eval_over_time_hist`
+                // alongside every other `OverTimeFn` — no more A5a/A5b-ii
+                // early guard.
                 let metric_name = series.metric_name.as_deref().unwrap_or("");
                 let result = {
                     let mut annos = caches.annotations.borrow_mut();
@@ -1834,10 +1782,14 @@ fn eval_step(
                 // M7-A5b-ii: `quantile_over_time` gets the DROP-set
                 // histogram disposition (silent on a histogram-only
                 // window, `HistogramIgnoredInMixedRangeInfo` on a mixed
-                // one); `predict_linear`/`double_exponential_smoothing`
-                // stay out of scope, guarded exactly as A5a left them.
+                // one). M7-A5b-iii: `predict_linear`/
+                // `double_exponential_smoothing` get their pinned
+                // float-subset disposition too (`funcPredictLinear`/
+                // `funcDoubleExponentialSmoothing` — compute on the float
+                // subset, info on a mixed window, empty below 2 floats;
+                // the LAST A5a 422 histogram guard is gone).
+                let metric_name = series.metric_name.as_deref().unwrap_or("");
                 let v = if *func == OverTimeParamFn::Quantile {
-                    let metric_name = series.metric_name.as_deref().unwrap_or("");
                     let mut annos = caches.annotations.borrow_mut();
                     hist_range_fns::eval_quantile_over_time_hist(
                         scalars[0],
@@ -1846,16 +1798,20 @@ fn eval_step(
                         &mut annos,
                     )
                 } else {
-                    reject_histogram_samples(
-                        &series.samples,
-                        "predict_linear/double_exponential_smoothing",
-                    )?;
                     // `predict_linear`'s regression intercept stays the
                     // outer evaluation STEP time `t_ms` — never the
                     // `@`/offset-shifted window edge (the #67
                     // adjudication; the offset golden lives in
                     // proof/m6_08a_at_subquery.test).
-                    functions::eval_over_time_param(*func, &series.samples, &scalars, t_ms)?
+                    let mut annos = caches.annotations.borrow_mut();
+                    hist_range_fns::eval_over_time_param_hist(
+                        *func,
+                        &series.samples,
+                        &scalars,
+                        t_ms,
+                        metric_name,
+                        &mut annos,
+                    )?
                 };
                 if let Some(v) = v {
                     out.push(InstantSample {
@@ -1923,7 +1879,9 @@ fn eval_step(
                     construct: "absent() over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "absent()")?;
+            // M7-A5b-iii: `funcAbsent` is type-agnostic (`len(vec) > 0`,
+            // `functions.go:1643-1651`) — a histogram-valued vector still
+            // suppresses `absent()`'s synthetic output.
             if !v.is_empty() {
                 return Ok(StepValue::Vector(Vec::new()));
             }
@@ -1957,7 +1915,9 @@ fn eval_step(
                     construct: "sort()/sort_desc() over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "sort()/sort_desc()")?;
+            // M7-A5b-iii: `funcSort`/`funcSortDesc` DROP histogram samples
+            // (`filterFloats`, `functions.go:964-971`) — never an error.
+            v.retain(|s| s.h.is_none());
             labels::sort_vector(&mut v, *descending);
             Ok(StepValue::Vector(v))
         }
@@ -1979,7 +1939,8 @@ fn eval_step(
                         .to_string(),
                 });
             };
-            reject_histogram_vector(&v, "sort_by_label()/sort_by_label_desc()")?;
+            // M7-A5b-iii: sorts by LABEL only — value-agnostic, so a
+            // histogram sample passes through unchanged (no guard).
             labels::sort_by_label_vector(&mut v, names, *descending);
             Ok(StepValue::Vector(v))
         }
@@ -2001,7 +1962,9 @@ fn eval_step(
                     construct: "label_replace() over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "label_replace()")?;
+            // M7-A5b-iii: label rewrites are value-agnostic — a histogram
+            // sample's `h` passes through `label_replace_vector` untouched
+            // (no guard).
             Ok(StepValue::Vector(labels::label_replace_vector(
                 v,
                 dst,
@@ -2022,7 +1985,7 @@ fn eval_step(
                     construct: "label_join() over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "label_join()")?;
+            // M7-A5b-iii: value-agnostic — no guard (see `LabelReplace`).
             Ok(StepValue::Vector(labels::label_join_vector(
                 v, dst, separator, src_labels,
             )?))
@@ -2237,7 +2200,6 @@ fn eval_step(
                     construct: "aggregation over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "an aggregation")?;
             let param_v = match param {
                 Some(p) => {
                     let StepValue::Scalar(k) =
@@ -2252,7 +2214,12 @@ fn eval_step(
                 }
                 None => None,
             };
-            let out = aggregation::aggregate(*op, &v, grouping.as_ref(), param_v)?;
+            // M7-A5b-iii: every `AggOp` now has a defined native-histogram
+            // disposition (compute for sum/avg, skip+info for min/max/
+            // stddev/stdvar/quantile/topk/bottomk, type-agnostic for
+            // count/group) — the A5a blanket reject is gone.
+            let mut annos = caches.annotations.borrow_mut();
+            let out = aggregation::aggregate(*op, &v, grouping.as_ref(), param_v, &mut annos)?;
             Ok(StepValue::Vector(out))
         }
 
@@ -2271,7 +2238,8 @@ fn eval_step(
                     construct: "aggregation over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "count_values()")?;
+            // M7-A5b-iii: a histogram sample's value-label text is its
+            // `String()` rendering (`aggregation::histogram_display_string`).
             Ok(StepValue::Vector(aggregation::count_values(
                 &v,
                 label,
@@ -2287,13 +2255,16 @@ fn eval_step(
             arg,
             scalar_args,
         } => {
-            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
+            let StepValue::Vector(mut v) =
+                eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: format!("{func:?} over a scalar expression"),
                 });
             };
-            reject_histogram_vector(&v, "an elementwise math function")?;
+            // M7-A5b-iii: `simpleFloatFunc`'s shared `filterFloats` drops
+            // histogram samples (`functions.go:964`) — never an error.
+            v.retain(|s| s.h.is_none());
             let mut scalars = Vec::with_capacity(scalar_args.len());
             for sa in scalar_args {
                 let StepValue::Scalar(s) =
@@ -2441,9 +2412,12 @@ fn eval_step(
                         construct: format!("{func:?} over a scalar expression"),
                     });
                 };
-                reject_histogram_vector(&v, "a date/time function")?;
+                // M7-A5b-iii: `dateWrapper` ignores a histogram sample
+                // silently (`continue`, `functions.go:2482-2484`) — never
+                // an error.
                 let out = v
                     .into_iter()
+                    .filter(|s| s.h.is_none())
                     .map(|s| InstantSample {
                         labels: s.labels,
                         // Name-dropping class (issue #86): retained +
@@ -2482,9 +2456,10 @@ fn eval_step(
                     if let Some(sample) =
                         staleness::instant_value(&series.samples, eff_t, lookback_ms)
                     {
-                        if sample.h.is_some() {
-                            return Err(histogram_unsupported("timestamp()"));
-                        }
+                        // M7-A5b-iii: `funcTimestamp` is value-agnostic
+                        // (`float64(el.T)/1000`, `functions.go:1838`) — a
+                        // histogram sample's timestamp is emitted exactly
+                        // like a float sample's.
                         out.push(InstantSample {
                             labels: series.labels.clone(),
                             // Name-dropping class (issue #86): retained
@@ -2512,7 +2487,8 @@ fn eval_step(
                         construct: "timestamp() over a scalar expression".to_string(),
                     });
                 };
-                reject_histogram_vector(&v, "timestamp()")?;
+                // M7-A5b-iii: value-agnostic (see the bare-selector arm
+                // above) — no guard.
                 let out = v
                     .into_iter()
                     .map(|s| InstantSample {
@@ -2539,9 +2515,12 @@ fn eval_step(
                     construct: "scalar() over a scalar expression".to_string(),
                 });
             };
-            reject_histogram_vector(&v, "scalar()")?;
-            Ok(StepValue::Scalar(match v.as_slice() {
-                [only] => only.v,
+            // M7-A5b-iii: `funcScalar` ignores histogram samples and
+            // returns the single remaining FLOAT (`>1` float found ⇒ NaN;
+            // `functions.go:1104-1126`) — never an error.
+            let floats: Vec<f64> = v.iter().filter(|s| s.h.is_none()).map(|s| s.v).collect();
+            Ok(StepValue::Scalar(match floats.as_slice() {
+                [only] => *only,
                 _ => f64::NAN,
             }))
         }
@@ -2593,13 +2572,14 @@ fn eval_step(
                         *group == crate::plan::Group::OneToOne && *fill == Default::default(),
                         "plan_binary discards group/fill for scalar operands"
                     );
-                    reject_histogram_vector(&v, "a binary operator")?;
+                    let mut annos = caches.annotations.borrow_mut();
                     Ok(StepValue::Vector(binop::vector_scalar(
                         *op,
                         *bool_modifier,
                         &v,
                         s,
                         false,
+                        &mut annos,
                     )))
                 }
                 (StepValue::Scalar(s), StepValue::Vector(v)) => {
@@ -2607,18 +2587,18 @@ fn eval_step(
                         *group == crate::plan::Group::OneToOne && *fill == Default::default(),
                         "plan_binary discards group/fill for scalar operands"
                     );
-                    reject_histogram_vector(&v, "a binary operator")?;
+                    let mut annos = caches.annotations.borrow_mut();
                     Ok(StepValue::Vector(binop::vector_scalar(
                         *op,
                         *bool_modifier,
                         &v,
                         s,
                         true,
+                        &mut annos,
                     )))
                 }
                 (StepValue::Vector(l), StepValue::Vector(r)) => {
-                    reject_histogram_vector(&l, "a binary operator")?;
-                    reject_histogram_vector(&r, "a binary operator")?;
+                    let mut annos = caches.annotations.borrow_mut();
                     Ok(StepValue::Vector(binop::vector_vector(
                         *op,
                         *bool_modifier,
@@ -2627,6 +2607,7 @@ fn eval_step(
                         fill,
                         &l,
                         &r,
+                        &mut annos,
                     )?))
                 }
                 // Unreachable through `plan()`: a string literal only ever
@@ -2650,9 +2631,10 @@ fn eval_step(
             let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, caches)?;
             let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, caches)?;
             match (l, r) {
+                // M7-A5b-iii: `and`/`or`/`unless` are value-agnostic
+                // (`VectorAnd`/`VectorOr`/`VectorUnless` copy the surviving
+                // element unchanged, `h` included) — no guard needed.
                 (StepValue::Vector(l), StepValue::Vector(r)) => {
-                    reject_histogram_vector(&l, "a set operator")?;
-                    reject_histogram_vector(&r, "a set operator")?;
                     Ok(StepValue::Vector(binop::set_op(*op, matching, &l, &r)))
                 }
                 _ => Err(PromqlError::Unsupported {
@@ -2694,7 +2676,10 @@ fn eval_step(
                 // steps, or the enclosing subquery's inner grid).
                 .expect("prepare_info covers every evaluation step of its horizon")
                 .clone();
-            reject_histogram_vector(&base_v, "info()")?;
+            // M7-A5b-iii: `info()` is value-agnostic on BOTH sides —
+            // `info::combine` passes the base sample's `v`/`h` straight
+            // through, and the info (metadata) side's `InfoSeriesAtStep`
+            // never carries a value at all (labels only) — no guard.
 
             let sel = &selectors[*info_selector];
             let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
@@ -2702,9 +2687,6 @@ fn eval_step(
             for series in data.get(*info_selector) {
                 if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
                 {
-                    if sample.h.is_some() {
-                        return Err(histogram_unsupported("info()"));
-                    }
                     // Per-series name with the concrete-name fallback
                     // (the `Selector` arm's contract); a genuinely
                     // nameless series can never be an info source.
@@ -2966,37 +2948,197 @@ mod tests {
         data
     }
 
-    /// Plans `query`, evaluates it over [`histogram_selector_data`], and
-    /// asserts a native-histogram-unsupported execution error naming A5b —
-    /// never an `Ok` result (which would carry a fabricated `0.0`).
-    fn assert_histogram_unsupported(query: &str, p: PlanParams) {
-        let expr = crate::parser::parse(query).unwrap();
-        let plan = plan(&expr, p).unwrap();
+    /// M7-A5b-iii superseded the A5a blanket reject for aggregation: a
+    /// single-member `sum` group over a histogram series computes the
+    /// (trivial, one-addend) Kahan sum — the input histogram, unchanged.
+    #[test]
+    fn sum_aggregation_over_a_single_histogram_series_computes_the_sum() {
+        let expr = crate::parser::parse("sum(up)").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
         match evaluate(&plan, &histogram_selector_data()) {
-            Err(PromqlError::Unsupported { construct }) => assert!(
-                construct.contains("native histogram") && construct.contains("A5b"),
-                "the error names the native-histogram/A5b cause: {construct:?}"
-            ),
-            other => panic!(
-                "expected a histogram-unsupported error for {query:?}, got {other:?} \
-                 — an Ok result would be the AC8 fabricated-0.0 defect"
-            ),
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                let h = v[0]
+                    .h
+                    .as_ref()
+                    .expect("sum() over a histogram computes a histogram");
+                assert!(h.bits_eq(&single_histogram().to_float()));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
         }
     }
 
+    /// `histogram + scalar` (`+` unsupported for float/histogram, only
+    /// `*` is — `vectorElemBinop`'s `hlhs!=nil,hrhs==nil` arm): the
+    /// element is dropped and an `IncompatibleTypesInBinOpInfo` fires,
+    /// never an error and never a fabricated float.
     #[test]
-    fn aggregation_over_a_histogram_series_errors_never_fabricates_a_float() {
-        assert_histogram_unsupported("sum(up)", params(1_000, 1_000, 0));
+    fn binary_op_add_over_a_histogram_and_a_scalar_drops_with_info() {
+        let expr = crate::parser::parse("up + 1").unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
+        assert_eq!(value, QueryValue::Vector(Vec::new()));
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                crate::annotations::messages::incompatible_types_in_binop_info(
+                    "histogram",
+                    "+",
+                    "float"
+                )
+            ]
+        );
     }
 
+    /// M7-A5b-iii (codex round-1 [medium]): a histogram-ONLY window is a
+    /// SILENT empty result for `predict_linear` — `funcPredictLinear`
+    /// returns before any annotation when `len(Floats) == 0`
+    /// (`functions.go:1928-1934`), never a 422.
     #[test]
-    fn binary_op_over_a_histogram_series_errors() {
-        assert_histogram_unsupported("up + 1", params(1_000, 1_000, 0));
+    fn predict_linear_over_a_histogram_only_window_is_silently_empty() {
+        let expr = crate::parser::parse("predict_linear(up[5m], 10)").unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
+        assert_eq!(value, QueryValue::Vector(Vec::new()));
+        assert!(
+            annos.is_empty(),
+            "a histogram-only window is silent: {:?}",
+            annos.as_strings(0, 0)
+        );
     }
 
-    /// M7-A5b-ii superseded the A5a blanket reject for `rate`/`increase`/
-    /// `delta`/`irate`: a native-histogram range function now computes a
-    /// real result — never an error, never a fabricated `0.0` float.
+    /// A MIXED window (≥2 floats + histograms) computes the regression on
+    /// the FLOAT SUBSET and emits `HistogramIgnoredInMixedRangeInfo` once
+    /// (`functions.go:1936-1939`). Floats at t=0/1000ms with values 0/1
+    /// regress to slope 1/s, intercept 1 at eval time 1s → `predict_linear
+    /// (…, 10) = 11`; the interleaved histogram must not perturb it.
+    #[test]
+    fn predict_linear_over_a_mixed_window_computes_on_floats_and_annotates() {
+        let expr = crate::parser::parse("predict_linear(up[5m], 10)").unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![
+                    Sample::float(0, 0.0),
+                    Sample::hist(500, single_histogram().to_float()),
+                    Sample::float(1_000, 1.0),
+                ],
+            )],
+        );
+        let (value, annos) = super::evaluate(&p, &data).unwrap();
+        match value {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].v, 11.0);
+                assert!(v[0].h.is_none());
+            }
+            other => panic!("expected a float vector, got {other:?}"),
+        }
+        let (warnings, infos) = annos.as_strings(0, 0);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            infos,
+            vec![crate::annotations::messages::histogram_ignored_in_mixed_range_info("up")]
+        );
+    }
+
+    /// ONE float + histograms → too few float points: EMPTY result but
+    /// the mixed-window info still fires (`functions.go:1928-1932`'s
+    /// `len(Floats) == 1 && len(Histograms) > 0` arm).
+    #[test]
+    fn predict_linear_with_one_float_in_a_mixed_window_is_empty_with_info() {
+        let expr = crate::parser::parse("predict_linear(up[5m], 10)").unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![
+                    Sample::hist(500, single_histogram().to_float()),
+                    Sample::float(1_000, 1.0),
+                ],
+            )],
+        );
+        let (value, annos) = super::evaluate(&p, &data).unwrap();
+        assert_eq!(value, QueryValue::Vector(Vec::new()));
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![crate::annotations::messages::histogram_ignored_in_mixed_range_info("up")]
+        );
+    }
+
+    /// `double_exponential_smoothing` shares the disposition
+    /// (`funcDoubleExponentialSmoothing`, `functions.go:930-963`) — mixed
+    /// window computes on the float subset + info — AND its sf/tf
+    /// validation still precedes the float-count check (`:923-928`): a
+    /// histogram-only window with an invalid factor errors, with a valid
+    /// factor it is silently empty.
+    #[test]
+    fn double_exponential_smoothing_histogram_disposition_and_validation_order() {
+        let params_exp = PlanParams {
+            experimental_functions: true,
+            ..params(1_000, 1_000, 0)
+        };
+        // Histogram-only + valid factors → silent empty.
+        let expr = crate::parser::parse("double_exponential_smoothing(up[5m], 0.5, 0.5)").unwrap();
+        let p = plan(&expr, params_exp).unwrap();
+        let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
+        assert_eq!(value, QueryValue::Vector(Vec::new()));
+        assert!(annos.is_empty());
+        // Histogram-only + INVALID factor → the validation error fires
+        // before the float-count check (the pin's panic ordering).
+        let expr_bad =
+            crate::parser::parse("double_exponential_smoothing(up[5m], 2.0, 0.5)").unwrap();
+        let p_bad = plan(&expr_bad, params_exp).unwrap();
+        assert!(matches!(
+            super::evaluate(&p_bad, &histogram_selector_data()),
+            Err(PromqlError::InvalidParameter { .. })
+        ));
+        // Mixed window → float-subset result + the mixed info.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![
+                    Sample::float(0, 1.0),
+                    Sample::hist(500, single_histogram().to_float()),
+                    Sample::float(1_000, 3.0),
+                ],
+            )],
+        );
+        let p2 = plan(
+            &crate::parser::parse("double_exponential_smoothing(up[5m], 0.5, 0.5)").unwrap(),
+            params_exp,
+        )
+        .unwrap();
+        let (value2, annos2) = super::evaluate(&p2, &data).unwrap();
+        match value2 {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                // Two floats [1, 3], sf=tf=0.5: s1 = 0.5*3 + 0.5*(1+2) = 3.
+                assert_eq!(v[0].v, 3.0);
+            }
+            other => panic!("expected a float vector, got {other:?}"),
+        }
+        let (_, infos2) = annos2.as_strings(0, 0);
+        assert_eq!(
+            infos2,
+            vec![crate::annotations::messages::histogram_ignored_in_mixed_range_info("up")]
+        );
+    }
+
+    /// M7-A5b-ii: a native-histogram range function computes a real
+    /// result — never an error, never a fabricated `0.0` float.
     #[test]
     fn range_function_over_a_histogram_series_now_computes_a_histogram() {
         let expr = crate::parser::parse("rate(up[5m])").unwrap();
@@ -3013,40 +3155,118 @@ mod tests {
         }
     }
 
-    /// `sum_over_time`/`avg_over_time`'s histogram (KahanAdd) path is
-    /// deferred out of A5b-ii scope — still 422-guarded exactly like A5a.
+    /// M7-A5b-iii: `avg_over_time`'s histogram (KahanAdd direct-mean) path
+    /// — two identical fixture samples average to the same histogram.
     #[test]
-    fn over_time_function_over_a_histogram_series_errors() {
-        assert_histogram_unsupported("avg_over_time(up[5m])", params(1_000, 1_000, 0));
+    fn avg_over_time_over_a_histogram_series_computes_the_mean() {
+        let expr = crate::parser::parse("avg_over_time(up[5m])").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                let h = v[0]
+                    .h
+                    .as_ref()
+                    .expect("avg_over_time() over histograms computes a histogram");
+                assert!(h.bits_eq(&single_histogram().to_float()));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
+    /// M7-A5b-iii: `simpleFloatFunc`'s `filterFloats` drops histogram
+    /// samples silently (empty result, never an error).
     #[test]
-    fn elementwise_math_over_a_histogram_series_errors() {
-        assert_histogram_unsupported("abs(up)", params(1_000, 1_000, 0));
-    }
-
-    #[test]
-    fn label_replace_over_a_histogram_series_errors() {
-        assert_histogram_unsupported(
-            "label_replace(up, \"x\", \"y\", \"job\", \".*\")",
-            params(1_000, 1_000, 0),
+    fn elementwise_math_drops_histogram_samples_silently() {
+        let expr = crate::parser::parse("abs(up)").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        assert_eq!(
+            evaluate(&plan, &histogram_selector_data()).unwrap(),
+            QueryValue::Vector(Vec::new())
         );
     }
 
+    /// M7-A5b-iii: `label_replace`/`label_join` are value-agnostic — a
+    /// histogram sample's `h` passes through the label rewrite unchanged.
     #[test]
-    fn timestamp_over_a_histogram_series_errors() {
-        assert_histogram_unsupported("timestamp(up)", params(1_000, 1_000, 0));
+    fn label_replace_over_a_histogram_series_preserves_the_histogram() {
+        let expr =
+            crate::parser::parse("label_replace(up, \"x\", \"y\", \"job\", \".*\")").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].labels.get("x"), Some("y"));
+                let h = v[0]
+                    .h
+                    .as_ref()
+                    .expect("label_replace() preserves the histogram sample");
+                assert!(h.bits_eq(&single_histogram().to_float()));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
     #[test]
-    fn a_range_query_aggregation_over_a_histogram_series_errors_at_every_step() {
-        // The per-step matrix accumulation path (step_ms > 0) rejects too,
-        // rather than folding a 0.0 histogram value into the matrix.
-        assert_histogram_unsupported("sum(up)", params(1_000, 2_000, 1_000));
+    fn label_join_over_a_histogram_series_preserves_the_histogram() {
+        let expr = crate::parser::parse("label_join(up, \"x\", \"-\", \"job\")").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].labels.get("x"), Some("a"));
+                assert!(
+                    v[0].h.is_some(),
+                    "label_join() preserves the histogram sample"
+                );
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
+    /// M7-A5b-iii: `funcTimestamp` is value-agnostic — a histogram
+    /// sample's real stored timestamp is emitted exactly like a float
+    /// sample's (bare-selector special case, per the #66 adjudication).
     #[test]
-    fn set_op_over_a_histogram_series_errors() {
+    fn timestamp_of_a_bare_histogram_selector_returns_the_sample_time() {
+        let expr = crate::parser::parse("timestamp(up)").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].v, 1.0, "1000ms -> 1s");
+                assert!(v[0].h.is_none(), "timestamp() always emits a float");
+            }
+            other => panic!("expected an Ok float-valued vector, got {other:?}"),
+        }
+    }
+
+    /// The per-step matrix accumulation path (step_ms > 0) computes too,
+    /// rather than rejecting or folding a fabricated `0.0` into the
+    /// matrix.
+    #[test]
+    fn a_range_query_sum_aggregation_over_a_histogram_series_computes_every_step() {
+        let expr = crate::parser::parse("sum(up)").unwrap();
+        let plan = plan(&expr, params(1_000, 2_000, 1_000)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Matrix(m)) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(m[0].points.len(), 2);
+                for p in &m[0].points {
+                    let h =
+                        p.h.as_ref()
+                            .expect("sum() computes a histogram at every step");
+                    assert!(h.bits_eq(&single_histogram().to_float()));
+                }
+            }
+            other => panic!("expected an Ok histogram-valued matrix, got {other:?}"),
+        }
+    }
+
+    /// M7-A5b-iii: `and`/`or`/`unless` are value-agnostic passthroughs —
+    /// a histogram operand's `h` survives the set-op membership filter.
+    #[test]
+    fn set_op_and_over_a_histogram_series_preserves_the_histogram() {
         let expr = crate::parser::parse("up and up").unwrap();
         let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
         let mut data = SeriesData::new();
@@ -3062,23 +3282,43 @@ mod tests {
                 )],
             );
         }
-        assert!(
-            matches!(evaluate(&p, &data), Err(PromqlError::Unsupported { .. })),
-            "a set operator over a histogram operand errors, never fabricates a float"
+        match evaluate(&p, &data) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                assert!(v[0].h.is_some(), "and preserves the histogram operand");
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
+    }
+
+    /// The scalar-op-vector arm (`1 + up`) drops with the same
+    /// `IncompatibleTypesInBinOpInfo` as the vector-op-scalar arm
+    /// (`up + 1`, covered above) — `float`/`histogram` operand order
+    /// swapped in the message.
+    #[test]
+    fn scalar_vector_binop_add_over_a_histogram_series_drops_with_info() {
+        let expr = crate::parser::parse("1 + up").unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
+        assert_eq!(value, QueryValue::Vector(Vec::new()));
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                crate::annotations::messages::incompatible_types_in_binop_info(
+                    "float",
+                    "+",
+                    "histogram"
+                )
+            ]
         );
     }
 
+    /// Both operands of `up + up` are histogram-valued vectors; `Add` is
+    /// a SUPPORTED histogram/histogram op (`hlhs.Add(hrhs)`) — the
+    /// vector-vector arm now computes the real sum, never an error.
     #[test]
-    fn scalar_vector_binop_over_a_histogram_series_errors() {
-        // The scalar-op-vector arm (`1 + up`) rejects the histogram vector
-        // just like the vector-op-scalar arm (`up + 1`) already covered.
-        assert_histogram_unsupported("1 + up", params(1_000, 1_000, 0));
-    }
-
-    #[test]
-    fn vector_vector_binop_over_histogram_operands_errors() {
-        // Both operands of `up + up` are histogram-valued vectors; the
-        // vector-vector arm must reject, never fold either operand's `v`.
+    fn vector_vector_binop_add_over_histogram_operands_computes_the_sum() {
         let expr = crate::parser::parse("up + up").unwrap();
         let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
         let mut data = SeriesData::new();
@@ -3096,41 +3336,58 @@ mod tests {
             );
         }
         match evaluate(&p, &data) {
-            Err(PromqlError::Unsupported { construct }) => assert!(
-                construct.contains("native histogram") && construct.contains("A5b"),
-                "the error names the native-histogram/A5b cause: {construct:?}"
-            ),
-            other => panic!(
-                "a vector-vector binary operator over histogram operands must error, \
-                 never fabricate a float — got {other:?}"
-            ),
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                let h = v[0].h.as_ref().expect("up + up computes a histogram");
+                let mut want = single_histogram().to_float();
+                want.count = 8.0;
+                want.sum = 10.0;
+                want.positive_buckets = vec![2.0, 4.0, 2.0];
+                assert!(h.bits_eq(&want));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
         }
     }
 
+    /// M7-A5b-iii: `sum_over_time`'s histogram (KahanAdd) path now
+    /// computes through a subquery-materialized grid too, not just a
+    /// plain range selector. The `:1s` inner step lands the fixture's
+    /// t=1000 (=1s) histogram sample on a grid point.
     #[test]
-    fn label_join_over_a_histogram_series_errors() {
-        assert_histogram_unsupported(
-            "label_join(up, \"x\", \"-\", \"job\")",
-            params(1_000, 1_000, 0),
-        );
+    fn sum_over_time_subquery_over_a_histogram_series_computes_the_sum() {
+        let expr = crate::parser::parse("sum_over_time(up[5m:1s])").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                let h = v[0]
+                    .h
+                    .as_ref()
+                    .expect("sum_over_time() over a subquery grid computes a histogram");
+                assert!(h.bits_eq(&single_histogram().to_float()));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
+    /// `@ 1` pins the selector at 1 s = 1000 ms — the fixture's second
+    /// histogram sample — so the step-invariant `@`-pinned subtree still
+    /// feeds a histogram vector into `sum`, which now computes.
     #[test]
-    fn sum_over_time_subquery_over_a_histogram_series_errors() {
-        // The subquery materializes an instant grid that carries the
-        // histogram channel (`h`) into its matrix; `sum_over_time` then
-        // rejects that matrix rather than folding a 0.0. The `:1s` inner
-        // step lands the fixture's t=1000 (=1s) histogram sample on a grid
-        // point, so the guarded path is genuinely exercised.
-        assert_histogram_unsupported("sum_over_time(up[5m:1s])", params(1_000, 1_000, 0));
-    }
-
-    #[test]
-    fn at_pinned_aggregation_over_a_histogram_series_errors() {
-        // `@ 1` pins the selector at 1 s = 1000 ms — the fixture's second
-        // histogram sample — so the step-invariant `@`-pinned subtree still
-        // feeds a histogram vector into `sum`, which must reject.
-        assert_histogram_unsupported("sum(up @ 1)", params(1_000, 1_000, 0));
+    fn at_pinned_sum_aggregation_over_a_histogram_series_computes_the_sum() {
+        let expr = crate::parser::parse("sum(up @ 1)").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                let h = v[0]
+                    .h
+                    .as_ref()
+                    .expect("sum() over an @-pinned histogram computes");
+                assert!(h.bits_eq(&single_histogram().to_float()));
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
     #[test]

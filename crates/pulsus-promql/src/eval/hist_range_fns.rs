@@ -396,10 +396,9 @@ impl From<RangeValue> for OverTimeValue {
     }
 }
 
-/// The M7-A5b-ii `OverTimeFn` disposition map (plan v3/v4, issue #124),
-/// for every variant EXCEPT `Sum`/`Avg` (deferred — KahanAdd histogram
-/// accumulation is out of this item's scope; callers must keep guarding
-/// those two via `reject_histogram_samples`, never dispatch here).
+/// The `OverTimeFn` disposition map (plan v3/v4, issue #124) — complete
+/// since M7-A5b-iii: `Sum`/`Avg` dispatch to the KahanAdd fold below
+/// ([`eval_sum_avg_over_time_hist`]), every other variant per A5b-ii.
 ///
 /// **IMPLEMENT / preserve / count** (`functions.go`, cited per arm below).
 /// **DROP + info-only-on-a-MIXED-window** (`min`/`max`/`stddev`/`stdvar`/
@@ -447,17 +446,190 @@ pub fn eval_over_time_hist(
         | OverTimeFn::Deriv
         | OverTimeFn::TsOfMin
         | OverTimeFn::TsOfMax => eval_drop_set_over_time(func, samples, metric_name, annos),
+        // M7-A5b-iii: `funcSumOverTime`/`funcAvgOverTime`'s histogram
+        // (KahanAdd) path — deferred out of A5b-ii, landed here.
         OverTimeFn::Sum | OverTimeFn::Avg => {
-            debug_assert!(
-                false,
-                "Sum/Avg histogram (KahanAdd) handling is deferred out of \
-                 A5b-ii scope (issue #124) -- callers must keep guarding \
-                 these two via reject_histogram_samples and never dispatch \
-                 here"
-            );
-            None
+            eval_sum_avg_over_time_hist(func, samples, metric_name, annos)
         }
     }
+}
+
+/// `funcSumOverTime`/`funcAvgOverTime`'s histogram-aware path
+/// (`functions.go:1148-1163` avg / `1498-1513` sum — the `len(Floats)>0 &&
+/// len(Histograms)>0` mixed-window warning; `aggrHistOverTime` + the
+/// `sum`/`avg` full-histogram KahanAdd fold otherwise — `avg`'s
+/// direct-mean-with-overflow-switch mirrors the pin verbatim, per
+/// `aggregation.rs`'s `fold_histogram_into_avg` (deliberately duplicated
+/// here rather than sharing an `Acc`-shaped type across the two call
+/// shapes — flagged as a candidate follow-up refactor, not attempted
+/// under this item's scope)). A pure-float window delegates to the
+/// byte-unchanged [`super::functions::eval_over_time`].
+///
+/// Pin-exact tails: NO `Compact` (neither `funcSumOverTime` nor
+/// `funcAvgOverTime` compacts — unlike the `engine.go` aggregation arms);
+/// `sum`'s final flush captures the flush-`Add`'s own
+/// `nhcbBoundsReconciled` (`functions.go:1547-1554`) while `avg`'s two
+/// flush arms discard it (`:1249-1256`, the `_, _, _, err :=` pattern);
+/// an `ErrHistogramsIncompatibleSchema` anywhere — mid-fold or in the
+/// final flush — yields the `MixedExponentialCustomHistogramsWarning` and
+/// an EMPTY result with every accumulated fold annotation DISCARDED
+/// (`funcSumOverTime`'s error arm returns a FRESH annotation set,
+/// `:1558-1562`, dropping the deferred `nhcbBoundsReconciledSeen` info) —
+/// hence the info here is buffered in `nhcb_seen` and emitted only on
+/// success.
+fn eval_sum_avg_over_time_hist(
+    func: OverTimeFn,
+    samples: &[Sample],
+    metric_name: &str,
+    annos: &mut Annotations,
+) -> Option<OverTimeValue> {
+    let has_float = samples.iter().any(|s| s.h.is_none());
+    let has_hist = samples.iter().any(|s| s.h.is_some());
+    if samples.is_empty() {
+        return None;
+    }
+    if has_float && has_hist {
+        annos.warning(messages::mixed_floats_histograms_warning(metric_name));
+        return None;
+    }
+    if !has_hist {
+        return super::functions::eval_over_time(func, samples).map(OverTimeValue::Float);
+    }
+
+    let mut hists = samples.iter().filter_map(|s| s.h.as_deref());
+    let mut sum = hists
+        .next()
+        .expect("has_hist implies at least one histogram sample")
+        .clone();
+    // The running FULL compensation histogram (upstream `comp`/`kahanC`,
+    // `nil` until the first KahanAdd).
+    let mut c: Option<FloatHistogram> = None;
+    let mut count = 1.0_f64;
+    let mut incremental_mean = false;
+    let mut mean: Option<FloatHistogram> = None;
+    // The pin's `nhcbBoundsReconciledSeen` — added once, in the deferred
+    // block, only when the fold SUCCEEDS (see the fn doc).
+    let mut nhcb_seen = false;
+
+    macro_rules! incompatible_schema {
+        () => {{
+            annos.warning(messages::mixed_exponential_custom_histograms_warning(
+                metric_name,
+            ));
+            return None;
+        }};
+    }
+
+    for h in hists {
+        count += 1.0;
+        match func {
+            OverTimeFn::Sum => match sum.kahan_add(h, c.as_ref()) {
+                Ok(outcome) => {
+                    nhcb_seen |= outcome.nhcb_bounds_reconciled;
+                    sum = outcome.result;
+                    c = Some(outcome.compensation);
+                }
+                Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+            },
+            OverTimeFn::Avg => {
+                if !incremental_mean {
+                    let outcome = match sum.kahan_add(h, c.as_ref()) {
+                        Ok(o) => o,
+                        Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+                    };
+                    nhcb_seen |= outcome.nhcb_bounds_reconciled;
+                    if !outcome.result.has_overflow() {
+                        sum = outcome.result;
+                        c = Some(outcome.compensation);
+                        continue;
+                    }
+                    // Overflow: switch to incremental mean, seeded from
+                    // the pre-overflow sum/compensation, the compensation
+                    // scaled as a WHOLE histogram (`kahanC.Div(count-1)`,
+                    // `functions.go:1229-1232`).
+                    incremental_mean = true;
+                    let mut m = sum.clone();
+                    m.div(count - 1.0);
+                    mean = Some(m);
+                    if let Some(c) = c.as_mut() {
+                        c.div(count - 1.0);
+                    }
+                }
+                let q = (count - 1.0) / count;
+                if let Some(c) = c.as_mut() {
+                    c.mul(q);
+                }
+                let mut to_add = h.clone();
+                to_add.div(count);
+                let mut scaled_mean = mean.clone().expect("incremental_mean implies mean is Some");
+                scaled_mean.mul(q);
+                match scaled_mean.kahan_add(&to_add, c.as_ref()) {
+                    Ok(outcome) => {
+                        nhcb_seen |= outcome.nhcb_bounds_reconciled;
+                        mean = Some(outcome.result);
+                        c = Some(outcome.compensation);
+                    }
+                    Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+                }
+            }
+            _ => unreachable!("only called for Sum/Avg"),
+        }
+    }
+
+    // Final compensation flush — a full-histogram `Add`, guarded on
+    // presence like the pin's `!= nil` checks, error → the same
+    // incompatible-schema disposition as a mid-fold error (fn doc).
+    let result = match (func, incremental_mean) {
+        // `funcSumOverTime` (`:1547-1554`): `sum.Add(comp)` — the flush's
+        // own `nhcbBoundsReconciled` counts toward the deferred info.
+        (OverTimeFn::Sum, _) => match c {
+            Some(comp) => match sum.add(&comp) {
+                Ok(outcome) => {
+                    nhcb_seen |= outcome.nhcb_bounds_reconciled;
+                    outcome.result
+                }
+                Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+            },
+            None => sum,
+        },
+        // `funcAvgOverTime` incremental tail (`:1247-1252`):
+        // `mean.Add(kahanC)`, nhcb flag discarded (`_, _, _, err :=`).
+        (OverTimeFn::Avg, true) => {
+            let mean = mean.expect("incremental_mean implies mean is Some");
+            match c {
+                Some(comp) => match mean.add(&comp) {
+                    Ok(outcome) => outcome.result,
+                    Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+                },
+                None => mean,
+            }
+        }
+        // `funcAvgOverTime` direct tail (`:1253-1258`):
+        // `sum.Div(count).Add(kahanC.Div(count))` — the compensation
+        // scaled as a whole histogram; nhcb flag discarded.
+        (OverTimeFn::Avg, false) => {
+            sum.div(count);
+            match c {
+                Some(mut comp) => {
+                    comp.div(count);
+                    match sum.add(&comp) {
+                        Ok(outcome) => outcome.result,
+                        Err(FloatHistogramOpError::IncompatibleSchema) => incompatible_schema!(),
+                    }
+                }
+                None => sum,
+            }
+        }
+        _ => unreachable!("only called for Sum/Avg"),
+    };
+    if nhcb_seen {
+        annos.info(messages::mismatched_custom_buckets_histograms_info(
+            messages::HistogramOperation::Agg,
+        ));
+    }
+    // NO Compact — neither pinned function compacts its result (unlike
+    // the engine aggregation arms' `Compact(0)`).
+    Some(OverTimeValue::Histogram(result))
 }
 
 fn sample_to_over_time_value(s: &Sample) -> OverTimeValue {
@@ -568,6 +740,47 @@ pub fn eval_quantile_over_time_hist(
         annos.info(messages::histogram_ignored_in_mixed_range_info(metric_name));
     }
     result
+}
+
+/// M7-A5b-iii (the codex round-1 [medium] finding — these two were the
+/// LAST 422-guarded histogram windows): `predict_linear`/
+/// `double_exponential_smoothing`'s histogram disposition, ported from
+/// `funcPredictLinear` (`functions.go:1919-1943`) and
+/// `funcDoubleExponentialSmoothing` (`:911-964`) — both share the exact
+/// same shape:
+/// - parameter validation FIRST (`double_exponential_smoothing`'s
+///   sf/tf panic precedes the float-count check, `:923-928` — a
+///   histogram-only window with bad factors still errors; the existing
+///   [`super::functions::eval_over_time_param`] already validates before
+///   its own `< 2` check, the #67 validation-ordering rule);
+/// - the computation runs over the FLOAT SUBSET only (`samples.Floats`);
+/// - fewer than 2 floats → EMPTY (no sample), with
+///   `NewHistogramIgnoredInMixedRangeInfo` iff exactly 1 float coexists
+///   with histograms (`:1928-1934`, `:932-940`) — a histogram-ONLY window
+///   is silent;
+/// - ≥ 2 floats with histograms present → the float result + the same
+///   info (`:1936-1939`, `:959-962`).
+///
+/// Net: the info fires iff `floats >= 1 && histograms > 0`; the result
+/// exists iff `floats >= 2` — never a hard error for histogram presence.
+pub fn eval_over_time_param_hist(
+    func: crate::plan::OverTimeParamFn,
+    samples: &[Sample],
+    scalars: &[f64],
+    eval_t_ms: i64,
+    metric_name: &str,
+    annos: &mut Annotations,
+) -> Result<Option<f64>, crate::error::PromqlError> {
+    let floats: Vec<Sample> = samples.iter().filter(|s| s.h.is_none()).cloned().collect();
+    let hist_present = floats.len() != samples.len();
+    // Validation (inside `eval_over_time_param`, before its float-count
+    // check) runs regardless of the float subset's size — an invalid
+    // factor errors BEFORE any annotation, exactly like the pin's panic.
+    let result = super::functions::eval_over_time_param(func, &floats, scalars, eval_t_ms)?;
+    if hist_present && !floats.is_empty() {
+        annos.info(messages::histogram_ignored_in_mixed_range_info(metric_name));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1181,5 +1394,342 @@ mod tests {
         assert!(v.is_none());
         let (warnings, _) = annos.as_strings(0, 0);
         assert_eq!(warnings.len(), 1);
+    }
+
+    // -- M7-A5b-iii: `sum_over_time`/`avg_over_time`'s histogram KahanAdd
+    //    path — the same `nhcb_metric` 12m-window fixture (`:1296-1304`). --
+
+    /// `sum_over_time(nhcb_metric[13m])` at 12m == `{{schema:-53 count:3
+    /// sum:3 custom_values:[5] buckets:[3]}}`, `expect no_warn` +
+    /// `expect info msg: … reconciled during aggregation` (`:1296-1299`).
+    #[test]
+    fn sum_over_time_over_nhcb_bounds_change_matches_the_pinned_corpus_value() {
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(
+            OverTimeFn::Sum,
+            &nhcb_metric_window_at_12m(),
+            "nhcb_metric",
+            &mut annos,
+        );
+        match v {
+            Some(OverTimeValue::Histogram(h)) => {
+                assert_eq!(h.custom_values, vec![5.0]);
+                assert_eq!(h.count, 3.0);
+                assert_eq!(h.sum, 3.0);
+                assert_eq!(h.positive_buckets, vec![3.0]);
+            }
+            other => panic!("expected a reconciled histogram, got {other:?}"),
+        }
+        let (warnings, infos) = annos.as_strings(0, 0);
+        assert!(warnings.is_empty(), "expect no_warn per the corpus");
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: mismatched custom buckets were reconciled during aggregation"
+                    .to_string()
+            ],
+        );
+    }
+
+    /// `avg_over_time(nhcb_metric[13m])` at 12m == `{{schema:-53 count:1
+    /// sum:1 custom_values:[5] buckets:[1]}}` (`:1301-1304`) — the direct-
+    /// mean path (no `HasOverflow` switch for these small values).
+    #[test]
+    fn avg_over_time_over_nhcb_bounds_change_matches_the_pinned_corpus_value() {
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(
+            OverTimeFn::Avg,
+            &nhcb_metric_window_at_12m(),
+            "nhcb_metric",
+            &mut annos,
+        );
+        match v {
+            Some(OverTimeValue::Histogram(h)) => {
+                assert_eq!(h.custom_values, vec![5.0]);
+                assert_eq!(h.count, 1.0);
+                assert_eq!(h.sum, 1.0);
+                assert_eq!(h.positive_buckets, vec![1.0]);
+            }
+            other => panic!("expected a reconciled histogram, got {other:?}"),
+        }
+        let (warnings, _) = annos.as_strings(0, 0);
+        assert!(warnings.is_empty(), "expect no_warn per the corpus");
+    }
+
+    /// `sum_over_time` over a MIXED float+histogram window drops the
+    /// WHOLE window with `NewMixedFloatsHistogramsWarning`
+    /// (`functions.go:1148-1153,1498-1503` — a whole-window guard, unlike
+    /// the DROP-set functions' per-histogram-sample skip).
+    #[test]
+    fn sum_over_time_over_a_mixed_window_warns_and_drops_the_whole_window() {
+        let samples = vec![
+            Sample::float(0, 1.0),
+            hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        assert!(v.is_none());
+        let (warnings, _) = annos.as_strings(0, 0);
+        assert_eq!(
+            warnings,
+            vec![messages::mixed_floats_histograms_warning("m")]
+        );
+    }
+
+    /// A pure-float window delegates to the byte-unchanged float
+    /// `sum_over_time`/`avg_over_time` (no histogram machinery touched).
+    #[test]
+    fn sum_over_time_over_a_pure_float_window_is_unaffected() {
+        let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 2.0)];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 3.0));
+        assert!(annos.is_empty());
+    }
+
+    /// `sum_over_time` folding THREE same-schema exponential histograms —
+    /// the common (non-NHCB) fold path, fully Kahan-compensated.
+    #[test]
+    fn sum_over_time_folds_three_same_schema_histograms() {
+        let samples = vec![
+            hist_sample(0, 4, 5.0, vec![1, 1, -1]),
+            hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
+            hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        match v {
+            Some(OverTimeValue::Histogram(h)) => {
+                assert_eq!(h.count, 12.0);
+                assert_eq!(h.sum, 15.0);
+                assert_eq!(h.positive_buckets, vec![3.0, 6.0, 3.0]);
+            }
+            other => panic!("expected a folded histogram, got {other:?}"),
+        }
+        assert!(annos.is_empty());
+    }
+
+    /// A pre-built `Sample` carrying an f64-valued (non-integer-encodable)
+    /// histogram — the adversarial fold fixtures below can't route
+    /// through `NativeHistogram` (integer bucket columns).
+    fn float_hist_sample(t_ms: i64, bucket: f64) -> Sample {
+        Sample::hist(
+            t_ms,
+            FloatHistogram {
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0.0,
+                count: bucket,
+                sum: bucket,
+                positive_spans: vec![Span {
+                    offset: 0,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![bucket],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            },
+        )
+    }
+
+    /// ADVERSARIAL (codex round-1 [high], end-to-end through
+    /// `sum_over_time`): bucket-level Kahan compensation recovers `+1.0`
+    /// contributions plain accumulation loses above 2^53.
+    #[test]
+    fn sum_over_time_bucket_compensation_recovers_lost_low_order_adds() {
+        const BIG: f64 = 9007199254740992.0; // 2^53
+        const BIG_PLUS_2: f64 = 9007199254740994.0;
+        let samples = vec![
+            float_hist_sample(0, BIG),
+            float_hist_sample(60_000, 1.0),
+            float_hist_sample(120_000, 1.0),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        match v {
+            Some(OverTimeValue::Histogram(h)) => {
+                assert_eq!(h.positive_buckets, vec![BIG_PLUS_2]);
+                assert_ne!(
+                    h.positive_buckets,
+                    vec![BIG],
+                    "plain bucket accumulation would plateau at 2^53"
+                );
+                assert_eq!(h.count, BIG_PLUS_2);
+                assert_eq!(h.sum, BIG_PLUS_2);
+            }
+            other => panic!("expected a folded histogram, got {other:?}"),
+        }
+        assert!(annos.is_empty());
+    }
+
+    /// ADVERSARIAL through `avg_over_time` (direct mean): the flushed
+    /// compensated mean is `2^53/3 + 2/3` via the pin's `Div(count)` +
+    /// `Add(kahanC.Div(count))` arithmetic — a plain fold would yield
+    /// exactly `2^53 / 3`.
+    #[test]
+    fn avg_over_time_bucket_compensation_survives_the_mean_division() {
+        const BIG: f64 = 9007199254740992.0;
+        let samples = vec![
+            float_hist_sample(0, BIG),
+            float_hist_sample(60_000, 1.0),
+            float_hist_sample(120_000, 1.0),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Avg, &samples, "m", &mut annos);
+        match v {
+            Some(OverTimeValue::Histogram(h)) => {
+                let expected = BIG / 3.0 + 2.0 / 3.0;
+                assert_eq!(h.positive_buckets, vec![expected]);
+                assert_ne!(
+                    h.positive_buckets,
+                    vec![BIG / 3.0],
+                    "the compensation must survive the mean division"
+                );
+                assert_eq!(h.count, expected);
+            }
+            other => panic!("expected a folded histogram, got {other:?}"),
+        }
+    }
+
+    // -- M7-A5b-iii (codex round-1 [medium]): predict_linear /
+    //    double_exponential_smoothing float-subset dispositions
+    //    (`eval_over_time_param_hist`). Full-pipeline coverage lives in
+    //    `eval::tests`; this is the per-condition unit matrix. --
+
+    #[test]
+    fn predict_linear_histogram_only_window_is_silently_empty() {
+        let samples = vec![
+            hist_sample(0, 4, 5.0, vec![1, 1, -1]),
+            hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_param_hist(
+            crate::plan::OverTimeParamFn::PredictLinear,
+            &samples,
+            &[10.0],
+            120_000,
+            "m",
+            &mut annos,
+        )
+        .unwrap();
+        assert!(v.is_none());
+        assert!(annos.is_empty(), "histogram-only window is silent");
+    }
+
+    #[test]
+    fn predict_linear_mixed_window_computes_on_the_float_subset_and_annotates() {
+        let samples = vec![
+            Sample::float(0, 0.0),
+            hist_sample(30_000, 4, 5.0, vec![1, 1, -1]),
+            Sample::float(60_000, 60.0),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_param_hist(
+            crate::plan::OverTimeParamFn::PredictLinear,
+            &samples,
+            &[0.0],
+            60_000,
+            "m",
+            &mut annos,
+        )
+        .unwrap();
+        // Floats regress to slope 1/s, intercept 60 at t=60s; the
+        // interleaved histogram must not perturb the regression.
+        assert_eq!(v, Some(60.0));
+        let (warnings, infos) = annos.as_strings(0, 0);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            infos,
+            vec![messages::histogram_ignored_in_mixed_range_info("m")]
+        );
+    }
+
+    /// One float + histograms: too few float points → EMPTY, but the
+    /// mixed info still fires (`functions.go:1928-1932`).
+    #[test]
+    fn predict_linear_one_float_in_a_mixed_window_is_empty_with_info() {
+        let samples = vec![
+            hist_sample(0, 4, 5.0, vec![1, 1, -1]),
+            Sample::float(60_000, 1.0),
+        ];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_param_hist(
+            crate::plan::OverTimeParamFn::PredictLinear,
+            &samples,
+            &[10.0],
+            60_000,
+            "m",
+            &mut annos,
+        )
+        .unwrap();
+        assert!(v.is_none());
+        assert_eq!(
+            annos.as_strings(0, 0).1,
+            vec![messages::histogram_ignored_in_mixed_range_info("m")]
+        );
+    }
+
+    /// Float-only windows are byte-identical to the direct float path
+    /// (no annotation, same value).
+    #[test]
+    fn predict_linear_float_only_window_is_unchanged() {
+        let samples = vec![Sample::float(0, 0.0), Sample::float(60_000, 60.0)];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_param_hist(
+            crate::plan::OverTimeParamFn::PredictLinear,
+            &samples,
+            &[0.0],
+            60_000,
+            "m",
+            &mut annos,
+        )
+        .unwrap();
+        let direct = super::super::functions::eval_over_time_param(
+            crate::plan::OverTimeParamFn::PredictLinear,
+            &samples,
+            &[0.0],
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(v, direct);
+        assert!(annos.is_empty());
+    }
+
+    /// `double_exponential_smoothing`'s sf/tf validation precedes the
+    /// float-count check (`functions.go:923-928`): a histogram-only
+    /// window with an invalid factor errors; with valid factors it is
+    /// silently empty.
+    #[test]
+    fn double_exponential_smoothing_validates_factors_before_the_float_count_check() {
+        let samples = vec![
+            hist_sample(0, 4, 5.0, vec![1, 1, -1]),
+            hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
+        ];
+        let mut annos = Annotations::new();
+        // Invalid sf → error even though the float subset is empty.
+        assert!(
+            eval_over_time_param_hist(
+                crate::plan::OverTimeParamFn::DoubleExpSmoothing,
+                &samples,
+                &[2.0, 0.5],
+                0,
+                "m",
+                &mut annos,
+            )
+            .is_err()
+        );
+        // Valid factors → silent empty.
+        let v = eval_over_time_param_hist(
+            crate::plan::OverTimeParamFn::DoubleExpSmoothing,
+            &samples,
+            &[0.5, 0.5],
+            0,
+            "m",
+            &mut annos,
+        )
+        .unwrap();
+        assert!(v.is_none());
+        assert!(annos.is_empty());
     }
 }

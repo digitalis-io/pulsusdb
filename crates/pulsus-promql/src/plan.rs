@@ -415,6 +415,28 @@ impl BinOp {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         )
     }
+
+    /// M7-A5b-iii: the operator's canonical text — upstream
+    /// `parser.ItemTypeStr[op]` (`promql/parser/lex.go`), the operand-type
+    /// text `NewIncompatibleTypesInBinOpInfo`/
+    /// `NewIncompatibleBucketLayoutInBinOpWarning` embed.
+    pub fn item_type_str(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "^",
+            BinOp::Atan2 => "atan2",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+        }
+    }
 }
 
 /// Set operators (issue #70, M6-07): verbatim-passthrough set membership
