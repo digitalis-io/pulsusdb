@@ -2187,6 +2187,17 @@ pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 /// (review round 1, finding 1's quantile bound).
 pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 
+/// Derived-series cap for client-aggregated metric queries: the number
+/// of distinct output groups (final label sets, or fingerprints on the
+/// non-mutating path) a single query may materialize. Bounds the last
+/// unbounded axis of reducer state — total accumulators are then
+/// `<= MAX_CLIENT_AGG_SERIES x MAX_CLIENT_AGG_BUCKETS`. 500 matches the
+/// reference oracle's default series ceiling (it likewise ERRORS, never
+/// truncates, past it). A documented constant, not a config field (the
+/// `DEFAULT_MAX_STREAMS` / `MAX_CLIENT_AGG_BUCKETS` precedent); operator-
+/// scale tuning routes to #25.
+pub const MAX_CLIENT_AGG_SERIES: u64 = 500;
+
 /// Streaming client-aggregation state (issue M6-10, review round 1
 /// finding 1): rows fold into reducer state as they arrive so process
 /// memory stays `O(buckets x series)` (+ the caller's bounded chunk)
@@ -2306,9 +2317,15 @@ impl<'q> ClientAggState<'q> {
             let buckets = if self.fan_out {
                 scratch.sort_unstable();
                 let key = render_labels_json_sorted(&scratch);
+                let groups = self.label_groups.len() as u64;
                 match self.label_groups.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => &mut e.into_mut().1,
                     std::collections::hash_map::Entry::Vacant(e) => {
+                        if groups >= MAX_CLIENT_AGG_SERIES {
+                            return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+                                cap: MAX_CLIENT_AGG_SERIES,
+                            }));
+                        }
                         let labels: LabelSet = scratch
                             .iter()
                             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2317,6 +2334,13 @@ impl<'q> ClientAggState<'q> {
                     }
                 }
             } else {
+                let groups = self.fp_groups.len() as u64;
+                if !self.fp_groups.contains_key(&row.fingerprint) && groups >= MAX_CLIENT_AGG_SERIES
+                {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricSeries {
+                        cap: MAX_CLIENT_AGG_SERIES,
+                    }));
+                }
                 self.fp_groups.entry(row.fingerprint).or_default()
             };
             match buckets.entry(bucket) {

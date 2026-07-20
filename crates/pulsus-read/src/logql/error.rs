@@ -98,6 +98,16 @@ pub enum TooBroadReason {
     /// query aborts with this named error, never an OOM and never a
     /// silently approximated quantile.
     QuantileValues { count: u64, cap: u64 },
+    /// Issue #73 (retroactive re-review): a client-aggregated LogQL
+    /// metric query resolved more distinct output series (final label
+    /// sets on the fan-out/label-mutating path, or fingerprints on the
+    /// non-mutating path) than
+    /// [`crate::logql::exec::MAX_CLIENT_AGG_SERIES`] — rejected DURING
+    /// aggregation before the (cap+1)-th group is materialized, so the
+    /// group axis of reducer state (`groups x buckets`) stays bounded.
+    /// Complete-or-error, never a truncated result. A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    MetricSeries { cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -151,6 +161,16 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "name-less selector matched more than {cap} metric names, exceeding the \
                      fan-out cap (reader.promql_max_metric_fanout)"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`: the guard bails at
+            // the breach point (the cap+1-th group), so this is not an
+            // exact final tally.
+            TooBroadReason::MetricSeries { cap } => {
+                write!(
+                    f,
+                    "resolved more than {cap} series — narrow the pipeline (fewer parsed/\
+                     formatted labels), use a coarser grouping, or a narrower window"
                 )
             }
         }
@@ -387,6 +407,16 @@ mod tests {
         .to_string();
         assert!(msg.contains("4000001"), "{msg}");
         assert!(msg.contains("4000000-value cap"), "{msg}");
+    }
+
+    /// Issue #73 (retroactive re-review): the derived-series cap uses
+    /// LOWER-BOUND wording ("more than {cap}"), like `MetricFanout` — the
+    /// guard bails at the breach point, never an exact final tally.
+    #[test]
+    fn metric_series_display_names_the_cap_with_lower_bound_wording() {
+        let msg = ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: 500 }).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(msg.contains("resolved more than 500 series"), "{msg}");
     }
 
     #[test]
