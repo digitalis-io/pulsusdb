@@ -163,6 +163,34 @@ fn proof_corpus_is_fully_green_and_exercises_every_executed_directive() {
     );
 }
 
+/// AC5 (issue #86): a non-UTF-8 `expect string` literal now EXECUTES
+/// instead of hard-erroring the whole file — before the fix,
+/// `go_unquote`'s `String::from_utf8` gate turned this snippet into a
+/// grammar (file-fatal) error, never reaching a case report. The case
+/// itself still fails: the vendored engine parser decodes the
+/// query-text `\xff` escape to a code point (U+00FF `ÿ`), not the raw
+/// byte the corpus literal channel now carries losslessly — a normal,
+/// ledger-classifiable per-case mismatch, not a driver defect.
+#[test]
+fn expect_string_with_non_utf8_literal_executes_as_a_classifiable_mismatch() {
+    let text = "eval instant at 0 \"\\xff\"\n\texpect string \"\\xff\"\n";
+    let run = run_file("inline/non_utf8_expect_string.test", text)
+        .expect("go_unquote must no longer hard-error on a non-UTF-8 byte literal (issue #86)");
+    assert_eq!(run.cases.len(), 1, "one eval block expected");
+    let case = &run.cases[0];
+    assert!(
+        !case.passed,
+        "a non-UTF-8 expect-string literal can never byte-match the engine's UTF-8 \
+         QueryValue::String (recorded vendored-parser divergence) — it must fail honestly, \
+         not pass"
+    );
+    assert!(
+        case.detail.contains("b\"\\xff\""),
+        "mismatch detail must render the non-UTF-8 want losslessly via escape_ascii: {}",
+        case.detail
+    );
+}
+
 /// AC2 + AC9: the vendored upstream corpus replays with zero unclassified
 /// failures, the skip-manifest matches reality in both directions, and
 /// the eval-divergence ledger carries no stale entries.

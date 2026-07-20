@@ -421,6 +421,17 @@ fn judge(
     }
 }
 
+/// Renders an `expect string` want-value losslessly for a diagnostic:
+/// valid UTF-8 keeps today's `{:?}` form, non-UTF-8 falls back to a
+/// `b"…"` `escape_ascii` form (never `from_utf8_lossy` — that could
+/// false-read as matching engine output containing U+FFFD).
+fn format_expected_bytes(want: &[u8]) -> String {
+    match std::str::from_utf8(want) {
+        Ok(s) => format!("{s:?}"),
+        Err(_) => format!("b\"{}\"", want.escape_ascii()),
+    }
+}
+
 /// The value-shaped half of [`judge`] (everything but `Expected::Fail`,
 /// handled by the caller before this is reached).
 fn judge_value(
@@ -432,22 +443,33 @@ fn judge_value(
         (Expected::Fail { .. }, _) => {
             unreachable!("judge() handles Expected::Fail before calling judge_value")
         }
-        // `expect string` (issue #86): exact string comparison — no
-        // epsilon, no normalization (upstream compares the unquoted
-        // literal against the `promql.String` value verbatim).
+        // `expect string` (issue #86): exact BYTE comparison — no
+        // epsilon, no normalization (upstream compares the unquoted Go
+        // string, itself a byte slice, against the `promql.String` value
+        // verbatim). `want` is `Vec<u8>` so a non-UTF-8 Go literal is
+        // representable; the engine's `QueryValue::String` is always
+        // valid UTF-8 (Prometheus's data model), so such a case can
+        // never pass — it fails honestly with a lossless diagnostic
+        // instead of a file-fatal grammar error.
         (Expected::String(want), QueryValue::String(got)) => {
-            if *want == got {
+            if want.as_slice() == got.as_bytes() {
                 Ok((true, String::new()))
             } else {
                 Ok((
                     false,
-                    format!("string mismatch: got {got:?}, want {want:?}"),
+                    format!(
+                        "string mismatch: got {got:?}, want {}",
+                        format_expected_bytes(want)
+                    ),
                 ))
             }
         }
         (Expected::String(want), other) => Ok((
             false,
-            format!("expected string {want:?}, got non-string {other:?}"),
+            format!(
+                "expected string {}, got non-string {other:?}",
+                format_expected_bytes(want)
+            ),
         )),
         (Expected::Scalar(want), QueryValue::Scalar(got)) => {
             if almost_equal(*want, got) {
@@ -870,4 +892,26 @@ pub fn almost_equal(a: f64, b: f64) -> bool {
         return diff < EPSILON * f64::MIN_POSITIVE;
     }
     diff / abs_sum.min(f64::MAX) < EPSILON
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_expected_bytes;
+
+    /// AC4 (issue #86): a UTF-8 `want` renders exactly today's `{:?}`
+    /// form — unchanged by the byte-comparison fix (the non-UTF-8 branch
+    /// is covered end-to-end by
+    /// `promqltest_corpus::expect_string_with_non_utf8_literal_executes_as_a_classifiable_mismatch`).
+    #[test]
+    fn format_expected_bytes_keeps_the_debug_form_for_utf8_input() {
+        assert_eq!(format_expected_bytes(b"Foo"), "\"Foo\"");
+        assert_eq!(format_expected_bytes(b""), "\"\"");
+    }
+
+    /// A non-UTF-8 `want` falls back to a lossless `b"…"` escape_ascii
+    /// form.
+    #[test]
+    fn format_expected_bytes_uses_escaped_byte_form_for_non_utf8_input() {
+        assert_eq!(format_expected_bytes(&[0xff]), "b\"\\xff\"");
+    }
 }

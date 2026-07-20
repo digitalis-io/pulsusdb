@@ -139,8 +139,10 @@ pub enum Expected {
         regexp: Option<String>,
     },
     /// `expect string <quoted>` (issue #86): the instant query must
-    /// evaluate to exactly this string.
-    String(String),
+    /// evaluate to exactly these bytes (a Go string is a byte slice, so
+    /// the literal channel is byte-exact — issue #86's fix; see
+    /// [`go_unquote`]).
+    String(Vec<u8>),
 }
 
 /// One block-form `expect warn|no_warn|info|no_info`'s optional
@@ -505,7 +507,7 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
     // (upstream pairs `expect fail` with inline `msg:`/`regex:` instead).
     let directive_fail = mode == EvalMode::Fail;
     let mut expect_fail = false;
-    let mut expect_string: Option<String> = None;
+    let mut expect_string: Option<Vec<u8>> = None;
     let mut fail_message: Option<String> = None;
     let mut fail_regexp: Option<String> = None;
     let mut expect_warn: Vec<AnnotationMatch> = Vec::new();
@@ -662,7 +664,7 @@ fn parse_expect_line(
     expect_fail: &mut bool,
     fail_message: &mut Option<String>,
     fail_regexp: &mut Option<String>,
-    expect_string: &mut Option<String>,
+    expect_string: &mut Option<Vec<u8>>,
     expect_warn: &mut Vec<AnnotationMatch>,
     expect_no_warn: &mut bool,
     expect_info: &mut Vec<AnnotationMatch>,
@@ -836,14 +838,15 @@ fn parse_optional_tag(line: &str, keyword: &str) -> Result<AnnotationMatch, Stri
 /// one raw BYTE each (a Go string is a byte slice — `"\xe4\xb8\x96"` is
 /// the three UTF-8 bytes of `世`, never three separate code points), and
 /// an octal value above 255 is a syntax error; `\uXXXX`/`\UXXXXXXXX`
-/// produce one CODE POINT, UTF-8-encoded. One deliberate narrowing:
-/// Go tolerates byte escapes that do not form valid UTF-8 (its strings
-/// are arbitrary bytes) — a Rust `String` cannot, so such input is a
-/// loud error here rather than lossy replacement; no vendored file uses
-/// one. Single-quoted rune literals are not used by any vendored file
-/// and are rejected loudly (extend if a corpus file legitimately needs
-/// them — the `series.rs::scan_quoted_string` convention).
-fn go_unquote(s: &str) -> Result<String, String> {
+/// produce one CODE POINT, UTF-8-encoded. The result is `Vec<u8>` (issue
+/// #86): a Go string is an arbitrary byte slice, so byte escapes that do
+/// not form valid UTF-8 (`"\xff"`) are legal Go output and must survive
+/// here too — only the `Expected::String` comparison channel carries
+/// these bytes, everything else in the driver stays `String` (see the
+/// call site). Single-quoted rune literals are not used by any vendored
+/// file and are rejected loudly (extend if a corpus file legitimately
+/// needs them — the `series.rs::scan_quoted_string` convention).
+fn go_unquote(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 {
         return Err(format!("invalid quoted string {s:?}"));
@@ -858,7 +861,7 @@ fn go_unquote(s: &str) -> Result<String, String> {
             if inner.contains('`') {
                 return Err(format!("backquoted string contains a backquote: {s:?}"));
             }
-            Ok(inner.replace('\r', ""))
+            Ok(inner.replace('\r', "").into_bytes())
         }
         b'"' => {
             // Accumulate BYTES, not chars: `\xHH`/`\OOO` are raw bytes in
@@ -944,12 +947,7 @@ fn go_unquote(s: &str) -> Result<String, String> {
                     other => return Err(format!("unsupported escape \\{other} in {s:?}")),
                 }
             }
-            String::from_utf8(out).map_err(|e| {
-                format!(
-                    "byte escapes in {s:?} do not form valid UTF-8 ({e}) — Go permits \
-                     non-UTF-8 strings, a Rust String cannot; no vendored file needs one"
-                )
-            })
+            Ok(out)
         }
         _ => Err(format!(
             "unsupported quote style in {s:?} — extend grammar.rs::go_unquote if the corpus \
@@ -984,11 +982,18 @@ mod tests {
     /// mojibake code points.
     #[test]
     fn go_unquote_hex_escapes_are_raw_bytes_multibyte_sequences_decode_as_utf8() {
-        assert_eq!(go_unquote(r#""\xe4\xb8\x96""#).unwrap(), "世");
-        assert_eq!(go_unquote(r#""\x41\x42""#).unwrap(), "AB");
-        // Bytes that do NOT form valid UTF-8 are a loud error (documented
-        // narrowing vs Go's arbitrary-byte strings).
-        assert!(go_unquote(r#""\xff""#).unwrap_err().contains("UTF-8"));
+        assert_eq!(go_unquote(r#""\xe4\xb8\x96""#).unwrap(), "世".as_bytes());
+        assert_eq!(go_unquote(r#""\x41\x42""#).unwrap(), b"AB");
+    }
+
+    /// Issue #86: `\xHH`/octal byte escapes that do NOT form valid UTF-8
+    /// are legal Go output (a Go string is an arbitrary byte slice) and
+    /// must survive to the exact bytes — no UTF-8 gate on the result.
+    /// `"a\xc5z"` is the exact vendored literal at `aggregators.test:481`.
+    #[test]
+    fn go_unquote_non_utf8_byte_escapes_survive_as_exact_bytes() {
+        assert_eq!(go_unquote(r#""\xff""#).unwrap(), vec![0xffu8]);
+        assert_eq!(go_unquote(r#""a\xc5z""#).unwrap(), vec![b'a', 0xc5, b'z']);
     }
 
     /// Octal escapes are raw bytes too (Go: `"\101\102"` == `"AB"`,
@@ -997,8 +1002,8 @@ mod tests {
     /// as a widened code point.
     #[test]
     fn go_unquote_octal_escapes_are_raw_bytes_and_reject_values_above_255() {
-        assert_eq!(go_unquote(r#""\101\102""#).unwrap(), "AB");
-        assert_eq!(go_unquote(r#""\344\270\226""#).unwrap(), "世");
+        assert_eq!(go_unquote(r#""\101\102""#).unwrap(), b"AB");
+        assert_eq!(go_unquote(r#""\344\270\226""#).unwrap(), "世".as_bytes());
         assert!(go_unquote(r#""\400""#).unwrap_err().contains("377"));
         assert!(go_unquote(r#""\777""#).unwrap_err().contains("377"));
     }
@@ -1007,9 +1012,27 @@ mod tests {
     /// the raw/simple forms round-trip.
     #[test]
     fn go_unquote_unicode_escapes_are_code_points_and_raw_strings_pass_through() {
-        assert_eq!(go_unquote(r#""世""#).unwrap(), "世");
-        assert_eq!(go_unquote(r#""\U0001F600""#).unwrap(), "😀");
-        assert_eq!(go_unquote("`a\\n b`").unwrap(), "a\\n b");
-        assert_eq!(go_unquote(r#""a\tb\"c""#).unwrap(), "a\tb\"c");
+        assert_eq!(go_unquote(r#""世""#).unwrap(), "世".as_bytes());
+        assert_eq!(go_unquote(r#""\U0001F600""#).unwrap(), "😀".as_bytes());
+        assert_eq!(go_unquote("`a\\n b`").unwrap(), b"a\\n b");
+        assert_eq!(go_unquote(r#""a\tb\"c""#).unwrap(), b"a\tb\"c");
+    }
+
+    /// Per-escape syntax checks are untouched by the byte-result change:
+    /// a short `\x` hex sequence and unsupported escape characters still
+    /// reject loudly.
+    #[test]
+    fn go_unquote_invalid_escape_syntax_still_rejects() {
+        assert!(go_unquote(r#""\xf""#).is_err());
+        assert!(go_unquote(r#""\q""#).is_err());
+    }
+
+    /// Surrogate code points must stay rejected (Go `utf8.ValidRune`
+    /// parity) — dropping the whole-result UTF-8 gate must not widen the
+    /// per-escape `\u`/`\U` code-point path, which already rejects them
+    /// via `char::from_u32`.
+    #[test]
+    fn go_unquote_surrogate_unicode_escape_rejects() {
+        assert!(go_unquote(r#""\ud800""#).is_err());
     }
 }
