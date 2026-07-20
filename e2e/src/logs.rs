@@ -455,6 +455,32 @@ fn ordered_entries(body: &serde_json::Value) -> Result<OrderedEntries> {
     Ok(out)
 }
 
+/// Wraps [`ordered_entries`] so an order/shape violation dumps a repro
+/// artifact (kind "order_violation") BEFORE bailing — #115 re-review of
+/// #100: the bare `?` skipped the dump for exactly the failure class the
+/// ordered gate exists to catch. Passing path: dump is never invoked.
+fn ordered_entries_or_dump(
+    store: &str,
+    body: &serde_json::Value,
+    case_id: &str,
+    dump: &dyn Fn(&str, &str) -> Result<std::path::PathBuf>,
+) -> Result<OrderedEntries> {
+    match ordered_entries(body) {
+        Ok(entries) => Ok(entries),
+        Err(err) => {
+            let path = dump(
+                "order_violation",
+                &format!("{store} response failed the ordered-entries gate: {err:#}"),
+            )?;
+            bail!(
+                "case {case_id:?}: {store} response failed the forward-order/shape gate: \
+                 {err:#} (repro {})",
+                path.display()
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Metric-case normalization + comparison (issue M6-10)
 // ---------------------------------------------------------------------
@@ -1709,7 +1735,7 @@ async fn run_streams_limited_case(
                 path.display()
             );
         }
-        let entries = ordered_entries(body)?;
+        let entries = ordered_entries_or_dump(store, body, &case.case_id, &dump)?;
         let distinct: BTreeSet<_> = entries.iter().cloned().collect();
         if distinct.len() != entries.len() {
             let path = dump(
@@ -1741,7 +1767,7 @@ async fn run_streams_limited_case(
     }
 
     // PulsusDB vs the corpus ordered prefix: ALWAYS hard.
-    let pulsus_entries = ordered_entries(&pulsus_body)?;
+    let pulsus_entries = ordered_entries_or_dump("pulsusdb", &pulsus_body, &case.case_id, &dump)?;
     if pulsus_entries != expected {
         let path = dump(
             "pulsus_vs_corpus",
@@ -1756,7 +1782,7 @@ async fn run_streams_limited_case(
     }
 
     // Oracle vs the corpus ordered prefix (== vs PulsusDB, transitively).
-    let loki_entries = ordered_entries(&loki_body)?;
+    let loki_entries = ordered_entries_or_dump("oracle", &loki_body, &case.case_id, &dump)?;
     if loki_entries != expected {
         let path = dump(
             "oracle_vs_corpus",
@@ -3094,6 +3120,103 @@ mod tests {
         assert!(
             err.to_string().contains("out of forward order"),
             "expected a forward-order violation, got: {err}"
+        );
+    }
+
+    /// #100 re-review fix (issue #115 finding, plan comment 5024235495):
+    /// `ordered_entries_or_dump` must dump a repro artifact BEFORE bailing
+    /// on an order/shape violation, and must never dump on a passing body.
+    /// Reuses the tripped/ok bodies from
+    /// `ordered_entries_rejects_a_within_stream_descending_pair` with a
+    /// recording `dump` closure — no live stack, no `write_artifact`. Also
+    /// covers the mechanical companion check (AC2): `run_streams_limited_case`
+    /// must route all three `ordered_entries` call sites through the
+    /// wrapper, source-inspected below, so a bare call can't silently
+    /// reintroduce the skip.
+    #[test]
+    fn an_order_validity_failure_dumps_a_repro_before_bailing() {
+        let get = serde_json::json!({"method": "GET", "status": "503", "took_ms": "500"});
+        let delete = serde_json::json!({"method": "DELETE", "status": "503", "took_ms": "500"});
+        let put = serde_json::json!({"method": "PUT", "status": "503", "took_ms": "500"});
+        let mk = |get_values: serde_json::Value| {
+            serde_json::json!({
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {"stream": get.clone(), "values": get_values},
+                        {"stream": delete.clone(), "values": [["200", "c"]]},
+                        {"stream": put.clone(), "values": [["300", "d"]]},
+                    ]
+                }
+            })
+        };
+        let ok_body = mk(serde_json::json!([["100", "a"], ["400", "b"]]));
+        let tripped = mk(serde_json::json!([["400", "b"], ["100", "a"]]));
+
+        let calls: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+        let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
+            calls
+                .borrow_mut()
+                .push((kind.to_string(), detail.to_string()));
+            Ok(std::path::PathBuf::from("/sentinel/repro.json"))
+        };
+
+        // Passing path: the wrapper is transparent and dumps nothing.
+        let ok = ordered_entries_or_dump("pulsusdb", &ok_body, "case-ok", &dump)
+            .expect("an ascending body must pass through unchanged");
+        assert_eq!(ok, ordered_entries(&ok_body).unwrap());
+        assert!(
+            calls.borrow().is_empty(),
+            "a passing body must never invoke dump, got {:?}",
+            calls.borrow()
+        );
+
+        // Failing path: exactly one dump, before the bail, path embedded.
+        let err = ordered_entries_or_dump("pulsusdb", &tripped, "case-tripped", &dump)
+            .expect_err("a within-stream descending pair must fail");
+        let recorded = calls.borrow();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "an order-validity failure must dump exactly once, got {recorded:?}"
+        );
+        assert_eq!(recorded[0].0, "order_violation");
+        assert!(
+            recorded[0].1.contains("out of forward order"),
+            "dump detail must carry the underlying cause: {}",
+            recorded[0].1
+        );
+        assert!(
+            err.to_string().contains("/sentinel/repro.json"),
+            "the bail message must embed the dump's repro path: {err}"
+        );
+
+        // Mechanical companion (AC2): `run_streams_limited_case` must route
+        // every `ordered_entries` call through the dump-then-bail wrapper —
+        // a bare `ordered_entries(...)` call inside that function silently
+        // reintroduces the #115 skip. Source-inspects this file's shipped
+        // copy (not a compiled artifact), scoped to the function body.
+        let root = crate::engine::workspace_root();
+        let src = std::fs::read_to_string(root.join("e2e/src/logs.rs")).unwrap();
+        let start = src
+            .find("async fn run_streams_limited_case(")
+            .expect("run_streams_limited_case must still exist");
+        let end = src[start..]
+            .find("\nfn describe_diff(")
+            .map(|rel| start + rel)
+            .expect("describe_diff must still follow run_streams_limited_case");
+        let body = &src[start..end];
+        assert_eq!(
+            body.matches("ordered_entries_or_dump(").count(),
+            3,
+            "expected exactly the three known call sites to route through the wrapper"
+        );
+        assert!(
+            !body
+                .replace("ordered_entries_or_dump(", "")
+                .contains("ordered_entries("),
+            "run_streams_limited_case must not call ordered_entries(...) directly — route it \
+             through ordered_entries_or_dump so a failure dumps a repro before bailing"
         );
     }
 
