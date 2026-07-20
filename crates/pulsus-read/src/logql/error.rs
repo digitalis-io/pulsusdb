@@ -36,6 +36,12 @@ use thiserror::Error;
 ///   throw — code 191) set **only** by `traces::exec`'s metrics query
 ///   settings; no other path sets a set limit, and no other code maps
 ///   code 191.
+/// - [`TooBroadReason::QueryTextBytes`] — issue #35: the FINAL rendered
+///   SQL text (after placeholder-doubling) reached [`crate::querytext::MAX_QUERY_TEXT_BYTES`]
+///   — a Rust-side pre-dispatch admission check
+///   ([`crate::querytext::ensure_query_text_fits`]), never a ClickHouse
+///   error code (the raised `max_query_size` setting means ClickHouse's own
+///   parse-buffer rejection should never be reached in practice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooBroadReason {
     /// A ClickHouse-side or engine-side **byte** budget was exceeded. On
@@ -134,6 +140,12 @@ pub enum TooBroadReason {
     /// ClickHouse error code. Identifying-label VALUE narrowing of the
     /// fetch (closing the gap this cap merely backstops) routes to #25.
     InfoCardinality { matched: usize, cap: u64 },
+    /// Issue #35: the rendered SQL text (after placeholder-doubling) for a
+    /// read-path query reached or exceeded
+    /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — rejected pre-dispatch by
+    /// [`crate::querytext::ensure_query_text_fits`], never by a ClickHouse
+    /// server error code.
+    QueryTextBytes { rendered_bytes: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -219,6 +231,17 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "info() metadata family matched more than {cap} series, exceeding the \
                      cardinality cap (reader.promql_max_info_series)"
+                )
+            }
+            TooBroadReason::QueryTextBytes {
+                rendered_bytes,
+                cap,
+            } => {
+                write!(
+                    f,
+                    "rendered query text is {rendered_bytes} bytes, exceeding the {cap}-byte \
+                     query-text cap — narrow the selector (fewer streams/metric names) or \
+                     shorten the query"
                 )
             }
         }
@@ -493,6 +516,20 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("1000000"));
         assert!(msg.contains("attribute-set"));
+    }
+
+    /// Issue #35: the query-text guard's message names both the rendered
+    /// size and the cap, and states the remedy.
+    #[test]
+    fn query_text_bytes_display_names_both_numbers_and_the_remedy() {
+        let reason = TooBroadReason::QueryTextBytes {
+            rendered_bytes: 9_000_000,
+            cap: 8_388_608,
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("9000000"), "{msg}");
+        assert!(msg.contains("8388608"), "{msg}");
+        assert!(msg.contains("narrow the selector"), "{msg}");
     }
 
     #[test]

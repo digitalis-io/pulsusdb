@@ -380,6 +380,8 @@ The engine maps fingerprints to `service` from stage 2 and finishes the `sum by`
 
 **Live tail** polls stage 3's shape with a monotonic `timestamp_ns >` cursor; line-filter pushdown identical.
 
+**Query-text admission (issue #35).** Every read-path query — LogQL, PromQL/metrics, and TraceQL — carries `max_query_size = 8 MiB` as a per-request session setting: ClickHouse's own SQL-text parse-buffer cap defaults to 262,144 bytes, well under the literal `fingerprint IN (...)` list a stage2/stage3 read renders at the documented 100k-stream cap (~2.2 MiB). Because `services`/line-filter text and metrics fan-out width are not bounded by any single constant, a rendered-SQL admission guard rejects any query text at or past the 8 MiB cap *before* dispatch as a clean `422 query_too_broad`, rather than letting an oversized request fail with an opaque ClickHouse parse error — the guaranteed-admitted envelope (100k worst-case fingerprints + a generous services/line-filter margin) fits comfortably inside it. Residual: the guaranteed-admitted envelope arithmetic assumes the shipped caps — should the stream cap or metrics cache/fanout caps ever become operator-configurable, the envelope must be re-derived against `MAX_QUERY_TEXT_BYTES`; scale considerations route to #25.
+
 ---
 
 ## 4. Traces

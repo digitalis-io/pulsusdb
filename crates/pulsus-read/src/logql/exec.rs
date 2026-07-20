@@ -269,8 +269,7 @@ impl LogQlEngine {
         let mut names = Vec::new();
         let mut stream = self
             .query_stream::<LabelNameRow>(&sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             names.push(row.name);
@@ -313,8 +312,7 @@ impl LogQlEngine {
         let mut values = Vec::new();
         let mut stream = self
             .query_stream::<LabelValueRow>(&sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             values.push(row.value);
@@ -445,13 +443,27 @@ impl LogQlEngine {
     /// Wraps [`ChClient::query_stream`] with the placeholder-escaping fix
     /// (see [`escape_query_placeholders`]) every call site in this module
     /// must apply — centralized here so no future call site can forget it.
+    /// Issue #35: also the guard choke point — [`ensure_query_text_fits`]
+    /// runs against the FINAL text (after doubling, so a `?`-heavy regex
+    /// predicate is never undercounted) before the query ever reaches
+    /// ClickHouse, and a dispatch-time `ChError` is mapped through
+    /// [`map_read_error`] here so call sites no longer need their own
+    /// outer `map_err` (per-row mapping inside the streaming loop is
+    /// unchanged — a `ChRowStream` yields raw `ChError` per row, not
+    /// through this wrapper).
     async fn query_stream<'a, R: ChRow>(
         &'a self,
         sql: &str,
         settings: &QuerySettings,
-    ) -> Result<ChRowStream<'a, R>, ChError> {
+    ) -> Result<ChRowStream<'a, R>, ReadError> {
         let sql = escape_query_placeholders(sql);
-        self.client.query_stream::<R>(&sql, settings).await
+        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+            return Err(ReadError::QueryTooBroad(reason));
+        }
+        self.client
+            .query_stream::<R>(&sql, settings)
+            .await
+            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))
     }
 
     /// Stage 1 — stream resolution. **Budget-capped** (fix-plan amendment
@@ -464,8 +476,7 @@ impl LogQlEngine {
         let mut fingerprints = Vec::new();
         let mut stream = self
             .query_stream::<StreamRow>(stage1_sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             fingerprints.push(row.fingerprint);
@@ -489,8 +500,7 @@ impl LogQlEngine {
         let sql = super::sql::stage2(streams_table, fingerprints);
         let mut stream = self
             .query_stream::<StreamMetaRow>(&sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             // ReplacingMergeTree without FINAL may yield duplicate rows per
@@ -502,9 +512,7 @@ impl LogQlEngine {
     }
 
     fn budget_settings(&self) -> QuerySettings {
-        QuerySettings::new()
-            .set("max_bytes_to_read", self.config.scan_budget_bytes)
-            .set("read_overflow_mode", "throw")
+        read_query_settings(self.config.scan_budget_bytes)
     }
 
     /// Per-page settings for the fetch-until-limit paging loop (issue
@@ -534,10 +542,7 @@ impl LogQlEngine {
     /// method's caller uses for budget accounting), so the wiring is only
     /// observable here, at the settings object (issue #90).
     pub fn paging_settings(&self, remaining: u64) -> QuerySettings {
-        QuerySettings::new()
-            .set("max_bytes_to_read", remaining)
-            .set("read_overflow_mode", "throw")
-            .set("wait_end_of_query", 1)
+        read_query_settings(remaining).set("wait_end_of_query", 1)
     }
 
     /// Executes a [`StreamsPlan`] end to end. When `explain` is `Some`,
@@ -621,8 +626,7 @@ impl LogQlEngine {
             let mut sm_rows: Vec<SampleRow> = Vec::new();
             let mut stream = self
                 .query_stream::<SampleRow>(&sql, &self.budget_settings())
-                .await
-                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                .await?;
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
                 if row.structured_metadata.is_empty() {
@@ -670,8 +674,7 @@ impl LogQlEngine {
         let mut rows: Vec<SampleRow> = Vec::new();
         let mut stream = self
             .query_stream::<SampleRow>(&sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
         }
@@ -778,12 +781,20 @@ impl LogQlEngine {
             // stream's pooled-connection lease releases before the next
             // page.
             let mut rows: Vec<TailSampleRow> = Vec::new();
-            let page_result: Result<Option<u64>, ChError> = async {
+            // Issue #35: `query_stream` now returns `Result<_, ReadError>`
+            // directly (already mapped through `map_read_error` for a
+            // dispatch-time failure); per-row errors are still raw
+            // `ChError` from `ChRowStream::next()`, mapped explicitly below
+            // with the SAME `map_read_error(_, budget)` the dispatch-time
+            // path uses internally — so `page_result`'s `Err` is uniformly
+            // an already-mapped `ReadError` either way, preserving the
+            // first-page-vs-later-page branching below unchanged.
+            let page_result: Result<Option<u64>, ReadError> = async {
                 let mut stream = self
                     .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
                     .await?;
                 while let Some(row) = stream.next().await {
-                    rows.push(row?);
+                    rows.push(row.map_err(|e| map_read_error(e, budget))?);
                 }
                 Ok(stream.read_bytes())
             }
@@ -791,8 +802,7 @@ impl LogQlEngine {
 
             let read = match page_result {
                 Ok(rb) => rb.unwrap_or(page_cap),
-                Err(e) => {
-                    let mapped = map_read_error(e, budget);
+                Err(mapped) => {
                     if matches!(
                         mapped,
                         ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
@@ -943,8 +953,7 @@ impl LogQlEngine {
             }
             let mut stream = self
                 .query_stream::<MetricInstantRow>(&sql, &self.budget_settings())
-                .await
-                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                .await?;
             let mut series: Vec<InstantSeries> = Vec::new();
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
@@ -987,8 +996,7 @@ impl LogQlEngine {
             }
             let mut stream = self
                 .query_stream::<MetricBucketRow>(&sql, &self.budget_settings())
-                .await
-                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                .await?;
             let mut by_fp: HashMap<u64, BTreeMap<i64, f64>> = HashMap::new();
             while let Some(row) = stream.next().await {
                 let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
@@ -1084,8 +1092,7 @@ impl LogQlEngine {
             // runs inside this block, and the lease ends at the brace.
             let mut stream = self
                 .query_stream::<MetricScanRow>(&sql, &self.budget_settings())
-                .await
-                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                .await?;
             while let Some(row) = stream.next().await {
                 chunk.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
                 if chunk.len() >= CLIENT_AGG_CHUNK_ROWS {
@@ -1530,8 +1537,7 @@ impl LogQlEngine {
         let mut result = LogStats::default();
         let mut stream = self
             .query_stream::<LogStatsRow>(&sql, &self.budget_settings())
-            .await
-            .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            .await?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
             result = LogStats {
@@ -1685,8 +1691,7 @@ impl LogQlEngine {
             // dropped (the `ChRowStream` lease rule).
             let mut stream = self
                 .query_stream::<TailSampleRow>(&sql, &self.budget_settings())
-                .await
-                .map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                .await?;
             while let Some(row) = stream.next().await {
                 rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
             }
@@ -3399,6 +3404,25 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// The read-path settings every LogQL query now carries (issue #35): the
+/// byte scan budget (`max_bytes_to_read` + `read_overflow_mode = 'throw'`,
+/// unchanged from before this issue) plus `max_query_size` — ClickHouse's
+/// own SQL-text parse-buffer setting, raised to
+/// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] so the documented worst-case
+/// stage2/stage3 `IN` lists (at `DEFAULT_MAX_STREAMS`) never trip the
+/// 262,144-byte server default. Single source of truth — [`LogQlEngine::
+/// budget_settings`]/[`LogQlEngine::paging_settings`] both delegate to this
+/// rather than re-deriving the trio, and the `xtask` bench sources
+/// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] directly (not this function)
+/// to keep its own settings key-for-key identical to what produced the
+/// frozen evidence JSONs (issue #35 plan v2, "Frozen-bench resolution").
+pub fn read_query_settings(scan_budget_bytes: u64) -> QuerySettings {
+    QuerySettings::new()
+        .set("max_bytes_to_read", scan_budget_bytes)
+        .set("read_overflow_mode", "throw")
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+}
+
 /// Maps a ClickHouse error to [`ReadError`], translating the byte-budget
 /// overflow code to a structured [`TooBroadReason::ScanBudgetBytes`] and
 /// leaving every other server code (including 158 `TOO_MANY_ROWS`, which
@@ -3946,6 +3970,114 @@ mod tests {
         };
         let err = map_read_error(e, 1024);
         assert!(matches!(err, ReadError::Clickhouse(_)));
+    }
+
+    /// Issue #35: `read_query_settings` — the single source of truth
+    /// `budget_settings`/`paging_settings` delegate to — carries exactly
+    /// the byte-budget pair plus the raised `max_query_size`.
+    #[test]
+    fn read_query_settings_sets_the_scan_budget_and_the_raised_query_text_cap() {
+        let s = read_query_settings(1024);
+        assert_eq!(s.get("max_bytes_to_read"), Some("1024"));
+        assert_eq!(s.get("read_overflow_mode"), Some("throw"));
+        assert_eq!(
+            s.get("max_query_size"),
+            Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
+        );
+    }
+
+    /// Issue #35 acceptance criterion 2: the full-shape admission
+    /// identity — `stage2`'s worst-case rendering (100,000 `u64::MAX`
+    /// fingerprint literals, the documented `DEFAULT_MAX_STREAMS` cap)
+    /// fits comfortably under [`crate::querytext::MAX_QUERY_TEXT_BYTES`]
+    /// while exceeding ClickHouse's 262,144-byte default — proving the
+    /// raised setting is load-bearing, not vacuous.
+    #[test]
+    fn stage2_at_default_max_streams_worst_case_fits_under_the_query_text_cap() {
+        let fps: Vec<u64> =
+            std::iter::repeat_n(u64::MAX, super::super::params::DEFAULT_MAX_STREAMS).collect();
+        let sql = super::super::sql::stage2("log_streams", &fps);
+        let bytes = sql.len() as u64;
+        assert!(
+            bytes > 262_144,
+            "worst-case stage2 SQL ({bytes} B) must exceed the ClickHouse default cap to prove \
+             the raised setting is load-bearing"
+        );
+        assert!(
+            bytes < crate::querytext::MAX_QUERY_TEXT_BYTES,
+            "worst-case stage2 SQL ({bytes} B) must fit under the {}-byte cap",
+            crate::querytext::MAX_QUERY_TEXT_BYTES
+        );
+    }
+
+    /// The full guaranteed-admitted envelope this issue's plan derives:
+    /// 100,000 worst-case fingerprints + 10,000 escaped 64-byte service
+    /// literals + 1 MiB of pre-rendered line-filter predicate text ≈ 3.73
+    /// MiB — comfortably under the 8 MiB cap, comfortably over the
+    /// ClickHouse default.
+    fn worst_case_envelope() -> (Vec<u64>, Vec<String>, Vec<String>) {
+        let fps: Vec<u64> =
+            std::iter::repeat_n(u64::MAX, super::super::params::DEFAULT_MAX_STREAMS).collect();
+        // Pre-escaped 64-byte literals (`'` + 62 chars + `'`), matching
+        // `stage3`'s documented "services are pre-escaped string literals"
+        // contract — the SQL builders never re-escape these.
+        let services: Vec<String> = (0..10_000).map(|i| format!("'{i:062}'")).collect();
+        // 16 × 64 KiB pre-rendered predicates ≈ 1 MiB, a generous multiple
+        // of any realistic compiled line-filter chain.
+        let line_filters: Vec<String> = std::iter::repeat_n("x".repeat(65_536), 16).collect();
+        (fps, services, line_filters)
+    }
+
+    #[test]
+    fn stage3_at_the_full_worst_case_envelope_fits_under_the_query_text_cap() {
+        let (fps, services, line_filters) = worst_case_envelope();
+        let sql = super::super::sql::stage3(
+            "log_samples",
+            &services,
+            &fps,
+            super::super::sql::TimeWindow {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            &line_filters,
+            Direction::Backward,
+            u32::MAX,
+        );
+        let bytes = sql.len() as u64;
+        assert!(bytes > 262_144, "stage3 envelope SQL is {bytes} B");
+        assert!(
+            bytes < crate::querytext::MAX_QUERY_TEXT_BYTES,
+            "stage3 envelope SQL is {bytes} B, expected < {}",
+            crate::querytext::MAX_QUERY_TEXT_BYTES
+        );
+    }
+
+    #[test]
+    fn stage3_keyset_at_the_full_worst_case_envelope_fits_under_the_query_text_cap() {
+        let (fps, services, line_filters) = worst_case_envelope();
+        let sql = super::super::sql::stage3_keyset(
+            "log_samples",
+            &services,
+            &fps,
+            super::super::sql::TimeWindow {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            super::super::sql::KeysetLower::After {
+                tuple: (i64::MAX, u64::MAX, u64::MAX),
+                offset: u32::MAX,
+            },
+            Direction::Backward,
+            &line_filters,
+            u32::MAX,
+        );
+        let bytes = sql.len() as u64;
+        assert!(bytes > 262_144, "stage3_keyset envelope SQL is {bytes} B");
+        assert!(
+            bytes < crate::querytext::MAX_QUERY_TEXT_BYTES,
+            "stage3_keyset envelope SQL is {bytes} B, expected < {}",
+            crate::querytext::MAX_QUERY_TEXT_BYTES
+        );
     }
 
     #[test]

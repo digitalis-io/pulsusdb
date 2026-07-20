@@ -68,6 +68,22 @@ SQL. The correctness gate compares each path's own production
 timestamp_ns, body, labels), cross-path within each breadth and
 cross-breadth against the first breadth's reference envelope.
 
+**`max_query_size` resolution (issue #35).** A retroactive re-review
+found this bench raising ClickHouse's `max_query_size` (the SQL-text
+parse-buffer setting) to 8 MiB solely to let the full-tier
+breadth-50,000 sweep's literal `fingerprint IN (...)` lists parse — while
+production sent no such setting on any read path. Investigation confirmed
+this was a REAL production limitation, not a bench artifact: the
+documented 100k-stream cap alone renders past ClickHouse's 262,144-byte
+default. The product now fixes it (`pulsus_read::querytext`, sent on
+every read-path query); this bench consumes ONLY that shared 8 MiB
+constant (not a full settings builder), so the settings sent here are
+key-for-key, value-for-value identical to those that produced the
+committed `docs/benchmarks/data/logs-hydration-{ci,full}.json` — the
+frozen evidence stands unchanged, and a drift-guard unit test
+(`paths::tests::entry_set_matches_production_max_query_size_exactly`)
+pins the exact entry-set equality going forward.
+
 - **Corpus** (`xtask/src/bench/dataset.rs::load_broad_tier`) — one
   breadth-scoped database per pass: a **fixed** 100-stream result-bearing
   set (`HYDRATION_RESULT_STREAMS`, one sample each, newest timestamp band)

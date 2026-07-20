@@ -71,7 +71,7 @@ pub use exec::{
     ClientWindow, EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
     LogStats, MatrixSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS, TailCursor,
     TailLower, TailPage, TailSetup, VectorSample, apply_vector_aggs, combine_binary,
-    run_client_agg_rows,
+    read_query_settings, run_client_agg_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};

@@ -261,6 +261,22 @@ mod tests {
         );
     }
 
+    /// Issue #35: the query-text guard's reason rides the existing
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this test proves it.
+    #[tokio::test]
+    async fn read_error_query_text_bytes_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::QueryTextBytes {
+                rendered_bytes: 9_000_000,
+                cap: 8_388_608,
+            },
+        );
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+    }
+
     #[tokio::test]
     async fn promql_parse_error_maps_to_400_bad_data_and_embeds_the_message() {
         let err = PromqlError::Parse("unexpected token at char 3".to_string());

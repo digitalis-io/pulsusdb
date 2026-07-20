@@ -285,6 +285,20 @@ mod tests {
         assert_eq!(json["errorType"], "query_too_broad");
     }
 
+    /// Issue #35: the query-text guard's reason rides the existing
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this test proves it.
+    #[tokio::test]
+    async fn read_error_query_text_bytes_maps_to_422_query_too_broad() {
+        let err = ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::QueryTextBytes {
+            rendered_bytes: 9_000_000,
+            cap: 8_388_608,
+        });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+    }
+
     #[tokio::test]
     async fn read_error_clickhouse_timeout_maps_to_504() {
         let err = ReadError::Clickhouse(ChError::Timeout("deadline".to_string()));

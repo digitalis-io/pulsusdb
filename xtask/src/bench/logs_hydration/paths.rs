@@ -152,19 +152,23 @@ fn log_comment(variant: Variant, breadth: u32, stage: &str) -> String {
 /// decimal literals (this scenario's stage 2/3 SQL is the product's own
 /// `sql::stage2`/`sql::stage3` builders, reused byte-for-byte — architect
 /// plan "no product read-path changes"), renders to roughly 1 MiB of SQL
-/// text. Bumping the **session setting** (never the SQL text itself) is
-/// the only bench-local accommodation needed to let that unmodified SQL
-/// text parse; **observed live during implementation**: a real deployment
-/// resolving a comparably broad selector would hit this same
-/// `max_query_size` wall on `sql::stage2`'s eager hydration (and every
-/// variant's `sql::stage3` `fingerprint IN (...)`) unless its own
-/// ClickHouse server config raises it — worth surfacing to the decision
-/// report as a related, independent finding.
-const MAX_QUERY_SIZE_BYTES: u64 = 8 * 1024 * 1024;
-
+/// text. **Issue #35 resolution:** this was a REAL production limitation,
+/// not a bench artifact — the product now fixes it in
+/// `pulsus_read::querytext::MAX_QUERY_TEXT_BYTES`, sent as `max_query_size`
+/// on every read-path query. This bench consumes ONLY that shared
+/// constant (not a full settings builder), so the settings sent here are
+/// key-for-key, value-for-value identical to those that produced the
+/// committed `docs/benchmarks/data/logs-hydration-{ci,full}.json` evidence
+/// (same 8 MiB value, same sole key) — the frozen artifacts stand
+/// unchanged. The `entry_set_matches_production_max_query_size_exactly`
+/// test below pins that no bench-local drift (an extra setting, or a
+/// diverged value) can creep back in unnoticed.
 fn settings(query_id: &str, comment: &str) -> QuerySettings {
     tagged_settings(
-        QuerySettings::new().set("max_query_size", MAX_QUERY_SIZE_BYTES),
+        QuerySettings::new().set(
+            "max_query_size",
+            pulsus_read::querytext::MAX_QUERY_TEXT_BYTES,
+        ),
         query_id,
         Some(comment),
     )
@@ -1022,6 +1026,32 @@ mod tests {
 
     fn set(vals: &[u64]) -> std::collections::BTreeSet<u64> {
         vals.iter().copied().collect()
+    }
+
+    /// Issue #35 drift guard: this bench's own settings must carry
+    /// EXACTLY the production `max_query_size` key/value plus the
+    /// harness's `query_id`/`log_comment` run-tagging — nothing more,
+    /// nothing less. A future bench-local override or a dropped
+    /// production setting fails this test, keeping the frozen
+    /// `docs/benchmarks/data/logs-hydration-{ci,full}.json` evidence's
+    /// byte-equivalence claim honest.
+    #[test]
+    fn entry_set_matches_production_max_query_size_exactly() {
+        let got: std::collections::BTreeSet<(String, String)> = settings("id", "c")
+            .entries()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let expected: std::collections::BTreeSet<(String, String)> = [
+            (
+                "max_query_size".to_string(),
+                pulsus_read::querytext::MAX_QUERY_TEXT_BYTES.to_string(),
+            ),
+            ("query_id".to_string(), "id".to_string()),
+            ("log_comment".to_string(), "c".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

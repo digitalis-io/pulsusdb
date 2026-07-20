@@ -113,6 +113,16 @@ impl QuerySettings {
         self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
+    /// Public introspection twin of [`Self::iter`] (same posture as
+    /// [`Self::get`]): lets a caller outside this crate compare its own
+    /// settings' exact `(key, value)` entry set against another builder's
+    /// — issue #35's `xtask` bench drift guard needs exactly this to prove
+    /// its settings never diverge from production's without reaching into
+    /// `pub(crate)` internals.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.iter()
+    }
+
     /// Applies every `(key, value)` pair to a `clickhouse::query::Query`
     /// builder as per-request settings (sent as HTTP query parameters, not
     /// SQL text).
@@ -158,6 +168,22 @@ mod tests {
     fn set_renders_key_value_pairs() {
         let s = QuerySettings::new().set("max_threads", 4);
         assert_eq!(s.render_suffix(), " SETTINGS max_threads = 4");
+    }
+
+    /// Issue #35: `entries()` is the public introspection twin of the
+    /// crate-private `iter()` — the bench drift guard's exact-entry-set
+    /// equality check depends on this being complete and in insertion
+    /// order.
+    #[test]
+    fn entries_exposes_every_key_value_pair_in_insertion_order() {
+        let s = QuerySettings::new()
+            .set("max_query_size", 8_388_608u64)
+            .set("query_id", "abc");
+        let got: Vec<(&str, &str)> = s.entries().collect();
+        assert_eq!(
+            got,
+            vec![("max_query_size", "8388608"), ("query_id", "abc")]
+        );
     }
 
     #[test]

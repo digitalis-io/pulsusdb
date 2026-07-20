@@ -4,6 +4,7 @@
 pub mod eval_gate;
 pub mod logql;
 pub mod metrics;
+pub mod querytext;
 pub mod traces;
 
 pub use eval_gate::{DEFAULT_EVAL_CONCURRENCY, EvalGate, EvalGateSnapshot};
@@ -20,6 +21,7 @@ pub use metrics::{
     MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, Resolution, SeriesResolver,
     TSDB_TOP_METRIC_NAMES, TsdbCacheSnapshot, TsdbStatus, spawn_refresh_loop,
 };
+pub use querytext::{MAX_QUERY_TEXT_BYTES, ensure_query_text_fits};
 pub use traces::{
     BATCH_TRACES, DEFAULT_METRICS_POINTS, HYDRATION_BYTE_BUDGET, MAX_METRICS_POINTS,
     MAX_SPANS_PER_TRACE, MetricFunc, MetricsCtx, MetricsParams, PlanError as TracePlanError,

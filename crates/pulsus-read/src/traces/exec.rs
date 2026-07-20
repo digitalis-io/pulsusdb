@@ -456,6 +456,7 @@ impl TraceEngine {
     pub async fn metrics_range(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.range_sql());
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut points: Vec<(i64, f64)> = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption (≤ cap buckets).
@@ -486,6 +487,7 @@ impl TraceEngine {
     pub async fn metrics_instant(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.instant_sql());
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut count: Option<u64> = None;
         // Scoped stream: same lease/drain contract as metrics_range
         // (exactly one row by the SQL shape).
@@ -512,6 +514,12 @@ impl TraceEngine {
     /// An empty `Vec` means the trace is absent (the handler maps that to
     /// `404`); duplicate `span_id`s from at-least-once ingest are returned
     /// as stored — dedup is the assembler's read-time concern.
+    ///
+    /// **Issue #35: exempt from the query-text guard.** `point_read_sql`
+    /// is a fixed template plus 32 caller-validated hex chars — SQL well
+    /// under 1 KiB by construction, with no unbounded-width component
+    /// (pinned by `point_read_sql_stays_under_4kib_by_construction` in
+    /// this module's tests).
     pub async fn fetch_by_id(&self, hex32: &str) -> Result<Vec<StoredSpan>, ReadError> {
         let sql = super::sql::point_read_sql(&self.config.spans_table, hex32);
         let mut spans = Vec::new();
@@ -552,6 +560,7 @@ impl TraceEngine {
             TAG_NAMES_MAX + 1,
         );
         let settings = catalog_settings(&self.config);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut names = Vec::new();
         // Scoped stream (module convention): the pooled-connection lease
         // drops at return, after full consumption — the stream is always
@@ -591,6 +600,7 @@ impl TraceEngine {
             TAG_VALUES_MAX + 1,
         );
         let settings = catalog_settings(&self.config);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
         let mut values = Vec::new();
         // Scoped stream: same lease/drain contract as list_tag_names.
         let mut stream = self
@@ -635,6 +645,13 @@ impl TraceEngine {
     /// budget by more than the driver's one-block transient (the
     /// documented Layer-1 residual). `charged` accumulates what the
     /// caller must release when it discards the rows.
+    ///
+    /// **Issue #35: the single choke point for every search-phase read.**
+    /// Every phase-1 generator, phase-2 hydration/membership/attribute-
+    /// value batch, and the root-hydration read all route through this one
+    /// function — [`crate::querytext::ensure_query_text_fits`] runs once
+    /// here (against the FINAL escaped text) rather than at each of the
+    /// half-dozen call sites.
     async fn collect_rows_charged<R: ChRow, F: FnMut(&R) -> usize>(
         &self,
         sql: &str,
@@ -644,6 +661,9 @@ impl TraceEngine {
         mut cost: F,
     ) -> Result<Vec<R>, ReadError> {
         let sql = escape_query_placeholders(sql);
+        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+            return Err(ReadError::QueryTooBroad(reason));
+        }
         let mut rows = Vec::new();
         let mut stream = self
             .client
@@ -1019,6 +1039,11 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("read_overflow_mode", "throw")
         .set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
         .set("result_overflow_mode", "throw")
+        // Issue #35: the raised `max_query_size` parse-buffer cap — every
+        // search-phase read (generators, hydration/membership/attribute
+        // batches, root hydration) routes through `collect_rows_charged`,
+        // which carries this settings object.
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
 }
 
 /// The Layer-1 read budget the two §4.3 catalog reads carry (issue #58
@@ -1042,6 +1067,8 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("max_rows_to_read", config.scan_budget_rows)
         .set("max_bytes_to_read", TRACE_READ_BYTES_BUDGET)
         .set("read_overflow_mode", "throw")
+        // Issue #35: same raised parse-buffer cap as `search_settings`.
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
 }
 
 /// The Layer-1 settings every metrics query carries (issue #59 plan v2
@@ -1058,10 +1085,15 @@ fn catalog_settings(config: &TraceReadConfig) -> QuerySettings {
 /// coordinator merges per-bucket partial states, bounded by the point
 /// cap × shards. Scale evidence routes to #25.)
 fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
+    // `max_query_size` is already present, inherited from `search_settings`
+    // — set again here (idempotent, `QuerySettings::set` overrides rather
+    // than duplicates) so the setting's presence is explicit at this call
+    // site too, per issue #35's plan.
     let base = search_settings(config)
         .set("max_rows_in_set", TRACE_METRICS_MAX_SET_ROWS)
         .set("max_bytes_in_set", TRACE_METRICS_MAX_SET_BYTES)
-        .set("set_overflow_mode", "throw");
+        .set("set_overflow_mode", "throw")
+        .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES);
     if config.distributed {
         base.set("distributed_product_mode", "local")
     } else {
@@ -1367,6 +1399,7 @@ mod tests {
             "max_rows_to_read",
             "max_bytes_to_read",
             "max_result_bytes",
+            "max_query_size",
         ] {
             assert!(local.contains(needle), "missing {needle} in {local}");
         }
@@ -1757,6 +1790,7 @@ mod tests {
             "throw",
             "max_result_bytes",
             "result_overflow_mode",
+            "max_query_size",
         ] {
             assert!(
                 rendered.contains(expected),
@@ -1794,7 +1828,13 @@ mod tests {
     #[test]
     fn catalog_settings_pin_the_layer_1_read_budget_contract() {
         let rendered = format!("{:?}", catalog_settings(&cfg()));
-        for expected in ["max_rows_to_read", "1000", "read_overflow_mode", "throw"] {
+        for expected in [
+            "max_rows_to_read",
+            "1000",
+            "read_overflow_mode",
+            "throw",
+            "max_query_size",
+        ] {
             assert!(
                 rendered.contains(expected),
                 "missing {expected} in {rendered}"
@@ -1819,5 +1859,48 @@ mod tests {
         let rendered = format!("{:?}", catalog_settings(&config));
         assert!(!rendered.contains("optimize_skip_unused_shards"));
         assert!(!rendered.contains("prefer_localhost_replica"));
+    }
+
+    // --- Issue #35: full-shape parse bound (traces) ---
+
+    /// Pins `fetch_by_id`'s guard exemption: the point-read template plus
+    /// 32 hex chars stays well under any plausible query-text cap, let
+    /// alone [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — `fetch_by_id`
+    /// never calls [`crate::querytext::ensure_query_text_fits`], and this
+    /// is why that is safe.
+    #[test]
+    fn point_read_sql_stays_under_4kib_by_construction() {
+        let sql =
+            crate::traces::sql::point_read_sql("trace_spans", "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert!(
+            sql.len() < 4096,
+            "point-read SQL is {} bytes, expected < 4 KiB",
+            sql.len()
+        );
+    }
+
+    /// The batch hydration read at the `BATCH_TRACES` batch size — the
+    /// module's own documented residual (≤ 48 B × 32 ≈ ≤ 2 KB, module
+    /// doc) — stays well under the guard's cap. Pinned so a future
+    /// `BATCH_TRACES` increase that breaks the assumption is caught here,
+    /// not live.
+    #[test]
+    fn hydration_sql_at_batch_traces_batch_size_stays_under_4kib() {
+        let trace_ids: Vec<[u8; 16]> = (0..BATCH_TRACES as u8).map(|i| [i; 16]).collect();
+        let sql = crate::traces::search_sql::hydration_sql(
+            "trace_spans",
+            &trace_ids,
+            crate::logql::sql::TimeWindow {
+                start_ns: 0,
+                end_ns: i64::MAX,
+            },
+            MAX_SPANS_PER_TRACE,
+        );
+        assert!(
+            sql.len() < 4096,
+            "hydration SQL at the BATCH_TRACES={} batch size is {} bytes, expected < 4 KiB",
+            BATCH_TRACES,
+            sql.len()
+        );
     }
 }

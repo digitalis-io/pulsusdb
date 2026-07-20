@@ -797,16 +797,25 @@ impl MetricsEngine {
     /// [`crate::logql::exec::escape_query_placeholders`] applies — the
     /// `SqlFallback` sub-query's `^(?:...)$` regex predicates always carry
     /// a literal `?`, and the `clickhouse` crate's `SqlBuilder` treats a
-    /// bare `?` as an unbound bind placeholder unless doubled. No scan-
-    /// budget concept in M2's metrics scope (unlike `logql::exec`'s own
-    /// `query_stream` wrapper) — every `ChError` passes through as
-    /// [`ReadError::Clickhouse`] unmapped; a byte-budget cap for metric
-    /// reads is out of scope for this issue.
+    /// bare `?` as an unbound bind placeholder unless doubled. Still no
+    /// scan-budget concept in M2's metrics scope (unlike `logql::exec`'s
+    /// own `query_stream` wrapper) — that stays a standing out-of-scope
+    /// decision; every non-guard `ChError` passes through as
+    /// [`ReadError::Clickhouse`] unmapped. Issue #35 closes a live gap:
+    /// this path previously sent NO settings at all, so a broad selector's
+    /// rendered `IN` lists could trip ClickHouse's 262,144-byte
+    /// `max_query_size` default with an opaque parse error — now every
+    /// dispatch carries the raised setting AND is guarded pre-dispatch by
+    /// [`crate::querytext::ensure_query_text_fits`] (checked against the
+    /// FINAL escaped text, same ordering `logql::exec` uses).
     async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
         let sql = escape_query_placeholders(&sql);
+        if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
+            return Err(ReadError::QueryTooBroad(reason));
+        }
         let mut stream: ChRowStream<'_, R> = self
             .client
-            .query_stream::<R>(&sql, &QuerySettings::new())
+            .query_stream::<R>(&sql, &metrics_read_settings())
             .await
             .map_err(ReadError::Clickhouse)?;
         let mut out = Vec::new();
@@ -1191,6 +1200,19 @@ impl MetricsEngine {
             series_count_by_metric_name: cache_snapshot.series_count_by_metric_name,
         })
     }
+}
+
+/// The metrics read-path settings (issue #35): `max_query_size` only —
+/// scan budgets (`max_bytes_to_read`) remain explicitly out of scope for
+/// the metrics path (standing decision, [`MetricsEngine::fetch_rows`]'s
+/// doc comment), so this is deliberately narrower than `logql::exec::
+/// read_query_settings`. Closes a live gap: `fetch_rows` previously sent
+/// `QuerySettings::new()` (no settings at all), so a broad selector's
+/// rendered `metric_name IN (...)`/`fingerprint IN (...)` lists could trip
+/// ClickHouse's 262,144-byte `max_query_size` default with an opaque
+/// parse error instead of the engine's own `422 query_too_broad`.
+fn metrics_read_settings() -> QuerySettings {
+    QuerySettings::new().set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
 }
 
 /// Pure fan-out bound decision for the degraded-cache discovery probe
@@ -2015,6 +2037,56 @@ mod tests {
             })
         );
         assert_eq!(probe_fanout_bound(cap as usize, cap), None);
+    }
+
+    // --- Issue #35: full-shape parse bound (metrics read path) ---
+
+    #[test]
+    fn metrics_read_settings_sets_the_raised_query_text_cap() {
+        let s = metrics_read_settings();
+        assert_eq!(
+            s.get("max_query_size"),
+            Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
+        );
+    }
+
+    /// Acceptance criterion 3: the metrics path's own default-scale
+    /// envelope (1,000 × 256 B metric names + 50,000 fingerprints, ≈1.36
+    /// MB) fits under the raised cap while exceeding ClickHouse's
+    /// 262,144-byte default — proving the newly-sent setting is
+    /// load-bearing here too (`fetch_rows` previously sent NO settings at
+    /// all).
+    #[test]
+    fn metrics_default_envelope_fits_the_query_text_cap_and_exceeds_the_ch_default() {
+        let names: Vec<String> = (0..1_000u32).map(|i| format!("{i:0254}")).collect();
+        let fps: Vec<Fingerprint> = std::iter::repeat_n(u64::MAX, 50_000).collect();
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &fps, 0, i64::MAX);
+        let bytes = sql.len() as u64;
+        assert!(
+            bytes > 262_144,
+            "default-scale envelope SQL ({bytes} B) must exceed the ClickHouse default cap to \
+             prove the raised setting is load-bearing"
+        );
+        assert!(
+            crate::querytext::ensure_query_text_fits(&sql).is_ok(),
+            "default-scale envelope SQL ({bytes} B) must fit under the 8 MiB cap"
+        );
+    }
+
+    /// A ceiling-scale fan-out (near `PROMQL_MAX_METRIC_FANOUT_CEILING`)
+    /// renders SQL past [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — the
+    /// pre-dispatch guard rejects it as `QueryTextBytes` instead of
+    /// ClickHouse hitting an opaque parse error.
+    #[test]
+    fn metrics_ceiling_scale_envelope_is_rejected_by_the_guard() {
+        let names: Vec<String> = (0..1_000_000u32)
+            .map(|i| format!("metric_name_{i}"))
+            .collect();
+        let sql = sample_sql::sample_fetch_multi("metric_samples", &names, &[], 0, i64::MAX);
+        match crate::querytext::ensure_query_text_fits(&sql) {
+            Err(TooBroadReason::QueryTextBytes { .. }) => {}
+            other => panic!("expected QueryTextBytes rejection, got {other:?}"),
+        }
     }
 
     // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge
