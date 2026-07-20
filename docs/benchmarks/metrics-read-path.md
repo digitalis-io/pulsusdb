@@ -205,7 +205,7 @@ lifetime). The gate exports six `pulsus_query_eval_*` metrics on
 `/metrics`: gauges `pulsus_query_eval_permits_limit`,
 `pulsus_query_eval_permits_available`, `pulsus_query_eval_in_flight`,
 `pulsus_query_eval_waiting`; counters `pulsus_query_eval_contended_total`,
-`pulsus_query_eval_wait_seconds_total`. Hermetic counting/identity gates
+`pulsus_query_eval_wait_nanoseconds_total`. Hermetic counting/identity gates
 (`crates/pulsus-read/src/eval_gate.rs`, plus AC6 in `metrics/exec.rs`)
 prove the bound is tight, the fast path is uninstrumented, and the permit
 spans the whole blocking closure without any wall-time assert.

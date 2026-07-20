@@ -2326,20 +2326,47 @@ mod tests {
         );
     }
 
-    /// Issue #101 (AC6, strengthened per code-review round 1): proves the
-    /// permit is held for the WHOLE DURATION of the blocking eval *inside*
-    /// `evaluate_offloaded`, not merely queued-before / released-after. The
-    /// prior AC6 assertion could not see mid-eval state, so an
-    /// acquire-release-before-`spawn_blocking` regression in
-    /// `evaluate_offloaded` would pass it. This is AC2's counting-gate shape
-    /// driven THROUGH `evaluate_offloaded`: `N + K` concurrent calls share an
-    /// `EvalGate::new(N)`, and each injected eval closure counts the evals
-    /// concurrently in flight *inside the offloaded blocking task* via a
-    /// `fetch_max` (read only after every task joins — no race, no wall-time
-    /// assert). If the permit were dropped before the spawn, all `N + K`
-    /// eval closures would run at once and `max_seen` would exceed `N`. The
-    /// closure ends by running the real `pulsus_promql::evaluate`, so the
-    /// integration still exercises actual eval work.
+    /// Issue #101 (AC6, strengthened per code-review round 1, then
+    /// re-strengthened per group-D re-review comment 5011870282 / plan
+    /// comment 5026188137): proves the permit is held for the WHOLE
+    /// DURATION of the blocking eval *inside* `evaluate_offloaded`, not
+    /// merely queued-before / released-after. This is AC2's counting-gate
+    /// shape driven THROUGH `evaluate_offloaded`: `N + K` concurrent calls
+    /// share an `EvalGate::new(N)`, and each injected eval closure counts
+    /// the evals concurrently in flight *inside the offloaded blocking
+    /// task* via a `fetch_max` (read only after every task joins — no race,
+    /// no wall-time assert). If the permit were dropped before the spawn,
+    /// all `N + K` eval closures would run at once and `max_seen` would
+    /// exceed `N`. The closure ends by running the real
+    /// `pulsus_promql::evaluate`, so the integration still exercises actual
+    /// eval work.
+    ///
+    /// The round-1 version of this test had two defects, both fixed here:
+    /// 1. **Vacuous-pass window:** `entered.acquire_many(N)` only proves the
+    ///    first `N` closures entered — nothing forced the `K` excess
+    ///    `evaluate_offloaded` calls to have been *polled* before the
+    ///    assertions ran, so under the exact regression this test exists to
+    ///    catch (permit dropped before `spawn_blocking`), the excess
+    ///    closures over-admitted only if the scheduler happened to have run
+    ///    them already. Fixed with a second rendezvous: loop until
+    ///    `gate.snapshot().waiting == K` (every excess acquirer provably
+    ///    reached the contended slow path), asserting
+    ///    `entered.available_permits() == 0` on every iteration as an
+    ///    over-admission tripwire. Termination is deterministic under any
+    ///    scheduler — a correct gate makes every excess task eventually
+    ///    register in `waiting`; a broken gate makes it eventually enter and
+    ///    trip the in-loop assert instead.
+    /// 2. **Counting window excluded the eval:** `in_flight.fetch_sub` used
+    ///    to run *before* `pulsus_promql::evaluate`, so the concurrency
+    ///    counter never observed the real evaluation. Fixed by moving the
+    ///    decrement to *after* `evaluate` returns, so the counting window
+    ///    now spans the real eval, not just the parked prefix.
+    ///
+    /// `contended_total == K` is a load-bearing identity precondition: it
+    /// only holds because no permit is released (`release`/`admitted`)
+    /// before the second rendezvous completes — every one of the first `N`
+    /// holders is still parked, so exactly `N` fast-path successes and `K`
+    /// slow-path acquisitions have occurred by that point.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn offloaded_evaluate_holds_its_permit_for_the_whole_eval_bounding_concurrency() {
         use std::sync::Arc;
@@ -2374,8 +2401,11 @@ mod tests {
                     while !release.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(1));
                     }
+                    // The counting window spans the real eval: decrement
+                    // only after `evaluate` returns, not before it runs.
+                    let out = pulsus_promql::evaluate(plan, data);
                     in_flight.fetch_sub(1, Ordering::SeqCst);
-                    pulsus_promql::evaluate(plan, data)
+                    out
                 })
                 .await
                 .unwrap()
@@ -2398,6 +2428,31 @@ mod tests {
             gate.snapshot().available,
             0,
             "the gate is fully occupied by the in-flight evals"
+        );
+
+        // Second rendezvous: force every excess call to be provably queued
+        // at the gate before trusting the over-admission tripwire — closes
+        // the round-1 vacuous-pass window (see doc comment above).
+        loop {
+            assert_eq!(
+                entered.available_permits(),
+                0,
+                "over-admission: more than N eval closures entered while the gate is full"
+            );
+            if gate.snapshot().waiting == K as u64 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.snapshot().available,
+            0,
+            "the gate is fully occupied by the in-flight evals"
+        );
+        assert_eq!(
+            gate.snapshot().contended_total,
+            K as u64,
+            "exactly the K excess acquisitions take the contended slow path"
         );
 
         // Release everyone and let all N+K run to completion.

@@ -156,18 +156,34 @@ fn record_label_cache_metrics(cache: &LabelCache) {
 /// Issue #101: bridges the read path's [`pulsus_read::EvalGateSnapshot`]
 /// through the `metrics` facade on scrape (same snapshot→pull model as
 /// [`record_label_cache_metrics`], so the read path never touches the
-/// `metrics` facade in its hot loop). Gauges use `.set()`; the two
-/// monotonic counters use `.absolute()` (this crate mirrors the gate's own
-/// atomics, it does not own the exporter's running total).
+/// `metrics` facade in its hot loop). Thin wrapper over
+/// [`record_eval_gate_snapshot`] — the split exists so the exposition can be
+/// unit-tested with pinned `EvalGateSnapshot` values instead of driving a
+/// real gate through contention.
 fn record_eval_gate_metrics(gate: &pulsus_read::EvalGate) {
-    let snap = gate.snapshot();
+    record_eval_gate_snapshot(&gate.snapshot());
+}
+
+/// Issue #101 (re-review comment 5011870282): gauges use `.set()`; the
+/// counters use `.absolute()` (this crate mirrors the gate's own atomics, it
+/// does not own the exporter's running total). `wait_nanos_total` is
+/// exported verbatim as `pulsus_query_eval_wait_nanoseconds_total` — the
+/// prior `pulsus_query_eval_wait_seconds_total` divided by
+/// `1_000_000_000` with integer division, so it read `0` until a full
+/// cumulative *second* of contended waiting had ever accrued (eval-gate
+/// waits are typically milliseconds); the `metrics` 0.24 `Counter` facade
+/// is `u64`-only, so sub-second seconds are unrepresentable under that
+/// name/type. The source atomic is already exact (and, since #101's
+/// saturating-accumulator hardening, saturation-capped at `u64::MAX` —
+/// `eval_gate.rs`'s `add_wait_nanos`), so this exports it directly with no
+/// division.
+fn record_eval_gate_snapshot(snap: &pulsus_read::EvalGateSnapshot) {
     metrics::gauge!("pulsus_query_eval_permits_limit").set(snap.limit as f64);
     metrics::gauge!("pulsus_query_eval_permits_available").set(snap.available as f64);
     metrics::gauge!("pulsus_query_eval_in_flight").set(snap.in_flight as f64);
     metrics::gauge!("pulsus_query_eval_waiting").set(snap.waiting as f64);
     metrics::counter!("pulsus_query_eval_contended_total").absolute(snap.contended_total);
-    metrics::counter!("pulsus_query_eval_wait_seconds_total")
-        .absolute(snap.wait_nanos_total / 1_000_000_000);
+    metrics::counter!("pulsus_query_eval_wait_nanoseconds_total").absolute(snap.wait_nanos_total);
 }
 
 /// `GET /config`: effective configuration, secrets redacted
@@ -301,6 +317,54 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!text.contains("s3cret"));
+    }
+
+    /// Issue #101 (plan v1/v2): pins `record_eval_gate_snapshot`'s exact
+    /// exposition — a fresh recorder per value (`Counter::absolute` is
+    /// monotonic-max within one recorder, so reusing one across values would
+    /// silently keep the max instead of proving each round-trips). `1`,
+    /// `999_999_999` (mutation-sensitive: the old truncating `/
+    /// 1_000_000_000` code rendered `0`), `1_500_000_000` (old code rendered
+    /// `1`), and `u64::MAX` (the saturating-accumulator boundary, now
+    /// genuinely reachable per `eval_gate.rs`'s `add_wait_nanos`) all
+    /// round-trip exactly with no division. Also pins the rename: the old
+    /// `pulsus_query_eval_wait_seconds_total` name must never appear.
+    #[test]
+    fn eval_gate_snapshot_exports_exact_wait_nanoseconds_with_no_division() {
+        for wait_nanos_total in [1u64, 999_999_999, 1_500_000_000, u64::MAX] {
+            let snap = pulsus_read::EvalGateSnapshot {
+                limit: 256,
+                available: 200,
+                in_flight: 56,
+                waiting: 3,
+                contended_total: 7,
+                wait_nanos_total,
+            };
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, || record_eval_gate_snapshot(&snap));
+            let rendered = handle.render();
+
+            let exported = rendered
+                .lines()
+                .find_map(|line| line.strip_prefix("pulsus_query_eval_wait_nanoseconds_total "))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing pulsus_query_eval_wait_nanoseconds_total sample in:\n{rendered}"
+                    )
+                })
+                .trim()
+                .parse::<u64>()
+                .expect("exported sample must parse as a u64");
+            assert_eq!(
+                exported, wait_nanos_total,
+                "exact u64 round-trip for wait_nanos_total={wait_nanos_total}"
+            );
+            assert!(
+                !rendered.contains("pulsus_query_eval_wait_seconds_total"),
+                "the stale metric name must never be emitted"
+            );
+        }
     }
 
     #[tokio::test]
