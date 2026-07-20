@@ -535,29 +535,36 @@ impl CompiledPipeline {
                     }
                 }
                 CompiledStage::LabelFilter(filter) => {
-                    // Both paths capture the first offending `(kind, value)`
+                    // Both paths capture the first offending `(kind, raw)`
                     // for the detail string: streams and metric now each
-                    // carry `__error_details__` (issue #104). The capture is
-                    // only reached on a conversion failure (`None` arm), so
-                    // well-formed lines allocate nothing.
-                    let mut failed: Option<(UnitKind, String)> = None;
+                    // carry `__error_details__` (issue #104). `failed` only
+                    // borrows the raw value — an `And`/`Or` sibling can
+                    // still absorb this into a definite `Some`, masking the
+                    // error entirely, so masked lines never allocate.
+                    let mut failed: Option<(UnitKind, &str)> = None;
                     match eval_label_filter(filter, labels, &mut failed) {
                         Some(true) => {}
                         Some(false) => return MetricRun::Dropped,
                         // Conversion failure: keep the line, tag the error
                         // class (pinned semantics, oracle-verified; a later
-                        // `__error__=""` filter drops it).
+                        // `__error__=""` filter drops it). Build the owned
+                        // detail from the borrowed `raw` before the first
+                        // `set_label` mutation (NLL: the borrow of `labels`
+                        // held by `failed` must end before `labels` is
+                        // mutated).
                         None => {
+                            let details =
+                                failed.map(|(kind, value)| label_filter_error_details(kind, value));
                             set_label(
                                 labels,
                                 Cow::Borrowed(ERROR_LABEL),
                                 Cow::Borrowed("LabelFilterErr"),
                             );
-                            if let Some((kind, value)) = failed {
+                            if let Some(details) = details {
                                 set_label(
                                     labels,
                                     Cow::Borrowed(ERROR_DETAILS_LABEL),
-                                    Cow::Owned(label_filter_error_details(kind, &value)),
+                                    Cow::Owned(details),
                                 );
                             }
                         }
@@ -1279,10 +1286,16 @@ fn render_template(parts: &[TmplPart], labels: &[(Cow<'_, str>, Cow<'_, str>)]) 
 /// drop, `None` = a numeric conversion failed somewhere the outcome
 /// depends on (→ keep + `__error__`). Kleene semantics: a definite
 /// `false` under `and` / definite `true` under `or` absorbs an error.
-fn eval_label_filter(
+///
+/// `failed` borrows the offending raw label value rather than owning it:
+/// an `And`/`Or` sibling can still absorb the `None` into a definite
+/// `Some(false)`/`Some(true)` (masked, no label ever set), so the owned
+/// detail `String` is deferred to the caller's `None` arm — the only
+/// place a label is actually written.
+fn eval_label_filter<'v>(
     f: &CompiledLabelFilter,
-    labels: &[(Cow<'_, str>, Cow<'_, str>)],
-    failed: &mut Option<(UnitKind, String)>,
+    labels: &'v [(Cow<'_, str>, Cow<'_, str>)],
+    failed: &mut Option<(UnitKind, &'v str)>,
 ) -> Option<bool> {
     match f {
         CompiledLabelFilter::Match {
@@ -1314,11 +1327,14 @@ fn eval_label_filter(
                 return Some(false);
             };
             let Some(v) = convert_label_value(*kind, raw) else {
-                // Record the leftmost conversion failure for the detail
-                // string (both paths now carry `__error_details__`, issue
-                // #104). Reached only on failure, so no happy-path alloc.
+                // Record the leftmost conversion failure as a borrow —
+                // no allocation here. A sibling `And`/`Or` combinator may
+                // still absorb this `None` into a definite outcome (the
+                // line is masked and no label is ever set), so the owned
+                // detail string is built by the caller, only once, only
+                // on the surviving `None` outcome.
                 if failed.is_none() {
-                    *failed = Some((*kind, raw.to_string()));
+                    *failed = Some((*kind, raw));
                 }
                 return None;
             };
@@ -1916,5 +1932,88 @@ mod tests {
         );
         assert!(parse_json_path("").is_err());
         assert!(parse_json_path("a[b").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Issues #99 + #104: a compound `and`/`or` label filter can absorb a
+    // sibling's conversion failure into a definite outcome (masking) —
+    // `eval_label_filter`'s `failed` capture must never allocate on that
+    // path, and a genuinely-surviving error must stay byte-exact.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn masked_and_drops_the_line_and_emits_no_error_label_streams() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"{a="b"} | logfmt | level = "warn" and took > 250ms"#,
+        ))
+        .unwrap();
+        let base = vec![("a".to_string(), "b".to_string())];
+        // `level = "warn"` is definite-false; `and` absorbs the sibling's
+        // conversion failure on `took=bad` without ever setting a label.
+        assert!(compiled.run("level=info took=bad", &base).is_none());
+    }
+
+    #[test]
+    fn masked_or_keeps_the_line_and_emits_no_error_label_streams() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"{a="b"} | logfmt | level = "info" or took > 250ms"#,
+        ))
+        .unwrap();
+        let base = vec![("a".to_string(), "b".to_string())];
+        // `level = "info"` is definite-true; `or` absorbs the sibling's
+        // conversion failure on `took=bad` without ever setting a label.
+        let out = compiled
+            .run("level=info took=bad", &base)
+            .expect("or-true absorbs the failure and keeps the line");
+        assert!(!out.labels.iter().any(|(k, _)| k == ERROR_LABEL));
+        assert!(!out.labels.iter().any(|(k, _)| k == ERROR_DETAILS_LABEL));
+    }
+
+    #[test]
+    fn masked_or_keeps_the_line_and_emits_no_error_label_metric() {
+        let compiled = CompiledPipeline::compile(&stages_of(
+            r#"sum_over_time({a="b"} | logfmt | level = "info" or took > 250ms [5m])"#,
+        ))
+        .unwrap();
+        let base = vec![("a".to_string(), "b".to_string())];
+        let mut labels = Vec::new();
+        let MetricRun::Kept { .. } =
+            compiled.run_metric_into("level=info took=bad", &base, &mut labels)
+        else {
+            panic!("or-true absorbs the failure and keeps the line");
+        };
+        assert!(!labels.iter().any(|(k, _)| k == ERROR_LABEL));
+        assert!(!labels.iter().any(|(k, _)| k == ERROR_DETAILS_LABEL));
+    }
+
+    #[test]
+    fn a_genuine_compound_error_still_emits_byte_exact_error_labels() {
+        let base = vec![("a".to_string(), "b".to_string())];
+        for query in [
+            // `or`: both sides fail to produce a definite `true`
+            // (`level = "warn"` is false, `took > 250ms` errors) → `None`.
+            r#"{a="b"} | logfmt | level = "warn" or took > 250ms"#,
+            // `and`: both sides fail to produce a definite `false`
+            // (`level = "info"` is true, `took > 250ms` errors) → `None`.
+            r#"{a="b"} | logfmt | level = "info" and took > 250ms"#,
+        ] {
+            let compiled = CompiledPipeline::compile(&stages_of(query)).unwrap();
+            let out = compiled
+                .run("level=info took=bad", &base)
+                .unwrap_or_else(|| panic!("{query}: an unabsorbed error keeps the line"));
+            assert!(
+                out.labels
+                    .iter()
+                    .any(|(k, v)| k == ERROR_LABEL && v == "LabelFilterErr"),
+                "{query}: {:?}",
+                out.labels
+            );
+            assert!(
+                out.labels.iter().any(|(k, v)| k == ERROR_DETAILS_LABEL
+                    && v == "time: invalid duration \"bad\""),
+                "{query}: {:?}",
+                out.labels
+            );
+        }
     }
 }

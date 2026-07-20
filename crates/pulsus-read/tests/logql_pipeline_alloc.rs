@@ -177,6 +177,50 @@ fn per_row_allocation_bounds_hold() {
          (the captured value + the detail string), not a per-row growth series"
     );
 
+    // --- Issues #99 + #104: a compound `and`/`or` label filter can
+    // --- absorb a sibling's conversion failure into a definite outcome
+    // --- (masking). `eval_label_filter`'s `failed` capture must borrow,
+    // --- never allocate, the offending value — the owned detail string
+    // --- is built only in the caller's surviving `None` arm.
+    //
+    // Masked AND: `level = "warn"` is definite-false over every body
+    // (`level=info`), so `and` absorbs the sibling's duration-conversion
+    // failure into `Some(false)` — dropped, ZERO allocations per row.
+    let masked_and_total = count_run_into(
+        r#"{a="b"} | logfmt | level = "warn" and took > 250ms"#,
+        &bad_dur_bodies,
+        &base,
+    );
+    assert!(
+        masked_and_total <= ZERO_RESIDUE,
+        "masked-and: {masked_and_total} allocations over {ROWS} rows — the compound label \
+         filter must not allocate the sibling's absorbed conversion failure"
+    );
+
+    // Masked OR: `level = "info"` is definite-true over every body, so
+    // `or` absorbs the sibling's duration-conversion failure into
+    // `Some(true)` — kept, and must cost no more than a clean keep with
+    // no error at all (differential: masked bodies vs bodies whose
+    // duration converts cleanly, so no error is ever captured).
+    let good_dur_bodies: Vec<String> = (0..64)
+        .map(|i| format!("level=info took={}ms", 300 + i))
+        .collect();
+    let masked_or_total = count_run_into(
+        r#"{a="b"} | logfmt | level = "info" or took > 250ms"#,
+        &bad_dur_bodies,
+        &base,
+    );
+    let clean_or_total = count_run_into(
+        r#"{a="b"} | logfmt | level = "info" or took > 250ms"#,
+        &good_dur_bodies,
+        &base,
+    );
+    assert!(
+        masked_or_total <= clean_or_total + ZERO_RESIDUE,
+        "masked-or: {masked_or_total} allocations over {ROWS} rows vs {clean_or_total} for a \
+         clean keep — the absorbed conversion failure must not cost more than a normal keep"
+    );
+
     // --- Assembly paths (`run_pipeline_rows` end to end). Output
     // --- materialization is inherent (owned `StreamResult`s), so these
     // --- pin small per-surviving-row constants, not zero.
