@@ -115,6 +115,24 @@ Out of this ledger's scope by design:
   cross-store fingerprint assertion. There is **no SM predicate pushdown** —
   SM label filters are evaluated client-side (the #97 baseline), so this lane
   adds no read-path SQL and cannot regress the Tier-1 SQL/alloc goldens.
+  **Cross-store duplicate-on-retry semantics are a permanent carve-out
+  (issue #102 un-defer).** `grafana/loki:3.4.2`'s native `/loki/api/v1/push`
+  has no idempotency-key or request-dedup contract, so whether a live
+  double-push renders as one entry or two on the oracle side is an
+  undocumented implementation detail, not a comparable behavior — and
+  deliberately double-pushing against the shared nightly stores would poison
+  this lane's own `raw == distinct` duplicate-delivery validity gate
+  (`wait_for_sm_completeness`/`run_sm_case`, `e2e/src/logs.rs:2051-2070`).
+  That gate is the permanent live backstop: any retry-path regression that
+  actually replays a body against a real store surfaces there as a loud
+  `bail!`, never a silent pass. The producer's own no-replay invariant is
+  instead pinned hermetically, per-PR, against a loopback fake store that
+  deterministically reproduces "server ingested the body, then the transport
+  died before the response" — a fault the live stores cannot be coerced into
+  reproducing deterministically — by
+  `sm_push_lane_cannot_replay_the_corpus_on_an_ambiguous_post_ingest_failure`
+  (`e2e/src/logs.rs`), which drives the real `push_sm_corpus` producer
+  through `poll_until` and `push_loki_json` end to end.
 
 - **`__error_details__` on the METRIC pipeline-error message (issue #99
   OQ2 → RESOLVED, issue #104).** The `grafana/loki:3.4.2` probe found

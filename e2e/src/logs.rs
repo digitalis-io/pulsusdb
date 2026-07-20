@@ -1955,6 +1955,9 @@ pub async fn logs_structured_metadata_differential(ctx: &Ctx) -> Result<()> {
 /// failure *after* the server may have ingested the body maps to
 /// `Ok(Some(Err(_)))` and fails fast, so the idempotency guard is in place —
 /// the identical body is never resent once the connection was established.
+/// Pinned end-to-end through the real [`push_sm_corpus`] call site by
+/// `sm_push_lane_cannot_replay_the_corpus_on_an_ambiguous_post_ingest_failure`
+/// (issue #102), not just the classifier in isolation (issue #105).
 async fn push_loki_json(
     ctx: &Ctx,
     url: &str,
@@ -3377,5 +3380,182 @@ mod tests {
         assert_eq!(diff.matched, set_entry_count(&expected));
         assert!(diff.missing.is_empty());
         assert!(diff.extra.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #102 (un-defer): the SM push lane cannot replay a corpus
+    // body it has already sent, under a fault the store can only
+    // observe as "ingested, then the transport died".
+    // ---------------------------------------------------------------
+
+    /// Finds the first byte offset of `needle` in `haystack`, or `None`.
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// Reads one full HTTP request off `socket` — headers, then exactly
+    /// `Content-Length` body bytes — without ever writing a response. This
+    /// is the "ingested, then the transport died" fault: from the client's
+    /// perspective the connection was established and the request fully
+    /// sent, but the response read fails, which `classify_push_send`
+    /// classifies as post-connect (issue #105's terminal arm), never a
+    /// safe-to-retry connect failure.
+    async fn read_full_request_then_drop(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return, // closed before headers completed
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]);
+        let content_length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let mut have = buf.len() - (header_end + 4);
+        while have < content_length {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => have += n,
+            }
+        }
+        // Full body read; drop the socket without writing any response —
+        // the deterministic post-ingest transport-death fault.
+    }
+
+    /// Ingest-then-drop fake store: accepts connections in a LOOP,
+    /// reading one full request per connection then dropping it without a
+    /// response. The loop is the non-vacuity linchpin (plan edge case): if
+    /// the fake store stopped accepting after one connection, a mutated
+    /// replay would hit connect-refused (silently retried by
+    /// `classify_push_send`'s safe arm) and `hits` would never move past 1,
+    /// masking the exact mutation this test exists to kill.
+    async fn serve_ingest_then_drop(
+        listener: tokio::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            read_full_request_then_drop(&mut socket).await;
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(socket);
+        }
+    }
+
+    /// A [`Ctx`] whose `base_url` and `loki_url` both point at the fake
+    /// ingest-then-drop store, so the real `push_sm_corpus` fans its very
+    /// first push attempt at it; `collector_url`/`prometheus_url`/
+    /// `tempo_url` are unroutable placeholders this test never touches, and
+    /// `compose` is never invoked.
+    fn faulty_store_ctx(addr: std::net::SocketAddr) -> Ctx {
+        let fake_url = format!("http://{addr}");
+        Ctx {
+            http: reqwest::Client::new(),
+            base_url: fake_url.clone(),
+            collector_url: "http://127.0.0.1:1".to_string(),
+            prometheus_url: "http://127.0.0.1:1".to_string(),
+            tempo_url: "http://127.0.0.1:1".to_string(),
+            loki_url: fake_url,
+            variant: crate::scenarios::Variant::Single,
+            fixtures_dir: crate::engine::workspace_root().join("test/fixtures"),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "sm-retry-guard-test",
+            ),
+        }
+    }
+
+    /// Resolves once `hits` reaches 2 — a replayed body was counted. Never
+    /// resolves under correct code (the terminal arm never resends), so it
+    /// only ever wins the `select!` race below when the mutation under test
+    /// is present.
+    async fn hits_reached_two(hits: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        loop {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The un-deferred retry-differential (issue #102, replaces the FAIL'd
+    /// retro-review's TEST GAP): drives the REAL `push_sm_corpus` against a
+    /// loopback store that deterministically reproduces "server ingested
+    /// the body, then the transport died before the response" — an
+    /// ambiguous post-ingest fault that #105's `classify_push_send` fails
+    /// fast on rather than retries. Proves the lane's actual wiring, not
+    /// just the classifier in isolation (harness.rs:421,451).
+    #[tokio::test]
+    async fn sm_push_lane_cannot_replay_the_corpus_on_an_ambiguous_post_ingest_failure() {
+        let corpus = logs_sm_corpus::generate(&logs_sm_corpus::SmCorpusSpec {
+            base_ns: 1_700_000_000_000_000_000,
+            run_id: "e2e-logs-sm-retry-guard".to_string(),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_task = tokio::spawn(serve_ingest_then_drop(listener, hits.clone()));
+
+        let ctx = faulty_store_ctx(addr);
+
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = push_sm_corpus(&ctx, &corpus) => result,
+                _ = hits_reached_two(&hits) => {
+                    panic!(
+                        "the SM push lane replayed an already-sent body (hits >= 2) — the \
+                         idempotency guard did not hold end-to-end"
+                    );
+                }
+            }
+        })
+        .await
+        .expect("push_sm_corpus (or the replay watchdog) did not resolve within 30s");
+
+        let err = result.expect_err(
+            "an ambiguous post-ingest transport failure must fail the push, not succeed",
+        );
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("idempotency guard, issue #105"),
+            "expected the #105 terminal-arm context in the error chain, got: {chain}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first body of the first store must ever reach the fake store"
+        );
+
+        // Liveness ceiling (plan step 6): a late replay after resolution is
+        // exactly the defect a background/spawned resend would produce. The
+        // accept task MUST stay alive through this window (review fix): if
+        // the listener were dropped before the settle, a late resend would
+        // hit connect-refused instead of being counted, making this exact
+        // assertion vacuous against the stray-background-resend mutation.
+        tokio::time::sleep(COLLECTOR_READY_POLL_INTERVAL * 4).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no late/background resend after the terminal failure (2s settle)"
+        );
+
+        accept_task.abort();
     }
 }
