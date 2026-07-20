@@ -16,7 +16,9 @@ pub use fingerprint::{
     build_metric_buffer, build_stream_buffer, metric_fingerprint, raw_cityhash64,
     stream_fingerprint,
 };
-pub use float_histogram::{Bucket as FloatBucket, FloatHistogram};
+pub use float_histogram::{
+    Bucket as FloatBucket, CombineOp, CombineOutcome, FloatHistogram, FloatHistogramOpError,
+};
 pub use histogram::{
     CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MIN, HistogramColumns,
     HistogramError, NativeHistogram, SampleValue, Span, ValueType,

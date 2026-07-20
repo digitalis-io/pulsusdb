@@ -648,6 +648,99 @@ pub mod messages {
             metric_name,
         )
     }
+
+    /// **Warning** (M7-A5b-ii). Upstream `NewMixedFloatsHistogramsWarning`
+    /// (`annotations.go:254`): a range-vector function's window (or an
+    /// `instantValue`/`irate`/`idelta` last-two-samples pair) contains
+    /// BOTH float and histogram samples. Unlike
+    /// [`histogram_quantile_forced_monotonicity_info`] and friends, the
+    /// pin embeds the metric name unconditionally via raw `%q` (NOT
+    /// `maybeAddMetricName`) — always appended, never omitted for an
+    /// empty name.
+    pub fn mixed_floats_histograms_warning(metric_name: &str) -> String {
+        format!(
+            "PromQL warning: encountered a mix of histograms and floats for metric name {metric_name:?}"
+        )
+    }
+
+    /// **Warning** (M7-A5b-ii). Upstream
+    /// `NewNativeHistogramNotGaugeWarning` (`annotations.go:286`): a
+    /// gauge-expecting function (`delta`/`idelta` — `histogramRate`'s
+    /// `!isCounter` arm, `functions.go:695-697`, and `instantValue`'s
+    /// `!isRate` arm, `:850-853`) received a native histogram whose
+    /// `CounterResetHint` is NOT `GaugeType`. PulsusDB stores no hint
+    /// (A3/OQ2: every decoded histogram is `UnknownCounterReset`, and
+    /// `Unknown != GaugeType`), so under this port the pin's condition is
+    /// unconditionally true — this warning IS reproducible, unlike its
+    /// `NewNativeHistogramNotCounterWarning` counterpart (which fires only
+    /// when a hint IS `GaugeType` — impossible without stored hints) and
+    /// `HistogramCounterResetCollisionWarning` (needs `CounterReset` and
+    /// `NotCounterReset` hints simultaneously). Metric name embedded via
+    /// raw `%q` (`fmt.Errorf("%w %q", …)` — always appended, never
+    /// omitted for an empty name).
+    pub fn native_histogram_not_gauge_warning(metric_name: &str) -> String {
+        format!("PromQL warning: this native histogram metric is not a gauge: {metric_name:?}")
+    }
+
+    /// **Warning** (M7-A5b-ii). Upstream
+    /// `NewMixedExponentialCustomHistogramsWarning` (`annotations.go:299`):
+    /// a `rate`/`increase`/`delta`/`irate`/`idelta` window mixes
+    /// exponential-schema and NHCB (custom-buckets) histograms — this
+    /// port's `combine` `IncompatibleSchema` outcome. (Mismatched custom
+    /// bounds between two NHCB histograms are NOT this warning — they
+    /// reconcile, with [`mismatched_custom_buckets_histograms_info`].)
+    pub fn mixed_exponential_custom_histograms_warning(metric_name: &str) -> String {
+        format!(
+            "PromQL warning: vector contains a mix of histograms with exponential and custom buckets schemas for metric name {metric_name:?}"
+        )
+    }
+
+    /// **Info** (M7-A5b-ii). Upstream `NewHistogramIgnoredInMixedRangeInfo`
+    /// (`annotations.go:412`): a `*_over_time`/`quantile_over_time`/`deriv`
+    /// window contains BOTH floats and histograms — the histograms are
+    /// dropped, the float-only computation proceeds. Fires ONLY on a mixed
+    /// window; a histogram-only window is silent (plan v4 residual A,
+    /// `functions.go:1461,1464`) — the caller's disposition, not this
+    /// constructor's concern. Always embeds the metric name (raw `%q`, not
+    /// `maybeAddMetricName` — same convention as the two constructors
+    /// above).
+    pub fn histogram_ignored_in_mixed_range_info(metric_name: &str) -> String {
+        format!(
+            "PromQL info: ignored histograms in a range containing both floats and histograms for metric name {metric_name:?}"
+        )
+    }
+
+    /// Which histogram operation reconciled mismatched NHCB custom bounds
+    /// — the A5b-ii subset of upstream's `HistogramOperation`
+    /// (`annotations.go:458-464`; `aggregation` joins with A5b-iii's
+    /// `sum`/`avg`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HistogramOperation {
+        Add,
+        Sub,
+    }
+
+    impl HistogramOperation {
+        fn as_str(self) -> &'static str {
+            match self {
+                HistogramOperation::Add => "addition",
+                HistogramOperation::Sub => "subtraction",
+            }
+        }
+    }
+
+    /// **Info** (M7-A5b-ii). Upstream
+    /// `NewMismatchedCustomBucketsHistogramsInfo` (`annotations.go:486`):
+    /// an `Add`/`Sub` between NHCB histograms with MISMATCHED custom
+    /// bounds reconciled them to their intersection (`nhcbBoundsReconciled`
+    /// — `functions.go:672-674,689-691,863-865`). No metric-name suffix —
+    /// the pin renders only the operation.
+    pub fn mismatched_custom_buckets_histograms_info(op: HistogramOperation) -> String {
+        format!(
+            "PromQL info: mismatched custom buckets were reconciled during {}",
+            op.as_str()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -940,6 +1033,68 @@ mod tests {
         assert_eq!(
             messages::bad_bucket_label_warning("my_metric", ""),
             "PromQL warning: bucket label \"le\" is missing or has a malformed value of \"\" for metric name \"my_metric\""
+        );
+    }
+
+    // -- M7-A5b-ii annotation message text --
+
+    #[test]
+    fn mixed_floats_histograms_warning_message_text() {
+        assert_eq!(
+            messages::mixed_floats_histograms_warning("m"),
+            "PromQL warning: encountered a mix of histograms and floats for metric name \"m\""
+        );
+        // Always embedded, even when empty (unlike maybeAddMetricName).
+        assert_eq!(
+            messages::mixed_floats_histograms_warning(""),
+            "PromQL warning: encountered a mix of histograms and floats for metric name \"\""
+        );
+    }
+
+    /// The `native_histograms.test` corpus asserts this exact text
+    /// (`expect warn msg: PromQL warning: this native histogram metric is
+    /// not a gauge: "nhcb_metric"`, `:1323`).
+    #[test]
+    fn native_histogram_not_gauge_warning_message_text() {
+        assert_eq!(
+            messages::native_histogram_not_gauge_warning("nhcb_metric"),
+            "PromQL warning: this native histogram metric is not a gauge: \"nhcb_metric\""
+        );
+        // Raw %q, always appended — an empty name renders as "".
+        assert_eq!(
+            messages::native_histogram_not_gauge_warning(""),
+            "PromQL warning: this native histogram metric is not a gauge: \"\""
+        );
+    }
+
+    #[test]
+    fn mixed_exponential_custom_histograms_warning_message_text() {
+        assert_eq!(
+            messages::mixed_exponential_custom_histograms_warning("m"),
+            "PromQL warning: vector contains a mix of histograms with exponential and custom buckets schemas for metric name \"m\""
+        );
+    }
+
+    #[test]
+    fn histogram_ignored_in_mixed_range_info_message_text() {
+        assert_eq!(
+            messages::histogram_ignored_in_mixed_range_info("m"),
+            "PromQL info: ignored histograms in a range containing both floats and histograms for metric name \"m\""
+        );
+    }
+
+    /// The `native_histograms.test` corpus asserts this exact text
+    /// (`expect info msg: PromQL info: mismatched custom buckets were
+    /// reconciled during subtraction`, `:1369`).
+    #[test]
+    fn mismatched_custom_buckets_histograms_info_message_text() {
+        assert_eq!(
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Sub),
+            "PromQL info: mismatched custom buckets were reconciled during subtraction"
+        );
+        assert_eq!(
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Add),
+            "PromQL info: mismatched custom buckets were reconciled during addition"
         );
     }
 }

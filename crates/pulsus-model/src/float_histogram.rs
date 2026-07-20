@@ -190,6 +190,8 @@ impl FloatHistogram {
     }
 }
 
+include!("float_histogram_ops.rs");
+
 impl NativeHistogram {
     /// Converts the stored integer histogram to its query-time float form
     /// — a lossless (within f64 precision) port of upstream

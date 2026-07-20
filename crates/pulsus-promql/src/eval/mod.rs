@@ -21,6 +21,7 @@ pub mod binop;
 pub mod datetime;
 pub mod elementwise;
 pub mod functions;
+pub mod hist_range_fns;
 pub mod histogram_fns;
 pub(crate) mod info;
 pub mod labels;
@@ -33,8 +34,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use crate::annotations::Annotations;
 use crate::error::PromqlError;
 use crate::plan::{
-    HistogramAccessorFn, MathFn, OverTimeFn, PlanExpr, QueryPlan, RangeSource, ScalarFn,
-    SelectorSpec, SubqueryPlan,
+    HistogramAccessorFn, MathFn, OverTimeFn, OverTimeParamFn, PlanExpr, QueryPlan, RangeSource,
+    ScalarFn, SelectorSpec, SubqueryPlan,
 };
 use crate::value::{InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData};
 
@@ -1412,13 +1413,15 @@ fn windowed_range_source(
             }
         }
     };
-    // M7-A5a: every range/`*_over_time` function is float-only until A5b.
-    // A histogram sample in the window (from a matrix selector or a
-    // subquery source) is rejected here — the single chokepoint for all
-    // four range-function arms — rather than folded into a `0.0` float.
-    for series in &source_view.series {
-        reject_histogram_samples(&series.samples, "a range-vector function")?;
-    }
+    // M7-A5b-ii: the blanket "reject any histogram in the window" guard
+    // that used to live here (M7-A5a) is gone — `rate`/`increase`/`delta`/
+    // `irate`/`idelta`/`resets`/`changes`/the `OverTimeFn` disposition map
+    // now have real histogram semantics (`hist_range_fns`). What remains
+    // out of A5b-ii scope (`sum_over_time`/`avg_over_time`'s KahanAdd
+    // path, `predict_linear`, `double_exponential_smoothing`) keeps
+    // guarding itself explicitly at its own call site below, via
+    // [`reject_histogram_samples`] — this function no longer is a single
+    // shared chokepoint for that.
     Ok(source_view)
 }
 
@@ -1437,6 +1440,29 @@ fn windowed_non_stale(samples: &[Sample], lower_excl: i64, upper_incl: i64) -> V
         .filter(|s| !s.is_stale())
         .cloned()
         .collect()
+}
+
+/// Converts a [`hist_range_fns::RangeValue`] into the `(v, h)` pair
+/// [`InstantSample`] carries — `v: 0.0` for a histogram result (matching
+/// [`crate::value::Sample::hist`]'s convention: `h` disambiguates).
+fn range_value_to_sample_fields(
+    value: hist_range_fns::RangeValue,
+) -> (f64, Option<Box<pulsus_model::FloatHistogram>>) {
+    match value {
+        hist_range_fns::RangeValue::Float(v) => (v, None),
+        hist_range_fns::RangeValue::Histogram(h) => (0.0, Some(Box::new(h))),
+    }
+}
+
+/// Converts a [`hist_range_fns::OverTimeValue`] into the `(v, h)` pair
+/// [`InstantSample`] carries — see [`range_value_to_sample_fields`].
+fn over_time_value_to_sample_fields(
+    value: hist_range_fns::OverTimeValue,
+) -> (f64, Option<Box<pulsus_model::FloatHistogram>>) {
+    match value {
+        hist_range_fns::OverTimeValue::Float(v) => (v, None),
+        hist_range_fns::OverTimeValue::Histogram(h) => (0.0, Some(Box::new(h))),
+    }
 }
 
 /// M7-A5a native-histogram guard error (surfaces as 422 `execution`).
@@ -1659,24 +1685,36 @@ fn eval_step(
         // reads it; the terminal cleanup nulls it. Issue #83: the source
         // may be a subquery — `windowed_range_source` slices its step
         // window from the once-materialized union grid.
+        // M7-A5b-ii: histogram-aware — `hist_range_fns::eval_range_fn_hist`
+        // dispatches float-only windows to the byte-unchanged
+        // `functions::eval_range_fn` internally and adds the native-
+        // histogram `rate`/`increase`/`delta`/`irate` semantics.
         PlanExpr::RangeFn { func, source } => {
             let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms)?;
             let mut out = Vec::new();
             for series in src.series {
-                if let Some(v) = functions::eval_range_fn(
-                    *func,
-                    &series.samples,
-                    src.range_ms,
-                    src.lower_excl,
-                    src.upper_incl,
-                ) {
+                let metric_name = series.metric_name.as_deref().unwrap_or("");
+                let result = {
+                    let mut annos = caches.annotations.borrow_mut();
+                    hist_range_fns::eval_range_fn_hist(
+                        *func,
+                        &series.samples,
+                        src.range_ms,
+                        src.lower_excl,
+                        src.upper_incl,
+                        metric_name,
+                        &mut annos,
+                    )
+                };
+                if let Some(value) = result {
+                    let (v, h) = range_value_to_sample_fields(value);
                     out.push(InstantSample {
                         labels: series.labels,
                         metric_name: series.metric_name,
                         drop_name: true,
                         t_ms,
                         v,
-                        h: None,
+                        h,
                     });
                 }
             }
@@ -1701,7 +1739,37 @@ fn eval_step(
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
             for series in src.series {
-                if let Some(v) = functions::eval_over_time(*func, &series.samples) {
+                // M7-A5b-ii: `sum_over_time`/`avg_over_time` histogram
+                // (KahanAdd) accumulation is deferred out of this item's
+                // scope — kept explicitly 422-guarded, exactly the A5a
+                // behavior, rather than silently dispatching through the
+                // hist-aware map (which asserts unreachable for these two).
+                if matches!(func, OverTimeFn::Sum | OverTimeFn::Avg) {
+                    reject_histogram_samples(&series.samples, "sum_over_time/avg_over_time")?;
+                    if let Some(v) = functions::eval_over_time(*func, &series.samples) {
+                        out.push(InstantSample {
+                            labels: series.labels,
+                            metric_name: series.metric_name,
+                            drop_name: !keeps_name || series.drop_name,
+                            t_ms,
+                            v,
+                            h: None,
+                        });
+                    }
+                    continue;
+                }
+                let metric_name = series.metric_name.as_deref().unwrap_or("");
+                let result = {
+                    let mut annos = caches.annotations.borrow_mut();
+                    hist_range_fns::eval_over_time_hist(
+                        *func,
+                        &series.samples,
+                        metric_name,
+                        &mut annos,
+                    )
+                };
+                if let Some(value) = result {
+                    let (v, h) = over_time_value_to_sample_fields(value);
                     out.push(InstantSample {
                         labels: series.labels,
                         // Retained name always (issue #86: selector
@@ -1717,7 +1785,7 @@ fn eval_step(
                         drop_name: !keeps_name || series.drop_name,
                         t_ms,
                         v,
-                        h: None,
+                        h,
                     });
                 }
             }
@@ -1763,13 +1831,33 @@ fn eval_step(
                 if series.samples.is_empty() {
                     continue;
                 }
-                // `predict_linear`'s regression intercept stays the outer
-                // evaluation STEP time `t_ms` — never the `@`/offset-
-                // shifted window edge (the #67 adjudication; the offset
-                // golden lives in proof/m6_08a_at_subquery.test).
-                if let Some(v) =
+                // M7-A5b-ii: `quantile_over_time` gets the DROP-set
+                // histogram disposition (silent on a histogram-only
+                // window, `HistogramIgnoredInMixedRangeInfo` on a mixed
+                // one); `predict_linear`/`double_exponential_smoothing`
+                // stay out of scope, guarded exactly as A5a left them.
+                let v = if *func == OverTimeParamFn::Quantile {
+                    let metric_name = series.metric_name.as_deref().unwrap_or("");
+                    let mut annos = caches.annotations.borrow_mut();
+                    hist_range_fns::eval_quantile_over_time_hist(
+                        scalars[0],
+                        &series.samples,
+                        metric_name,
+                        &mut annos,
+                    )
+                } else {
+                    reject_histogram_samples(
+                        &series.samples,
+                        "predict_linear/double_exponential_smoothing",
+                    )?;
+                    // `predict_linear`'s regression intercept stays the
+                    // outer evaluation STEP time `t_ms` — never the
+                    // `@`/offset-shifted window edge (the #67
+                    // adjudication; the offset golden lives in
+                    // proof/m6_08a_at_subquery.test).
                     functions::eval_over_time_param(*func, &series.samples, &scalars, t_ms)?
-                {
+                };
+                if let Some(v) = v {
                     out.push(InstantSample {
                         labels: series.labels,
                         // Name-dropping class: retained name + verdict
@@ -2906,11 +2994,27 @@ mod tests {
         assert_histogram_unsupported("up + 1", params(1_000, 1_000, 0));
     }
 
+    /// M7-A5b-ii superseded the A5a blanket reject for `rate`/`increase`/
+    /// `delta`/`irate`: a native-histogram range function now computes a
+    /// real result — never an error, never a fabricated `0.0` float.
     #[test]
-    fn range_function_over_a_histogram_series_errors() {
-        assert_histogram_unsupported("rate(up[5m])", params(1_000, 1_000, 0));
+    fn range_function_over_a_histogram_series_now_computes_a_histogram() {
+        let expr = crate::parser::parse("rate(up[5m])").unwrap();
+        let plan = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        match evaluate(&plan, &histogram_selector_data()) {
+            Ok(QueryValue::Vector(v)) => {
+                assert_eq!(v.len(), 1);
+                assert!(
+                    v[0].h.is_some(),
+                    "rate() over identical histogram samples yields a histogram result, not a fabricated float"
+                );
+            }
+            other => panic!("expected an Ok histogram-valued vector, got {other:?}"),
+        }
     }
 
+    /// `sum_over_time`/`avg_over_time`'s histogram (KahanAdd) path is
+    /// deferred out of A5b-ii scope — still 422-guarded exactly like A5a.
     #[test]
     fn over_time_function_over_a_histogram_series_errors() {
         assert_histogram_unsupported("avg_over_time(up[5m])", params(1_000, 1_000, 0));
