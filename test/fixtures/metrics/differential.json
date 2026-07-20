@@ -1,5 +1,5 @@
 {
-  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan). Issue #82 (M6-05b) adds the `target_info` info-metric family (one series per instance — instance-keyed ONLY, no job, matching the base families' identifying labels; data labels `version`/`env`) plus three `info(...)` entries x 2 modes, growing the pinned matrix 156 -> 162 rows; both compose files' Prometheus oracle gained --enable-feature=promql-experimental-functions for them.",
+  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan). Issue #82 (M6-05b) adds the `target_info` info-metric family (one series per instance — instance-keyed ONLY, no job, matching the base families' identifying labels; data labels `version`/`env`) plus three `info(...)` entries x 2 modes, growing the pinned matrix 156 -> 162 rows; both compose files' Prometheus oracle gained --enable-feature=promql-experimental-functions for them. Issue #83 adds one `max_over_time(...[10s:5s])` subquery entry x 2 modes (162 -> 163 was #88's separate range-only row; 163 -> 165 here), exercising client-side sparse-envelope pruning (the harness's 15s range step exceeds the subquery's own 10s range) against the live Prometheus oracle for value parity.",
   "seed": 424242,
   "step_ms": 15000,
   "sample_count": 40,
@@ -39,6 +39,8 @@
     { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
     { "expr": "sum_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
     { "expr": "count_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+
+    { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[10s:5s])", "modes": ["instant", "range"] },
 
     { "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
     { "expr": "avg without(instance)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },

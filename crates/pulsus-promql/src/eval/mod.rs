@@ -36,8 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::annotations::Annotations;
 use crate::error::PromqlError;
 use crate::plan::{
-    HistogramAccessorFn, MathFn, OverTimeFn, OverTimeParamFn, PlanExpr, QueryPlan, RangeSource,
-    ScalarFn, SelectorSpec, SubqueryPlan,
+    AggOp, HistogramAccessorFn, MathFn, OverTimeFn, OverTimeParamFn, PlanExpr, QueryPlan,
+    RangeSource, ScalarFn, SelectorSpec, SubqueryPlan,
 };
 use crate::value::{
     FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
@@ -194,11 +194,11 @@ fn evaluate_counted_with(
         &plan.root,
         &plan.selectors,
         data,
-        Horizon {
+        StepGrid::Dense(Horizon {
             start_ms: p.start_ms,
             end_ms: p.end_ms,
             step_ms: p.step_ms,
-        },
+        }),
         p.lookback_ms,
         &mut caches,
         &mut counts.inner_evals,
@@ -656,6 +656,89 @@ impl Horizon {
     }
 }
 
+/// The exact evaluation timestamps a subtree will be stepped at (issue
+/// #83 plan v2, sparse subquery envelope pruning): threaded through the
+/// subquery prepare pass (`prepare_subqueries`/`prepare_source`/
+/// `prepare_subquery`/`prepare_info`) so `prepare_subquery` can prune its
+/// own inner materialization to the consumer windows' union instead of
+/// the full envelope.
+#[derive(Debug, Clone, Copy)]
+enum StepGrid<'a> {
+    /// A regular grid, `start..=end` by `step` (`step <= 0` ⇒ a single
+    /// point at `start` — the instant-query shape). The query's own grid
+    /// at the root; a dense (unpruned) subquery's own materialization
+    /// grid.
+    Dense(Horizon),
+    /// A pruned subquery grid: `live` is the ascending, deduped subset of
+    /// `envelope`'s points that lies inside at least one consumer window
+    /// (see [`live_grid_points`]). `envelope` is kept ONLY for anchor
+    /// derivation (`mint_min`/`maxt_max`/`grid_start` in
+    /// [`prepare_subquery`]) — upstream's child-evaluator bounds are
+    /// envelope bounds regardless of any client-side pruning
+    /// (`engine.go:1952-1954` at the pin), so an anchor must never be
+    /// derived from `live`.
+    Sparse { envelope: Horizon, live: &'a [i64] },
+}
+
+impl<'a> StepGrid<'a> {
+    /// The full grid extent — ANCHOR DERIVATION ONLY (see the `Sparse`
+    /// variant's doc); never the set of points actually visited.
+    fn envelope(self) -> Horizon {
+        match self {
+            StepGrid::Dense(h) => h,
+            StepGrid::Sparse { envelope, .. } => envelope,
+        }
+    }
+
+    /// The ascending evaluation points this grid actually visits.
+    fn points(self) -> GridPoints<'a> {
+        match self {
+            StepGrid::Dense(h) => GridPoints::Dense {
+                next: Some(h.start_ms),
+                end_ms: h.end_ms,
+                step_ms: h.step_ms,
+            },
+            StepGrid::Sparse { live, .. } => GridPoints::Sparse(live.iter()),
+        }
+    }
+}
+
+/// [`StepGrid::points`]'s iterator — a plain `while` loop for `Dense`
+/// (zero allocation, byte-identical to the pre-#83-round-2 materialization
+/// loop) or a slice walk for `Sparse`.
+enum GridPoints<'a> {
+    Dense {
+        next: Option<i64>,
+        end_ms: i64,
+        step_ms: i64,
+    },
+    Sparse(std::slice::Iter<'a, i64>),
+}
+
+impl Iterator for GridPoints<'_> {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
+        match self {
+            GridPoints::Dense {
+                next,
+                end_ms,
+                step_ms,
+            } => {
+                let current = (*next)?;
+                *next = if *step_ms <= 0 {
+                    None
+                } else {
+                    let candidate = current + *step_ms;
+                    (candidate <= *end_ms).then_some(candidate)
+                };
+                Some(current)
+            }
+            GridPoints::Sparse(it) => it.next().copied(),
+        }
+    }
+}
+
 /// The first inner-grid timestamp for a subquery window `(mint, maxt]`:
 /// the smallest multiple of `step` STRICTLY GREATER than `mint` — the
 /// epoch-anchored ascending grid (upstream `runSubquery`: `subqStart :=
@@ -677,10 +760,10 @@ fn subquery_grid_start(mint: i64, step: i64) -> i64 {
 
 /// Walks `expr` and materializes every [`RangeSource::Subquery`] node —
 /// children (nested subqueries) first, so each materialization's own
-/// inner evaluations find their nested results already cached. `span` is
-/// the closed `[start, end]` range of evaluation times this node will be
-/// evaluated at (the query's own span at the root; a subquery's grid
-/// extent for its inner expression).
+/// inner evaluations find their nested results already cached. `grid` is
+/// the exact set of evaluation times this node will be stepped at (the
+/// query's own grid at the root; a subquery's own materialization grid —
+/// dense or pruned, issue #83 plan v2 — for its inner expression).
 // Issue #95 threads the step-invariance classifier through the subquery
 // prep recursion (plan-mandated signature), pushing this to 8 params.
 #[allow(clippy::too_many_arguments)]
@@ -688,7 +771,7 @@ fn prepare_subqueries(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
     data: &SeriesData,
-    horizon: Horizon,
+    grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
@@ -705,7 +788,7 @@ fn prepare_subqueries(
             source,
             selectors,
             data,
-            horizon.span(),
+            grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -717,7 +800,7 @@ fn prepare_subqueries(
                     a,
                     selectors,
                     data,
-                    horizon,
+                    grid,
                     lookback_ms,
                     caches,
                     inner_evals,
@@ -728,7 +811,7 @@ fn prepare_subqueries(
                 source,
                 selectors,
                 data,
-                horizon.span(),
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -746,7 +829,7 @@ fn prepare_subqueries(
             arg,
             selectors,
             data,
-            horizon,
+            grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -757,7 +840,7 @@ fn prepare_subqueries(
                 arg,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -770,7 +853,7 @@ fn prepare_subqueries(
                 quantile,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -780,7 +863,7 @@ fn prepare_subqueries(
                 expr,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -791,7 +874,7 @@ fn prepare_subqueries(
             arg,
             selectors,
             data,
-            horizon,
+            grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -802,7 +885,7 @@ fn prepare_subqueries(
                 lower,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -812,7 +895,7 @@ fn prepare_subqueries(
                 upper,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -822,7 +905,7 @@ fn prepare_subqueries(
                 expr,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -835,7 +918,7 @@ fn prepare_subqueries(
                     p,
                     selectors,
                     data,
-                    horizon,
+                    grid,
                     lookback_ms,
                     caches,
                     inner_evals,
@@ -846,7 +929,7 @@ fn prepare_subqueries(
                 expr,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -857,7 +940,7 @@ fn prepare_subqueries(
             expr,
             selectors,
             data,
-            horizon,
+            grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -868,7 +951,7 @@ fn prepare_subqueries(
                 lhs,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -878,7 +961,7 @@ fn prepare_subqueries(
                 rhs,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -892,7 +975,7 @@ fn prepare_subqueries(
                 arg,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
@@ -903,7 +986,7 @@ fn prepare_subqueries(
                     a,
                     selectors,
                     data,
-                    horizon,
+                    grid,
                     lookback_ms,
                     caches,
                     inner_evals,
@@ -918,7 +1001,7 @@ fn prepare_subqueries(
                     a,
                     selectors,
                     data,
-                    horizon,
+                    grid,
                     lookback_ms,
                     caches,
                     inner_evals,
@@ -938,13 +1021,13 @@ fn prepare_subqueries(
                 base,
                 selectors,
                 data,
-                horizon,
+                grid,
                 lookback_ms,
                 caches,
                 inner_evals,
                 classifier,
             )?;
-            prepare_info(expr, selectors, data, horizon, lookback_ms, caches)
+            prepare_info(expr, selectors, data, grid, lookback_ms, caches)
         }
     }
 }
@@ -962,11 +1045,20 @@ fn prepare_subqueries(
 /// selector's fetched series narrowed to the eligible subset ONCE — see
 /// [`PreparedInfo::eligible_info`]'s doc for why this is sound (the
 /// eligibility predicate is purely label-based, never sample-dependent).
+///
+/// Issue #83 plan v2 (edge case 5): `grid` may be a pruned [`StepGrid`]
+/// when this `info()` node sits inside an annotation-free subquery inner
+/// — `base_steps`/`id_lbl_values` are then built from only the LIVE
+/// points, not the full envelope. That is value-exact: eligibility is
+/// purely label-based (never sample-dependent), and the stepping phase
+/// only ever looks up a live point's own `base_steps` entry (never a
+/// pruned gap point's), so narrowing over a subset of steps that
+/// (super)sets every step actually consulted is sound.
 fn prepare_info(
     node: &PlanExpr,
     selectors: &[SelectorSpec],
     data: &SeriesData,
-    horizon: Horizon,
+    grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
 ) -> Result<(), PromqlError> {
@@ -986,8 +1078,7 @@ fn prepare_info(
     let mut base_steps: HashMap<i64, Vec<InstantSample>> = HashMap::new();
     let mut id_lbl_values: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
-    let mut t = horizon.start_ms;
-    loop {
+    for t in grid.points() {
         let StepValue::Vector(v) = eval_step(base, selectors, data, t, lookback_ms, caches)? else {
             // The vendored parser type-checks info()'s first argument as
             // an instant vector; kept total (defense-in-depth).
@@ -1014,13 +1105,6 @@ fn prepare_info(
             }
         }
         base_steps.insert(t, v);
-        // A single step for an instant query (step 0, span.0 == span.1);
-        // the enclosing horizon's own grid otherwise — exactly the steps
-        // the stepping phase will evaluate this node at.
-        if horizon.step_ms <= 0 || t >= horizon.end_ms {
-            break;
-        }
-        t += horizon.step_ms;
     }
 
     // Issue #82 (retroactive re-review, Option B): narrow the
@@ -1076,7 +1160,7 @@ fn prepare_source(
     source: &RangeSource,
     selectors: &[SelectorSpec],
     data: &SeriesData,
-    span: (i64, i64),
+    grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
@@ -1088,7 +1172,7 @@ fn prepare_source(
             sq,
             selectors,
             data,
-            span,
+            grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -1097,12 +1181,19 @@ fn prepare_source(
     }
 }
 
-/// Materializes one subquery over the epoch-anchored ASCENDING union
-/// grid: the union of every outer step's `(mint, maxt]` window over
-/// `span` (a single window when the subquery carries its own `@` — the
-/// anchor is fixed), realized as `{ k·step : k·step > mint_min, k·step ≤
-/// maxt_max }`, each point evaluated exactly once. Recursion depth is
-/// bounded by the planner's `MAX_SUBQUERY_DEPTH` guard.
+/// Materializes one subquery over its own grid: the DENSE epoch-anchored
+/// ASCENDING envelope `{ k·step : k·step > mint_min, k·step ≤ maxt_max }`
+/// (a single window when the subquery carries its own `@` — the anchor is
+/// fixed), or — issue #83 plan v2 — the SPARSE subset of that envelope
+/// actually consumed by `grid` (the consumer's own evaluation-time set),
+/// whenever pruning to it cannot drop a Prometheus-visible annotation
+/// (see [`expr_may_annotate`]). `mint_min`/`maxt_max`/`grid_start` are
+/// always derived from `grid.envelope()`, NEVER from `grid`'s live
+/// points — upstream's child-evaluator bounds are envelope bounds
+/// regardless of any client-side pruning (`engine.go:1952-1954,1981-1986`
+/// at the pin), and the aggregate-param quirk (issue #88) makes the
+/// freeze anchor value-bearing. Recursion depth is bounded by the
+/// planner's `MAX_SUBQUERY_DEPTH` guard.
 ///
 /// Issue #95: after the inside-out `prepare_subqueries` recursion and
 /// before the grid loop, [`prepare_step_invariant`] freezes the highest
@@ -1116,15 +1207,16 @@ fn prepare_subquery(
     sq: &SubqueryPlan,
     selectors: &[SelectorSpec],
     data: &SeriesData,
-    span: (i64, i64),
+    grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
     inner_evals: &mut u64,
     classifier: &mut crate::plan::StepInvariance<'_>,
 ) -> Result<(), PromqlError> {
+    let envelope = grid.envelope();
     let (anchor_min, anchor_max) = match sq.at_ms {
         Some(at) => (at, at),
-        None => span,
+        None => envelope.span(),
     };
     let maxt_max = anchor_max - sq.offset_ms;
     let mint_min = anchor_min - sq.offset_ms - sq.range_ms;
@@ -1135,21 +1227,41 @@ fn prepare_subquery(
     // accumulator's (issue #86 plan v2 Δ1 — see `MaterializedSeries`).
     let mut acc: BTreeMap<SeriesIdentity, (bool, Vec<Sample>)> = BTreeMap::new();
     if grid_start <= maxt_max {
+        // Issue #83 plan v2 (codex Q1 ruling): prune to the consumer
+        // windows' union ONLY when `sq.inner` is provably annotation-free
+        // — a capable inner keeps the FULL envelope exactly as before
+        // #83, because a gap point it would otherwise skip can carry a
+        // Prometheus-visible warning/info this materialization is the
+        // only place that ever observes.
+        let live: Option<Vec<i64>> = if expr_may_annotate(&sq.inner) {
+            None
+        } else {
+            live_grid_points(sq, grid, mint_min, maxt_max)
+        };
+
         // Children first (inside-out): the inner expression's own nested
         // subqueries must be materialized before it can be evaluated. Its
-        // evaluation span is exactly this grid's extent.
+        // own grid is this one (dense envelope, or the pruned live set —
+        // nested subqueries AND any nested info() nodes are evaluated on
+        // it, so pruning compounds inside-out).
         let grid_last = maxt_max - (maxt_max - grid_start).rem_euclid(sq.step_ms);
+        let inner_envelope = Horizon {
+            start_ms: grid_start,
+            end_ms: grid_last,
+            step_ms: sq.step_ms,
+        };
+        let inner_grid = match live.as_deref() {
+            Some(pts) => StepGrid::Sparse {
+                envelope: inner_envelope,
+                live: pts,
+            },
+            None => StepGrid::Dense(inner_envelope),
+        };
         prepare_subqueries(
             &sq.inner,
             selectors,
             data,
-            // The inner horizon's own grid: nested subqueries AND any
-            // nested info() nodes are evaluated on it.
-            Horizon {
-                start_ms: grid_start,
-                end_ms: grid_last,
-                step_ms: sq.step_ms,
-            },
+            inner_grid,
             lookback_ms,
             caches,
             inner_evals,
@@ -1177,8 +1289,12 @@ fn prepare_subquery(
             classifier,
         )?;
 
-        let mut it = grid_start;
-        while it <= maxt_max {
+        // Issue #83 plan v2: `inner_grid.points()` visits the DENSE
+        // envelope byte-identically to the pre-#83-round-2 `while it <=
+        // maxt_max { …; it += sq.step_ms }` loop when `live` is `None`
+        // (zero allocation — see `GridPoints::Dense`), or only the pruned
+        // live points when `Some`.
+        for it in inner_grid.points() {
             // Issue #93: one `Relaxed` load per grid point, mirroring the
             // outer range-step checkpoint above.
             if caches.cancel.is_cancelled() {
@@ -1207,7 +1323,6 @@ fn prepare_subquery(
                     });
                 }
             }
-            it += sq.step_ms;
         }
     }
 
@@ -1229,6 +1344,231 @@ fn prepare_subquery(
         .subqueries
         .insert(sq as *const _, MaterializedSubquery { series });
     Ok(())
+}
+
+/// Union of consumer windows on the subquery's own epoch grid (issue #83
+/// plan v2). Per consumer evaluation time `t` (ascending, from `consumer
+/// .points()`): `eff_t = sq.at_ms.unwrap_or(t) − sq.offset_ms`, window
+/// `(eff_t − sq.range_ms, eff_t]` — the EXACT arithmetic
+/// `windowed_range_source` slices with. Emits every step-multiple inside
+/// at least one such window, sorted ascending and unique BY CONSTRUCTION
+/// (code review [medium]): the consumer points are ascending and the
+/// offset is constant, so the windows are pre-sorted — a single
+/// monotonic grid cursor resumes each overlapping window just past the
+/// last emitted point, pushing every union point exactly once. No
+/// duplicate ever enters the buffer and there is no sort/dedup pass, so
+/// the work is `O(|consumer points| + |union|)`, never
+/// `O(|consumer points| × points-per-window)`
+/// (`tests::live_grid_points_with_heavily_overlapping_windows_emits_each_point_once`).
+///
+/// Returns `None` when pruning cannot help (the caller then iterates the
+/// full envelope, unpruned): `sq.at_ms.is_some()` (a single fixed window
+/// already equals the envelope), or a [`StepGrid::Dense`] consumer whose
+/// step is `<= sq.range_ms` (its windows overlap or touch end-to-end, so
+/// their union IS the envelope — the common non-sparse case, kept on
+/// today's zero-allocation loop).
+fn live_grid_points(
+    sq: &SubqueryPlan,
+    consumer: StepGrid<'_>,
+    mint_min: i64,
+    maxt_max: i64,
+) -> Option<Vec<i64>> {
+    if sq.at_ms.is_some() {
+        return None;
+    }
+    if let StepGrid::Dense(h) = consumer
+        && h.step_ms <= sq.range_ms
+    {
+        return None;
+    }
+    let mut live: Vec<i64> = Vec::new();
+    let mut prev_eff_t: Option<i64> = None;
+    for t in consumer.points() {
+        // `sq.at_ms` is `None` on this path (checked above).
+        let eff_t = t - sq.offset_ms;
+        let lower_excl = eff_t - sq.range_ms;
+        debug_assert!(
+            lower_excl >= mint_min && eff_t <= maxt_max,
+            "every consumer window must lie within the caller's envelope-derived bounds \
+             (`mint_min`/`maxt_max`) — a violation means `grid`/`consumer` diverged from the \
+             envelope this call's `mint_min`/`maxt_max` were computed against"
+        );
+        // The cursor's soundness contract: ascending consumer points
+        // (both `GridPoints` arms are ascending by construction).
+        debug_assert!(
+            prev_eff_t.is_none_or(|prev| prev < eff_t),
+            "consumer points must be strictly ascending for the monotonic cursor to be a union"
+        );
+        prev_eff_t = Some(eff_t);
+        // First candidate in THIS window, clamped past the last emitted
+        // point when the window overlaps its predecessor. Both operands
+        // are multiples of `sq.step_ms` on the same epoch grid, so the
+        // max stays grid-aligned.
+        let mut p = subquery_grid_start(lower_excl, sq.step_ms);
+        if let Some(&last) = live.last() {
+            p = p.max(last + sq.step_ms);
+        }
+        while p <= eff_t {
+            live.push(p);
+            p += sq.step_ms;
+        }
+    }
+    Some(live)
+}
+
+// ---------------------------------------------------------------------------
+// Annotation-capability analysis (issue #83 plan v2, codex Q1 ruling)
+// ---------------------------------------------------------------------------
+
+/// CONSERVATIVE static annotation-capability analysis: `true` iff `expr`
+/// MAY emit a warning/info [`Annotations`] entry on SOME data. Purely
+/// structural — never inspects a sample. [`prepare_subquery`] retains the
+/// full envelope (never prunes to the consumer windows' union) whenever
+/// this returns `true` for a subquery's inner, because a gap point the
+/// pruned grid would skip can be the ONLY place an annotation-capable
+/// arm ever sees the data that triggers it.
+///
+/// Exhaustive match, no wildcard arm: a new [`PlanExpr`] variant is a
+/// compile error here, forcing a conscious classification. Any future
+/// change that adds an annotation emission site (a `caches.annotations`/
+/// `&mut Annotations` access) to an evaluator arm currently classified
+/// FREE below MUST move that shape to the CAPABLE side — this is a
+/// standing obligation of that change, not merely a suggestion.
+///
+/// Emission-site inventory this whitelist is verified against (plan
+/// review round 2, comment 5024575855): `eval/mod.rs:1659-1685,1803-
+/// 1813,1853-1861,1935-1957,2167-2220,2364-2366,2718-2754`,
+/// `aggregation.rs:238-349,407-454,571-576,624-626`,
+/// `hist_range_fns.rs:64-65,143-177,227-311,492-520,625-629,705-706,780-
+/// 782`, `histogram_fns.rs:110-115,128-136,262-270`, `binop.rs:111-254`.
+/// No other evaluator module (`elementwise.rs`/`datetime.rs`/`labels.rs`/
+/// `info.rs`/`staleness.rs`/`quote.rs`/`functions.rs`) touches the sink.
+fn expr_may_annotate(expr: &PlanExpr) -> bool {
+    match expr {
+        // FREE leaves — no evaluator arm here ever touches the sink.
+        PlanExpr::Selector(_)
+        | PlanExpr::Scalar(_)
+        | PlanExpr::StringLiteral(_)
+        | PlanExpr::Time => false,
+
+        // CAPABLE unconditionally: `rate`/`irate`/`increase`/`delta` all
+        // carry mixed-floats/not-gauge/mixed-schema warnings and NHCB
+        // reconcile infos (`hist_range_fns.rs:65-311`).
+        PlanExpr::RangeFn { .. } => true,
+
+        PlanExpr::OverTime { func, source } => {
+            over_time_fn_may_annotate(*func) || range_source_may_annotate(source)
+        }
+        // CAPABLE unconditionally: quantile/predict_linear/
+        // double_exponential_smoothing all carry
+        // `HistogramIgnoredInMixedRangeInfo` (`hist_range_fns.rs:706-781`).
+        PlanExpr::OverTimeParam { .. } => true,
+        PlanExpr::AbsentOverTime { source } => range_source_may_annotate(source),
+        PlanExpr::Absent { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::Sort { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::SortByLabel { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::LabelReplace { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::LabelJoin { arg, .. } => expr_may_annotate(arg),
+        // CAPABLE unconditionally: partition warnings, invalid-φ and
+        // NaN-observation infos, forced monotonicity (`histogram_fns.rs`).
+        PlanExpr::HistogramQuantile { .. } => true,
+        // FREE own shape (pure accessors, no sink access — `mod.rs:2240-
+        // 2266`), recurse into `arg`.
+        PlanExpr::HistogramAccessor { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::HistogramFraction { .. } => true,
+        PlanExpr::Aggregate {
+            op, expr, param, ..
+        } => {
+            agg_op_may_annotate(*op)
+                || expr_may_annotate(expr)
+                || param.as_deref().is_some_and(expr_may_annotate)
+        }
+        // FREE own shape (`aggregation.rs:741-810`, no `annos` param),
+        // recurse into `expr`.
+        PlanExpr::CountValues { expr, .. } => expr_may_annotate(expr),
+        // CAPABLE unconditionally: the incompatible-types info fires for
+        // ANY operator the moment one operand sample is a histogram
+        // (`binop.rs:112-230`).
+        PlanExpr::Binary { .. } => true,
+        // FREE own shape (verbatim passthrough, `binop.rs:403-430`, no
+        // `annos` param), recurse into both operands.
+        PlanExpr::SetOp { lhs, rhs, .. } => expr_may_annotate(lhs) || expr_may_annotate(rhs),
+        PlanExpr::MathFn {
+            arg, scalar_args, ..
+        } => expr_may_annotate(arg) || scalar_args.iter().any(|a| expr_may_annotate(a)),
+        PlanExpr::ScalarFn { args, .. } => args.iter().any(|a| expr_may_annotate(a)),
+        PlanExpr::DateFn { arg, .. } => arg.as_deref().is_some_and(expr_may_annotate),
+        PlanExpr::Timestamp { arg, .. } => expr_may_annotate(arg),
+        PlanExpr::ScalarOf { arg } => expr_may_annotate(arg),
+        PlanExpr::VectorOf { arg } => expr_may_annotate(arg),
+        // FREE own shape (`info.rs` has no emission site), recurse into
+        // `base`.
+        PlanExpr::Info { base, .. } => expr_may_annotate(base),
+    }
+}
+
+/// [`expr_may_annotate`]'s [`RangeSource`] half: a bare selector is
+/// always FREE; a subquery source recurses into its own inner — the
+/// nested-subquery-poisons-ancestors case (a capable node anywhere
+/// beneath a subquery inner makes every enclosing subquery capable too).
+fn range_source_may_annotate(source: &RangeSource) -> bool {
+    match source {
+        RangeSource::Selector(_) => false,
+        RangeSource::Subquery(sq) => expr_may_annotate(&sq.inner),
+    }
+}
+
+/// [`expr_may_annotate`]'s [`OverTimeFn`] half (`hist_range_fns.rs:417-
+/// 455` dispositions): CAPABLE = {`Sum`, `Avg`, `Min`, `Max`, `Stddev`,
+/// `Stdvar`, `Mad`, `Deriv`, `TsOfMin`, `TsOfMax`, `Idelta`} (drop-set
+/// info / mixed-agg warn / `instant_value_hist`); FREE = {`Last`,
+/// `First`, `Count`, `Present`, `Resets`, `Changes`, `TsOfFirst`,
+/// `TsOfLast`} (pure, no `annos` access).
+fn over_time_fn_may_annotate(f: OverTimeFn) -> bool {
+    match f {
+        OverTimeFn::Sum
+        | OverTimeFn::Avg
+        | OverTimeFn::Min
+        | OverTimeFn::Max
+        | OverTimeFn::Stddev
+        | OverTimeFn::Stdvar
+        | OverTimeFn::Mad
+        | OverTimeFn::Deriv
+        | OverTimeFn::TsOfMin
+        | OverTimeFn::TsOfMax
+        | OverTimeFn::Idelta => true,
+        OverTimeFn::Last
+        | OverTimeFn::First
+        | OverTimeFn::Count
+        | OverTimeFn::Present
+        | OverTimeFn::Resets
+        | OverTimeFn::Changes
+        | OverTimeFn::TsOfFirst
+        | OverTimeFn::TsOfLast => false,
+    }
+}
+
+/// [`expr_may_annotate`]'s [`AggOp`] half (`aggregation.rs:250-454,572,
+/// 625`): CAPABLE = {`Sum`, `Avg`, `Min`, `Max`, `Stddev`, `Stdvar`,
+/// `Quantile`, `Topk`, `Bottomk`} plus `LimitRatio` (pre-emptively
+/// conservative — experimental, upstream carries a ratio-validation
+/// warning surface not yet ported; costs nothing since it is already
+/// experimental-gated); FREE = {`Count`, `Group`, `LimitK`} (no `annos`
+/// access at all — `aggregation.rs:438-442,681-726`).
+fn agg_op_may_annotate(op: AggOp) -> bool {
+    match op {
+        AggOp::Sum
+        | AggOp::Avg
+        | AggOp::Min
+        | AggOp::Max
+        | AggOp::Stddev
+        | AggOp::Stdvar
+        | AggOp::Quantile
+        | AggOp::Topk
+        | AggOp::Bottomk
+        | AggOp::LimitRatio => true,
+        AggOp::Count | AggOp::Group | AggOp::LimitK => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5266,6 +5606,563 @@ mod tests {
         assert_eq!(v[0].v, 3.0, "three inner windows of one 1.0 sample each");
     }
 
+    // -----------------------------------------------------------------
+    // Issue #83 plan v2: annotation-capability-aware sparse envelope
+    // pruning.
+    // -----------------------------------------------------------------
+
+    /// AC2: a sparse outer range whose step (600s) far exceeds the
+    /// subquery's own range (30s) prunes the inner materialization to
+    /// the DISCRETE UNION of the seven disjoint `(t−30s, t]` windows (21
+    /// points) — never the 363-point envelope this same query would
+    /// materialize on a capable inner (see the gap-annotation regression
+    /// below). `up` is FREE (a bare selector), so pruning fires.
+    #[test]
+    fn sparse_subqueries_materialize_only_the_window_union() {
+        let expr = crate::parser::parse("sum_over_time(up[30s:10s])").unwrap();
+        let p = plan(&expr, params(0, 3_600_000, 600_000)).unwrap();
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=360).map(|k| s(k * 10_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+        let (value, counts, annotations) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.inner_evals, 21,
+            "seven disjoint 3-point windows, deduped and unioned — never the 363-point envelope"
+        );
+        assert!(
+            annotations.is_empty(),
+            "a free (bare-selector) inner emits nothing regardless of pruning"
+        );
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].points,
+            vec![
+                (0, 1.0),
+                (600_000, 3.0),
+                (1_200_000, 3.0),
+                (1_800_000, 3.0),
+                (2_400_000, 3.0),
+                (3_000_000, 3.0),
+                (3_600_000, 3.0),
+            ]
+        );
+    }
+
+    /// AC2 (materialized-length half): the per-series materialized
+    /// sample count is exactly the live points that resolve to a real
+    /// sample — 19, not 21. Two of the union's 21 grid points (the first
+    /// window's `−20s`/`−10s`, both before `up`'s earliest real sample at
+    /// `0s`) evaluate to an empty vector and contribute nothing to the
+    /// accumulator, even though they still count as one `eval_step` each
+    /// (`inner_evals` stays 21 — proven by the sibling test above).
+    #[test]
+    fn sparse_subquery_materialized_length_matches_live_points_with_data() {
+        let expr = crate::parser::parse("sum_over_time(up[30s:10s])").unwrap();
+        let p = plan(&expr, params(0, 3_600_000, 600_000)).unwrap();
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=360).map(|k| s(k * 10_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+
+        let PlanExpr::OverTime {
+            source: RangeSource::Subquery(sq),
+            ..
+        } = &p.root
+        else {
+            panic!("expected an OverTime node over a subquery source");
+        };
+        let mut caches = EvalCaches::default();
+        let mut inner_evals = 0u64;
+        let mut classifier = crate::plan::StepInvariance::new(&p.selectors);
+        prepare_subqueries(
+            &p.root,
+            &p.selectors,
+            &data,
+            StepGrid::Dense(Horizon {
+                start_ms: p.params.start_ms,
+                end_ms: p.params.end_ms,
+                step_ms: p.params.step_ms,
+            }),
+            p.params.lookback_ms,
+            &mut caches,
+            &mut inner_evals,
+            &mut classifier,
+        )
+        .unwrap();
+        let materialized = caches.subqueries.get(&(sq.as_ref() as *const _)).unwrap();
+        assert_eq!(materialized.series.len(), 1);
+        assert_eq!(
+            materialized.series[0].samples.len(),
+            19,
+            "21 live points minus the 2 pre-data gap points (−20s, −10s) in the first window"
+        );
+    }
+
+    /// AC3: nested pruning compounds inside-out. The outer subquery
+    /// prunes to its own window union (driven by the query's 3 steps),
+    /// and that pruned live set becomes the INNER subquery's consumer
+    /// grid, so the inner prunes too instead of falling back to its own
+    /// envelope (a `Sparse` consumer never gets the dense short-circuit —
+    /// only a `Dense` one with `step ≤ range` does).
+    #[test]
+    fn nested_sparse_subqueries_compound_pruning() {
+        let expr =
+            crate::parser::parse("count_over_time(count_over_time(up[10s:10s])[20s:10s])").unwrap();
+        let p = plan(&expr, params(0, 1_200_000, 600_000)).unwrap();
+        let mut data = SeriesData::new();
+        // Dense 10s-spaced coverage from −10s through 1210s — every live
+        // point either subquery ever visits falls inside this range.
+        let samples: Vec<Sample> = (-1..=121).map(|k| s(k * 10_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
+        // Outer subquery (range=20s, step=10s): consumer = the query's 3
+        // steps {0, 600, 1200}s; each window `(t−20s, t]` holds 2 grid
+        // points, all six distinct ⇒ 6 outer live points. Those 6 points
+        // become the inner subquery's (range=10s, step=10s) consumer
+        // grid; each window degenerates to exactly the consumer point
+        // itself ⇒ 6 inner live points too. Total: 6 + 6 = 12 — the full
+        // envelope is ≈244 points.
+        assert_eq!(counts.inner_evals, 12);
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].points,
+            vec![(0, 2.0), (600_000, 2.0), (1_200_000, 2.0)]
+        );
+    }
+
+    /// AC4: an `@`-fixed subquery is a single window — its envelope IS
+    /// the union, so [`live_grid_points`] returns `None` (`sq.at_ms
+    /// .is_some()`) and the full `[100s:1s] @ 100` grid (100 points)
+    /// materializes exactly as before #83's round-2 amendment.
+    #[test]
+    fn at_fixed_subquery_grid_is_never_pruned() {
+        let expr = crate::parser::parse("sum_over_time(metric[100s:1s] @ 100)").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (0..=100).map(|k| s(k * 1_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[], samples)]);
+        let (_value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
+        assert_eq!(
+            counts.inner_evals, 100,
+            "a single @-fixed window is its own full envelope — never pruned"
+        );
+    }
+
+    /// AC6 (codex Q1 ruling; task-manager precision note, comment
+    /// 5024580850): `(up + 1)`'s `Binary` root makes the inner
+    /// unconditionally CAPABLE, so `prepare_subquery` retains the FULL
+    /// envelope (363 points — the same envelope
+    /// `sparse_subqueries_materialize_only_the_window_union`'s FREE `up`
+    /// inner prunes to 21) even though every actual OUTPUT window is
+    /// disjoint from the one histogram sample at `t=100s`. That gap
+    /// point is evaluated anyway, and its
+    /// `incompatible_types_in_binop_info` annotation surfaces in the
+    /// response — proof the capability gate, not merely a comment, is
+    /// what still forces the full-envelope evaluation. Values are
+    /// asserted against an EXPLICIT full-envelope reference (hand-derived
+    /// from the window arithmetic, not "identical to the free-inner
+    /// `up`-only control" — `(up+1) != up`).
+    #[test]
+    fn capable_subquery_inner_keeps_the_envelope_and_the_gap_annotation_surfaces() {
+        let expr = crate::parser::parse("sum_over_time((up + 1)[30s:10s])").unwrap();
+        let p = plan(&expr, params(0, 3_600_000, 600_000)).unwrap();
+        let mut data = SeriesData::new();
+        let mut samples: Vec<Sample> = (0..=360).map(|k| s(k * 10_000, 1.0)).collect();
+        // A lone native-histogram sample at t=100s — a GAP point: 100s
+        // lies outside every consumer window `(t−30s, t]` for t ∈ {0,
+        // 600, …, 3600}s (the nearest window edges are 0s and 570s).
+        let gap_idx = samples
+            .iter()
+            .position(|s| s.t_ms == 100_000)
+            .expect("100s is one of the 10s-spaced grid points");
+        samples[gap_idx] = Sample::hist(100_000, single_histogram().to_float());
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+
+        let (value, counts, annotations) = evaluate_counted(&p, &data).unwrap();
+        // (a) Full envelope retained.
+        assert_eq!(counts.inner_evals, 363);
+        // (b) The gap-point annotation surfaces exactly as the capable
+        // `Binary` arm emits it.
+        let (_warnings, infos) = annotations.base_messages();
+        assert!(
+            infos.iter().any(|m| m
+                == &crate::annotations::messages::incompatible_types_in_binop_info(
+                    "histogram",
+                    "+",
+                    "float"
+                )),
+            "the gap-point histogram+scalar info must survive pruning: {infos:?}"
+        );
+        // (c) Values match an EXPLICIT full-envelope reference: `up`'s
+        // all-float shape sums to `2 * (element count)` per window under
+        // `+1` — the gap point at 100s never falls in ANY window, so its
+        // type has zero effect on any value.
+        let QueryValue::Matrix(m) = value else {
+            panic!("expected Matrix");
+        };
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].points,
+            vec![
+                (0, 2.0),
+                (600_000, 6.0),
+                (1_200_000, 6.0),
+                (1_800_000, 6.0),
+                (2_400_000, 6.0),
+                (3_000_000, 6.0),
+                (3_600_000, 6.0),
+            ]
+        );
+    }
+
+    /// AC7 (predicate unit tests): `expr_may_annotate` false for the
+    /// plan's own worked FREE examples.
+    #[test]
+    fn expr_may_annotate_is_false_for_the_plans_free_worked_examples() {
+        for q in [
+            "up",
+            "count_over_time(up[10s:10s])",
+            "label_replace(up, \"x\", \"$1\", \"job\", \"(.*)\")",
+            "abs(up)",
+        ] {
+            let expr = crate::parser::parse(q).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            assert!(!expr_may_annotate(&p.root), "{q:?} must classify FREE");
+        }
+    }
+
+    /// AC7: `expr_may_annotate` true for the plan's own worked CAPABLE
+    /// examples, including the nested-subquery-poisons-ancestors case
+    /// (`count_over_time`'s own func is FREE, but its subquery inner
+    /// wraps a capable `rate`).
+    #[test]
+    fn expr_may_annotate_is_true_for_the_plans_capable_worked_examples() {
+        for q in [
+            "rate(up[1m])",
+            "up + 1",
+            "up > 0",
+            "sum(up)",
+            "histogram_quantile(0.9, up)",
+            "count_over_time(rate(up[1m])[10s:10s])",
+        ] {
+            let expr = crate::parser::parse(q).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            assert!(expr_may_annotate(&p.root), "{q:?} must classify CAPABLE");
+        }
+    }
+
+    /// AC7: a capable grandchild under a FREE parent poisons the whole
+    /// tree — `sort()` (FREE) wrapping `rate()` (CAPABLE) must classify
+    /// CAPABLE, and the reverse (`rate()` wrapping nothing capable stays
+    /// CAPABLE regardless) is covered above.
+    #[test]
+    fn a_capable_grandchild_poisons_a_free_ancestor() {
+        let expr = crate::parser::parse("sort(rate(up[1m]))").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        assert!(expr_may_annotate(&p.root));
+    }
+
+    /// AC8 (adversarial whitelist tripwire — the empirical backstop for
+    /// the static predicate): every FREE shape, evaluated over data
+    /// mixing floats, an exponential-schema histogram, a custom-buckets
+    /// (NHCB) histogram, a NaN-sum histogram, and a "malformed" classic-
+    /// bucket-shaped series (`le` label with a non-numeric value), yields
+    /// EMPTY [`Annotations`]. A future change that adds data-dependent
+    /// emission to one of these paths without updating the predicate
+    /// would still need to move the shape here to CAPABLE — this is the
+    /// runtime half of that obligation.
+    #[test]
+    fn every_free_shape_over_adversarial_data_emits_no_annotations() {
+        let nhcb = pulsus_model::FloatHistogram {
+            schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 3.0,
+            sum: 6.0,
+            positive_spans: vec![Span {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            positive_buckets: vec![3.0],
+            negative_buckets: vec![],
+            custom_values: vec![1.0, 5.0, 10.0],
+        };
+        let nan_sum = pulsus_model::FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: f64::NAN,
+            sum: f64::NAN,
+            positive_spans: vec![Span {
+                offset: 0,
+                length: 1,
+            }],
+            negative_spans: vec![],
+            positive_buckets: vec![1.0],
+            negative_buckets: vec![],
+            custom_values: vec![],
+        };
+
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(
+                    1,
+                    &[("job", "a")],
+                    vec![
+                        s(1_000, 5.0),
+                        Sample::hist(2_000, single_histogram().to_float()),
+                        Sample::hist(3_000, nhcb),
+                        Sample::hist(4_000, nan_sum),
+                        s(5_000, 7.0),
+                    ],
+                ),
+                // A "malformed" classic-bucket-shaped series: an `le`
+                // label whose value never parses as a bucket boundary.
+                // None of the FREE shapes below ever interpret `le`
+                // specially (only `histogram_quantile`'s classic-bucket
+                // reconstruction does, and that shape is CAPABLE).
+                series(
+                    2,
+                    &[("job", "a"), ("le", "not-a-number")],
+                    vec![s(1_000, 1.0), s(3_000, 2.0), s(5_000, 3.0)],
+                ),
+            ],
+        );
+
+        let queries = [
+            "m{job=\"a\"}",
+            "5",
+            "time()",
+            "vector(time())",
+            "last_over_time(m{job=\"a\"}[10s])",
+            "count_over_time(m{job=\"a\"}[10s])",
+            "present_over_time(m{job=\"a\"}[10s])",
+            "resets(m{job=\"a\"}[10s])",
+            "changes(m{job=\"a\"}[10s])",
+            "absent_over_time(nonexistent{job=\"a\"}[10s])",
+            "absent(nonexistent{job=\"a\"})",
+            "count(m{job=\"a\"})",
+            "group(m{job=\"a\"})",
+            "count_values(\"v\", m{job=\"a\"})",
+            "m{job=\"a\"} and m{job=\"a\"}",
+            "abs(m{job=\"a\"})",
+            "pi()",
+            "year(m{job=\"a\"})",
+            "timestamp(m{job=\"a\"})",
+            "scalar(m{job=\"a\"})",
+            "vector(5)",
+            "sort(m{job=\"a\"})",
+            "label_replace(m{job=\"a\"}, \"x\", \"$1\", \"job\", \"(.*)\")",
+            "label_join(m{job=\"a\"}, \"x\", \"-\", \"job\")",
+            "histogram_count(m{job=\"a\"})",
+            "histogram_sum(m{job=\"a\"})",
+            "histogram_avg(m{job=\"a\"})",
+        ];
+        for q in queries {
+            let expr = crate::parser::parse(q).unwrap();
+            let p = plan(&expr, params(0, 5_000, 0)).unwrap();
+            assert!(!expr_may_annotate(&p.root), "{q:?} must classify FREE");
+            let (_value, annotations) = super::evaluate(&p, &data).unwrap();
+            assert!(
+                annotations.is_empty(),
+                "{q:?} emitted annotations over adversarial data: {annotations:?}"
+            );
+        }
+    }
+
+    /// AC9 / edge case 4: a `Sparse` consumer with an EMPTY live set
+    /// (reachable when an enclosing subquery's own pruning yields zero
+    /// points) still inserts a materialized cache entry — the
+    /// `windowed_range_source` invariant ("`prepare_subqueries`
+    /// materializes every subquery before stepping") tolerates no
+    /// exceptions, even for a subquery whose own grid never gets a
+    /// single live point.
+    #[test]
+    fn a_sparse_consumer_with_no_live_points_still_inserts_an_empty_cache_entry() {
+        let expr = crate::parser::parse("sum_over_time(up[10s:10s])").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let PlanExpr::OverTime {
+            source: RangeSource::Subquery(sq),
+            ..
+        } = &p.root
+        else {
+            panic!("expected an OverTime node over a subquery source");
+        };
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]);
+        let mut caches = EvalCaches::default();
+        let mut inner_evals = 0u64;
+        let mut classifier = crate::plan::StepInvariance::new(&p.selectors);
+        prepare_subquery(
+            sq,
+            &p.selectors,
+            &data,
+            StepGrid::Sparse {
+                envelope: Horizon {
+                    start_ms: 0,
+                    end_ms: 100_000,
+                    step_ms: 10_000,
+                },
+                live: &[],
+            },
+            p.params.lookback_ms,
+            &mut caches,
+            &mut inner_evals,
+            &mut classifier,
+        )
+        .unwrap();
+        assert_eq!(
+            inner_evals, 0,
+            "no consumer points ⇒ no grid points to evaluate"
+        );
+        let materialized = caches
+            .subqueries
+            .get(&(sq.as_ref() as *const _))
+            .expect("the cache entry invariant holds even for an empty live grid");
+        assert!(materialized.series.is_empty());
+    }
+
+    /// Edge case 2: `mint_min`/`maxt_max`/`grid_start` must derive from
+    /// the CONSUMER's envelope, never from its (possibly pruned) live
+    /// set — upstream's child-evaluator bounds are envelope bounds
+    /// regardless of any client-side pruning. `(m + 0)` is `Binary` ⇒
+    /// CAPABLE ⇒ never pruned, so the materialization loop always walks
+    /// the DENSE, envelope-derived grid and its first point directly
+    /// reveals `grid_start`. A `live[0]`-derived anchor bug would instead
+    /// materialize starting at `5000`, not `4000`.
+    #[test]
+    fn subquery_anchors_derive_from_the_envelope_not_the_live_set() {
+        let expr = crate::parser::parse("sum_over_time((m{job=\"a\"} + 0)[1s:1s])").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let PlanExpr::OverTime {
+            source: RangeSource::Subquery(sq),
+            ..
+        } = &p.root
+        else {
+            panic!("expected an OverTime node over a subquery source");
+        };
+        let mut data = SeriesData::new();
+        let samples: Vec<Sample> = (3..=9).map(|k| s(k * 1_000, 1.0)).collect();
+        data.insert(0, vec![series(1, &[("job", "a")], samples)]);
+
+        let envelope = Horizon {
+            start_ms: 4_000,
+            end_ms: 9_000,
+            step_ms: 1_000,
+        };
+        let live = [5_000i64];
+        assert!(
+            live[0] > envelope.start_ms,
+            "the live set's first point must NOT be the envelope start"
+        );
+
+        let mut caches = EvalCaches::default();
+        let mut inner_evals = 0u64;
+        let mut classifier = crate::plan::StepInvariance::new(&p.selectors);
+        prepare_subquery(
+            sq,
+            &p.selectors,
+            &data,
+            StepGrid::Sparse {
+                envelope,
+                live: &live,
+            },
+            p.params.lookback_ms,
+            &mut caches,
+            &mut inner_evals,
+            &mut classifier,
+        )
+        .unwrap();
+        let materialized = caches
+            .subqueries
+            .get(&(sq.as_ref() as *const _))
+            .expect("cache entry present");
+        assert_eq!(
+            materialized.series[0].samples[0].t_ms, 4_000,
+            "grid_start must be envelope-derived (4000), not live[0]-derived (5000)"
+        );
+        assert_eq!(
+            inner_evals, 6,
+            "grid_start=4000..=maxt_max=9000 step 1000 => 6 points"
+        );
+    }
+
+    /// Code review [medium] (comment 5025425065): `live_grid_points`
+    /// must compute the union with a monotonic cursor over the
+    /// pre-sorted windows, never by pushing every candidate per window
+    /// and globally sort/dedup-ing. Forty sparse consumer points 5s
+    /// apart, each carrying a 100s window at a 1s subquery step —
+    /// consecutive windows overlap 95%, so a per-window-push
+    /// implementation materializes 40 × 100 = 4000 temporary entries
+    /// for a 295-point union. Asserts (a) the emitted points equal a
+    /// naive per-window-union reference, and (b) the buffer NEVER held a
+    /// duplicate: the cursor path has no dedup pass, so any duplicate
+    /// push would survive into the returned Vec and fail both the
+    /// strictly-ascending walk and the exact 295 length (the
+    /// work-proportionality seam — the output IS the raw buffer).
+    #[test]
+    fn live_grid_points_with_heavily_overlapping_windows_emits_each_point_once() {
+        let expr = crate::parser::parse("sum_over_time(up[100s:1s])").unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let PlanExpr::OverTime {
+            source: RangeSource::Subquery(sq),
+            ..
+        } = &p.root
+        else {
+            panic!("expected an OverTime node over a subquery source");
+        };
+
+        // 40 consumer points: 100s, 105s, …, 295s (windows (t−100s, t]).
+        let consumer_points: Vec<i64> = (0..40).map(|k| 100_000 + k * 5_000).collect();
+        let consumer = StepGrid::Sparse {
+            envelope: Horizon {
+                start_ms: 100_000,
+                end_ms: 295_000,
+                step_ms: 5_000,
+            },
+            live: &consumer_points,
+        };
+        // Envelope-derived bounds, exactly as `prepare_subquery` computes
+        // them from `consumer.envelope().span()`.
+        let mint_min = 100_000 - sq.range_ms;
+        let maxt_max = 295_000;
+
+        let live = live_grid_points(sq, consumer, mint_min, maxt_max)
+            .expect("a sparse consumer without @ must take the pruning path");
+
+        // (a) Value: identical to the naive per-window union.
+        let mut reference = std::collections::BTreeSet::new();
+        for &t in &consumer_points {
+            let eff_t = t - sq.offset_ms;
+            let mut p = subquery_grid_start(eff_t - sq.range_ms, sq.step_ms);
+            while p <= eff_t {
+                reference.insert(p);
+                p += sq.step_ms;
+            }
+        }
+        let reference: Vec<i64> = reference.into_iter().collect();
+        assert_eq!(live, reference);
+
+        // (b) Work: the union is 295 points (100 from the first window +
+        // 5 new per subsequent window) and the returned buffer holds
+        // exactly them, strictly ascending — a per-window-push
+        // implementation would have returned 4000 entries (or needed the
+        // removed dedup pass to hide them).
+        assert_eq!(live.len(), 295);
+        assert!(
+            live.windows(2).all(|w| w[0] < w[1]),
+            "no duplicate may ever enter the output buffer"
+        );
+    }
+
     /// Issue #88 (Δ2, the Tier-1 once-and-copy gate at the eval site): a
     /// wrappable step-invariant root is genuinely evaluated EXACTLY once
     /// across a multi-step range — a per-step recompute counts once per
@@ -6280,11 +7177,11 @@ mod tests {
             &sq_plan.root,
             &sq_plan.selectors,
             &sq_data,
-            Horizon {
+            StepGrid::Dense(Horizon {
                 start_ms: sq_plan.params.start_ms,
                 end_ms: sq_plan.params.end_ms,
                 step_ms: sq_plan.params.step_ms,
-            },
+            }),
             sq_plan.params.lookback_ms,
             &mut caches,
             &mut inner_evals,

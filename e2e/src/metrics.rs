@@ -2161,13 +2161,23 @@ mod tests {
     /// mismatches the oracle on half the steps whichever parity the
     /// run's wall-clock start lands on. Plain query text — no new
     /// oracle flags (the `@` modifier and start() are stable upstream).
+    /// Resized 163 -> 165 by issue #83 (annotation-capability-aware
+    /// sparse subquery envelope pruning): one new entry x 2 modes,
+    /// `max_over_time(mem_usage_bytes{run_id="{R}"}[10s:5s])` — the
+    /// harness's 15s range step exceeds the subquery's own 10s range, so
+    /// the range-mode row is genuinely sparse (client-side pruning to
+    /// the window union fires; the inner is a bare selector, so it is
+    /// annotation-free per `expr_may_annotate`) while both modes stay
+    /// value-identical to the (unobservable) unpruned envelope — live
+    /// parity against the real Prometheus oracle proves the pruning is
+    /// value-exact, not merely unit-tested.
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_three_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_five_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 163,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 163 — update \
+            rows, 165,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 165 — update \
              this test deliberately if the matrix was intentionally resized"
         );
     }
