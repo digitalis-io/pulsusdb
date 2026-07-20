@@ -389,6 +389,16 @@ fn malformed_exemplar_value_is_a_decode_error() {
 }
 
 #[test]
+fn malformed_any_value_is_a_decode_error() {
+    // `AnyValue.value` is the fourth flatten site (P2's hand-written visitor,
+    // not P6's `deserialize_with`). Its `map.next_value()?` propagates a
+    // malformed inner scalar rather than swallowing it to `None` — this was
+    // previously asserted only in the ADR/PATCHES prose, not tested.
+    assert!(serde_json::from_str::<AnyValue>(r#"{"doubleValue":{"bad":1}}"#).is_err());
+    assert!(serde_json::from_str::<AnyValue>(r#"{"intValue":{}}"#).is_err());
+}
+
+#[test]
 fn multiple_metric_data_oneof_members_is_a_decode_error() {
     // Canonical proto3/protojson rejects more than one oneof member set; this
     // used to silently decode to `None` (last-wins/first-wins ambiguity).

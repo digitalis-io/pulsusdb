@@ -1548,6 +1548,58 @@ mod tests {
         assert_eq!(batch.samples[0].value, 42.0);
     }
 
+    #[tokio::test]
+    async fn metrics_json_malformed_value_oneofs_return_400() {
+        // `Metric.data` (above) is the master swallow site; these are the
+        // three sibling `serde(flatten)` oneofs on the metrics decode surface
+        // — `NumberDataPoint.value`, `Exemplar.value`, `AnyValue.value` — each
+        // of which already errors on a malformed inner value at the serde
+        // layer (`otlp_json_vendor_patch.rs`). This proves the same holds at
+        // the HTTP endpoint: 400/code 3, nothing admitted.
+        let cases: &[(&str, &[u8])] = &[
+            // NumberDataPoint.value: asDouble given a JSON object.
+            (
+                "ndp_asdouble_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":{"bad":1}}]}}]}]}]}"#,
+            ),
+            // NumberDataPoint.value: asInt given a non-integer string (distinct
+            // from the valid string form asserted at :1525).
+            (
+                "ndp_asint_nonnumeric",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asInt":"abc"}]}}]}]}]}"#,
+            ),
+            // NumberDataPoint.value: asInt given a JSON object.
+            (
+                "ndp_asint_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asInt":{}}]}}]}]}]}"#,
+            ),
+            // Exemplar.value: asDouble given a JSON object.
+            (
+                "exemplar_asdouble_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":1.0,"exemplars":[{"asDouble":{"bad":1}}]}]}}]}]}]}"#,
+            ),
+            // AnyValue.value: a resource attribute's doubleValue given a JSON
+            // object. Deserialized by the whole-request decode, so the
+            // vendored visitor's error propagates to the same 400.
+            (
+                "anyvalue_doublevalue_object",
+                br#"{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":{"doubleValue":{"bad":1}}}]},"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":1.0}]}}]}]}]}"#,
+            ),
+        ];
+        for (label, body) in cases {
+            let sink = MockMetricSink::new(Outcome::Admit);
+            let res =
+                post_metrics_body(metrics_router(sink.clone()), body.to_vec(), &[JSON_CT]).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{label}");
+            let status = decode_status_body(res).await;
+            assert_eq!(status.code, 3, "{label}");
+            assert!(
+                sink.admitted.lock().unwrap().is_empty(),
+                "{label}: nothing admitted"
+            );
+        }
+    }
+
     // -- `/v1/traces` (issue #54) ------------------------------------------
     // Mirrors the `/v1/logs`/`/v1/metrics` suites above exactly — same
     // shared helpers, only the sink/request/response types differ.

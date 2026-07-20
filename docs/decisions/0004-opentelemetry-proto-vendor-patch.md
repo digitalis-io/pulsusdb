@@ -119,7 +119,11 @@ metric (202, data loss) rather than a 400. A `deserialize_with` on each of the
 (canonical proto3 "at most one member"). Flatten-site count correction: there are
 **four** `serde(flatten)` sites total, not three — `AnyValue.value`
 (`common.v1.rs`) is the fourth, but it uses the P2 hand-written visitor and does
-NOT swallow, so only the three plain-`Option` metrics oneofs are fixed.
+NOT swallow, so only the three plain-`Option` metrics oneofs are fixed. The
+`AnyValue.value` non-swallow, previously assertion-only in this note, is now
+test-covered by `malformed_any_value_is_a_decode_error`
+(`otlp_json_vendor_patch.rs`) and the sibling-oneof endpoint row
+`metrics_json_malformed_value_oneofs_return_400` (`ingest/http.rs`, #103).
 
 The two `AsInt` arms additionally lift the int64-as-string limitation noted above
 (adjudication #103, override): both route through the crate's existing
