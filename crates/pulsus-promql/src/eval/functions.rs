@@ -193,15 +193,11 @@ fn eval_extrapolated(
 /// port now replicates operation-for-operation instead of reusing
 /// [`KahanSum`] the same way `sum_over_time` does.
 ///
-/// `min`/`max`/`count_over_time` (issue #39 audit) carry no ULP risk at
-/// all — upstream's `compareOverTime` (`funcMinOverTime`/
-/// `funcMaxOverTime`) does nothing but direct `>`/`<` value comparisons
-/// (no arithmetic, so no rounding to diverge on) and `funcCountOverTime`
-/// is a plain length; both already match here bit-for-bit by construction.
-/// (Their `NaN`-vs-leading-value tie-breaking rule does differ subtly from
-/// this port's `f64::max`/`f64::min` fold — out of scope for #39, which is
-/// specifically about floating-point *accumulation order*, not `NaN`
-/// handling; flagged as a distinct follow-up.)
+/// `min`/`max_over_time` (issue #39) are now bit-faithful, including
+/// `NaN`/signed-zero tie-breaking — see [`eval_extremum_over_time`], ported
+/// from upstream's `compareOverTime` (`promql/functions.go` v3.13.0,
+/// lines 1467-1494). `count_over_time` is a plain length and carries no
+/// ULP or `NaN` risk at all.
 pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
     if samples.is_empty() {
         return None;
@@ -216,13 +212,8 @@ pub fn eval_over_time(func: OverTimeFn, samples: &[Sample]) -> Option<f64> {
             Some(k.value())
         }
         OverTimeFn::Avg => Some(eval_avg_over_time(samples)),
-        OverTimeFn::Min => Some(samples.iter().map(|s| s.v).fold(f64::INFINITY, f64::min)),
-        OverTimeFn::Max => Some(
-            samples
-                .iter()
-                .map(|s| s.v)
-                .fold(f64::NEG_INFINITY, f64::max),
-        ),
+        OverTimeFn::Min => Some(eval_extremum_over_time(samples, WhichExtremum::Min)),
+        OverTimeFn::Max => Some(eval_extremum_over_time(samples, WhichExtremum::Max)),
         // Issue #67 (M6-04) — the rest of the parameterless range-window
         // surface, each ported from `promql/functions.go` v3.13.0.
         OverTimeFn::Stddev => Some(eval_stdvar_over_time(samples).sqrt()),
@@ -581,6 +572,39 @@ fn calc_trend_value(i: usize, tf: f64, s0: f64, s1: f64, b: f64) -> f64 {
     let x = tf * (s1 - s0);
     let y = (1.0 - tf) * b;
     x + y
+}
+
+/// Which extremum [`eval_extremum_over_time`] tracks (an enum, not a
+/// boolean parameter, per house style).
+#[derive(Debug, Clone, Copy)]
+enum WhichExtremum {
+    Min,
+    Max,
+}
+
+/// `min_over_time`/`max_over_time` float path — upstream `compareOverTime`
+/// (`promql/functions.go` v3.13.0, lines 1467-1494) ported
+/// operation-for-operation: seed with the first sample, then for every
+/// sample replace when `(cur </> extremum) || extremum.is_nan()`.
+/// Strict `</>` makes `-0 == +0` a non-replacement, so the first sample
+/// wins on a signed-zero tie; the `is_nan()` disjunct keeps replacing while
+/// the accumulator is NaN, so a leading NaN is overwritten by the first
+/// non-NaN sample and an all-NaN window returns NaN. Structurally the same
+/// comparison shape as [`eval_ts_of_extremum`] below. Callers guarantee
+/// non-empty.
+fn eval_extremum_over_time(samples: &[Sample], which: WhichExtremum) -> f64 {
+    debug_assert!(!samples.is_empty(), "caller already checked non-empty");
+    let mut extremum = samples[0].v;
+    for s in samples {
+        let replace = match which {
+            WhichExtremum::Min => s.v < extremum,
+            WhichExtremum::Max => s.v > extremum,
+        } || extremum.is_nan();
+        if replace {
+            extremum = s.v;
+        }
+    }
+    extremum
 }
 
 /// `avg_over_time` — upstream's `funcAvgOverTime` float path
@@ -1259,6 +1283,87 @@ mod tests {
         assert_eq!(eval_over_time(OverTimeFn::Min, &samples), Some(1.0));
         assert_eq!(eval_over_time(OverTimeFn::Max, &samples), Some(3.0));
         assert_eq!(eval_over_time(OverTimeFn::Count, &samples), Some(3.0));
+    }
+
+    /// Issue #39: an all-`NaN` window must yield `NaN` (upstream's
+    /// `compareOverTime` seeds from `Floats[0]` and its `|| IsNaN(extremum)`
+    /// disjunct keeps replacing while the accumulator is `NaN`, so it never
+    /// escapes `NaN`) — not `+Inf`, which is what the old `f64::min` fold
+    /// returned (`f64::min` ignores `NaN` operands entirely).
+    #[test]
+    fn min_over_time_all_nan_window_is_nan() {
+        let two = vec![s(0, f64::NAN), s(60_000, f64::NAN)];
+        let three = vec![s(0, f64::NAN), s(60_000, f64::NAN), s(120_000, f64::NAN)];
+        for samples in [two, three] {
+            let v = eval_over_time(OverTimeFn::Min, &samples).unwrap();
+            assert!(v.is_nan(), "got {v:?}");
+        }
+    }
+
+    /// Issue #39: same all-`NaN` case for `max_over_time` (old
+    /// `f64::max`-fold returned `-Inf`).
+    #[test]
+    fn max_over_time_all_nan_window_is_nan() {
+        let two = vec![s(0, f64::NAN), s(60_000, f64::NAN)];
+        let three = vec![s(0, f64::NAN), s(60_000, f64::NAN), s(120_000, f64::NAN)];
+        for samples in [two, three] {
+            let v = eval_over_time(OverTimeFn::Max, &samples).unwrap();
+            assert!(v.is_nan(), "got {v:?}");
+        }
+    }
+
+    /// Issue #39: upstream's strict `<` never fires on an exact tie, so
+    /// `-0 == +0` never replaces and the first sample wins — `min([+0,
+    /// -0]) == +0`. The old `f64::min` fold returned `-0` here.
+    /// `to_bits()` (not `==`, which treats `+0.0 == -0.0`) is required to
+    /// observe the sign.
+    #[test]
+    fn min_over_time_signed_zero_tie_keeps_first() {
+        let samples = vec![s(0, 0.0_f64), s(60_000, -0.0_f64)];
+        let v = eval_over_time(OverTimeFn::Min, &samples).unwrap();
+        assert_eq!(
+            v.to_bits(),
+            0.0_f64.to_bits(),
+            "got {v:?} (bits {:x})",
+            v.to_bits()
+        );
+    }
+
+    /// Issue #39: same tie rule for `max_over_time` — `max([-0, +0]) ==
+    /// -0`, first sample wins. The old `f64::max` fold returned `+0` here.
+    #[test]
+    fn max_over_time_signed_zero_tie_keeps_first() {
+        let samples = vec![s(0, -0.0_f64), s(60_000, 0.0_f64)];
+        let v = eval_over_time(OverTimeFn::Max, &samples).unwrap();
+        assert_eq!(
+            v.to_bits(),
+            (-0.0_f64).to_bits(),
+            "got {v:?} (bits {:x})",
+            v.to_bits()
+        );
+    }
+
+    /// Issue #39 regression guard (passes on both old and new code): an
+    /// interior `NaN` alongside finite samples must not poison the result —
+    /// the `is_nan()` disjunct only keeps replacing while the *accumulator*
+    /// is `NaN`, so once a finite sample has been seen it sticks.
+    #[test]
+    fn min_max_over_time_skip_interior_nan() {
+        let samples = vec![s(0, 5.0), s(60_000, f64::NAN), s(120_000, 3.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Min, &samples), Some(3.0));
+        assert_eq!(eval_over_time(OverTimeFn::Max, &samples), Some(5.0));
+    }
+
+    /// Issue #39: a *leading* `NaN` seed must be replaced by the first finite
+    /// sample and not poison the window — this exercises the accumulator-`NaN`
+    /// disjunct on the seed itself (`compareOverTime` seeds from `samples[0]`,
+    /// so a `NaN` seed relies on `|| extremum.is_nan()` to let a later finite
+    /// value win). Distinct from the interior-`NaN` guard above.
+    #[test]
+    fn min_max_over_time_leading_nan_is_replaced_by_first_finite() {
+        let samples = vec![s(0, f64::NAN), s(60_000, 5.0), s(120_000, 3.0)];
+        assert_eq!(eval_over_time(OverTimeFn::Min, &samples), Some(3.0));
+        assert_eq!(eval_over_time(OverTimeFn::Max, &samples), Some(5.0));
     }
 
     #[test]
