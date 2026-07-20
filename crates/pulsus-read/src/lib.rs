@@ -8,10 +8,10 @@ pub mod traces;
 
 pub use eval_gate::{DEFAULT_EVAL_CONCURRENCY, EvalGate, EvalGateSnapshot};
 pub use logql::{
-    DEFAULT_MAX_STREAMS, Direction, EngineConfig, ExplainStage, LogQlEngine, LogStats,
-    MatrixSeries, PlanCtx, PlanExplain, QueryParams, QueryResult, QuerySpec, ReadError,
-    RouteChoice, RoutingDecision, StreamResult, TailCursor, TailLower, TailPage, TailSetup,
-    TimeBounds, VectorSample,
+    DEFAULT_MAX_STREAMS, Direction, EngineConfig, ExplainStage, HistMatrixSeries, HistOrFloat,
+    HistVectorSample, LogQlEngine, LogStats, MatrixSeries, PlanCtx, PlanExplain, QueryParams,
+    QueryResult, QuerySpec, ReadError, RouteChoice, RoutingDecision, StreamResult, TailCursor,
+    TailLower, TailPage, TailSetup, TimeBounds, VectorSample,
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,

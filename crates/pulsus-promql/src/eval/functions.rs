@@ -649,20 +649,156 @@ pub struct Bucket {
     pub count: f64,
 }
 
+/// `smallDeltaTolerance` (`quantile.go:45`) — the relative-delta threshold
+/// below which a difference between successive cumulative bucket counts is
+/// treated as a floating-point artifact (silently equalized, never
+/// reported as forced monotonicity).
+const SMALL_DELTA_TOLERANCE: f64 = 1e-12;
+
+/// The smallest positive normal f64 — upstream `almost.minNormal`
+/// (`util/almost/almost.go:22`, `math.Float64frombits(0x0010000000000000)`).
+const MIN_NORMAL: f64 = f64::MIN_POSITIVE;
+
+/// Upstream `almost.Equal` (`util/almost/almost.go`, pinned `40af9c2`),
+/// ported for [`ensure_monotonic_and_ignore_small_deltas`]'s tolerance
+/// check. The stale-NaN/NaN special cases are ported for fidelity even
+/// though cumulative bucket counts are never NaN in practice.
+fn almost_equal(a: f64, b: f64, epsilon: f64) -> bool {
+    let a_stale = a.to_bits() == pulsus_model::STALE_NAN_BITS;
+    let b_stale = b.to_bits() == pulsus_model::STALE_NAN_BITS;
+    if a_stale || b_stale {
+        return a_stale && b_stale;
+    }
+    if a.is_nan() && b.is_nan() {
+        return true;
+    }
+    if a == b {
+        return true;
+    }
+    let abs_sum = a.abs() + b.abs();
+    let diff = (a - b).abs();
+    if a == 0.0 || b == 0.0 || abs_sum < MIN_NORMAL {
+        return diff < epsilon * MIN_NORMAL;
+    }
+    diff / abs_sum.min(f64::MAX) < epsilon
+}
+
+/// `ensureMonotonicAndIgnoreSmallDeltas`'s non-`fixedPrecision` returns
+/// (M7-A5b-i #124 review finding 2a): the forced-monotonicity flag plus
+/// the bucket-bound/diff detail `NewHistogramQuantileForcedMonotonicityInfo`
+/// renders (`histogramQuantileForcedMonotonicityErr.Error()`,
+/// `annotations.go:333-341`). `min_bucket`/`max_bucket` start at
+/// `+Inf`/`-Inf` (upstream's zero-value-via-`math.Inf` convention,
+/// `quantile.go:678-679`) and only move when a genuine decrease is
+/// clamped; meaningless (and never rendered) when `forced` is `false`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MonotonicityReport {
+    pub forced: bool,
+    pub min_bucket: f64,
+    pub max_bucket: f64,
+    pub max_diff: f64,
+}
+
+impl MonotonicityReport {
+    /// The "nothing forced" report every early-return path before
+    /// `ensure_monotonic_and_ignore_small_deltas` runs uses (upstream:
+    /// the zero value of `forcedMonotonic, minBucket, maxBucket, maxDiff`
+    /// at those same early returns, `quantile.go:107-146`).
+    const NONE: Self = Self {
+        forced: false,
+        min_bucket: 0.0,
+        max_bucket: 0.0,
+        max_diff: 0.0,
+    };
+}
+
+/// Upstream `ensureMonotonicAndIgnoreSmallDeltas` (`quantile.go`, pinned
+/// `40af9c2`), the count-mutating core: numerically-insignificant
+/// differences between successive cumulative counts (relative delta below
+/// `tolerance`, EITHER direction) are silently equalized to the previous
+/// count; genuine decreases are clamped up and reported via
+/// [`MonotonicityReport`] — the trigger for
+/// `NewHistogramQuantileForcedMonotonicityInfo`. (The pin also returns
+/// `fixedPrecision`; nothing in A5b-i's annotation text needs it, so it
+/// is not ported.)
+fn ensure_monotonic_and_ignore_small_deltas(
+    buckets: &mut [Bucket],
+    tolerance: f64,
+) -> MonotonicityReport {
+    let mut forced_monotonic = false;
+    let mut min_bucket = f64::INFINITY;
+    let mut max_bucket = f64::NEG_INFINITY;
+    let mut max_diff = 0.0f64;
+    let mut prev = buckets[0].count;
+    for b in &mut buckets[1..] {
+        let curr = b.count;
+        if curr == prev {
+            continue;
+        }
+        if almost_equal(prev, curr, tolerance) {
+            // Silently correct numerically insignificant differences from
+            // floating-point precision errors, regardless of direction.
+            // `prev` is NOT updated (the difference is ignored).
+            b.count = prev;
+            continue;
+        }
+        if curr < prev {
+            // Force monotonicity by removing any decreases regardless of
+            // magnitude. `prev` is NOT updated (the decrease is ignored).
+            b.count = prev;
+            forced_monotonic = true;
+            if b.le < min_bucket {
+                min_bucket = b.le;
+            }
+            if b.le > max_bucket {
+                max_bucket = b.le;
+            }
+            let diff = prev - curr;
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            continue;
+        }
+        prev = curr;
+    }
+    MonotonicityReport {
+        forced: forced_monotonic,
+        min_bucket,
+        max_bucket,
+        max_diff,
+    }
+}
+
 /// `histogram_quantile` — Prometheus's `bucketQuantile`, ported: sorts by
-/// `le`, forces cumulative monotonicity (independent scrapes can produce
-/// non-monotonic buckets), requires a `+Inf` bucket, then linearly
-/// interpolates within the bucket the requested quantile's rank falls
-/// into.
-pub fn histogram_quantile(quantile: f64, mut buckets: Vec<Bucket>) -> Result<f64, PromqlError> {
+/// `le`, coalesces duplicate bounds, forces cumulative monotonicity
+/// (independent scrapes can produce non-monotonic buckets), requires a
+/// `+Inf` bucket, then linearly interpolates within the bucket the
+/// requested quantile's rank falls into. The float-value verdicts are
+/// [`histogram_quantile_with_monotonicity_report`]'s (all pre-M7 tests
+/// unchanged); this thin wrapper drops the forced-monotonicity report for
+/// callers that don't report the info annotation.
+pub fn histogram_quantile(quantile: f64, buckets: Vec<Bucket>) -> Result<f64, PromqlError> {
+    histogram_quantile_with_monotonicity_report(quantile, buckets).map(|(q, _report)| q)
+}
+
+/// [`histogram_quantile`] plus upstream `BucketQuantile`'s
+/// `forcedMonotonic`/`minBucket`/`maxBucket`/`maxDiff` returns
+/// (M7-A5b-i): the [`MonotonicityReport`] a genuine (beyond
+/// `smallDeltaTolerance`) cumulative-count decrease produces — the
+/// trigger for `NewHistogramQuantileForcedMonotonicityInfo`
+/// (`funcHistogramQuantile`, `functions.go:2111-2117`).
+pub fn histogram_quantile_with_monotonicity_report(
+    quantile: f64,
+    mut buckets: Vec<Bucket>,
+) -> Result<(f64, MonotonicityReport), PromqlError> {
     if quantile.is_nan() {
-        return Ok(f64::NAN);
+        return Ok((f64::NAN, MonotonicityReport::NONE));
     }
     if quantile < 0.0 {
-        return Ok(f64::NEG_INFINITY);
+        return Ok((f64::NEG_INFINITY, MonotonicityReport::NONE));
     }
     if quantile > 1.0 {
-        return Ok(f64::INFINITY);
+        return Ok((f64::INFINITY, MonotonicityReport::NONE));
     }
     if buckets.is_empty() {
         return Err(PromqlError::HistogramBucket {
@@ -672,24 +808,25 @@ pub fn histogram_quantile(quantile: f64, mut buckets: Vec<Bucket>) -> Result<f64
 
     buckets.sort_by(|a, b| a.le.partial_cmp(&b.le).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Upstream `coalesceBuckets` (M7-A5b-i, landed with the monotonicity
+    // report): duplicate `le` bounds (two series whose `le` strings parse
+    // to the same f64, e.g. "1" and "1.0") merge by adding counts —
+    // BEFORE the monotonicity pass, so a duplicate can never masquerade
+    // as a forced-monotonicity decrease.
+    let mut buckets = coalesce_buckets(buckets);
+
     // Ported from Prometheus's own `bucketQuantile`: fewer than 2 buckets
     // (e.g. a lone `+Inf` bucket, no finite boundary to interpolate
     // against) cannot produce an interpolated quantile.
     if buckets.len() < 2 {
-        return Ok(f64::NAN);
+        return Ok((f64::NAN, MonotonicityReport::NONE));
     }
 
     // Force cumulative monotonicity (edge case 5): independent scrapes can
     // produce a bucket whose count is lower than a smaller-`le` bucket's;
-    // clamp it up rather than silently produce a wrong quantile.
-    let mut max_count = f64::NEG_INFINITY;
-    for b in &mut buckets {
-        if b.count < max_count {
-            b.count = max_count;
-        } else {
-            max_count = b.count;
-        }
-    }
+    // clamp it up rather than silently produce a wrong quantile. Tolerance
+    // + reporting per the pin (`ensureMonotonicAndIgnoreSmallDeltas`).
+    let report = ensure_monotonic_and_ignore_small_deltas(&mut buckets, SMALL_DELTA_TOLERANCE);
 
     let last = *buckets.last().expect("checked non-empty above");
     if last.le.is_finite() {
@@ -700,7 +837,7 @@ pub fn histogram_quantile(quantile: f64, mut buckets: Vec<Bucket>) -> Result<f64
 
     let total = last.count;
     if total == 0.0 {
-        return Ok(f64::NAN);
+        return Ok((f64::NAN, report));
     }
 
     let rank = quantile * total;
@@ -712,10 +849,10 @@ pub fn histogram_quantile(quantile: f64, mut buckets: Vec<Bucket>) -> Result<f64
     if b_idx == buckets.len() - 1 {
         // The rank falls in the +Inf bucket itself — Prometheus reports
         // the previous (highest finite) bucket boundary rather than +Inf.
-        return Ok(buckets[buckets.len() - 2].le);
+        return Ok((buckets[buckets.len() - 2].le, report));
     }
     if b_idx == 0 {
-        return Ok(buckets[0].le.max(0.0));
+        return Ok((buckets[0].le.max(0.0), report));
     }
 
     let bucket_start = buckets[b_idx - 1].le.max(0.0);
@@ -723,9 +860,123 @@ pub fn histogram_quantile(quantile: f64, mut buckets: Vec<Bucket>) -> Result<f64
     let count = buckets[b_idx].count - buckets[b_idx - 1].count;
     let rank_in_bucket = rank - buckets[b_idx - 1].count;
     if count <= 0.0 {
-        return Ok(bucket_end);
+        return Ok((bucket_end, report));
     }
-    Ok(bucket_start + (bucket_end - bucket_start) * (rank_in_bucket / count))
+    Ok((
+        bucket_start + (bucket_end - bucket_start) * (rank_in_bucket / count),
+        report,
+    ))
+}
+
+/// Merges buckets sharing the same `le` — mirrors upstream `coalesceBuckets`
+/// (`quantile.go`). `buckets` must already be sorted by `le`.
+fn coalesce_buckets(buckets: Vec<Bucket>) -> Vec<Bucket> {
+    let mut out: Vec<Bucket> = Vec::with_capacity(buckets.len());
+    for b in buckets {
+        match out.last_mut() {
+            Some(last) if last.le == b.le => last.count += b.count,
+            _ => out.push(b),
+        }
+    }
+    out
+}
+
+/// `interpolateLinearly` (`quantile.go`, `BucketFraction`'s inner closure):
+/// the -Inf lower bound special case returns the bucket's own cumulative
+/// count (no contribution beyond it — the same "skip the infinite-width
+/// bucket" trick native `histogram_fraction`'s counterpart uses).
+fn interpolate_bucket_linearly(
+    lower_bound: f64,
+    upper_bound: f64,
+    count: f64,
+    rank: f64,
+    v: f64,
+) -> f64 {
+    if lower_bound == f64::NEG_INFINITY {
+        count
+    } else {
+        rank + (count - rank) * (v - lower_bound) / (upper_bound - lower_bound)
+    }
+}
+
+/// `histogram_fraction`'s classic-`le`-bucket counterpart — Prometheus's
+/// `BucketFraction` (`quantile.go`), ported: the fraction of observations
+/// between `lower` and `upper` over one group's classic (`_bucket`/`le`)
+/// buckets. Mirrors [`histogram_quantile`]'s own sort/`+Inf`-requirement/
+/// coalesce contract.
+pub fn bucket_fraction(lower: f64, upper: f64, mut buckets: Vec<Bucket>) -> f64 {
+    if buckets.is_empty() {
+        return f64::NAN;
+    }
+    buckets.sort_by(|a, b| a.le.partial_cmp(&b.le).unwrap_or(std::cmp::Ordering::Equal));
+    if !buckets
+        .last()
+        .expect("checked non-empty above")
+        .le
+        .is_infinite()
+    {
+        return f64::NAN;
+    }
+    let buckets = coalesce_buckets(buckets);
+
+    let count = buckets.last().expect("checked non-empty above").count;
+    if count == 0.0 || lower.is_nan() || upper.is_nan() {
+        return f64::NAN;
+    }
+    if lower >= upper {
+        return 0.0;
+    }
+
+    let mut rank = 0.0f64;
+    let mut lower_rank = 0.0f64;
+    let mut upper_rank = 0.0f64;
+    let mut lower_set = false;
+    let mut upper_set = false;
+    let mut lower_bound = if buckets[0].le <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        0.0
+    };
+
+    for (i, b) in buckets.iter().enumerate() {
+        if i > 0 {
+            lower_bound = buckets[i - 1].le;
+        }
+        let upper_bound = b.le;
+
+        if !lower_set && lower_bound >= lower {
+            lower_rank = rank;
+            lower_set = true;
+        }
+        if !upper_set && lower_bound >= upper {
+            upper_rank = rank;
+            upper_set = true;
+        }
+        if lower_set && upper_set {
+            break;
+        }
+        if !lower_set && lower_bound < lower && upper_bound > lower {
+            lower_rank =
+                interpolate_bucket_linearly(lower_bound, upper_bound, b.count, rank, lower);
+            lower_set = true;
+        }
+        if !upper_set && lower_bound < upper && upper_bound > upper {
+            upper_rank =
+                interpolate_bucket_linearly(lower_bound, upper_bound, b.count, rank, upper);
+            upper_set = true;
+        }
+        if lower_set && upper_set {
+            break;
+        }
+        rank = b.count;
+    }
+    if !lower_set || lower_rank > count {
+        lower_rank = count;
+    }
+    if !upper_set || upper_rank > count {
+        upper_rank = count;
+    }
+    (upper_rank - lower_rank) / count
 }
 
 #[cfg(test)]
@@ -1114,6 +1365,158 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert_eq!(histogram_quantile(1.5, bs).unwrap(), f64::INFINITY);
+    }
+
+    // --- ensure_monotonic_and_ignore_small_deltas (M7-A5b-i: the
+    //     forced-monotonicity report + smallDeltaTolerance port) ---
+
+    #[test]
+    fn a_genuine_decrease_is_clamped_and_reported_as_forced() {
+        let mut bs = buckets(&[(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 10.0)]);
+        let report = ensure_monotonic_and_ignore_small_deltas(&mut bs, SMALL_DELTA_TOLERANCE);
+        assert!(report.forced);
+        assert_eq!(bs[1].count, 5.0, "the decrease is clamped up to prev");
+        // The clamped bucket (le=0.5) is both the min and max forced bound
+        // for a single decrease; the diff is the clamped-away delta (2.0).
+        assert_eq!(report.min_bucket, 0.5);
+        assert_eq!(report.max_bucket, 0.5);
+        assert_eq!(report.max_diff, 2.0);
+        // The clamped quantile verdict is unchanged from the pre-A5b port.
+        let (q, report) = histogram_quantile_with_monotonicity_report(
+            0.5,
+            buckets(&[(0.1, 5.0), (0.5, 3.0), (f64::INFINITY, 10.0)]),
+        )
+        .unwrap();
+        assert!(report.forced);
+        assert!(q.is_finite());
+    }
+
+    #[test]
+    fn a_small_delta_below_tolerance_is_equalized_but_never_reported_as_forced() {
+        // A relative delta of ~1e-16 (far below 1e-12) in EITHER direction
+        // is a floating-point artifact: equalized to prev, no forced flag
+        // (upstream `fixedPrecision`, quantile.go).
+        let big = 1e15;
+        let tiny_down = big - 0.1; // relative delta ~1e-16
+        let mut bs = buckets(&[(0.1, big), (0.5, tiny_down), (f64::INFINITY, big)]);
+        let report = ensure_monotonic_and_ignore_small_deltas(&mut bs, SMALL_DELTA_TOLERANCE);
+        assert!(!report.forced, "a tolerance-level decrease is not forced");
+        assert_eq!(bs[1].count, big, "equalized to the previous count");
+
+        let tiny_up = big + 0.1;
+        let mut bs = buckets(&[(0.1, big), (0.5, tiny_up), (f64::INFINITY, tiny_up)]);
+        let report = ensure_monotonic_and_ignore_small_deltas(&mut bs, SMALL_DELTA_TOLERANCE);
+        assert!(!report.forced);
+        assert_eq!(
+            bs[1].count, big,
+            "a tolerance-level INCREASE is also equalized (upstream: 'regardless of direction')"
+        );
+    }
+
+    #[test]
+    fn a_monotone_input_is_untouched_and_unreported() {
+        let mut bs = buckets(&[(0.1, 1.0), (0.5, 5.0), (f64::INFINITY, 10.0)]);
+        let report = ensure_monotonic_and_ignore_small_deltas(&mut bs, SMALL_DELTA_TOLERANCE);
+        assert!(!report.forced);
+        assert_eq!(bs[1].count, 5.0);
+    }
+
+    #[test]
+    fn almost_equal_matches_the_pinned_semantics() {
+        // Exact equality and the zero/subnormal branch.
+        assert!(almost_equal(1.0, 1.0, 1e-12));
+        assert!(almost_equal(0.0, 0.0, 1e-12));
+        assert!(!almost_equal(0.0, 1e-300, 1e-12)); // diff >= eps*minNormal
+        // Relative branch.
+        assert!(almost_equal(1e15, 1e15 - 0.1, 1e-12));
+        assert!(!almost_equal(1.0, 2.0, 1e-12));
+        // NaN pairs equal; stale-NaN only equals stale-NaN.
+        assert!(almost_equal(f64::NAN, f64::NAN, 1e-12));
+        let stale = f64::from_bits(pulsus_model::STALE_NAN_BITS);
+        assert!(almost_equal(stale, stale, 1e-12));
+        assert!(!almost_equal(stale, f64::NAN, 1e-12));
+    }
+
+    #[test]
+    fn histogram_quantile_coalesces_duplicate_le_bounds_before_monotonicity() {
+        // Two buckets at le=1.0 (counts 3 and 2) coalesce to one (count 5)
+        // BEFORE the monotonicity pass — never reported as forced.
+        let bs = vec![
+            Bucket {
+                le: 1.0,
+                count: 3.0,
+            },
+            Bucket {
+                le: 1.0,
+                count: 2.0,
+            },
+            Bucket {
+                le: f64::INFINITY,
+                count: 5.0,
+            },
+        ];
+        let (q, report) = histogram_quantile_with_monotonicity_report(0.5, bs).unwrap();
+        assert!(!report.forced, "a coalesced duplicate is not a decrease");
+        assert!(q.is_finite());
+    }
+
+    // --- bucket_fraction: classic-le histogram_fraction counterpart ---
+
+    #[test]
+    fn bucket_fraction_empty_is_nan() {
+        assert!(bucket_fraction(0.0, 1.0, Vec::new()).is_nan());
+    }
+
+    #[test]
+    fn bucket_fraction_missing_inf_bucket_is_nan() {
+        let bs = buckets(&[(0.1, 1.0), (0.5, 5.0)]);
+        assert!(bucket_fraction(0.0, 1.0, bs).is_nan());
+    }
+
+    #[test]
+    fn bucket_fraction_lower_ge_upper_is_zero() {
+        let bs = buckets(&[(1.0, 5.0), (f64::INFINITY, 10.0)]);
+        assert_eq!(bucket_fraction(1.0, 1.0, bs.clone()), 0.0);
+        assert_eq!(bucket_fraction(2.0, 1.0, bs), 0.0);
+    }
+
+    #[test]
+    fn bucket_fraction_full_range_is_one() {
+        let bs = buckets(&[(1.0, 5.0), (f64::INFINITY, 10.0)]);
+        let f = bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, bs);
+        assert!((f - 1.0).abs() < 1e-12, "got {f}");
+    }
+
+    #[test]
+    fn bucket_fraction_is_inverse_of_histogram_quantile_at_the_same_point() {
+        let bs = buckets(&[(1.0, 5.0), (2.0, 8.0), (f64::INFINITY, 10.0)]);
+        let q = histogram_quantile(0.5, bs.clone()).unwrap();
+        let f = bucket_fraction(f64::NEG_INFINITY, q, bs);
+        assert!((f - 0.5).abs() < 1e-9, "quantile={q} fraction={f}");
+    }
+
+    #[test]
+    fn bucket_fraction_coalesces_duplicate_upper_bounds() {
+        // Two buckets sharing le=1.0 (independent scrapes / a spurious
+        // duplicate) coalesce to one before ranking.
+        let bs = vec![
+            Bucket {
+                le: 1.0,
+                count: 3.0,
+            },
+            Bucket {
+                le: 1.0,
+                count: 2.0,
+            },
+            Bucket {
+                le: f64::INFINITY,
+                count: 5.0,
+            },
+        ];
+        // All 5 observations are at/below 1.0 (coalesced le=1.0 count=5),
+        // so the full range [−Inf, +Inf) fraction is 1.0.
+        let f = bucket_fraction(f64::NEG_INFINITY, f64::INFINITY, bs);
+        assert!((f - 1.0).abs() < 1e-12, "got {f}");
     }
 
     // =======================================================================

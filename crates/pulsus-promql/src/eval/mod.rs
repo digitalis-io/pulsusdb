@@ -21,17 +21,20 @@ pub mod binop;
 pub mod datetime;
 pub mod elementwise;
 pub mod functions;
+pub mod histogram_fns;
 pub(crate) mod info;
 pub mod labels;
 pub mod quote;
 pub mod staleness;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use crate::annotations::Annotations;
 use crate::error::PromqlError;
 use crate::plan::{
-    MathFn, OverTimeFn, PlanExpr, QueryPlan, RangeSource, ScalarFn, SelectorSpec, SubqueryPlan,
+    HistogramAccessorFn, MathFn, OverTimeFn, PlanExpr, QueryPlan, RangeSource, ScalarFn,
+    SelectorSpec, SubqueryPlan,
 };
 use crate::value::{InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData};
 
@@ -52,9 +55,16 @@ enum StepValue {
 /// set — upstream hashes the complete label set, `__name__` included.
 type SeriesIdentity = (Option<String>, Labels);
 
-/// Evaluates `plan` against `data` — pure, no I/O.
-pub fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, PromqlError> {
-    evaluate_counted(plan, data).map(|(value, _)| value)
+/// Evaluates `plan` against `data` — pure, no I/O. Returns the value
+/// alongside the accumulated [`Annotations`] (M7-A5b-i): a generic sink —
+/// empty for every float-only query (byte-identical to the pre-A5b-i
+/// behavior) — that native-histogram arms populate (`histogram_quantile`'s
+/// out-of-range φ, NaN-observation info, …).
+pub fn evaluate(
+    plan: &QueryPlan,
+    data: &SeriesData,
+) -> Result<(QueryValue, Annotations), PromqlError> {
+    evaluate_counted(plan, data).map(|(value, _counts, annotations)| (value, annotations))
 }
 
 /// The evaluation-count observables [`evaluate_counted`] returns
@@ -93,11 +103,11 @@ struct EvalCounts {
     finalize_matrix_merge_passes: u64,
 }
 
-/// [`evaluate`] plus [`EvalCounts`].
+/// [`evaluate`] plus [`EvalCounts`] and the drained [`Annotations`] sink.
 fn evaluate_counted(
     plan: &QueryPlan,
     data: &SeriesData,
-) -> Result<(QueryValue, EvalCounts), PromqlError> {
+) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
     let p = &plan.params;
 
     // Issue #83 (round-2 amendment): materialize every subquery ONCE over
@@ -158,7 +168,7 @@ fn evaluate_counted(
         };
         counts.step_invariant_evals = caches.step_invariant_evals.get();
         let value = finalize_metadata_labels(value, &mut counts.finalize_matrix_merge_passes)?;
-        return Ok((value, counts));
+        return Ok((value, counts, caches.annotations.take()));
     }
 
     // Issue #68 (plan v3 Δ5, superseding the #37 `Labels`-only key): the
@@ -253,6 +263,7 @@ fn evaluate_counted(
                 points: scalar_points,
             }]),
             counts,
+            caches.annotations.take(),
         ));
     }
 
@@ -274,7 +285,7 @@ fn evaluate_counted(
         QueryValue::Matrix(out),
         &mut counts.finalize_matrix_merge_passes,
     )?;
-    Ok((value, counts))
+    Ok((value, counts, caches.annotations.take()))
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +533,13 @@ struct EvalCaches {
     /// Single-threaded by construction — the evaluator never shares
     /// `EvalCaches` across threads.
     step_invariant_evals: Cell<u64>,
+    /// M7-A5b-i: the annotations sink, threaded via interior mutability
+    /// (a [`RefCell`], because [`eval_step`] holds `&EvalCaches`) so
+    /// native-histogram arms (and future non-histogram annotation sources)
+    /// can push a warning/info without widening every frame's return type
+    /// (plan v2 OQ1(a): "thread a collector, do not widen every `Result`").
+    /// Drained by [`evaluate_counted`] at both return points.
+    annotations: RefCell<Annotations>,
 }
 
 /// The evaluation grid a node will be stepped over: the closed
@@ -653,6 +671,48 @@ fn prepare_subqueries(
         PlanExpr::HistogramQuantile { quantile, expr } => {
             prepare_subqueries(
                 quantile,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+                classifier,
+            )?;
+            prepare_subqueries(
+                expr,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+                classifier,
+            )
+        }
+        PlanExpr::HistogramAccessor { arg, .. } => prepare_subqueries(
+            arg,
+            selectors,
+            data,
+            horizon,
+            lookback_ms,
+            caches,
+            inner_evals,
+            classifier,
+        ),
+        PlanExpr::HistogramFraction { lower, upper, expr } => {
+            prepare_subqueries(
+                lower,
+                selectors,
+                data,
+                horizon,
+                lookback_ms,
+                caches,
+                inner_evals,
+                classifier,
+            )?;
+            prepare_subqueries(
+                upper,
                 selectors,
                 data,
                 horizon,
@@ -1123,7 +1183,8 @@ fn prepare_step_invariant(
         | PlanExpr::LabelJoin { arg, .. }
         | PlanExpr::Timestamp { arg, .. }
         | PlanExpr::ScalarOf { arg }
-        | PlanExpr::VectorOf { arg } => prepare_step_invariant(
+        | PlanExpr::VectorOf { arg }
+        | PlanExpr::HistogramAccessor { arg, .. } => prepare_step_invariant(
             arg,
             selectors,
             data,
@@ -1161,6 +1222,35 @@ fn prepare_step_invariant(
             )?;
             prepare_step_invariant(
                 b,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )
+        }
+        PlanExpr::HistogramFraction { lower, upper, expr } => {
+            prepare_step_invariant(
+                lower,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )?;
+            prepare_step_invariant(
+                upper,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )?;
+            prepare_step_invariant(
+                expr,
                 selectors,
                 data,
                 start_ms,
@@ -1387,6 +1477,87 @@ fn reject_histogram_samples(samples: &[Sample], op: &str) -> Result<(), PromqlEr
         return Err(histogram_unsupported(op));
     }
     Ok(())
+}
+
+/// M7-A5b-i port of upstream `EvalNodeHelper.resetHistograms`
+/// (`engine.go:1311-1373`, pinned `40af9c2`): partitions
+/// `histogram_quantile`/`histogram_fraction`'s input vector into
+/// native-histogram samples and classic `le`-bucket groups, then applies
+/// the native/classic same-timestamp conflict filter — an identity
+/// carrying BOTH classic buckets and a native histogram evaluates
+/// NEITHER, and `NewMixedClassicNativeHistogramsWarning` fires once per
+/// conflicting native sample (`engine.go:1358-1369`: the classic group is
+/// deleted and the native sample's `H` nil'd, so both are dropped).
+/// Upstream keys the native side on the FULL label set (`Metric.Bytes`)
+/// and the classic side on labels-without-`le`
+/// (`BytesWithoutLabels(le)`); mirrored as `(metric_name, labels)` vs
+/// `(metric_name, labels.without("le"))` — same values under the
+/// name-outside-`Labels` split.
+///
+/// A classic (float) sample whose `le` label is missing or unparsable is
+/// SKIPPED with a [`crate::annotations::messages::bad_bucket_label_warning`]
+/// (`#124` review finding 4) — matching upstream's `resetHistograms`
+/// exactly (`engine.go:1331-1341`): the bucket is dropped from its group,
+/// not the whole query rejected. This corrects a pre-A5b (M2-era)
+/// divergence that used to hard-error here.
+fn partition_histogram_inputs(
+    v: Vec<InstantSample>,
+    caches: &EvalCaches,
+) -> (
+    Vec<InstantSample>,
+    HashMap<SeriesIdentity, Vec<functions::Bucket>>,
+) {
+    let le_key = "le".to_string();
+    let mut native: Vec<InstantSample> = Vec::new();
+    let mut groups: HashMap<SeriesIdentity, Vec<functions::Bucket>> = HashMap::new();
+    for s in v {
+        if s.h.is_some() {
+            native.push(s);
+            continue;
+        }
+        // Group key = the FULL retained identity minus `le` (issue #86):
+        // upstream's bucket signature is `BytesWithoutLabels(le)` over the
+        // whole metric — under the delayed model that still includes the
+        // retained `__name__` (`excludedLabels` at the pin is `le` alone,
+        // quantile.go:51), so two bucket families sharing non-name labels
+        // never merge; the output retains the group's name with
+        // `drop_name: true`.
+        let le_str = s.labels.get("le").unwrap_or("");
+        let le: Result<f64, _> = le_str.parse();
+        let Ok(le) = le else {
+            caches.annotations.borrow_mut().warning(
+                crate::annotations::messages::bad_bucket_label_warning(
+                    s.metric_name.as_deref().unwrap_or(""),
+                    le_str,
+                ),
+            );
+            continue;
+        };
+        let key = (
+            s.metric_name.clone(),
+            s.labels.without(std::slice::from_ref(&le_key)),
+        );
+        groups
+            .entry(key)
+            .or_default()
+            .push(functions::Bucket { le, count: s.v });
+    }
+    // The conflict filter (`engine.go:1354-1371`): drop BOTH sides + warn.
+    native.retain(|s| {
+        let key = (s.metric_name.clone(), s.labels.clone());
+        if groups.get(&key).is_some_and(|b| !b.is_empty()) {
+            caches.annotations.borrow_mut().warning(
+                crate::annotations::messages::mixed_classic_native_histograms_warning(
+                    s.metric_name.as_deref().unwrap_or(""),
+                ),
+            );
+            groups.remove(&key);
+            false
+        } else {
+            true
+        }
+    });
+    (native, groups)
 }
 
 fn eval_step(
@@ -1769,10 +1940,19 @@ fn eval_step(
             )?))
         }
 
-        // Issue #37: `histogram_quantile` **computes** a new value from
-        // the bucket series — Prometheus drops `__name__` (interactively
-        // verified: `histogram_quantile(0.5, x_bucket_histogram_bucket)`
-        // -> `"metric":{}`, PROVENANCE.md's table).
+        // Issue #37 (M7-A5b-i extends to the native form): `histogram_quantile`
+        // **computes** a new value from the bucket series — Prometheus drops
+        // `__name__` (interactively verified: `histogram_quantile(0.5,
+        // x_bucket_histogram_bucket)` -> `"metric":{}`, PROVENANCE.md's
+        // table). Dispatches per sample via [`partition_histogram_inputs`]
+        // (the `resetHistograms` port, incl. the native/classic conflict
+        // filter): a histogram-valued sample (`h.is_some()`) takes the
+        // native `quantile.go` `HistogramQuantile` path (no grouping — one
+        // histogram per sample, unlike classic buckets); a float sample
+        // carrying an `le` label takes the existing classic
+        // `bucketQuantile` path (grouped by identity minus `le`,
+        // `funcHistogramQuantile`, `functions.go`), which since M7-A5b-i
+        // also reports upstream's forced-monotonicity info.
         PlanExpr::HistogramQuantile { quantile, expr } => {
             let StepValue::Scalar(q) =
                 eval_step(quantile, selectors, data, t_ms, lookback_ms, caches)?
@@ -1789,44 +1969,161 @@ fn eval_step(
                         .to_string(),
                 });
             };
-            reject_histogram_vector(&v, "histogram_quantile()")?;
 
-            let le_key = "le".to_string();
-            // Group key = the FULL retained identity minus `le` (issue
-            // #86): upstream's bucket signature is
-            // `BytesWithoutLabels(le)` over the whole metric — under the
-            // delayed model that still includes the retained `__name__`
-            // (`excludedLabels` at the pin is `le` alone, quantile.go:51),
-            // so two bucket families sharing non-name labels never merge;
-            // the output retains the group's name with `drop_name: true`
-            // (funcHistogramQuantile, functions.go).
-            let mut groups: HashMap<SeriesIdentity, Vec<functions::Bucket>> = HashMap::new();
-            for s in v {
-                let le_str = s
-                    .labels
-                    .get("le")
-                    .ok_or_else(|| PromqlError::HistogramBucket {
-                        detail: "bucket series is missing an 'le' label".to_string(),
-                    })?;
-                let le: f64 = le_str.parse().map_err(|_| PromqlError::HistogramBucket {
-                    detail: format!("invalid 'le' label value: {le_str:?}"),
-                })?;
-                let key = (
-                    s.metric_name.clone(),
-                    s.labels.without(std::slice::from_ref(&le_key)),
-                );
-                groups
-                    .entry(key)
-                    .or_default()
-                    .push(functions::Bucket { le, count: s.v });
+            if q.is_nan() || !(0.0..=1.0).contains(&q) {
+                caches
+                    .annotations
+                    .borrow_mut()
+                    .warning(crate::annotations::messages::invalid_quantile_warning(q));
+            }
+
+            let (native, mut groups) = partition_histogram_inputs(v, caches);
+            let mut out = Vec::new();
+            for s in native {
+                let Some(h) = &s.h else { continue };
+                let metric_name = s.metric_name.as_deref().unwrap_or("");
+                let qv = {
+                    let mut annos = caches.annotations.borrow_mut();
+                    histogram_fns::histogram_quantile(q, h, metric_name, &mut annos)
+                };
+                out.push(InstantSample {
+                    labels: s.labels,
+                    metric_name: s.metric_name,
+                    drop_name: true,
+                    t_ms,
+                    v: qv,
+                    h: None,
+                });
             }
 
             let mut keys: Vec<SeriesIdentity> = groups.keys().cloned().collect();
             keys.sort();
-            let mut out = Vec::with_capacity(keys.len());
             for key in keys {
                 let buckets = groups.remove(&key).expect("key came from groups.keys()");
-                let v = functions::histogram_quantile(q, buckets)?;
+                let (v, report) =
+                    functions::histogram_quantile_with_monotonicity_report(q, buckets)?;
+                let (metric_name, labels) = key;
+                if report.forced {
+                    // `funcHistogramQuantile` (`functions.go:2111-2117`):
+                    // BucketQuantile forced monotonicity — info, with the
+                    // group's retained metric name (the pin passes it
+                    // under `enableDelayedNameRemoval`, pulsus's model).
+                    // Repeat firings for the same metric name — other
+                    // groups this step, other steps of a range query —
+                    // MERGE into one widened info (the pin's per-step
+                    // `warnings.Merge(ws)` in `rangeEval` runs
+                    // `annoError.Merge` on the key collision).
+                    caches.annotations.borrow_mut().forced_monotonicity_info(
+                        crate::annotations::messages::histogram_quantile_forced_monotonicity_info(
+                            metric_name.as_deref().unwrap_or(""),
+                        ),
+                        crate::annotations::ForcedMonotonicityDetail::single(
+                            t_ms,
+                            report.min_bucket,
+                            report.max_bucket,
+                            report.max_diff,
+                        ),
+                    );
+                }
+                out.push(InstantSample {
+                    labels,
+                    metric_name,
+                    drop_name: true,
+                    t_ms,
+                    v,
+                    h: None,
+                });
+            }
+            Ok(StepValue::Vector(out))
+        }
+
+        // M7-A5b-i: the five single-vector-argument native-histogram
+        // accessors (`histogram_count/_sum/_avg/_stddev/_stdvar`) —
+        // `simpleHistogramFunc`/`histogramVariance`, `functions.go`.
+        // Float-valued input samples are silently dropped (upstream:
+        // "process only histogram samples"); the output drops the metric
+        // name.
+        PlanExpr::HistogramAccessor { func, arg } => {
+            let StepValue::Vector(v) = eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: format!("{func:?} over a scalar expression"),
+                });
+            };
+            let mut out = Vec::new();
+            for s in v {
+                let Some(h) = &s.h else { continue };
+                let value = match func {
+                    HistogramAccessorFn::Count => histogram_fns::histogram_count(h),
+                    HistogramAccessorFn::Sum => histogram_fns::histogram_sum(h),
+                    HistogramAccessorFn::Avg => histogram_fns::histogram_avg(h),
+                    HistogramAccessorFn::StdDev => histogram_fns::histogram_stddev(h),
+                    HistogramAccessorFn::StdVar => histogram_fns::histogram_stdvar(h),
+                };
+                out.push(InstantSample {
+                    labels: s.labels,
+                    metric_name: s.metric_name,
+                    drop_name: true,
+                    t_ms,
+                    v: value,
+                    h: None,
+                });
+            }
+            Ok(StepValue::Vector(out))
+        }
+
+        // M7-A5b-i: `histogram_fraction(lower, upper, v)` — dispatches per
+        // sample like `HistogramQuantile` (native vs classic `le`-labelled
+        // float), `funcHistogramFraction`, `functions.go`.
+        PlanExpr::HistogramFraction { lower, upper, expr } => {
+            let StepValue::Scalar(lower_v) =
+                eval_step(lower, selectors, data, t_ms, lookback_ms, caches)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "histogram_fraction's first argument must evaluate to a scalar"
+                        .to_string(),
+                });
+            };
+            let StepValue::Scalar(upper_v) =
+                eval_step(upper, selectors, data, t_ms, lookback_ms, caches)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "histogram_fraction's second argument must evaluate to a scalar"
+                        .to_string(),
+                });
+            };
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "histogram_fraction's third argument must evaluate to a vector"
+                        .to_string(),
+                });
+            };
+
+            let (native, mut groups) = partition_histogram_inputs(v, caches);
+            let mut out = Vec::new();
+            for s in native {
+                let Some(h) = &s.h else { continue };
+                let metric_name = s.metric_name.as_deref().unwrap_or("");
+                let fv = {
+                    let mut annos = caches.annotations.borrow_mut();
+                    histogram_fns::histogram_fraction(lower_v, upper_v, h, metric_name, &mut annos)
+                };
+                out.push(InstantSample {
+                    labels: s.labels,
+                    metric_name: s.metric_name,
+                    drop_name: true,
+                    t_ms,
+                    v: fv,
+                    h: None,
+                });
+            }
+
+            let mut keys: Vec<SeriesIdentity> = groups.keys().cloned().collect();
+            keys.sort();
+            for key in keys {
+                let buckets = groups.remove(&key).expect("key came from groups.keys()");
+                let v = functions::bucket_fraction(lower_v, upper_v, buckets);
                 let (metric_name, labels) = key;
                 out.push(InstantSample {
                     labels,
@@ -2359,6 +2656,18 @@ mod tests {
     use crate::plan::{PlanParams, plan};
     use crate::value::FetchedSeries;
 
+    /// M7-A5b-i shim: the crate's public `evaluate` now returns
+    /// `(QueryValue, Annotations)` (the annotations channel, plan v2
+    /// OQ1(a)) — this local shadow (Rust resolves an inner-scope `fn` over
+    /// the `use super::*;` glob import) keeps every pre-existing
+    /// float-test call site (`evaluate(&p, &data)`) compiling with **zero
+    /// assertion edits** (the A5a `Sample` Copy->Clone migration's own
+    /// precedent). Tests that need the annotations directly call
+    /// `super::evaluate` instead.
+    fn evaluate(plan: &QueryPlan, data: &SeriesData) -> Result<QueryValue, PromqlError> {
+        super::evaluate(plan, data).map(|(v, _annotations)| v)
+    }
+
     /// `single_histogram` (`native_histograms.test:34`, A3 corpus fixture).
     fn single_histogram() -> NativeHistogram {
         NativeHistogram {
@@ -2476,14 +2785,17 @@ mod tests {
             vec![series(
                 1,
                 &[("job", "a")],
-                vec![Sample::hist(900, single_histogram())],
+                vec![Sample::hist(900, single_histogram().to_float())],
             )],
         );
         match evaluate(&p, &data).unwrap() {
             QueryValue::Vector(v) => {
                 assert_eq!(v.len(), 1);
                 assert!(
-                    v[0].h.as_deref().unwrap().bits_eq(&single_histogram()),
+                    v[0].h
+                        .as_deref()
+                        .unwrap()
+                        .bits_eq(&single_histogram().to_float()),
                     "the decoded histogram is carried through selection"
                 );
             }
@@ -2502,8 +2814,8 @@ mod tests {
                 1,
                 &[("job", "a")],
                 vec![
-                    Sample::hist(1_000, single_histogram()),
-                    Sample::hist(2_000, single_histogram()),
+                    Sample::hist(1_000, single_histogram().to_float()),
+                    Sample::hist(2_000, single_histogram().to_float()),
                 ],
             )],
         );
@@ -2514,7 +2826,7 @@ mod tests {
                     m[0].points.iter().all(|pt| pt
                         .h
                         .as_deref()
-                        .is_some_and(|h| h.bits_eq(&single_histogram()))),
+                        .is_some_and(|h| h.bits_eq(&single_histogram().to_float()))),
                     "range materialization threads h into every step point"
                 );
             }
@@ -2528,7 +2840,7 @@ mod tests {
         // layer drops it exactly as it drops a float stale marker.
         let expr = crate::parser::parse("up").unwrap();
         let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
-        let mut stale = single_histogram();
+        let mut stale = single_histogram().to_float();
         stale.sum = f64::from_bits(STALE_NAN_BITS);
         let mut data = SeriesData::new();
         data.insert(
@@ -2558,8 +2870,8 @@ mod tests {
                 1,
                 &[("job", "a")],
                 vec![
-                    Sample::hist(900, single_histogram()),
-                    Sample::hist(1_000, single_histogram()),
+                    Sample::hist(900, single_histogram().to_float()),
+                    Sample::hist(1_000, single_histogram().to_float()),
                 ],
             )],
         );
@@ -2642,7 +2954,7 @@ mod tests {
                 vec![series(
                     1,
                     &[("job", "a")],
-                    vec![Sample::hist(900, single_histogram())],
+                    vec![Sample::hist(900, single_histogram().to_float())],
                 )],
             );
         }
@@ -2675,7 +2987,7 @@ mod tests {
                 vec![series(
                     1,
                     &[("job", "a")],
-                    vec![Sample::hist(1_000, single_histogram())],
+                    vec![Sample::hist(1_000, single_histogram().to_float())],
                 )],
             );
         }
@@ -2950,6 +3262,194 @@ mod tests {
             }
             other => panic!("expected Vector, got {other:?}"),
         }
+    }
+
+    /// M7-A5b-i: the classic-`le` path reports upstream's
+    /// forced-monotonicity info (`funcHistogramQuantile`,
+    /// `functions.go:2111-2117`) when a genuine cumulative-count decrease
+    /// was clamped — and stays silent for a monotone input.
+    #[test]
+    fn classic_histogram_quantile_forced_monotonicity_fires_the_info_once() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, x_bucket)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        // Cumulative counts 5 -> 3 (a real decrease) -> 10: forced.
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 5.0)]),
+                series(2, &[("le", "0.5")], vec![s(0, 3.0)]),
+                series(3, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(matches!(value, QueryValue::Vector(v) if v.len() == 1));
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
+        assert_eq!(infos.len(), 1, "exactly one forced-monotonicity info");
+        assert!(
+            infos[0].contains("needed to be fixed for monotonicity")
+                && infos[0].contains("for metric name \"x_bucket\""),
+            "got {infos:?}"
+        );
+
+        // Monotone counterpart: NO annotation (float behavior unchanged).
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 3.0)]),
+                series(2, &[("le", "0.5")], vec![s(0, 5.0)]),
+                series(3, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (_, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(
+            annotations.is_empty(),
+            "monotone classic input adds no annotation"
+        );
+    }
+
+    /// `#124` round-2 blocker B: a RANGE query that forces monotonicity at
+    /// every step emits ONE merged info — not one per step — with the
+    /// pin's widened detail (`over N samples from <minTs> to <maxTs>`),
+    /// matching upstream's per-step `warnings.Merge(ws)` in `rangeEval`
+    /// (`engine.go:1523-1525`) running `histogramQuantileForcedMonotonicityErr
+    /// .Merge` on the base-message key collision.
+    #[test]
+    fn range_query_merges_forced_monotonicity_infos_across_steps_into_one_widened_info() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, x_bucket)"#).unwrap();
+        // 3 steps: t = 0, 60s, 120s; the same forced decrease (5 -> 3,
+        // clamped at le=0.5, diff 2) is visible at every step via the
+        // staleness lookback.
+        let p = plan(&expr, params(0, 120_000, 60_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 5.0)]),
+                series(2, &[("le", "0.5")], vec![s(0, 3.0)]),
+                series(3, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(matches!(value, QueryValue::Matrix(_)));
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: input to histogram_quantile needed to be fixed for monotonicity (see https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile) for metric name \"x_bucket\", from buckets 0.5 to 0.5, with a max diff of 2, over 3 samples from 1970-01-01T00:00:00Z to 1970-01-01T00:02:00Z".to_string()
+            ],
+            "exactly one info, merged across the 3 steps"
+        );
+    }
+
+    /// M7-A5b-i: the `resetHistograms` conflict filter — one identity
+    /// carrying BOTH classic `le` buckets and a native histogram at the
+    /// same timestamp evaluates NEITHER and warns
+    /// (`MixedClassicNativeHistogramsWarning`, `engine.go:1354-1371`);
+    /// an unconflicted identity in the same vector still evaluates.
+    #[test]
+    fn mixed_classic_native_conflict_drops_both_sides_and_warns() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, m)"#).unwrap();
+        let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                // job=a: classic buckets AND a native histogram — conflict.
+                series(1, &[("job", "a"), ("le", "1")], vec![s(900, 5.0)]),
+                series(2, &[("job", "a"), ("le", "+Inf")], vec![s(900, 10.0)]),
+                series(
+                    3,
+                    &[("job", "a")],
+                    vec![Sample::hist(900, single_histogram().to_float())],
+                ),
+                // job=b: clean classic identity — evaluates normally.
+                series(4, &[("job", "b"), ("le", "1")], vec![s(900, 5.0)]),
+                series(5, &[("job", "b"), ("le", "+Inf")], vec![s(900, 10.0)]),
+            ],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        match value {
+            QueryValue::Vector(v) => {
+                assert_eq!(
+                    v.len(),
+                    1,
+                    "only the unconflicted identity evaluates: {v:?}"
+                );
+                assert_eq!(v[0].labels.get("job"), Some("b"));
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert!(infos.is_empty(), "no info expected: {infos:?}");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("mix of classic and native histograms"),
+            "got {warnings:?}"
+        );
+    }
+
+    /// `#124` review finding 4: a classic bucket with a malformed
+    /// (unparsable) `le` label is SKIPPED — not a 422 — and warns
+    /// `bad_bucket_label_warning`; the rest of the group still evaluates.
+    /// Matches pinned `resetHistograms` (`engine.go:1331-1341`).
+    #[test]
+    fn histogram_quantile_skips_a_malformed_le_bucket_and_warns_instead_of_erroring() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, x_bucket)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 1.0)]),
+                // Malformed `le` — must be skipped, not a hard error.
+                series(2, &[("le", "notanumber")], vec![s(0, 2.0)]),
+                series(3, &[("le", "1")], vec![s(0, 10.0)]),
+                series(4, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(
+            matches!(value, QueryValue::Vector(v) if v.len() == 1),
+            "the query succeeds despite the malformed bucket"
+        );
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert!(infos.is_empty(), "no info expected: {infos:?}");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("bucket label \"le\" is missing or has a malformed value")
+                && warnings[0].contains("\"notanumber\""),
+            "got {warnings:?}"
+        );
+    }
+
+    /// A MISSING `le` label (empty raw value, matching upstream's
+    /// `labels.Get` not-found convention) is likewise skipped + warned.
+    #[test]
+    fn histogram_quantile_skips_a_bucket_missing_the_le_label_and_warns() {
+        let expr = crate::parser::parse(r#"histogram_quantile(0.5, x_bucket)"#).unwrap();
+        let p = plan(&expr, params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 1.0)]),
+                // No `le` label at all.
+                series(2, &[("job", "a")], vec![s(0, 2.0)]),
+                series(3, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(matches!(value, QueryValue::Vector(v) if v.len() == 1));
+        let (warnings, _) = annotations.as_strings(0, 0);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("is missing or has a malformed value of \"\""),
+            "got {warnings:?}"
+        );
     }
 
     #[test]
@@ -4198,7 +4698,7 @@ mod tests {
         let mut data = SeriesData::new();
         let samples: Vec<Sample> = (0..=12).map(|k| s(k * 10_000, 1.0)).collect();
         data.insert(0, vec![series(1, &[("job", "a")], samples)]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         // Union grid: multiples of 10s in (0−60s, 60s] = (−60s, 60s] →
         // {−50s, …, 60s} = 12 points. A per-outer-step reevaluation
         // implementation would count one eval per (window, point) pair —
@@ -4241,7 +4741,7 @@ mod tests {
         let mut data = SeriesData::new();
         let samples: Vec<Sample> = (0..=10).map(|k| s(k * 10_000, 1.0)).collect();
         data.insert(0, vec![series(1, &[], samples)]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         // Outer grid: (70s, 100s] step 10s = {80, 90, 100}s → 3 evals of
         // the outer's inner expression. Inner union grid (materialized
         // FIRST, over the outer grid's extent): windows (70,80] ∪ (80,90]
@@ -4275,7 +4775,7 @@ mod tests {
         let p = plan(&expr, params(1_000, 4_000, 1_000)).unwrap();
         let mut data = SeriesData::new();
         data.insert(0, vec![series(1, &[("job", "a")], vec![s(10_000, 1.0)])]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(
             counts.step_invariant_evals, 1,
             "the marked aggregate root must evaluate once, not per step"
@@ -4302,7 +4802,7 @@ mod tests {
         let p = plan(&expr, params(0, 60_000, 10_000)).unwrap();
         let mut data = SeriesData::new();
         data.insert(0, vec![series(1, &[("job", "a")], vec![s(30_000, -3.0)])]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(counts.step_invariant_evals, 1);
         let QueryValue::Matrix(m) = value else {
             panic!("expected Matrix");
@@ -4335,7 +4835,7 @@ mod tests {
         let p = plan(&expr, params(6_000, 9_000, 1_000)).unwrap();
         let mut data = SeriesData::new();
         data.insert(0, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(
             counts.step_invariant_evals, 1,
             "the invariant subquery inner freezes exactly once at the subquery grid start"
@@ -4369,7 +4869,7 @@ mod tests {
 
         // Instant at 7s: subqStart = 4 ⇒ k = 0 ⇒ topk(0) ⇒ empty.
         let p = plan(&expr, params(7_000, 7_000, 0)).unwrap();
-        let (value, _) = evaluate_counted(&p, &data).unwrap();
+        let (value, _, _annotations) = evaluate_counted(&p, &data).unwrap();
         let QueryValue::Vector(v) = value else {
             panic!("expected Vector");
         };
@@ -4380,7 +4880,7 @@ mod tests {
 
         // Range 6s..9s: the 7s step reads 12, frozen at subqStart = 3 (k = 1).
         let p = plan(&expr, params(6_000, 9_000, 1_000)).unwrap();
-        let (value, _) = evaluate_counted(&p, &data).unwrap();
+        let (value, _, _annotations) = evaluate_counted(&p, &data).unwrap();
         let QueryValue::Matrix(m) = value else {
             panic!("expected Matrix");
         };
@@ -4410,7 +4910,7 @@ mod tests {
         let mut data = SeriesData::new();
         data.insert(0, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
         data.insert(1, vec![series(1, &[("job", "a")], m_ten_second_grid())]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(
             counts.step_invariant_evals, 1,
             "only the topk subtree is frozen; the sibling m{{job=a}} varies per grid point"
@@ -4475,7 +4975,7 @@ mod tests {
                 ),
             ],
         );
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(
             counts.finalize_matrix_merge_passes, 0,
             "a drop_name-free range must short-circuit the finalize Matrix merge pass"
@@ -4649,7 +5149,7 @@ mod tests {
         let p = plan(&expr, params(1_000, 4_000, 1_000)).unwrap();
         let mut data = SeriesData::new();
         data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 5.0)])]);
-        let (value, counts) = evaluate_counted(&p, &data).unwrap();
+        let (value, counts, _annotations) = evaluate_counted(&p, &data).unwrap();
         assert_eq!(counts.step_invariant_evals, 0);
         let QueryValue::Matrix(m) = value else {
             panic!("expected Matrix");

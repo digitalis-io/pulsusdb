@@ -306,7 +306,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -399,7 +399,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    match engine.query(&expr, &params).await.expect("query") {
+    match engine.query(&expr, &params).await.expect("query").0 {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -414,7 +414,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
 
     // Aggregation over the same data: drops __name__.
     let expr = parse("sum(up)").expect("parse");
-    match engine.query(&expr, &params).await.expect("query") {
+    match engine.query(&expr, &params).await.expect("query").0 {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -502,7 +502,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
         end_ms: last_week_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -594,7 +594,7 @@ async fn group_with_offset_routes_through_metric_series() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -727,7 +727,7 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         end_ms: t2,
         step_ms,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Matrix(mut m) => {
             // `by (service)` splits into one group per distinct `service`
@@ -836,7 +836,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         end_ms: t0,
         step_ms: 0,
     };
-    let (instant_result, instant_explain) = engine
+    let (instant_result, _annotations, instant_explain) = engine
         .query_explained(&expr, &instant_params)
         .await
         .expect("instant query_explained");
@@ -863,7 +863,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         end_ms: t1,
         step_ms,
     };
-    let (range_result, range_explain) = engine
+    let (range_result, _annotations, range_explain) = engine
         .query_explained(&expr, &range_params)
         .await
         .expect("range query_explained");
@@ -1121,7 +1121,7 @@ async fn rate_end_to_end_against_real_samples() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
@@ -1193,7 +1193,7 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
             ..engine_config(db)
         },
     );
-    let (result, explain) = on_engine
+    let (result, _annotations, explain) = on_engine
         .query_explained(&expr, &params)
         .await
         .expect("max_of must evaluate with the flag on");
@@ -1248,7 +1248,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
 
     // time() -> the eval time in seconds, as a scalar.
     let expr = parse("time()").expect("parse");
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("time() query");
@@ -1268,7 +1268,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
     // vector(time()) -> a one-element vector with the empty label set
     // (no __name__ spliced back in), same zero-fetch story.
     let expr = parse("vector(time())").expect("parse");
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("vector(time()) query");
@@ -1363,7 +1363,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     // count/group cache-only fast path), which resolves from the (warm,
     // in-window) cache.
     let expr = parse("sum(up)").expect("parse");
-    let (_, explain) = engine
+    let (_, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -1446,7 +1446,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     };
 
     let expr = parse("sum(up)").expect("parse");
-    let (_, explain) = engine
+    let (_, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -2103,7 +2103,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -2273,7 +2273,7 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
 
     match result {
         QueryResult::Vector(v) => {
@@ -2409,7 +2409,7 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
 
     // The float metric converts unchanged (dual-read's complementary hist
     // read is empty for `up`).
-    let float = engine
+    let (float, _annotations) = engine
         .query(&parse("up").expect("parse"), &params)
         .await
         .expect("float query ok");
@@ -2422,36 +2422,50 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
     }
 
     // The histogram metric was fetched from metric_hist_samples, merged,
-    // and decoded — reaching the value model as a histogram (rejected by
-    // the A5a encoder as `HistogramResultUnsupported`, never emitting 0.0).
-    let hist_instant = engine
+    // and decoded — reaching the value model as a histogram and (M7-A5b-i)
+    // now ENCODING as `QueryResult::VectorHist` instead of the A5a
+    // `HistogramResultUnsupported` reject: proves the hist row was
+    // dual-read, merged, decoded, and `to_float`'d end to end.
+    let (hist_instant, _annotations) = engine
         .query(&parse("req_seconds").expect("parse"), &params)
-        .await;
-    assert!(
-        matches!(
-            hist_instant,
-            Err(pulsus_read::logql::ReadError::HistogramResultUnsupported)
-        ),
-        "instant histogram result must surface as HistogramResultUnsupported \
-         (proving the hist row was dual-read, merged, and decoded), got: {hist_instant:?}"
-    );
+        .await
+        .expect("histogram instant query ok");
+    match hist_instant {
+        QueryResult::VectorHist(v) => {
+            assert_eq!(v.len(), 1);
+            match &v[0].value {
+                pulsus_read::logql::HistOrFloat::Hist(h) => {
+                    assert_eq!(h.count, 4.0);
+                    assert_eq!(h.sum, 5.0);
+                }
+                other => panic!("expected Hist, got {other:?}"),
+            }
+        }
+        other => panic!("expected VectorHist, got {other:?}"),
+    }
 
-    // The matrix path is detected independently (range query).
+    // The matrix path is exercised independently (range query).
     let range_params = MetricQueryParams {
         start_ms: recent_bucket,
         end_ms: recent_bucket + 60_000,
         step_ms: 60_000,
     };
-    let hist_range = engine
+    let (hist_range, _annotations) = engine
         .query(&parse("req_seconds").expect("parse"), &range_params)
-        .await;
-    assert!(
-        matches!(
-            hist_range,
-            Err(pulsus_read::logql::ReadError::HistogramResultUnsupported)
-        ),
-        "range histogram result must surface as HistogramResultUnsupported, got: {hist_range:?}"
-    );
+        .await
+        .expect("histogram range query ok");
+    match hist_range {
+        QueryResult::MatrixHist(m) => {
+            assert_eq!(m.len(), 1);
+            assert!(
+                m[0].points
+                    .iter()
+                    .any(|(_, v)| matches!(v, pulsus_read::logql::HistOrFloat::Hist(_))),
+                "range materialization carries the histogram through"
+            );
+        }
+        other => panic!("expected MatrixHist, got {other:?}"),
+    }
 
     drop_database(&bootstrap, db).await;
 }

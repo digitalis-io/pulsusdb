@@ -342,7 +342,9 @@ fn run_eval(storage: &TestStorage, cmd: &EvalCmd) -> Result<CaseReport, String> 
                     let data = storage.fetch(&query_plan).map_err(|e| {
                         format!("{}:{}: driver fetch error: {e}", cmd.query, cmd.line)
                     })?;
-                    evaluate(&query_plan, &data).map_err(|e| e.to_string())
+                    evaluate(&query_plan, &data)
+                        .map(|(v, _annotations)| v)
+                        .map_err(|e| e.to_string())
                 }
             }
         }

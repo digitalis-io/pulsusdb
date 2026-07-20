@@ -48,9 +48,13 @@ pub enum PromqlError {
     #[error("binary operator matching error: {detail}")]
     BadMatching { detail: String },
 
-    /// `histogram_quantile` could not compute a quantile — a malformed
-    /// `le` label (parse failure) or a bucket series missing the required
-    /// `+Inf` bucket. Never a silently wrong quantile.
+    /// `histogram_quantile`/`histogram_fraction` could not compute a
+    /// result — an empty bucket group or a bucket series missing the
+    /// required `+Inf` bucket. Never a silently wrong quantile. (A
+    /// malformed/missing `le` label is NOT this variant as of `#124`:
+    /// that bucket is skipped with a `bad_bucket_label_warning`,
+    /// matching pinned `resetHistograms` — `eval::mod::
+    /// partition_histogram_inputs`'s doc.)
     #[error("histogram_quantile error: {detail}")]
     HistogramBucket { detail: String },
 

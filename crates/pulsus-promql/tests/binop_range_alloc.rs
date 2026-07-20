@@ -119,7 +119,7 @@ fn range_binop_allocations_per_cell_stay_bounded() {
     let (qp, data) = fixture();
 
     // Warm-up (allocator internals) + prove the shape is exercised.
-    let warm = evaluate(&qp, &data).expect("evaluate");
+    let (warm, _annotations) = evaluate(&qp, &data).expect("evaluate");
     let out_series = match &warm {
         pulsus_promql::QueryValue::Matrix(m) => m.len(),
         other => panic!("expected Matrix, got {other:?}"),

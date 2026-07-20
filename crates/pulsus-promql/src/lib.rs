@@ -3,6 +3,7 @@
 //! only crate that resolves/fetches and then calls into this one
 //! (`plan` -> `evaluate`).
 
+pub mod annotations;
 pub mod error;
 pub mod eval;
 pub mod math;
@@ -10,6 +11,7 @@ pub mod parser;
 pub mod plan;
 pub mod value;
 
+pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
 pub use error::PromqlError;
 pub use eval::evaluate;
 pub use math::KahanSum;

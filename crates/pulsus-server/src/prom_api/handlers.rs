@@ -240,16 +240,24 @@ async fn run_query(
     // the encoder's deterministic label sort.
     let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
     if explain {
-        let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
-        Ok(encode::query_response(
+        let (result, annotations, plan_explain) =
+            engine.query_explained(expr, query_params).await?;
+        Ok(encode::query_response_annotated(
             result,
             Some(plan_explain),
             at_ms,
             ordered,
+            &annotations,
         ))
     } else {
-        let result = engine.query(expr, query_params).await?;
-        Ok(encode::query_response(result, None, at_ms, ordered))
+        let (result, annotations) = engine.query(expr, query_params).await?;
+        Ok(encode::query_response_annotated(
+            result,
+            None,
+            at_ms,
+            ordered,
+            &annotations,
+        ))
     }
 }
 

@@ -172,6 +172,27 @@ fn check_structural(
                 ));
             }
         }
+        // M7-A5b-i (issue #124): unit-witnessed-only entries must name the
+        // corpus-witness blocker in their rationale (tying it to the A6
+        // `{{…}}` grammar deliverable) and must NOT claim a corpus witness
+        // — one would be fake by construction while the native-histogram
+        // load grammar is a deferred directive.
+        Status::ImplementedUnitWitnessed => {
+            let rationale = rationale.as_deref().unwrap_or("");
+            if !rationale.contains("A6") {
+                problems.push(format!(
+                    "{kind} {name}: implemented_unit_witnessed without a rationale naming \
+                     the A6 corpus-witness blocker"
+                ));
+            }
+            if witness.is_some() {
+                problems.push(format!(
+                    "{kind} {name}: implemented_unit_witnessed must not claim a corpus \
+                     witness (the native-histogram load grammar is A6-deferred — a witness \
+                     would be fake); flip to implemented WITH the witness once A6 lands"
+                ));
+            }
+        }
     }
 }
 
@@ -326,13 +347,17 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
 fn classify_probe(kind: &str, name: &str, status: Status, probe: &str, problems: &mut Vec<String>) {
     let outcome = probe_outcome(probe);
     match (status, outcome) {
-        (Status::Implemented, Ok(())) => {}
+        // `implemented_unit_witnessed` (M7-A5b-i) carries the SAME
+        // probe obligation as `implemented` — the construct must
+        // genuinely evaluate; only the corpus-witness requirement is
+        // relaxed (structural check), never this one.
+        (Status::Implemented | Status::ImplementedUnitWitnessed, Ok(())) => {}
         (Status::Scheduled | Status::Deferred, Err(e)) => {
             // The error kind is printed for visibility, never gated.
             println!("probe {kind} {name} ({probe}) correctly errors: {e}");
         }
-        (Status::Implemented, Err(e)) => problems.push(format!(
-            "{kind} {name} is marked implemented but its probe {probe:?} failed: {e} — \
+        (Status::Implemented | Status::ImplementedUnitWitnessed, Err(e)) => problems.push(format!(
+            "{kind} {name} is marked {status:?} but its probe {probe:?} failed: {e} — \
              either implement it or flip the manifest status"
         )),
         (Status::Scheduled | Status::Deferred, Ok(())) => problems.push(format!(
@@ -496,8 +521,51 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // M6-05b (issue #82): the info() metadata-join, experimental
             // (planner-gated behind promql-experimental-functions).
             "info",
+            // M7-A5b-i (issue #124): histogram_fraction's classic
+            // `le`-bucket path (BucketFraction) — the native-histogram
+            // path is implemented too, but this manifest tracks the
+            // *function* as a whole (mirrors histogram_quantile's own
+            // entry, whose native dispatch landed in the same sub-track).
+            "histogram_fraction",
         ])
     );
+
+    // M7-A5b-i (issue #124): the CLOSED unit-witnessed-only set — the five
+    // native-histogram-only accessors, whose semantics are proven by
+    // `eval::histogram_fns`'s hermetic unit tests but whose CORPUS witness
+    // is structurally blocked until A6 lands the promqltest `{{…}}`
+    // native-histogram load grammar (a deferred directive today —
+    // `grammar.rs`'s own doc; proof files must use none). Pinned exactly
+    // so no other entry can quietly adopt the relaxed status: adding a
+    // sixth name here must be as deliberate as flipping `implemented`.
+    let unit_witnessed_fns: BTreeSet<&str> = manifest
+        .functions
+        .iter()
+        .filter(|f| f.status == Status::ImplementedUnitWitnessed)
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(
+        unit_witnessed_fns,
+        BTreeSet::from([
+            "histogram_count",
+            "histogram_sum",
+            "histogram_avg",
+            "histogram_stddev",
+            "histogram_stdvar",
+        ])
+    );
+    assert!(
+        manifest
+            .aggregation_operators
+            .iter()
+            .all(|o| o.status != Status::ImplementedUnitWitnessed)
+            && manifest
+                .language_features
+                .iter()
+                .all(|l| l.status != Status::ImplementedUnitWitnessed),
+        "implemented_unit_witnessed is function-only (the A6 corpus-grammar gap)"
+    );
+
     let implemented_ops: BTreeSet<&str> = manifest
         .aggregation_operators
         .iter()

@@ -271,20 +271,23 @@
     {
       "name": "histogram_avg",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented_unit_witnessed",
+      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
     },
     {
       "name": "histogram_count",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented_unit_witnessed",
+      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
     },
     {
       "name": "histogram_fraction",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "histogram_fraction(-Inf, 0.5, hist_bucket)"
+      }
     },
     {
       "name": "histogram_quantile",
@@ -304,20 +307,20 @@
     {
       "name": "histogram_stddev",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented_unit_witnessed",
+      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
     },
     {
       "name": "histogram_stdvar",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented_unit_witnessed",
+      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
     },
     {
       "name": "histogram_sum",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented_unit_witnessed",
+      "rationale": "implemented in M7-A5b-i (#124), unit-witnessed in eval::histogram_fns (native-histogram-only \u2014 no classic fallback exists to witness); the corpus witness is blocked until A6 lands the promqltest {{...}} native-histogram load grammar (a deferred directive today); A6 flips this to implemented with a real corpus witness"
     },
     {
       "name": "hour",

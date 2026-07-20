@@ -51,7 +51,10 @@ use super::matcher::{DataWindow, DiscoveryFilter};
 use super::sample_rows::{HistSampleRow, MultiHistSampleRow, MultiSampleRow, SampleRow};
 use super::sample_sql;
 use crate::logql::error::{ReadError, TooBroadReason};
-use crate::logql::exec::{MatrixSeries, QueryResult, VectorSample, escape_query_placeholders};
+use crate::logql::exec::{
+    HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, QueryResult, VectorSample,
+    escape_query_placeholders,
+};
 use crate::logql::explain::PlanExplain;
 
 /// Owned table configuration a [`MetricsEngine`] plans every query
@@ -221,11 +224,14 @@ impl MetricsEngine {
         self
     }
 
+    /// Returns the encoded result alongside its accumulated
+    /// [`pulsus_promql::Annotations`] (M7-A5b-i) — empty for every
+    /// float-only query (byte-identical to the pre-A5b-i behavior).
     pub async fn query(
         &self,
         expr: &Expr,
         p: &MetricQueryParams,
-    ) -> Result<QueryResult, ReadError> {
+    ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
         self.query_inner(expr, p, None).await
     }
 
@@ -236,10 +242,10 @@ impl MetricsEngine {
         &self,
         expr: &Expr,
         p: &MetricQueryParams,
-    ) -> Result<(QueryResult, PlanExplain), ReadError> {
+    ) -> Result<(QueryResult, pulsus_promql::Annotations, PlanExplain), ReadError> {
         let mut explain = PlanExplain::new("metrics");
-        let result = self.query_inner(expr, p, Some(&mut explain)).await?;
-        Ok((result, explain))
+        let (result, annotations) = self.query_inner(expr, p, Some(&mut explain)).await?;
+        Ok((result, annotations, explain))
     }
 
     async fn query_inner(
@@ -247,7 +253,7 @@ impl MetricsEngine {
         expr: &Expr,
         p: &MetricQueryParams,
         mut explain: Option<&mut PlanExplain>,
-    ) -> Result<QueryResult, ReadError> {
+    ) -> Result<(QueryResult, pulsus_promql::Annotations), ReadError> {
         let plan_params = p.plan_params(self.config.experimental_functions);
         let plan = pulsus_promql::plan(expr, plan_params)?;
 
@@ -474,9 +480,9 @@ impl MetricsEngine {
         // early), so cancellation is unreachable. Re-raising the panic
         // preserves today's panic-on-bug behavior exactly (no new
         // `ReadError` variant — a panic is not a domain error).
-        let value =
+        let (value, annotations) =
             evaluate_offloaded(&self.eval_gate, plan, data, pulsus_promql::evaluate).await?;
-        value_to_query_result(value)
+        Ok((value_to_query_result(value), annotations))
     }
 
     /// Issue #85 (M6-08c): builds a name-less/regex-`__name__` selector's
@@ -1168,13 +1174,15 @@ async fn evaluate_offloaded<F>(
     plan: pulsus_promql::QueryPlan,
     data: pulsus_promql::SeriesData,
     eval: F,
-) -> Result<pulsus_promql::QueryValue, ReadError>
+) -> Result<(pulsus_promql::QueryValue, pulsus_promql::Annotations), ReadError>
 where
     F: FnOnce(
             &pulsus_promql::QueryPlan,
             &pulsus_promql::SeriesData,
-        ) -> Result<pulsus_promql::QueryValue, pulsus_promql::PromqlError>
-        + Send
+        ) -> Result<
+            (pulsus_promql::QueryValue, pulsus_promql::Annotations),
+            pulsus_promql::PromqlError,
+        > + Send
         + 'static,
 {
     match gate.run_blocking(move || eval(&plan, &data)).await {
@@ -1281,13 +1289,18 @@ where
 }
 
 /// Decodes a `metric_hist_samples` row's value columns into a
-/// [`NativeHistogram`] (M7-A5a) — `from_columns` **only**, never
-/// `validate`: the A4 ingest seam validated before storing, so re-
-/// validating on the hot read path is wasted work that would reject
-/// nothing new (trusted-storage decode). A structural failure maps to
-/// [`ReadError::HistogramDecode`].
-fn decode_hist(cols: &pulsus_model::HistogramColumns) -> Result<NativeHistogram, ReadError> {
-    Ok(NativeHistogram::from_columns(cols)?)
+/// [`pulsus_model::FloatHistogram`] (M7-A5a decode, M7-A5b-i `to_float`
+/// eval-boundary conversion) — `from_columns` **only**, never `validate`:
+/// the A4 ingest seam validated before storing, so re-validating on the hot
+/// read path is wasted work that would reject nothing new (trusted-storage
+/// decode). A structural failure maps to [`ReadError::HistogramDecode`].
+/// `to_float` runs here, once, so no integer histogram survives past this
+/// function — every sample the value model carries downstream is
+/// `FloatHistogram` (M7-A5b plan v3 finding 1).
+fn decode_hist(
+    cols: &pulsus_model::HistogramColumns,
+) -> Result<pulsus_model::FloatHistogram, ReadError> {
+    Ok(NativeHistogram::from_columns(cols)?.to_float())
 }
 
 /// The float half of a mergeable sample row (`SampleRow`/`MultiSampleRow`).
@@ -1300,7 +1313,7 @@ trait FloatPoint {
 /// (`HistSampleRow`/`MultiHistSampleRow`).
 trait HistPoint {
     fn unix_milli(&self) -> i64;
-    fn decode(&self) -> Result<NativeHistogram, ReadError>;
+    fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError>;
 }
 
 impl FloatPoint for SampleRow {
@@ -1325,7 +1338,7 @@ impl HistPoint for HistSampleRow {
     fn unix_milli(&self) -> i64 {
         self.unix_milli
     }
-    fn decode(&self) -> Result<NativeHistogram, ReadError> {
+    fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
 }
@@ -1334,7 +1347,7 @@ impl HistPoint for MultiHistSampleRow {
     fn unix_milli(&self) -> i64 {
         self.unix_milli
     }
-    fn decode(&self) -> Result<NativeHistogram, ReadError> {
+    fn decode(&self) -> Result<pulsus_model::FloatHistogram, ReadError> {
         decode_hist(&self.to_columns())
     }
 }
@@ -1710,43 +1723,72 @@ fn vector_to_query_result(vector: Vec<InstantSample>) -> QueryResult {
 /// [`QueryResult`] — the sole `QueryValue`→wire chokepoint in the metrics
 /// read path.
 ///
-/// **M7-A5a histogram rejection (plan v3 finding 1):** a *correct*
-/// Prometheus native-histogram JSON element requires span→bucket-boundary
-/// iteration (the `FloatHistogram` machinery A5b builds), so A5a rejects a
-/// histogram-valued result cleanly rather than emit an incomplete or `0.0`
-/// value. Both detection paths are checked independently — a `Vector`
-/// element carrying `h.is_some()` (8a) and a `Matrix` point carrying a
-/// histogram (8b) — and both surface as
-/// [`ReadError::HistogramResultUnsupported`] (422 `execution`, naming
-/// A5b). The Scalar/String/float-Vector/float-Matrix arms are unchanged, so
-/// float output stays byte-identical and **no path emits `0.0` for a
-/// histogram** (AC5/AC8).
-fn value_to_query_result(value: QueryValue) -> Result<QueryResult, ReadError> {
+/// **M7-A5b-i histogram encoding (plan v3 finding 1, replacing the A5a
+/// `HistogramResultUnsupported` reject):** a `Vector`/`Matrix` carrying at
+/// least one histogram-valued element/point routes through
+/// [`QueryResult::VectorHist`]/[`QueryResult::MatrixHist`] (the
+/// `pulsus_model::FloatHistogram`-carrying siblings — `prom_api::encode`
+/// walks `FloatHistogram::all_bucket_iterator`-equivalent
+/// (`all_buckets`) to render the Prometheus `histogram` JSON shape); an
+/// all-float `Vector`/`Matrix` takes the EXACT SAME path as before
+/// (`vector_to_query_result`/the plain `QueryResult::Matrix` arm), so float
+/// output stays byte-identical (AC5) and no path emits `0.0` for a
+/// histogram.
+fn value_to_query_result(value: QueryValue) -> QueryResult {
     match value {
         QueryValue::Vector(v) => {
             if v.iter().any(|s| s.h.is_some()) {
-                return Err(ReadError::HistogramResultUnsupported);
+                QueryResult::VectorHist(
+                    v.into_iter()
+                        .map(|s| HistVectorSample {
+                            labels: with_metric_name(s.labels, s.metric_name),
+                            value: match s.h {
+                                Some(h) => HistOrFloat::Hist(h),
+                                None => HistOrFloat::Float(s.v),
+                            },
+                        })
+                        .collect(),
+                )
+            } else {
+                vector_to_query_result(v)
             }
-            Ok(vector_to_query_result(v))
         }
         QueryValue::Matrix(m) => {
             if m.iter().any(|s| s.points.iter().any(|p| p.h.is_some())) {
-                return Err(ReadError::HistogramResultUnsupported);
+                QueryResult::MatrixHist(
+                    m.into_iter()
+                        .map(|s: RangeSeries| HistMatrixSeries {
+                            labels: with_metric_name(s.labels, s.metric_name),
+                            points: s
+                                .points
+                                .into_iter()
+                                .map(|p| {
+                                    let v = match p.h {
+                                        Some(h) => HistOrFloat::Hist(h),
+                                        None => HistOrFloat::Float(p.v),
+                                    };
+                                    (p.t_ms, v)
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                )
+            } else {
+                QueryResult::Matrix(
+                    m.into_iter()
+                        .map(|s: RangeSeries| MatrixSeries {
+                            labels: with_metric_name(s.labels, s.metric_name),
+                            points: s.points.into_iter().map(|p| (p.t_ms, p.v)).collect(),
+                        })
+                        .collect(),
+                )
             }
-            Ok(QueryResult::Matrix(
-                m.into_iter()
-                    .map(|s: RangeSeries| MatrixSeries {
-                        labels: with_metric_name(s.labels, s.metric_name),
-                        points: s.points.into_iter().map(|p| (p.t_ms, p.v)).collect(),
-                    })
-                    .collect(),
-            ))
         }
-        QueryValue::Scalar(v) => Ok(QueryResult::Scalar(v)),
+        QueryValue::Scalar(v) => QueryResult::Scalar(v),
         // Issue #86 (M6-08d): a top-level string-literal query — value
         // only; the encoder stamps the eval-time timestamp (the Scalar
         // precedent).
-        QueryValue::String(s) => Ok(QueryResult::String(s)),
+        QueryValue::String(s) => QueryResult::String(s),
     }
 }
 
@@ -2004,7 +2046,7 @@ mod tests {
             "the concurrent task made progress during the offloaded eval — the reactor stayed live"
         );
         assert!(
-            matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+            matches!(out.0, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
             "the heavy fixture must produce a non-empty matrix"
         );
 
@@ -2062,7 +2104,7 @@ mod tests {
         drop(held);
         let out = handle.await.unwrap();
         assert!(
-            matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+            matches!(out.0, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
             "the heavy fixture must produce a non-empty matrix"
         );
         assert_eq!(
@@ -2152,7 +2194,7 @@ mod tests {
         for h in handles {
             let out = h.await.unwrap();
             assert!(
-                matches!(out, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
+                matches!(out.0, pulsus_promql::QueryValue::Matrix(ref m) if !m.is_empty()),
                 "each offloaded eval must produce the heavy fixture's non-empty matrix"
             );
         }
@@ -2438,7 +2480,7 @@ mod tests {
 
     #[test]
     fn value_to_query_result_maps_scalar() {
-        match value_to_query_result(QueryValue::Scalar(42.0)).unwrap() {
+        match value_to_query_result(QueryValue::Scalar(42.0)) {
             QueryResult::Scalar(v) => assert_eq!(v, 42.0),
             other => panic!("expected Scalar, got {other:?}"),
         }
@@ -2449,7 +2491,7 @@ mod tests {
     /// externally (the Scalar precedent).
     #[test]
     fn value_to_query_result_maps_string() {
-        match value_to_query_result(QueryValue::String("Foo".to_string())).unwrap() {
+        match value_to_query_result(QueryValue::String("Foo".to_string())) {
             QueryResult::String(s) => assert_eq!(s, "Foo"),
             other => panic!("expected String, got {other:?}"),
         }
@@ -2463,7 +2505,7 @@ mod tests {
             drop_name: false,
             points: vec![Point::float(0, 1.0), Point::float(1000, 2.0)],
         }];
-        match value_to_query_result(QueryValue::Matrix(matrix)).unwrap() {
+        match value_to_query_result(QueryValue::Matrix(matrix)) {
             QueryResult::Matrix(m) => {
                 assert_eq!(m.len(), 1);
                 assert_eq!(m[0].points, vec![(0, 1.0), (1000, 2.0)]);
@@ -2484,7 +2526,7 @@ mod tests {
             drop_name: false,
             points: vec![Point::float(0, 1.0), Point::float(1000, 2.0)],
         }];
-        match value_to_query_result(QueryValue::Matrix(matrix)).unwrap() {
+        match value_to_query_result(QueryValue::Matrix(matrix)) {
             QueryResult::Matrix(m) => {
                 assert_eq!(m.len(), 1);
                 assert!(
@@ -2575,7 +2617,10 @@ mod tests {
         for h in [single_histogram(), custom_buckets_histogram()] {
             let row = hist_row(1, 0, &h);
             let back = decode_hist(&row.to_columns()).expect("decode");
-            assert!(back.bits_eq(&h), "round-trip mismatch: {back:?} != {h:?}");
+            assert!(
+                back.bits_eq(&h.to_float()),
+                "round-trip mismatch: {back:?} != {h:?}"
+            );
         }
     }
 
@@ -2590,7 +2635,7 @@ mod tests {
         assert_eq!((merged[0].t_ms, merged[0].h.is_none()), (0, true));
         assert_eq!(merged[0].v, 1.0);
         assert_eq!(merged[1].t_ms, 10);
-        assert!(merged[1].h.as_deref().unwrap().bits_eq(&hist));
+        assert!(merged[1].h.as_deref().unwrap().bits_eq(&hist.to_float()));
         assert_eq!((merged[2].t_ms, merged[2].h.is_none()), (20, true));
     }
 
@@ -2604,7 +2649,7 @@ mod tests {
         let merged = merge_series(&float, &h).unwrap();
         assert_eq!(merged.len(), 1, "the float at the collision is dropped");
         assert_eq!(merged[0].t_ms, 10);
-        assert!(merged[0].h.as_deref().unwrap().bits_eq(&hist));
+        assert!(merged[0].h.as_deref().unwrap().bits_eq(&hist.to_float()));
     }
 
     #[test]
@@ -2637,7 +2682,13 @@ mod tests {
         assert!(series[0].samples.iter().all(|s| s.h.is_none()));
         assert_eq!(series[1].fingerprint, 2);
         assert_eq!(series[1].samples.len(), 1);
-        assert!(series[1].samples[0].h.as_deref().unwrap().bits_eq(&hist));
+        assert!(
+            series[1].samples[0]
+                .h
+                .as_deref()
+                .unwrap()
+                .bits_eq(&hist.to_float())
+        );
     }
 
     #[test]
@@ -2770,9 +2821,10 @@ mod tests {
         );
     }
 
-    // -- AC8: histogram-valued API results are rejected (422, never 0.0);
-    //    float results convert unchanged. Vector (8a) and Matrix (8b) paths
-    //    are detected independently.
+    // -- M7-A5b-i: histogram-valued API results now ENCODE (VectorHist/
+    //    MatrixHist), replacing the A5a HistogramResultUnsupported reject.
+    //    Vector and Matrix paths are exercised independently; a pure-float
+    //    result still takes the unchanged float path (byte-identical, AC5).
 
     fn hist_instant() -> InstantSample {
         InstantSample {
@@ -2781,30 +2833,40 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v: 0.0,
-            h: Some(Box::new(single_histogram())),
+            h: Some(Box::new(single_histogram().to_float())),
         }
     }
 
     #[test]
-    fn ac8a_histogram_vector_result_is_rejected() {
-        let err = value_to_query_result(QueryValue::Vector(vec![hist_instant()])).unwrap_err();
-        assert!(matches!(err, ReadError::HistogramResultUnsupported));
+    fn a_histogram_vector_result_encodes_as_vector_hist() {
+        match value_to_query_result(QueryValue::Vector(vec![hist_instant()])) {
+            QueryResult::VectorHist(v) => {
+                assert_eq!(v.len(), 1);
+                assert!(matches!(v[0].value, HistOrFloat::Hist(_)));
+            }
+            other => panic!("expected VectorHist, got {other:?}"),
+        }
     }
 
     #[test]
-    fn ac8b_histogram_matrix_point_is_rejected() {
+    fn a_histogram_matrix_point_encodes_as_matrix_hist() {
         let matrix = vec![RangeSeries {
             labels: Labels::new(vec![("job".to_string(), "a".to_string())]),
             metric_name: Some("m".to_string()),
             drop_name: false,
-            points: vec![Point::hist(0, single_histogram())],
+            points: vec![Point::hist(0, single_histogram().to_float())],
         }];
-        let err = value_to_query_result(QueryValue::Matrix(matrix)).unwrap_err();
-        assert!(matches!(err, ReadError::HistogramResultUnsupported));
+        match value_to_query_result(QueryValue::Matrix(matrix)) {
+            QueryResult::MatrixHist(m) => {
+                assert_eq!(m.len(), 1);
+                assert!(matches!(m[0].points[0].1, HistOrFloat::Hist(_)));
+            }
+            other => panic!("expected MatrixHist, got {other:?}"),
+        }
     }
 
     #[test]
-    fn ac8d_pure_float_vector_and_matrix_still_convert() {
+    fn pure_float_vector_and_matrix_still_convert_unchanged() {
         let vector = QueryValue::Vector(vec![InstantSample {
             labels: Labels::new(vec![("job".to_string(), "a".to_string())]),
             metric_name: Some("m".to_string()),
@@ -2814,7 +2876,7 @@ mod tests {
             h: None,
         }]);
         assert!(matches!(
-            value_to_query_result(vector).unwrap(),
+            value_to_query_result(vector),
             QueryResult::Vector(_)
         ));
         let matrix = QueryValue::Matrix(vec![RangeSeries {
@@ -2823,7 +2885,7 @@ mod tests {
             drop_name: false,
             points: vec![Point::float(0, 1.0)],
         }]);
-        match value_to_query_result(matrix).unwrap() {
+        match value_to_query_result(matrix) {
             QueryResult::Matrix(m) => assert_eq!(m[0].points, vec![(0, 1.0)]),
             other => panic!("expected Matrix, got {other:?}"),
         }

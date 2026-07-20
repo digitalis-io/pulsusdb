@@ -56,6 +56,20 @@ pub enum Status {
     Implemented,
     Scheduled,
     Deferred,
+    /// M7-A5b-i (issue #124): semantics are implemented and proven by
+    /// hermetic in-crate unit tests, but a CORPUS witness cannot exist
+    /// yet — the function is native-histogram-only, and the promqltest
+    /// harness's `{{…}}` native-histogram input grammar is itself an A6
+    /// deliverable (a deferred directive; a proof-corpus file may not use
+    /// one, `promqltest_corpus.rs`). The probe classifier requires the
+    /// probe to evaluate `Ok` exactly like [`Status::Implemented`]; the
+    /// structural check requires a `rationale` naming the blocking gap
+    /// and REJECTS a corpus `witness` (any witness claimed under this
+    /// status would be fake by construction). A6 flips these to
+    /// `implemented` with a real corpus witness — the
+    /// `function_coverage.rs` pinned set for this status keeps it closed
+    /// so no other entry can quietly adopt it.
+    ImplementedUnitWitnessed,
 }
 
 /// A pointer at the concrete corpus case that proves an `implemented`

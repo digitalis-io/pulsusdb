@@ -101,6 +101,48 @@ pub struct MatrixSeries {
     pub points: Vec<(i64, f64)>,
 }
 
+/// M7-A5b-i: one element's value — a plain float or a native histogram
+/// (`FloatHistogram`, the eval-result type). Additive companion to
+/// [`VectorSample`]/[`MatrixSeries`] (which stay float-only, LogQL/traces-
+/// shared, untouched) — a metrics query whose result carries at least one
+/// histogram-valued element/point routes through [`QueryResult::VectorHist`]/
+/// [`QueryResult::MatrixHist`] instead.
+#[derive(Debug, Clone)]
+pub enum HistOrFloat {
+    Float(f64),
+    Hist(Box<pulsus_model::FloatHistogram>),
+}
+
+/// Hand-written (no `PartialEq` derive on `FloatHistogram` — NaN-bearing
+/// fields, `pulsus_model`'s own doc): float arm via native `f64::eq`
+/// (`NaN != NaN`), histogram arm via `FloatHistogram::bits_eq`, mirroring
+/// `pulsus-promql::value`'s `Sample`/`Point` contract.
+impl PartialEq for HistOrFloat {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Float(a), Self::Float(b)) => a == b,
+            (Self::Hist(a), Self::Hist(b)) => a.bits_eq(b),
+            _ => false,
+        }
+    }
+}
+
+/// One instant-query series whose value may be a native histogram.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistVectorSample {
+    pub labels: Vec<(String, String)>,
+    pub value: HistOrFloat,
+}
+
+/// One range-query series whose points may mix float and histogram values
+/// (a series's underlying sample type can change mid-window).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistMatrixSeries {
+    pub labels: Vec<(String, String)>,
+    /// `(step_ns, value)`, ascending by step.
+    pub points: Vec<(i64, HistOrFloat)>,
+}
+
 /// The engine's raw result — #13 encodes this into the query-API JSON
 /// envelope (out of scope here per the architect plan). `Scalar` is issue
 /// #31's addition (`pulsus_promql::QueryValue::Scalar` — a bare-number
@@ -128,6 +170,13 @@ pub enum QueryResult {
     /// evaluation time (`at_ms`), never carried in the variant. LogQL
     /// never produces it.
     String(String),
+    /// M7-A5b-i: an instant-query result carrying at least one histogram-
+    /// valued element (metrics-only — replaces the A5a
+    /// `HistogramResultUnsupported` reject).
+    VectorHist(Vec<HistVectorSample>),
+    /// M7-A5b-i: a range-query result carrying at least one histogram-
+    /// valued point (metrics-only).
+    MatrixHist(Vec<HistMatrixSeries>),
 }
 
 pub struct LogQlEngine {

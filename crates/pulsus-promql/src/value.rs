@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use pulsus_model::{NativeHistogram, STALE_NAN_BITS};
+use pulsus_model::{FloatHistogram, STALE_NAN_BITS};
 
 use crate::plan::SelectorId;
 
@@ -13,20 +13,26 @@ use crate::plan::SelectorId;
 /// Unix epoch (`metric_samples.unix_milli`, docs/schemas.md §2.3) —
 /// verbatim, never rounded.
 ///
-/// **Native-histogram channel (M7-A5a):** `h` carries a decoded
-/// [`NativeHistogram`] for a histogram sample (from `metric_hist_samples`,
-/// merged into the sample stream by the read path). It is `Some` only for
-/// a histogram value; a float sample leaves it `None` and reads `v`. The
-/// two are mutually exclusive by construction — `metric_samples` and
+/// **Native-histogram channel (M7-A5a; M7-A5b-i migrated the type from the
+/// integer [`pulsus_model::NativeHistogram`] to [`FloatHistogram`]):** `h`
+/// carries a decoded, float-bucket histogram for a histogram sample (from
+/// `metric_hist_samples`, merged into the sample stream by the read path,
+/// `NativeHistogram::to_float`'d once at `decode_hist` — no integer
+/// histogram survives past the read boundary). It is `Some` only for a
+/// histogram value; a float sample leaves it `None` and reads `v`. The two
+/// are mutually exclusive by construction — `metric_samples` and
 /// `metric_hist_samples` never carry the same `(name, fp, unix_milli)`.
 /// `Box`ed so the float `Sample` stays small (a null pointer, no heap
 /// alloc for the `None` case). `Copy` is dropped for `Clone` because
-/// `NativeHistogram` owns `Vec`s.
+/// `FloatHistogram` owns `Vec`s. `FloatHistogram` (not the integer form) is
+/// also THE eval-result type: `rate`/`sum`/binop-derived histogram outputs
+/// carry fractional bucket counts the integer form cannot represent
+/// (M7-A5b plan v3 finding 1).
 #[derive(Debug, Clone)]
 pub struct Sample {
     pub t_ms: i64,
     pub v: f64,
-    pub h: Option<Box<NativeHistogram>>,
+    pub h: Option<Box<FloatHistogram>>,
 }
 
 impl Sample {
@@ -38,7 +44,7 @@ impl Sample {
     /// A native-histogram sample. `v` is unused for a histogram value and
     /// set to `0.0` so the hand-written `PartialEq` float arm (`v == v`)
     /// holds and `h` disambiguates.
-    pub fn hist(t_ms: i64, h: NativeHistogram) -> Self {
+    pub fn hist(t_ms: i64, h: FloatHistogram) -> Self {
         Self {
             t_ms,
             v: 0.0,
@@ -62,7 +68,7 @@ impl Sample {
 /// Bit-exact equality preserving the pre-M7 derived float semantics: the
 /// float value compares with native `f64::eq` (`self.v == o.v`, so
 /// `NaN != NaN`, exactly the old `#[derive(PartialEq)]`), and the
-/// histogram channel compares by [`NativeHistogram::bits_eq`]. A float
+/// histogram channel compares by [`FloatHistogram::bits_eq`]. A float
 /// sample (`h: None`) and a histogram sample (`h: Some`) are never equal.
 impl PartialEq for Sample {
     fn eq(&self, o: &Self) -> bool {
@@ -72,13 +78,13 @@ impl PartialEq for Sample {
 
 /// One range-vector (matrix) point: a float or histogram value at `t_ms`.
 /// The histogram channel mirrors [`Sample::h`]. `PartialEq` is hand-written
-/// (same contract as [`Sample`]) because [`NativeHistogram`] lacks a
-/// derive.
+/// (same contract as [`Sample`]) because [`FloatHistogram`] lacks a derive
+/// (NaN-bearing `sum`/`zero_threshold`/`custom_values`).
 #[derive(Debug, Clone)]
 pub struct Point {
     pub t_ms: i64,
     pub v: f64,
-    pub h: Option<Box<NativeHistogram>>,
+    pub h: Option<Box<FloatHistogram>>,
 }
 
 impl Point {
@@ -88,7 +94,7 @@ impl Point {
     }
 
     /// A native-histogram point (`v` set to `0.0`, see [`Sample::hist`]).
-    pub fn hist(t_ms: i64, h: NativeHistogram) -> Self {
+    pub fn hist(t_ms: i64, h: FloatHistogram) -> Self {
         Self {
             t_ms,
             v: 0.0,
@@ -119,7 +125,7 @@ impl PartialEq<(i64, f64)> for Point {
 /// Shared histogram-channel equality for the hand-written `PartialEq`s
 /// ([`Sample`], [`Point`], [`InstantSample`], [`RangeSeries`]): both absent
 /// is equal, both present compares by bits, presence-mismatch is unequal.
-fn hist_opt_eq(a: &Option<Box<NativeHistogram>>, b: &Option<Box<NativeHistogram>>) -> bool {
+fn hist_opt_eq(a: &Option<Box<FloatHistogram>>, b: &Option<Box<FloatHistogram>>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => x.bits_eq(y),
@@ -305,12 +311,12 @@ pub struct InstantSample {
     /// The native-histogram channel (M7-A5a) — mirrors [`Sample::h`].
     /// `Some` only for a histogram-valued instant sample carried through
     /// the evaluator's **selection** path; float samples leave it `None`.
-    pub h: Option<Box<NativeHistogram>>,
+    pub h: Option<Box<FloatHistogram>>,
 }
 
 /// Bit-exact equality with the pre-M7 derived float semantics preserved
 /// (`v` via native `f64::eq`); the histogram channel compares by
-/// [`NativeHistogram::bits_eq`]. See [`Sample`]'s `PartialEq`.
+/// [`FloatHistogram::bits_eq`]. See [`Sample`]'s `PartialEq`.
 impl PartialEq for InstantSample {
     fn eq(&self, o: &Self) -> bool {
         self.labels == o.labels
@@ -372,13 +378,15 @@ pub enum QueryValue {
 
 #[cfg(test)]
 mod tests {
-    use pulsus_model::{STALE_NAN_BITS, Span};
+    use pulsus_model::{NativeHistogram, STALE_NAN_BITS, Span};
 
     use super::*;
 
     /// `single_histogram` (`native_histograms.test:34`), the A3 corpus
     /// fixture: `schema:0 sum:5 count:4 buckets:[1 2 1]` (deltas `[1 1 -1]`).
-    fn single_histogram() -> NativeHistogram {
+    /// Returned already `to_float`'d (M7-A5b-i): the value-model histogram
+    /// channel is `FloatHistogram`, never the integer form.
+    fn single_histogram() -> FloatHistogram {
         NativeHistogram {
             schema: 0,
             zero_threshold: 0.0,
@@ -394,10 +402,11 @@ mod tests {
             negative_buckets: vec![],
             custom_values: vec![],
         }
+        .to_float()
     }
 
-    // -- M7-A5a: value-model equality (AC9) — float arm byte-identical,
-    //    histogram arm via NativeHistogram::bits_eq --
+    // -- M7-A5a/A5b-i: value-model equality (AC9) — float arm byte-identical,
+    //    histogram arm via FloatHistogram::bits_eq --
 
     #[test]
     fn two_equal_float_samples_are_eq_unchanged() {
@@ -422,7 +431,7 @@ mod tests {
             Sample::hist(1000, single_histogram())
         );
         let mut other = single_histogram();
-        other.count = 5;
+        other.count = 5.0;
         assert_ne!(
             Sample::hist(1000, single_histogram()),
             Sample::hist(1000, other)

@@ -300,6 +300,19 @@ pub enum AggOp {
     LimitRatio,
 }
 
+/// M7-A5b-i: the five single-vector-argument native-histogram accessors
+/// (`histogram_fraction` takes two extra scalar args, so it is its own
+/// [`PlanExpr::HistogramFraction`] variant rather than a sixth
+/// discriminant here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistogramAccessorFn {
+    Count,
+    Sum,
+    Avg,
+    StdDev,
+    StdVar,
+}
+
 /// Elementwise vector→vector math/trig functions (issue #65, M6-02):
 /// pure post-fetch transforms — every discriminant maps one input sample
 /// to one output value, so the wrapped expression's selector set (and
@@ -549,6 +562,24 @@ pub enum PlanExpr {
     },
     HistogramQuantile {
         quantile: Box<PlanExpr>,
+        expr: Box<PlanExpr>,
+    },
+    /// M7-A5b-i: the single-vector-argument native-histogram accessors
+    /// (`histogram_count`/`_sum`/`_avg`/`_stddev`/`_stdvar`,
+    /// `functions.go` `simpleHistogramFunc`/`histogramVariance`). Each
+    /// silently drops a float-valued input sample (upstream: "process only
+    /// histogram samples") and drops the metric name on output (`DropName:
+    /// true`, mirroring [`PlanExpr::HistogramQuantile`]).
+    HistogramAccessor {
+        func: HistogramAccessorFn,
+        arg: Box<PlanExpr>,
+    },
+    /// M7-A5b-i: `histogram_fraction(lower, upper, v)` — dispatches per
+    /// sample like [`PlanExpr::HistogramQuantile`] (native histogram vs
+    /// classic `le`-labelled float), `functions.go` `funcHistogramFraction`.
+    HistogramFraction {
+        lower: Box<PlanExpr>,
+        upper: Box<PlanExpr>,
         expr: Box<PlanExpr>,
     },
     Aggregate {
@@ -1411,15 +1442,17 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
     }
 
     if name == "histogram_quantile" {
-        let [quantile_arg, expr_arg] = args.as_slice() else {
-            return Err(unsupported("histogram_quantile() with != 2 arguments"));
-        };
-        let quantile = plan_expr(planner, quantile_arg)?;
-        let expr = plan_expr(planner, expr_arg)?;
-        return Ok(PlanExpr::HistogramQuantile {
-            quantile: Box::new(quantile),
-            expr: Box::new(expr),
-        });
+        return plan_histogram_quantile(planner, args);
+    }
+
+    // M7-A5b-i: the five single-vector-argument native-histogram accessors.
+    if let Some(func) = histogram_accessor_fn(name) {
+        return plan_histogram_accessor(planner, name, func, args);
+    }
+
+    // M7-A5b-i: `histogram_fraction(lower, upper, v)`.
+    if name == "histogram_fraction" {
+        return plan_histogram_fraction(planner, args);
     }
 
     // Issue #65 (M6-02): the 23 unary elementwise math/trig functions —
@@ -1871,6 +1904,87 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             data_matchers,
         })
     }
+}
+
+/// The `histogram_quantile(q, v)` planning arm (issue #37) — out of line
+/// (the `resolve_subquery_fields`/`plan_info` precedent, extended to this
+/// pre-existing arm by M7-A5b-i when the two new histogram arms below
+/// pushed `plan_call`'s frame past [`MAX_SUBQUERY_DEPTH`]'s tuned budget):
+/// `plan_call` sits on the plan recursion cycle whose per-level debug-build
+/// frame budget sizes `MAX_SUBQUERY_DEPTH` — this arm's locals must not
+/// ride every recursion frame.
+#[inline(never)]
+fn plan_histogram_quantile(
+    planner: &mut Planner,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [quantile_arg, expr_arg] = args else {
+        return Err(unsupported("histogram_quantile() with != 2 arguments"));
+    };
+    let quantile = plan_expr(planner, quantile_arg)?;
+    let expr = plan_expr(planner, expr_arg)?;
+    Ok(PlanExpr::HistogramQuantile {
+        quantile: Box::new(quantile),
+        expr: Box::new(expr),
+    })
+}
+
+/// `name` -> the matching [`HistogramAccessorFn`] discriminant, or `None`.
+/// A tiny, non-recursive lookup (no `plan_expr` call), so it stays inline
+/// in `plan_call` without affecting the recursion-cycle frame budget (see
+/// [`plan_histogram_accessor`]'s own doc for the functions that DO need
+/// the out-of-line split).
+fn histogram_accessor_fn(name: &str) -> Option<HistogramAccessorFn> {
+    match name {
+        "histogram_count" => Some(HistogramAccessorFn::Count),
+        "histogram_sum" => Some(HistogramAccessorFn::Sum),
+        "histogram_avg" => Some(HistogramAccessorFn::Avg),
+        "histogram_stddev" => Some(HistogramAccessorFn::StdDev),
+        "histogram_stdvar" => Some(HistogramAccessorFn::StdVar),
+        _ => None,
+    }
+}
+
+/// The single-vector-argument native-histogram accessor planning arm
+/// (M7-A5b-i) — out of line (the `resolve_subquery_fields`/`plan_info`
+/// precedent): `plan_call` sits on the plan recursion cycle whose
+/// per-level debug-build frame budget sizes [`MAX_SUBQUERY_DEPTH`] — this
+/// arm's locals must not ride every recursion frame.
+#[inline(never)]
+fn plan_histogram_accessor(
+    planner: &mut Planner,
+    name: &str,
+    func: HistogramAccessorFn,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [arg] = args else {
+        return Err(unsupported(format!("{name}() with != 1 argument")));
+    };
+    let arg = plan_expr(planner, arg)?;
+    Ok(PlanExpr::HistogramAccessor {
+        func,
+        arg: Box::new(arg),
+    })
+}
+
+/// The `histogram_fraction(lower, upper, v)` planning arm (M7-A5b-i) — out
+/// of line, same rationale as [`plan_histogram_accessor`].
+#[inline(never)]
+fn plan_histogram_fraction(
+    planner: &mut Planner,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [lower_arg, upper_arg, expr_arg] = args else {
+        return Err(unsupported("histogram_fraction() with != 3 arguments"));
+    };
+    let lower = plan_expr(planner, lower_arg)?;
+    let upper = plan_expr(planner, upper_arg)?;
+    let expr = plan_expr(planner, expr_arg)?;
+    Ok(PlanExpr::HistogramFraction {
+        lower: Box::new(lower),
+        upper: Box::new(upper),
+        expr: Box::new(expr),
+    })
 }
 
 /// The first `VectorSelector` in pre-order source order — the port of
@@ -2403,6 +2517,14 @@ impl<'a> StepInvariance<'a> {
                 let inv = self.classify(quantile).0 && self.classify(expr).0;
                 (inv, inv)
             }
+            PlanExpr::HistogramAccessor { arg, .. } => {
+                let inv = self.classify(arg).0;
+                (inv, inv)
+            }
+            PlanExpr::HistogramFraction { lower, upper, expr } => {
+                let inv = self.classify(lower).0 && self.classify(upper).0 && self.classify(expr).0;
+                (inv, inv)
+            }
             // The param-IGNORING quirk: upstream's AggregateExpr arm
             // returns `preprocessExprHelper(n.Expr)` verbatim — the
             // param is neither classified nor ever wrapped.
@@ -2453,6 +2575,7 @@ fn over_time_param_fn_is_at_modifier_unsafe(func: OverTimeParamFn) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::parser::parse;
 
@@ -3397,15 +3520,18 @@ mod tests {
 
     #[test]
     fn a_function_outside_the_implemented_list_is_unsupported() {
-        // `histogram_count` is scheduled for the native-histogram issue
-        // (#22) — a stand-in for "any function the planner does not yet
-        // map" (issue #65 moved the previous stand-in, `abs`, into the
-        // implemented set; issue #68 moved its successor, `sort`).
-        let expr = parse("histogram_count(up)").unwrap();
+        // `histogram_quantiles` (the experimental multi-quantile variant —
+        // out of scope per M7-A5b's plan: `TRIM_*`/`histogram_quantiles`/
+        // `ReduceResolution` stay unimplemented) is a stand-in for "any
+        // function the planner does not yet map" (issue #65 moved the
+        // previous stand-in, `abs`, into the implemented set; issue #68
+        // moved its successor, `sort`; M7-A5b-i moved `histogram_count`
+        // and its five siblings).
+        let expr = parse(r#"histogram_quantiles(up, "q", 0.5)"#).unwrap();
         let err = plan(&expr, params()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => {
-                assert!(construct.contains("histogram_count"));
+                assert!(construct.contains("histogram_quantiles"));
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }

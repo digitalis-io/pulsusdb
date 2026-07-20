@@ -464,6 +464,20 @@ pub(crate) fn query_response(
             })),
         )
             .into_response(),
+        // Unreachable: `QueryResult::VectorHist`/`MatrixHist` (M7-A5b-i)
+        // are PromQL metrics-only variants (native-histogram results) —
+        // LogQL never fetches `metric_hist_samples` and so never produces
+        // one. Mirrors the `String` arm's well-formed-error-over-panic
+        // precedent.
+        QueryResult::VectorHist(_) | QueryResult::MatrixHist(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "errorType": "internal",
+                "error": "unexpected histogram result from a logs query",
+            })),
+        )
+            .into_response(),
     }
 }
 
