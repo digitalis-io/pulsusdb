@@ -150,7 +150,7 @@ eval instant at 5m requests * on(status) group_left(__name__) limits
 # One-to-one with two lhs matches for one signature: many-to-one must be
 # explicit.
 eval_fail instant at 5m requests * on(status) limits
-	expected_fail_message multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)
+	expected_fail_regexp ^multiple matches for labels: many-to-one matching must be explicit \(group_left/group_right\)$
 
 # A duplicate signature on the one side is many-to-many — verbatim
 # upstream error, "right hand-side" under group_left.
@@ -164,7 +164,7 @@ eval_fail instant at 5m limits_dup * on(status) group_right requests
 # Duplicate output identity across the many side: the include copy
 # collapses method=GET/POST onto one output labelset.
 eval_fail instant at 5m requests * on(status) group_left(method) onemeta
-	expected_fail_message multiple matches for labels: grouping labels must ensure unique matches
+	expected_fail_regexp ^multiple matches for labels: grouping labels must ensure unique matches$
 
 clear
 

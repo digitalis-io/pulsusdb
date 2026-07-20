@@ -278,12 +278,22 @@ mod tests {
 
     #[tokio::test]
     async fn promql_bad_matching_error_maps_to_422_execution() {
+        // Issue #70: the duplicate-match detail is the upstream text
+        // verbatim — no added prefix — asserted byte-equal at the HTTP
+        // surface, not just by substring.
         let err = PromqlError::BadMatching {
-            detail: "many-to-one match without group_left".to_string(),
+            detail: "multiple matches for labels: many-to-one matching must be explicit \
+                     (group_left/group_right)"
+                .to_string(),
         };
         let (status, json) = envelope(ApiError::Promql(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "multiple matches for labels: many-to-one matching must be explicit \
+             (group_left/group_right)"
+        );
     }
 
     #[tokio::test]

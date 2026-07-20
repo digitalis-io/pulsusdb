@@ -1861,6 +1861,34 @@ mod tests {
         );
     }
 
+    /// Issue #70: the duplicate-one-side error is byte-exact upstream —
+    /// no added prefix, including the metric-identity brackets and the
+    /// trailing "many-to-many matching not allowed" clause.
+    #[test]
+    fn duplicate_one_side_error_is_the_full_upstream_message_verbatim() {
+        let many = vec![sample(&[("s", "200")], 1.0)];
+        let one = vec![
+            named_sample("limits", &[("s", "200"), ("z", "a")], 1.0),
+            named_sample("limits", &[("s", "200"), ("z", "b")], 2.0),
+        ];
+        let err = vv_group(
+            BinOp::Mul,
+            false,
+            &on(&["s"]),
+            &group_left(&[]),
+            &many,
+            &one,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "found duplicate series for the match group {s=\"200\"} on the right hand-side of \
+             the operation: [{__name__=\"limits\", s=\"200\", z=\"b\"}, \
+             {__name__=\"limits\", s=\"200\", z=\"a\"}];many-to-many matching not allowed: \
+             matching labels must be unique on one side"
+        );
+    }
+
     /// One-to-one with multiple lhs matches for one signature is the
     /// verbatim "must be explicit" error.
     #[test]
@@ -1871,12 +1899,10 @@ mod tests {
         ];
         let rhs = vec![sample(&[("s", "200")], 10.0)];
         let err = vv(BinOp::Add, false, &on(&["s"]), &lhs, &rhs).unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "multiple matches for labels: many-to-one matching must be explicit \
-                 (group_left/group_right)"
-            ),
-            "got {err}"
+        assert_eq!(
+            err.to_string(),
+            "multiple matches for labels: many-to-one matching must be explicit \
+             (group_left/group_right)"
         );
     }
 
@@ -1900,11 +1926,9 @@ mod tests {
             &one,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains(
-                "multiple matches for labels: grouping labels must ensure unique matches"
-            ),
-            "got {err}"
+        assert_eq!(
+            err.to_string(),
+            "multiple matches for labels: grouping labels must ensure unique matches"
         );
     }
 

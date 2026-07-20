@@ -41,11 +41,12 @@ pub enum PromqlError {
     /// A binary expression's vector matching is invalid — the upstream
     /// duplicate-match errors (a many-to-one match without
     /// `group_left`/`group_right`, a duplicate "one"-side signature, a
-    /// non-unique many-to-one output identity — issue #70 carries the
-    /// verbatim upstream v3.13 message in `detail`) and the
-    /// modifier-misuse rejections ported from upstream parse.go (fill
-    /// with a scalar operand or a set operator).
-    #[error("binary operator matching error: {detail}")]
+    /// non-unique many-to-one output identity) and the modifier-misuse
+    /// rejections ported from upstream parse.go (fill with a scalar
+    /// operand or a set operator). `detail` carries the exact upstream
+    /// v3.13 message verbatim (issue #70) — `Display` is the raw detail
+    /// with no added prefix, mirroring `LabelSet` below.
+    #[error("{detail}")]
     BadMatching { detail: String },
 
     /// `histogram_quantile`/`histogram_fraction` could not compute a
@@ -102,12 +103,18 @@ mod tests {
         assert!(err.to_string().contains("the @ modifier"));
     }
 
+    /// Issue #70: the vendored corpus asserts these messages as substrings
+    /// (and, after this fix, an anchored regex) of the query error —
+    /// `Display` must be the raw upstream text with no added prefix.
     #[test]
-    fn bad_matching_display_names_the_detail() {
+    fn bad_matching_display_is_the_raw_detail_with_no_prefix() {
         let err = PromqlError::BadMatching {
             detail: "many-to-one match without group_left/group_right".to_string(),
         };
-        assert!(err.to_string().contains("many-to-one"));
+        assert_eq!(
+            err.to_string(),
+            "many-to-one match without group_left/group_right"
+        );
     }
 
     #[test]
