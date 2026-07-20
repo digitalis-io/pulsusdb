@@ -108,6 +108,20 @@ pub enum TooBroadReason {
     /// Complete-or-error, never a truncated result. A Rust-side
     /// structural limit, never from a ClickHouse error code.
     MetricSeries { cap: u64 },
+    /// Issue #89 (retroactive re-review): a regex/negated-`__name__`
+    /// PromQL selector's multi-metric resolution *examined* more resident
+    /// cache entries (metric names plus candidate fingerprints) than
+    /// `reader.promql_max_cache_scan` before it could finish — an
+    /// independent enumeration bound, distinct from [`Self::MetricFanout`]
+    /// (which counts only matched names) and `OverCardinality` (which
+    /// counts only matched series): a selector whose matchers yield few or
+    /// no matches can still examine the whole resident cache. Produced
+    /// **only** by `metrics::exec`'s multi-metric resolution, on both the
+    /// query and discovery paths — the discovery path never routes this to
+    /// the degraded-cache probe fallback (a warm cache that reaches this
+    /// bound is not degraded, it is genuinely too broad). A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    CacheScan { cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -171,6 +185,17 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "resolved more than {cap} series — narrow the pipeline (fewer parsed/\
                      formatted labels), use a coarser grouping, or a narrower window"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`/`MetricSeries`: the
+            // walk bails the instant it would cross the budget, so
+            // `examined` is never presented here as an exact final tally.
+            TooBroadReason::CacheScan { cap } => {
+                write!(
+                    f,
+                    "regex/negated-name selector examined more than {cap} cache entries, \
+                     exceeding the scan budget (reader.promql_max_cache_scan) — narrow the \
+                     __name__ matcher or use a metric-scoped selector"
                 )
             }
         }
@@ -417,6 +442,24 @@ mod tests {
         let msg = ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: 500 }).to_string();
         assert!(msg.contains("query too broad"), "{msg}");
         assert!(msg.contains("resolved more than 500 series"), "{msg}");
+    }
+
+    /// Issue #89 (retroactive re-review): the cache-scan budget uses
+    /// LOWER-BOUND wording, names the knob, and maps `QueryTooBroad` to a
+    /// 422-class message — the message-discrimination string live tests
+    /// pin against `MetricFanout`/`NamelessSelectorUnresolvable`.
+    #[test]
+    fn cache_scan_display_names_the_cap_and_the_knob() {
+        let msg = ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap: 200_000 }).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(
+            msg.contains("examined more than 200000 cache entries"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("scan budget (reader.promql_max_cache_scan)"),
+            "{msg}"
+        );
     }
 
     #[test]

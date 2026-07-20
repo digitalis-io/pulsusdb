@@ -146,6 +146,8 @@ fn record_label_cache_metrics(cache: &LabelCache) {
         .absolute(snap.miss_over_cardinality_total);
     metrics::counter!("pulsus_label_cache_misses_total", "reason" => "regex_unsupported")
         .absolute(snap.miss_regex_unsupported_total);
+    metrics::counter!("pulsus_label_cache_misses_total", "reason" => "scan_budget")
+        .absolute(snap.miss_scan_budget_total);
     metrics::counter!("pulsus_label_cache_refreshes_total").absolute(snap.refreshes_total);
     metrics::counter!("pulsus_label_cache_refresh_failures_total")
         .absolute(snap.refresh_failures_total);

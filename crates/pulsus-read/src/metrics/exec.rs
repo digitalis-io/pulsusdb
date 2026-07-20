@@ -97,6 +97,18 @@ pub struct MetricsConfig {
     /// [`crate::logql::error::TooBroadReason::MetricFanout`] error, never
     /// an unbounded `IN` set. Operator-scale tuning routes to issue #25.
     pub max_metric_fanout: u64,
+    /// Issue #89 (retroactive re-review): `ReaderConfig::promql_max_cache_scan`
+    /// — the independent bound on how many cache entries (metric names
+    /// plus candidate fingerprints) one name-less/regex-`__name__`
+    /// selector's resolution may *examine* before it is rejected as too
+    /// broad (default 200_000). Distinct from `max_metric_fanout` (which
+    /// bounds only the matched result): a selector whose matchers yield
+    /// few or no matches can still examine the whole resident cache.
+    /// Above it the resolution fails with the named
+    /// [`crate::logql::error::TooBroadReason::CacheScan`] error on both
+    /// the query and discovery paths — the discovery path never routes
+    /// this to the degraded-cache probe fallback.
+    pub max_cache_scan: u64,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -505,6 +517,7 @@ impl MetricsEngine {
             &sel.matchers,
             window,
             self.config.max_metric_fanout,
+            self.config.max_cache_scan,
         );
         let groups: Vec<MetricSeriesGroup> = match resolution {
             MultiMetricResolution::Groups(groups) => groups,
@@ -518,6 +531,9 @@ impl MetricsEngine {
                     matched,
                     cap,
                 }));
+            }
+            MultiMetricResolution::ScanBudgetExceeded { cap, .. } => {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap }));
             }
         };
 
@@ -847,7 +863,13 @@ impl MetricsEngine {
     /// `metric_series` whose sorted names feed the SAME flat fetch shape
     /// with label matchers in SQL. The cap-breach error mapping stays
     /// identical to [`Self::plan_multi_metric_fetch`] (the query path keeps
-    /// its degraded `422`; only discovery falls back).
+    /// its degraded `422`; only discovery falls back). A
+    /// [`MultiMetricResolution::ScanBudgetExceeded`] breach (retroactive
+    /// re-review) is a THIRD, distinct outcome: it maps to the same named
+    /// `422` [`Self::plan_multi_metric_fetch`] uses, never the `Probe`
+    /// fallback — the walk only reaches this bound on a warm, authoritative
+    /// cache (the fallback exists for a degraded one, not a too-broad
+    /// query against a healthy one).
     fn discovery_multi_query(
         &self,
         filter: &DiscoveryFilter,
@@ -859,6 +881,7 @@ impl MetricsEngine {
             &filter.matchers,
             window,
             self.config.max_metric_fanout,
+            self.config.max_cache_scan,
         );
         let groups: Vec<MetricSeriesGroup> = match resolution {
             MultiMetricResolution::Groups(groups) => groups,
@@ -879,6 +902,11 @@ impl MetricsEngine {
                     matched,
                     cap,
                 }));
+            }
+            MultiMetricResolution::ScanBudgetExceeded { cap, .. } => {
+                // NOT `Probe`: a warm-cache scan-budget breach is a
+                // genuinely too-broad query, not a degraded cache.
+                return Err(ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap }));
             }
         };
         if groups.is_empty() {

@@ -276,6 +276,10 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // production carrier — `ReaderConfig -> MetricsConfig ->
         // MetricsEngine::plan_multi_metric_fetch`.
         max_metric_fanout: config.reader.promql_max_metric_fanout,
+        // Issue #89 (retroactive re-review): the independent
+        // cache-enumeration scan-budget's production carrier —
+        // `ReaderConfig -> MetricsConfig -> resolve_multi_metric`.
+        max_cache_scan: config.reader.promql_max_cache_scan,
     }
 }
 
@@ -659,6 +663,17 @@ mod tests {
         assert_eq!(metrics_config_from(&config).max_metric_fanout, 1_000);
         config.reader.promql_max_metric_fanout = 250;
         assert_eq!(metrics_config_from(&config).max_metric_fanout, 250);
+    }
+
+    /// Issue #89 (retroactive re-review): `reader.promql_max_cache_scan`
+    /// maps into `MetricsConfig.max_cache_scan` — the 200_000 default and
+    /// an override both survive the production carrier.
+    #[test]
+    fn metrics_config_from_maps_the_cache_scan_budget() {
+        let mut config = Config::default();
+        assert_eq!(metrics_config_from(&config).max_cache_scan, 200_000);
+        config.reader.promql_max_cache_scan = 500;
+        assert_eq!(metrics_config_from(&config).max_cache_scan, 500);
     }
 
     /// Issue #65 (M6-02) plan v2 Δ4: the hermetic production-path

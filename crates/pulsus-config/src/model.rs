@@ -277,6 +277,17 @@ pub struct ReaderConfig {
     /// adjudication) — the bound on the flat `PREWHERE metric_name IN
     /// (…)` fetch's `IN`-set width. Operator-scale tuning routes to #25.
     pub promql_max_metric_fanout: u64,
+    /// Issue #89 (retroactive re-review): the independent bound on how
+    /// many cache entries (metric names plus candidate fingerprints) one
+    /// name-less/regex-`__name__` PromQL selector's resolution may
+    /// **examine** before it is rejected as too broad (default 200_000 —
+    /// above `cache_max_series` so no legitimate warm resolution
+    /// false-rejects). Distinct from `promql_max_metric_fanout`, which
+    /// bounds only the *matched* result: a selector whose matchers yield
+    /// few or no matches can still examine the whole resident cache
+    /// without tripping the fan-out or `cache_max_series` guards.
+    /// Operator-scale tuning routes to issue #25.
+    pub promql_max_cache_scan: u64,
     pub logql_scan_budget_bytes: ByteSize,
     /// Issue M6-09 / #90 (LogQL pipelines): the **first-page fetch-size
     /// hint** for fetch-until-limit paging, applied when a query pipeline
@@ -363,6 +374,7 @@ impl Default for ReaderConfig {
             promql_lookback: HumanDuration(Duration::from_secs(300)),
             promql_experimental_functions: false,
             promql_max_metric_fanout: 1_000,
+            promql_max_cache_scan: 200_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,

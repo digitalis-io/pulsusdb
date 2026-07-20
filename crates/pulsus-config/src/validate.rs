@@ -152,6 +152,13 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.promql_max_metric_fanout",
         cfg.reader.promql_max_metric_fanout,
     )?;
+    // Issue #89 (retroactive re-review): a zero scan budget would reject
+    // every regex/negated-`__name__` selector's resolution before it could
+    // examine a single cache entry.
+    positive_u64(
+        "reader.promql_max_cache_scan",
+        cfg.reader.promql_max_cache_scan,
+    )?;
     positive_bytes(
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
@@ -517,6 +524,17 @@ mod tests {
         assert_eq!(Config::default().reader.promql_max_metric_fanout, 1_000);
         let mut cfg = Config::default();
         cfg.reader.promql_max_metric_fanout = 0;
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #89 (retroactive re-review): the cache-scan budget follows the
+    /// sibling u64 caps' validation shape — zero is an invalid value,
+    /// rejected at config load, and the documented default is 200_000.
+    #[test]
+    fn zero_promql_max_cache_scan_is_rejected_and_the_default_is_200_000() {
+        assert_eq!(Config::default().reader.promql_max_cache_scan, 200_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_cache_scan = 0;
         assert!(validate(&cfg).is_err());
     }
 

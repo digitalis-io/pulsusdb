@@ -210,6 +210,20 @@ pub enum MultiMetricResolution {
     /// metric-fan-out-exceeded error; operator-scale tuning routes to
     /// issue #25.
     FanoutExceeded { matched: usize, cap: u64 },
+    /// Issue #89 (retroactive re-review): the walk *examined* more cache
+    /// entries (metric names plus candidate fingerprints) than
+    /// `ReaderConfig::promql_max_cache_scan` (default 200_000) before it
+    /// could finish — a regex/negated-`__name__` selector with a low or
+    /// zero match rate can examine the whole resident cache without
+    /// tripping [`FanoutExceeded`]/`OverCardinality` (which count only
+    /// matched results). This is an independent, examined-entry bound: the
+    /// walk bails the instant the count would cross the budget, so
+    /// `examined` is a **lower bound** (it never exceeds `cap + 1`, and
+    /// reaches exactly `cap + 1` whenever the walk had that many entries to
+    /// examine). Never routed to the discovery `Probe` fallback — a warm
+    /// cache that reaches this bound is not degraded, it is genuinely too
+    /// broad.
+    ScanBudgetExceeded { examined: usize, cap: u64 },
 }
 
 /// Issue #85: evaluates a selector's `name_matchers` against one concrete
@@ -273,14 +287,27 @@ fn cached_name_matches(
 
 /// The issue #85 name-less/regex-`__name__` resolution, pure over the
 /// snapshot (the [`resolve_over`] factoring precedent): walk the
-/// name-keyed `by_metric` map in sorted-name order, keep the names
-/// passing `name_matchers`, evaluate the ordinary label `matchers` over
-/// each kept name's series, and return the non-empty per-metric groups.
-/// Shares [`resolve_over`]'s cold/out-of-window/stale gates verbatim (a
-/// snapshot that cannot answer a single-metric query cannot answer a
-/// multi-metric one either); both the fan-out cap and the
-/// `cache_max_series` total-series guard short-circuit the walk, so the
-/// worst case is bounded by the resident snapshot, never by the query.
+/// name-keyed `by_metric` map in native `HashMap` iteration order, keep
+/// the names passing `name_matchers`, evaluate the ordinary label
+/// `matchers` over each kept name's series, and return the non-empty
+/// per-metric groups (sorted by name before returning — see below). Shares
+/// [`resolve_over`]'s cold/out-of-window/stale gates verbatim (a snapshot
+/// that cannot answer a single-metric query cannot answer a multi-metric
+/// one either).
+///
+/// Issue #89 (retroactive re-review): the fan-out cap and the
+/// `cache_max_series` total-series guard bound only the **matched**
+/// result, not the **walk** — a selector whose name/label matchers yield
+/// few or no matches (e.g. `{__name__=~".*", nonexistent="x"}`) previously
+/// completed a full scan of every resident name (and every resident
+/// fingerprint) before either guard could fire. `scan_budget` closes that
+/// hole independently: `examined` counts one unit per metric name
+/// inspected plus one per candidate fingerprint inspected, and the walk
+/// bails to [`MultiMetricResolution::ScanBudgetExceeded`] the instant that
+/// count would cross `scan_budget`. Per-query in-process work is therefore
+/// bounded by `scan_budget + 1` examined entries regardless of resident
+/// cache size — the fan-out/`cache_max_series` guards still bound the
+/// matched result, `scan_budget` bounds the examined universe.
 #[allow(clippy::too_many_arguments)] // mirrors resolve_over/resolve_labelled_over's shape
 pub(crate) fn resolve_multi_metric_over(
     snapshot: &CacheSnapshot,
@@ -291,6 +318,7 @@ pub(crate) fn resolve_multi_metric_over(
     matchers: &[LabelMatcher],
     window: DataWindow,
     fanout_cap: u64,
+    scan_budget: u64,
 ) -> MultiMetricResolution {
     if snapshot.generation == 0 {
         metrics.miss_cold_total.fetch_add(1, Ordering::Relaxed);
@@ -319,15 +347,32 @@ pub(crate) fn resolve_multi_metric_over(
         };
     }
 
-    // Sorted-name walk: deterministic group order (and therefore a
-    // deterministic `IN` list / explain trace) regardless of HashMap
-    // iteration order.
-    let mut names: Vec<&String> = snapshot.by_metric.keys().collect();
-    names.sort_unstable();
-
+    // Issue #89 fix: walk `by_metric` directly in native `HashMap` order —
+    // NO pre-loop `keys().collect()`/sort. The old sorted-name walk
+    // allocated and sorted every resident name before either the fan-out
+    // or `cache_max_series` guard could fire, an O(resident cache) cost
+    // regardless of match rate. `examined` gates the enumeration itself:
+    // it bails to `ScanBudgetExceeded` the instant it would cross
+    // `scan_budget`, so at most `scan_budget + 1` names/fingerprints are
+    // ever inspected. Determinism is preserved on the success path by
+    // sorting the bounded `groups` output below (never the input
+    // universe): when the walk completes under budget, every name was
+    // examined, so the matched set is order-independent regardless of
+    // which order the map was walked in.
     let mut groups: Vec<MetricSeriesGroup> = Vec::new();
     let mut total_series = 0usize;
-    for name in names {
+    let mut examined: u64 = 0;
+    for (name, candidates) in &snapshot.by_metric {
+        examined += 1;
+        if examined > scan_budget {
+            metrics
+                .miss_scan_budget_total
+                .fetch_add(1, Ordering::Relaxed);
+            return MultiMetricResolution::ScanBudgetExceeded {
+                examined: examined as usize,
+                cap: scan_budget,
+            };
+        }
         match cached_name_matches(regex_cache, name_matchers, name) {
             Ok(true) => {}
             Ok(false) => continue,
@@ -338,11 +383,18 @@ pub(crate) fn resolve_multi_metric_over(
                 return MultiMetricResolution::Unresolvable { reason };
             }
         }
-        let Some(candidates) = snapshot.by_metric.get(name) else {
-            continue;
-        };
         let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
         for &fp in candidates {
+            examined += 1;
+            if examined > scan_budget {
+                metrics
+                    .miss_scan_budget_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return MultiMetricResolution::ScanBudgetExceeded {
+                    examined: examined as usize,
+                    cap: scan_budget,
+                };
+            }
             let Some(labels) = snapshot.by_fingerprint.get(&fp) else {
                 continue;
             };
@@ -390,6 +442,14 @@ pub(crate) fn resolve_multi_metric_over(
             series: matched,
         });
     }
+
+    // Sort only the BOUNDED matched output (<= fanout_cap groups), not the
+    // resident name universe: the walk completed under budget, so every
+    // name was examined and the matched set is independent of `HashMap`
+    // iteration order — sorting here reproduces the deterministic `IN`
+    // list / explain trace the old pre-loop sort provided, at O(matched)
+    // cost instead of O(resident).
+    groups.sort_unstable_by(|a, b| a.metric_name.cmp(&b.metric_name));
 
     metrics.hits_total.fetch_add(1, Ordering::Relaxed);
     MultiMetricResolution::Groups(groups)
@@ -931,15 +991,17 @@ impl LabelCache {
     /// over the name-keyed snapshot — see [`resolve_multi_metric_over`]
     /// and [`MultiMetricResolution`] for the contract (no SQL fallback;
     /// degraded caches and cap breaches are named outcomes). `fanout_cap`
-    /// is `ReaderConfig::promql_max_metric_fanout`, threaded per call by
-    /// `MetricsEngine` rather than stored here (it is a reader/query cap,
-    /// not a cache-shape parameter).
+    /// is `ReaderConfig::promql_max_metric_fanout`; `scan_budget` (issue
+    /// #89) is `ReaderConfig::promql_max_cache_scan` — both threaded per
+    /// call by `MetricsEngine` rather than stored here (they are
+    /// reader/query caps, not cache-shape parameters).
     pub fn resolve_multi_metric(
         &self,
         name_matchers: &[LabelMatcher],
         matchers: &[LabelMatcher],
         window: DataWindow,
         fanout_cap: u64,
+        scan_budget: u64,
     ) -> MultiMetricResolution {
         let snapshot = self.current_snapshot();
         resolve_multi_metric_over(
@@ -951,6 +1013,118 @@ impl LabelCache {
             matchers,
             window,
             fanout_cap,
+            scan_budget,
+        )
+    }
+}
+
+/// Issue #89 (plan v3/v4): a narrow, `#[doc(hidden)]` test seam letting the
+/// isolated allocation-gate binary (`tests/multi_metric_scan_alloc.rs`)
+/// reach the `pub(crate)` resolver core without exposing it as public API.
+/// These items cannot live under `#[cfg(test)]` — an external integration
+/// test binary does not see this crate's `cfg(test)` items, and gating
+/// them behind a cargo feature would either not compile under the plain
+/// `cargo test --workspace` CI lane (feature off) or ship the seam anyway
+/// (feature on by default) — so `#[doc(hidden)] pub` is the smallest
+/// CI-runnable surface (plan review round 3). Internals (`RegexCache`,
+/// `CacheMetrics`, `LabelCacheConfig` construction) stay `pub(crate)`/
+/// private; only the two opaque entry points below are public.
+impl CacheSnapshot {
+    /// `n` one-series metrics (`m000000`..), each with an empty
+    /// [`LabelSet`] — mirrors the `#[cfg(test)]` `many_metric_snapshot`
+    /// helper, but public so the isolated alloc-gate binary can build a
+    /// large resident-cache fixture with no `ChClient`/network dependency.
+    /// Warm and window-open (`generation: 1`, `covered_from_ms: 0`, a
+    /// sweep timestamp far in the future) so control reaches the walk
+    /// rather than one of the cold/stale/out-of-window short-circuits.
+    #[doc(hidden)]
+    pub fn with_distinct_metric_names_for_test(n: usize) -> CacheSnapshot {
+        let mut by_fingerprint = HashMap::with_capacity(n);
+        let mut by_metric = HashMap::with_capacity(n);
+        for i in 0..n {
+            by_fingerprint.insert(i as Fingerprint, LabelSet::from_verbatim(Vec::new()));
+            by_metric.insert(format!("m{i:06}"), vec![i as Fingerprint]);
+        }
+        CacheSnapshot {
+            by_fingerprint,
+            by_metric,
+            // Mirrors the `#[cfg(test)]` `BASE_SWEEP_MS` baseline: far
+            // larger than any window used against this fixture, so the
+            // staleness gate never fires.
+            sweep_time_ms: 1_000_000_000_000,
+            covered_from_ms: 0,
+            generation: 1,
+        }
+    }
+}
+
+/// Issue #89: an opaque probe over [`resolve_multi_metric_over`], reusing
+/// [`RegexCache`] — the isolated alloc-gate binary's only way to reach the
+/// `pub(crate)` resolver. Its name matcher is fixed at construction (a
+/// reject-all `__name__` regex that matches no
+/// [`CacheSnapshot::with_distinct_metric_names_for_test`] fixture name),
+/// so every call examines up to `scan_budget + 1` names and rejects — the
+/// binary measures only the resolver's own aux heap over that walk, never
+/// any network/ClickHouse machinery (none exists here).
+#[doc(hidden)]
+pub struct MultiMetricScanProbe {
+    regex_cache: RegexCache,
+    metrics: CacheMetrics,
+    config: LabelCacheConfig,
+    name_matchers: Vec<LabelMatcher>,
+    matchers: Vec<LabelMatcher>,
+    window: DataWindow,
+    fanout_cap: u64,
+}
+
+impl MultiMetricScanProbe {
+    #[doc(hidden)]
+    pub fn new_reject_all_for_test() -> Self {
+        MultiMetricScanProbe {
+            regex_cache: RegexCache::new(REGEX_CACHE_CAPACITY),
+            metrics: CacheMetrics::default(),
+            config: LabelCacheConfig {
+                db: "pulsus".to_string(),
+                series_table: "metric_series".to_string(),
+                bucket_ms: 3_600_000,
+                window_ms: 24 * 3_600_000,
+                cache_max_series: 50_000,
+                ttl: Duration::from_secs(60),
+                staleness_multiplier: DEFAULT_STALENESS_MULTIPLIER,
+            },
+            // Never matches any `m######` fixture name — every examined
+            // name `continue`s, so the fingerprint loop never runs and no
+            // `groups`/`matched` allocation happens on the success path.
+            name_matchers: vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Re,
+                value: "zzz_no_such_metric_.*".to_string(),
+            }],
+            matchers: Vec::new(),
+            window: DataWindow {
+                start_ms: 0,
+                end_ms: 1_000,
+            },
+            fanout_cap: 1_000,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn resolve_for_test(
+        &self,
+        snapshot: &CacheSnapshot,
+        scan_budget: u64,
+    ) -> MultiMetricResolution {
+        resolve_multi_metric_over(
+            snapshot,
+            &self.regex_cache,
+            &self.metrics,
+            &self.config,
+            &self.name_matchers,
+            &self.matchers,
+            self.window,
+            self.fanout_cap,
+            scan_budget,
         )
     }
 }
@@ -1610,6 +1784,7 @@ mod tests {
         matchers: &[LabelMatcher],
         w: DataWindow,
         fanout_cap: u64,
+        scan_budget: u64,
     ) -> MultiMetricResolution {
         let regex_cache = RegexCache::new(REGEX_CACHE_CAPACITY);
         let metrics = CacheMetrics::default();
@@ -1622,6 +1797,7 @@ mod tests {
             matchers,
             w,
             fanout_cap,
+            scan_budget,
         )
     }
 
@@ -1642,7 +1818,15 @@ mod tests {
             op: MatchOp::Eq,
             value: "api".to_string(),
         };
-        match resolve_multi(&snap, &config(), &[], &[m], window(0, 1_000), 1_000) {
+        match resolve_multi(
+            &snap,
+            &config(),
+            &[],
+            &[m],
+            window(0, 1_000),
+            1_000,
+            u64::MAX,
+        ) {
             MultiMetricResolution::Groups(groups) => {
                 // Sorted by name; `ccc` (no matching series) is absent.
                 let names: Vec<&str> = groups.iter().map(|g| g.metric_name.as_str()).collect();
@@ -1673,6 +1857,7 @@ mod tests {
             &[],
             window(0, 1_000),
             1_000,
+            u64::MAX,
         ) {
             MultiMetricResolution::Groups(groups) => {
                 let names: Vec<&str> = groups.iter().map(|g| g.metric_name.as_str()).collect();
@@ -1695,7 +1880,15 @@ mod tests {
             op: MatchOp::Neq,
             value: "drop".to_string(),
         };
-        match resolve_multi(&snap, &config(), &[neq], &[], window(0, 1_000), 1_000) {
+        match resolve_multi(
+            &snap,
+            &config(),
+            &[neq],
+            &[],
+            window(0, 1_000),
+            1_000,
+            u64::MAX,
+        ) {
             MultiMetricResolution::Groups(groups) => {
                 assert_eq!(groups.len(), 1);
                 assert_eq!(groups[0].metric_name, "keep");
@@ -1735,6 +1928,7 @@ mod tests {
             &[],
             window(0, 1_000),
             1_000,
+            u64::MAX,
         ) {
             MultiMetricResolution::Groups(groups) => assert_eq!(groups.len(), 1_000),
             other => panic!("1000 matched metrics must pass at cap 1000, got {other:?}"),
@@ -1746,6 +1940,7 @@ mod tests {
             &[],
             window(0, 1_000),
             1_000,
+            u64::MAX,
         ) {
             MultiMetricResolution::FanoutExceeded { matched, cap } => {
                 assert_eq!(cap, 1_000);
@@ -1761,11 +1956,11 @@ mod tests {
     fn multi_metric_fanout_cap_override_is_honored() {
         let snap = many_metric_snapshot(3);
         assert!(matches!(
-            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 2),
+            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 2, u64::MAX),
             MultiMetricResolution::FanoutExceeded { cap: 2, .. }
         ));
         assert!(matches!(
-            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 3),
+            resolve_multi(&snap, &config(), &[], &[], window(0, 1_000), 3, u64::MAX),
             MultiMetricResolution::Groups(_)
         ));
     }
@@ -1781,7 +1976,8 @@ mod tests {
                 &[],
                 &[],
                 window(0, 1_000),
-                1_000
+                1_000,
+                u64::MAX,
             ),
             MultiMetricResolution::Unresolvable {
                 reason: FallbackReason::ColdCache
@@ -1790,7 +1986,7 @@ mod tests {
         // Out of window.
         let snap = snapshot(vec![("up", 1, &[])], 10_000, BASE_SWEEP_MS, 1);
         assert!(matches!(
-            resolve_multi(&snap, &cfg, &[], &[], window(0, 20_000), 1_000),
+            resolve_multi(&snap, &cfg, &[], &[], window(0, 20_000), 1_000, u64::MAX),
             MultiMetricResolution::Unresolvable {
                 reason: FallbackReason::OutOfWindow
             }
@@ -1801,7 +1997,15 @@ mod tests {
         stale_cfg.staleness_multiplier = 1;
         let snap = snapshot(vec![("up", 1, &[])], 0, 0, 1);
         assert!(matches!(
-            resolve_multi(&snap, &stale_cfg, &[], &[], window(0, 1_000), 1_000),
+            resolve_multi(
+                &snap,
+                &stale_cfg,
+                &[],
+                &[],
+                window(0, 1_000),
+                1_000,
+                u64::MAX
+            ),
             MultiMetricResolution::Unresolvable {
                 reason: FallbackReason::StaleCache { .. }
             }
@@ -1814,7 +2018,7 @@ mod tests {
         cfg.cache_max_series = 1;
         let snap = snapshot(vec![("a", 1, &[]), ("b", 2, &[])], 0, BASE_SWEEP_MS, 1);
         assert!(matches!(
-            resolve_multi(&snap, &cfg, &[], &[], window(0, 1_000), 1_000),
+            resolve_multi(&snap, &cfg, &[], &[], window(0, 1_000), 1_000, u64::MAX),
             MultiMetricResolution::Unresolvable {
                 reason: FallbackReason::OverCardinality { matched: 2, cap: 1 }
             }
@@ -1831,12 +2035,124 @@ mod tests {
                 &[name_re("(unclosed")],
                 &[],
                 window(0, 1_000),
-                1_000
+                1_000,
+                u64::MAX,
             ),
             MultiMetricResolution::Unresolvable {
                 reason: FallbackReason::RegexUnsupported { .. }
             }
         ));
+    }
+
+    // --- scan-budget bound (issue #89, retroactive re-review) ---
+
+    /// One metric name with `n` fingerprints, for the fingerprint-dimension
+    /// scan-budget tests.
+    fn many_fingerprint_snapshot(name: &str, n: usize) -> CacheSnapshot {
+        let mut by_fingerprint = HashMap::new();
+        let mut fps = Vec::with_capacity(n);
+        for i in 0..n {
+            by_fingerprint.insert(i as Fingerprint, labels(&[]));
+            fps.push(i as Fingerprint);
+        }
+        let mut by_metric = HashMap::new();
+        by_metric.insert(name.to_string(), fps);
+        CacheSnapshot {
+            by_fingerprint,
+            by_metric,
+            sweep_time_ms: BASE_SWEEP_MS,
+            covered_from_ms: 0,
+            generation: 1,
+        }
+    }
+
+    /// v2 test (a): the fingerprint-dimension bound — a single name with
+    /// `N` (much greater than the budget) candidate fingerprints, a label
+    /// matcher matching none, proves the per-fingerprint counter bails the
+    /// walk at `budget + 1` regardless of `N`.
+    #[test]
+    fn multi_metric_scan_budget_bounds_the_walk() {
+        let snap = many_fingerprint_snapshot("m", 10_000);
+        let never_matches = LabelMatcher {
+            key: "nonexistent".to_string(),
+            op: MatchOp::Eq,
+            value: "x".to_string(),
+        };
+        match resolve_multi(
+            &snap,
+            &config(),
+            &[],
+            &[never_matches],
+            window(0, 1_000),
+            1_000,
+            4,
+        ) {
+            MultiMetricResolution::ScanBudgetExceeded { examined, cap } => {
+                assert_eq!(
+                    examined, 5,
+                    "examined must stop at budget + 1, not scale with N"
+                );
+                assert_eq!(cap, 4);
+            }
+            other => panic!("expected ScanBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    /// v2 test (b): a selective query well under the budget still resolves
+    /// — the scan budget must never false-reject a query that finishes
+    /// examining a small candidate set.
+    #[test]
+    fn multi_metric_selective_query_under_scan_budget_still_groups() {
+        let snap = snapshot(
+            vec![("aaa", 1, &[("job", "api")]), ("bbb", 2, &[("job", "api")])],
+            0,
+            BASE_SWEEP_MS,
+            1,
+        );
+        let m = LabelMatcher {
+            key: "job".to_string(),
+            op: MatchOp::Eq,
+            value: "api".to_string(),
+        };
+        match resolve_multi(&snap, &config(), &[], &[m], window(0, 1_000), 1_000, 10) {
+            MultiMetricResolution::Groups(groups) => assert_eq!(groups.len(), 2),
+            other => panic!("expected Groups under budget, got {other:?}"),
+        }
+    }
+
+    /// Demoted secondary check (v2/v3 plan): the name-enumeration
+    /// dimension bails at `budget + 1` regardless of the resident name
+    /// universe's size — a reject-all name matcher costs exactly one
+    /// budget unit per examined name, so the fingerprint loop never runs.
+    /// **This test alone is vacuous against a regressed pre-loop
+    /// `keys().collect() + sort` — a broken implementation that restores
+    /// that O(N) step but keeps this loop counter reports the identical
+    /// `examined == B + 1`.** The primary, non-vacuous proof of the fix is
+    /// the bytes allocation gate in
+    /// `crates/pulsus-read/tests/multi_metric_scan_alloc.rs` (round-2 plan
+    /// review finding); this unit test is retained only as a cheap,
+    /// hermetic secondary bound.
+    #[test]
+    fn multi_metric_scan_budget_is_scale_invariant_over_the_name_universe() {
+        const B: u64 = 4;
+        let nomatch = name_re("nomatch.*");
+        for n in [2 * B as usize, 4 * B as usize] {
+            match resolve_multi(
+                &many_metric_snapshot(n),
+                &config(),
+                std::slice::from_ref(&nomatch),
+                &[],
+                window(0, 1_000),
+                1_000,
+                B,
+            ) {
+                MultiMetricResolution::ScanBudgetExceeded { examined, cap } => {
+                    assert_eq!(examined, (B + 1) as usize, "universe size {n}");
+                    assert_eq!(cap, B);
+                }
+                other => panic!("expected ScanBudgetExceeded for universe {n}, got {other:?}"),
+            }
+        }
     }
 
     // --- concrete_name_matches (issue #85: name_matchers over a

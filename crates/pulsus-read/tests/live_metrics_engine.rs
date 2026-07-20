@@ -189,6 +189,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
+        max_cache_scan: 200_000,
     }
 }
 
