@@ -71,14 +71,46 @@ extra round-trip.**
 Selection carries no active health probing on the hot path. Instead, a
 **transport-class failure** on a real query — a connection/timeout/IO error or
 a retryable ClickHouse server code, never a bad-SQL/decode/logic error —
-demotes that endpoint (lock-free atomics, never an async mutex, never in
-`Drop`). The next `get()` skips it until a short cooldown elapses, then
-re-admits it as a probe candidate; a successful probe re-promotes it. This
-matches "immediately start using other AZs on disconnect" with zero
-healthy-path overhead: at most one failed request per newly-dead endpoint.
+demotes that endpoint. Health is published as lock-free mirror atomics for the
+hot path (`get()`'s healthy+fresh path never locks anything), backed by a tiny
+non-async transition lock — never held across an `.await`, never in `Drop` —
+that makes every state change (a demotion, a promotion, or a probe outcome)
+one atomic critical section. The next `get()` skips a demoted endpoint until a
+short cooldown elapses, then re-admits it as a probe candidate; a successful
+probe re-promotes it immediately. This matches "immediately start using other
+AZs on disconnect" with zero healthy-path overhead: at most one failed request
+per newly-dead endpoint.
 
 Startup uses "ping-any": the pool starts if at least one endpoint answers, so
 a partially-degraded cluster is still serviceable.
+
+## Recovery: background re-probe
+
+Real traffic alone cannot rediscover a recovered endpoint once any other
+endpoint is healthy — `candidate_order` ranks a demoted-but-cooldown-expired
+endpoint below every healthy one, so `get()` never reaches it while the pool
+has a healthy candidate to hand out instead. A background task closes that
+gap: every 5 seconds it scans for demoted endpoints whose cooldown has
+expired and re-pings **only those**, each capped at a 2-second timeout.
+Promotion requires 2 **consecutive** successful pings (hysteresis) — a single
+lucky ping does not resurrect a flapping endpoint, and any probe failure
+resets the streak and restarts the cooldown.
+
+Each probe borrows one permit from the pool's single concurrency semaphore —
+the same budget every real request draws from — via a **non-queuing**
+attempt: it never enters the semaphore's FIFO wait queue, so it can only ever
+use capacity nobody else wants at that instant. If the pool is fully leased
+(or has real callers already queued), the rest of that pass is deferred to
+the next 5-second tick rather than making a request wait behind a health
+probe. Concurrent transitions (a real query demoting the same endpoint, or
+`get()`'s own single-success emergency/staleness probe) are reconciled via a
+per-endpoint generation counter: whichever transition lands first wins, and a
+stale probe outcome is discarded entirely rather than clobbering it.
+
+The background task is spawned once the connection pool is established and is
+stopped (aborted and joined) as part of the same graceful-shutdown sequence as
+the schema-rotation and label-cache-refresh tasks, so pool teardown never
+races an in-flight probe.
 
 ## Availability-zone auto-detection
 

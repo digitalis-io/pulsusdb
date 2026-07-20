@@ -308,3 +308,88 @@ async fn dead_endpoint_is_demoted_and_all_requests_still_served() {
     );
     assert_eq!(counts[1].1, 0, "dead endpoint never selected: {counts:?}");
 }
+
+/// Comfortably past the pool's 5s demotion cooldown, used to drive the
+/// explicit-clock re-probe entry point without wall-clock sleeps. If the
+/// cooldown constant ever outgrows this margin, the probe-executed
+/// (cooldown-restart) asserts below fail LOUDLY — the test can never
+/// silently regress back to skipping the probe.
+const PAST_COOLDOWN_MS: u64 = 60_000;
+
+#[tokio::test]
+async fn reprobe_pass_leaves_dead_endpoint_demoted_and_serving_unaffected() {
+    // AC5 (issue #43 re-probe plan): a re-probe pass against a genuinely
+    // dead port must actually EXECUTE its probe and still never flap the
+    // endpoint healthy — zero promotions across two passes, still demoted
+    // afterwards, and every request keeps being served by the live
+    // endpoint. No wall-time asserts.
+    //
+    // Code-review fix (vacuity): the dead endpoint is demoted at connect
+    // (ping-any), which is within the demotion cooldown of "now" — an
+    // immediate `reprobe_demoted()` would SKIP it at the cooldown gate and
+    // return 0 without ever dialing the dead port. So the pass is driven
+    // through the explicit-clock entry point (`reprobe_demoted_at`),
+    // shifted past the cooldown, making the REAL `SELECT 1` run against
+    // the dead port. Execution is then asserted positively: an *applied*
+    // probe failure restarts the cooldown (`unhealthy_since_ms` == the
+    // injected clock), which a skipped probe can never do.
+    skip_unless_live!();
+    let live = shard1();
+    let dead = ChEndpoint {
+        host: live.host.clone(),
+        http_port: 9, // discard port: nothing listens -> connection refused
+        zone: None,
+    };
+    let pool = ChPool::connect(base_config(vec![live, dead]))
+        .await
+        .expect("connect succeeds: at least one (the live) endpoint answers");
+
+    // The dead endpoint is demoted by the startup ping-any pass; the pings
+    // below are all served by the live endpoint (spread never reaches the
+    // demoted one on the hot path).
+    for _ in 0..5 {
+        pool.ping().await.expect("served by the live endpoint");
+    }
+    assert!(
+        !pool.endpoint_health()[1].1,
+        "the dead endpoint must already be demoted before re-probing"
+    );
+    let since0 = pool.endpoint_unhealthy_since_ms()[1].1;
+
+    // Pass 1, clock driven past the cooldown: the probe must EXECUTE
+    // (cooldown restarted to exactly t1 — only an applied failure does
+    // that) and must not promote.
+    let t1 = since0 + PAST_COOLDOWN_MS;
+    let promoted_first = pool.reprobe_demoted_at(t1).await;
+    assert_eq!(promoted_first, 0, "a dead endpoint must never be promoted");
+    assert_eq!(
+        pool.endpoint_unhealthy_since_ms()[1].1,
+        t1,
+        "the failed probe must restart the cooldown from the injected clock \
+         — proves the SELECT 1 actually executed against the dead port \
+         rather than being skipped by the cooldown gate"
+    );
+
+    // Pass 2, past the RESTARTED cooldown: executes and fails again.
+    let t2 = t1 + PAST_COOLDOWN_MS;
+    let promoted_second = pool.reprobe_demoted_at(t2).await;
+    assert_eq!(promoted_second, 0, "a dead endpoint must never be promoted");
+    assert_eq!(
+        pool.endpoint_unhealthy_since_ms()[1].1,
+        t2,
+        "the second failed probe must also have executed (cooldown restarted again)"
+    );
+
+    let health = pool.endpoint_health();
+    assert!(health[0].1, "the live endpoint stays healthy: {health:?}");
+    assert!(
+        !health[1].1,
+        "the dead endpoint stays demoted after re-probing: {health:?}"
+    );
+
+    for _ in 0..5 {
+        pool.ping()
+            .await
+            .expect("still served by the live endpoint");
+    }
+}
