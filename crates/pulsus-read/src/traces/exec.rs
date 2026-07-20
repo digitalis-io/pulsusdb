@@ -446,8 +446,9 @@ impl TraceEngine {
     /// pruning all happen in ClickHouse; the engine only frames at most
     /// `MAX_METRICS_POINTS` `(t_ms, value)` points (the plan enforced the
     /// cap statically) and applies the explicit encode-boundary
-    /// conversions (`n as f64`, rate ÷ `step_s`; `t_secs × 1000` → the
-    /// millisecond point unit `prom_api::encode` consumes). Empty result
+    /// conversions (`n as f64`, rate ÷ `step_s`; the row's `t_ms` is
+    /// already the millisecond point unit `prom_api::encode` consumes —
+    /// issue #59 re-audit, `Int64` epoch-milliseconds). Empty result
     /// → `Matrix(vec![])` (the documented empty-DB oracle); otherwise one
     /// label-less series (single-series M4 output — `by()` is M7).
     pub async fn metrics_range(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
@@ -463,10 +464,7 @@ impl TraceEngine {
             .map_err(|e| map_trace_metrics_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-            points.push((
-                i64::from(row.t_secs) * 1000,
-                metric_value(plan.func(), row.n, plan.step_s()),
-            ));
+            points.push((row.t_ms, metric_value(plan.func(), row.n, plan.step_s())));
         }
         if points.is_empty() {
             return Ok(QueryResult::Matrix(vec![]));

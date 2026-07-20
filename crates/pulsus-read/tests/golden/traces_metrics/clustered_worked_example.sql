@@ -2,7 +2,7 @@
 -- q: { resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s } | rate()
 
 == range (query_range) ==
-SELECT toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60 SECOND)) AS t,
+SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t,
        uniqExact(trace_id, span_id) AS n
 FROM trace_spans_dist
 PREWHERE service = 'checkout'

@@ -101,15 +101,17 @@ pub struct RootRow {
 }
 
 /// One metrics range-query bucket row (`metrics_sql::metrics_range_sql`,
-/// issue #59): `t` is the `toUnixTimestamp(...)`-pinned `UInt32`
-/// epoch-seconds bucket start, `n` the `uniqExact(trace_id, span_id)`
-/// replay-deduped span count (`UInt64` — conversions to the wire's `f64`
-/// happen explicitly at the encode boundary, plan v2 delta 5).
+/// issue #59): `t` is the `toUnixTimestamp64Milli(...)`-pinned `Int64`
+/// epoch-milliseconds bucket start (covers pre-1970/post-2106 buckets that
+/// a `UInt32` epoch-seconds column would wrap — issue #59 re-audit), `n`
+/// the `uniqExact(trace_id, span_id)` replay-deduped span count (`UInt64`
+/// — conversions to the wire's `f64` happen explicitly at the encode
+/// boundary, plan v2 delta 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricBucketRow {
     /// Renamed to the SQL alias `t` for the driver's column-name check.
     #[serde(rename = "t")]
-    pub t_secs: u32,
+    pub t_ms: i64,
     pub n: u64,
 }
 

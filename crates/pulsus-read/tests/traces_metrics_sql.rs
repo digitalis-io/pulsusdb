@@ -167,8 +167,8 @@ fn worked_example_pins_the_documented_fragments() {
     let plan = plan_for(&CASES[0]);
     let range = plan.range_sql();
     assert!(range.starts_with(
-        "SELECT toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL 60 SECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n"
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL 60000 MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n"
     ));
     assert!(range.contains("PREWHERE service = 'checkout'"));
     // Snapped, left-closed/right-open bounds (plan v2 delta 2) — NOT the
@@ -190,6 +190,11 @@ fn worked_example_pins_the_documented_fragments() {
     assert!(
         !range.contains("/ 60"),
         "the rate division is client-side at the encode boundary, never SQL"
+    );
+    assert!(
+        !range.contains("toUnixTimestamp("),
+        "the bucket column is Int64 epoch-milliseconds (toUnixTimestamp64Milli), never the \
+         UInt32-overflowing toUnixTimestamp — issue #59 re-audit"
     );
     // The instant form is the same body without bucketing.
     let instant = plan.instant_sql();
@@ -240,7 +245,7 @@ fn shipped_metrics_shapes_and_limits_are_documented() {
     let api = std::fs::read_to_string(root.join("docs/api.md")).expect("read api.md");
 
     for needle in [
-        "toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60 SECOND)) AS t",
+        "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), INTERVAL 60000 MILLISECOND)) AS t",
         "uniqExact(trace_id, span_id) AS n",
         "PREWHERE service = 'checkout'",
         "GROUP BY t",

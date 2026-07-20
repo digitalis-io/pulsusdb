@@ -87,6 +87,18 @@ const CORPUS_SPANS: i64 = 600;
 
 const NS: i64 = 1_000_000_000;
 
+/// Extreme-epoch bucket labels (issue #59 re-audit): pre-1970
+/// (1969-12-31T23:00:00Z) and post-2106 (> the `UInt32` epoch-seconds max
+/// `4_294_967_296`, still inside the `DateTime64(9)` domain). Both aligned
+/// to a 60s boundary, far outside `[base_s(), base_s() + CORPUS_SPANS)` so
+/// no existing identity/replay/edge assertion is affected.
+const EXTREME_PAST_S: i64 = -3_600;
+const EXTREME_FUTURE_S: i64 = 4_300_000_020;
+/// Trace/span IDs for the extreme-epoch fixture rows, far outside the
+/// primary corpus's `numbers(600)` range — no collision.
+const EXTREME_PAST_ID: i64 = 900_000;
+const EXTREME_FUTURE_ID: i64 = 900_001;
+
 async fn exec(client: &ChClient, sql: &str) {
     client
         .execute(sql, &QuerySettings::new(), Idempotency::Idempotent)
@@ -157,6 +169,57 @@ async fn seed_corpus(client: &ChClient, db: &str) {
         )
         .await;
     }
+}
+
+/// Creates a plain `VIEW` (never `INSERT`ed into `trace_spans`) holding
+/// exactly the two extreme-epoch match-all rows (issue #59 re-audit).
+///
+/// Deliberately **not** a physical insert into `trace_spans`: that table's
+/// `PARTITION BY toDate(...)` / `TTL toDateTime(...) + INTERVAL
+/// retention_days DAY` (docs/schemas.md §4.1, `pulsus-schema` migrations
+/// 16/17) both convert through ClickHouse's 32-bit `Date`/`DateTime`,
+/// which silently wrap for timestamps outside their domain — confirmed
+/// live: a pre-1970 row's partition key wraps to `Date`'s own max
+/// (`2149-06-06`), and a post-2106 row's TTL threshold wraps to a
+/// near-1970 date, so a background TTL merge deletes it almost
+/// immediately regardless of `retention_days`. That is a genuine,
+/// separate defect in the trace schema's DDL (out of #59's scope — the
+/// schema is unchanged here; the finding is reported on the issue) that
+/// would make a physically-inserted extreme-epoch fixture flaky-to-absent
+/// in CI. A `VIEW` has no partitioning or TTL — it is a live ClickHouse
+/// evaluation of the exact generated SQL (`toStartOfInterval`,
+/// `toUnixTimestamp64Milli`, real `DateTime64` arithmetic) with none of
+/// that storage-layer risk, so it still proves the fix round-trips
+/// end-to-end against a real server.
+async fn create_extreme_epoch_view(client: &ChClient, db: &str) {
+    exec(
+        client,
+        &format!(
+            "CREATE VIEW {db}.trace_spans_extreme AS \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(id)), 32, '0')), 16) AS trace_id, \
+               toFixedString(unhex(leftPad(lower(hex(id)), 16, '0')), 8) AS span_id, \
+               toFixedString(unhex('0000000000000000'), 8) AS parent_id, \
+               'op' AS name, 'svc-x' AS service, \
+               ts_ns AS timestamp_ns, \
+               1000000 AS duration_ns, 0 AS status_code, 1 AS kind, 1 AS payload_type, \
+               'p' AS payload \
+             FROM (\
+               SELECT {EXTREME_PAST_ID} AS id, toInt64({EXTREME_PAST_S}) * {NS} AS ts_ns \
+               UNION ALL \
+               SELECT {EXTREME_FUTURE_ID} AS id, toInt64({EXTREME_FUTURE_S}) * {NS} AS ts_ns\
+             )"
+        ),
+    )
+    .await;
+}
+
+/// A `TraceEngine` reading the extreme-epoch view in place of the real
+/// `trace_spans` table (see [`create_extreme_epoch_view`]).
+fn extreme_epoch_engine(client: ChClient) -> TraceEngine {
+    let mut cfg = engine_config();
+    cfg.spans_table = "trace_spans_extreme".to_string();
+    TraceEngine::new(client, cfg)
 }
 
 fn engine_config() -> TraceReadConfig {
@@ -441,4 +504,52 @@ async fn metrics_internal_consistency_identities() {
     );
     let instant = engine.metrics_instant(&plan).await.expect("empty instant");
     assert_eq!(vector_value(&instant), 0.0);
+
+    // ---- Extreme-epoch bucket labels (issue #59 re-audit): pre-1970 and
+    // post-2106 buckets must produce the correct Int64 millisecond label,
+    // never a UInt32-epoch-seconds wrap. Runs against `trace_spans_extreme`
+    // (see `create_extreme_epoch_view`), not the physical `trace_spans`
+    // table — sidesteps a separate, out-of-scope schema TTL/partition
+    // overflow, still a live round trip through the real generated SQL. ---
+    create_extreme_epoch_view(&client, DB).await;
+    let extreme_engine = extreme_epoch_engine(data_client().await);
+
+    let past_plan = plan_for(
+        &extreme_engine,
+        "{} | count_over_time()",
+        EXTREME_PAST_S,
+        EXTREME_PAST_S + 60,
+        60,
+    );
+    let past_points = matrix_points(
+        &extreme_engine
+            .metrics_range(&past_plan)
+            .await
+            .expect("pre-1970 range"),
+    );
+    assert_eq!(
+        past_points,
+        vec![(EXTREME_PAST_S * 1_000, 1.0)],
+        "pre-1970 bucket label must be the exact negative millisecond value, not wrapped"
+    );
+
+    let future_plan = plan_for(
+        &extreme_engine,
+        "{} | count_over_time()",
+        EXTREME_FUTURE_S,
+        EXTREME_FUTURE_S + 60,
+        60,
+    );
+    let future_points = matrix_points(
+        &extreme_engine
+            .metrics_range(&future_plan)
+            .await
+            .expect("post-2106 range"),
+    );
+    assert_eq!(
+        future_points,
+        vec![(EXTREME_FUTURE_S * 1_000, 1.0)],
+        "post-2106 bucket label must be the exact >UInt32-max millisecond value, not wrapped \
+         mod 2^32"
+    );
 }

@@ -941,6 +941,16 @@ mod tests {
         assert_eq!(prom_timestamp(0), "0");
     }
 
+    #[test]
+    fn prom_timestamp_a_negative_whole_second_has_no_fraction() {
+        // Guards the negative-epoch bucket label the trace-metrics Int64-ms
+        // fix (issue #59 re-audit) newly enables: a pre-1970 whole-second
+        // bucket, e.g. 1969-12-31T23:00:00Z. `div_euclid`/`rem_euclid` are
+        // correct for this whole-second case (unaffected — trace-metrics
+        // buckets are always whole-second aligned).
+        assert_eq!(prom_timestamp(-3_600_000), "-3600");
+    }
+
     // --- query_response wire shapes ---
 
     #[tokio::test]
