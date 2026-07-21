@@ -307,8 +307,11 @@
     {
       "name": "histogram_quantiles",
       "experimental": true,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_quantiles(single_histogram, \"q\", 0.5)"
+      }
     },
     {
       "name": "histogram_stddev",

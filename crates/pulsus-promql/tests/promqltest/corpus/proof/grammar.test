@@ -75,14 +75,17 @@ eval range from 0 to 70s step 10s n1
 eval instant at 0 1 + 1
 	2
 
-# eval_fail + expected_fail_message (substring of the error Display): an
-# out-of-subset function is named in PromqlError::Unsupported.
-# (`histogram_quantiles`, the experimental multi-quantile variant, is
-# out of scope per M7-A5b's plan — issue #65 implemented the previous
-# stand-in, `abs`; issue #68 its successor, `sort`; M7-A5b-i moved
-# `histogram_count` and its five siblings.)
-eval_fail instant at 0 histogram_quantiles(n1, "q", 0.5)
-	expected_fail_message not yet supported: function histogram_quantiles()
+# eval_fail + expected_fail_message (substring of the error Display): a
+# PERMANENTLY-invalid construct — upstream itself parse-rejects a bare
+# metric name in info()'s second argument with this exact wording
+# (parse.go:852 @ 40af9c2; vendored via PATCHES.md #7, issue #132).
+# The unsupported-function stand-in succession (lineage: `abs` →
+# `sort` → `histogram_count` → the multi-quantile histogram function)
+# is closed: issue #153 implemented the last remaining candidate, and
+# no parseable-but-unplanned function exists today — the planner
+# fall-through is pinned by plan.rs's synthesized-AST unit test instead.
+eval_fail instant at 0 info(n1, n1)
+	expected_fail_message expected label selectors only, got vector selector instead
 
 # eval_fail + expected_fail_regexp (regex over the error Display).
 # (Issue #83 implemented the previous stand-in, `n1 @ 100`; a bare
@@ -96,6 +99,10 @@ eval_fail instant at 0 n1[5m:1m]
 # m6_08c_utf8_selectors.test — is its successor).
 eval_fail instant at 0 {k="v" or q="w"}
 
-# eval_fail on a range query.
-eval_fail range from 0 to 20s step 10s histogram_quantiles(n1, "q", 0.5)
-	expected_fail_message function histogram_quantiles()
+# eval_fail on a range query: brace-level `or` matchers — never valid
+# Prometheus selector syntax (the same permanently-rejected construct as
+# the bare eval_fail case above), here additionally pinning the message
+# form on a range query. (Issue #153 closed the unsupported-function
+# stand-in succession — see the instant eval_fail case above.)
+eval_fail range from 0 to 20s step 10s {k="v" or q="w"}
+	expected_fail_message label matchers must be comma-separated

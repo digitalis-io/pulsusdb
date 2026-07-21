@@ -650,6 +650,21 @@ pub enum PlanExpr {
         quantile: Box<PlanExpr>,
         expr: Box<PlanExpr>,
     },
+    /// Issue #153: `histogram_quantiles(v, label, q0, qs…)` — the
+    /// experimental multi-quantile variant (`parser/functions.go:214-220`,
+    /// `funcHistogramQuantiles` `functions.go:2141-2214`). Partitions the
+    /// input ONCE and loops the quantiles over the same native/classic
+    /// primitives the singular [`PlanExpr::HistogramQuantile`] uses,
+    /// setting `label` on each output sample to the OpenMetrics-formatted
+    /// quantile value.
+    HistogramQuantiles {
+        /// Arg 0 (vector) — planned FIRST (selector source order).
+        expr: Box<PlanExpr>,
+        /// Arg 1 — a string literal, extracted at plan time.
+        label: String,
+        /// Args 2.. — 1..=10 scalar expressions, source order.
+        quantiles: Vec<Box<PlanExpr>>,
+    },
     /// M7-A5b-i: the single-vector-argument native-histogram accessors
     /// (`histogram_count`/`_sum`/`_avg`/`_stddev`/`_stdvar`,
     /// `functions.go` `simpleHistogramFunc`/`histogramVariance`). Each
@@ -1087,6 +1102,18 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
             PlanExpr::HistogramQuantile { quantile, expr } => {
                 walk(quantile, in_accessor, true, selectors);
                 walk(expr, in_accessor, true, selectors);
+            }
+            // Issue #153: `histogram_quantiles` is in the pin's stop list
+            // (`engine.go:4680`) alongside the singular form — stop-and-
+            // clear, so `histogram_quantiles(m unless histogram_count(m)
+            // == 0, …)` never reads stats-only.
+            PlanExpr::HistogramQuantiles {
+                expr, quantiles, ..
+            } => {
+                walk(expr, in_accessor, true, selectors);
+                for q in quantiles {
+                    walk(q, in_accessor, true, selectors);
+                }
             }
             PlanExpr::HistogramFraction { lower, upper, expr } => {
                 walk(lower, in_accessor, true, selectors);
@@ -1705,6 +1732,11 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         return plan_histogram_fraction(planner, args);
     }
 
+    // Issue #153: `histogram_quantiles(v, label, q0, qs…)` — experimental.
+    if name == "histogram_quantiles" {
+        return plan_histogram_quantiles(planner, args);
+    }
+
     // Issue #65 (M6-02): the 23 unary elementwise math/trig functions —
     // one vector argument, no scalar arguments.
     let unary_fn = match name {
@@ -2181,6 +2213,52 @@ fn plan_histogram_quantile(
     Ok(PlanExpr::HistogramQuantile {
         quantile: Box::new(quantile),
         expr: Box::new(expr),
+    })
+}
+
+/// The `histogram_quantiles(v, label, q0, qs…)` planning arm (issue
+/// #153) — out of line (the `resolve_subquery_fields`/`plan_info`
+/// precedent): `plan_call` sits on the plan recursion cycle whose
+/// per-level debug-build frame budget sizes [`MAX_SUBQUERY_DEPTH`] — this
+/// arm's locals must not ride every recursion frame.
+///
+/// Experimental at the pin (`parser/functions.go:219`), gated like
+/// `info()`. The vendored parser already enforces the oracle arity
+/// (3..=12, `parse.go:832-844`) and per-argument types (arg 1 must be a
+/// string — `check_args_match_types`), so the shape match here is
+/// defense-in-depth for caller-supplied ASTs. The string label is
+/// extracted BEFORE `plan_expr` (which rejects string literals — the
+/// `label_replace` precedent); the vector arg plans before the quantile
+/// args so any selector inside a quantile expression keeps its id in
+/// source order.
+#[inline(never)]
+fn plan_histogram_quantiles(
+    planner: &mut Planner,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    if !planner.experimental {
+        return Err(unsupported(
+            "experimental function histogram_quantiles() (requires promql-experimental-functions)",
+        ));
+    }
+    let [expr_arg, label_arg, q_args @ ..] = args else {
+        return Err(unsupported("histogram_quantiles() with < 3 arguments"));
+    };
+    if q_args.is_empty() || q_args.len() > 10 {
+        return Err(unsupported(
+            "histogram_quantiles() with a quantile count outside 1..=10",
+        ));
+    }
+    let label = plan_string_arg("histogram_quantiles", label_arg)?;
+    let expr = plan_expr(planner, expr_arg)?;
+    let quantiles = q_args
+        .iter()
+        .map(|q| plan_expr(planner, q).map(Box::new))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PlanExpr::HistogramQuantiles {
+        expr: Box::new(expr),
+        label,
+        quantiles,
     })
 }
 
@@ -2792,6 +2870,12 @@ impl<'a> StepInvariance<'a> {
             },
             PlanExpr::HistogramQuantile { quantile, expr } => {
                 let inv = self.classify(quantile).0 && self.classify(expr).0;
+                (inv, inv)
+            }
+            PlanExpr::HistogramQuantiles {
+                expr, quantiles, ..
+            } => {
+                let inv = self.classify(expr).0 && quantiles.iter().all(|q| self.classify(q).0);
                 (inv, inv)
             }
             PlanExpr::HistogramAccessor { arg, .. } => {
@@ -3916,18 +4000,31 @@ mod tests {
 
     #[test]
     fn a_function_outside_the_implemented_list_is_unsupported() {
-        // `histogram_quantiles` (the experimental multi-quantile variant —
-        // out of scope per M7-A5b's plan: `TRIM_*`/`histogram_quantiles`/
-        // `ReduceResolution` stay unimplemented) is a stand-in for "any
-        // function the planner does not yet map" (issue #65 moved the
-        // previous stand-in, `abs`, into the implemented set; issue #68
-        // moved its successor, `sort`; M7-A5b-i moved `histogram_count`
-        // and its five siblings).
-        let expr = parse(r#"histogram_quantiles(up, "q", 0.5)"#).unwrap();
-        let err = plan(&expr, params()).unwrap_err();
+        // Issue #153 moved the last parseable stand-in
+        // (`histogram_quantiles` — succession: `abs` → `sort` →
+        // `histogram_count` → `histogram_quantiles`) into the implemented
+        // set. No parser-accepted function remains planner-unmapped
+        // today: the manifest's non-implemented functions are exactly
+        // `start`/`end`/`range`/`step`, which the VENDORED parser rejects
+        // in expression position (a grammar arm not yet ported — at the
+        // pin they parse as ordinary experimental calls), so the planner
+        // fall-through (`function {name}()`) is unreachable from query
+        // text and is pinned here by synthesizing the `Call` AST directly
+        // through the vendor crate's public constructors.
+        let call = Call {
+            func: promql_parser::parser::Function::new(
+                "start",
+                vec![],
+                0,
+                crate::parser::ValueType::Scalar,
+                true,
+            ),
+            args: promql_parser::parser::FunctionArgs::empty_args(),
+        };
+        let err = plan(&Expr::Call(call), params()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => {
-                assert!(construct.contains("histogram_quantiles"));
+                assert!(construct.contains("start"), "got {construct:?}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -4431,6 +4528,97 @@ mod tests {
             }
             other => panic!("expected HistogramQuantile, got {other:?}"),
         }
+    }
+
+    // --- issue #153: histogram_quantiles (experimental multi-quantile) ---
+
+    /// AC2 (gate-off half): without the experimental flag the planner
+    /// rejects by name, carrying the house toggle (the `info()` wording
+    /// pattern).
+    #[test]
+    fn histogram_quantiles_is_gated_behind_the_experimental_flag() {
+        let expr = parse(r#"histogram_quantiles(up, "q", 0.5)"#).unwrap();
+        let err = plan(&expr, params()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => {
+                assert!(
+                    construct.contains("histogram_quantiles")
+                        && construct.contains("promql-experimental-functions"),
+                    "got {construct:?}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// AC2 (gate-on half): the same query plans with the flag, extracting
+    /// the label at plan time; multi-quantile keeps source order.
+    #[test]
+    fn histogram_quantiles_plans_with_the_experimental_flag() {
+        let expr = parse(r#"histogram_quantiles(up, "q", 0.5)"#).unwrap();
+        let p = plan(&expr, params_experimental()).unwrap();
+        match &p.root {
+            PlanExpr::HistogramQuantiles {
+                expr,
+                label,
+                quantiles,
+            } => {
+                assert_eq!(**expr, PlanExpr::Selector(0));
+                assert_eq!(label, "q");
+                assert_eq!(quantiles.len(), 1);
+                assert_eq!(*quantiles[0], PlanExpr::Scalar(0.5));
+            }
+            other => panic!("expected HistogramQuantiles, got {other:?}"),
+        }
+
+        let expr = parse(r#"histogram_quantiles(up, "phi", 0.5, 0.9, 0.99)"#).unwrap();
+        let p = plan(&expr, params_experimental()).unwrap();
+        match &p.root {
+            PlanExpr::HistogramQuantiles {
+                label, quantiles, ..
+            } => {
+                assert_eq!(label, "phi");
+                assert_eq!(
+                    quantiles.iter().map(|q| (**q).clone()).collect::<Vec<_>>(),
+                    vec![
+                        PlanExpr::Scalar(0.5),
+                        PlanExpr::Scalar(0.9),
+                        PlanExpr::Scalar(0.99)
+                    ]
+                );
+            }
+            other => panic!("expected HistogramQuantiles, got {other:?}"),
+        }
+    }
+
+    /// AC3: the oracle arity bounds (3..=12, `parse.go:832-844` with
+    /// `ArgTypes` 4 / `Variadic` 9) and the arg-1 string type are enforced
+    /// by the vendored parser — these are PARSE errors, before the
+    /// planner's gate can fire.
+    #[test]
+    fn histogram_quantiles_arity_and_label_type_are_parse_errors() {
+        let err = parse(r#"histogram_quantiles(up, "q")"#).unwrap_err();
+        assert!(
+            err.to_string().contains("expected at least 3 argument(s)"),
+            "got {err}"
+        );
+
+        // 13 args = 11 quantiles: one past the Variadic:9 cap.
+        let err = parse(
+            r#"histogram_quantiles(up, "q", 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99)"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("expected at most 12 argument(s)"),
+            "got {err}"
+        );
+
+        // A non-string label argument fails the parser's type check.
+        let err = parse("histogram_quantiles(up, up, 0.5)").unwrap_err();
+        assert!(
+            err.to_string().contains("expected type string"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -5713,6 +5901,32 @@ mod tests {
         assert_eq!(
             stats_flags("histogram_count(histogram_quantile(0.5, m) + on() m2)"),
             vec![false, true]
+        );
+    }
+
+    /// The flag of every selector of `query`, planned with the
+    /// experimental gate on (issue #153: `histogram_quantiles` is
+    /// experimental, so its stop-arm coverage needs the gated planner).
+    fn stats_flags_experimental(query: &str) -> Vec<bool> {
+        let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
+        p.selectors.iter().map(|s| s.histogram_stats).collect()
+    }
+
+    /// Issue #153: `histogram_quantiles` is in the pin's stop list
+    /// (`engine.go:4680`) exactly like the singular form — including the
+    /// row-1989 shape, where a `histogram_count` (enabler) sits UNDER the
+    /// quantiles call and must still read full buckets.
+    #[test]
+    fn histogram_stats_is_cleared_by_histogram_quantiles() {
+        assert_eq!(
+            stats_flags_experimental(r#"histogram_quantiles(m, "q", 0.5)"#),
+            vec![false]
+        );
+        assert_eq!(
+            stats_flags_experimental(
+                r#"histogram_quantiles(m unless histogram_count(m) == 0, "q", 0.5)"#
+            ),
+            vec![false, false]
         );
     }
 

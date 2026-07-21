@@ -264,9 +264,17 @@ fn every_entry_has_a_home_and_implemented_entries_have_witnesses() {
 /// generic `scalar -> 1` argument is exactly the value its `0 < f < 1`
 /// factor validator rejects, so the auto-probe would spuriously fail an
 /// implemented function — valid mid-range factors probe it instead.
+/// `histogram_quantiles` is special-cased too (issue #153): its registry
+/// shape (4 arg types, variadic 9) makes the generic formula
+/// `4.saturating_sub(9) = 0` required args, and the zero-arg probe
+/// `histogram_quantiles()` is a parse error — a minimal genuine call
+/// probes it instead.
 fn build_function_probe(f: &RegistryFunction) -> String {
     if f.name == "double_exponential_smoothing" {
         return "double_exponential_smoothing(m[5m], 0.5, 0.5)".to_string();
+    }
+    if f.name == "histogram_quantiles" {
+        return "histogram_quantiles(m, \"q\", 0.5)".to_string();
     }
     let required = if f.variadic < 0 {
         f.arg_types.len().saturating_sub(1)
@@ -534,6 +542,10 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             "histogram_avg",
             "histogram_stddev",
             "histogram_stdvar",
+            // M7 (issue #153): the experimental multi-quantile variant
+            // (planner-gated behind promql-experimental-functions),
+            // corpus-witnessed via `native_histograms.test`.
+            "histogram_quantiles",
         ])
     );
 

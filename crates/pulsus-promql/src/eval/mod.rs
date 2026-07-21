@@ -1051,6 +1051,33 @@ fn prepare_subqueries(
                 classifier,
             )
         }
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => {
+            prepare_subqueries(
+                expr,
+                selectors,
+                data,
+                grid,
+                lookback_ms,
+                caches,
+                inner_evals,
+                classifier,
+            )?;
+            for q in quantiles {
+                prepare_subqueries(
+                    q,
+                    selectors,
+                    data,
+                    grid,
+                    lookback_ms,
+                    caches,
+                    inner_evals,
+                    classifier,
+                )?;
+            }
+            Ok(())
+        }
         PlanExpr::HistogramAccessor { arg, .. } => prepare_subqueries(
             arg,
             selectors,
@@ -1671,6 +1698,9 @@ fn expr_may_annotate(expr: &PlanExpr) -> bool {
         // CAPABLE unconditionally: partition warnings, invalid-φ and
         // NaN-observation infos, forced monotonicity (`histogram_fns.rs`).
         PlanExpr::HistogramQuantile { .. } => true,
+        // Issue #153: same emission surface as the singular form (per-
+        // quantile invalid-φ warnings on top).
+        PlanExpr::HistogramQuantiles { .. } => true,
         // FREE own shape (pure accessors, no sink access — `mod.rs:2240-
         // 2266`), recurse into `arg`.
         PlanExpr::HistogramAccessor { arg, .. } => expr_may_annotate(arg),
@@ -1891,6 +1921,33 @@ fn prepare_step_invariant(
             ),
             None => Ok(()),
         },
+        // Issue #153: variable child count (1 vector + 1..=10 quantiles),
+        // so it cannot join the two-child binding below.
+        PlanExpr::HistogramQuantiles {
+            expr, quantiles, ..
+        } => {
+            prepare_step_invariant(
+                expr,
+                selectors,
+                data,
+                start_ms,
+                lookback_ms,
+                caches,
+                classifier,
+            )?;
+            for q in quantiles {
+                prepare_step_invariant(
+                    q,
+                    selectors,
+                    data,
+                    start_ms,
+                    lookback_ms,
+                    caches,
+                    classifier,
+                )?;
+            }
+            Ok(())
+        }
         PlanExpr::HistogramQuantile {
             quantile: a,
             expr: b,
@@ -2232,6 +2289,58 @@ fn partition_histogram_inputs(
         }
     });
     (native, groups)
+}
+
+/// Issue #153: port of `labels.FormatOpenMetricsFloat`
+/// (`model/labels/float.go:35-60`, pinned `40af9c2`) — Go `%g` shortest
+/// formatting with `".0"` appended when the result carries neither `.`
+/// nor `e`. The hardcoded cases run FIRST, exactly as the pin's switch:
+/// `f == 0` catches `-0.0` too (Go `-0.0 == 0` is true), which is
+/// load-bearing — falling through would render `-0.0` as `"-0.0"` via
+/// [`crate::annotations::go_float::format_g`]'s `"-0"`.
+fn format_open_metrics_float(f: f64) -> String {
+    if f == 1.0 {
+        return "1.0".to_string();
+    }
+    if f == 0.0 {
+        return "0.0".to_string();
+    }
+    if f == -1.0 {
+        return "-1.0".to_string();
+    }
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "+Inf" } else { "-Inf" }.to_string();
+    }
+    let s = crate::annotations::go_float::format_g(f);
+    if s.contains('.') || s.contains('e') {
+        s
+    } else {
+        format!("{s}.0")
+    }
+}
+
+/// Issue #153: stamps the quantile label onto one output sample's
+/// identity — `Labels::set` overwrites an existing entry (upstream
+/// `getOrCreateLblsWithQuantile`'s `labels.Builder.Set`); `"__name__"`
+/// routes to the metric-name channel instead (`Labels` carries the name
+/// outside the map by construction — the `count_values` precedent). The
+/// caller keeps `drop_name: true`, so the `__name__` route's net effect
+/// equals the pin's Set-then-DropName.
+fn set_quantile_label(
+    mut labels: Labels,
+    metric_name: Option<String>,
+    label: &str,
+    q_str: &str,
+) -> (Labels, Option<String>) {
+    if label == "__name__" {
+        (labels, Some(q_str.to_string()))
+    } else {
+        labels.set(label.to_string(), q_str.to_string());
+        (labels, metric_name)
+    }
 }
 
 fn eval_step(
@@ -2769,6 +2878,116 @@ fn eval_step(
                     v,
                     h: None,
                 });
+            }
+            Ok(StepValue::Vector(out))
+        }
+
+        // Issue #153: `histogram_quantiles(v, label, q0, qs…)` — the pin's
+        // `funcHistogramQuantiles` (`functions.go:2141-2214`). Order
+        // matters, mirroring the pin: every quantile is validated (per-
+        // value invalid-quantile warn) BEFORE the input is partitioned;
+        // the partition runs ONCE (the single `resetHistograms` at
+        // `functions.go:2168` — mixed-histograms / bad-`le` warns fire
+        // once, not per quantile); then quantiles loop OUTER over the
+        // natives-then-classics inner walk, reusing the singular arm's
+        // primitives verbatim. Each output sample sets `label` to the
+        // OpenMetrics-formatted quantile — overwriting an existing value
+        // (upstream `labels.Builder.Set`); `label == "__name__"` routes to
+        // the metric-name channel instead (`Labels` never carries the
+        // name), with the net effect equal to the pin's Set-then-DropName
+        // since `drop_name` stays true. Duplicate quantile values re-emit
+        // (the pin does not de-duplicate).
+        PlanExpr::HistogramQuantiles {
+            expr,
+            label,
+            quantiles,
+        } => {
+            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
+            else {
+                return Err(PromqlError::Unsupported {
+                    construct: "histogram_quantiles' first argument must evaluate to a vector"
+                        .to_string(),
+                });
+            };
+            let mut qs: Vec<f64> = Vec::with_capacity(quantiles.len());
+            for q_expr in quantiles {
+                let StepValue::Scalar(q) =
+                    eval_step(q_expr, selectors, data, t_ms, lookback_ms, caches)?
+                else {
+                    return Err(PromqlError::Unsupported {
+                        construct:
+                            "histogram_quantiles' quantile arguments must evaluate to scalars"
+                                .to_string(),
+                    });
+                };
+                // `validateQuantile` per argument (`functions.go:2158`).
+                if q.is_nan() || !(0.0..=1.0).contains(&q) {
+                    caches
+                        .annotations
+                        .borrow_mut()
+                        .warning(crate::annotations::messages::invalid_quantile_warning(q));
+                }
+                qs.push(q);
+            }
+
+            let (native, groups) = partition_histogram_inputs(v, caches);
+            // Sort the classic group keys once (the singular arm's
+            // determinism rule — upstream iterates a Go map).
+            let mut keys: Vec<SeriesIdentity> = groups.keys().cloned().collect();
+            keys.sort();
+
+            let mut out = Vec::new();
+            for &q in &qs {
+                let q_str = format_open_metrics_float(q);
+                for s in &native {
+                    let Some(h) = &s.h else { continue };
+                    let metric_name = s.metric_name.as_deref().unwrap_or("");
+                    let qv = {
+                        let mut annos = caches.annotations.borrow_mut();
+                        histogram_fns::histogram_quantile(q, h, metric_name, &mut annos)
+                    };
+                    let (labels, metric_name) =
+                        set_quantile_label(s.labels.clone(), s.metric_name.clone(), label, &q_str);
+                    out.push(InstantSample {
+                        labels,
+                        metric_name,
+                        drop_name: true,
+                        t_ms,
+                        v: qv,
+                        h: None,
+                    });
+                }
+                for key in &keys {
+                    let buckets = groups.get(key).expect("key came from groups.keys()");
+                    let (qv, report) =
+                        functions::histogram_quantile_with_monotonicity_report(q, buckets.clone())?;
+                    let (metric_name, labels) = key.clone();
+                    if report.forced {
+                        // Merged exactly as the singular arm merges (see
+                        // its comment on the pin's `Merge` collision).
+                        caches.annotations.borrow_mut().forced_monotonicity_info(
+                            crate::annotations::messages::histogram_quantile_forced_monotonicity_info(
+                                metric_name.as_deref().unwrap_or(""),
+                            ),
+                            crate::annotations::ForcedMonotonicityDetail::single(
+                                t_ms,
+                                report.min_bucket,
+                                report.max_bucket,
+                                report.max_diff,
+                            ),
+                        );
+                    }
+                    let (labels, metric_name) =
+                        set_quantile_label(labels, metric_name, label, &q_str);
+                    out.push(InstantSample {
+                        labels,
+                        metric_name,
+                        drop_name: true,
+                        t_ms,
+                        v: qv,
+                        h: None,
+                    });
+                }
             }
             Ok(StepValue::Vector(out))
         }
@@ -4989,6 +5208,177 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains("is missing or has a malformed value of \"\""),
+            "got {warnings:?}"
+        );
+    }
+
+    // --- issue #153: histogram_quantiles (experimental multi-quantile) ---
+
+    /// AC6: the `FormatOpenMetricsFloat` port (`labels/float.go:35-60`) —
+    /// exactly the pinned vector. `-0.0 → "0.0"` is the load-bearing
+    /// hardcode-first case (Go `-0.0 == 0` is true; the `%g` fallback
+    /// would render `"-0.0"`).
+    #[test]
+    fn format_open_metrics_float_matches_the_pinned_vector() {
+        for (input, want) in [
+            (1.0, "1.0"),
+            (0.0, "0.0"),
+            (-0.0, "0.0"),
+            (-1.0, "-1.0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "+Inf"),
+            (f64::NEG_INFINITY, "-Inf"),
+            (0.5, "0.5"),
+            (0.81, "0.81"),
+            (100.0, "100.0"),
+            (1e21, "1e+21"),
+            (1e-7, "1e-07"),
+        ] {
+            assert_eq!(format_open_metrics_float(input), want, "input {input:?}");
+        }
+    }
+
+    /// AC7 (emission half): a two-quantile call over a native histogram
+    /// emits one sample per input × quantile — quantile-outer order, the
+    /// label set to the formatted value, the metric name dropped, and the
+    /// per-quantile value equal to the singular primitive's (row 65's
+    /// median witness).
+    #[test]
+    fn histogram_quantiles_emits_one_sample_per_input_and_quantile() {
+        let params_exp = PlanParams {
+            experimental_functions: true,
+            ..params(60_000, 60_000, 0)
+        };
+        let expr = crate::parser::parse(r#"histogram_quantiles(m, "q", 0.5, 0.9)"#).unwrap();
+        let p = plan(&expr, params_exp).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("job", "a")],
+                vec![Sample::hist(60_000, single_histogram().to_float())],
+            )],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 2, "one sample per input × quantile: {v:?}");
+        assert_eq!(v[0].labels.get("q"), Some("0.5"));
+        assert_eq!(v[1].labels.get("q"), Some("0.9"));
+        for s in &v {
+            assert_eq!(s.labels.get("job"), Some("a"));
+            assert_eq!(s.metric_name, None, "name dropped");
+        }
+        // The shared native primitive: `single_histogram`'s median is
+        // √2 — exponential interpolation's midpoint of 1 < x <= 2
+        // (`native_histograms.test:65`).
+        assert!(
+            (v[0].v - std::f64::consts::SQRT_2).abs() < 1e-12,
+            "got {}",
+            v[0].v
+        );
+    }
+
+    /// AC7 (overwrite half): an EXISTING label under the quantile name is
+    /// overwritten, never duplicated (upstream `labels.Builder.Set`).
+    #[test]
+    fn histogram_quantiles_overwrites_an_existing_quantile_label() {
+        let params_exp = PlanParams {
+            experimental_functions: true,
+            ..params(60_000, 60_000, 0)
+        };
+        let expr = crate::parser::parse(r#"histogram_quantiles(m, "q", 0.5)"#).unwrap();
+        let p = plan(&expr, params_exp).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("q", "stale-value")],
+                vec![Sample::hist(60_000, single_histogram().to_float())],
+            )],
+        );
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].labels.get("q"), Some("0.5"), "overwritten, {v:?}");
+        assert_eq!(
+            v[0].labels.0.iter().filter(|(k, _)| k == "q").count(),
+            1,
+            "no duplicate entry"
+        );
+    }
+
+    /// `label == "__name__"` routes to the metric-name channel (the
+    /// `count_values` precedent — `Labels` never carries the name), and
+    /// `drop_name: true` still removes it from the output, matching the
+    /// pin's Set-then-DropName net effect.
+    #[test]
+    fn histogram_quantiles_routes_a_dunder_name_label_to_the_name_channel() {
+        let params_exp = PlanParams {
+            experimental_functions: true,
+            ..params(60_000, 60_000, 0)
+        };
+        let expr = crate::parser::parse(r#"histogram_quantiles(m, "__name__", 0.5)"#).unwrap();
+        let p = plan(&expr, params_exp).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("job", "a")],
+                vec![Sample::hist(60_000, single_histogram().to_float())],
+            )],
+        );
+        // Must not trip `Labels::set`'s `__name__` debug_assert; the
+        // written name channel is then dropped (`drop_name: true`).
+        let v = instant_vector(evaluate(&p, &data).unwrap());
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].labels.get("__name__"), None);
+        assert_eq!(v[0].metric_name, None);
+        assert_eq!(v[0].labels.get("job"), Some("a"));
+    }
+
+    /// AC7 (validation half): each out-of-`[0,1]`/NaN quantile fires its
+    /// own `invalid_quantile_warning` (`validateQuantile` per argument,
+    /// `functions.go:2158`) — and every quantile still emits its samples
+    /// (the pin computes regardless).
+    #[test]
+    fn histogram_quantiles_warns_per_invalid_quantile_value() {
+        let params_exp = PlanParams {
+            experimental_functions: true,
+            ..params(60_000, 60_000, 0)
+        };
+        let expr = crate::parser::parse(r#"histogram_quantiles(m, "q", 1.5, -0.5, 0.5)"#).unwrap();
+        let p = plan(&expr, params_exp).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[],
+                vec![Sample::hist(60_000, single_histogram().to_float())],
+            )],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        let QueryValue::Vector(v) = value else {
+            panic!("expected Vector");
+        };
+        assert_eq!(v.len(), 3, "invalid quantiles still emit: {v:?}");
+        // Quantile-outer emission order (argument source order).
+        let qs: Vec<_> = v.iter().map(|s| s.labels.get("q").unwrap()).collect();
+        assert_eq!(qs, vec!["1.5", "-0.5", "0.5"]);
+        let (warnings, _) = annotations.as_strings(0, 0);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warn per offending value: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("1.5"))
+                && warnings.iter().any(|w| w.contains("-0.5")),
             "got {warnings:?}"
         );
     }
