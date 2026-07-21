@@ -130,7 +130,8 @@ carries the same note.
 `duration_expression`, `fill-modifier`, `selectors`, `staleness`,
 `trig_functions`, `type_and_unit`); 13 use deferred directives (`expect`
 assertion lines, `{{…}}` native-histogram sample literals,
-`load_with_nhcb`, `@st` start-timestamp lines) and are listed — loudly,
+`load_with_nhcb`, and — until issue #155 activated them — `@st`
+start-timestamp lines) and are listed — loudly,
 wholesale, with activation issues — in `../skip-manifest.json`. Residual
 divergences of the executed files that the coverage-manifest oracle
 cannot attribute to a scheduled/deferred construct are classified
@@ -153,6 +154,9 @@ histograms and are deferred via the non-directive `manual_skip` lever
 `load_with_nhcb` (a distinct classic-bucket-to-NHCB `load` conversion,
 never a `{{…}}` literal) and the block `expect ordered`/`expect range
 vector` forms remain deferred directives —
-`histograms.test`/`operators.test`/`start_timestamps.test`/
+`histograms.test`/`operators.test`/
 `aggregators.test`/`functions.test`/`range_queries.test` stay
-skip-manifested on those grounds.
+skip-manifested on those grounds. `@st` start-timestamp lines became
+executable in issue #155 (loader grammar + the rate/irate/increase/
+resets ST semantics), de-listing `start_timestamps.test` — the file now
+replays fully green.

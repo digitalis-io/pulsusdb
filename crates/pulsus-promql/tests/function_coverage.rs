@@ -344,6 +344,7 @@ fn probe_outcome(probe: &str) -> Result<(), String> {
                     ("le".to_string(), "+Inf".to_string()),
                 ]),
                 samples,
+                start_ts: None,
             }],
         );
     }

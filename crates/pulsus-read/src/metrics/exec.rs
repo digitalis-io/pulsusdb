@@ -1805,6 +1805,7 @@ fn group_rows(
                     metric_name: Some(metric_name.to_string()),
                     labels: to_promql_labels(&labels),
                     samples: vec![sample],
+                    start_ts: None,
                 });
             }
         }
@@ -1865,6 +1866,7 @@ fn group_multi_rows(
                     metric_name: Some(key.0.clone()),
                     labels: to_promql_labels(&labels),
                     samples: vec![sample],
+                    start_ts: None,
                 });
                 true
             }
@@ -1920,6 +1922,7 @@ fn group_merged_rows(
             metric_name: Some(metric_name.to_string()),
             labels: to_promql_labels(&labels),
             samples,
+            start_ts: None,
         });
     }
     Ok(out)
@@ -1984,6 +1987,7 @@ fn group_merged_multi_rows(
             metric_name: Some(key.0),
             labels: to_promql_labels(&labels),
             samples,
+            start_ts: None,
         });
     }
     Ok(out)
@@ -2464,6 +2468,7 @@ mod tests {
                         metric_name: Some("foo".to_string()),
                         labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                         samples: samples(1.0),
+                        start_ts: None,
                     });
                 }
             } else {
@@ -2479,6 +2484,7 @@ mod tests {
                                 ("region".to_string(), "us-east-1".to_string()),
                             ]),
                             samples: samples(2.0),
+                            start_ts: None,
                         });
                         fp += 1;
                     }

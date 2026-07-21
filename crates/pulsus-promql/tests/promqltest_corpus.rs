@@ -195,6 +195,45 @@ fn expect_string_with_non_utf8_literal_executes_as_a_classifiable_mismatch() {
     );
 }
 
+/// Issue #155 (AC1): `start_timestamps.test` — the `@st` loader grammar
+/// plus the rate/irate/increase/resets start-timestamp semantics —
+/// executes from the checksum-verified upstream cache with exactly 18
+/// eval cases, ALL passing (a pinpoint diagnostic independent of the
+/// aggregate replay below).
+#[test]
+fn start_timestamps_all_18_rows_pass() {
+    let (_, contents) = load_upstream_verified();
+    let text = contents
+        .get("start_timestamps.test")
+        .expect("start_timestamps.test is part of the pinned upstream corpus");
+    assert!(
+        scan_deferred_directives(text).is_empty(),
+        "@st is executable since issue #155 — no deferred directive may remain in the file"
+    );
+    let run = run_file("upstream/start_timestamps.test", text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        run.cases.len(),
+        18,
+        "start_timestamps.test carries exactly 18 eval rows at the pin"
+    );
+    let failures: Vec<String> = run
+        .cases
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| {
+            format!(
+                "upstream/start_timestamps.test:{} `{}` — {}",
+                c.line, c.query, c.detail
+            )
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "all 18 start-timestamp rows must pass:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// AC2 + AC9: the pinned upstream corpus replays with zero unclassified
 /// failures, the skip-manifest matches reality in both directions, and
 /// the eval-divergence ledger carries no stale entries.

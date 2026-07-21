@@ -70,6 +70,10 @@ impl<'a> EvalData<'a> {
                             metric_name: fs.metric_name.clone(),
                             labels: fs.labels.clone(),
                             samples: reduce_histogram_stats_samples(&fs.samples),
+                            // Issue #155: the stats reduction is 1:1 per
+                            // sample, so the aligned ST channel (if any)
+                            // carries over unchanged.
+                            start_ts: fs.start_ts.clone(),
                         })
                         .collect(),
                 );
@@ -2073,6 +2077,13 @@ struct WindowedSeries {
     /// `seriesDropName = dropName || inputDropName`, engine.go:2281).
     drop_name: bool,
     samples: Vec<Sample>,
+    /// Issue #155: the optional start-timestamp channel, windowed in
+    /// lockstep with `samples` (aligned 1:1, `0` = unset). `Some` only
+    /// for a Selector source whose fetched series carried
+    /// [`FetchedSeries::start_ts`]; a Subquery source always cuts it.
+    /// Consumed only by the `RangeFn` (rate/irate/increase) and
+    /// `OverTime::Resets` arms — the `engine.go:2243-2246` gate.
+    st: Option<Vec<i64>>,
 }
 
 /// The extended range-selector mode (issue #150) of a [`WindowedSource`],
@@ -2137,14 +2148,36 @@ fn windowed_range_source(
             let series = data
                 .get(*id)
                 .iter()
-                .map(|s| WindowedSeries {
-                    labels: s.labels.clone(),
-                    // Per-series name (issue #85), with the same
-                    // concrete-name-only fallback the `Selector` arm
-                    // documents.
-                    metric_name: s.metric_name.clone().or_else(|| sel.metric_name.clone()),
-                    drop_name: false,
-                    samples: windowed_non_stale(&s.samples, slice_lower, slice_upper),
+                .map(|s| {
+                    // Issue #155: a series carrying the ST channel windows
+                    // sample/ST PAIRS (the stale filter drops the paired
+                    // ST too); the overwhelmingly common `None` case takes
+                    // the untouched pre-change path.
+                    let (samples, st) = match &s.start_ts {
+                        None => (
+                            windowed_non_stale(&s.samples, slice_lower, slice_upper),
+                            None,
+                        ),
+                        Some(st) => {
+                            let (samples, st) = windowed_non_stale_with_st(
+                                &s.samples,
+                                st,
+                                slice_lower,
+                                slice_upper,
+                            );
+                            (samples, Some(st))
+                        }
+                    };
+                    WindowedSeries {
+                        labels: s.labels.clone(),
+                        // Per-series name (issue #85), with the same
+                        // concrete-name-only fallback the `Selector` arm
+                        // documents.
+                        metric_name: s.metric_name.clone().or_else(|| sel.metric_name.clone()),
+                        drop_name: false,
+                        samples,
+                        st,
+                    }
                 })
                 .collect();
             WindowedSource {
@@ -2179,6 +2212,13 @@ fn windowed_range_source(
                         metric_name: s.metric_name.clone(),
                         drop_name: s.drop_name,
                         samples: s.samples[start..end].to_vec(),
+                        // Issue #155: subqueries CUT start-timestamp
+                        // propagation — materialized inner series never
+                        // carry the channel (upstream: a materialized
+                        // `storageSeriesIterator.AtST` returns 0,
+                        // `promql/value.go:528-530`; witnessed by
+                        // `start_timestamps.test:35-40,:90-96`).
+                        st: None,
                     }
                 })
                 .collect();
@@ -2216,6 +2256,35 @@ fn windowed_non_stale(samples: &[Sample], lower_excl: i64, upper_incl: i64) -> V
         .filter(|s| !s.is_stale())
         .cloned()
         .collect()
+}
+
+/// [`windowed_non_stale`]'s paired variant for a series carrying the
+/// start-timestamp channel (issue #155): identical `(lower_excl,
+/// upper_incl]` slicing and stale filtering, moving `(sample, st)` pairs
+/// TOGETHER so the aligned-channel invariant survives windowing (a
+/// desync would shift every reset placement by one).
+fn windowed_non_stale_with_st(
+    samples: &[Sample],
+    st: &[i64],
+    lower_excl: i64,
+    upper_incl: i64,
+) -> (Vec<Sample>, Vec<i64>) {
+    debug_assert_eq!(
+        samples.len(),
+        st.len(),
+        "start_ts must be aligned 1:1 with samples"
+    );
+    let start = samples.partition_point(|s| s.t_ms <= lower_excl);
+    let end = samples.partition_point(|s| s.t_ms <= upper_incl);
+    let mut out_samples = Vec::with_capacity(end - start);
+    let mut out_st = Vec::with_capacity(end - start);
+    for (s, &s_st) in samples[start..end].iter().zip(&st[start..end]) {
+        if !s.is_stale() {
+            out_samples.push(s.clone());
+            out_st.push(s_st);
+        }
+    }
+    (out_samples, out_st)
 }
 
 /// Issue #150: `extrapolatedRate`'s anchored/smoothed branch
@@ -2587,15 +2656,27 @@ fn eval_step(
             let mut out = Vec::new();
             for series in src.series {
                 let metric_name = series.metric_name.as_deref().unwrap_or("");
+                // Issue #155: the four-function gate (engine.go:2243-2246)
+                // — only `rate`/`irate`/`increase` consume the ST channel;
+                // `delta` is outside the name list and gets `None`.
+                let st = {
+                    use crate::plan::RangeFn;
+                    matches!(func, RangeFn::Rate | RangeFn::Irate | RangeFn::Increase)
+                        .then(|| series.st.as_deref())
+                        .flatten()
+                };
                 let result = {
                     let mut annos = caches.annotations.borrow_mut();
                     if src.mode == RangeMode::Plain {
                         hist_range_fns::eval_range_fn_hist(
                             *func,
                             &series.samples,
-                            src.range_ms,
-                            src.lower_excl,
-                            src.upper_incl,
+                            hist_range_fns::RangeWindow {
+                                range_ms: src.range_ms,
+                                start_ms: src.lower_excl,
+                                end_ms: src.upper_incl,
+                            },
+                            st,
                             metric_name,
                             &mut annos,
                         )
@@ -2674,9 +2755,24 @@ fn eval_step(
                     None
                 };
                 let windowed = anchored_samples.unwrap_or(&series.samples);
+                // Issue #155: only `resets` is in the four-function gate
+                // (engine.go:2243-2246) — every other `OverTimeFn` ignores
+                // the ST channel. `anchor_trim` keeps a SUFFIX of the
+                // windowed samples, so the paired channel is sliced by the
+                // same offset to preserve the 1:1 alignment.
+                let st = matches!(func, OverTimeFn::Resets)
+                    .then(|| series.st.as_deref())
+                    .flatten()
+                    .map(|st| &st[series.samples.len() - windowed.len()..]);
                 let result = {
                     let mut annos = caches.annotations.borrow_mut();
-                    hist_range_fns::eval_over_time_hist(*func, windowed, metric_name, &mut annos)
+                    hist_range_fns::eval_over_time_hist(
+                        *func,
+                        windowed,
+                        st,
+                        metric_name,
+                        &mut annos,
+                    )
                 };
                 if let Some(value) = result {
                     let (v, h) = over_time_value_to_sample_fields(value);
@@ -4083,6 +4179,7 @@ mod tests {
             metric_name: None,
             labels: Labels::new(labels.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
             samples,
+            start_ts: None,
         }
     }
 
@@ -4122,6 +4219,23 @@ mod tests {
         let samples = vec![s(0, 1.0), s(50, stale), s(100, 2.0)];
         let w = windowed_non_stale(&samples, -1, 100);
         assert_eq!(w, vec![s(0, 1.0), s(100, 2.0)]);
+    }
+
+    /// Issue #155: the paired variant slices and stale-filters `(sample,
+    /// st)` pairs TOGETHER — the stale marker's ST is dropped with it and
+    /// the bounds match [`windowed_non_stale`] exactly.
+    #[test]
+    fn windowed_non_stale_with_st_moves_pairs_together_through_slicing_and_stale_filtering() {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let samples = vec![s(0, 1.0), s(50, stale), s(100, 2.0), s(200, 3.0)];
+        let st = vec![10, 20, 30, 40];
+        let (w, w_st) = windowed_non_stale_with_st(&samples, &st, -1, 100);
+        assert_eq!(w, vec![s(0, 1.0), s(100, 2.0)]);
+        assert_eq!(w_st, vec![10, 30]);
+        // Left-open lower bound drops the paired ST too.
+        let (w, w_st) = windowed_non_stale_with_st(&samples, &st, 0, 200);
+        assert_eq!(w, vec![s(100, 2.0), s(200, 3.0)]);
+        assert_eq!(w_st, vec![30, 40]);
     }
 
     // --- end-to-end evaluate() ---

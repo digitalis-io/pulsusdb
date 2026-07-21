@@ -231,6 +231,14 @@ pub struct FetchedSeries {
     pub metric_name: Option<String>,
     pub labels: Labels,
     pub samples: Vec<Sample>,
+    /// Start timestamps aligned 1:1 with `samples`; `0` = unset (the
+    /// upstream sentinel — `isStartTimestampReset`'s "value is 0" arm,
+    /// `promql/functions.go:705-708` @ v3.13.0 `40af9c2`). Production
+    /// fetches always construct `None` (the ClickHouse `metric_samples`
+    /// schema has no ST column); only the promqltest store populates it.
+    /// Consumed exclusively by `rate`/`irate`/`increase`/`resets`
+    /// (`engine.go:2243-2246`'s four-function gate).
+    pub start_ts: Option<Vec<i64>>,
 }
 
 /// Every selector's fetched series, keyed by [`SelectorId`] — populated by
@@ -555,6 +563,7 @@ mod tests {
             metric_name: Some("up".to_string()),
             labels: Labels::new(vec![("job".to_string(), "api".to_string())]),
             samples: vec![Sample::float(0, 1.0)],
+            start_ts: None,
         }];
         data.insert(0, series.clone());
         assert_eq!(data.get(0), series.as_slice());

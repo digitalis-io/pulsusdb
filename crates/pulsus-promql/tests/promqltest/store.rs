@@ -30,6 +30,15 @@ struct StoredSeries {
     labels: BTreeMap<String, String>,
     samples: Vec<Sample>,
     readback: Vec<CounterResetHint>,
+    /// Issue #155: per-sample start timestamps aligned 1:1 with
+    /// `samples` (`0` = unset — the upstream sentinel). Always
+    /// materialized (zeros when no `@st` line ever bound to this
+    /// series) so multi-`load` merges stay a plain pair-sort;
+    /// `has_st` gates whether `fetch` exposes the channel at all.
+    st: Vec<i64>,
+    /// Whether ANY `load` block bound an `@st` line to this series —
+    /// a plain `load` fetches `start_ts: None` end-to-end (AC5).
+    has_st: bool,
 }
 
 #[derive(Debug, Default)]
@@ -55,25 +64,63 @@ impl TestStorage {
     pub fn load(&mut self, step_ms: i64, series: &[LoadSeries]) -> Result<(), String> {
         for s in series {
             let mut samples = Vec::new();
+            let mut sts: Vec<i64> = Vec::new();
             for (k, v) in s.values.iter().enumerate() {
                 let t_ms = k as i64 * step_ms;
+                // Issue #155: the bound `@st` offset for this value
+                // position (upstream `cmd.set`, test.go:905-906: `s.ST =
+                // tsMs + stVals[i].Value` for a non-omitted item; `0` =
+                // unset).
+                let st =
+                    s.st.as_ref()
+                        .and_then(|st| st[k])
+                        .map(|offset| t_ms + offset)
+                        .unwrap_or(0);
                 match v {
                     SeqValue::Gap => {}
                     SeqValue::Stale => {
-                        samples.push(Sample::float(t_ms, f64::from_bits(STALE_NAN_BITS)))
+                        samples.push(Sample::float(t_ms, f64::from_bits(STALE_NAN_BITS)));
+                        sts.push(st);
                     }
-                    SeqValue::Value(v) => samples.push(Sample::float(t_ms, *v)),
+                    SeqValue::Value(v) => {
+                        samples.push(Sample::float(t_ms, *v));
+                        sts.push(st);
+                    }
                     // `load` ignores hint_set; the hint VALUE rides inside
                     // the histogram (an explicit gauge/reset drives the
                     // chunk-cut emulation below).
-                    SeqValue::Histogram(h, _) => samples.push(Sample::hist(t_ms, h.clone())),
+                    //
+                    // Issue #155: the ST is FORCED to 0 on histogram
+                    // samples — the pin's tsdb has no histogram-ST
+                    // support ("TODO: start timestamps doesn't work for
+                    // histograms yet, because the tsdb support is
+                    // missing", start_timestamps.test:126,:151), so the
+                    // engine reads histogram STs back as 0; this store is
+                    // the emulation point of that gap, mirroring
+                    // upstream's own storage/eval split (the eval-side
+                    // hist ST checks are still implemented per the pin).
+                    SeqValue::Histogram(h, _) => {
+                        samples.push(Sample::hist(t_ms, h.clone()));
+                        sts.push(0);
+                    }
                 }
             }
+            let has_st = s.st.is_some();
             match self.series.iter_mut().find(|st| st.labels == s.labels) {
                 Some(existing) => {
-                    existing.samples.extend(samples);
-                    existing.samples.sort_by_key(|s| s.t_ms);
+                    // Pair-sort `(sample, st)` by timestamp so the aligned
+                    // channel survives a multi-`load` merge (issue #155);
+                    // a side without `@st` already materialized zeros.
+                    let mut pairs: Vec<(Sample, i64)> = existing
+                        .samples
+                        .drain(..)
+                        .zip(existing.st.drain(..))
+                        .chain(samples.into_iter().zip(sts))
+                        .collect();
+                    pairs.sort_by_key(|(s, _)| s.t_ms);
+                    (existing.samples, existing.st) = pairs.into_iter().unzip();
                     existing.readback = readback_hints(&existing.samples);
+                    existing.has_st |= has_st;
                 }
                 None => {
                     let readback = readback_hints(&samples);
@@ -81,6 +128,8 @@ impl TestStorage {
                         labels: s.labels.clone(),
                         samples,
                         readback,
+                        st: sts,
+                        has_st,
                     });
                 }
             }
@@ -126,29 +175,37 @@ impl TestStorage {
                 if !matched {
                     continue;
                 }
-                let samples: Vec<Sample> = stored
+                // Issue #155: window `(sample, st)` PAIRS so the aligned
+                // ST channel survives the fetch-window slice.
+                let mut samples: Vec<Sample> = Vec::new();
+                let mut sts: Vec<i64> = Vec::new();
+                for ((s, hint), st) in stored
                     .samples
                     .iter()
                     .zip(&stored.readback)
-                    .filter(|(s, _)| s.t_ms > lower_excl && s.t_ms <= upper_incl)
-                    .map(|(s, hint)| {
-                        // Issue #125: what the engine sees is the STORAGE
-                        // read-back hint, not the literal's — explicit
-                        // NCR/CR per-sample hints are deliberately not
-                        // round-tripped (chunks store only headers).
-                        let mut s = s.clone();
-                        if let Some(h) = s.h.as_mut() {
-                            h.counter_reset_hint = *hint;
-                        }
-                        s
-                    })
-                    .collect();
+                    .zip(&stored.st)
+                    .filter(|((s, _), _)| s.t_ms > lower_excl && s.t_ms <= upper_incl)
+                {
+                    // Issue #125: what the engine sees is the STORAGE
+                    // read-back hint, not the literal's — explicit
+                    // NCR/CR per-sample hints are deliberately not
+                    // round-tripped (chunks store only headers).
+                    let mut s = s.clone();
+                    if let Some(h) = s.h.as_mut() {
+                        h.counter_reset_hint = *hint;
+                    }
+                    samples.push(s);
+                    sts.push(*st);
+                }
                 fetched.push(FetchedSeries {
                     fingerprint: idx as u64,
                     metric_name: name.map(str::to_string),
                     // `Labels::new` drops `__name__` itself.
                     labels: Labels::new(stored.labels.iter().map(|(k, v)| (k.clone(), v.clone()))),
                     samples,
+                    // A series never touched by `@st` fetches `None` —
+                    // the production shape (AC5).
+                    start_ts: stored.has_st.then_some(sts),
                 });
             }
             data.insert(spec.id, fetched);
@@ -420,5 +477,124 @@ mod tests {
         wider.h.as_mut().unwrap().schema = 1;
         let hints = readback_hints(&[hist(0, 4.0, Unknown), wider]);
         assert_eq!(hints, vec![Unknown, Unknown]);
+    }
+
+    // -- issue #155 (AC5): the ST channel through load + fetch --
+
+    /// A `rate(m[10m])` instant plan at `at_ms` — one selector whose
+    /// fetch window `(at-10m, at]` covers every test sample.
+    fn rate_plan(at_ms: i64) -> QueryPlan {
+        let expr = pulsus_promql::parse("rate(m[10m])").expect("valid query");
+        pulsus_promql::plan(
+            &expr,
+            pulsus_promql::PlanParams {
+                start_ms: at_ms,
+                end_ms: at_ms,
+                step_ms: 60_000,
+                lookback_ms: pulsus_promql::DEFAULT_LOOKBACK_MS,
+                experimental_functions: false,
+            },
+        )
+        .expect("plannable query")
+    }
+
+    fn m_labels() -> BTreeMap<String, String> {
+        BTreeMap::from([("__name__".to_string(), "m".to_string())])
+    }
+
+    /// AC5 half 1: a PLAIN `load` (no `@st` line anywhere) fetches
+    /// `start_ts: None` end-to-end — the production shape; ST-free
+    /// queries take the unchanged code path.
+    #[test]
+    fn plain_load_fetches_start_ts_none_end_to_end() {
+        let mut store = TestStorage::new();
+        store
+            .load(
+                60_000,
+                &[LoadSeries {
+                    labels: m_labels(),
+                    values: vec![SeqValue::Value(1.0), SeqValue::Value(2.0)],
+                    st: None,
+                }],
+            )
+            .unwrap();
+        let plan = rate_plan(300_000);
+        let data = store.fetch(&plan).unwrap();
+        let fetched = data.get(plan.selectors[0].id);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].samples.len(), 2);
+        assert_eq!(fetched[0].start_ts, None);
+    }
+
+    /// AC5 half 2: an `@st`-bound load fetches `Some` with `st = t +
+    /// offset` per non-omitted position, `0` at `_` positions, and `0`
+    /// FORCED on histogram samples (the pin's tsdb gap — the store is
+    /// the emulation point).
+    #[test]
+    fn st_load_fetches_computed_start_ts_with_zero_for_omitted_and_histogram_samples() {
+        let mut store = TestStorage::new();
+        let h = hist(0, 4.0, CounterResetHint::Unknown).h.unwrap();
+        store
+            .load(
+                60_000,
+                &[LoadSeries {
+                    labels: m_labels(),
+                    values: vec![
+                        SeqValue::Value(1.0),           // t=0, `_` ST
+                        SeqValue::Value(2.0),           // t=60k, ST=-30s
+                        SeqValue::Value(3.0),           // t=120k, ST=-0ms
+                        SeqValue::Histogram(*h, false), // t=180k, ST forced 0
+                    ],
+                    st: Some(vec![None, Some(-30_000), Some(0), Some(-1)]),
+                }],
+            )
+            .unwrap();
+        let plan = rate_plan(300_000);
+        let data = store.fetch(&plan).unwrap();
+        let fetched = data.get(plan.selectors[0].id);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].samples.len(), 4);
+        assert_eq!(
+            fetched[0].start_ts,
+            Some(vec![0, 30_000, 120_000, 0]),
+            "`_` ⇒ 0; t+offset otherwise; histogram STs forced to 0"
+        );
+    }
+
+    /// The fetch window slices `(sample, st)` pairs together: a window
+    /// dropping the first sample drops its ST too.
+    #[test]
+    fn fetch_windows_sample_and_st_pairs_together() {
+        let mut store = TestStorage::new();
+        store
+            .load(
+                60_000,
+                &[LoadSeries {
+                    labels: m_labels(),
+                    values: vec![
+                        SeqValue::Value(1.0),
+                        SeqValue::Value(2.0),
+                        SeqValue::Value(3.0),
+                    ],
+                    st: Some(vec![None, Some(-30_000), Some(-1_000)]),
+                }],
+            )
+            .unwrap();
+        // `rate(m[10m])` at 1_000_000: the fetch window `(at - range -
+        // lookback, at]` = (100_000, 1_000_000] keeps only the t=120_000
+        // sample (t=0 and t=60_000 fall at/below the left-open bound).
+        let plan = rate_plan(1_000_000);
+        let data = store.fetch(&plan).unwrap();
+        let fetched = data.get(plan.selectors[0].id);
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(
+            fetched[0]
+                .samples
+                .iter()
+                .map(|s| s.t_ms)
+                .collect::<Vec<_>>(),
+            vec![120_000]
+        );
+        assert_eq!(fetched[0].start_ts, Some(vec![119_000]));
     }
 }

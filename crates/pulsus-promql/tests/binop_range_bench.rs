@@ -282,5 +282,6 @@ fn fs(fp: u64, name: &str, labels: Labels, base: f64) -> FetchedSeries {
         samples: (0..STEPS)
             .map(|k| Sample::float(k * STEP_MS, base + k as f64))
             .collect(),
+        start_ts: None,
     }
 }

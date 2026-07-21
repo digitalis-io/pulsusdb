@@ -1,5 +1,5 @@
 {
-  "_comment": "Issue #64 plan v2 Δ2: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Homes (issue #86, M6-08d split the expect family): the still-deferred block-expect forms (expect ordered, expect range vector) and eval_warn/eval_info/@st start-timestamp lines -> #22. expect fail/expect string (issue #86) and expect warn|no_warn|info|no_info plus the {{...}} native-histogram sample-literal grammar (issue #124, M7-A6) are EXECUTABLE. load_with_nhcb (a distinct classic-bucket-to-NHCB load conversion, not the {{...}} literal grammar) stays deferred -> #22. The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest. `manual_skip` (issue #124, M7-A6) is the non-directive lever: a file with ZERO deferred directives that still fails on replay for reasons outside any tracked directive — no drift check applies to it, unlike blocking_directives. No current users (issue #130 de-listed the last three).",
+  "_comment": "Issue #64 plan v2 Δ2: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Homes (issue #86, M6-08d split the expect family): the still-deferred block-expect forms (expect ordered, expect range vector) and eval_warn/eval_info -> #22. expect fail/expect string (issue #86) and expect warn|no_warn|info|no_info plus the {{...}} native-histogram sample-literal grammar (issue #124, M7-A6) and @st start-timestamp lines (issue #155) are EXECUTABLE. load_with_nhcb (a distinct classic-bucket-to-NHCB load conversion, not the {{...}} literal grammar) stays deferred -> #22. The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest. `manual_skip` (issue #124, M7-A6) is the non-directive lever: a file with ZERO deferred directives that still fails on replay for reasons outside any tracked directive — no drift check applies to it, unlike blocking_directives. No current users (issue #130 de-listed the last three).",
   "files": [
     {
       "file": "aggregators.test",
@@ -42,15 +42,6 @@
       "blocking_directives": [
         {
           "directive": "expect",
-          "activation_issue": "#22"
-        }
-      ]
-    },
-    {
-      "file": "start_timestamps.test",
-      "blocking_directives": [
-        {
-          "directive": "@st",
           "activation_issue": "#22"
         }
       ]

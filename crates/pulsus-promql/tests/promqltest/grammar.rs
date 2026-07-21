@@ -17,10 +17,16 @@
 //!   against the captured [`pulsus_promql::Annotations`] channel), and
 //!   `{{…}}` native-histogram sample literals in `load`/result lines
 //!   ([`super::histogram_literal`])
+//! - `metric{...}@st <sequence>` start-timestamp lines inside `load`
+//!   blocks (issue #155 — upstream `isSTLine`/`parseSTLine`/
+//!   `parseSTSequence`, `promql/promqltest/test.go:296-341,345-510` at
+//!   the pinned SHA): each line binds duration offsets to the
+//!   immediately-following sample line with the same metric and value
+//!   count (`ST = T + offset` per non-omitted position)
 //!
 //! Everything else in the upstream grammar (`eval_warn`/`eval_info`, the
 //! block `expect ordered` form and `expect range vector`,
-//! `load_with_nhcb`, `@st` start-timestamp lines) is a **deferred
+//! `load_with_nhcb`) is a **deferred
 //! directive**: [`scan_deferred_directives`] detects them before grammar
 //! parsing, and the corpus test requires any file using one to be listed
 //! — loudly, wholesale — in `corpus/skip-manifest.json` with an
@@ -32,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::series::{SeqValue, parse_series_line, scan_signed_number};
+use super::series::{SeqValue, parse_metric, parse_series_line, scan_signed_number};
 
 /// Milliseconds in each Prometheus duration unit (`model.ParseDuration`).
 const UNIT_MS: &[(&str, i64)] = &[
@@ -84,11 +90,20 @@ pub fn parse_duration_ms(s: &str) -> Result<i64, String> {
     Ok(total)
 }
 
+/// An expanded `@st` offset sequence (issue #155): one item per sample
+/// position, `None` = omitted (`_`).
+pub type StOffsets = Vec<Option<i64>>;
+
 /// One `load` block series.
 #[derive(Debug, Clone)]
 pub struct LoadSeries {
     pub labels: BTreeMap<String, String>,
     pub values: Vec<SeqValue>,
+    /// `@st` offsets (issue #155): milliseconds relative to the sample's
+    /// own timestamp (`ST = t + offset`; offsets are typically negative);
+    /// a `None` item = omitted (`_`). Invariant guaranteed at parse:
+    /// `st.as_ref().map_or(true, |s| s.len() == values.len())`.
+    pub st: Option<StOffsets>,
 }
 
 /// One expected result series of an `eval` block (labels include
@@ -217,8 +232,6 @@ pub enum DeferredDirective {
     EvalInfo,
     /// `load_with_nhcb …` (native-histogram-compatible bucket conversion).
     LoadWithNhcb,
-    /// `metric@st …` start-timestamp definition lines.
-    StartTimestampLine,
 }
 
 impl DeferredDirective {
@@ -229,7 +242,6 @@ impl DeferredDirective {
             DeferredDirective::EvalWarn => "eval_warn",
             DeferredDirective::EvalInfo => "eval_info",
             DeferredDirective::LoadWithNhcb => "load_with_nhcb",
-            DeferredDirective::StartTimestampLine => "@st",
         }
     }
 
@@ -239,7 +251,6 @@ impl DeferredDirective {
             DeferredDirective::EvalWarn,
             DeferredDirective::EvalInfo,
             DeferredDirective::LoadWithNhcb,
-            DeferredDirective::StartTimestampLine,
         ]
         .into_iter()
         .find(|d| d.name() == name)
@@ -293,11 +304,6 @@ pub fn scan_deferred_directives(text: &str) -> BTreeSet<DeferredDirective> {
         }
         if first_word == "load_with_nhcb" {
             out.insert(DeferredDirective::LoadWithNhcb);
-        }
-        // Upstream `isSTLine`: the first whitespace-delimited token ends
-        // with `@st` (no space before it).
-        if first_word.ends_with("@st") {
-            out.insert(DeferredDirective::StartTimestampLine);
         }
     }
     out
@@ -369,12 +375,219 @@ fn parse_load(file: &str, lines: &[String], start: usize) -> Result<(Command, us
 
     let mut series = Vec::new();
     let mut i = start + 1;
+    // Issue #155: the pending-`@st` state machine (upstream `parseLoad`,
+    // test.go:296-341 at the pin) — an `@st` line binds to the
+    // IMMEDIATELY-following sample line, which must carry the same metric
+    // and the same expanded value count; every violation is a loud,
+    // oracle-shaped error raised at the `@st` line.
+    struct PendingSt {
+        labels: BTreeMap<String, String>,
+        vals: StOffsets,
+        line: usize,
+    }
+    let mut pending_st: Option<PendingSt> = None;
     while i < lines.len() && !lines[i].is_empty() {
+        if is_st_line(&lines[i]) {
+            if let Some(p) = &pending_st {
+                return Err(err_at(
+                    file,
+                    p.line,
+                    "@st line has no following sample line",
+                ));
+            }
+            let (st_labels, st_vals) = parse_st_line(&lines[i]).map_err(|e| err_at(file, i, e))?;
+            pending_st = Some(PendingSt {
+                labels: st_labels,
+                vals: st_vals,
+                line: i,
+            });
+            i += 1;
+            continue;
+        }
         let (labels, values) = parse_series_line(&lines[i]).map_err(|e| err_at(file, i, e))?;
-        series.push(LoadSeries { labels, values });
+        let st = match pending_st.take() {
+            None => None,
+            Some(p) => {
+                if p.labels != labels {
+                    return Err(err_at(
+                        file,
+                        p.line,
+                        "@st metric does not match the following sample line metric",
+                    ));
+                }
+                if p.vals.len() != values.len() {
+                    return Err(err_at(
+                        file,
+                        p.line,
+                        format!(
+                            "@st line has {} values but sample line has {}",
+                            p.vals.len(),
+                            values.len()
+                        ),
+                    ));
+                }
+                Some(p.vals)
+            }
+        };
+        series.push(LoadSeries { labels, values, st });
         i += 1;
     }
+    if let Some(p) = pending_st {
+        return Err(err_at(
+            file,
+            p.line,
+            "@st line has no following sample line",
+        ));
+    }
     Ok((Command::Load { step_ms, series }, i))
+}
+
+/// Upstream `isSTLine` (test.go:345-354): the line's FIRST
+/// whitespace-delimited token ends in `@st` (no space before it) and a
+/// value sequence follows.
+fn is_st_line(line: &str) -> bool {
+    let line = line.trim();
+    match line.split_ascii_whitespace().next() {
+        Some(first) => first.ends_with("@st") && line.len() > first.len(),
+        None => false,
+    }
+}
+
+/// Upstream `parseSTLine` (test.go:359-382): `metric{labels}@st
+/// <st_sequence>` — the metric part (with the `@st` suffix stripped)
+/// reuses the series metric parser; each non-omitted sequence item is the
+/// ST offset in milliseconds relative to the corresponding sample's
+/// timestamp.
+fn parse_st_line(line: &str) -> Result<(BTreeMap<String, String>, StOffsets), String> {
+    let line = line.trim();
+    let Some(space_idx) = line.find([' ', '\t']) else {
+        return Err("invalid @st line: missing value sequence".to_string());
+    };
+    let metric_part = line[..space_idx]
+        .strip_suffix("@st")
+        .expect("is_st_line guaranteed the @st suffix");
+    let vals_part = line[space_idx + 1..].trim();
+
+    let (labels, remainder) = parse_metric(metric_part)
+        .map_err(|e| format!("invalid @st line metric {metric_part:?}: {e}"))?;
+    if !remainder.trim().is_empty() {
+        return Err(format!(
+            "invalid @st line metric {metric_part:?}: trailing input {remainder:?}"
+        ));
+    }
+    let st_vals = parse_st_sequence(vals_part).map_err(|e| format!("invalid @st sequence: {e}"))?;
+    Ok((labels, st_vals))
+}
+
+/// Upstream `parseSTSequence` (test.go:384-407): a space-separated
+/// sequence of ST offset items. Item grammar (`parseSTItem`,
+/// test.go:409-470):
+///
+/// - `_` — one omitted position; `_xN` — N omitted positions (N=0 is an
+///   error);
+/// - `<dur>` — one position; `<dur>xN` — N+1 positions;
+/// - `<dur>+<dur>xN` / `<dur>-<dur>xN` — N+1 positions stepping by the
+///   signed delta.
+fn parse_st_sequence(input: &str) -> Result<StOffsets, String> {
+    let mut result = Vec::new();
+    for item in input.split_ascii_whitespace() {
+        let vals = parse_st_item(item).map_err(|e| format!("invalid ST item {item:?}: {e}"))?;
+        result.extend(vals);
+    }
+    Ok(result)
+}
+
+fn parse_st_item(item: &str) -> Result<StOffsets, String> {
+    if item == "_" {
+        return Ok(vec![None]);
+    }
+    if let Some(count) = item.strip_prefix("_x") {
+        let n: u64 = count
+            .parse()
+            .map_err(|_| "invalid repeat count".to_string())?;
+        if n == 0 {
+            return Err("invalid repeat count".to_string());
+        }
+        return Ok(vec![None; n as usize]);
+    }
+
+    let (base, rest) = scan_st_duration_prefix(item)?;
+    // No step: `<dur>` or `<dur>xN` (N+1 positions).
+    if rest.is_empty() {
+        return Ok(vec![Some(base)]);
+    }
+    if let Some(count) = rest.strip_prefix('x') {
+        let n: u64 = count
+            .parse()
+            .map_err(|_| "invalid repeat count".to_string())?;
+        return Ok(vec![Some(base); n as usize + 1]);
+    }
+    // Step: `<dur>+<dur>xN` or `<dur>-<dur>xN`.
+    let negative = match rest.as_bytes()[0] {
+        b'+' => false,
+        b'-' => true,
+        c => {
+            return Err(format!(
+                "unexpected character {:?} after duration",
+                c as char
+            ));
+        }
+    };
+    let (delta, rest2) =
+        scan_st_duration_prefix(&rest[1..]).map_err(|e| format!("invalid step duration: {e}"))?;
+    let delta = if negative { -delta } else { delta };
+    let Some(count) = rest2.strip_prefix('x') else {
+        return Err("expected 'x<count>' after step duration".to_string());
+    };
+    let n: u64 = count
+        .parse()
+        .map_err(|e| format!("invalid repeat count: {e}"))?;
+    let mut vals = Vec::with_capacity(n as usize + 1);
+    let mut offset = base;
+    for _ in 0..=n {
+        vals.push(Some(offset));
+        offset += delta;
+    }
+    Ok(vals)
+}
+
+/// Upstream `parseDurationPrefix` (test.go:473-510): a single-segment
+/// Prometheus duration with an optional leading sign at the start of `s`
+/// — digits, then unit letters, the unit scan stopping at `x` (the
+/// repeat-count separator, never part of a valid unit — so `-1mx2`
+/// parses as `-1m` + `x2`). Returns milliseconds and the unparsed rest.
+fn scan_st_duration_prefix(s: &str) -> Result<(i64, &str), String> {
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let negative = match bytes[0] {
+        b'-' => {
+            i += 1;
+            true
+        }
+        b'+' => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return Err(format!("expected digits in duration {s:?}"));
+    }
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() && bytes[i] != b'x' {
+        i += 1;
+    }
+    // `parse_duration_ms` accepts the scanned single segment (and the
+    // bare-`0` special case), exactly like upstream's
+    // `model.ParseDuration` on the scanned prefix.
+    let ms = parse_duration_ms(&s[digits_start..i])?;
+    Ok((if negative { -ms } else { ms }, &s[i..]))
 }
 
 /// Strips a leading `word` from `s` only when it stands alone (followed
@@ -1034,5 +1247,149 @@ mod tests {
     #[test]
     fn go_unquote_surrogate_unicode_escape_rejects() {
         assert!(go_unquote(r#""\ud800""#).is_err());
+    }
+
+    // -- issue #155 (AC3/AC4): `@st` loader grammar — item expansion and
+    //    the oracle-shaped loud errors (test.go:313,330,333,363,379 at
+    //    the pin) --
+
+    use super::{Command, parse_file, parse_st_item, parse_st_line};
+
+    fn parse_err(text: &str) -> String {
+        parse_file("t.test", text).expect_err("must fail loudly")
+    }
+
+    #[test]
+    fn st_line_binds_offsets_to_the_following_sample_line() {
+        let cmds = parse_file(
+            "t.test",
+            "load 1m\n\tm{a=\"b\"}@st _ -1m -30sx1\n\tm{a=\"b\"} 1 2 3 4\n",
+        )
+        .unwrap();
+        let Command::Load { series, .. } = &cmds[0] else {
+            panic!("expected a load command");
+        };
+        assert_eq!(series.len(), 1);
+        assert_eq!(
+            series[0].st,
+            Some(vec![None, Some(-60_000), Some(-30_000), Some(-30_000)]),
+            "`_`=omitted, `-1m`=one offset, `-30sx1`=2 positions (N+1)"
+        );
+        // A plain series in the same block carries no channel.
+        let cmds = parse_file("t.test", "load 1m\n\tm 1 2\n").unwrap();
+        let Command::Load { series, .. } = &cmds[0] else {
+            panic!("expected a load command");
+        };
+        assert_eq!(series[0].st, None);
+    }
+
+    /// test.go:409-470: `_xN` = N omitted (N=0 error), `<dur>xN` = N+1,
+    /// `<dur>±<dur>xN` = N+1 stepping; the unit scan stops at `x`
+    /// (`-1mx2` = `-1m` × 3, never a `mx` unit); `-0ms` is legal.
+    #[test]
+    fn st_item_expansion_matches_the_pin() {
+        assert_eq!(parse_st_item("_").unwrap(), vec![None]);
+        assert_eq!(parse_st_item("_x3").unwrap(), vec![None, None, None]);
+        assert!(
+            parse_st_item("_x0")
+                .unwrap_err()
+                .contains("invalid repeat count")
+        );
+        assert_eq!(parse_st_item("-1m").unwrap(), vec![Some(-60_000)]);
+        assert_eq!(parse_st_item("-0ms").unwrap(), vec![Some(0)]);
+        assert_eq!(
+            parse_st_item("-1mx2").unwrap(),
+            vec![Some(-60_000); 3],
+            "unit scan stops at `x`: -1m repeated N+1 times"
+        );
+        assert_eq!(
+            parse_st_item("-30s-1mx2").unwrap(),
+            vec![Some(-30_000), Some(-90_000), Some(-150_000)]
+        );
+        assert_eq!(
+            parse_st_item("-59999ms+1sx1").unwrap(),
+            vec![Some(-59_999), Some(-58_999)]
+        );
+        assert!(
+            parse_st_item("1h30m")
+                .unwrap_err()
+                .contains("unexpected character")
+        );
+        assert!(
+            parse_st_item("bogus")
+                .unwrap_err()
+                .contains("expected digits")
+        );
+    }
+
+    /// test.go:313: a second `@st` line before any sample line.
+    #[test]
+    fn st_line_followed_by_another_st_line_fails_loudly() {
+        let err = parse_err("load 1m\n\tm@st -1m\n\tm@st -1m\n\tm 1\n");
+        assert!(
+            err.contains("@st line has no following sample line"),
+            "got {err:?}"
+        );
+        // The error carries the @st line's own location (1-based line 2).
+        assert!(err.starts_with("t.test:2:"), "got {err:?}");
+    }
+
+    /// test.go:339-341: an `@st` line at the end of the load block.
+    #[test]
+    fn st_line_at_the_end_of_a_load_block_fails_loudly() {
+        let err = parse_err("load 1m\n\tm@st -1m\n");
+        assert!(
+            err.contains("@st line has no following sample line"),
+            "got {err:?}"
+        );
+    }
+
+    /// test.go:330: the following sample line has a different metric.
+    #[test]
+    fn st_line_with_a_mismatched_metric_fails_loudly() {
+        let err = parse_err("load 1m\n\tm{a=\"b\"}@st -1m\n\tm{a=\"c\"} 1\n");
+        assert!(
+            err.contains("@st metric does not match the following sample line metric"),
+            "got {err:?}"
+        );
+    }
+
+    /// test.go:333: expanded value counts differ.
+    #[test]
+    fn st_line_with_a_mismatched_value_count_fails_loudly() {
+        let err = parse_err("load 1m\n\tm@st -1mx1\n\tm 1 2 3\n");
+        assert!(
+            err.contains("@st line has 2 values but sample line has 3"),
+            "got {err:?}"
+        );
+    }
+
+    /// test.go:379: a malformed ST item fails the sequence parse.
+    #[test]
+    fn st_line_with_an_invalid_item_fails_loudly() {
+        let err = parse_err("load 1m\n\tm@st nope\n\tm 1\n");
+        assert!(err.contains("invalid @st sequence:"), "got {err:?}");
+        assert!(err.contains("invalid ST item \"nope\""), "got {err:?}");
+    }
+
+    /// test.go:363 (defensive in upstream too — `isSTLine` requires the
+    /// whitespace): `parse_st_line` on a sequence-less line reports the
+    /// oracle's message.
+    #[test]
+    fn st_line_without_a_value_sequence_reports_the_oracle_error() {
+        let err = parse_st_line("m@st").unwrap_err();
+        assert_eq!(err, "invalid @st line: missing value sequence");
+        // ...and via `parse_load`, a lone `metric@st` token is NOT an ST
+        // line (upstream `isSTLine` returns false) — it fails as a
+        // malformed series line instead, still loudly.
+        assert!(parse_file("t.test", "load 1m\n\tm@st\n\tm 1\n").is_err());
+    }
+
+    /// A malformed metric part before `@st` is loud, with the upstream
+    /// error shape (test.go:373-376).
+    #[test]
+    fn st_line_with_a_malformed_metric_part_fails_loudly() {
+        let err = parse_err("load 1m\n\tm{a=\"b\"canary@st -1m\n\tm 1\n");
+        assert!(err.contains("invalid @st line metric"), "got {err:?}");
     }
 }

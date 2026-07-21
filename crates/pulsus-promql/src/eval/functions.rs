@@ -16,21 +16,42 @@ use crate::value::Sample;
 /// `range_start_ms`/`range_end_ms` are the *nominal* window edges (`t −
 /// offset − range`, `t − offset`) used only for the extrapolation distance
 /// calculation, not for filtering (filtering already happened).
+///
+/// `start_ts` (issue #155) is the optional per-sample start-timestamp
+/// side-channel, aligned 1:1 with `samples` (`0` = unset). The evaluator
+/// only ever passes `Some` for `rate`/`irate`/`increase` (the
+/// `engine.go:2243-2246` four-function gate — `delta` always gets
+/// `None`); each consumer branches ONCE on the `Option`, with the `None`
+/// arm the pre-change instruction sequence verbatim (the issue-#39 ULP
+/// rule: no float-op reordering).
 pub fn eval_range_fn(
     func: RangeFn,
     samples: &[Sample],
     range_ms: i64,
     range_start_ms: i64,
     range_end_ms: i64,
+    start_ts: Option<&[i64]>,
 ) -> Option<f64> {
     match func {
-        RangeFn::Irate => eval_irate(samples),
-        RangeFn::Rate => {
-            eval_extrapolated(samples, range_ms, range_start_ms, range_end_ms, true, true)
-        }
-        RangeFn::Increase => {
-            eval_extrapolated(samples, range_ms, range_start_ms, range_end_ms, true, false)
-        }
+        RangeFn::Irate => eval_irate(samples, start_ts),
+        RangeFn::Rate => eval_extrapolated(
+            samples,
+            range_ms,
+            range_start_ms,
+            range_end_ms,
+            true,
+            true,
+            start_ts,
+        ),
+        RangeFn::Increase => eval_extrapolated(
+            samples,
+            range_ms,
+            range_start_ms,
+            range_end_ms,
+            true,
+            false,
+            start_ts,
+        ),
         RangeFn::Delta => eval_extrapolated(
             samples,
             range_ms,
@@ -38,8 +59,44 @@ pub fn eval_range_fn(
             range_end_ms,
             false,
             false,
+            start_ts,
         ),
     }
+}
+
+/// `isStartTimestampReset` (`promql/functions.go:703-733`, v3.13.0
+/// `40af9c2`), ported arm-for-arm: whether the current sample's start
+/// timestamp marks a counter reset relative to the previous sample.
+///
+/// - `curr_st == 0` (unset) or `curr_st > curr_t` (clearly invalid) →
+///   no reset (`:704-708`);
+/// - `curr_st < prev_t` → no reset (`:710-712`);
+/// - `curr_st > prev_t` → reset (`:714-716`);
+/// - `curr_st == prev_t` (the OTel delta-vs-cumulative-with-unknown-start
+///   disambiguation, `:718-732`): a previous start timestamp greater than
+///   the previous sample timestamp is invalid — treated as unknown to
+///   avoid a spurious reset (`:728-730`); otherwise a reset iff
+///   `prev_st != 0` (`:732` — a KNOWN previous start means this is a
+///   delta datapoint).
+pub(super) fn is_start_timestamp_reset(
+    prev_st: i64,
+    prev_t: i64,
+    curr_st: i64,
+    curr_t: i64,
+) -> bool {
+    if curr_st == 0 || curr_st > curr_t {
+        return false;
+    }
+    if curr_st < prev_t {
+        return false;
+    }
+    if curr_st > prev_t {
+        return true;
+    }
+    if prev_st > prev_t {
+        return false;
+    }
+    prev_st != 0
 }
 
 /// `irate` — Prometheus's `instantValue(vals, samples, isRate=true)`: uses
@@ -55,7 +112,14 @@ pub fn eval_range_fn(
 /// `resultSample.F /= float64(sampledInterval) / 1000` (matching `result /=
 /// interval_ms as f64 / 1000.0`) — already bit-exact, unlike
 /// `eval_extrapolated` below; no change needed here.
-fn eval_irate(samples: &[Sample]) -> Option<f64> {
+///
+/// Issue #155: with a `Some` start-timestamp channel, the reset condition
+/// becomes `ss[1].F < ss[0].F || isStartTimestampReset(ss[0].ST, ss[0].T,
+/// ss[1].ST, ss[1].T)` (`functions.go:837` at the pin); `None` keeps the
+/// value comparison alone (the pre-change path — upstream's ST fields are
+/// zero-valued when the engine option is off, and `is_start_timestamp_
+/// reset` with `curr_st == 0` is always false).
+fn eval_irate(samples: &[Sample], start_ts: Option<&[i64]>) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
@@ -65,11 +129,19 @@ fn eval_irate(samples: &[Sample]) -> Option<f64> {
     if interval_ms == 0 {
         return None;
     }
-    let mut result = if last.v < prev.v {
-        last.v
-    } else {
-        last.v - prev.v
+    let is_reset = match start_ts {
+        None => last.v < prev.v,
+        Some(st) => {
+            last.v < prev.v
+                || is_start_timestamp_reset(
+                    st[samples.len() - 2],
+                    prev.t_ms,
+                    st[samples.len() - 1],
+                    last.t_ms,
+                )
+        }
     };
+    let mut result = if is_reset { last.v } else { last.v - prev.v };
     result /= interval_ms as f64 / 1000.0;
     Some(result)
 }
@@ -92,6 +164,7 @@ fn eval_extrapolated(
     range_end_ms: i64,
     is_counter: bool,
     is_rate: bool,
+    start_ts: Option<&[i64]>,
 ) -> Option<f64> {
     if samples.len() < 2 {
         return None;
@@ -109,13 +182,35 @@ fn eval_extrapolated(
     // (including the first) is equivalent for a counter — the first
     // comparison (`first.v < 0.0`) can never fire for a genuine
     // non-negative counter reading — without needing a second slice index.
+    //
+    // Issue #155: one branch per WINDOW on the ST channel — the `None`
+    // arm is the pre-change loop verbatim; the `Some` arm mirrors the
+    // pin's `:521` condition `currPoint.F < prevPoint.F || (i+1 <
+    // len(startTimestamps) && isStartTimestampReset(startTimestamps[i],
+    // prevPoint.T, startTimestamps[i+1], currPoint.T))`.
     if is_counter {
-        let mut last_value = 0.0_f64;
-        for s in samples {
-            if s.v < last_value {
-                result_value += last_value;
+        match start_ts {
+            None => {
+                let mut last_value = 0.0_f64;
+                for s in samples {
+                    if s.v < last_value {
+                        result_value += last_value;
+                    }
+                    last_value = s.v;
+                }
             }
-            last_value = s.v;
+            Some(st) => {
+                for i in 1..samples.len() {
+                    let prev = &samples[i - 1];
+                    let curr = &samples[i];
+                    if curr.v < prev.v
+                        || (i < st.len()
+                            && is_start_timestamp_reset(st[i - 1], prev.t_ms, st[i], curr.t_ms))
+                    {
+                        result_value += prev.v;
+                    }
+                }
+            }
         }
     }
 
@@ -1017,14 +1112,14 @@ mod tests {
     fn rate_divides_increase_by_the_range_width_in_seconds() {
         // 2 samples exactly at the window edges: no extrapolation needed.
         let samples = vec![s(0, 0.0), s(60_000, 60.0)];
-        let v = eval_range_fn(RangeFn::Rate, &samples, 60_000, 0, 60_000).unwrap();
+        let v = eval_range_fn(RangeFn::Rate, &samples, 60_000, 0, 60_000, None).unwrap();
         assert!((v - 1.0).abs() < 1e-9, "got {v}");
     }
 
     #[test]
     fn increase_does_not_divide_by_the_range_width() {
         let samples = vec![s(0, 0.0), s(60_000, 60.0)];
-        let v = eval_range_fn(RangeFn::Increase, &samples, 60_000, 0, 60_000).unwrap();
+        let v = eval_range_fn(RangeFn::Increase, &samples, 60_000, 0, 60_000, None).unwrap();
         assert!((v - 60.0).abs() < 1e-9, "got {v}");
     }
 
@@ -1033,7 +1128,7 @@ mod tests {
         // A "drop" in a delta (gauge) series is a real negative delta, not
         // a reset to correct for.
         let samples = vec![s(0, 10.0), s(60_000, 4.0)];
-        let v = eval_range_fn(RangeFn::Delta, &samples, 60_000, 0, 60_000).unwrap();
+        let v = eval_range_fn(RangeFn::Delta, &samples, 60_000, 0, 60_000, None).unwrap();
         assert!((v - (-6.0)).abs() < 1e-9, "got {v}");
     }
 
@@ -1048,7 +1143,7 @@ mod tests {
             s(120_000, 10.0),
             s(180_000, 40.0),
         ];
-        let v = eval_range_fn(RangeFn::Increase, &samples, 180_000, 0, 180_000).unwrap();
+        let v = eval_range_fn(RangeFn::Increase, &samples, 180_000, 0, 180_000, None).unwrap();
         assert!((v - 140.0).abs() < 1e-9, "got {v}");
     }
 
@@ -1070,7 +1165,7 @@ mod tests {
             s(150_000, 20.0),
             s(210_000, 30.0),
         ];
-        let v = eval_range_fn(RangeFn::Delta, &samples, 200_000, 20_000, 220_000).unwrap();
+        let v = eval_range_fn(RangeFn::Delta, &samples, 200_000, 20_000, 220_000, None).unwrap();
         // sampled_interval = 180s, extrapolate_to = 180 + 10 + 10 = 200s
         // raw delta = 30, scale = 200/180 -> 100/3.
         assert!((v - 100.0 / 3.0).abs() < 1e-6, "got {v}");
@@ -1094,14 +1189,22 @@ mod tests {
         // range_start = -1_000_000 (duration_to_start huge), range_end =
         // 1_000_000 (duration_to_end huge): average interval = 60s,
         // extrapolate_to = 180 + 30 + 30 = 240s (half-interval each side).
-        let v = eval_range_fn(RangeFn::Delta, &samples, 2_000_000, -1_000_000, 1_000_000).unwrap();
+        let v = eval_range_fn(
+            RangeFn::Delta,
+            &samples,
+            2_000_000,
+            -1_000_000,
+            1_000_000,
+            None,
+        )
+        .unwrap();
         assert!((v - 40.0).abs() < 1e-6, "got {v}");
     }
 
     #[test]
     fn a_two_sample_series_still_extrapolates() {
         let samples = vec![s(10_000, 5.0), s(50_000, 25.0)];
-        let v = eval_range_fn(RangeFn::Increase, &samples, 60_000, 0, 60_000).unwrap();
+        let v = eval_range_fn(RangeFn::Increase, &samples, 60_000, 0, 60_000, None).unwrap();
         // sampled_interval = 40s, avg interval = 40s, threshold = 44s.
         // duration_to_start = 10s (< threshold) -> full extrapolation;
         // duration_to_end = 10s (< threshold) -> full extrapolation.
@@ -1113,10 +1216,13 @@ mod tests {
     #[test]
     fn fewer_than_two_samples_yields_no_result() {
         assert_eq!(
-            eval_range_fn(RangeFn::Rate, &[s(0, 1.0)], 60_000, 0, 60_000),
+            eval_range_fn(RangeFn::Rate, &[s(0, 1.0)], 60_000, 0, 60_000, None),
             None
         );
-        assert_eq!(eval_range_fn(RangeFn::Rate, &[], 60_000, 0, 60_000), None);
+        assert_eq!(
+            eval_range_fn(RangeFn::Rate, &[], 60_000, 0, 60_000, None),
+            None
+        );
     }
 
     /// Issue #39 hand-derived golden: the exact #33 differential-harness
@@ -1168,6 +1274,7 @@ mod tests {
             range_ms,
             range_start_ms,
             range_end_ms,
+            None,
         )
         .expect("8 samples in window");
 
@@ -1187,7 +1294,7 @@ mod tests {
     #[test]
     fn irate_uses_only_the_last_two_samples() {
         let samples = vec![s(0, 0.0), s(60_000, 100.0), s(120_000, 130.0)];
-        let v = eval_range_fn(RangeFn::Irate, &samples, 120_000, 0, 120_000).unwrap();
+        let v = eval_range_fn(RangeFn::Irate, &samples, 120_000, 0, 120_000, None).unwrap();
         // (130 - 100) / 60s = 0.5/s
         assert!((v - 0.5).abs() < 1e-9, "got {v}");
     }
@@ -1195,7 +1302,7 @@ mod tests {
     #[test]
     fn irate_treats_a_drop_as_a_reset_using_the_last_value() {
         let samples = vec![s(0, 100.0), s(60_000, 10.0)];
-        let v = eval_range_fn(RangeFn::Irate, &samples, 60_000, 0, 60_000).unwrap();
+        let v = eval_range_fn(RangeFn::Irate, &samples, 60_000, 0, 60_000, None).unwrap();
         assert!((v - (10.0 / 60.0)).abs() < 1e-9, "got {v}");
     }
 
@@ -2094,5 +2201,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PromqlError::InvalidParameter { .. }));
+    }
+
+    // -- issue #155 (AC6): `is_start_timestamp_reset` truth table, the 7
+    //    arms pinned to `promql/functions.go:704-733` @ 40af9c2 --
+
+    #[test]
+    fn is_start_timestamp_reset_truth_table_matches_the_pin() {
+        // 1. Unset current ST (the 0 sentinel) — never a reset (:705-708).
+        assert!(!is_start_timestamp_reset(30_000, 60_000, 0, 120_000));
+        // 2. Clearly invalid current ST (after its own sample) (:705-708).
+        assert!(!is_start_timestamp_reset(30_000, 60_000, 120_001, 120_000));
+        // 3. Current ST older than the previous sample (:710-712).
+        assert!(!is_start_timestamp_reset(30_000, 60_000, 59_999, 120_000));
+        // 4. Current ST newer than the previous sample — a reset (:714-716).
+        assert!(is_start_timestamp_reset(30_000, 60_000, 60_001, 120_000));
+        // 5. ST_curr == T_prev with UNKNOWN previous start (prev_st == 0):
+        //    a cumulative series with unknown start — NOT a reset (:732).
+        assert!(!is_start_timestamp_reset(0, 60_000, 60_000, 120_000));
+        // 6. ST_curr == T_prev with a KNOWN, valid previous start: a delta
+        //    datapoint — a reset (:732).
+        assert!(is_start_timestamp_reset(30_000, 60_000, 60_000, 120_000));
+        // 7. ST_curr == T_prev with an INVALID previous start (prev_st >
+        //    prev_t): treated as unknown, no spurious reset (:728-730).
+        assert!(!is_start_timestamp_reset(60_001, 60_000, 60_000, 120_000));
+    }
+
+    // -- issue #155 (AC7): the float consumption sites with a synthetic
+    //    `Some(st)` channel --
+
+    /// `eval_extrapolated`'s ST arm adds `prev.v` on an ST reset even
+    /// though the values are monotone (no value drop): `increase` over a
+    /// 2-sample window where the 2nd sample's ST lands after the 1st
+    /// sample's timestamp (`functions.go:521`).
+    #[test]
+    fn eval_extrapolated_adds_the_previous_value_on_a_start_timestamp_reset() {
+        let samples = [s(60_000, 1.0), s(120_000, 2.0)];
+        let none = eval_range_fn(RangeFn::Increase, &samples, 120_000, 0, 120_000, None).unwrap();
+        // No value drop ⇒ no reset without the ST channel: raw delta 1,
+        // zero-point clamp keeps durationToStart at 60s ⇒ factor 2.
+        assert_eq!(none, 2.0);
+        let with_st = eval_range_fn(
+            RangeFn::Increase,
+            &samples,
+            120_000,
+            0,
+            120_000,
+            Some(&[0, 90_000]),
+        )
+        .unwrap();
+        // ST reset (90_000 > 60_000) adds prev.v: delta 2, zero-point
+        // 60*(1/2)=30s ⇒ factor 1.5 ⇒ 3.
+        assert_eq!(with_st, 3.0);
+    }
+
+    /// `eval_irate`'s ST arm returns the LAST value verbatim on an ST
+    /// reset (no subtraction), mirroring `instantValue`'s float arm
+    /// (`functions.go:837`).
+    #[test]
+    fn eval_irate_returns_the_last_value_on_a_start_timestamp_reset() {
+        let samples = [s(0, 5.0), s(60_000, 7.0)];
+        let none = eval_range_fn(RangeFn::Irate, &samples, 60_000, 0, 60_000, None).unwrap();
+        assert_eq!(none, (7.0 - 5.0) / 60.0);
+        let with_st = eval_range_fn(
+            RangeFn::Irate,
+            &samples,
+            60_000,
+            0,
+            60_000,
+            Some(&[0, 30_000]),
+        )
+        .unwrap();
+        assert_eq!(with_st, 7.0 / 60.0);
+    }
+
+    /// The four-function gate's `Delta` exclusion is enforced by the
+    /// evaluator (it always passes `None` for `delta`) — but even a
+    /// defensively-threaded channel is inert for a non-counter:
+    /// `eval_extrapolated`'s ST site lives inside the `is_counter` block,
+    /// exactly like the pin's.
+    #[test]
+    fn eval_delta_ignores_a_start_timestamp_channel() {
+        let samples = [s(60_000, 1.0), s(120_000, 2.0)];
+        let none = eval_range_fn(RangeFn::Delta, &samples, 120_000, 0, 120_000, None);
+        let with_st = eval_range_fn(
+            RangeFn::Delta,
+            &samples,
+            120_000,
+            0,
+            120_000,
+            Some(&[0, 90_000]),
+        );
+        assert_eq!(none, with_st);
     }
 }

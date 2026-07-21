@@ -29,15 +29,35 @@ pub enum RangeValue {
     Histogram(FloatHistogram),
 }
 
+/// The step's nominal range-vector window (issue #155 code-review fix:
+/// bundling the three edge parameters keeps [`eval_range_fn_hist`] under
+/// clippy's argument limit without suppression): `range_ms` is the
+/// window width; `start_ms`/`end_ms` are the *nominal* `(start, end]`
+/// edges (`t − offset − range`, `t − offset`), used only for the
+/// extrapolation distance calculation, never for filtering (the caller
+/// already windowed `samples`).
+#[derive(Debug, Clone, Copy)]
+pub struct RangeWindow {
+    pub range_ms: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
 /// `rate`/`increase`/`delta`/`irate` over a window that may contain
 /// histogram samples. `metric_name` feeds the mixed/incompatible-schema
 /// warnings (empty if none — same convention as [`super::histogram_fns`]).
+///
+/// `start_ts` (issue #155): the optional start-timestamp channel, aligned
+/// 1:1 with `samples` — see [`super::functions::eval_range_fn`]'s doc.
+/// The evaluator's four-function gate means `Delta` only ever receives
+/// `None`; the pass-through here is unconditional (the ST consumption
+/// sites inside `histogram_rate` are themselves `is_counter`-gated,
+/// exactly like the pin's).
 pub fn eval_range_fn_hist(
     func: RangeFn,
     samples: &[Sample],
-    range_ms: i64,
-    range_start_ms: i64,
-    range_end_ms: i64,
+    window: RangeWindow,
+    start_ts: Option<&[i64]>,
     metric_name: &str,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
@@ -47,16 +67,17 @@ pub fn eval_range_fn_hist(
     // `rate`/`increase`/`delta` below. `instant_value_hist` is therefore
     // self-contained and bypasses the whole-window gate entirely.
     if func == RangeFn::Irate {
-        return instant_value_hist(samples, true, metric_name, annos);
+        return instant_value_hist(samples, true, start_ts, metric_name, annos);
     }
     let hist_count = samples.iter().filter(|s| s.h.is_some()).count();
     if hist_count == 0 {
         return super::functions::eval_range_fn(
             func,
             samples,
-            range_ms,
-            range_start_ms,
-            range_end_ms,
+            window.range_ms,
+            window.start_ms,
+            window.end_ms,
+            start_ts,
         )
         .map(RangeValue::Float);
     }
@@ -66,36 +87,15 @@ pub fn eval_range_fn_hist(
     }
     match func {
         RangeFn::Irate => unreachable!("handled above"),
-        RangeFn::Rate => extrapolated_rate_hist(
-            samples,
-            range_ms,
-            range_start_ms,
-            range_end_ms,
-            true,
-            true,
-            metric_name,
-            annos,
-        ),
-        RangeFn::Increase => extrapolated_rate_hist(
-            samples,
-            range_ms,
-            range_start_ms,
-            range_end_ms,
-            true,
-            false,
-            metric_name,
-            annos,
-        ),
-        RangeFn::Delta => extrapolated_rate_hist(
-            samples,
-            range_ms,
-            range_start_ms,
-            range_end_ms,
-            false,
-            false,
-            metric_name,
-            annos,
-        ),
+        RangeFn::Rate => {
+            extrapolated_rate_hist(samples, window, true, true, start_ts, metric_name, annos)
+        }
+        RangeFn::Increase => {
+            extrapolated_rate_hist(samples, window, true, false, start_ts, metric_name, annos)
+        }
+        RangeFn::Delta => {
+            extrapolated_rate_hist(samples, window, false, false, start_ts, metric_name, annos)
+        }
     }
 }
 
@@ -114,9 +114,17 @@ pub fn eval_range_fn_hist(
 /// returns the LAST value verbatim on a reset — matching float `irate`'s
 /// own reset rule — while `idelta` always subtracts, matching upstream's
 /// `!isRate ||` short-circuit).
+///
+/// `start_ts` (issue #155): aligned with `samples`; only `irate`
+/// (`is_rate`) ever receives `Some` — the evaluator's four-function gate
+/// hands `idelta` `None` (`idelta` is outside `engine.go:2243-2246`'s
+/// name list), and the hist arm's reset check mirrors the pin's
+/// `!isRate || (!isStartTimestampReset(ss[0].ST, ss[0].T, ss[1].ST,
+/// ss[1].T) && !ss[1].H.DetectReset(ss[0].H))` (`functions.go:854`).
 pub fn instant_value_hist(
     samples: &[Sample],
     is_rate: bool,
+    start_ts: Option<&[i64]>,
     metric_name: &str,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
@@ -132,7 +140,7 @@ pub fn instant_value_hist(
     let (last_h, prev_h) = match (&last.h, &prev.h) {
         (None, None) => {
             let f = if is_rate {
-                super::functions::eval_range_fn(RangeFn::Irate, samples, 0, 0, 0)
+                super::functions::eval_range_fn(RangeFn::Irate, samples, 0, 0, 0, start_ts)
             } else {
                 super::functions::eval_over_time(OverTimeFn::Idelta, samples)
             };
@@ -143,6 +151,19 @@ pub fn instant_value_hist(
             annos.warning(messages::mixed_floats_histograms_warning(metric_name));
             return None;
         }
+    };
+    // Issue #155: the last-two-samples ST reset check (`functions.go:854`
+    // — `ss[0]`/`ss[1]` are exactly `samples[len-2..]` here, the merged-
+    // stream note on this fn's doc). `None` ⇒ `false`, leaving
+    // `should_subtract` the pre-change expression.
+    let st_reset = match start_ts {
+        None => false,
+        Some(st) => super::functions::is_start_timestamp_reset(
+            st[samples.len() - 2],
+            prev.t_ms,
+            st[samples.len() - 1],
+            last.t_ms,
+        ),
     };
 
     let mut result = last_h.as_ref().clone();
@@ -159,7 +180,7 @@ pub fn instant_value_hist(
     if !is_rate && (last_h.counter_reset_hint != Gauge || prev_h.counter_reset_hint != Gauge) {
         annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
     }
-    let should_subtract = !is_rate || !last_h.detect_reset(prev_h);
+    let should_subtract = !is_rate || (!st_reset && !last_h.detect_reset(prev_h));
     if should_subtract {
         match result.sub(prev_h) {
             Ok(outcome) => {
@@ -197,8 +218,15 @@ pub fn instant_value_hist(
 /// delta between the FIRST and LAST histogram sample in `points`, reduced
 /// to the minimum schema seen across the window. `points` must be
 /// all-histogram with at least 2 elements.
+///
+/// `start_ts` (issue #155): the pin's `startTimestamps []int64` parameter
+/// (`functions.go:598-604`) — consumed at exactly its two `is_counter`-
+/// gated sites: the first-sample null-out (`:625-631`) and the
+/// reset-add loop (`:677-683`, ST checked FIRST, short-circuiting
+/// `DetectReset`).
 fn histogram_rate(
     points: &[Sample],
+    start_ts: Option<&[i64]>,
     is_counter: bool,
     metric_name: &str,
     annos: &mut Annotations,
@@ -220,7 +248,24 @@ fn histogram_rate(
     // incompatible) bucket layout at all.
     if is_counter && points.len() > 1 {
         let second = points[1].h.as_ref()?;
-        if second.detect_reset(&prev) {
+        // Issue #155: the pin's `:627` condition — `(len(startTimestamps)
+        // > 1 && isStartTimestampReset(startTimestamps[0], points[0].T,
+        // startTimestamps[1], points[1].T)) || second.DetectReset(prev)`
+        // (Go `&&` binds tighter than `||`). `None` ⇒ the pre-change
+        // `detect_reset` alone.
+        let st_null_out = match start_ts {
+            None => false,
+            Some(st) => {
+                st.len() > 1
+                    && super::functions::is_start_timestamp_reset(
+                        st[0],
+                        points[0].t_ms,
+                        st[1],
+                        points[1].t_ms,
+                    )
+            }
+        };
+        if st_null_out || second.detect_reset(&prev) {
             prev = FloatHistogram {
                 counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
                 schema: second.schema,
@@ -293,29 +338,40 @@ fn histogram_rate(
 
     if is_counter {
         let mut prev_iter = prev;
-        for p in &points[1..] {
-            let curr = p.h.as_ref()?;
-            if curr.detect_reset(&prev_iter) {
-                match h.add(&prev_iter) {
-                    Ok(outcome) => {
-                        h = outcome.result;
-                        // The counter-reset-loop Add reconcile info
-                        // (`functions.go:689-691`).
-                        if outcome.nhcb_bounds_reconciled {
-                            annos.info(messages::mismatched_custom_buckets_histograms_info(
-                                messages::HistogramOperation::Add,
-                            ));
-                        }
+        // Issue #155 (code-review fix): the ST branch is resolved ONCE
+        // per series-window — the `None` arm is the pre-change loop with
+        // ZERO per-row ST work (the plan's "no per-row work anywhere"
+        // rule, matching the float path's hoisted structure). The `Some`
+        // arm mirrors the pin's `:681` — "Check start timestamps first
+        // since it's potentially cheaper": `i+1 < len(startTimestamps) &&
+        // isStartTimestampReset(startTimestamps[i], points[i].T,
+        // startTimestamps[i+1], currPoint.T) || curr.DetectReset(prev)`.
+        match start_ts {
+            None => {
+                for p in &points[1..] {
+                    let curr = p.h.as_ref()?;
+                    if curr.detect_reset(&prev_iter) {
+                        fold_reset_add(&mut h, &prev_iter, metric_name, annos)?;
                     }
-                    Err(FloatHistogramOpError::IncompatibleSchema) => {
-                        annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                            metric_name,
-                        ));
-                        return None;
-                    }
+                    prev_iter = curr.as_ref().clone();
                 }
             }
-            prev_iter = curr.as_ref().clone();
+            Some(st) => {
+                for (i, p) in points[1..].iter().enumerate() {
+                    let curr = p.h.as_ref()?;
+                    let st_reset = i + 1 < st.len()
+                        && super::functions::is_start_timestamp_reset(
+                            st[i],
+                            points[i].t_ms,
+                            st[i + 1],
+                            p.t_ms,
+                        );
+                    if st_reset || curr.detect_reset(&prev_iter) {
+                        fold_reset_add(&mut h, &prev_iter, metric_name, annos)?;
+                    }
+                    prev_iter = curr.as_ref().clone();
+                }
+            }
         }
     } else if points[0].h.as_ref()?.counter_reset_hint != Gauge
         || points[points.len() - 1].h.as_ref()?.counter_reset_hint != Gauge
@@ -336,6 +392,37 @@ fn histogram_rate(
     Some(h)
 }
 
+/// The reset-add correction shared by [`histogram_rate`]'s two
+/// per-window loop arms (issue #155 code-review fix — factored out so
+/// hoisting the ST branch does not duplicate the fold): folds the
+/// pre-reset `prev` back into `h` (`functions.go:682-692`), emitting the
+/// Add reconcile info (`:689-691`). `None` = incompatible schema — the
+/// caller's early return, exactly like the pin's error arm.
+fn fold_reset_add(
+    h: &mut FloatHistogram,
+    prev: &FloatHistogram,
+    metric_name: &str,
+    annos: &mut Annotations,
+) -> Option<()> {
+    match h.add(prev) {
+        Ok(outcome) => {
+            *h = outcome.result;
+            if outcome.nhcb_bounds_reconciled {
+                annos.info(messages::mismatched_custom_buckets_histograms_info(
+                    messages::HistogramOperation::Add,
+                ));
+            }
+            Some(())
+        }
+        Err(FloatHistogramOpError::IncompatibleSchema) => {
+            annos.warning(messages::mixed_exponential_custom_histograms_warning(
+                metric_name,
+            ));
+            None
+        }
+    }
+}
+
 /// `extrapolatedRate`'s histogram branch (`functions.go:489-590`):
 /// `histogram_rate` plus the shared extrapolation-factor computation
 /// (duration-to-start/end, the counter zero-point override, the 1.1x
@@ -345,21 +432,24 @@ fn histogram_rate(
 /// deliberately duplicated rather than refactoring already-reviewed,
 /// heavily-tested float code (risk-minimization convention already used
 /// elsewhere in this crate).
-#[allow(clippy::too_many_arguments)]
 fn extrapolated_rate_hist(
     samples: &[Sample],
-    range_ms: i64,
-    range_start_ms: i64,
-    range_end_ms: i64,
+    window: RangeWindow,
     is_counter: bool,
     is_rate: bool,
+    start_ts: Option<&[i64]>,
     metric_name: &str,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
+    let RangeWindow {
+        range_ms,
+        start_ms: range_start_ms,
+        end_ms: range_end_ms,
+    } = window;
     if samples.len() < 2 {
         return None;
     }
-    let mut result = histogram_rate(samples, is_counter, metric_name, annos)?;
+    let mut result = histogram_rate(samples, start_ts, is_counter, metric_name, annos)?;
 
     let first_t = samples[0].t_ms;
     let last_t = samples[samples.len() - 1].t_ms;
@@ -430,9 +520,14 @@ impl From<RangeValue> for OverTimeValue {
 /// SILENT (plan v4 residual A — the float-count check returns before any
 /// annotation), a MIXED window drops the histograms and fires
 /// `HistogramIgnoredInMixedRangeInfo` once.
+/// `start_ts` (issue #155): consumed ONLY by the `Resets` arm (`resets`
+/// is in `engine.go:2243-2246`'s four-function gate); `Idelta` passes
+/// `None` to [`instant_value_hist`] (`idelta` is outside the gate), and
+/// every other arm ignores the channel entirely.
 pub fn eval_over_time_hist(
     func: OverTimeFn,
     samples: &[Sample],
+    start_ts: Option<&[i64]>,
     metric_name: &str,
     annos: &mut Annotations,
 ) -> Option<OverTimeValue> {
@@ -446,8 +541,10 @@ pub fn eval_over_time_hist(
         OverTimeFn::Last => samples.last().map(sample_to_over_time_value),
         OverTimeFn::First => samples.first().map(sample_to_over_time_value),
         // `funcIdelta` (`:756-758`) shares `instantValue` with `irate`.
+        // ST channel deliberately NOT forwarded: `idelta` is outside the
+        // four-function gate (issue #155).
         OverTimeFn::Idelta => {
-            instant_value_hist(samples, false, metric_name, annos).map(OverTimeValue::from)
+            instant_value_hist(samples, false, None, metric_name, annos).map(OverTimeValue::from)
         }
         // `funcResets`/`funcChanges` (`:2258-2327`/`:2330-2379`): an EMPTY
         // `(t-r, t]` window drops the series — upstream never invokes the
@@ -456,7 +553,7 @@ pub fn eval_over_time_hist(
         // extended_vectors.test:314/:336). Every other arm already returns
         // `None` on empty.
         OverTimeFn::Resets => {
-            (!samples.is_empty()).then(|| OverTimeValue::Float(eval_resets_hist(samples)))
+            (!samples.is_empty()).then(|| OverTimeValue::Float(eval_resets_hist(samples, start_ts)))
         }
         OverTimeFn::Changes => {
             (!samples.is_empty()).then(|| OverTimeValue::Float(eval_changes_hist(samples)))
@@ -698,16 +795,50 @@ fn sample_to_over_time_value(s: &Sample) -> OverTimeValue {
 /// [`super::functions::eval_resets`]'s doc), ANY type transition
 /// (float↔histogram), or `curr.DetectReset(prev)` for a histogram→
 /// histogram pair.
-fn eval_resets_hist(samples: &[Sample]) -> f64 {
+///
+/// `start_ts` (issue #155): the pin's `prevST`/`curST` walk over the
+/// merged stream (`:2270-2320`) — the float pair gains `|| isStartTime-
+/// stampReset(prevST, prevSample.T, curST, curSample.T)` (`:2311-2313`),
+/// the histogram pair checks the ST FIRST (`:2317-2319`), and the type
+/// transition stays unconditional. Our single merged-order ST array
+/// equals upstream's per-stream arrays because the walk here IS the
+/// merged timestamp order `funcResets` reconstructs.
+fn eval_resets_hist(samples: &[Sample], start_ts: Option<&[i64]>) -> f64 {
     let mut resets = 0.0_f64;
-    for w in samples.windows(2) {
-        let is_reset = match (&w[0].h, &w[1].h) {
-            (None, None) => w[1].v < w[0].v,
-            (Some(prev), Some(curr)) => curr.detect_reset(prev),
-            _ => true, // a float<->histogram transition is always a reset.
-        };
-        if is_reset {
-            resets += 1.0;
+    // Issue #155 (code-review fix): one ST branch per series-WINDOW — the
+    // `None` arm is the pre-change loop verbatim, with zero per-row ST
+    // work (the plan's "no per-row work anywhere" rule, matching the
+    // float path's hoisted structure).
+    match start_ts {
+        None => {
+            for w in samples.windows(2) {
+                let is_reset = match (&w[0].h, &w[1].h) {
+                    (None, None) => w[1].v < w[0].v,
+                    (Some(prev), Some(curr)) => curr.detect_reset(prev),
+                    _ => true, // a float<->histogram transition is always a reset.
+                };
+                if is_reset {
+                    resets += 1.0;
+                }
+            }
+        }
+        Some(st) => {
+            for (i, w) in samples.windows(2).enumerate() {
+                let st_reset = super::functions::is_start_timestamp_reset(
+                    st[i],
+                    w[0].t_ms,
+                    st[i + 1],
+                    w[1].t_ms,
+                );
+                let is_reset = match (&w[0].h, &w[1].h) {
+                    (None, None) => w[1].v < w[0].v || st_reset,
+                    (Some(prev), Some(curr)) => st_reset || curr.detect_reset(prev),
+                    _ => true, // a float<->histogram transition is always a reset.
+                };
+                if is_reset {
+                    resets += 1.0;
+                }
+            }
         }
     }
     resets
@@ -895,9 +1026,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Increase,
             &samples,
-            900_000,
-            -300_000,
-            600_000,
+            RangeWindow {
+                range_ms: 900_000,
+                start_ms: -300_000,
+                end_ms: 600_000,
+            },
+            None,
             "reset_in_bucket",
             &mut annos,
         );
@@ -929,9 +1063,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Rate,
             &samples,
-            600_000,
-            2_400_000,
-            3_000_000,
+            RangeWindow {
+                range_ms: 600_000,
+                start_ms: 2_400_000,
+                end_ms: 3_000_000,
+            },
+            None,
             "incr_histogram",
             &mut annos,
         );
@@ -967,9 +1104,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Rate,
             &samples,
-            300_000,
-            0,
-            300_000,
+            RangeWindow {
+                range_ms: 300_000,
+                start_ms: 0,
+                end_ms: 300_000,
+            },
+            None,
             "m",
             &mut annos,
         );
@@ -983,7 +1123,18 @@ mod tests {
     fn float_only_window_delegates_to_the_byte_unchanged_float_path() {
         let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 3.0)];
         let mut annos = Annotations::new();
-        let v = eval_range_fn_hist(RangeFn::Delta, &samples, 60_000, 0, 60_000, "m", &mut annos);
+        let v = eval_range_fn_hist(
+            RangeFn::Delta,
+            &samples,
+            RangeWindow {
+                range_ms: 60_000,
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            None,
+            "m",
+            &mut annos,
+        );
         match v {
             Some(RangeValue::Float(f)) => assert!((f - 2.0).abs() < 1e-9),
             other => panic!("expected a float, got {other:?}"),
@@ -1002,7 +1153,18 @@ mod tests {
             hist_sample(60_000, 3, 3.0, vec![3]), // reset: count/bucket both dropped
         ];
         let mut annos = Annotations::new();
-        let v = eval_range_fn_hist(RangeFn::Irate, &samples, 60_000, 0, 60_000, "m", &mut annos);
+        let v = eval_range_fn_hist(
+            RangeFn::Irate,
+            &samples,
+            RangeWindow {
+                range_ms: 60_000,
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            None,
+            "m",
+            &mut annos,
+        );
         match v {
             Some(RangeValue::Histogram(h)) => {
                 // irate divides by interval seconds even on a reset
@@ -1029,7 +1191,7 @@ mod tests {
             hist_sample(60_000, 3, 3.0, vec![3]),
         ];
         let mut annos = Annotations::new();
-        let v = instant_value_hist(&samples, false, "m", &mut annos);
+        let v = instant_value_hist(&samples, false, None, "m", &mut annos);
         match v {
             Some(RangeValue::Histogram(h)) => {
                 assert!((h.count - (-7.0)).abs() < 1e-9, "count {}", h.count);
@@ -1052,7 +1214,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Last, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Last, &samples, None, "m", &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => assert_eq!(h.count, 4.0),
             other => panic!("expected a preserved histogram, got {other:?}"),
@@ -1067,7 +1229,7 @@ mod tests {
             Sample::float(60_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::First, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::First, &samples, None, "m", &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => assert_eq!(h.count, 4.0),
             other => panic!("expected a preserved histogram, got {other:?}"),
@@ -1082,7 +1244,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Count, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Count, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 3.0));
     }
 
@@ -1096,7 +1258,7 @@ mod tests {
             hist_sample(600_000, 6, 7.0, vec![1, 1, 1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1107,7 +1269,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1118,7 +1280,7 @@ mod tests {
     #[test]
     fn resets_over_an_empty_window_returns_none() {
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &[], "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &[], None, "m", &mut annos);
         assert!(v.is_none(), "empty window must drop the series, got {v:?}");
         assert!(annos.is_empty());
     }
@@ -1130,7 +1292,7 @@ mod tests {
             hist_sample(60_000, 5, 6.0, vec![1, 1, 0]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1141,7 +1303,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 0.0));
     }
 
@@ -1151,7 +1313,7 @@ mod tests {
     #[test]
     fn changes_over_an_empty_window_returns_none() {
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &[], "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &[], None, "m", &mut annos);
         assert!(v.is_none(), "empty window must drop the series, got {v:?}");
         assert!(annos.is_empty());
     }
@@ -1167,7 +1329,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Min, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", &mut annos);
         assert!(v.is_none());
         assert!(annos.is_empty(), "no annotation on a histogram-only window");
     }
@@ -1183,7 +1345,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Min, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
         let (_, infos) = annos.as_strings(0, 0);
         assert_eq!(infos.len(), 1);
@@ -1198,7 +1360,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::TsOfMin, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::TsOfMin, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if (f - 60.0).abs() < 1e-9));
         assert!(!annos.is_empty());
     }
@@ -1232,7 +1394,7 @@ mod tests {
     fn idelta_over_a_float_only_window_matches_the_byte_unchanged_float_path() {
         let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 4.0)];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if (f - 3.0).abs() < 1e-9));
         assert!(annos.is_empty());
     }
@@ -1289,9 +1451,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Increase,
             &nhcb_metric_window_at_12m(),
-            780_000,
-            -60_000,
-            720_000,
+            RangeWindow {
+                range_ms: 780_000,
+                start_ms: -60_000,
+                end_ms: 720_000,
+            },
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1327,9 +1492,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Rate,
             &nhcb_metric_window_at_12m(),
-            780_000,
-            -60_000,
-            720_000,
+            RangeWindow {
+                range_ms: 780_000,
+                start_ms: -60_000,
+                end_ms: 720_000,
+            },
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1366,9 +1534,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Delta,
             &samples,
-            780_000,
-            300_000,
-            1_080_000,
+            RangeWindow {
+                range_ms: 780_000,
+                start_ms: 300_000,
+                end_ms: 1_080_000,
+            },
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1406,9 +1577,12 @@ mod tests {
         let v = eval_range_fn_hist(
             RangeFn::Delta,
             &nhcb_metric_window_at_12m(),
-            780_000,
-            -60_000,
-            720_000,
+            RangeWindow {
+                range_ms: 780_000,
+                start_ms: -60_000,
+                end_ms: 720_000,
+            },
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1439,6 +1613,7 @@ mod tests {
         let v = eval_over_time_hist(
             OverTimeFn::Resets,
             &nhcb_metric_window_at_12m(),
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1456,6 +1631,7 @@ mod tests {
         let v = eval_over_time_hist(
             OverTimeFn::Changes,
             &nhcb_metric_window_at_12m(),
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1469,7 +1645,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", &mut annos);
         assert!(v.is_none());
         let (warnings, _) = annos.as_strings(0, 0);
         assert_eq!(warnings.len(), 1);
@@ -1487,6 +1663,7 @@ mod tests {
         let v = eval_over_time_hist(
             OverTimeFn::Sum,
             &nhcb_metric_window_at_12m(),
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1519,6 +1696,7 @@ mod tests {
         let v = eval_over_time_hist(
             OverTimeFn::Avg,
             &nhcb_metric_window_at_12m(),
+            None,
             "nhcb_metric",
             &mut annos,
         );
@@ -1546,7 +1724,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
         assert!(v.is_none());
         let (warnings, _) = annos.as_strings(0, 0);
         assert_eq!(
@@ -1561,7 +1739,7 @@ mod tests {
     fn sum_over_time_over_a_pure_float_window_is_unaffected() {
         let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 2.0)];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 3.0));
         assert!(annos.is_empty());
     }
@@ -1576,7 +1754,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 assert_eq!(h.count, 12.0);
@@ -1626,7 +1804,7 @@ mod tests {
             float_hist_sample(120_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 assert_eq!(h.positive_buckets, vec![BIG_PLUS_2]);
@@ -1656,7 +1834,7 @@ mod tests {
             float_hist_sample(120_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Avg, &samples, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Avg, &samples, None, "m", &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 let expected = BIG / 3.0 + 2.0 / 3.0;
@@ -1810,6 +1988,149 @@ mod tests {
         )
         .unwrap();
         assert!(v.is_none());
+        assert!(annos.is_empty());
+    }
+
+    // -- issue #155 (AC7): the histogram consumption sites with a
+    //    synthetic `Some(st)` channel (the test store zeroes histogram
+    //    STs, so the corpus cannot reach these — the pin's eval-side
+    //    checks are exercised here directly) --
+
+    /// `histogramRate`'s first-sample null-out (`functions.go:625-631`):
+    /// an ST reset between the 1st and 2nd points replaces `prev` with an
+    /// empty histogram even though no bucket/count drop is detectable.
+    #[test]
+    fn histogram_rate_nulls_out_the_first_sample_on_a_start_timestamp_reset() {
+        let points = vec![
+            hist_sample(0, 5, 5.0, vec![5]),
+            hist_sample(60_000, 7, 7.0, vec![7]),
+        ];
+        let mut annos = Annotations::new();
+        let none = histogram_rate(&points, None, true, "m", &mut annos).unwrap();
+        assert!((none.count - 2.0).abs() < 1e-9, "count {}", none.count);
+        // st[1]=30_000 > prev_t=0 ⇒ reset: prev nulled, then the
+        // reset-add loop re-adds the (empty) prev — last survives whole.
+        let with_st = histogram_rate(&points, Some(&[0, 30_000]), true, "m", &mut annos).unwrap();
+        assert!(
+            (with_st.count - 7.0).abs() < 1e-9,
+            "count {}",
+            with_st.count
+        );
+        assert!(annos.is_empty());
+    }
+
+    /// `histogramRate`'s reset-add loop (`functions.go:677-683`): a
+    /// mid-window ST reset (past the 1st/2nd pair, so the null-out does
+    /// not fire) adds the pre-reset histogram back in.
+    #[test]
+    fn histogram_rate_reset_add_loop_counts_a_mid_window_start_timestamp_reset() {
+        let points = vec![
+            hist_sample(0, 5, 5.0, vec![5]),
+            hist_sample(60_000, 7, 7.0, vec![7]),
+            hist_sample(120_000, 9, 9.0, vec![9]),
+        ];
+        let mut annos = Annotations::new();
+        let none = histogram_rate(&points, None, true, "m", &mut annos).unwrap();
+        assert!((none.count - 4.0).abs() < 1e-9, "count {}", none.count);
+        // st[2]=90_000 > points[1].t=60_000 ⇒ reset at the 3rd point:
+        // (9 - 5) + prev(7) = 11.
+        let with_st =
+            histogram_rate(&points, Some(&[0, 0, 90_000]), true, "m", &mut annos).unwrap();
+        assert!(
+            (with_st.count - 11.0).abs() < 1e-9,
+            "count {}",
+            with_st.count
+        );
+        assert!(annos.is_empty());
+    }
+
+    /// `instantValue`'s histogram arm (`functions.go:854`): an ST reset
+    /// between the last two samples skips the subtraction — `irate`
+    /// returns the last histogram verbatim (then divides by the
+    /// interval), exactly like a `DetectReset` hit.
+    #[test]
+    fn instant_value_hist_skips_the_subtraction_on_a_start_timestamp_reset() {
+        let samples = vec![
+            hist_sample(0, 5, 5.0, vec![5]),
+            hist_sample(60_000, 7, 7.0, vec![7]),
+        ];
+        let mut annos = Annotations::new();
+        let none = instant_value_hist(&samples, true, None, "m", &mut annos);
+        match none {
+            Some(RangeValue::Histogram(h)) => {
+                assert!((h.count - 2.0 / 60.0).abs() < 1e-12, "count {}", h.count);
+            }
+            other => panic!("expected a histogram, got {other:?}"),
+        }
+        let with_st = instant_value_hist(&samples, true, Some(&[0, 30_000]), "m", &mut annos);
+        match with_st {
+            Some(RangeValue::Histogram(h)) => {
+                assert!((h.count - 7.0 / 60.0).abs() < 1e-12, "count {}", h.count);
+            }
+            other => panic!("expected a histogram, got {other:?}"),
+        }
+        assert!(annos.is_empty());
+    }
+
+    /// `funcResets`' float arm (`functions.go:2311-2313`): an ST reset
+    /// counts even without a value drop; the `None` channel keeps the
+    /// pre-change count.
+    #[test]
+    fn eval_resets_hist_float_arm_counts_start_timestamp_resets() {
+        let samples = vec![
+            Sample::float(0, 1.0),
+            Sample::float(60_000, 2.0),
+            Sample::float(120_000, 3.0),
+        ];
+        assert_eq!(eval_resets_hist(&samples, None), 0.0);
+        // st[1]=30_000 > prev_t=0 ⇒ one reset; the (1→2) pair's ST is
+        // unset and the (2→3) values are monotone.
+        assert_eq!(eval_resets_hist(&samples, Some(&[0, 30_000, 0])), 1.0);
+    }
+
+    /// `funcResets`' histogram arm (`functions.go:2317-2319`): the ST
+    /// check fires first, counting a reset `DetectReset` cannot see.
+    #[test]
+    fn eval_resets_hist_histogram_arm_counts_start_timestamp_resets() {
+        let samples = vec![
+            hist_sample(0, 5, 5.0, vec![5]),
+            hist_sample(60_000, 7, 7.0, vec![7]),
+        ];
+        assert_eq!(eval_resets_hist(&samples, None), 0.0);
+        assert_eq!(eval_resets_hist(&samples, Some(&[0, 30_000])), 1.0);
+    }
+
+    /// The `eval_over_time_hist` wiring: `Resets` forwards the channel
+    /// (four-function gate) — same synthetic reset as above, observed
+    /// through the dispatch layer.
+    #[test]
+    fn eval_over_time_hist_forwards_the_st_channel_to_resets_only() {
+        let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 2.0)];
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(
+            OverTimeFn::Resets,
+            &samples,
+            Some(&[0, 30_000]),
+            "m",
+            &mut annos,
+        );
+        match v {
+            Some(OverTimeValue::Float(f)) => assert_eq!(f, 1.0),
+            other => panic!("expected a float, got {other:?}"),
+        }
+        // `changes` (outside the gate) ignores the channel entirely: two
+        // distinct values = one change, ST reset notwithstanding.
+        let v = eval_over_time_hist(
+            OverTimeFn::Changes,
+            &samples,
+            Some(&[0, 30_000]),
+            "m",
+            &mut annos,
+        );
+        match v {
+            Some(OverTimeValue::Float(f)) => assert_eq!(f, 1.0),
+            other => panic!("expected a float, got {other:?}"),
+        }
         assert!(annos.is_empty());
     }
 }

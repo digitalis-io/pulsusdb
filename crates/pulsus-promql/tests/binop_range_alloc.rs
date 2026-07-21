@@ -89,6 +89,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
                     metric_name: Some("foo".to_string()),
                     labels: Labels::new([("g".to_string(), format!("g{g}"))]),
                     samples: samples(1.0),
+                    start_ts: None,
                 });
             }
         } else {
@@ -104,6 +105,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
                             ("region".to_string(), "us-east-1".to_string()),
                         ]),
                         samples: samples(2.0),
+                        start_ts: None,
                     });
                     fp += 1;
                 }
