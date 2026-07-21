@@ -129,13 +129,21 @@ shared all-mode Service, or the `-reader` Service in split mode.
 {{- end -}}
 
 {{/*
-Full pulsusdb image reference. Empty `image.tag` falls back to
+Full pulsusdb image reference. `image.digest` (issue #38 #115 group)
+is PREFERRED over `image.tag` when set — a digest pin is the OCI
+convention for an immutable deployment reference, and mixing both into
+one ref (`repo@sha256:...:tag`) is invalid, so `tag` is silently
+dropped rather than erroring. Otherwise empty `image.tag` falls back to
 `Chart.AppVersion` (issue #38 plan: "appVersion == the released image
 tag", not the pulsus-server crate's 0.0.0 dev placeholder).
 */}}
 {{- define "pulsusdb.image" -}}
+{{- if .Values.image.digest -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
 {{- $tag := .Values.image.tag | default .Chart.AppVersion -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -286,6 +294,28 @@ macros/Keeper-path identity is implemented (tracked follow-up).
 {{- define "pulsusdb.validateClickhouseAuth" -}}
 {{- if and (not .Values.clickhouse.enabled) (not .Values.clickhouse.auth.existingSecret) -}}
 {{- fail "clickhouse.auth.existingSecret must be set when clickhouse.enabled=false (external ClickHouse) — the chart never invents a password for a database it doesn't manage." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Fail-closed guard (issue #38 #115 group) for `pulsusdb.auth`'s validity
+matrix — mirrors the `pulsusdb.validateClickhouseAuth` precedent
+(guard-only, not a schema `oneOf`, so the per-case message stays
+actionable): `user` non-empty and a password source (`password` or
+`existingSecret`) non-empty must always agree, and `password` /
+`existingSecret` are mutually exclusive. One-sided HTTP Basic auth is a
+hard startup error in the product (docs/configuration.md §1).
+*/}}
+{{- define "pulsusdb.validateAuth" -}}
+{{- $a := .Values.pulsusdb.auth -}}
+{{- if and $a.password $a.existingSecret -}}
+{{- fail "pulsusdb.auth.password and pulsusdb.auth.existingSecret are mutually exclusive — set exactly one password source" -}}
+{{- end -}}
+{{- if and $a.user (not (or $a.password $a.existingSecret)) -}}
+{{- fail "pulsusdb.auth.user is set but no password source is (pulsusdb.auth.password or pulsusdb.auth.existingSecret) — one-sided HTTP Basic auth is a pulsusdb startup error; set both or neither" -}}
+{{- end -}}
+{{- if and (or $a.password $a.existingSecret) (not $a.user) -}}
+{{- fail "a pulsusdb.auth password source is set but pulsusdb.auth.user is not — one-sided HTTP Basic auth is a pulsusdb startup error; set both or neither" -}}
 {{- end -}}
 {{- end -}}
 

@@ -45,12 +45,11 @@ async fn engine_for(state: &AppState) -> Result<MetricsEngine, ApiError> {
         .get()
         .cloned()
         .ok_or(ApiError::Unavailable)?;
-    Ok(chconfig::metrics_engine(
-        pool,
-        label_cache,
-        &state.config,
-        state.eval_gate.clone(),
-    ))
+    // Issue #114: the consistency-config invariant is already enforced at
+    // config load, so this is unreachable in the real binary; a failure maps
+    // to the existing 503 "not serving" semantics.
+    chconfig::metrics_engine(pool, label_cache, &state.config, state.eval_gate.clone())
+        .map_err(|_| ApiError::Unavailable)
 }
 
 async fn read_form_pairs(
@@ -241,16 +240,24 @@ async fn run_query(
     // the encoder's deterministic label sort.
     let ordered = query_params.step_ms == 0 && pulsus_promql::expr_is_sort_root(expr);
     if explain {
-        let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
-        Ok(encode::query_response(
+        let (result, annotations, plan_explain) =
+            engine.query_explained(expr, query_params).await?;
+        Ok(encode::query_response_annotated(
             result,
             Some(plan_explain),
             at_ms,
             ordered,
+            &annotations,
         ))
     } else {
-        let result = engine.query(expr, query_params).await?;
-        Ok(encode::query_response(result, None, at_ms, ordered))
+        let (result, annotations) = engine.query(expr, query_params).await?;
+        Ok(encode::query_response_annotated(
+            result,
+            None,
+            at_ms,
+            ordered,
+            &annotations,
+        ))
     }
 }
 

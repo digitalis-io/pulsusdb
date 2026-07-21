@@ -97,6 +97,10 @@ pub struct ParsedLogs {
 /// decode boundary: a malformed/truncated protobuf is a whole-request,
 /// atomic failure (architect plan) — never partially applied.
 pub fn decode(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> {
+    // Wire pre-scan (issue #115, track 5): reject an over-cap / over-deep
+    // request by walking the raw protobuf bytes BEFORE `decode` materializes
+    // the amplified structure (malformed bodies deferred to `decode` below).
+    crate::protocols::otlp_prescan::prescan_logs(body)?;
     Ok(ExportLogsServiceRequest::decode(body)?)
 }
 
@@ -109,7 +113,12 @@ pub fn decode(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> 
 /// impls; a malformed body is the same whole-request atomic failure as a bad
 /// protobuf, mapped to 400/code 3 via [`LogsIngestError::DecodeJson`].
 pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestError> {
-    Ok(serde_json::from_slice(body)?)
+    // Issue #115 track 6b: bounded proto3-JSON building wrappers replace the
+    // vendored derive's UNBOUNDED repeated-field decode, rejecting a DoS-shaped
+    // body DURING deserialization at the SAME per-level / aggregate / depth
+    // thresholds the protobuf wire pre-scan (`otlp_prescan`) enforces (mirrors
+    // `otlp_traces::decode_json`, track 6a).
+    crate::protocols::otlp_json::decode_logs(body)
 }
 
 /// Parses a decoded `ExportLogsServiceRequest` into normalized rows. Pure:
@@ -117,7 +126,21 @@ pub fn decode_json(body: &[u8]) -> Result<ExportLogsServiceRequest, LogsIngestEr
 /// caller (the ingest handler) is the only clock/IO boundary, so `parse`
 /// itself is trivially unit-testable and deterministic across calls with
 /// identical arguments.
-pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
+///
+/// `Err` iff a body/attribute `AnyValue` tree nests deeper than
+/// [`otlp_depth::MAX_ANYVALUE_DEPTH`](crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH)
+/// — a whole-request, atomic structural failure (400 / `code = 3`), exactly
+/// like a decode error; malformed per-record timestamps stay per-record
+/// partial-success rejections inside the `Ok`.
+pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep body/attribute tree before any value is rendered or a
+    // row materialized, so the recursive `any_value_to_string` render below
+    // can never overflow the stack. This makes `parse` fallible (it was
+    // previously infallible) — a whole-request, atomic 400/`code = 3` reject,
+    // the same class as a decode failure.
+    crate::protocols::otlp_depth::ensure_logs_anyvalue_depth(req)?;
+
     let mut out = ParsedLogs::default();
     // Dedups stream registration within this request by `(fingerprint,
     // month)` (architect plan amendment) — a fingerprint-only key would
@@ -150,7 +173,34 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
                     }
                 };
 
-                let month = Date::start_of_month_utc(timestamp_ns);
+                // `log_samples` is partitioned by the RAW sample day
+                // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`), so a
+                // record whose day falls outside the ClickHouse `Date` range
+                // (before 1970-01-01 or at/after 2149-06-07) cannot land in a
+                // valid partition even when its month-start still can — e.g.
+                // 2149-06-07 = day 65536 (unrepresentable) has month-start
+                // 2149-06-01 = day 65530 (representable). Gate acceptance on
+                // the DAY, then derive the month for the `log_streams`
+                // registration (guaranteed `Some` once the day is in range,
+                // but kept fallible — no `.unwrap()` on untrusted input).
+                // Saturating either would orphan the sample into the wrong
+                // partition, so the record is rejected into partial success.
+                let month = match (
+                    Date::start_of_day_utc(timestamp_ns),
+                    Date::start_of_month_utc(timestamp_ns),
+                ) {
+                    (Some(_day), Some(month)) => month,
+                    _ => {
+                        out.rejected += 1;
+                        if out.rejected_message.is_none() {
+                            out.rejected_message = Some(format!(
+                                "log record timestamp {timestamp_ns} is outside the \
+                                 representable ClickHouse Date range"
+                            ));
+                        }
+                        continue;
+                    }
+                };
                 if seen_streams.insert((fingerprint, month)) {
                     out.streams.push(StreamRow {
                         month,
@@ -175,7 +225,7 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
         }
     }
 
-    out
+    Ok(out)
 }
 
 /// Flattens `resource.attributes` — and ONLY those — into the stream
@@ -399,6 +449,15 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::logs::v1::ResourceLogs;
+
+    /// The `AnyValue` depth guard (finding #54) made `super::parse` fallible.
+    /// Every legacy assertion below constructs shallow, in-bounds requests, so
+    /// this shim unwraps the whole-request result to keep those cases reading
+    /// against `ParsedLogs` unchanged; the dedicated depth tests call
+    /// `super::parse` directly to observe the `Err`.
+    fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> ParsedLogs {
+        super::parse(req, now_ns).expect("test request is within the AnyValue depth cap")
+    }
 
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -1081,6 +1140,96 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_a_far_future_record_instead_of_orphaning_it_into_the_max_date_partition() {
+        // Representable as i64 ns but ~year 2200 — past the 2149-06-06
+        // ClickHouse `Date` cutoff. Before #8's fix this saturated the month
+        // to day 65535, silently orphaning the sample; now it is a clean
+        // per-record rejection (partial success), contributing no stream row.
+        let far_future_ns: i64 = 86_400_000_000_000 * 84_000;
+        let bad = LogRecord {
+            time_unix_nano: far_future_ns as u64,
+            body: string_body("far-future"),
+            ..Default::default()
+        };
+        let good = LogRecord {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            body: string_body("good"),
+            ..Default::default()
+        };
+        let out = parse(
+            &request(vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![simple_scope_logs(vec![bad, good])],
+                schema_url: String::new(),
+            }]),
+            0,
+        );
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "good");
+        assert_eq!(out.streams.len(), 1);
+        // No stream row registered at the max-`Date` boundary.
+        assert!(
+            out.streams
+                .iter()
+                .all(|s| s.month.days_since_epoch() != u16::MAX)
+        );
+    }
+
+    #[test]
+    fn parse_accepts_the_last_representable_day_but_rejects_the_first_unrepresentable_one() {
+        // The exact record #8's round-2 review flagged: `log_samples`
+        // partitions by the RAW sample day
+        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`). Day 65535 =
+        // 2149-06-06 is the last day ClickHouse `Date` can represent; day
+        // 65536 = 2149-06-07 is the first it cannot — yet its month-start
+        // (2149-06-01 = day 65530) IS representable, so the prior month-only
+        // gate wrongly ACCEPTED it into a partition it can never store. The
+        // day-65536 record must now be rejected while the day-65535 record
+        // stays accepted (no over-rejection).
+        const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+        let last_ok_ns = NANOS_PER_DAY * 65_535; // 2149-06-06 00:00 UTC
+        let first_bad_ns = NANOS_PER_DAY * 65_536; // 2149-06-07 00:00 UTC
+        let accepted = LogRecord {
+            time_unix_nano: last_ok_ns as u64,
+            body: string_body("last-representable-day"),
+            ..Default::default()
+        };
+        let rejected = LogRecord {
+            time_unix_nano: first_bad_ns as u64,
+            body: string_body("first-unrepresentable-day"),
+            ..Default::default()
+        };
+        let out = parse(
+            &request(vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![simple_scope_logs(vec![accepted, rejected])],
+                schema_url: String::new(),
+            }]),
+            0,
+        );
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+        // Only the in-range record survives, unchanged.
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].body, "last-representable-day");
+        // Its stream registers exactly its representable month (2149-06-01).
+        assert_eq!(out.streams.len(), 1);
+        assert_eq!(out.streams[0].month.days_since_epoch(), 65_530);
+    }
+
+    #[test]
     fn parse_dedups_streams_by_fingerprint_and_month_across_scopes() {
         // Two ScopeLogs with identical resource+scope (same fingerprint),
         // both in the same UTC month: exactly one StreamRow.
@@ -1159,7 +1308,7 @@ mod tests {
         );
         assert_eq!(out.streams.len(), 1);
         let month_days = out.streams[0].month.days_since_epoch();
-        let now_month_days = Date::start_of_month_utc(now_ns).days_since_epoch();
+        let now_month_days = Date::start_of_month_utc(now_ns).unwrap().days_since_epoch();
         assert_ne!(month_days, now_month_days);
         // 2020-01-01 is day 18262 since the epoch.
         assert_eq!(month_days, 18_262);
@@ -1224,5 +1373,91 @@ mod tests {
         assert_eq!(base64_encode(b"a"), "YQ==");
         assert_eq!(base64_encode(b"ab"), "YWI=");
         assert_eq!(base64_encode(b"abc"), "YWJj");
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// A log record `body` nested `levels` `AnyValue` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). Built
+    /// iteratively; `levels <= MAX_ANYVALUE_DEPTH + 1` here, so its `Drop`
+    /// recursion is trivially safe.
+    fn nested_body(levels: usize) -> AnyValue {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value
+    }
+
+    fn request_with_body(body: AnyValue) -> ExportLogsServiceRequest {
+        request(vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_000_000_000_000,
+                    body: Some(body),
+                    ..Default::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }])
+    }
+
+    #[test]
+    fn parse_accepts_body_anyvalue_nesting_at_the_depth_cap() {
+        let req = request_with_body(nested_body(
+            crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH,
+        ));
+        // Calls the real fallible `parse` (not the unwrap shim): an at-cap
+        // body renders and yields exactly one row, unchanged by the guard.
+        let out = super::parse(&req, 0).expect("at-cap body is within the depth guard");
+        assert_eq!(out.rows.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_body_anyvalue_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders to a JSON string and
+        // yields one row); the guard makes it a whole-request reject before
+        // any row is materialized, proving the reject is non-vacuous.
+        let req = request_with_body(nested_body(
+            crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+        ));
+        let err = super::parse(&req, 0).expect_err("over-depth body is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
+    }
+
+    #[test]
+    fn parse_rejects_attribute_anyvalue_nesting_past_the_depth_cap() {
+        // The reject also covers resource attribute values, not just bodies.
+        let req = request(vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "deep".to_string(),
+                    value: Some(nested_body(
+                        crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+                    )),
+                    key_strindex: 0,
+                }],
+                dropped_attributes_count: 0,
+                entity_refs: vec![],
+            }),
+            scope_logs: vec![simple_scope_logs(vec![LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000,
+                body: string_body("x"),
+                ..Default::default()
+            }])],
+            schema_url: String::new(),
+        }]);
+        let err = super::parse(&req, 0).expect_err("over-depth resource attribute is rejected");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }

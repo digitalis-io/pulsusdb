@@ -17,10 +17,11 @@ use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
 use thiserror::Error;
 
-/// Why a query was rejected as too broad. Four structurally separate
-/// reasons, never conflated (architect plan amendment §4; issue #57 adds
-/// the traces row budget; issue #59 adds the trace-metrics IN-set
-/// budget), each with its own exclusive code path:
+/// Why a query was rejected as too broad. Six structurally separate
+/// reason families, never conflated (architect plan amendment §4; issue
+/// #57 adds the traces row budget and (re-audit) the traces generator
+/// memory budget; issue #59 adds the trace-metrics IN-set budget), each
+/// with its own exclusive code path:
 ///
 /// - [`TooBroadReason::ScanBudgetBytes`] — byte budgets only: LogQL
 ///   `max_bytes_to_read` (code 307), the traces `max_bytes_to_read`/
@@ -36,6 +37,17 @@ use thiserror::Error;
 ///   throw — code 191) set **only** by `traces::exec`'s metrics query
 ///   settings; no other path sets a set limit, and no other code maps
 ///   code 191.
+/// - [`TooBroadReason::TraceGeneratorMemory`] — issue #57 re-audit: the
+///   traces phase-1 candidate-generator's memory ceiling
+///   (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
+///   throw — code 241) set **only** on generator reads; no other path
+///   sets a memory limit, and no other code maps code 241.
+/// - [`TooBroadReason::QueryTextBytes`] — issue #35: the FINAL rendered
+///   SQL text (after placeholder-doubling) reached [`crate::querytext::MAX_QUERY_TEXT_BYTES`]
+///   — a Rust-side pre-dispatch admission check
+///   ([`crate::querytext::ensure_query_text_fits`]), never a ClickHouse
+///   error code (the raised `max_query_size` setting means ClickHouse's own
+///   parse-buffer rejection should never be reached in practice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TooBroadReason {
     /// A ClickHouse-side or engine-side **byte** budget was exceeded. On
@@ -75,6 +87,15 @@ pub enum TooBroadReason {
     /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
     /// with the byte scan budget or the trace row budget.
     TraceMetricsSetRows { max_set_rows: u64 },
+    /// Issue #57 re-audit (sub-problem B): the traces phase-1 candidate-
+    /// generator read's memory ceiling (`max_memory_usage` +
+    /// `max_bytes_before_external_group_by = 0`, throw — server code 241
+    /// `MEMORY_LIMIT_EXCEEDED`) was exceeded — a dense common-value
+    /// prefix's `GROUP BY trace_id` aggregation state grew past the
+    /// budget. Set **only** by `traces::exec`'s generator error mapper
+    /// (`map_trace_generator_error`); never conflated with the row/byte
+    /// scan budgets or the trace-metrics set budget.
+    TraceGeneratorMemory { budget_bytes: u64 },
     /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
     /// matched more metric names than the configured fan-out cap
     /// (`reader.promql_max_metric_fanout`, default 1000 — the adjudicated
@@ -98,6 +119,48 @@ pub enum TooBroadReason {
     /// query aborts with this named error, never an OOM and never a
     /// silently approximated quantile.
     QuantileValues { count: u64, cap: u64 },
+    /// Issue #73 (retroactive re-review): a client-aggregated LogQL
+    /// metric query resolved more distinct output series (final label
+    /// sets on the fan-out/label-mutating path, or fingerprints on the
+    /// non-mutating path) than
+    /// [`crate::logql::exec::MAX_CLIENT_AGG_SERIES`] — rejected DURING
+    /// aggregation before the (cap+1)-th group is materialized, so the
+    /// group axis of reducer state (`groups x buckets`) stays bounded.
+    /// Complete-or-error, never a truncated result. A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    MetricSeries { cap: u64 },
+    /// Issue #89 (retroactive re-review): a regex/negated-`__name__`
+    /// PromQL selector's multi-metric resolution *examined* more resident
+    /// cache entries (metric names plus candidate fingerprints) than
+    /// `reader.promql_max_cache_scan` before it could finish — an
+    /// independent enumeration bound, distinct from [`Self::MetricFanout`]
+    /// (which counts only matched names) and `OverCardinality` (which
+    /// counts only matched series): a selector whose matchers yield few or
+    /// no matches can still examine the whole resident cache. Produced
+    /// **only** by `metrics::exec`'s multi-metric resolution, on both the
+    /// query and discovery paths — the discovery path never routes this to
+    /// the degraded-cache probe fallback (a warm cache that reaches this
+    /// bound is not degraded, it is genuinely too broad). A Rust-side
+    /// structural limit, never from a ClickHouse error code.
+    CacheScan { cap: u64 },
+    /// Issue #82 (retroactive re-review): a PromQL `info()` node's
+    /// synthetic `*_info` metadata-family selector (`SelectorSpec::
+    /// info_family`) resolved more series than
+    /// `reader.promql_max_info_series` — a pathological-cardinality
+    /// backstop, enforced BEFORE any sample fetch is issued (the warm
+    /// label-cache path caps `pairs.len()` before building chunk SQL; the
+    /// degraded/regex paths bound the series-selection query itself with
+    /// `LIMIT cap+1`, mirroring the `MetricFanout` probe shape). Produced
+    /// **only** by `metrics::exec`'s info-family resolution, never from a
+    /// ClickHouse error code. Identifying-label VALUE narrowing of the
+    /// fetch (closing the gap this cap merely backstops) routes to #25.
+    InfoCardinality { matched: usize, cap: u64 },
+    /// Issue #35: the rendered SQL text (after placeholder-doubling) for a
+    /// read-path query reached or exceeded
+    /// [`crate::querytext::MAX_QUERY_TEXT_BYTES`] — rejected pre-dispatch by
+    /// [`crate::querytext::ensure_query_text_fits`], never by a ClickHouse
+    /// server error code.
+    QueryTextBytes { rendered_bytes: u64, cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -128,6 +191,12 @@ impl fmt::Display for TooBroadReason {
                     "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
                 )
             }
+            TooBroadReason::TraceGeneratorMemory { budget_bytes } => {
+                write!(
+                    f,
+                    "trace search generator memory budget of {budget_bytes} bytes exceeded"
+                )
+            }
             TooBroadReason::MetricBuckets { buckets, cap } => {
                 write!(
                     f,
@@ -151,6 +220,49 @@ impl fmt::Display for TooBroadReason {
                     f,
                     "name-less selector matched more than {cap} metric names, exceeding the \
                      fan-out cap (reader.promql_max_metric_fanout)"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`: the guard bails at
+            // the breach point (the cap+1-th group), so this is not an
+            // exact final tally.
+            TooBroadReason::MetricSeries { cap } => {
+                write!(
+                    f,
+                    "resolved more than {cap} series — narrow the pipeline (fewer parsed/\
+                     formatted labels), use a coarser grouping, or a narrower window"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`/`MetricSeries`: the
+            // walk bails the instant it would cross the budget, so
+            // `examined` is never presented here as an exact final tally.
+            TooBroadReason::CacheScan { cap } => {
+                write!(
+                    f,
+                    "regex/negated-name selector examined more than {cap} cache entries, \
+                     exceeding the scan budget (reader.promql_max_cache_scan) — narrow the \
+                     __name__ matcher or use a metric-scoped selector"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`: the resolution
+            // bails at the breach point (before or at the `cap+1`-th
+            // row), so `matched` is never presented as an exact final
+            // tally.
+            TooBroadReason::InfoCardinality { matched: _, cap } => {
+                write!(
+                    f,
+                    "info() metadata family matched more than {cap} series, exceeding the \
+                     cardinality cap (reader.promql_max_info_series)"
+                )
+            }
+            TooBroadReason::QueryTextBytes {
+                rendered_bytes,
+                cap,
+            } => {
+                write!(
+                    f,
+                    "rendered query text is {rendered_bytes} bytes, exceeding the {cap}-byte \
+                     query-text cap — narrow the selector (fewer streams/metric names) or \
+                     shorten the query"
                 )
             }
         }
@@ -261,6 +373,30 @@ pub enum ReadError {
     #[error("range query step_ns must be greater than zero")]
     InvalidStep,
 
+    /// M7-A5a: the metrics dual-read decoded a `metric_hist_samples` row
+    /// whose value columns cannot rebuild a [`NativeHistogram`]
+    /// (`from_columns` structural failure — parallel span arrays of
+    /// unequal length). Structurally unreachable for writer-produced rows
+    /// (the A4 ingest seam validated before storing), so this is a
+    /// data-integrity defect surfaced defensively, never a client error.
+    /// `pulsus_model::NativeHistogram` is referenced only in this doc.
+    #[error("histogram decode: {0}")]
+    HistogramDecode(#[from] pulsus_model::HistogramError),
+
+    /// M7-A5a: a well-formed, executed query whose evaluated result is a
+    /// native-histogram vector/matrix element — a result type the current
+    /// (A5a) response encoder declines to render. The native-histogram
+    /// **function set and JSON encoder** land in **M7-A5b**; until then no
+    /// code path emits `0.0` for a histogram value — this is returned
+    /// instead. Maps like [`ReadError::QueryTooBroad`]: 422 `execution`
+    /// (the engine declines to render the result), never 400/5xx.
+    #[error(
+        "native-histogram query results are not yet renderable: the histogram function set and \
+         JSON encoding land with M7-A5b — until then a bare native-histogram selector result \
+         cannot be returned over the query API"
+    )]
+    HistogramResultUnsupported,
+
     /// An unclassified/passthrough ClickHouse error (network, decode,
     /// server exception not mapped to [`ReadError::QueryTooBroad`]).
     #[error("clickhouse: {0}")]
@@ -365,6 +501,34 @@ mod tests {
         assert!(msg.contains("4000000-value cap"), "{msg}");
     }
 
+    /// Issue #73 (retroactive re-review): the derived-series cap uses
+    /// LOWER-BOUND wording ("more than {cap}"), like `MetricFanout` — the
+    /// guard bails at the breach point, never an exact final tally.
+    #[test]
+    fn metric_series_display_names_the_cap_with_lower_bound_wording() {
+        let msg = ReadError::QueryTooBroad(TooBroadReason::MetricSeries { cap: 500 }).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(msg.contains("resolved more than 500 series"), "{msg}");
+    }
+
+    /// Issue #89 (retroactive re-review): the cache-scan budget uses
+    /// LOWER-BOUND wording, names the knob, and maps `QueryTooBroad` to a
+    /// 422-class message — the message-discrimination string live tests
+    /// pin against `MetricFanout`/`NamelessSelectorUnresolvable`.
+    #[test]
+    fn cache_scan_display_names_the_cap_and_the_knob() {
+        let msg = ReadError::QueryTooBroad(TooBroadReason::CacheScan { cap: 200_000 }).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(
+            msg.contains("examined more than 200000 cache entries"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("scan budget (reader.promql_max_cache_scan)"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn trace_metrics_set_rows_display_names_the_set_budget() {
         let reason = TooBroadReason::TraceMetricsSetRows {
@@ -373,6 +537,31 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("1000000"));
         assert!(msg.contains("attribute-set"));
+    }
+
+    /// Issue #57 re-audit: the generator memory reason names the budget.
+    #[test]
+    fn trace_generator_memory_display_names_the_memory_budget() {
+        let reason = TooBroadReason::TraceGeneratorMemory {
+            budget_bytes: 1_048_576,
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("1048576"), "{msg}");
+        assert!(msg.contains("generator memory"), "{msg}");
+    }
+
+    /// Issue #35: the query-text guard's message names both the rendered
+    /// size and the cap, and states the remedy.
+    #[test]
+    fn query_text_bytes_display_names_both_numbers_and_the_remedy() {
+        let reason = TooBroadReason::QueryTextBytes {
+            rendered_bytes: 9_000_000,
+            cap: 8_388_608,
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("9000000"), "{msg}");
+        assert!(msg.contains("8388608"), "{msg}");
+        assert!(msg.contains("narrow the selector"), "{msg}");
     }
 
     #[test]

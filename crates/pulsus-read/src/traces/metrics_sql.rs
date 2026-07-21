@@ -231,19 +231,33 @@ fn semi_join_sql(
 }
 
 /// The range query — one fully-pushed-down, time-bucketed, replay-deduped
-/// conditional aggregation (docs/schemas.md §4.2). `toUnixTimestamp(...)`
-/// pins the bucket column to a deterministic `UInt32` epoch-seconds wire
+/// conditional aggregation (docs/schemas.md §4.2). `toUnixTimestamp64Milli(...)`
+/// pins the bucket column to a deterministic `Int64` epoch-milliseconds wire
 /// type (plan v1 edge 2: `toStartOfInterval(DateTime64(9), …)`'s own
-/// type/scale is version-sensitive).
+/// type/scale is version-sensitive; `Int64` ms also covers pre-1970/post-2106
+/// buckets that a `UInt32` epoch-seconds column would wrap — issue #59
+/// re-audit). The interval is rendered in **milliseconds**
+/// (`INTERVAL {step_ms} MILLISECOND`), not seconds: live ClickHouse 24.8
+/// evaluates `toStartOfInterval(DateTime64, INTERVAL n SECOND)` (and
+/// MINUTE/HOUR/…) as a 32-bit `DateTime`, silently wrapping/clamping
+/// pre-1970/post-2106 instants (verified live — the SQL then also fails
+/// `toUnixTimestamp64Milli`'s strict `DateTime64` argument outright, for
+/// every window, not only extreme ones); the millisecond-unit form is the
+/// documented ClickHouse boundary at which `toStartOfInterval` keeps its
+/// `DateTime64` precision/range. `step_ms = step_s * 1000` never overflows
+/// `i64`: `metrics_plan::plan_trace_metrics` already requires the snapped
+/// window (which is at least one whole step) to fit in `i64` nanoseconds,
+/// so `step_s <= i64::MAX / NS_PER_S`.
 pub fn metrics_range_sql(
     spans_table: &str,
     filter: &FilterSql,
     window: SnappedWindow,
     step_s: i64,
 ) -> String {
+    let step_ms = step_s * 1000;
     let mut sql = format!(
-        "SELECT toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-         INTERVAL {step_s} SECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
          FROM {spans_table}\n"
     );
     if let Some(prewhere) = &filter.prewhere {
@@ -427,8 +441,8 @@ mod tests {
         let f = compile(r#"{ resource.service.name = "checkout" && duration > 2s }"#);
         let sql = metrics_range_sql("trace_spans", &f, W, 60);
         assert!(sql.starts_with(
-            "SELECT toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
-             INTERVAL 60 SECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
+            "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+             INTERVAL 60000 MILLISECOND)) AS t,\n       uniqExact(trace_id, span_id) AS n\n\
              FROM trace_spans\nPREWHERE service = 'checkout'\n"
         ));
         assert!(sql.contains(

@@ -29,8 +29,17 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 
+use pulsus_config::ExpHistogramMode;
 use pulsus_model::STALE_NAN_BITS;
-use pulsus_write::protocols::otlp_metrics::{decode, parse};
+use pulsus_write::protocols::otlp_metrics::{decode, parse as parse_with_mode};
+use pulsus_write::{LogsIngestError, ParsedMetrics};
+
+/// Test shim (issue #120): these fixtures assert the default `Classic`
+/// exp-histogram mode, so a thin `parse` wrapper keeps every call site
+/// unchanged after the `parse` signature gained a `mode` argument.
+fn parse(req: &ExportMetricsServiceRequest, now_ns: i64) -> Result<ParsedMetrics, LogsIngestError> {
+    parse_with_mode(req, now_ns, ExpHistogramMode::Classic)
+}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/otlp-metrics")

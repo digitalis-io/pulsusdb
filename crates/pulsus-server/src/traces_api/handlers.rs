@@ -7,7 +7,7 @@
 //! `pulsus-read`, OTLP assembly in `assemble.rs`.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use pulsus_read::TraceEngine;
@@ -31,20 +31,31 @@ pub(super) async fn engine_for(state: &AppState) -> Result<TraceEngine, ApiError
         guard.clone()
     };
     let pool = pool.ok_or(ApiError::PoolUnavailable)?;
-    Ok(chconfig::trace_engine(pool, &state.config))
+    // Issue #114: the consistency-config invariant is already enforced at
+    // config load, so this is unreachable in the real binary; a failure maps
+    // to the existing 503 "not serving" semantics.
+    chconfig::trace_engine(pool, &state.config).map_err(|_| ApiError::PoolUnavailable)
 }
 
 /// `GET /api/traces/v1/trace/{traceId}` — representation by `Accept`
-/// (default JSON).
+/// (default JSON). Every response (success or error) carries
+/// `Vary: accept` (RFC 9110 §12.5.5, issue #55 review): the 200/406
+/// genuinely vary by `Accept`, and a blanket insert on the pre-negotiation
+/// error paths (400/404/503) is conservative-but-cache-safe and avoids
+/// plumbing "negotiation reached" state through `ApiError`. The `/json`
+/// route below never consults `Accept`, so it gets no `Vary`.
 pub(crate) async fn trace_by_id(
     State(state): State<AppState>,
     Path(trace_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    match trace_by_id_impl(state, &trace_id, Some(&headers)).await {
+    let mut res = match trace_by_id_impl(state, &trace_id, Some(&headers)).await {
         Ok(res) => res,
         Err(e) => e.into_response(),
-    }
+    };
+    res.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("accept"));
+    res
 }
 
 /// `GET /api/traces/v1/trace/{traceId}/json` — forces JSON; never
@@ -144,6 +155,10 @@ mod tests {
             HeaderMap::new(),
         )
         .await;
+        assert_eq!(
+            res.headers().get(header::VARY).map(|v| v.as_bytes()),
+            Some(b"accept".as_slice())
+        );
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");
@@ -157,6 +172,7 @@ mod tests {
             HeaderMap::new(),
         )
         .await;
+        assert!(res.headers().get(header::VARY).is_none());
         let (status, json) = status_and_body(res).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["errorType"], "unavailable");

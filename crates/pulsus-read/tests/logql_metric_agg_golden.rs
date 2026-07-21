@@ -844,6 +844,108 @@ fn a_surviving_parser_error_also_fails_a_metric_query() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #73 (retroactive re-review): the derived-series cap bounds the
+// last unbounded axis of client-agg reducer state (`groups x buckets`).
+// Both `Vacant`-insert sites — `label_groups` (fan-out/label-mutating)
+// and `fp_groups` (non-mutating) — are proven independently: reject at
+// cap+1, succeed at exactly the cap.
+// ---------------------------------------------------------------------
+
+fn meta_n(n: usize) -> HashMap<u64, StreamMetaRow> {
+    (1..=n as u64)
+        .map(|fp| {
+            (
+                fp,
+                StreamMetaRow {
+                    fingerprint: fp,
+                    service: "checkout".to_string(),
+                    labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn label_groups_fan_out_past_the_series_cap_is_a_named_too_broad_error() {
+    // `logfmt` is a parser -> `mutates_labels` -> fan-out. Every row
+    // carries a unique `id=<n>` body on the SAME fingerprint, so each
+    // survivor's final label set is distinct -> one `label_groups` entry
+    // per row.
+    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+    let params = instant_params(60 * NS);
+    let over_cap: Vec<MetricScanRow> = (0..=cap)
+        .map(|n| row(1, 10 * NS, &format!("id={n}")))
+        .collect();
+    let err = run_client(
+        r#"count_over_time({env="prod"} | logfmt [1m])"#,
+        &params,
+        &over_cap,
+        &meta_one(),
+    )
+    .unwrap_err();
+    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
+        err
+    else {
+        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
+    };
+    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
+
+    // Exactly at the cap: `cap` distinct label sets -> Ok, `cap` series.
+    let at_cap: Vec<MetricScanRow> = (0..cap)
+        .map(|n| row(1, 10 * NS, &format!("id={n}")))
+        .collect();
+    let result = run_client(
+        r#"count_over_time({env="prod"} | logfmt [1m])"#,
+        &params,
+        &at_cap,
+        &meta_one(),
+    )
+    .unwrap();
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    assert_eq!(items.len(), cap);
+}
+
+#[test]
+fn fp_groups_non_mutating_past_the_series_cap_is_a_named_too_broad_error() {
+    // Plan v2 correction: `line_format` is beyond-line-filter (so the
+    // query IS client-aggregated) but its compile arm sets only
+    // `rewrites_line`, never `mutates_labels` (pipeline.rs) — so
+    // `metric_mutates_labels() == false` and the query lands on the
+    // NON-fan-out `fp_groups` branch, keyed by fingerprint. Driven with
+    // one row per distinct fingerprint.
+    let cap = pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES as usize;
+    let params = instant_params(60 * NS);
+    let query = r#"count_over_time({env="prod"} | line_format "keep" [1m])"#;
+
+    let over_cap_meta = meta_n(cap + 1);
+    let over_cap_rows: Vec<MetricScanRow> = (1..=(cap as u64 + 1))
+        .map(|fp| row(fp, 10 * NS, "hello"))
+        .collect();
+    let err = run_client(query, &params, &over_cap_rows, &over_cap_meta).unwrap_err();
+    let ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::MetricSeries { cap: got }) =
+        err
+    else {
+        panic!("expected QueryTooBroad(MetricSeries), got {err:?}");
+    };
+    assert_eq!(got, pulsus_read::logql::exec::MAX_CLIENT_AGG_SERIES);
+
+    // Exactly at the cap: `cap` distinct fingerprints -> Ok, `cap`
+    // series.
+    let at_cap_meta = meta_n(cap);
+    let at_cap_rows: Vec<MetricScanRow> = (1..=cap as u64)
+        .map(|fp| row(fp, 10 * NS, "hello"))
+        .collect();
+    let result = run_client(query, &params, &at_cap_rows, &at_cap_meta).unwrap();
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    assert_eq!(items.len(), cap);
+}
+
+// ---------------------------------------------------------------------
 // AC4a: `absent_over_time` is selector-wide per bucket (plan v2 D2) —
 // at most ONE series, absence only for buckets where the WHOLE selector
 // produced zero surviving lines, labels = the selector's Eq matchers.
@@ -1584,6 +1686,34 @@ fn duplicate_one_side_signature_is_many_to_many_error() {
     assert!(
         reason.contains("found duplicate series on the right hand-side"),
         "{reason}"
+    );
+}
+
+/// A duplicate ONE/RHS-side signature under a PLAIN one-to-one match (no
+/// group_left/group_right) is many-to-many — the one-side map is built
+/// unconditionally, so it errors even without a group modifier. Distinct
+/// from `duplicate_one_side_signature_is_many_to_many_error` (group_left)
+/// and from `one_to_one_second_many_side_match_is_multiple_matches_error`
+/// (LHS-side). Loki-verbatim wording (grafana/loki:3.4.2).
+#[test]
+fn plain_one_to_one_duplicate_rhs_signature_is_many_to_many_error() {
+    let lhs = QueryResult::Vector(vec![sample(&[("app", "p"), ("inst", "1")], 10.0)]);
+    // Two rhs series reduce to the same on(app) signature.
+    let rhs = QueryResult::Vector(vec![
+        sample(&[("app", "p"), ("inst", "1")], 2.0),
+        sample(&[("app", "p"), ("inst", "2")], 3.0),
+    ]);
+    // NOTE: on(app) with group = None — plain one-to-one, the missing AC3 case.
+    let err = combine_binary(BinOp::Div, false, Some(&on(&["app"], None)), lhs, rhs).unwrap_err();
+    let ReadError::PipelineInvalid { reason } = &err else {
+        panic!("expected PipelineInvalid, got {err:?}");
+    };
+    // Full byte-exact string (side = "right", not swapped) — anchors the
+    // whole message, catching side-label and wording drift.
+    assert_eq!(
+        reason,
+        "found duplicate series on the right hand-side;many-to-many matching \
+         not allowed: matching labels must be unique on one side"
     );
 }
 

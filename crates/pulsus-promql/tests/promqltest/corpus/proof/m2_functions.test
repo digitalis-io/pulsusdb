@@ -53,6 +53,13 @@ eval instant at 10m count_over_time(gauge_m[5m])
 eval instant at 10m histogram_quantile(0.5, hist_bucket)
 	{} 0.5
 
+# M7-A5b-i: histogram_fraction's classic `le`-bucket path (BucketFraction).
+# The fraction of observations below the same rank the quantile witness
+# above lands on is the query's own φ, by construction (histogram_fraction
+# is the inverse of histogram_quantile).
+eval instant at 10m histogram_fraction(-Inf, 0.5, hist_bucket)
+	{} 0.5
+
 # A range query through a range function: constant-rate counter.
 eval range from 5m to 10m step 1m rate(http_req[5m])
 	{job="a"} 1 1 1 1 1 1

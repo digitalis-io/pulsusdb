@@ -19,6 +19,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
+use pulsus_config::ExpHistogramMode;
 use pulsus_write::protocols::otlp_metrics;
 use pulsus_write::protocols::remote_write::{
     Label, MetricMetadataProto, Sample, TimeSeries, WriteRequest, parse as rw_parse,
@@ -103,7 +104,8 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
 #[test]
 fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
     let otlp_req = otlp_gauge_request("up", "node-a", "checkout");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0).expect("within the expansion budget");
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0, ExpHistogramMode::Classic)
+        .expect("within the expansion budget");
 
     let rw_req = rw_request("up", "node-a", "checkout");
     let rw_out = rw_parse(&rw_req, 0).expect("within the expansion budget");
@@ -137,7 +139,8 @@ fn same_logical_series_fingerprints_identically_across_otlp_and_remote_write() {
 #[test]
 fn dotted_otlp_attribute_and_underscored_remote_write_label_fingerprint_identically() {
     let otlp_req = otlp_gauge_request("cpu_usage_ratio", "node-b", "billing");
-    let otlp_out = otlp_metrics::parse(&otlp_req, 0).expect("within the expansion budget");
+    let otlp_out = otlp_metrics::parse(&otlp_req, 0, ExpHistogramMode::Classic)
+        .expect("within the expansion budget");
 
     let rw_req = rw_request("cpu_usage_ratio", "node-b", "billing");
     let rw_out = rw_parse(&rw_req, 0).expect("within the expansion budget");
@@ -209,7 +212,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_gauge",
     );
-    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0)
+    let otlp_gauge_type = otlp_metrics::parse(&gauge_req, 0, ExpHistogramMode::Classic)
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type
@@ -232,7 +235,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_counter",
     );
-    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0)
+    let otlp_counter_type = otlp_metrics::parse(&counter_req, 0, ExpHistogramMode::Classic)
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type
@@ -259,7 +262,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_histogram",
     );
-    let otlp_histogram_type = otlp_metrics::parse(&histogram_req, 0)
+    let otlp_histogram_type = otlp_metrics::parse(&histogram_req, 0, ExpHistogramMode::Classic)
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type
@@ -287,7 +290,7 @@ fn metric_type_strings_match_the_otlp_parsers_actual_output_for_every_shared_typ
         }),
         "a_summary",
     );
-    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0)
+    let otlp_summary_type = otlp_metrics::parse(&summary_req, 0, ExpHistogramMode::Classic)
         .expect("within the expansion budget")
         .metadata[0]
         .metric_type

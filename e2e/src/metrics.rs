@@ -90,13 +90,64 @@ const STALE_NAN_BITS: u64 = 0x7FF0_0000_0000_0002;
 const STALE_METRIC: &str = "stale_marker_seconds";
 
 /// One entry in `test/fixtures/metrics/differential.json`'s
-/// `query_matrix` (issue #33 architect plan interface: `MatrixQuery`).
-/// `{R}` inside `expr` is replaced with the run's `run_id` at execution
-/// time ([`run_query_matrix`]).
+/// `query_matrix`/`historical.fallback_matrix` (issue #33 architect plan
+/// interface: `MatrixQuery`). `{R}` inside `expr` is replaced with the
+/// run's `run_id` at execution time ([`run_query_matrix`]/[`fallback_leg`]).
+/// `min_series` is a **required** field, deliberately with no `#[serde]`
+/// default (issue #33 false-pass-guard follow-up, AC3a): every row must
+/// carry an explicit positive-signal floor — [`compare_query`] fails a row
+/// whose compared series count falls below it, so an all-empty comparison
+/// on both backends (a fixture typo, a broken `{R}` substitution, a
+/// selector regression) can never pass silently. `0` is legitimate only
+/// for the two pinned scale/parity exceptions (the shipped fixture's own
+/// `_comment`s, and [`tests::shipped_fixture_zero_floor_rows_are_exactly_the_two_pinned_scale_and_parity_exceptions`]);
+/// a zero floor means "allowed to be empty", never "required to be empty"
+/// (codex review round 2, [high] — see [`MatrixTally`]).
+///
+/// `min_series_full` (optional, codex review round 2): a **full-tier
+/// override** for rows whose legitimate result population depends on the
+/// corpus scale — concretely the `instance!~"inst-0.*"` row, empty at the
+/// `ci` tier (23 zero-padded instances all match the `inst-0` prefix) but
+/// deterministically non-empty at the `full` tier (instances 100..=224
+/// escape it). [`Self::effective_min_series`] resolves the floor for the
+/// running [`Scale`]; rows without the override use their single
+/// `min_series` at both tiers.
 #[derive(Debug, Deserialize)]
 struct MatrixQueryRaw {
     expr: String,
     modes: Vec<String>,
+    min_series: usize,
+    #[serde(default)]
+    min_series_full: Option<usize>,
+}
+
+impl MatrixQueryRaw {
+    /// The positive-signal floor in effect for `scale` — `min_series`
+    /// unless the row carries a full-tier override and the run is the
+    /// `full` tier.
+    fn effective_min_series(&self, scale: Scale) -> usize {
+        match scale {
+            Scale::Ci => self.min_series,
+            Scale::Full => self.min_series_full.unwrap_or(self.min_series),
+        }
+    }
+}
+
+/// `test/fixtures/metrics/differential.json`'s top-level `"historical"`
+/// section (issue #33 false-pass-guard + fallback-coverage follow-up,
+/// [`fallback_leg`]): a small, constant-size corpus direct-remote-written
+/// `offset_hours` in the past, forcing every selector's resolution onto
+/// PulsusDB's `metric_series` SqlFallback read path (never exercised by
+/// the main, always-recent differential corpus). Shares the outer
+/// fixture's `seed`/`step_ms`/`histogram_bounds` — this leg reuses the
+/// same already-proven-parity generation code, just offset in time and at
+/// its own (much smaller) `families`/`sample_count`.
+#[derive(Debug, Deserialize)]
+struct HistoricalFixture {
+    offset_hours: i64,
+    sample_count: usize,
+    families: FamilyCounts,
+    fallback_matrix: Vec<MatrixQueryRaw>,
 }
 
 /// The corpus/query-matrix fixture (architect plan: "declarative corpus
@@ -110,6 +161,7 @@ struct DifferentialFixture {
     ci: FamilyCounts,
     full: FamilyCounts,
     query_matrix: Vec<MatrixQueryRaw>,
+    historical: HistoricalFixture,
 }
 
 fn load_fixture(ctx: &Ctx) -> Result<DifferentialFixture> {
@@ -255,10 +307,19 @@ pub async fn metrics_differential(ctx: &Ctx) -> Result<()> {
     .await
     .context("differential corpus never reached completeness on both backends")?;
 
+    // Issue #33 false-pass-guard follow-up: closes the count-only-
+    // completeness gap (module doc comment on the fallback-coverage
+    // section below) for every family, including the raw `_sum`/`_count`/
+    // `target_info` surfaces the query matrix never directly selects.
+    preflight_raw_per_metric(ctx, &corpus, query_request_timeout(scale))
+        .await
+        .context("raw per-metric preflight failed for the main corpus")?;
+
     run_query_matrix(ctx, &corpus, &fixture).await?;
     assert_info_enrichment(ctx, &corpus).await?;
     assert_label_resolution(ctx, &corpus).await?;
     stalenan_micro_case(ctx, scale).await?;
+    fallback_leg(ctx, &fixture, scale, &corpus).await?;
 
     Ok(())
 }
@@ -392,6 +453,17 @@ fn manifest_satisfied(manifest: &Manifest, actual: &Manifest) -> bool {
         .all(|(name, expected)| actual.get(name) == Some(expected))
 }
 
+/// `true` only when `body`'s top-level `status` field is the literal
+/// string `"success"` (issue #33 false-pass-guard follow-up): HTTP-level
+/// errors already hard-fail every call site via [`query_get`]/
+/// [`query_get_raw`]'s status-code check, but a `200 OK` carrying a
+/// well-formed JSON `{"status":"error",...}` body — or an empty/absent
+/// `data` — was never checked, so a body that also happened to parse as a
+/// harmless-looking empty result could otherwise pass silently.
+fn status_ok(body: &serde_json::Value) -> bool {
+    body["status"].as_str() == Some("success")
+}
+
 async fn completeness_attempt(
     ctx: &Ctx,
     run_id: &str,
@@ -431,6 +503,19 @@ async fn completeness_attempt(
                 &[("query", samples_expr.as_str()), ("time", time.as_str())],
             )
             .await?;
+            // Issue #33 false-pass-guard follow-up: a `200` + JSON
+            // `"status":"error"` body is never treated as a (vacuously
+            // empty) completeness signal.
+            if !status_ok(&series_body) {
+                bail!(
+                    "completeness series-count query against {base_url} did not return status=\"success\": {series_body}"
+                );
+            }
+            if !status_ok(&samples_body) {
+                bail!(
+                    "completeness sample-count query against {base_url} did not return status=\"success\": {samples_body}"
+                );
+            }
             let series = single_instant_value(&series_body)?.unwrap_or(0.0).round() as usize;
             let samples = single_instant_value(&samples_body)?.unwrap_or(0.0).round() as usize;
             actual.insert(name.clone(), (series, samples));
@@ -497,6 +582,58 @@ struct QueryWindow {
     step_ms: i64,
 }
 
+/// Pure core of [`run_query_matrix`]'s lane-level tally assertion (issue
+/// #33 false-pass-guard follow-up, AC5; semantics corrected by codex
+/// review round 2, [high]): every executed row is [`Self::record`]ed with
+/// its **effective** positive-signal floor and its compared-series count,
+/// and [`Self::check`] then requires (a) `executed` equals the fixture's
+/// own expansion count (a silently dropped row is never invisible), and
+/// (b) every positive-floor row compared non-empty. **Zero-floor rows do
+/// not participate in the non-empty tally at all** — a zero floor means
+/// "allowed to be empty", never "required to be empty" (the original
+/// tally counted every non-empty row against a positive-floor-only
+/// expectation, which spuriously hard-failed whenever a legitimately-
+/// empty-eligible row happened to return data: the `topk(time() % 2, …)`
+/// parity row is non-empty on ~half of all evaluations, and the
+/// `instance!~"inst-0.*"` row is *always* non-empty at the full tier).
+#[derive(Debug, Default)]
+struct MatrixTally {
+    executed: usize,
+    positive_rows: usize,
+    positive_non_empty: usize,
+}
+
+impl MatrixTally {
+    fn record(&mut self, effective_min_series: usize, series_compared: usize) {
+        self.executed += 1;
+        if effective_min_series >= 1 {
+            self.positive_rows += 1;
+            if series_compared > 0 {
+                self.positive_non_empty += 1;
+            }
+        }
+    }
+
+    fn check(&self, expected_rows: usize) -> Result<()> {
+        if self.executed != expected_rows {
+            bail!(
+                "run_query_matrix executed {} (query, mode) rows, but the fixture expands to \
+                 {expected_rows} — a row was silently skipped",
+                self.executed
+            );
+        }
+        if self.positive_non_empty != self.positive_rows {
+            bail!(
+                "run_query_matrix compared a non-empty series set on only {} of {} \
+                 positive-floor rows — a positive-signal row unexpectedly went empty",
+                self.positive_non_empty,
+                self.positive_rows
+            );
+        }
+        Ok(())
+    }
+}
+
 async fn run_query_matrix(ctx: &Ctx, corpus: &Corpus, fixture: &DifferentialFixture) -> Result<()> {
     let window = QueryWindow {
         eval_ms: corpus.last_ts_ms,
@@ -508,14 +645,93 @@ async fn run_query_matrix(ctx: &Ctx, corpus: &Corpus, fixture: &DifferentialFixt
     // includes the heavy `count_values` range that hit the strict 60s
     // client timeout under single-node saturation.
     let query_timeout = query_request_timeout(corpus.scale);
+    let mut tally = MatrixTally::default();
     for raw in &fixture.query_matrix {
         let expr = raw.expr.replace("{R}", &corpus.run_id);
+        let min_series = raw.effective_min_series(corpus.scale);
         for mode_raw in &raw.modes {
             let mode = parse_mode(mode_raw)?;
-            compare_query(ctx, "mismatch", &expr, mode, window, query_timeout)
-                .await
-                .with_context(|| format!("query {expr:?} ({mode:?})"))?;
+            let outcome = compare_query(
+                ctx,
+                "mismatch",
+                &expr,
+                mode,
+                window,
+                query_timeout,
+                min_series,
+            )
+            .await
+            .with_context(|| format!("query {expr:?} ({mode:?})"))?;
+            tally.record(min_series, outcome.series_compared);
         }
+    }
+    let expected_rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
+    tally.check(expected_rows)?;
+    println!(
+        "pulsus-e2e:   metrics_differential query matrix tally: executed={} \
+         positive_non_empty={}/{}",
+        tally.executed, tally.positive_non_empty, tally.positive_rows
+    );
+    Ok(())
+}
+
+/// Issue #33 false-pass-guard follow-up: closes the completeness gap the
+/// module doc comment describes — `wait_for_completeness` only ever
+/// compares per-metric `(series, samples)` **counts**, which two engines
+/// can satisfy while still diverging on labels/timestamps/values (or on a
+/// family the query matrix never directly selects, e.g. the histogram
+/// `_sum`/`_count` suffixes or `target_info`'s own values). For every
+/// concrete metric name in `corpus`'s manifest, strictly compares two
+/// **raw** range rows (never a bare top-level matrix selector — those are
+/// unsupported by the engine, `crates/pulsus-promql/src/plan.rs`; a
+/// `query_range` of the bare instant-vector selector is the supported,
+/// already-proven-parity substitute, matching the fixed sample grid):
+/// the bare selector itself, and `timestamp(...)` of it — floored at the
+/// metric's *exact* manifest series count (every series with `samples_
+/// emitted >= 1` — which is every series — appears at least once
+/// somewhere in the corpus's own `[first_ts_ms, last_ts_ms]` range, so
+/// this floor is exact, not merely conservative).
+async fn preflight_raw_per_metric(
+    ctx: &Ctx,
+    corpus: &Corpus,
+    query_timeout: Duration,
+) -> Result<()> {
+    let window = QueryWindow {
+        eval_ms: corpus.last_ts_ms,
+        start_ms: corpus.first_ts_ms,
+        end_ms: corpus.last_ts_ms,
+        step_ms: corpus.step_ms,
+    };
+    for (name, (series_count, _samples_count)) in corpus.per_metric_manifest() {
+        let bare_expr = format!(
+            r#"{name}{{{label}="{run_id}"}}"#,
+            label = corpus::RUN_ID_LABEL,
+            run_id = corpus.run_id
+        );
+        compare_query(
+            ctx,
+            "preflight",
+            &bare_expr,
+            Mode::Range,
+            window,
+            query_timeout,
+            series_count,
+        )
+        .await
+        .with_context(|| format!("raw per-metric preflight (bare selector) for {name:?}"))?;
+
+        let ts_expr = format!("timestamp({bare_expr})");
+        compare_query(
+            ctx,
+            "preflight",
+            &ts_expr,
+            Mode::Range,
+            window,
+            query_timeout,
+            series_count,
+        )
+        .await
+        .with_context(|| format!("raw per-metric preflight (timestamp) for {name:?}"))?;
     }
     Ok(())
 }
@@ -626,12 +842,30 @@ async fn query_get(
         .with_context(|| format!("GET {base_url}{path} body was not JSON: {raw}"))
 }
 
+/// [`compare_query`]'s success return — how many series it actually
+/// compared (issue #33 false-pass-guard follow-up): both backends' series
+/// counts are equal by construction whenever this is returned at all
+/// (`diff_series_maps` already asserted equal key sets before this is
+/// computed), so one count suffices. Callers use it for the positive-
+/// signal floor check and the lane-level tally ([`run_query_matrix`]).
+#[derive(Debug)]
+struct RowOutcome {
+    series_compared: usize,
+}
+
 /// One query, run against both backends at identical params, compared
 /// bit-exact-except-NaN. `window.eval_ms` is only used for
 /// [`Mode::Instant`]; `window.{start,end,step}_ms` only for
 /// [`Mode::Range`] — callers always pass a full [`QueryWindow`] so this fn
-/// stays a single reusable entry point for both the main query matrix and
-/// the StaleNaN micro-case.
+/// stays a single reusable entry point for the main query matrix, the raw
+/// per-metric preflight, the fallback leg, and the StaleNaN micro-case.
+/// `min_series` is the fixture-pinned positive-signal floor (issue #33
+/// false-pass-guard follow-up): a clean, otherwise-passing comparison
+/// that compared fewer series than this is itself a failure — closes the
+/// "both backends silently return empty" false-pass class (module doc
+/// comment). A `200` response whose JSON `status` field is not
+/// `"success"` on either backend fails the row the same way an HTTP-level
+/// error already does, before any series comparison is attempted.
 async fn compare_query(
     ctx: &Ctx,
     artifact_prefix: &str,
@@ -639,7 +873,8 @@ async fn compare_query(
     mode: Mode,
     window: QueryWindow,
     query_timeout: Duration,
-) -> Result<()> {
+    min_series: usize,
+) -> Result<RowOutcome> {
     // Owned strings throughout (not `&str` borrows of a match arm's own
     // locals): the params vec must outlive both awaited requests below,
     // well past the match expression's own scope.
@@ -720,18 +955,53 @@ async fn compare_query(
     // finding, issue #33 live-run follow-up: a `resultType` contract
     // violation on one backend previously bailed via `?` before a repro
     // was ever written).
-    let pulsus_series = extract_series(&pulsus_body, &pulsus_timestamps, mode);
-    let prom_series = extract_series(&prom_body, &prom_timestamps, mode);
-
-    let detail = match (pulsus_series, prom_series) {
-        (Ok(p), Ok(r)) => diff_series_maps(&p, &r),
-        (Err(err), _) => Some(format!(
-            "pulsusdb response did not match the expected shape: {err:#}"
-        )),
-        (_, Err(err)) => Some(format!(
-            "prometheus response did not match the expected shape: {err:#}"
-        )),
+    // Issue #33 false-pass-guard follow-up: a `200` carrying a JSON
+    // `"status":"error"` body must fail here, before any series
+    // comparison — closes the class the module doc comment describes
+    // ("a hypothetical 200+status:error body with well-formed empty
+    // data would pass"). Checked before `extract_series` so a status-
+    // error body (which may have no `data` at all) never has to parse as
+    // a valid result shape first.
+    let mut series_compared = 0usize;
+    let detail = if !status_ok(&pulsus_body) || !status_ok(&prom_body) {
+        Some(format!(
+            "status field check failed: pulsusdb status={:?} prometheus status={:?}",
+            pulsus_body.get("status"),
+            prom_body.get("status"),
+        ))
+    } else {
+        let pulsus_series = extract_series(&pulsus_body, &pulsus_timestamps, mode);
+        let prom_series = extract_series(&prom_body, &prom_timestamps, mode);
+        match (pulsus_series, prom_series) {
+            (Ok(p), Ok(r)) => {
+                let diff = diff_series_maps(&p, &r);
+                if diff.is_none() {
+                    series_compared = p.len();
+                }
+                diff
+            }
+            (Err(err), _) => Some(format!(
+                "pulsusdb response did not match the expected shape: {err:#}"
+            )),
+            (_, Err(err)) => Some(format!(
+                "prometheus response did not match the expected shape: {err:#}"
+            )),
+        }
     };
+
+    // Positive-signal floor (issue #33 false-pass-guard follow-up):
+    // checked only once the comparison above is otherwise clean — a real
+    // shape/value/status mismatch always reports as that, never masked by
+    // the floor check.
+    let detail = detail.or_else(|| {
+        (series_compared < min_series).then(|| {
+            format!(
+                "positive-signal violation: compared {series_compared} series for {expr:?} \
+                 ({mode:?}), expected at least {min_series} (fixture min_series floor) — an \
+                 all-empty (or under-floor) comparison on both backends must never pass silently"
+            )
+        })
+    });
 
     if let Some(detail) = detail {
         let mode_str = format!("{mode:?}");
@@ -749,7 +1019,7 @@ async fn compare_query(
             path.display()
         );
     }
-    Ok(())
+    Ok(RowOutcome { series_compared })
 }
 
 type LabelKey = Vec<(String, String)>;
@@ -1381,59 +1651,69 @@ struct Sample {
     timestamp: i64,
 }
 
-/// `services` independent series, each carrying two ordinary samples
-/// (`base_ms`, `base_ms + step_ms`) followed by an explicit StaleNaN
-/// marker sample at `base_ms + 2*step_ms` — labels sorted by name (real
-/// Prometheus's remote-write receiver rejects out-of-order label sets).
-fn build_stalenan_write_request(
-    run_id: &str,
-    base_ms: i64,
-    step_ms: i64,
-    services: usize,
-) -> WriteRequest {
-    let timeseries = (0..services)
-        .map(|service_idx| {
-            let mut labels = vec![
-                Label {
-                    name: "__name__".to_string(),
-                    value: STALE_METRIC.to_string(),
-                },
-                Label {
-                    name: "service".to_string(),
-                    value: corpus::service_label(service_idx),
-                },
-                Label {
-                    name: corpus::RUN_ID_LABEL.to_string(),
-                    value: run_id.to_string(),
-                },
-            ];
+/// Builds a `prompb.WriteRequest` from a batch of [`corpus::RemoteWriteSeries`]
+/// (issue #33 false-pass-guard + fallback-coverage follow-up: generalized
+/// from the StaleNaN micro-case's original single-purpose builder so
+/// [`fallback_leg`] can reuse it for the historical corpus). Labels are
+/// re-sorted defensively (real Prometheus's remote-write receiver rejects
+/// an out-of-order label set) even though [`corpus::to_remote_write_series`]
+/// already emits them sorted — cheap, and keeps this fn correct for any
+/// caller regardless of its input's own ordering discipline.
+fn build_write_request(series: &[corpus::RemoteWriteSeries]) -> WriteRequest {
+    let timeseries = series
+        .iter()
+        .map(|s| {
+            let mut labels: Vec<Label> = s
+                .labels
+                .iter()
+                .map(|(name, value)| Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect();
             labels.sort_by(|a, b| a.name.cmp(&b.name));
-
-            let samples = vec![
-                Sample {
-                    value: 100.0 + service_idx as f64,
-                    timestamp: base_ms,
-                },
-                Sample {
-                    value: 200.0 + service_idx as f64,
-                    timestamp: base_ms + step_ms,
-                },
-                Sample {
-                    value: f64::from_bits(STALE_NAN_BITS),
-                    timestamp: base_ms + step_ms * 2,
-                },
-            ];
+            let samples = s
+                .samples
+                .iter()
+                .map(|&(timestamp, value)| Sample { value, timestamp })
+                .collect();
             TimeSeries { labels, samples }
         })
         .collect();
     WriteRequest { timeseries }
 }
 
-fn encode_stalenan_write_request(req: &WriteRequest) -> Result<Vec<u8>> {
+/// `services` independent series, each carrying two ordinary samples
+/// (`base_ms`, `base_ms + step_ms`) followed by an explicit StaleNaN
+/// marker sample at `base_ms + 2*step_ms`.
+fn build_stalenan_write_request(
+    run_id: &str,
+    base_ms: i64,
+    step_ms: i64,
+    services: usize,
+) -> WriteRequest {
+    let series: Vec<corpus::RemoteWriteSeries> = (0..services)
+        .map(|service_idx| corpus::RemoteWriteSeries {
+            labels: vec![
+                ("__name__".to_string(), STALE_METRIC.to_string()),
+                ("service".to_string(), corpus::service_label(service_idx)),
+                (corpus::RUN_ID_LABEL.to_string(), run_id.to_string()),
+            ],
+            samples: vec![
+                (base_ms, 100.0 + service_idx as f64),
+                (base_ms + step_ms, 200.0 + service_idx as f64),
+                (base_ms + step_ms * 2, f64::from_bits(STALE_NAN_BITS)),
+            ],
+        })
+        .collect();
+    build_write_request(&series)
+}
+
+fn encode_write_request(req: &WriteRequest) -> Result<Vec<u8>> {
     let bytes = req.encode_to_vec();
     snap::raw::Encoder::new()
         .compress_vec(&bytes)
-        .context("failed to snappy-compress the StaleNaN micro-case WriteRequest")
+        .context("failed to snappy-compress a direct-remote-write WriteRequest")
 }
 
 /// Direct `POST {base_url}/api/v1/write` (bypassing the collector — module
@@ -1472,7 +1752,7 @@ async fn stalenan_micro_case(ctx: &Ctx, scale: Scale) -> Result<()> {
     const SERVICES: usize = 3;
 
     let req = build_stalenan_write_request(&run_id, base_ms, step_ms, SERVICES);
-    let body = encode_stalenan_write_request(&req)?;
+    let body = encode_write_request(&req)?;
 
     post_remote_write(&ctx.http, &ctx.base_url, body.clone())
         .await
@@ -1502,6 +1782,11 @@ async fn stalenan_micro_case(ctx: &Ctx, scale: Scale) -> Result<()> {
         end_ms: marker_ts,
         step_ms,
     };
+    // Stays floor-0 (do not "fix" its emptiness — issue #33
+    // false-pass-guard follow-up edge case 8): the instant query at the
+    // marker timestamp is EXPECTED to return no series (the stale-NaN
+    // marker is dropped from every query surface); its positive signal
+    // is the completeness manifest above plus the range row's floor.
     compare_query(
         ctx,
         "stalenan",
@@ -1509,6 +1794,7 @@ async fn stalenan_micro_case(ctx: &Ctx, scale: Scale) -> Result<()> {
         Mode::Instant,
         instant_window,
         query_timeout,
+        0,
     )
     .await
     .context("StaleNaN micro-case: instant query at the marker timestamp")?;
@@ -1526,9 +1812,327 @@ async fn stalenan_micro_case(ctx: &Ctx, scale: Scale) -> Result<()> {
         Mode::Range,
         range_window,
         query_timeout,
+        SERVICES,
     )
     .await
     .context("StaleNaN micro-case: range query spanning the marker timestamp")?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Fallback leg (direct remote-write, bypassing the collector — issue #33
+// false-pass-guard + fallback-coverage follow-up): forces PulsusDB's
+// `metric_series` SqlFallback read path and proves it was actually taken.
+// ---------------------------------------------------------------------
+//
+// A retroactive independent re-review found the differential lane never
+// exercises the historical `metric_series` fallback: the main corpus and
+// every historical-window discovery case sit inside the 24h label-cache
+// window (`PULSUS_CACHE_WINDOW`), so `resolve_over`/`resolve_labelled`
+// always resolve from the warm cache (`crates/pulsus-read/src/metrics/
+// labels.rs`). This leg direct-remote-writes ([`corpus::to_remote_write_series`],
+// the StaleNaN micro-case's own precedent — the leg targets the *read*
+// path, not ingest-path fidelity, so bypassing the collector is
+// deliberate, not a shortcut) a small corpus at `now - offset_hours`,
+// guaranteed (by construction, `test/fixtures/metrics/differential.json`'s
+// `historical.offset_hours` + its own pinned bounds test) to land before
+// `covered_from_ms = floor(now - 24h, 1h bucket)` with a >1h margin that
+// only grows as real time advances — every selector over it resolves via
+// `FallbackReason::OutOfWindow` deterministically. Then it runs the same
+// three classes of strict, never-allowlisted assertion the main corpus
+// does (raw per-metric preflight, a pinned `fallback_matrix`, and the
+// documented bucket-floor discovery contract) against it, plus two proofs
+// that the fallback path was actually exercised (not merely "would have
+// been, in principle"): an `X-Pulsus-Explain` probe and a `/metrics`
+// `pulsus_label_cache_misses_total{reason="out_of_window"}` counter delta.
+
+/// One `GET /api/v1/query` with `X-Pulsus-Explain: 1` (docs/api.md
+/// "Request headers") — deliberately **never** routed through
+/// [`compare_query`]: the explain payload is interleaved into the same
+/// JSON body [`extract_raw_timestamps`] would otherwise scan for bare
+/// `[<digits>` tokens, and an explain SQL string can legitimately contain
+/// a `[` followed by a digit (e.g. `IN (1, 2, 3)` does not, but a future
+/// SQL shape might) — keeping this a separate, undecorated probe means
+/// that risk never has to be reasoned about.
+async fn explain_probe(ctx: &Ctx, expr: &str, time_ms: i64) -> Result<serde_json::Value> {
+    let time = ts_param(time_ms);
+    let res = ctx
+        .http
+        .get(format!("{}/api/v1/query", ctx.base_url))
+        .query(&[("query", expr), ("time", time.as_str())])
+        .header("x-pulsus-explain", "1")
+        .timeout(QUERY_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "GET {}/api/v1/query (explain probe {expr:?}) failed",
+                ctx.base_url
+            )
+        })?;
+    if !res.status().is_success() {
+        bail!(
+            "GET {}/api/v1/query (explain probe {expr:?}) returned {}",
+            ctx.base_url,
+            res.status()
+        );
+    }
+    res.json::<serde_json::Value>()
+        .await
+        .with_context(|| format!("explain probe {expr:?} response was not JSON"))
+}
+
+fn explain_stages(body: &serde_json::Value) -> Result<&Vec<serde_json::Value>> {
+    body["data"]["explain"]["stages"]
+        .as_array()
+        .with_context(|| format!("missing data.explain.stages: {body}"))
+}
+
+/// Asserts `body` (an [`explain_probe`] response) shows the historical
+/// selector was resolved via the `metric_series` SqlFallback path
+/// (`crates/pulsus-read/src/metrics/labels.rs`'s `FallbackReason::
+/// OutOfWindow`, surfaced by `exec.rs::query_inner` as a `series_
+/// resolution` stage whose `note` carries the reason and whose `sql` is
+/// the historical sub-query) and that the resulting `sample_fetch` stage
+/// nests it as `fingerprint IN ( <subquery> )`
+/// (`crates/pulsus-read/src/metrics/sample_sql.rs::sample_fetch_subquery`).
+fn assert_explain_fallback(body: &serde_json::Value) -> Result<()> {
+    let stages = explain_stages(body)?;
+    let series_resolution_ok = stages.iter().any(|s| {
+        s["name"].as_str() == Some("series_resolution")
+            && s["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("OutOfWindow"))
+            && s["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("metric_series"))
+    });
+    if !series_resolution_ok {
+        bail!(
+            "fallback-leg explain trace does not show a series_resolution stage carrying \
+             OutOfWindow + a metric_series sub-query: {body}"
+        );
+    }
+    let sample_fetch_ok = stages.iter().any(|s| {
+        s["name"].as_str() == Some("sample_fetch")
+            && s["sql"].as_str().is_some_and(|sql| sql.contains("IN ("))
+    });
+    if !sample_fetch_ok {
+        bail!(
+            "fallback-leg explain trace does not show a sample_fetch stage with a nested \
+             IN (...) sub-query: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// The opposite control (issue #33 false-pass-guard follow-up, AC6): an
+/// [`explain_probe`] over the (still-warm) main corpus must show the
+/// ordinary `LabelledResolution::Series` cache-hit path
+/// (`exec.rs::query_inner`: `"label cache: {n} matching series"`), proving
+/// this leg's fallback assertion above is discriminating, not vacuously
+/// true for every query.
+fn assert_explain_warm(body: &serde_json::Value) -> Result<()> {
+    let stages = explain_stages(body)?;
+    let ok = stages.iter().any(|s| {
+        s["name"].as_str() == Some("series_resolution")
+            && s["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("label cache:"))
+    });
+    if !ok {
+        bail!(
+            "warm-control explain trace does not show a \"label cache:\" series_resolution stage: {body}"
+        );
+    }
+    Ok(())
+}
+
+/// The current value of `pulsus_label_cache_misses_total{reason=
+/// "out_of_window"}` from PulsusDB's own `/metrics` (Prometheus text
+/// exposition, `crates/pulsus-server/src/ops.rs`) — a plain line-scan
+/// (never a full exposition-format parse; this is the one counter this
+/// leg cares about).
+async fn out_of_window_miss_count(ctx: &Ctx) -> Result<u64> {
+    let res = ctx
+        .http
+        .get(format!("{}/metrics", ctx.base_url))
+        .timeout(QUERY_REQUEST_TIMEOUT)
+        .send()
+        .await
+        .with_context(|| format!("GET {}/metrics failed", ctx.base_url))?;
+    if !res.status().is_success() {
+        bail!("GET {}/metrics returned {}", ctx.base_url, res.status());
+    }
+    let body = res
+        .text()
+        .await
+        .with_context(|| format!("GET {}/metrics body was not valid UTF-8 text", ctx.base_url))?;
+    parse_out_of_window_miss_count(&body)
+}
+
+fn parse_out_of_window_miss_count(body: &str) -> Result<u64> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        if line.starts_with("pulsus_label_cache_misses_total")
+            && line.contains(r#"reason="out_of_window""#)
+        {
+            let value = line
+                .rsplit(' ')
+                .next()
+                .with_context(|| format!("metric line {line:?} has no value field"))?;
+            return value
+                .trim()
+                .parse::<f64>()
+                .map(|v| v.round() as u64)
+                .with_context(|| {
+                    format!("metric line {line:?} value {value:?} was not a parseable f64")
+                });
+        }
+    }
+    bail!(
+        "pulsus_label_cache_misses_total{{reason=\"out_of_window\"}} not found in /metrics body: {body:?}"
+    );
+}
+
+/// The fallback leg itself (module doc comment above): direct-remote-
+/// writes a small historical corpus, proves it via the same
+/// completeness/preflight/matrix/discovery machinery the main corpus
+/// uses, then proves the resolution actually took the SqlFallback path.
+/// `main_corpus` supplies the warm-control explain probe's expression and
+/// eval time (its data is known-warm, having just completed the full
+/// query matrix) — the plan's own interface omitted this parameter, but
+/// AC6's warm-control contrast has no other source of an in-cache
+/// selector to probe (implementation deviation, documented in the issue
+/// #33 implementation notes).
+async fn fallback_leg(
+    ctx: &Ctx,
+    fixture: &DifferentialFixture,
+    scale: Scale,
+    main_corpus: &Corpus,
+) -> Result<()> {
+    let query_timeout = query_request_timeout(scale);
+    let h = &fixture.historical;
+    let run_id = format!("e2e-metrics-historical-{:x}", unique_id()?);
+    let now_ms = now_unix_millis()?;
+    let base_ms = now_ms - h.offset_hours * 3_600_000;
+
+    let spec = CorpusSpec {
+        seed: fixture.seed,
+        scale,
+        step_ms: fixture.step_ms,
+        sample_count: h.sample_count,
+        base_ms,
+        run_id: run_id.clone(),
+        families: h.families,
+        histogram_bounds: fixture.histogram_bounds.clone(),
+    };
+    let corpus = corpus::generate(&spec);
+    println!(
+        "pulsus-e2e:   metrics_differential fallback leg [{:?}]: direct-remote-writing {} \
+         historical series ({}h in the past, run_id={run_id:?})",
+        ctx.variant, corpus.expected_series, h.offset_hours
+    );
+
+    let series = corpus::to_remote_write_series(&corpus);
+    let req = build_write_request(&series);
+    let body = encode_write_request(&req)?;
+    post_remote_write(&ctx.http, &ctx.base_url, body.clone())
+        .await
+        .context("direct remote-write of the historical fallback corpus to PulsusDB failed")?;
+    post_remote_write(&ctx.http, &ctx.prometheus_url, body)
+        .await
+        .context("direct remote-write of the historical fallback corpus to Prometheus failed")?;
+
+    wait_for_completeness(
+        ctx,
+        &run_id,
+        &corpus.per_metric_manifest(),
+        corpus.first_ts_ms,
+    )
+    .await
+    .context("historical fallback corpus never reached completeness on both backends")?;
+
+    let miss_before = out_of_window_miss_count(ctx)
+        .await
+        .context("fallback leg: reading the pre-leg out_of_window miss counter")?;
+
+    preflight_raw_per_metric(ctx, &corpus, query_timeout)
+        .await
+        .context("fallback leg: raw per-metric preflight over the historical corpus")?;
+    let preflight_rows = corpus.per_metric_manifest().len() * 2;
+
+    let window = QueryWindow {
+        eval_ms: corpus.last_ts_ms,
+        start_ms: corpus.first_ts_ms,
+        end_ms: corpus.last_ts_ms,
+        step_ms: corpus.step_ms,
+    };
+    let mut fallback_rows = 0usize;
+    for raw in &h.fallback_matrix {
+        let expr = raw.expr.replace("{R}", &run_id);
+        for mode_raw in &raw.modes {
+            let mode = parse_mode(mode_raw)?;
+            compare_query(
+                ctx,
+                "fallback",
+                &expr,
+                mode,
+                window,
+                query_timeout,
+                raw.min_series,
+            )
+            .await
+            .with_context(|| format!("fallback_matrix query {expr:?} ({mode:?})"))?;
+            fallback_rows += 1;
+        }
+    }
+
+    assert_label_resolution(ctx, &corpus)
+        .await
+        .context("fallback leg: historical discovery windows over the historical corpus")?;
+
+    let fallback_expr = format!(
+        r#"{}{{{label}="{run_id}"}}"#,
+        corpus::GAUGE_METRIC,
+        label = corpus::RUN_ID_LABEL
+    );
+    let fallback_explain = explain_probe(ctx, &fallback_expr, corpus.last_ts_ms)
+        .await
+        .context("fallback leg: explain probe over the historical corpus")?;
+    assert_explain_fallback(&fallback_explain)?;
+
+    let warm_expr = format!(
+        r#"{}{{{label}="{run_id2}"}}"#,
+        corpus::GAUGE_METRIC,
+        label = corpus::RUN_ID_LABEL,
+        run_id2 = main_corpus.run_id
+    );
+    let warm_explain = explain_probe(ctx, &warm_expr, main_corpus.last_ts_ms)
+        .await
+        .context("fallback leg: warm-control explain probe over the main corpus")?;
+    assert_explain_warm(&warm_explain)?;
+
+    let miss_after = out_of_window_miss_count(ctx)
+        .await
+        .context("fallback leg: reading the post-leg out_of_window miss counter")?;
+    let pulsusdb_rows = (preflight_rows + fallback_rows) as u64;
+    let delta = miss_after.saturating_sub(miss_before);
+    if delta < pulsusdb_rows {
+        bail!(
+            "fallback leg: pulsus_label_cache_misses_total{{reason=\"out_of_window\"}} rose by \
+             only {delta}, expected at least {pulsusdb_rows} (this leg's PulsusDB query count) — \
+             the historical corpus does not appear to be resolving through the SqlFallback path"
+        );
+    }
+    println!(
+        "pulsus-e2e:   metrics_differential fallback leg: {pulsusdb_rows} pulsusdb queries, \
+         out_of_window miss delta {delta}"
+    );
 
     Ok(())
 }
@@ -1659,16 +2263,308 @@ mod tests {
             end_ms: 0,
             step_ms: 0,
         };
-        compare_query(
+        let outcome = compare_query(
             &ctx,
             "mismatch",
             "up",
             Mode::Instant,
             window,
             QUERY_REQUEST_TIMEOUT,
+            1,
         )
         .await
         .expect("byte-identical stub responses must compare equal");
+        assert_eq!(outcome.series_compared, 1);
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC1: two stub backends that
+    /// both return a well-formed, `status:"success"`, but **empty** vector
+    /// must fail once `min_series` requires a positive signal — the false-
+    /// pass class the retroactive re-review found (`e2e/src/metrics.rs`'s
+    /// module doc comment: "empty-vs-empty rows pass vacuously").
+    #[tokio::test]
+    async fn compare_query_rejects_two_empty_stub_backends_when_min_series_requires_a_positive_signal()
+     {
+        const BODY: &str = r#"{"status":"success","data":{"resultType":"vector","result":[]}}"#;
+        let pulsus_addr = spawn_stub_backend(BODY).await;
+        let prom_addr = spawn_stub_backend(BODY).await;
+        let ctx = Ctx {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{pulsus_addr}"),
+            collector_url: String::new(),
+            prometheus_url: format!("http://{prom_addr}"),
+            tempo_url: String::new(),
+            loki_url: String::new(),
+            variant: Variant::Single,
+            fixtures_dir: PathBuf::new(),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "pulsus-e2e-metrics-unit-stub",
+            ),
+        };
+        let window = QueryWindow {
+            eval_ms: 0,
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 0,
+        };
+        let err = compare_query(
+            &ctx,
+            "mismatch",
+            "up",
+            Mode::Instant,
+            window,
+            QUERY_REQUEST_TIMEOUT,
+            1,
+        )
+        .await
+        .expect_err("two empty stub responses must fail a min_series=1 positive-signal floor");
+        assert!(err.to_string().contains("positive-signal"), "{err:#}");
+    }
+
+    /// A `min_series=0` floor (the pinned parity-exception shape) must
+    /// still accept two empty stub backends — the guard above is a floor,
+    /// never a blanket "empty is always wrong" rule.
+    #[tokio::test]
+    async fn compare_query_accepts_two_empty_stub_backends_when_min_series_is_zero() {
+        const BODY: &str = r#"{"status":"success","data":{"resultType":"vector","result":[]}}"#;
+        let pulsus_addr = spawn_stub_backend(BODY).await;
+        let prom_addr = spawn_stub_backend(BODY).await;
+        let ctx = Ctx {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{pulsus_addr}"),
+            collector_url: String::new(),
+            prometheus_url: format!("http://{prom_addr}"),
+            tempo_url: String::new(),
+            loki_url: String::new(),
+            variant: Variant::Single,
+            fixtures_dir: PathBuf::new(),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "pulsus-e2e-metrics-unit-stub",
+            ),
+        };
+        let window = QueryWindow {
+            eval_ms: 0,
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 0,
+        };
+        let outcome = compare_query(
+            &ctx,
+            "mismatch",
+            "up",
+            Mode::Instant,
+            window,
+            QUERY_REQUEST_TIMEOUT,
+            0,
+        )
+        .await
+        .expect("min_series=0 must accept two empty backends");
+        assert_eq!(outcome.series_compared, 0);
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC2: a `200 OK` carrying a
+    /// well-formed JSON `{"status":"error",...}` body must never be
+    /// treated as a (vacuously empty, or otherwise) successful comparison
+    /// — closes the gap `crates/pulsus-server`'s HTTP-status-only check
+    /// left open (module doc comment: "closes the 200+status:error
+    /// shape"). `min_series=0` isolates this from the positive-signal
+    /// floor above (proving the status check fires independently).
+    #[tokio::test]
+    async fn compare_query_rejects_status_error_bodies_even_with_well_formed_empty_data() {
+        const BODY: &str = r#"{"status":"error","errorType":"bad_data","error":"synthetic","data":{"resultType":"vector","result":[]}}"#;
+        let pulsus_addr = spawn_stub_backend(BODY).await;
+        let prom_addr = spawn_stub_backend(BODY).await;
+        let ctx = Ctx {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{pulsus_addr}"),
+            collector_url: String::new(),
+            prometheus_url: format!("http://{prom_addr}"),
+            tempo_url: String::new(),
+            loki_url: String::new(),
+            variant: Variant::Single,
+            fixtures_dir: PathBuf::new(),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "pulsus-e2e-metrics-unit-stub",
+            ),
+        };
+        let window = QueryWindow {
+            eval_ms: 0,
+            start_ms: 0,
+            end_ms: 0,
+            step_ms: 0,
+        };
+        let err = compare_query(
+            &ctx,
+            "mismatch",
+            "up",
+            Mode::Instant,
+            window,
+            QUERY_REQUEST_TIMEOUT,
+            0,
+        )
+        .await
+        .expect_err("a status:\"error\" body must never be treated as a successful comparison");
+        assert!(
+            err.to_string().contains("status field check failed"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn status_ok_reads_the_status_field() {
+        assert!(status_ok(&serde_json::json!({"status": "success"})));
+        assert!(!status_ok(&serde_json::json!({"status": "error"})));
+        assert!(!status_ok(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn matrix_tally_rejects_a_shrunken_row_count() {
+        let mut t = MatrixTally::default();
+        for _ in 0..4 {
+            t.record(1, 3);
+        }
+        assert!(t.check(5).is_err());
+    }
+
+    /// Codex review round 2, [high] + test gap (a): a **non-empty
+    /// zero-floor row must never fail the tally** — a zero floor means
+    /// "allowed to be empty", not "required to be empty". Covers both
+    /// parities of the `topk(time() % 2, …)` row (empty on even eval
+    /// seconds, non-empty on odd ones) and the full-tier-non-empty
+    /// `instance!~` shape, hermetically and deterministically — no live
+    /// run/wall-clock parity needed.
+    #[test]
+    fn matrix_tally_accepts_a_zero_floor_row_whether_empty_or_non_empty() {
+        for zero_floor_series_compared in [0usize, 5] {
+            let mut t = MatrixTally::default();
+            t.record(1, 3); // an ordinary positive-floor row, non-empty
+            t.record(0, zero_floor_series_compared); // the exception row, either parity
+            assert!(
+                t.check(2).is_ok(),
+                "a zero-floor row with {zero_floor_series_compared} compared series must not \
+                 fail the tally"
+            );
+        }
+    }
+
+    /// Codex review round 2, test gap (b): the positive-floor discipline
+    /// is still enforced — a positive-floor row that compared empty fails
+    /// the tally (belt-and-suspenders on top of `compare_query`'s own
+    /// per-row floor bail).
+    #[test]
+    fn matrix_tally_rejects_an_empty_positive_floor_row() {
+        let mut t = MatrixTally::default();
+        t.record(1, 3);
+        t.record(1, 0);
+        t.record(0, 0);
+        let err = t
+            .check(3)
+            .expect_err("an empty positive-floor row must fail the tally");
+        assert!(err.to_string().contains("positive-floor"), "{err:#}");
+    }
+
+    #[test]
+    fn matrix_tally_accepts_all_positive_floor_rows_non_empty() {
+        let mut t = MatrixTally::default();
+        for _ in 0..5 {
+            t.record(2, 7);
+        }
+        assert!(t.check(5).is_ok());
+    }
+
+    /// The per-tier floor resolution ([`MatrixQueryRaw::effective_min_series`]):
+    /// `min_series` everywhere, unless a `min_series_full` override exists
+    /// and the run is the full tier.
+    #[test]
+    fn effective_min_series_resolves_the_full_tier_override_only_at_full_scale() {
+        let plain = MatrixQueryRaw {
+            expr: "up".to_string(),
+            modes: vec!["instant".to_string()],
+            min_series: 3,
+            min_series_full: None,
+        };
+        assert_eq!(plain.effective_min_series(Scale::Ci), 3);
+        assert_eq!(plain.effective_min_series(Scale::Full), 3);
+
+        let overridden = MatrixQueryRaw {
+            expr: "up".to_string(),
+            modes: vec!["instant".to_string()],
+            min_series: 0,
+            min_series_full: Some(1562),
+        };
+        assert_eq!(overridden.effective_min_series(Scale::Ci), 0);
+        assert_eq!(overridden.effective_min_series(Scale::Full), 1562);
+    }
+
+    fn canned_warm_explain() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "explain": {
+                    "stages": [
+                        {"name": "series_resolution", "sql": "label cache: 3 matching series", "note": null},
+                        {"name": "sample_fetch", "sql": "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE fingerprint IN (1, 2, 3)", "note": null},
+                    ]
+                }
+            }
+        })
+    }
+
+    fn canned_fallback_explain() -> serde_json::Value {
+        serde_json::json!({
+            "data": {
+                "explain": {
+                    "stages": [
+                        {"name": "series_resolution", "sql": "SELECT fingerprint\nFROM metric_series\nWHERE metric_name = 'mem_usage_bytes'", "note": "OutOfWindow"},
+                        {"name": "sample_fetch", "sql": "SELECT fingerprint, unix_milli, value\nFROM metric_samples\nWHERE fingerprint IN (\nSELECT fingerprint\nFROM metric_series\n)", "note": null},
+                    ]
+                }
+            }
+        })
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC7: [`assert_explain_fallback`]
+    /// must reject a warm-shaped trace and accept a fallback-shaped one.
+    #[test]
+    fn assert_explain_fallback_rejects_a_warm_shaped_trace_and_accepts_a_fallback_shaped_one() {
+        assert!(assert_explain_fallback(&canned_warm_explain()).is_err());
+        assert!(assert_explain_fallback(&canned_fallback_explain()).is_ok());
+    }
+
+    /// The mirror image: [`assert_explain_warm`] must reject a
+    /// fallback-shaped trace and accept a warm-shaped one.
+    #[test]
+    fn assert_explain_warm_rejects_a_fallback_shaped_trace_and_accepts_a_warm_shaped_one() {
+        assert!(assert_explain_warm(&canned_fallback_explain()).is_err());
+        assert!(assert_explain_warm(&canned_warm_explain()).is_ok());
+    }
+
+    #[test]
+    fn parse_out_of_window_miss_count_reads_the_reason_labeled_line() {
+        let body = "# HELP pulsus_label_cache_misses_total x\n# TYPE pulsus_label_cache_misses_total counter\npulsus_label_cache_misses_total{reason=\"cold\"} 3\npulsus_label_cache_misses_total{reason=\"out_of_window\"} 42\npulsus_label_cache_misses_total{reason=\"stale\"} 1\n";
+        assert_eq!(parse_out_of_window_miss_count(body).unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_out_of_window_miss_count_errors_when_the_line_is_absent() {
+        let body = "# HELP x\npulsus_label_cache_misses_total{reason=\"cold\"} 3\n";
+        assert!(parse_out_of_window_miss_count(body).is_err());
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC3a: `min_series` has no
+    /// serde default, so a fixture entry missing it must fail to parse
+    /// rather than silently defaulting to a non-load-bearing floor.
+    #[test]
+    fn matrix_query_raw_requires_min_series() {
+        let missing = r#"{"expr":"up","modes":["instant"]}"#;
+        let err = serde_json::from_str::<MatrixQueryRaw>(missing)
+            .expect_err("min_series must be a required field");
+        assert!(err.to_string().contains("min_series"), "{err}");
     }
 
     /// Issue #33 code review, [medium]: a per-metric-family compensating
@@ -1942,7 +2838,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_stalenan_write_request_round_trips_through_snappy() {
+    fn encode_write_request_round_trips_through_snappy() {
         // Not a plain `assert_eq!(decoded, req)`: `req` carries a genuine
         // NaN value (the stale marker), and `f64`'s `PartialEq` makes
         // `NaN != NaN` — a derived `WriteRequest: PartialEq` would always
@@ -1950,7 +2846,7 @@ mod tests {
         // Comparing every field's bits instead is the correct equality
         // for this round-trip assertion.
         let req = build_stalenan_write_request("r1", 1_000, 15_000, 1);
-        let compressed = encode_stalenan_write_request(&req).unwrap();
+        let compressed = encode_write_request(&req).unwrap();
         let decompressed = snap::raw::Decoder::new()
             .decompress_vec(&compressed)
             .unwrap();
@@ -2161,14 +3057,189 @@ mod tests {
     /// mismatches the oracle on half the steps whichever parity the
     /// run's wall-clock start lands on. Plain query text — no new
     /// oracle flags (the `@` modifier and start() are stable upstream).
+    /// Resized 163 -> 165 by issue #83 (annotation-capability-aware
+    /// sparse subquery envelope pruning): one new entry x 2 modes,
+    /// `max_over_time(mem_usage_bytes{run_id="{R}"}[10s:5s])` — the
+    /// harness's 15s range step exceeds the subquery's own 10s range, so
+    /// the range-mode row is genuinely sparse (client-side pruning to
+    /// the window union fires; the inner is a bare selector, so it is
+    /// annotation-free per `expr_may_annotate`) while both modes stay
+    /// value-identical to the (unobservable) unpruned envelope — live
+    /// parity against the real Prometheus oracle proves the pruning is
+    /// value-exact, not merely unit-tested.
     #[test]
-    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_three_query_mode_rows() {
+    fn shipped_fixture_query_matrix_has_exactly_one_hundred_sixty_five_query_mode_rows() {
         let fixture = shipped_fixture();
         let rows: usize = fixture.query_matrix.iter().map(|e| e.modes.len()).sum();
         assert_eq!(
-            rows, 163,
-            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 163 — update \
+            rows, 165,
+            "query_matrix now expands to {rows} (query, mode) rows, not the pinned 165 — update \
              this test deliberately if the matrix was intentionally resized"
+        );
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC3b (per-tier form, codex
+    /// review round 2): pins the *exact* set of query_matrix rows whose
+    /// **effective** floor is zero, per tier, so a future edit zeroing
+    /// another row's floor (accidentally weakening the guard) fails this
+    /// test immediately. At the `ci` tier there are two exceptions, both
+    /// provable scale/parity properties of the corpus: the topk parity
+    /// case (`k = time() % 2`) and `instance!~"inst-0.*"` (`instance_label`
+    /// zero-pads to 3 digits, and `ci`'s `gauge_instances=23` means every
+    /// instance matches the literal `inst-0` prefix). At the `full` tier
+    /// only the topk parity row remains zero-floored — the regex row's
+    /// `min_series_full` override kicks in there (instances 100..=224
+    /// escape the prefix; the exact count is pinned by
+    /// `shipped_fixture_full_tier_regex_floor_matches_the_generator_derived_instant_count`).
+    /// Every `fallback_matrix` row must carry a positive single floor and
+    /// no per-tier override (the historical corpus is constant-size across
+    /// tiers, so a tier-dependent floor there could only be a mistake).
+    #[test]
+    fn shipped_fixture_zero_effective_floor_rows_are_exactly_the_pinned_exceptions_per_tier() {
+        let fixture = shipped_fixture();
+        let zero_floor_at = |scale: Scale| -> Vec<&str> {
+            fixture
+                .query_matrix
+                .iter()
+                .filter(|e| e.effective_min_series(scale) == 0)
+                .map(|e| e.expr.as_str())
+                .collect()
+        };
+        assert_eq!(
+            zero_floor_at(Scale::Ci),
+            vec![
+                "mem_usage_bytes{run_id=\"{R}\",instance!~\"inst-0.*\"}",
+                "topk(time() % 2, mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} @ start())",
+            ],
+            "the only ci-tier legitimately-empty query_matrix rows are the ci-tier-empty \
+             instance regex and the parity-of-eval-second topk case"
+        );
+        assert_eq!(
+            zero_floor_at(Scale::Full),
+            vec!["topk(time() % 2, mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} @ start())"],
+            "at the full tier only the topk parity row stays zero-floored — the instance regex \
+             row's min_series_full override must apply there"
+        );
+        assert!(
+            fixture
+                .historical
+                .fallback_matrix
+                .iter()
+                .all(|e| e.min_series >= 1 && e.min_series_full.is_none()),
+            "every fallback_matrix row must carry a positive single floor and no per-tier \
+             override (the historical corpus is constant-size across tiers)"
+        );
+    }
+
+    /// Codex review round 2 (full-tier floor arithmetic, pinned against
+    /// the generator rather than by hand alone): the
+    /// `instance!~"inst-0.*"` row's `min_series_full` must equal the
+    /// full-tier corpus's exact **instant-mode** compared-series count —
+    /// gauges whose zero-padded instance label escapes the `inst-0`
+    /// prefix (instance_idx >= 100, i.e. `inst-100`..`inst-224`) AND that
+    /// are still live at the corpus's last evaluated timestamp (the
+    /// engineered stale subset is excluded by both engines' 5m lookback
+    /// there — `corpus::tests::stale_gauge_gap_ages_past_the_lookback_boundary
+    /// _by_the_last_evaluated_timestamp` proves the gap crosses the
+    /// boundary at this exact fixture shape). Range mode returns the full
+    /// escaped population (1875 = 5 services x 125 instances x 3 slots,
+    /// stale or not — their samples still fall inside the queried range),
+    /// which is strictly larger, so the instant-mode count is the correct
+    /// (and exact) floor for both modes. On paper: 313 of the 1875 escaped
+    /// series are stale (flat index ≡ 0 mod 6 ⇔ slot 0 ∧ service+instance
+    /// even ⇒ 3·63 + 2·62), leaving 1562 — this test re-derives that from
+    /// `corpus::generate` so the fixture number can never silently drift.
+    #[test]
+    fn shipped_fixture_full_tier_regex_floor_matches_the_generator_derived_instant_count() {
+        let fixture = shipped_fixture();
+        let spec = CorpusSpec {
+            seed: fixture.seed,
+            scale: Scale::Full,
+            step_ms: fixture.step_ms,
+            sample_count: fixture.sample_count,
+            base_ms: 0,
+            run_id: "fixture-check".to_string(),
+            families: fixture.full,
+            histogram_bounds: fixture.histogram_bounds.clone(),
+        };
+        let c = corpus::generate(&spec);
+        let live_escaped = c
+            .gauges
+            .iter()
+            .filter(|g| !corpus::instance_label(g.instance_idx).starts_with("inst-0"))
+            .filter(|g| g.stale_from.is_none())
+            .count();
+        let row = fixture
+            .query_matrix
+            .iter()
+            .find(|e| e.expr.contains("instance!~"))
+            .expect("the instance regex row must exist");
+        assert_eq!(
+            row.min_series_full,
+            Some(live_escaped),
+            "min_series_full must equal the generator-derived full-tier instant-mode count \
+             ({live_escaped})"
+        );
+        // The paper arithmetic in the fixture comment, held to directly.
+        assert_eq!(live_escaped, 1562);
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC3c: pins the fallback leg's
+    /// own expansion count exactly, the same discipline as the 165-row
+    /// query_matrix pin above.
+    #[test]
+    fn shipped_fixture_fallback_matrix_has_exactly_sixteen_query_mode_rows() {
+        let fixture = shipped_fixture();
+        let rows: usize = fixture
+            .historical
+            .fallback_matrix
+            .iter()
+            .map(|e| e.modes.len())
+            .sum();
+        assert_eq!(
+            rows, 16,
+            "historical.fallback_matrix now expands to {rows} (query, mode) rows, not the \
+             pinned 16 — update this test deliberately if the fixture was intentionally resized"
+        );
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC3d (edge case 4): the
+    /// historical leg's offset must keep a >1h margin past the 24h cache
+    /// window boundary (so `covered_from_ms` is guaranteed exceeded, with
+    /// margin, on every completeness poll retry) and stay well under
+    /// Prometheus's 48h out-of-order acceptance window pinned in
+    /// `deploy/e2e/prometheus.yml`.
+    #[test]
+    fn shipped_fixture_historical_offset_keeps_a_safety_margin_around_the_cache_window_boundary() {
+        let fixture = shipped_fixture();
+        let h = fixture.historical.offset_hours;
+        assert!(
+            h > 25 && h < 47,
+            "offset_hours={h} must stay strictly between 25h (a >1h margin past the 24h cache \
+             window boundary) and 47h (a margin under the 48h Prometheus out-of-order window)"
+        );
+    }
+
+    /// Issue #33 false-pass-guard follow-up, AC3e: the historical leg must
+    /// stay a small, constant-size corpus (never scaling with `ci`/`full`).
+    #[test]
+    fn shipped_fixture_historical_corpus_totals_at_most_one_hundred_series() {
+        let fixture = shipped_fixture();
+        let spec = CorpusSpec {
+            seed: fixture.seed,
+            scale: Scale::Ci,
+            step_ms: fixture.step_ms,
+            sample_count: fixture.historical.sample_count,
+            base_ms: 0,
+            run_id: "fixture-check".to_string(),
+            families: fixture.historical.families,
+            histogram_bounds: fixture.histogram_bounds.clone(),
+        };
+        let c = corpus::generate(&spec);
+        assert!(
+            c.expected_series <= 100,
+            "the historical fallback corpus must stay constant-size (<=100 series), got {}",
+            c.expected_series
         );
     }
 

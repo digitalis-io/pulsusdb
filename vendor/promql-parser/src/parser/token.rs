@@ -140,6 +140,8 @@ pub(crate) fn token_display(id: TokenId) -> &'static str {
         T_EQL_REGEX => "=~",
         T_GTE => ">=",
         T_GTR => ">",
+        T_TRIM_UPPER => "</",
+        T_TRIM_LOWER => ">/",
         T_LAND => "and",
         T_LOR => "or",
         T_LSS => "<",
@@ -313,6 +315,8 @@ mod tests {
         assert_eq!(token_display(T_EQL_REGEX), "=~");
         assert_eq!(token_display(T_GTE), ">=");
         assert_eq!(token_display(T_GTR), ">");
+        assert_eq!(token_display(T_TRIM_UPPER), "</");
+        assert_eq!(token_display(T_TRIM_LOWER), ">/");
         assert_eq!(token_display(T_LAND), "and");
         assert_eq!(token_display(T_LOR), "or");
         assert_eq!(token_display(T_LSS), "<");
@@ -368,13 +372,13 @@ mod tests {
         assert_eq!(token_display(T_PREPROCESSOR_END), "preprocessors_end");
 
         // if new token added in promql.y, this has to be updated
-        for i in 83..=88 {
+        for i in 85..=90 {
             assert_eq!(token_display(i), "not used");
         }
 
         // All tokens are now tested individually above
 
-        for i in 89..=u16::MAX {
+        for i in 91..=u16::MAX {
             assert_eq!(token_display(i), "unknown token");
         }
     }
@@ -459,6 +463,11 @@ mod tests {
 
         assert!(!TokenType(T_ADD).is_comparison_operator());
         assert!(!TokenType(T_LAND).is_comparison_operator());
+        // Trim operators are deliberately excluded: this is what makes `bool`
+        // parse-reject on them (ast.rs) and exempts scalar operands from the
+        // BOOL-modifier requirement.
+        assert!(!TokenType(T_TRIM_UPPER).is_comparison_operator());
+        assert!(!TokenType(T_TRIM_LOWER).is_comparison_operator());
     }
 
     #[test]
@@ -480,6 +489,8 @@ mod tests {
         assert!(TokenType(T_EQL_REGEX).is_operator());
         assert!(TokenType(T_GTE).is_operator());
         assert!(TokenType(T_GTR).is_operator());
+        assert!(TokenType(T_TRIM_UPPER).is_operator());
+        assert!(TokenType(T_TRIM_LOWER).is_operator());
         assert!(TokenType(T_LAND).is_operator());
         assert!(TokenType(T_LOR).is_operator());
         assert!(TokenType(T_LSS).is_operator());

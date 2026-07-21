@@ -269,6 +269,143 @@ async fn metric_hist_samples_explain_shows_metric_name_pk_pruning() {
     );
 }
 
+/// Collects the raw `EXPLAIN indexes = 1` lines for `sql`.
+async fn explain_lines(client: &ChClient, sql: &str) -> Vec<String> {
+    let mut stream = client
+        .query_stream::<ExplainRow>(&format!("EXPLAIN indexes = 1 {sql}"), &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("EXPLAIN failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode explain row").explain);
+    }
+    out
+}
+
+/// The LAST `Granules: k/N` *selected* count in the plan — the PrimaryKey
+/// section's post-pruning selection, which follows the MinMax/Partition
+/// sections (each of which reports its own `Granules` line). `None` when
+/// the query prunes so completely that no `Granules` line survives; both
+/// `None` and `Some(0)` mean "zero granules read" (the `last_granules`
+/// parser precedent, live_traces.rs).
+fn last_selected_granules(plan: &[String]) -> Option<u64> {
+    plan.iter()
+        .rev()
+        .find_map(|l| l.trim().strip_prefix("Granules: "))
+        .and_then(|g| g.split_once('/'))
+        .map(|(k, _)| k.trim().parse::<u64>().expect("granules selected"))
+}
+
+/// M7-A5a AC3 (Tier-1, query-performance mandate): the dual-read's
+/// complementary `metric_hist_samples` read touches **zero granules** for a
+/// single-type series — proven for BOTH prune components of the compound
+/// primary key `(metric_name, fingerprint, unix_milli)`:
+///   (i) a **pure-float metric name** — the leading-PK `metric_name`
+///       PREWHERE prunes every histogram granule; and
+///   (ii) a **float-only fingerprint inside a histogram-bearing metric** —
+///        the `fingerprint IN (…)` prunes the histogram granule whose
+///        fingerprint range excludes it.
+/// The complementary read is dispatched concurrently with the float read
+/// (latency-hidden), and this gate proves it is also byte-free on the wire
+/// for single-type series (A1 v5), never a full scan.
+#[tokio::test]
+async fn complementary_hist_read_selects_zero_granules_for_single_type_series() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_hist_it_zero_granules";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg)
+        .await
+        .expect("connect (data client)");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    let unix_milli = i64::try_from(now.as_millis()).expect("fits i64");
+
+    // Seed ONE histogram granule under `mixed_metric` at fingerprint BIG, so
+    // the hist table is non-empty (an empty MergeTree trims to a NullSource
+    // read and would make the prune trivially/meaninglessly pass).
+    const HIST_FP: u64 = 18374588331335825905;
+    let seed = HistSampleRow {
+        metric_name: "mixed_metric".to_string(),
+        fingerprint: HIST_FP,
+        unix_milli,
+        schema: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        count: 4,
+        sum: 5.0,
+        pos_span_offsets: vec![0],
+        pos_span_lengths: vec![3],
+        pos_bucket_deltas: vec![1, 1, -1],
+        neg_span_offsets: vec![],
+        neg_span_lengths: vec![],
+        neg_bucket_deltas: vec![],
+        custom_values: vec![],
+    };
+    data_client
+        .insert_block("metric_hist_samples", std::slice::from_ref(&seed))
+        .await
+        .expect("insert seed histogram sample");
+
+    let lo = unix_milli - 300_000;
+    let hi = unix_milli + 1;
+
+    // (i) Pure-float metric name: the complementary hist read for a metric
+    // that has NO histogram data — metric_name PREWHERE prunes all granules.
+    let float_only = format!(
+        "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
+         PREWHERE metric_name = 'pure_float_metric' \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN ({HIST_FP}) \
+         ORDER BY fingerprint, unix_milli"
+    );
+    let plan_i = explain_lines(&client, &float_only).await;
+    assert!(
+        matches!(last_selected_granules(&plan_i), None | Some(0)),
+        "(i) pure-float metric name must select zero histogram granules, got:\n{}",
+        plan_i.join("\n")
+    );
+
+    // (ii) Float-only fingerprint inside a histogram-bearing metric: the
+    // `fingerprint IN (1)` prunes the only hist granule (fingerprint range
+    // [BIG, BIG] excludes 1).
+    let float_fp = format!(
+        "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
+         PREWHERE metric_name = 'mixed_metric' \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN (1) \
+         ORDER BY fingerprint, unix_milli"
+    );
+    let plan_ii = explain_lines(&client, &float_fp).await;
+    assert!(
+        matches!(last_selected_granules(&plan_ii), None | Some(0)),
+        "(ii) float-only fingerprint must select zero histogram granules, got:\n{}",
+        plan_ii.join("\n")
+    );
+
+    // Sanity: the matching read DOES select the granule (the gate is not
+    // vacuously passing because the table/part is unreadable).
+    let matching = format!(
+        "SELECT fingerprint, unix_milli, count, sum FROM {db}.metric_hist_samples \
+         PREWHERE metric_name = 'mixed_metric' \
+         WHERE unix_milli > {lo} AND unix_milli <= {hi} AND fingerprint IN ({HIST_FP}) \
+         ORDER BY fingerprint, unix_milli"
+    );
+    let plan_hit = explain_lines(&client, &matching).await;
+    assert_eq!(
+        last_selected_granules(&plan_hit),
+        Some(1),
+        "the matching histogram read must select its one granule, got:\n{}",
+        plan_hit.join("\n")
+    );
+
+    drop_database(&client, db).await;
+}
+
 /// Issue #113 (AC): a native-histogram row round-trips LOSSLESSLY for BOTH a
 /// standard exponential sample AND an NHCB (schema −53) sample — insert →
 /// select → field-equal, including the sparse spans, delta buckets, and NHCB

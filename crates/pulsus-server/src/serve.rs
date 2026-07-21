@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use pulsus_clickhouse::{ChClient, ChError, ChPool};
+use pulsus_clickhouse::{ChClient, ChError, ChPool, spawn_reprobe_loop};
 use pulsus_config::{Config, LogLevel, Mode};
 use pulsus_read::LabelCache;
 use pulsus_schema::SchemaError;
@@ -30,8 +30,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{self, AppState, BuildInfo};
 use crate::chconfig::{
-    bootstrap_conn_config_from, build_label_cache, conn_config_from, metric_writer_tables_from,
-    schema_params_from, trace_writer_tables_from, writer_tables_from,
+    bootstrap_conn_config_from, build_label_cache, conn_config_from, consistency_from,
+    metric_writer_tables_from, schema_params_from, trace_writer_tables_from, writer_tables_from,
 };
 use crate::ingest::{MetricWriterSink, TraceWriterSink, WriterSink};
 
@@ -109,6 +109,11 @@ pub async fn run(config: Config) -> ExitCode {
     // (issue #30 architect plan: "abort/join the refresh handle in the
     // shutdown ordering next to rotation").
     let (label_cache_refresh_tx, label_cache_refresh_rx) = oneshot::channel();
+    // The background ClickHouse-endpoint re-probe task's handle, handed back
+    // the same way (issue #43 re-probe plan: spawned unconditionally right
+    // after `pool_slot` is published — every serving mode holds a pool —
+    // and abort+joined in shutdown ordering after the refresh handle).
+    let (reprobe_tx, reprobe_rx) = oneshot::channel();
     let reconnect_handle = spawn_reconnect_loop(
         Arc::clone(&pool_slot),
         WriterSlots {
@@ -120,6 +125,7 @@ pub async fn run(config: Config) -> ExitCode {
         Arc::clone(&config),
         rotation_tx,
         label_cache_refresh_tx,
+        reprobe_tx,
     );
 
     // The live-tail shutdown signal (issue #74): fired inside the
@@ -152,7 +158,13 @@ pub async fn run(config: Config) -> ExitCode {
         Ok(router) => router,
         Err(err) => {
             eprintln!("pulsusdb: {err}");
-            shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx).await;
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            )
+            .await;
             return ExitCode::FAILURE;
         }
     };
@@ -162,7 +174,13 @@ pub async fn run(config: Config) -> ExitCode {
         Ok(listener) => listener,
         Err(source) => {
             eprintln!("pulsusdb: {}", ServeError::Bind { addr, source });
-            shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx).await;
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            )
+            .await;
             return ExitCode::FAILURE;
         }
     };
@@ -200,32 +218,40 @@ pub async fn run(config: Config) -> ExitCode {
         trace_writer.shutdown(WRITER_DRAIN_DEADLINE).await;
     }
 
-    shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx).await;
+    shutdown_background_tasks(
+        reconnect_handle,
+        rotation_rx,
+        label_cache_refresh_rx,
+        reprobe_rx,
+    )
+    .await;
 
     ExitCode::SUCCESS
 }
 
 /// Stops the reconnect task, then (if one was ever spawned) the rotation
-/// task, then (if one was ever spawned) the label cache refresh task — in
-/// that order, and always joined (never just aborted-and-dropped) so
-/// callers never race `pool_slot`'s teardown against an in-flight
-/// `connect`/`ping`/rotation tick/refresh sweep. Shared by the two
-/// pre-listen startup failure paths above and the normal end-of-`run`
+/// task, then (if one was ever spawned) the label cache refresh task, then
+/// (if one was ever spawned) the background re-probe task — in that order,
+/// and always joined (never just aborted-and-dropped) so callers never race
+/// `pool_slot`'s teardown against an in-flight
+/// `connect`/`ping`/rotation tick/refresh sweep/re-probe pass. Shared by the
+/// two pre-listen startup failure paths above and the normal end-of-`run`
 /// shutdown path, so the ordering contract lives in exactly one place.
 async fn shutdown_background_tasks(
     reconnect_handle: JoinHandle<()>,
     rotation_rx: oneshot::Receiver<JoinHandle<()>>,
     label_cache_refresh_rx: oneshot::Receiver<JoinHandle<()>>,
+    reprobe_rx: oneshot::Receiver<JoinHandle<()>>,
 ) {
     reconnect_handle.abort();
     let _ = reconnect_handle.await;
 
     // By now the reconnect task's fate (finished, or aborted mid-flight) is
-    // sealed, so the sender side of `rotation_rx`/`label_cache_refresh_rx`
-    // has either already sent (schema ready, task running) or been dropped
-    // (skip_ddl, writer-only/no-reader mode, or aborted before ever
-    // reconciling) — these `.await`s therefore resolve immediately either
-    // way, never hanging.
+    // sealed, so the sender side of `rotation_rx`/`label_cache_refresh_rx`/
+    // `reprobe_rx` has either already sent (schema ready, task running) or
+    // been dropped (skip_ddl, writer-only/no-reader mode, or aborted before
+    // ever reconciling) — these `.await`s therefore resolve immediately
+    // either way, never hanging.
     if let Ok(rotation_handle) = rotation_rx.await {
         rotation_handle.abort();
         let _ = rotation_handle.await;
@@ -233,6 +259,15 @@ async fn shutdown_background_tasks(
     if let Ok(refresh_handle) = label_cache_refresh_rx.await {
         refresh_handle.abort();
         let _ = refresh_handle.await;
+    }
+    // The re-probe task is spawned unconditionally the instant `pool_slot`
+    // is published (issue #43 re-probe plan), so `reprobe_rx` only ever
+    // fails to resolve here if the reconnect loop was aborted before its
+    // first successful pass — same "never started" case the rotation/
+    // refresh receivers above already handle.
+    if let Ok(reprobe_handle) = reprobe_rx.await {
+        reprobe_handle.abort();
+        let _ = reprobe_handle.await;
     }
 }
 
@@ -292,6 +327,7 @@ fn spawn_reconnect_loop(
     config: Arc<Config>,
     rotation_tx: oneshot::Sender<JoinHandle<()>>,
     label_cache_refresh_tx: oneshot::Sender<JoinHandle<()>>,
+    reprobe_tx: oneshot::Sender<JoinHandle<()>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut backoff = INITIAL_BACKOFF;
@@ -305,10 +341,30 @@ fn spawn_reconnect_loop(
                     // on `pool_slot`) must imply the ingest route is live
                     // too, not just that the reader's pool exists.
                     if writer_enabled(&config) {
-                        let client = Arc::new(ChClient::from_shared_pool(
+                        // Issue #114: install the consistency policy on the
+                        // shared writer client (fallible — validates the
+                        // quorum/deadline invariant). A config-invariant
+                        // violation is non-self-healing (unlike the transient
+                        // connect/schema failures that log-and-backoff), so
+                        // it terminates the bootstrap task: the writer/cache
+                        // never publish and `/ready` stays 503. In the real
+                        // binary this is unreachable — `pulsus_config::load`
+                        // already rejected it — but the type enforces it.
+                        let client = match ChClient::from_shared_pool(
                             Arc::clone(&pool),
                             config.query_timeout.0,
-                        ));
+                        )
+                        .with_consistency(consistency_from(&config))
+                        {
+                            Ok(c) => Arc::new(c),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "invalid clickhouse consistency config"
+                                );
+                                return;
+                            }
+                        };
                         let writer = Arc::new(LogWriter::new_with_tables(
                             client.clone(),
                             &config.writer,
@@ -362,13 +418,34 @@ fn spawn_reconnect_loop(
                     // gate the rest (cold-cache "label cache warming" 503
                     // for the whole first sweep).
                     if reader_enabled(&config) {
-                        let cache = Arc::new(build_label_cache(Arc::clone(&pool), &config));
+                        // Issue #114: the label cache's shared client also
+                        // installs the consistency policy (fallible). Same
+                        // non-self-healing termination as the writer above.
+                        let cache = match build_label_cache(Arc::clone(&pool), &config) {
+                            Ok(c) => Arc::new(c),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "invalid clickhouse consistency config"
+                                );
+                                return;
+                            }
+                        };
                         let _ = label_cache_slot.set(Arc::clone(&cache));
                         let refresh_handle =
                             pulsus_read::spawn_refresh_loop(cache, config.reader.cache_ttl.0);
                         let _ = label_cache_refresh_tx.send(refresh_handle);
                     }
                     *pool_slot.write().await = Some(Arc::clone(&pool));
+                    // Issue #43 re-probe: spawned unconditionally right
+                    // after `pool_slot` publication — every serving mode
+                    // (`all`/`writer`/`reader`) holds a pool, so demoted
+                    // endpoints must recover in all of them, not just when
+                    // rotation/reader-specific features are enabled.
+                    let reprobe_handle = spawn_reprobe_loop(Arc::clone(&pool));
+                    // Same "receiver may already be gone" reasoning as
+                    // `rotation_tx`/`label_cache_refresh_tx` below/above.
+                    let _ = reprobe_tx.send(reprobe_handle);
                     if rotation_enabled(&config) {
                         let handle = spawn_rotation_task(Arc::clone(&config));
                         // The receiver may already be gone (e.g. `run` is
@@ -610,6 +687,7 @@ mod tests {
         cfg.clickhouse.pool_size = 1;
         let (rotation_tx, _rotation_rx) = oneshot::channel();
         let (label_cache_refresh_tx, _label_cache_refresh_rx) = oneshot::channel();
+        let (reprobe_tx, _reprobe_rx) = oneshot::channel();
         let handle = spawn_reconnect_loop(
             Arc::new(RwLock::new(None)),
             WriterSlots {
@@ -621,6 +699,7 @@ mod tests {
             Arc::new(cfg),
             rotation_tx,
             label_cache_refresh_tx,
+            reprobe_tx,
         );
         assert!(!handle.is_finished());
         handle.abort();
@@ -766,18 +845,25 @@ mod tests {
         rotation_tx
             .send(rotation_handle)
             .unwrap_or_else(|_| panic!("receiver must still be open"));
-        // No label cache refresh task in this scenario — drop the sender
-        // immediately so its receiver resolves to `Err` right away, rather
-        // than hanging on a sender that is merely unused-but-still-alive
-        // for the rest of this test's scope.
+        // No label cache refresh task or re-probe task in this scenario —
+        // drop both senders immediately so their receivers resolve to `Err`
+        // right away, rather than hanging on a sender that is merely
+        // unused-but-still-alive for the rest of this test's scope.
         let (label_cache_refresh_tx, label_cache_refresh_rx) = oneshot::channel::<JoinHandle<()>>();
         drop(label_cache_refresh_tx);
+        let (reprobe_tx, reprobe_rx) = oneshot::channel::<JoinHandle<()>>();
+        drop(reprobe_tx);
 
         // Bounded so a regression that hangs shutdown fails this test
         // instead of the whole suite.
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang on a pending rotation task");
@@ -800,13 +886,53 @@ mod tests {
         label_cache_refresh_tx
             .send(refresh_handle)
             .unwrap_or_else(|_| panic!("receiver must still be open"));
+        // No re-probe task in this scenario (same reasoning as the rotation
+        // sender above).
+        let (reprobe_tx, reprobe_rx) = oneshot::channel::<JoinHandle<()>>();
+        drop(reprobe_tx);
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang on a pending label cache refresh task");
+    }
+
+    /// The background re-probe task's shutdown-ordering counterpart to
+    /// `shutdown_background_tasks_stops_a_pending_rotation_task_too` (issue
+    /// #43 re-probe plan: "abort+joins it after the refresh handle").
+    #[tokio::test]
+    async fn shutdown_background_tasks_stops_a_pending_reprobe_task_too() {
+        let reconnect_handle = tokio::spawn(async {});
+        // No rotation or label cache refresh task in this scenario (same
+        // reasoning as the mirrored fixes above).
+        let (rotation_tx, rotation_rx) = oneshot::channel::<JoinHandle<()>>();
+        drop(rotation_tx);
+        let (label_cache_refresh_tx, label_cache_refresh_rx) = oneshot::channel::<JoinHandle<()>>();
+        drop(label_cache_refresh_tx);
+        let (reprobe_tx, reprobe_rx) = oneshot::channel();
+        let reprobe_handle = tokio::spawn(std::future::pending::<()>());
+        reprobe_tx
+            .send(reprobe_handle)
+            .unwrap_or_else(|_| panic!("receiver must still be open"));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            ),
+        )
+        .await
+        .expect("shutdown_background_tasks must not hang on a pending reprobe task");
     }
 
     /// `PULSUS_SKIP_DDL=1` (or a reconnect loop aborted before ever
@@ -820,10 +946,17 @@ mod tests {
         drop(rotation_tx);
         let (label_cache_refresh_tx, label_cache_refresh_rx) = oneshot::channel::<JoinHandle<()>>();
         drop(label_cache_refresh_tx);
+        let (reprobe_tx, reprobe_rx) = oneshot::channel::<JoinHandle<()>>();
+        drop(reprobe_tx);
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            shutdown_background_tasks(reconnect_handle, rotation_rx, label_cache_refresh_rx),
+            shutdown_background_tasks(
+                reconnect_handle,
+                rotation_rx,
+                label_cache_refresh_rx,
+                reprobe_rx,
+            ),
         )
         .await
         .expect("shutdown_background_tasks must not hang when rotation was never started");

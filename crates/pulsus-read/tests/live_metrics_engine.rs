@@ -32,8 +32,9 @@ use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
-    DataWindow, DiscoveryFilter, ExplainStage, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
-    MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain, QueryResult,
+    DataWindow, DiscoveryFilter, ExplainStage, FetchProbe, LabelCache, LabelCacheConfig,
+    LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
+    QueryResult,
 };
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -116,6 +117,34 @@ struct SeedSampleRow {
     value: f64,
 }
 
+/// M7-A5a: a `metric_hist_samples` seed row (column order matches the
+/// catalog CREATE, RowBinary is positional).
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct SeedHistRow {
+    metric_name: String,
+    fingerprint: u64,
+    unix_milli: i64,
+    schema: i8,
+    zero_threshold: f64,
+    zero_count: u64,
+    count: u64,
+    sum: f64,
+    pos_span_offsets: Vec<i32>,
+    pos_span_lengths: Vec<u32>,
+    pos_bucket_deltas: Vec<i64>,
+    neg_span_offsets: Vec<i32>,
+    neg_span_lengths: Vec<u32>,
+    neg_bucket_deltas: Vec<i64>,
+    custom_values: Vec<f64>,
+}
+
+async fn seed_hist_samples(client: &ChClient, rows: &[SeedHistRow]) {
+    client
+        .insert_block("metric_hist_samples", rows)
+        .await
+        .expect("seed metric_hist_samples");
+}
+
 async fn seed_series(client: &ChClient, rows: &[SeedSeriesRow]) {
     client
         .insert_block("metric_series", rows)
@@ -156,10 +185,14 @@ fn engine_config(db: &str) -> MetricsConfig {
     MetricsConfig {
         db: db.to_string(),
         samples_table: "metric_samples".to_string(),
+        hist_samples_table: "metric_hist_samples".to_string(),
         series_table: "metric_series".to_string(),
         metadata_table: "metric_metadata".to_string(),
         experimental_functions: false,
         max_metric_fanout: 1_000,
+        max_cache_scan: 200_000,
+        max_info_series: 100_000,
+        distributed: false,
     }
 }
 
@@ -277,7 +310,7 @@ async fn count_by_job_up_is_lookback_correct_and_excludes_a_silent_series() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -370,7 +403,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    match engine.query(&expr, &params).await.expect("query") {
+    match engine.query(&expr, &params).await.expect("query").0 {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -385,7 +418,7 @@ async fn bare_selector_query_keeps_metric_name_end_to_end() {
 
     // Aggregation over the same data: drops __name__.
     let expr = parse("sum(up)").expect("parse");
-    match engine.query(&expr, &params).await.expect("query") {
+    match engine.query(&expr, &params).await.expect("query").0 {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
             assert!(
@@ -473,7 +506,7 @@ async fn count_by_job_up_historical_variant_routes_through_metric_series() {
         end_ms: last_week_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -565,7 +598,7 @@ async fn group_with_offset_routes_through_metric_series() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(
@@ -698,7 +731,7 @@ async fn count_by_service_up_over_query_range_returns_a_matrix_not_a_vector() {
         end_ms: t2,
         step_ms,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Matrix(mut m) => {
             // `by (service)` splits into one group per distinct `service`
@@ -807,7 +840,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         end_ms: t0,
         step_ms: 0,
     };
-    let (instant_result, instant_explain) = engine
+    let (instant_result, _annotations, instant_explain) = engine
         .query_explained(&expr, &instant_params)
         .await
         .expect("instant query_explained");
@@ -834,7 +867,7 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
         end_ms: t1,
         step_ms,
     };
-    let (range_result, range_explain) = engine
+    let (range_result, _annotations, range_explain) = engine
         .query_explained(&expr, &range_params)
         .await
         .expect("range query_explained");
@@ -856,28 +889,27 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
 }
 
 /// Ratified concurrency contract (issue #31 plan amendment §2): every
-/// selector's fetch is issued before any of them completes. Proven by an
-/// A/B timing comparison that cancels out everything *except* fetch
-/// concurrency: (A) two **separate** `engine.query()` calls, one per
-/// metric — true sequential fetching, same total I/O and CPU work as (B);
-/// (B) **one** `sum(foo) + sum(bar)` query, whose two selectors fetch
-/// concurrently via `join_all`. Comparing "one query with N selectors" to
-/// "a single selector" directly (an earlier version of this test) confounds
-/// the comparison with the binop's own extra planning/evaluation CPU cost;
-/// comparing (A) to (B) instead holds that cost equal on both sides — (B)
-/// does the *same* evaluation work, just with concurrent I/O — so the
-/// measured gap isolates fetch concurrency specifically. A throwaway
-/// warm-up query runs first so neither timed measurement pays for first-
-/// connection setup. Timing-based and therefore has an inherent (bounded)
-/// flakiness risk shared by every timing assertion in this class of test;
-/// the 0.75x threshold leaves generous headroom over the ~0.5-0.6x a truly
-/// concurrent implementation achieves here (two fetches of equal cost,
-/// overlapped, take roughly one fetch's worth of wall-clock time).
+/// selector's fetch is issued before any of them completes. Issue #135
+/// replaced the original wall-clock A/B timing comparison (flaky on
+/// shared/virtualized hosts) with a deterministic mechanism assertion: a
+/// [`FetchProbe`] installed via [`MetricsEngine::with_fetch_probe`] parks
+/// every selector fetch at entry until released, so a `sum(foo) +
+/// sum(bar)` query's two selector fetches can only both be observed
+/// in-flight (`FetchProbe::in_flight() == 2`) if `query_inner`'s
+/// `join_all` (`metrics/exec.rs:524-529`) truly dispatched them
+/// concurrently — under a regression to a sequential per-selector loop,
+/// the second selector's fetch is never even constructed until the first
+/// completes, so `in_flight` can never reach 2 and the rendezvous below
+/// times out. This is a causal proof, not a timing inference: it holds
+/// under any scheduler, thread count, or ClickHouse round-trip latency.
+/// **Do not reintroduce a wall-clock pass/fail bound here** — the TRIALS
+/// loop below is kept strictly as informational `eprintln` logging (it
+/// remains useful context when investigating a real perf regression) and
+/// must never grow an `assert!` again.
 // Multi-threaded runtime (unlike every other test in this file): the
-// concurrent phase's two fetches must be able to overlap CPU-bound row
-// decode work across real OS threads, not just I/O wait on a single
-// thread — a current-thread runtime under-states the achievable overlap
-// for this specific timing comparison.
+// informational timing phase's two fetches must be able to overlap
+// CPU-bound row decode work across real OS threads, not just I/O wait on
+// a single thread, to produce a representative logged comparison.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_expression_fetches_both_sides_concurrently() {
     skip_unless_live!();
@@ -896,6 +928,9 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     let engine_client = ChClient::new(test_config(db))
         .await
         .expect("connect (engine client)");
+    let probe_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (probe client)");
 
     let now = now_ms();
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
@@ -938,7 +973,11 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     ));
     cache.refresh().await.expect("refresh");
 
-    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    // `Arc::clone` (not a deep copy): the cache's resident snapshot is
+    // shared read-only state, and both engines below need their own
+    // `MetricsEngine` (each owns a distinct `ChClient`) over the same
+    // resolved series.
+    let engine = MetricsEngine::new(engine_client, Arc::clone(&cache), engine_config(db));
     let params = MetricQueryParams {
         start_ms: recent_bucket,
         end_ms: recent_bucket,
@@ -994,26 +1033,52 @@ async fn binary_expression_fetches_both_sides_concurrently() {
 
     eprintln!(
         "sequential (2 queries) median: {seq_median:?} {seq_trials:?}, concurrent (1 binop \
-         query) median: {concurrent_median:?} {concurrent_trials:?}"
+         query) median: {concurrent_median:?} {concurrent_trials:?} (informational only — \
+         issue #135; no pass/fail bound on this measurement)"
     );
-    // Deliberately a loose (non-strict) bound, not a specific speedup
-    // ratio: repeated local measurements against a small single-node
-    // ClickHouse showed a real but noisy 0.77-0.9x concurrent/sequential
-    // ratio — constant per-request overhead dominates over data-scan time
-    // at this scale, on a shared/virtualized CI host the margin can shrink
-    // further still. The claim this assertion makes is narrower but far
-    // more robust: the concurrent (`join_all`-based) path's median is not
-    // *slower* than the sequential path's — which would only fail for a
-    // genuine regression to sequential (`for sel in selectors { fetch(sel)
-    // .await }`) fetching, where the two medians converge to
-    // approximately equal (or the "concurrent" path is a hair slower, from
-    // its extra `join_all` bookkeeping over a plain loop).
+
+    // Issue #135 mechanism assertion: a fresh `MetricsEngine` (its own
+    // `ChClient`, sharing the already-warm `cache`) is built with a
+    // `FetchProbe` installed. Every selector fetch this engine issues
+    // parks at entry until `probe.release()`. Driving the binop query and
+    // the rendezvous observer concurrently via `tokio::join!` means the
+    // observer's poll loop and the query's two selector fetches interleave
+    // on the same runtime: if `join_all` truly dispatches both selectors'
+    // fetches before either completes, both park simultaneously and
+    // `in_flight` reaches 2; under a regression to sequential per-selector
+    // fetching, the second fetch is never even constructed until the
+    // first completes (which cannot happen before release), so
+    // `in_flight` can never exceed 1 and the 30s bound below — a liveness
+    // bound, not a performance comparison — fires deterministically.
+    let probe = FetchProbe::new();
+    let probe_engine = MetricsEngine::new(probe_client, Arc::clone(&cache), engine_config(db))
+        .with_fetch_probe(Arc::clone(&probe));
+
+    let (query_res, rendezvous) = tokio::join!(probe_engine.query(&both_expr, &params), async {
+        let seen = tokio::time::timeout(Duration::from_secs(30), async {
+            while probe.in_flight() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        // ALWAYS release, even on a rendezvous timeout, so a mutated
+        // (sequential-fetch) engine's query still completes and fails at
+        // the assertion below instead of hanging forever on a parked
+        // fetch.
+        probe.release();
+        seen
+    });
+    query_res.expect("binop query under probe");
     assert!(
-        concurrent_median <= seq_median,
-        "expected the concurrent binop query's median time to be no slower than the two \
-         sequential queries' median combined time; sequential_median={seq_median:?} \
-         concurrent_median={concurrent_median:?} (a regression to sequential per-selector \
-         fetching would make these converge or invert)"
+        rendezvous.is_ok(),
+        "both selector fetches were never observed in flight simultaneously within 30s — \
+         regression to sequential per-selector fetching"
+    );
+    assert!(
+        probe.max_in_flight() >= 2,
+        "expected both selector fetches to be in flight at once (max_in_flight={}), proving \
+         `query_inner`'s `join_all` dispatches every selector's fetch concurrently",
+        probe.max_in_flight()
     );
 
     drop_database(&bootstrap, db).await;
@@ -1092,7 +1157,7 @@ async fn rate_end_to_end_against_real_samples() {
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
     match result {
         QueryResult::Vector(v) => {
             assert_eq!(v.len(), 1);
@@ -1164,7 +1229,7 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
             ..engine_config(db)
         },
     );
-    let (result, explain) = on_engine
+    let (result, _annotations, explain) = on_engine
         .query_explained(&expr, &params)
         .await
         .expect("max_of must evaluate with the flag on");
@@ -1177,6 +1242,340 @@ async fn experimental_function_gate_applies_at_the_engine_query_boundary() {
         "max_of(1, 1) has no selectors and must fetch nothing: {:#?}",
         explain.stages
     );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 (retroactive re-review, Finding 1): the info() cardinality
+/// cap on the WARM label-cache path (`LabelledResolution::Series`)
+/// rejects BEFORE any sample fetch — the check runs on `pairs.len()`,
+/// in-memory, before `build_chunk_sqls` is ever called. Three
+/// `target_info` series over a configured cap of 2 must reject with the
+/// named `InfoCardinality` error (which `prom_api::error` maps to `422
+/// execution`), never attempt to fetch a single sample.
+#[tokio::test]
+async fn info_cardinality_cap_rejects_over_cap_before_materialization() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality";
+    init_db(&bootstrap, db).await;
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    // Three distinct target_info series — one more than the cap below —
+    // plus one base series for `info(metric)` to (never get the chance
+    // to) enrich.
+    let info_series: Vec<SeedSeriesRow> = (0..3u64)
+        .map(|i| SeedSeriesRow {
+            metric_name: "target_info".to_string(),
+            fingerprint: 900_000_000_000_000_000 + i,
+            unix_milli: now,
+            labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
+        })
+        .collect();
+    seed_series(&cache_client, &info_series).await;
+    let info_samples: Vec<SeedSampleRow> = info_series
+        .iter()
+        .map(|s| SeedSampleRow {
+            metric_name: s.metric_name.clone(),
+            fingerprint: s.fingerprint,
+            unix_milli: now,
+            value: 1.0,
+        })
+        .collect();
+    seed_samples(&cache_client, &info_samples).await;
+
+    let base = SeedSeriesRow {
+        metric_name: "metric".to_string(),
+        fingerprint: 900_000_000_000_000_100,
+        unix_milli: now,
+        labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+    };
+    seed_series(&cache_client, std::slice::from_ref(&base)).await;
+    seed_samples(
+        &cache_client,
+        &[SeedSampleRow {
+            metric_name: base.metric_name.clone(),
+            fingerprint: base.fingerprint,
+            unix_milli: now,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: now,
+        end_ms: now,
+        step_ms: 0,
+    };
+    let err = engine
+        .query(&expr, &params)
+        .await
+        .expect_err("3 target_info series over a cap of 2 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("info()") && msg.contains("cardinality") && msg.contains('2'),
+        "named info() cardinality rejection naming the cap, got {msg:?}"
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 (retroactive re-review, Finding 1) — the DEGRADED-path twin
+/// of the warm-path cap test above: an out-of-cache-window query forces
+/// `LabelledResolution::SqlFallback`, so the cap is enforced by the
+/// `LIMIT cap+1` cardinality PROBE (`info_series_cardinality_probe`),
+/// run and counted BEFORE the real (unbounded) `sample_fetch_subquery`
+/// ever executes — never a post-fetch backstop.
+#[tokio::test]
+async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality_fallback";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days ago: outside the 24h cache window below (forcing
+    // `SqlFallback`), safely inside the 7-day raw retention TTL — the
+    // `count_by_job_up_historical_variant_routes_through_metric_series`
+    // precedent.
+    let two_days_ms = 2 * 24 * 3_600_000;
+    let last_week_bucket = ((now - two_days_ms) / bucket) * bucket;
+
+    let info_series: Vec<SeedSeriesRow> = (0..3u64)
+        .map(|i| SeedSeriesRow {
+            metric_name: "target_info".to_string(),
+            fingerprint: 900_000_000_000_001_000 + i,
+            unix_milli: last_week_bucket,
+            labels: format!(r#"{{"instance":"i{i}","job":"j"}}"#),
+        })
+        .collect();
+    seed_series(&client, &info_series).await;
+    let info_samples: Vec<SeedSampleRow> = info_series
+        .iter()
+        .map(|s| SeedSampleRow {
+            metric_name: s.metric_name.clone(),
+            fingerprint: s.fingerprint,
+            unix_milli: last_week_bucket,
+            value: 1.0,
+        })
+        .collect();
+    seed_samples(&client, &info_samples).await;
+
+    let base = SeedSeriesRow {
+        metric_name: "metric".to_string(),
+        fingerprint: 900_000_000_000_001_100,
+        unix_milli: last_week_bucket,
+        labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+    };
+    seed_series(&client, std::slice::from_ref(&base)).await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: base.metric_name.clone(),
+            fingerprint: base.fingerprint,
+            unix_milli: last_week_bucket,
+            value: 1.0,
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: last_week_bucket,
+        end_ms: last_week_bucket,
+        step_ms: 0,
+    };
+    let err = engine
+        .query(&expr, &params)
+        .await
+        .expect_err("3 target_info series over a cap of 2 must be rejected (degraded path)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("info()") && msg.contains("cardinality") && msg.contains('2'),
+        "named info() cardinality rejection naming the cap, got {msg:?}"
+    );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #82 code-review round ([high] over-count fix): the degraded-path
+/// cardinality probe counts DISTINCT series, never per-activity-bucket
+/// `metric_series` rows. `metric_series` is written once per series PER
+/// activity bucket (docs/schemas.md §2.1), so 2 distinct `target_info`
+/// series active across 3 buckets yield 6 raw rows — over the cap of 2
+/// under the pre-fix raw-row count (`LIMIT 3` would return 3 rows → a
+/// FALSE 422), but exactly 2 under `SELECT DISTINCT fingerprint` → the
+/// query must SUCCEED and enrich. The genuinely-over-cap distinct count
+/// is covered by the sibling degraded-path test above (3 distinct > 2 →
+/// still 422).
+#[tokio::test]
+async fn info_cardinality_probe_counts_distinct_series_not_activity_bucket_rows() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_info_cardinality_distinct";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days ago (outside the 24h cache window → `SqlFallback`, inside
+    // the 7-day retention), bucket-aligned; the range query below spans
+    // buckets [b0, b0+2*bucket] so all three activity buckets fall inside
+    // the probe's floored window.
+    let two_days_ms = 2 * 24 * 3_600_000;
+    let b0 = ((now - two_days_ms) / bucket) * bucket;
+    let buckets = [b0, b0 + bucket, b0 + 2 * bucket];
+
+    // 2 distinct target_info series × 3 activity buckets = 6 raw
+    // metric_series rows in-window.
+    let mut info_series: Vec<SeedSeriesRow> = Vec::new();
+    let mut samples: Vec<SeedSampleRow> = Vec::new();
+    for i in 0..2u64 {
+        let fp = 900_000_000_000_002_000 + i;
+        for &t in &buckets {
+            info_series.push(SeedSeriesRow {
+                metric_name: "target_info".to_string(),
+                fingerprint: fp,
+                unix_milli: t,
+                labels: format!(r#"{{"instance":"i{i}","job":"j","data":"d{i}"}}"#),
+            });
+            samples.push(SeedSampleRow {
+                metric_name: "target_info".to_string(),
+                fingerprint: fp,
+                unix_milli: t,
+                value: 1.0,
+            });
+        }
+    }
+    seed_series(&client, &info_series).await;
+
+    let base_fp = 900_000_000_000_002_100;
+    seed_series(
+        &client,
+        &[SeedSeriesRow {
+            metric_name: "metric".to_string(),
+            fingerprint: base_fp,
+            unix_milli: b0,
+            labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+        }],
+    )
+    .await;
+    for &t in &buckets {
+        samples.push(SeedSampleRow {
+            metric_name: "metric".to_string(),
+            fingerprint: base_fp,
+            unix_milli: t,
+            value: 1.0,
+        });
+    }
+    seed_samples(&client, &samples).await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(
+        engine_client,
+        cache,
+        MetricsConfig {
+            experimental_functions: true,
+            max_info_series: 2,
+            ..engine_config(db)
+        },
+    );
+
+    // Range query spanning all three activity buckets: 6 raw rows > cap,
+    // 2 distinct series == cap — must succeed and actually enrich.
+    let expr = parse("info(metric)").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: b0,
+        end_ms: b0 + 2 * bucket,
+        step_ms: bucket,
+    };
+    let (result, _annotations) = engine.query(&expr, &params).await.expect(
+        "2 distinct series across 3 activity buckets (6 raw rows) must NOT trip the cap of 2",
+    );
+    match result {
+        QueryResult::Matrix(m) => {
+            assert_eq!(m.len(), 1, "one enriched base series, got {m:?}");
+            assert!(
+                m[0].labels.iter().any(|(k, v)| k == "data" && v == "d0"),
+                "the matching info series must actually enrich: {:?}",
+                m[0].labels
+            );
+        }
+        other => panic!("expected Matrix, got {other:?}"),
+    }
 
     drop_database(&bootstrap, db).await;
 }
@@ -1219,7 +1618,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
 
     // time() -> the eval time in seconds, as a scalar.
     let expr = parse("time()").expect("parse");
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("time() query");
@@ -1239,7 +1638,7 @@ async fn time_only_query_shapes_execute_with_zero_fetch_stages() {
     // vector(time()) -> a one-element vector with the empty label set
     // (no __name__ spliced back in), same zero-fetch story.
     let expr = parse("vector(time())").expect("parse");
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("vector(time()) query");
@@ -1334,7 +1733,7 @@ async fn explain_carries_the_real_generated_sample_fetch_sql() {
     // count/group cache-only fast path), which resolves from the (warm,
     // in-window) cache.
     let expr = parse("sum(up)").expect("parse");
-    let (_, explain) = engine
+    let (_, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -1417,7 +1816,7 @@ async fn explain_carries_the_fallback_subquery_sample_fetch_sql() {
     };
 
     let expr = parse("sum(up)").expect("parse");
-    let (_, explain) = engine
+    let (_, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -2074,7 +2473,7 @@ async fn nameless_selector_fans_out_with_per_series_names_and_one_flat_in_set_fe
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let (result, explain) = engine
+    let (result, _annotations, explain) = engine
         .query_explained(&expr, &params)
         .await
         .expect("query_explained");
@@ -2244,7 +2643,7 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
         end_ms: recent_bucket,
         step_ms: 0,
     };
-    let result = engine.query(&expr, &params).await.expect("query");
+    let (result, _annotations) = engine.query(&expr, &params).await.expect("query");
 
     match result {
         QueryResult::Vector(v) => {
@@ -2270,6 +2669,172 @@ async fn nameless_selector_hydrates_a_post_sweep_cross_pair_never_empty_labels()
             );
         }
         other => panic!("expected Vector, got {other:?}"),
+    }
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// M7-A5a end-to-end against real ClickHouse: the metrics read path
+/// UNCONDITIONALLY dual-reads `metric_samples` + `metric_hist_samples`,
+/// merges by `unix_milli`, and decodes histogram value columns into the
+/// value model. Proven by:
+///  - a **float** metric queried instant returns its float value unchanged
+///    (the dual-read leaves the float path byte-identical — its
+///    complementary histogram read is empty), and
+///  - a **histogram** metric queried instant AND range reaches the value
+///    model as a histogram-valued result (`h: Some`) — observable as the
+///    A5a `HistogramResultUnsupported` rejection, which is only reachable
+///    if the hist row was fetched, merged, and decoded (a fetch/merge/decode
+///    failure would instead yield an empty vector or a decode error).
+#[tokio::test]
+async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_dual_read_hist";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache)");
+    let engine_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (engine)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    let recent_bucket = (now / bucket) * bucket;
+
+    // Two series: a float `up{job="api"}` (fp 1) and a native-histogram
+    // `req_seconds{job="api"}` (fp 2). Both registered in metric_series so
+    // the label cache resolves them; the float goes to metric_samples, the
+    // histogram to metric_hist_samples.
+    seed_series(
+        &client,
+        &[
+            SeedSeriesRow {
+                metric_name: "up".to_string(),
+                fingerprint: 1,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+            SeedSeriesRow {
+                metric_name: "req_seconds".to_string(),
+                fingerprint: 2,
+                unix_milli: recent_bucket,
+                labels: r#"{"job":"api"}"#.to_string(),
+            },
+        ],
+    )
+    .await;
+    seed_samples(
+        &client,
+        &[SeedSampleRow {
+            metric_name: "up".to_string(),
+            fingerprint: 1,
+            unix_milli: recent_bucket,
+            value: 42.0,
+        }],
+    )
+    .await;
+    seed_hist_samples(
+        &client,
+        &[SeedHistRow {
+            metric_name: "req_seconds".to_string(),
+            fingerprint: 2,
+            unix_milli: recent_bucket,
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0,
+            count: 4,
+            sum: 5.0,
+            pos_span_offsets: vec![0],
+            pos_span_lengths: vec![3],
+            pos_bucket_deltas: vec![1, 1, -1],
+            neg_span_offsets: vec![],
+            neg_span_lengths: vec![],
+            neg_bucket_deltas: vec![],
+            custom_values: vec![],
+        }],
+    )
+    .await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    let params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket,
+        step_ms: 0,
+    };
+
+    // The float metric converts unchanged (dual-read's complementary hist
+    // read is empty for `up`).
+    let (float, _annotations) = engine
+        .query(&parse("up").expect("parse"), &params)
+        .await
+        .expect("float query ok");
+    match float {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1);
+            assert_eq!(v[0].value, 42.0);
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
+
+    // The histogram metric was fetched from metric_hist_samples, merged,
+    // and decoded — reaching the value model as a histogram and (M7-A5b-i)
+    // now ENCODING as `QueryResult::VectorHist` instead of the A5a
+    // `HistogramResultUnsupported` reject: proves the hist row was
+    // dual-read, merged, decoded, and `to_float`'d end to end.
+    let (hist_instant, _annotations) = engine
+        .query(&parse("req_seconds").expect("parse"), &params)
+        .await
+        .expect("histogram instant query ok");
+    match hist_instant {
+        QueryResult::VectorHist(v) => {
+            assert_eq!(v.len(), 1);
+            match &v[0].value {
+                pulsus_read::logql::HistOrFloat::Hist(h) => {
+                    assert_eq!(h.count, 4.0);
+                    assert_eq!(h.sum, 5.0);
+                }
+                other => panic!("expected Hist, got {other:?}"),
+            }
+        }
+        other => panic!("expected VectorHist, got {other:?}"),
+    }
+
+    // The matrix path is exercised independently (range query).
+    let range_params = MetricQueryParams {
+        start_ms: recent_bucket,
+        end_ms: recent_bucket + 60_000,
+        step_ms: 60_000,
+    };
+    let (hist_range, _annotations) = engine
+        .query(&parse("req_seconds").expect("parse"), &range_params)
+        .await
+        .expect("histogram range query ok");
+    match hist_range {
+        QueryResult::MatrixHist(m) => {
+            assert_eq!(m.len(), 1);
+            assert!(
+                m[0].points
+                    .iter()
+                    .any(|(_, v)| matches!(v, pulsus_read::logql::HistOrFloat::Hist(_))),
+                "range materialization carries the histogram through"
+            );
+        }
+        other => panic!("expected MatrixHist, got {other:?}"),
     }
 
     drop_database(&bootstrap, db).await;

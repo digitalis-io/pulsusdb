@@ -1,5 +1,5 @@
 //! Exhaustive, table-driven proof that every documented environment
-//! variable (docs/configuration.md §§1–8, 44 variables) parses. Each row
+//! variable (docs/configuration.md §§1–8, 62 variables) parses. Each row
 //! clears the environment, sets only its own variable, calls `parse()`
 //! (not `load()` — see issue #2 architect plan amendment 2), and asserts
 //! the target field. `PULSUS_AUTH_USER`/`PULSUS_AUTH_PASSWORD` need no
@@ -14,7 +14,9 @@ mod support;
 
 use std::time::Duration;
 
-use pulsus_config::{ByteSize, ChProto, Config, InsertMode, LogLevel, Mode, TierPolicy};
+use pulsus_config::{
+    ByteSize, ChProto, Config, ExpHistogramMode, InsertMode, LogLevel, Mode, TierPolicy,
+};
 
 struct Row {
     var: &'static str,
@@ -125,6 +127,26 @@ const ROWS: &[Row] = &[
         check: |c| c.clickhouse.pool_size == 32,
     },
     Row {
+        var: "CLICKHOUSE_INSERT_QUORUM",
+        value: "2",
+        check: |c| c.clickhouse.insert_quorum == 2,
+    },
+    Row {
+        var: "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
+        value: "false",
+        check: |c| !c.clickhouse.insert_quorum_parallel,
+    },
+    Row {
+        var: "CLICKHOUSE_INSERT_QUORUM_TIMEOUT",
+        value: "90s",
+        check: |c| c.clickhouse.insert_quorum_timeout.0 == Duration::from_secs(90),
+    },
+    Row {
+        var: "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
+        value: "true",
+        check: |c| c.clickhouse.select_sequential_consistency,
+    },
+    Row {
         var: "PULSUS_SKIP_DDL",
         value: "1",
         check: |c| c.skip_ddl,
@@ -195,6 +217,11 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.ingest_queue_bytes == ByteSize(8 * 1024 * 1024),
     },
     Row {
+        var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
+        value: "native",
+        check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
+    },
+    Row {
         var: "PULSUS_CACHE_TTL",
         value: "90s",
         check: |c| c.reader.cache_ttl.0 == Duration::from_secs(90),
@@ -235,6 +262,16 @@ const ROWS: &[Row] = &[
         check: |c| c.reader.promql_max_metric_fanout == 250,
     },
     Row {
+        var: "PULSUS_PROMQL_MAX_CACHE_SCAN",
+        value: "500",
+        check: |c| c.reader.promql_max_cache_scan == 500,
+    },
+    Row {
+        var: "PULSUS_PROMQL_MAX_INFO_SERIES",
+        value: "750",
+        check: |c| c.reader.promql_max_info_series == 750,
+    },
+    Row {
         var: "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
         value: "1GiB",
         check: |c| c.reader.logql_scan_budget_bytes == ByteSize(1024 * 1024 * 1024),
@@ -253,6 +290,11 @@ const ROWS: &[Row] = &[
         var: "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
         value: "12345",
         check: |c| c.reader.traceql_scan_budget_rows == 12_345,
+    },
+    Row {
+        var: "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+        value: "1048576",
+        check: |c| c.reader.traceql_generator_max_memory_bytes == 1_048_576,
     },
     Row {
         var: "PULSUS_QUERY_EVAL_CONCURRENCY",
@@ -334,8 +376,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        57,
-        "docs/configuration.md §§1-8 document exactly 57 variables"
+        65,
+        "docs/configuration.md §§1-8 document exactly 65 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();
@@ -363,6 +405,45 @@ fn each_documented_env_var_parses_in_isolation() {
             row.value
         );
     }
+
+    support::clear_all();
+}
+
+/// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` has three valid variants; the ROWS
+/// matrix only exercises `native` (one row per variable, by set equality).
+/// This covers the remaining `classic`/`dual` variants and asserts an
+/// unknown value is a parse error (not a silent default), matching env.rs'
+/// `parse_enum` contract for every config enum.
+#[test]
+fn exp_histogram_mode_accepts_every_variant_and_rejects_unknown() {
+    let _guard = support::lock_env();
+
+    for (value, expected) in [
+        ("classic", ExpHistogramMode::Classic),
+        ("native", ExpHistogramMode::Native),
+        ("dual", ExpHistogramMode::Dual),
+    ] {
+        support::clear_all();
+        support::set("PULSUS_METRICS_EXP_HISTOGRAM_MODE", value);
+        let cfg = pulsus_config::parse(None, None)
+            .unwrap_or_else(|e| panic!("exp-histogram mode {value:?}: parse() failed: {e}"));
+        assert_eq!(
+            cfg.exp_histogram_mode, expected,
+            "exp-histogram mode {value:?} did not map to the expected variant"
+        );
+        // Round-trips through Display back to the same variant.
+        assert_eq!(cfg.exp_histogram_mode.to_string(), value);
+    }
+
+    support::clear_all();
+    support::set("PULSUS_METRICS_EXP_HISTOGRAM_MODE", "quantile");
+    let err = pulsus_config::parse(None, None)
+        .expect_err("an unknown exp-histogram mode must be a parse error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("PULSUS_METRICS_EXP_HISTOGRAM_MODE") && msg.contains("classic, native, dual"),
+        "the rejection must name the variable and the accepted values: {msg}"
+    );
 
     support::clear_all();
 }

@@ -144,7 +144,13 @@ pub(crate) async fn ingest_metrics(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    pulsus_write::ingest_metrics(state.metric_writer.as_ref(), headers, body).await
+    pulsus_write::ingest_metrics(
+        state.metric_writer.as_ref(),
+        headers,
+        body,
+        state.config.exp_histogram_mode,
+    )
+    .await
 }
 
 /// `POST /v1/traces` (docs/api.md §1.1, issue #54): pulls `AppState`'s

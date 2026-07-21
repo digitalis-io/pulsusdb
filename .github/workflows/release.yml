@@ -6,10 +6,17 @@ name: Release
 # on every push — that is explicitly out of scope for this issue
 # (docs/releasing.md notes it as a possible follow-up).
 #
-# `workflow_dispatch` (issue #42) is a build-only dry-run: it compiles both
-# arches under QEMU with no push and no load, so a maintainer can prove the
-# arm64 build works pre-merge (the tag-only trigger otherwise gives no such
-# gate — the first real multi-arch build would only ever be a release).
+# Multi-arch is built on NATIVE runners (issue #111): the `build` job is a
+# per-arch matrix (`amd64 -> ubuntu-latest`, `arm64 -> ubuntu-24.04-arm`), so
+# neither leg emulates under QEMU. Each leg builds only its own platform,
+# smoke-tests the natively-loaded image, then pushes by digest; the dependent
+# `merge` job assembles the final OCI index from the per-arch digests with
+# `docker buildx imagetools create` and runs the #44 supply-chain steps.
+#
+# `workflow_dispatch` (issue #42) is a build-only dry-run: each matrix leg
+# compiles its arch natively with no push and no load, so a maintainer can
+# prove both arches build pre-merge (the tag-only trigger otherwise gives no
+# such gate — the first real multi-arch build would only ever be a release).
 on:
   push:
     tags: ["v*"]
@@ -20,6 +27,8 @@ on:
 # chain (issue #44): `id-token: write` mints the OIDC token keyless cosign
 # exchanges for a Fulcio signing cert, and `attestations: write` lets
 # `actions/attest-build-provenance` record the SLSA provenance attestation.
+# Workflow-level perms are inherited by both jobs (`build` uses only
+# packages:write + contents:read; `merge` uses all four).
 permissions:
   contents: read
   packages: write
@@ -27,16 +36,39 @@ permissions:
   attestations: write
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  # Per-arch build matrix on native runners (issue #111). Each leg builds only
+  # `linux/${{ matrix.arch }}` — no QEMU, no cross-emulation — smoke-tests the
+  # natively-loaded image, then pushes the arch image BY DIGEST (no tag) and
+  # hands its digest to `merge` via a per-arch artifact. `fail-fast: false` so
+  # one arch's failure still surfaces the other's result.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
 
-      # QEMU registers the arm64 binfmt handler used both to build the
-      # emulated linux/arm64 image stage and to `docker run --platform
-      # linux/arm64` the arm64 smoke test below (issue #42).
-      - uses: docker/setup-qemu-action@v3
+      # Mechanically enforce that this tag points at a commit that has
+      # actually been merged into main (issue #38 #115 group). Push-gated
+      # only: the workflow_dispatch dry-run has no tag/ref ancestry to
+      # check. `merge` needs `build`, so a failed gate on either matrix
+      # leg blocks the whole run.
+      - name: Enforce tag ancestry — publish only from merged main
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not an ancestor of origin/main — releases are published only from merged main commits"
+            exit 1
+          fi
 
       - uses: docker/setup-buildx-action@v4
 
@@ -59,6 +91,9 @@ jobs:
       # Tag-path only: a non-tag `workflow_dispatch` ref has no semver, so
       # metadata-action would emit no version/tags — the dry-run below is a
       # build check, not a publish, and references none of these outputs.
+      # In `build` this provides `outputs.version` (smoke assert) and
+      # `outputs.labels` (on the by-digest push); the actual tag list is
+      # applied in `merge`, where the index is assembled.
       - id: meta
         if: github.event_name == 'push'
         uses: docker/metadata-action@v5
@@ -72,58 +107,56 @@ jobs:
           labels: |
             org.opencontainers.image.licenses=AGPL-3.0-only
 
-      # Build-only dry-run (workflow_dispatch, issue #42): compile BOTH arches
-      # under QEMU with no push and no load — `type=cacheonly` discards the
-      # result, so this step succeeds iff the Dockerfile builds for
-      # linux/amd64 AND linux/arm64. A multi-platform build cannot be `load`ed
-      # into the daemon (no manifest list) and there is nothing to push or
-      # `imagetools inspect` here, so this is deliberately just the build
-      # gate the tag-only release otherwise lacks. It warms the same gha
-      # cache scope, so a subsequent real tag reuses these layers.
-      - name: Dry-run multi-arch build (no push, no load)
+      # Build-only dry-run (workflow_dispatch, issue #42/#111): compile THIS
+      # leg's arch natively with no push and no load — `type=cacheonly`
+      # discards the result, so this step succeeds iff the Dockerfile builds
+      # for linux/${{ matrix.arch }}. Nothing to push or `imagetools inspect`
+      # here; this is deliberately just the build gate the tag-only release
+      # otherwise lacks. It warms the per-arch gha cache scope, so a
+      # subsequent real tag reuses these layers.
+      - name: Dry-run build (no push, no load)
         if: github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           outputs: type=cacheonly
           build-args: |
             PULSUS_BUILD_VERSION=${{ github.ref_name }}
             PULSUS_BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=pulsusdb-release
+            type=gha,scope=pulsusdb-release-${{ matrix.arch }}
             type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-release
+          cache-to: type=gha,mode=max,scope=pulsusdb-release-${{ matrix.arch }}
 
-      # 1) Per-arch build + load + smoke, BEFORE anything is pushed — a
-      #    failing smoke test must never leave a broken tag on GHCR. `load:
-      #    true` is single-platform only (it cannot load a manifest list), so
-      #    each arch is built + loaded under its own local `release-smoke-*`
-      #    tag (distinct tags avoid a same-tag/two-arch load collision) and
-      #    smoke-tested with an explicit `--platform`. arm64 runs under QEMU.
-      #    All tag-path only; the dry-run above already covered the build.
-      - id: build-amd64
+      # 1) Native build + load + smoke, BEFORE anything is pushed — a failing
+      #    smoke test must never leave a broken tag on GHCR. `load: true` is
+      #    single-platform only; each leg builds + loads its own arch under a
+      #    local `release-smoke-<arch>` tag and smoke-tests it with an explicit
+      #    `--platform` that now runs NATIVELY (no QEMU). Tag-path only; the
+      #    dry-run above already covered the build.
+      - name: Build and load ${{ matrix.arch }} for smoke test
         if: github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.arch }}
           load: true
-          tags: pulsusdb:release-smoke-amd64
+          tags: pulsusdb:release-smoke-${{ matrix.arch }}
           build-args: |
             PULSUS_BUILD_VERSION=${{ github.ref_name }}
             PULSUS_BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=pulsusdb-release
+            type=gha,scope=pulsusdb-release-${{ matrix.arch }}
             type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-release
+          cache-to: type=gha,mode=max,scope=pulsusdb-release-${{ matrix.arch }}
 
-      - name: Smoke test amd64 (version+revision stamp, non-root, spool writable)
+      - name: Smoke test (version+revision stamp, non-root, spool writable)
         if: github.event_name == 'push'
         run: |
           set -euo pipefail
-          IMG=pulsusdb:release-smoke-amd64
-          PLATFORM=linux/amd64
+          IMG=pulsusdb:release-smoke-${{ matrix.arch }}
+          PLATFORM=linux/${{ matrix.arch }}
           OUT=$(docker run --rm --platform "$PLATFORM" "$IMG" --version)
           echo "$OUT"
           # clap prints: "pulsusdb <VERSION> (<REVISION>)". PULSUS_BUILD_REVISION
@@ -147,81 +180,130 @@ jobs:
             | grep -qF ok \
             || { echo "::error::pulsus (uid 10001) cannot write the spool dir under WORKDIR"; exit 1; }
 
-      - id: build-arm64
-        if: github.event_name == 'push'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm64
-          load: true
-          tags: pulsusdb:release-smoke-arm64
-          build-args: |
-            PULSUS_BUILD_VERSION=${{ github.ref_name }}
-            PULSUS_BUILD_REVISION=${{ github.sha }}
-          cache-from: |
-            type=gha,scope=pulsusdb-release
-            type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-release
-
-      - name: Smoke test arm64 (version+revision stamp, non-root, spool writable)
-        if: github.event_name == 'push'
-        run: |
-          set -euo pipefail
-          IMG=pulsusdb:release-smoke-arm64
-          PLATFORM=linux/arm64
-          OUT=$(docker run --rm --platform "$PLATFORM" "$IMG" --version)
-          echo "$OUT"
-          # Same assertion set as amd64 above, run against the QEMU-emulated
-          # arm64 image; the version/revision stamp is arch-independent.
-          EXPECT="${{ steps.meta.outputs.version }} (${{ github.sha }})"
-          echo "$OUT" | grep -qF "$EXPECT" \
-            || { echo "::error::version/revision stamp mismatch; want '$EXPECT'"; exit 1; }
-          docker run --rm --platform "$PLATFORM" "$IMG" --help >/dev/null
-          test "$(docker run --rm --platform "$PLATFORM" --entrypoint id "$IMG" -u)" != "0"
-          docker run --rm --platform "$PLATFORM" --entrypoint sh "$IMG" -c \
-            'mkdir -p ./spool/uncertain/probe && echo ok > ./spool/uncertain/probe/f && cat ./spool/uncertain/probe/f' \
-            | grep -qF ok \
-            || { echo "::error::pulsus (uid 10001) cannot write the spool dir under WORKDIR"; exit 1; }
-
-      # 2) Push a single multi-arch manifest list (OCI index) only after both
-      #    smoke tests above passed. Cache is warm from the per-arch builds,
-      #    so this rebuild reuses those layers rather than recompiling arm64.
+      # 2) Push THIS arch's image BY DIGEST (no tag) only after its smoke test
+      #    passed. Cache is warm from the load build above (per-arch scope).
       #
-      #    #44 (cosign) seam — do not remove/rename: `id: push` exposes
-      #    `steps.push.outputs.digest`, the OCI *index* digest #44 signs and
-      #    attests (signing the index transitively covers both child
-      #    manifests, so no per-arch signing). `provenance: false` STAYS: it
-      #    pins the index to exactly the two platform manifests, keeping the
-      #    deterministic 2-entry shape the `Verify multi-arch manifest` grep
-      #    below relies on. #44 does NOT re-enable buildx `provenance:`/`sbom:`
-      #    on THIS step — provenance and SBOM are delivered as SEPARATE,
-      #    Rekor-backed attestations keyed to this index digest in the steps
-      #    after the verify (attest-build-provenance + cosign attest).
-      - id: push
+      #    #44 (cosign) seam — `provenance: false` STAYS: it keeps each
+      #    per-arch push a single image manifest (no buildx attestation-manifest
+      #    child), so `imagetools create` in `merge` yields the deterministic
+      #    2-entry OCI index the arch grep and #44 attestations rely on. SLSA
+      #    provenance + SBOM are delivered as SEPARATE Rekor-backed attestations
+      #    keyed to the MERGED-INDEX digest in `merge`, not here.
+      #
+      #    `push-by-digest=true` publishes the manifest under its content digest
+      #    with no tag; `name-canonical=true` records the canonical name. The
+      #    digest is exported as a per-arch artifact for the `merge` fan-in
+      #    (matrix legs share one job-outputs namespace and would clobber each
+      #    other, so job outputs cannot carry distinct per-arch digests).
+      - id: build
         if: github.event_name == 'push'
         uses: docker/build-push-action@v7
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: linux/${{ matrix.arch }}
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=ghcr.io/digitalis-io/pulsusdb,push-by-digest=true,name-canonical=true,push=true
           build-args: |
             PULSUS_BUILD_VERSION=${{ github.ref_name }}
             PULSUS_BUILD_REVISION=${{ github.sha }}
           cache-from: |
-            type=gha,scope=pulsusdb-release
+            type=gha,scope=pulsusdb-release-${{ matrix.arch }}
             type=gha,scope=pulsusdb-e2e
-          cache-to: type=gha,mode=max,scope=pulsusdb-release
+          cache-to: type=gha,mode=max,scope=pulsusdb-release-${{ matrix.arch }}
 
-      # Post-push verification (tag path only): fail the job unless the
-      # published index actually carries both arches.
-      - name: Verify multi-arch manifest
+      - name: Export digest
         if: github.event_name == 'push'
         run: |
           set -euo pipefail
-          IMG=ghcr.io/digitalis-io/pulsusdb:${{ steps.meta.outputs.version }}
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      # upload-artifact@v4 forbids two uploads sharing a name, so each arch
+      # uploads a distinct `digests-<arch>`; `merge` downloads them with a
+      # `digests-*` pattern + merge-multiple.
+      - name: Upload digest
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Fan-in: assemble the multi-arch OCI index from the per-arch digests and run
+  # the #44 supply-chain seam against the immutable index digest (issue #111).
+  # Push-gated at the job level, so the `workflow_dispatch` dry-run produces no
+  # publish; every step below is therefore unconditional within the job.
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+    steps:
+      - name: Download per-arch digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: /tmp/digests
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Provides `DOCKER_METADATA_OUTPUT_JSON` (the tag list applied to the
+      # assembled index) with the same prerelease-suppression contract as the
+      # `build` leg above.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/digitalis-io/pulsusdb
+          flavor: |
+            latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      # Assemble the OCI index from the per-arch digests and capture ITS OWN
+      # digest from `imagetools create`'s metadata file — the immutable digest
+      # of the index THIS run created. We never re-inspect the mutable version
+      # tag to resolve the digest (that was a TOCTOU: a concurrent rerun/retag
+      # could bind the signature/attestations to a different index). The
+      # metadata file is written to `$RUNNER_TEMP`, OUTSIDE the
+      # `working-directory: /tmp/digests` where the `printf ... *` glob runs,
+      # so it is never swept in as a bogus digest argument to `create`.
+      - name: Create multi-arch index and capture its digest
+        id: index
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          # Intentional word-splitting of the tag/ref lists below.
+          # shellcheck disable=SC2046,SC2086
+          docker buildx imagetools create \
+            --metadata-file "${RUNNER_TEMP}/index-metadata.json" \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/digitalis-io/pulsusdb@sha256:%s ' *)
+          DIGEST=$(jq -r '."containerimage.digest"' "${RUNNER_TEMP}/index-metadata.json")
+          if [ -z "$DIGEST" ] || [ "$DIGEST" = null ]; then
+            echo "::error::imagetools create emitted no containerimage.digest"
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # Post-create verification: fail the job unless the index we just built
+      # (addressed by its immutable digest, NOT the mutable tag) carries both
+      # arches.
+      - name: Verify multi-arch manifest
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/digitalis-io/pulsusdb@${{ steps.index.outputs.digest }}
           RAW=$(docker buildx imagetools inspect "$IMG" --raw)
           echo "$RAW"
           echo "$RAW" | grep -q '"architecture": *"amd64"' \
@@ -231,42 +313,39 @@ jobs:
 
       # --- Supply chain: keyless cosign sign + attestations (issue #44) ---
       #
-      # Every step below is tag-path only (`if: github.event_name == 'push'`):
-      # the build-only `workflow_dispatch` dry-run runs no `push` step, so
-      # `steps.push.outputs.digest` is empty there and an ungated step would
-      # sign/attest/verify nothing (or fail). Everything keys off the exact
-      # pushed OCI *index* digest (never a mutable tag). We are already logged
-      # in to ghcr.io (docker/login-action above), so cosign reuses that
-      # credential. Keyless: the workflow's OIDC token -> Fulcio short-lived
-      # cert -> Rekor transparency log; no private key material anywhere.
+      # Everything keys off the exact created OCI *index* digest
+      # (`steps.index.outputs.digest`, from `imagetools create`'s metadata
+      # file) — never a mutable tag. Signing the index transitively covers both
+      # child (amd64 + arm64) manifests via their content-addressed digests.
+      # We are already logged in to ghcr.io (docker/login-action above), so
+      # cosign reuses that credential. Keyless: the workflow's OIDC token ->
+      # Fulcio short-lived cert -> Rekor transparency log; no private key
+      # material anywhere.
       - name: Install cosign
-        if: github.event_name == 'push'
         uses: sigstore/cosign-installer@v3
 
       # Sign the index by digest. Signing the index transitively covers both
       # child (amd64 + arm64) manifests via their content-addressed digests,
       # so there is no `--recursive` / per-arch signing.
       - name: Sign image index (keyless)
-        if: github.event_name == 'push'
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.index.outputs.digest }}
         run: |
           set -euo pipefail
           cosign sign --yes "ghcr.io/digitalis-io/pulsusdb@${DIGEST}"
 
       # SLSA v1.0 build provenance keyed to the index digest, delivered as a
       # Rekor-backed attestation (NOT buildx `provenance: true` — that stays
-      # false above to keep the deterministic index the arch grep relies on).
-      # `push-to-registry` attaches it to the digest in GHCR; its native
-      # verifier is `gh attestation verify` (used in the self-check below —
-      # NOT `cosign verify-attestation --type slsaprovenance`, whose type
-      # maps to the older v0.2 predicate URI and would silently mismatch).
+      # false on the per-arch pushes to keep the deterministic index the arch
+      # grep relies on). `push-to-registry` attaches it to the digest in GHCR;
+      # its native verifier is `gh attestation verify` (used in the self-check
+      # below — NOT `cosign verify-attestation --type slsaprovenance`, whose
+      # type maps to the older v0.2 predicate URI and would silently mismatch).
       - name: Attest build provenance (SLSA v1.0)
-        if: github.event_name == 'push'
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/digitalis-io/pulsusdb
-          subject-digest: ${{ steps.push.outputs.digest }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
 
       # SBOM for the index in SPDX-JSON, generated with syft (anchore), then
@@ -274,17 +353,15 @@ jobs:
       # syft on an index resolves to a single platform (amd64) for v1;
       # per-arch SBOMs are a follow-up (out of scope, noted in docs).
       - name: Generate SBOM (SPDX-JSON)
-        if: github.event_name == 'push'
         uses: anchore/sbom-action@v0
         with:
-          image: ghcr.io/digitalis-io/pulsusdb@${{ steps.push.outputs.digest }}
+          image: ghcr.io/digitalis-io/pulsusdb@${{ steps.index.outputs.digest }}
           format: spdx-json
           output-file: sbom.spdx.json
 
       - name: Attest SBOM (keyless)
-        if: github.event_name == 'push'
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.index.outputs.digest }}
         run: |
           set -euo pipefail
           cosign attest --yes --type spdxjson \
@@ -297,10 +374,9 @@ jobs:
       # SLSA v1.0 provenance (its native verifier); `cosign verify` for the
       # signature; `cosign verify-attestation --type spdxjson` for the SBOM.
       - name: Self-verify provenance (gh attestation verify)
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.index.outputs.digest }}
         run: |
           set -euo pipefail
           gh attestation verify "oci://ghcr.io/digitalis-io/pulsusdb@${DIGEST}" \
@@ -308,9 +384,8 @@ jobs:
             --signer-workflow digitalis-io/pulsusdb/.github/workflows/release.yml
 
       - name: Self-verify signature + SBOM (cosign)
-        if: github.event_name == 'push'
         env:
-          DIGEST: ${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.index.outputs.digest }}
           IDENTITY: https://github.com/digitalis-io/pulsusdb/.github/workflows/release.yml@${{ github.ref }}
         run: |
           set -euo pipefail

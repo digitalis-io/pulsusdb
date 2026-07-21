@@ -42,6 +42,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use prost::Message;
+use pulsus_config::ExpHistogramMode;
 
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -109,7 +110,14 @@ pub async fn ingest(sink: &dyn LogSink, headers: HeaderMap, body: Body) -> Respo
         Err(err) => return error_response(err),
     };
 
-    let parsed = otlp_logs::parse(&request, now_ns);
+    // Fallible since the `AnyValue` recursion-depth guard (finding #54): a
+    // maliciously deep body/attribute tree is a whole-request 400/`code = 3`
+    // reject, the same classification a decode failure gets. `ingest` returns
+    // `Response` (not `Result`), so this matches rather than `?`-propagates.
+    let parsed = match otlp_logs::parse(&request, now_ns) {
+        Ok(parsed) => parsed,
+        Err(err) => return error_response(err),
+    };
     let rejected = parsed.rejected;
     let rejected_message = parsed.rejected_message.clone();
 
@@ -147,7 +155,12 @@ where
 /// shared helper below verbatim. See this module's doc comment for why
 /// `pulsus-server` mounts this `&dyn MetricSink` core directly rather than
 /// [`metrics`]'s generic-`State` form.
-pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Body) -> Response {
+pub async fn ingest_metrics(
+    sink: &dyn MetricSink,
+    headers: HeaderMap,
+    body: Body,
+    mode: ExpHistogramMode,
+) -> Response {
     let now_ns = now_unix_nanos();
 
     let body = match read_capped_body(body, decompress::MAX_DECOMPRESSED_BYTES).await {
@@ -163,8 +176,9 @@ pub async fn ingest_metrics(sink: &dyn MetricSink, headers: HeaderMap, body: Bod
     // Fallible, unlike the logs parse: the metrics parser's expansion
     // budget (`otlp_metrics::MAX_EXPANDED_BYTES`, a structural whole-request
     // bound, issue #62) surfaces here as the same 400/`code = 3`
-    // classification a decode failure gets.
-    let parsed = match otlp_metrics::parse(&request, now_ns) {
+    // classification a decode failure gets. `mode` (issue #120) selects the
+    // OTLP exponential-histogram storage path.
+    let parsed = match otlp_metrics::parse(&request, now_ns, mode) {
         Ok(parsed) => parsed,
         Err(err) => return error_response(err),
     };
@@ -193,7 +207,10 @@ pub async fn metrics<S>(State(sink): State<Arc<S>>, headers: HeaderMap, body: Bo
 where
     S: MetricSink + 'static,
 {
-    ingest_metrics(sink.as_ref(), headers, body).await
+    // This crate's own generic mount point carries no `Config`; it defaults
+    // to `Classic` (current behavior). The server threads the configured
+    // mode through `pulsus_write::ingest_metrics` directly.
+    ingest_metrics(sink.as_ref(), headers, body, ExpHistogramMode::Classic).await
 }
 
 /// `POST /v1/traces` (issue #54): the traces analog of [`ingest`] —
@@ -412,7 +429,10 @@ fn decode_loki_push(
 ///   supported encoding; v1/protobuf/thrift are out of scope), decompressed
 ///   per `Content-Encoding` for gzip; a malformed array or any span with a
 ///   bad id/timestamp is a whole-request `ZipkinDecode` 400 plain-text.
-///   `parsed.rejected` is therefore always 0 here.
+///   Any per-span rejection surfaced by `otlp_traces::parse` (an
+///   out-of-`Date`-range timestamp, issue #8) is likewise promoted to a
+///   whole-request 400 in [`decode_zipkin`], so no partially-accepted batch
+///   is ever admitted here.
 pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body) -> Response {
     let now_ns = now_unix_nanos();
 
@@ -450,6 +470,15 @@ pub async fn ingest_zipkin(sink: &dyn TraceSink, headers: HeaderMap, body: Body)
 /// v2 JSON span array, adapts it to OTLP, and runs the shared
 /// `otlp_traces::parse`. See [`ingest_zipkin`] for why `Content-Type` is
 /// not consulted.
+///
+/// **All-or-nothing promotion (issue #8):** `otlp_traces::parse` keeps
+/// per-span partial-success for the native `/v1/traces` path, but Zipkin has
+/// no partial-success channel — a span rejected by `parse` (e.g. a timestamp
+/// whose UTC day is outside the ClickHouse `Date` range, `start_of_day_utc`
+/// ⇒ `None`) must fail the WHOLE request rather than be silently dropped. So
+/// any `parsed.rejected > 0` is promoted here to a whole-request
+/// [`LogsIngestError::ZipkinDecode`] (400/code 3) before returning — no batch
+/// is admitted, since [`ingest_zipkin`] only admits on `Ok`.
 fn decode_zipkin(
     headers: &HeaderMap,
     body: &[u8],
@@ -459,7 +488,15 @@ fn decode_zipkin(
     let decompressed = decompress::decompress(encoding, body)?;
     let spans = zipkin::decode(&decompressed)?;
     let request = zipkin::to_otlp(spans)?;
-    otlp_traces::parse(&request, now_ns)
+    let parsed = otlp_traces::parse(&request, now_ns)?;
+    if parsed.rejected > 0 {
+        return Err(LogsIngestError::ZipkinDecode(
+            parsed
+                .rejected_message
+                .unwrap_or_else(|| "a span was rejected during parsing".to_string()),
+        ));
+    }
+    Ok(parsed)
 }
 
 /// `true` when the request's `Content-Type` selects a JSON body — the Loki
@@ -1425,6 +1462,61 @@ mod tests {
         assert!(!partial.error_message.is_empty());
     }
 
+    /// Issue #126: a data point whose day falls outside the ClickHouse
+    /// `Date` range (day 65536 = 2149-06-07, one day past the last
+    /// representable day) is rejected as partial success, exactly like the
+    /// zero-timestamp case above — and the admitted batch reaching the sink
+    /// carries no sample for it (nothing can land in `metric_samples`'
+    /// clamped partition).
+    #[tokio::test]
+    async fn metrics_far_future_data_point_is_rejected_and_never_reaches_the_admitted_batch() {
+        let far_future_ns: u64 = 5_662_310_400_000_000_000;
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "up".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                opentelemetry_proto::tonic::metrics::v1::NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: far_future_ns,
+                                    exemplars: vec![],
+                                    flags: 0,
+                                    value: Some(number_data_point::Value::AsDouble(1.0)),
+                                },
+                            ],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(metrics_router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response = ExportMetricsServiceResponse::decode(bytes.as_ref()).unwrap();
+        let partial = response.partial_success.expect("partial success is set");
+        assert_eq!(partial.rejected_data_points, 1);
+
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert!(
+            admitted[0].samples.is_empty(),
+            "the far-future sample must never reach the admitted batch"
+        );
+    }
+
     // -- OTLP/JSON decode surfacing (issue #103, docs/decisions/0004 P6) -----
     // The vendored serde flatten oneofs used to SWALLOW a malformed inner field
     // to `None`, so a bad OTLP/JSON metric returned 202 with the metric silently
@@ -1509,6 +1601,58 @@ mod tests {
         assert_eq!(batch.rejected, 0, "no data point should be rejected");
         assert_eq!(batch.samples.len(), 1, "the asInt counter must ingest");
         assert_eq!(batch.samples[0].value, 42.0);
+    }
+
+    #[tokio::test]
+    async fn metrics_json_malformed_value_oneofs_return_400() {
+        // `Metric.data` (above) is the master swallow site; these are the
+        // three sibling `serde(flatten)` oneofs on the metrics decode surface
+        // — `NumberDataPoint.value`, `Exemplar.value`, `AnyValue.value` — each
+        // of which already errors on a malformed inner value at the serde
+        // layer (`otlp_json_vendor_patch.rs`). This proves the same holds at
+        // the HTTP endpoint: 400/code 3, nothing admitted.
+        let cases: &[(&str, &[u8])] = &[
+            // NumberDataPoint.value: asDouble given a JSON object.
+            (
+                "ndp_asdouble_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":{"bad":1}}]}}]}]}]}"#,
+            ),
+            // NumberDataPoint.value: asInt given a non-integer string (distinct
+            // from the valid string form asserted at :1525).
+            (
+                "ndp_asint_nonnumeric",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asInt":"abc"}]}}]}]}]}"#,
+            ),
+            // NumberDataPoint.value: asInt given a JSON object.
+            (
+                "ndp_asint_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asInt":{}}]}}]}]}]}"#,
+            ),
+            // Exemplar.value: asDouble given a JSON object.
+            (
+                "exemplar_asdouble_object",
+                br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":1.0,"exemplars":[{"asDouble":{"bad":1}}]}]}}]}]}]}"#,
+            ),
+            // AnyValue.value: a resource attribute's doubleValue given a JSON
+            // object. Deserialized by the whole-request decode, so the
+            // vendored visitor's error propagates to the same 400.
+            (
+                "anyvalue_doublevalue_object",
+                br#"{"resourceMetrics":[{"resource":{"attributes":[{"key":"k","value":{"doubleValue":{"bad":1}}}]},"scopeMetrics":[{"metrics":[{"name":"m","gauge":{"dataPoints":[{"asDouble":1.0}]}}]}]}]}"#,
+            ),
+        ];
+        for (label, body) in cases {
+            let sink = MockMetricSink::new(Outcome::Admit);
+            let res =
+                post_metrics_body(metrics_router(sink.clone()), body.to_vec(), &[JSON_CT]).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{label}");
+            let status = decode_status_body(res).await;
+            assert_eq!(status.code, 3, "{label}");
+            assert!(
+                sink.admitted.lock().unwrap().is_empty(),
+                "{label}: nothing admitted"
+            );
+        }
     }
 
     // -- `/v1/traces` (issue #54) ------------------------------------------
@@ -1722,6 +1866,48 @@ mod tests {
         assert_eq!(status.code, 3);
     }
 
+    /// AC-15 (finding #54 scalar backstop): a *structurally valid* single-span
+    /// request — one resource_span / scope_span / span / attribute, under every
+    /// element cap — whose lone `AnyValue.bytes_value` scalar ALONE exceeds
+    /// `MAX_DECOMPRESSED_BYTES`. `read_capped_body` must reject the raw encoded
+    /// body on the `OversizeBody` path (400 / `code = 3`) BEFORE
+    /// `decode_traces_request`/`parse` ever runs, so the oversized scalar never
+    /// materializes into the vendored struct and no row is admitted. This is
+    /// the pre-decode backstop for scalar `bytes`/`string` fields (which carry
+    /// no per-field cap of their own — they are bounded by the shared body cap).
+    #[tokio::test]
+    async fn traces_giant_scalar_bytes_value_is_rejected_pre_decode_by_the_body_cap() {
+        use opentelemetry_proto::tonic::common::v1::KeyValue;
+
+        let mut span = trace_span(vec![1; 16], vec![2; 8]);
+        span.attributes = vec![KeyValue {
+            key: "blob".to_string(),
+            value: Some(AnyValue {
+                value: Some(Value::BytesValue(vec![
+                    0u8;
+                    decompress::MAX_DECOMPRESSED_BYTES
+                        + 1
+                ])),
+            }),
+            key_strindex: 0,
+        }];
+        let body = traces_request(vec![span]).encode_to_vec();
+        assert!(
+            body.len() > decompress::MAX_DECOMPRESSED_BYTES,
+            "the single scalar must push the raw body past the 64 MiB cap"
+        );
+
+        let sink = MockTraceSink::new(Outcome::Admit);
+        let res = post_traces_body(traces_router(sink.clone()), body, &[]).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let status = decode_status_body(res).await;
+        assert_eq!(status.code, 3);
+        assert!(
+            sink.admitted.lock().unwrap().is_empty(),
+            "rejected pre-decode: the oversized scalar never reached the sink"
+        );
+    }
+
     #[tokio::test]
     async fn traces_sink_backpressure_returns_429_with_status_code_8() {
         let sink = MockTraceSink::new(Outcome::Backpressure);
@@ -1771,6 +1957,46 @@ mod tests {
         let partial = response.partial_success.expect("partial success is set");
         assert_eq!(partial.rejected_spans, 1);
         assert!(!partial.error_message.is_empty());
+    }
+
+    // -- `/api/v2/spans` Zipkin all-or-nothing (issue #8) -----------------
+
+    /// Issue #8 (deferred Zipkin reject): a Zipkin span whose `timestamp`
+    /// (microseconds) resolves to a UTC day outside the ClickHouse `Date`
+    /// range (`70_000` days ⇒ `start_of_day_utc` returns `None`) is a per-span
+    /// rejection inside `otlp_traces::parse`. Because Zipkin is all-or-nothing,
+    /// `decode_zipkin` must promote that `parsed.rejected > 0` to a
+    /// whole-request [`LogsIngestError::ZipkinDecode`] (400/code 3) — NOT a
+    /// silent partial drop. The `Err` structurally precludes admission
+    /// ([`ingest_zipkin`] admits only on `Ok`).
+    #[test]
+    fn zipkin_out_of_date_range_timestamp_rejects_the_whole_request() {
+        // 70_000 days in microseconds — well past 2149-06-06 (day 65535).
+        let far_future_micros: i64 = 70_000 * 86_400_000_000;
+        let body = format!(
+            r#"[{{"traceId":"0000000000000001","id":"0000000000000002","timestamp":{far_future_micros}}}]"#
+        );
+        let err = decode_zipkin(
+            &HeaderMap::new(),
+            body.as_bytes(),
+            1_700_000_000_000_000_000,
+        )
+        .expect_err("out-of-Date-range span must reject the whole request");
+        assert!(
+            matches!(err, LogsIngestError::ZipkinDecode(_)),
+            "expected a whole-request ZipkinDecode, got {err:?}"
+        );
+    }
+
+    /// Positive (no false reject): an in-range Zipkin span decodes, adapts,
+    /// and parses with `rejected == 0` — the #8 promotion does not fire on
+    /// legitimate traffic.
+    #[test]
+    fn zipkin_in_range_timestamp_parses_without_rejection() {
+        let body = br#"[{"traceId":"0000000000000001","id":"0000000000000002","timestamp":1700000000000000}]"#;
+        let parsed = decode_zipkin(&HeaderMap::new(), body, 1_700_000_000_000_000_000)
+            .expect("in-range span parses");
+        assert_eq!(parsed.rejected, 0);
     }
 
     // -- `/api/v1/write` (issue #28) --------------------------------------
@@ -1982,6 +2208,36 @@ mod tests {
                 samples: vec![Sample {
                     value: 1.0,
                     timestamp: 1,
+                }],
+            }],
+            metadata: vec![],
+        };
+        let body = snappy_compress(&req.encode_to_vec());
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = call_remote_write(&sink, body, &[]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rejected, 1);
+        assert!(admitted[0].samples.is_empty());
+    }
+
+    /// Issue #126: same reject-boundary contract as the missing-`__name__`
+    /// case above, but for a sample whose day falls outside the ClickHouse
+    /// `Date` range (day 65536 = 2149-06-07) — a per-sample drop, still a
+    /// `204`, and nothing reaches `metric_samples`' clamped partition
+    /// because the admitted batch carries no sample for it.
+    #[tokio::test]
+    async fn remote_write_far_future_timestamp_still_returns_204_sample_never_admitted() {
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![Label {
+                    name: "__name__".to_string(),
+                    value: "up".to_string(),
+                }],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 5_662_310_400_000,
                 }],
             }],
             metadata: vec![],

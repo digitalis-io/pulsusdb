@@ -60,7 +60,9 @@ use crate::writer::config::WriterRuntime;
 use crate::writer::error::WriteError;
 use crate::writer::metrics::{MetricWriterMetrics, MetricWriterMetricsSnapshot};
 use crate::writer::registration::{MetadataCache, SeriesKey, SeriesLru};
-use crate::writer::rows::{MetricMetadataRow, MetricSampleRow, MetricSeriesRow};
+use crate::writer::rows::{
+    MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
+};
 use crate::writer::spool;
 use crate::writer::table::{self, BlockInserter, ChBlockInserter, ShutdownSignal, TableContext};
 
@@ -70,6 +72,15 @@ const SERIES_TABLE: &str = "metric_series";
 /// None`) — it never carries a `_dist` suffix, unlike `metric_samples`/
 /// `metric_series` (docs/schemas.md §7).
 const METADATA_TABLE: &str = "metric_metadata";
+/// `metric_hist_samples` (catalog id 23, M7-A4 issue #120) — a Metrics-family
+/// per-shard table, co-sharded with `metric_samples`, so it carries a `_dist`
+/// suffix in cluster mode exactly like `metric_samples`/`metric_series`.
+const HIST_SAMPLES_TABLE: &str = "metric_hist_samples";
+
+/// The `metric_series.value_type` discriminant for a float sample.
+const VALUE_TYPE_FLOAT: u8 = 0;
+/// The `metric_series.value_type` discriminant for a native-histogram sample.
+const VALUE_TYPE_HISTOGRAM: u8 = 1;
 
 /// The three target table names a [`MetricWriter`] inserts into (docs/
 /// schemas.md §2.1, mirroring [`crate::writer::WriterTables`]'s issue #15
@@ -83,6 +94,9 @@ pub struct MetricWriterTables {
     pub samples: Arc<str>,
     pub series: Arc<str>,
     pub metadata: Arc<str>,
+    /// `metric_hist_samples` (M7-A4, issue #120) — `_dist`-aware like
+    /// `samples`/`series` (a co-sharded Metrics-family table).
+    pub hist_samples: Arc<str>,
 }
 
 impl MetricWriterTables {
@@ -94,6 +108,7 @@ impl MetricWriterTables {
             samples: Arc::from(SAMPLES_TABLE),
             series: Arc::from(SERIES_TABLE),
             metadata: Arc::from(METADATA_TABLE),
+            hist_samples: Arc::from(HIST_SAMPLES_TABLE),
         }
     }
 }
@@ -102,9 +117,11 @@ struct Shared {
     samples: Arc<buffer::TableBuffer<MetricSampleRow>>,
     series: Arc<buffer::TableBuffer<MetricSeriesRow>>,
     metadata: Arc<buffer::TableBuffer<MetricMetadataRow>>,
+    hist_samples: Arc<buffer::TableBuffer<MetricHistSampleRow>>,
     samples_notify: Arc<Notify>,
     series_notify: Arc<Notify>,
     metadata_notify: Arc<Notify>,
+    hist_samples_notify: Arc<Notify>,
     queued_bytes: Arc<AtomicU64>,
     runtime: Arc<WriterRuntime>,
     metrics: Arc<MetricWriterMetrics>,
@@ -119,6 +136,7 @@ struct Shared {
     samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     series_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metadata_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    hist_samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Implements issue #26's `MetricSink` over a generic per-table columnar
@@ -154,6 +172,7 @@ impl MetricWriter {
         Self::with_inserters_with_tables(
             inserter.clone(),
             inserter.clone(),
+            inserter.clone(),
             inserter,
             cfg,
             bucket_ms,
@@ -161,13 +180,14 @@ impl MetricWriter {
         )
     }
 
-    /// Test/mock constructor: any [`BlockInserter`] triple — e.g. a
+    /// Test/mock constructor: any [`BlockInserter`] quadruple — e.g. a
     /// scriptable mock that can fail/hang on demand — against the
     /// unclustered default table names.
     pub fn with_inserters(
         samples_inserter: Arc<dyn BlockInserter<MetricSampleRow>>,
         series_inserter: Arc<dyn BlockInserter<MetricSeriesRow>>,
         metadata_inserter: Arc<dyn BlockInserter<MetricMetadataRow>>,
+        hist_samples_inserter: Arc<dyn BlockInserter<MetricHistSampleRow>>,
         cfg: &WriterConfig,
         bucket_ms: i64,
     ) -> Self {
@@ -175,6 +195,7 @@ impl MetricWriter {
             samples_inserter,
             series_inserter,
             metadata_inserter,
+            hist_samples_inserter,
             cfg,
             bucket_ms,
             MetricWriterTables::metrics_default(),
@@ -186,6 +207,7 @@ impl MetricWriter {
         samples_inserter: Arc<dyn BlockInserter<MetricSampleRow>>,
         series_inserter: Arc<dyn BlockInserter<MetricSeriesRow>>,
         metadata_inserter: Arc<dyn BlockInserter<MetricMetadataRow>>,
+        hist_samples_inserter: Arc<dyn BlockInserter<MetricHistSampleRow>>,
         cfg: &WriterConfig,
         bucket_ms: i64,
         tables: MetricWriterTables,
@@ -213,9 +235,11 @@ impl MetricWriter {
         let samples = Arc::new(buffer::TableBuffer::new());
         let series = Arc::new(buffer::TableBuffer::new());
         let metadata = Arc::new(buffer::TableBuffer::new());
+        let hist_samples = Arc::new(buffer::TableBuffer::new());
         let samples_notify = Arc::new(Notify::new());
         let series_notify = Arc::new(Notify::new());
         let metadata_notify = Arc::new(Notify::new());
+        let hist_samples_notify = Arc::new(Notify::new());
 
         // `metric_series`'s success-only LRU promotion (architect plan
         // amendment 1): populated ONLY here, after a confirmed flush —
@@ -234,6 +258,7 @@ impl MetricWriter {
                         Arc::from(row.metric_name.as_str()),
                         row.fingerprint,
                         row.unix_milli,
+                        row.value_type,
                     );
                     guard.insert(key);
                 }
@@ -290,18 +315,37 @@ impl MetricWriter {
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_metadata_flush_success),
         };
+        // `metric_hist_samples` (M7-A4, issue #120): no flush-success hook —
+        // `metric_series` registration (the only success-gated cache) is
+        // driven at admission from BOTH float samples and hist samples, and
+        // is promoted via the `metric_series` flush hook above, not this
+        // table's flush.
+        let hist_samples_ctx = TableContext {
+            table: tables.hist_samples,
+            buffer: hist_samples.clone(),
+            notify: hist_samples_notify.clone(),
+            inserter: hist_samples_inserter,
+            runtime: runtime.clone(),
+            table_metrics: metrics.hist_samples.clone(),
+            spool: spool.clone(),
+            queued_bytes: queued_bytes.clone(),
+            on_flush_success: None,
+        };
 
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
         let series_task = table::spawn(series_ctx, shutdown_rx.clone());
-        let metadata_task = table::spawn(metadata_ctx, shutdown_rx);
+        let metadata_task = table::spawn(metadata_ctx, shutdown_rx.clone());
+        let hist_samples_task = table::spawn(hist_samples_ctx, shutdown_rx);
 
         let shared = Arc::new(Shared {
             samples,
             series,
             metadata,
+            hist_samples,
             samples_notify,
             series_notify,
             metadata_notify,
+            hist_samples_notify,
             queued_bytes,
             runtime,
             metrics,
@@ -313,6 +357,7 @@ impl MetricWriter {
             samples_task: Mutex::new(Some(samples_task)),
             series_task: Mutex::new(Some(series_task)),
             metadata_task: Mutex::new(Some(metadata_task)),
+            hist_samples_task: Mutex::new(Some(hist_samples_task)),
         });
 
         MetricWriter { shared }
@@ -348,10 +393,16 @@ impl MetricWriter {
             .iter()
             .map(MetricSampleRow::est_source_bytes)
             .sum();
+        let hist_sample_bytes: u64 = batch
+            .hist_samples
+            .iter()
+            .map(MetricHistSampleRow::est_source_bytes)
+            .sum();
 
         // An exact `(metric_name, fingerprint) -> &SeriesRef` index, built
         // once per admission and consulted per touched bucket (architect
-        // plan, "Data flow").
+        // plan, "Data flow"). One `SeriesRef` serves whichever of the float
+        // and histogram samples reference that `(metric_name, fingerprint)`.
         let series_by_key: HashMap<(&str, u64), &SeriesRef> = batch
             .series
             .iter()
@@ -361,18 +412,38 @@ impl MetricWriter {
         // Cross-bucket-in-one-request rule (docs/schemas.md §2.1, edge case
         // 4): buckets are derived per-*sample*, not per-series, so a
         // backfilled/straddling request emits one `metric_series` row per
-        // touched `(metric_name, fingerprint, bucket)`, not one per series.
+        // touched `(metric_name, fingerprint, bucket, value_type)`. Both
+        // float samples (`value_type = 0`) and native-histogram samples
+        // (`value_type = 1`, M7-A4 issue #120) drive registration; the
+        // `value_type`-extended key means a series carrying both a float and
+        // a histogram sample in one bucket registers BOTH rows.
         let mut seen_in_request: HashSet<SeriesKey> = HashSet::new();
-        let mut new_series: Vec<(&SeriesRef, i64)> = Vec::new();
+        let mut new_series: Vec<(&SeriesRef, i64, u8)> = Vec::new();
         {
             let mut lru = self
                 .shared
                 .series_lru
                 .lock()
                 .expect("series lru mutex poisoned");
-            for sample in &batch.samples {
-                let bucket = floor_to_activity_bucket(sample.unix_milli, self.shared.bucket_ms);
-                let key: SeriesKey = (sample.metric_name.clone(), sample.fingerprint, bucket);
+            let float_keys = batch.samples.iter().map(|s| {
+                (
+                    &s.metric_name,
+                    s.fingerprint,
+                    s.unix_milli,
+                    VALUE_TYPE_FLOAT,
+                )
+            });
+            let hist_keys = batch.hist_samples.iter().map(|h| {
+                (
+                    &h.metric_name,
+                    h.fingerprint,
+                    h.unix_milli,
+                    VALUE_TYPE_HISTOGRAM,
+                )
+            });
+            for (metric_name, fingerprint, unix_milli, value_type) in float_keys.chain(hist_keys) {
+                let bucket = floor_to_activity_bucket(unix_milli, self.shared.bucket_ms);
+                let key: SeriesKey = (metric_name.clone(), fingerprint, bucket, value_type);
                 if !seen_in_request.insert(key.clone()) {
                     continue; // already queued by an earlier sample this request
                 }
@@ -388,7 +459,7 @@ impl MetricWriter {
                     .series_lru_misses_total
                     .fetch_add(1, Ordering::Relaxed);
                 let Some(series_ref) = series_by_key
-                    .get(&(sample.metric_name.as_ref(), sample.fingerprint))
+                    .get(&(metric_name.as_ref(), fingerprint))
                     .copied()
                 else {
                     // The receiver's contract requires a `SeriesRef` for
@@ -399,12 +470,12 @@ impl MetricWriter {
                     // admitted below.
                     continue;
                 };
-                new_series.push((series_ref, bucket));
+                new_series.push((series_ref, bucket, value_type));
             }
         }
         let series_bytes: u64 = new_series
             .iter()
-            .map(|(s, _)| MetricSeriesRow::est_source_bytes(s))
+            .map(|(s, _, _)| MetricSeriesRow::est_source_bytes(s))
             .sum();
 
         // `metric_metadata`: local-dedup (last occurrence per metric_name
@@ -437,7 +508,7 @@ impl MetricWriter {
             .map(|m| MetricMetadataRow::est_source_bytes(m))
             .sum();
 
-        let total_bytes = sample_bytes + series_bytes + metadata_bytes;
+        let total_bytes = sample_bytes + series_bytes + metadata_bytes + hist_sample_bytes;
 
         // Atomic reservation (mirrors `LogWriter::admit_batch`): reserve
         // first, roll back on overflow.
@@ -468,11 +539,18 @@ impl MetricWriter {
             batch.samples.iter().map(MetricSampleRow::from).collect();
         let series_rows: Vec<MetricSeriesRow> = new_series
             .iter()
-            .map(|(s, bucket)| MetricSeriesRow::from_series_at_bucket(s, *bucket))
+            .map(|(s, bucket, value_type)| {
+                MetricSeriesRow::from_series_at_bucket(s, *bucket, *value_type)
+            })
             .collect();
         let metadata_rows: Vec<MetricMetadataRow> = new_metadata
             .iter()
             .map(|m| MetricMetadataRow::from(*m))
+            .collect();
+        let hist_sample_rows: Vec<MetricHistSampleRow> = batch
+            .hist_samples
+            .iter()
+            .map(MetricHistSampleRow::from)
             .collect();
 
         let mut receivers = Vec::new();
@@ -545,6 +623,26 @@ impl MetricWriter {
             }
         }
 
+        if !hist_sample_rows.is_empty() {
+            if with_waiters {
+                let (should_notify, rx) = self.shared.hist_samples.append_and_wait(
+                    hist_sample_rows,
+                    hist_sample_bytes,
+                    self.shared.runtime.batch_bytes,
+                );
+                receivers.push(rx);
+                if should_notify {
+                    self.shared.hist_samples_notify.notify_one();
+                }
+            } else if self.shared.hist_samples.append(
+                hist_sample_rows,
+                hist_sample_bytes,
+                self.shared.runtime.batch_bytes,
+            ) {
+                self.shared.hist_samples_notify.notify_one();
+            }
+        }
+
         Ok(receivers)
     }
 
@@ -581,6 +679,12 @@ impl MetricWriter {
             .lock()
             .expect("task handle mutex poisoned")
             .take();
+        let hist_samples_task = self
+            .shared
+            .hist_samples_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
 
         if let Some(task) = samples_task
             && let Err(e) = task.await
@@ -596,6 +700,11 @@ impl MetricWriter {
             && let Err(e) = task.await
         {
             warn!(error = %e, table = METADATA_TABLE, "flush task panicked during shutdown");
+        }
+        if let Some(task) = hist_samples_task
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, table = HIST_SAMPLES_TABLE, "flush task panicked during shutdown");
         }
     }
 }

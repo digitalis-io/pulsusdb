@@ -17,9 +17,9 @@ mod settings;
 mod tls;
 
 pub use client::{ChClient, ChRow, ChRowStream, Row};
-pub use config::{ChConnConfig, ChEndpoint, ChProto, ResolvedEndpoint};
+pub use config::{ChConnConfig, ChEndpoint, ChProto, ConsistencyConfig, ResolvedEndpoint};
 pub use error::{ChError, Idempotency};
-pub use pool::{ChPool, PooledConn};
+pub use pool::{ChPool, PooledConn, spawn_reprobe_loop};
 pub use settings::QuerySettings;
 
 #[cfg(test)]

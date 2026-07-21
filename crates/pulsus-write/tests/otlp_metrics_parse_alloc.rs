@@ -50,6 +50,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
+use pulsus_config::ExpHistogramMode;
 use pulsus_write::error::LogsIngestError;
 use pulsus_write::protocols::otlp_metrics::{MAX_EXPANDED_BYTES, parse};
 
@@ -123,7 +124,8 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     let valid_req = gauge_request(resource, data_points);
 
     // Warm-up (allocator internals) + prove the shape is exercised.
-    let warm = parse(&valid_req, 0).expect("valid request within budget");
+    let warm =
+        parse(&valid_req, 0, ExpHistogramMode::Classic).expect("valid request within budget");
     assert_eq!(warm.samples.len(), N_VALID, "one sample per data point");
     assert_eq!(
         warm.series.len(),
@@ -133,7 +135,7 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     drop(warm);
 
     let start = ALLOCS.load(Ordering::Relaxed);
-    let out = parse(&valid_req, 0).expect("valid request within budget");
+    let out = parse(&valid_req, 0, ExpHistogramMode::Classic).expect("valid request within budget");
     let valid_allocs = ALLOCS.load(Ordering::Relaxed) - start;
     black_box(&out);
 
@@ -171,7 +173,8 @@ fn otlp_metrics_parse_allocations_stay_bounded() {
     let over_budget_req = gauge_request(big_resource, big_data_points);
 
     let start = ALLOCS.load(Ordering::Relaxed);
-    let err = parse(&over_budget_req, 0).expect_err("over-budget request must abort");
+    let err = parse(&over_budget_req, 0, ExpHistogramMode::Classic)
+        .expect_err("over-budget request must abort");
     let abort_allocs = ALLOCS.load(Ordering::Relaxed) - start;
 
     assert!(

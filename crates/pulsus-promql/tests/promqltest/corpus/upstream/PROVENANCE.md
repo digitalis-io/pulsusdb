@@ -19,11 +19,10 @@ touches).
 
 ## Contents
 
-The upstream directory holds **21** `.test` scenario files. **20 are
-vendored here byte-verbatim**; `native_histograms.test` is the sole
-exclusion — native histograms are M7 (issue #22), which vendors and
-activates that file (recorded machine-readably in
-`upstream-manifest.json`'s `excluded` array, never a silent omission).
+The upstream directory holds **21** `.test` scenario files, **all 21
+vendored here byte-verbatim** as of issue #124 (M7-A6), which vendored
+the last one, `native_histograms.test` (previously the sole exclusion,
+tracked in `upstream-manifest.json`'s now-empty `excluded` array).
 
 `upstream-manifest.json` pins every vendored file's SHA-256 and line
 count plus the tag/SHA above. `tests/promqltest_corpus.rs` re-verifies
@@ -76,7 +75,7 @@ exact inner timestamps and fails any end-anchored port (which yields
 66). The grid helper itself (`src/eval/mod.rs::subquery_grid_start`)
 carries the same note.
 
-## Executed vs skipped at vendor time
+## Executed vs skipped at vendor time (M6-01)
 
 7 files execute fully under the M6-01 grammar subset (`at_modifier`,
 `duration_expression`, `fill-modifier`, `selectors`, `staleness`,
@@ -88,3 +87,21 @@ divergences of the executed files that the coverage-manifest oracle
 cannot attribute to a scheduled/deferred construct are classified
 per-case in `../eval-divergences.jsonl` (105 entries at vendor time; see
 each entry's `construct`/`reason`).
+
+## M7-A6 update (issue #124)
+
+The `{{…}}` native-histogram sample-literal grammar and the block-form
+`expect warn|no_warn|info|no_info` annotation directives landed
+(`../histogram_literal.rs`, `../grammar.rs`, `../runner.rs`), and
+`native_histograms.test` was vendored (above). This incidentally cleared
+every deferred directive from four already-skip-manifested files
+(`extended_vectors.test`, `info.test`, `limit.test`, `subquery.test`);
+`subquery.test` now replays 100% green and executes unlisted, the other
+three fail on gaps unrelated to native histograms and are deferred via
+the non-directive `manual_skip` lever (see `../skip-manifest.json`'s
+top-level comment and issue #130). `load_with_nhcb` (a distinct
+classic-bucket-to-NHCB `load` conversion, never a `{{…}}` literal) and
+the block `expect ordered`/`expect range vector` forms remain deferred
+directives — `histograms.test`/`operators.test`/`start_timestamps.test`/
+`aggregators.test`/`functions.test`/`range_queries.test` stay
+skip-manifested on those grounds.

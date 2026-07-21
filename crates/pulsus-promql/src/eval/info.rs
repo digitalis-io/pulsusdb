@@ -99,6 +99,12 @@ pub(crate) struct InfoSeriesAtStep {
     pub metric_name: String,
     pub labels: Labels,
     pub orig_t_ms: i64,
+    /// The resolved info sample carried a native histogram — validated
+    /// inside [`combine`]'s dedup loop (`info.go:383-385`: the type check
+    /// is the FIRST check of each info-hashing iteration, after the
+    /// empty-base return and before that sample's own dedup handling),
+    /// never at resolution time (issue #130 Δ3).
+    pub is_histogram: bool,
 }
 
 /// Compiled-regex memo for one evaluation scope (a `combine` call or one
@@ -161,6 +167,48 @@ pub(crate) fn matches_all(
     for m in ms {
         if !cache.matches(m, value)? {
             return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Steps 5+6 of the module doc's pipeline (the `:183` empty-`id_lbl_values`
+/// short-circuit is the CALLER's job — see both call sites — this is only
+/// the per-candidate eligibility test once that guard has already passed):
+/// `name` must match every effective `__name__` matcher, `labels` must
+/// satisfy every data matcher, and for every identifying label carrying a
+/// non-empty `id_lbl_values` entry the candidate must CARRY that label
+/// with an in-set value (absence is not a wildcard — round-2 finding 1).
+///
+/// Issue #82 (retroactive re-review, Option B perf fix): hoisted out of
+/// `combine`'s own loop so `eval::prepare_info` can apply the identical
+/// label-only half of this test ONCE per horizon, over the raw fetched
+/// series, before any per-step staleness resolution — `combine` keeps
+/// calling this too (now over an already-narrowed set), so there is one
+/// definition of "eligible," never two that could drift.
+pub(crate) fn is_eligible_info_candidate(
+    cache: &mut MatcherCache,
+    name: &str,
+    labels: &Labels,
+    id_lbl_values: &BTreeMap<String, BTreeSet<String>>,
+    name_matchers: &[LabelMatcher],
+    data_matchers: &[(String, Vec<LabelMatcher>)],
+) -> Result<bool, PromqlError> {
+    if !matches_all(cache, name_matchers, name)? {
+        return Ok(false);
+    }
+    for (key, ms) in data_matchers {
+        let value = labels.get(key).unwrap_or("");
+        if !matches_all(cache, ms, value)? {
+            return Ok(false);
+        }
+    }
+    for (label, allowed) in id_lbl_values {
+        match labels.get(label) {
+            Some(v) if allowed.contains(v) => {}
+            // Absent ≡ "" fails upstream's value regexp — absence is NOT
+            // a wildcard (round-2 finding 1).
+            _ => return Ok(false),
         }
     }
     Ok(true)
@@ -232,30 +280,25 @@ pub(crate) fn combine(
 
     // Steps 5+6: the :183 short-circuit, then the eligibility filter —
     // both BEFORE dedup, so an out-of-set or absent-ID info series can
-    // never raise a spurious duplicate/conflict. The name/data-matcher
-    // re-filter mirrors the fetch pushdown (belt-and-braces: the
-    // synthetic selector already carries both channels).
+    // never raise a spurious duplicate/conflict. Issue #82 (retroactive
+    // re-review, Option B): the SAME predicate now also runs once per
+    // horizon, over the raw fetched series, in `eval::prepare_info` —
+    // `is_eligible_info_candidate` is the single shared definition, so
+    // this loop is a no-op re-check on an already-narrowed `info` in the
+    // hot (live) path, never a second source of truth.
     let mut eligible: Vec<InfoSeriesAtStep> = Vec::new();
     if !id_lbl_values.is_empty() {
-        'candidates: for series in info {
-            if !matches_all(&mut cache, name_matchers, &series.metric_name)? {
-                continue;
+        for series in info {
+            if is_eligible_info_candidate(
+                &mut cache,
+                &series.metric_name,
+                &series.labels,
+                id_lbl_values,
+                name_matchers,
+                data_matchers,
+            )? {
+                eligible.push(series);
             }
-            for (key, ms) in data_matchers {
-                let value = series.labels.get(key).unwrap_or("");
-                if !matches_all(&mut cache, ms, value)? {
-                    continue 'candidates;
-                }
-            }
-            for (label, allowed) in id_lbl_values {
-                match series.labels.get(label) {
-                    Some(v) if allowed.contains(v) => {}
-                    // Absent ≡ "" fails upstream's value regexp —
-                    // absence is NOT a wildcard (round-2 finding 1).
-                    _ => continue 'candidates,
-                }
-            }
-            eligible.push(series);
         }
     }
 
@@ -264,6 +307,22 @@ pub(crate) fn combine(
     // the pinned duplicate-series error (info.go:401).
     let mut by_sig: BTreeMap<Signature, InfoSeriesAtStep> = BTreeMap::new();
     for series in eligible {
+        // Type check FIRST within each iteration (info.go:383-385), so an
+        // equal-timestamp duplicate pair arriving BEFORE a histogram
+        // sample errors as the duplicate, and vice versa — per-sample
+        // check-then-dedup precedence is upstream-exact (issue #130 Δ3).
+        // Cross-series ARRIVAL order remains a storage artifact in both
+        // engines: ours is fetch order (test store = load order, live =
+        // fingerprint order), upstream's is its storage's return order
+        // under an explicitly unsorted `Select` contract (info.go:225) —
+        // no per-step sort is added to imitate an order upstream itself
+        // does not guarantee.
+        if series.is_histogram {
+            return Err(PromqlError::LabelSet {
+                // Byte-exact to info.go:384.
+                detail: "info sample should be float".to_string(),
+            });
+        }
         let sig = signature(&series.metric_name, &series.labels, &id_keys);
         match by_sig.entry(sig) {
             std::collections::btree_map::Entry::Vacant(e) => {
@@ -327,6 +386,7 @@ pub(crate) fn combine(
                 drop_name: false,
                 t_ms,
                 v: bs.v,
+                h: bs.h,
             });
             continue;
         }
@@ -386,6 +446,7 @@ pub(crate) fn combine(
             drop_name: false,
             t_ms,
             v: bs.v,
+            h: bs.h,
         });
     }
     Ok(out)
@@ -430,6 +491,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 
@@ -438,6 +500,15 @@ mod tests {
             metric_name: name.to_string(),
             labels: labels(pairs),
             orig_t_ms,
+            is_histogram: false,
+        }
+    }
+
+    /// [`info_series`] with the histogram marker set (issue #130 Δ3).
+    fn hist_info_series(name: &str, pairs: &[(&str, &str)], orig_t_ms: i64) -> InfoSeriesAtStep {
+        InfoSeriesAtStep {
+            is_histogram: true,
+            ..info_series(name, pairs, orig_t_ms)
         }
     }
 
@@ -602,6 +673,70 @@ mod tests {
              {__name__=\"target_info\", data=\"info\", instance=\"a\", job=\"1\"} @ 60000, \
              new {__name__=\"target_info\", data=\"updated\", instance=\"a\", job=\"1\"} @ 60000"
         );
+    }
+
+    /// Issue #130 Δ3 (4b′-iii): per-sample check-then-dedup precedence is
+    /// upstream-exact — with an equal-timestamp duplicate pair PRECEDING
+    /// the histogram sample in input order, the DUPLICATE error surfaces
+    /// (upstream's info-hashing loop reaches the pair's second member and
+    /// errors at info.go:401-403 before ever seeing the histogram).
+    #[test]
+    fn duplicate_pair_preceding_a_histogram_sample_errors_with_the_duplicate_message() {
+        let base = vec![base_sample(
+            "metric",
+            &[("instance", "a"), ("job", "1")],
+            1.0,
+        )];
+        let info = vec![
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "info")],
+                60_000,
+            ),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "updated")],
+                60_000,
+            ),
+            hist_info_series("target_info", &[("instance", "a"), ("job", "1")], 60_000),
+        ];
+        let ids = id_values(&[("instance", &["a"]), ("job", &["1"])]);
+        let err = combine(base, info, &ids, &default_name_matchers(), &[], 60_000).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "found duplicate series for info metric: existing \
+             {__name__=\"target_info\", data=\"info\", instance=\"a\", job=\"1\"} @ 60000, \
+             new {__name__=\"target_info\", data=\"updated\", instance=\"a\", job=\"1\"} @ 60000"
+        );
+    }
+
+    /// Issue #130 Δ3 (4b′-iii), the reverse order: the histogram sample
+    /// arriving FIRST errors with `info sample should be float`
+    /// (info.go:383-385 — the type check is the first check of its
+    /// iteration, before any dedup handling).
+    #[test]
+    fn histogram_sample_preceding_a_duplicate_pair_errors_with_the_float_type_message() {
+        let base = vec![base_sample(
+            "metric",
+            &[("instance", "a"), ("job", "1")],
+            1.0,
+        )];
+        let info = vec![
+            hist_info_series("target_info", &[("instance", "a"), ("job", "1")], 60_000),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "info")],
+                60_000,
+            ),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "updated")],
+                60_000,
+            ),
+        ];
+        let ids = id_values(&[("instance", &["a"]), ("job", &["1"])]);
+        let err = combine(base, info, &ids, &default_name_matchers(), &[], 60_000).unwrap_err();
+        assert_eq!(err.to_string(), "info sample should be float");
     }
 
     /// `conflicting label: <name>` (info.go:446), byte-exact.

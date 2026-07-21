@@ -191,7 +191,8 @@ fn loki_stream_fingerprints_identically_to_the_equivalent_otlp_log_stream() {
             schema_url: String::new(),
         }],
     };
-    let otlp_out = otlp_logs::parse(&otlp, 0);
+    let otlp_out =
+        otlp_logs::parse(&otlp, 0).expect("OTLP fixture is within the AnyValue depth cap");
 
     assert_eq!(
         loki_out.rows[0].fingerprint, otlp_out.rows[0].fingerprint,
@@ -264,7 +265,8 @@ fn scope_present_otlp_converges_with_loki_scope_leaves_the_fingerprint() {
             schema_url: String::new(),
         }],
     };
-    let otlp_out = otlp_logs::parse(&otlp, 0);
+    let otlp_out =
+        otlp_logs::parse(&otlp, 0).expect("OTLP fixture is within the AnyValue depth cap");
 
     // Scope is out of the fingerprint: identical stream identity + labels.
     assert_eq!(

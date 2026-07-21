@@ -146,6 +146,8 @@ pub struct MetricWriterMetrics {
     pub samples: Arc<TableMetrics>,
     pub series: Arc<TableMetrics>,
     pub metadata: Arc<TableMetrics>,
+    /// `metric_hist_samples` per-table counters (M7-A4, issue #120).
+    pub hist_samples: Arc<TableMetrics>,
     pub backpressure_total: AtomicU64,
     pub spool_poison_total: AtomicU64,
     pub spool_uncertain_total: AtomicU64,
@@ -162,6 +164,8 @@ pub struct MetricWriterMetricsSnapshot {
     pub samples: TableMetricsSnapshot,
     pub series: TableMetricsSnapshot,
     pub metadata: TableMetricsSnapshot,
+    /// `metric_hist_samples` per-table counters (M7-A4, issue #120).
+    pub hist_samples: TableMetricsSnapshot,
     /// The live `queued_bytes` gauge — passed in by the caller
     /// ([`crate::writer::MetricWriter::metrics`]), which owns the
     /// authoritative `AtomicU64` (not duplicated here).
@@ -193,6 +197,7 @@ impl MetricWriterMetrics {
             samples: self.samples.snapshot(),
             series: self.series.snapshot(),
             metadata: self.metadata.snapshot(),
+            hist_samples: self.hist_samples.snapshot(),
             queue_bytes,
             backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
             spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),

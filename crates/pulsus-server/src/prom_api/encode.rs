@@ -38,7 +38,8 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    ExplainStage, MatrixSeries, MetricMeta, PlanExplain, QueryResult, TsdbStatus, VectorSample,
+    ExplainStage, HistMatrixSeries, HistOrFloat, HistVectorSample, MatrixSeries, MetricMeta,
+    PlanExplain, QueryResult, TsdbStatus, VectorSample,
 };
 
 use crate::app::BuildInfo;
@@ -321,6 +322,160 @@ fn render_vector_item(s: &VectorSample, at_ms: i64) -> Vec<u8> {
     .into_bytes()
 }
 
+/// M7-A5b-i: the boundary-inclusivity code upstream's `MarshalHistogram`
+/// writes as a bucket array's 1st element (`util/jsonutil/marshal.go`,
+/// pinned `40af9c2`): `0` lower-exclusive/upper-inclusive, `1` lower-
+/// inclusive/upper-exclusive, `2` both exclusive (the default — an open
+/// interval), `3` both inclusive.
+fn histogram_boundary_code(lower_inclusive: bool, upper_inclusive: bool) -> u8 {
+    match (lower_inclusive, upper_inclusive) {
+        (true, true) => 3,
+        (true, false) => 1,
+        (false, true) => 0,
+        (false, false) => 2,
+    }
+}
+
+/// Renders a native histogram to Prometheus's `MarshalHistogram` wire shape
+/// (`util/jsonutil/marshal.go`, pinned `40af9c2`):
+/// `{"count":"<c>","sum":"<s>","buckets":[[<code>,"<lower>","<upper>","<count>"],…]}`
+/// — `count`/`sum`/bucket fields are quoted float strings (`quoted_value`,
+/// [`prom_float`]'s own contract — bit-for-bit `MarshalFloat`); zero-count
+/// buckets are skipped; the `buckets` key is omitted entirely when every
+/// bucket is empty (upstream's `bucketFound` guard).
+fn render_histogram_json(h: &pulsus_model::FloatHistogram) -> String {
+    let mut buckets = String::new();
+    let mut any = false;
+    for b in h.all_buckets() {
+        if b.count == 0.0 {
+            continue;
+        }
+        if any {
+            buckets.push(',');
+        }
+        any = true;
+        let code = histogram_boundary_code(b.lower_inclusive, b.upper_inclusive);
+        buckets.push_str(&format!(
+            "[{code},{},{},{}]",
+            quoted_value(b.lower),
+            quoted_value(b.upper),
+            quoted_value(b.count)
+        ));
+    }
+    let buckets_field = if any {
+        format!(",\"buckets\":[{buckets}]")
+    } else {
+        String::new()
+    };
+    format!(
+        "{{\"count\":{},\"sum\":{}{buckets_field}}}",
+        quoted_value(h.count),
+        quoted_value(h.sum)
+    )
+}
+
+fn render_hist_or_float(v: &HistOrFloat) -> String {
+    match v {
+        HistOrFloat::Float(f) => quoted_value(*f),
+        HistOrFloat::Hist(h) => render_histogram_json(h),
+    }
+}
+
+/// M7-A5b-i: one `QueryResult::VectorHist` element — `"value"` for a float,
+/// `"histogram"` for a native histogram (`web/api/v1/json_codec.go`
+/// `marshalSampleJSON`, pinned `40af9c2`).
+fn render_hist_vector_item(s: &HistVectorSample, at_ms: i64) -> Vec<u8> {
+    let key = match &s.value {
+        HistOrFloat::Float(_) => "value",
+        HistOrFloat::Hist(_) => "histogram",
+    };
+    format!(
+        "{{\"metric\":{},\"{key}\":[{},{}]}}",
+        labels_object_json(&s.labels),
+        prom_timestamp(at_ms),
+        render_hist_or_float(&s.value)
+    )
+    .into_bytes()
+}
+
+/// M7-A5b-i: one `QueryResult::MatrixHist` series — upstream splits float
+/// and histogram points into SEPARATE `"values"`/`"histograms"` arrays
+/// (`promql.Series{Floats,Histograms}`, `marshalSeriesJSON`, pinned
+/// `40af9c2`), each internally time-ordered but not interleaved with the
+/// other; both keys are omitted when empty (mirrors the float `"values"`-
+/// only shape when there are no histogram points at all).
+fn render_hist_matrix_item(s: &HistMatrixSeries) -> Vec<u8> {
+    let mut values = String::new();
+    let mut any_values = false;
+    let mut histograms = String::new();
+    let mut any_histograms = false;
+    for (t_ms, v) in &s.points {
+        match v {
+            HistOrFloat::Float(f) => {
+                if any_values {
+                    values.push(',');
+                }
+                any_values = true;
+                values.push_str(&format!("[{},{}]", prom_timestamp(*t_ms), quoted_value(*f)));
+            }
+            HistOrFloat::Hist(h) => {
+                if any_histograms {
+                    histograms.push(',');
+                }
+                any_histograms = true;
+                histograms.push_str(&format!(
+                    "[{},{}]",
+                    prom_timestamp(*t_ms),
+                    render_histogram_json(h)
+                ));
+            }
+        }
+    }
+    let mut body = format!("{{\"metric\":{}", labels_object_json(&s.labels));
+    if any_values {
+        body.push_str(&format!(",\"values\":[{values}]"));
+    }
+    if any_histograms {
+        body.push_str(&format!(",\"histograms\":[{histograms}]"));
+    }
+    body.push('}');
+    body.into_bytes()
+}
+
+/// M7-A5b-i: the `warnings`/`infos` envelope suffix — TOP-LEVEL siblings of
+/// `data` (`web/api/v1/api.go` `Response`, pinned `40af9c2`: `Warnings
+/// []string \`json:"warnings,omitempty"\``, `Infos` likewise), so this is
+/// appended AFTER `data`'s own closing brace, never nested inside it (unlike
+/// `explain_suffix`). Empty ⇒ no bytes ⇒ float-only responses (empty
+/// `Annotations`) stay byte-identical. Caps/dedup/overflow-line contract:
+/// [`pulsus_promql::Annotations::as_strings`] (upstream `AsStrings(query, 10,
+/// 10)`, `web/api/v1/api.go`).
+fn annotations_suffix(annotations: &pulsus_promql::Annotations) -> String {
+    let (warnings, infos) = annotations.as_strings(10, 10);
+    let mut s = String::new();
+    if !warnings.is_empty() {
+        s.push_str(",\"warnings\":[");
+        for (i, w) in warnings.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(w));
+        }
+        s.push(']');
+    }
+    if !infos.is_empty() {
+        s.push_str(",\"infos\":[");
+        for (i, w) in infos.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json_string(w));
+        }
+        s.push(']');
+    }
+    s
+}
+
 /// Encodes a `query`/`query_range` result (docs/api.md §3.1/§3.2):
 /// `data.resultType`/`result`(/`explain`). `at_ms` is the instant
 /// evaluation time (`/query`'s `time` param) — only read for
@@ -341,6 +496,25 @@ pub(crate) fn query_response(
     at_ms: i64,
     ordered: bool,
 ) -> Response {
+    let empty = pulsus_promql::Annotations::new();
+    query_response_annotated(result, explain, at_ms, ordered, &empty)
+}
+
+/// [`query_response`] plus the `warnings`/`infos` envelope arrays (M7-A5b-i)
+/// and the two histogram-carrying `QueryResult` variants
+/// ([`QueryResult::VectorHist`]/[`QueryResult::MatrixHist`], replacing the
+/// A5a `HistogramResultUnsupported` reject). Split from `query_response` so
+/// every pre-existing float-only call site (and its golden byte-exact
+/// tests) is untouched — an empty [`pulsus_promql::Annotations`] renders
+/// zero extra bytes (AC6, `omitempty`).
+pub(crate) fn query_response_annotated(
+    result: QueryResult,
+    explain: Option<PlanExplain>,
+    at_ms: i64,
+    ordered: bool,
+    annotations: &pulsus_promql::Annotations,
+) -> Response {
+    let annos = annotations_suffix(annotations);
     match result {
         QueryResult::Vector(mut items) => {
             if !ordered {
@@ -350,7 +524,7 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix("]".to_string(), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{annos}}}").into_bytes();
             json_response(stream_array(
                 prefix,
                 items,
@@ -364,8 +538,38 @@ pub(crate) fn query_response(
                 b"{\"status\":\"success\",\"data\":{\"resultType\":\"matrix\",\"result\":["
                     .to_vec();
             let suffix = explain_suffix("]".to_string(), explain.as_ref());
-            let suffix = format!("{suffix}}}}}").into_bytes();
+            let suffix = format!("{suffix}}}{annos}}}").into_bytes();
             json_response(stream_array(prefix, items, render_matrix_item, suffix))
+        }
+        // M7-A5b-i: a histogram-valued instant result — same shape as the
+        // `Vector` arm above, one level of indirection through
+        // `render_hist_vector_item` for the per-element `"value"`/
+        // `"histogram"` key choice.
+        QueryResult::VectorHist(mut items) => {
+            if !ordered {
+                items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            }
+            let prefix =
+                b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":["
+                    .to_vec();
+            let suffix = explain_suffix("]".to_string(), explain.as_ref());
+            let suffix = format!("{suffix}}}{annos}}}").into_bytes();
+            json_response(stream_array(
+                prefix,
+                items,
+                move |s: &HistVectorSample| render_hist_vector_item(s, at_ms),
+                suffix,
+            ))
+        }
+        // M7-A5b-i: a histogram-valued range result.
+        QueryResult::MatrixHist(mut items) => {
+            items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            let prefix =
+                b"{\"status\":\"success\",\"data\":{\"resultType\":\"matrix\",\"result\":["
+                    .to_vec();
+            let suffix = explain_suffix("]".to_string(), explain.as_ref());
+            let suffix = format!("{suffix}}}{annos}}}").into_bytes();
+            json_response(stream_array(prefix, items, render_hist_matrix_item, suffix))
         }
         // Code-review round-1 fix: `explain` must nest under `data`
         // exactly like the vector/matrix arms above — the data object is
@@ -384,7 +588,7 @@ pub(crate) fn query_response(
                 ),
                 explain.as_ref(),
             );
-            json_response(Body::from(format!("{data_body}}}}}")))
+            json_response(Body::from(format!("{data_body}}}{annos}}}")))
         }
         // Issue #86 (M6-08d): a top-level string-literal query — the
         // Prometheus `resultType:"string"` shape, `result: [<t>,"<val>"]`
@@ -399,7 +603,7 @@ pub(crate) fn query_response(
                 ),
                 explain.as_ref(),
             );
-            json_response(Body::from(format!("{data_body}}}}}")))
+            json_response(Body::from(format!("{data_body}}}{annos}}}")))
         }
         // Unreachable: `MetricsEngine` never produces `QueryResult::Streams`
         // (a `LogQlEngine`-only variant of the shared `QueryResult` type,
@@ -737,6 +941,16 @@ mod tests {
         assert_eq!(prom_timestamp(0), "0");
     }
 
+    #[test]
+    fn prom_timestamp_a_negative_whole_second_has_no_fraction() {
+        // Guards the negative-epoch bucket label the trace-metrics Int64-ms
+        // fix (issue #59 re-audit) newly enables: a pre-1970 whole-second
+        // bucket, e.g. 1969-12-31T23:00:00Z. `div_euclid`/`rem_euclid` are
+        // correct for this whole-second case (unaffected — trace-metrics
+        // buckets are always whole-second aligned).
+        assert_eq!(prom_timestamp(-3_600_000), "-3600");
+    }
+
     // --- query_response wire shapes ---
 
     #[tokio::test]
@@ -765,6 +979,143 @@ mod tests {
             body,
             r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"job":"api"},"values":[[0,"1"],[1,"2.5"]]}]}}"#
         );
+    }
+
+    /// `single_histogram` (`native_histograms.test:34`, A3/A5b corpus
+    /// fixture): schema 0, `sum:5 count:4`, positive buckets (absolute)
+    /// `[1,2,1]` at schema-index 0 -> (0.5,1]:1, (1,2]:2, (2,4]:1.
+    fn single_float_histogram() -> pulsus_model::FloatHistogram {
+        pulsus_model::FloatHistogram {
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 4.0,
+            sum: 5.0,
+            positive_spans: vec![pulsus_model::Span {
+                offset: 0,
+                length: 3,
+            }],
+            negative_spans: vec![],
+            positive_buckets: vec![1.0, 2.0, 1.0],
+            negative_buckets: vec![],
+            custom_values: vec![],
+        }
+    }
+
+    // -- M7-A5b-i: the native-histogram wire encoder (MarshalHistogram) --
+
+    #[tokio::test]
+    async fn hist_vector_envelope_encodes_a_native_histogram_value() {
+        let sample = HistVectorSample {
+            labels: vec![("job".to_string(), "api".to_string())],
+            value: HistOrFloat::Hist(Box::new(single_float_histogram())),
+        };
+        let res = query_response(QueryResult::VectorHist(vec![sample]), None, 5_000, false);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"job":"api"},"histogram":[5,{"count":"4","sum":"5","buckets":[[0,"0.5","1","1"],[0,"1","2","2"],[0,"2","4","1"]]}]}]}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn hist_vector_envelope_float_element_still_uses_the_value_key() {
+        let sample = HistVectorSample {
+            labels: vec![("job".to_string(), "api".to_string())],
+            value: HistOrFloat::Float(7.0),
+        };
+        let res = query_response(QueryResult::VectorHist(vec![sample]), None, 1_000, false);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"job":"api"},"value":[1,"7"]}]}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn hist_matrix_envelope_splits_values_and_histograms_into_separate_arrays() {
+        let series = HistMatrixSeries {
+            labels: vec![("job".to_string(), "api".to_string())],
+            points: vec![
+                (0, HistOrFloat::Float(1.0)),
+                (1_000, HistOrFloat::Hist(Box::new(single_float_histogram()))),
+            ],
+        };
+        let res = query_response(QueryResult::MatrixHist(vec![series]), None, 0, false);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"job":"api"},"values":[[0,"1"]],"histograms":[[1,{"count":"4","sum":"5","buckets":[[0,"0.5","1","1"],[0,"1","2","2"],[0,"2","4","1"]]}]]}]}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn hist_matrix_envelope_omits_the_values_key_when_every_point_is_a_histogram() {
+        let series = HistMatrixSeries {
+            labels: vec![("job".to_string(), "api".to_string())],
+            points: vec![(0, HistOrFloat::Hist(Box::new(single_float_histogram())))],
+        };
+        let res = query_response(QueryResult::MatrixHist(vec![series]), None, 0, false);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(json["data"]["result"][0].get("values").is_none());
+        assert!(json["data"]["result"][0]["histograms"].is_array());
+    }
+
+    // -- M7-A5b-i: the `warnings`/`infos` envelope (top-level, omitempty) --
+
+    #[tokio::test]
+    async fn annotations_envelope_is_empty_for_a_float_only_query_byte_identical() {
+        // query_response (the pre-A5b-i signature) and
+        // query_response_annotated with an empty Annotations must render
+        // byte-identically — AC6's "float responses stay byte-identical".
+        let sample = VectorSample {
+            labels: vec![("job".to_string(), "api".to_string())],
+            value: 42.0,
+        };
+        let plain = query_response(
+            QueryResult::Vector(vec![sample.clone()]),
+            None,
+            5_500,
+            false,
+        );
+        let annotated = query_response_annotated(
+            QueryResult::Vector(vec![sample]),
+            None,
+            5_500,
+            false,
+            &pulsus_promql::Annotations::new(),
+        );
+        assert_eq!(body_string(plain).await, body_string(annotated).await);
+    }
+
+    #[tokio::test]
+    async fn annotations_envelope_adds_warnings_and_infos_as_top_level_siblings_of_data() {
+        let mut annos = pulsus_promql::Annotations::new();
+        annos.warning("w1");
+        annos.info("i1");
+        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, &annos);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"scalar","result":[0,"1"]},"warnings":["w1"],"infos":["i1"]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn annotations_envelope_dedups_caps_at_10_and_appends_the_overflow_line() {
+        let mut annos = pulsus_promql::Annotations::new();
+        for i in 0..12 {
+            annos.warning(format!("w{i}"));
+        }
+        annos.warning("w0"); // duplicate -- deduped, not double-counted.
+        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, &annos);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let warnings = json["warnings"].as_array().expect("warnings array");
+        assert_eq!(warnings.len(), 11, "10 kept + 1 overflow line");
+        assert_eq!(warnings[10], "2 more warning annotations omitted");
+        assert!(json.get("infos").is_none(), "omitempty: no infos at all");
     }
 
     #[tokio::test]

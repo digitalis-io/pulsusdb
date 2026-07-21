@@ -33,7 +33,6 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   artifact to `oci://ghcr.io/digitalis-io/charts/pulsusdb` on `helm-v*`
   tags, gated on an already-exists preflight guard and a digest-verified
   `helm pull` round trip.
-- `CHANGELOG.md` (this file).
 - Local-only Grafana demo stack (`make grafana-up`/`grafana-down`/
   `grafana-logs`): a `deploy/e2e/compose.grafana.yaml` overlay on the
   existing single-node e2e fixture adding Tempo-compat and native
@@ -56,3 +55,12 @@ is versioned independently — see `deploy/charts/pulsusdb/Chart.yaml` and
   traces than firehose's single-service ones, for Tempo-view
   exploration. A `curlimages/curl` loop drives traffic (otel-tier ships
   no load generator of its own).
+- Helm chart: a `pulsusdb.validateAuth` render-time guard rejects
+  partial/ambiguous `pulsusdb.auth` combinations (one-sided `user`,
+  one-sided password source, or `password`+`existingSecret` together);
+  `image.digest` (preferred over `image.tag`) and validated optional
+  `@sha256:` suffixes on `clickhouse.image`/`clickhouse.keeperImage`/
+  `otelCollector.image` make every chart-rendered image digest-pinnable;
+  `.github/workflows/helm-release.yml` and `.github/workflows/release.yml`
+  now mechanically enforce, as their first post-checkout step, that a
+  release tag is an ancestor of `origin/main`.

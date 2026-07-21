@@ -271,20 +271,29 @@
     {
       "name": "histogram_avg",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_avg(single_histogram)"
+      }
     },
     {
       "name": "histogram_count",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_count(single_histogram)"
+      }
     },
     {
       "name": "histogram_fraction",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m2_functions.test",
+        "query": "histogram_fraction(-Inf, 0.5, hist_bucket)"
+      }
     },
     {
       "name": "histogram_quantile",
@@ -304,20 +313,29 @@
     {
       "name": "histogram_stddev",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_stddev(histogram_stddev_stdvar_1)"
+      }
     },
     {
       "name": "histogram_stdvar",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_stdvar(histogram_stddev_stdvar_1)"
+      }
     },
     {
       "name": "histogram_sum",
       "experimental": false,
-      "status": "deferred",
-      "rationale": "native histograms \u2014 M7 (#22); histogram_quantile itself stays implemented for classic buckets, the native path is an M7 concern within the same function"
+      "status": "implemented",
+      "witness": {
+        "file": "upstream/native_histograms.test",
+        "query": "histogram_sum(single_histogram)"
+      }
     },
     {
       "name": "hour",

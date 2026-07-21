@@ -8,7 +8,7 @@ use pulsus_clickhouse::Row;
 use pulsus_model::LabelSet;
 use serde::{Deserialize, Serialize};
 
-use crate::ingest::metrics::{MetricMetadata, MetricPoint, SeriesRef};
+use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
 use crate::ingest::traces::{AttrRecord, SpanRecord};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
 use crate::writer::spool::SpoolEncode;
@@ -251,24 +251,38 @@ impl SpoolEncode for MetricSampleRow {
 /// bucket is derived per-sample, from `ParsedMetrics::samples`, not from the
 /// series identity — docs/schemas.md §2.1's cross-bucket-in-one-request
 /// rule).
+///
+/// `value_type` (M7-A4, issue #120) is the LAST field, matching the additive
+/// `ALTER TABLE ... ADD COLUMN value_type UInt8 DEFAULT 0` (catalog id 25/26)
+/// column order — `0` = float, `1` = histogram. The writer registers one row
+/// per `(metric_name, fingerprint, bucket, value_type)`, so a series that
+/// carries both a float and a histogram sample in one bucket registers two
+/// rows (the per-series float/histogram discriminator A5 rolls up).
 #[derive(Debug, Clone, Row, Serialize, Deserialize)]
 pub struct MetricSeriesRow {
     pub metric_name: String,
     pub fingerprint: u64,
     pub unix_milli: i64,
     pub labels: String,
+    pub value_type: u8,
 }
 
 impl MetricSeriesRow {
     /// Builds a row for `series`, bucket-floored to `bucket_unix_milli`
     /// (already computed by the caller via
-    /// `pulsus_model::floor_to_activity_bucket`).
-    pub fn from_series_at_bucket(series: &SeriesRef, bucket_unix_milli: i64) -> Self {
+    /// `pulsus_model::floor_to_activity_bucket`), stamped with `value_type`
+    /// (`0` = float, `1` = histogram — issue #120).
+    pub fn from_series_at_bucket(
+        series: &SeriesRef,
+        bucket_unix_milli: i64,
+        value_type: u8,
+    ) -> Self {
         MetricSeriesRow {
             metric_name: series.metric_name.to_string(),
             fingerprint: series.fingerprint,
             unix_milli: bucket_unix_milli,
             labels: series.labels.to_canonical_json(),
+            value_type,
         }
     }
 
@@ -291,7 +305,8 @@ impl MetricSeriesRow {
     }
 
     fn estimate(metric_name: &str, labels_len: usize) -> u64 {
-        (metric_name.len() + labels_len + 8 /* fingerprint */ + 8/* unix_milli */) as u64
+        (metric_name.len() + labels_len
+            + 8 /* fingerprint */ + 8 /* unix_milli */ + 1/* value_type */) as u64
     }
 }
 
@@ -301,6 +316,150 @@ impl SpoolEncode for MetricSeriesRow {
     fn to_spool_value(&self) -> serde_json::Value {
         serde_json::to_value(self)
             .expect("MetricSeriesRow has no non-finite float fields: JSON encoding cannot fail")
+    }
+}
+
+/// One `metric_hist_samples` row (docs/schemas.md §2.4, catalog id 23,
+/// M7-A4 issue #120). Field names/order match the DDL column list EXACTLY
+/// (identity triplet first, then the A3 histogram value columns). `schema`
+/// is `i8` — the physical `Int8` column width. No `PartialEq` derive
+/// (like [`MetricSampleRow`]): `sum`/`zero_threshold`/`custom_values` may be
+/// NaN markers, so equality must compare `.to_bits()` explicitly.
+///
+/// Built from a validated A3 [`NativeHistogram`](pulsus_model::NativeHistogram)
+/// via `to_columns()` — the ingest seam
+/// (`otlp_metrics::emit_native_exponential_histogram`) already ran
+/// `validate()`, so `to_columns` cannot fail here (the only failure is a
+/// schema outside `Int8`, unreachable for a validated exponential/NHCB
+/// schema).
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct MetricHistSampleRow {
+    pub metric_name: String,
+    pub fingerprint: u64,
+    pub unix_milli: i64,
+    pub schema: i8,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub pos_span_offsets: Vec<i32>,
+    pub pos_span_lengths: Vec<u32>,
+    pub pos_bucket_deltas: Vec<i64>,
+    pub neg_span_offsets: Vec<i32>,
+    pub neg_span_lengths: Vec<u32>,
+    pub neg_bucket_deltas: Vec<i64>,
+    pub custom_values: Vec<f64>,
+}
+
+impl From<&HistogramPoint> for MetricHistSampleRow {
+    fn from(point: &HistogramPoint) -> Self {
+        let cols = point
+            .histogram
+            .to_columns()
+            .expect("histogram validated at the ingest seam: to_columns cannot fail");
+        MetricHistSampleRow {
+            metric_name: point.metric_name.to_string(),
+            fingerprint: point.fingerprint,
+            unix_milli: point.unix_milli,
+            schema: cols.schema,
+            zero_threshold: cols.zero_threshold,
+            zero_count: cols.zero_count,
+            count: cols.count,
+            sum: cols.sum,
+            pos_span_offsets: cols.pos_span_offsets,
+            pos_span_lengths: cols.pos_span_lengths,
+            pos_bucket_deltas: cols.pos_bucket_deltas,
+            neg_span_offsets: cols.neg_span_offsets,
+            neg_span_lengths: cols.neg_span_lengths,
+            neg_bucket_deltas: cols.neg_bucket_deltas,
+            custom_values: cols.custom_values,
+        }
+    }
+}
+
+impl MetricHistSampleRow {
+    /// See [`LogSampleRow::est_bytes`]'s doc comment for the estimate's
+    /// intent and limits.
+    pub fn est_bytes(&self) -> u64 {
+        Self::estimate(
+            self.metric_name.len(),
+            self.pos_span_offsets.len() + self.neg_span_offsets.len(),
+            self.pos_bucket_deltas.len() + self.neg_bucket_deltas.len(),
+            self.custom_values.len(),
+        )
+    }
+
+    /// Estimates a [`HistogramPoint`]'s footprint *before* it is
+    /// materialized into a `MetricHistSampleRow` (reserve-before-materialize,
+    /// the established `est_source_bytes` pattern) — read straight off the
+    /// source histogram (span/bucket lengths are preserved by `to_columns`,
+    /// so this matches [`Self::est_bytes`] on the materialized row).
+    pub fn est_source_bytes(point: &HistogramPoint) -> u64 {
+        let h = &point.histogram;
+        Self::estimate(
+            point.metric_name.len(),
+            h.positive_spans.len() + h.negative_spans.len(),
+            h.positive_buckets.len() + h.negative_buckets.len(),
+            h.custom_values.len(),
+        )
+    }
+
+    fn estimate(
+        metric_name_len: usize,
+        span_count: usize,
+        bucket_count: usize,
+        custom_count: usize,
+    ) -> u64 {
+        (metric_name_len
+            + 8 /* fingerprint */ + 8 /* unix_milli */ + 1 /* schema */
+            + 8 /* zero_threshold */ + 8 /* zero_count */ + 8 /* count */ + 8 /* sum */
+            + span_count * (4 /* offset */ + 4 /* length */)
+            + bucket_count * 8 /* delta */
+            + custom_count * 8/* custom bound */) as u64
+    }
+}
+
+impl SpoolEncode for MetricHistSampleRow {
+    /// Like [`MetricSampleRow`]'s impl (issue #26): the value columns that
+    /// may carry a non-finite `f64` — `sum` (stale/absent-NaN marker) and
+    /// `zero_threshold`/`custom_values` — are emitted with their exact bit
+    /// pattern via a decimal-string `*_bits` field, since plain
+    /// `serde_json` collapses a non-finite float to `null`. The best-effort
+    /// human-readable value is a JSON number when finite, `null` otherwise.
+    /// The integer span/delta arrays are exact as plain JSON.
+    fn to_spool_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "metric_name": self.metric_name,
+            "fingerprint": self.fingerprint,
+            "unix_milli": self.unix_milli,
+            "schema": self.schema,
+            "zero_threshold": finite_or_null(self.zero_threshold),
+            "zero_threshold_bits": self.zero_threshold.to_bits().to_string(),
+            "zero_count": self.zero_count,
+            "count": self.count,
+            "sum": finite_or_null(self.sum),
+            "sum_bits": self.sum.to_bits().to_string(),
+            "pos_span_offsets": self.pos_span_offsets,
+            "pos_span_lengths": self.pos_span_lengths,
+            "pos_bucket_deltas": self.pos_bucket_deltas,
+            "neg_span_offsets": self.neg_span_offsets,
+            "neg_span_lengths": self.neg_span_lengths,
+            "neg_bucket_deltas": self.neg_bucket_deltas,
+            "custom_values": self.custom_values.iter().copied().map(finite_or_null).collect::<Vec<_>>(),
+            "custom_values_bits": self.custom_values.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// A finite `f64` as a JSON number, or JSON `null` for a non-finite value
+/// (NaN/±Inf are not JSON-representable — the exact bits travel in the
+/// paired `*_bits` string field). Shared by [`MetricHistSampleRow`]'s spool
+/// audit encoding.
+fn finite_or_null(v: f64) -> serde_json::Value {
+    if v.is_finite() {
+        serde_json::json!(v)
+    } else {
+        serde_json::Value::Null
     }
 }
 
@@ -534,7 +693,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use pulsus_model::{Date, LabelSet, STALE_NAN_BITS, UnixNano};
+    use pulsus_model::{Date, LabelSet, NativeHistogram, STALE_NAN_BITS, Span, UnixNano};
 
     use super::*;
 
@@ -631,7 +790,7 @@ mod tests {
         let (labels, _) =
             LabelSet::from_normalized([("service_name".to_string(), "checkout".to_string())]);
         let row = StreamRow {
-            month: Date::start_of_month_utc(1_700_000_000_000_000_000),
+            month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
             fingerprint: 7,
             service: "checkout".to_string(),
             labels,
@@ -652,7 +811,7 @@ mod tests {
             ("env".to_string(), "prod".to_string()),
         ]);
         let row = StreamRow {
-            month: Date::start_of_month_utc(1_700_000_000_000_000_000),
+            month: Date::start_of_month_utc(1_700_000_000_000_000_000).unwrap(),
             fingerprint: 7,
             service: "checkout".to_string(),
             labels,
@@ -794,11 +953,15 @@ mod tests {
             fingerprint: 7,
             labels,
         };
-        let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000);
+        let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 0);
         assert_eq!(mapped.metric_name, "http_requests_total");
         assert_eq!(mapped.fingerprint, 7);
         assert_eq!(mapped.unix_milli, 3_600_000);
         assert_eq!(mapped.labels, r#"{"job":"checkout"}"#);
+        assert_eq!(mapped.value_type, 0);
+        // Issue #120: a histogram series stamps value_type = 1.
+        let hist = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 1);
+        assert_eq!(hist.value_type, 1);
     }
 
     #[test]
@@ -812,7 +975,7 @@ mod tests {
             fingerprint: 7,
             labels,
         };
-        let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000);
+        let mapped = MetricSeriesRow::from_series_at_bucket(&series, 3_600_000, 1);
         assert_eq!(
             MetricSeriesRow::est_source_bytes(&series),
             mapped.est_bytes()
@@ -850,6 +1013,113 @@ mod tests {
             MetricMetadataRow::est_source_bytes(&meta),
             mapped.est_bytes()
         );
+    }
+
+    // -- MetricHistSampleRow (issue #120) --
+
+    /// A single-histogram fixture with an internal zero bucket: absolute
+    /// counts [5, 0, 3] delta-encode to [5, -5, 3].
+    fn hist_point_with_internal_zero(sum: f64) -> HistogramPoint {
+        HistogramPoint {
+            metric_name: Arc::from("http_request_duration_seconds"),
+            fingerprint: 99,
+            unix_milli: 1_700_000_000_000,
+            histogram: NativeHistogram {
+                schema: 2,
+                zero_threshold: 1e-9,
+                zero_count: 0,
+                count: 8,
+                sum,
+                positive_spans: vec![Span {
+                    offset: 1,
+                    length: 3,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![5, -5, 3],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn metric_hist_sample_row_from_point_copies_every_column_in_ddl_order() {
+        let point = hist_point_with_internal_zero(4.5);
+        let row = MetricHistSampleRow::from(&point);
+        assert_eq!(row.metric_name, "http_request_duration_seconds");
+        assert_eq!(row.fingerprint, 99);
+        assert_eq!(row.unix_milli, 1_700_000_000_000);
+        assert_eq!(row.schema, 2);
+        assert_eq!(row.zero_threshold.to_bits(), 1e-9f64.to_bits());
+        assert_eq!(row.zero_count, 0);
+        assert_eq!(row.count, 8);
+        assert_eq!(row.sum.to_bits(), 4.5f64.to_bits());
+        assert_eq!(row.pos_span_offsets, vec![1]);
+        assert_eq!(row.pos_span_lengths, vec![3]);
+        assert_eq!(row.pos_bucket_deltas, vec![5, -5, 3]);
+        assert!(row.neg_span_offsets.is_empty());
+        assert!(row.neg_bucket_deltas.is_empty());
+        assert!(row.custom_values.is_empty());
+    }
+
+    /// AC1 (issue #120): an internal-zero bucket round-trips OTLP →
+    /// NativeHistogram → to_columns/MetricHistSampleRow → decode, reproducing
+    /// the original absolute counts (including the zero).
+    #[test]
+    fn metric_hist_sample_row_internal_zero_bucket_reconstructs_absolute_counts() {
+        let row = MetricHistSampleRow::from(&hist_point_with_internal_zero(4.5));
+        // Delta-decode the running absolute counts.
+        let mut running = 0i64;
+        let abs: Vec<i64> = row
+            .pos_bucket_deltas
+            .iter()
+            .map(|&d| {
+                running += d;
+                running
+            })
+            .collect();
+        assert_eq!(abs, vec![5, 0, 3], "the internal zero bucket is preserved");
+    }
+
+    #[test]
+    fn metric_hist_sample_row_est_source_bytes_matches_est_bytes_on_the_materialized_row() {
+        let point = hist_point_with_internal_zero(4.5);
+        let row = MetricHistSampleRow::from(&point);
+        assert_eq!(
+            MetricHistSampleRow::est_source_bytes(&point),
+            row.est_bytes()
+        );
+    }
+
+    /// The stale-NaN and absent-NaN `sum` bit patterns survive the
+    /// `HistogramPoint → MetricHistSampleRow` conversion exactly and remain
+    /// distinct (asserted via `.to_bits()`, never `PartialEq`/`is_nan()`).
+    #[test]
+    fn metric_hist_sample_row_preserves_stale_and_absent_nan_sum_bits_distinctly() {
+        let stale = MetricHistSampleRow::from(&hist_point_with_internal_zero(f64::from_bits(
+            STALE_NAN_BITS,
+        )));
+        assert_eq!(stale.sum.to_bits(), STALE_NAN_BITS);
+        let absent = MetricHistSampleRow::from(&hist_point_with_internal_zero(f64::NAN));
+        assert_eq!(absent.sum.to_bits(), f64::NAN.to_bits());
+        assert_ne!(stale.sum.to_bits(), absent.sum.to_bits());
+    }
+
+    #[test]
+    fn metric_hist_sample_row_spool_encoding_preserves_stale_nan_sum_via_bits_string() {
+        let row = MetricHistSampleRow::from(&hist_point_with_internal_zero(f64::from_bits(
+            STALE_NAN_BITS,
+        )));
+        let spooled = row.to_spool_value();
+        assert_eq!(
+            spooled["sum_bits"],
+            serde_json::Value::String(STALE_NAN_BITS.to_string())
+        );
+        assert!(
+            spooled["sum"].is_null(),
+            "a non-finite sum is not JSON-representable; sum_bits is the source of truth"
+        );
+        assert_eq!(spooled["pos_bucket_deltas"], serde_json::json!([5, -5, 3]));
     }
 
     fn span_record() -> SpanRecord {

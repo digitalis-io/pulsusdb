@@ -28,6 +28,19 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `CLICKHOUSE_AUTH` | `default:` | `user:password` |
 | `CLICKHOUSE_TLS_SKIP_VERIFY` | `false` | accept self-signed certificates |
 | `PULSUS_CH_POOL_SIZE` | `8` | connections per process |
+| `CLICKHOUSE_INSERT_QUORUM` | `0` | replicas that must confirm a block before an insert is acknowledged (`0` = off, `1` = rejected at startup — a silent no-op in ClickHouse — `>= 2` = active quorum). Integer-only — `auto`/majority is unsupported. Only meaningful on `Replicated*` engines; see [Consistency](#consistency) |
+| `CLICKHOUSE_INSERT_QUORUM_PARALLEL` | `true` | allow parallel quorum inserts; only applied when `CLICKHOUSE_INSERT_QUORUM > 0` |
+| `CLICKHOUSE_INSERT_QUORUM_TIMEOUT` | `120s` | quorum wait bound; must be `0 < timeout <=` `PULSUS_QUERY_TIMEOUT` when quorum is enabled (the insert deadline otherwise preempts the wait). Reconciled to the default `PULSUS_QUERY_TIMEOUT`; ClickHouse's own default is 600s |
+| `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` | `false` | reads see all prior quorum-committed writes (read-your-writes); off by default |
+
+### Consistency
+
+Defaults are all-off: writes are not quorum-committed and reads may hit a lagging replica. This preserves the lowest-latency behaviour on single-node and non-replicated deployments (quorum inserts *throw* on a plain `MergeTree`). On a `Replicated*` multi-replica cluster you can opt in to strong consistency — `CLICKHOUSE_INSERT_QUORUM > 0` makes an insert wait for that many replicas to confirm (so an ack survives a replica loss), and `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY=true` gives read-your-writes. Both add latency (a quorum write waits for replication; a sequential read waits for the replica to catch up), which is why they are opt-in — enable them only where the durability/read-your-writes guarantee is worth the round-trip cost. The quorum timeout is bounded by `PULSUS_QUERY_TIMEOUT` (the insert deadline that bounds the whole insert), so it is rejected at startup if it exceeds — or is zero while quorum is enabled.
+
+Two further constraints are enforced fail-fast at startup so a config never promises a guarantee ClickHouse will not honour:
+
+- **`CLICKHOUSE_INSERT_QUORUM = 1` is rejected.** ClickHouse disables quorum writes below 2, so `1` is a silent no-op. Use `0` to disable quorum, or `>= 2` for an active quorum.
+- **`CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY = true` requires non-parallel quorum inserts.** Read-your-writes only holds when quorum inserts are enabled *and* non-parallel, so seq-consistency is rejected unless `CLICKHOUSE_INSERT_QUORUM >= 2` **and** `CLICKHOUSE_INSERT_QUORUM_PARALLEL = false`. (The startup error names the exact keys and required values rather than silently forcing parallel off.)
 
 The hard requirements are columnar bulk-insert/fetch performance and reliable DDL + `INSERT ... SELECT` maintenance statements; which transport serves which statement class is an implementation detail settled by the M0 client benchmark (docs/decisions/0001). `CLICKHOUSE_PORT`/`CLICKHOUSE_HTTP_PORT` both remain configurable so either split works.
 
@@ -55,7 +68,9 @@ The hard requirements are columnar bulk-insert/fetch performance and reliable DD
 
 By default PulsusDB dials one ClickHouse endpoint (`CLICKHOUSE_SERVER`/`CLICKHOUSE_HTTP_PORT`) and relies on the `_dist` tables for cross-shard fan-out. Setting `CLICKHOUSE_SERVERS` instead makes the connection pool hold one client **per endpoint** and spread separate queries across them (a single streaming cursor stays pinned to one endpoint for its whole life). The concurrency bound (`PULSUS_CH_POOL_SIZE`) is unchanged — it is a total, not per-endpoint, limit.
 
-Selection is **zone-preferring round-robin**: endpoints whose `zone` matches this node's `PULSUS_AVAILABILITY_ZONE` are used first (round-robin among them), saving cross-AZ network cost; when none is configured or reachable the pool spreads evenly across all endpoints. On a transport failure (connection/timeout/IO or a retryable server code — never a bad-SQL/logic error) the failing endpoint is demoted for a short cooldown and the next request fails over to another zone, returning to local endpoints once one recovers. There is no health ping on the healthy hot path.
+Selection is **zone-preferring round-robin**: endpoints whose `zone` matches this node's `PULSUS_AVAILABILITY_ZONE` are used first (round-robin among them), saving cross-AZ network cost; when none is configured or reachable the pool spreads evenly across all endpoints. On a transport failure (connection/timeout/IO or a retryable server code — never a bad-SQL/logic error) the failing endpoint is demoted for a short cooldown and the next request fails over to another zone. There is no health ping on the healthy hot path.
+
+A demoted endpoint recovers via a **background re-probe**, not by relying on request traffic to rediscover it: every 5s a pass re-pings only demoted endpoints whose cooldown has expired, promoting one back to healthy after 2 consecutive successful pings (hysteresis, so a flapping endpoint can't thrash in and out). Each probe borrows one permit from the pool's own concurrency budget via a non-queuing attempt — it never waits behind real requests, so it can only use genuinely idle capacity, and a saturated pool simply defers recovery to the next 5s tick. Once promoted, the endpoint leads again on the very next `get()`, returning to local endpoints once one recovers.
 
 `PULSUS_AZ_DETECT` populates this node's zone from the provider metadata service when you have not set `PULSUS_AVAILABILITY_ZONE` explicitly: AWS uses IMDSv2 (token-required), GCP `metadata.google.internal`, Azure the instance-metadata endpoint. It is a one-time startup probe, individually time-bounded, and fail-soft — off-cloud or when IMDS is blocked it simply leaves the zone unset. The zone strings it returns (e.g. `us-east-1a`, `us-central1-a`) must match the `=zone` labels you give `CLICKHOUSE_SERVERS` for affinity to take effect.
 
@@ -78,6 +93,9 @@ Deployment topologies:
 | `PULSUS_BATCH_MS` | `200` | flush a table buffer at this age |
 | `PULSUS_INSERT_MODE` | `sync` | `sync` \| `async` default when `X-Pulsus-Async` absent |
 | `PULSUS_INGEST_QUEUE_BYTES` | `256MiB` | total buffered bytes before `429` backpressure |
+| `PULSUS_METRICS_EXP_HISTOGRAM_MODE` | `classic` | `classic` \| `native` \| `dual` — how OTLP exponential histograms are stored (see below) |
+
+`PULSUS_METRICS_EXP_HISTOGRAM_MODE` selects how OTLP **exponential-histogram** data points are ingested (M7-A4). `classic` (default) keeps the existing behavior byte-for-byte: each data point is flattened to cumulative `<name>_bucket{le}`/`<name>_sum`/`<name>_count` float series. `native` instead stores the sparse native histogram (schema, spans, delta-encoded buckets) in `metric_hist_samples` under the base metric name, and stamps `metric_series.value_type = 1` for that series. `dual` emits **both** — the classic float series (suffixed names) and one base-name native row; their fingerprints are disjoint so they never collide. Flipping the mode mid-stream leaves a series' pre-flip classic history and post-flip native history as disjoint series (a visible gap), which is expected, not a defect.
 
 A batch that exhausts its insert retry budget is spooled to `./spool/{poison,uncertain}/<table>/` (relative to the process's working directory — a documented constant, not yet a `PULSUS_*` variable). In the published container image (§10), the working directory is `/var/lib/pulsusdb`, owned by the non-root `pulsus` user, so this resolves to `/var/lib/pulsusdb/spool/`; mount a volume over that path if spooled batches need to survive a container restart.
 
@@ -92,11 +110,14 @@ A batch that exhausts its insert retry budget is spooled to `./spool/{poison,unc
 | `PULSUS_PROMQL_MAX_SAMPLES` | `50000000` | evaluation sample budget per query |
 | `PULSUS_PROMQL_LOOKBACK` | `5m` | staleness/lookback delta |
 | `PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS` | `false` | permit the experimental slice of the pinned Prometheus function registry (mirrors upstream `--enable-feature=promql-experimental-functions`); inert until the first experimental function lands (M6) — the machine-checked inventory of what it will gate is `crates/pulsus-promql/tests/promqltest/coverage/function-coverage.json` |
-| `PULSUS_PROMQL_MAX_METRIC_FANOUT` | `1000` | cap on how many metric names one name-less/regex-`__name__` PromQL selector (e.g. `{job="api"}`, `{__name__=~"http_.*"}`) may fan out to; resolved from the warm label cache into a single `metric_name IN (...)` fetch — exceeding the cap returns "query too broad", never an unbounded scan |
+| `PULSUS_PROMQL_MAX_METRIC_FANOUT` | `1000` | cap on how many metric names one name-less/regex-`__name__` PromQL selector (e.g. `{job="api"}`, `{__name__=~"http_.*"}`) may fan out to; resolved from the warm label cache into a single `metric_name IN (...)` fetch — exceeding the cap returns "query too broad", never an unbounded scan. Accepted range `1..=1000000`: values above the ceiling are rejected at config load, since they would make the fan-out guard unreachable. **Query-text interaction (issue #35):** a fanout configured near the 1,000,000 ceiling can render a `metric_name IN (...)` list past the 8 MiB read-path query-text budget before the fanout guard itself would trip — such a query fails a deterministic `422 query_too_broad` rather than an opaque ClickHouse parse error. No config-load cross-check between the fanout ceiling and the query-text budget is possible: rendered width depends on stored metric-name lengths, unknowable at config load. Scale tuning routes to #25 |
+| `PULSUS_PROMQL_MAX_CACHE_SCAN` | `200000` | independent cap on how many resident label-cache entries (metric names plus candidate fingerprints) one name-less/regex-`__name__` selector's resolution may *examine* before it is rejected as too broad — distinct from `PULSUS_PROMQL_MAX_METRIC_FANOUT` (which bounds only the matched result): a selector whose matchers yield few or no matches can still examine the whole resident cache. Above the default, which sits above `PULSUS_CACHE_MAX_SERIES`, no legitimate warm resolution false-rejects |
+| `PULSUS_PROMQL_MAX_INFO_SERIES` | `100000` | pathological-cardinality backstop on a PromQL `info()` node's synthetic `*_info` metadata-family selector — how many series that family may resolve to before the query is rejected `422 query_too_broad`, enforced BEFORE any sample fetch is issued. Distinct from `PULSUS_PROMQL_MAX_METRIC_FANOUT` (bounds distinct metric *names*, not series) and `PULSUS_PROMQL_MAX_CACHE_SCAN` (bounds examined, not matched, cache entries); a backstop above realistic scrape-target-fleet size, not identifying-label narrowing |
 | `PULSUS_LOGQL_SCAN_BUDGET_BYTES` | `50GiB` | approximate best-effort per-query scan guard, **not** a hard byte ceiling: a first page alone over budget fails `QueryTooBroad`, but once at least one page has returned a spent budget (or a later page tripping its cap) returns the survivors so far with `data.stats.pulsus_partial` set; actual bytes scanned can exceed it under query parallelism / shard count (see `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR`) |
 | `PULSUS_LOGQL_PIPELINE_SCAN_FACTOR` | `10` | LogQL pipeline first-page fetch-size hint (must be >= 1): when a query pipeline contains an in-engine dropping stage that cannot push down to SQL (a label filter, or a line filter placed after `line_format`), the engine keyset-pages `limit × factor` rows at a time through the pipeline until the true `limit` fills, the window is exhausted, or the byte scan budget is spent — responses fill exactly to `limit` (no under-return) and never over-return. This is no longer an oversample-and-truncate ceiling; a larger factor only sizes the first page (fewer round-trips). `PULSUS_LOGQL_SCAN_BUDGET_BYTES` is an approximate best-effort scan guard, not a hard byte ceiling: if the first page alone exceeds the budget the query fails `QueryTooBroad`, but once at least one page has returned a spent budget (or a later page tripping its positive cap) returns the survivors so far with `data.stats.pulsus_partial` set — never a zero/unlimited cap. Because ClickHouse enforces the cap per read block per concurrent reader (per thread, per shard), actual bytes can exceed the budget, growing with parallelism and shard count |
 | `PULSUS_TRACEQL_MAX_CANDIDATES` | `100000` | trace-search candidate depth: per-generator top-K and the merged consumption ceiling; engaging it marks the response `metrics.partial` (docs/api.md §4.2) |
 | `PULSUS_TRACEQL_SCAN_BUDGET_ROWS` | `50000000` | per-query row scan cap on every trace-search read (`max_rows_to_read`, throw); exceeding returns `422 query_too_broad` — non-indexable searches are budget-limited, never silently slow |
+| `PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES` | `536870912` | phase-1 candidate-generator query's memory ceiling (`max_memory_usage` + `max_bytes_before_external_group_by=0`, throw-not-spill); bounds a dense common-value prefix's `GROUP BY trace_id` aggregation state — exceeding returns `422 query_too_broad` (never an OOM). Applied only to the generator read, never phase-2 hydration/membership/value/root reads |
 | `PULSUS_QUERY_EVAL_CONCURRENCY` | `256` | process-wide bound on concurrent CPU-bound PromQL evaluations offloaded onto the blocking pool (the read path's one `spawn_blocking(evaluate)` site); a query past the limit waits (bounded by `PULSUS_QUERY_TIMEOUT`, `408`), never a hard rejection. Default sits below tokio's 512 blocking-pool ceiling yet above realistic heavy-query fan-in, so the uncontended fast path is the norm (must be >= 1) |
 | `PULSUS_TAIL_POLL_INTERVAL` | `1s` | how often an idle (caught-up) live-tail connection re-polls for new rows (must be > 0) |
 | `PULSUS_TAIL_MAX_DELAY` | `5s` | ceiling on a tail client's `delay_for` param (docs/api.md §2.4); larger requests are clamped |
@@ -180,6 +201,10 @@ clickhouse:
   proto: http                    # http | https  (native rejected at startup — ADR 0001)
   tls_skip_verify: false
   pool_size: 8
+  insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only). §Consistency
+  insert_quorum_parallel: true   # only applied when insert_quorum > 0
+  insert_quorum_timeout: 120s    # 0 < timeout <= query_timeout when insert_quorum > 0 (deadline preempts otherwise)
+  select_sequential_consistency: false  # read-your-writes; adds latency, off by default
   servers: []                    # multi-endpoint spreading (overrides `server` when non-empty).
                                  # Each entry: {host, http_port?, zone?}; http_port falls back to
                                  # clickhouse.http_port. IPv6 literal hosts must use this object form,
@@ -203,10 +228,13 @@ reader:
   promql_lookback: 5m
   promql_experimental_functions: false
   promql_max_metric_fanout: 1000
+  promql_max_cache_scan: 200000
+  promql_max_info_series: 100000
   logql_scan_budget_bytes: 50GiB
   logql_pipeline_scan_factor: 10
   traceql_max_candidates: 100000
   traceql_scan_budget_rows: 50000000
+  traceql_generator_max_memory_bytes: 536870912
   query_eval_concurrency: 256
   tail_poll_interval: 1s
   tail_max_delay: 5s

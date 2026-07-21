@@ -1,5 +1,5 @@
 {
-  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan). Issue #82 (M6-05b) adds the `target_info` info-metric family (one series per instance — instance-keyed ONLY, no job, matching the base families' identifying labels; data labels `version`/`env`) plus three `info(...)` entries x 2 modes, growing the pinned matrix 156 -> 162 rows; both compose files' Prometheus oracle gained --enable-feature=promql-experimental-functions for them.",
+  "_comment": "issue #33 M2 differential-accuracy corpus + query matrix (e2e/src/metrics.rs, e2e/src/corpus.rs). `{R}` in every query_matrix expr is replaced with this run's run_id label value at execution time. Tier sizing: `ci` sums to ~1,000 series (gates every PR inside e2e-single/e2e-cluster); `full` sums to ~10,000 series (the docs/features.md §7 acceptance criterion — closure evidence + nightly schedule + workflow_dispatch, PULSUS_E2E_METRICS_SCALE=full). Both tiers share the same 5 services / 8 histogram bounds / 40-sample window so every query_matrix construct is exercised identically at either scale (correctness is scale-invariant, per the architect plan). Issue #82 (M6-05b) adds the `target_info` info-metric family (one series per instance — instance-keyed ONLY, no job, matching the base families' identifying labels; data labels `version`/`env`) plus three `info(...)` entries x 2 modes, growing the pinned matrix 156 -> 162 rows; both compose files' Prometheus oracle gained --enable-feature=promql-experimental-functions for them. Issue #83 adds one `max_over_time(...[10s:5s])` subquery entry x 2 modes (162 -> 163 was #88's separate range-only row; 163 -> 165 here), exercising client-side sparse-envelope pruning (the harness's 15s range step exceeds the subquery's own 10s range) against the live Prometheus oracle for value parity.",
   "seed": 424242,
   "step_ms": 15000,
   "sample_count": 40,
@@ -21,114 +21,153 @@
     "target_info_instances": 225
   },
   "query_matrix": [
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\",service!=\"svc-3\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=~\"svc-(1|2)\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\",instance!~\"inst-0.*\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service!=\"svc-3\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\",service=~\"svc-(1|2)\"}", "modes": ["instant", "range"], "min_series": 1 },
+    {
+      "_comment": "scale-dependent floor (issue #33 false-pass-guard follow-up, found live; per-tier override added by codex review round 2): instance_label zero-pads to 3 digits ('inst-000'..), so at the ci tier (gauge_instances=23) EVERY instance matches the literal prefix 'inst-0' and the negated regex matches zero series (min_series 0 — allowed empty). At the full tier (gauge_instances=225) instances 100..=224 escape the prefix: 5 services x 125 escaped instances x 3 slots = 1875 series, of which 313 are the engineered stale subset (flat index multiple of 6; excluded by both engines' 5m lookback at the instant eval time), leaving exactly 1562 live series at instant mode (range mode returns all 1875, above the floor either way). min_series_full pins that exact instant-mode count; e2e/src/metrics.rs's shipped-fixture test re-derives it from the generator so this number can never silently drift from the corpus.",
+      "expr": "mem_usage_bytes{run_id=\"{R}\",instance!~\"inst-0.*\"}",
+      "modes": ["instant", "range"],
+      "min_series": 0,
+      "min_series_full": 1562
+    },
 
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} offset 1m", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} offset 1m", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "rate(requests_total{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"] },
-    { "expr": "irate(requests_total{run_id=\"{R}\"}[1m])", "modes": ["instant", "range"] },
-    { "expr": "increase(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "delta(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "rate(requests_total{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "irate(requests_total{run_id=\"{R}\"}[1m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "increase(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "delta(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "avg_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "min_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "sum_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "count_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "avg_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "min_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sum_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "count_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
-    { "expr": "avg without(instance)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "min by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "max by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "count by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "topk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"] },
-    { "expr": "bottomk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"] },
+    { "expr": "max_over_time(mem_usage_bytes{run_id=\"{R}\"}[10s:5s])", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * 2", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} > bool 5e8", "modes": ["instant", "range"] },
+    { "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "avg without(instance)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "min by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "max by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "count by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "topk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "bottomk(3, sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])))", "modes": ["instant", "range"], "min_series": 1 },
+
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * 2", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} > bool 5e8", "modes": ["instant", "range"], "min_series": 1 },
     {
       "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m])) + on(service) sum by(service)(rate(requests_total{run_id=\"{R}\"}[5m]))",
-      "modes": ["instant", "range"]
+      "modes": ["instant", "range"], "min_series": 1
     },
     {
       "_comment": "matching-drop case (architect plan §6, substituting this corpus's own `slot` dimension for the plan's illustrative `method` label — the corpus has no `method` label; deviation noted in the issue #33 implementation notes): left selects every instance at slot-0 for svc-1, right pins a single instance at slot-1 — `ignoring(slot)` matches on (service,instance), so every left-side series without a slot-1 counterpart at the *same* instance is silently dropped from the output, leaving exactly one result series.",
       "expr": "mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\",slot=\"slot-0\"} + ignoring(slot) mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\",slot=\"slot-1\",instance=\"inst-000\"}",
-      "modes": ["instant", "range"]
+      "modes": ["instant", "range"], "min_series": 1
     },
 
     {
       "expr": "histogram_quantile(0.9, sum by(le)(rate(request_duration_seconds_bucket{run_id=\"{R}\"}[5m])))",
-      "modes": ["instant", "range"]
+      "modes": ["instant", "range"], "min_series": 1
     },
     {
       "expr": "histogram_quantile(0.5, rate(request_duration_seconds_bucket{run_id=\"{R}\",service=\"svc-3\"}[5m]))",
-      "modes": ["instant", "range"]
+      "modes": ["instant", "range"], "min_series": 1
     },
 
-    { "expr": "abs(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "ceil(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "floor(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "sqrt(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "sgn(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "deg(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "rad(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "clamp(mem_usage_bytes{run_id=\"{R}\"}, 3e8, 7e8)", "modes": ["instant", "range"] },
-    { "expr": "clamp_min(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
-    { "expr": "clamp_max(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"] },
-    { "expr": "round(mem_usage_bytes{run_id=\"{R}\"}, 1000)", "modes": ["instant", "range"] },
-    { "expr": "time()", "modes": ["instant", "range"] },
-    { "expr": "vector(time())", "modes": ["instant", "range"] },
-    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"} offset 1m)", "modes": ["instant", "range"] },
-    { "expr": "scalar(sum(mem_usage_bytes{run_id=\"{R}\"}))", "modes": ["instant", "range"] },
-    { "expr": "vector(scalar(sum(mem_usage_bytes{run_id=\"{R}\"})))", "modes": ["instant", "range"] },
-    { "expr": "year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "day_of_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "day_of_week(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "day_of_year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "days_in_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "hour(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "minute(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "month()", "modes": ["instant", "range"] },
+    { "expr": "abs(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "ceil(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "floor(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sqrt(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sgn(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "deg(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "rad(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "clamp(mem_usage_bytes{run_id=\"{R}\"}, 3e8, 7e8)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "clamp_min(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "clamp_max(mem_usage_bytes{run_id=\"{R}\"}, 5e8)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "round(mem_usage_bytes{run_id=\"{R}\"}, 1000)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "time()", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "vector(time())", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"} offset 1m)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "scalar(sum(mem_usage_bytes{run_id=\"{R}\"}))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "vector(scalar(sum(mem_usage_bytes{run_id=\"{R}\"})))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "day_of_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "day_of_week(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "day_of_year(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "days_in_month(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "hour(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "minute(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "month()", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "idelta(mem_usage_bytes{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"] },
-    { "expr": "resets(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "changes(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "last_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "present_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
-    { "expr": "absent_over_time(nonexistent_metric{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"] },
+    { "expr": "idelta(mem_usage_bytes{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "resets(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "changes(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "last_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "present_over_time(mem_usage_bytes{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "absent_over_time(nonexistent_metric{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "label_replace(mem_usage_bytes{run_id=\"{R}\"}, \"rewritten\", \"$1-copy\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
-    { "expr": "label_join(mem_usage_bytes{run_id=\"{R}\"}, \"joined\", \"-\", \"service\", \"instance\")", "modes": ["instant", "range"] },
-    { "expr": "absent(nonexistent_metric{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "label_replace(mem_usage_bytes{run_id=\"{R}\"}, \"rewritten\", \"$1-copy\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "label_join(mem_usage_bytes{run_id=\"{R}\"}, \"joined\", \"-\", \"service\", \"instance\")", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "absent(nonexistent_metric{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "group by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "group without(instance)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
-    { "expr": "count_values(\"v\", mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
+    { "expr": "group by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "group without(instance)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "count_values(\"v\", mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} and ignoring(slot) requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} or requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} unless requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"] },
-    { "expr": "requests_total{run_id=\"{R}\"} unless on(instance, run_id) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} / on(service, run_id) group_left max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * on(service, run_id) group_left(team) label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"] },
-    { "expr": "label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\") * on(service, run_id) group_right(team) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"] },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} and ignoring(slot) requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} or requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} unless requests_total{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "requests_total{run_id=\"{R}\"} unless on(instance, run_id) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} / on(service, run_id) group_left max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "mem_usage_bytes{run_id=\"{R}\"} * on(service, run_id) group_left(team) label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\")", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "label_replace(max by(service, run_id)(mem_usage_bytes{run_id=\"{R}\"}), \"team\", \"$1\", \"service\", \"svc-(.*)\") * on(service, run_id) group_right(team) mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "sum by(__name__)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"] },
-    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} or rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]))", "modes": ["instant", "range"] },
-    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\"} or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-2\"} * 1))", "modes": ["instant", "range"] },
-    { "expr": "(mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} > 200000150) or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} * 1)", "modes": ["instant", "range"] },
-    { "expr": "sum by(__name__)(label_replace(rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]) or delta(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}[5m]), \"__name__\", \"$1\", \"__name__\", \"(.+)\"))", "modes": ["instant", "range"] },
+    { "expr": "sum by(__name__)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} or rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sum by(__name__)(mem_usage_bytes{run_id=\"{R}\",service=\"svc-1\"} or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-2\"} * 1))", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "(mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} > 200000150) or (mem_usage_bytes{run_id=\"{R}\",service=\"svc-0\",instance=\"inst-000\",slot=\"slot-1\"} * 1)", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "sum by(__name__)(label_replace(rate(requests_total{run_id=\"{R}\",service=\"svc-3\"}[2m]) or delta(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}[5m]), \"__name__\", \"$1\", \"__name__\", \"(.+)\"))", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"] },
-    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"}, {version=~\".+\"})", "modes": ["instant", "range"] },
-    { "expr": "info(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}, {__name__=\"target_info\"})", "modes": ["instant", "range"] },
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\"}, {version=~\".+\"})", "modes": ["instant", "range"], "min_series": 1 },
+    { "expr": "info(mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"}, {__name__=\"target_info\"})", "modes": ["instant", "range"], "min_series": 1 },
 
-    { "expr": "topk(time() % 2, mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} @ start())", "modes": ["range"] }
-  ]
+    {
+      "_comment": "legitimately-empty exception (issue #33 false-pass-guard follow-up): k is the parity of the eval second (time() % 2), so this row returns 0 series on roughly half of any given run's evaluations — the only query_matrix row permitted a zero positive-signal floor.",
+      "expr": "topk(time() % 2, mem_usage_bytes{run_id=\"{R}\",service=\"svc-3\"} @ start())",
+      "modes": ["range"],
+      "min_series": 0
+    }
+  ],
+  "historical": {
+    "_comment": "issue #33 false-pass-guard + fallback-coverage follow-up: a small, constant-size (<=100 series) corpus direct-remote-written to both backends at now-offset_hours (well past the 24h label-cache window and PulsusDB's metric_series bucket floor, but inside Prometheus's 2d out-of-order acceptance window pinned in deploy/e2e/prometheus.yml and the 7-day metric_samples TTL), forcing every selector onto the metric_series SqlFallback read path. `fallback_matrix` reruns a representative subset of the main query_matrix's constructs (bare selector, a regex matcher, rate/increase, an aggregation, and histogram_quantile) plus a raw timestamp() probe, strictly compared against Prometheus exactly like query_matrix (never an allowlist) — e2e/src/metrics.rs's `fallback_leg` additionally proves the fallback path was actually taken (X-Pulsus-Explain + a pulsus_label_cache_misses_total{reason=\"out_of_window\"} counter delta). `min_series` floors below are exact live series counts for this fixed families/step_ms shape (no staleness gap ever crosses the 5-minute lookback within this corpus's own short span, so every family stays fully populated at the corpus's own eval time), except the histogram_quantile row (sum by(le) collapses every remaining label, always exactly 1 result series).",
+    "offset_hours": 26,
+    "sample_count": 20,
+    "families": {
+      "services": 5,
+      "gauge_instances": 2,
+      "gauge_slots": 2,
+      "counter_instances": 2,
+      "histogram_instances": 1,
+      "target_info_instances": 0
+    },
+    "fallback_matrix": [
+      { "expr": "mem_usage_bytes{run_id=\"{R}\"}", "modes": ["instant", "range"], "min_series": 20 },
+      { "expr": "mem_usage_bytes{run_id=\"{R}\",service=~\"svc-(1|2)\"}", "modes": ["instant", "range"], "min_series": 8 },
+      { "expr": "rate(requests_total{run_id=\"{R}\"}[2m])", "modes": ["instant", "range"], "min_series": 10 },
+      { "expr": "increase(requests_total{run_id=\"{R}\"}[5m])", "modes": ["instant", "range"], "min_series": 10 },
+      { "expr": "sum by(service)(rate(requests_total{run_id=\"{R}\"}[2m]))", "modes": ["instant", "range"], "min_series": 5 },
+      { "expr": "count by(service)(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 5 },
+      {
+        "expr": "histogram_quantile(0.9, sum by(le)(rate(request_duration_seconds_bucket{run_id=\"{R}\"}[5m])))",
+        "modes": ["instant", "range"], "min_series": 1
+      },
+      { "expr": "timestamp(mem_usage_bytes{run_id=\"{R}\"})", "modes": ["instant", "range"], "min_series": 20 }
+    ]
+  }
 }

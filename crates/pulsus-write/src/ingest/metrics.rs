@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use pulsus_model::{Fingerprint, LabelSet};
+use pulsus_model::{Fingerprint, LabelSet, NativeHistogram};
 
 use crate::ingest::{Backpressure, FlushWait};
 
@@ -24,6 +24,51 @@ pub struct MetricPoint {
     /// it never mutates it.
     pub unix_milli: i64,
     pub value: f64,
+}
+
+/// One `metric_hist_samples` row's source data (M7-A4, issue #120): a native
+/// (sparse) histogram sample produced by the OTLP exponential-histogram
+/// ingest path. Parallels [`MetricPoint`] (the float row's source), carrying
+/// the base metric name, series fingerprint, and verbatim `unix_milli`; the
+/// histogram value is the A3 [`NativeHistogram`] validated at the ingest
+/// seam.
+///
+/// Hand-written [`PartialEq`] (so [`ParsedMetrics`] keeps its `derive`):
+/// [`NativeHistogram`] deliberately has no `PartialEq` — its `f64` fields
+/// (`sum`, `zero_threshold`, `custom_values`) may be NaN markers, so they are
+/// compared by `to_bits()` here, everything else structurally.
+#[derive(Debug, Clone)]
+pub struct HistogramPoint {
+    pub metric_name: Arc<str>,
+    pub fingerprint: Fingerprint,
+    /// Milliseconds since the Unix epoch, verbatim (same contract as
+    /// [`MetricPoint::unix_milli`]).
+    pub unix_milli: i64,
+    pub histogram: NativeHistogram,
+}
+
+impl PartialEq for HistogramPoint {
+    fn eq(&self, other: &Self) -> bool {
+        let a = &self.histogram;
+        let b = &other.histogram;
+        self.metric_name == other.metric_name
+            && self.fingerprint == other.fingerprint
+            && self.unix_milli == other.unix_milli
+            && a.schema == b.schema
+            && a.zero_threshold.to_bits() == b.zero_threshold.to_bits()
+            && a.zero_count == b.zero_count
+            && a.count == b.count
+            && a.sum.to_bits() == b.sum.to_bits()
+            && a.positive_spans == b.positive_spans
+            && a.negative_spans == b.negative_spans
+            && a.positive_buckets == b.positive_buckets
+            && a.negative_buckets == b.negative_buckets
+            && a.custom_values.len() == b.custom_values.len()
+            && a.custom_values
+                .iter()
+                .zip(&b.custom_values)
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+    }
 }
 
 /// A `(metric_name, fingerprint)` series' resolved label set — the carrier
@@ -68,6 +113,12 @@ pub struct ParsedMetrics {
     /// series per activity bucket").
     pub series: Vec<SeriesRef>,
     pub metadata: Vec<MetricMetadata>,
+    /// Native-histogram samples destined for `metric_hist_samples` (M7-A4).
+    /// Empty unless the request carried OTLP exponential histograms under a
+    /// `native`/`dual` [`ExpHistogramMode`](pulsus_config::ExpHistogramMode).
+    /// Their series are registered from [`Self::series`] just like float
+    /// samples, but stamped `value_type = 1`.
+    pub hist_samples: Vec<HistogramPoint>,
     /// Sum of every label set's normalized-key collision count across the
     /// whole request — never swallowed, surfaced for the writer's collision
     /// metric.
@@ -128,6 +179,7 @@ mod tests {
         assert!(parsed.samples.is_empty());
         assert!(parsed.series.is_empty());
         assert!(parsed.metadata.is_empty());
+        assert!(parsed.hist_samples.is_empty());
         assert_eq!(parsed.collisions, 0);
         assert_eq!(parsed.rejected, 0);
         assert_eq!(parsed.rejected_message, None);

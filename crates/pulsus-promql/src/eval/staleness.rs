@@ -16,8 +16,6 @@
 //!    since `NaN != NaN` and a bare `is_nan()` check would not distinguish
 //!    a genuinely stale marker from any other NaN payload).
 
-use pulsus_model::STALE_NAN_BITS;
-
 use crate::value::Sample;
 
 /// Returns the most recent sample in `(t_ms − lookback_ms, t_ms]`, or
@@ -31,22 +29,28 @@ pub fn instant_value(samples: &[Sample], t_ms: i64, lookback_ms: i64) -> Option<
     if idx == 0 {
         return None;
     }
-    let candidate = samples[idx - 1];
+    let candidate = &samples[idx - 1];
     if candidate.t_ms <= lower_excl {
         return None;
     }
-    if candidate.v.to_bits() == STALE_NAN_BITS {
+    // Stale-NaN exclusion covers BOTH channels (M7-A5a): the float
+    // `STALE_NAN` bit pattern and a histogram whose `sum` carries it (A4
+    // encodes histogram staleness as an empty histogram with that `sum`).
+    // `Sample::is_stale` folds both; an ordinary NaN is never stale.
+    if candidate.is_stale() {
         return None;
     }
-    Some(candidate)
+    Some(candidate.clone())
 }
 
 #[cfg(test)]
 mod tests {
+    use pulsus_model::STALE_NAN_BITS;
+
     use super::*;
 
     fn s(t_ms: i64, v: f64) -> Sample {
-        Sample { t_ms, v }
+        Sample::float(t_ms, v)
     }
 
     #[test]

@@ -27,6 +27,11 @@ metrics-exporter-prometheus.workspace = true
 pulsus-clickhouse = { path = "../pulsus-clickhouse" }
 pulsus-config = { path = "../pulsus-config" }
 pulsus-logql = { path = "../pulsus-logql" }
+# M7-A5b-i: `prom_api/encode.rs`'s native-histogram wire encoder walks
+# `FloatHistogram::all_buckets` directly (the `MarshalHistogram` port) — a
+# real (not dev-only) dependency now, promoted from the dev-only role it
+# held before A5b (see the `[dev-dependencies]` note this superseded).
+pulsus-model = { path = "../pulsus-model" }
 # `prom_api` (issue #32) parses PromQL directly (`pulsus_promql::parse`)
 # and reuses `pulsus_promql::plan`'s already-tested `__name__`-extraction
 # for `match[]` selectors — mirrors `pulsus-logql`'s own role on the log
@@ -72,11 +77,6 @@ tracing-subscriber.workspace = true
 # dev-only precedent as `pulsus-read`'s own live tests
 # (`clickhouse.workspace = true` there too).
 clickhouse.workspace = true
-# `pulsus_model::UnixNano` in `ingest.rs`'s `WriterSink` unit tests only
-# (constructing a `LogRow` directly) — never referenced from production
-# code, so this stays dev-only rather than pulling `pulsus-model` into the
-# binary's real dependency graph.
-pulsus-model = { path = "../pulsus-model" }
 tower = { workspace = true, features = ["util"] }
 # gzip-decodes `CompressionLayer` response bodies in the poll-after-end
 # regression coverage for issue #24 — dev-only, never a runtime dependency

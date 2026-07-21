@@ -4,6 +4,8 @@
 
 mod canonical;
 mod fingerprint;
+mod float_histogram;
+mod histogram;
 mod labels;
 mod matcher;
 mod sample;
@@ -13,6 +15,14 @@ pub use canonical::{METRIC_NAME_LABEL, SERVICE_NAME_LABEL, canonicalize_label_ke
 pub use fingerprint::{
     build_metric_buffer, build_stream_buffer, metric_fingerprint, raw_cityhash64,
     stream_fingerprint,
+};
+pub use float_histogram::{
+    Bucket as FloatBucket, CombineOp, CombineOutcome, FloatHistogram, FloatHistogramOpError,
+    KahanAddOutcome,
+};
+pub use histogram::{
+    CUSTOM_BUCKETS_SCHEMA, EXPONENTIAL_SCHEMA_MAX, EXPONENTIAL_SCHEMA_MIN, HistogramColumns,
+    HistogramError, NativeHistogram, SampleValue, Span, ValueType,
 };
 pub use labels::{LabelError, LabelSet};
 pub use matcher::{LabelMatcher, MatchOp};

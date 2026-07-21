@@ -20,7 +20,12 @@
 //! against its name-keyed label cache (`pulsus-read`'s per-metric
 //! fan-out, capped) and carries each fetched series' own name on
 //! `FetchedSeries::metric_name`, so `__name__` still never enters the
-//! matcher list or the evaluator's `Labels`.
+//! matcher list or the evaluator's `Labels`. A second or later `Eq
+//! __name__` matcher inside braces (e.g. `{__name__="a",__name__="b"}`)
+//! also lands in `name_matchers` rather than erroring: the first `Eq`
+//! still sets `metric_name`, and the fetch layer's existing intersection
+//! resolves agreement to that name and conflict to an empty result with
+//! no query issued.
 
 use pulsus_model::{LabelMatcher, MatchOp};
 
@@ -91,11 +96,12 @@ pub struct SelectorSpec {
     /// `None` ⟺ a matcher-only or regex/negative-`__name__` selector —
     /// the fetch layer fans out over its name-keyed cache (issue #85).
     pub metric_name: Option<String>,
-    /// Non-`Eq` `__name__` matchers (`=~`/`!~`/`!=`), evaluated by the
-    /// fetch layer against candidate metric *names* (the single concrete
-    /// name when `metric_name` is `Some`, the cache's name key set when
-    /// `None`) — never against `Labels`, which excludes `__name__` by
-    /// construction.
+    /// Non-`Eq` `__name__` matchers (`=~`/`!~`/`!=`), plus any redundant or
+    /// conflicting duplicate `Eq __name__` matcher beyond the first
+    /// (issue #85), evaluated by the fetch layer against candidate metric
+    /// *names* (the single concrete name when `metric_name` is `Some`, the
+    /// cache's name key set when `None`) — never against `Labels`, which
+    /// excludes `__name__` by construction.
     pub name_matchers: Vec<LabelMatcher>,
     pub matchers: Vec<LabelMatcher>,
     /// `Some` for a matrix selector (the range-vector width); `None` for
@@ -109,6 +115,13 @@ pub struct SelectorSpec {
     pub at_ms: Option<i64>,
     /// Accumulated fetch-window context. Fetch only; never affects eval.
     pub fetch: FetchExtent,
+    /// Issue #82 (retroactive re-review, v4 Δ1): `true` for the ONE
+    /// synthetic selector `plan_info` pushes per `info()` node — the
+    /// `*_info` metadata-family fetch. Fetch only; never affects eval.
+    /// Marks the selector for the reader's pre-materialization
+    /// `promql_max_info_series` cardinality cap (never applied to an
+    /// ordinary selector, which must always return complete results).
+    pub info_family: bool,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -300,6 +313,19 @@ pub enum AggOp {
     LimitRatio,
 }
 
+/// M7-A5b-i: the five single-vector-argument native-histogram accessors
+/// (`histogram_fraction` takes two extra scalar args, so it is its own
+/// [`PlanExpr::HistogramFraction`] variant rather than a sixth
+/// discriminant here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistogramAccessorFn {
+    Count,
+    Sum,
+    Avg,
+    StdDev,
+    StdVar,
+}
+
 /// Elementwise vector→vector math/trig functions (issue #65, M6-02):
 /// pure post-fetch transforms — every discriminant maps one input sample
 /// to one output value, so the wrapped expression's selector set (and
@@ -378,6 +404,15 @@ pub struct Grouping {
 /// v3.13 @ 40af9c2) lists `ATAN2` alongside the six arithmetic operators,
 /// so it drops `__name__` and never filters. Set operators (`and`/`or`/
 /// `unless`) are not `BinOp`s at all — they plan to [`PlanExpr::SetOp`].
+///
+/// `TrimUpper`/`TrimLower` (issue #129) are Prometheus's experimental
+/// native-histogram **trim** operators (`</` TRIM_UPPER, `>/` TRIM_LOWER,
+/// `promql/parser/lex.go:470-489` at the pinned v3.13.0 conformance SHA
+/// `40af9c2`) — NOT comparisons: they are deliberately excluded from the
+/// vendored parser's `is_comparison_operator` (`token.rs`), which is what
+/// makes `bool` parse-reject on them and exempts their scalar operands
+/// from the BOOL-modifier requirement. [`Self::is_comparison`] mirrors
+/// that exclusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -393,6 +428,8 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    TrimUpper,
+    TrimLower,
 }
 
 impl BinOp {
@@ -401,6 +438,56 @@ impl BinOp {
             self,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         )
+    }
+
+    /// Whether this is a native-histogram trim operator (`</`/`>/`) —
+    /// issue #129.
+    pub fn is_trim(self) -> bool {
+        matches!(self, BinOp::TrimUpper | BinOp::TrimLower)
+    }
+
+    /// Upstream `changesMetricSchema` (`promql/engine.go:4407-4414`,
+    /// pinned `40af9c2`): whether the operator computes a new value and so
+    /// drops `__name__` (and other metadata) immediately — the six
+    /// arithmetic operators plus `atan2`. Comparisons and the trim
+    /// operators are excluded (a trim's result stays "the same metric,
+    /// filtered/reshaped" for naming purposes, exactly like a filter-mode
+    /// comparison).
+    pub fn changes_metric_schema(self) -> bool {
+        matches!(
+            self,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::Pow
+                | BinOp::Atan2
+        )
+    }
+
+    /// M7-A5b-iii: the operator's canonical text — upstream
+    /// `parser.ItemTypeStr[op]` (`promql/parser/lex.go`), the operand-type
+    /// text `NewIncompatibleTypesInBinOpInfo`/
+    /// `NewIncompatibleBucketLayoutInBinOpWarning` embed.
+    pub fn item_type_str(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "^",
+            BinOp::Atan2 => "atan2",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::TrimUpper => "</",
+            BinOp::TrimLower => ">/",
+        }
     }
 }
 
@@ -549,6 +636,24 @@ pub enum PlanExpr {
     },
     HistogramQuantile {
         quantile: Box<PlanExpr>,
+        expr: Box<PlanExpr>,
+    },
+    /// M7-A5b-i: the single-vector-argument native-histogram accessors
+    /// (`histogram_count`/`_sum`/`_avg`/`_stddev`/`_stdvar`,
+    /// `functions.go` `simpleHistogramFunc`/`histogramVariance`). Each
+    /// silently drops a float-valued input sample (upstream: "process only
+    /// histogram samples") and drops the metric name on output (`DropName:
+    /// true`, mirroring [`PlanExpr::HistogramQuantile`]).
+    HistogramAccessor {
+        func: HistogramAccessorFn,
+        arg: Box<PlanExpr>,
+    },
+    /// M7-A5b-i: `histogram_fraction(lower, upper, v)` — dispatches per
+    /// sample like [`PlanExpr::HistogramQuantile`] (native histogram vs
+    /// classic `le`-labelled float), `functions.go` `funcHistogramFraction`.
+    HistogramFraction {
+        lower: Box<PlanExpr>,
+        upper: Box<PlanExpr>,
         expr: Box<PlanExpr>,
     },
     Aggregate {
@@ -752,6 +857,13 @@ struct Planner {
 }
 
 impl Planner {
+    /// `info_family` (issue #82, retroactive re-review v4 Δ1): `true`
+    /// only from `plan_info`'s single call site — marks the synthetic
+    /// `*_info` metadata-family selector for the reader's
+    /// pre-materialization cardinality cap. The
+    /// `gate_duration_expr`/`experimental` precedent for a plain `bool`
+    /// param on a narrow, internal, few-call-site helper.
+    #[allow(clippy::too_many_arguments)]
     fn push_selector(
         &mut self,
         metric_name: Option<String>,
@@ -760,6 +872,7 @@ impl Planner {
         range_ms: Option<i64>,
         offset_ms: i64,
         at_ms: Option<i64>,
+        info_family: bool,
     ) -> SelectorId {
         // Own `@` dominates and discards the accumulated subquery context
         // (the sub-tree is step-invariant at that fixed time); otherwise
@@ -787,6 +900,7 @@ impl Planner {
             offset_ms,
             at_ms,
             fetch,
+            info_family,
         });
         id
     }
@@ -1110,8 +1224,12 @@ fn or_matchers_rejection() -> PromqlError {
 /// from a [`VectorSelector`], per the module doc's metric-scoping rule
 /// (issue #85: matcher-only and regex/negative-`__name__` selectors now
 /// extract instead of erroring — `metric_name: None` plus the non-`Eq`
-/// `__name__` matchers in the dedicated name channel). Public because it
-/// is [`series_selector`]'s return type (issue #89).
+/// `__name__` matchers in the dedicated name channel). A second or later
+/// `Eq __name__` matcher (braces-only forms only — the parser still
+/// rejects a bare name combined with an explicit `__name__` matcher) also
+/// lands in the name channel rather than being rejected, so the fetch
+/// layer's intersection resolves agreement/conflict Prometheus-exactly.
+/// Public because it is [`series_selector`]'s return type (issue #89).
 pub type ExtractedSelector = (Option<String>, Vec<LabelMatcher>, Vec<LabelMatcher>);
 
 fn extract_name_and_matchers(vs: &VectorSelector) -> Result<ExtractedSelector, PromqlError> {
@@ -1128,13 +1246,15 @@ fn extract_name_and_matchers(vs: &VectorSelector) -> Result<ExtractedSelector, P
                 PLabelMatchOp::Equal if metric_name.is_none() => {
                     metric_name = Some(m.value.clone());
                 }
-                PLabelMatchOp::Equal => {
-                    // The parser rejects a bare name *and* an explicit
-                    // `__name__` matcher together before this is ever
-                    // reached, but this branch keeps the extraction total
-                    // rather than relying on that upstream invariant.
-                    return Err(unsupported("selector with a metric name set twice"));
-                }
+                // A second (or later) `Eq __name__` matcher — the parser
+                // rejects a bare name plus an explicit `__name__` matcher
+                // together (`metric name must not be set twice`), but
+                // braces-only forms like `{__name__="a",__name__="b"}` parse
+                // fine (issue #85: upstream only guards the bare-name case).
+                // Route it through `name_matchers`, which every consumer
+                // already intersects against the concrete name: agreement
+                // resolves to that name, conflict resolves to empty with no
+                // fetch issued.
                 _ => {
                     name_matchers.push(convert_matcher(m)?);
                 }
@@ -1170,7 +1290,15 @@ fn plan_vector_selector(
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
     let offset = planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?;
-    let id = planner.push_selector(metric_name, name_matchers, matchers, None, offset, at_ms);
+    let id = planner.push_selector(
+        metric_name,
+        name_matchers,
+        matchers,
+        None,
+        offset,
+        at_ms,
+        false,
+    );
     Ok(PlanExpr::Selector(id))
 }
 
@@ -1196,6 +1324,7 @@ fn plan_matrix_selector_id(
         Some(range_ms),
         offset,
         at_ms,
+        false,
     ))
 }
 
@@ -1411,15 +1540,17 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
     }
 
     if name == "histogram_quantile" {
-        let [quantile_arg, expr_arg] = args.as_slice() else {
-            return Err(unsupported("histogram_quantile() with != 2 arguments"));
-        };
-        let quantile = plan_expr(planner, quantile_arg)?;
-        let expr = plan_expr(planner, expr_arg)?;
-        return Ok(PlanExpr::HistogramQuantile {
-            quantile: Box::new(quantile),
-            expr: Box::new(expr),
-        });
+        return plan_histogram_quantile(planner, args);
+    }
+
+    // M7-A5b-i: the five single-vector-argument native-histogram accessors.
+    if let Some(func) = histogram_accessor_fn(name) {
+        return plan_histogram_accessor(planner, name, func, args);
+    }
+
+    // M7-A5b-i: `histogram_fraction(lower, upper, v)`.
+    if name == "histogram_fraction" {
+        return plan_histogram_fraction(planner, args);
     }
 
     // Issue #65 (M6-02): the 23 unary elementwise math/trig functions —
@@ -1863,6 +1994,7 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             None,
             offset_ms,
             at_ms,
+            true,
         );
         Ok(PlanExpr::Info {
             base: Box::new(base),
@@ -1871,6 +2003,87 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             data_matchers,
         })
     }
+}
+
+/// The `histogram_quantile(q, v)` planning arm (issue #37) — out of line
+/// (the `resolve_subquery_fields`/`plan_info` precedent, extended to this
+/// pre-existing arm by M7-A5b-i when the two new histogram arms below
+/// pushed `plan_call`'s frame past [`MAX_SUBQUERY_DEPTH`]'s tuned budget):
+/// `plan_call` sits on the plan recursion cycle whose per-level debug-build
+/// frame budget sizes `MAX_SUBQUERY_DEPTH` — this arm's locals must not
+/// ride every recursion frame.
+#[inline(never)]
+fn plan_histogram_quantile(
+    planner: &mut Planner,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [quantile_arg, expr_arg] = args else {
+        return Err(unsupported("histogram_quantile() with != 2 arguments"));
+    };
+    let quantile = plan_expr(planner, quantile_arg)?;
+    let expr = plan_expr(planner, expr_arg)?;
+    Ok(PlanExpr::HistogramQuantile {
+        quantile: Box::new(quantile),
+        expr: Box::new(expr),
+    })
+}
+
+/// `name` -> the matching [`HistogramAccessorFn`] discriminant, or `None`.
+/// A tiny, non-recursive lookup (no `plan_expr` call), so it stays inline
+/// in `plan_call` without affecting the recursion-cycle frame budget (see
+/// [`plan_histogram_accessor`]'s own doc for the functions that DO need
+/// the out-of-line split).
+fn histogram_accessor_fn(name: &str) -> Option<HistogramAccessorFn> {
+    match name {
+        "histogram_count" => Some(HistogramAccessorFn::Count),
+        "histogram_sum" => Some(HistogramAccessorFn::Sum),
+        "histogram_avg" => Some(HistogramAccessorFn::Avg),
+        "histogram_stddev" => Some(HistogramAccessorFn::StdDev),
+        "histogram_stdvar" => Some(HistogramAccessorFn::StdVar),
+        _ => None,
+    }
+}
+
+/// The single-vector-argument native-histogram accessor planning arm
+/// (M7-A5b-i) — out of line (the `resolve_subquery_fields`/`plan_info`
+/// precedent): `plan_call` sits on the plan recursion cycle whose
+/// per-level debug-build frame budget sizes [`MAX_SUBQUERY_DEPTH`] — this
+/// arm's locals must not ride every recursion frame.
+#[inline(never)]
+fn plan_histogram_accessor(
+    planner: &mut Planner,
+    name: &str,
+    func: HistogramAccessorFn,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [arg] = args else {
+        return Err(unsupported(format!("{name}() with != 1 argument")));
+    };
+    let arg = plan_expr(planner, arg)?;
+    Ok(PlanExpr::HistogramAccessor {
+        func,
+        arg: Box::new(arg),
+    })
+}
+
+/// The `histogram_fraction(lower, upper, v)` planning arm (M7-A5b-i) — out
+/// of line, same rationale as [`plan_histogram_accessor`].
+#[inline(never)]
+fn plan_histogram_fraction(
+    planner: &mut Planner,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    let [lower_arg, upper_arg, expr_arg] = args else {
+        return Err(unsupported("histogram_fraction() with != 3 arguments"));
+    };
+    let lower = plan_expr(planner, lower_arg)?;
+    let upper = plan_expr(planner, upper_arg)?;
+    let expr = plan_expr(planner, expr_arg)?;
+    Ok(PlanExpr::HistogramFraction {
+        lower: Box::new(lower),
+        upper: Box::new(upper),
+        expr: Box::new(expr),
+    })
 }
 
 /// The first `VectorSelector` in pre-order source order — the port of
@@ -2045,6 +2258,8 @@ fn bin_op(op: token::TokenType) -> Option<BinOp> {
         id if id == token::T_LTE => Some(BinOp::Le),
         id if id == token::T_GTR => Some(BinOp::Gt),
         id if id == token::T_GTE => Some(BinOp::Ge),
+        id if id == token::T_TRIM_UPPER => Some(BinOp::TrimUpper),
+        id if id == token::T_TRIM_LOWER => Some(BinOp::TrimLower),
         _ => None,
     }
 }
@@ -2237,21 +2452,41 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
         // arguments) routes through `plan_string_arg` — anything reaching
         // here (`"a" + 1`, `sum("x")`, …) is genuinely unplannable.
         Expr::StringLiteral(_) => Err(unsupported("string literal")),
-        // Issue #83 (adjudicated fold from the M6-08 split): unary minus
-        // desugars to `0 - operand` — upstream semantics exactly (unary
-        // minus is arithmetic-class: per-element negation, `__name__`
-        // dropped like every arithmetic operator; scalar operands negate
-        // through the same scalar-scalar path). The vendored parser folds
-        // unary over a bare number literal itself, so this arm only sees
-        // composite operands (`-metric`, `-10^3` ≡ `-(10^3)`, `---m`).
-        // Pinned by `at_modifier.test:61,65` (`-metric @ 100`,
-        // `---metric @ 100`).
+        // Issue #83 (adjudicated fold from the M6-08 split), reworked by
+        // issue #124 (M7-A6): unary minus desugars to `operand * -1` —
+        // upstream semantics exactly (unary minus is arithmetic-class:
+        // per-element negation, `__name__` dropped like every arithmetic
+        // operator; scalar operands negate through the same scalar-scalar
+        // path). The vendored parser folds unary over a bare number
+        // literal itself, so this arm only sees composite operands
+        // (`-metric`, `-10^3` ≡ `-(10^3)`, `---m`). Pinned by
+        // `at_modifier.test:61,65` (`-metric @ 100`, `---metric @ 100`).
+        //
+        // **`Mul`, not `Sub` (M7-A6 fix):** the ORIGINAL `0 - operand`
+        // desugaring was byte-identical to upstream for floats
+        // (`0.0 - x == -x`), but the pin does NOT actually evaluate
+        // `-metric` as a scalar-vector subtraction at all — `UnaryExpr`
+        // has its OWN dedicated engine case (`engine.go:2461-2480`) that
+        // negates floats and `Mul(-1)`s histograms directly. A `0 -
+        // histogram` genuinely has no disposal in the pin's own binop
+        // matrix (`vectorElemBinop`'s `hlhs==nil,hrhs!=nil` case supports
+        // only `MUL`; `SUB` there returns `IncompatibleTypesInBinOpInfo`
+        // and drops) — so the old desugaring silently dropped every
+        // histogram-valued unary-minus operand (`native_histograms.test`
+        // `-histogram_mul_div`/`-metric`). `operand * -1` uses the
+        // SYMMETRIC disposal the pin's matrix DOES support in both
+        // scalar-position arrangements (`hlhs!=nil,hrhs==nil,MUL` ⇒
+        // `hlhs.Copy().Mul(rhs)`), is bit-identical to `0 - x` for every
+        // float value (including signed zero and infinities), and
+        // preserves the same arithmetic-class `__name__`-drop semantics
+        // (`eval/binop.rs::vector_scalar` drops uniformly across every
+        // non-comparison operator, not `Sub`-specific).
         Expr::Unary(UnaryExpr { expr }) => {
             let operand = plan_expr(planner, expr)?;
             Ok(PlanExpr::Binary {
-                op: BinOp::Sub,
-                lhs: Box::new(PlanExpr::Scalar(0.0)),
-                rhs: Box::new(operand),
+                op: BinOp::Mul,
+                lhs: Box::new(operand),
+                rhs: Box::new(PlanExpr::Scalar(-1.0)),
                 bool_modifier: false,
                 matching: Matching::default_ignoring_none(),
                 group: Group::OneToOne,
@@ -2403,6 +2638,14 @@ impl<'a> StepInvariance<'a> {
                 let inv = self.classify(quantile).0 && self.classify(expr).0;
                 (inv, inv)
             }
+            PlanExpr::HistogramAccessor { arg, .. } => {
+                let inv = self.classify(arg).0;
+                (inv, inv)
+            }
+            PlanExpr::HistogramFraction { lower, upper, expr } => {
+                let inv = self.classify(lower).0 && self.classify(upper).0 && self.classify(expr).0;
+                (inv, inv)
+            }
             // The param-IGNORING quirk: upstream's AggregateExpr arm
             // returns `preprocessExprHelper(n.Expr)` verbatim — the
             // param is neither classified nor ever wrapped.
@@ -2453,6 +2696,7 @@ fn over_time_param_fn_is_at_modifier_unsafe(func: OverTimeParamFn) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::parser::parse;
 
@@ -2595,6 +2839,79 @@ mod tests {
             ),
             other => panic!("expected Parse, got {other:?}"),
         }
+    }
+
+    // --- issue #85 combined/duplicate __name__ equality matchers: a
+    // second-or-later `Eq __name__` matcher (braces-only forms; a bare
+    // name plus an explicit matcher is still a parse-time reject) is now
+    // intersected via `name_matchers` instead of being rejected. ---
+
+    #[test]
+    fn a_conflicting_duplicate_name_matcher_intersects_instead_of_rejecting() {
+        let expr = parse(r#"{__name__="a",__name__="b"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "b".to_string(),
+            }]
+        );
+        assert!(p.selectors[0].matchers.is_empty());
+    }
+
+    #[test]
+    fn an_agreeing_duplicate_name_matcher_intersects_to_the_same_name() {
+        let expr = parse(r#"{__name__="a",__name__="a"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "a".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_quoted_leading_name_plus_a_name_matcher_intersects() {
+        let expr = parse(r#"{"bar", __name__="baz"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("bar"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![LabelMatcher {
+                key: "__name__".to_string(),
+                op: MatchOp::Eq,
+                value: "baz".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn three_or_more_duplicate_name_matchers_all_land_in_the_name_channel() {
+        let expr = parse(r#"{__name__="a",__name__="a",__name__="b"}"#).unwrap();
+        let p = plan(&expr, params()).unwrap();
+        assert_eq!(p.selectors[0].metric_name.as_deref(), Some("a"));
+        assert_eq!(
+            p.selectors[0].name_matchers,
+            vec![
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Eq,
+                    value: "a".to_string(),
+                },
+                LabelMatcher {
+                    key: "__name__".to_string(),
+                    op: MatchOp::Eq,
+                    value: "b".to_string(),
+                },
+            ]
+        );
     }
 
     // --- series_selector (issue #32 code-review round-1 fix) ---
@@ -3026,24 +3343,26 @@ mod tests {
         }
     }
 
-    /// Issue #83 (adjudicated unary fold): unary minus desugars to
-    /// `0 - operand` — arithmetic-class, so `__name__` drops and scalar
-    /// operands negate through the ordinary scalar path.
+    /// Issue #83 (adjudicated unary fold), reworked by issue #124
+    /// (M7-A6, `operand * -1` — the pin has no `0 - histogram` disposal):
+    /// unary minus desugars to `operand * -1` — arithmetic-class, so
+    /// `__name__` drops and scalar operands negate through the ordinary
+    /// scalar path.
     #[test]
-    fn unary_minus_desugars_to_zero_minus_operand() {
+    fn unary_minus_desugars_to_operand_times_minus_one() {
         let p = plan(&parse("-up").unwrap(), params()).unwrap();
         match &p.root {
             PlanExpr::Binary {
-                op: BinOp::Sub,
+                op: BinOp::Mul,
                 lhs,
                 rhs,
                 bool_modifier: false,
                 ..
             } => {
-                assert_eq!(**lhs, PlanExpr::Scalar(0.0));
-                assert_eq!(**rhs, PlanExpr::Selector(0));
+                assert_eq!(**lhs, PlanExpr::Selector(0));
+                assert_eq!(**rhs, PlanExpr::Scalar(-1.0));
             }
-            other => panic!("expected 0 - up, got {other:?}"),
+            other => panic!("expected up * -1, got {other:?}"),
         }
         // Stacked unaries nest (at_modifier.test:65's `---metric`).
         assert!(plan(&parse("---up").unwrap(), params()).is_ok());
@@ -3132,6 +3451,50 @@ mod tests {
                 assert!(!op.is_comparison(), "atan2 is arithmetic-class");
             }
             other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// Issue #129: `</`/`>/` plan to their own `BinOp` variants, are NOT
+    /// comparison-class (`is_comparison`), and do NOT change the metric
+    /// schema (`changes_metric_schema` — `engine.go:4407-4414` excludes
+    /// TRIM, unlike the six arithmetic operators + `atan2`).
+    #[test]
+    fn plans_trim_operators_as_their_own_non_comparison_non_schema_changing_class() {
+        for (query, want_op, want_str) in [
+            ("foo </ 3", BinOp::TrimUpper, "</"),
+            ("foo >/ 3", BinOp::TrimLower, ">/"),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::Binary { op, .. } => {
+                    assert_eq!(*op, want_op, "{query}");
+                    assert!(op.is_trim(), "{query}: must be trim-class");
+                    assert!(!op.is_comparison(), "{query}: trim is not comparison-class");
+                    assert!(
+                        !op.changes_metric_schema(),
+                        "{query}: trim does not change the metric schema"
+                    );
+                    assert_eq!(op.item_type_str(), want_str);
+                }
+                other => panic!("{query}: expected Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #129: `bool` is parse-rejected on a trim operator — the
+    /// vendored parser's `is_comparison_operator` deliberately excludes
+    /// `T_TRIM_UPPER`/`T_TRIM_LOWER` (`token.rs`), matching upstream's
+    /// `IsComparisonOperator` (`lex.go:82-90`).
+    #[test]
+    fn trim_operator_with_bool_modifier_is_a_parse_error() {
+        for query in ["foo </ bool 3", "foo >/ bool 3"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("bool modifier can only be used on comparison operators"),
+                "{query}: got {err}"
+            );
         }
     }
 
@@ -3397,15 +3760,18 @@ mod tests {
 
     #[test]
     fn a_function_outside_the_implemented_list_is_unsupported() {
-        // `histogram_count` is scheduled for the native-histogram issue
-        // (#22) — a stand-in for "any function the planner does not yet
-        // map" (issue #65 moved the previous stand-in, `abs`, into the
-        // implemented set; issue #68 moved its successor, `sort`).
-        let expr = parse("histogram_count(up)").unwrap();
+        // `histogram_quantiles` (the experimental multi-quantile variant —
+        // out of scope per M7-A5b's plan: `TRIM_*`/`histogram_quantiles`/
+        // `ReduceResolution` stay unimplemented) is a stand-in for "any
+        // function the planner does not yet map" (issue #65 moved the
+        // previous stand-in, `abs`, into the implemented set; issue #68
+        // moved its successor, `sort`; M7-A5b-i moved `histogram_count`
+        // and its five siblings).
+        let expr = parse(r#"histogram_quantiles(up, "q", 0.5)"#).unwrap();
         let err = plan(&expr, params()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => {
-                assert!(construct.contains("histogram_count"));
+                assert!(construct.contains("histogram_quantiles"));
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -3928,6 +4294,7 @@ mod tests {
                 extra_range_ms: 0,
                 total_offset_ms: 60_000,
             },
+            info_family: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -4813,7 +5180,16 @@ mod tests {
         let p = plan(&parse("info(m)").unwrap(), params_experimental()).unwrap();
         assert_eq!(p.selectors.len(), 2);
         assert_eq!(p.selectors[0].metric_name.as_deref(), Some("m"));
+        assert!(
+            !p.selectors[0].info_family,
+            "the base selector is an ordinary fetch, never info-family"
+        );
         assert_eq!(p.selectors[1].metric_name.as_deref(), Some("target_info"));
+        assert!(
+            p.selectors[1].info_family,
+            "issue #82 (retroactive re-review): the synthetic info-family \
+             selector must carry the pre-materialization cap marker"
+        );
         assert!(p.selectors[1].name_matchers.is_empty());
         assert!(p.selectors[1].matchers.is_empty());
         assert_eq!(p.selectors[1].range_ms, None);
@@ -4983,6 +5359,55 @@ mod tests {
                 .contains("vector selector must contain at least one non-empty matcher"),
             "{err}"
         );
+    }
+
+    /// Issue #82 v5/v6 AC2: `info(m, {})` — the literal empty matcher as
+    /// `info()`'s second argument, now accepted by the vendored parser —
+    /// plans IDENTICALLY to `info(m)` (no arg1 at all): empty
+    /// `info_name_matchers`/`data_matchers` fold to the same
+    /// `effective_info_name_matchers` default-`target_info` branch, so
+    /// the flattened selector set and the `PlanExpr::Info` node are
+    /// byte-equal.
+    #[test]
+    fn m6_05b_info_empty_matcher_second_arg_plans_identically_to_info_m() {
+        let with_empty = plan(&parse("info(m, {})").unwrap(), params_experimental()).unwrap();
+        let bare = plan(&parse("info(m)").unwrap(), params_experimental()).unwrap();
+        assert_eq!(with_empty.selectors, bare.selectors);
+        assert_eq!(with_empty.root, bare.root);
+    }
+
+    /// Issue #82 v6: field-modifier wrappers on the exempt direct
+    /// selector (`@`/`offset` are in-place `VectorSelector` fields, not
+    /// wrapper nodes) still parse and plan — `info(m, {}@5)` carries the
+    /// same empty-matcher arg1 as `info(m, {})`, just with an `@`
+    /// attached that upstream's bypass also accepts.
+    #[test]
+    fn m6_05b_info_empty_matcher_with_at_or_offset_modifier_still_plans() {
+        for query in ["info(m, {}@5)", "info(m, {} offset 5m)"] {
+            let p = plan(&parse(query).unwrap(), params_experimental());
+            assert!(p.is_ok(), "{query}: {p:?}");
+            match &p.unwrap().root {
+                PlanExpr::Info { .. } => {}
+                other => panic!("{query}: expected Info, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #82 v6: a paren-wrapped empty matcher in `info()`'s second
+    /// argument is REJECTED (Prometheus v3.13.0 parity — the bypass
+    /// type-asserts a direct `*VectorSelector`; a `*ParenExpr` fails
+    /// that assertion). Confirms the plan-time rejection surfaces the
+    /// parser's own message, not a plan-time panic.
+    #[test]
+    fn m6_05b_info_paren_wrapped_empty_matcher_second_arg_is_rejected() {
+        for query in ["info(m, ({}))", "info(m, (({})))"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("vector selector must contain at least one non-empty matcher"),
+                "{query}: {err}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------

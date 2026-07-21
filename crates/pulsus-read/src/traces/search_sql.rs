@@ -18,6 +18,46 @@ use crate::logql::sql::TimeWindow;
 
 use super::filter::{GenTable, LeafGenerator};
 
+/// Hard **byte** ceiling on every string value the search response
+/// returns (`name`/`service`/`select()`-projected attribute values) —
+/// owner-approved response truncation (issue #57 re-audit, comment
+/// 5028629688/5028693510). ClickHouse's `length()` counts bytes, so
+/// [`byte_capped`]'s `length(col) <= TRACE_STR_COL_CAP` branch is
+/// byte-identical passthrough for every string at or under the cap; the
+/// fallback branch cuts at [`TRACE_STR_COL_CP_FALLBACK`] UTF-8 code
+/// points instead of bytes, but a code point is at most 4 bytes, so the
+/// fallback output itself never exceeds this same byte ceiling either —
+/// documented in docs/api.md §4.2.
+pub const TRACE_STR_COL_CAP: u64 = 8192;
+
+/// The truncation fallback's code-point cut: `TRACE_STR_COL_CAP / 4` — a
+/// UTF-8 sequence is at most 4 bytes per code point, so
+/// `TRACE_STR_COL_CP_FALLBACK` code points can never exceed
+/// `TRACE_STR_COL_CAP` bytes even at the worst-case 4-byte width.
+const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
+
+/// Renders the byte-bound truncation expression for a plain (non-
+/// aggregated) string column read, aliased back to its own name:
+/// `if(length(col) <= 8192, col, substringUTF8(col, 1, 2048)) AS col`.
+/// Used by [`hydration_sql`]/[`root_sql`] on `service`/`name`.
+fn byte_capped(col: &str) -> String {
+    format!(
+        "if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
+         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK})) AS {col}"
+    )
+}
+
+/// The same byte-bound expression wrapped in `any(...)` for the
+/// aggregate `attr_values_sql` string arm (dedup replicas via
+/// `GROUP BY (trace_id, span_id)`), unaliased — the caller appends
+/// `AS v`.
+fn byte_capped_agg(col: &str) -> String {
+    format!(
+        "any(if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
+         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK})))"
+    )
+}
+
 /// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
 /// civil-date conversion (proleptic Gregorian), pure integer math.
 /// `pub(crate)`: [`super::metrics_sql`] reuses it for the metrics
@@ -145,12 +185,14 @@ pub fn hydration_sql(
     max_spans_per_trace: usize,
 ) -> String {
     format!(
-        "SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns, \
+        "SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns, \
          status_code, kind\n\
          FROM {spans_table}\n\
          WHERE {}\n  AND {}\n\
          ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
          LIMIT {} BY trace_id",
+        byte_capped("service"),
+        byte_capped("name"),
         trace_id_in(trace_ids),
         time_clause(window),
         max_spans_per_trace + 1
@@ -189,10 +231,15 @@ pub fn attr_values_sql(
     trace_ids: &[[u8; 16]],
     window: TimeWindow,
 ) -> String {
-    let (value_col, extra) = if numeric {
-        ("any(val_num) AS v", "\n  AND isNotNull(val_num)")
+    let value_col = if numeric {
+        "any(val_num) AS v".to_string()
     } else {
-        ("any(val) AS v", "")
+        format!("{} AS v", byte_capped_agg("val"))
+    };
+    let extra = if numeric {
+        "\n  AND isNotNull(val_num)"
+    } else {
+        ""
     };
     let scope_clause = match scope_literal {
         Some(scope) => format!("\n  AND scope = {scope}"),
@@ -219,9 +266,11 @@ pub fn attr_values_sql(
 /// columns, never payloads).
 pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
     format!(
-        "SELECT trace_id, span_id, parent_id, service, name, timestamp_ns, duration_ns\n\
+        "SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns\n\
          FROM {spans_table}\n\
          WHERE {}",
+        byte_capped("service"),
+        byte_capped("name"),
         trace_id_in(trace_ids)
     )
 }
@@ -293,5 +342,59 @@ mod tests {
             !sql.contains("LIMIT"),
             "a per-trace row cap could drop the true root (code review round 1)"
         );
+    }
+
+    /// Issue #57 re-audit AC-A1: the fallback code-point cut is exactly
+    /// one quarter of the byte ceiling — a worst-case 4-byte UTF-8 code
+    /// point at that cut still lands exactly at the byte ceiling, never
+    /// past it.
+    #[test]
+    fn cp_fallback_is_exactly_one_quarter_of_the_byte_cap() {
+        assert_eq!(TRACE_STR_COL_CP_FALLBACK, TRACE_STR_COL_CAP / 4);
+        assert_eq!(TRACE_STR_COL_CAP, 8192);
+        assert_eq!(TRACE_STR_COL_CP_FALLBACK, 2048);
+    }
+
+    /// Issue #57 re-audit AC-A1: the byte-bound truncation expression
+    /// appears in every string-returning Phase-2 builder (hydration/root
+    /// plain columns, the `attr_values_sql` string arm) and NOWHERE in
+    /// the generator/membership/numeric-value SQL — the cap is a
+    /// response-projection concern only, never a predicate.
+    #[test]
+    fn the_byte_cap_expression_appears_only_in_the_three_string_returning_builders() {
+        let needle = format!(
+            "if(length(service) <= {TRACE_STR_COL_CAP}, service, \
+             substringUTF8(service, 1, {TRACE_STR_COL_CP_FALLBACK})) AS service"
+        );
+        let hydration = hydration_sql("trace_spans", &[[7u8; 16]], W, 10_000);
+        assert!(hydration.contains(&needle), "{hydration}");
+        let root = root_sql("trace_spans", &[[7u8; 16]]);
+        assert!(root.contains(&needle), "{root}");
+
+        let val_needle = format!(
+            "any(if(length(val) <= {TRACE_STR_COL_CAP}, val, \
+             substringUTF8(val, 1, {TRACE_STR_COL_CP_FALLBACK}))) AS v"
+        );
+        let select_values =
+            attr_values_sql("trace_attrs_idx", "'foo'", None, false, &[[7u8; 16]], W);
+        assert!(select_values.contains(&val_needle), "{select_values}");
+        // The numeric arm is untouched — no cap expression, plain
+        // `any(val_num) AS v`.
+        let agg_values = attr_values_sql("trace_attrs_idx", "'foo'", None, true, &[[7u8; 16]], W);
+        assert!(!agg_values.contains("substringUTF8"), "{agg_values}");
+        assert_eq!(agg_values.matches("any(val_num) AS v").count(), 1);
+
+        // Generator/membership SQL never truncates — never touches
+        // strings at all, and carries no `substringUTF8`.
+        let generator = generator_sql(
+            &super::super::filter::LeafGenerator::time_range(),
+            W,
+            "trace_spans",
+            "trace_attrs_idx",
+            100,
+        );
+        assert!(!generator.contains("substringUTF8"), "{generator}");
+        let membership = membership_sql("trace_attrs_idx", "key = 'foo'", &[[7u8; 16]], W);
+        assert!(!membership.contains("substringUTF8"), "{membership}");
     }
 }

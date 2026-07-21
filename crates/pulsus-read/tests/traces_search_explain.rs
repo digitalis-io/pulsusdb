@@ -1,5 +1,6 @@
-//! Issue #57 AC2/AC6 (Tier-1, scale-invariant): live gates for the
-//! two-phase TraceQL search against ClickHouse 24.8.
+//! Issue #57 AC2/AC6 plus the re-audit's AC-A2/AC-A3/AC-B1/AC-B2
+//! (Tier-1, scale-invariant): live gates for the two-phase TraceQL
+//! search against ClickHouse 24.8.
 //!
 //! - **AC2** — `EXPLAIN indexes = 1` on the **real** per-generator plans
 //!   (the exact SQL `plan_search` emits, which since plan v7 is also the
@@ -11,12 +12,42 @@
 //!   dense fixed prefix — strictly fewer granules), the key-only
 //!   numeric/regex generator classes, the indexed
 //!   `resource.service.name =~` generator, and a top-K `Limit` node.
-//! - **AC6** — the scan budget trips for real (a fallback-generator
+//! - **AC6 (a)** — the scan budget trips for real (a fallback-generator
 //!   search under a tiny `scan_budget_rows` → 158 →
-//!   `TooBroadReason::TraceScanBudgetRows`); the Layer-1 result-byte
-//!   ceiling trips for real (oversized string payloads → 396 → 422); a
-//!   per-trace span overflow (> `MAX_SPANS_PER_TRACE` in-window spans)
-//!   truncates and marks the response partial.
+//!   `TooBroadReason::TraceScanBudgetRows`).
+//! - **AC-A2** (re-audit, source truncation) — a multi-byte 4 MiB span
+//!   name is truncated at the SOURCE to exactly the documented byte
+//!   ceiling, proven by successful decode (no oversized block ever
+//!   reaches the driver) and no retention-counter trip.
+//! - **AC-A3′** (re-audit v7, the Layer-1 per-batch gate) — the sub-A
+//!   source-truncation projection makes `max_result_bytes` accounting
+//!   effective on hydration reads (a deliberate hardening), so a single
+//!   over-sized batch now trips SERVER-side: 32 traces (=
+//!   `BATCH_TRACES`, one phase-2 batch) × 1,250 spans × 8,000-byte
+//!   (untruncated, ≤ `TRACE_STR_COL_CAP`) ASCII names → code 396 →
+//!   `ScanBudgetBytes { TRACE_MAX_RESULT_BYTES }` → 422, before the
+//!   driver materializes anything. Carries the full drift guard
+//!   (P1/P2/P3′/P4-P7/P9/P10 + the enumerated S1-S8 loud-only
+//!   residuals; M1 lives as a hermetic unit test in
+//!   `pulsus_read::traces::exec`).
+//! - **AC-A4** (re-audit v7/v8, the Layer-2 cross-batch gate) — the
+//!   retention counter's distinct job is retained accumulation ACROSS
+//!   batches: 256 traces (= 8 × `BATCH_TRACES`) × 160 spans × 8,000-byte
+//!   names with `limit`=300/`spss`=200 (no evict, every match retained)
+//!   keep every batch's result far under `TRACE_MAX_RESULT_BYTES`, while
+//!   the heap-held `SpanSummary` charges (≥ 8,064 B each, surviving the
+//!   per-batch release) accumulate to 330,301,440 B > the 256 MiB
+//!   budget → `ScanBudgetBytes { HYDRATION_BYTE_BUDGET }` → 422 at
+//!   ~batch 7 of 8. Guard Q1-Q9 + the S-carries.
+//! - **AC-B1** (re-audit, generator memory) — the phase-1 candidate-
+//!   generator's memory ceiling trips for real on the dense common-value
+//!   corpus under a tiny `generator_max_memory_bytes` → 241 →
+//!   `TooBroadReason::TraceGeneratorMemory`.
+//! - **AC-B2** (re-audit, no regression) — AC6 (a) above and gate 8's
+//!   transfer/`(Limit)` differential (below) stay green: the generator
+//!   SQL shape is unchanged by the re-audit.
+//! - **AC6 (c)** — a per-trace span overflow (> `MAX_SPANS_PER_TRACE`
+//!   in-window spans) truncates and marks the response partial.
 //!
 //! Corpus: ≥100k time-spread spans, ≤5% low-frequency target service
 //! (issue #53's binding fixture requirements for the data-dependent 24.8
@@ -34,6 +65,7 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::{ReadError, TooBroadReason};
 use pulsus_read::traces::search_plan::{SearchParams, plan_search};
+use pulsus_read::traces::search_sql;
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
@@ -346,6 +378,7 @@ fn engine_config() -> TraceReadConfig {
         catalog_table: "trace_tag_catalog".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }
@@ -358,14 +391,28 @@ async fn data_client() -> ChClient {
 }
 
 fn plan_for(engine: &TraceEngine, q: &str, start_ns: i64, end_ns: i64) -> SearchPlan {
+    plan_for_with(engine, q, start_ns, end_ns, 20, 3)
+}
+
+/// `plan_for` with explicit `limit`/`spss` — the AC-A4 retained-
+/// accumulation gate needs both caps above its fixture dimensions so the
+/// heap never evicts and every matched span is retained.
+fn plan_for_with(
+    engine: &TraceEngine,
+    q: &str,
+    start_ns: i64,
+    end_ns: i64,
+    limit: u32,
+    spss: u32,
+) -> SearchPlan {
     let query = pulsus_traceql::parse(q).expect("query parses");
     plan_search(
         &query,
         &SearchParams {
             start_ns,
             end_ns,
-            limit: 20,
-            spss: 3,
+            limit,
+            spss,
         },
         &engine.search_ctx(),
     )
@@ -673,6 +720,93 @@ async fn two_phase_search_explain_and_budget_gates() {
         3 * CORPUS_SPANS
     );
 
+    // ---- AC-B1 (issue #57 re-audit): the phase-1 generator memory
+    // ceiling trips for real ------------------------------------------------
+    // Same dense common-value corpus as gate 8 above (env=prod, 120k
+    // rows / 120k distinct trace_id groups): under a deliberately tiny
+    // `generator_max_memory_bytes`, the `GROUP BY trace_id` aggregation
+    // state exceeds the ceiling before the top-K `LIMIT` can trim it
+    // (live-verified physics, plan v2: a dense distinct-key prefix's
+    // aggregation state scales with the matching prefix, not the LIMIT).
+    let mut tiny_mem = engine_config();
+    tiny_mem.generator_max_memory_bytes = 1024 * 1024; // 1 MiB
+    let tiny_mem_engine = TraceEngine::new(data_client().await, tiny_mem);
+    let plan = plan_for(&tiny_mem_engine, r#"{ .env = "prod" }"#, base, now);
+    let err = tiny_mem_engine
+        .search(&plan)
+        .await
+        .expect_err("a 120k-distinct-key generator must exceed a 1 MiB memory ceiling");
+    match err {
+        ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { budget_bytes }) => {
+            assert_eq!(budget_bytes, 1024 * 1024);
+        }
+        other => panic!("expected TraceGeneratorMemory, got {other:?}"),
+    }
+
+    // ---- AC-A2 (issue #57 re-audit): source truncation is a hard BYTE
+    // ceiling, proven on multi-byte UTF-8 ------------------------------------
+    // One trace, two spans, in a disjoint future window: span 0 (the
+    // all-zero-parent root) carries a 4 MiB name of 4-byte code points
+    // (`repeat('𠜎', 1_000_000)`) and a 20 KB service of 2-byte code
+    // points (`repeat('é', 10_000)`) — both far past `TRACE_STR_COL_CAP`;
+    // span 1 carries an exactly-8192-byte ASCII name (at the cap, so
+    // untouched passthrough). A successful RowBinary decode into `String`
+    // is itself the UTF-8-validity proof (invalid UTF-8 cannot decode).
+    let mb_start = now + 15 * 3_600_000_000_000;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(3000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex(if(number = 0, '0000000000000000', 'ffffffffffffffff')), 8), \
+               if(number = 0, repeat('𠜎', 1000000), repeat('a', 8192)), \
+               if(number = 0, repeat('é', 10000), 'svc'), \
+               {mb_start} + toInt64(number), 1000, 0, 1, 1, 'p' \
+             FROM numbers(2)"
+        ),
+    )
+    .await;
+    let plan = plan_for(&engine, "{}", mb_start - 1, mb_start + 1_000_000_000);
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("the multi-byte fixture must NOT trip the retention counter");
+    assert!(!output.partial, "a small, in-budget search is not partial");
+    assert_eq!(output.returned, 1);
+    let trace = &output.traces[0];
+    assert_eq!(trace.spans.len(), 2, "both spans fit spss=3");
+    // Span 0 (the root): the 4 MiB / 4-byte-code-point name truncates to
+    // EXACTLY the byte ceiling (2048 code points x 4 bytes = 8192 bytes)
+    // — the exact boundary case verified live in the plan's empirics.
+    assert_eq!(
+        trace.spans[0].name.len(),
+        search_sql::TRACE_STR_COL_CAP as usize,
+        "the 4-byte-code-point name must truncate to exactly the byte ceiling"
+    );
+    assert_eq!(
+        trace.spans[0].name.chars().count(),
+        2048,
+        "the fallback cut is exactly 2048 code points"
+    );
+    // The root's service (2-byte code points, 20 KB) truncates to 2048
+    // code points x 2 bytes = 4096 bytes.
+    assert_eq!(
+        trace.root.service.len(),
+        4096,
+        "the 2-byte-code-point service must truncate to 2048 code points (4096 bytes)"
+    );
+    // Span 1: exactly-8192-byte ASCII name passes through byte-identical
+    // (the `length(col) <= TRACE_STR_COL_CAP` branch).
+    assert_eq!(
+        trace.spans[1].name.len(),
+        search_sql::TRACE_STR_COL_CAP as usize
+    );
+    assert_eq!(trace.spans[1].name, "a".repeat(8192));
+
     // ---- AC6 (a): the scan budget trips for real -----------------------
     let mut tight = engine_config();
     tight.scan_budget_rows = 1_000;
@@ -689,16 +823,70 @@ async fn two_phase_search_explain_and_budget_gates() {
         other => panic!("expected TraceScanBudgetRows, got {other:?}"),
     }
 
-    // ---- AC6 (b): the Layer-2 retention counter trips for real ---------
-    // One trace with 300 spans × 900 KB names in a disjoint future
-    // window: a single hydration batch would accumulate ~270 MB of
-    // unbounded-String rows. ClickHouse 24.8 does NOT throw
-    // `max_result_bytes` on streamed SELECT shapes (verified against a
-    // live 24.8 — it throws only on aggregated results), which is exactly
-    // why the final plan amendment makes the Rust retention counter the
-    // BINDING bound on accumulated state: the engine charges every row as
-    // it streams and trips the 256 MiB budget mid-stream → 422.
-    let big_start = now + 3_600_000_000_000;
+    // ---- AC-A3′ (issue #57 re-audit v7): the newly-effective Layer-1
+    // per-batch bound trips server-side on one over-sized batch ----------
+    // Fixture: N = BATCH_TRACES (32, exactly one phase-2 batch — all
+    // 40k rows flow through ONE hydration query) traces x
+    // M = 1,250 spans/trace (<= MAX_SPANS_PER_TRACE, so every row
+    // hydrates) x NAME_BYTES = 8,000-byte ASCII names (<=
+    // TRACE_STR_COL_CAP, untouched passthrough) = 320,000,000 result
+    // bytes >= 4x TRACE_MAX_RESULT_BYTES. The sub-A source-truncation
+    // projection makes `max_result_bytes` accounting effective on the
+    // hydration read (live-verified — unwrapped passthrough columns were
+    // never accounted; a deliberate hardening), so ClickHouse throws
+    // code 396 BEFORE the driver materializes anything →
+    // ScanBudgetBytes { TRACE_MAX_RESULT_BYTES } → 422.
+    const AC_A3_N: u64 = 32;
+    const AC_A3_M: u64 = 1_250;
+    const AC_A3_NAME_BYTES: u64 = 8_000;
+
+    let engine_cfg = engine_config();
+
+    // ---- Guard layer 1: hermetic preconditions (v4/v5/v6 drift guard) --
+    // P1-P4 compare only `const` fixture/production values — clippy
+    // correctly observes they're compile-time-decidable, so they're
+    // written as `const` blocks: a drift fails to COMPILE (louder than a
+    // runtime panic, and still exactly the guard the plan specifies).
+    const _: () = assert!(
+        AC_A3_N == pulsus_read::BATCH_TRACES as u64,
+        "P1: the fixture's trace count must equal BATCH_TRACES exactly — otherwise \
+         per-batch charge release can split the accumulation under budget"
+    );
+    const _: () = assert!(
+        AC_A3_M <= pulsus_read::MAX_SPANS_PER_TRACE as u64,
+        "P2: the fixture's per-trace span count must not exceed MAX_SPANS_PER_TRACE, or \
+         the hydration LIMIT truncates it away from the counter"
+    );
+    const _: () = assert!(
+        AC_A3_N * AC_A3_M * AC_A3_NAME_BYTES
+            >= 4 * pulsus_read::traces::exec::TRACE_MAX_RESULT_BYTES,
+        "P3': the fixture's total result bytes must be at least 4x TRACE_MAX_RESULT_BYTES \
+         — the A/B-observed 396 onset is <= ~2x the setting, so 4x pins a deterministic \
+         throw with >= 2x headroom"
+    );
+    const _: () = assert!(
+        AC_A3_NAME_BYTES <= search_sql::TRACE_STR_COL_CAP,
+        "P4: the fixture's name bytes must not exceed TRACE_STR_COL_CAP, or sub-problem \
+         A's truncation shrinks the seeded bytes before they're hydrated"
+    );
+    assert!(
+        engine_cfg.max_candidates >= AC_A3_N,
+        "P5: max_candidates must admit every fixture trace through the generator LIMIT \
+         and the consumption ceiling"
+    );
+    assert_eq!(
+        engine_cfg.scan_budget_rows, 50_000_000,
+        "P6a: scan_budget_rows must equal the production default (pulsus-config \
+         model.rs) — a tightened test config would falsely bound reads before P6b"
+    );
+    assert!(
+        engine_cfg.generator_max_memory_bytes >= 64 * 1024 * 1024,
+        "P7: generator_max_memory_bytes must stay well above this tiny generator's \
+         real memory use, or the new memory ceiling could preempt this gate with a \
+         DIFFERENT (loud, distinguishable) error"
+    );
+
+    let ac_a3_start = now + 3_600_000_000_000;
     exec(
         &client,
         &format!(
@@ -706,22 +894,357 @@ async fn two_phase_search_explain_and_budget_gates() {
              (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
               status_code, kind, payload_type, payload) \
              SELECT \
-               toFixedString(unhex(leftPad(lower(hex(1000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(1000000 + number % {AC_A3_N})), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), \
-               repeat('x', 900000), 'bulky', {big_start} + toInt64(number), 1000, 0, 1, 1, 'p' \
-             FROM numbers(300)"
+               repeat('x', {AC_A3_NAME_BYTES}), 'bulky', {ac_a3_start} + toInt64(number), \
+               1000, 0, 1, 1, 'p' \
+             FROM numbers({})",
+            AC_A3_N * AC_A3_M
         ),
     )
     .await;
-    let plan = plan_for(&engine, "{}", big_start - 1, big_start + 1_000_000_000);
-    let err = engine
-        .search(&plan)
-        .await
-        .expect_err("an oversized-string hydration must trip the retention counter");
+
+    // ---- Guard layer 2: live fixture-integrity pre-check (v4) ----------
+    // P9: the seeded fixture is EXACTLY the shape P1-P3' assume, and no
+    // foreign row shares the window — a foreign candidate could displace
+    // a bulky trace into a later batch, defeating batch confinement.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct FixtureIntegrityRow {
+        distinct_traces: u64,
+        total_rows: u64,
+        min_count: u64,
+        max_count: u64,
+        min_name_len: u64,
+        max_name_len: u64,
+    }
+    /// One window's fixture-integrity aggregate — a helper fn so each
+    /// read's `ChRowStream` (and its pooled-connection lease) is scoped
+    /// here, not held to the end of the whole test body.
+    async fn fixture_integrity(
+        client: &ChClient,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> FixtureIntegrityRow {
+        let sql = format!(
+            "SELECT uniqExact(trace_id) AS distinct_traces, sum(c) AS total_rows, \
+                    min(c) AS min_count, max(c) AS max_count, \
+                    min(mn) AS min_name_len, max(mx) AS max_name_len \
+             FROM (SELECT trace_id, count() AS c, min(length(name)) AS mn, \
+                          max(length(name)) AS mx \
+                   FROM {DB}.trace_spans \
+                   WHERE timestamp_ns > {start_ns} AND timestamp_ns <= {end_ns} \
+                   GROUP BY trace_id)"
+        );
+        let mut stream = client
+            .query_stream::<FixtureIntegrityRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("fixture-integrity read");
+        let mut integrity = None;
+        while let Some(row) = stream.next().await {
+            integrity = Some(row.expect("decode fixture-integrity row"));
+        }
+        integrity.expect("the fixture-integrity aggregate must return a row")
+    }
+    let integrity = fixture_integrity(&client, ac_a3_start - 1, ac_a3_start + 1_000_000_000).await;
+    assert_eq!(
+        integrity.distinct_traces, AC_A3_N,
+        "P9: distinct trace count in the retention window"
+    );
+    assert_eq!(
+        integrity.total_rows,
+        AC_A3_N * AC_A3_M,
+        "P9: total row count in the retention window"
+    );
+    assert_eq!(
+        integrity.min_count, AC_A3_M,
+        "P9: per-trace row count must be uniform (min)"
+    );
+    assert_eq!(
+        integrity.max_count, AC_A3_M,
+        "P9: per-trace row count must be uniform (max)"
+    );
+    assert_eq!(
+        integrity.min_name_len, AC_A3_NAME_BYTES,
+        "P9: name length must be uniform (min)"
+    );
+    assert_eq!(
+        integrity.max_name_len, AC_A3_NAME_BYTES,
+        "P9: name length must be uniform (max)"
+    );
+
+    // P6b: the whole-DB row count is a sound physical-read upper bound
+    // for any single query — a query cannot select more granule rows
+    // than the touched tables contain, so this re-derives with the
+    // corpus (10x margin absorbs multi-stage PREWHERE/projection
+    // accounting; no granule arithmetic needed).
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct RowCountRow {
+        n: u64,
+    }
+    async fn table_row_count(client: &ChClient, table: &str) -> u64 {
+        let sql = format!("SELECT count() AS n FROM {table}");
+        let mut stream = client
+            .query_stream::<RowCountRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("row count read");
+        let mut n = 0u64;
+        while let Some(row) = stream.next().await {
+            n = row.expect("decode row-count row").n;
+        }
+        n
+    }
+    let spans_total = table_row_count(&client, &format!("{DB}.trace_spans")).await;
+    let attrs_total = table_row_count(&client, &format!("{DB}.trace_attrs_idx")).await;
+    assert!(
+        10 * (spans_total + attrs_total) <= engine_cfg.scan_budget_rows,
+        "P6b: the whole-DB row count (10x margin) must stay under scan_budget_rows \
+         (spans={spans_total}, attrs={attrs_total}, budget={})",
+        engine_cfg.scan_budget_rows
+    );
+
+    let plan = plan_for(&engine, "{}", ac_a3_start - 1, ac_a3_start + 1_000_000_000);
+
+    // P10 (v6, reclassified belt-and-braces in v7): the pre-hydration
+    // Layer-2 charge bound, derived from the PLAN's own candidate cap
+    // (the runtime source, exec.rs) — the tripwire pins it equal to the
+    // engine config's cap too, so a future plan/config bifurcation trips
+    // loudly instead of silently underbounding.
+    assert_eq!(
+        plan.max_candidates(),
+        engine_cfg.max_candidates,
+        "P10 tripwire: the plan's candidate cap must match the engine config's"
+    );
+    let cap = usize::try_from(plan.max_candidates()).expect("max_candidates fits usize");
+    let pre_hydration_worst =
+        2 * plan.generator_sqls.len() * (cap + 1) * pulsus_read::CANDIDATE_TUPLE_BYTES
+            + pulsus_read::BATCH_TRACES * std::mem::size_of::<[u8; 16]>()
+            + pulsus_read::RETAINED_ENTRY_OVERHEAD;
+    assert!(
+        pre_hydration_worst < pulsus_read::HYDRATION_BYTE_BUDGET / 8,
+        "P10: the pre-hydration charge bound ({pre_hydration_worst} B) must stay far \
+         under the hydration budget — a pre-hydration Layer-2 breach would carry \
+         HYDRATION_BYTE_BUDGET, a loudly-different budget_bytes on this gate"
+    );
+
+    // Skipped-with-mechanism (v4/v5/v7): every OTHER trip source can only
+    // fail this gate LOUDLY — a mismatched error variant or
+    // `budget_bytes`, or an outright panic — never silently: S1 the
+    // read-side byte preempt (code 307) is pinned to its OWN
+    // budget_bytes by exec.rs's `m1_*` unit test; S3 the query-text
+    // guard maps to a distinct TooBroadReason; S4 threshold termination
+    // requires a populated heap (structurally inert on the first batch);
+    // S5 `max_block_size` is framing only; S6 the generator's `+1`
+    // truncation probe cannot engage (P5+P9 establish exactly N groups
+    // exist); S7 `charge_explain` charges exactly 0 on this
+    // `engine.search()` (non-explained) call path; S8 (v7) a Layer-2
+    // retention preempt would carry HYDRATION_BYTE_BUDGET != the
+    // expected TRACE_MAX_RESULT_BYTES (M1 distinctness → panic), and
+    // cannot fire first anyway: client-side charge at 396-arrival is
+    // <= ~2x 64 MiB (the observed onset ceiling) + P10's budget/8
+    // ≈ 167.7 MB < 268.4 MB.
+    let err = engine.search(&plan).await.expect_err(
+        "32 x 1,250 x 8,000-byte ASCII names in one batch must trip max_result_bytes \
+         server-side (code 396)",
+    );
     match err {
         ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
-            assert_eq!(budget_bytes, pulsus_read::HYDRATION_BYTE_BUDGET as u64);
+            assert_eq!(
+                budget_bytes,
+                pulsus_read::traces::exec::TRACE_MAX_RESULT_BYTES,
+                "AC-A3': the newly-effective Layer-1 per-batch bound (396) must fire, \
+                 not the retention counter — the projection made max_result_bytes \
+                 accounting effective on hydration reads"
+            );
+        }
+        other => panic!("expected ScanBudgetBytes (TRACE_MAX_RESULT_BYTES), got {other:?}"),
+    }
+
+    // ---- AC-A4 (issue #57 re-audit v7/v8): the Layer-2 retention
+    // counter's distinct job — CROSS-BATCH retained accumulation --------
+    // 256 traces (= 8 x BATCH_TRACES) x 160 spans x 8,000-byte ASCII
+    // names, searched with limit=300 (> N: the heap never fills, never
+    // evicts, never threshold-terminates) and spss=200 (> M: every
+    // matched span's summary is retained). Every batch's RESULT stays
+    // far under TRACE_MAX_RESULT_BYTES (Q5), but the heap-held
+    // SpanSummary charges (>= RETAINED_ENTRY_OVERHEAD + name.len() =
+    // 8,064 B each, charged pre-clone in search_eval and NEVER released
+    // — they survive the per-batch `budget.release(batch_charged)`)
+    // accumulate to 256 x 160 x 8,064 = 330,301,440 B > 268,435,456 B →
+    // the retention counter trips ~batch 7 of 8 →
+    // ScanBudgetBytes { HYDRATION_BYTE_BUDGET } → 422. The trip site is
+    // any ByteBudget::charge overflow; ATTRIBUTION to cross-batch
+    // retention rests on Q7's arithmetic (no single batch plus phase-1
+    // can trip alone), not on which site fired. The per-entry charge
+    // formula itself (the 64-B overhead term + name bytes, at exact
+    // equality) is pinned by the hermetic
+    // `span_summary_charge_is_exactly_overhead_plus_name_len` unit in
+    // `search_eval.rs` — this aggregate gate's slack over the budget
+    // deliberately exceeds the summed overhead term (name bytes alone
+    // trip it), so the unit test, not this gate, is what fails if the
+    // overhead term is silently dropped.
+    const AC_A4_N: u64 = 256;
+    const AC_A4_M: u64 = 160;
+    const AC_A4_NAME_BYTES: u64 = 8_000;
+    const AC_A4_LIMIT: u32 = 300;
+    const AC_A4_SPSS: u32 = 200;
+
+    // Q1-Q5: compile-time where both sides are consts (the ratified
+    // const-block discipline — drift fails to compile).
+    const _: () = assert!(
+        AC_A4_N.is_multiple_of(pulsus_read::BATCH_TRACES as u64)
+            && AC_A4_N / (pulsus_read::BATCH_TRACES as u64) >= 4,
+        "Q1: the fixture must be genuinely multi-batch (a whole multiple of \
+         BATCH_TRACES, at least 4 batches)"
+    );
+    const _: () = assert!(
+        AC_A4_M <= pulsus_read::MAX_SPANS_PER_TRACE as u64,
+        "Q2: the per-trace span count must not exceed MAX_SPANS_PER_TRACE — the \
+         hydration LIMIT BY must retain every seeded row"
+    );
+    const _: () = assert!(
+        AC_A4_N * AC_A4_M * (pulsus_read::RETAINED_ENTRY_OVERHEAD as u64 + AC_A4_NAME_BYTES)
+            > pulsus_read::HYDRATION_BYTE_BUDGET as u64,
+        "Q3 (v8): the retained floor — every matched span's summary charges at least \
+         RETAINED_ENTRY_OVERHEAD + name.len() before its clone and is never released \
+         (Q6: no evict) — must exceed HYDRATION_BYTE_BUDGET"
+    );
+    const _: () = assert!(
+        AC_A4_NAME_BYTES <= search_sql::TRACE_STR_COL_CAP,
+        "Q4: names must pass the source-truncation cap untouched end-to-end — \
+         hydration rows AND retained summaries carry the full seeded bytes"
+    );
+    const _: () = assert!(
+        (pulsus_read::BATCH_TRACES as u64) * AC_A4_M * (AC_A4_NAME_BYTES + 1024)
+            <= pulsus_read::traces::exec::TRACE_MAX_RESULT_BYTES * 3 / 4,
+        "Q5: no per-batch 396 — one batch's result bytes (1,024 over-bounds the \
+         per-row non-name bytes) must stay at or below 3/4 of TRACE_MAX_RESULT_BYTES, \
+         under the accounting threshold"
+    );
+
+    let ac_a4_start = now + 20 * 3_600_000_000_000;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(4000000 + number % {AC_A4_N})), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), \
+               repeat('y', {AC_A4_NAME_BYTES}), 'retained', {ac_a4_start} + toInt64(number), \
+               1000, 0, 1, 1, 'p' \
+             FROM numbers({})",
+            AC_A4_N * AC_A4_M
+        ),
+    )
+    .await;
+
+    // Q9 (live integrity, the P9 aggregate shape over the new window):
+    // the seeded fixture is exactly the Q1-Q5 shape and no foreign row
+    // shares the window.
+    let integrity = fixture_integrity(&client, ac_a4_start - 1, ac_a4_start + 1_000_000_000).await;
+    assert_eq!(integrity.distinct_traces, AC_A4_N, "Q9: distinct traces");
+    assert_eq!(integrity.total_rows, AC_A4_N * AC_A4_M, "Q9: total rows");
+    assert_eq!(
+        integrity.min_count, AC_A4_M,
+        "Q9: uniform per-trace count (min)"
+    );
+    assert_eq!(
+        integrity.max_count, AC_A4_M,
+        "Q9: uniform per-trace count (max)"
+    );
+    assert_eq!(
+        integrity.min_name_len, AC_A4_NAME_BYTES,
+        "Q9: uniform name length (min)"
+    );
+    assert_eq!(
+        integrity.max_name_len, AC_A4_NAME_BYTES,
+        "Q9: uniform name length (max)"
+    );
+
+    // Q8 + P6a/P6b re-run (delivery; the whole-DB row-count bound
+    // re-derives itself with the +40,960 fixture rows).
+    assert!(
+        engine_cfg.max_candidates >= AC_A4_N,
+        "Q8: max_candidates must admit every AC-A4 trace"
+    );
+    assert_eq!(
+        engine_cfg.scan_budget_rows, 50_000_000,
+        "P6a (re-run): scan_budget_rows must equal the production default"
+    );
+    let spans_total = table_row_count(&client, &format!("{DB}.trace_spans")).await;
+    let attrs_total = table_row_count(&client, &format!("{DB}.trace_attrs_idx")).await;
+    assert!(
+        10 * (spans_total + attrs_total) <= engine_cfg.scan_budget_rows,
+        "P6b (re-run): the whole-DB row count (10x margin) must stay under \
+         scan_budget_rows (spans={spans_total}, attrs={attrs_total})"
+    );
+
+    let plan = plan_for_with(
+        &engine,
+        "{}",
+        ac_a4_start - 1,
+        ac_a4_start + 1_000_000_000,
+        AC_A4_LIMIT,
+        AC_A4_SPSS,
+    );
+
+    // Q6 (runtime, on the BUILT plan — the runtime source): the heap
+    // never reaches `limit`, so there is no evict-release and no
+    // threshold termination; every matched span is fully retained
+    // (spss > M).
+    assert!(
+        plan.limit() as u64 >= AC_A4_N && plan.spss() as u64 >= AC_A4_M,
+        "Q6: limit ({}) must be >= N ({AC_A4_N}) and spss ({}) >= M ({AC_A4_M}) — \
+         eviction or spss-capping would release retained charges and defeat the gate",
+        plan.limit(),
+        plan.spss()
+    );
+
+    // Q7 (attribution): phase-1 charges plus TWO batch-transient
+    // envelopes stay under the budget — so no single batch plus phase-1
+    // can trip alone, and the asserted trip REQUIRES retained carryover
+    // from >= 4 completed prior batches (the cross-batch path, by
+    // arithmetic). The 2x(NAME+1024) per-row envelope covers one batch's
+    // transient hydration charge plus its own retained summaries plus
+    // eval sets/transients.
+    assert_eq!(
+        plan.max_candidates(),
+        engine_cfg.max_candidates,
+        "Q7 tripwire (P10's): plan cap must match config cap"
+    );
+    let cap = usize::try_from(plan.max_candidates()).expect("max_candidates fits usize");
+    let pre_hydration_worst =
+        2 * plan.generator_sqls.len() * (cap + 1) * pulsus_read::CANDIDATE_TUPLE_BYTES
+            + pulsus_read::BATCH_TRACES * std::mem::size_of::<[u8; 16]>()
+            + pulsus_read::RETAINED_ENTRY_OVERHEAD;
+    let batch_ceiling =
+        2 * pulsus_read::BATCH_TRACES * (AC_A4_M as usize) * ((AC_A4_NAME_BYTES as usize) + 1024);
+    assert!(
+        pre_hydration_worst + 2 * batch_ceiling < pulsus_read::HYDRATION_BYTE_BUDGET,
+        "Q7: phase-1 worst ({pre_hydration_worst} B) + 2 batch ceilings \
+         ({batch_ceiling} B each) must stay under HYDRATION_BYTE_BUDGET — otherwise a \
+         single batch could trip without cross-batch accumulation"
+    );
+
+    // S-carries (v7): S3 query-text (unchanged 32-id batches), S5 block
+    // framing, S6 the +1 probe (Q9: exactly N groups), S7 explain-zero;
+    // S1/S2/per-batch-396 loud via M1 value distinctness AND non-firing
+    // via Q5.
+    let err = engine.search(&plan).await.expect_err(
+        "256 x 160 x 8,000-byte retained summaries must trip the retention counter \
+         across batches",
+    );
+    match err {
+        ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+            assert_eq!(
+                budget_bytes,
+                pulsus_read::HYDRATION_BYTE_BUDGET as u64,
+                "AC-A4: the retention counter (cross-batch retained accumulation) must \
+                 be the tripping bound — a 396 here would carry TRACE_MAX_RESULT_BYTES"
+            );
         }
         other => panic!("expected ScanBudgetBytes (retention counter), got {other:?}"),
     }

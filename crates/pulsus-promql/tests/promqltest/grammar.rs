@@ -12,11 +12,15 @@
 //!   `expect string <quoted>` result lines (issue #86, M6-08d — the
 //!   executable subset of upstream's `expect` family; `parseExpect`/
 //!   `parseAsStringLiteral` at the pinned SHA)
+//! - block-form `expect warn|no_warn|info|no_info [msg:<s>|regex:<p>]`
+//!   annotation assertions (issue #124, M7-A6 — checked by `runner.rs`
+//!   against the captured [`pulsus_promql::Annotations`] channel), and
+//!   `{{…}}` native-histogram sample literals in `load`/result lines
+//!   ([`super::histogram_literal`])
 //!
 //! Everything else in the upstream grammar (`eval_warn`/`eval_info`, the
-//! `expect warn|no_warn|info|no_info|ordered` annotation forms and
-//! `expect range vector`, `load_with_nhcb`, `{{…}}` native-histogram
-//! sample syntax, `@st` start-timestamp lines) is a **deferred
+//! block `expect ordered` form and `expect range vector`,
+//! `load_with_nhcb`, `@st` start-timestamp lines) is a **deferred
 //! directive**: [`scan_deferred_directives`] detects them before grammar
 //! parsing, and the corpus test requires any file using one to be listed
 //! — loudly, wholesale — in `corpus/skip-manifest.json` with an
@@ -135,8 +139,22 @@ pub enum Expected {
         regexp: Option<String>,
     },
     /// `expect string <quoted>` (issue #86): the instant query must
-    /// evaluate to exactly this string.
-    String(String),
+    /// evaluate to exactly these bytes (a Go string is a byte slice, so
+    /// the literal channel is byte-exact — issue #86's fix; see
+    /// [`go_unquote`]).
+    String(Vec<u8>),
+}
+
+/// One block-form `expect warn|no_warn|info|no_info`'s optional
+/// `msg:`/`regex:` match tag (issue #124, M7-A6) — mirrors upstream
+/// `expectCmd`/`CheckMatch` (`promqltest/test.go:1096-1111`): a bare
+/// directive matches any non-empty annotation of that kind, `msg:`
+/// requires an exact-text match, `regex:` a pattern match.
+#[derive(Debug, Clone)]
+pub enum AnnotationMatch {
+    Any,
+    Message(String),
+    Regex(String),
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +174,20 @@ pub struct EvalCmd {
     pub expect_fail: bool,
     /// `true` when the block used `expect string` (issue #86).
     pub expect_string: bool,
+    /// `expect warn [msg:/regex:]` directives (issue #124, M7-A6) — every
+    /// entry must match at least one actual warning, and every actual
+    /// warning must match at least one entry (upstream
+    /// `validateExpectedAnnotationsOfType`).
+    pub expect_warn: Vec<AnnotationMatch>,
+    /// `true` when the block used bare `expect no_warn` — asserts zero
+    /// warning annotations. Mutually exclusive with `expect_warn`
+    /// (upstream `validateExpectedCmds`).
+    pub expect_no_warn: bool,
+    /// `expect info [msg:/regex:]` directives — see `expect_warn`.
+    pub expect_info: Vec<AnnotationMatch>,
+    /// `true` when the block used bare `expect no_info`. Mutually
+    /// exclusive with `expect_info`.
+    pub expect_no_info: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -173,12 +205,11 @@ pub enum Command {
 /// committed activation home in `corpus/skip-manifest.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeferredDirective {
-    /// The still-deferred block-`expect` forms (issue #86 split the
-    /// family): `expect warn|no_warn|info|no_info` (annotation emission,
-    /// #22), `expect ordered` (no activatable file uses it — every
-    /// carrier is also native-histogram-blocked; plan v2 Δ3), and
-    /// `expect range vector`. `expect fail`/`expect string` are
-    /// EXECUTABLE and never route here.
+    /// The still-deferred block-`expect` forms: `expect ordered` (no
+    /// activatable file uses it — every carrier is also blocked by another
+    /// directive; plan v2 Δ3) and `expect range vector`. `expect fail`/
+    /// `expect string` (issue #86) and `expect warn|no_warn|info|no_info`
+    /// (issue #124, M7-A6) are EXECUTABLE and never route here.
     ExpectLine,
     /// `eval_warn …` (annotation assertion).
     EvalWarn,
@@ -186,8 +217,6 @@ pub enum DeferredDirective {
     EvalInfo,
     /// `load_with_nhcb …` (native-histogram-compatible bucket conversion).
     LoadWithNhcb,
-    /// `{{…}}` native-histogram sample literals.
-    NativeHistogramValue,
     /// `metric@st …` start-timestamp definition lines.
     StartTimestampLine,
 }
@@ -200,7 +229,6 @@ impl DeferredDirective {
             DeferredDirective::EvalWarn => "eval_warn",
             DeferredDirective::EvalInfo => "eval_info",
             DeferredDirective::LoadWithNhcb => "load_with_nhcb",
-            DeferredDirective::NativeHistogramValue => "native-histogram-value",
             DeferredDirective::StartTimestampLine => "@st",
         }
     }
@@ -211,7 +239,6 @@ impl DeferredDirective {
             DeferredDirective::EvalWarn,
             DeferredDirective::EvalInfo,
             DeferredDirective::LoadWithNhcb,
-            DeferredDirective::NativeHistogramValue,
             DeferredDirective::StartTimestampLine,
         ]
         .into_iter()
@@ -247,17 +274,14 @@ pub fn scan_deferred_directives(text: &str) -> BTreeSet<DeferredDirective> {
         }
         let first_word = line.split_ascii_whitespace().next().unwrap_or("");
         if first_word == "expect" {
-            // Issue #86: `expect` is deferred IFF its second token is one
-            // of the annotation forms, `ordered`, or `range` (`expect
-            // range vector`); `expect fail`/`expect string` are part of
-            // the executed subset. Any OTHER second token is left for the
-            // grammar parser, which hard-errors on it (loud, never
-            // skipped).
+            // `expect` is deferred IFF its second token is `ordered` or
+            // `range` (`expect range vector`); `expect fail`/`expect
+            // string` (issue #86) and `expect warn|no_warn|info|no_info`
+            // (issue #124, M7-A6) are part of the executed subset. Any
+            // OTHER second token is left for the grammar parser, which
+            // hard-errors on it (loud, never skipped).
             let second = line.split_ascii_whitespace().nth(1).unwrap_or("");
-            if matches!(
-                second,
-                "ordered" | "warn" | "no_warn" | "info" | "no_info" | "range"
-            ) {
+            if matches!(second, "ordered" | "range") {
                 out.insert(DeferredDirective::ExpectLine);
             }
         }
@@ -269,9 +293,6 @@ pub fn scan_deferred_directives(text: &str) -> BTreeSet<DeferredDirective> {
         }
         if first_word == "load_with_nhcb" {
             out.insert(DeferredDirective::LoadWithNhcb);
-        }
-        if line.contains("{{") {
-            out.insert(DeferredDirective::NativeHistogramValue);
         }
         // Upstream `isSTLine`: the first whitespace-delimited token ends
         // with `@st` (no space before it).
@@ -486,9 +507,13 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
     // (upstream pairs `expect fail` with inline `msg:`/`regex:` instead).
     let directive_fail = mode == EvalMode::Fail;
     let mut expect_fail = false;
-    let mut expect_string: Option<String> = None;
+    let mut expect_string: Option<Vec<u8>> = None;
     let mut fail_message: Option<String> = None;
     let mut fail_regexp: Option<String> = None;
+    let mut expect_warn: Vec<AnnotationMatch> = Vec::new();
+    let mut expect_no_warn = false;
+    let mut expect_info: Vec<AnnotationMatch> = Vec::new();
+    let mut expect_no_info = false;
     let mut result_series: Vec<ExpectedSeries> = Vec::new();
     let mut scalar: Option<f64> = None;
 
@@ -512,10 +537,10 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
             ));
         }
 
-        // Block-form `expect` directives (issue #86). Like upstream, only
-        // a line whose FIRST whitespace-delimited token is literally
-        // `expect` routes here — a metric named `expect` is still
-        // writable as `expect{}`.
+        // Block-form `expect` directives (issue #86; issue #124 M7-A6 adds
+        // the annotation forms). Like upstream, only a line whose FIRST
+        // whitespace-delimited token is literally `expect` routes here —
+        // a metric named `expect` is still writable as `expect{}`.
         if line.split_ascii_whitespace().next() == Some("expect") {
             if scalar.is_some() || !result_series.is_empty() {
                 return Err(err_at(
@@ -524,15 +549,19 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
                     "an `expect` directive cannot follow result lines in one eval block",
                 ));
             }
-            parse_expect_line(file, i, line, &kind, &mut expect_fail, &mut expect_string).map(
-                |(msg, pat)| {
-                    if msg.is_some() {
-                        fail_message = msg;
-                    }
-                    if pat.is_some() {
-                        fail_regexp = pat;
-                    }
-                },
+            parse_expect_line(
+                file,
+                i,
+                line,
+                &kind,
+                &mut expect_fail,
+                &mut fail_message,
+                &mut fail_regexp,
+                &mut expect_string,
+                &mut expect_warn,
+                &mut expect_no_warn,
+                &mut expect_info,
+                &mut expect_no_info,
             )?;
             i += 1;
             continue;
@@ -609,6 +638,10 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
             bare_instant,
             expect_fail,
             expect_string: used_expect_string,
+            expect_warn,
+            expect_no_warn,
+            expect_info,
+            expect_no_info,
         },
         i,
     ))
@@ -622,15 +655,21 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
 /// vector`) are routed to the skip-manifest by
 /// [`scan_deferred_directives`] before this parser runs — reaching here
 /// is a hard error (defense in depth), as is any unrecognised form.
-/// Returns `expect fail`'s optional `(message, regexp)` pair.
+#[allow(clippy::too_many_arguments)]
 fn parse_expect_line(
     file: &str,
     line_no: usize,
     line: &str,
     kind: &EvalKind,
     expect_fail: &mut bool,
-    expect_string: &mut Option<String>,
-) -> Result<(Option<String>, Option<String>), String> {
+    fail_message: &mut Option<String>,
+    fail_regexp: &mut Option<String>,
+    expect_string: &mut Option<Vec<u8>>,
+    expect_warn: &mut Vec<AnnotationMatch>,
+    expect_no_warn: &mut bool,
+    expect_info: &mut Vec<AnnotationMatch>,
+    expect_no_info: &mut bool,
+) -> Result<(), String> {
     if line == "expect string" {
         return Err(err_at(
             file,
@@ -654,7 +693,7 @@ fn parse_expect_line(
             ));
         }
         *expect_string = Some(go_unquote(literal).map_err(|e| err_at(file, line_no, e))?);
-        return Ok((None, None));
+        return Ok(());
     }
 
     let mut words = line.split_ascii_whitespace();
@@ -669,44 +708,125 @@ fn parse_expect_line(
                 ));
             }
             *expect_fail = true;
-            // Optional `msg:<s>` / `regex:<p>` tail — everything after
-            // the tag, trimmed (upstream captures `(.+)` and TrimSpaces).
-            let tail = line.split_once("fail").map(|(_, t)| t.trim()).unwrap_or("");
-            if tail.is_empty() {
-                return Ok((None, None));
+            match parse_optional_tag(line, "fail").map_err(|e| err_at(file, line_no, e))? {
+                AnnotationMatch::Any => {}
+                AnnotationMatch::Message(m) => *fail_message = Some(m),
+                AnnotationMatch::Regex(p) => *fail_regexp = Some(p),
             }
-            if let Some(msg) = tail.strip_prefix("msg:") {
-                return Ok((Some(msg.trim().to_string()), None));
-            }
-            if let Some(pat) = tail.strip_prefix("regex:") {
-                return Ok((None, Some(pat.trim().to_string())));
-            }
-            Err(err_at(
-                file,
-                line_no,
-                format!("invalid token after expect fail: {tail:?} (want msg:/regex:)"),
-            ))
+            Ok(())
         }
-        Some(deferred @ ("ordered" | "warn" | "no_warn" | "info" | "no_info" | "range")) => {
-            Err(err_at(
-                file,
-                line_no,
-                format!(
-                    "deferred `expect {deferred}` directive reached the executed-grammar \
-                     parser — scan_deferred_directives must route this file to the \
-                     skip-manifest first"
-                ),
-            ))
+        // Issue #124 (M7-A6): the annotation directives — checked in
+        // `runner.rs` against the [`pulsus_promql::Annotations`] channel
+        // `evaluate()` returns. `warn`/`info` accumulate match patterns
+        // (multiple lines build a set, upstream
+        // `validateExpectedAnnotationsOfType`); `no_warn`/`no_info` are
+        // bare presence assertions (upstream's tag-less regex branch —
+        // no vendored corpus file tags them, so a tail there is a loud
+        // error rather than a silently-ignored extension).
+        Some("warn") => {
+            if *expect_no_warn {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "invalid expect lines, warn and no_warn cannot be used together",
+                ));
+            }
+            expect_warn
+                .push(parse_optional_tag(line, "warn").map_err(|e| err_at(file, line_no, e))?);
+            Ok(())
         }
+        Some("no_warn") => {
+            if !expect_warn.is_empty() {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "invalid expect lines, warn and no_warn cannot be used together",
+                ));
+            }
+            if line.trim() != "expect no_warn" {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "expect no_warn takes no msg:/regex: tail",
+                ));
+            }
+            *expect_no_warn = true;
+            Ok(())
+        }
+        Some("info") => {
+            if *expect_no_info {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "invalid expect lines, info and no_info cannot be used together",
+                ));
+            }
+            expect_info
+                .push(parse_optional_tag(line, "info").map_err(|e| err_at(file, line_no, e))?);
+            Ok(())
+        }
+        Some("no_info") => {
+            if !expect_info.is_empty() {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "invalid expect lines, info and no_info cannot be used together",
+                ));
+            }
+            if line.trim() != "expect no_info" {
+                return Err(err_at(
+                    file,
+                    line_no,
+                    "expect no_info takes no msg:/regex: tail",
+                ));
+            }
+            *expect_no_info = true;
+            Ok(())
+        }
+        Some(deferred @ ("ordered" | "range")) => Err(err_at(
+            file,
+            line_no,
+            format!(
+                "deferred `expect {deferred}` directive reached the executed-grammar \
+                 parser — scan_deferred_directives must route this file to the \
+                 skip-manifest first"
+            ),
+        )),
         other => Err(err_at(
             file,
             line_no,
             format!(
-                "invalid expect statement {other:?} — executable forms are `expect fail` and \
-                 `expect string`"
+                "invalid expect statement {other:?} — executable forms are `expect fail`, \
+                 `expect string`, and `expect warn|no_warn|info|no_info`"
             ),
         )),
     }
+}
+
+/// The optional `msg:<s>`/`regex:<p>` tail shared by `expect
+/// fail|warn|info` (upstream `patExpect`'s single capture group,
+/// `test.go:55`): everything after the FIRST occurrence of `keyword` in
+/// the line, trimmed. `keyword` is always the second whitespace-delimited
+/// token, immediately after `expect `, so its first occurrence in the
+/// line is unambiguous for every corpus message body (none begins with
+/// the bare keyword text before the tag).
+fn parse_optional_tag(line: &str, keyword: &str) -> Result<AnnotationMatch, String> {
+    let tail = line
+        .split_once(keyword)
+        .map(|(_, t)| t.trim())
+        .unwrap_or("");
+    if tail.is_empty() {
+        return Ok(AnnotationMatch::Any);
+    }
+    if let Some(msg) = tail.strip_prefix("msg:") {
+        return Ok(AnnotationMatch::Message(msg.trim().to_string()));
+    }
+    if let Some(pat) = tail.strip_prefix("regex:") {
+        return Ok(AnnotationMatch::Regex(pat.trim().to_string()));
+    }
+    Err(format!(
+        "invalid token after expect {keyword}: {tail:?} (want msg:/regex:)"
+    ))
 }
 
 /// Go `strconv.Unquote` for the forms upstream `.test` files use
@@ -718,14 +838,15 @@ fn parse_expect_line(
 /// one raw BYTE each (a Go string is a byte slice — `"\xe4\xb8\x96"` is
 /// the three UTF-8 bytes of `世`, never three separate code points), and
 /// an octal value above 255 is a syntax error; `\uXXXX`/`\UXXXXXXXX`
-/// produce one CODE POINT, UTF-8-encoded. One deliberate narrowing:
-/// Go tolerates byte escapes that do not form valid UTF-8 (its strings
-/// are arbitrary bytes) — a Rust `String` cannot, so such input is a
-/// loud error here rather than lossy replacement; no vendored file uses
-/// one. Single-quoted rune literals are not used by any vendored file
-/// and are rejected loudly (extend if a corpus file legitimately needs
-/// them — the `series.rs::scan_quoted_string` convention).
-fn go_unquote(s: &str) -> Result<String, String> {
+/// produce one CODE POINT, UTF-8-encoded. The result is `Vec<u8>` (issue
+/// #86): a Go string is an arbitrary byte slice, so byte escapes that do
+/// not form valid UTF-8 (`"\xff"`) are legal Go output and must survive
+/// here too — only the `Expected::String` comparison channel carries
+/// these bytes, everything else in the driver stays `String` (see the
+/// call site). Single-quoted rune literals are not used by any vendored
+/// file and are rejected loudly (extend if a corpus file legitimately
+/// needs them — the `series.rs::scan_quoted_string` convention).
+fn go_unquote(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 {
         return Err(format!("invalid quoted string {s:?}"));
@@ -740,7 +861,7 @@ fn go_unquote(s: &str) -> Result<String, String> {
             if inner.contains('`') {
                 return Err(format!("backquoted string contains a backquote: {s:?}"));
             }
-            Ok(inner.replace('\r', ""))
+            Ok(inner.replace('\r', "").into_bytes())
         }
         b'"' => {
             // Accumulate BYTES, not chars: `\xHH`/`\OOO` are raw bytes in
@@ -826,12 +947,7 @@ fn go_unquote(s: &str) -> Result<String, String> {
                     other => return Err(format!("unsupported escape \\{other} in {s:?}")),
                 }
             }
-            String::from_utf8(out).map_err(|e| {
-                format!(
-                    "byte escapes in {s:?} do not form valid UTF-8 ({e}) — Go permits \
-                     non-UTF-8 strings, a Rust String cannot; no vendored file needs one"
-                )
-            })
+            Ok(out)
         }
         _ => Err(format!(
             "unsupported quote style in {s:?} — extend grammar.rs::go_unquote if the corpus \
@@ -866,11 +982,18 @@ mod tests {
     /// mojibake code points.
     #[test]
     fn go_unquote_hex_escapes_are_raw_bytes_multibyte_sequences_decode_as_utf8() {
-        assert_eq!(go_unquote(r#""\xe4\xb8\x96""#).unwrap(), "世");
-        assert_eq!(go_unquote(r#""\x41\x42""#).unwrap(), "AB");
-        // Bytes that do NOT form valid UTF-8 are a loud error (documented
-        // narrowing vs Go's arbitrary-byte strings).
-        assert!(go_unquote(r#""\xff""#).unwrap_err().contains("UTF-8"));
+        assert_eq!(go_unquote(r#""\xe4\xb8\x96""#).unwrap(), "世".as_bytes());
+        assert_eq!(go_unquote(r#""\x41\x42""#).unwrap(), b"AB");
+    }
+
+    /// Issue #86: `\xHH`/octal byte escapes that do NOT form valid UTF-8
+    /// are legal Go output (a Go string is an arbitrary byte slice) and
+    /// must survive to the exact bytes — no UTF-8 gate on the result.
+    /// `"a\xc5z"` is the exact vendored literal at `aggregators.test:481`.
+    #[test]
+    fn go_unquote_non_utf8_byte_escapes_survive_as_exact_bytes() {
+        assert_eq!(go_unquote(r#""\xff""#).unwrap(), vec![0xffu8]);
+        assert_eq!(go_unquote(r#""a\xc5z""#).unwrap(), vec![b'a', 0xc5, b'z']);
     }
 
     /// Octal escapes are raw bytes too (Go: `"\101\102"` == `"AB"`,
@@ -879,8 +1002,8 @@ mod tests {
     /// as a widened code point.
     #[test]
     fn go_unquote_octal_escapes_are_raw_bytes_and_reject_values_above_255() {
-        assert_eq!(go_unquote(r#""\101\102""#).unwrap(), "AB");
-        assert_eq!(go_unquote(r#""\344\270\226""#).unwrap(), "世");
+        assert_eq!(go_unquote(r#""\101\102""#).unwrap(), b"AB");
+        assert_eq!(go_unquote(r#""\344\270\226""#).unwrap(), "世".as_bytes());
         assert!(go_unquote(r#""\400""#).unwrap_err().contains("377"));
         assert!(go_unquote(r#""\777""#).unwrap_err().contains("377"));
     }
@@ -889,9 +1012,27 @@ mod tests {
     /// the raw/simple forms round-trip.
     #[test]
     fn go_unquote_unicode_escapes_are_code_points_and_raw_strings_pass_through() {
-        assert_eq!(go_unquote(r#""世""#).unwrap(), "世");
-        assert_eq!(go_unquote(r#""\U0001F600""#).unwrap(), "😀");
-        assert_eq!(go_unquote("`a\\n b`").unwrap(), "a\\n b");
-        assert_eq!(go_unquote(r#""a\tb\"c""#).unwrap(), "a\tb\"c");
+        assert_eq!(go_unquote(r#""世""#).unwrap(), "世".as_bytes());
+        assert_eq!(go_unquote(r#""\U0001F600""#).unwrap(), "😀".as_bytes());
+        assert_eq!(go_unquote("`a\\n b`").unwrap(), b"a\\n b");
+        assert_eq!(go_unquote(r#""a\tb\"c""#).unwrap(), b"a\tb\"c");
+    }
+
+    /// Per-escape syntax checks are untouched by the byte-result change:
+    /// a short `\x` hex sequence and unsupported escape characters still
+    /// reject loudly.
+    #[test]
+    fn go_unquote_invalid_escape_syntax_still_rejects() {
+        assert!(go_unquote(r#""\xf""#).is_err());
+        assert!(go_unquote(r#""\q""#).is_err());
+    }
+
+    /// Surrogate code points must stay rejected (Go `utf8.ValidRune`
+    /// parity) — dropping the whole-result UTF-8 gate must not widen the
+    /// per-escape `\u`/`\U` code-point path, which already rejects them
+    /// via `char::from_u32`.
+    #[test]
+    fn go_unquote_surrogate_unicode_escape_rejects() {
+        assert!(go_unquote(r#""\ud800""#).is_err());
     }
 }

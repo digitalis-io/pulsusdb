@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{
-    ChClient, ChConnConfig, ChEndpoint, ChPool, Idempotency, QuerySettings, Row,
+    ChClient, ChConnConfig, ChEndpoint, ChPool, ConsistencyConfig, Idempotency, QuerySettings, Row,
 };
 
 fn should_run() -> bool {
@@ -219,6 +219,59 @@ async fn marked_queries_land_on_each_node_server_side() {
 }
 
 #[tokio::test]
+async fn with_consistency_validates_against_the_client_deadline() {
+    // AC14 (issue #114): the fallible `ChClient::with_consistency` wires
+    // `self.default_timeout` (the `from_shared_pool` `query_timeout` arg,
+    // 10s here) through the full quorum/deadline invariant on the ACTUAL
+    // shared-pool path. A `ChClient` cannot be built hermetically
+    // (`from_shared_pool` needs a connected `ChPool`), so this is the wiring
+    // proof; the invariant's own logic is proved hermetically in
+    // `config.rs`'s `validate_for_deadline` unit tests.
+    skip_unless_live!();
+    let pool = Arc::new(
+        ChPool::connect(base_config(vec![shard1()]))
+            .await
+            .expect("connect for with_consistency wiring proof"),
+    );
+    let deadline = Duration::from_secs(10);
+
+    // Zero quorum timeout with quorum enabled -> Err (dangerous no/infinite
+    // wait), before any I/O.
+    let zero = ChClient::from_shared_pool(Arc::clone(&pool), deadline).with_consistency(
+        ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::ZERO,
+            ..ConsistencyConfig::default()
+        },
+    );
+    assert!(
+        zero.is_err(),
+        "a zero quorum timeout must be rejected by with_consistency"
+    );
+
+    // Quorum timeout above the 10s client deadline -> Err (preempt).
+    let over = ChClient::from_shared_pool(Arc::clone(&pool), deadline).with_consistency(
+        ConsistencyConfig {
+            insert_quorum: 2,
+            insert_quorum_timeout: Duration::from_secs(300),
+            ..ConsistencyConfig::default()
+        },
+    );
+    assert!(
+        over.is_err(),
+        "a quorum timeout above the client deadline must be rejected"
+    );
+
+    // The default (quorum off) -> Ok.
+    let ok =
+        ChClient::from_shared_pool(pool, deadline).with_consistency(ConsistencyConfig::default());
+    assert!(
+        ok.is_ok(),
+        "the default consistency config must be accepted"
+    );
+}
+
+#[tokio::test]
 async fn dead_endpoint_is_demoted_and_all_requests_still_served() {
     // AC6: a pool over one live endpoint + one dead port. Every request is
     // served by the live endpoint, and the dead endpoint ends demoted
@@ -254,4 +307,89 @@ async fn dead_endpoint_is_demoted_and_all_requests_still_served() {
         "live endpoint served everything: {counts:?}"
     );
     assert_eq!(counts[1].1, 0, "dead endpoint never selected: {counts:?}");
+}
+
+/// Comfortably past the pool's 5s demotion cooldown, used to drive the
+/// explicit-clock re-probe entry point without wall-clock sleeps. If the
+/// cooldown constant ever outgrows this margin, the probe-executed
+/// (cooldown-restart) asserts below fail LOUDLY — the test can never
+/// silently regress back to skipping the probe.
+const PAST_COOLDOWN_MS: u64 = 60_000;
+
+#[tokio::test]
+async fn reprobe_pass_leaves_dead_endpoint_demoted_and_serving_unaffected() {
+    // AC5 (issue #43 re-probe plan): a re-probe pass against a genuinely
+    // dead port must actually EXECUTE its probe and still never flap the
+    // endpoint healthy — zero promotions across two passes, still demoted
+    // afterwards, and every request keeps being served by the live
+    // endpoint. No wall-time asserts.
+    //
+    // Code-review fix (vacuity): the dead endpoint is demoted at connect
+    // (ping-any), which is within the demotion cooldown of "now" — an
+    // immediate `reprobe_demoted()` would SKIP it at the cooldown gate and
+    // return 0 without ever dialing the dead port. So the pass is driven
+    // through the explicit-clock entry point (`reprobe_demoted_at`),
+    // shifted past the cooldown, making the REAL `SELECT 1` run against
+    // the dead port. Execution is then asserted positively: an *applied*
+    // probe failure restarts the cooldown (`unhealthy_since_ms` == the
+    // injected clock), which a skipped probe can never do.
+    skip_unless_live!();
+    let live = shard1();
+    let dead = ChEndpoint {
+        host: live.host.clone(),
+        http_port: 9, // discard port: nothing listens -> connection refused
+        zone: None,
+    };
+    let pool = ChPool::connect(base_config(vec![live, dead]))
+        .await
+        .expect("connect succeeds: at least one (the live) endpoint answers");
+
+    // The dead endpoint is demoted by the startup ping-any pass; the pings
+    // below are all served by the live endpoint (spread never reaches the
+    // demoted one on the hot path).
+    for _ in 0..5 {
+        pool.ping().await.expect("served by the live endpoint");
+    }
+    assert!(
+        !pool.endpoint_health()[1].1,
+        "the dead endpoint must already be demoted before re-probing"
+    );
+    let since0 = pool.endpoint_unhealthy_since_ms()[1].1;
+
+    // Pass 1, clock driven past the cooldown: the probe must EXECUTE
+    // (cooldown restarted to exactly t1 — only an applied failure does
+    // that) and must not promote.
+    let t1 = since0 + PAST_COOLDOWN_MS;
+    let promoted_first = pool.reprobe_demoted_at(t1).await;
+    assert_eq!(promoted_first, 0, "a dead endpoint must never be promoted");
+    assert_eq!(
+        pool.endpoint_unhealthy_since_ms()[1].1,
+        t1,
+        "the failed probe must restart the cooldown from the injected clock \
+         — proves the SELECT 1 actually executed against the dead port \
+         rather than being skipped by the cooldown gate"
+    );
+
+    // Pass 2, past the RESTARTED cooldown: executes and fails again.
+    let t2 = t1 + PAST_COOLDOWN_MS;
+    let promoted_second = pool.reprobe_demoted_at(t2).await;
+    assert_eq!(promoted_second, 0, "a dead endpoint must never be promoted");
+    assert_eq!(
+        pool.endpoint_unhealthy_since_ms()[1].1,
+        t2,
+        "the second failed probe must also have executed (cooldown restarted again)"
+    );
+
+    let health = pool.endpoint_health();
+    assert!(health[0].1, "the live endpoint stays healthy: {health:?}");
+    assert!(
+        !health[1].1,
+        "the dead endpoint stays demoted after re-probing: {health:?}"
+    );
+
+    for _ in 0..5 {
+        pool.ping()
+            .await
+            .expect("still served by the live endpoint");
+    }
 }

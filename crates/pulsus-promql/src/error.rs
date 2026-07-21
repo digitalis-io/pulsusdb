@@ -41,16 +41,21 @@ pub enum PromqlError {
     /// A binary expression's vector matching is invalid — the upstream
     /// duplicate-match errors (a many-to-one match without
     /// `group_left`/`group_right`, a duplicate "one"-side signature, a
-    /// non-unique many-to-one output identity — issue #70 carries the
-    /// verbatim upstream v3.13 message in `detail`) and the
-    /// modifier-misuse rejections ported from upstream parse.go (fill
-    /// with a scalar operand or a set operator).
-    #[error("binary operator matching error: {detail}")]
+    /// non-unique many-to-one output identity) and the modifier-misuse
+    /// rejections ported from upstream parse.go (fill with a scalar
+    /// operand or a set operator). `detail` carries the exact upstream
+    /// v3.13 message verbatim (issue #70) — `Display` is the raw detail
+    /// with no added prefix, mirroring `LabelSet` below.
+    #[error("{detail}")]
     BadMatching { detail: String },
 
-    /// `histogram_quantile` could not compute a quantile — a malformed
-    /// `le` label (parse failure) or a bucket series missing the required
-    /// `+Inf` bucket. Never a silently wrong quantile.
+    /// `histogram_quantile`/`histogram_fraction` could not compute a
+    /// result — an empty bucket group or a bucket series missing the
+    /// required `+Inf` bucket. Never a silently wrong quantile. (A
+    /// malformed/missing `le` label is NOT this variant as of `#124`:
+    /// that bucket is skipped with a `bad_bucket_label_warning`,
+    /// matching pinned `resetHistograms` — `eval::mod::
+    /// partition_histogram_inputs`'s doc.)
     #[error("histogram_quantile error: {detail}")]
     HistogramBucket { detail: String },
 
@@ -78,6 +83,23 @@ pub enum PromqlError {
     /// error.
     #[error("invalid function parameter: {detail}")]
     InvalidParameter { detail: String },
+
+    /// A native-histogram trim operator (`</`/`>/`, issue #129) applied to
+    /// two scalars — upstream `scalarBinop` panics `operator %q not
+    /// allowed for Scalar operations` for TRIM (`promql/engine.go:3434`),
+    /// surfaced as a query error via `ev.recover` (`:1199-1200`); mirrored
+    /// here as a typed error instead of a panic. `op` is the operator's
+    /// [`crate::plan::BinOp::item_type_str`] (`"</"`/`">/"`).
+    #[error("operator \"{op}\" not allowed for Scalar operations")]
+    ScalarOp { op: &'static str },
+
+    /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
+    /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
+    /// the awaiting request future was dropped (client disconnect, or the
+    /// server's `TimeoutLayer` firing first). `evaluate` (the `never()`
+    /// token) can never produce this variant.
+    #[error("query evaluation cancelled")]
+    Cancelled,
 }
 
 #[cfg(test)]
@@ -98,12 +120,18 @@ mod tests {
         assert!(err.to_string().contains("the @ modifier"));
     }
 
+    /// Issue #70: the vendored corpus asserts these messages as substrings
+    /// (and, after this fix, an anchored regex) of the query error —
+    /// `Display` must be the raw upstream text with no added prefix.
     #[test]
-    fn bad_matching_display_names_the_detail() {
+    fn bad_matching_display_is_the_raw_detail_with_no_prefix() {
         let err = PromqlError::BadMatching {
             detail: "many-to-one match without group_left/group_right".to_string(),
         };
-        assert!(err.to_string().contains("many-to-one"));
+        assert_eq!(
+            err.to_string(),
+            "many-to-one match without group_left/group_right"
+        );
     }
 
     #[test]
@@ -136,6 +164,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid function parameter: invalid smoothing factor: expected 0 < sf < 1, got 2"
+        );
+    }
+
+    /// Issue #129: verbatim upstream `scalarBinop` panic text
+    /// (`engine.go:3434`), for both trim operators.
+    #[test]
+    fn scalar_op_display_carries_the_upstream_panic_text_verbatim() {
+        let err = PromqlError::ScalarOp { op: "</" };
+        assert_eq!(
+            err.to_string(),
+            "operator \"</\" not allowed for Scalar operations"
+        );
+        let err = PromqlError::ScalarOp { op: ">/" };
+        assert_eq!(
+            err.to_string(),
+            "operator \">/\" not allowed for Scalar operations"
         );
     }
 }

@@ -15,6 +15,7 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 hyper-rustls.workspace = true
 hyper-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

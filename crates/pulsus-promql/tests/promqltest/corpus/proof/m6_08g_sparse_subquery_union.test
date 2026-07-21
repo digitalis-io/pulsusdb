@@ -1,0 +1,63 @@
+# Issue #83 (M6-08g) proof corpus — annotation-capability-aware sparse
+# subquery envelope pruning (codex Q1 ruling on the 2026-07-20 plan v2).
+#
+# Model: `prepare_subquery` prunes a subquery's own materialization grid
+# to the DISCRETE UNION of its consumer windows — instead of the full
+# `(mint_min, maxt_max]` envelope — whenever the subquery's inner
+# expression is PROVABLY annotation-free (`eval::expr_may_annotate`, a
+# static, conservative, exhaustive-match predicate over the plan tree; no
+# data inspection). A capable inner (any `RangeFn`, most `OverTime`/
+# `Aggregate` ops, `Binary` unconditionally, `histogram_quantile`, …)
+# always keeps the full envelope, because a gap point the pruned grid
+# would skip can be the ONLY place an annotation-capable arm ever sees
+# the sample that triggers it. Anchors (`grid_start` and every anchor
+# below it) stay ENVELOPE-derived either way — pruning only shrinks which
+# grid points are materialized, never where the grid starts.
+#
+# `m{job="a"}`: v(t) = t/10 — exactly linear, so every golden below is
+# arithmetic-exact.
+load 10s
+	m{job="a"} 0+1x100
+
+# --- A general sparse golden: step (40s) > range (30s), so the five
+# outer windows are pairwise disjoint. Free inner (`m` is a bare
+# selector) ⇒ pruned to the union (15 grid points, not the ~19-point
+# envelope `(−30s, 160s]` would otherwise realize).
+eval range from 0 to 160s step 40s sum_over_time(m{job="a"}[30s:10s])
+	{job="a"} 0 9 21 33 45
+
+# --- The window-upper-boundary point (guards an under-pruning off-by-
+# one). `range == step == 10s` ⇒ every window `(t−10s, t]` has EXACTLY
+# ONE candidate grid point: `t` itself, the window's own right-closed
+# (inclusive) edge. An implementation that computed the union with an
+# exclusive upper bound (`p < eff_t` instead of `p <= eff_t`) would
+# never include ANY point, and every step below would go missing
+# (empty) instead of reading `m`'s value at that step.
+eval range from 0 to 40s step 10s sum_over_time(m{job="a"}[10s:10s])
+	{job="a"} 0 1 2 3 4
+
+# --- Dense control: step (10s) <= range (20s) ⇒ the windows overlap
+# end-to-end, so their union IS the envelope and `live_grid_points`
+# returns `None` (the pre-existing #83 round-2 dense path, untouched by
+# the capability gate). Same value shape as the sparse cases above,
+# proving pruning changes nothing observable.
+eval range from 20s to 60s step 10s sum_over_time(m{job="a"}[20s:10s])
+	{job="a"} 3 5 7 9 11
+
+clear
+
+# --- The gap-only-annotation regression (codex Q1 ruling / AC6). `up`
+# is 1 at every 1s tick except a lone native-histogram sample at t=20s —
+# a GAP point: 20s lies outside every consumer window `(t−3s, t]` for
+# t ∈ {0, 6, 12, 18, 24, 30, 36}s (nearest windows are `(15s,18s]` and
+# `(21s,24s]`). `(up + 1)`'s `Binary` root is unconditionally CAPABLE
+# (`expr_may_annotate`), so the full envelope is retained regardless of
+# the gap being value-unobservable — the histogram+scalar info still
+# surfaces, and the values match the all-float shape exactly (the gap
+# point affects no window).
+load 1s
+	up 1x19 {{schema:0 count:4 sum:5 buckets:[1 1 -1]}} 1x16
+
+eval range from 0s to 36s step 6s sum_over_time((up + 1)[3s:1s])
+	expect info
+	{} 2 6 6 6 6 6 6

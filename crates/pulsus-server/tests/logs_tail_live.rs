@@ -30,7 +30,24 @@
 //!   proven from the FIRST keyset poll's `timestamp_ns > N` bound in
 //!   `system.query_log` — within-retention rows still delivered, catch-up
 //!   collapsed to a handful of polls (port 31142);
-//! - the `/loki/api/v1/tail` compat alias streams identically.
+//! - the `/loki/api/v1/tail` compat alias streams identically;
+//! - bounded month refresh + orphan cache (issue #94, atomicity-safe
+//!   revision): a stream registered ONLY in an older calendar month
+//!   (simulating the non-atomic `log_streams`/`log_samples` write path)
+//!   stays tail-resolvable after the stage-1 month window narrows past
+//!   its registration month (port 31147);
+//! - scan-gated phase split (issue #94 v6-v8): reworked 31147 now proves
+//!   every stage-1 poll (catch-up AND live-edge) stays FULL-SPAN through
+//!   the registration-visibility hold — no port, WS e2e through the real
+//!   producer; L1 (no port, direct-drive on real ClickHouse — the test
+//!   IS the producer, so insert-vs-scan ordering is program order) proves
+//!   the transition instant: a registration inserted in the inter-poll
+//!   gap right after the last pre-qualifying full-span scan is caught by
+//!   the NEXT (qualifying) full-span scan and delivered, narrowing then
+//!   excludes the registration month and further delivery is
+//!   cache-attributed; a strand-replay phase demonstrates the abolished
+//!   v6 time-gated rule (`narrow = live && dwell >= grace`, no scan gate)
+//!   strands an equivalent registration.
 //!
 //! Gated behind `PULSUS_TEST_CLICKHOUSE=1`. Run locally:
 //!
@@ -41,7 +58,7 @@
 //! podman rm -f pulsus-ch-test
 //! ```
 //!
-//! Ports 31140-31146, distinct from every other live suite.
+//! Ports 31140-31147, distinct from every other live suite.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -566,14 +583,13 @@ async fn engine_keyset_pages_resume_split_ties_and_honor_the_composite_cursor() 
         limit: 100,
         direction: Direction::Forward,
     };
-    let setup = engine.tail_setup(&expr, &qp).expect("setup");
+    let mut setup = engine.tail_setup(&expr, &qp).expect("setup");
     let upper = ts0 + 1_000_000_000;
 
     // Page 1: LIMIT 2 splits the 5-row tie group.
     let page1 = engine
         .tail_poll(
-            &setup.compiled,
-            &setup.plan,
+            &mut setup,
             TailLower::Start {
                 start_ns: ts0 - 1_000_000_000,
             },
@@ -624,13 +640,7 @@ async fn engine_keyset_pages_resume_split_ties_and_honor_the_composite_cursor() 
     let mut cursor = c1;
     for _ in 0..10 {
         let page = engine
-            .tail_poll(
-                &setup.compiled,
-                &setup.plan,
-                TailLower::After(cursor),
-                upper,
-                2,
-            )
+            .tail_poll(&mut setup, TailLower::After(cursor), upper, 2)
             .await
             .expect("page");
         delivered_rest.extend(page_lines(&page.streams));
@@ -737,12 +747,12 @@ async fn tail_pages_and_range_query_deliver_identical_entry_sets() {
     let mut range_entries = entry_set(&range_streams);
 
     // (b) tail_poll paged with fetch_limit 3 — several pages, split ties.
-    let setup = engine.tail_setup(&expr, &qp).expect("setup");
+    let mut setup = engine.tail_setup(&expr, &qp).expect("setup");
     let mut tail_streams: Vec<StreamResult> = Vec::new();
     let mut lower = TailLower::Start { start_ns: start };
     for _ in 0..32 {
         let page = engine
-            .tail_poll(&setup.compiled, &setup.plan, lower, end, 3)
+            .tail_poll(&mut setup, lower, end, 3)
             .await
             .expect("tail page");
         tail_streams.extend(page.streams);
@@ -1228,4 +1238,453 @@ async fn loki_tail_alias_streams_like_native() {
     assert_eq!(entries[0].2, "via-alias");
     ws.close();
     drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 7) Bounded month refresh + orphan cache (issue #94, atomicity-safe
+//    revision): a stream registered ONLY in an older calendar month
+//    (simulating the non-atomic log_streams/log_samples write path,
+//    writer/mod.rs:9-19) stays tail-resolvable after the narrowed
+//    stage-1 month window scrolls past its registration month — proven
+//    non-vacuous via system.query_log (port 31147)
+// ---------------------------------------------------------------------
+
+/// The `'YYYY-MM-01'` ClickHouse date literal a single UTC instant falls
+/// in — the live-test-side equivalent of the month literal
+/// `pulsus_read::logql::plan::months_overlapping` renders (not reachable
+/// from here, `pub(crate)` to that crate).
+fn month_literal(ts_ns: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(ts_ns)
+        .format("'%Y-%m-01'")
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stage1_month_narrowing_keeps_an_older_registered_orphan_resolvable_via_the_cache() {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const DAY_NS: i64 = 86_400_000_000_000;
+    let port = 31_147;
+    let db = "pulsus_tail_it_orphan";
+    drop_db(db).await;
+
+    // B (sample month) and A (registration month): A is exactly TWO
+    // CALENDAR MONTHS before B (not a fixed day-count) — deviation from
+    // plan v3's literal "A_reg = B_sample − 45 days", documented in the
+    // implementation notes. A fixed 45-day gap only guarantees "a
+    // different month", not "a non-adjacent month": depending on the
+    // day-of-month this suite happens to run on, 45 days can land A and B
+    // in ADJACENT months (verified against an actual run), and an
+    // intermediate catch-up poll straddling that single shared boundary
+    // — one that never reaches `b_sample_ns` — then legitimately carries
+    // BOTH month literals, which the plan's own assertion (2) forbids.
+    // Two full calendar months guarantees a whole BUFFER month strictly
+    // between month(A) and month(B); no single <=10-day poll window can
+    // ever span three consecutive calendar months (every month is >= 28
+    // days, far wider than the slice), so no poll can carry both literals
+    // — assertion (2) now holds by construction, not by day-count luck.
+    let now = now_ns();
+    let b_sample_ns = now - 3 * DAY_NS;
+    let b_date = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(b_sample_ns);
+    let a_date = b_date
+        .checked_sub_months(chrono::Months::new(2))
+        .expect("2 months before a valid UTC instant is representable");
+    let a_reg_ns = a_date.timestamp_nanos_opt().expect("fits in i64 ns");
+    let a_lit = month_literal(a_reg_ns);
+    let b_lit = month_literal(b_sample_ns);
+    assert_ne!(
+        a_lit, b_lit,
+        "construction sanity: A and B fall in different calendar months"
+    );
+
+    // PULSUS_RETENTION_DAYS=90 keeps the clamp floor (issue #94 item 1)
+    // below A (~59-62 days back) and log_samples' TTL from expiring
+    // either seed. PULSUS_TAIL_CATCHUP_SLICE=10d is strictly shorter than
+    // any single calendar month, so the lowest lower bound of any poll
+    // window containing B_sample sits at least `10d` before it — still
+    // within B's month or the buffer month, never month(A) — guaranteeing
+    // every B-containing poll excludes month(A).
+    let _guard = spawn_ready(
+        port,
+        db,
+        &[
+            ("PULSUS_TAIL_POLL_INTERVAL", "50ms"),
+            ("PULSUS_RETENTION_DAYS", "90"),
+            ("PULSUS_TAIL_CATCHUP_SLICE", "10d"),
+        ],
+    );
+    let client = data_client(db).await;
+    const F: u64 = 99;
+    // The partial-failure orphan: log_streams/log_streams_idx registered
+    // ONLY in month(A); the sample lands in month(B), where no
+    // registration exists (the non-atomic write path).
+    seed_stream(&client, db, F, r#"{"service_name":"orphan"}"#, a_reg_ns).await;
+    seed_samples(&client, db, &[(F, b_sample_ns, "orphan-line")]).await;
+
+    let query = "query=%7Bservice_name%3D%22orphan%22%7D&delay_for=5";
+    let start = a_reg_ns - 3_600_000_000_000;
+    let run_marker_us = now_ns() / 1_000;
+    let mut ws = WsClient::connect(port, &format!("/api/logs/v1/tail?{query}&start={start}"));
+
+    // Under the pre-cache narrowing alone this times out empty (F is
+    // unresolvable once the stage-1 window scrolls past month A); with
+    // the resolved-fingerprint cache the orphan sample arrives.
+    let entries = collect_entries(&mut ws, 1, Instant::now() + Duration::from_secs(60));
+
+    // Reworked for the v6-v8 phase split (the v2-era narrowed-catch-up
+    // month-set assertions below are abolished — under the hold every
+    // catch-up poll (including B-covering ones) legitimately carries
+    // BOTH months, which the abolished assertions forbade): keep the WS
+    // open past delivery and poll `system.query_log` (event-gated, no
+    // bare sleeps) until >= 15 stage-1 polls are visible. Catch-up is
+    // <= 8 polls at 10d slices over ~63d; under `PULSUS_RETENTION_DAYS`'s
+    // 1h production grace, live polls (every 50ms) never narrow within
+    // this test's window, so >= 7 of the 15 are live-edge, still
+    // full-span, polls. Cache attribution (delivery is NOT attributable
+    // to a wide window) now lives in the `scan_gate_*` direct-drive test.
+    let mut polls: Vec<QueryLogRow> = Vec::new();
+    let query_log_deadline = Instant::now() + Duration::from_secs(60);
+    while polls.len() < 15 && Instant::now() < query_log_deadline {
+        client
+            .execute(
+                "SYSTEM FLUSH LOGS",
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("flush logs");
+        let sql = format!(
+            "SELECT query, read_rows FROM system.query_log \
+             WHERE type = 'QueryFinish' AND current_database = '{db}' \
+               AND query_start_time_microseconds >= fromUnixTimestamp64Micro({run_marker_us}) \
+               AND query LIKE '%log_streams_idx%' \
+               AND query NOT LIKE '%system.query_log%' \
+             ORDER BY query_start_time_microseconds ASC"
+        );
+        polls = Vec::new();
+        let mut stream = client
+            .query_stream::<QueryLogRow>(&sql, &QuerySettings::new())
+            .await
+            .expect("query_log stream");
+        while let Some(row) = stream.next().await {
+            polls.push(row.expect("query_log row"));
+        }
+        if polls.len() < 15 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    ws.close();
+    assert!(
+        polls.len() >= 15,
+        "expected >= 15 stage-1 polls within 60s (catch-up + live cadence), got {}",
+        polls.len()
+    );
+
+    // Every stage-1 poll (catch-up AND live-edge, held through the
+    // production grace) must stay full-span from the frozen floor — the
+    // structural anti-strand property, proven e2e through the real
+    // producer. Under a no-hold mutation the live polls narrow within
+    // ~8 polls and this fails deterministically.
+    for p in &polls {
+        assert!(
+            p.query.contains(&a_lit),
+            "every stage-1 poll must remain full-span (contain month(A)) through the hold: {}",
+            p.query
+        );
+    }
+    // Subsumed by the above, kept as an explicit sanity pin: some poll's
+    // window also reaches month(B).
+    assert!(
+        polls.iter().any(|p| p.query.contains(&b_lit)),
+        "some stage-1 poll must also cover month(B)"
+    );
+
+    // The orphan sample is DELIVERED (F's sole registration is month(A),
+    // scanned by every poll above — full-span, not narrowed).
+    assert_eq!(
+        entries.len(),
+        1,
+        "the orphan sample must be delivered: {entries:?}"
+    );
+    assert_eq!(entries[0].2, "orphan-line");
+
+    drop_db(db).await;
+}
+
+// ---------------------------------------------------------------------
+// 8) L1: scan-gate transition instant, direct-drive on real ClickHouse
+//    (issue #94 v6-v8) — no server/port; the test IS the producer, so
+//    insert-vs-scan ordering is program order, not timing.
+// ---------------------------------------------------------------------
+
+/// Phase 1 (scan-gated contract, AC9 steps (1)-(5)): a registration
+/// inserted in the inter-poll gap right after the LAST pre-qualifying
+/// full-span scan is caught by the NEXT (qualifying) full-span scan
+/// (program order) and delivered; narrowing (`narrow=true`) then excludes
+/// the registration month and a further sample is delivered attributably
+/// only to the cached resolved-fingerprint union. Phase 2 (strand
+/// replay, a SEPARATE database): repeats catch-up, then applies the
+/// ABOLISHED v6 time-gated rule's next step directly (`narrow=true`
+/// immediately on the first live-edge refresh, no scan gate) — the
+/// registration is never caught and delivery is empty, the committed
+/// demonstration that the scan gate (not a bare wall-clock hold) is
+/// load-bearing.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_gate_catches_a_gap_registration_via_the_qualifying_scan_then_narrows_and_a_time_gated_replay_strands_it()
+ {
+    if !should_run() {
+        eprintln!("skipping: set PULSUS_TEST_CLICKHOUSE=1");
+        return;
+    }
+    const DAY_NS: i64 = 86_400_000_000_000;
+    const SLICE_NS: i64 = 10 * DAY_NS;
+
+    // Month A: two calendar months back from "now" — a full buffer month
+    // guaranteed (same construction rationale as the 31147 test), so no
+    // <= 10-day poll window can ever span 3 consecutive calendar months.
+    let now = now_ns();
+    let now_date = chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(now);
+    let a_date = now_date
+        .checked_sub_months(chrono::Months::new(2))
+        .expect("2 months before a valid UTC instant is representable");
+    let a_reg_ns = a_date.timestamp_nanos_opt().expect("fits in i64 ns");
+    let a_lit = month_literal(a_reg_ns);
+    let now_lit = month_literal(now);
+    assert_ne!(
+        a_lit, now_lit,
+        "construction sanity: month(A) differs from month(now)"
+    );
+
+    // -------------------- Phase 1 --------------------
+    let db1 = "pulsus_tail_it_scan_gate";
+    drop_db(db1).await;
+    init_schema(db1);
+    let client1 = data_client(db1).await;
+    let engine1 = engine_for_db(data_client(db1).await);
+    let expr = pulsus_logql::parse(r#"{service_name="scangate"}"#).expect("parse");
+    let start = a_reg_ns - 3_600_000_000_000; // a_reg_ns - 1h
+    let qp = QueryParams {
+        spec: QuerySpec::Range {
+            start_ns: start,
+            end_ns: now,
+            step_ns: 1_000_000_000,
+        },
+        limit: 1_000,
+        direction: Direction::Forward,
+    };
+    let mut setup = engine1.tail_setup(&expr, &qp).expect("setup");
+
+    // (1) Catch-up, narrow=false, from `start` to the live edge: no
+    // registration exists yet — F stays unresolved, every stage-1 scan
+    // is full-span (contains a_lit).
+    let mut lower = start;
+    while lower < now {
+        let upper = (lower + SLICE_NS).min(now);
+        engine1
+            .tail_refresh_months(&mut setup, lower, upper, false)
+            .expect("no I/O, cannot fail");
+        assert!(
+            setup.plan.stage1_sql.contains(&a_lit),
+            "catch-up (narrow=false) must stay full-span through month A: {}",
+            setup.plan.stage1_sql
+        );
+        let page = engine1
+            .tail_poll(
+                &mut setup,
+                TailLower::Start { start_ns: lower },
+                upper,
+                1_000,
+            )
+            .await
+            .expect("catch-up poll");
+        assert_eq!(page.fetched, 0, "no data seeded yet");
+        lower = upper;
+    }
+
+    // (2) >= 1 further narrow=false live-edge pair — the in-hold polls,
+    // still full-span, still no registration.
+    for _ in 0..2 {
+        engine1
+            .tail_refresh_months(&mut setup, lower, now, false)
+            .expect("no I/O, cannot fail");
+        assert!(setup.plan.stage1_sql.contains(&a_lit));
+        let page = engine1
+            .tail_poll(&mut setup, TailLower::Start { start_ns: lower }, now, 1_000)
+            .await
+            .expect("in-hold poll");
+        assert_eq!(page.fetched, 0);
+    }
+
+    // The transition instant: immediately after the LAST pre-qualifying
+    // full-span scan completes, sync-insert F's registration (month A)
+    // and a sample — the exact just-after-the-prior-broad-scan gap the
+    // codex v6 finding named.
+    const F: u64 = 4_001;
+    let gap_ns = now_ns();
+    seed_stream(&client1, db1, F, r#"{"service_name":"scangate"}"#, a_reg_ns).await;
+    seed_samples(&client1, db1, &[(F, gap_ns, "gap-line")]).await;
+
+    // (3) ONE more narrow=false refresh+poll — the QUALIFYING scan: still
+    // full-span (a_lit present), F resolves, the gap sample is delivered
+    // in THIS poll's page (program order: the insert strictly precedes
+    // this scan).
+    engine1
+        .tail_refresh_months(&mut setup, lower, gap_ns, false)
+        .expect("no I/O, cannot fail");
+    assert!(
+        setup.plan.stage1_sql.contains(&a_lit),
+        "the qualifying scan is still full-span: {}",
+        setup.plan.stage1_sql
+    );
+    let page = engine1
+        .tail_poll(
+            &mut setup,
+            TailLower::Start { start_ns: lower },
+            gap_ns,
+            1_000,
+        )
+        .await
+        .expect("qualifying scan poll");
+    let delivered: Vec<String> = page
+        .streams
+        .iter()
+        .flat_map(|s| s.entries.iter().map(|(_, l)| l.clone()))
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["gap-line".to_string()],
+        "the inter-poll-gap registration is caught by the qualifying full-span scan"
+    );
+    let cursor = page.next.expect("cursor after the delivered gap-line");
+
+    // (4) narrow=true refresh with lower ~ the resumed cursor — real
+    // narrowing; A is 2 months behind `lower - GRACE` on any calendar
+    // date, so a_lit must be ABSENT.
+    let resume_ns = cursor.tuple.0;
+    let now2 = now_ns();
+    engine1
+        .tail_refresh_months(&mut setup, resume_ns, now2, true)
+        .expect("no I/O, cannot fail");
+    assert!(
+        !setup.plan.stage1_sql.contains(&a_lit),
+        "narrow=true must drop month A once the live floor advances past GRACE: {}",
+        setup.plan.stage1_sql
+    );
+
+    // (5) A second F sample, polled over the narrowed plan — delivered
+    // ONLY via the cached resolved-fingerprint union (stage-1 provably
+    // excludes A).
+    let now3 = now_ns();
+    seed_samples(&client1, db1, &[(F, now3, "narrowed-line")]).await;
+    engine1
+        .tail_refresh_months(&mut setup, resume_ns, now3, true)
+        .expect("no I/O, cannot fail");
+    assert!(!setup.plan.stage1_sql.contains(&a_lit));
+    let page2 = engine1
+        .tail_poll(&mut setup, TailLower::After(cursor), now3, 1_000)
+        .await
+        .expect("narrowed poll");
+    let delivered2: Vec<String> = page2
+        .streams
+        .iter()
+        .flat_map(|s| s.entries.iter().map(|(_, l)| l.clone()))
+        .collect();
+    assert_eq!(
+        delivered2,
+        vec!["narrowed-line".to_string()],
+        "the narrowed-window sample is delivered via the cached resolved-fingerprint union"
+    );
+    drop_db(db1).await;
+
+    // -------------------- Phase 2: strand replay (separate database) ---
+    // Repeats catch-up to the live edge, then applies the ABOLISHED v6
+    // time-gated rule's contract directly (`narrow=true` immediately on
+    // the first live-edge refresh — no scan gate, exactly the flag
+    // sequence a `narrow = live && dwell >= grace` producer emits,
+    // pinned against the real producer by the `narrow_gate_*` hermetic
+    // tests) — F2's registration, inserted at the identical program
+    // point, is never caught: a committed demonstration that the scan
+    // gate is load-bearing.
+    let db2 = "pulsus_tail_it_scan_gate_strand";
+    drop_db(db2).await;
+    init_schema(db2);
+    let client2 = data_client(db2).await;
+    let engine2 = engine_for_db(data_client(db2).await);
+    let mut setup2 = engine2.tail_setup(&expr, &qp).expect("setup2");
+
+    let mut lower2 = start;
+    while lower2 < now {
+        let upper2 = (lower2 + SLICE_NS).min(now);
+        engine2
+            .tail_refresh_months(&mut setup2, lower2, upper2, false)
+            .expect("no I/O, cannot fail");
+        let page = engine2
+            .tail_poll(
+                &mut setup2,
+                TailLower::Start { start_ns: lower2 },
+                upper2,
+                1_000,
+            )
+            .await
+            .expect("catch-up poll");
+        assert_eq!(page.fetched, 0);
+        lower2 = upper2;
+    }
+    // The FIRST live-edge poll is a full-span scan at dwell 0
+    // (narrow=false).
+    engine2
+        .tail_refresh_months(&mut setup2, lower2, now, false)
+        .expect("no I/O, cannot fail");
+    assert!(setup2.plan.stage1_sql.contains(&a_lit));
+    let page = engine2
+        .tail_poll(
+            &mut setup2,
+            TailLower::Start { start_ns: lower2 },
+            now,
+            1_000,
+        )
+        .await
+        .expect("dwell-0 live poll");
+    assert_eq!(page.fetched, 0);
+
+    const F2: u64 = 4_002;
+    let strand_now = now_ns();
+    seed_stream(
+        &client2,
+        db2,
+        F2,
+        r#"{"service_name":"scangate"}"#,
+        a_reg_ns,
+    )
+    .await;
+    seed_samples(&client2, db2, &[(F2, strand_now, "strand-line")]).await;
+
+    // The TIME-GATED v6 rule's NEXT step: narrow=true immediately.
+    engine2
+        .tail_refresh_months(&mut setup2, lower2, strand_now, true)
+        .expect("no I/O, cannot fail");
+    assert!(
+        !setup2.plan.stage1_sql.contains(&a_lit),
+        "the time-gated rule narrows immediately, excluding month A: {}",
+        setup2.plan.stage1_sql
+    );
+    let page2 = engine2
+        .tail_poll(
+            &mut setup2,
+            TailLower::Start { start_ns: lower2 },
+            strand_now,
+            1_000,
+        )
+        .await
+        .expect("time-gated poll");
+    assert!(
+        page2.streams.iter().all(|s| s.entries.is_empty()),
+        "under the time-gated rule F2 is stranded (its only registration, month A, was \
+         excluded before ever being scanned): {:?}",
+        page2.streams
+    );
+
+    drop_db(db2).await;
 }

@@ -75,10 +75,7 @@ fn fixture() -> (QueryPlan, SeriesData) {
     let qp = plan(&expr, params).expect("plan");
     let samples = |base: f64| -> Vec<Sample> {
         (0..STEPS)
-            .map(|k| Sample {
-                t_ms: k * STEP_MS,
-                v: base + k as f64,
-            })
+            .map(|k| Sample::float(k * STEP_MS, base + k as f64))
             .collect()
     };
     let mut data = SeriesData::new();
@@ -122,7 +119,7 @@ fn range_binop_allocations_per_cell_stay_bounded() {
     let (qp, data) = fixture();
 
     // Warm-up (allocator internals) + prove the shape is exercised.
-    let warm = evaluate(&qp, &data).expect("evaluate");
+    let (warm, _annotations) = evaluate(&qp, &data).expect("evaluate");
     let out_series = match &warm {
         pulsus_promql::QueryValue::Matrix(m) => m.len(),
         other => panic!("expected Matrix, got {other:?}"),

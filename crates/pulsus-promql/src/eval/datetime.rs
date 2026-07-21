@@ -79,6 +79,25 @@ fn days_in_month(y: i64, m: u32) -> u32 {
     }
 }
 
+/// One RFC 3339 UTC timestamp string with zero fractional seconds —
+/// `time.Unix(unix_secs, 0).UTC().Format(time.RFC3339)` (Go's
+/// `"2006-01-02T15:04:05Z07:00"` layout, always rendering the `Z` UTC
+/// designator here since the instant is already UTC). The sole consumer
+/// is [`crate::annotations::messages::histogram_quantile_forced_monotonicity_info`]
+/// (`#124` review finding 2a): the pin's forced-monotonicity detail
+/// renders each occurrence's timestamp this way
+/// (`histogramQuantileForcedMonotonicityErr.Error()`, `annotations.go:
+/// 333-341`).
+pub(crate) fn rfc3339_utc_seconds(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let second_of_day = unix_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 /// One UTC calendar/clock field of `unix_secs`, per Go
 /// `time.Unix(unix_secs, 0).UTC()`: `Year`/`Month` (1..12)/
 /// `DayOfMonth` (1..31)/`DayOfWeek` (Sunday = 0)/`DayOfYear` (1..366)/
@@ -251,5 +270,18 @@ mod tests {
         let below = f64::from_bits(9_223_372_036_854_775_808.0f64.to_bits() - 1);
         assert!(below < 9_223_372_036_854_775_808.0);
         assert_eq!(to_unix_secs(below), Some(below as i64));
+    }
+
+    #[test]
+    fn rfc3339_utc_seconds_formats_the_epoch_and_a_realistic_instant() {
+        assert_eq!(rfc3339_utc_seconds(0), "1970-01-01T00:00:00Z");
+        // 2024-01-15T10:30:45Z, cross-checked against `date -u -d @<secs>`.
+        assert_eq!(rfc3339_utc_seconds(1_705_314_645), "2024-01-15T10:30:45Z");
+    }
+
+    #[test]
+    fn rfc3339_utc_seconds_handles_pre_epoch_instants() {
+        // -86_400 = one day before the epoch.
+        assert_eq!(rfc3339_utc_seconds(-86_400), "1969-12-31T00:00:00Z");
     }
 }

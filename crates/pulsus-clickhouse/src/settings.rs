@@ -79,6 +79,50 @@ impl QuerySettings {
         self.set("max_execution_time", max_execution_time_secs(d))
     }
 
+    /// Write-side quorum consistency (issue #114). Returns `self` unchanged
+    /// when `quorum == 0` (quorum off — the default, byte-for-byte the
+    /// pre-#114 insert): the `insert_quorum_parallel`/`insert_quorum_timeout`
+    /// values are only meaningful alongside a non-zero quorum. When
+    /// `quorum > 0` all three are emitted so behaviour is pinned regardless
+    /// of the server default. `timeout` is rendered in **milliseconds**
+    /// (`as_millis`) — ClickHouse's unit for `insert_quorum_timeout`.
+    pub fn with_insert_quorum(self, quorum: u64, parallel: bool, timeout: Duration) -> Self {
+        if quorum == 0 {
+            return self;
+        }
+        self.set("insert_quorum", quorum)
+            .set("insert_quorum_parallel", u8::from(parallel))
+            .set("insert_quorum_timeout", timeout.as_millis())
+    }
+
+    /// Read-side sequential consistency (issue #114). Sets
+    /// `select_sequential_consistency = 1` iff `enabled`; emits nothing when
+    /// `false` (the default — byte-for-byte the pre-#114 select).
+    pub fn with_select_sequential_consistency(self, enabled: bool) -> Self {
+        if enabled {
+            self.set("select_sequential_consistency", 1)
+        } else {
+            self
+        }
+    }
+
+    /// Iterates the `(key, value)` pairs so a caller (e.g. `insert_block`)
+    /// can apply them to an `Insert` builder, which has no typed settings
+    /// helper of its own.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Public introspection twin of [`Self::iter`] (same posture as
+    /// [`Self::get`]): lets a caller outside this crate compare its own
+    /// settings' exact `(key, value)` entry set against another builder's
+    /// — issue #35's `xtask` bench drift guard needs exactly this to prove
+    /// its settings never diverge from production's without reaching into
+    /// `pub(crate)` internals.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.iter()
+    }
+
     /// Applies every `(key, value)` pair to a `clickhouse::query::Query`
     /// builder as per-request settings (sent as HTTP query parameters, not
     /// SQL text).
@@ -97,7 +141,7 @@ impl QuerySettings {
     /// tests — the client applies settings via [`Self::apply_to_query`],
     /// never by concatenating this into SQL text.
     #[cfg(test)]
-    fn render_suffix(&self) -> String {
+    pub(crate) fn render_suffix(&self) -> String {
         if self.0.is_empty() {
             return String::new();
         }
@@ -124,6 +168,22 @@ mod tests {
     fn set_renders_key_value_pairs() {
         let s = QuerySettings::new().set("max_threads", 4);
         assert_eq!(s.render_suffix(), " SETTINGS max_threads = 4");
+    }
+
+    /// Issue #35: `entries()` is the public introspection twin of the
+    /// crate-private `iter()` — the bench drift guard's exact-entry-set
+    /// equality check depends on this being complete and in insertion
+    /// order.
+    #[test]
+    fn entries_exposes_every_key_value_pair_in_insertion_order() {
+        let s = QuerySettings::new()
+            .set("max_query_size", 8_388_608u64)
+            .set("query_id", "abc");
+        let got: Vec<(&str, &str)> = s.entries().collect();
+        assert_eq!(
+            got,
+            vec![("max_query_size", "8388608"), ("query_id", "abc")]
+        );
     }
 
     #[test]
@@ -156,5 +216,32 @@ mod tests {
     fn with_max_execution_time_renders_seconds() {
         let s = QuerySettings::new().with_max_execution_time(Duration::from_secs(30));
         assert_eq!(s.render_suffix(), " SETTINGS max_execution_time = 30.000");
+    }
+
+    /// AC1 (issue #114): an enabled quorum emits all three keys, with
+    /// `insert_quorum_timeout` in milliseconds (`as_millis`); a zero quorum
+    /// emits nothing (off = pre-#114 insert).
+    #[test]
+    fn with_insert_quorum_emits_the_trio_in_ms_and_nothing_when_off() {
+        let s = QuerySettings::new().with_insert_quorum(2, false, Duration::from_secs(5));
+        assert_eq!(
+            s.render_suffix(),
+            " SETTINGS insert_quorum = 2, insert_quorum_parallel = 0, insert_quorum_timeout = 5000"
+        );
+        let off = QuerySettings::new().with_insert_quorum(0, true, Duration::from_secs(5));
+        assert_eq!(off.render_suffix(), "");
+    }
+
+    /// AC2 (issue #114): sequential consistency emits `= 1` only when
+    /// enabled; nothing when disabled (off = pre-#114 select).
+    #[test]
+    fn with_select_sequential_consistency_emits_one_only_when_enabled() {
+        let on = QuerySettings::new().with_select_sequential_consistency(true);
+        assert_eq!(
+            on.render_suffix(),
+            " SETTINGS select_sequential_consistency = 1"
+        );
+        let off = QuerySettings::new().with_select_sequential_consistency(false);
+        assert_eq!(off.render_suffix(), "");
     }
 }

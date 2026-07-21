@@ -18,10 +18,13 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
+use pulsus_model::FloatHistogram;
 use pulsus_promql::parser::{Expr, PLabelMatchOp, VectorMatchCardinality, VectorSelector, token};
-use pulsus_promql::{PlanParams, QueryValue, evaluate, plan};
+use pulsus_promql::{Annotations, PlanParams, QueryValue, evaluate, plan};
 
-use super::grammar::{Command, EvalCmd, EvalKind, EvalMode, Expected, ExpectedSeries, parse_file};
+use super::grammar::{
+    AnnotationMatch, Command, EvalCmd, EvalKind, EvalMode, Expected, ExpectedSeries, parse_file,
+};
 use super::series::SeqValue;
 use super::store::TestStorage;
 
@@ -330,23 +333,24 @@ fn run_eval(storage: &TestStorage, cmd: &EvalCmd) -> Result<CaseReport, String> 
     let params = params_for(&cmd.kind);
 
     let mut constructs = None;
-    let engine_result: Result<QueryValue, String> = match pulsus_promql::parse(&cmd.query) {
-        Err(e) => Err(e.to_string()),
-        Ok(expr) => {
-            constructs = Some(collect_constructs(&expr));
-            match plan(&expr, params) {
-                Err(e) => Err(e.to_string()),
-                Ok(query_plan) => {
-                    // A store/regex failure is a driver defect, not an
-                    // engine error — it must never satisfy `eval_fail`.
-                    let data = storage.fetch(&query_plan).map_err(|e| {
-                        format!("{}:{}: driver fetch error: {e}", cmd.query, cmd.line)
-                    })?;
-                    evaluate(&query_plan, &data).map_err(|e| e.to_string())
+    let engine_result: Result<(QueryValue, Annotations), String> =
+        match pulsus_promql::parse(&cmd.query) {
+            Err(e) => Err(e.to_string()),
+            Ok(expr) => {
+                constructs = Some(collect_constructs(&expr));
+                match plan(&expr, params) {
+                    Err(e) => Err(e.to_string()),
+                    Ok(query_plan) => {
+                        // A store/regex failure is a driver defect, not an
+                        // engine error — it must never satisfy `eval_fail`.
+                        let data = storage.fetch(&query_plan).map_err(|e| {
+                            format!("{}:{}: driver fetch error: {e}", cmd.query, cmd.line)
+                        })?;
+                        evaluate(&query_plan, &data).map_err(|e| e.to_string())
+                    }
                 }
             }
-        }
-    };
+        };
 
     let (passed, detail) = judge(cmd, engine_result)?;
     Ok(CaseReport {
@@ -361,7 +365,16 @@ fn run_eval(storage: &TestStorage, cmd: &EvalCmd) -> Result<CaseReport, String> 
 
 /// Applies the case's expectation to the engine outcome. `Err` = a driver
 /// defect (bad expected-regexp etc.), everything else is a pass/fail.
-fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, String), String> {
+/// Issue #124 (M7-A6): a successful outcome now also carries the
+/// [`Annotations`] channel — checked via [`check_annotations`] AFTER the
+/// value comparison passes, mirroring upstream's `compareResult` then
+/// `checkAnnotations` ordering (`promqltest/test.go:1720-1742`); a failing
+/// `eval_fail`/`expect fail` case never reaches annotation checking
+/// (upstream's error branch doesn't call `checkAnnotations` either).
+fn judge(
+    cmd: &EvalCmd,
+    outcome: Result<(QueryValue, Annotations), String>,
+) -> Result<(bool, String), String> {
     match (&cmd.expected, outcome) {
         (Expected::Fail { message, regexp }, Err(err_text)) => {
             if let Some(m) = message
@@ -390,41 +403,87 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
             }
             Ok((true, String::new()))
         }
-        (Expected::Fail { .. }, Ok(v)) => Ok((
+        (Expected::Fail { .. }, Ok((v, _))) => Ok((
             false,
             format!("eval_fail expected an error but the query succeeded with {v:?}"),
         )),
         (_, Err(err_text)) => Ok((false, format!("query errored: {err_text}"))),
-        // `expect string` (issue #86): exact string comparison — no
-        // epsilon, no normalization (upstream compares the unquoted
-        // literal against the `promql.String` value verbatim).
-        (Expected::String(want), Ok(QueryValue::String(got))) => {
-            if *want == got {
+        (expected, Ok((value, annotations))) => {
+            let (ok, detail) = judge_value(cmd, expected, value)?;
+            if !ok {
+                return Ok((false, detail));
+            }
+            match check_annotations(cmd, &annotations) {
+                Ok(()) => Ok((true, String::new())),
+                Err(detail) => Ok((false, detail)),
+            }
+        }
+    }
+}
+
+/// Renders an `expect string` want-value losslessly for a diagnostic:
+/// valid UTF-8 keeps today's `{:?}` form, non-UTF-8 falls back to a
+/// `b"…"` `escape_ascii` form (never `from_utf8_lossy` — that could
+/// false-read as matching engine output containing U+FFFD).
+fn format_expected_bytes(want: &[u8]) -> String {
+    match std::str::from_utf8(want) {
+        Ok(s) => format!("{s:?}"),
+        Err(_) => format!("b\"{}\"", want.escape_ascii()),
+    }
+}
+
+/// The value-shaped half of [`judge`] (everything but `Expected::Fail`,
+/// handled by the caller before this is reached).
+fn judge_value(
+    cmd: &EvalCmd,
+    expected: &Expected,
+    value: QueryValue,
+) -> Result<(bool, String), String> {
+    match (expected, value) {
+        (Expected::Fail { .. }, _) => {
+            unreachable!("judge() handles Expected::Fail before calling judge_value")
+        }
+        // `expect string` (issue #86): exact BYTE comparison — no
+        // epsilon, no normalization (upstream compares the unquoted Go
+        // string, itself a byte slice, against the `promql.String` value
+        // verbatim). `want` is `Vec<u8>` so a non-UTF-8 Go literal is
+        // representable; the engine's `QueryValue::String` is always
+        // valid UTF-8 (Prometheus's data model), so such a case can
+        // never pass — it fails honestly with a lossless diagnostic
+        // instead of a file-fatal grammar error.
+        (Expected::String(want), QueryValue::String(got)) => {
+            if want.as_slice() == got.as_bytes() {
                 Ok((true, String::new()))
             } else {
                 Ok((
                     false,
-                    format!("string mismatch: got {got:?}, want {want:?}"),
+                    format!(
+                        "string mismatch: got {got:?}, want {}",
+                        format_expected_bytes(want)
+                    ),
                 ))
             }
         }
-        (Expected::String(want), Ok(other)) => Ok((
+        (Expected::String(want), other) => Ok((
             false,
-            format!("expected string {want:?}, got non-string {other:?}"),
+            format!(
+                "expected string {}, got non-string {other:?}",
+                format_expected_bytes(want)
+            ),
         )),
-        (Expected::Scalar(want), Ok(QueryValue::Scalar(got))) => {
+        (Expected::Scalar(want), QueryValue::Scalar(got)) => {
             if almost_equal(*want, got) {
                 Ok((true, String::new()))
             } else {
                 Ok((false, format!("scalar mismatch: got {got}, want {want}")))
             }
         }
-        (Expected::Scalar(want), Ok(other)) => Ok((
+        (Expected::Scalar(want), other) => Ok((
             false,
             format!("expected scalar {want}, got non-scalar {other:?}"),
         )),
-        (Expected::Vector(expected), Ok(QueryValue::Vector(actual))) => {
-            let actual: Vec<(LabelsVec, f64)> = actual
+        (Expected::Vector(expected), QueryValue::Vector(actual)) => {
+            let actual: Vec<(LabelsVec, Val)> = actual
                 .iter()
                 .map(|s| {
                     let mut labels: LabelsVec = s.labels.0.clone();
@@ -432,7 +491,7 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
                         labels.push(("__name__".to_string(), name.clone()));
                     }
                     labels.sort();
-                    (labels, s.v)
+                    (labels, Val::from_sample(s.v, &s.h))
                 })
                 .collect();
             match cmd.mode {
@@ -440,7 +499,7 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
                 _ => Ok(compare_vector_unordered(expected, &actual)),
             }
         }
-        (Expected::Vector(expected), Ok(other)) => {
+        (Expected::Vector(expected), other) => {
             if expected.is_empty() {
                 // An empty expectation asserts an empty instant vector — a
                 // scalar/matrix result is still a type mismatch.
@@ -452,7 +511,7 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
                 Ok((false, format!("expected an instant vector, got {other:?}")))
             }
         }
-        (Expected::Matrix(expected), Ok(QueryValue::Matrix(actual))) => {
+        (Expected::Matrix(expected), QueryValue::Matrix(actual)) => {
             let EvalKind::Range {
                 from_ms, step_ms, ..
             } = cmd.kind
@@ -461,11 +520,138 @@ fn judge(cmd: &EvalCmd, outcome: Result<QueryValue, String>) -> Result<(bool, St
             };
             Ok(compare_matrix(expected, &actual, from_ms, step_ms))
         }
-        (Expected::Matrix(_), Ok(other)) => Ok((
+        (Expected::Matrix(_), other) => Ok((
             false,
             format!("expected a range-query matrix, got {other:?}"),
         )),
     }
+}
+
+/// Checks the case's `expect warn|no_warn|info|no_info` directives
+/// (issue #124, M7-A6) against `evaluate()`'s [`Annotations`] channel —
+/// mirrors upstream `checkAnnotations` (`promqltest/test.go:1211-1235`).
+/// [`Annotations::base_messages`] (not `as_strings`) matches upstream's
+/// query-unset comparison exactly: no cap/omission line, no
+/// forced-monotonicity detail suffix.
+fn check_annotations(cmd: &EvalCmd, annotations: &Annotations) -> Result<(), String> {
+    let (warnings, infos) = annotations.base_messages();
+    check_annotation_kind(&cmd.expect_warn, cmd.expect_no_warn, &warnings, "warn")?;
+    check_annotation_kind(&cmd.expect_info, cmd.expect_no_info, &infos, "info")?;
+    Ok(())
+}
+
+fn check_annotation_kind(
+    expected: &[AnnotationMatch],
+    expect_none: bool,
+    actual: &[String],
+    kind: &str,
+) -> Result<(), String> {
+    if !expected.is_empty() {
+        if actual.is_empty() {
+            return Err(format!("expected {kind} annotations but none were found"));
+        }
+        for e in expected {
+            if !actual.iter().any(|a| annotation_matches(e, a)) {
+                return Err(format!(
+                    "expected {kind} annotation matching {e:?} but no matching annotation was \
+                     found, found: {actual:?}"
+                ));
+            }
+        }
+        for a in actual {
+            if !expected.iter().any(|e| annotation_matches(e, a)) {
+                return Err(format!("unexpected {kind} annotation {a:?} found"));
+            }
+        }
+    }
+    if expect_none && !actual.is_empty() {
+        return Err(format!("unexpected {kind} annotations: {actual:?}"));
+    }
+    Ok(())
+}
+
+fn annotation_matches(m: &AnnotationMatch, actual: &str) -> bool {
+    match m {
+        AnnotationMatch::Any => true,
+        AnnotationMatch::Message(want) => want == actual,
+        AnnotationMatch::Regex(pat) => regex::Regex::new(pat)
+            .map(|re| re.is_match(actual))
+            .unwrap_or(false),
+    }
+}
+
+/// One value channel — float or native-histogram (issue #124, M7-A6) —
+/// unifying an expected `{{...}}`/plain-number literal with an actual
+/// [`pulsus_promql::InstantSample`]/[`pulsus_promql::Point`].
+#[derive(Debug, Clone)]
+enum Val {
+    Float(f64),
+    Hist(FloatHistogram),
+}
+
+impl Val {
+    fn from_sample(v: f64, h: &Option<Box<FloatHistogram>>) -> Val {
+        match h {
+            Some(h) => Val::Hist((**h).clone()),
+            None => Val::Float(v),
+        }
+    }
+
+    fn from_seq(sv: &SeqValue) -> Val {
+        match sv {
+            SeqValue::Value(v) => Val::Float(*v),
+            SeqValue::Histogram(h) => Val::Hist(h.clone()),
+            // The grammar rejects gaps/stale in an instant expectation,
+            // and range-matrix callers filter `Gap` before this is
+            // reached — see `compare_matrix`.
+            other => unreachable!("gap/stale not valid as a single expected value: {other:?}"),
+        }
+    }
+
+    fn matches(&self, got: &Val) -> bool {
+        match (self, got) {
+            (Val::Float(want), Val::Float(got)) => almost_equal(*want, *got),
+            (Val::Hist(want), Val::Hist(got)) => histogram_almost_equal(want, got),
+            _ => false,
+        }
+    }
+}
+
+/// Upstream `compareNativeHistogram` (`promqltest/test.go:1401-1447`),
+/// narrowed to this crate's unmodeled `CounterResetHint` (module doc,
+/// `pulsus-model::histogram`): schema exact, count/sum/zero_count within
+/// `almost_equal` tolerance, NHCB custom bounds exact, zero_threshold
+/// exact, bucket layout (spans + per-bucket value) within tolerance —
+/// after `Compact(0)` on both sides, exactly like the pin. The pin's
+/// `CounterResetHint` check only fires when the expected literal set one
+/// explicitly; this port can never set one (no field), so that check is
+/// always the pin's own "don't care" branch — never a silent mismatch of
+/// something this port actually models.
+fn histogram_almost_equal(expected: &FloatHistogram, actual: &FloatHistogram) -> bool {
+    let mut want = expected.clone();
+    let mut got = actual.clone();
+    want.compact();
+    got.compact();
+    if want.schema != got.schema {
+        return false;
+    }
+    if !almost_equal(want.count, got.count) || !almost_equal(want.sum, got.sum) {
+        return false;
+    }
+    if want.uses_custom_buckets() && want.custom_values != got.custom_values {
+        return false;
+    }
+    if want.zero_threshold != got.zero_threshold || !almost_equal(want.zero_count, got.zero_count) {
+        return false;
+    }
+    want.negative_spans == got.negative_spans
+        && buckets_almost_equal(&want.negative_buckets, &got.negative_buckets)
+        && want.positive_spans == got.positive_spans
+        && buckets_almost_equal(&want.positive_buckets, &got.positive_buckets)
+}
+
+fn buckets_almost_equal(want: &[f64], got: &[f64]) -> bool {
+    want.len() == got.len() && want.iter().zip(got).all(|(w, g)| almost_equal(*w, *g))
 }
 
 fn expected_labels_vec(s: &ExpectedSeries) -> LabelsVec {
@@ -476,9 +662,9 @@ fn expected_labels_vec(s: &ExpectedSeries) -> LabelsVec {
         .collect()
 }
 
-fn expected_single_value(s: &ExpectedSeries) -> f64 {
+fn expected_single_value(s: &ExpectedSeries) -> Val {
     match s.values.as_slice() {
-        [SeqValue::Value(v)] => *v,
+        [v @ (SeqValue::Value(_) | SeqValue::Histogram(_))] => Val::from_seq(v),
         // The grammar rejects gaps/stale/multi-value in instant
         // expectations before this is reachable.
         other => unreachable!("instant expectation with non-single value {other:?}"),
@@ -499,7 +685,7 @@ fn fmt_labels(labels: &[(String, String)]) -> String {
 
 fn compare_vector_unordered(
     expected: &[ExpectedSeries],
-    actual: &[(LabelsVec, f64)],
+    actual: &[(LabelsVec, Val)],
 ) -> (bool, String) {
     if expected.len() != actual.len() {
         return (
@@ -509,7 +695,7 @@ fn compare_vector_unordered(
                 actual.len(),
                 actual
                     .iter()
-                    .map(|(l, v)| format!("{} {v}", fmt_labels(l)))
+                    .map(|(l, v)| format!("{} {v:?}", fmt_labels(l)))
                     .collect::<Vec<_>>()
                     .join("; "),
                 expected.len(),
@@ -524,7 +710,7 @@ fn compare_vector_unordered(
     for exp in expected {
         let labels = expected_labels_vec(exp);
         let want = expected_single_value(exp);
-        let matches: Vec<&(LabelsVec, f64)> = actual.iter().filter(|(l, _)| *l == labels).collect();
+        let matches: Vec<&(LabelsVec, Val)> = actual.iter().filter(|(l, _)| *l == labels).collect();
         match matches.as_slice() {
             [] => {
                 return (
@@ -533,11 +719,11 @@ fn compare_vector_unordered(
                 );
             }
             [(_, got)] => {
-                if !almost_equal(want, *got) {
+                if !want.matches(got) {
                     return (
                         false,
                         format!(
-                            "value mismatch for {}: got {got}, want {want}",
+                            "value mismatch for {}: got {got:?}, want {want:?}",
                             fmt_labels(&labels)
                         ),
                     );
@@ -556,7 +742,7 @@ fn compare_vector_unordered(
 
 fn compare_vector_ordered(
     expected: &[ExpectedSeries],
-    actual: &[(LabelsVec, f64)],
+    actual: &[(LabelsVec, Val)],
 ) -> (bool, String) {
     if expected.len() != actual.len() {
         return (
@@ -582,11 +768,11 @@ fn compare_vector_ordered(
                 ),
             );
         }
-        if !almost_equal(want, *got) {
+        if !want.matches(got) {
             return (
                 false,
                 format!(
-                    "value mismatch at position {i} for {}: got {got}, want {want}",
+                    "value mismatch at position {i} for {}: got {got:?}, want {want:?}",
                     fmt_labels(&labels)
                 ),
             );
@@ -601,7 +787,11 @@ fn compare_matrix(
     from_ms: i64,
     step_ms: i64,
 ) -> (bool, String) {
-    let actual_by_labels: Vec<(LabelsVec, &[(i64, f64)])> = actual
+    // Issue #124 (M7-A6): `RangeSeries.points: Vec<Point>` carries a
+    // histogram channel too — projects each point to `(t_ms, Val)`
+    // instead of the pre-A6 `(t_ms, f64)` (float-only queries stay
+    // byte-identical: `Val::from_sample` reads `h: None` as `Val::Float`).
+    let actual_by_labels: Vec<(LabelsVec, Vec<(i64, Val)>)> = actual
         .iter()
         .map(|s| {
             let mut labels: LabelsVec = s.labels.0.clone();
@@ -609,19 +799,27 @@ fn compare_matrix(
                 labels.push(("__name__".to_string(), name.clone()));
             }
             labels.sort();
-            (labels, s.points.as_slice())
+            (
+                labels,
+                s.points
+                    .iter()
+                    .map(|p| (p.t_ms, Val::from_sample(p.v, &p.h)))
+                    .collect(),
+            )
         })
         .collect();
 
     let mut matched_actual = vec![false; actual_by_labels.len()];
     for exp in expected {
         let labels = expected_labels_vec(exp);
-        let want_points: Vec<(i64, f64)> = exp
+        let want_points: Vec<(i64, Val)> = exp
             .values
             .iter()
             .enumerate()
             .filter_map(|(k, v)| match v {
-                SeqValue::Value(v) => Some((from_ms + k as i64 * step_ms, *v)),
+                SeqValue::Value(_) | SeqValue::Histogram(_) => {
+                    Some((from_ms + k as i64 * step_ms, Val::from_seq(v)))
+                }
                 _ => None,
             })
             .collect();
@@ -643,7 +841,7 @@ fn compare_matrix(
             );
         }
         matched_actual[idx] = true;
-        let got_points = actual_by_labels[idx].1;
+        let got_points = &actual_by_labels[idx].1;
         if got_points.len() != want_points.len() {
             return (
                 false,
@@ -656,11 +854,11 @@ fn compare_matrix(
             );
         }
         for ((gt, gv), (wt, wv)) in got_points.iter().zip(&want_points) {
-            if gt != wt || !almost_equal(*wv, *gv) {
+            if gt != wt || !wv.matches(gv) {
                 return (
                     false,
                     format!(
-                        "point mismatch for {}: got ({gt}, {gv}), want ({wt}, {wv})",
+                        "point mismatch for {}: got ({gt}, {gv:?}), want ({wt}, {wv:?})",
                         fmt_labels(&labels)
                     ),
                 );
@@ -694,4 +892,26 @@ pub fn almost_equal(a: f64, b: f64) -> bool {
         return diff < EPSILON * f64::MIN_POSITIVE;
     }
     diff / abs_sum.min(f64::MAX) < EPSILON
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_expected_bytes;
+
+    /// AC4 (issue #86): a UTF-8 `want` renders exactly today's `{:?}`
+    /// form — unchanged by the byte-comparison fix (the non-UTF-8 branch
+    /// is covered end-to-end by
+    /// `promqltest_corpus::expect_string_with_non_utf8_literal_executes_as_a_classifiable_mismatch`).
+    #[test]
+    fn format_expected_bytes_keeps_the_debug_form_for_utf8_input() {
+        assert_eq!(format_expected_bytes(b"Foo"), "\"Foo\"");
+        assert_eq!(format_expected_bytes(b""), "\"\"");
+    }
+
+    /// A non-UTF-8 `want` falls back to a lossless `b"…"` escape_ascii
+    /// form.
+    #[test]
+    fn format_expected_bytes_uses_escaped_byte_form_for_non_utf8_input() {
+        assert_eq!(format_expected_bytes(&[0xff]), "b\"\\xff\"");
+    }
 }

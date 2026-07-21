@@ -55,6 +55,7 @@ tests:
     templates:
       - configmap.yaml
     set:
+      pulsusdb.auth.user: "admin"
       pulsusdb.auth.password: "super-secret-marker"
     asserts:
       - notMatchRegex:
@@ -89,3 +90,32 @@ tests:
           count: 1
       - isNotEmpty:
           path: stringData.password
+
+  - it: given image.digest is set, when rendering, then the container image is exactly repository@sha256:<digest> (tag ignored)
+    set:
+      image.digest: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/digitalis-io/pulsusdb@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+  - it: given both image.digest and image.tag are set, when rendering, then digest wins (no :tag in the rendered ref)
+    set:
+      image.tag: "1.2.3"
+      image.digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: "ghcr.io/digitalis-io/pulsusdb@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+
+  - it: given no image.digest, when rendering, then it falls back to repository:tag unchanged
+    templates:
+      - deployment-all.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: "^ghcr\\.io/digitalis-io/pulsusdb:"

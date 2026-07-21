@@ -57,6 +57,12 @@ pub struct Config {
     /// explicitly, how to determine this node's zone from cloud instance
     /// metadata at startup (`off` — the default — leaves it unset).
     pub az_detect: AzDetect,
+    /// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (M7-A4, issue #120): how OTLP
+    /// exponential-histogram data points are stored. `classic` (default,
+    /// current behavior unchanged) flattens to `_bucket`/`_sum`/`_count`
+    /// float series; `native` stores the sparse native histogram in
+    /// `metric_hist_samples`; `dual` emits both (disjoint fingerprints).
+    pub exp_histogram_mode: ExpHistogramMode,
     // Nested subsystem objects
     pub clickhouse: ClickHouseConfig,
     pub writer: WriterConfig,
@@ -87,6 +93,7 @@ impl Default for Config {
             skip_unavailable_shards: false,
             availability_zone: None,
             az_detect: AzDetect::default(),
+            exp_histogram_mode: ExpHistogramMode::default(),
             clickhouse: ClickHouseConfig::default(),
             writer: WriterConfig::default(),
             reader: ReaderConfig::default(),
@@ -127,6 +134,27 @@ pub struct ClickHouseConfig {
     /// spreads requests across them (availability-zone aware). An entry that
     /// omits `http_port` inherits `clickhouse.http_port`.
     pub servers: Vec<ChServerEntry>,
+    /// `CLICKHOUSE_INSERT_QUORUM` (issue #114, default `0` = off): the
+    /// number of replicas that must confirm a block before the insert is
+    /// acknowledged. `0` = off, `1` = rejected at startup (a silent no-op in
+    /// ClickHouse, which disables quorum below 2 — use `0` to disable),
+    /// `>= 2` = active quorum. Integer-only — ClickHouse's `auto` (majority)
+    /// value is unsupported. Only meaningful on `Replicated*` engines; adds
+    /// latency, so it is off by default (strong consistency is opt-in).
+    pub insert_quorum: u64,
+    /// `CLICKHOUSE_INSERT_QUORUM_PARALLEL` (issue #114, default `true`).
+    /// Only emitted when `insert_quorum > 0`.
+    pub insert_quorum_parallel: bool,
+    /// `CLICKHOUSE_INSERT_QUORUM_TIMEOUT` (issue #114, default `120s` —
+    /// reconciled to equal the default `query_timeout`, which bounds the
+    /// whole insert). Must be `0 < timeout <= query_timeout` when
+    /// `insert_quorum > 0`, else the insert deadline preempts the quorum
+    /// wait. Only emitted when `insert_quorum > 0`.
+    pub insert_quorum_timeout: HumanDuration,
+    /// `CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY` (issue #114, default
+    /// `false`): when set, reads see all prior quorum-committed writes
+    /// (read-your-writes). Adds latency, so it is off by default.
+    pub select_sequential_consistency: bool,
 }
 
 impl Default for ClickHouseConfig {
@@ -141,6 +169,10 @@ impl Default for ClickHouseConfig {
             tls_skip_verify: false,
             pool_size: 8,
             servers: Vec::new(),
+            insert_quorum: 0,
+            insert_quorum_parallel: true,
+            insert_quorum_timeout: HumanDuration(Duration::from_secs(120)),
+            select_sequential_consistency: false,
         }
     }
 }
@@ -245,6 +277,29 @@ pub struct ReaderConfig {
     /// adjudication) — the bound on the flat `PREWHERE metric_name IN
     /// (…)` fetch's `IN`-set width. Operator-scale tuning routes to #25.
     pub promql_max_metric_fanout: u64,
+    /// Issue #89 (retroactive re-review): the independent bound on how
+    /// many cache entries (metric names plus candidate fingerprints) one
+    /// name-less/regex-`__name__` PromQL selector's resolution may
+    /// **examine** before it is rejected as too broad (default 200_000 —
+    /// above `cache_max_series` so no legitimate warm resolution
+    /// false-rejects). Distinct from `promql_max_metric_fanout`, which
+    /// bounds only the *matched* result: a selector whose matchers yield
+    /// few or no matches can still examine the whole resident cache
+    /// without tripping the fan-out or `cache_max_series` guards.
+    /// Operator-scale tuning routes to issue #25.
+    pub promql_max_cache_scan: u64,
+    /// Issue #82 (retroactive re-review): the pathological-cardinality
+    /// backstop on a PromQL `info()` node's synthetic `*_info`
+    /// metadata-family selector — how many series that family may
+    /// resolve to before the query is rejected as too broad (default
+    /// 100_000, above realistic scrape-target-count fleets — a backstop,
+    /// not the narrowing). Enforced BEFORE any sample fetch is issued.
+    /// Distinct from `promql_max_metric_fanout` (bounds distinct metric
+    /// *names*, not series) and `promql_max_cache_scan` (bounds
+    /// examined, not matched, cache entries). Identifying-label VALUE
+    /// narrowing of the fetch (closing the gap this cap merely
+    /// backstops) routes to issue #25.
+    pub promql_max_info_series: u64,
     pub logql_scan_budget_bytes: ByteSize,
     /// Issue M6-09 / #90 (LogQL pipelines): the **first-page fetch-size
     /// hint** for fetch-until-limit paging, applied when a query pipeline
@@ -270,6 +325,16 @@ pub struct ReaderConfig {
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #57 re-audit (sub-problem B): the trace-search phase-1
+    /// candidate-generator query's `max_memory_usage` ceiling (throw) —
+    /// bounds a dense common-value prefix's `GROUP BY trace_id`
+    /// aggregation state; exceeding it is a `422 query_too_broad`
+    /// (server code 241 `MEMORY_LIMIT_EXCEEDED`), never an OOM. Applied
+    /// only to the generator read, never phase-2 hydration/membership/
+    /// value/root reads. Default 512 MiB — well above the ~21 MB
+    /// measured for a 500k-row/500k-key aggregation, well below the
+    /// server's 10 GiB default.
+    pub traceql_generator_max_memory_bytes: u64,
     /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
     /// evaluations offloaded onto tokio's blocking pool (the read path's
     /// one `spawn_blocking(evaluate)` site). A query past the limit waits
@@ -331,10 +396,13 @@ impl Default for ReaderConfig {
             promql_lookback: HumanDuration(Duration::from_secs(300)),
             promql_experimental_functions: false,
             promql_max_metric_fanout: 1_000,
+            promql_max_cache_scan: 200_000,
+            promql_max_info_series: 100_000,
             logql_scan_budget_bytes: ByteSize(50u64 * 1024 * 1024 * 1024),
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            traceql_generator_max_memory_bytes: 536_870_912,
             query_eval_concurrency: 256,
             tail_poll_interval: HumanDuration(Duration::from_secs(1)),
             tail_max_delay: HumanDuration(Duration::from_secs(5)),
@@ -534,6 +602,49 @@ impl std::str::FromStr for InsertMode {
     }
 }
 
+/// `PULSUS_METRICS_EXP_HISTOGRAM_MODE` (docs/configuration.md §5, M7-A4
+/// issue #120): how OTLP exponential-histogram data points are stored.
+/// `Classic` (default) keeps the current flatten-to-`_bucket`/`_sum`/
+/// `_count` behavior byte-unchanged; `Native` stores the sparse native
+/// histogram in `metric_hist_samples`; `Dual` emits both (the classic
+/// float series under suffixed names AND one base-name native row — their
+/// fingerprints are disjoint, so they never collide).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpHistogramMode {
+    #[default]
+    Classic,
+    Native,
+    Dual,
+}
+
+impl std::str::FromStr for ExpHistogramMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "classic" => Ok(ExpHistogramMode::Classic),
+            "native" => Ok(ExpHistogramMode::Native),
+            "dual" => Ok(ExpHistogramMode::Dual),
+            _ => Err("one of: classic, native, dual".to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for ExpHistogramMode {
+    /// Canonical lowercase rendering, round-tripping with [`FromStr`]
+    /// (`FromStr::from_str(&mode.to_string()) == Ok(mode)`).
+    ///
+    /// [`FromStr`]: std::str::FromStr
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExpHistogramMode::Classic => "classic",
+            ExpHistogramMode::Native => "native",
+            ExpHistogramMode::Dual => "dual",
+        })
+    }
+}
+
 /// `PULSUS_TIER_POLICY` (docs/configuration.md §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -696,6 +807,29 @@ mod tests {
         assert_eq!("off".parse::<AzDetect>().unwrap(), AzDetect::Off);
         let err = "bogus".parse::<AzDetect>().unwrap_err();
         assert!(err.contains("off, aws, gcp, azure, auto"), "{err}");
+    }
+
+    #[test]
+    fn exp_histogram_mode_defaults_to_classic_and_parses_each_value() {
+        assert_eq!(ExpHistogramMode::default(), ExpHistogramMode::Classic);
+        assert_eq!(
+            Config::default().exp_histogram_mode,
+            ExpHistogramMode::Classic
+        );
+        assert_eq!(
+            "classic".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Classic
+        );
+        assert_eq!(
+            "native".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Native
+        );
+        assert_eq!(
+            "dual".parse::<ExpHistogramMode>().unwrap(),
+            ExpHistogramMode::Dual
+        );
+        let err = "bogus".parse::<ExpHistogramMode>().unwrap_err();
+        assert!(err.contains("classic, native, dual"), "{err}");
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "CLICKHOUSE_PROTO",
     "CLICKHOUSE_TLS_SKIP_VERIFY",
     "PULSUS_CH_POOL_SIZE",
+    "CLICKHOUSE_INSERT_QUORUM",
+    "CLICKHOUSE_INSERT_QUORUM_PARALLEL",
+    "CLICKHOUSE_INSERT_QUORUM_TIMEOUT",
+    "CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY",
     "PULSUS_SKIP_DDL",
     "PULSUS_RETENTION_DAYS",
     "PULSUS_STORAGE_POLICY",
@@ -46,6 +50,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_BATCH_MS",
     "PULSUS_INSERT_MODE",
     "PULSUS_INGEST_QUEUE_BYTES",
+    "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
     "PULSUS_CACHE_TTL",
     "PULSUS_CACHE_MAX_SERIES",
     "PULSUS_SERIES_ACTIVITY_BUCKET",
@@ -54,10 +59,13 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_PROMQL_LOOKBACK",
     "PULSUS_PROMQL_EXPERIMENTAL_FUNCTIONS",
     "PULSUS_PROMQL_MAX_METRIC_FANOUT",
+    "PULSUS_PROMQL_MAX_CACHE_SCAN",
+    "PULSUS_PROMQL_MAX_INFO_SERIES",
     "PULSUS_LOGQL_SCAN_BUDGET_BYTES",
     "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
+    "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
     "PULSUS_QUERY_EVAL_CONCURRENCY",
     "PULSUS_TAIL_POLL_INTERVAL",
     "PULSUS_TAIL_MAX_DELAY",
@@ -205,6 +213,20 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_CH_POOL_SIZE") {
         cfg.clickhouse.pool_size = parse_int("PULSUS_CH_POOL_SIZE", &v)?;
     }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM") {
+        cfg.clickhouse.insert_quorum = parse_int("CLICKHOUSE_INSERT_QUORUM", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM_PARALLEL") {
+        cfg.clickhouse.insert_quorum_parallel =
+            parse_bool("CLICKHOUSE_INSERT_QUORUM_PARALLEL", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_INSERT_QUORUM_TIMEOUT") {
+        cfg.clickhouse.insert_quorum_timeout = parse_dur("CLICKHOUSE_INSERT_QUORUM_TIMEOUT", &v)?;
+    }
+    if let Some(v) = read("CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY") {
+        cfg.clickhouse.select_sequential_consistency =
+            parse_bool("CLICKHOUSE_SELECT_SEQUENTIAL_CONSISTENCY", &v)?;
+    }
     if let Some(v) = read("PULSUS_SKIP_DDL") {
         cfg.skip_ddl = parse_bool("PULSUS_SKIP_DDL", &v)?;
     }
@@ -247,6 +269,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_INGEST_QUEUE_BYTES") {
         cfg.writer.ingest_queue_bytes = parse_size("PULSUS_INGEST_QUEUE_BYTES", &v)?;
     }
+    if let Some(v) = read("PULSUS_METRICS_EXP_HISTOGRAM_MODE") {
+        cfg.exp_histogram_mode = parse_enum("PULSUS_METRICS_EXP_HISTOGRAM_MODE", &v)?;
+    }
     if let Some(v) = read("PULSUS_CACHE_TTL") {
         cfg.reader.cache_ttl = parse_dur("PULSUS_CACHE_TTL", &v)?;
     }
@@ -272,6 +297,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_PROMQL_MAX_METRIC_FANOUT") {
         cfg.reader.promql_max_metric_fanout = parse_int("PULSUS_PROMQL_MAX_METRIC_FANOUT", &v)?;
     }
+    if let Some(v) = read("PULSUS_PROMQL_MAX_CACHE_SCAN") {
+        cfg.reader.promql_max_cache_scan = parse_int("PULSUS_PROMQL_MAX_CACHE_SCAN", &v)?;
+    }
+    if let Some(v) = read("PULSUS_PROMQL_MAX_INFO_SERIES") {
+        cfg.reader.promql_max_info_series = parse_int("PULSUS_PROMQL_MAX_INFO_SERIES", &v)?;
+    }
     if let Some(v) = read("PULSUS_LOGQL_SCAN_BUDGET_BYTES") {
         cfg.reader.logql_scan_budget_bytes = parse_size("PULSUS_LOGQL_SCAN_BUDGET_BYTES", &v)?;
     }
@@ -283,6 +314,10 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_TRACEQL_SCAN_BUDGET_ROWS") {
         cfg.reader.traceql_scan_budget_rows = parse_int("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES") {
+        cfg.reader.traceql_generator_max_memory_bytes =
+            parse_int("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES", &v)?;
     }
     if let Some(v) = read("PULSUS_QUERY_EVAL_CONCURRENCY") {
         cfg.reader.query_eval_concurrency = parse_int("PULSUS_QUERY_EVAL_CONCURRENCY", &v)?;
@@ -340,8 +375,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            57,
-            "docs/configuration.md §§1-8 document exactly 57 variables"
+            65,
+            "docs/configuration.md §§1-8 document exactly 65 variables"
         );
     }
 
@@ -364,5 +399,23 @@ mod tests {
     fn invalid_promql_max_metric_fanout_is_rejected_at_load() {
         let err = parse_int::<u64>("PULSUS_PROMQL_MAX_METRIC_FANOUT", "not-a-number").unwrap_err();
         assert!(err.to_string().contains("PULSUS_PROMQL_MAX_METRIC_FANOUT"));
+    }
+
+    /// Issue #89 (retroactive re-review): a non-integer
+    /// `PULSUS_PROMQL_MAX_CACHE_SCAN` is rejected at config load through
+    /// the shared `parse_int` path.
+    #[test]
+    fn invalid_promql_max_cache_scan_is_rejected_at_load() {
+        let err = parse_int::<u64>("PULSUS_PROMQL_MAX_CACHE_SCAN", "not-a-number").unwrap_err();
+        assert!(err.to_string().contains("PULSUS_PROMQL_MAX_CACHE_SCAN"));
+    }
+
+    /// Issue #82 (retroactive re-review): a non-integer
+    /// `PULSUS_PROMQL_MAX_INFO_SERIES` is rejected at config load through
+    /// the shared `parse_int` path.
+    #[test]
+    fn invalid_promql_max_info_series_is_rejected_at_load() {
+        let err = parse_int::<u64>("PULSUS_PROMQL_MAX_INFO_SERIES", "not-a-number").unwrap_err();
+        assert!(err.to_string().contains("PULSUS_PROMQL_MAX_INFO_SERIES"));
     }
 }

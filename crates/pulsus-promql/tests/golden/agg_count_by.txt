@@ -1,7 +1,7 @@
 Aggregate(
     AggregateExpr {
         op: TokenType(
-            47,
+            49,
         ),
         expr: VectorSelector(
             VectorSelector {

@@ -61,8 +61,8 @@ pub use metrics::{
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
-    LogSampleRow, LogStreamRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow, TraceAttrRow,
-    TraceSpanRow,
+    LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow,
+    MetricSeriesRow, TraceAttrRow, TraceSpanRow,
 };
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};

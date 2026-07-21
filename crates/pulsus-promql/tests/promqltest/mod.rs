@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 pub mod grammar;
+pub mod histogram_literal;
 pub mod runner;
 pub mod series;
 pub mod store;
@@ -56,6 +57,21 @@ pub enum Status {
     Implemented,
     Scheduled,
     Deferred,
+    /// M7-A5b-i (issue #124): semantics are implemented and proven by
+    /// hermetic in-crate unit tests, but a CORPUS witness cannot exist
+    /// yet because the construct's ONLY corpus-executable form is gated
+    /// behind a still-deferred directive (the pattern's original users,
+    /// the 5 native-histogram accessors, were unblocked and flipped to
+    /// `implemented` by M7-A6's `{{…}}` grammar landing — the status
+    /// itself stays available for the next construct in the same
+    /// shape). The probe classifier requires the probe to evaluate `Ok`
+    /// exactly like [`Status::Implemented`]; the structural check
+    /// requires a `rationale` naming the blocking gap and REJECTS a
+    /// corpus `witness` (any witness claimed under this status would be
+    /// fake by construction). `function_coverage.rs`'s pinned set for
+    /// this status is a CLOSED drift guard (currently empty) so no entry
+    /// can adopt it without a deliberate test update.
+    ImplementedUnitWitnessed,
 }
 
 /// A pointer at the concrete corpus case that proves an `implemented`
@@ -365,10 +381,27 @@ pub struct BlockingDirective {
     pub activation_issue: String,
 }
 
+/// A non-directive skip lever (issue #124, M7-A6 adjudication): the file
+/// has ZERO deferred directives (the driver could execute it), but
+/// replaying it surfaces a genuine gap outside any tracked directive —
+/// new syntax the parser doesn't have, an unimplemented annotation, etc.
+/// `reason` is a short human description; `activation_issue` the
+/// follow-up tracking it. Unlike [`BlockingDirective`], this carries no
+/// drift check (there is no directive presence to re-scan) — periodic
+/// re-review is manual.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ManualSkip {
+    pub reason: String,
+    pub activation_issue: String,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SkipEntry {
     pub file: String,
+    #[serde(default)]
     pub blocking_directives: Vec<BlockingDirective>,
+    #[serde(default)]
+    pub manual_skip: Option<ManualSkip>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

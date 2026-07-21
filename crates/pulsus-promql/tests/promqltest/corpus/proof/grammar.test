@@ -77,11 +77,12 @@ eval instant at 0 1 + 1
 
 # eval_fail + expected_fail_message (substring of the error Display): an
 # out-of-subset function is named in PromqlError::Unsupported.
-# (`histogram_count` is scheduled for the native-histogram issue #22 —
-# issue #65 implemented the previous stand-in, `abs`; issue #68 its
-# successor, `sort`.)
-eval_fail instant at 0 histogram_count(n1)
-	expected_fail_message not yet supported: function histogram_count()
+# (`histogram_quantiles`, the experimental multi-quantile variant, is
+# out of scope per M7-A5b's plan — issue #65 implemented the previous
+# stand-in, `abs`; issue #68 its successor, `sort`; M7-A5b-i moved
+# `histogram_count` and its five siblings.)
+eval_fail instant at 0 histogram_quantiles(n1, "q", 0.5)
+	expected_fail_message not yet supported: function histogram_quantiles()
 
 # eval_fail + expected_fail_regexp (regex over the error Display).
 # (Issue #83 implemented the previous stand-in, `n1 @ 100`; a bare
@@ -96,5 +97,5 @@ eval_fail instant at 0 n1[5m:1m]
 eval_fail instant at 0 {k="v" or q="w"}
 
 # eval_fail on a range query.
-eval_fail range from 0 to 20s step 10s histogram_count(n1)
-	expected_fail_message function histogram_count()
+eval_fail range from 0 to 20s step 10s histogram_quantiles(n1, "q", 0.5)
+	expected_fail_message function histogram_quantiles()

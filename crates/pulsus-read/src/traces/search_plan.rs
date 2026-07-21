@@ -180,6 +180,13 @@ impl SearchPlan {
         self.limit
     }
 
+    /// The spans-per-spanset cap (issue #57 re-audit v7, visibility-only:
+    /// the AC-A4 retained-accumulation gate's Q6 pin reads the PLAN's
+    /// cap — the runtime source — mirroring [`Self::limit`]).
+    pub fn spss(&self) -> u32 {
+        self.spss
+    }
+
     pub fn max_candidates(&self) -> u64 {
         self.max_candidates
     }

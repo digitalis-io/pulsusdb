@@ -40,7 +40,7 @@ Environment variables always win over the YAML file ([docs/configuration.md](../
 
 ## ClickHouse: bundled vs. external
 
-`clickhouse.enabled: true` (default) renders a bundled ClickHouse — a CI/compose-fixture-parity deployment (mirrors [`deploy/e2e/compose.single.yaml`](../../e2e/compose.single.yaml) and [`ci/clickhouse-cluster/`](../../../ci/clickhouse-cluster/)), **not a hardened, HA production ClickHouse**. It is never passwordless: a random password is generated on install (stable across upgrades — a `lookup`-guarded Secret) and wired into both the bundled server and `pulsusdb`'s `CLICKHOUSE_AUTH`. `clickhouse.image`/`clickhouse.keeperImage` are pinned to a full patch tag (`24.8.14`), not a floating `24.8` minor — re-verify the pin is still a published, non-EOL patch before bumping the chart's own default; digest-pinning is left to operators who want it.
+`clickhouse.enabled: true` (default) renders a bundled ClickHouse — a CI/compose-fixture-parity deployment (mirrors [`deploy/e2e/compose.single.yaml`](../../e2e/compose.single.yaml) and [`ci/clickhouse-cluster/`](../../../ci/clickhouse-cluster/)), **not a hardened, HA production ClickHouse**. It is never passwordless: a random password is generated on install (stable across upgrades — a `lookup`-guarded Secret) and wired into both the bundled server and `pulsusdb`'s `CLICKHOUSE_AUTH`. `clickhouse.image`/`clickhouse.keeperImage` are pinned to a full patch tag (`24.8.14`), not a floating `24.8` minor — re-verify the pin is still a published, non-EOL patch before bumping the chart's own default.
 
 **Recommended production path: `clickhouse.enabled: false`** — point `pulsusdb.config.clickhouse.server` (+ `port`/`http_port`/`database`) at your own ClickHouse and supply credentials via `clickhouse.auth.existingSecret` (a Secret you manage, holding the password under `clickhouse.auth.existingSecretPasswordKey`, default `password`).
 
@@ -49,6 +49,13 @@ Environment variables always win over the YAML file ([docs/configuration.md](../
 `topology: cluster` + `clickhouse.shards: N` renders `N` distinct ClickHouse StatefulSets (`<release>-clickhouse-shard-0..N-1`) plus a Keeper StatefulSet — but `pulsusdb.config.clickhouse.server` remains a **single** entry point (shard 0's Service), with `cluster: <clickhouse.clusterName>` set. This matches the product's real connection model: `CLICKHOUSE_SERVER` is one host ([docs/configuration.md §2](../../../docs/configuration.md)); ClickHouse's own `Distributed` engine (`remote_servers.xml`, rendered by this chart's ClickHouse ConfigMap and enumerating **all** shards) fans queries out from there. PulsusDB does not, and cannot today, load-balance connections across shards itself — a documented product gap tracked as a follow-up, not something this chart can work around.
 
 `clickhouse.replicasPerShard` is restricted to `1` (schema `maximum: 1` + a template-time `fail` guard) — true multi-replica-per-shard support needs per-replica `macros.xml` identity and Keeper paths tied to StatefulSet ordinals, a documented follow-up.
+
+### Digest-pinning images
+
+All four images this chart can render support an immutable digest pin, `values.schema.json`-validated:
+
+- `image.digest` (`sha256:<64 hex>`) is preferred over `image.tag` when set — `_helpers.tpl`'s `pulsusdb.image` renders `repository@sha256:...` and silently drops `tag` rather than producing an invalid combined ref.
+- `clickhouse.image`, `clickhouse.keeperImage`, and `otelCollector.image` are single-string refs rendered verbatim; an optional `@sha256:<64 hex>` suffix on any of them is schema-validated (e.g. `--set clickhouse.image=docker.io/clickhouse/clickhouse-server:24.8.14@sha256:<digest>`).
 
 ### Inter-node authentication (cluster mode)
 
@@ -98,7 +105,8 @@ Every Service/StatefulSet name this chart generates is safe up to Helm's own 53-
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `image.repository` | string | `ghcr.io/digitalis-io/pulsusdb` | Placeholder until M7 publishes the image |
-| `image.tag` | string | `""` | Falls back to `.Chart.AppVersion` |
+| `image.tag` | string | `""` | Falls back to `.Chart.AppVersion`; dropped when `image.digest` is set |
+| `image.digest` | string | `""` | `sha256:<64 hex>` — preferred over `image.tag` when set |
 | `image.pullPolicy` | string | `IfNotPresent` | |
 | `imagePullSecrets` | list | `[]` | |
 | `topology` | enum | `single` | `single` \| `cluster` — ClickHouse topology axis |
@@ -108,7 +116,7 @@ Every Service/StatefulSet name this chart generates is safe up to Helm's own 53-
 | `pulsusdb.reader.replicaCount` / `.resources` | int / object | `2` / non-zero | Split-mode reader tier |
 | `pulsusdb.resources` | object | non-zero | All-mode resources |
 | `pulsusdb.config.*` | object | see `values.yaml` | 1:1 with docs/configuration.md §9 |
-| `pulsusdb.auth.user` / `.password` / `.existingSecret` | string | `""` | HTTP Basic auth (off when both unset) |
+| `pulsusdb.auth.user` / `.password` / `.existingSecret` | string | `""` | HTTP Basic auth (off when all unset); `user` and a password source (`password` or `existingSecret`) must be set together, and `password`/`existingSecret` are mutually exclusive — enforced by a render-time `fail` guard |
 | `pulsusdb.extraEnv` | list | `[]` | Escape hatch, `[{name, value\|valueFrom}, ...]` |
 | `pulsusdb.spool.persistence.enabled` / `.size` / `.storageClass` | bool / string / string | `false` / `5Gi` / `""` | PVC for the insert-failure spool instead of `emptyDir` |
 | `initJob.enabled` | bool | `false` | Disabled-by-default operator-convenience `--mode init` Job |

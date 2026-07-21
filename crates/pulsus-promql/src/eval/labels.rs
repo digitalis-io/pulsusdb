@@ -452,6 +452,7 @@ mod tests {
             drop_name: false,
             t_ms: 0,
             v,
+            h: None,
         }
     }
 

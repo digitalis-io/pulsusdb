@@ -23,31 +23,39 @@ The workflow builds the repo's `Dockerfile` (the same one CI's `e2e-single`/
 `e2e-cluster` legs build) with `PULSUS_BUILD_VERSION=<tag>` and
 `PULSUS_BUILD_REVISION=<github.sha>` build-args, so the image's `--version`
 output and `/status/buildinfo` response are stamped with the exact tag and
-commit — not the `0.0.0`/local-git-SHA dev-build fallback. It is pushed to
-`ghcr.io/digitalis-io/pulsusdb` **only after** a smoke test (`--version`
-exact-match, `--help`, non-root `id`, spool write probe) passes against the
-freshly built image; a failing smoke test aborts the job before anything is
-pushed, so a tag can never end up pointing at a broken image on GHCR.
+commit — not the `0.0.0`/local-git-SHA dev-build fallback. Each arch is pushed to `ghcr.io/digitalis-io/pulsusdb` (by digest) **only
+after** its own smoke test (`--version` exact-match, `--help`, non-root `id`,
+spool write probe) passes against that freshly built arch image, and the
+tagged multi-arch index is assembled by the `merge` job **only after both arch
+legs succeed** — so a failing smoke test on either arch means no tag or index
+is ever created, and a tag can never end up pointing at a broken image on
+GHCR. (A passing leg may push its own untagged digest before the other leg
+fails; such an orphan digest is never tagged, indexed, or referenced.)
 
-**Multi-arch (`linux/amd64` + `linux/arm64`).** The tag now resolves to a
+**Multi-arch (`linux/amd64` + `linux/arm64`).** The tag resolves to a
 multi-arch **manifest list (OCI image index)** with one child manifest per
-arch, so `docker pull` picks the right image for the host automatically. Both
-arches are built via buildx: amd64 natively, arm64 under QEMU emulation
-(`docker/setup-qemu-action`) — the `Dockerfile` compiles the binary inside
-the build stage unmodified, so its C-backed dependencies build natively in
-the emulated arm64 stage with no cross-toolchain. Because `load: true` cannot
-load a manifest list, each arch is first built, loaded, and smoke-tested
-separately (arm64's smoke runs the same assertion set under
-`docker run --platform linux/arm64`), and only then is a single cache-warm
-multi-platform image pushed. The tag/label scheme is unchanged; only the
-digest a tag points to is now an image **index** rather than a single image
-manifest (pull-by-tag and pull-by-child-digest both still work).
+arch, so `docker pull` picks the right image for the host automatically. Each
+arch is built on a **native runner** — amd64 on `ubuntu-latest`, arm64 on
+`ubuntu-24.04-arm` — with no QEMU emulation. A per-arch matrix job builds
+`linux/<arch>` only, loads and smoke-tests it (the same assertion set per
+arch), then pushes it **by digest** (`push-by-digest=true`, no tag). A
+dependent `merge` job assembles the manifest list from the two per-arch
+digests via `docker buildx imagetools create` and applies the tag. The
+tag/label scheme is unchanged; only the digest a tag points to is an image
+**index** rather than a single image manifest (pull-by-tag and
+pull-by-child-digest both still work).
+
+The `merge` job captures the created index's own digest from
+`imagetools create --metadata-file` (the `containerimage.digest` field) — the
+immutable digest of the index this run just built — and the keyless signing +
+SBOM/provenance attestation (issue #44) bind that merged-index digest, never a
+mutable tag.
 
 A build-only dry-run is available via the workflow's `workflow_dispatch`
-trigger (Actions → Release → Run workflow): it compiles both arches under
-QEMU with no push and no load, so you can prove the arm64 build works before
-merging a change to the release path — the tag-only trigger otherwise gives
-no pre-merge signal.
+trigger (Actions → Release → Run workflow): it builds both arches on their
+native runners with no push and no load, so you can prove the arm64 build
+works before merging a change to the release path — the tag-only trigger
+otherwise gives no pre-merge signal.
 
 The runtime stage runs as the non-root `pulsus` user (uid/gid `10001`) with
 its working directory set to `/var/lib/pulsusdb`, owned by that user — so
@@ -263,3 +271,11 @@ having already gated the `main` commit a `helm-v*` tag is cut from. If
 untested chart could be published. A `GITHUB_TOKEN` cannot modify
 repository branch-protection settings, so this is a manual, one-time
 action in the repository's Settings → Branches page.
+
+Both `.github/workflows/helm-release.yml` and `.github/workflows/release.yml`
+now mechanically enforce, as their first post-checkout step, that the
+tagged commit is an ancestor of `origin/main` (`git merge-base
+--is-ancestor`) — a tag on an unmerged commit fails at that step instead
+of publishing. Ancestry no longer rests on convention; branch protection
+is still required for the *behavioural test* gate (`chart-test-kind`),
+which no workflow step re-runs.

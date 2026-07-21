@@ -58,6 +58,12 @@ pub fn floor_to_activity_bucket(unix_milli: i64, bucket_ms: i64) -> i64 {
 /// a whole day before civil-calendar conversion.
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 
+/// Milliseconds per day, used to floor a [`UnixMilli`]-scale timestamp down
+/// to a whole day for [`Date::start_of_day_utc_ms`] — metric samples are
+/// stored at millisecond resolution (docs/architecture.md §2), so this
+/// avoids re-deriving the day from nanoseconds.
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
 /// Days since the Unix epoch (1970-01-01), used for ClickHouse `Date`
 /// columns — currently `log_streams.month` (docs/schemas.md §3.1,
 /// `toStartOfMonth(...)`, issue #8 plan amendment). Represented as a bare
@@ -77,29 +83,50 @@ impl Date {
     ///
     /// `timestamp_ns` is floored to a whole UTC day before the civil-
     /// calendar conversion, so sub-day precision never affects the result.
-    /// A `timestamp_ns`/day count outside the `u16` day range (before
-    /// 1970-01-01 or at/after 2149-06-06) saturates to the nearest
-    /// in-range end rather than panicking — pathological or malicious
-    /// input must never crash the parser (no `.unwrap()` on untrusted
-    /// data), and saturation keeps the result deterministic.
-    pub fn start_of_month_utc(timestamp_ns: i64) -> Date {
+    /// Returns `None` when the resulting month-start day falls outside the
+    /// `u16` `Date` range (before 1970-01-01 or after 2149-06-06):
+    /// clamping such a value to the nearest in-range end would silently
+    /// orphan the sample into the wrong (max-`Date`) monthly partition,
+    /// breaking the `(fingerprint, sample month)` registration invariant
+    /// (docs/schemas.md §3.1). The caller must reject the record instead —
+    /// pathological or malicious input must never crash the parser (no
+    /// `.unwrap()` on untrusted data) and must never be silently saturated.
+    pub fn start_of_month_utc(timestamp_ns: i64) -> Option<Date> {
         let day = timestamp_ns.div_euclid(NANOS_PER_DAY);
         let (year, month, _day_of_month) = civil_from_days(day);
         let month_start_day = days_from_civil(year, month, 1);
-        Date(month_start_day.clamp(0, i64::from(u16::MAX)) as u16)
+        u16::try_from(month_start_day).ok().map(Date)
     }
 
     /// The UTC start-of-day containing `timestamp_ns` — the per-**day**
     /// floor `trace_attrs_idx.date` needs (docs/schemas.md §4.1:
     /// `PARTITION BY date` is daily, unlike `log_streams.month`'s monthly
     /// [`Date::start_of_month_utc`] floor; issue #54 task-manager
-    /// adjudication #1). Same saturation contract as
-    /// [`Date::start_of_month_utc`]: a day count outside the `u16` range
-    /// clamps to the nearest in-range end rather than panicking on
-    /// pathological/malicious input.
-    pub fn start_of_day_utc(timestamp_ns: i64) -> Date {
+    /// adjudication #1). Same representability contract as
+    /// [`Date::start_of_month_utc`]: returns `None` when the day count
+    /// falls outside the `u16` `Date` range (before 1970-01-01 or after
+    /// 2149-06-06) rather than clamping it, so the caller rejects the record
+    /// instead of orphaning it into the wrong daily partition.
+    pub fn start_of_day_utc(timestamp_ns: i64) -> Option<Date> {
         let day = timestamp_ns.div_euclid(NANOS_PER_DAY);
-        Date(day.clamp(0, i64::from(u16::MAX)) as u16)
+        u16::try_from(day).ok().map(Date)
+    }
+
+    /// The UTC start-of-day containing `unix_milli` — the millisecond-scale
+    /// sibling of [`Date::start_of_day_utc`] for `metric_samples` /
+    /// `metric_hist_samples`, which partition on
+    /// `toDate(fromUnixTimestamp64Milli(unix_milli))` (docs/schemas.md,
+    /// issue #126). Deliberately NOT `start_of_day_utc(unix_milli *
+    /// 1_000_000)`: that multiply overflows `i64` for `unix_milli` beyond
+    /// roughly year 2262, while flooring directly at millisecond scale is
+    /// overflow-free for the full `i64` range. Same representability
+    /// contract as [`Date::start_of_day_utc`]: returns `None` when the day
+    /// falls outside the `u16` `Date` range (before 1970-01-01 or after
+    /// 2149-06-06) rather than clamping it, so the caller rejects the
+    /// sample instead of orphaning it into the wrong daily partition.
+    pub fn start_of_day_utc_ms(unix_milli: i64) -> Option<Date> {
+        let day = unix_milli.div_euclid(MILLIS_PER_DAY);
+        u16::try_from(day).ok().map(Date)
     }
 
     /// Days since the Unix epoch — the exact value ClickHouse's `Date`
@@ -198,7 +225,7 @@ mod tests {
     fn start_of_month_utc_floors_a_mid_month_timestamp_to_the_first() {
         // 2024-03-15T12:34:56Z, arbitrary nanosecond precision.
         let ts_ns = 1_710_505_996_123_456_789;
-        let month = Date::start_of_month_utc(ts_ns);
+        let month = Date::start_of_month_utc(ts_ns).unwrap();
         assert_eq!(
             civil_from_days(i64::from(month.days_since_epoch())),
             (2024, 3, 1)
@@ -207,33 +234,33 @@ mod tests {
 
     #[test]
     fn start_of_month_utc_of_the_epoch_instant_is_1970_01() {
-        let month = Date::start_of_month_utc(0);
+        let month = Date::start_of_month_utc(0).unwrap();
         assert_eq!(month.days_since_epoch(), 0);
     }
 
     #[test]
-    fn start_of_month_utc_saturates_a_pre_epoch_timestamp_to_the_epoch() {
+    fn start_of_month_utc_rejects_a_pre_epoch_timestamp() {
         // 1969-06-15, well before the epoch: ClickHouse's `Date` column
-        // (and this `u16` encoding) cannot represent a pre-1970 day, so the
-        // saturating clamp documented on `start_of_month_utc` floors it to
-        // day 0 (1970-01-01) rather than panicking or wrapping.
+        // (and this `u16` encoding) cannot represent a pre-1970 day.
+        // Clamping to day 0 would orphan the sample into the wrong monthly
+        // partition, so the function returns `None` and the caller rejects
+        // the record rather than silently saturating.
         let ts_ns = -(NANOS_PER_DAY * 200);
-        let month = Date::start_of_month_utc(ts_ns);
-        assert_eq!(month.days_since_epoch(), 0);
+        assert_eq!(Date::start_of_month_utc(ts_ns), None);
     }
 
     #[test]
     fn start_of_month_utc_two_timestamps_in_the_same_month_yield_equal_dates() {
-        let start = Date::start_of_month_utc(1_710_000_000_000_000_000);
-        let end = Date::start_of_month_utc(1_710_999_999_000_000_000);
+        let start = Date::start_of_month_utc(1_710_000_000_000_000_000).unwrap();
+        let end = Date::start_of_month_utc(1_710_999_999_000_000_000).unwrap();
         assert_eq!(start, end);
     }
 
     #[test]
     fn start_of_month_utc_across_a_month_boundary_differs() {
         // 2024-02-29T23:00Z (leap day) vs 2024-03-01T01:00Z.
-        let feb = Date::start_of_month_utc(1_709_247_600_000_000_000);
-        let mar = Date::start_of_month_utc(1_709_262_000_000_000_000);
+        let feb = Date::start_of_month_utc(1_709_247_600_000_000_000).unwrap();
+        let mar = Date::start_of_month_utc(1_709_262_000_000_000_000).unwrap();
         assert_ne!(feb, mar);
         assert_eq!(
             civil_from_days(i64::from(feb.days_since_epoch())),
@@ -246,13 +273,18 @@ mod tests {
     }
 
     #[test]
-    fn start_of_month_utc_saturates_instead_of_panicking_on_an_out_of_range_timestamp() {
+    fn start_of_month_utc_rejects_out_of_range_timestamps_instead_of_saturating() {
         // Far beyond the u16 day range (year ~2149 cutoff) in both
-        // directions: must saturate, never panic.
-        let far_future = Date::start_of_month_utc(i64::MAX);
-        assert_eq!(far_future.days_since_epoch(), u16::MAX);
-        let far_past = Date::start_of_month_utc(i64::MIN);
-        assert_eq!(far_past.days_since_epoch(), 0);
+        // directions: must return `None`, never panic and never saturate to
+        // the max-`Date` partition (which would silently orphan the sample).
+        assert_eq!(Date::start_of_month_utc(i64::MAX), None);
+        assert_eq!(Date::start_of_month_utc(i64::MIN), None);
+        // A concrete post-2106 / far-future instant well inside the i64 ns
+        // range but past the 2149-06-06 `Date` cutoff (~year 2200): this is
+        // the data-integrity case #8 flagged — it previously saturated to
+        // day 65535, now it is rejectable.
+        let year_2200_ns = NANOS_PER_DAY * 84_000;
+        assert_eq!(Date::start_of_month_utc(year_2200_ns), None);
     }
 
     #[test]
@@ -260,7 +292,7 @@ mod tests {
         // 2024-03-15T12:34:56Z — same instant `start_of_month_utc`'s
         // mid-month test uses, so the two floors are directly comparable.
         let ts_ns = 1_710_505_996_123_456_789;
-        let day = Date::start_of_day_utc(ts_ns);
+        let day = Date::start_of_day_utc(ts_ns).unwrap();
         assert_eq!(
             civil_from_days(i64::from(day.days_since_epoch())),
             (2024, 3, 15)
@@ -270,16 +302,16 @@ mod tests {
     #[test]
     fn start_of_day_utc_two_timestamps_in_the_same_day_yield_equal_dates() {
         // 2024-03-15T00:00:00Z and 2024-03-15T23:59:59.999999999Z.
-        let start = Date::start_of_day_utc(1_710_460_800_000_000_000);
-        let end = Date::start_of_day_utc(1_710_547_199_999_999_999);
+        let start = Date::start_of_day_utc(1_710_460_800_000_000_000).unwrap();
+        let end = Date::start_of_day_utc(1_710_547_199_999_999_999).unwrap();
         assert_eq!(start, end);
     }
 
     #[test]
     fn start_of_day_utc_across_a_day_boundary_differs() {
         // 2024-03-15T23:59:59Z vs 2024-03-16T00:00:00Z.
-        let before = Date::start_of_day_utc(1_710_547_199_000_000_000);
-        let after = Date::start_of_day_utc(1_710_547_200_000_000_000);
+        let before = Date::start_of_day_utc(1_710_547_199_000_000_000).unwrap();
+        let after = Date::start_of_day_utc(1_710_547_200_000_000_000).unwrap();
         assert_ne!(before, after);
         assert_eq!(
             after.days_since_epoch(),
@@ -290,20 +322,70 @@ mod tests {
 
     #[test]
     fn start_of_day_utc_of_the_epoch_instant_is_day_zero() {
-        assert_eq!(Date::start_of_day_utc(0).days_since_epoch(), 0);
+        assert_eq!(Date::start_of_day_utc(0).unwrap().days_since_epoch(), 0);
     }
 
     #[test]
-    fn start_of_day_utc_saturates_instead_of_panicking_on_out_of_range_timestamps() {
+    fn start_of_day_utc_rejects_out_of_range_timestamps_instead_of_saturating() {
+        // Both directions past the u16 day range must return `None`, never
+        // panic and never saturate.
+        assert_eq!(Date::start_of_day_utc(i64::MAX), None);
+        assert_eq!(Date::start_of_day_utc(i64::MIN), None);
+        // Pre-epoch but in the representable i64 range: still rejected, not
+        // clamped to day 0.
+        assert_eq!(Date::start_of_day_utc(-(NANOS_PER_DAY * 200)), None);
+        // A concrete far-future (~year 2200) instant past the 2149-06-06
+        // `Date` cutoff: previously saturated to day 65535, now rejectable.
+        assert_eq!(Date::start_of_day_utc(NANOS_PER_DAY * 84_000), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_of_the_epoch_instant_is_day_zero() {
+        assert_eq!(Date::start_of_day_utc_ms(0).unwrap().days_since_epoch(), 0);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_accepts_the_last_representable_day() {
+        // Day 65535 = 2149-06-06, the last day `Date` can represent; the
+        // last millisecond within it is 65536 * MILLIS_PER_DAY - 1.
+        let last_ms = 65_536 * MILLIS_PER_DAY - 1;
+        assert_eq!(last_ms, 5_662_310_399_999);
         assert_eq!(
-            Date::start_of_day_utc(i64::MAX).days_since_epoch(),
-            u16::MAX
+            Date::start_of_day_utc_ms(last_ms)
+                .unwrap()
+                .days_since_epoch(),
+            65_535
         );
-        assert_eq!(Date::start_of_day_utc(i64::MIN).days_since_epoch(), 0);
-        // Pre-epoch but in the representable i64 range: clamps to day 0.
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_the_first_unrepresentable_day() {
+        // Day 65536 = 2149-06-07, the first day past the `u16` range.
+        let first_bad_ms = 65_536 * MILLIS_PER_DAY;
+        assert_eq!(first_bad_ms, 5_662_310_400_000);
+        assert_eq!(Date::start_of_day_utc_ms(first_bad_ms), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_a_negative_timestamp() {
+        assert_eq!(Date::start_of_day_utc_ms(-1), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_i64_extremes_instead_of_saturating() {
+        assert_eq!(Date::start_of_day_utc_ms(i64::MAX), None);
+        assert_eq!(Date::start_of_day_utc_ms(i64::MIN), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_agrees_with_start_of_day_utc_on_an_in_range_instant() {
+        // 2024-03-15T12:34:56.123Z, expressed at both ms and ns scale: the
+        // two helpers must floor to the same day.
+        let ms = 1_710_505_996_123;
+        let ns = ms * 1_000_000;
         assert_eq!(
-            Date::start_of_day_utc(-(NANOS_PER_DAY * 200)).days_since_epoch(),
-            0
+            Date::start_of_day_utc_ms(ms).unwrap(),
+            Date::start_of_day_utc(ns).unwrap()
         );
     }
 

@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use pulsus_clickhouse::{ChClient, ChConnConfig, ChEndpoint, ChPool, ChProto};
+use pulsus_clickhouse::{
+    ChClient, ChConnConfig, ChEndpoint, ChError, ChPool, ChProto, ConsistencyConfig,
+};
 use pulsus_config::Config;
 use pulsus_read::{
     EngineConfig, LabelCache, LabelCacheConfig, LogQlEngine, MetricsConfig, MetricsEngine,
@@ -57,6 +59,25 @@ pub(crate) fn conn_config_from(config: &Config) -> ChConnConfig {
             })
             .collect(),
         local_zone: config.availability_zone.clone(),
+        // Issue #114: the consistency policy carried by the write/DDL path's
+        // `ChClient::new`. `bootstrap_conn_config_from` inherits this via
+        // `..conn_config_from`. The shared-pool read/write clients install
+        // it via the fallible `ChClient::with_consistency`.
+        consistency: consistency_from(config),
+    }
+}
+
+/// Maps `Config` to [`pulsus_clickhouse::ConsistencyConfig`] (issue #114):
+/// the four `clickhouse.*` consistency keys the write insert path and the
+/// read select path apply per-statement. Defaults are all-off (strong
+/// consistency is opt-in), so an unconfigured deployment's insert/select is
+/// byte-for-byte the pre-#114 behaviour.
+pub(crate) fn consistency_from(config: &Config) -> ConsistencyConfig {
+    ConsistencyConfig {
+        insert_quorum: config.clickhouse.insert_quorum,
+        insert_quorum_parallel: config.clickhouse.insert_quorum_parallel,
+        insert_quorum_timeout: config.clickhouse.insert_quorum_timeout.0,
+        select_sequential_consistency: config.clickhouse.select_sequential_consistency,
     }
 }
 
@@ -160,6 +181,9 @@ pub(crate) fn metric_writer_tables_from(config: &Config) -> MetricWriterTables {
         samples: Arc::from(format!("metric_samples{dist}")),
         series: Arc::from(format!("metric_series{dist}")),
         metadata: Arc::from("metric_metadata"),
+        // `metric_hist_samples` (M7-A4, issue #120) is a co-sharded
+        // Metrics-family table, `_dist`-aware exactly like `metric_samples`.
+        hist_samples: Arc::from(format!("metric_hist_samples{dist}")),
     }
 }
 
@@ -187,9 +211,10 @@ pub(crate) fn trace_writer_tables_from(config: &Config) -> TraceWriterTables {
 /// already holds (`ChClient::from_shared_pool`, issue #13 resolved open
 /// question #1), so a `/api/logs/v1` request never opens a second
 /// connection pool.
-pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> LogQlEngine {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
-    LogQlEngine::new(client, engine_config_from(config))
+pub(crate) fn logql_engine(pool: Arc<ChPool>, config: &Config) -> Result<LogQlEngine, ChError> {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+        .with_consistency(consistency_from(config))?;
+    Ok(LogQlEngine::new(client, engine_config_from(config)))
 }
 
 /// Maps `Config` to [`pulsus_read::LabelCacheConfig`] (issue #30 architect
@@ -218,9 +243,10 @@ pub(crate) fn label_cache_config_from(config: &Config) -> LabelCacheConfig {
 
 /// Builds a [`LabelCache`] over `pool`, mirroring [`logql_engine`]'s
 /// "shared pool, no second connection" contract.
-pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> LabelCache {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
-    LabelCache::new(client, label_cache_config_from(config))
+pub(crate) fn build_label_cache(pool: Arc<ChPool>, config: &Config) -> Result<LabelCache, ChError> {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+        .with_consistency(consistency_from(config))?;
+    Ok(LabelCache::new(client, label_cache_config_from(config)))
 }
 
 /// Maps `Config` to [`pulsus_read::MetricsConfig`] (issue #32 architect
@@ -240,6 +266,9 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         samples_table: format!("metric_samples{dist}"),
         series_table: format!("metric_series{dist}"),
         metadata_table: "metric_metadata".to_string(),
+        // M7-A5a: the dual-read's complementary histogram table, `_dist`-
+        // aware exactly like `samples_table` (co-sharded Metrics family).
+        hist_samples_table: format!("metric_hist_samples{dist}"),
         // Issue #65 (M6-02): the experimental-function gate's production
         // carrier — `ReaderConfig -> MetricsConfig -> PlanParams`.
         experimental_functions: config.reader.promql_experimental_functions,
@@ -247,6 +276,21 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // production carrier — `ReaderConfig -> MetricsConfig ->
         // MetricsEngine::plan_multi_metric_fetch`.
         max_metric_fanout: config.reader.promql_max_metric_fanout,
+        // Issue #89 (retroactive re-review): the independent
+        // cache-enumeration scan-budget's production carrier —
+        // `ReaderConfig -> MetricsConfig -> resolve_multi_metric`.
+        max_cache_scan: config.reader.promql_max_cache_scan,
+        // Issue #82 (retroactive re-review): the info() metadata-family
+        // cardinality cap's production carrier — `ReaderConfig ->
+        // MetricsConfig -> MetricsEngine::query_inner`'s info_family cap.
+        max_info_series: config.reader.promql_max_info_series,
+        // Issue #136: mirrors `trace_read_config_from`'s own `distributed`
+        // flag — gates `distributed_product_mode='local'` on the
+        // `SqlFallback` sample fetches, the fix for the double-distributed
+        // `fingerprint IN (SELECT … FROM metric_series_dist …)` shape
+        // ClickHouse's default `distributed_product_mode='deny'` rejects
+        // (Code 288) on a clustered deployment.
+        distributed: config.cluster.is_some(),
     }
 }
 
@@ -259,9 +303,13 @@ pub(crate) fn metrics_engine(
     label_cache: Arc<LabelCache>,
     config: &Config,
     eval_gate: Arc<pulsus_read::EvalGate>,
-) -> MetricsEngine {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
-    MetricsEngine::new(client, label_cache, metrics_config_from(config)).with_eval_gate(eval_gate)
+) -> Result<MetricsEngine, ChError> {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+        .with_consistency(consistency_from(config))?;
+    Ok(
+        MetricsEngine::new(client, label_cache, metrics_config_from(config))
+            .with_eval_gate(eval_gate),
+    )
 }
 
 /// Maps `Config` to [`pulsus_read::TraceReadConfig`] (issues #55/#57):
@@ -289,6 +337,7 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         catalog_table: "trace_tag_catalog".to_string(),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
+        generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
         distributed: config.cluster.is_some(),
         skip_unavailable_shards: config.skip_unavailable_shards,
     }
@@ -296,9 +345,10 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
 
 /// Builds a [`TraceEngine`] over `pool`, mirroring [`logql_engine`]'s
 /// "shared pool, no second connection" contract.
-pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> TraceEngine {
-    let client = ChClient::from_shared_pool(pool, config.query_timeout.0);
-    TraceEngine::new(client, trace_read_config_from(config))
+pub(crate) fn trace_engine(pool: Arc<ChPool>, config: &Config) -> Result<TraceEngine, ChError> {
+    let client = ChClient::from_shared_pool(pool, config.query_timeout.0)
+        .with_consistency(consistency_from(config))?;
+    Ok(TraceEngine::new(client, trace_read_config_from(config)))
 }
 
 #[cfg(test)]
@@ -370,6 +420,43 @@ mod tests {
         assert_eq!(ch_cfg.database, "default");
         assert_eq!(ch_cfg.endpoints.len(), 1);
         assert_eq!(ch_cfg.local_zone.as_deref(), Some("az-a"));
+    }
+
+    /// Issue #114: `consistency_from` maps each of the four keys both ways
+    /// (default off; overrides carried), and `conn_config_from` populates
+    /// `ChConnConfig.consistency` — the production carrier proven with no
+    /// live server.
+    #[test]
+    fn consistency_from_maps_each_field_and_conn_config_carries_it() {
+        // Default: all-off (byte-for-byte pre-#114).
+        let default = consistency_from(&Config::default());
+        assert_eq!(default, ConsistencyConfig::default());
+        assert_eq!(default.insert_quorum, 0);
+        assert!(default.insert_quorum_parallel);
+        assert_eq!(
+            default.insert_quorum_timeout,
+            std::time::Duration::from_secs(120)
+        );
+        assert!(!default.select_sequential_consistency);
+
+        // Overrides carried through, including the HumanDuration -> Duration.
+        let mut config = Config::default();
+        config.clickhouse.insert_quorum = 3;
+        config.clickhouse.insert_quorum_parallel = false;
+        config.clickhouse.insert_quorum_timeout =
+            pulsus_config::HumanDuration(std::time::Duration::from_secs(90));
+        config.clickhouse.select_sequential_consistency = true;
+
+        let c = consistency_from(&config);
+        assert_eq!(c.insert_quorum, 3);
+        assert!(!c.insert_quorum_parallel);
+        assert_eq!(c.insert_quorum_timeout, std::time::Duration::from_secs(90));
+        assert!(c.select_sequential_consistency);
+
+        // The production carrier: conn_config_from populates the field.
+        assert_eq!(conn_config_from(&config).consistency, c);
+        // bootstrap inherits it via `..conn_config_from`.
+        assert_eq!(bootstrap_conn_config_from(&config).consistency, c);
     }
 
     #[test]
@@ -464,6 +551,7 @@ mod tests {
         assert_eq!(&*tables.samples, "metric_samples");
         assert_eq!(&*tables.series, "metric_series");
         assert_eq!(&*tables.metadata, "metric_metadata");
+        assert_eq!(&*tables.hist_samples, "metric_hist_samples");
     }
 
     #[test]
@@ -479,6 +567,7 @@ mod tests {
             &*tables.metadata, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+        assert_eq!(&*tables.hist_samples, "metric_hist_samples_dist");
     }
 
     #[test]
@@ -550,6 +639,7 @@ mod tests {
         assert_eq!(cfg.samples_table, "metric_samples");
         assert_eq!(cfg.series_table, "metric_series");
         assert_eq!(cfg.metadata_table, "metric_metadata");
+        assert!(!cfg.distributed);
     }
 
     #[test]
@@ -565,6 +655,7 @@ mod tests {
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+        assert!(cfg.distributed);
     }
 
     /// Issue #65 (M6-02): `reader.promql_experimental_functions` maps
@@ -586,6 +677,17 @@ mod tests {
         assert_eq!(metrics_config_from(&config).max_metric_fanout, 1_000);
         config.reader.promql_max_metric_fanout = 250;
         assert_eq!(metrics_config_from(&config).max_metric_fanout, 250);
+    }
+
+    /// Issue #89 (retroactive re-review): `reader.promql_max_cache_scan`
+    /// maps into `MetricsConfig.max_cache_scan` — the 200_000 default and
+    /// an override both survive the production carrier.
+    #[test]
+    fn metrics_config_from_maps_the_cache_scan_budget() {
+        let mut config = Config::default();
+        assert_eq!(metrics_config_from(&config).max_cache_scan, 200_000);
+        config.reader.promql_max_cache_scan = 500;
+        assert_eq!(metrics_config_from(&config).max_cache_scan, 500);
     }
 
     /// Issue #65 (M6-02) plan v2 Δ4: the hermetic production-path
@@ -679,6 +781,10 @@ mod tests {
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.max_candidates, config.reader.traceql_max_candidates);
         assert_eq!(cfg.scan_budget_rows, config.reader.traceql_scan_budget_rows);
+        assert_eq!(
+            cfg.generator_max_memory_bytes,
+            config.reader.traceql_generator_max_memory_bytes
+        );
         assert_eq!(cfg.skip_unavailable_shards, config.skip_unavailable_shards);
     }
 

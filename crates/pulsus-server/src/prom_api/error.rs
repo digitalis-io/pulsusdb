@@ -93,10 +93,11 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet}` | 422 | `execution` |
+/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
+/// | `PromqlError::Cancelled` (issue #93, unreachable in practice) | 408 | `timeout` |
 fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
     match e {
         PromqlError::Parse(_) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string()),
@@ -107,14 +108,26 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // `LabelSet` (issue #68: label_replace/label_join invalid
         // regex/label-name and duplicate-output-labelset errors) maps the
         // same way — a well-formed query whose evaluation is rejected,
-        // exactly upstream's 422 `execution` for these.
+        // exactly upstream's 422 `execution` for these. `ScalarOp` (issue
+        // #129: a native-histogram trim operator between two scalars)
+        // rides the same mapping — upstream surfaces its `scalarBinop`
+        // panic as a query execution error (`ev.recover`), never a 5xx.
         PromqlError::Unsupported { .. }
         | PromqlError::BadMatching { .. }
         | PromqlError::HistogramBucket { .. }
         | PromqlError::InvalidParameter { .. }
-        | PromqlError::LabelSet { .. } => {
+        | PromqlError::LabelSet { .. }
+        | PromqlError::ScalarOp { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
+        // Issue #93: a live `CancelToken` fired because the awaiting
+        // request future was already dropped (client disconnect, or the
+        // `TimeoutLayer` firing first — `middleware.rs`'s own 408
+        // `query_timeout`). Matched for exhaustiveness only — by the time
+        // this variant exists, the future that would encode this response
+        // is gone, so this arm is unreachable in practice. `408`/`timeout`
+        // mirrors the same convention rather than inventing a new status.
+        PromqlError::Cancelled => (StatusCode::REQUEST_TIMEOUT, "timeout", e.to_string()),
     }
 }
 
@@ -151,13 +164,28 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String) {
         | ReadError::PipelineUnsupportedInMetric { .. } => {
             (StatusCode::BAD_REQUEST, "bad_data", e.to_string())
         }
+        // M7-A5a: a `metric_hist_samples` row that cannot rebuild a
+        // histogram is a storage/data-integrity defect (validated at
+        // ingest, so unreachable for writer-produced rows), not a client
+        // error — 500 `internal`, exactly like `ChError::Decode`.
+        ReadError::HistogramDecode(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string())
+        }
         // Issue #85 (M6-08c): the name-less-selector fan-out cap
         // (`TooBroadReason::MetricFanout`) rides the existing
         // QueryTooBroad -> 422 `execution` mapping; the degraded-cache
         // name-less failure is likewise a well-formed query the engine
         // declines to execute — 422 `execution`, never a 5xx (ClickHouse
         // is healthy; the in-process cache just cannot answer it).
-        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => {
+        //
+        // M7-A5a: `HistogramResultUnsupported` joins this arm (plan v3
+        // finding 1) — a well-formed, executed query whose result type the
+        // A5a encoder declines to render (the histogram JSON encoder is
+        // A5b), the same class as `QueryTooBroad`. NOT 400 `bad_data`
+        // (that is the LogQL parse/matcher arm) and NOT a 5xx.
+        ReadError::QueryTooBroad(_)
+        | ReadError::NamelessSelectorUnresolvable { .. }
+        | ReadError::HistogramResultUnsupported => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
     }
@@ -219,6 +247,40 @@ mod tests {
         );
     }
 
+    /// M7-A5a AC8c: a native-histogram-valued query result surfaces as
+    /// 422 `execution` (the well-formed-but-undeclinable class), NOT 400
+    /// `bad_data`, and the message names M7-A5b.
+    #[tokio::test]
+    async fn read_error_histogram_result_unsupported_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::HistogramResultUnsupported;
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("M7-A5b"),
+            "{json}"
+        );
+    }
+
+    /// Issue #35: the query-text guard's reason rides the existing
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this test proves it.
+    #[tokio::test]
+    async fn read_error_query_text_bytes_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::QueryTextBytes {
+                rendered_bytes: 9_000_000,
+                cap: 8_388_608,
+            },
+        );
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+    }
+
     #[tokio::test]
     async fn promql_parse_error_maps_to_400_bad_data_and_embeds_the_message() {
         let err = PromqlError::Parse("unexpected token at char 3".to_string());
@@ -245,12 +307,22 @@ mod tests {
 
     #[tokio::test]
     async fn promql_bad_matching_error_maps_to_422_execution() {
+        // Issue #70: the duplicate-match detail is the upstream text
+        // verbatim — no added prefix — asserted byte-equal at the HTTP
+        // surface, not just by substring.
         let err = PromqlError::BadMatching {
-            detail: "many-to-one match without group_left".to_string(),
+            detail: "multiple matches for labels: many-to-one matching must be explicit \
+                     (group_left/group_right)"
+                .to_string(),
         };
         let (status, json) = envelope(ApiError::Promql(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "multiple matches for labels: many-to-one matching must be explicit \
+             (group_left/group_right)"
+        );
     }
 
     #[tokio::test]
@@ -281,6 +353,18 @@ mod tests {
         );
     }
 
+    /// Issue #93 (plan-review note 1): a cancelled offloaded eval maps to
+    /// 408, `errorType: "timeout"` — matching `middleware.rs`'s existing
+    /// `TimeoutLayer` 408 convention, not `503`/`unavailable` (the
+    /// `ChError::Timeout` mapping above) and not a made-up `499`.
+    #[tokio::test]
+    async fn promql_cancelled_error_maps_to_408_timeout() {
+        let err = PromqlError::Cancelled;
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(json["errorType"], "timeout");
+    }
+
     #[tokio::test]
     async fn promql_label_set_error_maps_to_422_execution_with_the_raw_message() {
         // Issue #68: label_replace/label_join validation and
@@ -295,6 +379,20 @@ mod tests {
         assert_eq!(
             json["error"],
             "vector cannot contain metrics with the same labelset"
+        );
+    }
+
+    #[tokio::test]
+    async fn promql_scalar_op_error_maps_to_422_execution_with_the_raw_message() {
+        // Issue #129: a native-histogram trim operator between two
+        // scalars — the upstream `scalarBinop` panic text verbatim.
+        let err = PromqlError::ScalarOp { op: "</" };
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "operator \"</\" not allowed for Scalar operations"
         );
     }
 

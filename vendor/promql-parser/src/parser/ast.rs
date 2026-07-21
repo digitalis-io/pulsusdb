@@ -1676,10 +1676,22 @@ pub(crate) fn check_ast(expr: Expr) -> Result<Expr, String> {
         Expr::Unary(ex) => check_ast_for_unary(ex),
         Expr::Subquery(ex) => check_ast_for_subquery(ex),
         Expr::VectorSelector(ex) => check_ast_for_vector_selector(ex),
-        Expr::Paren(_) => Ok(expr),
+        // PATCHES.md #6 (issue #82 v5): the eager empty-matcher operand
+        // guard, so a paren-wrapped bare `{}` cannot smuggle past the
+        // reductions below it (`(({}))`, etc.) into an accepting context.
+        Expr::Paren(p) => {
+            reject_empty_operand(&p.expr)?;
+            Ok(Expr::Paren(p))
+        }
         Expr::NumberLiteral(_) => Ok(expr),
         Expr::StringLiteral(_) => Ok(expr),
-        Expr::MatrixSelector(_) => Ok(expr),
+        // PATCHES.md #6 (issue #82 v5): a `MatrixSelector` is the one
+        // depth-adding reduction whose empty-matcher leaf never routes
+        // through the plain `expr: vector_selector` production (it is
+        // built from `expr LEFT_BRACKET duration RIGHT_BRACKET`, so its
+        // inner selector's own `check_ast` pass already ran — this arm
+        // catches a range-wrapped bare selector, e.g. `rate({}[5m])`).
+        Expr::MatrixSelector(ex) => check_ast_for_matrix_selector(ex),
         Expr::Extension(_) => Ok(expr),
     }
 }
@@ -1706,6 +1718,10 @@ fn expect_type(
 /// the original logic is redundant in prometheus, and the following coding blocks
 /// have been optimized for readability, but all logic SHOULD be covered.
 fn check_ast_for_binary_expr(mut ex: BinaryExpr) -> Result<Expr, String> {
+    // PATCHES.md #6 (issue #82 v5): the eager empty-matcher operand
+    // guard on both sides.
+    reject_empty_operand(&ex.lhs)?;
+    reject_empty_operand(&ex.rhs)?;
     if !ex.op.is_operator() {
         return Err(format!(
             "binary expression does not support operator '{}'",
@@ -1785,6 +1801,12 @@ fn check_ast_for_binary_expr(mut ex: BinaryExpr) -> Result<Expr, String> {
 }
 
 fn check_ast_for_aggregate_expr(ex: AggregateExpr) -> Result<Expr, String> {
+    // PATCHES.md #6 (issue #82 v5): the eager empty-matcher operand
+    // guard on the aggregated expression and its optional param.
+    reject_empty_operand(&ex.expr)?;
+    if let Some(param) = &ex.param {
+        reject_empty_operand(param)?;
+    }
     if !ex.op.is_aggregator() {
         return Err(format!(
             "aggregation operator expected in aggregation expression but got '{}'",
@@ -1842,6 +1864,19 @@ fn check_ast_for_call(ex: Call) -> Result<Expr, String> {
         }
     }
 
+    // PATCHES.md #6 (issue #82 v5): the eager empty-matcher operand
+    // guard on every call argument, EXCEPT `info()`'s second argument
+    // (index 1 — 0-indexed, matching the deferred bypass's own
+    // `bypass_second && i == 1` in `check_no_empty_selectors`) — the one
+    // context where a bare `{}` is a legal label-selector-only operand.
+    // `info()`'s own arg 0 is NOT exempt: `info({})` still rejects.
+    for (i, arg) in ex.args.args.iter().enumerate() {
+        if name == "info" && i == 1 {
+            continue;
+        }
+        reject_empty_operand(arg)?;
+    }
+
     check_args_match_types(&ex.args.args, &ex.func.arg_types, name)?;
     Ok(Expr::Call(ex))
 }
@@ -1892,6 +1927,7 @@ fn check_args_match_types(
 }
 
 fn check_ast_for_unary(ex: UnaryExpr) -> Result<Expr, String> {
+    reject_empty_operand(&ex.expr)?;
     let value_type = ex.expr.value_type();
     if value_type != ValueType::Scalar && value_type != ValueType::Vector {
         return Err(format!(
@@ -1903,6 +1939,7 @@ fn check_ast_for_unary(ex: UnaryExpr) -> Result<Expr, String> {
 }
 
 fn check_ast_for_subquery(ex: SubqueryExpr) -> Result<Expr, String> {
+    reject_empty_operand(&ex.expr)?;
     let value_type = ex.expr.value_type();
     if value_type != ValueType::Vector {
         return Err(format!(
@@ -1913,6 +1950,53 @@ fn check_ast_for_subquery(ex: SubqueryExpr) -> Result<Expr, String> {
     Ok(Expr::Subquery(ex))
 }
 
+/// `true` iff `expr` is a bare, name-less vector selector with no
+/// non-empty matcher (PATCHES.md #6, issue #82 v5) — the same predicate
+/// [`check_no_empty_selectors`]'s `selector_violates` applies, widened
+/// from the old reduction-time arm's literal "zero matchers" check to
+/// `Matchers::is_empty_matchers()` (a matcher set that only ever matches
+/// `""`, e.g. `{x=~".*"}`, is equally "empty" — matching the deferred
+/// walk exactly, so `sum({x=~".*"})` rejects eagerly too).
+fn is_bare_empty_selector(expr: &Expr) -> bool {
+    matches!(expr, Expr::VectorSelector(vs) if vs.name.is_none() && vs.matchers.is_empty_matchers())
+}
+
+/// The eager empty-matcher operand guard (PATCHES.md #6, issue #82 v5):
+/// called from every depth-adding reduction's `check_ast_for_*` on each
+/// of its immediate `Expr` operands, so a bare `{}` (or an
+/// all-empty-matching selector) is rejected at the SHALLOWEST reduction
+/// that wraps it — restoring the eager short-circuit the old
+/// leaf-arm rejection provided, now context-aware (`info()`'s second
+/// call argument is the one exempt position — see
+/// [`check_ast_for_call`]).
+fn reject_empty_operand(expr: &Expr) -> Result<(), String> {
+    if is_bare_empty_selector(expr) {
+        return Err("vector selector must contain at least one non-empty matcher".into());
+    }
+    Ok(())
+}
+
+/// The `MatrixSelector` eager check (PATCHES.md #6, issue #82 v5): a
+/// `matrix_selector` reduces through `check_ast` at its own grammar
+/// production (`promql.y:194`) — the innermost point at which a
+/// range-wrapped bare selector (`{}[5m]`, and so `rate({}[5m])`,
+/// `abs(rate({}[5m]))`, …) can be caught before any wrapping call or
+/// operator reduces. Without this arm the empty selector hides behind a
+/// type-valid `MatrixSelector` past every `VectorSelector`-only operand
+/// guard, deferring rejection until the post-parse
+/// [`check_no_empty_selectors`] walk — which only runs after the
+/// generated parser has already built the (deep) tree, reopening the
+/// stack-overflow hole `reject_empty_operand`'s eagerness otherwise
+/// closes. Predicate mirrors [`is_bare_empty_selector`] verbatim (a
+/// `MatrixSelector` is never `info()`'s second argument — that position
+/// type-checks as an instant vector — so no bypass ever applies here).
+fn check_ast_for_matrix_selector(ex: MatrixSelector) -> Result<Expr, String> {
+    if ex.vs.name.is_none() && ex.vs.matchers.is_empty_matchers() {
+        return Err("vector selector must contain at least one non-empty matcher".into());
+    }
+    Ok(Expr::MatrixSelector(ex))
+}
+
 fn check_ast_for_vector_selector(ex: VectorSelector) -> Result<Expr, String> {
     match ex.name {
         Some(ref name) => match ex.matchers.find_matcher_value(METRIC_NAME) {
@@ -1921,28 +2005,29 @@ fn check_ast_for_vector_selector(ex: VectorSelector) -> Result<Expr, String> {
             )),
             None => Ok(Expr::VectorSelector(ex)),
         },
-        // NOTE (PATCHES.md #6): the "at least one non-empty matcher"
-        // rejection for a selector CARRYING matchers no longer lives
-        // here. This reduction-time check runs before any enclosing call
-        // is known, but upstream (v3.13.0 parse.go checkAST) exempts
-        // exactly one context — `info()`'s second argument
-        // (`VectorSelector.BypassEmptyMatcherCheck`), a
-        // label-selector-only position where an all-empty-matching
-        // selector like `{data=~".*"}` is legal. That case is deferred to
-        // [`check_no_empty_selectors`], which `parse()` runs over the
-        // finished tree with the context available. The literal `{}`
-        // (zero matchers) KEEPS failing here: erroring at the first
-        // reduction short-circuits the pinned deep fuzz-regression input
-        // (`(-{}-1…` ×10k) before the generated LR parser ever builds
-        // its tree — that input sits beyond the parser's own measured
-        // recursion bound (~9k units on a 2 MiB stack, valid input
-        // included), so deferring `{}` would turn the pinned Err into a
-        // stack-overflow abort inside the grammar itself. The one
-        // recorded divergence is that `info(m, {})` stays rejected where
-        // upstream's bypass would admit it (see PATCHES.md #6).
-        None if ex.matchers.matchers.is_empty() && ex.matchers.or_matchers.is_empty() => {
-            Err("vector selector must contain at least one non-empty matcher".into())
-        }
+        // NOTE (PATCHES.md #6, issue #82 v5): a name-less selector's "at
+        // least one non-empty matcher" rejection no longer lives here.
+        // This reduction-time check used to run before any enclosing
+        // context was known, which is exactly why it could never accept
+        // upstream's one exempt context — `info()`'s second argument
+        // (`VectorSelector.BypassEmptyMatcherCheck`, v3.13.0
+        // parse.go:846-921), a label-selector-only position where an
+        // all-empty-matching selector like `{data=~".*"}` — or, per issue
+        // #82's re-review, the literal `{}` — is legal. The eager reject
+        // now lives on every depth-adding reduction ONE LEVEL UP
+        // (`reject_empty_operand`/`check_ast_for_matrix_selector`), which
+        // stays context-aware (`check_ast_for_call` skips it for
+        // `info()`'s second argument) while remaining just as eager: a
+        // bare selector's own reduction here always succeeds, but nothing
+        // wraps it without hitting a guard except the exempt position and
+        // the true top-level bare `{}` (caught by the post-parse
+        // [`check_no_empty_selectors`] backstop, which cannot overflow —
+        // a top-level expression has no wrapping nesting). Measured
+        // (PATCHES.md #6): this relocation does not reopen the pinned
+        // deep fuzz-regression input's stack-overflow hole (`(-{}-1…`
+        // ×10k, `parse.rs` `test_corner_fail_cases`) — it still returns
+        // this exact `Err` with no overflow, since `-{}-1` is caught
+        // eagerly at the innermost `unary_expr` reduction.
         _ => Ok(Expr::VectorSelector(ex)),
     }
 }
@@ -1988,11 +2073,17 @@ pub(crate) fn dismantle(expr: Expr) {
 
 /// The deferred "vector selector must contain at least one non-empty
 /// matcher" check (PATCHES.md #6): walks the finished tree iteratively
-/// (an explicit stack — a deep left-associative chain must not overflow
-/// the call stack where the old reduction-time check errored before ever
-/// building one) and rejects every name-less, all-empty-matching vector
-/// selector EXCEPT one in `info()`'s second-argument position — the port
-/// of upstream `BypassEmptyMatcherCheck` (v3.13.0 parse.go:846-921).
+/// and rejects every name-less, all-empty-matching vector selector
+/// EXCEPT one in `info()`'s second-argument position — the port of
+/// upstream `BypassEmptyMatcherCheck` (v3.13.0 parse.go:846-921).
+/// **Issue #82 v5:** every WRAPPED occurrence (operand of a unary/
+/// binary/subquery/aggregate/paren/call, or a `MatrixSelector`) is now
+/// caught EAGERLY by `reject_empty_operand`/`check_ast_for_matrix_selector`
+/// at its own depth-adding reduction, before this walk ever runs — this
+/// backstop is reached only for a bare top-level `{}` (no wrapping
+/// nesting, so no overflow risk) and remains the sole place the
+/// `info()`-arg-1 bypass is evaluated (a direct `VectorSelector` there
+/// never hits an eager guard at all — see `check_ast_for_call`).
 pub(crate) fn check_no_empty_selectors(expr: &Expr) -> Result<(), String> {
     fn selector_violates(name: &Option<String>, matchers: &Matchers) -> bool {
         // When name is None, a vector selector must contain at least one

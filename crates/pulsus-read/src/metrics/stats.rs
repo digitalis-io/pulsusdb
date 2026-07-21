@@ -34,6 +34,13 @@ pub struct CacheMetrics {
     pub miss_over_cardinality_total: AtomicU64,
     /// `FallbackReason::RegexUnsupported`.
     pub miss_regex_unsupported_total: AtomicU64,
+    /// Issue #89 (retroactive re-review): a multi-metric resolution's
+    /// cache-enumeration walk examined more entries (names plus candidate
+    /// fingerprints) than `ReaderConfig::promql_max_cache_scan` before it
+    /// could finish — [`super::labels::MultiMetricResolution::
+    /// ScanBudgetExceeded`], never a [`FallbackReason`] (a warm cache that
+    /// reaches this bound is not degraded).
+    pub miss_scan_budget_total: AtomicU64,
     /// Successful sweeps (each one swaps in a new snapshot).
     pub refreshes_total: AtomicU64,
     /// Sweeps that failed (transient `ChError`) — the last good snapshot
@@ -60,6 +67,7 @@ pub struct CacheMetricsSnapshot {
     pub miss_out_of_window_total: u64,
     pub miss_over_cardinality_total: u64,
     pub miss_regex_unsupported_total: u64,
+    pub miss_scan_budget_total: u64,
     pub refreshes_total: u64,
     pub refresh_failures_total: u64,
     pub series_count: u64,
@@ -91,6 +99,7 @@ impl CacheMetrics {
             miss_out_of_window_total: self.miss_out_of_window_total.load(Ordering::Relaxed),
             miss_over_cardinality_total: self.miss_over_cardinality_total.load(Ordering::Relaxed),
             miss_regex_unsupported_total: self.miss_regex_unsupported_total.load(Ordering::Relaxed),
+            miss_scan_budget_total: self.miss_scan_budget_total.load(Ordering::Relaxed),
             refreshes_total: self.refreshes_total.load(Ordering::Relaxed),
             refresh_failures_total: self.refresh_failures_total.load(Ordering::Relaxed),
             series_count: self.series_count.load(Ordering::Relaxed),
@@ -153,6 +162,9 @@ mod tests {
         metrics
             .miss_regex_unsupported_total
             .fetch_add(6, Ordering::Relaxed);
+        metrics
+            .miss_scan_budget_total
+            .fetch_add(7, Ordering::Relaxed);
         let snap = metrics.snapshot();
         assert_eq!(snap.hits_total, 5);
         assert_eq!(snap.miss_cold_total, 1);
@@ -160,5 +172,6 @@ mod tests {
         assert_eq!(snap.miss_out_of_window_total, 3);
         assert_eq!(snap.miss_over_cardinality_total, 4);
         assert_eq!(snap.miss_regex_unsupported_total, 6);
+        assert_eq!(snap.miss_scan_budget_total, 7);
     }
 }

@@ -39,8 +39,8 @@ use axum::response::{IntoResponse, Response};
 use pulsus_config::Config;
 use pulsus_logql::Expr;
 use pulsus_read::{
-    Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, StreamResult, TailLower, TailPage,
-    TailSetup,
+    Direction, LogQlEngine, QueryParams, QuerySpec, ReadError, StreamResult,
+    TAIL_REGISTRATION_GRACE_NS, TailLower, TailPage, TailSetup,
 };
 use tokio::sync::{Notify, watch};
 
@@ -176,6 +176,12 @@ struct TailLoopConfig {
     channel_depth: usize,
     send_timeout: Duration,
     dropped_sample_cap: usize,
+    /// The scan-gate's registration-visibility grace (issue #94 v6-v8): a
+    /// construction-site test seam, NOT an operator/request knob — the
+    /// production path always gets [`TAIL_REGISTRATION_GRACE_NS`]
+    /// (pinned by `narrow_grace_ns_defaults_to_the_production_constant`);
+    /// only the hermetic producer tests inject a smaller value.
+    narrow_grace_ns: i64,
 }
 
 impl TailLoopConfig {
@@ -189,6 +195,7 @@ impl TailLoopConfig {
             channel_depth: cfg.reader.tail_channel_depth,
             send_timeout: cfg.reader.tail_send_timeout.0,
             dropped_sample_cap: cfg.reader.tail_max_entries_per_frame,
+            narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
         }
     }
 }
@@ -264,11 +271,16 @@ pub(crate) async fn tail(
 
 /// One tail poll — the engine in production, a fake in the hermetic
 /// cancellation/backpressure tests (plan v3 AC4: "inject a fake fetch").
+/// `narrow` is the producer's scan-gate certification (issue #94 v6-v8,
+/// computed ONCE per iteration in `producer_loop` — see its doc) —
+/// threaded through so `EngineFetcher` can forward it to
+/// `tail_refresh_months`; the fakes below ignore it.
 trait TailFetcher: Send + 'static {
     fn poll(
         &mut self,
         lower: TailLower,
         upper_ns: i64,
+        narrow: bool,
         fetch_limit: u32,
     ) -> impl Future<Output = Result<TailPage, ReadError>> + Send;
 }
@@ -278,31 +290,44 @@ struct EngineFetcher {
     setup: TailSetup,
 }
 
+/// The poll window's lower instant, matching [`ScanState::lower`]'s own
+/// bound exactly (`Start{start_ns}` for a first/resumed slice, the
+/// keyset tuple's instant for a resumed page) — issue #94's bounded
+/// month refresh anchors stage-1 to this ADVANCING lower edge, not the
+/// connection's fixed setup floor.
+fn tail_lower_ts(lower: TailLower) -> i64 {
+    match lower {
+        TailLower::Start { start_ns } => start_ns,
+        TailLower::After(c) => c.tuple.0,
+    }
+}
+
 impl TailFetcher for EngineFetcher {
     async fn poll(
         &mut self,
         lower: TailLower,
         upper_ns: i64,
+        narrow: bool,
         fetch_limit: u32,
     ) -> Result<TailPage, ReadError> {
-        // Best-effort month refresh (issue #94 item 2): re-resolve the
-        // stage-1 month set when this poll's `upper_ns` crosses into a
-        // calendar month the plan doesn't cover — a pure `plan::plan`
-        // string rebuild, NO ClickHouse round-trip, ≤ once per calendar
-        // month per connection. Swallowed on failure (`let _`): the tail
-        // continues on the PRIOR plan (new-month streams surface on the
-        // next successful refresh or a reconnect) — a re-plan error can
-        // never tear down a working connection. The mutable borrow ends
-        // before `tail_poll`'s immutable borrows begin.
-        let _ = self.engine.tail_refresh_months(&mut self.setup, upper_ns);
+        // Best-effort, scan-gated month refresh (issue #94 v6-v8): the
+        // scan set is anchored to `setup.scan_floor_ns` (frozen during
+        // catch-up/fall-behind, advancing only when `narrow` certifies a
+        // completed full-span live-edge poll already dwelt >= GRACE) — a
+        // pure `plan::plan` string rebuild, NO ClickHouse round-trip.
+        // Narrowing past a fingerprint's registration month is safe only
+        // because `tail_poll` merges every poll's stage-1 result into a
+        // cumulative cache (`TailSetup::resolved`) rather than replacing
+        // it. Swallowed on failure (`let _`): the tail continues on the
+        // PRIOR plan — a re-plan error can never tear down a working
+        // connection. The mutable borrow ends before `tail_poll`'s own
+        // mutable borrow begins.
+        let lower_ns = tail_lower_ts(lower);
+        let _ = self
+            .engine
+            .tail_refresh_months(&mut self.setup, lower_ns, upper_ns, narrow);
         self.engine
-            .tail_poll(
-                &self.setup.compiled,
-                &self.setup.plan,
-                lower,
-                upper_ns,
-                fetch_limit,
-            )
+            .tail_poll(&mut self.setup, lower, upper_ns, fetch_limit)
             .await
     }
 }
@@ -595,6 +620,26 @@ async fn sleep_or_cancelled(
     }
 }
 
+/// Producer poll loop (issue #94 v6-v8: the ONLY place the scan-gate
+/// `narrow` flag is decided, from a SINGLE per-iteration `now` read —
+/// recomputing `now`/`horizon` downstream (e.g. inside a `TailFetcher`)
+/// is a documented trap: a fresh clock read always sees `horizon`
+/// advance past `upper`, misclassifying every steady-state live poll as
+/// catch-up and silently reintroducing lifetime-unbounded stage-1 month
+/// growth).
+///
+/// **Scan-gate rule:** `live = upper >= horizon` (the slice cap did not
+/// bind — the cursor sits within one `tail_catchup_slice` of the
+/// horizon). `live_since_ns` is set on the first live poll and RESET
+/// (along with `qualifying_scan_done`) on any non-live poll — a
+/// fall-behind episode re-arms the gate. `narrow = live &&
+/// qualifying_scan_done` is consumed by THIS poll's refresh (refresh
+/// runs before the poll — set-after-scan, consume-next-refresh).
+/// `dwell_ok` (the poll's START-time dwell, not its duration) is
+/// evaluated BEFORE the poll; `qualifying_scan_done` is set to `true`
+/// only AFTER the poll returns `Ok` (a completed full-span stage-1 scan —
+/// an `Err` breaks the loop, so no path narrows without a completed
+/// qualifying scan).
 async fn producer_loop<F: TailFetcher>(
     mut fetcher: F,
     shared: Arc<Shared>,
@@ -604,11 +649,14 @@ async fn producer_loop<F: TailFetcher>(
     cancel_tx: Arc<watch::Sender<bool>>,
 ) {
     let mut state = ScanState::new(cfg.start_ns);
+    let mut live_since_ns: Option<i64> = None;
+    let mut qualifying_scan_done = false;
     loop {
         if *shutdown.borrow() || *cancel.borrow() {
             break;
         }
-        let horizon = params::now_ns().saturating_sub(cfg.delay_ns);
+        let now = params::now_ns();
+        let horizon = now.saturating_sub(cfg.delay_ns);
         let (lower, lower_ts) = state.lower();
         // The boundary tuple's instant may still hold undelivered ties
         // (inclusive resume); a Start bound is exclusive.
@@ -625,10 +673,23 @@ async fn producer_loop<F: TailFetcher>(
         // Time-sliced catch-up (plan v4 D3): one query never scans/sorts
         // more than one `tail_catchup_slice` window.
         let upper = horizon.min(lower_ts.saturating_add(cfg.slice_ns));
+        let live = upper >= horizon;
+        if live {
+            live_since_ns.get_or_insert(now);
+        } else {
+            // Fall-behind: re-arm the gate — the drain that follows must
+            // earn a fresh qualifying full-span scan before narrowing
+            // again.
+            live_since_ns = None;
+            qualifying_scan_done = false;
+        }
+        let narrow = live && qualifying_scan_done;
+        let dwell_ok =
+            live && now.saturating_sub(live_since_ns.unwrap_or(now)) >= cfg.narrow_grace_ns;
 
         let result = tokio::select! {
             _ = cancelled(&mut shutdown, &mut cancel) => break,
-            r = fetcher.poll(lower, upper, cfg.fetch_limit) => r,
+            r = fetcher.poll(lower, upper, narrow, cfg.fetch_limit) => r,
         };
         let page = match result {
             Ok(page) => page,
@@ -641,6 +702,12 @@ async fn producer_loop<F: TailFetcher>(
                 break;
             }
         };
+        // This poll's stage-1 COMPLETED; if it started at dwell >= grace
+        // it was the qualifying full-span scan (narrow was false when it
+        // ran) — narrowing is permitted from the NEXT refresh only.
+        if dwell_ok {
+            qualifying_scan_done = true;
+        }
         let exhausted = state.observe(&page, upper, cfg.fetch_limit);
         if page.streams.iter().any(|s| !s.entries.is_empty()) {
             shared.lock().push_evicting(page.streams);
@@ -649,7 +716,7 @@ async fn producer_loop<F: TailFetcher>(
         // Caught up ⇒ idle for one poll interval; otherwise (full page,
         // or more backlog slices ahead) re-poll immediately.
         if exhausted
-            && upper >= horizon
+            && live
             && sleep_or_cancelled(&mut shutdown, &mut cancel, cfg.poll_interval).await
         {
             break;
@@ -798,6 +865,10 @@ mod tests {
             channel_depth: 4,
             send_timeout: Duration::from_secs(60),
             dropped_sample_cap: 1_000,
+            // Production default (issue #94 v6-v8): individual scan-gate
+            // tests override this with an injected grace via the same
+            // construction-site seam.
+            narrow_grace_ns: TAIL_REGISTRATION_GRACE_NS,
         }
     }
 
@@ -1068,6 +1139,7 @@ mod tests {
             &mut self,
             _lower: TailLower,
             upper_ns: i64,
+            _narrow: bool,
             _fetch_limit: u32,
         ) -> Result<TailPage, ReadError> {
             Ok(TailPage {
@@ -1085,6 +1157,7 @@ mod tests {
             &mut self,
             _lower: TailLower,
             _upper_ns: i64,
+            _narrow: bool,
             _fetch_limit: u32,
         ) -> Result<TailPage, ReadError> {
             std::future::pending().await
@@ -1099,6 +1172,7 @@ mod tests {
             &mut self,
             _lower: TailLower,
             _upper_ns: i64,
+            _narrow: bool,
             _fetch_limit: u32,
         ) -> Result<TailPage, ReadError> {
             Err(ReadError::QueryTooBroad(
@@ -1365,6 +1439,7 @@ mod tests {
                 &mut self,
                 lower: TailLower,
                 upper_ns: i64,
+                _narrow: bool,
                 _fetch_limit: u32,
             ) -> Result<TailPage, ReadError> {
                 let lower_ts = match lower {
@@ -1423,6 +1498,409 @@ mod tests {
         for pair in windows.windows(2).take(8) {
             assert_eq!(pair[1].0, pair[0].1, "lower must be the prior upper");
         }
+    }
+
+    // -- scan gate (issue #94 v6-v8, U6/U7) -------------------------------
+
+    /// A full-page response mode for [`NarrowRecorder`] (issue #94 v6-v8,
+    /// U6(e)/U7).
+    #[derive(Clone, Copy)]
+    enum FullPageMode {
+        /// The cursor tracks the poll's OWN `upper_ns` exactly — a
+        /// perpetually-full ingest that never drains its own poll window
+        /// (`ScanState` advances the watermark by one slice per poll,
+        /// forward-monotonic, exactly as a real backlog drain would) —
+        /// U7.
+        TracksUpper,
+        /// The cursor is pinned at a fixed, already-stale `ts` — because
+        /// `ScanState`'s watermark only ever advances (`max`), a stale
+        /// cursor is a no-op for it: the watermark FREEZES at whatever it
+        /// last was, stranding the connection behind the live horizon —
+        /// a deterministic fall-behind episode (U6(e)).
+        Frozen(i64),
+    }
+
+    /// Records each poll's `narrow` flag; optionally sleeps `poll_sleep`
+    /// inside `poll` (U6(b): a poll's own DURATION must not qualify it —
+    /// only the START-time dwell does) before returning a page per
+    /// `full_page`'s mode (`None` = exhausted-empty, the default
+    /// "instant" fake). A minimum 1ms per-poll floor bounds the busy-spin
+    /// rate during non-live/catch-up phases (no idle-sleep applies there)
+    /// — keeps iteration counts and timing predictable and avoids
+    /// `std::sync::Mutex` contention with the test driver thread.
+    struct NarrowRecorder {
+        narrows: Arc<Mutex<Vec<bool>>>,
+        poll_sleep: Duration,
+        full_page: Arc<Mutex<Option<FullPageMode>>>,
+    }
+    impl TailFetcher for NarrowRecorder {
+        async fn poll(
+            &mut self,
+            _lower: TailLower,
+            upper_ns: i64,
+            narrow: bool,
+            fetch_limit: u32,
+        ) -> Result<TailPage, ReadError> {
+            self.narrows.lock().unwrap().push(narrow);
+            tokio::time::sleep(self.poll_sleep.max(Duration::from_millis(1))).await;
+            let mode = *self.full_page.lock().unwrap();
+            match mode {
+                Some(FullPageMode::TracksUpper) => Ok(TailPage {
+                    streams: vec![],
+                    next: Some(TailCursor {
+                        tuple: (upper_ns, 0, 0),
+                        seen: 0,
+                    }),
+                    fetched: fetch_limit,
+                }),
+                Some(FullPageMode::Frozen(ts)) => Ok(TailPage {
+                    streams: vec![],
+                    next: Some(TailCursor {
+                        tuple: (ts, 0, 0),
+                        seen: 0,
+                    }),
+                    fetched: fetch_limit,
+                }),
+                None => Ok(TailPage {
+                    streams: vec![],
+                    next: None,
+                    fetched: 0,
+                }),
+            }
+        }
+    }
+
+    fn narrow_recorder(poll_sleep: Duration) -> (NarrowRecorder, Arc<Mutex<Vec<bool>>>) {
+        let narrows = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = NarrowRecorder {
+            narrows: Arc::clone(&narrows),
+            poll_sleep,
+            full_page: Arc::new(Mutex::new(None)),
+        };
+        (fetcher, narrows)
+    }
+
+    /// U6(a) (issue #94 v6-v8): `poll_interval` alone exceeding `GRACE`
+    /// must NOT narrow at poll 2 — the scan gate requires a COMPLETED
+    /// qualifying full-span scan, not merely elapsed wall clock (the exact
+    /// kill of the v6 time-gated rule, codex FAIL 5025191315). Poll 1 has
+    /// dwell 0; poll 2 runs at dwell >= 200ms > grace yet the flag is
+    /// still unset at ITS decision time, so it too is full-span; poll 3
+    /// narrows only once poll 2's scan has completed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_requires_a_completed_scan_when_poll_interval_exceeds_grace() {
+        let (fetcher, narrows) = narrow_recorder(Duration::ZERO);
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 50_000_000; // 50ms
+        cfg.poll_interval = Duration::from_millis(200);
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while narrows.lock().unwrap().len() < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+        let recorded = narrows.lock().unwrap();
+        assert!(
+            recorded.len() >= 3,
+            "expected >= 3 polls, got {}",
+            recorded.len()
+        );
+        assert_eq!(
+            &recorded[..3],
+            &[false, false, true],
+            "poll 2's dwell exceeds grace but must still be full-span (the flag is unset at \
+             decision time); poll 3 narrows only after poll 2's scan completed: {recorded:?}"
+        );
+    }
+
+    /// U6(b) (issue #94 v6-v8): a poll's own IN-FLIGHT duration exceeding
+    /// grace must not qualify it — only the START-time dwell counts. Poll
+    /// 1 starts at dwell 0 (even though it then sleeps 150ms); poll 2 is
+    /// the qualifying full-span scan (its start dwell is >= grace); poll 3
+    /// narrows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_uses_start_time_dwell_not_a_poll_own_duration() {
+        let (fetcher, narrows) = narrow_recorder(Duration::from_millis(150));
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 50_000_000; // 50ms
+        cfg.poll_interval = Duration::from_millis(5);
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while narrows.lock().unwrap().len() < 3 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+        let recorded = narrows.lock().unwrap();
+        assert!(
+            recorded.len() >= 3,
+            "expected >= 3 polls, got {}",
+            recorded.len()
+        );
+        assert_eq!(
+            &recorded[..3],
+            &[false, false, true],
+            "a poll's own 150ms duration must not qualify it — only start-time dwell: {recorded:?}"
+        );
+    }
+
+    /// U6(c) (issue #94 v6-v8): under normal cadence, at least TWO
+    /// full-span live polls always precede the first narrowed poll (a
+    /// theorem of the rule for grace > 0 — poll 1's dwell is 0, and the
+    /// flag is set only after a completed poll).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_opens_after_at_least_two_full_span_live_polls_under_normal_cadence() {
+        let (fetcher, narrows) = narrow_recorder(Duration::ZERO);
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 50_000_000; // 50ms
+        cfg.poll_interval = Duration::from_millis(5);
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if narrows.lock().unwrap().iter().any(|&n| n) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "narrow never opened within 5s");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+        let recorded = narrows.lock().unwrap();
+        let first_true = recorded
+            .iter()
+            .position(|&n| n)
+            .expect("some poll narrowed");
+        assert!(
+            first_true >= 2,
+            "at least two full-span live polls must precede narrowing, got index \
+             {first_true}: {recorded:?}"
+        );
+        assert!(
+            recorded[..first_true].iter().all(|&n| !n),
+            "every poll before the first narrowed one must be false: {recorded:?}"
+        );
+    }
+
+    /// U6(d) (issue #94 v6-v8): every catch-up poll (a slice-bounded
+    /// backlog drain) is `narrow = false` — the scan gate never opens
+    /// while behind, no matter how small `narrow_grace_ns` is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_never_opens_during_slice_bounded_catchup() {
+        let (fetcher, narrows) = narrow_recorder(Duration::ZERO);
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 1_000_000; // 1ms — even a trivial grace must not fire
+        cfg.slice_ns = 1_000_000_000; // 1s slices
+        cfg.start_ns = params::now_ns() - 10_000_000_000; // a 10-slice backlog
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while narrows.lock().unwrap().len() < 10 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+        let recorded = narrows.lock().unwrap();
+        assert!(recorded.len() >= 10, "backlog drained one slice per poll");
+        assert!(
+            recorded.iter().all(|&n| !n),
+            "catch-up polls must never narrow, even with a trivial grace: {recorded:?}"
+        );
+    }
+
+    /// U6(e) (issue #94 v6-v8): falling behind RE-ARMS the gate — after a
+    /// fall-behind episode, the connection must re-earn further full-span
+    /// polls before narrowing again (a state-not-reset regression would
+    /// narrow again immediately on re-entry).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_rearms_after_falling_behind_and_reopens_only_after_further_live_polls() {
+        let narrows = Arc::new(Mutex::new(Vec::new()));
+        let full_page = Arc::new(Mutex::new(None));
+        let fetcher = NarrowRecorder {
+            narrows: Arc::clone(&narrows),
+            poll_sleep: Duration::ZERO,
+            full_page: Arc::clone(&full_page),
+        };
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 50_000_000; // 50ms
+        cfg.poll_interval = Duration::from_millis(5);
+        cfg.slice_ns = 10_000_000; // 10ms slices — a short re-catchup after falling behind
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+
+        // Phase 1: reach narrow=true under normal cadence.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if narrows.lock().unwrap().iter().any(|&n| n) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "narrow never opened within 5s");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Phase 2: fall behind — full pages FROZEN 10s stale. Because
+        // `ScanState`'s watermark only ever advances (`max`), a stale
+        // cursor deterministically STRANDS it (upper < horizon ⇒ live =
+        // false) for as long as the mode holds — re-arming the gate. Held
+        // for 50ms of real time.
+        *full_page.lock().unwrap() = Some(FullPageMode::Frozen(params::now_ns() - 10_000_000_000));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let release_idx = {
+            *full_page.lock().unwrap() = None;
+            narrows.lock().unwrap().len()
+        };
+
+        // Phase 3: released — the connection re-drains the (small,
+        // ~50ms / 10ms-slice) gap and must re-earn further full-span/live
+        // polls before narrowing again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let reopened = {
+                let recorded = narrows.lock().unwrap();
+                recorded.len() > release_idx && recorded[release_idx..].iter().any(|&n| n)
+            };
+            if reopened {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "narrow never reopened after re-arm within 5s"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+
+        let recorded = narrows.lock().unwrap();
+        let post_release = &recorded[release_idx..];
+        let first_true = post_release
+            .iter()
+            .position(|&n| n)
+            .expect("narrow reopened after re-arm");
+        assert!(
+            first_true >= 2,
+            "re-arm must force at least two more polls before narrowing again, got index \
+             {first_true}: {post_release:?}"
+        );
+        assert!(
+            post_release[..first_true].iter().all(|&n| !n),
+            "every poll between re-arm and the next narrow must be false: {post_release:?}"
+        );
+    }
+
+    /// U7 (issue #94 v6-v8, codex finding 2): a page-lagged cursor whose
+    /// `upper` never reaches the horizon (ingest outrunning `fetch_limit`)
+    /// is never classified live — `narrow` stays `false`, no matter how
+    /// small `narrow_grace_ns` is, so the floor can never advance past it.
+    /// Deterministic BY CONSTRUCTION (not by racing wall-clock speed): a
+    /// 1000-slice backlog cannot be drained within the first 100 observed
+    /// polls (each poll consumes at most one slice of SIMULATED
+    /// backlog), so the horizon is provably unreachable within the
+    /// observation window regardless of how fast the loop executes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn narrow_gate_never_opens_for_a_page_lagged_cursor_that_never_reaches_the_horizon() {
+        let narrows = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = NarrowRecorder {
+            narrows: Arc::clone(&narrows),
+            poll_sleep: Duration::ZERO,
+            full_page: Arc::new(Mutex::new(Some(FullPageMode::TracksUpper))),
+        };
+        let mut cfg = test_cfg();
+        cfg.narrow_grace_ns = 1_000_000; // 1ms — even a trivial grace must never fire
+        cfg.slice_ns = 10_000_000; // 10ms slices
+        cfg.start_ns = params::now_ns() - 1_000 * cfg.slice_ns; // a 1000-slice backlog
+        let (tx, rx) = watch::channel(false);
+        let sender = FakeSender::new(SinkMode::Accept);
+        let handle = tokio::spawn(run_tail(
+            fetcher,
+            sender,
+            FakeReceiver(RecvMode::Silent),
+            cfg,
+            rx,
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while narrows.lock().unwrap().len() < 100 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("returns")
+            .expect("no panic");
+        let recorded = narrows.lock().unwrap();
+        assert!(
+            recorded.len() >= 100,
+            "expected the lagging cursor to poll repeatedly, got {}",
+            recorded.len()
+        );
+        assert!(
+            recorded.iter().all(|&n| !n),
+            "a page-lagged cursor whose backlog cannot possibly be drained within the \
+             observed polls must never be classified live/narrow: {recorded:?}"
+        );
+    }
+
+    /// Production always gets the documented constant — the grace field is
+    /// a construction-site test seam, not an operator/request knob.
+    #[test]
+    fn narrow_grace_ns_defaults_to_the_production_constant() {
+        let pairs = params::parse_pairs("query=%7Ba%3D%22x%22%7D");
+        let p = parse_tail_params(&pairs, &cfg_default()).expect("ok");
+        let cfg = TailLoopConfig::new(&cfg_default(), &p);
+        assert_eq!(cfg.narrow_grace_ns, TAIL_REGISTRATION_GRACE_NS);
     }
 
     // -- bare-GET rejection pin (the manifest's mounting oracle) ---------

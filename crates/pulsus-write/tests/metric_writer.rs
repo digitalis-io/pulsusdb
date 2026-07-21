@@ -16,9 +16,11 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChError, ChRow};
 use pulsus_config::{Config, WriterConfig};
-use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, LabelSet};
+use pulsus_model::{DEFAULT_ACTIVITY_BUCKET_MS, LabelSet, NativeHistogram, Span};
 use pulsus_write::writer::{BlockInserter, MetricWriter};
-use pulsus_write::{MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef};
+use pulsus_write::{
+    HistogramPoint, MetricMetadata, MetricPoint, MetricSink, ParsedMetrics, SeriesRef,
+};
 
 const BUCKET_MS: i64 = DEFAULT_ACTIVITY_BUCKET_MS;
 
@@ -99,7 +101,24 @@ fn writer_with(
     series: Arc<MockInserter>,
     metadata: Arc<MockInserter>,
 ) -> MetricWriter {
-    MetricWriter::with_inserters(samples, series, metadata, &cfg, BUCKET_MS)
+    // Issue #120: the fourth (`metric_hist_samples`) inserter is unexercised
+    // by these float-only tests — a always-`Ok` mock keeps their behavior
+    // unchanged; `hist_writer_with` below scripts it for the native path.
+    let hist_samples = MockInserter::new(MockBehavior::Ok);
+    MetricWriter::with_inserters(samples, series, metadata, hist_samples, &cfg, BUCKET_MS)
+}
+
+/// Constructor for the native-histogram tests (issue #120): exposes the
+/// `metric_hist_samples` inserter so a test can assert what was written to it
+/// (and stamp `value_type` on `metric_series`).
+fn hist_writer_with(
+    cfg: WriterConfig,
+    samples: Arc<MockInserter>,
+    series: Arc<MockInserter>,
+    hist_samples: Arc<MockInserter>,
+) -> MetricWriter {
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    MetricWriter::with_inserters(samples, series, metadata, hist_samples, &cfg, BUCKET_MS)
 }
 
 fn series_ref(metric_name: &str, fingerprint: u64) -> SeriesRef {
@@ -456,4 +475,144 @@ async fn metadata_repeated_identical_descriptor_flushes_once_then_a_change_flush
         "a repeated identical descriptor must never re-flush"
     );
     assert_eq!(writer.metrics().metadata_upserts_total, 1);
+}
+
+// -- native histogram write path (M7-A4, issue #120) -----------------
+
+/// A single-histogram fixture (schema 0, absolute buckets [1,2,1] ->
+/// deltas [1,1,-1], count 4).
+fn native_hist(metric_name: &str, fingerprint: u64, unix_milli: i64, sum: f64) -> NativeHistogram {
+    NativeHistogram {
+        schema: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        count: 4,
+        sum,
+        positive_spans: vec![Span {
+            offset: 1,
+            length: 3,
+        }],
+        negative_spans: vec![],
+        positive_buckets: vec![1, 1, -1],
+        negative_buckets: vec![],
+        custom_values: vec![],
+    }
+    .also_ident(metric_name, fingerprint, unix_milli)
+}
+
+// Tiny helper trait so the fixture reads top-to-bottom (the ident fields
+// live on `HistogramPoint`, not `NativeHistogram`).
+trait AlsoIdent {
+    fn also_ident(self, _n: &str, _f: u64, _u: i64) -> NativeHistogram;
+}
+impl AlsoIdent for NativeHistogram {
+    fn also_ident(self, _n: &str, _f: u64, _u: i64) -> NativeHistogram {
+        self
+    }
+}
+
+fn hist_batch_for(
+    metric_name: &str,
+    fingerprint: u64,
+    unix_milli: i64,
+    new_series: bool,
+) -> ParsedMetrics {
+    let mut out = ParsedMetrics {
+        hist_samples: vec![HistogramPoint {
+            metric_name: Arc::from(metric_name),
+            fingerprint,
+            unix_milli,
+            histogram: native_hist(metric_name, fingerprint, unix_milli, 5.0),
+        }],
+        ..Default::default()
+    };
+    if new_series {
+        out.series.push(series_ref(metric_name, fingerprint));
+    }
+    out
+}
+
+/// A native-histogram batch lands one `metric_hist_samples` row and one
+/// `metric_series` row stamped `value_type = 1`.
+#[tokio::test]
+async fn native_histogram_batch_writes_hist_row_and_registers_value_type_one() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1; // flush on the next append
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Ok);
+    let hist = MockInserter::new(MockBehavior::Ok);
+    let writer = hist_writer_with(cfg, samples.clone(), series.clone(), hist.clone());
+
+    let wait = writer
+        .admit_flush(hist_batch_for("http_request_duration_seconds", 7, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("flush settles")
+        .expect("flush succeeds");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(hist.call_count(), 1, "one metric_hist_samples flush");
+    assert_eq!(hist.last_row_count(), 1);
+    assert_eq!(series.call_count(), 1, "one metric_series registration");
+    assert!(
+        series.last_rows_json().contains("\"value_type\":1"),
+        "the histogram series must register value_type=1, got {}",
+        series.last_rows_json()
+    );
+    // No float samples in this batch.
+    assert_eq!(samples.call_count(), 0);
+    assert_eq!(writer.metrics().hist_samples.rows_total, 1);
+}
+
+/// AC4 (hermetic): a transition bucket — a float sample then a histogram
+/// sample at the SAME `(metric_name, fingerprint, bucket)` — registers BOTH
+/// `metric_series` rows (`value_type` 0 and 1). If `value_type` were absent
+/// from the LRU key, the second registration would be a false hit and the
+/// series would flush only once.
+#[tokio::test]
+async fn transition_bucket_registers_both_float_and_histogram_series_rows() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Ok);
+    let hist = MockInserter::new(MockBehavior::Ok);
+    let writer = hist_writer_with(cfg, samples.clone(), series.clone(), hist.clone());
+
+    // Float sample first: registers metric_series value_type=0, LRU-promoted
+    // on flush.
+    let wait = writer
+        .admit_flush(batch_for("m", 1, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("flush settles")
+        .expect("float flush succeeds");
+    assert_eq!(series.call_count(), 1);
+    assert!(series.last_rows_json().contains("\"value_type\":0"));
+
+    // Histogram sample at the SAME (name, fp, bucket): a distinct value_type
+    // key, so it must register a SECOND metric_series row (value_type=1).
+    let wait = writer
+        .admit_flush(hist_batch_for("m", 1, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("flush settles")
+        .expect("histogram flush succeeds");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        series.call_count(),
+        2,
+        "the histogram registration must NOT be suppressed by the float's LRU entry \
+         (value_type is part of the key)"
+    );
+    assert!(
+        series.last_rows_json().contains("\"value_type\":1"),
+        "the second registration is the histogram series (value_type=1), got {}",
+        series.last_rows_json()
+    );
 }

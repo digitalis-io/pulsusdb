@@ -3,7 +3,7 @@ Unary(
         expr: Binary(
             BinaryExpr {
                 op: TokenType(
-                    39,
+                    41,
                 ),
                 lhs: VectorSelector(
                     VectorSelector {

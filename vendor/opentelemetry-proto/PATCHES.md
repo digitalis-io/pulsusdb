@@ -181,8 +181,10 @@ Flatten-site count correction: there are **four** `serde(flatten)` sites in the
 vendored tonic files, not three — `AnyValue.value`
 (`opentelemetry.proto.common.v1.rs`, multi-line) is the fourth, but it routes
 through the P2 hand-written visitor and does NOT swallow (a malformed inner value
-already errors, verified). Only the three plain-`Option` metrics oneofs are fixed
-here.
+already errors, now test-covered by `malformed_any_value_is_a_decode_error` in
+`otlp_json_vendor_patch.rs` and the endpoint row `anyvalue_doublevalue_object`
+in `ingest/http.rs`, #103). Only the three plain-`Option` metrics oneofs are
+fixed here.
 
 `asInt` acceptance (adjudication #103, OVERRIDE of the P5 out-of-scope note):
 both `AsInt` arms (`NumberDataPoint::Value::AsInt`, `Exemplar::Value::AsInt`)

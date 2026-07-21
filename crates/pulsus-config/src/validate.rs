@@ -39,6 +39,18 @@ fn positive_u64(field: &str, v: u64) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Issue #96 (retroactive re-review): `reader.promql_max_metric_fanout`
+/// bounds a returned distinct-metric-name set (`metrics/exec.rs`'s
+/// `rows.len() as u64 > cap`) and a resolved-group count (`metrics/
+/// labels.rs`'s `groups.len() as u64 >= fanout_cap`). A value at/near
+/// `u64::MAX` makes both comparisons unreachable, silently DISABLING the
+/// too-broad guard. This is an explicit metrics-fanout policy ceiling
+/// (1000x the default of 1_000, above `cache_max_series` (50_000) and
+/// `promql_max_cache_scan` (200_000) so no legitimate warm/probe
+/// resolution false-rejects, and small enough that `cap + 1` is always
+/// representable) — not derived from any ClickHouse session setting.
+pub const PROMQL_MAX_METRIC_FANOUT_CEILING: u64 = 1_000_000;
+
 /// Validates cross-field startup invariants on an already-parsed [`Config`].
 /// Enum values are already rejected at parse time (invalid `--mode`,
 /// `PULSUS_LOG_LEVEL`, etc.); this only covers rules that need more than
@@ -152,6 +164,29 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.promql_max_metric_fanout",
         cfg.reader.promql_max_metric_fanout,
     )?;
+    // Issue #96 (retroactive re-review): reject values above the ceiling so
+    // the fan-out guard (metrics/exec.rs, metrics/labels.rs) can never be
+    // configured off.
+    if cfg.reader.promql_max_metric_fanout > PROMQL_MAX_METRIC_FANOUT_CEILING {
+        return Err(value_err(
+            "reader.promql_max_metric_fanout",
+            "exceeds the maximum fan-out ceiling (1_000_000): a larger value disables the too-broad guard",
+            "1..=1000000",
+        ));
+    }
+    // Issue #89 (retroactive re-review): a zero scan budget would reject
+    // every regex/negated-`__name__` selector's resolution before it could
+    // examine a single cache entry.
+    positive_u64(
+        "reader.promql_max_cache_scan",
+        cfg.reader.promql_max_cache_scan,
+    )?;
+    // Issue #82 (retroactive re-review): a zero cap would reject every
+    // `info()` query before a single `*_info` series could resolve.
+    positive_u64(
+        "reader.promql_max_info_series",
+        cfg.reader.promql_max_info_series,
+    )?;
     positive_bytes(
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
@@ -199,6 +234,61 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
     positive_duration("ruler.poll_interval", cfg.ruler.poll_interval)?;
     positive_bytes("ruler.max_result_bytes", cfg.ruler.max_result_bytes)?;
+
+    // Issue #114: consistency guards. `insert_quorum_timeout` must be
+    // positive, and — when quorum is enabled — must not exceed
+    // `query_timeout`, which bounds the whole insert (both the client tokio
+    // deadline and the server `max_execution_time`); a larger quorum wait
+    // could never be observed, the insert deadline fires first. These
+    // config-layer guards are defense-in-depth with better-located
+    // `ConfigError::Value{field}` messages; authoritative enforcement lives
+    // in `pulsus_clickhouse::ConsistencyConfig::validate_for_deadline`. The
+    // cross-field rule is inert when `insert_quorum == 0` (off).
+    positive_duration(
+        "clickhouse.insert_quorum_timeout",
+        cfg.clickhouse.insert_quorum_timeout,
+    )?;
+    if cfg.clickhouse.insert_quorum > 0
+        && cfg.clickhouse.insert_quorum_timeout.0 > cfg.query_timeout.0
+    {
+        return Err(value_err(
+            "clickhouse.insert_quorum_timeout",
+            "must not exceed query_timeout when insert_quorum is enabled: the insert \
+             deadline (query_timeout) preempts the quorum wait",
+            "<= query_timeout",
+        ));
+    }
+
+    // Issue #114 (code review round 1, finding 2): `insert_quorum == 1` is a
+    // silent no-op in ClickHouse — quorum writes are disabled below 2, so a
+    // config asking for a 1-replica quorum promises a guarantee that is never
+    // applied. Reject it: `0` disables quorum, `>= 2` is an active quorum.
+    if cfg.clickhouse.insert_quorum == 1 {
+        return Err(value_err(
+            "clickhouse.insert_quorum",
+            "1 is a silent no-op in ClickHouse (quorum writes are disabled below \
+             2): use 0 to disable quorum, or >= 2 for an active quorum",
+            "0 (off) or >= 2",
+        ));
+    }
+
+    // Issue #114 (code review round 1, finding 1): `select_sequential_consistency`
+    // (read-your-writes) only holds when quorum inserts are enabled AND
+    // non-parallel — ClickHouse cannot deliver the guarantee with parallel
+    // quorum or quorum off. Reject the combination fail-fast rather than
+    // silently forcing `insert_quorum_parallel = false`, so the operator's
+    // stated intent and the delivered behaviour never diverge.
+    if cfg.clickhouse.select_sequential_consistency
+        && (cfg.clickhouse.insert_quorum == 0 || cfg.clickhouse.insert_quorum_parallel)
+    {
+        return Err(value_err(
+            "clickhouse.select_sequential_consistency",
+            "read-your-writes requires quorum inserts enabled and non-parallel: set \
+             clickhouse.insert_quorum >= 2 and clickhouse.insert_quorum_parallel = false, \
+             or disable clickhouse.select_sequential_consistency",
+            "insert_quorum >= 2 and insert_quorum_parallel = false",
+        ));
+    }
 
     // Rule 8: raw_retention, if set, must be > 0.
     if let Some(raw_retention) = cfg.downsampling.raw_retention {
@@ -465,6 +555,61 @@ mod tests {
         assert!(validate(&cfg).is_err());
     }
 
+    /// Issue #96 (retroactive re-review): a `promql_max_metric_fanout` at
+    /// or near `u64::MAX` makes the returned-row/group-count fan-out
+    /// guards (`metrics/exec.rs`, `metrics/labels.rs`) unreachable —
+    /// silently disabling them. Config load must reject anything above
+    /// the ceiling while still accepting the ceiling itself and the
+    /// documented default.
+    #[test]
+    fn promql_max_metric_fanout_ceiling_rejects_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_metric_fanout = u64::MAX;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_max_metric_fanout");
+            }
+            other => panic!("expected a Value error for u64::MAX, got {other:?}"),
+        }
+
+        cfg.reader.promql_max_metric_fanout = PROMQL_MAX_METRIC_FANOUT_CEILING + 1;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_max_metric_fanout");
+            }
+            other => panic!("expected a Value error for ceiling+1, got {other:?}"),
+        }
+
+        cfg.reader.promql_max_metric_fanout = PROMQL_MAX_METRIC_FANOUT_CEILING;
+        assert!(validate(&cfg).is_ok());
+
+        cfg.reader.promql_max_metric_fanout = 1_000;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// Issue #89 (retroactive re-review): the cache-scan budget follows the
+    /// sibling u64 caps' validation shape — zero is an invalid value,
+    /// rejected at config load, and the documented default is 200_000.
+    #[test]
+    fn zero_promql_max_cache_scan_is_rejected_and_the_default_is_200_000() {
+        assert_eq!(Config::default().reader.promql_max_cache_scan, 200_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_cache_scan = 0;
+        assert!(validate(&cfg).is_err());
+    }
+
+    /// Issue #82 (retroactive re-review): the info() cardinality cap
+    /// follows the sibling u64 caps' validation shape — zero is an
+    /// invalid value, rejected at config load, and the documented
+    /// default is 100_000.
+    #[test]
+    fn zero_promql_max_info_series_is_rejected_and_the_default_is_100_000() {
+        assert_eq!(Config::default().reader.promql_max_info_series, 100_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_info_series = 0;
+        assert!(validate(&cfg).is_err());
+    }
+
     /// Issue #101: the eval-concurrency bound follows the sibling u64 caps'
     /// validation shape — zero is rejected at config load as
     /// `ConfigError::Value` naming the field (a zero bound admits no eval),
@@ -576,6 +721,137 @@ mod tests {
             http_port: None,
             zone: Some("az-a".to_string()),
         }];
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// AC11 (issue #114): the config-layer consistency guards. An enabled
+    /// quorum with `insert_quorum_timeout > query_timeout` is rejected as
+    /// `ConfigError::Value{field:"clickhouse.insert_quorum_timeout"}`; the
+    /// same values with quorum OFF pass (inert); a zero timeout is rejected;
+    /// the default (120s == default query_timeout 120s) passes.
+    #[test]
+    fn insert_quorum_timeout_guards_reject_over_deadline_and_zero_when_enabled() {
+        // > query_timeout with quorum enabled -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::from_secs(300));
+        cfg.query_timeout = HumanDuration(std::time::Duration::from_secs(120));
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum_timeout");
+            }
+            other => panic!("expected a Value error for the over-deadline timeout, got {other:?}"),
+        }
+
+        // Same values, quorum off -> inert, passes.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 0;
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::from_secs(300));
+        cfg.query_timeout = HumanDuration(std::time::Duration::from_secs(120));
+        assert!(validate(&cfg).is_ok());
+
+        // Zero timeout -> rejected by the positive-duration guard.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum_timeout = HumanDuration(std::time::Duration::ZERO);
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum_timeout");
+            }
+            other => panic!("expected a Value error for the zero timeout, got {other:?}"),
+        }
+
+        // Default is self-consistent (120s == 120s).
+        let d = Config::default();
+        assert_eq!(d.clickhouse.insert_quorum, 0);
+        assert!(d.clickhouse.insert_quorum_parallel);
+        assert_eq!(
+            d.clickhouse.insert_quorum_timeout.0,
+            std::time::Duration::from_secs(120)
+        );
+        assert!(!d.clickhouse.select_sequential_consistency);
+        assert!(validate(&d).is_ok());
+    }
+
+    /// Issue #114 (code review round 1, finding 2): `insert_quorum == 1` is a
+    /// silent no-op in ClickHouse and is rejected at startup naming the field;
+    /// `0` (off) and `2` (active quorum) are accepted.
+    #[test]
+    fn insert_quorum_of_one_is_rejected_as_a_no_op() {
+        // 0 = off -> OK.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 0;
+        assert!(validate(&cfg).is_ok());
+
+        // 1 = silent no-op -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 1;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.insert_quorum");
+            }
+            other => panic!("expected a Value error for insert_quorum == 1, got {other:?}"),
+        }
+
+        // 2 = active quorum -> OK (timeout 120s <= query_timeout 120s).
+        let mut cfg = Config::default();
+        cfg.clickhouse.insert_quorum = 2;
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// Issue #114 (code review round 1, finding 1): `select_sequential_consistency`
+    /// (read-your-writes) is only honoured by ClickHouse with quorum inserts
+    /// enabled AND non-parallel. Reject it with quorum off or parallel quorum;
+    /// accept it with `insert_quorum >= 2` and `insert_quorum_parallel = false`;
+    /// leave it untouched when disabled.
+    #[test]
+    fn select_sequential_consistency_requires_nonparallel_quorum() {
+        // seq-consistency on, quorum off -> rejected, naming the field.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.select_sequential_consistency");
+            }
+            other => {
+                panic!("expected a Value error for seq-consistency + quorum off, got {other:?}")
+            }
+        }
+
+        // seq-consistency on, quorum >= 2 but parallel -> rejected.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = true;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "clickhouse.select_sequential_consistency");
+            }
+            other => {
+                panic!(
+                    "expected a Value error for seq-consistency + parallel quorum, got {other:?}"
+                )
+            }
+        }
+
+        // seq-consistency on, quorum >= 2, non-parallel -> OK.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = true;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = false;
+        assert!(validate(&cfg).is_ok());
+
+        // seq-consistency off -> any quorum shape passes this rule.
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = false;
+        cfg.clickhouse.insert_quorum = 0;
+        cfg.clickhouse.insert_quorum_parallel = true;
+        assert!(validate(&cfg).is_ok());
+
+        let mut cfg = Config::default();
+        cfg.clickhouse.select_sequential_consistency = false;
+        cfg.clickhouse.insert_quorum = 2;
+        cfg.clickhouse.insert_quorum_parallel = true;
         assert!(validate(&cfg).is_ok());
     }
 

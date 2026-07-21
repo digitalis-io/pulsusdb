@@ -485,7 +485,9 @@ async fn run_path_b(db: &str, f: &Fixture) {
         structured_metadata,
     };
     let stream = LogStreamRow {
-        month: Date::start_of_month_utc(timestamp_ns).days_since_epoch(),
+        month: Date::start_of_month_utc(timestamp_ns)
+            .unwrap()
+            .days_since_epoch(),
         fingerprint,
         service,
         labels: labels.to_canonical_json(),

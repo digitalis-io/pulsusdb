@@ -330,6 +330,19 @@ fn shipped_shapes_and_limits_are_documented() {
         "result_overflow_mode = 'throw'",
         "block-granular",
         "256 MiB retention counter",
+        // Issue #57 re-audit: the hard block/string-byte bound and the
+        // generator memory ceiling.
+        "max_block_size = TRACE_SEARCH_MAX_BLOCK_ROWS",
+        "TRACE_STR_COL_CAP",
+        "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
+        "MEMORY_LIMIT_EXCEEDED",
+        // Issue #57 re-audit v7: the corrected two-layer framing —
+        // max_result_bytes is effective on the wrapped projection (a
+        // deliberate hardening), Layer 1 = per-batch, Layer 2 =
+        // cross-batch retained accumulation.
+        "unwrapped passthrough columns",
+        "per-batch",
+        "cross-batch retained accumulation",
     ] {
         assert!(
             schemas.contains(needle),
@@ -344,6 +357,10 @@ fn shipped_shapes_and_limits_are_documented() {
         "query_too_broad",
         "mutually exclusive",
         "logfmt",
+        // Issue #57 re-audit: the response string-truncation contract.
+        "8192-byte",
+        "2048 UTF-8 code points",
+        "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
     ] {
         assert!(
             api.contains(needle),

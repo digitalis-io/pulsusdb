@@ -3,6 +3,7 @@
 //! only crate that resolves/fetches and then calls into this one
 //! (`plan` -> `evaluate`).
 
+pub mod annotations;
 pub mod error;
 pub mod eval;
 pub mod math;
@@ -10,8 +11,9 @@ pub mod parser;
 pub mod plan;
 pub mod value;
 
+pub use annotations::{Annotation, AnnotationKind, Annotations, ForcedMonotonicityDetail};
 pub use error::PromqlError;
-pub use eval::evaluate;
+pub use eval::{CancelToken, evaluate, evaluate_cancellable};
 pub use math::KahanSum;
 pub use parser::parse;
 pub use plan::{
@@ -20,7 +22,7 @@ pub use plan::{
     SetOp, plan, series_selector,
 };
 pub use value::{
-    FetchedSeries, InstantSample, Labels, QueryValue, RangeSeries, Sample, SeriesData,
+    FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
 };
 
 /// True iff the (paren-stripped) root of `expr` is a call to one of the

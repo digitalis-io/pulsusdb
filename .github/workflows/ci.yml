@@ -207,6 +207,17 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test query_log_gates
 
+      # Issue #35 (full-shape parse bound): the live regression witness —
+      # a >256 KiB rendered stage2/sample_fetch_multi SQL text fails to
+      # parse under ClickHouse's server-default max_query_size and
+      # succeeds once the raised product setting is applied. Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Query-text admission live witness (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test query_text_cap_live
+
       # Issue #16 plan amendment: licenses the direct RowBinary bulk-load
       # shortcut `xtask bench logs-read`'s dataset generator uses for the
       # CI-scale/Tier-2 corpora, by proving it is byte-identical to the
@@ -238,6 +249,21 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test zipkin_ingest_roundtrip
+
+      # Issue #120 (M7-A4): the native-histogram write path — MetricWriter ->
+      # metric_hist_samples. Deciding ClickHouse-NaN gate (finite/stale-NaN/
+      # absent-NaN `sum` bit patterns survive Float64 RowBinary round-trip
+      # distinctly — also the first live proof of the landed float-stale
+      # assumption), an OTLP parse(Native) -> writer -> SELECT absolute-count
+      # round-trip incl. an internal zero bucket, and the value_type
+      # discriminator mask (a cross-request float+histogram at one series
+      # registers both metric_series rows, groupBitOr == 3). Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Native histogram writer round-trip (NaN gate + value_type)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_metric_hist_writer
 
       # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
       # step — reproducibility + a committed CI-scale evidence artifact
@@ -396,7 +422,11 @@ jobs:
       # bounded-transfer LIMIT differential) plus the live budget trips
       # (scan-budget 422, Layer-2 retention 422, span-overflow partial).
       # Wired here by issue #58 — the step was omitted when #57 landed.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Issue #57 re-audit adds: AC-A2 (source string truncation is a
+      # hard byte ceiling on multi-byte UTF-8), AC-A3 (the reshaped
+      # retention-counter trip with its full drift guard), AC-B1 (the
+      # phase-1 generator memory ceiling trips 241 -> 422). Reuses this
+      # job's ClickHouse 24.8 container.
       - name: TraceQL search EXPLAIN + budget gates (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
@@ -622,6 +652,17 @@ jobs:
         env:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
+
+      # Issue #136: the metrics SqlFallback fetch's double-distributed
+      # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied
+      # by ClickHouse's default `distributed_product_mode='deny'` without
+      # the `local` rewrite this issue adds — the negative control pins the
+      # exact denial code, the positive control proves the fix end-to-end
+      # over a cross-shard-split corpus.
+      - name: Live metrics SqlFallback fan-out (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
 
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),

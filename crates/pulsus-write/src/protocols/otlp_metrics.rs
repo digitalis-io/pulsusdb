@@ -47,10 +47,14 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
-use pulsus_model::{Fingerprint, LabelSet, STALE_NAN_BITS, metric_fingerprint};
+use pulsus_config::ExpHistogramMode;
+use pulsus_model::{Date, Fingerprint, LabelSet, STALE_NAN_BITS, metric_fingerprint};
 
 use crate::error::LogsIngestError;
-use crate::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef};
+use crate::ingest::metrics::{
+    HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
+};
+use crate::protocols::otlp_exp_histogram::to_native_histogram;
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (see the module doc's "Expansion budget" section). Own constant, same
@@ -79,6 +83,16 @@ const SAMPLE_ROW_OVERHEAD: usize = 64;
 /// non-multiplicative (one entry per wire bucket count), charged before that
 /// Vec is materialized so no site allocates uncharged.
 const EXP_BUCKET_PAIR_BYTES: usize = 16;
+
+/// Estimated per-entry heap cost of the transient histogram-wins dedup key
+/// set [`dedup_histogram_wins`] builds — one `(&str, Fingerprint, i64)` slot
+/// per native-histogram sample, floored to a round constant that also covers
+/// the `HashSet`'s per-slot bookkeeping. Charged against the expansion budget
+/// BEFORE the set is materialized so the native dedup path admits no
+/// unbudgeted per-sample allocation (issue #120 code review), mirroring how
+/// the classic path charges its per-sample series containers via
+/// [`SAMPLE_ROW_OVERHEAD`] before `emit_sample` materializes them.
+const HIST_DEDUP_KEY_BYTES: usize = 48;
 
 /// The maximum per-byte expansion `serde_json` string escaping can produce
 /// (a control byte renders as its 6-byte `\uXXXX` escape) — the worst-case
@@ -182,6 +196,10 @@ fn charge_budget(expanded_bytes: &mut usize, amount: usize) -> Result<(), LogsIn
 /// decode boundary: a malformed/truncated protobuf is a whole-request,
 /// atomic failure (mirrors `otlp_logs::decode`) — never partially applied.
 pub fn decode(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsIngestError> {
+    // Wire pre-scan (issue #115, track 5): reject an over-cap / over-deep
+    // request by walking the raw protobuf bytes BEFORE `decode` materializes
+    // the amplified structure (malformed bodies deferred to `decode` below).
+    crate::protocols::otlp_prescan::prescan_metrics(body)?;
     Ok(ExportMetricsServiceRequest::decode(body)?)
 }
 
@@ -193,7 +211,12 @@ pub fn decode(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsIngestErro
 /// (docs/decisions/0004); a malformed body maps to 400/code 3 via
 /// [`LogsIngestError::DecodeJson`].
 pub fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsIngestError> {
-    Ok(serde_json::from_slice(body)?)
+    // Issue #115 track 6c: bounded proto3-JSON building wrappers replace the
+    // vendored derive's UNBOUNDED repeated-field decode, rejecting a DoS-shaped
+    // body DURING deserialization at the SAME per-level / aggregate / depth
+    // thresholds the protobuf wire pre-scan (`otlp_prescan`) enforces (mirrors
+    // `otlp_traces::decode_json` / `otlp_logs::decode_json`, tracks 6a/6b).
+    crate::protocols::otlp_json::metrics::decode_metrics(body)
 }
 
 /// Parses a decoded `ExportMetricsServiceRequest` into normalized rows.
@@ -211,7 +234,14 @@ pub fn decode_json(body: &[u8]) -> Result<ExportMetricsServiceRequest, LogsInges
 pub fn parse(
     req: &ExportMetricsServiceRequest,
     now_ns: i64,
+    mode: ExpHistogramMode,
 ) -> Result<ParsedMetrics, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep attribute tree before any value is rendered or a
+    // sample materialized, so the recursive `any_value_to_string` render
+    // below can never overflow the stack.
+    crate::protocols::otlp_depth::ensure_metrics_anyvalue_depth(req)?;
+
     let mut out = ParsedMetrics::default();
     let mut expanded_bytes: usize = 0;
     // Dedups `SeriesRef` registration within this request by `(metric_name,
@@ -243,6 +273,7 @@ pub fn parse(
             let base = ScopeBase {
                 pairs: &base_pairs,
                 charge: base_charge,
+                mode,
             };
 
             for metric in &scope_metrics.metrics {
@@ -259,7 +290,63 @@ pub fn parse(
         }
     }
 
+    // Within-request histogram-wins dedup (issue #120 Fix 4): a native
+    // histogram and a float sample at the same `(metric_name, fingerprint,
+    // unix_milli)` must never both be written — the histogram wins (matching
+    // the read-side tie-break). This only fires on the pathological case
+    // where one base name arrives as BOTH a gauge/sum float and a native
+    // histogram at the same series+timestamp; classic/dual suffixed names
+    // (`_bucket`/`_sum`/`_count`) have disjoint fingerprints, so Dual's own
+    // output never trips this. Cross-request collisions are resolved by the
+    // read path, not here (a stateless writer cannot prevent them).
+    dedup_histogram_wins(&mut out, &mut expanded_bytes)?;
+
     Ok(out)
+}
+
+/// Drops any float sample whose `(metric_name, fingerprint, unix_milli)`
+/// coincides with a native-histogram sample in the same request, counting
+/// each drop in `rejected` (histogram-wins — issue #120 Fix 4).
+///
+/// The transient dedup key set is charged against the expansion budget BEFORE
+/// it is materialized (issue #120 code review — do not add an unbudgeted
+/// per-sample allocation on top of #62's undercount): one
+/// [`HIST_DEDUP_KEY_BYTES`] slot per native-histogram sample. The keys borrow
+/// `metric_name` as `&str` rather than `Arc::clone`-ing it, so no per-sample
+/// refcount churn is incurred on either the build or the lookup side.
+fn dedup_histogram_wins(
+    out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
+) -> Result<(), LogsIngestError> {
+    if out.hist_samples.is_empty() {
+        return Ok(());
+    }
+    charge_budget(
+        expanded_bytes,
+        out.hist_samples.len().saturating_mul(HIST_DEDUP_KEY_BYTES),
+    )?;
+    // Borrow the two disjoint fields separately so the borrow checker permits
+    // the immutable `hist_keys` borrow of `hist_samples` to coexist with the
+    // `retain` mutation of `samples`.
+    let hist_samples = &out.hist_samples;
+    let samples = &mut out.samples;
+    let hist_keys: HashSet<(&str, Fingerprint, i64)> = hist_samples
+        .iter()
+        .map(|h| (h.metric_name.as_ref(), h.fingerprint, h.unix_milli))
+        .collect();
+    let before = samples.len();
+    samples.retain(|s| !hist_keys.contains(&(s.metric_name.as_ref(), s.fingerprint, s.unix_milli)));
+    let dropped = (before - samples.len()) as u64;
+    if dropped > 0 {
+        out.rejected += dropped;
+        if out.rejected_message.is_none() {
+            out.rejected_message = Some(
+                "float sample dropped: native histogram present at the same series and timestamp"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Dispatches one `Metric` descriptor to its type-specific handler
@@ -348,15 +435,52 @@ fn parse_metric(
                 reject_whole_metric(out, &metric.name, exp.data_points.len());
                 return Ok(());
             }
+            // Dispatch on the configured exp-histogram mode (issue #120):
+            // `Classic` (default) keeps the existing float flatten byte-
+            // unchanged; `Native` stores only the sparse native histogram;
+            // `Dual` emits the native row THEN the classic flatten (disjoint
+            // fingerprints — base name vs `_bucket`/`_sum`/`_count`).
             for dp in &exp.data_points {
-                emit_exponential_histogram_point(
-                    out,
-                    expanded_bytes,
-                    seen_series,
-                    &name,
-                    base,
-                    dp,
-                )?;
+                match base.mode {
+                    ExpHistogramMode::Classic => {
+                        emit_exponential_histogram_point(
+                            out,
+                            expanded_bytes,
+                            seen_series,
+                            &name,
+                            base,
+                            dp,
+                        )?;
+                    }
+                    ExpHistogramMode::Native => {
+                        emit_native_exponential_histogram(
+                            out,
+                            expanded_bytes,
+                            seen_series,
+                            &name,
+                            base,
+                            dp,
+                        )?;
+                    }
+                    ExpHistogramMode::Dual => {
+                        emit_native_exponential_histogram(
+                            out,
+                            expanded_bytes,
+                            seen_series,
+                            &name,
+                            base,
+                            dp,
+                        )?;
+                        emit_exponential_histogram_point(
+                            out,
+                            expanded_bytes,
+                            seen_series,
+                            &name,
+                            base,
+                            dp,
+                        )?;
+                    }
+                }
             }
         }
         metric::Data::Summary(summary) => {
@@ -410,6 +534,10 @@ fn reject_point(out: &mut ParsedMetrics, message: impl FnOnce() -> String) {
 struct ScopeBase<'a> {
     pairs: &'a [(String, String)],
     charge: usize,
+    /// The request's exp-histogram storage mode (issue #120), carried here
+    /// (constant per request) so `parse_metric` stays within clippy's
+    /// argument threshold rather than threading a separate parameter.
+    mode: ExpHistogramMode,
 }
 
 /// The per-data-point context every `emit_sample` call within one data
@@ -791,6 +919,109 @@ fn emit_exponential_histogram_point(
     Ok(())
 }
 
+/// Native exponential-histogram ingest (issue #120, M7-A4): stores the data
+/// point as one sparse native histogram in `hist_samples` (base metric name,
+/// no `_bucket`/`_sum`/`_count` flatten), for the `Native`/`Dual` modes.
+///
+/// Rejects the whole data point into partial success (no sample emitted) on:
+/// a zero/invalid timestamp; an [`ExpReject`](crate::protocols::otlp_exp_histogram::ExpReject)
+/// from the OTLP→[`NativeHistogram`](pulsus_model::NativeHistogram) conversion
+/// (scale, overflow, or the aggregate count-equality cross-check); or a
+/// failed A3 `validate()` at the seam. The `#62` allocation budget is charged
+/// **before** the `NativeHistogram`/`LabelSet` are materialized.
+fn emit_native_exponential_histogram(
+    out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
+    seen_series: &mut HashSet<(Arc<str>, Fingerprint)>,
+    name: &Arc<str>,
+    base: &ScopeBase<'_>,
+    dp: &ExponentialHistogramDataPoint,
+) -> Result<(), LogsIngestError> {
+    let unix_milli = match resolve_timestamp_ms(dp.time_unix_nano) {
+        Ok(ms) => ms,
+        Err(message) => {
+            reject_point(out, || {
+                format!(
+                    "metric {}: {message}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
+        }
+    };
+
+    // Charge the native path's expanded output BEFORE materializing anything
+    // (issue #62 — do not worsen the pre-existing undercount): the fixed row
+    // floor, the per-scope base pairs the one sample clones (`base.charge`),
+    // this data point's own attributes, and a bounded per-wire-bucket floor
+    // for the span/delta arrays the conversion allocates. Allocation-free;
+    // aborts here before the `NativeHistogram`/`LabelSet` are built.
+    let dp_attr_charge = attrs_budget_charge(&dp.attributes);
+    let bucket_len = dp
+        .positive
+        .as_ref()
+        .map(|b| b.bucket_counts.len())
+        .unwrap_or(0)
+        .saturating_add(
+            dp.negative
+                .as_ref()
+                .map(|b| b.bucket_counts.len())
+                .unwrap_or(0),
+        );
+    let native_charge = SAMPLE_ROW_OVERHEAD
+        .saturating_add(base.charge)
+        .saturating_add(dp_attr_charge)
+        .saturating_add(bucket_len.saturating_mul(EXP_BUCKET_PAIR_BYTES));
+    charge_budget(expanded_bytes, native_charge)?;
+
+    // Convert (checked; includes the aggregate count-equality cross-check),
+    // then A3 `validate()` at the seam — either failure rejects the point.
+    let histogram = match to_native_histogram(dp) {
+        Ok(histogram) => histogram,
+        Err(reject) => {
+            reject_point(out, || {
+                format!(
+                    "metric {}: {reject}",
+                    diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+                )
+            });
+            return Ok(());
+        }
+    };
+    if let Err(err) = histogram.validate() {
+        reject_point(out, || {
+            format!(
+                "metric {}: invalid native histogram: {err}",
+                diag_snippet(name, DIAG_SNIPPET_MAX_BYTES)
+            )
+        });
+        return Ok(());
+    }
+
+    // One sample per data point, labeled by the scope base pairs ⊕ this data
+    // point's own attributes (no synthetic `le`/`quantile` — the native form
+    // carries no per-bucket label).
+    let pairs = base.pairs.iter().cloned().chain(attr_pairs(&dp.attributes));
+    let (labels, collisions) = LabelSet::from_normalized(pairs);
+    out.collisions += collisions as u64;
+    let fingerprint = metric_fingerprint(&labels);
+
+    if seen_series.insert((Arc::clone(name), fingerprint)) {
+        out.series.push(SeriesRef {
+            metric_name: Arc::clone(name),
+            fingerprint,
+            labels,
+        });
+    }
+    out.hist_samples.push(HistogramPoint {
+        metric_name: Arc::clone(name),
+        fingerprint,
+        unix_milli,
+        histogram,
+    });
+    Ok(())
+}
+
 /// Builds the raw `(bound, count)` pairs for one exponential-histogram data
 /// point — positive buckets, negative buckets, then the zero bucket
 /// (unconditionally, even when `zero_count == 0`: it contributes nothing to
@@ -1130,8 +1361,14 @@ fn base64_encode(input: &[u8]) -> String {
 /// integer division — ns is non-negative on the wire, docs/schemas.md
 /// "verbatim at millisecond precision"). `Err` when `time_unix_nano == 0`
 /// (task-manager resolution: a metric sample with no timestamp is
-/// malformed, unlike a log record's `now_ns` fallback) — a per-point
-/// rejection (partial success), not a whole-request failure.
+/// malformed, unlike a log record's `now_ns` fallback) or when the
+/// resulting day falls outside the ClickHouse `Date` range (before
+/// 1970-01-01 or after 2149-06-06): `metric_samples` /
+/// `metric_hist_samples` partition on
+/// `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126, mirroring
+/// #8's log/trace-path fix), so a day that range can't represent would
+/// otherwise silently orphan the sample into the wrong partition. Both are
+/// a per-point rejection (partial success), not a whole-request failure.
 ///
 /// The division-then-cast is infallible: `u64::MAX / 1_000_000 <
 /// i64::MAX`, so any `u64` nanosecond value converts without truncation or
@@ -1141,10 +1378,14 @@ fn resolve_timestamp_ms(time_unix_nano: u64) -> Result<i64, String> {
         return Err("data point has time_unix_nano == 0".to_string());
     }
     let millis = time_unix_nano / 1_000_000;
-    Ok(
-        i64::try_from(millis)
-            .expect("u64::MAX / 1_000_000 fits in i64 (see this fn's doc comment)"),
-    )
+    let millis = i64::try_from(millis)
+        .expect("u64::MAX / 1_000_000 fits in i64 (see this fn's doc comment)");
+    if Date::start_of_day_utc_ms(millis).is_none() {
+        return Err(format!(
+            "data point timestamp {millis}ms is outside the representable ClickHouse Date range"
+        ));
+    }
+    Ok(millis)
 }
 
 /// `NumberDataPoint::value`'s `AsDouble`/`AsInt` union: `AsDouble` verbatim,
@@ -1209,6 +1450,18 @@ mod tests {
         summary_data_point::ValueAtQuantile,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    /// Test shim (issue #120): every pre-A4 test asserts the default
+    /// `Classic` mode, so this local `parse` shadows the glob-imported
+    /// [`super::parse`] to keep those call sites byte-identical. The
+    /// native/dual/collision tests below call `super::parse` with an
+    /// explicit [`ExpHistogramMode`].
+    fn parse(
+        req: &ExportMetricsServiceRequest,
+        now_ns: i64,
+    ) -> Result<ParsedMetrics, LogsIngestError> {
+        super::parse(req, now_ns, ExpHistogramMode::Classic)
+    }
 
     fn kv(key: &str, value: Value) -> KeyValue {
         KeyValue {
@@ -1394,6 +1647,34 @@ mod tests {
         let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
+    }
+
+    #[test]
+    fn number_data_point_at_the_last_representable_day_is_accepted() {
+        // Day 65535 = 2149-06-06, the last day ClickHouse `Date` can
+        // represent. Last ms within it (5_662_310_399_999) at ns scale.
+        let ns: u64 = 5_662_310_399_999_000_000;
+        let req = one_metric_request(None, gauge_metric("up", number_dp(ns, 1.0, vec![])));
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 0);
+        assert_eq!(out.samples.len(), 1);
+        assert_eq!(out.samples[0].unix_milli, 5_662_310_399_999);
+    }
+
+    #[test]
+    fn number_data_point_at_the_first_unrepresentable_day_is_rejected_as_partial_success() {
+        // Day 65536 = 2149-06-07, the first day past the u16 `Date` range.
+        let ns: u64 = 5_662_310_400_000_000_000;
+        let req = one_metric_request(None, gauge_metric("up", number_dp(ns, 1.0, vec![])));
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(out.samples.is_empty());
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
     }
 
     #[test]
@@ -2260,5 +2541,327 @@ mod tests {
             msg.contains("bytes truncated"),
             "over-cap name must be visibly truncated: {msg:?}"
         );
+    }
+
+    // -- native exponential-histogram ingest (M7-A4, issue #120) -------
+
+    /// A scale-0 exp histogram (positive [1,2,1] at offset 0, count 4) as a
+    /// one-metric request.
+    fn native_exp_request() -> ExportMetricsServiceRequest {
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            count: 4,
+            sum: Some(5.0),
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        one_metric_request(None, exp_histogram_metric("request_size", dp))
+    }
+
+    #[test]
+    fn native_mode_stores_a_histogram_sample_and_no_flatten_floats() {
+        let out = super::parse(&native_exp_request(), 0, ExpHistogramMode::Native)
+            .expect("within the expansion budget");
+        assert_eq!(out.hist_samples.len(), 1, "one native histogram sample");
+        assert!(
+            out.samples.is_empty(),
+            "native mode emits no classic _bucket/_sum/_count floats"
+        );
+        let point = &out.hist_samples[0];
+        assert_eq!(&*point.metric_name, "request_size");
+        assert_eq!(point.histogram.count, 4);
+        assert_eq!(point.histogram.positive_buckets, vec![1, 1, -1]);
+        assert_eq!(point.unix_milli, 1_700_000_000_000);
+        // The series is registered (labels carrier) exactly once.
+        assert_eq!(out.series.len(), 1);
+        assert_eq!(&*out.series[0].metric_name, "request_size");
+    }
+
+    #[test]
+    fn native_mode_rejects_a_far_future_exp_histogram_point_and_writes_no_hist_sample() {
+        // Same day-65536 boundary as the number-point test, proving the
+        // gate also covers the `metric_hist_samples` path (issue #126).
+        let far_future_ns: u64 = 5_662_310_400_000_000_000;
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: far_future_ns,
+            count: 4,
+            sum: Some(5.0),
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
+        let out = super::parse(&req, 0, ExpHistogramMode::Native)
+            .expect("a rejected point is partial success, not a whole-request error");
+        assert_eq!(out.rejected, 1);
+        assert!(out.hist_samples.is_empty());
+        assert!(out.samples.is_empty());
+    }
+
+    #[test]
+    fn classic_mode_leaves_the_flatten_floats_unchanged_and_writes_no_hist_samples() {
+        let classic = super::parse(&native_exp_request(), 0, ExpHistogramMode::Classic)
+            .expect("within the expansion budget");
+        assert!(
+            classic.hist_samples.is_empty(),
+            "classic mode never populates hist_samples"
+        );
+        // The classic flatten emits _bucket/_count (+ _sum) float series.
+        assert!(
+            classic
+                .samples
+                .iter()
+                .any(|s| &*s.metric_name == "request_size_bucket")
+        );
+        assert!(
+            classic
+                .samples
+                .iter()
+                .any(|s| &*s.metric_name == "request_size_count")
+        );
+        assert!(
+            classic
+                .samples
+                .iter()
+                .any(|s| &*s.metric_name == "request_size_sum")
+        );
+    }
+
+    #[test]
+    fn dual_mode_emits_both_classic_floats_and_one_native_row() {
+        let out = super::parse(&native_exp_request(), 0, ExpHistogramMode::Dual)
+            .expect("within the expansion budget");
+        assert_eq!(
+            out.hist_samples.len(),
+            1,
+            "exactly one base-name native row"
+        );
+        assert_eq!(&*out.hist_samples[0].metric_name, "request_size");
+        // Classic suffixed float series also present (disjoint fingerprints).
+        assert!(
+            out.samples
+                .iter()
+                .any(|s| &*s.metric_name == "request_size_bucket")
+        );
+        assert!(
+            out.samples
+                .iter()
+                .any(|s| &*s.metric_name == "request_size_count")
+        );
+        // No collision dedup between them (suffixed vs base name).
+        assert_eq!(out.rejected, 0);
+    }
+
+    #[test]
+    fn native_mode_rejects_a_count_mismatch_with_absent_sum() {
+        // buckets sum to 4 but count says 99, sum absent -> rejected, no
+        // partial write.
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            count: 99,
+            sum: None,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
+        let out = super::parse(&req, 0, ExpHistogramMode::Native)
+            .expect("a rejected data point is partial success, not a whole-request error");
+        assert_eq!(out.rejected, 1);
+        assert!(out.hist_samples.is_empty(), "no partial write");
+        assert!(out.samples.is_empty());
+    }
+
+    #[test]
+    fn native_mode_rejects_an_aggregate_bucket_overflow() {
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            count: 0,
+            sum: None,
+            zero_count: 1,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![u64::MAX],
+            }),
+            ..exp_histogram_dp()
+        };
+        let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
+        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("partial success");
+        assert_eq!(out.rejected, 1);
+        assert!(out.hist_samples.is_empty());
+    }
+
+    #[test]
+    fn within_request_gauge_and_native_histogram_collision_drops_the_float() {
+        // A gauge `foo{l=x}@T` and an ExponentialHistogram `foo{l=x}@T` in one
+        // request share labels => same fingerprint, same (name, fp, ms). The
+        // histogram wins: the float is dropped, rejected == 1.
+        let attrs = vec![kv("l", Value::StringValue("x".into()))];
+        let gauge = gauge_metric(
+            "foo",
+            number_dp(1_700_000_000_000_000_000, 1.0, attrs.clone()),
+        );
+        let exp_dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            count: 4,
+            sum: Some(5.0),
+            attributes: attrs,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        let exp = exp_histogram_metric("foo", exp_dp);
+        let req = request(vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![scope_metrics(vec![gauge, exp])],
+            schema_url: String::new(),
+        }]);
+        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("within budget");
+        assert_eq!(out.hist_samples.len(), 1, "the histogram is kept");
+        assert!(
+            out.samples.is_empty(),
+            "the colliding float sample is dropped (histogram wins)"
+        );
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("native histogram present"),
+            "the drop is reported: {:?}",
+            out.rejected_message
+        );
+    }
+
+    /// The transient histogram-wins dedup key set is charged against the
+    /// expansion budget BEFORE it is materialized (issue #120 code review):
+    /// its per-native-sample cost is accounted, and — unlike the pre-fix code
+    /// — cannot admit an unbudgeted allocation. Exercised directly on the
+    /// private helper because the tipping point is unreachable through
+    /// `parse` at production budget scale (each native sample already charges
+    /// `SAMPLE_ROW_OVERHEAD`, so millions would be needed to approach it).
+    #[test]
+    fn dedup_histogram_wins_charges_its_key_set_against_the_budget() {
+        // A real HistogramPoint plus a float that collides on (name, fp, ms).
+        let parsed = super::parse(&native_exp_request(), 0, ExpHistogramMode::Native)
+            .expect("within budget");
+        let h = parsed.hist_samples[0].clone();
+        let float = MetricPoint {
+            metric_name: Arc::clone(&h.metric_name),
+            fingerprint: h.fingerprint,
+            unix_milli: h.unix_milli,
+            value: 1.0,
+        };
+
+        // (a) With headroom: the float is dropped and the key set is charged.
+        let mut out = ParsedMetrics {
+            samples: vec![float.clone()],
+            hist_samples: vec![h.clone()],
+            ..Default::default()
+        };
+        let mut bytes = 0usize;
+        super::dedup_histogram_wins(&mut out, &mut bytes).expect("headroom");
+        assert!(out.samples.is_empty(), "the colliding float is dropped");
+        assert_eq!(out.rejected, 1);
+        assert_eq!(
+            bytes, HIST_DEDUP_KEY_BYTES,
+            "one native sample charges exactly one dedup key slot"
+        );
+
+        // (b) At the budget ceiling: the dedup key charge itself trips it,
+        // proving the native dedup allocation is now accounted.
+        let mut out = ParsedMetrics {
+            samples: vec![float],
+            hist_samples: vec![h],
+            ..Default::default()
+        };
+        let mut bytes = MAX_EXPANDED_BYTES;
+        let err = super::dedup_histogram_wins(&mut out, &mut bytes)
+            .expect_err("the dedup key charge must trip a full budget");
+        assert!(
+            matches!(err, LogsIngestError::OversizeMessage { limit, .. } if limit == MAX_EXPANDED_BYTES),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn native_mode_stale_flag_stores_a_stale_marker() {
+        let dp = ExponentialHistogramDataPoint {
+            time_unix_nano: 1_700_000_000_000_000_000,
+            count: 4,
+            sum: Some(5.0),
+            flags: DataPointFlags::NoRecordedValueMask as u32,
+            positive: Some(Buckets {
+                offset: 0,
+                bucket_counts: vec![1, 2, 1],
+            }),
+            ..exp_histogram_dp()
+        };
+        let req = one_metric_request(None, exp_histogram_metric("request_size", dp));
+        let out = super::parse(&req, 0, ExpHistogramMode::Native).expect("within budget");
+        assert_eq!(out.hist_samples.len(), 1);
+        let h = &out.hist_samples[0].histogram;
+        assert_eq!(h.count, 0, "stale marker carries no observations");
+        assert_eq!(h.sum.to_bits(), STALE_NAN_BITS);
+        assert!(h.positive_spans.is_empty());
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// The inner `Value` of an `AnyValue` tree `levels` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). The `kv` helper
+    /// wraps it back into the depth-1 root `AnyValue`, so the resulting
+    /// attribute value tree is exactly `levels` `AnyValue` nodes deep. Built
+    /// iteratively; used only at `levels <= MAX_ANYVALUE_DEPTH + 1`, so its
+    /// `Drop` recursion is trivially safe.
+    fn deep_value(levels: usize) -> Value {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value.value.expect("nested value is present")
+    }
+
+    fn gauge_with_deep_attr(levels: usize) -> ExportMetricsServiceRequest {
+        let dp = number_dp(
+            1_700_000_000_000_000_000,
+            1.0,
+            vec![kv("deep", deep_value(levels))],
+        );
+        one_metric_request(None, gauge_metric("g", dp))
+    }
+
+    #[test]
+    fn parse_accepts_data_point_attribute_nesting_at_the_depth_cap() {
+        let req = gauge_with_deep_attr(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH);
+        let out = parse(&req, 0).expect("at-cap data-point attribute is within the depth guard");
+        assert_eq!(out.samples.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_data_point_attribute_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders and yields one sample);
+        // the guard makes it a whole-request reject before any sample is
+        // materialized, proving the reject is non-vacuous.
+        let req = gauge_with_deep_attr(crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1);
+        let err =
+            parse(&req, 0).expect_err("over-depth data-point attribute is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }

@@ -133,9 +133,23 @@ fn read_error_parts(e: &ReadError) -> (StatusCode, &'static str, String, Option<
         // exhaustiveness like `ReadError::Promql` below — mapped as a
         // too-broad-class client rejection, mirroring
         // `prom_api::error::read_error_parts`'s own 422 for it.
-        ReadError::QueryTooBroad(_) | ReadError::NamelessSelectorUnresolvable { .. } => (
+        // M7-A5a: `HistogramResultUnsupported` is a metrics-only variant
+        // (the LogQL engine never produces it), matched here for
+        // exhaustiveness — mapped like the other 422 declines, mirroring
+        // `prom_api::error::read_error_parts`.
+        ReadError::QueryTooBroad(_)
+        | ReadError::NamelessSelectorUnresolvable { .. }
+        | ReadError::HistogramResultUnsupported => (
             StatusCode::UNPROCESSABLE_ENTITY,
             "query_too_broad",
+            e.to_string(),
+            None,
+        ),
+        // M7-A5a: a histogram-decode failure is a metrics-only data-
+        // integrity defect (unreachable from LogQL), 500 `internal`.
+        ReadError::HistogramDecode(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
             e.to_string(),
             None,
         ),
@@ -265,6 +279,20 @@ mod tests {
         let err = ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::StreamCap {
             count: 1,
             cap: 1,
+        });
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+    }
+
+    /// Issue #35: the query-text guard's reason rides the existing
+    /// `QueryTooBroad(_)` wildcard arm — no mapper change was needed, and
+    /// this test proves it.
+    #[tokio::test]
+    async fn read_error_query_text_bytes_maps_to_422_query_too_broad() {
+        let err = ReadError::QueryTooBroad(pulsus_read::logql::TooBroadReason::QueryTextBytes {
+            rendered_bytes: 9_000_000,
+            cap: 8_388_608,
         });
         let (status, json) = envelope(ApiError::Read(err)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

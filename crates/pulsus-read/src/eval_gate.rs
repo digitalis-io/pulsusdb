@@ -55,7 +55,12 @@ pub struct EvalGate {
     /// path). Never touched on the fast path.
     contended_total: AtomicU64,
     /// Cumulative nanoseconds spent in *completed* contended waits. A wait
-    /// abandoned by cancellation contributes nothing (intended).
+    /// abandoned by cancellation contributes nothing (intended). Two
+    /// independent saturation mechanisms protect the exported value: each
+    /// individual wait is clamped to `u64::MAX` at the cast in `acquire()`
+    /// before accumulation, and the accumulation itself (`add_wait_nanos`)
+    /// saturates at `u64::MAX` rather than wrapping, so the exported
+    /// monotonic counter can never regress.
     wait_nanos_total: AtomicU64,
 }
 
@@ -118,12 +123,21 @@ impl EvalGate {
             .acquire_owned()
             .await
             .expect("eval-gate semaphore is never closed");
-        self.wait_nanos_total.fetch_add(
-            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        self.add_wait_nanos(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         drop(guard);
         permit
+    }
+
+    /// Accumulates a completed contended wait into `wait_nanos_total`,
+    /// saturating at `u64::MAX` (never wraps — the exported counter stays
+    /// monotonic). Single call site: `acquire()`'s contended slow path.
+    #[inline]
+    fn add_wait_nanos(&self, nanos: u64) {
+        let _ = self
+            .wait_nanos_total
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_add(nanos))
+            }); // closure always returns Some => Err is unreachable
     }
 
     /// The single read-path choke point: acquire a permit, then run `f` on
@@ -183,6 +197,26 @@ mod tests {
     /// max observed in-flight is read via `fetch_max` (no race) and, once
     /// all closures have run, equals `N` exactly — the bound is tight, not
     /// accidentally unreached. No wall-time assert.
+    ///
+    /// Issue #101 (re-review hardening): `entered.acquire_many(N)` alone
+    /// only proves the first `N` closures entered — nothing forces the `k`
+    /// excess closures to have been *polled* yet, so under the exact
+    /// regression this test exists to catch (permit dropped before the
+    /// closure runs), the over-admission assert below could pass vacuously
+    /// if the scheduler simply hadn't run the excess closures yet. A second
+    /// rendezvous closes that window: loop until `gate.snapshot().waiting
+    /// == K` (every excess acquirer has provably reached the contended slow
+    /// path and registered), asserting `entered.available_permits() == 0`
+    /// on every iteration (an over-admission tripwire that fires the moment
+    /// a broken gate lets an excess closure in). Termination is
+    /// deterministic under any scheduler: a correct gate makes every excess
+    /// task eventually reach `acquire()`'s slow path; a broken gate makes it
+    /// eventually enter and trip the in-loop assert instead. No sleeps, no
+    /// wall-time bound. The `contended_total == K` identity is then
+    /// provable because no permit is released (via `release`/`admitted`)
+    /// before this rendezvous completes — every earlier acquirer holder is
+    /// still parked, so exactly `N` fast-path successes and `K` slow-path
+    /// acquisitions have occurred.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_caps_concurrency_at_the_configured_limit() {
         const N: usize = 2;
@@ -231,6 +265,26 @@ mod tests {
             "in-flight evals must never exceed the configured limit"
         );
         assert_eq!(gate.snapshot().available, 0, "the gate is fully occupied");
+
+        // Second rendezvous: force every excess acquirer to be provably
+        // queued at the gate before trusting the over-admission tripwire.
+        loop {
+            assert_eq!(
+                entered.available_permits(),
+                0,
+                "over-admission: more than N closures entered while the gate is full"
+            );
+            if gate.snapshot().waiting == K as u64 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gate.snapshot().available, 0, "the gate is fully occupied");
+        assert_eq!(
+            gate.snapshot().contended_total,
+            K as u64,
+            "exactly the K excess acquisitions take the contended slow path"
+        );
 
         // Release everyone and let all N+k run to completion.
         drop(admitted);
@@ -397,5 +451,63 @@ mod tests {
         second.await.unwrap();
         assert_eq!(gate.snapshot().available, 1);
         assert_eq!(gate.snapshot().contended_total, 1);
+    }
+
+    /// Issue #101 (plan v2 — saturating wait accumulator). Two legs, both
+    /// clock-free / deterministic:
+    ///
+    /// 1. **Unit leg:** seed `wait_nanos_total` directly at `u64::MAX - 1`
+    ///    (private-field access, no clock), then `add_wait_nanos(2)` must
+    ///    saturate at `u64::MAX` rather than wrap; a further
+    ///    `add_wait_nanos(5)` must leave it pinned at `u64::MAX`. The old
+    ///    `fetch_add` code wraps the first call to `0` — deterministic
+    ///    discrimination, no scheduler/clock dependence.
+    /// 2. **Integration leg:** same seed, but the accumulation is driven by
+    ///    one real contended wait through `acquire()` (hold the sole permit
+    ///    of `EvalGate::new(1)`, spawn a waiter, rendezvous on
+    ///    `waiting == 1`, release, join). The exported counter must never
+    ///    regress below the seed — a wrap would land it near 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_accumulator_saturates_at_u64_max_instead_of_wrapping() {
+        // --- Unit leg: direct, clock-free accumulator exercise.
+        let gate = EvalGate::new(1);
+        gate.wait_nanos_total.store(u64::MAX - 1, Ordering::Relaxed);
+        gate.add_wait_nanos(2);
+        assert_eq!(
+            gate.snapshot().wait_nanos_total,
+            u64::MAX,
+            "cumulative accumulation must saturate at u64::MAX, not wrap"
+        );
+        gate.add_wait_nanos(5);
+        assert_eq!(
+            gate.snapshot().wait_nanos_total,
+            u64::MAX,
+            "the saturated value must stay pinned at u64::MAX, never move"
+        );
+
+        // --- Integration leg: one real contended wait through acquire().
+        let gate = Arc::new(EvalGate::new(1));
+        gate.wait_nanos_total.store(u64::MAX - 1, Ordering::Relaxed);
+        let held = gate.acquire().await;
+
+        let g = Arc::clone(&gate);
+        let waiter = tokio::spawn(async move {
+            let _p = g.acquire().await;
+        });
+
+        loop {
+            if gate.snapshot().waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        drop(held);
+        waiter.await.unwrap();
+
+        assert!(
+            gate.snapshot().wait_nanos_total >= u64::MAX - 1,
+            "the counter must never regress below the seed through the real accumulation path"
+        );
     }
 }

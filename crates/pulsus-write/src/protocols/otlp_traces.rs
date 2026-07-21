@@ -158,6 +158,12 @@ fn attr_budget_charge(kv: &KeyValue) -> usize {
 /// decode boundary: a malformed/truncated protobuf is a whole-request,
 /// atomic failure (mirrors `otlp_logs::decode`) — never partially applied.
 pub fn decode(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError> {
+    // Wire pre-scan (issue #115, track 5): reject an over-cap / over-deep
+    // request by walking the raw protobuf bytes BEFORE `decode` materializes
+    // the amplified structure. `Ok` for an in-bounds or malformed body — a
+    // malformed body is deferred to `decode` below for identical
+    // classification.
+    crate::protocols::otlp_prescan::prescan_traces(body)?;
     Ok(ExportTraceServiceRequest::decode(body)?)
 }
 
@@ -167,7 +173,11 @@ pub fn decode(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError>
 /// expansion budget, enforced in `parse`, applies to JSON unchanged). A
 /// malformed body maps to 400/code 3 via [`LogsIngestError::DecodeJson`].
 pub fn decode_json(body: &[u8]) -> Result<ExportTraceServiceRequest, LogsIngestError> {
-    Ok(serde_json::from_slice(body)?)
+    // Issue #115 track 6a: bounded proto3-JSON building wrappers replace the
+    // vendored derive's UNBOUNDED repeated-field decode, rejecting a DoS-shaped
+    // body DURING deserialization at the SAME per-level / aggregate / depth
+    // thresholds the protobuf wire pre-scan (`otlp_prescan`) enforces.
+    crate::protocols::otlp_json::decode_traces(body)
 }
 
 /// Parses a decoded `ExportTraceServiceRequest` into normalized rows.
@@ -187,6 +197,12 @@ pub fn parse(
     req: &ExportTraceServiceRequest,
     now_ns: i64,
 ) -> Result<ParsedTraces, LogsIngestError> {
+    // Whole-request `AnyValue` recursion-depth guard (finding #54): reject a
+    // maliciously deep attribute tree before any value is rendered or a row
+    // materialized, so the recursive `any_value_to_string` render below can
+    // never overflow the stack.
+    crate::protocols::otlp_depth::ensure_trace_anyvalue_depth(req)?;
+
     let mut out = ParsedTraces::default();
     let mut expanded_bytes: usize = 0;
 
@@ -356,7 +372,26 @@ fn parse_span(
         ),
     )?;
 
-    let date = Date::start_of_day_utc(timestamp_ns).days_since_epoch();
+    let date = match Date::start_of_day_utc(timestamp_ns) {
+        Some(date) => date.days_since_epoch(),
+        None => {
+            // The timestamp is representable as `i64` ns but its day falls
+            // outside the ClickHouse `Date` range (before 1970-01-01 or
+            // after 2149-06-06). Saturating `trace_attrs_idx.date` would
+            // orphan the span into the wrong daily partition, so the span is
+            // rejected wholesale into partial success.
+            reject_span(
+                out,
+                format!(
+                    "span {:?}: start_time_unix_nano {} is outside the representable \
+                     ClickHouse Date range",
+                    diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
+                    span.start_time_unix_nano
+                ),
+            );
+            return Ok(());
+        }
+    };
     for (scope, attrs) in [
         (SCOPE_RESOURCE, resource_attrs),
         (SCOPE_SPAN, &span.attributes),
@@ -865,6 +900,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_a_far_future_span_instead_of_orphaning_it_into_the_max_date_partition() {
+        // Representable as i64 ns but ~year 2200 — past the 2149-06-06
+        // ClickHouse `Date` cutoff. Before #8's fix `trace_attrs_idx.date`
+        // saturated to day 65535, silently orphaning the span; now it is a
+        // clean per-span rejection (partial success), with no span/attr rows.
+        let far_future_ns: u64 = 86_400_000_000_000 * 84_000;
+        let mut bad = valid_span();
+        bad.start_time_unix_nano = far_future_ns;
+        bad.end_time_unix_nano = far_future_ns;
+        bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
+        let good = valid_span();
+        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+            .expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+        assert_eq!(out.spans.len(), 1);
+        // No attr row registered at the max-`Date` boundary.
+        assert!(out.attrs.iter().all(|a| a.date != u16::MAX));
+    }
+
+    #[test]
     fn parse_zero_or_inverted_end_time_yields_zero_duration() {
         let mut unset_end = valid_span();
         unset_end.end_time_unix_nano = 0;
@@ -1353,5 +1414,63 @@ mod tests {
             payload_b.resource_spans[0].scope_spans[0].spans,
             vec![second]
         );
+    }
+
+    // -- AnyValue recursion-depth guard (finding #54) --------------------
+
+    /// The inner `Value` of an `AnyValue` tree `levels` nodes deep (a scalar
+    /// leaf wrapped in `levels - 1` `ArrayValue` containers). The `kv` helper
+    /// wraps it back into the depth-1 root `AnyValue`, so the resulting
+    /// attribute value tree is exactly `levels` `AnyValue` nodes deep. Built
+    /// iteratively; used only at `levels <= MAX_ANYVALUE_DEPTH + 1`, so its
+    /// `Drop` recursion is trivially safe.
+    fn deep_value(levels: usize) -> Value {
+        let mut value = AnyValue {
+            value: Some(Value::StringValue("leaf".to_string())),
+        };
+        for _ in 1..levels {
+            value = AnyValue {
+                value: Some(Value::ArrayValue(ArrayValue {
+                    values: vec![value],
+                })),
+            };
+        }
+        value.value.expect("nested value is present")
+    }
+
+    fn span_with_deep_attr(levels: usize) -> Span {
+        let mut span = valid_span();
+        span.attributes = vec![kv("deep", deep_value(levels))];
+        span
+    }
+
+    #[test]
+    fn parse_accepts_span_attribute_nesting_at_the_depth_cap() {
+        let req = request_with(
+            None,
+            None,
+            vec![span_with_deep_attr(
+                crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH,
+            )],
+        );
+        let out = parse(&req, 0).expect("at-cap span attribute is within the depth guard");
+        assert_eq!(out.spans.len(), 1);
+    }
+
+    #[test]
+    fn parse_rejects_span_attribute_nesting_past_the_depth_cap() {
+        // One container level deeper than the accepted case above — WITHOUT
+        // the guard this parses identically (renders and yields one span);
+        // the guard makes it a whole-request reject before any row is
+        // materialized, proving the reject is non-vacuous.
+        let req = request_with(
+            None,
+            None,
+            vec![span_with_deep_attr(
+                crate::protocols::otlp_depth::MAX_ANYVALUE_DEPTH + 1,
+            )],
+        );
+        let err = parse(&req, 0).expect_err("over-depth span attribute is rejected whole-request");
+        assert!(matches!(err, LogsIngestError::OversizeMessage { .. }));
     }
 }
