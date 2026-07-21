@@ -64,7 +64,9 @@ pub mod sample_sql;
 pub mod sql;
 pub mod stats;
 
-pub use exec::{MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus};
+pub use exec::{
+    FetchProbe, MetricMeta, MetricQueryParams, MetricsConfig, MetricsEngine, TsdbStatus,
+};
 pub use labels::{
     CacheSnapshot, DEFAULT_STALENESS_MULTIPLIER, FallbackReason, LabelCache, LabelCacheConfig,
     LabelledResolution, MetricSeriesGroup, MultiMetricResolution, MultiMetricScanProbe, Resolution,

@@ -224,6 +224,94 @@ impl MetricQueryParams {
     }
 }
 
+/// TEST SEAM (issue #135) — never installed by `pulsus-server`. Parks
+/// every selector fetch (`MetricsEngine::execute_fetch_plan`) at entry
+/// until [`FetchProbe::release`], exposing a concurrency high-water mark
+/// (`max_in_flight`) that proves — deterministically, independent of
+/// scheduler, thread count, or ClickHouse round-trip latency — that
+/// `query_inner`'s `join_all` fan-out dispatches every selector's fetch
+/// concurrently rather than one at a time. When unset (the only
+/// production configuration) the sole cost is one `Option` branch per
+/// selector FETCH, not per row: zero atomics, zero clock.
+///
+/// [`SelectorFetchPlan::Empty`] also parks here — harmless for the
+/// concurrency test (both metrics it seeds resolve to real fetch plans),
+/// but a future probe user with an empty selector should expect it too.
+#[derive(Debug)]
+pub struct FetchProbe {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_in_flight: std::sync::atomic::AtomicUsize,
+    // Retained via `send_replace`; `enter()`'s `wait_for` is a
+    // borrow-then-changed check, so there is no lost-wakeup window and a
+    // release landing before any `enter()` call (or after every parked
+    // entry has already dropped) still unparks every later entry — see
+    // issue #135's plan v2 review round.
+    release: tokio::sync::watch::Sender<bool>,
+}
+
+impl FetchProbe {
+    pub fn new() -> std::sync::Arc<Self> {
+        let (release, _rx) = tokio::sync::watch::channel(false);
+        std::sync::Arc::new(Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            max_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            release,
+        })
+    }
+
+    /// Increments `in_flight`, records the new high-water mark, then parks
+    /// until [`FetchProbe::release`] — returning a guard whose `Drop`
+    /// decrements `in_flight`, keeping it a true gauge.
+    pub(crate) async fn enter(&self) -> ProbeGuard<'_> {
+        let n = self
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_in_flight
+            .fetch_max(n, std::sync::atomic::Ordering::SeqCst);
+        let mut rx = self.release.subscribe();
+        // `wait_for` checks the CURRENT retained value first: a late
+        // `enter()` (subscribing after `release()` already ran) observes
+        // `true` immediately and never awaits. `Err` only if the `Sender`
+        // dropped, which cannot happen — `self` (the `FetchProbe`) owns it
+        // for as long as any `enter()` call can run.
+        rx.wait_for(|released| *released)
+            .await
+            .expect("FetchProbe owns the watch Sender");
+        ProbeGuard(self)
+    }
+
+    /// Releases every parked (and every future) `enter()` call.
+    /// `send_replace` stores the value unconditionally — retained even
+    /// with zero receivers — and is idempotent, unlike plain `send` (which
+    /// errors and drops the value when no receiver exists, which would
+    /// strand late entries parked forever).
+    pub fn release(&self) {
+        self.release.send_replace(true);
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// RAII guard returned by [`FetchProbe::enter`]; decrements `in_flight` on
+/// drop.
+#[derive(Debug)]
+pub struct ProbeGuard<'a>(&'a FetchProbe);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct MetricsEngine {
     client: ChClient,
     resolver: std::sync::Arc<super::labels::LabelCache>,
@@ -236,6 +324,12 @@ pub struct MetricsEngine {
     /// reset every request — the engine is rebuilt per query — and bound
     /// nothing).
     eval_gate: std::sync::Arc<crate::eval_gate::EvalGate>,
+    /// Issue #135: an optional test-only rendezvous installed via
+    /// [`MetricsEngine::with_fetch_probe`]. `None` in production and in
+    /// every call site that doesn't opt in, so the only cost when unset is
+    /// one `Option` branch per selector fetch in `execute_fetch_plan` —
+    /// zero atomics, zero clock.
+    fetch_probe: Option<std::sync::Arc<FetchProbe>>,
 }
 
 impl MetricsEngine {
@@ -251,6 +345,7 @@ impl MetricsEngine {
             eval_gate: std::sync::Arc::new(crate::eval_gate::EvalGate::new(
                 crate::eval_gate::DEFAULT_EVAL_CONCURRENCY,
             )),
+            fetch_probe: None,
         }
     }
 
@@ -262,6 +357,15 @@ impl MetricsEngine {
     /// query).
     pub fn with_eval_gate(mut self, gate: std::sync::Arc<crate::eval_gate::EvalGate>) -> Self {
         self.eval_gate = gate;
+        self
+    }
+
+    /// TEST SEAM (issue #135) — installs a [`FetchProbe`] that parks every
+    /// selector fetch at entry until released. Never called by
+    /// `pulsus-server`; production `MetricsEngine`s always run with
+    /// `fetch_probe: None`.
+    pub fn with_fetch_probe(mut self, probe: std::sync::Arc<FetchProbe>) -> Self {
+        self.fetch_probe = Some(probe);
         self
     }
 
@@ -715,6 +819,15 @@ impl MetricsEngine {
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
     ) -> Result<Vec<FetchedSeries>, ReadError> {
+        // Issue #135 TEST SEAM: when a probe is installed, park here until
+        // released — proving (via `FetchProbe::max_in_flight`) that
+        // `query_inner`'s `join_all` (:524-529) truly dispatches every
+        // selector's fetch concurrently rather than sequentially. `None`
+        // in production: a single `Option` branch, no atomics, no clock.
+        let _probe_guard = match &self.fetch_probe {
+            Some(p) => Some(p.enter().await),
+            None => None,
+        };
         match fetch_plan {
             SelectorFetchPlan::Empty => Ok(Vec::new()),
             SelectorFetchPlan::Chunks {

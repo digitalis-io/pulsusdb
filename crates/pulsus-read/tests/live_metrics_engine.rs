@@ -32,8 +32,9 @@ use pulsus_model::DEFAULT_ACTIVITY_BUCKET_MS;
 use pulsus_promql::DEFAULT_LOOKBACK_MS;
 use pulsus_promql::parser::parse;
 use pulsus_read::{
-    DataWindow, DiscoveryFilter, ExplainStage, LabelCache, LabelCacheConfig, LabelMatcher, MatchOp,
-    MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain, QueryResult,
+    DataWindow, DiscoveryFilter, ExplainStage, FetchProbe, LabelCache, LabelCacheConfig,
+    LabelMatcher, MatchOp, MetricQueryParams, MetricsConfig, MetricsEngine, PlanExplain,
+    QueryResult,
 };
 use pulsus_schema::{RenderCtx, run_init};
 
@@ -888,28 +889,27 @@ async fn count_by_service_routes_sample_fetch_for_both_instant_and_range() {
 }
 
 /// Ratified concurrency contract (issue #31 plan amendment §2): every
-/// selector's fetch is issued before any of them completes. Proven by an
-/// A/B timing comparison that cancels out everything *except* fetch
-/// concurrency: (A) two **separate** `engine.query()` calls, one per
-/// metric — true sequential fetching, same total I/O and CPU work as (B);
-/// (B) **one** `sum(foo) + sum(bar)` query, whose two selectors fetch
-/// concurrently via `join_all`. Comparing "one query with N selectors" to
-/// "a single selector" directly (an earlier version of this test) confounds
-/// the comparison with the binop's own extra planning/evaluation CPU cost;
-/// comparing (A) to (B) instead holds that cost equal on both sides — (B)
-/// does the *same* evaluation work, just with concurrent I/O — so the
-/// measured gap isolates fetch concurrency specifically. A throwaway
-/// warm-up query runs first so neither timed measurement pays for first-
-/// connection setup. Timing-based and therefore has an inherent (bounded)
-/// flakiness risk shared by every timing assertion in this class of test;
-/// the 0.75x threshold leaves generous headroom over the ~0.5-0.6x a truly
-/// concurrent implementation achieves here (two fetches of equal cost,
-/// overlapped, take roughly one fetch's worth of wall-clock time).
+/// selector's fetch is issued before any of them completes. Issue #135
+/// replaced the original wall-clock A/B timing comparison (flaky on
+/// shared/virtualized hosts) with a deterministic mechanism assertion: a
+/// [`FetchProbe`] installed via [`MetricsEngine::with_fetch_probe`] parks
+/// every selector fetch at entry until released, so a `sum(foo) +
+/// sum(bar)` query's two selector fetches can only both be observed
+/// in-flight (`FetchProbe::in_flight() == 2`) if `query_inner`'s
+/// `join_all` (`metrics/exec.rs:524-529`) truly dispatched them
+/// concurrently — under a regression to a sequential per-selector loop,
+/// the second selector's fetch is never even constructed until the first
+/// completes, so `in_flight` can never reach 2 and the rendezvous below
+/// times out. This is a causal proof, not a timing inference: it holds
+/// under any scheduler, thread count, or ClickHouse round-trip latency.
+/// **Do not reintroduce a wall-clock pass/fail bound here** — the TRIALS
+/// loop below is kept strictly as informational `eprintln` logging (it
+/// remains useful context when investigating a real perf regression) and
+/// must never grow an `assert!` again.
 // Multi-threaded runtime (unlike every other test in this file): the
-// concurrent phase's two fetches must be able to overlap CPU-bound row
-// decode work across real OS threads, not just I/O wait on a single
-// thread — a current-thread runtime under-states the achievable overlap
-// for this specific timing comparison.
+// informational timing phase's two fetches must be able to overlap
+// CPU-bound row decode work across real OS threads, not just I/O wait on
+// a single thread, to produce a representative logged comparison.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binary_expression_fetches_both_sides_concurrently() {
     skip_unless_live!();
@@ -928,6 +928,9 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     let engine_client = ChClient::new(test_config(db))
         .await
         .expect("connect (engine client)");
+    let probe_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (probe client)");
 
     let now = now_ms();
     let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
@@ -970,7 +973,11 @@ async fn binary_expression_fetches_both_sides_concurrently() {
     ));
     cache.refresh().await.expect("refresh");
 
-    let engine = MetricsEngine::new(engine_client, cache, engine_config(db));
+    // `Arc::clone` (not a deep copy): the cache's resident snapshot is
+    // shared read-only state, and both engines below need their own
+    // `MetricsEngine` (each owns a distinct `ChClient`) over the same
+    // resolved series.
+    let engine = MetricsEngine::new(engine_client, Arc::clone(&cache), engine_config(db));
     let params = MetricQueryParams {
         start_ms: recent_bucket,
         end_ms: recent_bucket,
@@ -1026,26 +1033,52 @@ async fn binary_expression_fetches_both_sides_concurrently() {
 
     eprintln!(
         "sequential (2 queries) median: {seq_median:?} {seq_trials:?}, concurrent (1 binop \
-         query) median: {concurrent_median:?} {concurrent_trials:?}"
+         query) median: {concurrent_median:?} {concurrent_trials:?} (informational only — \
+         issue #135; no pass/fail bound on this measurement)"
     );
-    // Deliberately a loose (non-strict) bound, not a specific speedup
-    // ratio: repeated local measurements against a small single-node
-    // ClickHouse showed a real but noisy 0.77-0.9x concurrent/sequential
-    // ratio — constant per-request overhead dominates over data-scan time
-    // at this scale, on a shared/virtualized CI host the margin can shrink
-    // further still. The claim this assertion makes is narrower but far
-    // more robust: the concurrent (`join_all`-based) path's median is not
-    // *slower* than the sequential path's — which would only fail for a
-    // genuine regression to sequential (`for sel in selectors { fetch(sel)
-    // .await }`) fetching, where the two medians converge to
-    // approximately equal (or the "concurrent" path is a hair slower, from
-    // its extra `join_all` bookkeeping over a plain loop).
+
+    // Issue #135 mechanism assertion: a fresh `MetricsEngine` (its own
+    // `ChClient`, sharing the already-warm `cache`) is built with a
+    // `FetchProbe` installed. Every selector fetch this engine issues
+    // parks at entry until `probe.release()`. Driving the binop query and
+    // the rendezvous observer concurrently via `tokio::join!` means the
+    // observer's poll loop and the query's two selector fetches interleave
+    // on the same runtime: if `join_all` truly dispatches both selectors'
+    // fetches before either completes, both park simultaneously and
+    // `in_flight` reaches 2; under a regression to sequential per-selector
+    // fetching, the second fetch is never even constructed until the
+    // first completes (which cannot happen before release), so
+    // `in_flight` can never exceed 1 and the 30s bound below — a liveness
+    // bound, not a performance comparison — fires deterministically.
+    let probe = FetchProbe::new();
+    let probe_engine = MetricsEngine::new(probe_client, Arc::clone(&cache), engine_config(db))
+        .with_fetch_probe(Arc::clone(&probe));
+
+    let (query_res, rendezvous) = tokio::join!(probe_engine.query(&both_expr, &params), async {
+        let seen = tokio::time::timeout(Duration::from_secs(30), async {
+            while probe.in_flight() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        // ALWAYS release, even on a rendezvous timeout, so a mutated
+        // (sequential-fetch) engine's query still completes and fails at
+        // the assertion below instead of hanging forever on a parked
+        // fetch.
+        probe.release();
+        seen
+    });
+    query_res.expect("binop query under probe");
     assert!(
-        concurrent_median <= seq_median,
-        "expected the concurrent binop query's median time to be no slower than the two \
-         sequential queries' median combined time; sequential_median={seq_median:?} \
-         concurrent_median={concurrent_median:?} (a regression to sequential per-selector \
-         fetching would make these converge or invert)"
+        rendezvous.is_ok(),
+        "both selector fetches were never observed in flight simultaneously within 30s — \
+         regression to sequential per-selector fetching"
+    );
+    assert!(
+        probe.max_in_flight() >= 2,
+        "expected both selector fetches to be in flight at once (max_in_flight={}), proving \
+         `query_inner`'s `join_all` dispatches every selector's fetch concurrently",
+        probe.max_in_flight()
     );
 
     drop_database(&bootstrap, db).await;
