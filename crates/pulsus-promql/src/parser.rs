@@ -85,6 +85,53 @@ mod tests {
         }
     }
 
+    /// Issue #132: the CI-visible twin of the vendored
+    /// `test_issue_132_info_direct_selector_parity` suite (vendored
+    /// PATCHES.md #7 — the vendored crate is its own cargo workspace and
+    /// does not ride `cargo test --workspace`). `info()`'s second
+    /// argument, when vector-typed, must be a DIRECT name-less
+    /// `VectorSelector` (Prometheus v3.13.0 `parse.go:846-859`): a named
+    /// selector rejects `expected label selectors only, got vector
+    /// selector instead`; wrapper/other vector-typed nodes reject
+    /// `expected label selectors only`; in-place `@`/`offset` selector
+    /// fields stay accepted; a non-vector arg keeps its type error
+    /// first; `info(m, ({}))` keeps #82's empty-matcher message.
+    #[test]
+    fn info_second_argument_must_be_a_direct_nameless_selector() {
+        for q in [
+            r#"info(m, {job="x"})"#,
+            r#"info(m, {job="x"} offset 5m)"#,
+            r#"info(m, {job="x"} @ 5)"#,
+            "info(m)",
+            r#"(({job="x"}))"#,
+        ] {
+            assert!(parse(q).is_ok(), "{q}: {:?}", parse(q));
+        }
+
+        for (q, msg) in [
+            (r#"info(m, ({job="x"}))"#, "expected label selectors only"),
+            (r#"info(m, (({job="x"})))"#, "expected label selectors only"),
+            ("info(m, sum(x))", "expected label selectors only"),
+            ("info(m, m2 + m3)", "expected label selectors only"),
+            ("info(m, rate(x[5m]))", "expected label selectors only"),
+            (
+                r#"info(m, target_info{job="x"})"#,
+                "expected label selectors only, got vector selector instead",
+            ),
+            (
+                "info(m, 1)",
+                "expected type vector in call to function 'info', got scalar",
+            ),
+            (
+                "info(m, ({}))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+        ] {
+            let err = parse(q).unwrap_err();
+            assert_eq!(err.to_string(), msg, "{q}");
+        }
+    }
+
     /// Issue #82 v5 (retroactive re-review finding 1): a range-wrapped
     /// empty selector rejects without ever reaching the deferred
     /// post-parse walk, even nested behind ordinary function calls —

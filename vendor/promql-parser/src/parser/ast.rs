@@ -1864,6 +1864,27 @@ fn check_ast_for_call(ex: Call) -> Result<Expr, String> {
         }
     }
 
+    // PATCHES.md #7 (issue #132): upstream-parity direct-selector check on
+    // info()'s second argument (v3.13.0 parse.go:846-859). Only applies
+    // when arg 1 is vector-typed: a non-vector arg falls through to
+    // check_args_match_types so the type error stays the first error,
+    // matching upstream's emission order (parse.go:848 runs first).
+    if name == "info" {
+        if let Some(arg) = ex.args.args.get(1) {
+            if arg.value_type() == ValueType::Vector {
+                match arg.as_ref() {
+                    Expr::VectorSelector(vs) if vs.name.is_some() => {
+                        return Err(
+                            "expected label selectors only, got vector selector instead".into()
+                        );
+                    }
+                    Expr::VectorSelector(_) => {}
+                    _ => return Err("expected label selectors only".into()),
+                }
+            }
+        }
+    }
+
     // PATCHES.md #6 (issue #82 v5): the eager empty-matcher operand
     // guard on every call argument, EXCEPT `info()`'s second argument
     // (index 1 — 0-indexed, matching the deferred bypass's own

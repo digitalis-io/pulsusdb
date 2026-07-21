@@ -2719,6 +2719,63 @@ mod tests {
         assert_cases(Case::new_fail_cases(fail_cases));
     }
 
+    /// Issue #132: upstream-parity direct-selector check on `info()`'s
+    /// second argument (PATCHES.md #7, pinned Prometheus v3.13.0
+    /// `parse.go:846-859` @ `40af9c2`). When arg 1 is vector-typed it
+    /// must be a DIRECT name-less `VectorSelector`: a named selector
+    /// rejects with `expected label selectors only, got vector selector
+    /// instead`; any wrapper/other vector-typed node (`Paren`, `Call`,
+    /// `Binary`, ...) rejects with `expected label selectors only`.
+    /// In-place `@`/`offset` are selector FIELDS, not wrapper nodes, so
+    /// they stay accepted. A non-vector arg 1 keeps its type error as
+    /// the FIRST error (the check gates on `value_type() == Vector`,
+    /// matching upstream's emission order), and `info(m, ({}))` keeps
+    /// #82's eager empty-matcher rejection (the `Expr::Paren` guard
+    /// fires bottom-up before the enclosing call is known — settled in
+    /// PATCHES.md #6, not to be "fixed" here).
+    #[test]
+    fn test_issue_132_info_direct_selector_parity() {
+        for input in [
+            r#"info(m, {job="x"})"#,
+            r#"info(m, {job="x"} offset 5m)"#,
+            r#"info(m, {job="x"} @ 5)"#,
+            "info(m)",
+            r#"(({job="x"}))"#,
+        ] {
+            assert!(
+                crate::parser::parse(input).is_ok(),
+                "expected {input:?} to parse, got {:?}",
+                crate::parser::parse(input)
+            );
+        }
+
+        let fail_cases = vec![
+            // wrapper nodes (Paren/Call/Binary) around a vector-typed arg 1.
+            (r#"info(m, ({job="x"}))"#, "expected label selectors only"),
+            (r#"info(m, (({job="x"})))"#, "expected label selectors only"),
+            ("info(m, sum(x))", "expected label selectors only"),
+            ("info(m, m2 + m3)", "expected label selectors only"),
+            ("info(m, rate(x[5m]))", "expected label selectors only"),
+            // a NAMED direct selector.
+            (
+                r#"info(m, target_info{job="x"})"#,
+                "expected label selectors only, got vector selector instead",
+            ),
+            // non-vector arg 1: the type error stays FIRST.
+            (
+                "info(m, 1)",
+                "expected type vector in call to function 'info', got scalar",
+            ),
+            // the #82 interaction: paren-wrapped EMPTY selector still hits
+            // the eager empty-matcher guard first (PATCHES.md #6).
+            (
+                "info(m, ({}))",
+                "vector selector must contain at least one non-empty matcher",
+            ),
+        ];
+        assert_cases(Case::new_fail_cases(fail_cases));
+    }
+
     /// Issue #82 v5 AC3 (comment 5021682187): the `MatrixSelector` eager
     /// check short-circuits a range-wrapped empty selector nested 10_000
     /// units deep, exactly like the pinned fuzz case above — measured

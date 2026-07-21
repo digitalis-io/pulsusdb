@@ -2075,11 +2075,13 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
         let base = plan_expr(planner, base_arg)?;
 
         // arg1 must be a bare vector selector (the absent()/timestamp()
-        // bare-selector precedent): upstream type-asserts
-        // `args[1].(*parser.VectorSelector)` and would panic on anything
-        // else — rejected here as a named error instead. Only its
-        // matchers are read (upstream ignores any offset/@ on it); a
-        // bare metric name is the parser's own `__name__` equality.
+        // bare-selector precedent): the vendored parser now rejects any
+        // non-direct-selector shape at parse time (vendored PATCHES.md
+        // #7, issue #132 — upstream parse.go:846-859), so this branch is
+        // a defense-in-depth backstop for caller-supplied ASTs (`plan()`
+        // is a public API over `&Expr`). Only the selector's matchers
+        // are read (upstream ignores any offset/@ on it); a bare metric
+        // name is the parser's own `__name__` equality.
         let mut info_name_matchers: Vec<LabelMatcher> = Vec::new();
         let mut data_matchers: Vec<(String, Vec<LabelMatcher>)> = Vec::new();
         if let Some(arg) = label_arg {
@@ -2093,8 +2095,10 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             }
             // Upstream rejects a bare metric name in this position at
             // parse time ("expected label selectors only, got vector
-            // selector instead", parse.go:852) — mirrored here as a
-            // plan-time rejection carrying the same wording.
+            // selector instead", parse.go:852) — since issue #132 the
+            // vendored parser does too (PATCHES.md #7), so this is the
+            // defense-in-depth backstop for caller-supplied ASTs,
+            // carrying the same wording.
             if vs.name.is_some() {
                 return Err(unsupported(
                     "info() second argument: expected label selectors only, \
@@ -5459,11 +5463,23 @@ mod tests {
         assert_eq!(p.selectors[0].at_ms, None);
     }
 
-    /// arg1 must be a bare vector selector — upstream type-asserts and
-    /// would panic on anything else; we reject by name.
+    /// arg1 must be a bare vector selector — since issue #132 the
+    /// vendored parser rejects a non-selector shape at parse time
+    /// (PATCHES.md #7), so `plan_info`'s branch is a defense-in-depth
+    /// backstop for caller-supplied ASTs (`plan()` is a public API over
+    /// `&Expr`): reached here by AST surgery, swapping `sum(x)` into
+    /// arg1 of a parseable `info()` call.
     #[test]
     fn m6_05b_info_rejects_a_non_selector_second_argument() {
-        let err = plan(&parse("info(m, sum(x))").unwrap(), params_experimental()).unwrap_err();
+        // The raw query now rejects at parse time with upstream's message.
+        let err = parse("info(m, sum(x))").unwrap_err();
+        assert_eq!(err.to_string(), "expected label selectors only");
+
+        let Expr::Call(mut call) = parse(r#"info(m, {data="x"})"#).unwrap() else {
+            panic!("expected Call");
+        };
+        *call.args.args[1] = parse("sum(x)").unwrap();
+        let err = plan(&Expr::Call(call), params_experimental()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => {
                 assert!(construct.contains("info()"), "{construct}");
@@ -5472,16 +5488,26 @@ mod tests {
         }
     }
 
-    /// A bare metric name in arg1 is rejected — upstream's parse-time
-    /// "expected label selectors only, got vector selector instead"
-    /// (parse.go:852), mirrored as a plan-time rejection.
+    /// A bare metric name in arg1 is rejected — since issue #132 at
+    /// parse time (upstream's "expected label selectors only, got
+    /// vector selector instead", parse.go:852, vendored PATCHES.md #7);
+    /// `plan_info`'s same-wording rejection stays as the
+    /// defense-in-depth backstop for caller-supplied ASTs, reached here
+    /// by AST surgery.
     #[test]
     fn m6_05b_info_rejects_a_bare_metric_name_second_argument() {
-        let err = plan(
-            &parse(r#"info(m, build_info{data="x"})"#).unwrap(),
-            params_experimental(),
-        )
-        .unwrap_err();
+        // The raw query now rejects at parse time with upstream's message.
+        let err = parse(r#"info(m, build_info{data="x"})"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "expected label selectors only, got vector selector instead"
+        );
+
+        let Expr::Call(mut call) = parse(r#"info(m, {data="x"})"#).unwrap() else {
+            panic!("expected Call");
+        };
+        *call.args.args[1] = parse(r#"build_info{data="x"}"#).unwrap();
+        let err = plan(&Expr::Call(call), params_experimental()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => assert!(
                 construct.contains("expected label selectors only, got vector selector instead"),

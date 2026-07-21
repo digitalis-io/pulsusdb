@@ -197,12 +197,13 @@ The patches fall into two classes:
     Propagating the exemption through parens would make this crate
     ACCEPT `info(m, ({}))`, diverging FROM upstream rather than closing
     a gap — not implemented. No divergence-ledger entry for this shape.
-- **Divergence from upstream (unrelated, pre-existing, out of scope):**
-  this crate has no analogue of upstream's "arg-1 must be a **direct**
-  label-selector" type assertion, so it accepts a paren-wrapped
-  **non-empty** `info(m, ({job="x"}))` where upstream rejects it
+- **Divergence from upstream (unrelated, pre-existing — since fixed by
+  entry #7 below):** at the time of this patch the crate had no analogue
+  of upstream's "arg-1 must be a **direct** label-selector" type
+  assertion, so it accepted a paren-wrapped **non-empty**
+  `info(m, ({job="x"}))` where upstream rejects it
   (`expected label selectors only`) — orthogonal to the empty-matcher
-  fix above; tracked on the reader-side issue, not fixed here.
+  fix above; now closed by entry #7 (issue #132).
 - **Corpus inputs fixed:** `info(metric, {data=~".*"})`,
   `info(metric, {non_existent=~".*"})`,
   `info(metric, {__name__!="target_info"})`,
@@ -213,6 +214,52 @@ The patches fall into two classes:
 - **Upstream PR:** not yet filed (targets v3.13 semantics past the
   crate's v2.45 baseline, like G1 — recorded here as the divergence
   ledger instead).
+
+## 7. `info()` second-argument direct-selector check (issue #132)
+
+- **Files:** `src/parser/ast.rs` (`check_ast_for_call`),
+  `src/parser/parse.rs` (`test_issue_132_info_direct_selector_parity`)
+- **Bug:** Prometheus v3.13.0 (`parse.go:846-859` at PulsusDB's pinned
+  conformance SHA `40af9c2`) requires `info()`'s second argument, when
+  vector-typed, to be a **direct** `*VectorSelector`: the bypass block
+  type-asserts `n.Args[1].(*VectorSelector)`; a named selector errors
+  `expected label selectors only, got vector selector instead`
+  (parse.go:852) and any other node — `*ParenExpr`, `*Call`,
+  `*BinaryExpr`, ... — takes the `else` path and errors
+  `expected label selectors only` (parse.go:858). This crate had no
+  analogue (entry #6's recorded divergence), so
+  `info(m, ({job="x"}))`, `info(m, target_info{job="x"})`,
+  `info(m, sum(x))`, `info(m, m2 + m3)`, and `info(m, rate(x[5m]))` all
+  parsed Ok where upstream rejects.
+- **Fix:** `check_ast_for_call` gains the direct-selector check for
+  `name == "info"`, gated on `args[1].value_type() == ValueType::Vector`
+  (a non-vector arg falls through to `check_args_match_types`, so
+  `info(m, 1)` keeps its type error as the FIRST error — upstream emits
+  the parse.go:848 type error before the assertion error), placed BEFORE
+  the entry-#6 empty-operand loop (upstream's info block runs before its
+  generic per-arg checks, so `info({}, sum(x))` reports
+  `expected label selectors only` first — oracle-verified ordering). A
+  direct name-less `VectorSelector` passes (in-place `@`/`offset` are
+  selector fields, not wrapper nodes, so `info(m, {job="x"} @ 5)` /
+  `... offset 5m` stay accepted); a named one rejects with the
+  parse.go:852 message; anything else with the parse.go:858 message
+  (both verbatim, no position prefix — crate convention).
+  `info(m, ({}))` is unchanged: entry #6's eager `Expr::Paren`
+  empty-matcher guard fires bottom-up before the enclosing call is
+  known, so it keeps rejecting with
+  `vector selector must contain at least one non-empty matcher`
+  (reject/reject parity with upstream; message-text difference
+  pre-adjudicated in entry #6 — the eager guard is the load-bearing
+  stack-overflow guard and must not be deferred).
+- **Corpus rows retired:** the two `accept_reject` allowlist rows in
+  `crates/pulsus-promql/tests/corpus/expected-divergences.jsonl` for
+  `info(rate(http_request_counter_total{}[5m]), target_info{foo="bar"})`
+  and `info(http_request_counter_total{namespace="zzz"}, {foo="bar"} == 1)`
+  (corpus rows 303/305) — both now match upstream and the rows are
+  deleted (the stale-allowlist guard enforces this).
+- **Upstream PR:** not yet filed (targets v3.13 semantics past the
+  crate's v2.45 baseline, like entry #6 and G1 — recorded here as the
+  divergence ledger instead).
 
 ## G1. Grammar-production patch: duration expressions (issue #84, M6-08b)
 
