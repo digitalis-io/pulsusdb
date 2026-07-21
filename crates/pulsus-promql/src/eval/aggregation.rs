@@ -674,8 +674,12 @@ fn aggregate_quantile(
 ///   invariants).
 /// - `limit_ratio` includes each series iff
 ///   [`ratio_includes`]`(r, `[`series_offset`]`(s))` — upstream
-///   `AddRatioSample`'s exact predicate; `r` caps to `[-1, 1]` first (the
-///   cap warn annotation is deferred to M6-08). Membership is
+///   `AddRatioSample`'s exact predicate; `r` caps to `[-1, 1]` first. The
+///   cap warn annotation is NOT emitted here (issue #130): upstream warns
+///   once per query from the evaluation-wide param extrema
+///   (`engine.go:1655-1660` at the pin), so emission lives in
+///   `eval::flush_ratio_warnings` over the per-node accumulator the
+///   `Aggregate` arm folds each step's raw param into. Membership is
 ///   per-series, so `by`/`without` grouping cannot change the selected
 ///   set — the input is filtered directly in input order.
 fn aggregate_limit(

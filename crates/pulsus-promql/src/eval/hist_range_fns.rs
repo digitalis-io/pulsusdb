@@ -427,8 +427,18 @@ pub fn eval_over_time_hist(
         OverTimeFn::Idelta => {
             instant_value_hist(samples, false, metric_name, annos).map(OverTimeValue::from)
         }
-        OverTimeFn::Resets => Some(OverTimeValue::Float(eval_resets_hist(samples))),
-        OverTimeFn::Changes => Some(OverTimeValue::Float(eval_changes_hist(samples))),
+        // `funcResets`/`funcChanges` (`:2258-2327`/`:2330-2379`): an EMPTY
+        // `(t-r, t]` window drops the series — upstream never invokes the
+        // function for a pointless series, so emitting `Float(0.0)` here
+        // manufactured a phantom `0` series (issue #130,
+        // extended_vectors.test:314/:336). Every other arm already returns
+        // `None` on empty.
+        OverTimeFn::Resets => {
+            (!samples.is_empty()).then(|| OverTimeValue::Float(eval_resets_hist(samples)))
+        }
+        OverTimeFn::Changes => {
+            (!samples.is_empty()).then(|| OverTimeValue::Float(eval_changes_hist(samples)))
+        }
         // `funcCountOverTime` (`len(Floats)+len(Histograms)`),
         // `funcPresentOverTime` (type-agnostic `1`),
         // `funcTsOfFirstOverTime`/`funcTsOfLastOverTime` (positional
@@ -1056,6 +1066,18 @@ mod tests {
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
+    /// Issue #130: an EMPTY window drops the series (`None`), never a
+    /// phantom `Float(0.0)` — upstream never invokes `funcResets` for a
+    /// pointless series (extended_vectors.test:336, `resets(metric[1m])`
+    /// at 3m over a series with no samples in the window).
+    #[test]
+    fn resets_over_an_empty_window_returns_none() {
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Resets, &[], "m", &mut annos);
+        assert!(v.is_none(), "empty window must drop the series, got {v:?}");
+        assert!(annos.is_empty());
+    }
+
     #[test]
     fn changes_counts_a_semantically_unequal_histogram_pair() {
         let samples = vec![
@@ -1076,6 +1098,17 @@ mod tests {
         let mut annos = Annotations::new();
         let v = eval_over_time_hist(OverTimeFn::Changes, &samples, "m", &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 0.0));
+    }
+
+    /// Issue #130: the `changes` twin of
+    /// [`resets_over_an_empty_window_returns_none`]
+    /// (extended_vectors.test:314, `changes(metric[1m])` at 3m).
+    #[test]
+    fn changes_over_an_empty_window_returns_none() {
+        let mut annos = Annotations::new();
+        let v = eval_over_time_hist(OverTimeFn::Changes, &[], "m", &mut annos);
+        assert!(v.is_none(), "empty window must drop the series, got {v:?}");
+        assert!(annos.is_empty());
     }
 
     /// Plan v4 residual A: a histogram-ONLY window over a DROP-set

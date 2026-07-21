@@ -239,6 +239,9 @@ fn evaluate_counted_with(
             StepValue::String(s) => QueryValue::String(s),
         };
         counts.step_invariant_evals = caches.step_invariant_evals.get();
+        // Issue #130 Δ2: emit the horizon-wide limit_ratio cap warnings
+        // BEFORE the annotations drain below.
+        flush_ratio_warnings(&caches);
         let value = finalize_metadata_labels(value, &mut counts.finalize_matrix_merge_passes)?;
         return Ok((value, counts, caches.annotations.take()));
     }
@@ -330,6 +333,10 @@ fn evaluate_counted_with(
         t += p.step_ms;
     }
 
+    // Issue #130 Δ2: after the step loop, before EITHER range return's
+    // annotations drain (scalar-only below, vector at the tail).
+    flush_ratio_warnings(&caches);
+
     counts.step_invariant_evals = caches.step_invariant_evals.get();
     if saw_scalar && !saw_vector {
         return Ok((
@@ -363,6 +370,38 @@ fn evaluate_counted_with(
         &mut counts.finalize_matrix_merge_passes,
     )?;
     Ok((value, counts, caches.annotations.take()))
+}
+
+/// Issue #130 Δ2: the once-per-query `limit_ratio` cap-warning emission —
+/// the port of upstream's pre-step-loop extrema checks
+/// (`engine.go:1655-1660` at the pin: `params.Max() > 1.0` ⇒ ONE
+/// `NewInvalidRatioWarning(Max(), 1.0)`, `params.Min() < -1.0` ⇒ ONE
+/// `…(Min(), -1.0)`; the per-step loop never warns). Called at exactly
+/// two sites in [`evaluate_counted_with`] — after the instant eval and
+/// after the range step loop — both before their annotations drain.
+/// Error paths never reach a call site, matching upstream (its NaN error
+/// precedes warn emission, and an `Err` return discards annotations).
+/// Two nodes with identical extrema collapse to one message via
+/// [`Annotations`]' exact-text dedup — same as upstream's message-keyed
+/// map. Deliberately NOT ported (per-step outcome-identical for
+/// everything the corpus pins): the all-zero `LIMIT_RATIO` early return
+/// (`r = 0` selects nothing per step anyway) and `LIMITK`'s horizon-wide
+/// `Max() < 1` / int64-overflow checks.
+fn flush_ratio_warnings(caches: &EvalCaches) {
+    let extrema = caches.ratio_extrema.borrow();
+    let mut annos = caches.annotations.borrow_mut();
+    for (_, e) in extrema.iter() {
+        if e.max > 1.0 {
+            annos.warning(crate::annotations::messages::invalid_ratio_warning(
+                e.max, 1.0,
+            ));
+        }
+        if e.min < -1.0 {
+            annos.warning(crate::annotations::messages::invalid_ratio_warning(
+                e.min, -1.0,
+            ));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +629,24 @@ struct PreparedInfo {
 /// (the [`SubqueryCache`] node-identity precedent).
 type InfoCache = HashMap<*const PlanExpr, PreparedInfo>;
 
+/// The running evaluation-wide `limit_ratio` parameter extrema for one
+/// [`PlanExpr::Aggregate`] node (issue #130 Δ2): upstream materializes
+/// the param expr over the WHOLE horizon before its step loop and warns
+/// from `params.Max()`/`params.Min()` — at most one
+/// `NewInvalidRatioWarning` per side per query (`engine.go:1649-1660` at
+/// the pin), never per step. Our param is evaluated per step inside the
+/// `Aggregate` arm, so the arm folds each step's raw (uncapped) value in
+/// here and [`flush_ratio_warnings`] emits once after stepping. Both
+/// engines evaluate the param at exactly the node's evaluation grid
+/// points (subqueries materialize once over the union grid per #83; a
+/// step-invariant root records once — extrema of a constant ≡ per-step),
+/// so the accumulated pair equals upstream's `params.Max()/Min()`.
+#[derive(Debug, Clone, Copy)]
+struct RatioExtrema {
+    max: f64,
+    min: f64,
+}
+
 /// Step-invariant cache roots keyed by node address (issue #88, the
 /// [`SubqueryCache`]/[`InfoCache`] node-identity precedent): the highest
 /// wrappable-invariant subtrees ([`crate::plan::step_invariance`]),
@@ -637,6 +694,14 @@ struct EvalCaches {
     /// lifetime is added to `EvalCaches` or any `prepare_*` signature.
     /// Defaults to [`CancelToken::never`] — the shape [`evaluate`] uses.
     cancel: CancelToken,
+    /// Issue #130 Δ2: per-`limit_ratio`-node parameter extrema, keyed by
+    /// node address (the [`InfoCache`] identity precedent — caches are
+    /// fresh per [`evaluate_counted_with`] call, so addresses cannot
+    /// collide or go stale). A `Vec` + linear scan keeps deterministic
+    /// insertion-order emission in [`flush_ratio_warnings`]; N = the
+    /// query's `limit_ratio` node count. Interior-mutable (`RefCell`)
+    /// because the `Aggregate` arm holds `&EvalCaches`.
+    ratio_extrema: RefCell<Vec<(*const PlanExpr, RatioExtrema)>>,
 }
 
 /// The evaluation grid a node will be stepped over: the closed
@@ -1550,11 +1615,14 @@ fn over_time_fn_may_annotate(f: OverTimeFn) -> bool {
 
 /// [`expr_may_annotate`]'s [`AggOp`] half (`aggregation.rs:250-454,572,
 /// 625`): CAPABLE = {`Sum`, `Avg`, `Min`, `Max`, `Stddev`, `Stdvar`,
-/// `Quantile`, `Topk`, `Bottomk`} plus `LimitRatio` (pre-emptively
-/// conservative — experimental, upstream carries a ratio-validation
-/// warning surface not yet ported; costs nothing since it is already
-/// experimental-gated); FREE = {`Count`, `Group`, `LimitK`} (no `annos`
-/// access at all — `aggregation.rs:438-442,681-726`).
+/// `Quantile`, `Topk`, `Bottomk`} plus `LimitRatio` (issue #130: its
+/// ratio-cap warning surface is now ported, emitted from
+/// [`flush_ratio_warnings`]'s horizon-wide extrema — CAPABLE is
+/// load-bearing precisely because [`expr_may_annotate`] then disables
+/// subquery live-grid pruning, keeping every grid point's param in the
+/// extrema, upstream's full `params` buffer); FREE = {`Count`, `Group`,
+/// `LimitK`} (no `annos` access at all — `aggregation.rs:438-442,
+/// 681-726`).
 fn agg_op_may_annotate(op: AggOp) -> bool {
     match op {
         AggOp::Sum
@@ -2673,11 +2741,15 @@ fn eval_step(
 
         PlanExpr::Aggregate {
             op,
-            expr,
+            // `input`, not `expr`: the arm needs the AGGREGATE node's own
+            // address (the outer `expr`) as the `ratio_extrema` key
+            // (issue #130 Δ2), which the field binding would shadow.
+            expr: input,
             param,
             grouping,
         } => {
-            let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
+            let StepValue::Vector(v) =
+                eval_step(input, selectors, data, t_ms, lookback_ms, caches)?
             else {
                 return Err(PromqlError::Unsupported {
                     construct: "aggregation over a scalar expression".to_string(),
@@ -2701,8 +2773,31 @@ fn eval_step(
             // disposition (compute for sum/avg, skip+info for min/max/
             // stddev/stdvar/quantile/topk/bottomk, type-agnostic for
             // count/group) — the A5a blanket reject is gone.
-            let mut annos = caches.annotations.borrow_mut();
-            let out = aggregation::aggregate(*op, &v, grouping.as_ref(), param_v, &mut annos)?;
+            let out = {
+                let mut annos = caches.annotations.borrow_mut();
+                aggregation::aggregate(*op, &v, grouping.as_ref(), param_v, &mut annos)?
+            };
+            // Issue #130 Δ2: fold the RAW (uncapped) ratio into this
+            // node's evaluation-wide extrema — AFTER `aggregate` returned
+            // `Ok` (a NaN param already errored inside `aggregate_limit`,
+            // aborting the query with annotations discarded, the same
+            // observable as upstream's up-front `HasAnyNaN` error).
+            // Emission happens once per query in `flush_ratio_warnings`,
+            // never here (upstream warns from the whole-horizon
+            // `params.Max()/Min()`, engine.go:1655-1660 at the pin).
+            if *op == AggOp::LimitRatio
+                && let Some(r) = param_v
+            {
+                let key = expr as *const PlanExpr;
+                let mut extrema = caches.ratio_extrema.borrow_mut();
+                match extrema.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, e)) => {
+                        e.max = e.max.max(r);
+                        e.min = e.min.min(r);
+                    }
+                    None => extrema.push((key, RatioExtrema { max: r, min: r })),
+                }
+            }
             Ok(StepValue::Vector(out))
         }
 
@@ -3173,10 +3268,24 @@ fn eval_step(
                 // steps, or the enclosing subquery's inner grid).
                 .expect("prepare_info covers every evaluation step of its horizon")
                 .clone();
-            // M7-A5b-iii: `info()` is value-agnostic on BOTH sides —
-            // `info::combine` passes the base sample's `v`/`h` straight
-            // through, and the info (metadata) side's `InfoSeriesAtStep`
-            // never carries a value at all (labels only) — no guard.
+            // Issue #130 Δ1: the info.go:371-373 empty-base short-circuit
+            // — `combineWithInfoVector`'s FIRST statement returns an
+            // empty result, no error, before any info-side sample is
+            // inspected. Per step, exactly like upstream's per-step call.
+            // `combine`'s own :268 guard remains the correctness anchor;
+            // this one is pure work-skipping (the resolution walk below
+            // cannot error since Δ3 moved the type check into `combine`).
+            if base_v.is_empty() {
+                return Ok(StepValue::Vector(Vec::new()));
+            }
+            // M7-A5b-iii, amended by issue #130 Δ3: `info()` passes the
+            // BASE sample's `v`/`h` straight through (value-agnostic on
+            // that side), but an info-side sample resolving to a native
+            // histogram is upstream's `info sample should be float` error
+            // (info.go:383-385) — carried as the `is_histogram` marker
+            // below and validated inside `combine`'s dedup loop, so the
+            // per-sample check-vs-duplicate error precedence matches
+            // upstream's interleaved loop.
 
             let sel = &selectors[*info_selector];
             let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
@@ -3195,6 +3304,7 @@ fn eval_step(
                             .expect("eligible_info series carry a resolved metric_name"),
                         labels: series.labels.clone(),
                         orig_t_ms: sample.t_ms,
+                        is_histogram: sample.h.is_some(),
                     });
                 }
             }
@@ -4014,6 +4124,266 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    // --- issue #130 Δ2: limit_ratio cap warning from horizon-wide extrema ---
+
+    /// The limit.test:118/:123 shape: a RANGE query with a CONSTANT
+    /// out-of-range ratio emits exactly ONE warning with the pinned
+    /// text — not one per step (`Annotations`' exact-text dedup would
+    /// mask per-step emission here; the varying-param tests below
+    /// discriminate the scheme).
+    #[test]
+    fn limit_ratio_constant_out_of_range_ratio_warns_exactly_once_over_a_range() {
+        for (query, want) in [
+            (
+                "limit_ratio(1.1, m)",
+                "PromQL warning: ratio value should be between -1 and 1, got 1.1, capping to 1",
+            ),
+            (
+                "limit_ratio(-1.1, m)",
+                "PromQL warning: ratio value should be between -1 and 1, got -1.1, capping to -1",
+            ),
+        ] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, experimental(params(0, 120_000, 60_000))).unwrap();
+            let mut data = SeriesData::new();
+            for spec in &p.selectors {
+                data.insert(
+                    spec.id,
+                    vec![series(
+                        1,
+                        &[("job", "a")],
+                        vec![s(0, 1.0), s(60_000, 1.0), s(120_000, 1.0)],
+                    )],
+                );
+            }
+            let (_, annotations) = super::evaluate(&p, &data).unwrap();
+            let (warnings, infos) = annotations.as_strings(0, 0);
+            assert_eq!(warnings, vec![want.to_string()], "{query}");
+            assert!(infos.is_empty(), "{query}: {infos:?}");
+        }
+    }
+
+    /// Boundary ratios (±1.0) are in range — silent, matching
+    /// limit.test:110-115.
+    #[test]
+    fn limit_ratio_boundary_ratios_are_silent() {
+        for query in ["limit_ratio(1.0, m)", "limit_ratio(-1.0, m)"] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, experimental(params(0, 120_000, 60_000))).unwrap();
+            let mut data = SeriesData::new();
+            for spec in &p.selectors {
+                data.insert(
+                    spec.id,
+                    vec![series(
+                        1,
+                        &[("job", "a")],
+                        vec![s(0, 1.0), s(60_000, 1.0), s(120_000, 1.0)],
+                    )],
+                );
+            }
+            let (_, annotations) = super::evaluate(&p, &data).unwrap();
+            assert!(
+                annotations.is_empty(),
+                "{query}: in-range ratios must not warn"
+            );
+        }
+    }
+
+    /// The scheme discriminator (plan v2 Δ2): a VARYING out-of-range
+    /// param across range steps yields exactly ONE warning citing the
+    /// horizon max — upstream warns from `params.Max()` once, never per
+    /// distinct step value (engine.go:1655-1657 at the pin). Per-step
+    /// emission would produce TWO distinct messages here (1.1 and 1.3).
+    #[test]
+    fn limit_ratio_varying_param_warns_once_from_the_horizon_max() {
+        let expr = crate::parser::parse("limit_ratio(scalar(r), m)").unwrap();
+        let p = plan(&expr, experimental(params(0, 120_000, 60_000))).unwrap();
+        let mut data = SeriesData::new();
+        for spec in &p.selectors {
+            match spec.metric_name.as_deref() {
+                Some("r") => data.insert(
+                    spec.id,
+                    vec![series(
+                        1,
+                        &[],
+                        vec![s(0, 0.5), s(60_000, 1.1), s(120_000, 1.3)],
+                    )],
+                ),
+                Some("m") => data.insert(
+                    spec.id,
+                    vec![series(
+                        2,
+                        &[("job", "a")],
+                        vec![s(0, 1.0), s(60_000, 1.0), s(120_000, 1.0)],
+                    )],
+                ),
+                other => panic!("unexpected selector {other:?}"),
+            }
+        }
+        let (_, annotations) = super::evaluate(&p, &data).unwrap();
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: ratio value should be between -1 and 1, got 1.3, capping to 1"
+                    .to_string()
+            ],
+            "exactly one warning, citing the horizon max"
+        );
+        assert!(infos.is_empty(), "{infos:?}");
+    }
+
+    /// Two-sided variant: steps spanning 1.2 and −1.3 yield exactly the
+    /// two extrema messages (`Max() > 1.0` and `Min() < -1.0` each fire
+    /// once — engine.go:1655-1660 at the pin).
+    #[test]
+    fn limit_ratio_two_sided_varying_param_warns_once_per_extrema_side() {
+        let expr = crate::parser::parse("limit_ratio(scalar(r), m)").unwrap();
+        let p = plan(&expr, experimental(params(0, 120_000, 60_000))).unwrap();
+        let mut data = SeriesData::new();
+        for spec in &p.selectors {
+            match spec.metric_name.as_deref() {
+                Some("r") => data.insert(
+                    spec.id,
+                    vec![series(
+                        1,
+                        &[],
+                        vec![s(0, 1.2), s(60_000, -1.3), s(120_000, 0.5)],
+                    )],
+                ),
+                Some("m") => data.insert(
+                    spec.id,
+                    vec![series(
+                        2,
+                        &[("job", "a")],
+                        vec![s(0, 1.0), s(60_000, 1.0), s(120_000, 1.0)],
+                    )],
+                ),
+                other => panic!("unexpected selector {other:?}"),
+            }
+        }
+        let (_, annotations) = super::evaluate(&p, &data).unwrap();
+        let (warnings, infos) = annotations.as_strings(0, 0);
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: ratio value should be between -1 and 1, got 1.2, capping to 1"
+                    .to_string(),
+                "PromQL warning: ratio value should be between -1 and 1, got -1.3, capping to -1"
+                    .to_string(),
+            ],
+            "one warning per extrema side"
+        );
+        assert!(infos.is_empty(), "{infos:?}");
+    }
+
+    // --- issue #130 Δ1+Δ3: info() histogram info-sample rejection ---
+
+    /// 4b′(ii): a non-empty base joined against an info-side series whose
+    /// resolved sample is a native histogram is upstream's pinned error
+    /// (info.go:383-385; info.test:191's `expect fail`).
+    #[test]
+    fn info_with_a_histogram_info_sample_over_a_non_empty_base_errors() {
+        let expr = crate::parser::parse("info(m)").unwrap();
+        let p = plan(&expr, experimental(params(0, 0, 0))).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            p.selectors[0].id,
+            vec![series(
+                1,
+                &[("instance", "a"), ("job", "1")],
+                vec![s(0, 0.0)],
+            )],
+        );
+        data.insert(
+            p.selectors[1].id,
+            vec![series(
+                2,
+                &[("instance", "a"), ("job", "1"), ("data", "x")],
+                vec![Sample::hist(0, single_histogram().to_float())],
+            )],
+        );
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(err.to_string(), "info sample should be float");
+    }
+
+    /// 4b′(i): an EMPTY base step short-circuits BEFORE any info-side
+    /// sample is inspected (info.go:371-373 — `combineWithInfoVector`'s
+    /// first statement), so a histogram info sample resolving only at
+    /// the empty step never errors. Step 0: base resolves, the info
+    /// histogram does not (its sample is at 400s). Step 400s: base is
+    /// past its 5m lookback (empty), the histogram resolves — and must
+    /// be short-circuited past, not type-checked.
+    #[test]
+    fn info_with_an_empty_base_step_ignores_a_histogram_info_sample_at_that_step() {
+        let expr = crate::parser::parse("info(m)").unwrap();
+        let p = plan(&expr, experimental(params(0, 400_000, 400_000))).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            p.selectors[0].id,
+            vec![series(
+                1,
+                &[("instance", "a"), ("job", "1")],
+                vec![s(0, 7.0)],
+            )],
+        );
+        data.insert(
+            p.selectors[1].id,
+            vec![series(
+                2,
+                &[("instance", "a"), ("job", "1"), ("data", "x")],
+                vec![Sample::hist(400_000, single_histogram().to_float())],
+            )],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        match value {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "only the step-0 base point survives");
+                assert_eq!(m[0].points.len(), 1);
+                assert_eq!(m[0].points[0].t_ms, 0);
+                assert_eq!(m[0].points[0].v, 7.0);
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+        assert!(annotations.is_empty());
+    }
+
+    /// 4b′(iv): the float info path is unaffected — an ordinary
+    /// `target_info` float sample still enriches, no error, no
+    /// annotations.
+    #[test]
+    fn info_float_path_still_enriches_after_the_histogram_guard() {
+        let expr = crate::parser::parse("info(m)").unwrap();
+        let p = plan(&expr, experimental(params(0, 0, 0))).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            p.selectors[0].id,
+            vec![series(
+                1,
+                &[("instance", "a"), ("job", "1")],
+                vec![s(0, 3.0)],
+            )],
+        );
+        data.insert(
+            p.selectors[1].id,
+            vec![series(
+                2,
+                &[("instance", "a"), ("job", "1"), ("data", "x")],
+                vec![s(0, 1.0)],
+            )],
+        );
+        let (value, annotations) = super::evaluate(&p, &data).unwrap();
+        match value {
+            QueryValue::Vector(v) => {
+                assert_eq!(v.len(), 1);
+                assert_eq!(v[0].v, 3.0);
+                assert_eq!(v[0].labels.get("data"), Some("x"), "enriched");
+            }
+            other => panic!("expected Vector, got {other:?}"),
+        }
+        assert!(annotations.is_empty());
     }
 
     /// Issue #69 (M6-06): `count_values` end-to-end through its dedicated

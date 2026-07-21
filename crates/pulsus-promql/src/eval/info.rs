@@ -99,6 +99,12 @@ pub(crate) struct InfoSeriesAtStep {
     pub metric_name: String,
     pub labels: Labels,
     pub orig_t_ms: i64,
+    /// The resolved info sample carried a native histogram — validated
+    /// inside [`combine`]'s dedup loop (`info.go:383-385`: the type check
+    /// is the FIRST check of each info-hashing iteration, after the
+    /// empty-base return and before that sample's own dedup handling),
+    /// never at resolution time (issue #130 Δ3).
+    pub is_histogram: bool,
 }
 
 /// Compiled-regex memo for one evaluation scope (a `combine` call or one
@@ -301,6 +307,22 @@ pub(crate) fn combine(
     // the pinned duplicate-series error (info.go:401).
     let mut by_sig: BTreeMap<Signature, InfoSeriesAtStep> = BTreeMap::new();
     for series in eligible {
+        // Type check FIRST within each iteration (info.go:383-385), so an
+        // equal-timestamp duplicate pair arriving BEFORE a histogram
+        // sample errors as the duplicate, and vice versa — per-sample
+        // check-then-dedup precedence is upstream-exact (issue #130 Δ3).
+        // Cross-series ARRIVAL order remains a storage artifact in both
+        // engines: ours is fetch order (test store = load order, live =
+        // fingerprint order), upstream's is its storage's return order
+        // under an explicitly unsorted `Select` contract (info.go:225) —
+        // no per-step sort is added to imitate an order upstream itself
+        // does not guarantee.
+        if series.is_histogram {
+            return Err(PromqlError::LabelSet {
+                // Byte-exact to info.go:384.
+                detail: "info sample should be float".to_string(),
+            });
+        }
         let sig = signature(&series.metric_name, &series.labels, &id_keys);
         match by_sig.entry(sig) {
             std::collections::btree_map::Entry::Vacant(e) => {
@@ -478,6 +500,15 @@ mod tests {
             metric_name: name.to_string(),
             labels: labels(pairs),
             orig_t_ms,
+            is_histogram: false,
+        }
+    }
+
+    /// [`info_series`] with the histogram marker set (issue #130 Δ3).
+    fn hist_info_series(name: &str, pairs: &[(&str, &str)], orig_t_ms: i64) -> InfoSeriesAtStep {
+        InfoSeriesAtStep {
+            is_histogram: true,
+            ..info_series(name, pairs, orig_t_ms)
         }
     }
 
@@ -642,6 +673,70 @@ mod tests {
              {__name__=\"target_info\", data=\"info\", instance=\"a\", job=\"1\"} @ 60000, \
              new {__name__=\"target_info\", data=\"updated\", instance=\"a\", job=\"1\"} @ 60000"
         );
+    }
+
+    /// Issue #130 Δ3 (4b′-iii): per-sample check-then-dedup precedence is
+    /// upstream-exact — with an equal-timestamp duplicate pair PRECEDING
+    /// the histogram sample in input order, the DUPLICATE error surfaces
+    /// (upstream's info-hashing loop reaches the pair's second member and
+    /// errors at info.go:401-403 before ever seeing the histogram).
+    #[test]
+    fn duplicate_pair_preceding_a_histogram_sample_errors_with_the_duplicate_message() {
+        let base = vec![base_sample(
+            "metric",
+            &[("instance", "a"), ("job", "1")],
+            1.0,
+        )];
+        let info = vec![
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "info")],
+                60_000,
+            ),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "updated")],
+                60_000,
+            ),
+            hist_info_series("target_info", &[("instance", "a"), ("job", "1")], 60_000),
+        ];
+        let ids = id_values(&[("instance", &["a"]), ("job", &["1"])]);
+        let err = combine(base, info, &ids, &default_name_matchers(), &[], 60_000).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "found duplicate series for info metric: existing \
+             {__name__=\"target_info\", data=\"info\", instance=\"a\", job=\"1\"} @ 60000, \
+             new {__name__=\"target_info\", data=\"updated\", instance=\"a\", job=\"1\"} @ 60000"
+        );
+    }
+
+    /// Issue #130 Δ3 (4b′-iii), the reverse order: the histogram sample
+    /// arriving FIRST errors with `info sample should be float`
+    /// (info.go:383-385 — the type check is the first check of its
+    /// iteration, before any dedup handling).
+    #[test]
+    fn histogram_sample_preceding_a_duplicate_pair_errors_with_the_float_type_message() {
+        let base = vec![base_sample(
+            "metric",
+            &[("instance", "a"), ("job", "1")],
+            1.0,
+        )];
+        let info = vec![
+            hist_info_series("target_info", &[("instance", "a"), ("job", "1")], 60_000),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "info")],
+                60_000,
+            ),
+            info_series(
+                "target_info",
+                &[("instance", "a"), ("job", "1"), ("data", "updated")],
+                60_000,
+            ),
+        ];
+        let ids = id_values(&[("instance", &["a"]), ("job", &["1"])]);
+        let err = combine(base, info, &ids, &default_name_matchers(), &[], 60_000).unwrap_err();
+        assert_eq!(err.to_string(), "info sample should be float");
     }
 
     /// `conflicting label: <name>` (info.go:446), byte-exact.

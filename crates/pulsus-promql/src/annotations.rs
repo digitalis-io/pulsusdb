@@ -588,6 +588,21 @@ pub mod messages {
         )
     }
 
+    /// **Warning** (issue #130). Upstream `NewInvalidRatioWarning`
+    /// (`annotations.go:234` at the pin, over `InvalidRatioWarning`,
+    /// `:150`): `limit_ratio`'s parameter fell outside `[-1, 1]` and was
+    /// capped. Both floats render via Go `%g` (`fmt.Errorf("%w, got %g,
+    /// capping to %g", …)`). Emitted at most once per extrema side per
+    /// query, from the evaluation-wide max/min — see
+    /// `eval::flush_ratio_warnings`, never per step.
+    pub fn invalid_ratio_warning(given: f64, capped: f64) -> String {
+        format!(
+            "PromQL warning: ratio value should be between -1 and 1, got {}, capping to {}",
+            super::go_float::format_g(given),
+            super::go_float::format_g(capped)
+        )
+    }
+
     /// **Info.** Upstream `NewNativeHistogramQuantileNaNResultInfo`
     /// (`annotations.go:437`): the histogram has NaN observations and the
     /// requested quantile falls above every bucket, so the result is NaN.
@@ -938,6 +953,24 @@ mod tests {
         assert_eq!(
             messages::invalid_quantile_warning(f64::NAN),
             "PromQL warning: quantile value should be between 0 and 1, got NaN"
+        );
+    }
+
+    /// Issue #130: the exact `limit.test:118/:123` message texts, plus a
+    /// non-finite `given` rendered per Go `%g` (`+Inf`, not Rust's `inf`).
+    #[test]
+    fn invalid_ratio_warning_names_the_given_and_capped_values() {
+        assert_eq!(
+            messages::invalid_ratio_warning(1.1, 1.0),
+            "PromQL warning: ratio value should be between -1 and 1, got 1.1, capping to 1"
+        );
+        assert_eq!(
+            messages::invalid_ratio_warning(-1.1, -1.0),
+            "PromQL warning: ratio value should be between -1 and 1, got -1.1, capping to -1"
+        );
+        assert_eq!(
+            messages::invalid_ratio_warning(f64::INFINITY, 1.0),
+            "PromQL warning: ratio value should be between -1 and 1, got +Inf, capping to 1"
         );
     }
 
