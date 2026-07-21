@@ -1462,6 +1462,61 @@ mod tests {
         assert!(!partial.error_message.is_empty());
     }
 
+    /// Issue #126: a data point whose day falls outside the ClickHouse
+    /// `Date` range (day 65536 = 2149-06-07, one day past the last
+    /// representable day) is rejected as partial success, exactly like the
+    /// zero-timestamp case above — and the admitted batch reaching the sink
+    /// carries no sample for it (nothing can land in `metric_samples`'
+    /// clamped partition).
+    #[tokio::test]
+    async fn metrics_far_future_data_point_is_rejected_and_never_reaches_the_admitted_batch() {
+        let far_future_ns: u64 = 5_662_310_400_000_000_000;
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: None,
+                scope_metrics: vec![ScopeMetrics {
+                    scope: None,
+                    metrics: vec![Metric {
+                        name: "up".to_string(),
+                        description: String::new(),
+                        unit: String::new(),
+                        metadata: vec![],
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                opentelemetry_proto::tonic::metrics::v1::NumberDataPoint {
+                                    attributes: vec![],
+                                    start_time_unix_nano: 0,
+                                    time_unix_nano: far_future_ns,
+                                    exemplars: vec![],
+                                    flags: 0,
+                                    value: Some(number_data_point::Value::AsDouble(1.0)),
+                                },
+                            ],
+                        })),
+                    }],
+                    schema_url: String::new(),
+                }],
+                schema_url: String::new(),
+            }],
+        };
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = post_metrics_body(metrics_router(sink.clone()), req.encode_to_vec(), &[]).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response = ExportMetricsServiceResponse::decode(bytes.as_ref()).unwrap();
+        let partial = response.partial_success.expect("partial success is set");
+        assert_eq!(partial.rejected_data_points, 1);
+
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert!(
+            admitted[0].samples.is_empty(),
+            "the far-future sample must never reach the admitted batch"
+        );
+    }
+
     // -- OTLP/JSON decode surfacing (issue #103, docs/decisions/0004 P6) -----
     // The vendored serde flatten oneofs used to SWALLOW a malformed inner field
     // to `None`, so a bad OTLP/JSON metric returned 202 with the metric silently
@@ -2153,6 +2208,36 @@ mod tests {
                 samples: vec![Sample {
                     value: 1.0,
                     timestamp: 1,
+                }],
+            }],
+            metadata: vec![],
+        };
+        let body = snappy_compress(&req.encode_to_vec());
+        let sink = MockMetricSink::new(Outcome::Admit);
+        let res = call_remote_write(&sink, body, &[]).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let admitted = sink.admitted.lock().unwrap();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].rejected, 1);
+        assert!(admitted[0].samples.is_empty());
+    }
+
+    /// Issue #126: same reject-boundary contract as the missing-`__name__`
+    /// case above, but for a sample whose day falls outside the ClickHouse
+    /// `Date` range (day 65536 = 2149-06-07) — a per-sample drop, still a
+    /// `204`, and nothing reaches `metric_samples`' clamped partition
+    /// because the admitted batch carries no sample for it.
+    #[tokio::test]
+    async fn remote_write_far_future_timestamp_still_returns_204_sample_never_admitted() {
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![Label {
+                    name: "__name__".to_string(),
+                    value: "up".to_string(),
+                }],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 5_662_310_400_000,
                 }],
             }],
             metadata: vec![],

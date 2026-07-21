@@ -58,6 +58,12 @@ pub fn floor_to_activity_bucket(unix_milli: i64, bucket_ms: i64) -> i64 {
 /// a whole day before civil-calendar conversion.
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 
+/// Milliseconds per day, used to floor a [`UnixMilli`]-scale timestamp down
+/// to a whole day for [`Date::start_of_day_utc_ms`] — metric samples are
+/// stored at millisecond resolution (docs/architecture.md §2), so this
+/// avoids re-deriving the day from nanoseconds.
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
 /// Days since the Unix epoch (1970-01-01), used for ClickHouse `Date`
 /// columns — currently `log_streams.month` (docs/schemas.md §3.1,
 /// `toStartOfMonth(...)`, issue #8 plan amendment). Represented as a bare
@@ -103,6 +109,23 @@ impl Date {
     /// instead of orphaning it into the wrong daily partition.
     pub fn start_of_day_utc(timestamp_ns: i64) -> Option<Date> {
         let day = timestamp_ns.div_euclid(NANOS_PER_DAY);
+        u16::try_from(day).ok().map(Date)
+    }
+
+    /// The UTC start-of-day containing `unix_milli` — the millisecond-scale
+    /// sibling of [`Date::start_of_day_utc`] for `metric_samples` /
+    /// `metric_hist_samples`, which partition on
+    /// `toDate(fromUnixTimestamp64Milli(unix_milli))` (docs/schemas.md,
+    /// issue #126). Deliberately NOT `start_of_day_utc(unix_milli *
+    /// 1_000_000)`: that multiply overflows `i64` for `unix_milli` beyond
+    /// roughly year 2262, while flooring directly at millisecond scale is
+    /// overflow-free for the full `i64` range. Same representability
+    /// contract as [`Date::start_of_day_utc`]: returns `None` when the day
+    /// falls outside the `u16` `Date` range (before 1970-01-01 or after
+    /// 2149-06-06) rather than clamping it, so the caller rejects the
+    /// sample instead of orphaning it into the wrong daily partition.
+    pub fn start_of_day_utc_ms(unix_milli: i64) -> Option<Date> {
+        let day = unix_milli.div_euclid(MILLIS_PER_DAY);
         u16::try_from(day).ok().map(Date)
     }
 
@@ -314,6 +337,56 @@ mod tests {
         // A concrete far-future (~year 2200) instant past the 2149-06-06
         // `Date` cutoff: previously saturated to day 65535, now rejectable.
         assert_eq!(Date::start_of_day_utc(NANOS_PER_DAY * 84_000), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_of_the_epoch_instant_is_day_zero() {
+        assert_eq!(Date::start_of_day_utc_ms(0).unwrap().days_since_epoch(), 0);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_accepts_the_last_representable_day() {
+        // Day 65535 = 2149-06-06, the last day `Date` can represent; the
+        // last millisecond within it is 65536 * MILLIS_PER_DAY - 1.
+        let last_ms = 65_536 * MILLIS_PER_DAY - 1;
+        assert_eq!(last_ms, 5_662_310_399_999);
+        assert_eq!(
+            Date::start_of_day_utc_ms(last_ms)
+                .unwrap()
+                .days_since_epoch(),
+            65_535
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_the_first_unrepresentable_day() {
+        // Day 65536 = 2149-06-07, the first day past the `u16` range.
+        let first_bad_ms = 65_536 * MILLIS_PER_DAY;
+        assert_eq!(first_bad_ms, 5_662_310_400_000);
+        assert_eq!(Date::start_of_day_utc_ms(first_bad_ms), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_a_negative_timestamp() {
+        assert_eq!(Date::start_of_day_utc_ms(-1), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_rejects_i64_extremes_instead_of_saturating() {
+        assert_eq!(Date::start_of_day_utc_ms(i64::MAX), None);
+        assert_eq!(Date::start_of_day_utc_ms(i64::MIN), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_agrees_with_start_of_day_utc_on_an_in_range_instant() {
+        // 2024-03-15T12:34:56.123Z, expressed at both ms and ns scale: the
+        // two helpers must floor to the same day.
+        let ms = 1_710_505_996_123;
+        let ns = ms * 1_000_000;
+        assert_eq!(
+            Date::start_of_day_utc_ms(ms).unwrap(),
+            Date::start_of_day_utc(ns).unwrap()
+        );
     }
 
     #[test]

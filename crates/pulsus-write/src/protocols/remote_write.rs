@@ -35,7 +35,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use prost::Message;
-use pulsus_model::{Fingerprint, LabelSet, METRIC_NAME_LABEL, metric_fingerprint};
+use pulsus_model::{Date, Fingerprint, LabelSet, METRIC_NAME_LABEL, metric_fingerprint};
 
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef};
@@ -772,6 +772,24 @@ fn parse_time_series(
     }
 
     for sample in &ts.samples {
+        // `metric_samples` partitions on
+        // `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126,
+        // mirroring #8's log/trace-path fix): a sample whose UTC day falls
+        // outside the ClickHouse `Date` range (before 1970-01-01 or after
+        // 2149-06-06) cannot be stored in a valid partition, so it is
+        // dropped here rather than accepted verbatim into the wrong one.
+        // Zero (1970-01-01, no sentinel meaning) still passes; a negative
+        // timestamp is now rejected too, per #8's pre-1970 `None` contract.
+        if Date::start_of_day_utc_ms(sample.timestamp).is_none() {
+            out.rejected += 1;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(format!(
+                    "sample timestamp {}ms is outside the representable ClickHouse Date range",
+                    sample.timestamp
+                ));
+            }
+            continue;
+        }
         // Charge each sample BEFORE pushing it (issue #62): the dominant
         // multiplicative term (a 2-byte wire sample → one ~40-byte
         // `MetricPoint`), so a 33.5M-sample fan-out aborts here before mass
@@ -780,10 +798,11 @@ fn parse_time_series(
         out.samples.push(MetricPoint {
             metric_name: Arc::clone(&metric_name),
             fingerprint,
-            // Verbatim: remote-write timestamps are already milliseconds,
-            // with no `0`-is-unset sentinel (unlike OTLP's nanosecond
-            // `time_unix_nano`, architect plan) — `0` is a literal 1970
-            // timestamp here, not a rejection trigger.
+            // Verbatim (once past the `Date`-range gate above): remote-write
+            // timestamps are already milliseconds, with no `0`-is-unset
+            // sentinel (unlike OTLP's nanosecond `time_unix_nano`, architect
+            // plan) — `0` is a literal 1970 timestamp here, not a rejection
+            // trigger.
             unix_milli: sample.timestamp,
             value: sample.value,
         });
@@ -1458,7 +1477,8 @@ mod tests {
         assert_eq!(&*out.samples[0].metric_name, "up");
     }
 
-    // -- timestamps verbatim, no sentinel -----------------------------------
+    // -- timestamps verbatim, no sentinel -------------------------------
+    // -- `Date`-range gate (issue #126) ----------------------------------
 
     #[test]
     fn zero_timestamp_is_accepted_verbatim_no_sentinel_rule() {
@@ -1475,7 +1495,11 @@ mod tests {
     }
 
     #[test]
-    fn negative_timestamp_is_accepted_verbatim() {
+    fn negative_timestamp_is_rejected_not_accepted_verbatim() {
+        // #8's pre-1970 `None` contract: `metric_samples` partitions on the
+        // raw sample day, which cannot represent a pre-epoch date, so it is
+        // dropped rather than accepted verbatim (was pinned the other way
+        // before issue #126).
         let req = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
@@ -1484,8 +1508,78 @@ mod tests {
             metadata: vec![],
         };
         let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(out.samples.is_empty());
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+    }
+
+    #[test]
+    fn sample_at_the_last_representable_day_is_accepted_verbatim() {
+        // Day 65535 = 2149-06-06, the last day ClickHouse `Date` can
+        // represent.
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "up")],
+                samples: vec![sample(1.0, 5_662_310_399_999)],
+            }],
+            metadata: vec![],
+        };
+        let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
-        assert_eq!(out.samples[0].unix_milli, -1_000);
+        assert_eq!(out.samples.len(), 1);
+        assert_eq!(out.samples[0].unix_milli, 5_662_310_399_999);
+    }
+
+    #[test]
+    fn sample_at_the_first_unrepresentable_day_is_rejected() {
+        // Day 65536 = 2149-06-07, the first day past the u16 `Date` range.
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "up")],
+                samples: vec![sample(1.0, 5_662_310_400_000)],
+            }],
+            metadata: vec![],
+        };
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(out.samples.is_empty());
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the representable ClickHouse Date range")
+        );
+    }
+
+    #[test]
+    fn mixed_series_keeps_the_good_sample_and_rejects_the_far_future_one() {
+        // One series, two samples: the in-range one survives, the
+        // far-future one is dropped — proving per-sample (not per-series)
+        // rejection semantics (issue #126 edge case).
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "up")],
+                samples: vec![
+                    sample(1.0, 1_700_000_000_000),
+                    sample(2.0, 5_662_310_400_000),
+                ],
+            }],
+            metadata: vec![],
+        };
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert_eq!(out.samples.len(), 1);
+        assert_eq!(out.samples[0].unix_milli, 1_700_000_000_000);
+        assert_eq!(out.samples[0].value, 1.0);
+        // The series is still registered: it has at least one accepted
+        // sample (writer/metric.rs derives `metric_series` rows from
+        // accepted samples only, so this is harmless either way).
+        assert_eq!(out.series.len(), 1);
     }
 
     // -- stale marker --------------------------------------------------------
