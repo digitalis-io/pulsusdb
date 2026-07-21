@@ -1988,6 +1988,32 @@ mod tests {
         );
     }
 
+    /// Issue #131 (mirrors the day-70_000 test above): a Zipkin span whose
+    /// `timestamp` resolves to day 49_710 (2106-02-07) — inside the `Date`
+    /// range but past `Date::LAST_DATETIME_SAFE_DAY`, so its trace-TTL
+    /// input would exceed the 32-bit DateTime domain — is a per-span
+    /// rejection inside `otlp_traces::parse`, which `decode_zipkin`
+    /// promotes to a whole-request 400 (`LogsIngestError::ZipkinDecode`).
+    /// Before the DateTime-safe gate this request was admitted (202).
+    #[test]
+    fn zipkin_datetime_unsafe_day_timestamp_rejects_the_whole_request() {
+        // The first microsecond of day 49_710 (2106-02-07 00:00:00 UTC).
+        let first_unsafe_micros: i64 = 49_710 * 86_400_000_000;
+        let body = format!(
+            r#"[{{"traceId":"0000000000000001","id":"0000000000000002","timestamp":{first_unsafe_micros}}}]"#
+        );
+        let err = decode_zipkin(
+            &HeaderMap::new(),
+            body.as_bytes(),
+            1_700_000_000_000_000_000,
+        )
+        .expect_err("DateTime-unsafe-day span must reject the whole request");
+        assert!(
+            matches!(err, LogsIngestError::ZipkinDecode(_)),
+            "expected a whole-request ZipkinDecode, got {err:?}"
+        );
+    }
+
     /// Positive (no false reject): an in-range Zipkin span decodes, adapts,
     /// and parses with `rejected == 0` — the #8 promotion does not fire on
     /// legitimate traffic.

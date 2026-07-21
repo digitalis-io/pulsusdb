@@ -38,8 +38,11 @@ pub struct SpanRecord {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttrRecord {
     /// The span's UTC **day** since the Unix epoch
-    /// (`pulsus_model::Date::start_of_day_utc` — `trace_attrs_idx` is
-    /// `PARTITION BY date`, daily, unlike `log_streams.month`).
+    /// (`pulsus_model::Date::start_of_day_utc_datetime_safe` —
+    /// `trace_attrs_idx` is `PARTITION BY date`, daily, unlike
+    /// `log_streams.month`; capped at day 49_709 = 2106-02-06 so the trace
+    /// tables' 32-bit-DateTime-domain delete-TTL input cannot wrap, issue
+    /// #131).
     pub date: u16,
     pub key: String,
     /// `'resource'` or `'span'` — the index's scope discriminator, so

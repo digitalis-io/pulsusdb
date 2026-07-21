@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_schema::{RenderCtx, SchemaParams, run_init};
+use pulsus_schema::{RenderCtx, SchemaParams, apply_ttl, run_init};
 
 /// Corpus size for both EXPLAIN gates — ≥100k per the binding 24.8 finding
 /// on issue #53 (projection selection is data-dependent below that scale).
@@ -628,9 +628,11 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
         .expect("run_init (retention_days=7)");
     for table in ["trace_spans", "trace_attrs_idx"] {
         let ddl = create_table_query(&client, db, table).await;
-        // ClickHouse normalizes `INTERVAL n DAY` to `toIntervalDay(n)`.
+        // `apply_ttl` (issue #131) supersedes the CREATE-time TTL with the
+        // saturating expression; ClickHouse normalizes the rendered
+        // `{{retention_days}} * 86400` product by wrapping it in parens.
         assert!(
-            ddl.contains("toIntervalDay(7)"),
+            ddl.contains("least(intDiv(timestamp_ns, 1000000000) + (7 * 86400), 4294967295)"),
             "{table}'s initial TTL must reflect retention_days=7: {ddl}"
         );
     }
@@ -643,13 +645,10 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
     for table in ["trace_spans", "trace_attrs_idx"] {
         let ddl = create_table_query(&client, db, table).await;
         assert!(
-            ddl.contains("toIntervalDay(30)"),
+            ddl.contains("(30 * 86400)"),
             "{table}'s TTL must be updated to the new retention_days: {ddl}"
         );
-        assert!(
-            !ddl.contains("toIntervalDay(7)"),
-            "{table}: stale TTL: {ddl}"
-        );
+        assert!(!ddl.contains("(7 * 86400)"), "{table}: stale TTL: {ddl}");
     }
 
     let catalog_ddl = create_table_query(&client, db, "trace_tag_catalog").await;
@@ -657,4 +656,206 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
         !catalog_ddl.contains("TTL"),
         "trace_tag_catalog is a bounded catalog and must carry no TTL: {catalog_ddl}"
     );
+}
+
+/// The last admitted trace timestamp (issue #131): the final nanosecond of
+/// day 49_709 (2106-02-06), whose floor-seconds value `4_294_943_999` is
+/// the last whole second of the last fully u32-representable UTC day.
+const BOUNDARY_TS_NS: i64 = 49_710 * 86_400_000_000_000 - 1;
+
+/// The saturating trace TTL expression `apply_ttl` renders (issue #131,
+/// Resolution C), as a SELECT-able snippet over a literal `ts`.
+fn new_ttl_expr(ts_ns: i64, retention_days: u32) -> String {
+    format!(
+        "toDateTime(least(intDiv(toInt64({ts_ns}), 1000000000) + {retention_days} * 86400, \
+         4294967295))"
+    )
+}
+
+/// Issue #131 AC10a/b/d: semantics of the saturating trace TTL expression
+/// on a live 24.8 server —
+/// (a) for a normal-range timestamp it is value-identical to the pre-#131
+///     `toDateTime(fromUnixTimestamp64Nano(ts)) + INTERVAL n DAY` form;
+/// (b) at the boundary timestamp it clamps exactly to
+///     `toDateTime(4294967295)` (2106-02-07T06:28:15Z);
+/// (d) `apply_ttl` with `retention_days = u32::MAX` is accepted by the
+///     server (the rendered arithmetic stays Int64 — max operand sum
+///     ≈ 3.71e14, no overflow, no type-coercion surprise) and the
+///     expression clamps an admitted present-day timestamp exactly to
+///     `toDateTime(4294967295)`.
+#[tokio::test]
+async fn trace_ttl_expression_is_equivalent_in_range_and_saturates_at_the_boundary() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_ttl_expr";
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    // (a) Equivalence for a normal-range timestamp (2023-11-14T22:13:20Z).
+    let normal_ts_ns: i64 = 1_700_000_000_123_456_789;
+    let new_expr = new_ttl_expr(normal_ts_ns, 7);
+    let equal = count(
+        &client,
+        &format!(
+            "SELECT toUInt64({new_expr} = \
+             (toDateTime(fromUnixTimestamp64Nano(toInt64({normal_ts_ns}))) + INTERVAL 7 DAY)) AS n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        equal, 1,
+        "new expression must equal the pre-#131 expiry for a normal-range ts"
+    );
+
+    // (b) Saturation at the boundary timestamp.
+    let boundary_expr = new_ttl_expr(BOUNDARY_TS_NS, 7);
+    let saturated = count(
+        &client,
+        &format!("SELECT toUInt64({boundary_expr} = toDateTime(4294967295)) AS n"),
+    )
+    .await;
+    assert_eq!(
+        saturated, 1,
+        "boundary ts + 7d must clamp exactly to toDateTime(4294967295)"
+    );
+
+    // (d) Extreme retention: the rendered ALTER is accepted at
+    // retention_days = u32::MAX, and the expression clamps an admitted
+    // present-day ts exactly to the u32::MAX instant. Also pin the
+    // arithmetic type: the un-clamped sum stays Int64 on the server.
+    ctx.retention_days = u32::MAX;
+    apply_ttl(&client, &ctx)
+        .await
+        .expect("apply_ttl at retention_days = u32::MAX must be accepted");
+    for table in ["trace_spans", "trace_attrs_idx"] {
+        let ddl = create_table_query(&client, db, table).await;
+        assert!(
+            ddl.contains("(4294967295 * 86400)"),
+            "{table}'s TTL must carry the extreme retention product: {ddl}"
+        );
+    }
+    let now = now_ns();
+    let extreme_expr = new_ttl_expr(now, u32::MAX);
+    let clamped = count(
+        &client,
+        &format!("SELECT toUInt64({extreme_expr} = toDateTime(4294967295)) AS n"),
+    )
+    .await;
+    assert_eq!(
+        clamped, 1,
+        "an admitted present-day ts must clamp exactly to toDateTime(4294967295) \
+         at retention_days = u32::MAX"
+    );
+    let int64_type = count(
+        &client,
+        &format!(
+            "SELECT toUInt64(toTypeName(intDiv(toInt64({now}), 1000000000) + \
+             4294967295 * 86400) = 'Int64') AS n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        int64_type, 1,
+        "the un-clamped seconds arithmetic must resolve to Int64 on the server"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #131 AC10c (survival, non-vacuous): a `trace_spans` row at the
+/// boundary timestamp survives `MATERIALIZE TTL` + `OPTIMIZE ... FINAL`
+/// under the saturating expression `apply_ttl` installed (retention 7),
+/// then DROPS once the pre-#131 wrapping expression is re-installed — its
+/// wrapped expiry is ~1970-01-07, so the part reads as long-expired
+/// (`ttl_only_drop_parts = 1`). The second phase is the pre-fix behavior
+/// pinned in-test: on pre-#131 `apply_ttl` text the first phase fails.
+#[tokio::test]
+async fn boundary_span_survives_saturating_ttl_and_drops_under_the_wrapping_ttl() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_ttl_boundary";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db); // retention_days = 7; run_init applies the new TTL
+    run_init(&client, &ctx).await.expect("run_init");
+
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_spans \
+                     (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                      status_code, kind, payload_type, payload) \
+                 VALUES (toFixedString('0123456789ABCDEF', 16), toFixedString('01234567', 8), \
+                         toFixedString('00000000', 8), 'op-boundary', 'svc-boundary', \
+                         {BOUNDARY_TS_NS}, 0, 0, 2, 1, 'payload-boundary')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert boundary span");
+
+    let materialize_and_optimize = |sql_db: String| {
+        let client = &client;
+        async move {
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {sql_db}.trace_spans MATERIALIZE TTL \
+                         SETTINGS mutations_sync = 2"
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("MATERIALIZE TTL");
+            client
+                .execute(
+                    &format!("OPTIMIZE TABLE {sql_db}.trace_spans FINAL"),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("OPTIMIZE FINAL");
+        }
+    };
+
+    materialize_and_optimize(db.to_string()).await;
+    let survived = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.trace_spans"),
+    )
+    .await;
+    assert_eq!(
+        survived, 1,
+        "the boundary row must survive MATERIALIZE TTL + OPTIMIZE FINAL under the \
+         saturating expression (fails on the pre-#131 wrapping expression)"
+    );
+
+    // Re-install the pre-#131 wrapping expression verbatim: the same row's
+    // expiry wraps past u32::MAX to ~1970-01-07 and the part is dropped.
+    client
+        .execute(
+            &format!(
+                "ALTER TABLE {db}.trace_spans MODIFY TTL \
+                 toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("re-install the pre-#131 wrapping TTL");
+    materialize_and_optimize(db.to_string()).await;
+    let dropped = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.trace_spans"),
+    )
+    .await;
+    assert_eq!(
+        dropped, 0,
+        "the same row must drop under the pre-#131 wrapping expression — this pins \
+         the defect the saturating expression closes"
+    );
+
+    drop_database(&client, db).await;
 }

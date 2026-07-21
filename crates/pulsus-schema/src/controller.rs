@@ -396,15 +396,51 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
     }
 }
 
-/// Applies the current `{{retention_days}}`-derived TTL to every retained
-/// table (docs/schemas.md §2.1/§3.1/§4.1): the raw metric/log sample tables
-/// plus both trace tables (`trace_attrs_idx` is time-scoped derived data —
-/// task-manager adjudication on issue #53; `trace_tag_catalog` is a bounded
-/// catalog and carries no TTL). `ALTER TABLE ... MODIFY TTL` is
-/// naturally idempotent (re-applying the same expression is a no-op), so
-/// this is safe both from `run_init` (applied once) and
-/// [`crate::rotation::spawn_rotation`] (applied on every tick, so a changed
-/// `PULSUS_RETENTION_DAYS` propagates without a restart).
+/// The `apply_ttl` statement templates. A module-level constant (not a
+/// local) so the unit test below pins the rendered trace ALTER text
+/// (issue #131 AC9).
+///
+/// The two **trace** TTL expressions are the saturating form (issue #131,
+/// Resolution C): `toDateTime(least(intDiv(timestamp_ns, 1000000000) +
+/// {{retention_days}} * 86400, 4294967295))`. The arithmetic is Int64
+/// (max operand sum ≈ 3.71e14 at `retention_days = u32::MAX`, far below
+/// `i64::MAX`), clamped to `u32::MAX` **before** `toDateTime`, so the
+/// expression cannot wrap in the 32-bit DateTime domain for any stored row
+/// under any `retention_days` value — pre-#131, a row whose
+/// `floor(timestamp_ns/1e9) + retention_days*86400` exceeded `u32::MAX`
+/// wrapped to a ~1970-epoch expiry and its part became drop-eligible
+/// immediately (`ttl_only_drop_parts = 1`). For rows below the clamp the
+/// expiry instant is bit-identical to the previous
+/// `toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL N DAY`
+/// form; a row's effective expiry is `min(floor(timestamp_ns/1e9) +
+/// retention_days*86400, 4294967295)` (docs/schemas.md §4.1). Migrations
+/// 16/17's CREATE DDL is untouched (byte-frozen — the checksum identity
+/// surface excludes TTL drift, and this ALTER lawfully supersedes the
+/// CREATE-time TTL from `run_init` before ingest serves).
+const TTL_STMTS: [&str; 8] = [
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
+     toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL {{retention_days}} DAY DELETE;",
+    "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY TTL \
+     toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
+    "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+];
+
+/// Applies the current `{{retention_days}}`-derived TTL ([`TTL_STMTS`]) to
+/// every retained table (docs/schemas.md §2.1/§3.1/§4.1): the raw
+/// metric/log sample tables plus both trace tables (`trace_attrs_idx` is
+/// time-scoped derived data — task-manager adjudication on issue #53;
+/// `trace_tag_catalog` is a bounded catalog and carries no TTL). `ALTER
+/// TABLE ... MODIFY TTL` is naturally idempotent (re-applying the same
+/// expression is a no-op), so this is safe both from `run_init` (applied
+/// once) and [`crate::rotation::spawn_rotation`] (applied on every tick, so
+/// a changed `PULSUS_RETENTION_DAYS` propagates without a restart).
 ///
 /// `ttl_only_drop_parts` is a per-table `MergeTree` *engine* setting, not a
 /// query-level one — `MODIFY TTL <expr> SETTINGS ttl_only_drop_parts = 1`
@@ -414,21 +450,7 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// operator who manually altered it away is corrected on the next rotation
 /// tick too.
 pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaError> {
-    let stmts = [
-        "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
-         toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL {{retention_days}} DAY DELETE;",
-        "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
-        "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY TTL \
-         toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
-        "ALTER TABLE {{db}}.log_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
-        "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY TTL \
-         toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
-        "ALTER TABLE {{db}}.trace_spans{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
-        "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY TTL \
-         toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE;",
-        "ALTER TABLE {{db}}.trace_attrs_idx{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
-    ];
-    for stmt in stmts {
+    for stmt in TTL_STMTS {
         let rendered = render::substitute_tokens(stmt, ctx);
         client
             .execute(&rendered, &QuerySettings::new(), Idempotency::Idempotent)
@@ -440,6 +462,51 @@ pub async fn apply_ttl(client: &ChClient, ctx: &RenderCtx) -> Result<(), SchemaE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #131 AC9: both trace `MODIFY TTL` statements render the
+    /// saturating expression — Int64 arithmetic clamped to `u32::MAX`
+    /// before `toDateTime` — and no longer the wrap-prone
+    /// `fromUnixTimestamp64Nano(...) + INTERVAL ... DAY` form. Fails on the
+    /// pre-#131 statement text.
+    #[test]
+    fn apply_ttl_trace_statements_render_the_saturating_datetime_expression() {
+        let ctx = RenderCtx {
+            db: "pulsus".to_string(),
+            cluster: None,
+            dist_suffix: "_dist".to_string(),
+            storage_policy: None,
+            retention_days: 7,
+            log_rollup: std::time::Duration::from_secs(5),
+        };
+        let trace_ttl_stmts: Vec<String> = TTL_STMTS
+            .iter()
+            .filter(|s| s.contains("MODIFY TTL") && s.contains("trace_"))
+            .map(|s| render::substitute_tokens(s, &ctx))
+            .collect();
+        assert_eq!(
+            trace_ttl_stmts.len(),
+            2,
+            "exactly trace_spans + trace_attrs_idx carry a trace MODIFY TTL"
+        );
+        for stmt in &trace_ttl_stmts {
+            assert!(
+                stmt.contains("least(intDiv(timestamp_ns, 1000000000) + "),
+                "trace TTL must use the clamped Int64-seconds form: {stmt}"
+            );
+            assert!(
+                stmt.contains(", 4294967295))"),
+                "trace TTL must clamp to u32::MAX before toDateTime: {stmt}"
+            );
+            assert!(
+                stmt.contains("7 * 86400"),
+                "retention_days must render into the seconds arithmetic: {stmt}"
+            );
+            assert!(
+                !stmt.contains("fromUnixTimestamp64Nano"),
+                "the wrap-prone DateTime64 form must be gone: {stmt}"
+            );
+        }
+    }
 
     #[test]
     fn guard_skip_ddl_in_init_refuses_when_set() {

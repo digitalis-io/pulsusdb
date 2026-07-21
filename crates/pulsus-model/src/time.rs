@@ -134,6 +134,28 @@ impl Date {
     pub fn days_since_epoch(&self) -> u16 {
         self.0
     }
+
+    /// Last UTC day fully inside ClickHouse's 32-bit `DateTime` domain
+    /// (u32 seconds since the epoch, max `4_294_967_295` =
+    /// 2106-02-07T06:28:15Z). Day `49_710` (2106-02-07) is only partially
+    /// representable — its final second `49_711 * 86_400 - 1` exceeds
+    /// `u32::MAX` — so the last day whose every second fits is `49_709`
+    /// (2106-02-06, final second `49_710 * 86_400 - 1 = 4_294_943_999`).
+    pub const LAST_DATETIME_SAFE_DAY: u16 = 49_709;
+
+    /// [`Date::start_of_day_utc`], additionally rejecting days past
+    /// [`Date::LAST_DATETIME_SAFE_DAY`] — for tables whose delete-TTL
+    /// evaluates the row timestamp in the 32-bit `DateTime` domain
+    /// (`trace_spans` / `trace_attrs_idx`, docs/schemas.md §4.1, issue
+    /// #131): a day in `49_710..=65_535` partitions correctly (inside the
+    /// `Date` range) but its TTL seconds value exceeds `u32::MAX`, so the
+    /// caller must reject the record rather than store it with a
+    /// wrap-prone timestamp. Full-day granularity is deliberate — the gate
+    /// stays a pure day comparison; the forfeited 6h28m15s of 2106-02-07
+    /// admissibility is immaterial (issue #131 plan).
+    pub fn start_of_day_utc_datetime_safe(timestamp_ns: i64) -> Option<Date> {
+        Date::start_of_day_utc(timestamp_ns).filter(|d| d.0 <= Date::LAST_DATETIME_SAFE_DAY)
+    }
 }
 
 /// Converts a day count since the Unix epoch (1970-01-01) to a proleptic
@@ -337,6 +359,58 @@ mod tests {
         // A concrete far-future (~year 2200) instant past the 2149-06-06
         // `Date` cutoff: previously saturated to day 65535, now rejectable.
         assert_eq!(Date::start_of_day_utc(NANOS_PER_DAY * 84_000), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_datetime_safe_accepts_the_last_datetime_safe_day() {
+        // The last nanosecond of day 49_709 (2106-02-06): every second of
+        // this day fits u32 (final second 4_294_943_999 <= u32::MAX).
+        let last_safe_ns = NANOS_PER_DAY * 49_710 - 1;
+        assert_eq!(
+            Date::start_of_day_utc_datetime_safe(last_safe_ns)
+                .unwrap()
+                .days_since_epoch(),
+            49_709
+        );
+        assert_eq!(Date::LAST_DATETIME_SAFE_DAY, 49_709);
+    }
+
+    #[test]
+    fn start_of_day_utc_datetime_safe_rejects_the_first_datetime_unsafe_day() {
+        // The first nanosecond of day 49_710 (2106-02-07): the day is still
+        // inside the u16 `Date` range (start_of_day_utc accepts it) but its
+        // final second exceeds u32::MAX, so the DateTime-safe gate rejects.
+        let first_unsafe_ns = NANOS_PER_DAY * 49_710;
+        assert_eq!(Date::start_of_day_utc_datetime_safe(first_unsafe_ns), None);
+        assert_eq!(
+            Date::start_of_day_utc(first_unsafe_ns)
+                .unwrap()
+                .days_since_epoch(),
+            49_710,
+            "sanity: the plain Date gate alone would have admitted this day"
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_datetime_safe_rejects_negative_and_i64_extremes() {
+        assert_eq!(
+            Date::start_of_day_utc_datetime_safe(-(NANOS_PER_DAY * 200)),
+            None
+        );
+        assert_eq!(Date::start_of_day_utc_datetime_safe(-1), None);
+        assert_eq!(Date::start_of_day_utc_datetime_safe(i64::MIN), None);
+        assert_eq!(Date::start_of_day_utc_datetime_safe(i64::MAX), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_datetime_safe_agrees_with_start_of_day_utc_inside_the_safe_range() {
+        // 2024-03-15T12:34:56Z — well inside the safe range: the two gates
+        // must resolve the identical day.
+        let ts_ns = 1_710_505_996_123_456_789;
+        assert_eq!(
+            Date::start_of_day_utc_datetime_safe(ts_ns).unwrap(),
+            Date::start_of_day_utc(ts_ns).unwrap()
+        );
     }
 
     #[test]

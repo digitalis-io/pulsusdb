@@ -372,19 +372,23 @@ fn parse_span(
         ),
     )?;
 
-    let date = match Date::start_of_day_utc(timestamp_ns) {
+    let date = match Date::start_of_day_utc_datetime_safe(timestamp_ns) {
         Some(date) => date.days_since_epoch(),
         None => {
             // The timestamp is representable as `i64` ns but its day falls
-            // outside the ClickHouse `Date` range (before 1970-01-01 or
-            // after 2149-06-06). Saturating `trace_attrs_idx.date` would
-            // orphan the span into the wrong daily partition, so the span is
-            // rejected wholesale into partial success.
+            // outside the storage-safe range: before 1970-01-01, or past
+            // day 49_709 (2106-02-06) — the last UTC day fully inside the
+            // 32-bit DateTime domain the trace tables' delete-TTL evaluates
+            // in (issue #131; days 49_710..=65_535 would partition
+            // correctly but wrap in the TTL expression, and later days fall
+            // outside the `Date` range entirely). Saturating would orphan
+            // or silently early-expire the span, so it is rejected
+            // wholesale into partial success.
             reject_span(
                 out,
                 format!(
-                    "span {:?}: start_time_unix_nano {} is outside the representable \
-                     ClickHouse Date range",
+                    "span {:?}: start_time_unix_nano {} is outside the supported \
+                     storage time range (1970-01-01 to 2106-02-06 UTC)",
                     diag_snippet(&span.name, DIAG_SNIPPET_MAX_BYTES),
                     span.start_time_unix_nano
                 ),
@@ -915,14 +919,58 @@ mod tests {
             .expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(
-            out.rejected_message
-                .as_deref()
-                .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+            out.rejected_message.as_deref().unwrap().contains(
+                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
+            )
         );
         assert_eq!(out.spans.len(), 1);
         // No attr row registered at the max-`Date` boundary.
         assert!(out.attrs.iter().all(|a| a.date != u16::MAX));
+    }
+
+    /// Issue #131: a span on day 49_710 (2106-02-07) partitions correctly
+    /// (inside the `Date` range) but its timestamp exceeds the 32-bit
+    /// DateTime domain the trace delete-TTL evaluates in — before the
+    /// DateTime-safe gate such a span was accepted and stored with a
+    /// wrap-prone TTL input. It is now a clean per-span rejection (partial
+    /// success), with no span/attr rows.
+    #[test]
+    fn parse_rejects_a_span_on_the_first_datetime_unsafe_day_as_partial_success() {
+        let first_unsafe_ns: u64 = 86_400_000_000_000 * 49_710;
+        let mut bad = valid_span();
+        bad.start_time_unix_nano = first_unsafe_ns;
+        bad.end_time_unix_nano = first_unsafe_ns;
+        bad.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
+        let good = valid_span();
+        let out = parse(&request_with(None, None, vec![bad, good]), 0)
+            .expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the supported storage time range")
+        );
+        assert_eq!(out.spans.len(), 1);
+        assert!(out.attrs.is_empty());
+    }
+
+    /// Issue #131 boundary acceptance: the last nanosecond of day 49_709
+    /// (2106-02-06, the last fully DateTime-safe UTC day) is still admitted,
+    /// and every attr row carries `date == 49_709`.
+    #[test]
+    fn parse_accepts_a_span_at_the_last_datetime_safe_nanosecond() {
+        let last_safe_ns: u64 = 86_400_000_000_000 * 49_710 - 1;
+        let mut s = valid_span();
+        s.start_time_unix_nano = last_safe_ns;
+        s.end_time_unix_nano = last_safe_ns;
+        s.attributes = vec![kv("http.method", Value::StringValue("GET".to_string()))];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 0);
+        assert_eq!(out.spans.len(), 1);
+        assert!(!out.attrs.is_empty());
+        assert!(out.attrs.iter().all(|a| a.date == 49_709));
     }
 
     #[test]
