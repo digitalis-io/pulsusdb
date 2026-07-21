@@ -398,6 +398,7 @@ fn tight_budget_config() -> TraceReadConfig {
         catalog_table: "trace_tag_catalog".to_string(),
         max_candidates: 100,
         scan_budget_rows: TIGHT_BUDGET_ROWS,
+        generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
     }

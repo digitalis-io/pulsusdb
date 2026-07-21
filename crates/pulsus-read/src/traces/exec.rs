@@ -22,14 +22,23 @@
 //!   because `bound_ts` upper-bounds the public sort key, docs/api.md
 //!   §4.2 ordering contract), at stream exhaustion, or at the
 //!   `max_candidates` ceiling.
-//! - **Memory contract (final amendment):** Layer 1 — every query
-//!   carries `max_bytes_to_read`/`read_overflow_mode='throw'` and
-//!   `max_result_bytes`/`result_overflow_mode='throw'` (plus the row
-//!   scan budget), breach → 422; the accepted residual is one
-//!   transiently-buffered block whose size is not a-priori row-bounded.
-//!   Layer 2 — a single request-scoped byte counter
-//!   ([`HYDRATION_BYTE_BUDGET`]) charges every retained byte (merge
-//!   tuples, batch rows, membership sets, heap summaries); breach → 422.
+//! - **Memory contract (issue #57 re-audit):** Layer 1 — every query
+//!   carries `max_bytes_to_read`/`read_overflow_mode='throw'`,
+//!   `max_result_bytes`/`result_overflow_mode='throw'`, the row scan
+//!   budget, and [`TRACE_SEARCH_MAX_BLOCK_ROWS`] (`max_block_size`);
+//!   breach → 422. The accepted residual is one transiently-buffered
+//!   block, now HARD-bounded: at most `TRACE_SEARCH_MAX_BLOCK_ROWS` rows
+//!   × (fixed-width columns + string columns each capped at
+//!   [`crate::traces::search_sql::TRACE_STR_COL_CAP`] bytes at the
+//!   source) — never a-priori row-unbounded (docs/schemas.md §7). Phase-1
+//!   generator reads additionally carry `max_memory_usage`
+//!   (`config.generator_max_memory_bytes`) +
+//!   `max_bytes_before_external_group_by=0`, bounding a dense
+//!   common-value prefix's `GROUP BY` aggregation state; breach → code
+//!   241 → [`TooBroadReason::TraceGeneratorMemory`] → 422. Layer 2 — a
+//!   single request-scoped byte counter ([`HYDRATION_BYTE_BUDGET`])
+//!   charges every retained byte (merge tuples, batch rows, membership
+//!   sets, heap summaries); breach → 422.
 //! - **Partiality (exhaustive conservative rule, plan v7 delta 2):**
 //!   `partial = true` iff a generator returned `gen_cap + 1` rows, the
 //!   consumption ceiling was reached with a lookahead candidate present,
@@ -102,7 +111,13 @@ pub const TAG_VALUES_MAX: usize = 1_000;
 /// Layer 2 — the single request-scoped retention budget: every byte the
 /// search accumulates (merge tuples, in-flight batch rows, membership
 /// sets, heap-held response summaries) is charged against this counter;
-/// a breach is a `422 query_too_broad`, never an OOM.
+/// a breach is a `422 query_too_broad`, never an OOM. With Layer 1's
+/// [`TRACE_MAX_RESULT_BYTES`] now effective per hydration batch (issue
+/// #57 re-audit v7), this counter's distinct, load-bearing role is
+/// **cross-batch retained accumulation** — heap-held response summaries
+/// (and merge tuples / root summaries) survive the per-batch charge
+/// release and grow across batches, where no per-query server setting
+/// can see them.
 pub const HYDRATION_BYTE_BUDGET: usize = 256 * 1024 * 1024;
 
 /// Layer 1 read-side byte budget (`max_bytes_to_read`, throw) applied to
@@ -112,13 +127,36 @@ pub const TRACE_READ_BYTES_BUDGET: u64 = 50 * 1024 * 1024 * 1024;
 
 /// Layer 1 result-side byte ceiling (`max_result_bytes`, throw) applied
 /// to every search query — bounds any single result set independent of
-/// string payload lengths.
+/// string payload lengths. Issue #57 re-audit v7: the sub-A
+/// source-truncation projection makes this setting's accounting
+/// **effective on the hydration/root/value reads** (live-verified —
+/// unwrapped passthrough columns were never accounted), a deliberate
+/// hardening: this is now the practical **per-batch** byte bound, firing
+/// server-side before the driver materializes anything; the
+/// [`HYDRATION_BYTE_BUDGET`] retention counter remains the binding bound
+/// on cross-batch retained accumulation.
 pub const TRACE_MAX_RESULT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Layer 1 block-row cap (`max_block_size`) applied to every search
+/// query (issue #57 re-audit, sub-problem A): bounds the row width of
+/// any single transiently-buffered result block, so the driver's
+/// documented one-block residual is a hard product with
+/// [`crate::traces::search_sql::TRACE_STR_COL_CAP`] rather than
+/// a-priori row-unbounded — see the module doc's memory-contract
+/// paragraph.
+pub const TRACE_SEARCH_MAX_BLOCK_ROWS: u64 = 4096;
 
 /// ClickHouse overflow codes the trace search budget settings can raise.
 const CODE_TOO_MANY_ROWS: i32 = 158;
 const CODE_TOO_MANY_BYTES: i32 = 307;
 const CODE_TOO_MANY_ROWS_OR_BYTES: i32 = 396;
+/// `MEMORY_LIMIT_EXCEEDED` — raised only by the phase-1 candidate-
+/// generator memory ceiling ([`generator_settings`]'s `max_memory_usage`
+/// and `max_bytes_before_external_group_by = 0`, throw-not-spill); maps
+/// exclusively to [`TooBroadReason::TraceGeneratorMemory`] via
+/// [`map_trace_generator_error`], applied only to phase-1 generator
+/// reads (issue #57 re-audit, sub-problem B).
+const CODE_MEMORY_LIMIT_EXCEEDED: i32 = 241;
 /// `SET_SIZE_LIMIT_EXCEEDED` — raised only by the metrics semi-join
 /// IN-set limits ([`TRACE_METRICS_MAX_SET_ROWS`]/[`TRACE_METRICS_MAX_SET_BYTES`],
 /// `set_overflow_mode='throw'`); no other trace/LogQL query sets a set
@@ -149,13 +187,18 @@ pub const TRACE_METRICS_MAX_SET_BYTES: u64 = 64 * 1024 * 1024;
 /// both — the review-round invariant is that **no retained collection
 /// grows without a corresponding live charge**, so every charge below is
 /// `size_of::<entry>() + RETAINED_ENTRY_OVERHEAD (+ string payloads)`.
-pub(crate) const RETAINED_ENTRY_OVERHEAD: usize = 64;
+/// `pub` (issue #57 re-audit, visibility-only): the retention-gate drift
+/// guard in `tests/traces_search_explain.rs` derives its pre-hydration
+/// charge bound from this and [`CANDIDATE_TUPLE_BYTES`] rather than
+/// re-hardcoding them.
+pub const RETAINED_ENTRY_OVERHEAD: usize = 64;
 
 /// Retention charge for one merged `(trace_id, bound_ts)` tuple — the
 /// per-generator row is charged at the merged-map entry's full cost
 /// (rows ≥ merged entries, so this upper-bounds the map, including when
-/// generators overlap on a trace).
-const CANDIDATE_TUPLE_BYTES: usize =
+/// generators overlap on a trace). `pub` for the same reason as
+/// [`RETAINED_ENTRY_OVERHEAD`].
+pub const CANDIDATE_TUPLE_BYTES: usize =
     std::mem::size_of::<([u8; 16], i64)>() + RETAINED_ENTRY_OVERHEAD;
 /// Retention charge for one membership set entry.
 const MEMBERSHIP_ENTRY_BYTES: usize =
@@ -191,6 +234,14 @@ pub struct TraceReadConfig {
     /// every search query; breach → 422 (code 158 →
     /// [`TooBroadReason::TraceScanBudgetRows`]).
     pub scan_budget_rows: u64,
+    /// `reader.traceql_generator_max_memory_bytes` — the phase-1
+    /// candidate-generator query's `max_memory_usage` ceiling (issue #57
+    /// re-audit, sub-problem B): bounds a dense common-value prefix's
+    /// `GROUP BY trace_id` aggregation state; breach → 422 (code 241 →
+    /// [`TooBroadReason::TraceGeneratorMemory`]). Never applied to
+    /// phase-2 reads (hydration/membership/value/root), which set no
+    /// memory limit of their own.
+    pub generator_max_memory_bytes: u64,
     /// Clustered mode: inject the docs/schemas.md §7 clustered-reader
     /// settings on every search query (both phases are shard-local by
     /// the `cityHash64(trace_id)` co-sharding).
@@ -374,6 +425,26 @@ fn map_trace_read_error(e: ChError, config: &TraceReadConfig) -> ReadError {
         }
     }
     ReadError::Clickhouse(e)
+}
+
+/// Maps a ClickHouse error on the **phase-1 candidate-generator** read
+/// path only (issue #57 re-audit, sub-problem B): code 241
+/// (`MEMORY_LIMIT_EXCEEDED`) — raised only by [`generator_settings`]'s
+/// memory ceiling — maps to the dedicated, never-conflated
+/// [`TooBroadReason::TraceGeneratorMemory`]; everything else delegates
+/// to the shared trace mapper ([`map_trace_read_error`]), which never
+/// maps 241 itself (no other trace/LogQL query sets a memory limit).
+fn map_trace_generator_error(e: ChError, config: &TraceReadConfig) -> ReadError {
+    if let ChError::Server {
+        code: CODE_MEMORY_LIMIT_EXCEEDED,
+        ..
+    } = &e
+    {
+        return ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory {
+            budget_bytes: config.generator_max_memory_bytes,
+        });
+    }
+    map_trace_read_error(e, config)
 }
 
 /// Worst-first heap ordering: the max-heap "greatest" entry is the WORST
@@ -652,12 +723,19 @@ impl TraceEngine {
     /// function — [`crate::querytext::ensure_query_text_fits`] runs once
     /// here (against the FINAL escaped text) rather than at each of the
     /// half-dozen call sites.
+    ///
+    /// **Issue #57 re-audit:** `mapper` lets phase-1 generator reads route
+    /// through [`map_trace_generator_error`] (which alone maps code 241 →
+    /// [`TooBroadReason::TraceGeneratorMemory`]) while every other call
+    /// site keeps [`map_trace_read_error`] — a single choke point, two
+    /// error taxonomies, never conflated.
     async fn collect_rows_charged<R: ChRow, F: FnMut(&R) -> usize>(
         &self,
         sql: &str,
         settings: &QuerySettings,
         budget: &mut ByteBudget,
         charged: &mut usize,
+        mapper: fn(ChError, &TraceReadConfig) -> ReadError,
         mut cost: F,
     ) -> Result<Vec<R>, ReadError> {
         let sql = escape_query_placeholders(sql);
@@ -669,9 +747,9 @@ impl TraceEngine {
             .client
             .query_stream::<R>(&sql, settings)
             .await
-            .map_err(|e| map_trace_read_error(e, &self.config))?;
+            .map_err(|e| mapper(e, &self.config))?;
         while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_read_error(e, &self.config))?;
+            let row = row.map_err(|e| mapper(e, &self.config))?;
             let bytes = cost(&row);
             budget.charge(bytes)?;
             *charged += bytes;
@@ -686,9 +764,17 @@ impl TraceEngine {
         mut explain: Option<&mut PlanExplain>,
     ) -> Result<SearchOutput, ReadError> {
         let settings = self.search_settings();
+        let gen_settings = generator_settings(&self.config);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
 
         // ---- Phase 1: per-generator bounded ranked queries + merge ----
+        // Every pre-hydration Layer-2 charge in this phase is enumerated
+        // and bounded by the `traces_search_explain.rs` retention-gate
+        // drift guard's P10 formula: `2 * generator_sqls.len() *
+        // (plan.max_candidates() + 1) * CANDIDATE_TUPLE_BYTES +
+        // BATCH_TRACES * size_of::<[u8; 16]>() + RETAINED_ENTRY_OVERHEAD`
+        // — a new pre-hydration charge site must be added to that
+        // formula's site inventory, not just this function.
         let gen_probe = plan.max_candidates() + 1;
         let mut generator_truncated = false;
         let mut per_generator: Vec<Vec<([u8; 16], i64)>> = Vec::new();
@@ -702,9 +788,14 @@ impl TraceEngine {
                 None,
             )?;
             let rows: Vec<CandidateRow> = self
-                .collect_rows_charged(sql, &settings, &mut budget, &mut phase1_charged, |_| {
-                    CANDIDATE_TUPLE_BYTES
-                })
+                .collect_rows_charged(
+                    sql,
+                    &gen_settings,
+                    &mut budget,
+                    &mut phase1_charged,
+                    map_trace_generator_error,
+                    |_| CANDIDATE_TUPLE_BYTES,
+                )
                 .await?;
             if rows.len() as u64 == gen_probe {
                 generator_truncated = true;
@@ -843,6 +934,7 @@ impl TraceEngine {
                     &settings,
                     &mut budget,
                     &mut root_rows_charged,
+                    map_trace_read_error,
                     |row: &RootRow| {
                         std::mem::size_of::<RootRow>()
                             + RETAINED_ENTRY_OVERHEAD
@@ -931,6 +1023,7 @@ impl TraceEngine {
                 settings,
                 budget,
                 batch_charged,
+                map_trace_read_error,
                 |row: &HydrationRow| {
                     std::mem::size_of::<HydrationRow>()
                         + RETAINED_ENTRY_OVERHEAD
@@ -964,9 +1057,14 @@ impl TraceEngine {
                 Some(("probe = ", &plan.probes[probe_idx].key)),
             )?;
             let rows: Vec<MembershipRow> = self
-                .collect_rows_charged(&sql, settings, budget, batch_charged, |_| {
-                    MEMBERSHIP_ENTRY_BYTES
-                })
+                .collect_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    |_| MEMBERSHIP_ENTRY_BYTES,
+                )
                 .await?;
             attrs
                 .membership
@@ -982,9 +1080,14 @@ impl TraceEngine {
                 Some(("aggregate field = ", &plan.agg_fields[field_idx].key)),
             )?;
             let rows: Vec<NumValueRow> = self
-                .collect_rows_charged(&sql, settings, budget, batch_charged, |_| {
-                    NUM_VALUE_ENTRY_BYTES
-                })
+                .collect_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    |_| NUM_VALUE_ENTRY_BYTES,
+                )
                 .await?;
             attrs.agg_values.push(
                 rows.into_iter()
@@ -1007,6 +1110,7 @@ impl TraceEngine {
                     settings,
                     budget,
                     batch_charged,
+                    map_trace_read_error,
                     |row: &StrValueRow| MEMBERSHIP_ENTRY_BYTES + row.v.len(),
                 )
                 .await?;
@@ -1020,14 +1124,17 @@ impl TraceEngine {
     }
 }
 
-/// The Layer-1 budget settings every search query carries (final
-/// amendment, issue #57): the row scan budget plus read-side and
-/// result-side byte budgets, all with throw semantics; clustered mode
-/// adds the docs/schemas.md §7 clustered-reader settings first. The
-/// accepted, documented residual is block-granular enforcement — the
-/// driver may transiently hold at most one block whose byte size is not
-/// a-priori bounded by row count (unbounded String columns); the Layer-2
-/// retention counter is the binding bound on accumulated state.
+/// The Layer-1 budget settings every search query carries (issue #57
+/// re-audit): the row scan budget plus read-side and result-side byte
+/// budgets, all with throw semantics, plus [`TRACE_SEARCH_MAX_BLOCK_ROWS`]
+/// (`max_block_size`) bounding the row width of any single transiently-
+/// buffered block; clustered mode adds the docs/schemas.md §7
+/// clustered-reader settings first. The accepted, documented residual is
+/// block-granular enforcement — the driver may transiently hold at most
+/// one block, now hard-bounded by `max_block_size` rows ×
+/// [`crate::traces::search_sql::TRACE_STR_COL_CAP`]-capped string columns
+/// (never a-priori row-unbounded); the Layer-2 retention counter is the
+/// binding bound on accumulated state across the whole request.
 fn search_settings(config: &TraceReadConfig) -> QuerySettings {
     let base = if config.distributed {
         QuerySettings::clustered_reader(config.skip_unavailable_shards)
@@ -1039,11 +1146,27 @@ fn search_settings(config: &TraceReadConfig) -> QuerySettings {
         .set("read_overflow_mode", "throw")
         .set("max_result_bytes", TRACE_MAX_RESULT_BYTES)
         .set("result_overflow_mode", "throw")
+        .set("max_block_size", TRACE_SEARCH_MAX_BLOCK_ROWS)
         // Issue #35: the raised `max_query_size` parse-buffer cap — every
         // search-phase read (generators, hydration/membership/attribute
         // batches, root hydration) routes through `collect_rows_charged`,
         // which carries this settings object.
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+}
+
+/// The phase-1 candidate-generator query settings (issue #57 re-audit,
+/// sub-problem B): [`search_settings`] plus the generator memory ceiling
+/// — `max_memory_usage` (from `config.generator_max_memory_bytes`) and
+/// `max_bytes_before_external_group_by = 0` (throw-not-spill: a spilled
+/// aggregation would silently slow rather than fail loud). Bounds a
+/// dense common-value prefix's `GROUP BY trace_id` aggregation state;
+/// breach → server code 241 → [`map_trace_generator_error`]. Applied
+/// ONLY to phase-1 generator reads — phase-2 reads set no memory limit
+/// of their own.
+fn generator_settings(config: &TraceReadConfig) -> QuerySettings {
+    search_settings(config)
+        .set("max_memory_usage", config.generator_max_memory_bytes)
+        .set("max_bytes_before_external_group_by", 0u64)
 }
 
 /// The Layer-1 read budget the two §4.3 catalog reads carry (issue #58
@@ -1289,6 +1412,7 @@ mod tests {
             catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
+            generator_max_memory_bytes: 536_870_912,
             distributed: false,
             skip_unavailable_shards: false,
         };
@@ -1305,6 +1429,7 @@ mod tests {
             catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
+            generator_max_memory_bytes: 536_870_912,
             distributed: false,
             skip_unavailable_shards: false,
         }
@@ -1440,6 +1565,85 @@ mod tests {
             map_trace_read_error(e, &cfg()),
             ReadError::Clickhouse(_)
         ));
+    }
+
+    #[test]
+    fn code_241_maps_to_the_generator_memory_reason_on_generator_reads_only() {
+        let e = || ChError::Server {
+            code: 241,
+            message: "Memory limit (for query) exceeded".to_string(),
+        };
+        match map_trace_generator_error(e(), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { budget_bytes }) => {
+                assert_eq!(budget_bytes, cfg().generator_max_memory_bytes);
+            }
+            other => panic!("expected TraceGeneratorMemory, got {other:?}"),
+        }
+        // The shared trace mapper never maps 241 — the memory ceiling is
+        // set only on the phase-1 generator settings, and the reasons
+        // stay unconflated.
+        assert!(matches!(
+            map_trace_read_error(e(), &cfg()),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    #[test]
+    fn the_generator_mapper_delegates_everything_else_to_the_shared_mapper() {
+        let e = ChError::Server {
+            code: 158,
+            message: "Limit for rows to read exceeded".to_string(),
+        };
+        assert!(matches!(
+            map_trace_generator_error(e, &cfg()),
+            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows: 1_000 })
+        ));
+        let t = ChError::Timeout("deadline".to_string());
+        assert!(matches!(
+            map_trace_generator_error(t, &cfg()),
+            ReadError::Clickhouse(_)
+        ));
+    }
+
+    /// M1 (issue #57 re-audit round-4/5 finding): the hermetic mapper pin
+    /// — every trace-search overflow code routes to ITS OWN reason (never
+    /// impersonating another), and the two byte-budget constants that
+    /// share `ScanBudgetBytes` are provably distinct from the Layer-2
+    /// retention budget, so a Layer-1 byte preempt can never impersonate
+    /// the retention-counter trip the `traces_search_explain.rs`
+    /// AC-A3 gate asserts on.
+    #[test]
+    fn m1_every_overflow_code_maps_to_its_own_reason_and_the_budgets_are_distinct() {
+        let server = |code| ChError::Server {
+            code,
+            message: "overflow".to_string(),
+        };
+        match map_trace_read_error(server(307), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, TRACE_READ_BYTES_BUDGET);
+            }
+            other => panic!("expected ScanBudgetBytes(TRACE_READ_BYTES_BUDGET), got {other:?}"),
+        }
+        match map_trace_read_error(server(396), &cfg()) {
+            ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { budget_bytes, .. }) => {
+                assert_eq!(budget_bytes, TRACE_MAX_RESULT_BYTES);
+            }
+            other => panic!("expected ScanBudgetBytes(TRACE_MAX_RESULT_BYTES), got {other:?}"),
+        }
+        assert!(matches!(
+            map_trace_read_error(server(158), &cfg()),
+            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { .. })
+        ));
+        assert!(matches!(
+            map_trace_generator_error(server(241), &cfg()),
+            ReadError::QueryTooBroad(TooBroadReason::TraceGeneratorMemory { .. })
+        ));
+        // Distinctness: neither Layer-1 byte-budget constant equals the
+        // Layer-2 retention budget, so `budget_bytes` equality is a
+        // sound discriminator between a Layer-1 preempt and the
+        // retention-counter trip.
+        assert_ne!(TRACE_READ_BYTES_BUDGET, HYDRATION_BYTE_BUDGET as u64);
+        assert_ne!(TRACE_MAX_RESULT_BYTES, HYDRATION_BYTE_BUDGET as u64);
     }
 
     fn tid(n: u8) -> [u8; 16] {
@@ -1790,6 +1994,8 @@ mod tests {
             "throw",
             "max_result_bytes",
             "result_overflow_mode",
+            "max_block_size",
+            "4096",
             "max_query_size",
         ] {
             assert!(
@@ -1801,6 +2007,26 @@ mod tests {
             !rendered.contains("optimize_skip_unused_shards"),
             "unclustered engines must not carry the §7 settings"
         );
+    }
+
+    /// Issue #57 re-audit AC-A1: the phase-1 generator settings pin —
+    /// `search_settings` plus the memory ceiling, throw-not-spill.
+    #[test]
+    fn generator_settings_pin_the_memory_ceiling_and_throw_not_spill() {
+        let rendered = format!("{:?}", generator_settings(&cfg()));
+        for expected in [
+            "max_memory_usage",
+            "536870912",
+            "max_bytes_before_external_group_by",
+            // The search settings must still be present underneath.
+            "max_rows_to_read",
+            "max_block_size",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected} in {rendered}"
+            );
+        }
     }
 
     #[test]

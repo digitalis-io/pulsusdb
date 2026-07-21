@@ -17,10 +17,11 @@ use pulsus_clickhouse::ChError;
 use pulsus_logql::LogQlError;
 use thiserror::Error;
 
-/// Why a query was rejected as too broad. Four structurally separate
-/// reasons, never conflated (architect plan amendment §4; issue #57 adds
-/// the traces row budget; issue #59 adds the trace-metrics IN-set
-/// budget), each with its own exclusive code path:
+/// Why a query was rejected as too broad. Six structurally separate
+/// reason families, never conflated (architect plan amendment §4; issue
+/// #57 adds the traces row budget and (re-audit) the traces generator
+/// memory budget; issue #59 adds the trace-metrics IN-set budget), each
+/// with its own exclusive code path:
 ///
 /// - [`TooBroadReason::ScanBudgetBytes`] — byte budgets only: LogQL
 ///   `max_bytes_to_read` (code 307), the traces `max_bytes_to_read`/
@@ -36,6 +37,11 @@ use thiserror::Error;
 ///   throw — code 191) set **only** by `traces::exec`'s metrics query
 ///   settings; no other path sets a set limit, and no other code maps
 ///   code 191.
+/// - [`TooBroadReason::TraceGeneratorMemory`] — issue #57 re-audit: the
+///   traces phase-1 candidate-generator's memory ceiling
+///   (`max_memory_usage` + `max_bytes_before_external_group_by = 0`,
+///   throw — code 241) set **only** on generator reads; no other path
+///   sets a memory limit, and no other code maps code 241.
 /// - [`TooBroadReason::QueryTextBytes`] — issue #35: the FINAL rendered
 ///   SQL text (after placeholder-doubling) reached [`crate::querytext::MAX_QUERY_TEXT_BYTES`]
 ///   — a Rust-side pre-dispatch admission check
@@ -81,6 +87,15 @@ pub enum TooBroadReason {
     /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
     /// with the byte scan budget or the trace row budget.
     TraceMetricsSetRows { max_set_rows: u64 },
+    /// Issue #57 re-audit (sub-problem B): the traces phase-1 candidate-
+    /// generator read's memory ceiling (`max_memory_usage` +
+    /// `max_bytes_before_external_group_by = 0`, throw — server code 241
+    /// `MEMORY_LIMIT_EXCEEDED`) was exceeded — a dense common-value
+    /// prefix's `GROUP BY trace_id` aggregation state grew past the
+    /// budget. Set **only** by `traces::exec`'s generator error mapper
+    /// (`map_trace_generator_error`); never conflated with the row/byte
+    /// scan budgets or the trace-metrics set budget.
+    TraceGeneratorMemory { budget_bytes: u64 },
     /// Issue #85 (M6-08c): a name-less/regex-`__name__` PromQL selector
     /// matched more metric names than the configured fan-out cap
     /// (`reader.promql_max_metric_fanout`, default 1000 — the adjudicated
@@ -174,6 +189,12 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
+                )
+            }
+            TooBroadReason::TraceGeneratorMemory { budget_bytes } => {
+                write!(
+                    f,
+                    "trace search generator memory budget of {budget_bytes} bytes exceeded"
                 )
             }
             TooBroadReason::MetricBuckets { buckets, cap } => {
@@ -516,6 +537,17 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("1000000"));
         assert!(msg.contains("attribute-set"));
+    }
+
+    /// Issue #57 re-audit: the generator memory reason names the budget.
+    #[test]
+    fn trace_generator_memory_display_names_the_memory_budget() {
+        let reason = TooBroadReason::TraceGeneratorMemory {
+            budget_bytes: 1_048_576,
+        };
+        let msg = reason.to_string();
+        assert!(msg.contains("1048576"), "{msg}");
+        assert!(msg.contains("generator memory"), "{msg}");
     }
 
     /// Issue #35: the query-text guard's message names both the rendered

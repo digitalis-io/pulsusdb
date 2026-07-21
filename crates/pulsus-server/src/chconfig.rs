@@ -337,6 +337,7 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         catalog_table: "trace_tag_catalog".to_string(),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
+        generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
         distributed: config.cluster.is_some(),
         skip_unavailable_shards: config.skip_unavailable_shards,
     }
@@ -780,6 +781,10 @@ mod tests {
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.max_candidates, config.reader.traceql_max_candidates);
         assert_eq!(cfg.scan_budget_rows, config.reader.traceql_scan_budget_rows);
+        assert_eq!(
+            cfg.generator_max_memory_bytes,
+            config.reader.traceql_generator_max_memory_bytes
+        );
         assert_eq!(cfg.skip_unavailable_shards, config.skip_unavailable_shards);
     }
 

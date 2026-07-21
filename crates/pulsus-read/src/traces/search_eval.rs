@@ -950,6 +950,38 @@ mod tests {
         );
     }
 
+    /// Issue #57 re-audit code-review round 2: the per-summary retained
+    /// charge floor — `RETAINED_ENTRY_OVERHEAD + name.len()` — pinned
+    /// PER ENTRY, at exact equality, for several name lengths including
+    /// zero (so the overhead term and the name term are each
+    /// independently load-bearing). The AC-A4 integration gate's fixture
+    /// deliberately trips on aggregate name bytes alone (its slack over
+    /// the budget exceeds the summed overhead term); THIS unit is what
+    /// fails if the 64-byte overhead term is silently dropped from the
+    /// charge site.
+    #[test]
+    fn span_summary_charge_is_exactly_overhead_plus_name_len() {
+        let p = plan("{}"); // no select() fields: attribute capacity is 0
+        let attrs = membership(&p, &[]);
+        for name_len in [0usize, 1, 8_000] {
+            let name = "n".repeat(name_len);
+            let s = span(1, "svc", &name, 10, 1);
+            let mut budget = ByteBudget::new(usize::MAX);
+            let summary =
+                build_summary(&p, tid(1), &s, &attrs, &mut budget).expect("within the test budget");
+            assert_eq!(
+                budget.used(),
+                super::super::exec::RETAINED_ENTRY_OVERHEAD + name_len,
+                "the summary charge must be EXACTLY overhead + name bytes at L={name_len}"
+            );
+            assert_eq!(
+                summary.heap_payload_bytes(),
+                super::super::exec::RETAINED_ENTRY_OVERHEAD + name_len,
+                "the release-side cost model must equal the charge at L={name_len}"
+            );
+        }
+    }
+
     /// Round-2 finding: unused preallocated `select()` capacity is
     /// retained memory — it is charged and counted even when no attribute
     /// value materializes (attributes len 0, capacity 1 here).

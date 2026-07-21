@@ -403,4 +403,26 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(json["errorType"], "query_too_broad");
     }
+
+    /// Issue #57 re-audit AC-conformance: the generator-memory reason
+    /// carries the same envelope as every other `QueryTooBroad` variant
+    /// — no dedicated match arm was needed (`ApiError::Read`'s
+    /// `QueryTooBroad(_)` arm already covers it).
+    #[tokio::test]
+    async fn the_generator_memory_reason_maps_to_422_query_too_broad() {
+        let err = ApiError::Read(ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::TraceGeneratorMemory {
+                budget_bytes: 1_048_576,
+            },
+        ));
+        let (status, json) = envelope(err).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("generator memory")),
+            "message must name the reason, got {json}"
+        );
+    }
 }

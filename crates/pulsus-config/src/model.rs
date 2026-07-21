@@ -325,6 +325,16 @@ pub struct ReaderConfig {
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #57 re-audit (sub-problem B): the trace-search phase-1
+    /// candidate-generator query's `max_memory_usage` ceiling (throw) —
+    /// bounds a dense common-value prefix's `GROUP BY trace_id`
+    /// aggregation state; exceeding it is a `422 query_too_broad`
+    /// (server code 241 `MEMORY_LIMIT_EXCEEDED`), never an OOM. Applied
+    /// only to the generator read, never phase-2 hydration/membership/
+    /// value/root reads. Default 512 MiB — well above the ~21 MB
+    /// measured for a 500k-row/500k-key aggregation, well below the
+    /// server's 10 GiB default.
+    pub traceql_generator_max_memory_bytes: u64,
     /// Issue #101: process-wide bound on concurrent CPU-bound PromQL
     /// evaluations offloaded onto tokio's blocking pool (the read path's
     /// one `spawn_blocking(evaluate)` site). A query past the limit waits
@@ -392,6 +402,7 @@ impl Default for ReaderConfig {
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            traceql_generator_max_memory_bytes: 536_870_912,
             query_eval_concurrency: 256,
             tail_poll_interval: HumanDuration(Duration::from_secs(1)),
             tail_max_delay: HumanDuration(Duration::from_secs(5)),

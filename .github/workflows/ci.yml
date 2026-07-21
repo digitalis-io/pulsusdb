@@ -422,7 +422,11 @@ jobs:
       # bounded-transfer LIMIT differential) plus the live budget trips
       # (scan-budget 422, Layer-2 retention 422, span-overflow partial).
       # Wired here by issue #58 — the step was omitted when #57 landed.
-      # Reuses this job's ClickHouse 24.8 container.
+      # Issue #57 re-audit adds: AC-A2 (source string truncation is a
+      # hard byte ceiling on multi-byte UTF-8), AC-A3 (the reshaped
+      # retention-counter trip with its full drift guard), AC-B1 (the
+      # phase-1 generator memory ceiling trips 241 -> 422). Reuses this
+      # job's ClickHouse 24.8 container.
       - name: TraceQL search EXPLAIN + budget gates (Tier 1)
         env:
           PULSUS_TEST_CLICKHOUSE: "1"

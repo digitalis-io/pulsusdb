@@ -715,6 +715,7 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             catalog_table: "trace_tag_catalog".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
+            generator_max_memory_bytes: 536_870_912,
             distributed: true,
             skip_unavailable_shards: false,
         },
