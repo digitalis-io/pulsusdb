@@ -84,6 +84,15 @@ pub enum PromqlError {
     #[error("invalid function parameter: {detail}")]
     InvalidParameter { detail: String },
 
+    /// A native-histogram trim operator (`</`/`>/`, issue #129) applied to
+    /// two scalars — upstream `scalarBinop` panics `operator %q not
+    /// allowed for Scalar operations` for TRIM (`promql/engine.go:3434`),
+    /// surfaced as a query error via `ev.recover` (`:1199-1200`); mirrored
+    /// here as a typed error instead of a panic. `op` is the operator's
+    /// [`crate::plan::BinOp::item_type_str`] (`"</"`/`">/"`).
+    #[error("operator \"{op}\" not allowed for Scalar operations")]
+    ScalarOp { op: &'static str },
+
     /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
     /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
     /// the awaiting request future was dropped (client disconnect, or the
@@ -155,6 +164,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid function parameter: invalid smoothing factor: expected 0 < sf < 1, got 2"
+        );
+    }
+
+    /// Issue #129: verbatim upstream `scalarBinop` panic text
+    /// (`engine.go:3434`), for both trim operators.
+    #[test]
+    fn scalar_op_display_carries_the_upstream_panic_text_verbatim() {
+        let err = PromqlError::ScalarOp { op: "</" };
+        assert_eq!(
+            err.to_string(),
+            "operator \"</\" not allowed for Scalar operations"
+        );
+        let err = PromqlError::ScalarOp { op: ">/" };
+        assert_eq!(
+            err.to_string(),
+            "operator \">/\" not allowed for Scalar operations"
         );
     }
 }

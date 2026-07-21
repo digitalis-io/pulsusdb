@@ -404,6 +404,15 @@ pub struct Grouping {
 /// v3.13 @ 40af9c2) lists `ATAN2` alongside the six arithmetic operators,
 /// so it drops `__name__` and never filters. Set operators (`and`/`or`/
 /// `unless`) are not `BinOp`s at all — they plan to [`PlanExpr::SetOp`].
+///
+/// `TrimUpper`/`TrimLower` (issue #129) are Prometheus's experimental
+/// native-histogram **trim** operators (`</` TRIM_UPPER, `>/` TRIM_LOWER,
+/// `promql/parser/lex.go:470-489` at the pinned v3.13.0 conformance SHA
+/// `40af9c2`) — NOT comparisons: they are deliberately excluded from the
+/// vendored parser's `is_comparison_operator` (`token.rs`), which is what
+/// makes `bool` parse-reject on them and exempts their scalar operands
+/// from the BOOL-modifier requirement. [`Self::is_comparison`] mirrors
+/// that exclusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -419,6 +428,8 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    TrimUpper,
+    TrimLower,
 }
 
 impl BinOp {
@@ -426,6 +437,32 @@ impl BinOp {
         matches!(
             self,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        )
+    }
+
+    /// Whether this is a native-histogram trim operator (`</`/`>/`) —
+    /// issue #129.
+    pub fn is_trim(self) -> bool {
+        matches!(self, BinOp::TrimUpper | BinOp::TrimLower)
+    }
+
+    /// Upstream `changesMetricSchema` (`promql/engine.go:4407-4414`,
+    /// pinned `40af9c2`): whether the operator computes a new value and so
+    /// drops `__name__` (and other metadata) immediately — the six
+    /// arithmetic operators plus `atan2`. Comparisons and the trim
+    /// operators are excluded (a trim's result stays "the same metric,
+    /// filtered/reshaped" for naming purposes, exactly like a filter-mode
+    /// comparison).
+    pub fn changes_metric_schema(self) -> bool {
+        matches!(
+            self,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Mod
+                | BinOp::Pow
+                | BinOp::Atan2
         )
     }
 
@@ -448,6 +485,8 @@ impl BinOp {
             BinOp::Le => "<=",
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
+            BinOp::TrimUpper => "</",
+            BinOp::TrimLower => ">/",
         }
     }
 }
@@ -2219,6 +2258,8 @@ fn bin_op(op: token::TokenType) -> Option<BinOp> {
         id if id == token::T_LTE => Some(BinOp::Le),
         id if id == token::T_GTR => Some(BinOp::Gt),
         id if id == token::T_GTE => Some(BinOp::Ge),
+        id if id == token::T_TRIM_UPPER => Some(BinOp::TrimUpper),
+        id if id == token::T_TRIM_LOWER => Some(BinOp::TrimLower),
         _ => None,
     }
 }
@@ -3410,6 +3451,50 @@ mod tests {
                 assert!(!op.is_comparison(), "atan2 is arithmetic-class");
             }
             other => panic!("expected Binary, got {other:?}"),
+        }
+    }
+
+    /// Issue #129: `</`/`>/` plan to their own `BinOp` variants, are NOT
+    /// comparison-class (`is_comparison`), and do NOT change the metric
+    /// schema (`changes_metric_schema` — `engine.go:4407-4414` excludes
+    /// TRIM, unlike the six arithmetic operators + `atan2`).
+    #[test]
+    fn plans_trim_operators_as_their_own_non_comparison_non_schema_changing_class() {
+        for (query, want_op, want_str) in [
+            ("foo </ 3", BinOp::TrimUpper, "</"),
+            ("foo >/ 3", BinOp::TrimLower, ">/"),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params()).unwrap();
+            match &p.root {
+                PlanExpr::Binary { op, .. } => {
+                    assert_eq!(*op, want_op, "{query}");
+                    assert!(op.is_trim(), "{query}: must be trim-class");
+                    assert!(!op.is_comparison(), "{query}: trim is not comparison-class");
+                    assert!(
+                        !op.changes_metric_schema(),
+                        "{query}: trim does not change the metric schema"
+                    );
+                    assert_eq!(op.item_type_str(), want_str);
+                }
+                other => panic!("{query}: expected Binary, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #129: `bool` is parse-rejected on a trim operator — the
+    /// vendored parser's `is_comparison_operator` deliberately excludes
+    /// `T_TRIM_UPPER`/`T_TRIM_LOWER` (`token.rs`), matching upstream's
+    /// `IsComparisonOperator` (`lex.go:82-90`).
+    #[test]
+    fn trim_operator_with_bool_modifier_is_a_parse_error() {
+        for query in ["foo </ bool 3", "foo >/ bool 3"] {
+            let err = parse(query).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("bool modifier can only be used on comparison operators"),
+                "{query}: got {err}"
+            );
         }
     }
 

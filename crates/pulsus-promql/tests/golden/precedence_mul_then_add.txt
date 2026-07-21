@@ -6,7 +6,7 @@ Binary(
         lhs: Binary(
             BinaryExpr {
                 op: TokenType(
-                    36,
+                    38,
                 ),
                 lhs: VectorSelector(
                     VectorSelector {

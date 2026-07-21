@@ -34,6 +34,9 @@ fn apply_arith(op: BinOp, l: f64, r: f64) -> f64 {
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             unreachable!("comparison operators are handled by apply_compare")
         }
+        BinOp::TrimUpper | BinOp::TrimLower => {
+            unreachable!("trim operators are handled by vector_elem_binop_hist's histogram arms")
+        }
     }
 }
 
@@ -74,6 +77,9 @@ fn apply_compare(op: BinOp, l: f64, r: f64) -> bool {
         | BinOp::Pow
         | BinOp::Atan2 => {
             unreachable!("arithmetic operators are handled by apply_arith")
+        }
+        BinOp::TrimUpper | BinOp::TrimLower => {
+            unreachable!("trim operators are handled by vector_elem_binop_hist's histogram arms")
         }
     }
 }
@@ -121,6 +127,10 @@ fn vector_elem_binop_hist(
         }
     };
     match (lh, rh) {
+        // Issue #129: `float TRIM float` (neither side a histogram) has no
+        // buckets to trim — dropped, same as `histogram TRIM histogram`
+        // below (`vectorElemBinop`, `engine.go:3506-3508`).
+        (None, None) if op.is_trim() => drop_incompatible_types("float", "float", annos),
         (None, None) => {
             if op.is_comparison() {
                 ElemBinopResult {
@@ -165,6 +175,26 @@ fn vector_elem_binop_hist(
             let mut result = lh.clone();
             result.div(rv);
             result.compact();
+            ElemBinopResult {
+                v: 0.0,
+                h: Some(result),
+                keep: true,
+            }
+        }
+        // Issue #129: `histogram </ float` / `histogram >/ float` — trim,
+        // never dropped (`vectorElemBinop`, `engine.go:3507-3510`). The
+        // result is already `Compact`-ed inside `trim_buckets` (upstream
+        // parity, same as `Mul`/`Div` above).
+        (Some(lh), None) if op == BinOp::TrimUpper => {
+            let result = lh.trim_buckets(rv, true);
+            ElemBinopResult {
+                v: 0.0,
+                h: Some(result),
+                keep: true,
+            }
+        }
+        (Some(lh), None) if op == BinOp::TrimLower => {
+            let result = lh.trim_buckets(rv, false);
             ElemBinopResult {
                 v: 0.0,
                 h: Some(result),
@@ -250,7 +280,9 @@ fn vector_elem_binop_hist(
             | BinOp::Lt
             | BinOp::Le
             | BinOp::Gt
-            | BinOp::Ge => drop_incompatible_types("histogram", "histogram", annos),
+            | BinOp::Ge
+            | BinOp::TrimUpper
+            | BinOp::TrimLower => drop_incompatible_types("histogram", "histogram", annos),
         },
     }
 }
@@ -306,11 +338,15 @@ pub fn vector_scalar(
                 if !result.keep {
                     return None;
                 }
+                // Issue #129: unlike every other arithmetic operator, trim
+                // does NOT change the metric schema (`engine.go:4407-4414`
+                // excludes TRIM) — its output stays "the same metric",
+                // subject only to the input's own already-marked verdict.
                 (
                     result.v,
                     result.h.map(Box::new),
                     s.metric_name.clone(),
-                    true,
+                    op.changes_metric_schema() || s.drop_name,
                 )
             };
             Some(InstantSample {
@@ -574,7 +610,7 @@ fn emit_pair(
     // `__name__` via the metric-name channel). The output's DELAYED
     // verdict is `DropName: returnBool` (engine.go:3279) — `bool`-mode
     // output drops terminally; a filter comparison's does not.
-    let immediate_drop = !ctx.op.is_comparison();
+    let immediate_drop = ctx.op.changes_metric_schema();
     let drop_name = ctx.bool_modifier;
     let one_to_one = ctx.include.is_none();
     let (mut labels, mut metric_name) = if one_to_one {
@@ -2749,6 +2785,164 @@ mod tests {
             .as_ref()
             .expect("histogram * scalar computes a histogram");
         assert!(h.bits_eq(&exp_hist(90.0, 99.0, vec![9.0, 9.0, 9.0])));
+        assert!(annos.is_empty());
+    }
+
+    // -- Issue #129: native-histogram trim operators (`</` TrimUpper,
+    // `>/` TrimLower). --
+
+    /// `hist </ float` computes the trim (`vectorElemBinop`,
+    /// `engine.go:3507-3508`), NAME KEPT and `drop_name` unchanged from
+    /// the input (trim does not `changesMetricSchema`).
+    #[test]
+    fn vector_scalar_trim_upper_computes_the_trim_and_keeps_the_metric_name() {
+        let mut annos = Annotations::new();
+        let h = exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]);
+        let vector = vec![hist_sample(&[], h.clone())];
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, &mut annos);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0]
+                .h
+                .as_ref()
+                .unwrap()
+                .bits_eq(&h.trim_buckets(2.0, true))
+        );
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(
+            !out[0].drop_name,
+            "trim does not change the metric schema, so drop_name is unchanged from the input"
+        );
+        assert!(annos.is_empty());
+    }
+
+    /// Same as above for `hist >/ float` (`engine.go:3509-3510`), and an
+    /// already-`drop_name`-marked input sample stays marked (the input's
+    /// own verdict survives, exactly like a filter-mode comparison).
+    #[test]
+    fn vector_scalar_trim_lower_computes_the_trim_and_propagates_drop_name() {
+        let mut annos = Annotations::new();
+        let h = exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]);
+        let mut marked = hist_sample(&[], h.clone());
+        marked.drop_name = true;
+        let out = vector_scalar(BinOp::TrimLower, false, &[marked], 2.0, false, &mut annos);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0]
+                .h
+                .as_ref()
+                .unwrap()
+                .bits_eq(&h.trim_buckets(2.0, false))
+        );
+        assert!(out[0].drop_name, "the input's drop verdict survives trim");
+    }
+
+    /// `float TRIM float` (neither side a histogram) — dropped, same
+    /// disposition as `histogram TRIM histogram` (`engine.go:3506-3508`).
+    #[test]
+    fn vector_scalar_trim_over_a_plain_float_vector_drops_with_info() {
+        let mut annos = Annotations::new();
+        let vector = vec![sample(&[], 5.0)];
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, &mut annos);
+        assert!(out.is_empty());
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                crate::annotations::messages::incompatible_types_in_binop_info(
+                    "float", "</", "float"
+                )
+            ]
+        );
+    }
+
+    /// `5 </ h` (scalar on the LEFT, histogram vector on the right) —
+    /// `vectorElemBinop`'s `(None, Some(_))` arm: dropped as
+    /// `"float","histogram"`, not routed through the histogram-trim path
+    /// (trim only fires `histogram TRIM float`, never `float TRIM
+    /// histogram`).
+    #[test]
+    fn vector_scalar_trim_with_scalar_on_left_and_histogram_rhs_drops_as_float_histogram() {
+        let mut annos = Annotations::new();
+        let vector = vec![hist_sample(&[], exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]))];
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 5.0, true, &mut annos);
+        assert!(out.is_empty());
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                crate::annotations::messages::incompatible_types_in_binop_info(
+                    "float",
+                    "</",
+                    "histogram"
+                )
+            ]
+        );
+    }
+
+    /// `histogram TRIM histogram` — dropped (`engine.go:3549-3551`),
+    /// same class as `MUL`/`DIV`/comparison between two histograms.
+    #[test]
+    fn vector_vector_trim_over_two_histograms_drops_with_info() {
+        let mut annos = Annotations::new();
+        let lhs = vec![hist_sample(&[], exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]))];
+        let rhs = vec![hist_sample(&[], exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]))];
+        let out = vector_vector(
+            BinOp::TrimLower,
+            false,
+            &ignoring_default(),
+            &Group::OneToOne,
+            &no_fill(),
+            &lhs,
+            &rhs,
+            &mut annos,
+        )
+        .unwrap();
+        assert!(out.is_empty());
+        let (_, infos) = annos.as_strings(0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                crate::annotations::messages::incompatible_types_in_binop_info(
+                    "histogram",
+                    ">/",
+                    "histogram"
+                )
+            ]
+        );
+    }
+
+    /// `cbh_for_join >/ on (label) float_for_join`-shaped case (corpus
+    /// `native_histograms.test:2385`): vector-vector trim where the RHS
+    /// vector's elements are plain floats keeps the LHS metric name (no
+    /// immediate drop — trim does not `changesMetricSchema`).
+    #[test]
+    fn vector_vector_trim_lower_over_a_histogram_and_a_float_vector_computes_and_keeps_name() {
+        let mut annos = Annotations::new();
+        let h = exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]);
+        let lhs = vec![hist_sample(&[("job", "a")], h.clone())];
+        let rhs = vec![sample(&[("job", "a")], 2.0)];
+        let out = vector_vector(
+            BinOp::TrimLower,
+            false,
+            &ignoring_default(),
+            &Group::OneToOne,
+            &no_fill(),
+            &lhs,
+            &rhs,
+            &mut annos,
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0]
+                .h
+                .as_ref()
+                .unwrap()
+                .bits_eq(&h.trim_buckets(2.0, false))
+        );
+        assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
+        assert!(!out[0].drop_name);
         assert!(annos.is_empty());
     }
 }

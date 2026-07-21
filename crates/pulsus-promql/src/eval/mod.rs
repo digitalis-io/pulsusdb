@@ -3048,6 +3048,16 @@ fn eval_step(
                         *group == crate::plan::Group::OneToOne && *fill == Default::default(),
                         "plan_binary discards group/fill for scalar operands"
                     );
+                    // Issue #129: upstream `scalarBinop` panics for TRIM
+                    // (`engine.go:3434`, surfaced as a query error via
+                    // `ev.recover`) — `binop::scalar_scalar` has no
+                    // fallible signature, so trim is intercepted here,
+                    // before it is ever called.
+                    if op.is_trim() {
+                        return Err(PromqlError::ScalarOp {
+                            op: op.item_type_str(),
+                        });
+                    }
                     Ok(StepValue::Scalar(binop::scalar_scalar(*op, l, r)))
                 }
                 (StepValue::Vector(v), StepValue::Scalar(s)) => {
@@ -4081,6 +4091,22 @@ mod tests {
         match evaluate(&p, &data).unwrap() {
             QueryValue::Scalar(v) => assert_eq!(v, 2.0),
             other => panic!("expected Scalar, got {other:?}"),
+        }
+    }
+
+    /// Issue #129: a trim operator (`</`/`>/`) between two scalars —
+    /// upstream `scalarBinop` panics `operator %q not allowed for Scalar
+    /// operations` (`engine.go:3434`), surfaced as a query error;
+    /// `binop::scalar_scalar` has no fallible signature, so this must be
+    /// intercepted before it is ever called.
+    #[test]
+    fn trim_operator_between_two_scalars_is_a_scalar_op_error() {
+        for (query, want_op) in [("1 </ 2", "</"), ("1 >/ 2", ">/")] {
+            let expr = crate::parser::parse(query).unwrap();
+            let p = plan(&expr, params(0, 0, 0)).unwrap();
+            let data = SeriesData::new();
+            let err = evaluate(&p, &data).unwrap_err();
+            assert_eq!(err, PromqlError::ScalarOp { op: want_op }, "{query}");
         }
     }
 

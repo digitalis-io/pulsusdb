@@ -192,6 +192,7 @@ impl FloatHistogram {
 
 include!("float_histogram_ops.rs");
 include!("float_histogram_kahan.rs");
+include!("float_histogram_trim.rs");
 
 impl NativeHistogram {
     /// Converts the stored integer histogram to its query-time float form

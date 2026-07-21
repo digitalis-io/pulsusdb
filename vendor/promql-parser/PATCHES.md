@@ -296,6 +296,44 @@ The patches fall into two classes:
   versions past that crate's v2.45 baseline); recorded here as the
   divergence ledger instead.
 
+## G2. Grammar-production patch: native-histogram trim operators (issue #129)
+
+- **Files:** `src/parser/promql.y`, `src/parser/token.rs`,
+  `src/parser/lex.rs`
+- **What:** Prometheus v3.13.0's experimental native-histogram *trim*
+  operators, `</` (`TRIM_UPPER`) and `>/` (`TRIM_LOWER`). Ported from
+  `generated_parser.y`/`lex.go` at PulsusDB's pinned v3.13.0 conformance
+  SHA (`40af9c2`); no experimental feature gate exists for this pair
+  upstream.
+- **Grammar (`promql.y`):** `TRIM_UPPER`/`TRIM_LOWER` tokens added inside
+  the `OPERATORS_START..OPERATORS_END` block (keeps `is_operator()`'s
+  range check correct), immediately after `GTR` — matching
+  `generated_parser.y`'s own token order. Precedence line extended to
+  `%left EQLC GTE GTR LSS LTE NEQ TRIM_UPPER TRIM_LOWER` (comparison
+  precedence, left-assoc, matching upstream). Two new `binary_expr`
+  productions, clones of the `LSS`/`GTR` arms. `%expect-rr` rises from
+  207 to 225 (each new comparison-precedence operator overlaps the same
+  G1 `offset_duration_expr`/`duration_expr` ambiguity); `%expect`
+  (shift/reduce) is unchanged at 11.
+- **Lexer (`lex.rs`):** the `'<'`/`'>'` arms gain a `peek() == '/'` guard
+  (checked before the existing `=` guard's fallthrough, mirroring
+  upstream's `if/else if/else` chain) emitting `T_TRIM_UPPER`/
+  `T_TRIM_LOWER`.
+- **`token.rs`:** `token_display` gains the two display strings (`"</"`,
+  `">/"`). `is_comparison_operator` is **deliberately unchanged** — it is
+  what makes `bool` parse-reject on trim operators
+  (`"bool modifier can only be used on comparison operators"`, `ast.rs`)
+  and what exempts scalar operands of trim from the BOOL-modifier
+  requirement, matching upstream's `IsComparisonOperator` (`lex.go:82-90`)
+  excluding `TRIM_UPPER`/`TRIM_LOWER`.
+- **Corpus inputs fixed:** the 110 native-histogram trim rows formerly in
+  `crates/pulsus-promql/tests/promqltest/corpus/eval-divergences.jsonl`
+  (`native_histograms.test`, e.g. `h_test </ 3`, `h_test >/ -Inf`,
+  `cbh_for_join >/ on (label) float_for_join`).
+- **Upstream PR:** not applicable — as with G1, this targets Prometheus
+  v3.13 grammar past the crate's v2.45 baseline; recorded here as the
+  divergence ledger instead.
+
 ## Upstream PR status
 
 None of the 5 leaf fixes above have been filed as upstream PRs against

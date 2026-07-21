@@ -93,7 +93,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet}` | 422 | `execution` |
+/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
@@ -108,12 +108,16 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // `LabelSet` (issue #68: label_replace/label_join invalid
         // regex/label-name and duplicate-output-labelset errors) maps the
         // same way — a well-formed query whose evaluation is rejected,
-        // exactly upstream's 422 `execution` for these.
+        // exactly upstream's 422 `execution` for these. `ScalarOp` (issue
+        // #129: a native-histogram trim operator between two scalars)
+        // rides the same mapping — upstream surfaces its `scalarBinop`
+        // panic as a query execution error (`ev.recover`), never a 5xx.
         PromqlError::Unsupported { .. }
         | PromqlError::BadMatching { .. }
         | PromqlError::HistogramBucket { .. }
         | PromqlError::InvalidParameter { .. }
-        | PromqlError::LabelSet { .. } => {
+        | PromqlError::LabelSet { .. }
+        | PromqlError::ScalarOp { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
         // Issue #93: a live `CancelToken` fired because the awaiting
@@ -375,6 +379,20 @@ mod tests {
         assert_eq!(
             json["error"],
             "vector cannot contain metrics with the same labelset"
+        );
+    }
+
+    #[tokio::test]
+    async fn promql_scalar_op_error_maps_to_422_execution_with_the_raw_message() {
+        // Issue #129: a native-histogram trim operator between two
+        // scalars — the upstream `scalarBinop` panic text verbatim.
+        let err = PromqlError::ScalarOp { op: "</" };
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "operator \"</\" not allowed for Scalar operations"
         );
     }
 

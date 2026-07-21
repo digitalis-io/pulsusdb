@@ -345,12 +345,24 @@ impl Lexer {
                     self.pop();
                     State::Lexeme(T_LTE)
                 }
+                // PulsusDB patch (docs/decisions/0003, grammar patch G2): `</` is
+                // the native-histogram TRIM_UPPER operator.
+                Some('/') => {
+                    self.pop();
+                    State::Lexeme(T_TRIM_UPPER)
+                }
                 _ => State::Lexeme(T_LSS),
             },
             '>' => match self.peek() {
                 Some('=') => {
                     self.pop();
                     State::Lexeme(T_GTE)
+                }
+                // PulsusDB patch (docs/decisions/0003, grammar patch G2): `>/` is
+                // the native-histogram TRIM_LOWER operator.
+                Some('/') => {
+                    self.pop();
+                    State::Lexeme(T_TRIM_LOWER)
                 }
                 _ => State::Lexeme(T_GTR),
             },
@@ -998,6 +1010,8 @@ mod tests {
             (">", vec![(T_GTR, 0, 1)], None),
             (">=", vec![(T_GTE, 0, 2)], None),
             ("<=", vec![(T_LTE, 0, 2)], None),
+            ("</", vec![(T_TRIM_UPPER, 0, 2)], None),
+            (">/", vec![(T_TRIM_LOWER, 0, 2)], None),
             ("+", vec![(T_ADD, 0, 1)], None),
             ("-", vec![(T_SUB, 0, 1)], None),
             ("*", vec![(T_MUL, 0, 1)], None),

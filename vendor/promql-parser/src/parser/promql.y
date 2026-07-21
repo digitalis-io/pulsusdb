@@ -70,6 +70,12 @@ EQLC
 EQL_REGEX
 GTE
 GTR
+// PulsusDB patch (docs/decisions/0003, grammar patch G2 — see
+// vendor/promql-parser/PATCHES.md): the native-histogram trim operators
+// (`</` TRIM_UPPER, `>/` TRIM_LOWER), ported from Prometheus v3.13.0's
+// generated_parser.y at the pinned conformance SHA.
+TRIM_UPPER
+TRIM_LOWER
 LAND
 LOR
 LSS
@@ -154,15 +160,21 @@ START_METRIC_SELECTOR
 // earlier-defined production — offset_duration_expr's arms, which is the
 // upstream precedence behaviour ("foo offset 100 + 2" == "(foo offset
 // 100) + 2"), pinned by the proof corpus.
+//
+// PulsusDB patch (docs/decisions/0003, grammar patch G2): the two new
+// `binary_expr` productions for TRIM_UPPER/TRIM_LOWER raise the
+// reduce/reduce count further (each new comparison-precedence operator
+// overlaps the same offset_duration_expr/duration_expr ambiguity above);
+// shift/reduce is unaffected.
 %expect 11
-%expect-rr 207
+%expect-rr 225
 
 %start start
 
 // Operators are listed with increasing precedence.
 %left LOR
 %left LAND LUNLESS
-%left EQLC GTE GTR LSS LTE NEQ
+%left EQLC GTE GTR LSS LTE NEQ TRIM_UPPER TRIM_LOWER
 %left ADD SUB
 %left MUL DIV MOD ATAN2
 %right POW
@@ -245,6 +257,8 @@ binary_expr -> Result<Expr, String>:
         |       expr NEQ     bin_modifier expr { Expr::new_binary_expr($1?, lexeme_to_token($lexer, $2)?.id(), $3?, $4?) }
         |       expr POW     bin_modifier expr { Expr::new_binary_expr($1?, lexeme_to_token($lexer, $2)?.id(), $3?, $4?) }
         |       expr SUB     bin_modifier expr { Expr::new_binary_expr($1?, lexeme_to_token($lexer, $2)?.id(), $3?, $4?) }
+        |       expr TRIM_LOWER bin_modifier expr { Expr::new_binary_expr($1?, lexeme_to_token($lexer, $2)?.id(), $3?, $4?) }
+        |       expr TRIM_UPPER bin_modifier expr { Expr::new_binary_expr($1?, lexeme_to_token($lexer, $2)?.id(), $3?, $4?) }
 ;
 
 // Using left recursion for the modifier rules, helps to keep the parser stack small and
