@@ -55,6 +55,12 @@ pub struct KahanAddOutcome {
     pub result: FloatHistogram,
     pub compensation: FloatHistogram,
     pub nhcb_bounds_reconciled: bool,
+    /// `CounterReset` met `NotCounterReset` (issue #125) — upstream
+    /// `KahanAdd`'s `counterResetCollision` return via `adjustCounterReset`
+    /// (`float_histogram.go:421`, `:2070-2094`). The aggregation callers
+    /// discard it (the pin's `_` — they track input-hint collisions
+    /// themselves); it is carried for pin-parity of the op itself.
+    pub counter_reset_collision: bool,
 }
 
 impl FloatHistogram {
@@ -72,6 +78,21 @@ impl FloatHistogram {
         if self.uses_custom_buckets() != other.uses_custom_buckets() {
             return Err(FloatHistogramOpError::IncompatibleSchema);
         }
+        // `adjustCounterReset` (`:421`) — right after the schema check,
+        // exactly like the plain `Add` (issue #125).
+        let (counter_reset_hint, counter_reset_collision) =
+            adjust_counter_reset(self.counter_reset_hint, other.counter_reset_hint);
+        // The compensation's hint (issue #125, load-bearing for the
+        // callers' final flush `Add`): the pin's `newCompensationHistogram`
+        // copies the receiver's ALREADY-ADJUSTED hint at creation
+        // (`float_histogram.go:2035-2043`, called AFTER `adjustCounterReset`
+        // at `:421-426`), and later KahanAdds never touch the passed-in
+        // `c`'s hint — so a fold of all-NotCounterReset inputs flushes
+        // `adjust(NCR, NCR) = NCR`, not `adjust(NCR, Unknown) = Unknown`.
+        let compensation_hint = match c {
+            Some(ch) => ch.counter_reset_hint,
+            None => counter_reset_hint,
+        };
         // `if c == nil { c = h.newCompensationHistogram() }` (`:424-426`):
         // zero-valued arrays parallel to self's.
         let (c_pos, c_neg, c_zero_in, c_count_in, c_sum_in) = match c {
@@ -139,6 +160,7 @@ impl FloatHistogram {
                 };
             return Ok(KahanAddOutcome {
                 result: FloatHistogram {
+                    counter_reset_hint,
                     schema: self.schema,
                     zero_threshold: 0.0,
                     zero_count: 0.0,
@@ -154,6 +176,7 @@ impl FloatHistogram {
                 // also sets `c.CustomValues = intersectedBounds`
                 // (`:464-466`).
                 compensation: FloatHistogram {
+                    counter_reset_hint: compensation_hint,
                     schema: self.schema,
                     zero_threshold: 0.0,
                     zero_count: 0.0,
@@ -166,6 +189,7 @@ impl FloatHistogram {
                     custom_values,
                 },
                 nhcb_bounds_reconciled: reconciled,
+                counter_reset_collision,
             });
         }
 
@@ -279,6 +303,7 @@ impl FloatHistogram {
 
         Ok(KahanAddOutcome {
             result: FloatHistogram {
+                counter_reset_hint,
                 schema: target_schema,
                 zero_threshold: threshold,
                 zero_count,
@@ -293,6 +318,7 @@ impl FloatHistogram {
             // `c.Schema = h.Schema; c.ZeroThreshold = h.ZeroThreshold;
             // c.PositiveSpans/NegativeSpans = h.…` (`:525-529`).
             compensation: FloatHistogram {
+                counter_reset_hint: compensation_hint,
                 schema: target_schema,
                 zero_threshold: threshold,
                 zero_count: c_zero,
@@ -305,6 +331,7 @@ impl FloatHistogram {
                 custom_values: Vec::new(),
             },
             nhcb_bounds_reconciled: false,
+            counter_reset_collision,
         })
     }
 
@@ -611,6 +638,7 @@ mod kahan_tests {
 
     fn exp_hist(count: f64, sum: f64, buckets: Vec<f64>) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -629,6 +657,7 @@ mod kahan_tests {
 
     fn nhcb_hist(count: f64, sum: f64, bounds: Vec<f64>, buckets: Vec<f64>) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -721,6 +750,7 @@ mod kahan_tests {
     #[test]
     fn zero_count_compensation_recovers_lost_low_order_adds() {
         let mk = |zc: f64| FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             zero_threshold: 1.0,
             zero_count: zc,
             ..exp_hist(zc, 0.0, vec![])
@@ -782,6 +812,7 @@ mod kahan_tests {
     #[test]
     fn self_side_kahan_schema_reduction_generates_compensation() {
         let hi_res = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             positive_spans: vec![Span {
                 offset: 1,
@@ -791,6 +822,7 @@ mod kahan_tests {
             ..exp_hist(BIG + 2.0, 0.0, vec![])
         };
         let lo_res = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             positive_spans: vec![Span {
                 offset: 1,
@@ -817,6 +849,7 @@ mod kahan_tests {
     #[test]
     fn other_side_reduction_compensation_flows_through_the_merge() {
         let lo_res = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             positive_spans: vec![Span {
                 offset: 1,
@@ -826,6 +859,7 @@ mod kahan_tests {
             ..exp_hist(1.0, 0.0, vec![])
         };
         let hi_res = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             positive_spans: vec![Span {
                 offset: 1,
@@ -850,6 +884,7 @@ mod kahan_tests {
         // (constructed directly for a focused unit test — the state a
         // prior lossy fold would leave).
         let sum = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.5,
             zero_count: 0.0,
@@ -861,6 +896,7 @@ mod kahan_tests {
             ..exp_hist(BIG, 0.0, vec![])
         };
         let comp = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             positive_buckets: vec![1.0],
             count: 0.0,
             ..sum.clone()
@@ -868,6 +904,7 @@ mod kahan_tests {
         // Other: zero bucket [-1,1] (threshold 1.0 > 0.5) with one more
         // observation — forces self's (0.5,1] bucket into the zero bucket.
         let other = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.0,
             zero_count: 1.0,
@@ -900,6 +937,7 @@ mod kahan_tests {
     #[test]
     fn kahan_add_folds_three_converted_native_histograms_exactly() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,

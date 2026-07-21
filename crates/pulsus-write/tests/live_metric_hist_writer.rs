@@ -146,6 +146,7 @@ async fn flush(writer: &MetricWriter, batch: ParsedMetrics) {
 /// (an internal zero) delta-encoded to [1, -1, 2], count 3.
 fn hist_with_internal_zero(sum: f64) -> NativeHistogram {
     NativeHistogram {
+        counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
         schema: 0,
         zero_threshold: 0.0,
         zero_count: 0,
@@ -183,7 +184,7 @@ async fn select_hist_rows(client: &ChClient, db: &str, name: &str) -> Vec<Metric
     let sql = format!(
         "SELECT metric_name, fingerprint, unix_milli, schema, zero_threshold, zero_count, count, \
          sum, pos_span_offsets, pos_span_lengths, pos_bucket_deltas, neg_span_offsets, \
-         neg_span_lengths, neg_bucket_deltas, custom_values \
+         neg_span_lengths, neg_bucket_deltas, custom_values, counter_reset_hint \
          FROM {db}.metric_hist_samples WHERE metric_name = '{name}' ORDER BY fingerprint"
     );
     let mut stream = client
@@ -324,6 +325,35 @@ async fn native_exp_histogram_round_trips_absolute_counts_through_clickhouse() {
         abs,
         vec![1, 0, 2],
         "the internal zero bucket round-trips through ClickHouse"
+    );
+    // Issue #125: today's OTLP ingest always writes counter_reset_hint 0
+    // (Unknown; no monotonicity signal exists on the wire), and the value
+    // decodes back to `CounterResetHint::Unknown` through the model's
+    // column round-trip.
+    assert_eq!(
+        row.counter_reset_hint, 0,
+        "OTLP-ingested native histograms always store hint 0 (Unknown)"
+    );
+    let decoded = pulsus_model::NativeHistogram::from_columns(&pulsus_model::HistogramColumns {
+        schema: row.schema,
+        zero_threshold: row.zero_threshold,
+        zero_count: row.zero_count,
+        count: row.count,
+        sum: row.sum,
+        pos_span_offsets: row.pos_span_offsets.clone(),
+        pos_span_lengths: row.pos_span_lengths.clone(),
+        pos_bucket_deltas: row.pos_bucket_deltas.clone(),
+        neg_span_offsets: row.neg_span_offsets.clone(),
+        neg_span_lengths: row.neg_span_lengths.clone(),
+        neg_bucket_deltas: row.neg_bucket_deltas.clone(),
+        custom_values: row.custom_values.clone(),
+        counter_reset_hint: row.counter_reset_hint,
+    })
+    .expect("decode stored columns");
+    assert_eq!(
+        decoded.to_float().counter_reset_hint,
+        pulsus_model::CounterResetHint::Unknown,
+        "stored 0 decodes to Unknown on the query-time FloatHistogram"
     );
 
     drop_database(&bootstrap, db).await;

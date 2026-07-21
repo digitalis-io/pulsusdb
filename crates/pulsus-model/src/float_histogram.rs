@@ -18,10 +18,12 @@
 //! `Compact`/`DetectReset`/`Equals` are **not** ported here — those are
 //! A5b-ii (range functions, counter resets) and A5b-iii (aggregation,
 //! binops) territory, per the locked 3-way split (issue #124 plan v2).
-//! `CounterResetHint` is likewise not modeled: A3 stores no
-//! `counter_reset_hint` column (`histogram.rs` doc), so every decoded
-//! histogram is upstream's `UnknownCounterReset` — a documented, adjudicated
-//! gap (OQ2), not something this port can or should paper over.
+//! [`CounterResetHint`] IS modeled (issue #125, closing A5b's OQ2 gap): the
+//! `metric_hist_samples` schema stores it as the additive
+//! `counter_reset_hint UInt8 DEFAULT 0` column (migrations 27/28), decode
+//! threads it through [`NativeHistogram::to_float`], and the ops apply the
+//! pinned hint algebra (`adjust_counter_reset` on Add/Sub, negate ⇒ Gauge,
+//! the `DetectReset` CR/NCR shortcuts — `float_histogram_ops.rs`).
 //!
 //! The bucket iterators here are a **semantically-equivalent
 //! simplification** of upstream's zero-alloc streaming iterators: rather
@@ -38,6 +40,54 @@
 use crate::histogram::{NativeHistogram, Span, is_custom_buckets_schema};
 
 include!("float_histogram_bounds.rs");
+
+/// The known counter-reset information of a histogram sample — ports the
+/// pinned `model/histogram.CounterResetHint` (`histogram.go:24-33`,
+/// v3.13.0, `40af9c2`). The discriminant values ARE the storage encoding:
+/// the `metric_hist_samples.counter_reset_hint UInt8` column stores
+/// [`Self::as_u8`] and decodes via [`Self::from_u8`] (0 = Unknown is the
+/// column `DEFAULT`, so pre-#125 rows read back semantically exactly).
+///
+/// Deliberately excluded from every equality primitive: upstream `Equals`
+/// ignores it, and so do [`FloatHistogram::equals`] and
+/// [`FloatHistogram::bits_eq`] here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CounterResetHint {
+    /// We cannot say if this histogram signals a counter reset or not.
+    #[default]
+    Unknown, // column value 0
+    /// There was definitely a counter reset starting from this histogram.
+    CounterReset, // 1
+    /// There was definitely no counter reset with this histogram.
+    NotCounterReset, // 2
+    /// A gauge histogram, where counter resets do not apply.
+    Gauge, // 3
+}
+
+impl CounterResetHint {
+    /// The storage-column encoding (upstream's own byte values).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            CounterResetHint::Unknown => 0,
+            CounterResetHint::CounterReset => 1,
+            CounterResetHint::NotCounterReset => 2,
+            CounterResetHint::Gauge => 3,
+        }
+    }
+
+    /// Decodes the storage column. Any out-of-range byte reads back
+    /// [`Self::Unknown`] — defensive (never panic on untrusted storage),
+    /// and semantically the conservative choice upstream makes for every
+    /// "cannot say" state.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CounterResetHint::CounterReset,
+            2 => CounterResetHint::NotCounterReset,
+            3 => CounterResetHint::Gauge,
+            _ => CounterResetHint::Unknown,
+        }
+    }
+}
 
 /// A decoded histogram bucket — mirrors upstream `histogram.Bucket[float64]`
 /// (`model/histogram/generic.go:128`): absolute (not cumulative) `count`,
@@ -58,6 +108,10 @@ pub struct Bucket {
 /// are absolute (not delta-encoded, unlike [`NativeHistogram`]).
 #[derive(Debug, Clone)]
 pub struct FloatHistogram {
+    /// Counter-reset information (issue #125) — decoded from storage,
+    /// adjusted by the ops per the pinned hint algebra, and ignored by
+    /// every equality primitive (upstream `Equals` parity).
+    pub counter_reset_hint: CounterResetHint,
     pub schema: i32,
     pub zero_threshold: f64,
     pub zero_count: f64,
@@ -172,7 +226,11 @@ impl FloatHistogram {
     /// through (mirrors [`NativeHistogram::bits_eq`]). **Distinct from**
     /// upstream `FloatHistogram.Equals` (`float_histogram.go:606`), which
     /// is compaction-sensitive *semantic* equality for the `h==h` binop
-    /// (A5b-iii) — not ported here.
+    /// (A5b-iii) — not ported here. [`Self::counter_reset_hint`] is
+    /// deliberately NOT compared — the pin's `Equals` ignores the hint,
+    /// and the value-model primitive follows (issue #125; the promqltest
+    /// comparator asserts hints separately, only when an expected literal
+    /// sets one).
     pub fn bits_eq(&self, other: &FloatHistogram) -> bool {
         fn bits_eq_slice(a: &[f64], b: &[f64]) -> bool {
             a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
@@ -214,6 +272,7 @@ impl NativeHistogram {
         let positive_buckets = decode_deltas(&self.positive_buckets);
         if self.is_custom_buckets() {
             FloatHistogram {
+                counter_reset_hint: self.counter_reset_hint,
                 schema: self.schema,
                 zero_threshold: 0.0,
                 zero_count: 0.0,
@@ -227,6 +286,7 @@ impl NativeHistogram {
             }
         } else {
             FloatHistogram {
+                counter_reset_hint: self.counter_reset_hint,
                 schema: self.schema,
                 zero_threshold: self.zero_threshold,
                 zero_count: self.zero_count as f64,
@@ -416,6 +476,7 @@ mod tests {
     /// delta-encode to `[1 1 -1]`.
     fn single_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -437,6 +498,7 @@ mod tests {
     /// (`native_histograms.test:1078`).
     fn custom_buckets_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -553,6 +615,7 @@ mod tests {
     #[test]
     fn all_buckets_negative_and_zero_bucket_interleave_ascending() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.5,
             zero_count: 3,
@@ -612,6 +675,7 @@ mod tests {
     fn to_float_accumulates_deltas_in_f64_matching_upstream_above_two_pow_53() {
         let deltas = vec![1i64 << 53, 1, 1, 1, 1, 1];
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,

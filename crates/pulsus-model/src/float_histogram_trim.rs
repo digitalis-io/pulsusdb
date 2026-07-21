@@ -398,6 +398,7 @@ mod trim_tests {
             abs_buckets[2] - abs_buckets[1],
         ];
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -430,6 +431,7 @@ mod trim_tests {
             deltas.push(w[1] - w[0]);
         }
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -541,6 +543,7 @@ mod trim_tests {
     #[test]
     fn zero_bucket_biases_to_positive_only_when_no_negative_side_populated() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.0,
             zero_count: 4,
@@ -565,6 +568,7 @@ mod trim_tests {
     #[test]
     fn zero_bucket_biases_to_negative_only_when_no_positive_side_populated() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.0,
             zero_count: 4,
@@ -613,6 +617,7 @@ mod trim_tests {
     fn trim_recomputed_totals_accumulate_serially_in_upstream_traversal_order() {
         const BIG: f64 = 9007199254740992.0; // 2^53
         let h = FloatHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.5,
             zero_count: 3.0,

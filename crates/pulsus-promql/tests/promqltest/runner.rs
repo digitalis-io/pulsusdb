@@ -582,17 +582,21 @@ fn annotation_matches(m: &AnnotationMatch, actual: &str) -> bool {
 
 /// One value channel — float or native-histogram (issue #124, M7-A6) —
 /// unifying an expected `{{...}}`/plain-number literal with an actual
-/// [`pulsus_promql::InstantSample`]/[`pulsus_promql::Point`].
+/// [`pulsus_promql::InstantSample`]/[`pulsus_promql::Point`]. The `Hist`
+/// `bool` is `hint_set` (issue #125): meaningful on the EXPECTED side
+/// only (whether the literal spelled `counter_reset_hint:` — the pin's
+/// `expectedHPoint.CounterResetHintSet`); actuals always carry `false`
+/// and the comparator never reads the actual's flag.
 #[derive(Debug, Clone)]
 enum Val {
     Float(f64),
-    Hist(FloatHistogram),
+    Hist(FloatHistogram, bool),
 }
 
 impl Val {
     fn from_sample(v: f64, h: &Option<Box<FloatHistogram>>) -> Val {
         match h {
-            Some(h) => Val::Hist((**h).clone()),
+            Some(h) => Val::Hist((**h).clone(), false),
             None => Val::Float(v),
         }
     }
@@ -600,7 +604,7 @@ impl Val {
     fn from_seq(sv: &SeqValue) -> Val {
         match sv {
             SeqValue::Value(v) => Val::Float(*v),
-            SeqValue::Histogram(h) => Val::Hist(h.clone()),
+            SeqValue::Histogram(h, hint_set) => Val::Hist(h.clone(), *hint_set),
             // The grammar rejects gaps/stale in an instant expectation,
             // and range-matrix callers filter `Gap` before this is
             // reached — see `compare_matrix`.
@@ -611,23 +615,26 @@ impl Val {
     fn matches(&self, got: &Val) -> bool {
         match (self, got) {
             (Val::Float(want), Val::Float(got)) => almost_equal(*want, *got),
-            (Val::Hist(want), Val::Hist(got)) => histogram_almost_equal(want, got),
+            (Val::Hist(want, hint_set), Val::Hist(got, _)) => {
+                histogram_almost_equal(want, got, *hint_set)
+            }
             _ => false,
         }
     }
 }
 
-/// Upstream `compareNativeHistogram` (`promqltest/test.go:1401-1447`),
-/// narrowed to this crate's unmodeled `CounterResetHint` (module doc,
-/// `pulsus-model::histogram`): schema exact, count/sum/zero_count within
-/// `almost_equal` tolerance, NHCB custom bounds exact, zero_threshold
-/// exact, bucket layout (spans + per-bucket value) within tolerance —
-/// after `Compact(0)` on both sides, exactly like the pin. The pin's
-/// `CounterResetHint` check only fires when the expected literal set one
-/// explicitly; this port can never set one (no field), so that check is
-/// always the pin's own "don't care" branch — never a silent mismatch of
-/// something this port actually models.
-fn histogram_almost_equal(expected: &FloatHistogram, actual: &FloatHistogram) -> bool {
+/// Upstream `compareNativeHistogram` (`promqltest/test.go:1401-1447`):
+/// schema exact, count/sum/zero_count within `almost_equal` tolerance,
+/// NHCB custom bounds exact, zero_threshold exact, bucket layout (spans +
+/// per-bucket value) within tolerance — after `Compact(0)` on both sides,
+/// exactly like the pin — and (issue #125) the `CounterResetHint` compared
+/// EXACTLY iff `hint_set` (the expected literal spelled a
+/// `counter_reset_hint:` key; otherwise "don't care", `test.go:1438-1445`).
+fn histogram_almost_equal(
+    expected: &FloatHistogram,
+    actual: &FloatHistogram,
+    hint_set: bool,
+) -> bool {
     let mut want = expected.clone();
     let mut got = actual.clone();
     want.compact();
@@ -642,6 +649,9 @@ fn histogram_almost_equal(expected: &FloatHistogram, actual: &FloatHistogram) ->
         return false;
     }
     if want.zero_threshold != got.zero_threshold || !almost_equal(want.zero_count, got.zero_count) {
+        return false;
+    }
+    if hint_set && want.counter_reset_hint != got.counter_reset_hint {
         return false;
     }
     want.negative_spans == got.negative_spans
@@ -664,7 +674,7 @@ fn expected_labels_vec(s: &ExpectedSeries) -> LabelsVec {
 
 fn expected_single_value(s: &ExpectedSeries) -> Val {
     match s.values.as_slice() {
-        [v @ (SeqValue::Value(_) | SeqValue::Histogram(_))] => Val::from_seq(v),
+        [v @ (SeqValue::Value(_) | SeqValue::Histogram(..))] => Val::from_seq(v),
         // The grammar rejects gaps/stale/multi-value in instant
         // expectations before this is reachable.
         other => unreachable!("instant expectation with non-single value {other:?}"),
@@ -817,7 +827,7 @@ fn compare_matrix(
             .iter()
             .enumerate()
             .filter_map(|(k, v)| match v {
-                SeqValue::Value(_) | SeqValue::Histogram(_) => {
+                SeqValue::Value(_) | SeqValue::Histogram(..) => {
                     Some((from_ms + k as i64 * step_ms, Val::from_seq(v)))
                 }
                 _ => None,
@@ -897,6 +907,46 @@ pub fn almost_equal(a: f64, b: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::format_expected_bytes;
+    use super::histogram_almost_equal;
+    use pulsus_model::{CounterResetHint, FloatHistogram};
+
+    /// Issue #125 (AC2): the comparator asserts the counter-reset hint iff
+    /// the expected literal SET one (the pin's `compareNativeHistogram(…,
+    /// counterResetHintSet)`, `test.go:1438-1445`): a hint-set expectation
+    /// with a mismatched actual fails; the identical values WITHOUT the
+    /// flag pass (don't-care); a hint-set expectation with a MATCHING
+    /// actual passes. Dropping the flag plumbing turns the middle
+    /// assertion vacuous and fails the first.
+    #[test]
+    fn histogram_comparator_asserts_the_hint_only_when_the_literal_set_one() {
+        let hist = |hint| FloatHistogram {
+            counter_reset_hint: hint,
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 4.0,
+            sum: 5.0,
+            positive_spans: vec![],
+            negative_spans: vec![],
+            positive_buckets: vec![],
+            negative_buckets: vec![],
+            custom_values: vec![],
+        };
+        let want_gauge = hist(CounterResetHint::Gauge);
+        let got_unknown = hist(CounterResetHint::Unknown);
+        assert!(
+            !histogram_almost_equal(&want_gauge, &got_unknown, true),
+            "hint_set + mismatched hint must FAIL"
+        );
+        assert!(
+            histogram_almost_equal(&want_gauge, &got_unknown, false),
+            "no hint in the literal ⇒ don't-care, values equal ⇒ pass"
+        );
+        assert!(
+            histogram_almost_equal(&want_gauge, &hist(CounterResetHint::Gauge), true),
+            "hint_set + matching hint must pass"
+        );
+    }
 
     /// AC4 (issue #86): a UTF-8 `want` renders exactly today's `{:?}`
     /// form — unchanged by the byte-comparison fix (the non-UTF-8 branch

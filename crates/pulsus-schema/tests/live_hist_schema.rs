@@ -101,6 +101,34 @@ async fn column_type(client: &ChClient, db: &str, table: &str, column: &str) -> 
     stream.next().await.map(|r| r.expect("decode ColumnRow").ty)
 }
 
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct ColumnDefaultRow {
+    default_kind: String,
+    default_expression: String,
+}
+
+/// The `(default_kind, default_expression)` of `column` on `db.table`, or
+/// `None` if absent.
+async fn column_default(
+    client: &ChClient,
+    db: &str,
+    table: &str,
+    column: &str,
+) -> Option<(String, String)> {
+    let sql = format!(
+        "SELECT default_kind, default_expression FROM system.columns \
+         WHERE database = '{db}' AND table = '{table}' AND name = '{column}'"
+    );
+    let mut stream = client
+        .query_stream::<ColumnDefaultRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns defaults");
+    stream.next().await.map(|r| {
+        let r = r.expect("decode ColumnDefaultRow");
+        (r.default_kind, r.default_expression)
+    })
+}
+
 async fn drop_database(client: &ChClient, db: &str) {
     client
         .execute(
@@ -194,6 +222,96 @@ async fn native_histogram_migrations_apply_and_are_idempotent() {
         .expect("run_init (second run — ids 23–26 must not drift)");
     let names_after = table_names(&client, db).await;
     assert_eq!(names, names_after, "second run must not add/remove objects");
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #125 (AC6): migrations 27/28 add `counter_reset_hint` to
+/// `metric_hist_samples` as an additive `UInt8 DEFAULT 0` column — the
+/// id-23 CREATE stays frozen (id-23's checksum is covered by the
+/// idempotency test above), a row inserted WITHOUT the column (the
+/// pre-#125 writer shape) reads back the `DEFAULT` 0 (= Unknown), and a
+/// second `run_init` does not drift.
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct HintRow {
+    counter_reset_hint: u8,
+}
+
+#[tokio::test]
+async fn counter_reset_hint_column_is_additive_uint8_default_zero() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_hist_it_reset_hint";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    assert_eq!(
+        column_type(&client, db, "metric_hist_samples", "counter_reset_hint")
+            .await
+            .as_deref(),
+        Some("UInt8"),
+        "counter_reset_hint must be a UInt8 column on metric_hist_samples"
+    );
+    assert_eq!(
+        column_default(&client, db, "metric_hist_samples", "counter_reset_hint").await,
+        Some(("DEFAULT".to_string(), "0".to_string())),
+        "counter_reset_hint must carry DEFAULT 0 (pre-#125 rows read back Unknown)"
+    );
+
+    // A row inserted through the PRE-#125 column list (this file's local
+    // HistSampleRow deliberately omits the column) materializes the
+    // DEFAULT: reads back 0 = Unknown.
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let data_client = ChClient::new(data_cfg)
+        .await
+        .expect("connect (data client)");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock");
+    let seed = HistSampleRow {
+        metric_name: "legacy_shape_metric".to_string(),
+        fingerprint: 7,
+        unix_milli: i64::try_from(now.as_millis()).expect("fits i64"),
+        schema: 0,
+        zero_threshold: 0.0,
+        zero_count: 0,
+        count: 4,
+        sum: 5.0,
+        pos_span_offsets: vec![0],
+        pos_span_lengths: vec![3],
+        pos_bucket_deltas: vec![1, 1, -1],
+        neg_span_offsets: vec![],
+        neg_span_lengths: vec![],
+        neg_bucket_deltas: vec![],
+        custom_values: vec![],
+    };
+    data_client
+        .insert_block("metric_hist_samples", std::slice::from_ref(&seed))
+        .await
+        .expect("insert without the counter_reset_hint column");
+    let mut stream = client
+        .query_stream::<HintRow>(
+            &format!(
+                "SELECT counter_reset_hint FROM {db}.metric_hist_samples \
+                 WHERE metric_name = 'legacy_shape_metric'"
+            ),
+            &QuerySettings::new(),
+        )
+        .await
+        .expect("select counter_reset_hint");
+    let row = stream
+        .next()
+        .await
+        .expect("one row")
+        .expect("decode HintRow");
+    assert_eq!(row.counter_reset_hint, 0, "the DEFAULT materializes as 0");
+
+    // Idempotency: a second run must not drift on the new ids 27/28.
+    run_init(&client, &ctx)
+        .await
+        .expect("run_init (second run — ids 27/28 must not drift)");
 
     drop_database(&client, db).await;
 }

@@ -122,6 +122,18 @@ pub struct SelectorSpec {
     /// `promql_max_info_series` cardinality cap (never applied to an
     /// ordinary selector, which must always return complete results).
     pub info_family: bool,
+    /// Issue #125: `true` when only histogram STATS (`schema`/`count`/
+    /// `sum`) of this selector's histogram samples are observable — the
+    /// selector sits under `histogram_count`/`histogram_sum`/
+    /// `histogram_avg` with no subquery and no whole-histogram function
+    /// (`histogram_quantile`(`s`)/`histogram_fraction`) in between,
+    /// mirroring the pin's `detectHistogramStatsDecoding`
+    /// (`engine.go:4647-4696`, [`detect_histogram_stats`]). **Eval only;
+    /// fetch untouched**: the evaluator builds a stats-reduced copy of the
+    /// fetched series with counter-reset hints synthesized on the fly (the
+    /// pin's `HistogramStatsIterator`); the fetch SQL/window is
+    /// byte-identical either way.
+    pub histogram_stats: bool,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -901,6 +913,10 @@ impl Planner {
             at_ms,
             fetch,
             info_family,
+            // Issue #125: assigned by the post-plan pass
+            // ([`detect_histogram_stats`]) once the whole tree exists —
+            // the flag depends on the selector's ANCESTORS.
+            histogram_stats: false,
         });
         id
     }
@@ -994,11 +1010,147 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         subquery_depth: 0,
     };
     let root = plan_expr(&mut planner, expr)?;
+    let mut selectors = planner.selectors;
+    detect_histogram_stats(&root, &mut selectors);
     Ok(QueryPlan {
         root,
-        selectors: planner.selectors,
+        selectors,
         params,
     })
+}
+
+/// Issue #125: the post-plan pass mirroring the pin's
+/// `detectHistogramStatsDecoding` (`engine.go:4647-4696`). The pin walks
+/// each vector selector's ancestor path innermost-out: a subquery ⇒
+/// `false` and stop; a `histogram_count`/`histogram_sum`/`histogram_avg`
+/// call ⇒ `true`, keep scanning; a `histogram_quantile`/
+/// `histogram_quantiles`/`histogram_fraction` call ⇒ `false` and stop.
+/// Because every stop rule assigns `false`, the walk's fixpoint is
+/// exactly: flagged ⟺ (some stats accessor is an ancestor) AND (no
+/// subquery/whole-histogram ancestor anywhere on the path) — computed
+/// here top-down with two carried booleans. `histogram_stddev`/`stdvar`
+/// do NOT enable (the pin's list is count/sum/avg only); the pin's
+/// `BinaryExpr` `TRIM_UPPER`/`TRIM_LOWER` stop rule IS ported (issue #129
+/// added `</`/`>/` to this grammar — trimming depends on buckets).
+fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
+    fn mark_source(
+        source: &RangeSource,
+        in_accessor: bool,
+        in_stop: bool,
+        selectors: &mut [SelectorSpec],
+    ) {
+        match source {
+            RangeSource::Selector(id) => {
+                if let Some(spec) = selectors.get_mut(*id) {
+                    spec.histogram_stats = in_accessor && !in_stop;
+                }
+            }
+            // "If we ever see a subquery in the path, we will not skip
+            // the buckets. We need the buckets for correct counter reset
+            // detection." (`engine.go:4670-4675`).
+            RangeSource::Subquery(sq) => walk(&sq.inner, in_accessor, true, selectors),
+        }
+    }
+
+    fn walk(expr: &PlanExpr, in_accessor: bool, in_stop: bool, selectors: &mut [SelectorSpec]) {
+        match expr {
+            PlanExpr::Selector(id) => {
+                if let Some(spec) = selectors.get_mut(*id) {
+                    spec.histogram_stats = in_accessor && !in_stop;
+                }
+            }
+            PlanExpr::RangeFn { source, .. }
+            | PlanExpr::OverTime { source, .. }
+            | PlanExpr::AbsentOverTime { source } => {
+                mark_source(source, in_accessor, in_stop, selectors);
+            }
+            PlanExpr::OverTimeParam { source, args, .. } => {
+                mark_source(source, in_accessor, in_stop, selectors);
+                for a in args {
+                    walk(a, in_accessor, in_stop, selectors);
+                }
+            }
+            PlanExpr::HistogramAccessor { func, arg } => {
+                let enables = matches!(
+                    func,
+                    HistogramAccessorFn::Count
+                        | HistogramAccessorFn::Sum
+                        | HistogramAccessorFn::Avg
+                );
+                // `histogram_stddev`/`stdvar` neither enable nor stop —
+                // the pin's `Call` arm simply doesn't match them.
+                walk(arg, in_accessor || enables, in_stop, selectors);
+            }
+            // Whole-histogram functions stop-and-clear; every argument
+            // position (φ/bound scalars included) lies under the call in
+            // the pin's path walk.
+            PlanExpr::HistogramQuantile { quantile, expr } => {
+                walk(quantile, in_accessor, true, selectors);
+                walk(expr, in_accessor, true, selectors);
+            }
+            PlanExpr::HistogramFraction { lower, upper, expr } => {
+                walk(lower, in_accessor, true, selectors);
+                walk(upper, in_accessor, true, selectors);
+                walk(expr, in_accessor, true, selectors);
+            }
+            PlanExpr::Absent { arg, .. }
+            | PlanExpr::Sort { arg, .. }
+            | PlanExpr::SortByLabel { arg, .. }
+            | PlanExpr::LabelReplace { arg, .. }
+            | PlanExpr::LabelJoin { arg, .. }
+            | PlanExpr::ScalarOf { arg }
+            | PlanExpr::VectorOf { arg }
+            | PlanExpr::Timestamp { arg, .. } => walk(arg, in_accessor, in_stop, selectors),
+            PlanExpr::MathFn {
+                arg, scalar_args, ..
+            } => {
+                walk(arg, in_accessor, in_stop, selectors);
+                for a in scalar_args {
+                    walk(a, in_accessor, in_stop, selectors);
+                }
+            }
+            PlanExpr::Aggregate { expr, param, .. } => {
+                walk(expr, in_accessor, in_stop, selectors);
+                if let Some(p) = param {
+                    walk(p, in_accessor, in_stop, selectors);
+                }
+            }
+            PlanExpr::CountValues { expr, .. } => walk(expr, in_accessor, in_stop, selectors),
+            PlanExpr::Binary { op, lhs, rhs, .. } => {
+                // The pin's `BinaryExpr` arm (`engine.go:4692-4696`):
+                // "Trimming depends on buckets, we will not skip them" —
+                // `</`/`>/` stop-and-clear like the whole-histogram
+                // functions (issue #129 added the operators to this
+                // grammar).
+                let stop = in_stop || op.is_trim();
+                walk(lhs, in_accessor, stop, selectors);
+                walk(rhs, in_accessor, stop, selectors);
+            }
+            PlanExpr::SetOp { lhs, rhs, .. } => {
+                walk(lhs, in_accessor, in_stop, selectors);
+                walk(rhs, in_accessor, in_stop, selectors);
+            }
+            PlanExpr::DateFn { arg, .. } => {
+                if let Some(a) = arg {
+                    walk(a, in_accessor, in_stop, selectors);
+                }
+            }
+            PlanExpr::Info { base, .. } => {
+                // The synthetic info-family selector is not part of the
+                // walked tree — it stays unflagged (safe default: full
+                // histograms).
+                walk(base, in_accessor, in_stop, selectors);
+            }
+            PlanExpr::Time | PlanExpr::Scalar(_) | PlanExpr::StringLiteral(_) => {}
+            PlanExpr::ScalarFn { args, .. } => {
+                for a in args {
+                    walk(a, in_accessor, in_stop, selectors);
+                }
+            }
+        }
+    }
+
+    walk(root, false, false, selectors);
 }
 
 /// Issue #32 code-review round-1 fix: a `match[]` discovery selector
@@ -4295,6 +4447,7 @@ mod tests {
                 total_offset_ms: 60_000,
             },
             info_family: false,
+            histogram_stats: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,
@@ -5483,5 +5636,83 @@ mod tests {
     fn m6_08e_literals_are_invariant_but_not_wrappable() {
         assert_eq!(classify("3"), (true, false));
         assert_eq!(classify("1 + 2"), (true, true));
+    }
+
+    // --- issue #125 (AC4): the histogram_stats plan pass mirrors the
+    // pin's detectHistogramStatsDecoding (engine.go:4647-4696) ---
+
+    /// The flag of every selector of `query`, in plan order.
+    fn stats_flags(query: &str) -> Vec<bool> {
+        let p = plan(&parse(query).unwrap(), params()).unwrap();
+        p.selectors.iter().map(|s| s.histogram_stats).collect()
+    }
+
+    #[test]
+    fn histogram_stats_enables_under_count_sum_avg_accessors() {
+        assert_eq!(stats_flags("histogram_count(sum(m))"), vec![true]);
+        assert_eq!(stats_flags("histogram_sum(m)"), vec![true]);
+        assert_eq!(stats_flags("histogram_avg(rate(m[1m]))"), vec![true]);
+        assert_eq!(stats_flags("histogram_count(rate(m[1m]))"), vec![true]);
+        assert_eq!(
+            stats_flags("histogram_count(sum_over_time(m[2m]))"),
+            vec![true],
+            "a plain matrix selector under the accessor is NOT a subquery"
+        );
+    }
+
+    /// "If we ever see a subquery in the path, we will not skip the
+    /// buckets" — the subquery arm stops-and-clears (edge case 6: the
+    /// `histogram_count(increase(h[40m:9m]))` corpus rows rely on full
+    /// buckets for a bucket-only reset).
+    #[test]
+    fn histogram_stats_is_cleared_by_an_enclosing_subquery() {
+        assert_eq!(
+            stats_flags("histogram_count(sum_over_time(m[2m:1m]))"),
+            vec![false]
+        );
+        assert_eq!(
+            stats_flags("histogram_count(increase(m[40m:9m]))"),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn histogram_stats_is_cleared_by_whole_histogram_functions() {
+        assert_eq!(stats_flags("histogram_quantile(0.5, m)"), vec![false]);
+        assert_eq!(stats_flags("histogram_fraction(0, 1, m)"), vec![false]);
+        // The stop is PER-PATH: `m` (under the quantile call) clears even
+        // with the accessor further out — the pin sets false and breaks
+        // at the quantile call — while `m2` (under the accessor only)
+        // still flags.
+        assert_eq!(
+            stats_flags("histogram_count(histogram_quantile(0.5, m) + on() m2)"),
+            vec![false, true]
+        );
+    }
+
+    /// `histogram_stddev`/`stdvar` do NOT enable stats decoding (the
+    /// pin's accessor list is count/sum/avg only).
+    #[test]
+    fn histogram_stats_is_not_enabled_by_stddev_or_stdvar() {
+        assert_eq!(stats_flags("histogram_stddev(m)"), vec![false]);
+        assert_eq!(stats_flags("histogram_stdvar(m)"), vec![false]);
+    }
+
+    /// Ordinary queries never flag — the eval-side reduction pass stays
+    /// zero-cost for them.
+    #[test]
+    fn histogram_stats_stays_false_without_an_accessor_ancestor() {
+        assert_eq!(stats_flags("sum(rate(m[1m]))"), vec![false]);
+        assert_eq!(stats_flags("m"), vec![false]);
+    }
+
+    /// Independent selectors keep independent flags (per-selector
+    /// assignment, not a query-global bit).
+    #[test]
+    fn histogram_stats_is_per_selector() {
+        assert_eq!(
+            stats_flags("histogram_count(sum(m)) + on() sum(m2)"),
+            vec![true, false]
+        );
     }
 }

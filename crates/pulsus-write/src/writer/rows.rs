@@ -349,6 +349,11 @@ pub struct MetricHistSampleRow {
     pub neg_span_lengths: Vec<u32>,
     pub neg_bucket_deltas: Vec<i64>,
     pub custom_values: Vec<f64>,
+    /// `counter_reset_hint` column (issue #125, migrations 27/28) — the
+    /// Prometheus hint byte from [`HistogramColumns`] (0 = Unknown; the
+    /// only value today's OTLP ingest ever produces, see
+    /// `otlp_metrics.rs`'s exponential-histogram seam).
+    pub counter_reset_hint: u8,
 }
 
 impl From<&HistogramPoint> for MetricHistSampleRow {
@@ -373,6 +378,7 @@ impl From<&HistogramPoint> for MetricHistSampleRow {
             neg_span_lengths: cols.neg_span_lengths,
             neg_bucket_deltas: cols.neg_bucket_deltas,
             custom_values: cols.custom_values,
+            counter_reset_hint: cols.counter_reset_hint,
         }
     }
 }
@@ -413,6 +419,7 @@ impl MetricHistSampleRow {
         (metric_name_len
             + 8 /* fingerprint */ + 8 /* unix_milli */ + 1 /* schema */
             + 8 /* zero_threshold */ + 8 /* zero_count */ + 8 /* count */ + 8 /* sum */
+            + 1 /* counter_reset_hint */
             + span_count * (4 /* offset */ + 4 /* length */)
             + bucket_count * 8 /* delta */
             + custom_count * 8/* custom bound */) as u64
@@ -447,6 +454,7 @@ impl SpoolEncode for MetricHistSampleRow {
             "neg_bucket_deltas": self.neg_bucket_deltas,
             "custom_values": self.custom_values.iter().copied().map(finite_or_null).collect::<Vec<_>>(),
             "custom_values_bits": self.custom_values.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+            "counter_reset_hint": self.counter_reset_hint,
         })
     }
 }
@@ -1025,6 +1033,7 @@ mod tests {
             fingerprint: 99,
             unix_milli: 1_700_000_000_000,
             histogram: NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
                 schema: 2,
                 zero_threshold: 1e-9,
                 zero_count: 0,

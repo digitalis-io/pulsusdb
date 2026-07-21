@@ -483,6 +483,7 @@ async fn metadata_repeated_identical_descriptor_flushes_once_then_a_change_flush
 /// deltas [1,1,-1], count 4).
 fn native_hist(metric_name: &str, fingerprint: u64, unix_milli: i64, sum: f64) -> NativeHistogram {
     NativeHistogram {
+        counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
         schema: 0,
         zero_threshold: 0.0,
         zero_count: 0,

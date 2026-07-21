@@ -388,6 +388,7 @@ mod tests {
     /// channel is `FloatHistogram`, never the integer form.
     fn single_histogram() -> FloatHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,

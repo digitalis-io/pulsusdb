@@ -37,11 +37,121 @@ use crate::annotations::Annotations;
 use crate::error::PromqlError;
 use crate::plan::{
     AggOp, HistogramAccessorFn, MathFn, OverTimeFn, OverTimeParamFn, PlanExpr, QueryPlan,
-    RangeSource, ScalarFn, SelectorSpec, SubqueryPlan,
+    RangeSource, ScalarFn, SelectorId, SelectorSpec, SubqueryPlan,
 };
 use crate::value::{
     FetchedSeries, InstantSample, Labels, Point, QueryValue, RangeSeries, Sample, SeriesData,
 };
+
+/// The evaluator's view over the fetched data (issue #125): a selector
+/// flagged [`SelectorSpec::histogram_stats`] reads its STATS-REDUCED copy
+/// (buckets dropped, counter-reset hints synthesized —
+/// [`reduce_histogram_stats_samples`]); every other selector — and every
+/// query with no flagged selector at all — borrows the caller's
+/// [`SeriesData`] untouched (zero cost for ordinary queries: `stats` is an
+/// empty map and `get` falls straight through).
+struct EvalData<'a> {
+    base: &'a SeriesData,
+    stats: HashMap<SelectorId, Vec<FetchedSeries>>,
+}
+
+impl<'a> EvalData<'a> {
+    fn new(selectors: &[SelectorSpec], data: &'a SeriesData) -> Self {
+        let mut stats = HashMap::new();
+        for spec in selectors {
+            if spec.histogram_stats {
+                stats.insert(
+                    spec.id,
+                    data.get(spec.id)
+                        .iter()
+                        .map(|fs| FetchedSeries {
+                            fingerprint: fs.fingerprint,
+                            metric_name: fs.metric_name.clone(),
+                            labels: fs.labels.clone(),
+                            samples: reduce_histogram_stats_samples(&fs.samples),
+                        })
+                        .collect(),
+                );
+            }
+        }
+        EvalData { base: data, stats }
+    }
+
+    fn get(&self, id: SelectorId) -> &[FetchedSeries] {
+        match self.stats.get(&id) {
+            Some(v) => v.as_slice(),
+            None => self.base.get(id),
+        }
+    }
+}
+
+/// The stats-decoding synthesis pass (issue #125) — one ts-order walk per
+/// series, porting the pin's `HistogramStatsIterator.AtFloatHistogram` +
+/// `getResetHint` (`promql/histogram_stats_iterator.go:91-168`):
+///
+/// - a REAL histogram sample emits the reduced `{schema, count, sum,
+///   counter_reset_hint}` shape (buckets/zero-bucket/`custom_values`
+///   dropped — the pin's `populateFH` literal keeps exactly those four
+///   fields), with the hint resolved as: the STORED hint when ≠ Unknown;
+///   else Unknown when no previous full histogram is retained; else
+///   `detect_reset(curr_full, prev_full)` ⇒ CounterReset/NotCounterReset —
+///   detection runs on the FULL histograms (`hsi.current.DetectReset(hsi.
+///   last)`), never the reduced ones. The retained `prev` then becomes
+///   this sample's full histogram (`setLastFromCurrent`).
+/// - a STALE histogram sample is emitted unchanged and `prev` is NOT
+///   mutated — neither updated nor cleared (the pin's `IsStaleNaN(sum)`
+///   early return skips `setLastFromCurrent`, PRESERVING `hsi.last`
+///   across the gap, so the next real sample's Unknown still resolves
+///   against the pre-stale histogram — plan v3 Δ1, AC9).
+/// - a float sample (stale markers included) passes through unchanged and
+///   likewise never touches `prev` (floats never route through
+///   `AtFloatHistogram`).
+fn reduce_histogram_stats_samples(samples: &[Sample]) -> Vec<Sample> {
+    use pulsus_model::{CounterResetHint, FloatHistogram};
+    let mut prev: Option<&FloatHistogram> = None;
+    let mut out = Vec::with_capacity(samples.len());
+    for s in samples {
+        match &s.h {
+            Some(h) if !s.is_stale() => {
+                let hint = if h.counter_reset_hint != CounterResetHint::Unknown {
+                    h.counter_reset_hint
+                } else {
+                    match prev {
+                        None => CounterResetHint::Unknown,
+                        Some(p) => {
+                            if h.detect_reset(p) {
+                                CounterResetHint::CounterReset
+                            } else {
+                                CounterResetHint::NotCounterReset
+                            }
+                        }
+                    }
+                };
+                out.push(Sample::hist(
+                    s.t_ms,
+                    FloatHistogram {
+                        counter_reset_hint: hint,
+                        schema: h.schema,
+                        zero_threshold: 0.0,
+                        zero_count: 0.0,
+                        count: h.count,
+                        sum: h.sum,
+                        positive_spans: Vec::new(),
+                        negative_spans: Vec::new(),
+                        positive_buckets: Vec::new(),
+                        negative_buckets: Vec::new(),
+                        custom_values: Vec::new(),
+                    },
+                ));
+                prev = Some(h);
+            }
+            // Stale (histogram OR float) and plain-float samples: emitted
+            // unchanged, `prev` untouched.
+            _ => out.push(s.clone()),
+        }
+    }
+    out
+}
 
 /// One step's evaluated value — collapsed into [`QueryValue`] once the
 /// whole query (instant, or every range-query step) has been evaluated.
@@ -173,6 +283,12 @@ fn evaluate_counted_with(
     cancel: CancelToken,
 ) -> Result<(QueryValue, EvalCounts, Annotations), PromqlError> {
     let p = &plan.params;
+
+    // Issue #125: build the per-flagged-selector stats-reduced view ONCE,
+    // before any stepping. Unflagged selectors (and every query with no
+    // `histogram_stats` flag at all) borrow `data` untouched.
+    let eval_data = EvalData::new(&plan.selectors, data);
+    let data = &eval_data;
 
     // Issue #83 (round-2 amendment): materialize every subquery ONCE over
     // its epoch-anchored union grid — inside-out for nested subqueries —
@@ -835,7 +951,7 @@ fn subquery_grid_start(mint: i64, step: i64) -> i64 {
 fn prepare_subqueries(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
@@ -1122,7 +1238,7 @@ fn prepare_subqueries(
 fn prepare_info(
     node: &PlanExpr,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
@@ -1224,7 +1340,7 @@ fn prepare_info(
 fn prepare_source(
     source: &RangeSource,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
@@ -1271,7 +1387,7 @@ fn prepare_source(
 fn prepare_subquery(
     sq: &SubqueryPlan,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     grid: StepGrid<'_>,
     lookback_ms: i64,
     caches: &mut EvalCaches,
@@ -1369,7 +1485,25 @@ fn prepare_subquery(
             match eval_step(&sq.inner, selectors, data, it, lookback_ms, caches)? {
                 StepValue::Vector(v) => {
                     for s in v {
-                        let h = s.h;
+                        let mut h = s.h;
+                        // Issue #125 — the pin's `evalSubquery` hint rule
+                        // (`engine.go:2036-2043`): NotCounterReset AND
+                        // CounterReset hints on subquery output samples
+                        // are reset to Unknown, "because we might
+                        // otherwise miss a counter reset happening in
+                        // samples not returned by the subquery, or we
+                        // might over-detect counter resets if the sample
+                        // with a counter reset is returned multiple
+                        // times". Gauge and Unknown pass through.
+                        if let Some(hist) = h.as_mut()
+                            && matches!(
+                                hist.counter_reset_hint,
+                                pulsus_model::CounterResetHint::NotCounterReset
+                                    | pulsus_model::CounterResetHint::CounterReset
+                            )
+                        {
+                            hist.counter_reset_hint = pulsus_model::CounterResetHint::Unknown;
+                        }
                         acc.entry((s.metric_name, s.labels))
                             .or_insert_with(|| (s.drop_name, Vec::new()))
                             .1
@@ -1688,7 +1822,7 @@ fn agg_op_may_annotate(op: AggOp) -> bool {
 fn prepare_step_invariant(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     start_ms: i64,
     lookback_ms: i64,
     caches: &mut EvalCaches,
@@ -1897,7 +2031,7 @@ struct WindowedSource {
 fn windowed_range_source(
     source: &RangeSource,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     subqueries: &SubqueryCache,
     t_ms: i64,
 ) -> Result<WindowedSource, PromqlError> {
@@ -2103,7 +2237,7 @@ fn partition_histogram_inputs(
 fn eval_step(
     expr: &PlanExpr,
     selectors: &[SelectorSpec],
-    data: &SeriesData,
+    data: &EvalData<'_>,
     t_ms: i64,
     lookback_ms: i64,
     caches: &EvalCaches,
@@ -3344,6 +3478,7 @@ mod tests {
     /// `single_histogram` (`native_histograms.test:34`, A3 corpus fixture).
     fn single_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -3368,6 +3503,172 @@ mod tests {
             lookback_ms: crate::plan::DEFAULT_LOOKBACK_MS,
             experimental_functions: false,
         }
+    }
+
+    // -- issue #125 (AC9 + plan edge cases): the stats-decoding synthesis
+    //    pass (`reduce_histogram_stats_samples`), pinned against
+    //    `promql/histogram_stats_iterator.go` @ 40af9c2 --
+
+    /// A schema-0 histogram sample with `count` observations in one
+    /// bucket (absolute `[count]`).
+    fn count_hist(t_ms: i64, count: u64) -> Sample {
+        Sample::hist(
+            t_ms,
+            NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count,
+                sum: count as f64,
+                positive_spans: vec![Span {
+                    offset: 0,
+                    length: 1,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![count as i64],
+                negative_buckets: vec![],
+                custom_values: vec![],
+            }
+            .to_float(),
+        )
+    }
+
+    fn synth_hint(s: &Sample) -> pulsus_model::CounterResetHint {
+        s.h.as_ref().expect("histogram sample").counter_reset_hint
+    }
+
+    /// AC9, both directions: the stale sample takes the pin's early-return
+    /// arm WITHOUT touching the retained `prev` (`AtFloatHistogram`'s
+    /// `IsStaleNaN(sum)` arm skips `setLastFromCurrent` — `hsi.last` is
+    /// PRESERVED, not cleared), so the post-stale sample's Unknown stored
+    /// hint resolves against the PRE-STALE full histogram: `count 5 →
+    /// stale → count 3` ⇒ CounterReset; `count 5 → stale → count 7` ⇒
+    /// NotCounterReset. Drill (plan v3 Δ2): an implementation that CLEARS
+    /// `prev` on the stale sample yields Unknown for the post-stale sample
+    /// in BOTH cases — each assertion fails under that mutation.
+    #[test]
+    fn stats_synthesis_detects_reset_across_a_stale_gap() {
+        use pulsus_model::CounterResetHint::{CounterReset, NotCounterReset};
+        // The float stale-marker form (what the test grammar's `stale`
+        // loads) and the histogram stale form (an empty histogram with a
+        // stale-NaN sum, the A4 encoding the pin's `AtFloatHistogram` arm
+        // handles) must BOTH preserve `prev`.
+        let stale_forms: [Sample; 2] = [Sample::float(60_000, f64::from_bits(STALE_NAN_BITS)), {
+            let mut h = single_histogram().to_float();
+            h.sum = f64::from_bits(STALE_NAN_BITS);
+            Sample::hist(60_000, h)
+        }];
+        for stale in stale_forms {
+            let reset = reduce_histogram_stats_samples(&[
+                count_hist(0, 5),
+                stale.clone(),
+                count_hist(120_000, 3),
+            ]);
+            assert_eq!(
+                synth_hint(&reset[2]),
+                CounterReset,
+                "count 5 → stale → count 3 must detect against the PRE-STALE histogram"
+            );
+            // The stale sample itself is emitted with its content (and
+            // hint channel) untouched. (`Sample`'s PartialEq is NaN-exact
+            // on the float channel — `NaN != NaN` — so the stale FLOAT
+            // form is compared field-by-bits instead.)
+            assert_eq!(reset[1].t_ms, stale.t_ms);
+            assert!(reset[1].is_stale());
+            assert_eq!(reset[1].v.to_bits(), stale.v.to_bits());
+            match (&reset[1].h, &stale.h) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert!(a.bits_eq(b), "stale histogram content untouched");
+                    assert_eq!(
+                        a.counter_reset_hint, b.counter_reset_hint,
+                        "stale histogram hint untouched"
+                    );
+                }
+                other => panic!("stale sample channel changed: {other:?}"),
+            }
+
+            let no_reset = reduce_histogram_stats_samples(&[
+                count_hist(0, 5),
+                stale.clone(),
+                count_hist(120_000, 7),
+            ]);
+            assert_eq!(
+                synth_hint(&no_reset[2]),
+                NotCounterReset,
+                "count 5 → stale → count 7 must resolve NOT-reset, never Unknown"
+            );
+        }
+    }
+
+    /// The plain chain rule (`getResetHint`): first sample with no prev ⇒
+    /// Unknown; a stored (≠ Unknown) hint is KEPT verbatim; a stored hint
+    /// still updates `prev` for the NEXT sample's detection.
+    #[test]
+    fn stats_synthesis_resolves_unknowns_and_keeps_stored_hints() {
+        use pulsus_model::CounterResetHint::{CounterReset, Gauge, NotCounterReset, Unknown};
+        let out = reduce_histogram_stats_samples(&[count_hist(0, 5), count_hist(60_000, 7)]);
+        assert_eq!(synth_hint(&out[0]), Unknown, "no prev ⇒ Unknown");
+        assert_eq!(synth_hint(&out[1]), NotCounterReset);
+
+        // Stored hints are kept (the pin returns them without detection)…
+        let mut gauge = count_hist(0, 5);
+        gauge.h.as_mut().unwrap().counter_reset_hint = Gauge;
+        let mut ncr = count_hist(60_000, 6);
+        ncr.h.as_mut().unwrap().counter_reset_hint = NotCounterReset;
+        // …and STILL update `prev` (setLastFromCurrent runs for every
+        // non-stale sample): the third sample's Unknown resolves against
+        // the second's FULL histogram.
+        let third = count_hist(120_000, 3);
+        let out = reduce_histogram_stats_samples(&[gauge, ncr, third]);
+        assert_eq!(synth_hint(&out[0]), Gauge);
+        assert_eq!(synth_hint(&out[1]), NotCounterReset);
+        assert_eq!(synth_hint(&out[2]), CounterReset, "6 → 3 is a reset");
+    }
+
+    /// Plan edge case 2: the emitted sample keeps ONLY `{schema, count,
+    /// sum, hint}` (the pin's `populateFH` literal), while detection runs
+    /// on the FULL histograms — a bucket-only reset (equal counts,
+    /// dropped bucket) is still detected even though the EMITTED shapes
+    /// carry no buckets.
+    #[test]
+    fn stats_synthesis_reduces_shape_but_detects_on_full_histograms() {
+        use pulsus_model::CounterResetHint::CounterReset;
+        // Same count (4), but bucket 1 drops 2 → 1: a bucket-only reset.
+        let a = Sample::hist(0, single_histogram().to_float()); // [1,2,1]
+        let b = Sample::hist(
+            60_000,
+            NativeHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
+                schema: 0,
+                zero_threshold: 0.0,
+                zero_count: 0,
+                count: 4,
+                sum: 6.0,
+                positive_spans: vec![Span {
+                    offset: 0,
+                    length: 3,
+                }],
+                negative_spans: vec![],
+                positive_buckets: vec![1, 0, 1], // absolute [1,1,2]
+                negative_buckets: vec![],
+                custom_values: vec![],
+            }
+            .to_float(),
+        );
+        let out = reduce_histogram_stats_samples(&[a, b]);
+        let reduced = out[1].h.as_ref().unwrap();
+        assert_eq!(
+            reduced.counter_reset_hint, CounterReset,
+            "bucket-only reset must be detected on the FULL previous histogram"
+        );
+        assert_eq!(reduced.schema, 0, "schema preserved");
+        assert_eq!(reduced.count, 4.0);
+        assert!(reduced.positive_buckets.is_empty(), "buckets dropped");
+        assert!(reduced.positive_spans.is_empty());
+        assert_eq!(reduced.zero_count, 0.0);
+        assert!(reduced.custom_values.is_empty());
     }
 
     /// A fetched series with an EMPTY per-series name channel — the
@@ -6075,7 +6376,7 @@ mod tests {
         prepare_subqueries(
             &p.root,
             &p.selectors,
-            &data,
+            &EvalData::new(&p.selectors, &data),
             StepGrid::Dense(Horizon {
                 start_ms: p.params.start_ms,
                 end_ms: p.params.end_ms,
@@ -6275,6 +6576,7 @@ mod tests {
     #[test]
     fn every_free_shape_over_adversarial_data_emits_no_annotations() {
         let nhcb = pulsus_model::FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -6290,6 +6592,7 @@ mod tests {
             custom_values: vec![1.0, 5.0, 10.0],
         };
         let nan_sum = pulsus_model::FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -6400,7 +6703,7 @@ mod tests {
         prepare_subquery(
             sq,
             &p.selectors,
-            &data,
+            &EvalData::new(&p.selectors, &data),
             StepGrid::Sparse {
                 envelope: Horizon {
                     start_ms: 0,
@@ -6466,7 +6769,7 @@ mod tests {
         prepare_subquery(
             sq,
             &p.selectors,
-            &data,
+            &EvalData::new(&p.selectors, &data),
             StepGrid::Sparse {
                 envelope,
                 live: &live,
@@ -6922,7 +7225,7 @@ mod tests {
         prepare_step_invariant(
             &p.root,
             &p.selectors,
-            &data,
+            &EvalData::new(&p.selectors, &data),
             0,
             300_000,
             &mut caches,
@@ -7284,7 +7587,7 @@ mod tests {
         let step = eval_step(
             &p.root,
             &p.selectors,
-            &data,
+            &EvalData::new(&p.selectors, &data),
             0,
             crate::plan::DEFAULT_LOOKBACK_MS,
             &EvalCaches::default(),
@@ -7572,7 +7875,7 @@ mod tests {
         let err = prepare_subqueries(
             &sq_plan.root,
             &sq_plan.selectors,
-            &sq_data,
+            &EvalData::new(&sq_plan.selectors, &sq_data),
             StepGrid::Dense(Horizon {
                 start_ms: sq_plan.params.start_ms,
                 end_ms: sq_plan.params.end_ms,

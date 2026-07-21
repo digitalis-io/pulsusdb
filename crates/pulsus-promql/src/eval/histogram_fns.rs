@@ -351,6 +351,7 @@ mod tests {
     /// buckets (0.5,1]:1, (1,2]:2, (2,4]:1.
     fn single_histogram() -> FloatHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -373,6 +374,7 @@ mod tests {
     /// NHCB, buckets (-Inf,5]:1, (5,10]:2, (10,+Inf]:1.
     fn custom_buckets_histogram() -> FloatHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -459,6 +461,7 @@ mod tests {
         // on any bucket's count — so the zero bucket's Lower clamps to 0
         // rather than -zero_threshold.
         let h = NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.5,
             zero_count: 10,
@@ -600,6 +603,7 @@ mod tests {
     #[test]
     fn variance_zero_bucket_uses_zero_as_the_representative_value() {
         let h = NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.5,
             zero_count: 10,

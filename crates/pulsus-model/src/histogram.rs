@@ -5,12 +5,14 @@
 //!
 //! The stored [`NativeHistogram`] mirrors, field-for-field, the pinned
 //! Prometheus integer `histogram.Histogram` (schema, zero bucket, spans,
-//! delta-encoded buckets, custom bounds) so both exponential (schema −4..=8)
-//! and NHCB (schema −53) samples represent exactly. `CounterResetHint` is
-//! intentionally not modeled: no storage column exists for it and it is a
-//! query-time derivation. Prometheus is a semantics reference only — nothing is
-//! linked or imported. This module adds only new types; the float path
-//! ([`crate::MetricSample`]) is untouched.
+//! delta-encoded buckets, custom bounds — and, since issue #125, the
+//! [`CounterResetHint`]) so both exponential (schema −4..=8) and NHCB
+//! (schema −53) samples represent exactly. The hint is stored in the
+//! additive `metric_hist_samples.counter_reset_hint UInt8 DEFAULT 0`
+//! column (migrations 27/28); pre-#125 rows read back 0 = Unknown, which
+//! is semantically exact. Prometheus is a semantics reference only —
+//! nothing is linked or imported. This module adds only new types; the
+//! float path ([`crate::MetricSample`]) is untouched.
 
 /// Minimum exponential (base-2) bucket schema. Mirrors Prometheus
 /// `generic.go` `ExponentialSchemaMin`.
@@ -19,6 +21,8 @@ pub const EXPONENTIAL_SCHEMA_MIN: i32 = -4;
 pub const EXPONENTIAL_SCHEMA_MAX: i32 = 8;
 /// Custom-bounds (NHCB) schema sentinel. Mirrors `CustomBucketsSchema`.
 pub const CUSTOM_BUCKETS_SCHEMA: i32 = -53;
+
+use crate::float_histogram::CounterResetHint;
 
 /// Whether `schema` selects NHCB (custom bounds). Mirrors
 /// `IsCustomBucketsSchema`.
@@ -43,7 +47,8 @@ pub struct Span {
 }
 
 /// Integer sparse native histogram — the STORED wire form (mirrors
-/// `histogram.Histogram`, minus `CounterResetHint`). `*_buckets` are
+/// `histogram.Histogram`, `CounterResetHint` included since issue #125).
+/// `*_buckets` are
 /// delta-encoded (first element absolute, the rest deltas relative to the
 /// previous) exactly as upstream; they map to the `*_bucket_deltas` columns.
 /// NHCB (schema −53) populates `custom_values` and leaves the negative/zero
@@ -54,6 +59,10 @@ pub struct Span {
 /// explicitly (`f64::to_bits`) where equality is needed.
 #[derive(Debug, Clone)]
 pub struct NativeHistogram {
+    /// Counter-reset information (issue #125) — mirrors upstream
+    /// `Histogram.CounterResetHint`; stored as the `counter_reset_hint`
+    /// `UInt8` column (default 0 = [`CounterResetHint::Unknown`]).
+    pub counter_reset_hint: CounterResetHint,
     /// Bucket schema: `EXPONENTIAL_SCHEMA_MIN..=EXPONENTIAL_SCHEMA_MAX` for
     /// exponential buckets, or `CUSTOM_BUCKETS_SCHEMA` for NHCB.
     pub schema: i32,
@@ -110,6 +119,10 @@ pub struct HistogramColumns {
     pub neg_bucket_deltas: Vec<i64>,
     /// `custom_values` column.
     pub custom_values: Vec<f64>,
+    /// `counter_reset_hint` column (issue #125, additive `UInt8 DEFAULT 0`
+    /// — migrations 27/28): [`CounterResetHint::as_u8`] on encode,
+    /// [`CounterResetHint::from_u8`] on decode (out-of-range ⇒ Unknown).
+    pub counter_reset_hint: u8,
 }
 
 /// Errors from histogram conversion and validation. One variant per upstream
@@ -373,6 +386,7 @@ impl NativeHistogram {
             neg_span_lengths,
             neg_bucket_deltas: self.negative_buckets.clone(),
             custom_values: self.custom_values.clone(),
+            counter_reset_hint: self.counter_reset_hint.as_u8(),
         })
     }
 
@@ -387,6 +401,7 @@ impl NativeHistogram {
         let negative_spans =
             join_spans("negative", &cols.neg_span_offsets, &cols.neg_span_lengths)?;
         Ok(Self {
+            counter_reset_hint: CounterResetHint::from_u8(cols.counter_reset_hint),
             schema: i32::from(cols.schema),
             zero_threshold: cols.zero_threshold,
             zero_count: cols.zero_count,
@@ -566,6 +581,47 @@ mod tests {
         let cols = h.to_columns().expect("to_columns");
         let back = NativeHistogram::from_columns(&cols).expect("from_columns");
         assert_hist_bits_eq(h, &back);
+        // Issue #125: the hint is outside `bits_eq` (never an equality
+        // participant), so its round-trip is asserted explicitly.
+        assert_eq!(back.counter_reset_hint, h.counter_reset_hint);
+    }
+
+    // -- issue #125: counter_reset_hint column threading --
+
+    #[test]
+    fn counter_reset_hint_encodes_to_the_pinned_byte_values_and_back() {
+        use crate::CounterResetHint::{CounterReset, Gauge, NotCounterReset, Unknown};
+        for (hint, byte) in [
+            (Unknown, 0u8),
+            (CounterReset, 1),
+            (NotCounterReset, 2),
+            (Gauge, 3),
+        ] {
+            assert_eq!(hint.as_u8(), byte);
+            assert_eq!(CounterResetHint::from_u8(byte), hint);
+        }
+        // Out-of-range storage bytes decode defensively to Unknown.
+        assert_eq!(CounterResetHint::from_u8(4), Unknown);
+        assert_eq!(CounterResetHint::from_u8(255), Unknown);
+    }
+
+    #[test]
+    fn counter_reset_hint_round_trips_through_the_value_columns() {
+        for hint in [
+            CounterResetHint::Unknown,
+            CounterResetHint::CounterReset,
+            CounterResetHint::NotCounterReset,
+            CounterResetHint::Gauge,
+        ] {
+            let mut h = single_histogram();
+            h.counter_reset_hint = hint;
+            let cols = h.to_columns().expect("to_columns");
+            assert_eq!(cols.counter_reset_hint, hint.as_u8());
+            let back = NativeHistogram::from_columns(&cols).expect("from_columns");
+            assert_eq!(back.counter_reset_hint, hint);
+            // And decode threads it into the query-time float form.
+            assert_eq!(back.to_float().counter_reset_hint, hint);
+        }
     }
 
     /// `single_histogram {{schema:0 sum:5 count:4 buckets:[1 2 1]}}`
@@ -573,6 +629,7 @@ mod tests {
     /// to `[1 1 -1]`.
     fn single_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -593,6 +650,7 @@ mod tests {
     /// buckets:[1 2 1]}}` (`native_histograms.test:1078`).
     fn custom_buckets_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -612,6 +670,7 @@ mod tests {
     /// `empty_histogram{h="exp"} {{}}` (`native_histograms.test:3`).
     fn empty_exponential() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -629,6 +688,7 @@ mod tests {
     /// (`native_histograms.test:4`).
     fn empty_nhcb() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -703,6 +763,7 @@ mod tests {
     #[test]
     fn negative_span_populated_round_trips_bit_for_bit() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1e-128,
             zero_count: 7,
@@ -911,6 +972,7 @@ mod tests {
     #[test]
     fn exponential_subsequent_span_negative_offset_rejected() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -943,6 +1005,7 @@ mod tests {
     #[test]
     fn nhcb_first_span_negative_offset_rejected() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -983,6 +1046,7 @@ mod tests {
     #[test]
     fn positive_delta_reconstruction_negative_rejected() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1009,6 +1073,7 @@ mod tests {
     #[test]
     fn negative_delta_reconstruction_negative_rejected() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1037,6 +1102,7 @@ mod tests {
         // Untrusted deltas that overflow i64 during reconstruction must wrap
         // (mirroring Go) and be rejected via the negative-count check, not panic.
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1063,6 +1129,7 @@ mod tests {
     #[test]
     fn negative_delta_overflow_does_not_panic() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1091,6 +1158,7 @@ mod tests {
         // Three max-count buckets overflow the u64 observation accumulator;
         // wrapping arithmetic must return a verdict rather than panic.
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1145,6 +1213,7 @@ mod tests {
         // Both violated: negative-side delta-decode (step 3) runs BEFORE the
         // exponential-no-custom-bounds check (step 4).
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1173,6 +1242,7 @@ mod tests {
         // Both violated on the positive side: the exp-custom-bounds check
         // (step 4) precedes the post-switch positive delta-decode (step 5).
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1198,6 +1268,7 @@ mod tests {
     #[test]
     fn from_columns_rejects_unequal_span_arrays() {
         let cols = HistogramColumns {
+            counter_reset_hint: 0,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,

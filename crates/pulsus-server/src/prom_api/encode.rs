@@ -986,6 +986,7 @@ mod tests {
     /// `[1,2,1]` at schema-index 0 -> (0.5,1]:1, (1,2]:2, (2,4]:1.
     fn single_float_histogram() -> pulsus_model::FloatHistogram {
         pulsus_model::FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0.0,

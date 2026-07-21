@@ -146,17 +146,17 @@ pub fn instant_value_hist(
     };
 
     let mut result = last_h.as_ref().clone();
-    // "idelta should only be applied to gauges" — `instantValue`'s
-    // `!isRate` arm (`functions.go:850-853`) warns when EITHER of the two
-    // samples' `CounterResetHint != GaugeType`, BEFORE the subtraction
-    // (the warning also accompanies a later incompatible-schema warning,
-    // matching the pin's annotation ordering). PulsusDB stores no hint
-    // (A3/OQ2: always `UnknownCounterReset`, and `Unknown != GaugeType`),
-    // so the condition is unconditionally true here. The `isRate`
-    // counterpart (`NewNativeHistogramNotCounterWarning`, `:847-849`)
-    // fires only when a hint IS `GaugeType` — genuinely unreachable
-    // without stored hints, and stays carved out.
-    if !is_rate {
+    // Issue #125 (hints now stored/propagated): the pin's exact hint
+    // conditions (`functions.go:846-853`). "irate should only be applied
+    // to counters" — warn when EITHER sample IS gauge-hinted; "idelta
+    // should only be applied to gauges" — warn when EITHER sample ISN'T.
+    // Both fire BEFORE the subtraction (the warning also accompanies a
+    // later incompatible-schema warning, matching the pin's ordering).
+    use pulsus_model::CounterResetHint::Gauge;
+    if is_rate && (last_h.counter_reset_hint == Gauge || prev_h.counter_reset_hint == Gauge) {
+        annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+    }
+    if !is_rate && (last_h.counter_reset_hint != Gauge || prev_h.counter_reset_hint != Gauge) {
         annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
     }
     let should_subtract = !is_rate || !last_h.detect_reset(prev_h);
@@ -182,6 +182,10 @@ pub fn instant_value_hist(
     // Else: a reset was detected for `irate` — `resultSample` stays the
     // last sample's own copy, matching upstream's "leave resultSample at
     // its current value" comment (`functions.go:842-843`).
+    //
+    // The result is a computed difference/rate, never a counter — the
+    // pin marks it gauge unconditionally (`functions.go:867`).
+    result.counter_reset_hint = Gauge;
     result.compact();
     if is_rate {
         result.div(interval_ms as f64 / 1000.0);
@@ -202,6 +206,15 @@ fn histogram_rate(
     let last = points[points.len() - 1].h.as_ref()?.as_ref().clone();
     let mut prev = points[0].h.as_ref()?.as_ref().clone();
 
+    // Issue #125: "this native histogram metric is not a counter" — the
+    // pin checks the FIRST and LAST points' hints up front
+    // (`functions.go:615-620`; the mid-loop below covers the rest), BEFORE
+    // the reset null-out (which replaces `prev` with an empty histogram).
+    use pulsus_model::CounterResetHint::Gauge;
+    if is_counter && (prev.counter_reset_hint == Gauge || last.counter_reset_hint == Gauge) {
+        annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+    }
+
     // Null out the 1st sample if there's a counter reset between it and
     // the 2nd — we then don't need the 1st sample's (possibly
     // incompatible) bucket layout at all.
@@ -209,6 +222,7 @@ fn histogram_rate(
         let second = points[1].h.as_ref()?;
         if second.detect_reset(&prev) {
             prev = FloatHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
                 schema: second.schema,
                 zero_threshold: 0.0,
                 zero_count: 0.0,
@@ -234,6 +248,12 @@ fn histogram_rate(
     if is_counter {
         for p in &points[1..points.len() - 1] {
             let curr = p.h.as_ref()?;
+            // Mid-window gauge-hinted sample under a counter function —
+            // the pin's per-sample check (`functions.go:649-651`; dedup
+            // collapses repeats to one warning).
+            if curr.counter_reset_hint == Gauge {
+                annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+            }
             if curr.schema < min_schema {
                 min_schema = curr.schema;
             }
@@ -297,19 +317,21 @@ fn histogram_rate(
             }
             prev_iter = curr.as_ref().clone();
         }
-    } else {
+    } else if points[0].h.as_ref()?.counter_reset_hint != Gauge
+        || points[points.len() - 1].h.as_ref()?.counter_reset_hint != Gauge
+    {
         // `delta` "should only be applied to gauges" — the pin's `else if`
         // (`functions.go:695-697`) warns when the FIRST or LAST point's
-        // `CounterResetHint != GaugeType`, once per series, after a
-        // successful Sub (an incompatible-schema Sub returned above,
-        // before this point, exactly like the pin's early return).
-        // PulsusDB stores no hint (A3/OQ2: always `UnknownCounterReset`,
-        // and `Unknown != GaugeType`), so the condition is unconditionally
-        // true here — this warning IS reproducible under hint-less
-        // storage, unlike `NewNativeHistogramNotCounterWarning` (fires
-        // only when a hint IS `GaugeType`).
+        // `CounterResetHint != GaugeType` (the ORIGINAL first point, not
+        // the possibly-nulled `prev`), once per series, after a successful
+        // Sub (an incompatible-schema Sub returned above, before this
+        // point, exactly like the pin's early return). Hint-conditional
+        // since issue #125.
         annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
     }
+    // The rate/increase/delta result is a computed difference, never a
+    // counter — marked gauge unconditionally (`functions.go:699`).
+    h.counter_reset_hint = Gauge;
     h.compact();
     Some(h)
 }
@@ -520,6 +542,20 @@ fn eval_sum_avg_over_time_hist(
     // The pin's `nhcbBoundsReconciledSeen` — added once, in the deferred
     // block, only when the fold SUCCEEDS (see the fn doc).
     let mut nhcb_seen = false;
+    // Issue #125: the pin's `counterResetSeen`/`notCounterResetSeen`
+    // tracking over INPUT sample hints (`functions.go:1178-1196` and the
+    // avg twin) — `trackCounterReset` runs on the first sample and each
+    // subsequent one; both-seen ⇒ the collision warning, emitted with the
+    // success tail below (the pin's deferred add is discarded on the
+    // error path, which returns a fresh annotation set).
+    let mut cr_seen = false;
+    let mut ncr_seen = false;
+    let mut track_counter_reset = |h: &FloatHistogram| match h.counter_reset_hint {
+        pulsus_model::CounterResetHint::CounterReset => cr_seen = true,
+        pulsus_model::CounterResetHint::NotCounterReset => ncr_seen = true,
+        _ => {}
+    };
+    track_counter_reset(&sum);
 
     macro_rules! incompatible_schema {
         () => {{
@@ -531,6 +567,7 @@ fn eval_sum_avg_over_time_hist(
     }
 
     for h in hists {
+        track_counter_reset(h);
         count += 1.0;
         match func {
             OverTimeFn::Sum => match sum.kahan_add(h, c.as_ref()) {
@@ -632,6 +669,13 @@ fn eval_sum_avg_over_time_hist(
         }
         _ => unreachable!("only called for Sum/Avg"),
     };
+    // The deferred block's order (`functions.go:1188-1195`): collision
+    // warning first, then the NHCB info.
+    if cr_seen && ncr_seen {
+        annos.warning(messages::histogram_counter_reset_collision_warning(
+            messages::HistogramOperation::Agg,
+        ));
+    }
     if nhcb_seen {
         annos.info(messages::mismatched_custom_buckets_histograms_info(
             messages::HistogramOperation::Agg,
@@ -801,6 +845,7 @@ mod tests {
 
     fn hist_sample(t_ms: i64, count: u64, sum: f64, buckets: Vec<i64>) -> Sample {
         let h = NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1205,6 +1250,7 @@ mod tests {
             deltas.push(w[1] - w[0]);
         }
         let h = NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1549,6 +1595,7 @@ mod tests {
         Sample::hist(
             t_ms,
             FloatHistogram {
+                counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
                 schema: 0,
                 zero_threshold: 0.0,
                 zero_count: 0.0,

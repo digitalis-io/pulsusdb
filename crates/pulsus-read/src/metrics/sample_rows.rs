@@ -34,7 +34,7 @@ pub struct MultiSampleRow {
 /// One `metric_hist_samples` row from
 /// [`super::sample_sql::hist_sample_fetch`] /
 /// [`super::sample_sql::hist_sample_fetch_subquery`] (M7-A5a dual-read):
-/// `SELECT fingerprint, unix_milli, <12 histogram value columns> FROM
+/// `SELECT fingerprint, unix_milli, <13 histogram value columns> FROM
 /// metric_hist_samples …`. The value-column order is locked to the
 /// catalog `CREATE` (id-23, `schema … custom_values`) and the writer row
 /// (`MetricHistSampleRow`, minus its `metric_name`) — the read row is a
@@ -59,6 +59,11 @@ pub struct HistSampleRow {
     pub neg_span_lengths: Vec<u32>,
     pub neg_bucket_deltas: Vec<i64>,
     pub custom_values: Vec<f64>,
+    /// `counter_reset_hint` column (issue #125, migrations 27/28) — LAST,
+    /// matching the SELECT list's trailing position (RowBinary is
+    /// positional); pre-#125 rows read back the column `DEFAULT 0`
+    /// (= Unknown).
+    pub counter_reset_hint: u8,
 }
 
 impl HistSampleRow {
@@ -79,6 +84,7 @@ impl HistSampleRow {
             neg_span_lengths: self.neg_span_lengths.clone(),
             neg_bucket_deltas: self.neg_bucket_deltas.clone(),
             custom_values: self.custom_values.clone(),
+            counter_reset_hint: self.counter_reset_hint,
         }
     }
 }
@@ -105,6 +111,9 @@ pub struct MultiHistSampleRow {
     pub neg_span_lengths: Vec<u32>,
     pub neg_bucket_deltas: Vec<i64>,
     pub custom_values: Vec<f64>,
+    /// See [`HistSampleRow::counter_reset_hint`] — LAST, matching the
+    /// SELECT list (issue #125).
+    pub counter_reset_hint: u8,
 }
 
 impl MultiHistSampleRow {
@@ -124,6 +133,7 @@ impl MultiHistSampleRow {
             neg_span_lengths: self.neg_span_lengths.clone(),
             neg_bucket_deltas: self.neg_bucket_deltas.clone(),
             custom_values: self.custom_values.clone(),
+            counter_reset_hint: self.counter_reset_hint,
         }
     }
 }

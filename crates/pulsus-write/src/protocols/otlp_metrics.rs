@@ -435,6 +435,12 @@ fn parse_metric(
                 reject_whole_metric(out, &metric.name, exp.data_points.len());
                 return Ok(());
             }
+            // Issue #125: past this gate every accepted exponential-
+            // histogram point is CUMULATIVE, and the OTLP data point
+            // carries no monotonicity flag — so the built native
+            // histograms always store `counter_reset_hint = 0` (Unknown;
+            // `otlp_exp_histogram.rs`). `Gauge` (3) is reserved for a
+            // future gauge-capable ingest surface (issue #140).
             // Dispatch on the configured exp-histogram mode (issue #120):
             // `Classic` (default) keeps the existing float flatten byte-
             // unchanged; `Native` stores only the sparse native histogram;

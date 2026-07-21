@@ -700,23 +700,47 @@ pub mod messages {
         )
     }
 
-    /// **Warning** (M7-A5b-ii). Upstream
-    /// `NewNativeHistogramNotGaugeWarning` (`annotations.go:286`): a
-    /// gauge-expecting function (`delta`/`idelta` — `histogramRate`'s
+    /// **Warning** (M7-A5b-ii; hint-conditional since issue #125).
+    /// Upstream `NewNativeHistogramNotGaugeWarning` (`annotations.go:286`):
+    /// a gauge-expecting function (`delta`/`idelta` — `histogramRate`'s
     /// `!isCounter` arm, `functions.go:695-697`, and `instantValue`'s
     /// `!isRate` arm, `:850-853`) received a native histogram whose
-    /// `CounterResetHint` is NOT `GaugeType`. PulsusDB stores no hint
-    /// (A3/OQ2: every decoded histogram is `UnknownCounterReset`, and
-    /// `Unknown != GaugeType`), so under this port the pin's condition is
-    /// unconditionally true — this warning IS reproducible, unlike its
-    /// `NewNativeHistogramNotCounterWarning` counterpart (which fires only
-    /// when a hint IS `GaugeType` — impossible without stored hints) and
-    /// `HistogramCounterResetCollisionWarning` (needs `CounterReset` and
-    /// `NotCounterReset` hints simultaneously). Metric name embedded via
-    /// raw `%q` (`fmt.Errorf("%w %q", …)` — always appended, never
+    /// `CounterResetHint` is NOT `GaugeType`. With the hint stored
+    /// (migrations 27/28) the callers now apply the pin's exact hint
+    /// conditions instead of firing unconditionally. Metric name embedded
+    /// via raw `%q` (`fmt.Errorf("%w %q", …)` — always appended, never
     /// omitted for an empty name).
     pub fn native_histogram_not_gauge_warning(metric_name: &str) -> String {
         format!("PromQL warning: this native histogram metric is not a gauge: {metric_name:?}")
+    }
+
+    /// **Warning** (issue #125). Upstream
+    /// `NewNativeHistogramNotCounterWarning` (`annotations.go:279-286`): a
+    /// counter-expecting function (`rate`/`increase` — `histogramRate`'s
+    /// `isCounter` arms, `functions.go:618,651` — and `irate`,
+    /// `instantValue`'s `isRate` arm, `:847-849`) received a native
+    /// histogram whose `CounterResetHint` IS `GaugeType`. Reachable now
+    /// that hints are stored/propagated. Metric name embedded via raw `%q`
+    /// (always appended, never omitted for an empty name).
+    pub fn native_histogram_not_counter_warning(metric_name: &str) -> String {
+        format!("PromQL warning: this native histogram metric is not a counter: {metric_name:?}")
+    }
+
+    /// **Warning** (issue #125). Upstream
+    /// `NewHistogramCounterResetCollisionWarning` (`annotations.go:485-492`
+    /// over `HistogramCounterResetCollisionWarning`, `:170`): a
+    /// `CounterReset` hint met a `NotCounterReset` hint during a histogram
+    /// operation — `+`/`-` binops (`engine.go:3519-3538`, via
+    /// `CombineOutcome::counter_reset_collision`) or a `sum`/`avg`
+    /// aggregation / `sum_over_time`/`avg_over_time` fold tracking input
+    /// hints (`engine.go:3939-3941`, `functions.go:1178-1196`). Renders the
+    /// operation word only (`aggregation`/`addition`/`subtraction`) — no
+    /// metric name, same as [`mismatched_custom_buckets_histograms_info`].
+    pub fn histogram_counter_reset_collision_warning(op: HistogramOperation) -> String {
+        format!(
+            "PromQL warning: conflicting counter resets during histogram {}",
+            op.as_str()
+        )
     }
 
     /// **Warning** (M7-A5b-ii). Upstream
@@ -1216,6 +1240,41 @@ mod tests {
             messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Agg),
             "PromQL info: mismatched custom buckets were reconciled during aggregation",
             "native_histograms.test:1300's sum_over_time(nhcb_metric[13m]) expect info"
+        );
+    }
+
+    /// Issue #125: the `native_histograms.test` corpus asserts this exact
+    /// text (`expect warn msg: PromQL warning: this native histogram
+    /// metric is not a counter: "some_metric"`, `:1095`).
+    #[test]
+    fn native_histogram_not_counter_warning_message_text() {
+        assert_eq!(
+            messages::native_histogram_not_counter_warning("some_metric"),
+            "PromQL warning: this native histogram metric is not a counter: \"some_metric\""
+        );
+        // Raw %q, always appended — an empty name renders as "".
+        assert_eq!(
+            messages::native_histogram_not_counter_warning(""),
+            "PromQL warning: this native histogram metric is not a counter: \"\""
+        );
+    }
+
+    /// Issue #125: the corpus asserts the aggregation form verbatim
+    /// (`native_histograms.test:1858` etc.); the addition/subtraction
+    /// forms are the binop arms' texts (`engine.go:3524,3535`).
+    #[test]
+    fn histogram_counter_reset_collision_warning_message_text() {
+        assert_eq!(
+            messages::histogram_counter_reset_collision_warning(messages::HistogramOperation::Agg),
+            "PromQL warning: conflicting counter resets during histogram aggregation"
+        );
+        assert_eq!(
+            messages::histogram_counter_reset_collision_warning(messages::HistogramOperation::Add),
+            "PromQL warning: conflicting counter resets during histogram addition"
+        );
+        assert_eq!(
+            messages::histogram_counter_reset_collision_warning(messages::HistogramOperation::Sub),
+            "PromQL warning: conflicting counter resets during histogram subtraction"
         );
     }
 

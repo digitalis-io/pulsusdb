@@ -3169,6 +3169,7 @@ mod tests {
     /// `single_histogram` (`native_histograms.test:34`, A3 corpus fixture).
     fn single_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -3188,6 +3189,7 @@ mod tests {
     /// `custom_buckets_histogram` (`native_histograms.test:1078`, NHCB).
     fn custom_buckets_histogram() -> NativeHistogram {
         NativeHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: -53,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -3229,6 +3231,7 @@ mod tests {
             neg_span_lengths: c.neg_span_lengths,
             neg_bucket_deltas: c.neg_bucket_deltas,
             custom_values: c.custom_values,
+            counter_reset_hint: c.counter_reset_hint,
         }
     }
 

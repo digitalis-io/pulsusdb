@@ -254,6 +254,14 @@ SETTINGS ttl_only_drop_parts = 1;
 - **Sparse wire form, lossless for both schemas.** The `schema`, `zero_threshold`, `zero_count`, `count`, `sum` scalars plus the positive/negative span-and-delta arrays are the integer sparse-histogram encoding (`Array(Int32)`/`Array(UInt32)` span offsets/lengths, `Array(Int64)` delta-encoded bucket counts). This is lossless for the standard exponential schema (−4..8) and for NHCB (schema −53, which populates `custom_values` and leaves the negative/zero fields empty). Each array carries `CODEC(ZSTD(1))` (§8's "everything wrapped in `ZSTD(1)` minimum").
 - **Co-sharded with floats.** In clustered mode `metric_hist_samples` reuses the Metrics family sharding key `cityHash64(metric_name, fingerprint)` (§7) — the byte-identical expression `metric_samples`, its tiers, and `metric_series` use. Its `_dist` wrapper is `CREATE TABLE metric_hist_samples_dist AS metric_hist_samples ENGINE = Distributed('{cluster}', pulsus, metric_hist_samples, cityHash64(metric_name, fingerprint))`. Consequence: a series' float samples, histogram samples, and `metric_series` metadata land on the **same shard**, so the read path's co-load of both sample types for one series stays shard-local.
 
+**Counter-reset hint (issue #125).** `metric_hist_samples` gains one additive column — never a mutation of the frozen id-23 `CREATE` (the `value_type` precedent below); the `_dist` wrapper gains the cluster-gated twin (migrations 27/28):
+
+```sql
+ALTER TABLE metric_hist_samples ADD COLUMN IF NOT EXISTS counter_reset_hint UInt8 DEFAULT 0;
+```
+
+`counter_reset_hint` stores the Prometheus per-sample counter-reset hint byte: `0` = unknown, `1` = counter reset, `2` = not a counter reset, `3` = gauge histogram. Pre-#125 rows read back `0` (the `DEFAULT`) — semantically exact (unknown), no data migration. The read path decodes it into the query-time histogram, where it drives the PromQL not-counter/not-gauge/reset-collision annotations and the reset-detection shortcuts. **Ingest writes `0` today:** OTLP exponential-histogram points carry no monotonicity flag and delta temporality is rejected at the ingest seam, so `3` (gauge) is unproducible until a gauge-capable ingest surface lands (issue #140). The column is fixed-width `UInt8` appended to the existing hist SELECT list — same table, same PK/ordering, same granule pruning, no extra round-trips.
+
 **Per-series value type on `metric_series`.** `metric_series` (§2.1) gains a discriminator column, added by additive `ALTER` (the §3.1 `structured_metadata` precedent — never a mutation of the frozen initial `CREATE`, so fresh and upgraded deployments converge byte-identically):
 
 ```sql

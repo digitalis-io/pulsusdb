@@ -2807,6 +2807,15 @@ async fn dual_read_merges_and_decodes_histogram_samples_end_to_end() {
                 pulsus_read::logql::HistOrFloat::Hist(h) => {
                     assert_eq!(h.count, 4.0);
                     assert_eq!(h.sum, 5.0);
+                    // Issue #125 (AC6): the seed row was written WITHOUT
+                    // the counter_reset_hint column (SeedHistRow is the
+                    // pre-#125 shape), so the read path fetched the
+                    // column DEFAULT 0 and decoded it to Unknown.
+                    assert_eq!(
+                        h.counter_reset_hint,
+                        pulsus_model::CounterResetHint::Unknown,
+                        "stored hint 0 must decode to Unknown end to end"
+                    );
                 }
                 other => panic!("expected Hist, got {other:?}"),
             }

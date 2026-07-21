@@ -550,6 +550,39 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- metric_hist_samples counter-reset hint (issue #125) ---
+    // Additive ALTER (the id 25/26 `value_type` precedent), never a mutation
+    // of id 23's frozen `metric_hist_samples` CREATE. `counter_reset_hint`
+    // stores the Prometheus hint byte (0 = Unknown, 1 = CounterReset,
+    // 2 = NotCounterReset, 3 = Gauge); pre-#125 rows read back 0 = Unknown —
+    // semantically exact, no data migration. Ingest writes 0 today (OTLP
+    // exponential histograms carry no monotonicity signal and delta
+    // temporality is rejected at the seam); Gauge-capable ingest is #140.
+    Migration {
+        id: 27,
+        name: "metric_hist_samples",
+        family: Some(Family::Metrics),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS counter_reset_hint UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 27 — cluster-gated (`StaticClusterOnly`),
+    // the id 26 precedent: `CREATE ... AS metric_hist_samples` copies columns
+    // at creation and does not inherit the base ALTER.
+    Migration {
+        id: 28,
+        name: "metric_hist_samples",
+        family: Some(Family::Metrics),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.metric_hist_samples{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS counter_reset_hint UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -970,15 +1003,71 @@ mod tests {
 
     /// Issue #113: the M7-A2 migrations inherit the same identity/replication
     /// scope as every other Metrics-family DDL — checksum-gated, per-shard
-    /// replicated (never config-named, never global).
+    /// replicated (never config-named, never global). Issue #125 extends the
+    /// set with the `counter_reset_hint` pair (ids 27/28).
     #[test]
     fn native_histogram_migrations_are_checksum_scoped_per_shard_metrics() {
-        for id in [23, 24, 25, 26] {
+        for id in [23, 24, 25, 26, 27, 28] {
             let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
             assert_eq!(m.scope, MigrationScope::Checksum);
             assert_eq!(m.replication, Replication::PerShard);
             assert_eq!(m.family, Some(Family::Metrics));
         }
+    }
+
+    /// Issue #125: `counter_reset_hint` is added to `metric_hist_samples` via
+    /// an additive `ADD COLUMN IF NOT EXISTS` (id 27) — never a mutation of
+    /// id 23's frozen CREATE — as `UInt8 DEFAULT 0` (0 = Unknown; pre-#125
+    /// rows read back 0, no data migration). The id-25 `value_type`
+    /// precedent shape exactly.
+    #[test]
+    fn hist_counter_reset_hint_base_alter_is_additive_uint8_default_zero() {
+        let ddl = rendered_static(27);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.metric_hist_samples\n\
+             ADD COLUMN IF NOT EXISTS counter_reset_hint UInt8 DEFAULT 0;",
+        );
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered =
+            render::render(static_tmpl(27), "metric_hist_samples", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+    }
+
+    /// Issue #125: the `counter_reset_hint` `_dist` ALTER (id 28) is
+    /// `StaticClusterOnly` — it targets `metric_hist_samples_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Mirrors id 26.
+    #[test]
+    fn hist_counter_reset_hint_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 28).expect("id 28");
+        assert_eq!(m.name, "metric_hist_samples");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 28 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "metric_hist_samples", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.metric_hist_samples_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS counter_reset_hint UInt8 DEFAULT 0;",
+        );
+    }
+
+    /// Issue #125: id 23's frozen `metric_hist_samples` CREATE is NOT
+    /// mutated — `counter_reset_hint` arrives only via the additive ALTER
+    /// (id 27), keeping the id-23 checksum byte-frozen.
+    #[test]
+    fn frozen_hist_base_create_is_not_mutated_by_the_hint_column() {
+        assert!(
+            !static_tmpl(23).contains("counter_reset_hint"),
+            "counter_reset_hint must arrive via the additive ALTER (id 27), not id 23's CREATE"
+        );
     }
 
     /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping

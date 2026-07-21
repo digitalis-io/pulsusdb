@@ -9,11 +9,14 @@
 // helpers; `rate`/`increase`/`delta`/`irate`/`idelta` and the binop arms
 // use this module's plain `Add`/`Sub` — `functions.go:663,680`,
 // `engine.go:3518,3532`.
-// `CounterResetHint` is never modeled (`float_histogram.rs`'s own module
-// doc, OQ2): every decoded histogram is upstream's `UnknownCounterReset`,
-// so `adjustCounterReset`/the two `CounterReset`/`NotCounterReset`
-// `DetectReset` shortcuts are dead code upstream would fall through
-// anyway — this port skips them rather than modeling an unreachable state.
+// `CounterResetHint` IS modeled (issue #125, closing A5b's OQ2 carve-out):
+// [`FloatHistogram::combine`] applies the pinned `adjustCounterReset` merge
+// (`float_histogram.go:2070-2094`) and reports a CR/NCR collision on
+// [`CombineOutcome::counter_reset_collision`]; `mul`/`div` by a negative
+// factor mark the result `Gauge` (`:289-330`); and [`FloatHistogram::
+// detect_reset`] takes the pinned CounterReset⇒true / NotCounterReset⇒false
+// shortcuts (`:750-765`) before any bucket work. `equals`/`bits_eq` ignore
+// the hint (upstream `Equals` parity).
 //
 // **Pin-conformance notes (the #124 A5b-ii codex round-1 findings):**
 // - **Kahan structure in the zero-bucket paths.** The pin's
@@ -105,11 +108,18 @@ pub enum CombineOp {
 /// whether NHCB custom bounds needed reconciling to their intersection —
 /// mirrors upstream `Add`/`Sub`'s `nhcbBoundsReconciled` return, which
 /// callers surface as `NewMismatchedCustomBucketsHistogramsInfo`
-/// (`functions.go:672-674,689-691,863-865`).
+/// (`functions.go:672-674,689-691,863-865`) — and (issue #125) whether the
+/// two operands' counter-reset hints collided.
 #[derive(Debug, Clone)]
 pub struct CombineOutcome {
     pub result: FloatHistogram,
     pub nhcb_bounds_reconciled: bool,
+    /// `true` iff one operand carried `CounterReset` and the other
+    /// `NotCounterReset` (upstream `adjustCounterReset`'s
+    /// `counterResetCollision` return, `float_histogram.go:2070-2094`) —
+    /// callers surface `NewHistogramCounterResetCollisionWarning`. All
+    /// other hint combinations are NOT a collision.
+    pub counter_reset_collision: bool,
 }
 
 impl FloatHistogram {
@@ -122,6 +132,8 @@ impl FloatHistogram {
     /// transparent). Distinct from [`Self::bits_eq`] (the value-model
     /// equality primitive, byte-identical arrays) — this is the `h==h`/
     /// `changes()` semantic primitive (M7-A5b-ii).
+    /// [`Self::counter_reset_hint`] deliberately does NOT participate —
+    /// upstream `Equals` ignores the hint (issue #125 keeps that parity).
     pub fn equals(&self, other: &FloatHistogram) -> bool {
         if self.schema != other.schema
             || self.count.to_bits() != other.count.to_bits()
@@ -154,9 +166,9 @@ impl FloatHistogram {
 
     /// Scales every bucket count, `zero_count`, `count`, and `sum` by
     /// `factor` in place — mirrors upstream `Mul` (`float_histogram.go:
-    /// 290`). `CounterResetHint` is not modeled (module doc), so the
-    /// pin's `factor < 0 -> GaugeType` side effect has no observable
-    /// counterpart here.
+    /// 290`), including its `factor < 0 ⇒ GaugeType` hint side effect
+    /// (issue #125): a negated histogram cannot be a counter, so unary
+    /// minus (`operand * -1`) marks the result a gauge.
     pub fn mul(&mut self, factor: f64) {
         self.zero_count *= factor;
         self.count *= factor;
@@ -167,11 +179,18 @@ impl FloatHistogram {
         for b in &mut self.negative_buckets {
             *b *= factor;
         }
+        if factor < 0.0 {
+            self.counter_reset_hint = CounterResetHint::Gauge;
+        }
     }
 
     /// Divides every bucket count, `zero_count`, `count`, and `sum` by
     /// `scalar` in place — mirrors upstream `Div` (`float_histogram.go:
-    /// 309`), including the "divide by zero clears every bucket" rule.
+    /// 309`), including the "divide by zero clears every bucket" rule and
+    /// the `scalar < 0 ⇒ GaugeType` hint side effect (issue #125; note the
+    /// pin's own order — division by zero returns BEFORE the hint check,
+    /// so `div(0.0)` leaves the hint untouched, and `div(-0.0)` does too:
+    /// `-0.0 < 0.0` is false).
     pub fn div(&mut self, scalar: f64) {
         self.zero_count /= scalar;
         self.count /= scalar;
@@ -188,6 +207,9 @@ impl FloatHistogram {
         }
         for b in &mut self.negative_buckets {
             *b /= scalar;
+        }
+        if scalar < 0.0 {
+            self.counter_reset_hint = CounterResetHint::Gauge;
         }
     }
 
@@ -239,6 +261,11 @@ impl FloatHistogram {
             target_schema,
         );
         FloatHistogram {
+            // Deliberately Unknown, not `self.counter_reset_hint`: the
+            // pin's reduced-copy literal (`float_histogram.go:161-167`)
+            // omits `CounterResetHint`, so only the same-schema fast path
+            // (`self.clone()` above, upstream `Copy`) preserves the hint.
+            counter_reset_hint: CounterResetHint::Unknown,
             schema: target_schema,
             zero_threshold: self.zero_threshold,
             zero_count: self.zero_count,
@@ -281,6 +308,11 @@ impl FloatHistogram {
             CombineOp::Add => 1.0,
             CombineOp::Sub => -1.0,
         };
+        // `adjustCounterReset` runs right after the schema check in the
+        // pin, before any bucket work (`float_histogram.go:353-356/538-541`
+        // via `:2070-2094`).
+        let (counter_reset_hint, counter_reset_collision) =
+            adjust_counter_reset(self.counter_reset_hint, other.counter_reset_hint);
         let count = self.count + sign * other.count;
         let sum = self.sum + sign * other.sum;
 
@@ -294,6 +326,7 @@ impl FloatHistogram {
                 );
                 return Ok(CombineOutcome {
                     result: FloatHistogram {
+                        counter_reset_hint,
                         schema: self.schema,
                         zero_threshold: 0.0,
                         zero_count: 0.0,
@@ -306,6 +339,7 @@ impl FloatHistogram {
                         custom_values: self.custom_values.clone(),
                     },
                     nhcb_bounds_reconciled: false,
+                    counter_reset_collision,
                 });
             }
             // Mismatched custom bounds: reconcile to the intersection
@@ -327,6 +361,7 @@ impl FloatHistogram {
             );
             return Ok(CombineOutcome {
                 result: FloatHistogram {
+                    counter_reset_hint,
                     schema: self.schema,
                     zero_threshold: 0.0,
                     zero_count: 0.0,
@@ -339,6 +374,7 @@ impl FloatHistogram {
                     custom_values: intersected,
                 },
                 nhcb_bounds_reconciled: true,
+                counter_reset_collision,
             });
         }
 
@@ -426,6 +462,7 @@ impl FloatHistogram {
 
         Ok(CombineOutcome {
             result: FloatHistogram {
+                counter_reset_hint,
                 schema: target_schema,
                 zero_threshold,
                 zero_count,
@@ -438,6 +475,7 @@ impl FloatHistogram {
                 custom_values: Vec::new(),
             },
             nhcb_bounds_reconciled: false,
+            counter_reset_collision,
         })
     }
 
@@ -452,12 +490,24 @@ impl FloatHistogram {
     }
 
     /// `DetectReset` — mirrors upstream `DetectReset` (`float_histogram.go:
-    /// 750`), minus the `CounterResetHint` shortcuts (module doc above).
+    /// 750`), including (issue #125) its `CounterResetHint` shortcuts:
+    /// `CounterReset` ⇒ `true` and `NotCounterReset` ⇒ `false` immediately,
+    /// before any bucket work; `Unknown` and `Gauge` fall through to the
+    /// full detection (the pin treats a gauge like an unknown counter here
+    /// — a warning is the caller's concern).
     /// NHCB with mismatched custom bounds compares rolled-up buckets over
     /// the common bounds (`detectResetWithMismatchedCustomBounds`,
     /// `:1703-1776`) — a bounds CHANGE alone is not a reset
     /// (`native_histograms.test`'s `resets(nhcb_metric[13m]) == 0`).
     pub fn detect_reset(&self, previous: &FloatHistogram) -> bool {
+        // The pinned shortcuts (`float_histogram.go:751-756`): only the
+        // RECEIVER's hint is consulted.
+        if self.counter_reset_hint == CounterResetHint::CounterReset {
+            return true;
+        }
+        if self.counter_reset_hint == CounterResetHint::NotCounterReset {
+            return false;
+        }
         if self.count < previous.count {
             return true;
         }
@@ -620,6 +670,29 @@ impl FloatHistogram {
         }
         false
     }
+}
+
+/// `adjustCounterReset` (`float_histogram.go:2070-2094`, issue #125): the
+/// counter-reset hint of an `Add`/`Sub`/`KahanAdd` result, plus whether the
+/// two operand hints collided. Case-for-case with the pin (receiver = `a`):
+/// equal hints keep `a`; a `Gauge` on either side wins; an `Unknown` on
+/// either side yields `Unknown`; the remaining combinations are exactly
+/// `CounterReset` meeting `NotCounterReset` — a COLLISION, conservatively
+/// `Unknown` with the flag set (callers surface
+/// `HistogramCounterResetCollisionWarning`).
+fn adjust_counter_reset(a: CounterResetHint, b: CounterResetHint) -> (CounterResetHint, bool) {
+    use CounterResetHint::{Gauge, Unknown};
+    if b == a {
+        return (a, false);
+    }
+    if a == Gauge || b == Gauge {
+        return (Gauge, false);
+    }
+    if a == Unknown || b == Unknown {
+        return (Unknown, false);
+    }
+    // Only CounterReset vs NotCounterReset (either order) remains.
+    (Unknown, true)
 }
 
 /// One Neumaier-compensated increment — ported operation-for-operation
@@ -1162,6 +1235,7 @@ mod ops_tests {
             abs_buckets[2] - abs_buckets[1],
         ];
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1187,6 +1261,7 @@ mod ops_tests {
             deltas.push(w[1] - w[0]);
         }
         NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1263,6 +1338,7 @@ mod ops_tests {
         // -> 1, idx=2 -> 1), so their counts (1, 2) merge into one target
         // bucket.
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1297,6 +1373,7 @@ mod ops_tests {
     #[test]
     fn copy_to_schema_keeps_zero_count_target_buckets() {
         let h = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1371,6 +1448,7 @@ mod ops_tests {
     fn combine_add_preserves_an_explicit_zero_bucket_from_one_operand() {
         let a = exp_hist(2, 2.0, [1, 0, 1]); // explicit zero at index 1
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1395,6 +1473,7 @@ mod ops_tests {
         // Schema-1 histogram (2 buckets, indices 1,2 -> abs [1,1]) added
         // to a schema-0 histogram (1 bucket, index 1 -> abs [5]).
         let hi_res = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1411,6 +1490,7 @@ mod ops_tests {
         }
         .to_float();
         let lo_res = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1443,6 +1523,7 @@ mod ops_tests {
         // (b's own layout is untouched; the merge's threshold skip
         // excludes the in-zero bucket).
         let a = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.0,
             zero_count: 3,
@@ -1456,6 +1537,7 @@ mod ops_tests {
         }
         .to_float();
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1492,6 +1574,7 @@ mod ops_tests {
     #[test]
     fn combine_reconciles_zero_threshold_at_native_schema_before_reduction() {
         let a = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1510,6 +1593,7 @@ mod ops_tests {
         }
         .to_float();
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.3,
             zero_count: 5,
@@ -1555,6 +1639,7 @@ mod ops_tests {
         // self: only a negative bucket (-2,-1]:3 (schema 0, index 1),
         // zero threshold 0. other: threshold 1.3, zero count 10.
         let a = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1571,6 +1656,7 @@ mod ops_tests {
         }
         .to_float();
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 1.3,
             zero_count: 10,
@@ -1671,6 +1757,7 @@ mod ops_tests {
     fn detect_reset_true_when_a_populated_bucket_disappears() {
         let prev = exp_hist(4, 5.0, [1, 2, 1]);
         let curr = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1693,6 +1780,7 @@ mod ops_tests {
     fn detect_reset_true_for_a_schema_increase() {
         let prev = exp_hist(4, 5.0, [1, 2, 1]);
         let curr = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1717,6 +1805,7 @@ mod ops_tests {
         // `curr` at schema 0 (coarser) with the merged, non-decreased
         // total (2) in the corresponding bucket.
         let prev = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1733,6 +1822,7 @@ mod ops_tests {
         }
         .to_float();
         let curr = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1800,6 +1890,7 @@ mod ops_tests {
         // tolerance (`histogram.go:287`).
         let a = exp_hist(4, 5.0, [1, 2, 1]);
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1841,6 +1932,7 @@ mod ops_tests {
     fn equals_false_for_differing_schema() {
         let a = exp_hist(4, 5.0, [1, 2, 1]);
         let b = NativeHistogram {
+            counter_reset_hint: crate::CounterResetHint::Unknown,
             schema: 1,
             zero_threshold: 0.0,
             zero_count: 0,
@@ -1864,5 +1956,116 @@ mod ops_tests {
         let a = nhcb_hist(1, 1.0, vec![5.0], vec![1]);
         let b = nhcb_hist(1, 1.0, vec![5.0, 10.0], vec![1]);
         assert!(!a.equals(&b));
+    }
+
+    // -- issue #125 (AC3): the counter-reset-hint algebra --
+
+    /// (a) The FULL `adjustCounterReset` truth table
+    /// (`float_histogram.go:2070-2094`), asserted through `combine` (the
+    /// only caller shape): result hint AND collision flag for all 16
+    /// ordered pairs.
+    #[test]
+    fn combine_adjusts_the_counter_reset_hint_per_the_pinned_truth_table() {
+        use crate::CounterResetHint::{CounterReset, Gauge, NotCounterReset, Unknown};
+        let cases = [
+            // (self, other, expected hint, expected collision)
+            (Unknown, Unknown, Unknown, false),
+            (Unknown, CounterReset, Unknown, false),
+            (Unknown, NotCounterReset, Unknown, false),
+            (Unknown, Gauge, Gauge, false),
+            (CounterReset, Unknown, Unknown, false),
+            (CounterReset, CounterReset, CounterReset, false),
+            (CounterReset, NotCounterReset, Unknown, true),
+            (CounterReset, Gauge, Gauge, false),
+            (NotCounterReset, Unknown, Unknown, false),
+            (NotCounterReset, CounterReset, Unknown, true),
+            (NotCounterReset, NotCounterReset, NotCounterReset, false),
+            (NotCounterReset, Gauge, Gauge, false),
+            (Gauge, Unknown, Gauge, false),
+            (Gauge, CounterReset, Gauge, false),
+            (Gauge, NotCounterReset, Gauge, false),
+            (Gauge, Gauge, Gauge, false),
+        ];
+        for (a_hint, b_hint, want_hint, want_collision) in cases {
+            let mut a = exp_hist(4, 5.0, [1, 2, 1]);
+            a.counter_reset_hint = a_hint;
+            let mut b = exp_hist(4, 5.0, [1, 2, 1]);
+            b.counter_reset_hint = b_hint;
+            for op in [CombineOp::Add, CombineOp::Sub] {
+                let outcome = a.combine(&b, op).unwrap();
+                assert_eq!(
+                    outcome.result.counter_reset_hint, want_hint,
+                    "{a_hint:?} {op:?} {b_hint:?}: hint"
+                );
+                assert_eq!(
+                    outcome.counter_reset_collision, want_collision,
+                    "{a_hint:?} {op:?} {b_hint:?}: collision"
+                );
+            }
+        }
+    }
+
+    /// (b) `Mul`/`Div` by a NEGATIVE factor/scalar set the Gauge hint
+    /// (`float_histogram.go:300-302,327-329`); a positive one preserves
+    /// whatever hint was there.
+    #[test]
+    fn mul_div_negative_factor_sets_gauge_positive_preserves() {
+        use crate::CounterResetHint::{Gauge, NotCounterReset};
+        let mut h = exp_hist(4, 5.0, [1, 2, 1]);
+        h.counter_reset_hint = NotCounterReset;
+        h.mul(2.0);
+        assert_eq!(h.counter_reset_hint, NotCounterReset, "positive mul");
+        h.div(2.0);
+        assert_eq!(h.counter_reset_hint, NotCounterReset, "positive div");
+        h.mul(-1.0);
+        assert_eq!(h.counter_reset_hint, Gauge, "negative mul ⇒ gauge");
+        let mut h = exp_hist(4, 5.0, [1, 2, 1]);
+        h.counter_reset_hint = NotCounterReset;
+        h.div(-1.0);
+        assert_eq!(h.counter_reset_hint, Gauge, "negative div ⇒ gauge");
+    }
+
+    /// (c) `DetectReset`'s pinned hint shortcuts (`float_histogram.go:
+    /// 751-756`): `CounterReset` ⇒ true even for a monotone-growth pair
+    /// (full detection would say false), `NotCounterReset` ⇒ false even
+    /// for a genuine count drop (full detection would say true) — proving
+    /// the shortcut fires BEFORE any bucket work. `Gauge`/`Unknown` fall
+    /// through to full detection.
+    #[test]
+    fn detect_reset_shortcuts_on_the_receiver_hint_before_bucket_work() {
+        use crate::CounterResetHint::{CounterReset, Gauge, NotCounterReset};
+        let prev = exp_hist(4, 5.0, [1, 2, 1]);
+        let mut grew = exp_hist(6, 7.0, [1, 3, 2]);
+        grew.counter_reset_hint = CounterReset;
+        assert!(grew.detect_reset(&prev), "CR shortcut wins over growth");
+        let mut dropped = exp_hist(2, 2.0, [1, 1, 0]);
+        dropped.counter_reset_hint = NotCounterReset;
+        assert!(
+            !dropped.detect_reset(&prev),
+            "NCR shortcut wins over a real count drop"
+        );
+        let mut dropped_gauge = exp_hist(2, 2.0, [1, 1, 0]);
+        dropped_gauge.counter_reset_hint = Gauge;
+        assert!(
+            dropped_gauge.detect_reset(&prev),
+            "Gauge falls through to full detection"
+        );
+        // Only the RECEIVER's hint is consulted (pin parity): a CR hint on
+        // `previous` changes nothing.
+        let mut prev_cr = exp_hist(4, 5.0, [1, 2, 1]);
+        prev_cr.counter_reset_hint = CounterReset;
+        let curr = exp_hist(6, 7.0, [1, 3, 2]);
+        assert!(!curr.detect_reset(&prev_cr));
+    }
+
+    /// (d) `equals` and `bits_eq` both IGNORE the hint (upstream `Equals`
+    /// parity — the promqltest comparator asserts hints separately).
+    #[test]
+    fn equals_and_bits_eq_ignore_the_counter_reset_hint() {
+        let a = exp_hist(4, 5.0, [1, 2, 1]);
+        let mut b = exp_hist(4, 5.0, [1, 2, 1]);
+        b.counter_reset_hint = crate::CounterResetHint::Gauge;
+        assert!(a.equals(&b));
+        assert!(a.bits_eq(&b));
     }
 }

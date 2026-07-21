@@ -93,6 +93,7 @@ fn is_stale(flags: u32) -> bool {
 /// trivially passes (`0 == 0`).
 fn stale_marker() -> NativeHistogram {
     NativeHistogram {
+        counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
         schema: 0,
         zero_threshold: 0.0,
         zero_count: 0,
@@ -275,6 +276,13 @@ pub(crate) fn to_native_histogram(
     let (negative_spans, negative_buckets) = convert_side(dp.negative.as_ref(), scale_down)?;
 
     let hist = NativeHistogram {
+        // Issue #125: every accepted point writes hint 0 (Unknown). OTLP
+        // `ExponentialHistogramDataPoint` carries no monotonicity flag and
+        // delta temporality is rejected wholesale at the dispatch seam
+        // (`otlp_metrics.rs`'s `is_delta` gate), so `Gauge` (3) is
+        // unproducible at ingest today — a gauge-capable ingest surface
+        // (e.g. remote-write receive) is issue #140.
+        counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
         schema,
         zero_threshold: dp.zero_threshold,
         zero_count: dp.zero_count,

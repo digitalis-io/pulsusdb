@@ -205,6 +205,13 @@ fn vector_elem_binop_hist(
         (Some(lh), Some(rh)) => match op {
             BinOp::Add => match lh.add(rh) {
                 Ok(outcome) => {
+                    // Issue #125: a CR/NCR hint collision during `+`
+                    // (`engine.go:3522-3524`).
+                    if outcome.counter_reset_collision {
+                        annos.warning(messages::histogram_counter_reset_collision_warning(
+                            messages::HistogramOperation::Add,
+                        ));
+                    }
                     if outcome.nhcb_bounds_reconciled {
                         annos.info(messages::mismatched_custom_buckets_histograms_info(
                             messages::HistogramOperation::Add,
@@ -229,17 +236,25 @@ fn vector_elem_binop_hist(
                     }
                 }
             },
-            // The pin marks a `Sub` result's `CounterResetHint = GaugeType`
-            // ("the result must be marked as gauge", `engine.go:3529-3531`)
-            // — a no-op here, `CounterResetHint` is not modeled (A3/OQ2).
             BinOp::Sub => match lh.sub(rh) {
                 Ok(outcome) => {
+                    // Issue #125: a CR/NCR hint collision during `-`
+                    // (`engine.go:3533-3535`).
+                    if outcome.counter_reset_collision {
+                        annos.warning(messages::histogram_counter_reset_collision_warning(
+                            messages::HistogramOperation::Sub,
+                        ));
+                    }
                     if outcome.nhcb_bounds_reconciled {
                         annos.info(messages::mismatched_custom_buckets_histograms_info(
                             messages::HistogramOperation::Sub,
                         ));
                     }
                     let mut result = outcome.result;
+                    // "The result must be marked as gauge"
+                    // (`engine.go:3529-3531`) — a difference is never a
+                    // counter (issue #125).
+                    result.counter_reset_hint = pulsus_model::CounterResetHint::Gauge;
                     result.compact();
                     ElemBinopResult {
                         v: 0.0,
@@ -2573,6 +2588,7 @@ mod tests {
 
     fn exp_hist(count: f64, sum: f64, buckets: Vec<f64>) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -2591,6 +2607,7 @@ mod tests {
 
     fn nhcb_hist(custom_values: Vec<f64>) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0.0,

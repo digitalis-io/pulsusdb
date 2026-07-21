@@ -34,22 +34,27 @@ pub enum SeqValue {
     Gap,
     /// `stale` — an explicit staleness marker sample.
     Stale,
-    /// A `{{...}}` native-histogram literal (issue #124, M7-A6).
-    Histogram(FloatHistogram),
+    /// A `{{...}}` native-histogram literal (issue #124, M7-A6). The
+    /// `bool` is `hint_set` (issue #125): whether the literal spelled a
+    /// `counter_reset_hint:` key — consulted ONLY by the runner's
+    /// expected-value comparator (the pin's `SequenceValue.
+    /// CounterResetHintSet`); `load` ignores it (the hint VALUE itself
+    /// travels inside the histogram).
+    Histogram(FloatHistogram, bool),
 }
 
 /// Hand-written (mirrors [`pulsus_model::FloatHistogram::bits_eq`] for the
 /// `Histogram` arm, since `FloatHistogram` has no `PartialEq` derive —
-/// NaN-bearing fields). The only existing use site
-/// (`grammar.rs`'s `values.contains(&SeqValue::Stale)`) never compares two
-/// `Histogram` values against each other.
+/// NaN-bearing fields; `hint_set` compares by value). The only existing
+/// use site (`grammar.rs`'s `values.contains(&SeqValue::Stale)`) never
+/// compares two `Histogram` values against each other.
 impl PartialEq for SeqValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (SeqValue::Value(a), SeqValue::Value(b)) => a == b,
             (SeqValue::Gap, SeqValue::Gap) => true,
             (SeqValue::Stale, SeqValue::Stale) => true,
-            (SeqValue::Histogram(a), SeqValue::Histogram(b)) => a.bits_eq(b),
+            (SeqValue::Histogram(a, sa), SeqValue::Histogram(b, sb)) => a.bits_eq(b) && sa == sb,
             _ => false,
         }
     }

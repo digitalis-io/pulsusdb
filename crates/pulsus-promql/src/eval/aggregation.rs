@@ -172,14 +172,15 @@ struct Acc {
     /// `KahanAdd`, mirroring the pin's `nil`; every scalar AND bucket
     /// carries its own Neumaier remainder, `float_histogram_kahan.rs`).
     hist_kahan_c: Option<FloatHistogram>,
-    // NOT modeled: upstream's `counterResetSeen`/`notCounterResetSeen`
-    // (`groupedAggregation`, `engine.go:3577-3578`) drive
-    // `NewHistogramCounterResetCollisionWarning` — unreachable here for
-    // the same reason A5b-ii's OQ2 carve-out states: `CounterResetHint`
-    // is never stored (A3), so every decoded histogram is
-    // `UnknownCounterReset` and the collision condition (`CounterReset`
-    // AND `NotCounterReset` both seen) can never hold. No field, no dead
-    // tracking.
+    /// Issue #125: upstream's `counterResetSeen`/`notCounterResetSeen`
+    /// (`groupedAggregation`, `engine.go:3577-3578`) — tracked over INPUT
+    /// sample hints (group init `:3619-3621`, SUM fold `:3681-3683`, AVG
+    /// fold `:3736-3738`; only when the group's first member was a
+    /// histogram, mirroring the pin's `group.histogramValue != nil`
+    /// guard); both-seen ⇒ `HistogramCounterResetCollisionWarning` at
+    /// group finalization (`:3939-3941`).
+    counter_reset_seen: bool,
+    not_counter_reset_seen: bool,
 }
 
 impl Acc {
@@ -201,7 +202,21 @@ impl Acc {
             hist_mean: None,
             hist_incremental_mean: false,
             hist_kahan_c: None,
+            counter_reset_seen: false,
+            not_counter_reset_seen: false,
         }
+    }
+}
+
+/// Issue #125: folds one INPUT sample's counter-reset hint into the
+/// group's collision-tracking booleans — the pin's `switch
+/// h.CounterResetHint` at the three tracked sites (`engine.go:3619-3621,
+/// 3681-3683,3736-3738`).
+fn track_counter_reset(acc: &mut Acc, h: &FloatHistogram) {
+    match h.counter_reset_hint {
+        pulsus_model::CounterResetHint::CounterReset => acc.counter_reset_seen = true,
+        pulsus_model::CounterResetHint::NotCounterReset => acc.not_counter_reset_seen = true,
+        _ => {}
     }
 }
 
@@ -384,7 +399,15 @@ fn aggregate_reduce(
                 acc.has_histogram = true;
                 if is_first {
                     acc.hist_value = Some((**h).clone());
+                    track_counter_reset(acc, h);
                 } else {
+                    // Hint tracking only for a histogram-first group — the
+                    // pin guards on `group.histogramValue != nil`
+                    // (`engine.go:3679-3683`); a float-first group's
+                    // histogram members are never folded OR tracked.
+                    if acc.hist_value.is_some() {
+                        track_counter_reset(acc, h);
+                    }
                     fold_histogram_into_sum(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
                 }
             }
@@ -393,7 +416,11 @@ fn aggregate_reduce(
                 acc.has_histogram = true;
                 if is_first {
                     acc.hist_value = Some((**h).clone());
+                    track_counter_reset(acc, h);
                 } else {
+                    if acc.hist_value.is_some() {
+                        track_counter_reset(acc, h);
+                    }
                     fold_histogram_into_avg(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
                 }
             }
@@ -456,6 +483,15 @@ fn aggregate_reduce(
             }
             if acc.incompatible_histograms {
                 return None;
+            }
+            // Issue #125: the group-finalization collision warning
+            // (`engine.go:3939-3941`) — AFTER the mixed/incompatible
+            // drops, exactly like the pin (a dropped group `continue`s
+            // before its check runs). Only sum/avg ever set the booleans.
+            if acc.counter_reset_seen && acc.not_counter_reset_seen {
+                annos.warning(messages::histogram_counter_reset_collision_warning(
+                    messages::HistogramOperation::Agg,
+                ));
             }
             let (v, h) = match op {
                 // The pin's SUM output arm (`engine.go:3893-3901`): flush
@@ -904,6 +940,7 @@ mod tests {
 
     fn exp_hist(count: f64, sum: f64, buckets: Vec<f64>) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: 0,
             zero_threshold: 0.0,
             zero_count: 0.0,
@@ -927,6 +964,7 @@ mod tests {
         buckets: Vec<f64>,
     ) -> FloatHistogram {
         FloatHistogram {
+            counter_reset_hint: pulsus_model::CounterResetHint::Unknown,
             schema: pulsus_model::CUSTOM_BUCKETS_SCHEMA,
             zero_threshold: 0.0,
             zero_count: 0.0,

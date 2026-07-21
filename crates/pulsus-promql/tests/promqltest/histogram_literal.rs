@@ -10,21 +10,17 @@
 //!
 //! Supported descriptor keys (`histogram_desc_item`): `schema`, `sum`,
 //! `count`, `z_bucket`, `z_bucket_w`, `custom_values`, `buckets`, `offset`,
-//! `n_buckets`, `n_offset`, `counter_reset_hint`. `counter_reset_hint` is
-//! parsed (so a corpus literal using it doesn't hard-error) but its value
-//! is DISCARDED: `pulsus_model::FloatHistogram` has no
-//! `CounterResetHint` field (A3/A5b's standing OQ2 — no storage column
-//! exists for it, `pulsus-model::histogram`'s own module doc). This is a
-//! documented, adjudicated no-op, not a silent gap: the two annotations
-//! that genuinely depend on a STORED hint
-//! (`NativeHistogramNotCounterWarning`, `HistogramCounterResetCollisionWarning`)
-//! are ledger-carved (issue #125); every other corpus assertion that merely
-//! *echoes* `counter_reset_hint:` in an expected-result literal is
-//! unaffected because the runner's histogram comparison
-//! (`runner.rs::histogram_almost_equal`) never reads a hint field either —
-//! mirroring the pin's own `compareNativeHistogram`, which only checks
-//! `CounterResetHint` when the expected literal explicitly set it (this
-//! port never can, so those checks are always "don't care").
+//! `n_buckets`, `n_offset`, `counter_reset_hint`. Since issue #125 the
+//! hint is KEPT: it is written into the built
+//! [`pulsus_model::FloatHistogram`], and [`parse_histogram_literal`]
+//! additionally returns `hint_set: bool` — whether the literal spelled a
+//! `counter_reset_hint:` key at all (the pin's
+//! `lastHistogramCounterResetHintSet`, `parser/parse.go:161-164,627`).
+//! The comparator (`runner.rs::histogram_almost_equal`) asserts the hint
+//! ONLY when an EXPECTED literal set one, mirroring the pin's
+//! `compareNativeHistogram(…, counterResetHintSet)`; load lines ignore
+//! `hint_set` but keep the hint value itself (a gauge-hinted load series
+//! becomes a gauge chunk in the store's read-back emulation).
 //!
 //! Combinators (`series_item`'s `histogram_series_value [TIMES uint |
 //! ADD histogram_series_value TIMES uint | SUB histogram_series_value
@@ -36,7 +32,7 @@
 //! including the pin's own schema-compatibility guard (the accumulator's
 //! schema must never exceed the increment's — `parse.go:544-546`).
 
-use pulsus_model::{CombineOp, FloatHistogram, Span};
+use pulsus_model::{CombineOp, CounterResetHint, FloatHistogram, Span};
 
 use super::series::{SeqValue, scan_signed_number};
 
@@ -54,15 +50,19 @@ struct HistogramDesc {
     offset: Option<i32>,
     n_buckets: Option<Vec<f64>>,
     n_offset: Option<i32>,
-    // counter_reset_hint is parsed (below) but intentionally has no field
-    // here — see the module doc.
+    /// Issue #125: `Some` iff the literal spelled `counter_reset_hint:` —
+    /// carries both the parsed hint and the pin's `counterResetHintSet`.
+    counter_reset_hint: Option<CounterResetHint>,
 }
 
 /// Parses one `{{...}}` histogram literal from the front of `s` (which
-/// must start with `{{`), returning the built [`FloatHistogram`] and the
-/// remainder of `s` starting right after the matching `}}`. Mirrors
+/// must start with `{{`), returning the built [`FloatHistogram`] — with
+/// `hint_set: bool`, whether the literal spelled a `counter_reset_hint:`
+/// key (issue #125; the pin's `counterResetHintSet`) — and the remainder
+/// of `s` starting right after the matching `}}`. Mirrors
 /// `histogram_series_value` + `buildHistogramFromMap`.
-pub fn parse_histogram_literal(s: &str) -> Result<(FloatHistogram, &str), String> {
+#[allow(clippy::type_complexity)]
+pub fn parse_histogram_literal(s: &str) -> Result<((FloatHistogram, bool), &str), String> {
     let after_open = s
         .strip_prefix("{{")
         .ok_or_else(|| format!("expected '{{{{' at {s:?}"))?;
@@ -79,12 +79,14 @@ pub fn parse_histogram_literal(s: &str) -> Result<(FloatHistogram, &str), String
     Ok((build_histogram_from_map(desc), rest))
 }
 
-fn build_histogram_from_map(desc: HistogramDesc) -> FloatHistogram {
+fn build_histogram_from_map(desc: HistogramDesc) -> (FloatHistogram, bool) {
     let (positive_buckets, positive_spans) =
         build_buckets_and_spans(desc.buckets, desc.offset.unwrap_or(0));
     let (negative_buckets, negative_spans) =
         build_buckets_and_spans(desc.n_buckets, desc.n_offset.unwrap_or(0));
-    FloatHistogram {
+    let hint_set = desc.counter_reset_hint.is_some();
+    let h = FloatHistogram {
+        counter_reset_hint: desc.counter_reset_hint.unwrap_or_default(),
         schema: desc.schema.unwrap_or(0),
         zero_threshold: desc.z_bucket_w.unwrap_or(0.0),
         zero_count: desc.z_bucket.unwrap_or(0.0),
@@ -95,7 +97,8 @@ fn build_histogram_from_map(desc: HistogramDesc) -> FloatHistogram {
         positive_buckets,
         negative_buckets,
         custom_values: desc.custom_values.unwrap_or_default(),
-    }
+    };
+    (h, hint_set)
 }
 
 /// `buildHistogramBucketsAndSpans` (`parse.go:669-694`): a non-empty
@@ -177,15 +180,24 @@ fn parse_desc_map(content: &str) -> Result<HistogramDesc, String> {
                 r
             }
             "counter_reset_hint" => {
-                // Parsed and discarded — see the module doc. Still
-                // validated against the pin's closed keyword set so a
-                // typo is a loud error, not a silent no-op.
+                // Issue #125: parsed AND kept — the pin's closed keyword
+                // set (`parse.go:630-641`); an explicit `unknown` still
+                // counts as "set" for the comparator (the pin sets
+                // `lastHistogramCounterResetHintSet = true` on the key,
+                // not on the value).
                 let (kw, r) = scan_ident(after_key)?;
-                if !matches!(kw, "unknown" | "reset" | "not_reset" | "gauge") {
-                    return Err(format!(
-                        "invalid counter_reset_hint {kw:?} (want unknown/reset/not_reset/gauge)"
-                    ));
-                }
+                let hint = match kw {
+                    "unknown" => CounterResetHint::Unknown,
+                    "reset" => CounterResetHint::CounterReset,
+                    "not_reset" => CounterResetHint::NotCounterReset,
+                    "gauge" => CounterResetHint::Gauge,
+                    _ => {
+                        return Err(format!(
+                            "invalid counter_reset_hint {kw:?} (want unknown/reset/not_reset/gauge)"
+                        ));
+                    }
+                };
+                reject_duplicate("counter_reset_hint", desc.counter_reset_hint.replace(hint))?;
                 r
             }
             other => {
@@ -283,10 +295,13 @@ fn scan_bucket_set(s: &str) -> Result<(Vec<f64>, &str), String> {
 /// literal, `{{...}}xN`, `{{A}}+{{B}}xN`, or `{{A}}-{{B}}xN`. Returns the
 /// expanded [`SeqValue::Histogram`] sequence and the remainder of `s`.
 pub fn parse_histogram_series_item(s: &str) -> Result<(Vec<SeqValue>, &str), String> {
-    let (first, rest) = parse_histogram_literal(s)?;
+    let ((first, hint_set), rest) = parse_histogram_literal(s)?;
     if let Some(after_x) = rest.strip_prefix('x') {
         let (n, rest2) = scan_uint(after_x)?;
-        return Ok((vec![SeqValue::Histogram(first); n as usize + 1], rest2));
+        return Ok((
+            vec![SeqValue::Histogram(first, hint_set); n as usize + 1],
+            rest2,
+        ));
     }
     if let Some(after_op) = rest.strip_prefix('+')
         && after_op.starts_with("{{")
@@ -298,24 +313,29 @@ pub fn parse_histogram_series_item(s: &str) -> Result<(Vec<SeqValue>, &str), Str
     {
         return combine_series(first, after_op, CombineOp::Sub);
     }
-    Ok((vec![SeqValue::Histogram(first)], rest))
+    Ok((vec![SeqValue::Histogram(first, hint_set)], rest))
 }
 
 /// `histogram_series_value ADD/SUB histogram_series_value TIMES uint` —
 /// `histogramsIncreaseSeries`/`histogramsDecreaseSeries` (`parse.go:517-559`).
+/// The `hint_set` flag applied to EVERY produced value is the INC
+/// literal's ("Capture the hint set flag immediately after inc histogram
+/// is built", `parse.go:520-523,530-532`), and each accumulation step's
+/// hint merges through the model `add`/`sub` (gauge + gauge ⇒ gauge —
+/// the pin's `histogramsIncreaseSeries` folds via `Add`, issue #125).
 fn combine_series(
     base: FloatHistogram,
     after_op: &str,
     op: CombineOp,
 ) -> Result<(Vec<SeqValue>, &str), String> {
-    let (inc, rest) = parse_histogram_literal(after_op)?;
+    let ((inc, hint_set), rest) = parse_histogram_literal(after_op)?;
     let after_x = rest
         .strip_prefix('x')
         .ok_or_else(|| format!("expected 'x<count>' after histogram combinator, at {rest:?}"))?;
     let (times, rest2) = scan_uint(after_x)?;
 
     let mut ret = Vec::with_capacity(times as usize + 1);
-    ret.push(SeqValue::Histogram(base.clone()));
+    ret.push(SeqValue::Histogram(base.clone(), hint_set));
     let mut cur = base;
     for _ in 0..times {
         if cur.schema > inc.schema {
@@ -330,7 +350,7 @@ fn combine_series(
         }
         .map_err(|e| e.to_string())?;
         cur = outcome.result;
-        ret.push(SeqValue::Histogram(cur.clone()));
+        ret.push(SeqValue::Histogram(cur.clone(), hint_set));
     }
     Ok((ret, rest2))
 }
@@ -356,7 +376,8 @@ mod tests {
 
     #[test]
     fn empty_histogram_literal_parses_to_a_zeroed_histogram() {
-        let (h, rest) = parse_histogram_literal("{{}}").unwrap();
+        let ((h, hint_set), rest) = parse_histogram_literal("{{}}").unwrap();
+        assert!(!hint_set, "no counter_reset_hint key => hint_set false");
         assert_eq!(rest, "");
         assert_eq!(h.schema, 0);
         assert_eq!(h.sum, 0.0);
@@ -367,7 +388,7 @@ mod tests {
 
     #[test]
     fn full_descriptor_populates_every_field() {
-        let (h, rest) =
+        let ((h, _), rest) =
             parse_histogram_literal("{{schema:0 sum:5 count:4 buckets:[1 2 1]}} trailing").unwrap();
         assert_eq!(rest, " trailing");
         assert_eq!(h.schema, 0);
@@ -385,7 +406,7 @@ mod tests {
 
     #[test]
     fn negative_custom_and_offset_fields_parse() {
-        let (h, _) = parse_histogram_literal(
+        let ((h, _), _) = parse_histogram_literal(
             "{{schema:-53 custom_values:[-2 3] n_buckets:[1 2] n_offset:-1}}",
         )
         .unwrap();
@@ -401,12 +422,26 @@ mod tests {
         );
     }
 
+    /// Issue #125: the hint is parsed AND kept — value on the histogram,
+    /// `hint_set` reported (even for an explicit `unknown`, the pin's
+    /// key-not-value rule).
     #[test]
-    fn counter_reset_hint_is_parsed_and_discarded() {
-        let (h, rest) =
-            parse_histogram_literal("{{sum:1 count:1 counter_reset_hint:gauge}}").unwrap();
-        assert_eq!(rest, "");
-        assert_eq!(h.sum, 1.0);
+    fn counter_reset_hint_is_parsed_and_kept_with_hint_set() {
+        for (kw, want) in [
+            ("unknown", pulsus_model::CounterResetHint::Unknown),
+            ("reset", pulsus_model::CounterResetHint::CounterReset),
+            ("not_reset", pulsus_model::CounterResetHint::NotCounterReset),
+            ("gauge", pulsus_model::CounterResetHint::Gauge),
+        ] {
+            let literal = format!("{{{{sum:1 count:1 counter_reset_hint:{kw}}}}}");
+            let ((h, hint_set), rest) = parse_histogram_literal(&literal).unwrap();
+            assert_eq!(rest, "");
+            assert_eq!(h.sum, 1.0);
+            assert_eq!(h.counter_reset_hint, want, "{kw}");
+            assert!(hint_set, "{kw}: an explicit key always sets hint_set");
+        }
+        let ((_, hint_set), _) = parse_histogram_literal("{{sum:1 count:1}}").unwrap();
+        assert!(!hint_set);
     }
 
     #[test]
@@ -431,9 +466,9 @@ mod tests {
             assert!(err.contains("empty bucket list"), "{literal}: {err}");
         }
         // A valid, non-empty bucket list still parses — no over-rejection.
-        let (h, _) = parse_histogram_literal("{{schema:0 buckets:[1]}}").unwrap();
+        let ((h, _), _) = parse_histogram_literal("{{schema:0 buckets:[1]}}").unwrap();
         assert_eq!(h.positive_buckets, vec![1.0]);
-        let (h, _) = parse_histogram_literal("{{schema:0 n_buckets:[0 5]}}").unwrap();
+        let ((h, _), _) = parse_histogram_literal("{{schema:0 n_buckets:[0 5]}}").unwrap();
         assert_eq!(h.negative_buckets, vec![0.0, 5.0]);
     }
 
@@ -449,7 +484,7 @@ mod tests {
         assert_eq!(rest, "");
         assert_eq!(vals.len(), 4);
         for v in &vals {
-            let SeqValue::Histogram(h) = v else {
+            let SeqValue::Histogram(h, _) = v else {
                 panic!("expected a histogram value")
             };
             assert_eq!(h.sum, 1.0);
@@ -464,16 +499,16 @@ mod tests {
         .unwrap();
         assert_eq!(rest, "");
         assert_eq!(vals.len(), 3);
-        let SeqValue::Histogram(first) = &vals[0] else {
+        let SeqValue::Histogram(first, _) = &vals[0] else {
             panic!()
         };
         assert_eq!(first.sum, 4.0);
-        let SeqValue::Histogram(second) = &vals[1] else {
+        let SeqValue::Histogram(second, _) = &vals[1] else {
             panic!()
         };
         assert_eq!(second.sum, 6.0);
         assert_eq!(second.count, 5.0);
-        let SeqValue::Histogram(third) = &vals[2] else {
+        let SeqValue::Histogram(third, _) = &vals[2] else {
             panic!()
         };
         assert_eq!(third.sum, 8.0);
@@ -486,7 +521,7 @@ mod tests {
             "{{schema:0 sum:10 count:4 buckets:[4]}}-{{sum:1 count:1 buckets:[1]}}x2",
         )
         .unwrap();
-        let SeqValue::Histogram(last) = &vals[2] else {
+        let SeqValue::Histogram(last, _) = &vals[2] else {
             panic!()
         };
         assert_eq!(last.sum, 8.0);

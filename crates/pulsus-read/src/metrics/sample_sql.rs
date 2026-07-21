@@ -88,15 +88,18 @@ pub fn sample_fetch_multi(
     )
 }
 
-/// The 12 `metric_hist_samples` value columns, order-locked to the catalog
-/// `CREATE` (id-23) and [`super::sample_rows::HistSampleRow`]. Appended
+/// The 13 `metric_hist_samples` value columns, order-locked to the catalog
+/// `CREATE` (id-23, plus the id-27 additive `counter_reset_hint` — LAST,
+/// issue #125) and [`super::sample_rows::HistSampleRow`]. Appended
 /// after the identity columns in every histogram fetch's SELECT list; the
 /// **only** difference from the float builders is this column list and the
 /// table name (M7-A5a AC1/AC5 — the PREWHERE/window/IN/ORDER-BY shape is
-/// byte-for-byte the float shape).
+/// byte-for-byte the float shape). The extra fixed-width `UInt8` column
+/// changes no PREWHERE/ORDER-BY shape and adds no per-row bucket work.
 const HIST_VALUE_COLUMNS: &str = "schema, zero_threshold, zero_count, count, sum, \
      pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-     neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values";
+     neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
+     counter_reset_hint";
 
 /// The histogram half of [`sample_fetch`]: the complementary
 /// `metric_hist_samples` read for the same `(metric_name, fingerprint set,
@@ -136,7 +139,7 @@ pub fn hist_sample_fetch_subquery(
 /// The histogram half of [`sample_fetch_multi`] — the name-less/regex-
 /// `__name__` fan-out's complementary read. Byte-for-byte its flat
 /// `PREWHERE metric_name IN (…) … fingerprint IN (…)` shape, only the
-/// SELECT column list (leading `metric_name`, then the 12 value columns)
+/// SELECT column list (leading `metric_name`, then the 13 value columns)
 /// and table name differ (M7-A5a).
 pub fn hist_sample_fetch_multi(
     table: &str,
@@ -345,10 +348,11 @@ mod tests {
 
     const HIST_COLS: &str = "schema, zero_threshold, zero_count, count, sum, \
          pos_span_offsets, pos_span_lengths, pos_bucket_deltas, \
-         neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values";
+         neg_span_offsets, neg_span_lengths, neg_bucket_deltas, custom_values, \
+         counter_reset_hint";
 
     /// AC1: the Chunks-path histogram builder renders the float builder's
-    /// exact PREWHERE/window/`IN`/ORDER-BY shape with the 12 histogram
+    /// exact PREWHERE/window/`IN`/ORDER-BY shape with the 13 histogram
     /// value columns and the `metric_hist_samples` table.
     #[test]
     fn hist_sample_fetch_renders_the_12_column_shape() {
