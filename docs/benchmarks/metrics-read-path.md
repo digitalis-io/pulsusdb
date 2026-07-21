@@ -3,8 +3,8 @@
 > **This report is Tier-1-gated evidence plus recorded wall-time context**
 > for the three read-path optimizations of
 > [#93](https://github.com/digitalis-io/pulsusdb/issues/93). Correctness is
-> pinned by `crates/pulsus-promql/tests/promqltest_corpus.rs` (the vendored
-> Prometheus v3.13 corpus + the hand-authored proof files) and the e2e
+> pinned by `crates/pulsus-promql/tests/promqltest_corpus.rs` (the pinned,
+> checksum-verified Prometheus v3.13 corpus + the hand-authored proof files) and the e2e
 > metrics differential — both stay green. No generated SQL changed, so the
 > `explain_indexes.rs` / `query_log_gates.rs` pruning gates are untouched.
 > Wall times here are **recorded context only** — never a CI assert

@@ -672,6 +672,10 @@ fn every_implemented_witness_exists_outside_all_buckets_and_passes() {
     let manifest = CoverageManifest::load();
     let skip_manifest = driver::SkipManifest::load();
     let ledger = driver::load_ledger();
+    // Issue #156: upstream witness files come from the checksum-verified
+    // cache (fetched from the pinned commit on cache miss), not from an
+    // in-tree vendored dir; `proof/` witnesses stay direct path reads.
+    let (_upstream_manifest, upstream_contents) = driver::load_upstream_verified();
 
     let mut witnesses: Vec<(ClaimKind, &str, &Witness)> = Vec::new();
     for f in &manifest.functions {
@@ -697,22 +701,28 @@ fn every_implemented_witness_exists_outside_all_buckets_and_passes() {
         let owner = format!("{} {name}", kind.label());
         let owner = &owner;
         if !runs.contains_key(&w.file) {
-            let path = driver::base_dir().join("corpus").join(&w.file);
-            if !path.is_file() {
-                problems.push(format!("{owner}: witness file {} does not exist", w.file));
-                continue;
-            }
-            if let Some(name) = w.file.strip_prefix("upstream/")
-                && skip_manifest.entry(name).is_some()
-            {
-                problems.push(format!(
-                    "{owner}: witness file {} is skip-manifested — a witness must lie \
-                     outside every skip bucket",
-                    w.file
-                ));
-                continue;
-            }
-            let text = driver::read_file(&path);
+            let text = if let Some(name) = w.file.strip_prefix("upstream/") {
+                let Some(text) = upstream_contents.get(name) else {
+                    problems.push(format!("{owner}: witness file {} does not exist", w.file));
+                    continue;
+                };
+                if skip_manifest.entry(name).is_some() {
+                    problems.push(format!(
+                        "{owner}: witness file {} is skip-manifested — a witness must lie \
+                         outside every skip bucket",
+                        w.file
+                    ));
+                    continue;
+                }
+                text.clone()
+            } else {
+                let path = driver::base_dir().join("corpus").join(&w.file);
+                if !path.is_file() {
+                    problems.push(format!("{owner}: witness file {} does not exist", w.file));
+                    continue;
+                }
+                driver::read_file(&path)
+            };
             match driver::runner::run_file(&w.file, &text) {
                 Ok(run) => {
                     runs.insert(w.file.clone(), run);

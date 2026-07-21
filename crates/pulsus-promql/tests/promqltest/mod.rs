@@ -1,13 +1,15 @@
 //! Issue #64 (M6-01): the shared promqltest driver — a native replayer for
 //! upstream Prometheus `.test` files against the pure
 //! `parse -> plan -> evaluate` pipeline, plus the committed-artifact
-//! loaders (coverage manifest, vendored-corpus integrity manifest,
+//! loaders (coverage manifest, upstream-corpus integrity manifest,
 //! skip-manifest, eval-divergence ledger) both test binaries
 //! (`promqltest_corpus.rs`, `function_coverage.rs`) `#[path]`-include so
 //! witnesses replay through the exact same runner (plan v2 Δ3).
 //!
-//! Everything here is hermetic: no ClickHouse, no network — the store
-//! (`store.rs`) stands in for the fetch layer only.
+//! No ClickHouse ever; hermetic once the corpus cache is warm — a cold
+//! cache triggers a one-time fetch from the pinned upstream commit,
+//! checksum-verified against the committed manifest (`fetch.rs`, issue
+//! #156). The store (`store.rs`) stands in for the fetch layer only.
 //!
 //! Shared-test-module convention: like `pulsus-config`'s and
 //! `pulsus-server`'s `tests/support` modules, this module is compiled into
@@ -16,6 +18,7 @@
 //! logic.
 #![allow(dead_code)]
 
+pub mod fetch;
 pub mod grammar;
 pub mod histogram_literal;
 pub mod runner;
@@ -308,62 +311,97 @@ pub struct UpstreamManifest {
     pub excluded: Vec<UpstreamExclusion>,
 }
 
-/// Verifies every vendored upstream file against the integrity manifest
-/// (SHA-256 + line count, both directions: a file on disk missing from
-/// the manifest is as fatal as a manifest entry missing on disk), then
-/// returns the manifest plus each file's contents keyed by name.
+/// The pinned v3.13.0 upstream corpus file set — duplicated from
+/// `upstream-manifest.json` ON PURPOSE (#156 code review):
+/// `fetch::ensure_cached` returns a name-keyed `BTreeMap`, so a manifest
+/// carrying a DUPLICATED entry name would pass a bare count check while
+/// silently replaying fewer than 21 distinct files (the map dedups).
+/// On a reference-version re-pin this list changes together with the
+/// manifest (PROVENANCE.md's re-pin procedure).
+pub const UPSTREAM_FILE_NAMES: [&str; 21] = [
+    "aggregators.test",
+    "at_modifier.test",
+    "collision.test",
+    "duration_expression.test",
+    "extended_vectors.test",
+    "fill-modifier.test",
+    "functions.test",
+    "histograms.test",
+    "info.test",
+    "limit.test",
+    "literals.test",
+    "name_label_dropping.test",
+    "native_histograms.test",
+    "operators.test",
+    "range_queries.test",
+    "selectors.test",
+    "staleness.test",
+    "start_timestamps.test",
+    "subquery.test",
+    "trig_functions.test",
+    "type_and_unit.test",
+];
+
+/// #156 code-review fix: asserts the manifest lists EXACTLY the pinned
+/// upstream file-name set — sorted multiset equality, so a duplicated,
+/// renamed, or omitted entry all fail loudly instead of being absorbed
+/// silently by the name-keyed cache map.
+pub fn assert_upstream_manifest_file_set(manifest: &UpstreamManifest) {
+    let mut names: Vec<&str> = manifest.files.iter().map(|f| f.name.as_str()).collect();
+    names.sort_unstable();
+    let mut expected = UPSTREAM_FILE_NAMES;
+    expected.sort_unstable();
+    assert_eq!(
+        names,
+        expected.as_slice(),
+        "upstream-manifest.json must list exactly the 21 pinned upstream .test file names — \
+         a duplicated, renamed, or missing entry would otherwise silently shrink the \
+         name-keyed corpus map; re-pin UPSTREAM_FILE_NAMES together with the manifest"
+    );
+}
+
+/// Loads the committed integrity manifest (the trust anchor), then
+/// returns it plus each upstream file's contents keyed by name — served
+/// from the local checksum-verified cache, fetched from the pinned
+/// upstream commit on cache miss (issue #156, `fetch.rs`). Every
+/// returned file is verified against the manifest (SHA-256 + line
+/// count); a persistent mismatch panics loudly inside `ensure_cached`.
+///
+/// The pre-#156 both-directions on-disk dir listing is gone: the
+/// manifest file LIST is now the authoritative set (a machine-local
+/// cache dir is not a reviewable surface the way an in-repo dir was);
+/// the manifest-count guard below plus committed-manifest review replace
+/// the truncation protection.
 pub fn load_upstream_verified() -> (UpstreamManifest, BTreeMap<String, String>) {
-    let dir = base_dir().join("corpus").join("upstream");
-    let manifest_path = dir.join("upstream-manifest.json");
+    let manifest_path = base_dir()
+        .join("corpus")
+        .join("upstream")
+        .join("upstream-manifest.json");
     let manifest: UpstreamManifest = serde_json::from_str(&read_file(&manifest_path))
         .unwrap_or_else(|e| panic!("invalid {}: {e}", manifest_path.display()));
 
-    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("failed to list {}: {e}", dir.display()))
-        .map(|entry| entry.expect("readable dir entry").file_name())
-        .filter_map(|name| {
-            let name = name.to_string_lossy().to_string();
-            name.ends_with(".test").then_some(name)
-        })
-        .collect();
-    on_disk.sort();
-
-    let mut in_manifest: Vec<String> = manifest.files.iter().map(|f| f.name.clone()).collect();
-    in_manifest.sort();
+    // Truncation guard, cross-checked against PROVENANCE.md's stated
+    // file count for the v3.13.0 pin.
     assert_eq!(
-        on_disk, in_manifest,
-        "the .test files on disk under corpus/upstream/ must exactly match \
-         upstream-manifest.json (both directions)"
+        manifest.files.len(),
+        21,
+        "upstream-manifest.json must list exactly the 21 upstream .test files \
+         (PROVENANCE.md's stated count for the pinned tag)"
     );
+    // #156 code review: count alone cannot catch a duplicated entry name
+    // (the name-keyed cache map dedups) — pin the exact name set too.
+    assert_upstream_manifest_file_set(&manifest);
 
     for excluded in &manifest.excluded {
         assert!(
-            !on_disk.contains(&excluded.name),
-            "{} is recorded as excluded ({}) but is present on disk",
+            !manifest.files.iter().any(|f| f.name == excluded.name),
+            "{} is recorded as excluded ({}) but is also listed in the manifest file set",
             excluded.name,
             excluded.reason
         );
     }
 
-    let mut contents = BTreeMap::new();
-    for entry in &manifest.files {
-        let path = dir.join(&entry.name);
-        let text = read_file(&path);
-        let sha = sha256_hex(text.as_bytes());
-        assert_eq!(
-            sha, entry.sha256,
-            "{} bytes do not match upstream-manifest.json — the vendored corpus \
-             drifted; re-fetch at the pinned SHA and recommit both together",
-            entry.name
-        );
-        let lines = text.lines().count();
-        assert_eq!(
-            lines, entry.lines,
-            "{} line count does not match upstream-manifest.json",
-            entry.name
-        );
-        contents.insert(entry.name.clone(), text);
-    }
+    let contents = fetch::ensure_cached(&manifest, fetch::UPSTREAM_SOURCE_BASE);
     (manifest, contents)
 }
 
@@ -435,7 +473,7 @@ impl SkipManifest {
 pub struct LedgerEntry {
     /// Relative to `corpus/`, e.g. `upstream/duration_expression.test`.
     pub file: String,
-    /// 1-based line of the `eval` directive (stable: the vendored file is
+    /// 1-based line of the `eval` directive (stable: the fetched file is
     /// byte-pinned by the integrity manifest).
     pub line: usize,
     /// The exact query text — a guard against line drift.

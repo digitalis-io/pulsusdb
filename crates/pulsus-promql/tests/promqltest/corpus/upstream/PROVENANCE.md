@@ -1,7 +1,9 @@
 # Corpus provenance — Prometheus v3.13 promqltest scenario files
 
 Issue: [#64](https://github.com/digitalis-io/pulsusdb/issues/64) (M6-01,
-PromQL `.test` corpus driver). Prometheus is a public standard PulsusDB
+PromQL `.test` corpus driver); sourcing changed by
+[#156](https://github.com/digitalis-io/pulsusdb/issues/156) (fetched at
+test time, no longer vendored). Prometheus is a public standard PulsusDB
 openly targets for PromQL compatibility (docs/architecture.md §5.1) —
 naming it here is correct, matching the precedent of
 `crates/pulsus-promql/tests/corpus/PROVENANCE.md` (#29, the parser
@@ -14,29 +16,76 @@ touches).
 - Directory: `promql/promqltest/testdata/`
 - Tag: `v3.13.0`
 - Commit SHA: `40af9c2cdc0eda00f3622e867a27f6359f7295f3`
-- Fetched: 2026-07-16, via
-  `https://raw.githubusercontent.com/prometheus/prometheus/<sha>/promql/promqltest/testdata/<file>`
 
-## Contents
+## Sourcing: fetched at test time, checksum-pinned (issue #156)
 
-The upstream directory holds **21** `.test` scenario files, **all 21
-vendored here byte-verbatim** as of issue #124 (M7-A6), which vendored
-the last one, `native_histograms.test` (previously the sole exclusion,
-tracked in `upstream-manifest.json`'s now-empty `excluded` array).
+The **21** upstream `.test` scenario files are **not vendored in this
+repo**. The shared test driver (`../../fetch.rs`) fetches each file on
+cache miss from
 
-`upstream-manifest.json` pins every vendored file's SHA-256 and line
-count plus the tag/SHA above. `tests/promqltest_corpus.rs` re-verifies
-all of it (both directions: a file on disk missing from the manifest is
-as fatal as a manifest entry missing on disk) before replaying a single
-case — the #29 F1 integrity pattern.
+```
+https://raw.githubusercontent.com/prometheus/prometheus/<commit-sha>/promql/promqltest/testdata/<name>
+```
 
-## Re-vendor rule
+addressed by the **commit SHA** above (never the tag name — a re-tag
+cannot move a commit), verifies its SHA-256 and line count against the
+committed `upstream-manifest.json` (the trust anchor; byte-frozen), and
+installs it atomically into the local cache at
 
-On a Prometheus reference-version bump: re-fetch all files at the new
-SHA, regenerate `upstream-manifest.json` (sha256 + line counts), update
-this file, then re-run
-`cargo test -p pulsus-promql --test promqltest_corpus` and re-classify
-whatever the skip-manifest drift gate and the divergence gates surface.
+```
+$PULSUSDB_PROMQLTEST_CACHE_DIR            (override, if set)
+$XDG_CACHE_HOME/pulsusdb/promqltest/<commit-sha>/   (else, if set)
+$HOME/.cache/pulsusdb/promqltest/<commit-sha>/      (else)
+```
+
+A warm cache is verified in place — no network process is ever spawned.
+A corrupted cache entry self-heals by refetching once; a persistent
+mismatch against the manifest fails loudly with the URL and both hashes
+(the truncation/tamper/re-tag guard). Pre-warm command (also the
+fast integrity gate):
+
+```sh
+cargo test -p pulsus-promql --test promqltest_corpus upstream_corpus_matches_its_integrity_manifest
+```
+
+CI restores the cache via `actions/cache` keyed on the manifest hash, so
+warm CI runs are fully hermetic. `cargo build` / packaging never runs
+tests and therefore never fetches.
+
+## License and attribution
+
+The upstream corpus files are © The Prometheus Authors, licensed under
+the **Apache License, Version 2.0**
+(<https://github.com/prometheus/prometheus/blob/main/LICENSE>). This
+attribution covers the files as fetched into the local cache at test
+time, and equally the byte-verbatim copies that remain in this
+repository's git history from the vendoring era (issues #64–#124, before
+#156 removed them from the tree). The files are used unmodified as test
+fixtures.
+
+## Re-pin procedure
+
+On a Prometheus reference-version bump: update the tag and commit SHA
+here and in `upstream-manifest.json`, regenerate the per-file entries,
+then re-run the replay and re-classify whatever the skip-manifest drift
+gate and the divergence gates surface. Per-file regeneration one-liner
+(run in a scratch dir; `SHA` is the new commit):
+
+```sh
+for f in aggregators at_modifier collision duration_expression extended_vectors \
+         fill-modifier functions histograms info limit literals \
+         name_label_dropping native_histograms operators range_queries \
+         selectors staleness start_timestamps subquery trig_functions \
+         type_and_unit; do
+  curl -sSfLo "$f.test" "https://raw.githubusercontent.com/prometheus/prometheus/$SHA/promql/promqltest/testdata/$f.test"
+  printf '%s sha256=%s lines=%s\n' "$f.test" "$(sha256sum "$f.test" | cut -d' ' -f1)" "$(wc -l < "$f.test")"
+done
+```
+
+(Confirm the upstream directory's file *set* against the tag's tree
+listing first — a bump can add or remove files; the manifest, the count
+assertion, and the pinned name-set list (`UPSTREAM_FILE_NAMES` in
+`../../mod.rs`, the duplicate/rename/omission guard) must follow.)
 The upstream driver grammar (directive regexes in
 `promql/promqltest/test.go`) must be re-checked against
 `tests/promqltest/grammar.rs`'s executed subset on every bump.
@@ -75,7 +124,7 @@ exact inner timestamps and fails any end-anchored port (which yields
 66). The grid helper itself (`src/eval/mod.rs::subquery_grid_start`)
 carries the same note.
 
-## Executed vs skipped at vendor time (M6-01)
+## Executed vs skipped at pin time (M6-01)
 
 7 files execute fully under the M6-01 grammar subset (`at_modifier`,
 `duration_expression`, `fill-modifier`, `selectors`, `staleness`,
@@ -85,7 +134,7 @@ assertion lines, `{{…}}` native-histogram sample literals,
 wholesale, with activation issues — in `../skip-manifest.json`. Residual
 divergences of the executed files that the coverage-manifest oracle
 cannot attribute to a scheduled/deferred construct are classified
-per-case in `../eval-divergences.jsonl` (105 entries at vendor time; see
+per-case in `../eval-divergences.jsonl` (105 entries at M6-01 time; see
 each entry's `construct`/`reason`).
 
 ## M7-A6 update (issue #124)
@@ -93,15 +142,17 @@ each entry's `construct`/`reason`).
 The `{{…}}` native-histogram sample-literal grammar and the block-form
 `expect warn|no_warn|info|no_info` annotation directives landed
 (`../histogram_literal.rs`, `../grammar.rs`, `../runner.rs`), and
-`native_histograms.test` was vendored (above). This incidentally cleared
-every deferred directive from four already-skip-manifested files
-(`extended_vectors.test`, `info.test`, `limit.test`, `subquery.test`);
-`subquery.test` now replays 100% green and executes unlisted, the other
-three fail on gaps unrelated to native histograms and are deferred via
-the non-directive `manual_skip` lever (see `../skip-manifest.json`'s
-top-level comment and issue #130). `load_with_nhcb` (a distinct
-classic-bucket-to-NHCB `load` conversion, never a `{{…}}` literal) and
-the block `expect ordered`/`expect range vector` forms remain deferred
-directives — `histograms.test`/`operators.test`/`start_timestamps.test`/
+`native_histograms.test` joined the corpus (previously the sole
+exclusion, tracked in `upstream-manifest.json`'s now-empty `excluded`
+array). This incidentally cleared every deferred directive from four
+already-skip-manifested files (`extended_vectors.test`, `info.test`,
+`limit.test`, `subquery.test`); `subquery.test` now replays 100% green
+and executes unlisted, the other three fail on gaps unrelated to native
+histograms and are deferred via the non-directive `manual_skip` lever
+(see `../skip-manifest.json`'s top-level comment and issue #130).
+`load_with_nhcb` (a distinct classic-bucket-to-NHCB `load` conversion,
+never a `{{…}}` literal) and the block `expect ordered`/`expect range
+vector` forms remain deferred directives —
+`histograms.test`/`operators.test`/`start_timestamps.test`/
 `aggregators.test`/`functions.test`/`range_queries.test` stay
 skip-manifested on those grounds.

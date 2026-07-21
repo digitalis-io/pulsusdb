@@ -53,6 +53,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Issue #156: the upstream promqltest corpus is no longer vendored —
+      # the test driver fetches it once from the pinned Prometheus commit,
+      # verifies it against the committed upstream-manifest.json, and
+      # caches it. Restoring the cache here keeps warm runs fully hermetic
+      # (zero network); a cold run (pin bump / evicted key) fetches once
+      # and the post-job save repopulates the key. No restore-keys: the
+      # cache is keyed by the manifest, and old-pin entries live in
+      # sha-keyed subdirs that would only be dead weight.
+      - name: Cache promqltest upstream corpus (pinned fetch, issue #156)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pulsusdb/promqltest
+          key: promqltest-testdata-v1-${{ hashFiles('crates/pulsus-promql/tests/promqltest/corpus/upstream/upstream-manifest.json') }}
+
       # Issue #87: same test set as `cargo test --workspace` (this is where
       # the hermetic conformance/drift suites — route_inventory and the
       # api_conformance/manifest unit halves — run), now via nextest so the

@@ -1,6 +1,7 @@
 //! Issue #64 (M6-01): replays the promqltest corpus — the hand-authored
 //! proof files (must be 100% green against today's M2 surface) and the
-//! vendored upstream Prometheus v3.13 `.test` files (integrity-gated;
+//! pinned upstream Prometheus v3.13 `.test` files (fetched at test time
+//! into a checksum-verified local cache, issue #156; integrity-gated;
 //! every failing case must be classified by the coverage-manifest oracle
 //! or by `corpus/eval-divergences.jsonl`; every deferred-directive file
 //! must be skip-manifested loudly — never a silent skip).
@@ -68,7 +69,9 @@ fn proof_corpus_files_match_the_directory() {
 
 /// Fast, isolated integrity signal (the replay test re-runs the same gate
 /// itself, first thing — filtering this test out cannot bypass it, the
-/// #29 F1 pattern).
+/// #29 F1 pattern). Since #156 this is also the cache pre-warm command:
+/// on a cold cache it fetches every corpus file from the pinned upstream
+/// commit and verifies it against the committed manifest.
 #[test]
 fn upstream_corpus_matches_its_integrity_manifest() {
     load_upstream_verified();
@@ -192,7 +195,7 @@ fn expect_string_with_non_utf8_literal_executes_as_a_classifiable_mismatch() {
     );
 }
 
-/// AC2 + AC9: the vendored upstream corpus replays with zero unclassified
+/// AC2 + AC9: the pinned upstream corpus replays with zero unclassified
 /// failures, the skip-manifest matches reality in both directions, and
 /// the eval-divergence ledger carries no stale entries.
 #[test]
@@ -211,8 +214,8 @@ fn upstream_corpus_replay_classifies_every_failure() {
 
     let mut problems: Vec<String> = Vec::new();
 
-    // Ledger structural rules: entries only ever point at vendored
-    // upstream files (the proof corpus must be green outright, never
+    // Ledger structural rules: entries only ever point at upstream
+    // corpus files (the proof corpus must be green outright, never
     // allowlisted), at files that exist.
     for entry in &ledger {
         let Some(name) = entry.file.strip_prefix("upstream/") else {
@@ -225,7 +228,7 @@ fn upstream_corpus_replay_classifies_every_failure() {
         };
         if !contents.contains_key(name) {
             problems.push(format!(
-                "eval-divergences.jsonl entry for {:?} — no such vendored file",
+                "eval-divergences.jsonl entry for {:?} — no such upstream corpus file",
                 entry.file
             ));
         }
@@ -236,7 +239,7 @@ fn upstream_corpus_replay_classifies_every_failure() {
     for entry in &skip_manifest.files {
         if !contents.contains_key(&entry.file) {
             problems.push(format!(
-                "skip-manifest.json lists {:?}, which is not a vendored file",
+                "skip-manifest.json lists {:?}, which is not an upstream corpus file",
                 entry.file
             ));
         }
@@ -436,4 +439,236 @@ fn upstream_corpus_replay_classifies_every_failure() {
         problems.len(),
         problems.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #156: hermetic fetch-layer guards — scratch cache dir + synthetic
+// manifest + `file://` base (curl reads the local path; zero network).
+// ---------------------------------------------------------------------------
+
+/// A synthetic pin "sha" — only a cache-subdirectory / URL-path
+/// component in these tests, never dereferenced upstream.
+const SYNTH_PIN_SHA: &str = "1111111111111111111111111111111111111111";
+
+/// A fresh per-test scratch directory under the OS temp dir (no tempfile
+/// dep in this crate; the name is unique per test + process).
+fn scratch_dir(test: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join("pulsusdb-promqltest-fetch-tests")
+        .join(format!("{test}-{}", std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clean stale scratch dir");
+    }
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Lays out `<root>/<SYNTH_PIN_SHA>/promql/promqltest/testdata/<name>`
+/// (the exact URL shape `ensure_cached` fetches) and returns the
+/// `file://` base plus a manifest whose entries hash the SOURCE bytes.
+fn synthetic_source(
+    root: &std::path::Path,
+    files: &[(&str, &str)],
+) -> (String, driver::UpstreamManifest) {
+    let testdata = root
+        .join(SYNTH_PIN_SHA)
+        .join("promql")
+        .join("promqltest")
+        .join("testdata");
+    std::fs::create_dir_all(&testdata).expect("create synthetic testdata dir");
+    let mut entries = Vec::new();
+    for (name, text) in files {
+        std::fs::write(testdata.join(name), text).expect("write synthetic source file");
+        entries.push(driver::UpstreamFileEntry {
+            name: (*name).to_string(),
+            sha256: driver::sha256_hex(text.as_bytes()),
+            lines: text.lines().count(),
+        });
+    }
+    let manifest = driver::UpstreamManifest {
+        prometheus_tag: "v-synthetic".to_string(),
+        prometheus_sha: SYNTH_PIN_SHA.to_string(),
+        files: entries,
+        excluded: Vec::new(),
+    };
+    (format!("file://{}", root.display()), manifest)
+}
+
+const SYNTH_FILES: &[(&str, &str)] = &[
+    (
+        "alpha.test",
+        "load 5m\n  alpha 1 2 3\n\neval instant at 5m alpha\n  alpha 2\n",
+    ),
+    ("beta.test", "load 1m\n  beta 7\n"),
+];
+
+/// #156 guard 1: a corrupted cache entry self-heals — `ensure_cached_in`
+/// refetches it from the (still-honest) source and returns
+/// manifest-verified bytes.
+#[test]
+fn fetch_self_heals_a_corrupted_cache_entry() {
+    let root = scratch_dir("self-heal");
+    let (base, manifest) = synthetic_source(&root, SYNTH_FILES);
+    let pin_dir = root.join("cache").join(&manifest.prometheus_sha);
+
+    // Cold fill.
+    let contents = driver::fetch::ensure_cached_in(&pin_dir, &manifest, &base);
+    assert_eq!(contents["alpha.test"], SYNTH_FILES[0].1);
+
+    // Corrupt one cached entry.
+    std::fs::write(pin_dir.join("alpha.test"), "corrupted garbage\n").expect("corrupt cache");
+
+    // Self-heal: the corrupted entry is refetched once and verifies.
+    let healed = driver::fetch::ensure_cached_in(&pin_dir, &manifest, &base);
+    assert_eq!(healed["alpha.test"], SYNTH_FILES[0].1);
+    assert_eq!(healed["beta.test"], SYNTH_FILES[1].1);
+    assert_eq!(
+        driver::sha256_hex(
+            std::fs::read_to_string(pin_dir.join("alpha.test"))
+                .expect("healed cache file readable")
+                .as_bytes()
+        ),
+        manifest.files[0].sha256,
+        "the on-disk cache entry must be restored to manifest-verified bytes"
+    );
+}
+
+/// #156 guard 2: when the SOURCE bytes do not match the committed
+/// manifest (truncation / tampering / upstream ref rewrite), the fetch
+/// panics loudly with the URL and both hashes — it never installs the
+/// bad bytes.
+#[test]
+fn fetch_fails_loudly_on_source_checksum_mismatch() {
+    let root = scratch_dir("checksum-mismatch");
+    let (base, mut manifest) = synthetic_source(&root, SYNTH_FILES);
+    let pin_dir = root.join("cache").join(&manifest.prometheus_sha);
+
+    // The manifest expects different bytes than the source serves.
+    let expected_sha = driver::sha256_hex(b"the bytes the trust anchor pinned");
+    manifest.files[0].sha256 = expected_sha.clone();
+
+    let actual_sha = driver::sha256_hex(SYNTH_FILES[0].1.as_bytes());
+    let panic = std::panic::catch_unwind(|| {
+        driver::fetch::ensure_cached_in(&pin_dir, &manifest, &base);
+    })
+    .expect_err("a source/manifest checksum mismatch must panic");
+    let msg = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("panic payload is a string");
+    let url = format!(
+        "{base}/{SYNTH_PIN_SHA}/promql/promqltest/testdata/{}",
+        SYNTH_FILES[0].0
+    );
+    assert!(msg.contains(&url), "panic must name the URL: {msg}");
+    assert!(
+        msg.contains(&expected_sha),
+        "panic must carry the expected sha: {msg}"
+    );
+    assert!(
+        msg.contains(&actual_sha),
+        "panic must carry the actual sha: {msg}"
+    );
+    assert!(
+        !pin_dir.join(SYNTH_FILES[0].0).exists(),
+        "mismatching bytes must never be installed into the cache"
+    );
+}
+
+/// #156 code-review fix (comment 5036732106): a manifest carrying a
+/// DUPLICATED entry name passes the bare `files.len() == 21` count check
+/// (and would silently dedup in the name-keyed cache map, replaying
+/// fewer than 21 distinct files) — the pinned name-set guard must reject
+/// it loudly. Hermetic: fixture manifest only, no filesystem, no
+/// network.
+#[test]
+fn manifest_with_a_duplicated_file_name_is_rejected_loudly() {
+    let mut files: Vec<driver::UpstreamFileEntry> = driver::UPSTREAM_FILE_NAMES
+        .iter()
+        .map(|name| driver::UpstreamFileEntry {
+            name: (*name).to_string(),
+            sha256: "0".repeat(64),
+            lines: 1,
+        })
+        .collect();
+    // Duplicate the first pinned name over the second: the count stays
+    // 21, so the length check alone cannot catch it.
+    files[1].name = files[0].name.clone();
+    let manifest = driver::UpstreamManifest {
+        prometheus_tag: "v-synthetic".to_string(),
+        prometheus_sha: SYNTH_PIN_SHA.to_string(),
+        files,
+        excluded: Vec::new(),
+    };
+    assert_eq!(
+        manifest.files.len(),
+        21,
+        "fixture precondition: the duplicate must be invisible to the count check"
+    );
+
+    let panic = std::panic::catch_unwind(|| {
+        driver::assert_upstream_manifest_file_set(&manifest);
+    })
+    .expect_err("a duplicated manifest file name must be rejected loudly");
+    let msg = panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .expect("panic payload is a string");
+    assert!(
+        msg.contains("exactly the 21 pinned upstream .test file names"),
+        "rejection must name the pinned-set guard: {msg}"
+    );
+}
+
+/// #156 AC-11 (plan v2 Δ1): concurrent fetchers inside ONE process
+/// (plain multi-threaded `cargo test`, not just nextest's
+/// process-per-test) never corrupt the cache — per-writer-unique temp
+/// names + atomic rename. All writers return manifest-verified contents
+/// and the pin dir ends up holding exactly the manifest file set with
+/// zero leftover `.tmp-*` files.
+#[test]
+fn fetch_concurrent_writers_in_one_process_do_not_corrupt_the_cache() {
+    let root = scratch_dir("concurrent-writers");
+    let (base, manifest) = synthetic_source(&root, SYNTH_FILES);
+    let pin_dir = root.join("cache").join(&manifest.prometheus_sha);
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| s.spawn(|| driver::fetch::ensure_cached_in(&pin_dir, &manifest, &base)))
+            .collect();
+        for handle in handles {
+            let contents = handle.join().expect("writer thread must not panic");
+            for (name, text) in SYNTH_FILES {
+                assert_eq!(contents[*name], *text, "writer returned corrupted {name}");
+            }
+        }
+    });
+
+    let mut on_disk: Vec<String> = std::fs::read_dir(&pin_dir)
+        .expect("pin dir listable")
+        .map(|e| {
+            e.expect("readable dir entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    on_disk.sort();
+    let mut expected: Vec<String> = manifest.files.iter().map(|f| f.name.clone()).collect();
+    expected.sort();
+    assert_eq!(
+        on_disk, expected,
+        "pin dir must contain exactly the manifest file set — no leftover .tmp-* files"
+    );
+    for entry in &manifest.files {
+        let text = std::fs::read_to_string(pin_dir.join(&entry.name)).expect("cache file readable");
+        assert_eq!(
+            driver::sha256_hex(text.as_bytes()),
+            entry.sha256,
+            "{} cache bytes must verify against the manifest",
+            entry.name
+        );
+    }
 }
