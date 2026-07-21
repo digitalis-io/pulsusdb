@@ -20,6 +20,7 @@ pub mod aggregation;
 pub mod binop;
 pub mod datetime;
 pub mod elementwise;
+pub mod extended;
 pub mod functions;
 pub mod hist_range_fns;
 pub mod histogram_fns;
@@ -2074,6 +2075,19 @@ struct WindowedSeries {
     samples: Vec<Sample>,
 }
 
+/// The extended range-selector mode (issue #150) of a [`WindowedSource`],
+/// derived from the selector's flags. `Plain` for every subquery source
+/// (the parser rejects a modifier on a subquery) and every unmodified
+/// selector. `Anchored`/`Smoothed` widen only the sample slice — the
+/// `(lower_excl, upper_incl]` bounds stay ORIGINAL so the extended ports
+/// have the correct boundary math and `isRate` divisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeMode {
+    Plain,
+    Anchored,
+    Smoothed,
+}
+
 /// A range source resolved at one evaluation step: the `(lower_excl,
 /// upper_incl]` window (`upper_incl` = the effective evaluation time) and
 /// every series' windowed, non-stale samples — the shared input for all
@@ -2082,6 +2096,9 @@ struct WindowedSource {
     range_ms: i64,
     lower_excl: i64,
     upper_incl: i64,
+    /// Issue #150: the extended range-selector mode. `Plain` unless the
+    /// underlying selector carried `anchored`/`smoothed`.
+    mode: RangeMode,
     series: Vec<WindowedSeries>,
 }
 
@@ -2091,6 +2108,7 @@ fn windowed_range_source(
     data: &EvalData<'_>,
     subqueries: &SubqueryCache,
     t_ms: i64,
+    lookback_ms: i64,
 ) -> Result<WindowedSource, PromqlError> {
     let source_view = match source {
         RangeSource::Selector(id) => {
@@ -2100,6 +2118,22 @@ fn windowed_range_source(
                 .range_ms
                 .expect("plan() only ever builds a range source over a matrix selector");
             let lower_excl = eff_t - range_ms;
+            // Issue #150: the ORIGINAL `(lower_excl, eff_t]` bounds stay
+            // fixed; the extended modes only widen the fetched sample slice
+            // (anchored: `(lower−lb, upper]`; smoothed: `(lower−lb,
+            // upper+lb]`) — engine.go:1007-1021's per-step window extension.
+            let mode = if sel.anchored {
+                RangeMode::Anchored
+            } else if sel.smoothed {
+                RangeMode::Smoothed
+            } else {
+                RangeMode::Plain
+            };
+            let (slice_lower, slice_upper) = match mode {
+                RangeMode::Plain => (lower_excl, eff_t),
+                RangeMode::Anchored => (lower_excl - lookback_ms, eff_t),
+                RangeMode::Smoothed => (lower_excl - lookback_ms, eff_t + lookback_ms),
+            };
             let series = data
                 .get(*id)
                 .iter()
@@ -2110,13 +2144,14 @@ fn windowed_range_source(
                     // documents.
                     metric_name: s.metric_name.clone().or_else(|| sel.metric_name.clone()),
                     drop_name: false,
-                    samples: windowed_non_stale(&s.samples, lower_excl, eff_t),
+                    samples: windowed_non_stale(&s.samples, slice_lower, slice_upper),
                 })
                 .collect();
             WindowedSource {
                 range_ms,
                 lower_excl,
                 upper_incl: eff_t,
+                mode,
                 series,
             }
         }
@@ -2151,6 +2186,9 @@ fn windowed_range_source(
                 range_ms: sq.range_ms,
                 lower_excl,
                 upper_incl: eff_t,
+                // A subquery source can never carry a modifier (the parser
+                // rejects `foo[5m:1m] anchored`).
+                mode: RangeMode::Plain,
                 series,
             }
         }
@@ -2178,6 +2216,63 @@ fn windowed_non_stale(samples: &[Sample], lower_excl: i64, upper_incl: i64) -> V
         .filter(|s| !s.is_stale())
         .cloned()
         .collect()
+}
+
+/// Issue #150: `extrapolatedRate`'s anchored/smoothed branch
+/// (functions.go:459-470) — the mixed / all-histogram / all-float dispatch
+/// over the already extended-windowed `samples`. Only Rate/Increase/Delta
+/// reach here (the plan-time allow-list rejects every other function on an
+/// anchored/smoothed selector); the `(is_counter, is_rate)` pair follows
+/// `extrapolatedRate`'s own callers.
+#[allow(clippy::too_many_arguments)]
+fn eval_extended_range_fn(
+    func: crate::plan::RangeFn,
+    samples: &[Sample],
+    range_ms: i64,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    smoothed: bool,
+    metric_name: &str,
+    annos: &mut Annotations,
+) -> Option<hist_range_fns::RangeValue> {
+    use crate::plan::RangeFn;
+    let (is_counter, is_rate) = match func {
+        RangeFn::Rate => (true, true),
+        RangeFn::Increase => (true, false),
+        RangeFn::Delta => (false, false),
+        RangeFn::Irate => unreachable!("irate is not in the anchored/smoothed allow-list"),
+    };
+    let hist_count = samples.iter().filter(|s| s.h.is_some()).count();
+    if hist_count > 0 && hist_count < samples.len() {
+        annos.warning(crate::annotations::messages::mixed_floats_histograms_warning(metric_name));
+        return None;
+    }
+    if hist_count > 0 {
+        extended::extended_histogram_rate(
+            samples,
+            range_ms,
+            range_start_ms,
+            range_end_ms,
+            smoothed,
+            is_counter,
+            is_rate,
+            metric_name,
+            annos,
+        )
+    } else if !samples.is_empty() {
+        extended::extended_rate(
+            samples,
+            range_ms,
+            range_start_ms,
+            range_end_ms,
+            smoothed,
+            is_counter,
+            is_rate,
+        )
+        .map(hist_range_fns::RangeValue::Float)
+    } else {
+        None
+    }
 }
 
 /// Converts a [`hist_range_fns::RangeValue`] into the `(v, h)` pair
@@ -2409,6 +2504,40 @@ fn eval_step(
             // applies relative to it) — step-invariant by construction.
             let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
             let mut out = Vec::new();
+            // Issue #150: a `smoothed` instant selector interpolates over the
+            // `(eff_t−lb, eff_t+lb]` window per step (`smoothSeries`); the
+            // metric name is KEPT (it is still a selection). An `anchored`
+            // instant selector is a no-op upstream (engine.go only widens for
+            // `Smoothed` in the instant arm), so it falls through unchanged.
+            if sel.smoothed {
+                for series in data.get(*id) {
+                    let metric_name = series
+                        .metric_name
+                        .clone()
+                        .or_else(|| sel.metric_name.clone());
+                    let smoothed = {
+                        let mut annos = caches.annotations.borrow_mut();
+                        extended::smoothed_instant(
+                            &series.samples,
+                            eff_t,
+                            lookback_ms,
+                            metric_name.as_deref().unwrap_or(""),
+                            &mut annos,
+                        )
+                    };
+                    if let Some((v, h)) = smoothed {
+                        out.push(InstantSample {
+                            labels: series.labels.clone(),
+                            metric_name,
+                            drop_name: false,
+                            t_ms,
+                            v,
+                            h,
+                        });
+                    }
+                }
+                return Ok(StepValue::Vector(out));
+            }
             for series in data.get(*id) {
                 if let Some(sample) = staleness::instant_value(&series.samples, eff_t, lookback_ms)
                 {
@@ -2447,21 +2576,45 @@ fn eval_step(
         // `functions::eval_range_fn` internally and adds the native-
         // histogram `rate`/`increase`/`delta`/`irate` semantics.
         PlanExpr::RangeFn { func, source } => {
-            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms)?;
+            let src = windowed_range_source(
+                source,
+                selectors,
+                data,
+                &caches.subqueries,
+                t_ms,
+                lookback_ms,
+            )?;
             let mut out = Vec::new();
             for series in src.series {
                 let metric_name = series.metric_name.as_deref().unwrap_or("");
                 let result = {
                     let mut annos = caches.annotations.borrow_mut();
-                    hist_range_fns::eval_range_fn_hist(
-                        *func,
-                        &series.samples,
-                        src.range_ms,
-                        src.lower_excl,
-                        src.upper_incl,
-                        metric_name,
-                        &mut annos,
-                    )
+                    if src.mode == RangeMode::Plain {
+                        hist_range_fns::eval_range_fn_hist(
+                            *func,
+                            &series.samples,
+                            src.range_ms,
+                            src.lower_excl,
+                            src.upper_incl,
+                            metric_name,
+                            &mut annos,
+                        )
+                    } else {
+                        // Issue #150: `extrapolatedRate`'s extended branch
+                        // (functions.go:459-470). Plan gating guarantees only
+                        // Rate/Increase/Delta reach an anchored/smoothed
+                        // selector.
+                        eval_extended_range_fn(
+                            *func,
+                            &series.samples,
+                            src.range_ms,
+                            src.lower_excl,
+                            src.upper_incl,
+                            src.mode == RangeMode::Smoothed,
+                            metric_name,
+                            &mut annos,
+                        )
+                    }
                 };
                 if let Some(value) = result {
                     let (v, h) = range_value_to_sample_fields(value);
@@ -2492,7 +2645,14 @@ fn eval_step(
         // `FetchedSeries::metric_name` (issue #85 — see the `Selector`
         // arm), threaded through `WindowedSeries::metric_name`.
         PlanExpr::OverTime { func, source } => {
-            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms)?;
+            let src = windowed_range_source(
+                source,
+                selectors,
+                data,
+                &caches.subqueries,
+                t_ms,
+                lookback_ms,
+            )?;
             let keeps_name = matches!(func, OverTimeFn::Last | OverTimeFn::First);
             let mut out = Vec::new();
             for series in src.series {
@@ -2501,14 +2661,22 @@ fn eval_step(
                 // alongside every other `OverTimeFn` — no more A5a/A5b-ii
                 // early guard.
                 let metric_name = series.metric_name.as_deref().unwrap_or("");
+                // Issue #150: an anchored selector (only `resets`/`changes`
+                // reach here — the allow-list) prepends the anchor sample and
+                // drops everything before it (`pickFirstSampleIndices`); no
+                // anchor after the range start ⇒ no output for the series.
+                let anchored_samples = if src.mode == RangeMode::Anchored {
+                    match extended::anchor_trim(&series.samples, src.lower_excl) {
+                        Some(s) => Some(s),
+                        None => continue,
+                    }
+                } else {
+                    None
+                };
+                let windowed = anchored_samples.unwrap_or(&series.samples);
                 let result = {
                     let mut annos = caches.annotations.borrow_mut();
-                    hist_range_fns::eval_over_time_hist(
-                        *func,
-                        &series.samples,
-                        metric_name,
-                        &mut annos,
-                    )
+                    hist_range_fns::eval_over_time_hist(*func, windowed, metric_name, &mut annos)
                 };
                 if let Some(value) = result {
                     let (v, h) = over_time_value_to_sample_fields(value);
@@ -2552,7 +2720,14 @@ fn eval_step(
                 };
                 scalars.push(s);
             }
-            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms)?;
+            let src = windowed_range_source(
+                source,
+                selectors,
+                data,
+                &caches.subqueries,
+                t_ms,
+                lookback_ms,
+            )?;
             let mut out = Vec::new();
             for series in src.series {
                 // Upstream engine.go only invokes a matrix-argument
@@ -2635,7 +2810,14 @@ fn eval_step(
         // MetricName matchers; `sel.matchers` already excludes it by the
         // planner's metric-scoping rule).
         PlanExpr::AbsentOverTime { source } => {
-            let src = windowed_range_source(source, selectors, data, &caches.subqueries, t_ms)?;
+            let src = windowed_range_source(
+                source,
+                selectors,
+                data,
+                &caches.subqueries,
+                t_ms,
+                lookback_ms,
+            )?;
             let present = src.series.iter().any(|s| !s.samples.is_empty());
             if present {
                 return Ok(StepValue::Vector(Vec::new()));

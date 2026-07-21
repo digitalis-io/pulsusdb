@@ -10,5 +10,7 @@ VectorSelector(
         offset: None,
         offset_expr: None,
         at: None,
+        anchored: false,
+        smoothed: false,
     },
 )

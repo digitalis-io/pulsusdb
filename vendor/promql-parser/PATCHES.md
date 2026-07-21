@@ -32,7 +32,14 @@ The patches fall into two classes:
   v3.13 duration expressions are structurally unimplementable as a leaf
   fix: the upstream feature is itself a grammar of new productions).
 
-## 1. Reserved-keyword lexing: `anchored`/`smoothed`
+## 1. Reserved-keyword lexing: `anchored`/`smoothed` (SUPERSEDED by G3)
+
+**Superseded by grammar patch G3 (issue #150):** G3 implements the
+`anchored`/`smoothed` modifier grammar, so both keywords are reserved in the
+runtime `KEYWORDS` table again (matching upstream v3.13 `lex.go:132-133`) and
+stay usable as metric/label names through the `metric_identifier`/
+`maybe_label` grammar arms (the G1 pattern) rather than by de-reservation.
+The original leaf fix is retained below for history.
 
 - **File:** `src/parser/token.rs`
 - **Bug:** `anchored`/`smoothed` were unconditionally reserved as keyword
@@ -378,6 +385,67 @@ The patches fall into two classes:
   (`native_histograms.test`, e.g. `h_test </ 3`, `h_test >/ -Inf`,
   `cbh_for_join >/ on (label) float_for_join`).
 - **Upstream PR:** not applicable — as with G1, this targets Prometheus
+  v3.13 grammar past the crate's v2.45 baseline; recorded here as the
+  divergence ledger instead.
+
+## G3. Grammar-production patch: extended range selectors (issue #150)
+
+- **Files:** `src/parser/promql.y`, `src/parser/token.rs`,
+  `src/parser/ast.rs`
+- **What:** Prometheus v3.13.0's experimental extended range-selector
+  modifiers, the trailing `anchored` / `smoothed` on a vector or matrix
+  selector (`metric[1m] anchored`, `metric smoothed @ 100`). Ported from
+  `generated_parser.y`/`parse.go`/`printer.go` at PulsusDB's pinned v3.13.0
+  conformance SHA (`40af9c2`), where the feature is gated behind the parser
+  option `EnableExtendedRangeSelectors` (the upstream test harness enables it
+  unconditionally).
+- **Grammar (`promql.y`):** new postfix productions `anchored_expr: expr
+  ANCHORED` and `smoothed_expr: expr SMOOTHED` (added to the `expr`
+  alternatives); their semantic actions call the new `Expr::set_anchored`/
+  `set_smoothed` (ast.rs). `ANCHORED`/`SMOOTHED` join
+  `metric_identifier`/`maybe_label` (upstream :837/:1095 — they stay usable
+  as metric/label names, e.g. `anchored{job="test"}`, `sum by (smoothed)`).
+  The `%expect-unused 'SMOOTHED' 'ANCHORED'` line is dropped (the tokens are
+  now used). ANCHORED/SMOOTHED carry no precedence (upstream declares none):
+  the shift/reduce conflicts resolve to shift (bind the modifier to the
+  preceding expr) and the reduce/reduce conflicts to the earlier-defined
+  production — upstream goyacc's default resolution, pinned by the parse
+  corpus and the crate's own `test_extended_range_selectors`.
+  `%expect` rises from 11 to **51** (shift/reduce) and `%expect-rr` from 225
+  to **243** (reduce/reduce): the new postfix productions overlap the
+  existing offset/at/bracket modifier states, and the two
+  metric_identifier/maybe_label arms add ambiguity with the postfix use of
+  the same tokens.
+- **Tokens (`token.rs`):** `"smoothed"`/`"anchored"` return to the runtime
+  `KEYWORDS` table (upstream `lex.go:132-133`), superseding leaf fix 1
+  above.
+- **AST (`ast.rs`):** `VectorSelector` gains `pub anchored: bool, pub
+  smoothed: bool` (both `#[cfg_attr(feature = "ser", serde(skip))]` — the
+  serialized JSON shape is unchanged). `Expr::set_anchored`/`set_smoothed`
+  port upstream's `setAnchored`/`setSmoothed` (parse.go:1078-1129) MINUS the
+  experimental-gate check: mutual exclusion ("anchored and smoothed
+  modifiers cannot be used together"), subquery rejection ("<mod> modifier
+  is not supported for subqueries"), and the default arm ("<mod> modifier
+  not implemented"), all verbatim. `Display` for both `VectorSelector`
+  (modifier after `@`, before `offset` — printer.go:413-418) and
+  `MatrixSelector` (modifier after `[range]`, before `@` — printer.go:
+  280-305) with `anchored` taking precedence over `smoothed`.
+- **Experimental gate:** deliberately NOT in this crate (the G1 precedent —
+  the parser has no options plumbing). PulsusDB gates at plan time on
+  `PlanParams::experimental_functions` via the `anchored`/`smoothed` flags,
+  carrying parse.go's "\<mod\> modifier is experimental and not enabled"
+  verbatim.
+- **Gate-off ordering divergence** (a G1-precedent class, not corpus-visible
+  — the harness always gates on): with the experimental gate OFF, a
+  subquery modifier such as `foo[5m:1m] anchored` errors "anchored modifier
+  is not supported for subqueries" (a parse error here) rather than
+  upstream's "anchored modifier is experimental and not enabled" (upstream
+  checks the gate first, inside the setter). Both reject the query before any
+  data is touched; the corpus-visible behaviour class is identical.
+- **Corpus inputs fixed:** the 135 `extended-range-selector (smoothed/
+  anchored)` rows formerly in `crates/pulsus-promql/tests/promqltest/corpus/
+  eval-divergences.jsonl` (`extended_vectors.test`).
+- **Upstream PR:** not applicable — as with G1/G2, this targets Prometheus
   v3.13 grammar past the crate's v2.45 baseline; recorded here as the
   divergence ledger instead.
 

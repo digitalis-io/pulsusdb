@@ -1022,6 +1022,16 @@ pub struct VectorSelector {
     #[cfg_attr(feature = "ser", serde(flatten))]
     #[cfg_attr(feature = "ser", serde(serialize_with = "serialize_at_modifier"))]
     pub at: Option<AtModifier>,
+    /// `true` iff the selector carried the `anchored` extended-range
+    /// modifier (docs/decisions/0003 grammar patch G3). Skipped from the
+    /// `ser` JSON shape (the experimental gate lives at plan time).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub anchored: bool,
+    /// `true` iff the selector carried the `smoothed` extended-range
+    /// modifier (docs/decisions/0003 grammar patch G3). Skipped from the
+    /// `ser` JSON shape (the experimental gate lives at plan time).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub smoothed: bool,
 }
 
 impl VectorSelector {
@@ -1032,6 +1042,8 @@ impl VectorSelector {
             offset: None,
             offset_expr: None,
             at: None,
+            anchored: false,
+            smoothed: false,
         }
     }
 }
@@ -1044,6 +1056,8 @@ impl Default for VectorSelector {
             offset: None,
             offset_expr: None,
             at: None,
+            anchored: false,
+            smoothed: false,
         }
     }
 }
@@ -1055,6 +1069,8 @@ impl From<String> for VectorSelector {
             offset: None,
             offset_expr: None,
             at: None,
+            anchored: false,
+            smoothed: false,
             matchers: Matchers::empty(),
         }
     }
@@ -1075,6 +1091,8 @@ impl From<String> for VectorSelector {
 ///     offset: None,
 ///     offset_expr: None,
 ///     at: None,
+///     anchored: false,
+///     smoothed: false,
 ///     matchers: Matchers::empty(),
 /// };
 ///
@@ -1106,6 +1124,13 @@ impl fmt::Display for VectorSelector {
         }
         if let Some(at) = &self.at {
             write!(f, " {at}")?;
+        }
+        // Grammar patch G3: printer.go:413-418 emits the modifier after the
+        // @ modifier and before offset (anchored takes precedence).
+        if self.anchored {
+            write!(f, " anchored")?;
+        } else if self.smoothed {
+            write!(f, " smoothed")?;
         }
         if let Some(offset) = &self.offset {
             write!(f, " offset {offset}")?;
@@ -1154,6 +1179,14 @@ impl fmt::Display for MatrixSelector {
         match &self.range_expr {
             Some(e) => write!(f, "[{e}]")?,
             None => write!(f, "[{}]", display_duration(&self.range))?,
+        }
+
+        // Grammar patch G3: printer.go:280-305 emits the modifier after the
+        // range and before the @ modifier (anchored takes precedence).
+        if self.vs.anchored {
+            write!(f, " anchored")?;
+        } else if self.vs.smoothed {
+            write!(f, " smoothed")?;
         }
 
         if let Some(at) = &self.vs.at {
@@ -1480,6 +1513,56 @@ impl Expr {
             _ => {
                 Err("offset modifier must be preceded by an vector selector or matrix selector or a subquery".into())
             }
+        }
+    }
+
+    /// set the `anchored` extended-range modifier (docs/decisions/0003
+    /// grammar patch G3 — upstream's `setAnchored`, parse.go:1078-1102,
+    /// minus the experimental gate which lives at plan time).
+    pub(crate) fn set_anchored(self) -> Result<Self, String> {
+        let mutual_excl_err = "anchored and smoothed modifiers cannot be used together";
+        match self {
+            Expr::VectorSelector(mut vs) => {
+                vs.anchored = true;
+                if vs.smoothed {
+                    return Err(mutual_excl_err.into());
+                }
+                Ok(Expr::VectorSelector(vs))
+            }
+            Expr::MatrixSelector(mut ms) => {
+                ms.vs.anchored = true;
+                if ms.vs.smoothed {
+                    return Err(mutual_excl_err.into());
+                }
+                Ok(Expr::MatrixSelector(ms))
+            }
+            Expr::Subquery(_) => Err("anchored modifier is not supported for subqueries".into()),
+            _ => Err("anchored modifier not implemented".into()),
+        }
+    }
+
+    /// set the `smoothed` extended-range modifier (docs/decisions/0003
+    /// grammar patch G3 — upstream's `setSmoothed`, parse.go:1105-1129,
+    /// minus the experimental gate which lives at plan time).
+    pub(crate) fn set_smoothed(self) -> Result<Self, String> {
+        let mutual_excl_err = "anchored and smoothed modifiers cannot be used together";
+        match self {
+            Expr::VectorSelector(mut vs) => {
+                vs.smoothed = true;
+                if vs.anchored {
+                    return Err(mutual_excl_err.into());
+                }
+                Ok(Expr::VectorSelector(vs))
+            }
+            Expr::MatrixSelector(mut ms) => {
+                ms.vs.smoothed = true;
+                if ms.vs.anchored {
+                    return Err(mutual_excl_err.into());
+                }
+                Ok(Expr::MatrixSelector(ms))
+            }
+            Expr::Subquery(_) => Err("smoothed modifier is not supported for subqueries".into()),
+            _ => Err("smoothed modifier not implemented".into()),
         }
     }
 

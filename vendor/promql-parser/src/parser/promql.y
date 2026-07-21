@@ -149,7 +149,6 @@ START_METRIC_SELECTOR
 %expect-unused 'KEYWORDS_START' 'KEYWORDS_END' 'PREPROCESSOR_START' 'PREPROCESSOR_END'
 %expect-unused 'STARTSYMBOLS_START'
 %expect-unused 'START_METRIC' 'START_SERIES_DESCRIPTION' 'START_EXPRESSION' 'START_METRIC_SELECTOR' 'STARTSYMBOLS_END'
-%expect-unused 'SMOOTHED' 'ANCHORED'
 
 // PulsusDB patch (docs/decisions/0003, grammar patch G1): the
 // duration-expression productions raise the conflict counts from the
@@ -166,8 +165,18 @@ START_METRIC_SELECTOR
 // reduce/reduce count further (each new comparison-precedence operator
 // overlaps the same offset_duration_expr/duration_expr ambiguity above);
 // shift/reduce is unaffected.
-%expect 11
-%expect-rr 225
+//
+// PulsusDB patch (docs/decisions/0003, grammar patch G3): the postfix
+// `anchored_expr`/`smoothed_expr` productions and the ANCHORED/SMOOTHED
+// arms of metric_identifier/maybe_label raise both counts. ANCHORED/
+// SMOOTHED carry no precedence (upstream declares none either); the
+// shift/reduce conflicts resolve to shift (bind the trailing modifier to
+// the preceding expr) and the reduce/reduce conflicts to the
+// earlier-defined production — upstream goyacc's default resolution,
+// pinned by the parse corpus (`m[1m] anchored`, `anchored{job="test"}`,
+// `sum by (smoothed)`) and the crate's own grammar tests.
+%expect 51
+%expect-rr 243
 
 %start start
 
@@ -200,6 +209,7 @@ start -> Result<Expr, String>:
 expr -> Result<Expr, String>:
 /* check_ast from bottom to up for nested exprs */
                 aggregate_expr { check_ast($1?) }
+        |       anchored_expr { check_ast($1?) }
         |       at_expr { check_ast($1?) }
         |       binary_expr { check_ast($1?) }
         |       function_call { check_ast($1?) }
@@ -207,10 +217,30 @@ expr -> Result<Expr, String>:
         |       number_literal { check_ast($1?) }
         |       offset_expr { check_ast($1?) }
         |       paren_expr { check_ast($1?) }
+        |       smoothed_expr { check_ast($1?) }
         |       string_literal { check_ast($1?) }
         |       subquery_expr { check_ast($1?) }
         |       unary_expr  { check_ast($1?) }
         |       vector_selector  { check_ast($1?) }
+;
+
+/*
+ * Anchored and smoothed modifiers (extended range selectors).
+ *
+ * PulsusDB patch (docs/decisions/0003, grammar patch G3): ported from
+ * upstream v3.13.0's `anchored_expr`/`smoothed_expr` productions
+ * (generated_parser.y:613-621). Upstream gates these behind the parser
+ * option `EnableExtendedRangeSelectors`; matching the G1 precedent the
+ * experimental gate is relocated to plan time (the parser has no options
+ * plumbing) — the setter actions here port `setAnchored`/`setSmoothed`
+ * (parse.go:1078-1129) minus the gate check.
+ */
+anchored_expr -> Result<Expr, String>:
+                expr ANCHORED { $1?.set_anchored() }
+;
+
+smoothed_expr -> Result<Expr, String>:
+                expr SMOOTHED { $1?.set_smoothed() }
 ;
 
 /*
@@ -755,6 +785,11 @@ metric_identifier -> Result<Token, String>:
         |       RANGE { lexeme_to_token($lexer, $1) }
         |       MAX_OF { lexeme_to_token($lexer, $1) }
         |       MIN_OF { lexeme_to_token($lexer, $1) }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G3): the
+        // extended-range-selector keywords stay usable as metric names
+        // (upstream v3.13 metric_identifier:837).
+        |       ANCHORED { lexeme_to_token($lexer, $1) }
+        |       SMOOTHED { lexeme_to_token($lexer, $1) }
 ;
 
 /*
@@ -824,6 +859,11 @@ maybe_label -> Result<Token, String>:
         |       RANGE { lexeme_to_token($lexer, $1) }
         |       MAX_OF { lexeme_to_token($lexer, $1) }
         |       MIN_OF { lexeme_to_token($lexer, $1) }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G3): the
+        // extended-range-selector keywords stay usable as label names
+        // (upstream v3.13 maybe_label:1095).
+        |       ANCHORED { lexeme_to_token($lexer, $1) }
+        |       SMOOTHED { lexeme_to_token($lexer, $1) }
 ;
 
 match_op -> Result<Token, String>:

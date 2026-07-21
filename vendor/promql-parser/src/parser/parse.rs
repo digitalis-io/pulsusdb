@@ -2116,6 +2116,61 @@ mod tests {
     }
 
     #[test]
+    fn test_extended_range_selectors() {
+        // Parse -> Display round-trip with exact printer ordering (grammar
+        // patch G3, upstream printer.go:280-305 matrix / :413-418 vector:
+        // the modifier prints after @ and before offset).
+        let display_cases = [
+            ("m[1m] anchored", "m[1m] anchored"),
+            (
+                "m[1m] smoothed @ 100 offset 5m",
+                "m[1m] smoothed @ 100.000 offset 5m",
+            ),
+            ("m @ 100 smoothed", "m @ 100.000 smoothed"),
+            ("m offset -100 smoothed", "m smoothed offset -1m40s"),
+        ];
+        for (input, expected_display) in display_cases {
+            let parsed = parser::parse(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let rendered = parsed.to_string();
+            assert_eq!(rendered, expected_display, "{input} display ordering");
+            let reparsed =
+                parser::parse(&rendered).unwrap_or_else(|e| panic!("{input} -> {rendered}: {e}"));
+            assert_eq!(parsed, reparsed, "{input} must round-trip");
+        }
+
+        // ANCHORED/SMOOTHED stay usable as metric/label names
+        // (metric_identifier:837, maybe_label:1095).
+        assert!(parser::parse(r#"anchored{job="test"}"#).is_ok());
+        assert!(parser::parse(r#"smoothed{job="test"}"#).is_ok());
+        assert!(parser::parse("sum by (anchored)(some_metric)").is_ok());
+        assert!(parser::parse("sum by (smoothed)(some_metric)").is_ok());
+
+        // Parse-time guard messages (upstream v3.13 verbatim,
+        // parse.go:1078-1129 minus the relocated experimental gate).
+        let fail_cases = vec![
+            (
+                "m[1m] anchored smoothed",
+                "anchored and smoothed modifiers cannot be used together",
+            ),
+            (
+                "m[1m] smoothed anchored",
+                "anchored and smoothed modifiers cannot be used together",
+            ),
+            (
+                "m[5m:1m] smoothed",
+                "smoothed modifier is not supported for subqueries",
+            ),
+            (
+                "m[5m:1m] anchored",
+                "anchored modifier is not supported for subqueries",
+            ),
+            ("\"s\" anchored", "anchored modifier not implemented"),
+            ("\"s\" smoothed", "smoothed modifier not implemented"),
+        ];
+        assert_cases(Case::new_fail_cases(fail_cases));
+    }
+
+    #[test]
     fn test_subquery() {
         let cases = vec![
             (r#"foo{bar="baz"}[10m:6s]"#, {
@@ -2658,7 +2713,10 @@ mod tests {
         }
 
         let fail_cases = vec![
-            ("{}", "vector selector must contain at least one non-empty matcher"),
+            (
+                "{}",
+                "vector selector must contain at least one non-empty matcher",
+            ),
             (
                 "sum({})",
                 "vector selector must contain at least one non-empty matcher",

@@ -134,6 +134,15 @@ pub struct SelectorSpec {
     /// pin's `HistogramStatsIterator`); the fetch SQL/window is
     /// byte-identical either way.
     pub histogram_stats: bool,
+    /// Issue #150: the selector carried the `anchored` extended-range
+    /// modifier. Eval only (the sample-selection semantics); fetch is
+    /// unchanged (the existing unconditional lookback lower bound already
+    /// covers the anchor sample).
+    pub anchored: bool,
+    /// Issue #150: the selector carried the `smoothed` extended-range
+    /// modifier. Eval AND fetch: [`SelectorSpec::fetch_window`] widens the
+    /// upper bound by one `lookback_ms` (engine.go's `end += LookbackDelta`).
+    pub smoothed: bool,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -171,14 +180,21 @@ impl SelectorSpec {
     /// evaluator strictly needs.
     pub fn fetch_window(&self, p: &PlanParams) -> (i64, i64) {
         let width = self.range_ms.unwrap_or(0) + self.fetch.extra_range_ms + p.lookback_ms;
+        // Issue #150: `smoothed` interpolates at the RIGHT boundary too, so
+        // the fetch window's upper bound widens by one lookback
+        // (engine.go:1009,1020 `end += LookbackDelta`; instant and matrix
+        // arms both). `anchored` needs NO change — the lower bound already
+        // subtracts one unconditional lookback, which covers the anchor
+        // sample (engine.go's anchored `start` extension folds into it).
+        let upper_extra = if self.smoothed { p.lookback_ms } else { 0 };
         match self.fetch.at_ms {
             Some(at) => (
                 at - width - self.fetch.total_offset_ms,
-                at - self.fetch.total_offset_ms,
+                at - self.fetch.total_offset_ms + upper_extra,
             ),
             None => (
                 p.start_ms - width - self.fetch.total_offset_ms,
-                p.end_ms - self.fetch.total_offset_ms,
+                p.end_ms - self.fetch.total_offset_ms + upper_extra,
             ),
         }
     }
@@ -900,6 +916,8 @@ impl Planner {
         offset_ms: i64,
         at_ms: Option<i64>,
         info_family: bool,
+        anchored: bool,
+        smoothed: bool,
     ) -> SelectorId {
         // Own `@` dominates and discards the accumulated subquery context
         // (the sub-tree is step-invariant at that fixed time); otherwise
@@ -932,6 +950,8 @@ impl Planner {
             // ([`detect_histogram_stats`]) once the whole tree exists —
             // the flag depends on the selector's ANCESTORS.
             histogram_stats: false,
+            anchored,
+            smoothed,
         });
         id
     }
@@ -1256,6 +1276,69 @@ fn gate_duration_expr(e: &Option<DurationExpr>, experimental: bool) -> Result<()
     Ok(())
 }
 
+/// Issue #150: the plan-time experimental gate for the `anchored`/`smoothed`
+/// extended range-selector modifiers. Upstream gates them behind the parser
+/// option `EnableExtendedRangeSelectors` (parse.go:1079,1107); matching the
+/// G1 duration-expression precedent the vendored parser parses them
+/// unconditionally and the single [`PlanParams::experimental_functions`]
+/// toggle governs here (Q2 adjudicated YES). Checked BEFORE the allow-list
+/// (upstream's ordering), carrying parse.go's message verbatim.
+fn gate_extended_modifier(
+    anchored: bool,
+    smoothed: bool,
+    experimental: bool,
+) -> Result<(), PromqlError> {
+    if experimental {
+        return Ok(());
+    }
+    if anchored {
+        return Err(unsupported(
+            "anchored modifier is experimental and not enabled",
+        ));
+    }
+    if smoothed {
+        return Err(unsupported(
+            "smoothed modifier is experimental and not enabled",
+        ));
+    }
+    Ok(())
+}
+
+/// Issue #150: `AnchoredSafeFunctions` (functions.go:2667-2673) — the sorted
+/// set of functions valid with the `anchored` modifier.
+const ANCHORED_SAFE_FUNCTIONS: [&str; 5] = ["changes", "delta", "increase", "rate", "resets"];
+
+/// Issue #150: `SmoothedSafeFunctions` (functions.go:2677-2681) — the sorted
+/// set of functions valid with the `smoothed` modifier.
+const SMOOTHED_SAFE_FUNCTIONS: [&str; 3] = ["delta", "increase", "rate"];
+
+/// Issue #150: the plan-time allow-list check for a range-function argument
+/// that carried an extended modifier (engine.go:2192-2201). Upstream raises
+/// a semantic (post-parse) error, satisfying the corpus `eval_fail` rows —
+/// the label-validation-at-plan-time precedent. `name` is the enclosing
+/// range function; the sets are already sorted (the pin joins
+/// `slices.Sorted(maps.Keys(...))`).
+fn check_extended_allow_list(
+    planner: &Planner,
+    name: &str,
+    id: SelectorId,
+) -> Result<(), PromqlError> {
+    let sel = &planner.selectors[id];
+    if sel.anchored && !ANCHORED_SAFE_FUNCTIONS.contains(&name) {
+        return Err(unsupported(format!(
+            "anchored modifier can only be used with: {} - not with {name}",
+            ANCHORED_SAFE_FUNCTIONS.join(", ")
+        )));
+    }
+    if sel.smoothed && !SMOOTHED_SAFE_FUNCTIONS.contains(&name) {
+        return Err(unsupported(format!(
+            "smoothed modifier can only be used with: {} - not with {name}",
+            SMOOTHED_SAFE_FUNCTIONS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// Issue #84: a resolve-time duration error — upstream
 /// `promql/durations.go` text verbatim (its position prefix excepted),
 /// carried on the [`PromqlError::Parse`] verbatim-text contract.
@@ -1464,8 +1547,9 @@ fn plan_vector_selector(
     planner: &mut Planner,
     vs: &VectorSelector,
 ) -> Result<PlanExpr, PromqlError> {
-    // Issue #84: gate before any resolution.
+    // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&vs.offset_expr, planner.experimental)?;
+    gate_extended_modifier(vs.anchored, vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(vs)?;
     let at_ms = planner.resolve_at(&vs.at);
     let offset = planner.resolve_offset_ms(&vs.offset, &vs.offset_expr)?;
@@ -1477,6 +1561,8 @@ fn plan_vector_selector(
         offset,
         at_ms,
         false,
+        vs.anchored,
+        vs.smoothed,
     );
     Ok(PlanExpr::Selector(id))
 }
@@ -1489,9 +1575,10 @@ fn plan_matrix_selector_id(
     planner: &mut Planner,
     ms: &MatrixSelector,
 ) -> Result<SelectorId, PromqlError> {
-    // Issue #84: gate before any resolution.
+    // Issue #84/#150: gate before any resolution.
     gate_duration_expr(&ms.range_expr, planner.experimental)?;
     gate_duration_expr(&ms.vs.offset_expr, planner.experimental)?;
+    gate_extended_modifier(ms.vs.anchored, ms.vs.smoothed, planner.experimental)?;
     let (metric_name, name_matchers, matchers) = extract_name_and_matchers(&ms.vs)?;
     let at_ms = planner.resolve_at(&ms.vs.at);
     let range_ms = planner.resolve_range_ms(ms.range, &ms.range_expr)?;
@@ -1504,6 +1591,8 @@ fn plan_matrix_selector_id(
         offset,
         at_ms,
         false,
+        ms.vs.anchored,
+        ms.vs.smoothed,
     ))
 }
 
@@ -1517,7 +1606,14 @@ fn plan_range_source(
 ) -> Result<RangeSource, PromqlError> {
     match arg {
         Expr::MatrixSelector(ms) => {
-            Ok(RangeSource::Selector(plan_matrix_selector_id(planner, ms)?))
+            let id = plan_matrix_selector_id(planner, ms)?;
+            // Issue #150: the extended-modifier allow-list (only reachable
+            // for a matrix-selector argument — a subquery can't carry a
+            // modifier). Covers every matrix-arg caller (RangeFn, OverTime,
+            // OverTimeParam, AbsentOverTime) so e.g. `irate`/
+            // `absent_over_time` reject too.
+            check_extended_allow_list(planner, name, id)?;
+            Ok(RangeSource::Selector(id))
         }
         Expr::Subquery(sq) => Ok(RangeSource::Subquery(Box::new(plan_subquery(planner, sq)?))),
         _ => Err(unsupported(format!(
@@ -2183,6 +2279,8 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             offset_ms,
             at_ms,
             true,
+            false,
+            false,
         );
         Ok(PlanExpr::Info {
             base: Box::new(base),
@@ -2955,6 +3053,113 @@ mod tests {
             experimental_functions: true,
             ..params()
         }
+    }
+
+    // --- issue #150: extended range-selector modifiers ---
+
+    fn plan_err(query: &str, p: PlanParams) -> String {
+        let expr = parse(query).unwrap();
+        plan(&expr, p).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn extended_modifier_gate_off_rejects_verbatim() {
+        // The experimental gate (params(): experimental_functions=false)
+        // fires BEFORE the allow-list, with parse.go's verbatim message.
+        assert!(
+            plan_err("rate(m[1m] anchored)", params())
+                .contains("anchored modifier is experimental and not enabled")
+        );
+        assert!(
+            plan_err("rate(m[1m] smoothed)", params())
+                .contains("smoothed modifier is experimental and not enabled")
+        );
+        // Instant selector variant too.
+        assert!(
+            plan_err("m smoothed", params())
+                .contains("smoothed modifier is experimental and not enabled")
+        );
+    }
+
+    #[test]
+    fn smoothed_allow_list_rejects_every_corpus_case_verbatim() {
+        let want = "smoothed modifier can only be used with: delta, increase, rate";
+        for (query, func) in [
+            ("deriv(foo[3m] smoothed)", "deriv"),
+            ("resets(foo[3m] smoothed)", "resets"),
+            ("changes(foo[3m] smoothed)", "changes"),
+            ("max_over_time(foo[3m] smoothed)", "max_over_time"),
+            ("predict_linear(foo[3m] smoothed, 4)", "predict_linear"),
+        ] {
+            let msg = plan_err(query, params_experimental());
+            assert!(
+                msg.contains(&format!("{want} - not with {func}")),
+                "{query}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_allow_list_rejects_every_corpus_case_verbatim() {
+        let want =
+            "anchored modifier can only be used with: changes, delta, increase, rate, resets";
+        for (query, func) in [
+            ("deriv(foo[3m] anchored)", "deriv"),
+            ("max_over_time(foo[3m] anchored)", "max_over_time"),
+            ("predict_linear(foo[3m] anchored, 4)", "predict_linear"),
+            ("irate(m[1m] anchored)", "irate"),
+        ] {
+            let msg = plan_err(query, params_experimental());
+            assert!(
+                msg.contains(&format!("{want} - not with {func}")),
+                "{query}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_resets_and_changes_plan_ok() {
+        for query in ["resets(foo[3m] anchored)", "changes(foo[3m] anchored)"] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params_experimental())
+                .unwrap_or_else(|e| panic!("{query} should plan: {e}"));
+            assert_eq!(p.selectors.len(), 1, "{query} emits exactly one selector");
+            assert!(p.selectors[0].anchored);
+        }
+    }
+
+    #[test]
+    fn smoothed_fetch_window_widens_only_the_upper_bound() {
+        // A smoothed selector's fetch upper bound is the plain upper + one
+        // lookback; the lower bound is byte-equal to plain. Compared against
+        // the same query without the modifier.
+        let p = params_experimental();
+        let smoothed = plan(&parse("rate(m[1m] smoothed)").unwrap(), p).unwrap();
+        let plain = plan(&parse("rate(m[1m])").unwrap(), p).unwrap();
+        let (s_lo, s_hi) = smoothed.selectors[0].fetch_window(&p);
+        let (p_lo, p_hi) = plain.selectors[0].fetch_window(&p);
+        assert_eq!(s_lo, p_lo, "smoothed lower bound unchanged");
+        assert_eq!(
+            s_hi,
+            p_hi + DEFAULT_LOOKBACK_MS,
+            "smoothed upper += lookback"
+        );
+        // Exactly one selector — no extra fetch (Tier-1 pushdown invariance).
+        assert_eq!(smoothed.selectors.len(), 1);
+    }
+
+    #[test]
+    fn anchored_fetch_window_is_byte_equal_to_plain() {
+        // The existing conservative lower-bound lookback subtraction already
+        // covers the anchor sample — anchored needs no fetch change.
+        let p = params_experimental();
+        let anchored = plan(&parse("rate(m[1m] anchored)").unwrap(), p).unwrap();
+        let plain = plan(&parse("rate(m[1m])").unwrap(), p).unwrap();
+        assert_eq!(
+            anchored.selectors[0].fetch_window(&p),
+            plain.selectors[0].fetch_window(&p)
+        );
+        assert_eq!(anchored.selectors.len(), 1);
     }
 
     #[test]
@@ -4640,6 +4845,8 @@ mod tests {
             },
             info_family: false,
             histogram_stats: false,
+            anchored: false,
+            smoothed: false,
         };
         let p = PlanParams {
             start_ms: 10_000_000,

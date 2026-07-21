@@ -15,6 +15,8 @@ MatrixSelector(
             ),
             offset_expr: None,
             at: None,
+            anchored: false,
+            smoothed: false,
         },
         range: 300s,
         range_expr: None,

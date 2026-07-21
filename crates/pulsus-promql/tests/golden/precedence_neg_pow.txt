@@ -17,6 +17,8 @@ Unary(
                         offset: None,
                         offset_expr: None,
                         at: None,
+                        anchored: false,
+                        smoothed: false,
                     },
                 ),
                 rhs: VectorSelector(
@@ -31,6 +33,8 @@ Unary(
                         offset: None,
                         offset_expr: None,
                         at: None,
+                        anchored: false,
+                        smoothed: false,
                     },
                 ),
                 modifier: None,

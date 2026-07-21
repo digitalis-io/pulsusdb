@@ -68,15 +68,16 @@ lazy_static! {
             ("group_left", T_GROUP_LEFT),
             ("group_right", T_GROUP_RIGHT),
             ("bool", T_BOOL),
-            // PulsusDB patch (docs/decisions/0003): "anchored"/"smoothed"
-            // are forward-reserved (`%expect-unused` in promql.y) for a
-            // not-yet-implemented upstream feature and Prometheus v3.13
-            // does not reserve them, so unconditionally keyword-izing them
-            // here rejects them as ordinary metric/label names. Dropped
-            // from the runtime lookup table (the grammar's token
-            // declarations are untouched, so this is a leaf lexing fix,
-            // not a grammar-production change) — see
-            // vendor/promql-parser/PATCHES.md.
+            // PulsusDB patch (docs/decisions/0003, grammar patch G3):
+            // Prometheus v3.13.0 (`promql/parser/lex.go`'s `key` map at the
+            // pinned conformance SHA, lines 132-133) reserves the
+            // extended-range-selector keywords `smoothed`/`anchored`. G3
+            // implements the `smoothed`/`anchored` modifier grammar, so they
+            // are reserved here again (superseding leaf fix 1) and stay
+            // usable as metric/label names via the `metric_identifier`/
+            // `maybe_label` grammar arms — see vendor/promql-parser/PATCHES.md.
+            ("smoothed", T_SMOOTHED),
+            ("anchored", T_ANCHORED),
             ("fill", T_FILL),
             ("fill_left", T_FILL_LEFT),
             ("fill_right", T_FILL_RIGHT),

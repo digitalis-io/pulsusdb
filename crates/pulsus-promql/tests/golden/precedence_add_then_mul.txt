@@ -15,6 +15,8 @@ Binary(
                 offset: None,
                 offset_expr: None,
                 at: None,
+                anchored: false,
+                smoothed: false,
             },
         ),
         rhs: Binary(
@@ -34,6 +36,8 @@ Binary(
                         offset: None,
                         offset_expr: None,
                         at: None,
+                        anchored: false,
+                        smoothed: false,
                     },
                 ),
                 rhs: VectorSelector(
@@ -48,6 +52,8 @@ Binary(
                         offset: None,
                         offset_expr: None,
                         at: None,
+                        anchored: false,
+                        smoothed: false,
                     },
                 ),
                 modifier: None,
