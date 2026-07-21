@@ -121,6 +121,13 @@ pub struct MetricsConfig {
     /// always return complete results. Identifying-label VALUE
     /// narrowing of the fetch routes to issue #25.
     pub max_info_series: u64,
+    /// Issue #136: mirrors [`crate::traces::exec::TraceReadConfig::
+    /// distributed`] — `true` iff `Config::cluster` is configured
+    /// (`pulsus-server`'s `metrics_config_from`). Gates
+    /// `distributed_product_mode='local'` on the `SqlFallback` sample
+    /// fetches only ([`fallback_fetch_settings`]); every other dispatch
+    /// keeps [`metrics_read_settings`] unchanged.
+    pub distributed: bool,
 }
 
 /// The `SqlFallback` sample-fetch path's label-hydration result row
@@ -751,9 +758,20 @@ impl MetricsEngine {
                     }
                 }
                 let metric_name = concrete_name(sel)?;
+                // Issue #136: the fallback fetch's `fingerprint IN (SELECT
+                // … FROM metric_series*_dist …)` shape is a
+                // double-distributed IN, rejected at analysis time under
+                // ClickHouse's default `distributed_product_mode='deny'`
+                // (Code 288) on a clustered `_dist` table set —
+                // `fallback_fetch_settings` injects the exact `'local'`
+                // rewrite ONLY here (never a blanket client-wide default).
+                let settings = fallback_fetch_settings(self.config.distributed);
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
-                    fetch_dual_concurrently(self.fetch_rows(sql), self.fetch_rows(hist_sql))
-                        .await?;
+                    fetch_dual_concurrently(
+                        self.fetch_rows_with(sql, &settings),
+                        self.fetch_rows_with(hist_sql, &settings),
+                    )
+                    .await?;
                 if rows.is_empty() && hist_rows.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -793,6 +811,13 @@ impl MetricsEngine {
         }
     }
 
+    /// [`Self::fetch_rows_with`] under the standard [`metrics_read_settings`]
+    /// — every dispatch except the `SqlFallback` sample fetches (issue
+    /// #136), which instead carry [`fallback_fetch_settings`].
+    async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
+        self.fetch_rows_with(sql, &metrics_read_settings()).await
+    }
+
     /// Wraps [`ChClient::query_stream`] with the placeholder-escaping fix
     /// [`crate::logql::exec::escape_query_placeholders`] applies — the
     /// `SqlFallback` sub-query's `^(?:...)$` regex predicates always carry
@@ -805,17 +830,25 @@ impl MetricsEngine {
     /// this path previously sent NO settings at all, so a broad selector's
     /// rendered `IN` lists could trip ClickHouse's 262,144-byte
     /// `max_query_size` default with an opaque parse error — now every
-    /// dispatch carries the raised setting AND is guarded pre-dispatch by
+    /// dispatch carries a settings object AND is guarded pre-dispatch by
     /// [`crate::querytext::ensure_query_text_fits`] (checked against the
-    /// FINAL escaped text, same ordering `logql::exec` uses).
-    async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
+    /// FINAL escaped text, same ordering `logql::exec` uses). Issue #136
+    /// threads the settings in explicitly (rather than always computing
+    /// [`metrics_read_settings`] internally) so the `SqlFallback` fetches
+    /// can carry the extra `distributed_product_mode` setting without a
+    /// second, near-duplicate dispatch method.
+    async fn fetch_rows_with<R: ChRow>(
+        &self,
+        sql: String,
+        settings: &QuerySettings,
+    ) -> Result<Vec<R>, ReadError> {
         let sql = escape_query_placeholders(&sql);
         if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
             return Err(ReadError::QueryTooBroad(reason));
         }
         let mut stream: ChRowStream<'_, R> = self
             .client
-            .query_stream::<R>(&sql, &metrics_read_settings())
+            .query_stream::<R>(&sql, settings)
             .await
             .map_err(ReadError::Clickhouse)?;
         let mut out = Vec::new();
@@ -1213,6 +1246,32 @@ impl MetricsEngine {
 /// parse error instead of the engine's own `422 query_too_broad`.
 fn metrics_read_settings() -> QuerySettings {
     QuerySettings::new().set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
+}
+
+/// The `SqlFallback` sample-fetch settings (issue #136): [`metrics_read_settings`]
+/// plus, when clustered, `distributed_product_mode='local'`. The fallback
+/// fetch's `FROM metric_samples*_dist … WHERE fingerprint IN (SELECT … FROM
+/// metric_series*_dist …)` shape is a double-distributed IN, rejected at
+/// analysis time under ClickHouse's default `distributed_product_mode=
+/// 'deny'` (Code 288, `DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`) — deterministic
+/// 500s on a clustered deployment. `local` is exact here (not merely
+/// permissive): `metric_samples` and `metric_series` are both Metrics-family
+/// tables sharded on the identical `cityHash64(metric_name, fingerprint)`
+/// key (docs/schemas.md §7), so a sample row's series row is always
+/// shard-local and shard-local `IN` decides identically to global `IN` —
+/// the same precedent already applied to the traces metrics semi-join
+/// (`crate::traces::exec::metrics_settings`, issue #59). Applied ONLY to
+/// the two fallback dispatches
+/// ([`MetricsEngine::execute_fetch_plan`]'s `Fallback` arm) — a blanket
+/// client-wide default would let a future non-co-sharded subquery silently
+/// return wrong shard-local results instead of failing loud.
+fn fallback_fetch_settings(distributed: bool) -> QuerySettings {
+    let base = metrics_read_settings();
+    if distributed {
+        base.set("distributed_product_mode", "local")
+    } else {
+        base
+    }
 }
 
 /// Pure fan-out bound decision for the degraded-cache discovery probe
@@ -2087,6 +2146,30 @@ mod tests {
             Err(TooBroadReason::QueryTextBytes { .. }) => {}
             other => panic!("expected QueryTextBytes rejection, got {other:?}"),
         }
+    }
+
+    // --- Issue #136: SqlFallback settings gate the local product mode ---
+
+    #[test]
+    fn fallback_fetch_settings_carries_the_read_settings_and_omits_local_product_mode_unclustered()
+    {
+        let unclustered = format!("{:?}", fallback_fetch_settings(false));
+        assert!(
+            unclustered.contains("max_query_size"),
+            "missing max_query_size in {unclustered}"
+        );
+        assert!(
+            !unclustered.contains("distributed_product_mode"),
+            "the local-product rewrite is clustered-only: {unclustered}"
+        );
+    }
+
+    #[test]
+    fn fallback_fetch_settings_adds_the_local_product_mode_when_clustered() {
+        let clustered = format!("{:?}", fallback_fetch_settings(true));
+        assert!(clustered.contains("max_query_size"));
+        assert!(clustered.contains("distributed_product_mode"));
+        assert!(clustered.contains("local"));
     }
 
     // --- build_chunk_sqls / fetch_all_concurrently: cross-chunk merge

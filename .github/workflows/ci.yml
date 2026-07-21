@@ -649,6 +649,17 @@ jobs:
           PULSUS_TEST_CLICKHOUSE: "1"
         run: cargo test -p pulsus-schema --test live_cluster
 
+      # Issue #136: the metrics SqlFallback fetch's double-distributed
+      # `fingerprint IN (SELECT … FROM metric_series_dist …)` shape, denied
+      # by ClickHouse's default `distributed_product_mode='deny'` without
+      # the `local` rewrite this issue adds — the negative control pins the
+      # exact denial code, the positive control proves the fix end-to-end
+      # over a cross-shard-split corpus.
+      - name: Live metrics SqlFallback fan-out (cluster)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+        run: cargo test -p pulsus-read --test live_metrics_cluster_fallback
+
       # Issue #43: cross-node connection spreading over the two DISTINCT real
       # nodes (SHARD1/SHARD2 default to the fixture IPs 172.28.0.11/12:8123),
       # proving the pool selects both nodes and fails over off a dead port,

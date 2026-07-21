@@ -154,6 +154,7 @@ fn engine_config(db: &str, max_metric_fanout: u64) -> MetricsConfig {
         max_metric_fanout,
         max_cache_scan: u64::MAX,
         max_info_series: u64::MAX,
+        distributed: false,
     }
 }
 

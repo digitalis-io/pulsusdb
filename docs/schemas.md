@@ -198,6 +198,8 @@ Partition pruning (daily) → primary-index pruning (metric, then fingerprints) 
 )
 ```
 
+**Clustered honesty:** on a clustered deployment this fallback fetch reads `_dist` names throughout — `metric_samples_dist`, and the nested subquery's `metric_series_dist` — and additionally injects `distributed_product_mode = 'local'`, rewriting that nested subquery to each shard's **local** `metric_series` table (exact under `metric_samples`/`metric_series`'s shared `cityHash64(metric_name, fingerprint)` co-sharding, §7; the same rewrite already applied to the traces metrics semi-join). Without it, ClickHouse's default `distributed_product_mode = 'deny'` rejects the nested `_dist`-inside-`_dist` shape as a double-distributed `IN` (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+
 **Same query over 30 days, step 1h.** Tier eligibility requires `tier.resolution ≤ step` *and* `tier.resolution ≤ the range-vector window` (a 5m-window `rate` can never be answered from 1h buckets, whatever the step). Routing then follows `PULSUS_TIER_POLICY`:
 
 - **`exact` (default):** raw samples are used wherever raw still exists — tiers serve only the range beyond raw retention. With 7-day raw retention, the plan is a two-segment `UNION ALL`: `metric_samples_1h` for `[30d ago, 7d ago)` (approximate, flagged), raw `metric_samples` for `[7d ago, now]` (exact, including edge extrapolation and staleness on real samples). **Exactness is per step, not per query:** a step is raw-exact only when its full evaluation window (range-vector window plus lookback) is covered by raw samples; steps whose window straddles the tier/raw boundary draw on approximate buckets and are flagged tier-approximate in `X-Pulsus-Explain` like any tier-served step.

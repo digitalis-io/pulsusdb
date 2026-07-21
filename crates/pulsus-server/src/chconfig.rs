@@ -284,6 +284,13 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // cardinality cap's production carrier — `ReaderConfig ->
         // MetricsConfig -> MetricsEngine::query_inner`'s info_family cap.
         max_info_series: config.reader.promql_max_info_series,
+        // Issue #136: mirrors `trace_read_config_from`'s own `distributed`
+        // flag — gates `distributed_product_mode='local'` on the
+        // `SqlFallback` sample fetches, the fix for the double-distributed
+        // `fingerprint IN (SELECT … FROM metric_series_dist …)` shape
+        // ClickHouse's default `distributed_product_mode='deny'` rejects
+        // (Code 288) on a clustered deployment.
+        distributed: config.cluster.is_some(),
     }
 }
 
@@ -631,6 +638,7 @@ mod tests {
         assert_eq!(cfg.samples_table, "metric_samples");
         assert_eq!(cfg.series_table, "metric_series");
         assert_eq!(cfg.metadata_table, "metric_metadata");
+        assert!(!cfg.distributed);
     }
 
     #[test]
@@ -646,6 +654,7 @@ mod tests {
             cfg.metadata_table, "metric_metadata",
             "metric_metadata is a global catalog table and must never carry a _dist suffix"
         );
+        assert!(cfg.distributed);
     }
 
     /// Issue #65 (M6-02): `reader.promql_experimental_functions` maps
