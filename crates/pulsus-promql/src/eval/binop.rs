@@ -104,6 +104,16 @@ struct ElemBinopResult {
     v: f64,
     h: Option<FloatHistogram>,
     keep: bool,
+    /// Issue #154: `true` when the pair was dropped through the pin's
+    /// annotation-ERROR channel (`vectorElemBinop` returning
+    /// `NewIncompatibleTypesInBinOpInfo`/an incompatible-schema error as
+    /// `err`) rather than an ordinary `keep = false` comparison verdict.
+    /// Upstream's `doBinOp` returns on `err != nil` BEFORE the
+    /// `returnBool` rewrite and before any matched-signature bookkeeping
+    /// (engine.go:3229-3232 at 40af9c2) — so an incompatible pair is
+    /// dropped even under `bool`, never emitted as `0` (pinned by
+    /// `operators.test:576-696,793-837`).
+    incompatible: bool,
 }
 
 fn vector_elem_binop_hist(
@@ -124,6 +134,9 @@ fn vector_elem_binop_hist(
             v: 0.0,
             h: None,
             keep: false,
+            // The pin returns this info through the ERROR channel —
+            // dropped before the `returnBool` rewrite (issue #154).
+            incompatible: true,
         }
     };
     match (lh, rh) {
@@ -137,12 +150,14 @@ fn vector_elem_binop_hist(
                     v: lv,
                     h: None,
                     keep: apply_compare(op, lv, rv),
+                    incompatible: false,
                 }
             } else {
                 ElemBinopResult {
                     v: apply_arith(op, lv, rv),
                     h: None,
                     keep: true,
+                    incompatible: false,
                 }
             }
         }
@@ -157,6 +172,7 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(result),
                 keep: true,
+                incompatible: false,
             }
         }
         (None, Some(_)) => drop_incompatible_types("float", "histogram", annos),
@@ -169,6 +185,7 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(result),
                 keep: true,
+                incompatible: false,
             }
         }
         (Some(lh), None) if op == BinOp::Div => {
@@ -179,6 +196,7 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(result),
                 keep: true,
+                incompatible: false,
             }
         }
         // Issue #129: `histogram </ float` / `histogram >/ float` — trim,
@@ -191,6 +209,7 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(result),
                 keep: true,
+                incompatible: false,
             }
         }
         (Some(lh), None) if op == BinOp::TrimLower => {
@@ -199,6 +218,7 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(result),
                 keep: true,
+                incompatible: false,
             }
         }
         (Some(_), None) => drop_incompatible_types("histogram", "float", annos),
@@ -223,16 +243,22 @@ fn vector_elem_binop_hist(
                         v: 0.0,
                         h: Some(result),
                         keep: true,
+                        incompatible: false,
                     }
                 }
                 Err(FloatHistogramOpError::IncompatibleSchema) => {
                     annos.warning(messages::incompatible_bucket_layout_in_binop_warning(
                         op.item_type_str(),
                     ));
+                    // The pin surfaces this through the error channel too
+                    // (`hlhs.Copy().Add/Sub(hrhs)` err -> `doBinOp` early
+                    // return, issue #154) - though `bool` can never reach
+                    // an arithmetic op, the flag keeps the port uniform.
                     ElemBinopResult {
                         v: 0.0,
                         h: None,
                         keep: false,
+                        incompatible: true,
                     }
                 }
             },
@@ -260,16 +286,22 @@ fn vector_elem_binop_hist(
                         v: 0.0,
                         h: Some(result),
                         keep: true,
+                        incompatible: false,
                     }
                 }
                 Err(FloatHistogramOpError::IncompatibleSchema) => {
                     annos.warning(messages::incompatible_bucket_layout_in_binop_warning(
                         op.item_type_str(),
                     ));
+                    // The pin surfaces this through the error channel too
+                    // (`hlhs.Copy().Add/Sub(hrhs)` err -> `doBinOp` early
+                    // return, issue #154) - though `bool` can never reach
+                    // an arithmetic op, the flag keeps the port uniform.
                     ElemBinopResult {
                         v: 0.0,
                         h: None,
                         keep: false,
+                        incompatible: true,
                     }
                 }
             },
@@ -281,11 +313,13 @@ fn vector_elem_binop_hist(
                 v: 0.0,
                 h: Some(lh.clone()),
                 keep: lh.equals(rh),
+                incompatible: false,
             },
             BinOp::Ne => ElemBinopResult {
                 v: 0.0,
                 h: Some(lh.clone()),
                 keep: !lh.equals(rh),
+                incompatible: false,
             },
             BinOp::Mul
             | BinOp::Div
@@ -330,6 +364,14 @@ pub fn vector_scalar(
                 (s.h.as_deref(), None)
             };
             let result = vector_elem_binop_hist(op, l, lh, r, rh, annos);
+            // Issue #154: an incompatible-types pair is dropped BEFORE
+            // the `bool` rewrite — upstream `VectorscalarBinop` skips the
+            // sample when `vectorElemBinop` errored (engine.go:3388-3393
+            // routes the err out before the keep/returnBool handling),
+            // so `left_histograms == bool 3` yields NO sample, never `0`.
+            if result.incompatible {
+                return None;
+            }
             // Issue #37: a filter-mode comparison (no `bool`) passes the
             // matched element through verbatim (`__name__` AND its own
             // `drop_name` — upstream `VectorscalarBinop` copies
@@ -599,6 +641,14 @@ fn emit_pair(
         (ls.h.as_deref(), rs.h.as_deref())
     };
     let elem = vector_elem_binop_hist(ctx.op, vl, hl, vr, hr, annos);
+    // Issue #154: an incompatible-types pair takes upstream's ERROR
+    // channel — `doBinOp` returns on `err != nil` BEFORE the
+    // `returnBool` rewrite, before `resultMetric`, and before any
+    // matched-signature registration (engine.go:3229-3232), so the pair
+    // is dropped even under `bool` and never blocks a later fill/match.
+    if elem.incompatible {
+        return Ok(());
+    }
     let (value, hist, keep) = if ctx.op.is_comparison() && ctx.bool_modifier {
         (f64::from(elem.keep), None, true)
     } else {

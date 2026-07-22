@@ -295,6 +295,22 @@ fn evaluate_counted_with(
     let eval_data = EvalData::new(&plan.selectors, data);
     let data = &eval_data;
 
+    // Issue #154: a top-level matrix selector of an INSTANT query
+    // (root-only, built exclusively by `plan()`'s lift) — one window
+    // slice per fetched series, no stepping, no subquery/step-invariant
+    // prep, no annotations (upstream `matrixSelector` emits none).
+    if let PlanExpr::RangeVector { source } = &plan.root {
+        debug_assert_eq!(
+            p.step_ms, 0,
+            "plan() only lifts a matrix root for instant params"
+        );
+        if cancel.is_cancelled() {
+            return Err(PromqlError::Cancelled);
+        }
+        let value = eval_range_vector_root(source, &plan.selectors, data, p.start_ms)?;
+        return Ok((value, EvalCounts::default(), Annotations::default()));
+    }
+
     // Issue #83 (round-2 amendment): materialize every subquery ONCE over
     // its epoch-anchored union grid — inside-out for nested subqueries —
     // before any stepping; each step below only slices `(mint, maxt]`
@@ -303,6 +319,10 @@ fn evaluate_counted_with(
     // its horizon-wide identifying-label narrowing (`prepare_info`).
     let mut caches = EvalCaches {
         cancel,
+        // Issue #154: upstream's `ev.startTimestamp != ev.endTimestamp`
+        // (engine.go:2166) — the sort-in-range-query warning gate, seeded
+        // with the TOP evaluator's horizon (subquery prep re-scopes it).
+        range_query: Cell::new(p.start_ms != p.end_ms),
         ..EvalCaches::default()
     };
     let mut counts = EvalCounts::default();
@@ -823,6 +843,20 @@ struct EvalCaches {
     /// query's `limit_ratio` node count. Interior-mutable (`RefCell`)
     /// because the `Aggregate` arm holds `&EvalCaches`.
     ratio_extrema: RefCell<Vec<(*const PlanExpr, RatioExtrema)>>,
+    /// Issue #154: whether the CURRENTLY EVALUATING horizon is
+    /// range-shaped — upstream's PER-EVALUATOR `ev.startTimestamp !=
+    /// ev.endTimestamp` (engine.go:2166): the top-level query's own
+    /// span, or, while a subquery's inner is being materialized, that
+    /// subquery's child-evaluator span (`subqStart != subqEnd`,
+    /// runSubquery engine.go:1963-1965 — set/restored around the inner
+    /// evaluation in [`prepare_subquery`], so a `sort()` nested in a
+    /// subquery of an INSTANT query warns exactly like the pin). Read by
+    /// the `Sort`/`SortByLabel` arms to emit `SortInRangeQueryWarning`;
+    /// the per-step emission dedups on the message text, matching
+    /// upstream's once-per-node `warnings.Add`. A `Cell` because
+    /// [`eval_step`] holds `&EvalCaches` (the `step_invariant_evals`
+    /// precedent).
+    range_query: Cell<bool>,
 }
 
 /// The evaluation grid a node will be stepped over: the closed
@@ -968,7 +1002,12 @@ fn prepare_subqueries(
         | PlanExpr::Scalar(_)
         | PlanExpr::StringLiteral(_)
         | PlanExpr::Time => Ok(()),
-        PlanExpr::RangeFn { source, .. }
+        // Issue #154: `RangeVector` is root-only and the instant path
+        // short-circuits before this pass runs — the arm exists for
+        // exhaustiveness and routes through the shared source prep
+        // (a no-op for its always-Selector source).
+        PlanExpr::RangeVector { source }
+        | PlanExpr::RangeFn { source, .. }
         | PlanExpr::OverTime { source, .. }
         | PlanExpr::AbsentOverTime { source } => prepare_source(
             source,
@@ -1440,6 +1479,18 @@ fn prepare_subquery(
     // accumulator's (issue #86 plan v2 Δ1 — see `MaterializedSeries`).
     let mut acc: BTreeMap<SeriesIdentity, (bool, Vec<Sample>)> = BTreeMap::new();
     if grid_start <= maxt_max {
+        // Issue #154 (code-review round 1): re-scope the sort-warning
+        // gate to THIS subquery's child-evaluator horizon — upstream's
+        // `runSubquery` builds a fresh evaluator with `startTimestamp =
+        // subqStart, endTimestamp = subqEnd` (engine.go:1963-1965), so a
+        // `sort()` inside a subquery warns iff subqStart != subqEnd
+        // (i.e. practically always, range > 0) even when the TOP query
+        // is an instant one. Saved/restored so nested subqueries and the
+        // enclosing horizon each see their own scope; error paths abort
+        // the whole evaluation (annotations discarded), so no restore is
+        // needed on them.
+        let saved_range_query = caches.range_query.get();
+        caches.range_query.set(grid_start != maxt_max);
         // Issue #83 plan v2 (codex Q1 ruling): prune to the consumer
         // windows' union ONLY when `sq.inner` is provably annotation-free
         // — a capable inner keeps the FULL envelope exactly as before
@@ -1555,6 +1606,7 @@ fn prepare_subquery(
                 }
             }
         }
+        caches.range_query.set(saved_range_query);
     }
 
     let series = acc
@@ -1677,9 +1729,12 @@ fn live_grid_points(
 fn expr_may_annotate(expr: &PlanExpr) -> bool {
     match expr {
         // FREE leaves — no evaluator arm here ever touches the sink.
+        // `RangeVector` (issue #154) is root-only (never inside a
+        // subquery inner) and its arm emits no annotations.
         PlanExpr::Selector(_)
         | PlanExpr::Scalar(_)
         | PlanExpr::StringLiteral(_)
+        | PlanExpr::RangeVector { .. }
         | PlanExpr::Time => false,
 
         // CAPABLE unconditionally: `rate`/`irate`/`increase`/`delta` all
@@ -1696,8 +1751,16 @@ fn expr_may_annotate(expr: &PlanExpr) -> bool {
         PlanExpr::OverTimeParam { .. } => true,
         PlanExpr::AbsentOverTime { source } => range_source_may_annotate(source),
         PlanExpr::Absent { arg, .. } => expr_may_annotate(arg),
-        PlanExpr::Sort { arg, .. } => expr_may_annotate(arg),
-        PlanExpr::SortByLabel { arg, .. } => expr_may_annotate(arg),
+        // CAPABLE own shape since issue #154: `SortInRangeQueryWarning`
+        // fires whenever the EVALUATING horizon is range-shaped — the
+        // engine.go:2165-2168 port, gated on the PER-EVALUATOR
+        // `EvalCaches::range_query` scope (a subquery's inner grid is
+        // such a horizon, so a sort inside a subquery of an instant
+        // query warns like the pin). CAPABLE keeps the subquery
+        // envelope retained so the warning-bearing grid points survive
+        // pruning.
+        PlanExpr::Sort { .. } => true,
+        PlanExpr::SortByLabel { .. } => true,
         PlanExpr::LabelReplace { arg, .. } => expr_may_annotate(arg),
         PlanExpr::LabelJoin { arg, .. } => expr_may_annotate(arg),
         // CAPABLE unconditionally: partition warnings, invalid-φ and
@@ -1878,6 +1941,7 @@ fn prepare_step_invariant(
         | PlanExpr::Scalar(_)
         | PlanExpr::StringLiteral(_)
         | PlanExpr::Time
+        | PlanExpr::RangeVector { .. }
         | PlanExpr::RangeFn { .. }
         | PlanExpr::OverTime { .. }
         | PlanExpr::AbsentOverTime { .. } => Ok(()),
@@ -2241,6 +2305,62 @@ fn windowed_range_source(
     Ok(source_view)
 }
 
+/// Issue #154: evaluates the root-only [`PlanExpr::RangeVector`] — the
+/// top-level matrix selector of an instant query. One `(eff_t − range,
+/// eff_t]` window slice per fetched series with stale markers dropped
+/// (upstream `matrixIterSlice` skips stale NaNs), series with no
+/// in-window samples omitted (upstream appends only `totalSize > 0`
+/// series, engine.go:2864-2868), `__name__` KEPT (a raw selection, no
+/// `drop_name`), output sorted `(labels, metric_name)`. A no-match or
+/// all-empty selection is `Matrix(vec![])`. Single pass over the fetched
+/// samples — no per-step loop, no extra allocation beyond the output.
+fn eval_range_vector_root(
+    source: &RangeSource,
+    selectors: &[SelectorSpec],
+    data: &EvalData<'_>,
+    t_ms: i64,
+) -> Result<QueryValue, PromqlError> {
+    let RangeSource::Selector(id) = source else {
+        // `plan()` only ever lifts a bare MATRIX selector into this
+        // root; a subquery root keeps its nested rejection (defense in
+        // depth, never reachable through `plan()`).
+        return Err(PromqlError::Unsupported {
+            construct: "subquery as a top-level range-vector query".to_string(),
+        });
+    };
+    let sel = &selectors[*id];
+    let eff_t = sel.at_ms.unwrap_or(t_ms) - sel.offset_ms;
+    let range_ms = sel
+        .range_ms
+        .expect("plan() only ever builds a range source over a matrix selector");
+    let lower_excl = eff_t - range_ms;
+    let mut out: Vec<RangeSeries> = Vec::new();
+    for series in data.get(*id) {
+        let samples = windowed_non_stale(&series.samples, lower_excl, eff_t);
+        if samples.is_empty() {
+            continue;
+        }
+        out.push(RangeSeries {
+            labels: series.labels.clone(),
+            metric_name: series
+                .metric_name
+                .clone()
+                .or_else(|| sel.metric_name.clone()),
+            drop_name: false,
+            points: samples
+                .into_iter()
+                .map(|s| Point {
+                    t_ms: s.t_ms,
+                    v: s.v,
+                    h: s.h,
+                })
+                .collect(),
+        });
+    }
+    out.sort_by(|a, b| (&a.labels, &a.metric_name).cmp(&(&b.labels, &b.metric_name)));
+    Ok(QueryValue::Matrix(out))
+}
+
 /// Slices `samples` (sorted ascending) to the left-open right-closed
 /// window `(lower_excl, upper_incl]` and drops any stale-NaN-marked
 /// sample — the shared windowing step for both range functions and
@@ -2545,6 +2665,14 @@ fn eval_step(
         // literal's value verbatim; the wire timestamp is stamped by the
         // response encoder (the `Scalar`/`at_ms` precedent).
         PlanExpr::StringLiteral(s) => Ok(StepValue::String(s.clone())),
+
+        // Issue #154: root-only, handled by `evaluate_counted_with`'s
+        // matrix short-circuit BEFORE any stepping — a `StepValue` has
+        // no matrix shape, so reaching here is a plan-invariant breach
+        // (defense in depth, never reachable through `plan()`).
+        PlanExpr::RangeVector { .. } => Err(PromqlError::Unsupported {
+            construct: "range vector outside an instant-query root".to_string(),
+        }),
 
         // Issue #37: a bare selector returns the **verbatim value of an
         // existing series** — Prometheus keeps `__name__` here (captured:
@@ -2980,6 +3108,17 @@ fn eval_step(
         // encoder preserves this order on the wire for sort-rooted
         // instant queries (`expr_is_sort_root`).
         PlanExpr::Sort { descending, arg } => {
+            // Issue #154: `SortInRangeQueryWarning` (engine.go:2165-2168
+            // at the pin) — emitted for a sort call under a range-shaped
+            // horizon, BEFORE argument evaluation (upstream adds to
+            // `warnings` before `rangeEval` runs); the per-step repeat
+            // dedups on the message text.
+            if caches.range_query.get() {
+                caches
+                    .annotations
+                    .borrow_mut()
+                    .warning(crate::annotations::messages::sort_in_range_query_warning());
+            }
             let StepValue::Vector(mut v) =
                 eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -3003,6 +3142,14 @@ fn eval_step(
             labels: names,
             arg,
         } => {
+            // Issue #154: same `SortInRangeQueryWarning` gate as `Sort`
+            // above (engine.go:2166 names all four sort functions).
+            if caches.range_query.get() {
+                caches
+                    .annotations
+                    .borrow_mut()
+                    .warning(crate::annotations::messages::sort_in_range_query_warning());
+            }
             let StepValue::Vector(mut v) =
                 eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -4260,6 +4407,186 @@ mod tests {
             }
             other => panic!("expected Vector, got {other:?}"),
         }
+    }
+
+    // --- issue #154: the instant matrix-selector root (PlanExpr::RangeVector) ---
+
+    /// `foo[5m]` as a whole instant query returns the raw windowed
+    /// samples as a matrix — `(eff_t − range, eff_t]` left-open (the
+    /// t=0 sample is excluded at at=300s with a 5m range), `__name__`
+    /// kept, sorted output.
+    #[test]
+    fn bare_matrix_selector_instant_root_returns_the_windowed_matrix() {
+        let expr = crate::parser::parse("foo[5m]").unwrap();
+        let p = plan(&expr, params(300_000, 300_000, 0)).unwrap();
+        assert!(matches!(p.root, PlanExpr::RangeVector { .. }));
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("env", "b")], vec![s(0, 1.0), s(60_000, 2.0)]),
+                series(2, &[("env", "a")], vec![s(120_000, 3.0)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 2);
+                // Sorted `(labels, metric_name)`: env=a before env=b.
+                assert_eq!(m[0].labels.get("env"), Some("a"));
+                assert_eq!(m[0].metric_name.as_deref(), Some("foo"));
+                assert!(!m[0].drop_name);
+                assert_eq!(
+                    m[0].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(120_000, 3.0)]
+                );
+                assert_eq!(
+                    m[1].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(60_000, 2.0)],
+                    "t=0 falls on the left-open bound and is excluded"
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// Stale markers are dropped from the window (the pin's
+    /// `matrixIterSlice` skips stale NaNs), and a series whose window is
+    /// empty after filtering is omitted (upstream appends only
+    /// `totalSize > 0` series).
+    #[test]
+    fn bare_matrix_selector_root_drops_stale_markers_and_empty_series() {
+        let expr = crate::parser::parse("foo[5m]").unwrap();
+        let p = plan(&expr, params(300_000, 300_000, 0)).unwrap();
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("env", "a")], vec![s(60_000, 1.0), s(120_000, stale)]),
+                series(2, &[("env", "b")], vec![s(60_000, stale)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "the all-stale series is omitted");
+                assert_eq!(
+                    m[0].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(60_000, 1.0)]
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// `offset` shifts the window; a no-match selection yields
+    /// `Matrix(vec![])`.
+    #[test]
+    fn bare_matrix_selector_root_applies_offset_and_yields_empty_matrix_on_no_match() {
+        let expr = crate::parser::parse("foo[1m] offset 1m").unwrap();
+        let p = plan(&expr, params(120_000, 120_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("env", "a")],
+                vec![s(30_000, 1.0), s(60_000, 2.0), s(90_000, 3.0)],
+            )],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                // eff_t = 120s − 60s = 60s; window (0s, 60s].
+                assert_eq!(
+                    m[0].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(30_000, 1.0), (60_000, 2.0)]
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+        let empty = SeriesData::new();
+        match evaluate(&p, &empty).unwrap() {
+            QueryValue::Matrix(m) => assert!(m.is_empty(), "no match ⇒ empty matrix"),
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// The carve-out is ROOT-only and INSTANT-only: a range-shaped query
+    /// over a bare matrix selector keeps the type error (the NESTED
+    /// rejection is pinned in `plan::tests::
+    /// a_bare_matrix_selector_outside_a_range_function_is_unsupported` —
+    /// the vendored parser's own type checker rejects every parseable
+    /// nested form, so that test hand-constructs the AST).
+    #[test]
+    fn range_shaped_matrix_selector_root_stays_rejected() {
+        let root = crate::parser::parse("foo[5m]").unwrap();
+        let err = plan(&root, params(0, 600_000, 60_000)).unwrap_err();
+        assert!(
+            err.to_string().contains("range vector used outside"),
+            "range-shaped params keep the type error, got {err}"
+        );
+    }
+
+    /// Issue #154: the `SortInRangeQueryWarning` port (engine.go:
+    /// 2165-2168) — a range-shaped horizon over `sort()` emits exactly
+    /// ONE warning (per-step emission dedups on the message text); an
+    /// instant horizon emits none.
+    #[test]
+    fn sort_in_a_range_query_warns_once_and_an_instant_sort_does_not() {
+        let expr = crate::parser::parse("sort(up)").unwrap();
+        let mut data = SeriesData::new();
+        data.insert(0, vec![series(1, &[("job", "a")], vec![s(0, 1.0)])]);
+
+        let p = plan(&expr, params(0, 120_000, 60_000)).unwrap();
+        let (_v, annotations) = super::evaluate(&p, &data).unwrap();
+        let (warnings, infos) = annotations.base_messages();
+        assert_eq!(
+            warnings,
+            vec![crate::annotations::messages::sort_in_range_query_warning()],
+            "one deduped warning for the whole range query"
+        );
+        assert!(infos.is_empty());
+
+        let p = plan(&expr, params(60_000, 60_000, 0)).unwrap();
+        let (_v, annotations) = super::evaluate(&p, &data).unwrap();
+        assert!(
+            annotations.is_empty(),
+            "an instant sort must not warn: {annotations:?}"
+        );
+    }
+
+    /// Issue #154 (code-review round 1): the gate is PER-EVALUATOR, not
+    /// per-top-level-query — a `sort()` nested in a subquery of an
+    /// INSTANT query evaluates under the subquery's child horizon
+    /// (`subqStart != subqEnd`, runSubquery engine.go:1963-1965) and
+    /// warns, exactly like the pin.
+    #[test]
+    fn sort_inside_a_subquery_of_an_instant_query_warns_per_evaluator() {
+        let expr = crate::parser::parse("max_over_time(sort(up)[2m:1m])").unwrap();
+        let p = plan(&expr, params(120_000, 120_000, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(1, &[("job", "a")], vec![s(0, 1.0), s(60_000, 2.0)])],
+        );
+        let (_v, annotations) = super::evaluate(&p, &data).unwrap();
+        let (warnings, _infos) = annotations.base_messages();
+        assert_eq!(
+            warnings,
+            vec![crate::annotations::messages::sort_in_range_query_warning()],
+            "the subquery child horizon is range-shaped even though the top query is instant"
+        );
     }
 
     // --- M7-A5a AC4: selection eval surface carries the histogram channel ---
@@ -7344,7 +7671,9 @@ mod tests {
             "timestamp(m{job=\"a\"})",
             "scalar(m{job=\"a\"})",
             "vector(5)",
-            "sort(m{job=\"a\"})",
+            // `sort(...)`/`sort_by_label(...)` left this list in issue
+            // #154: `SortInRangeQueryWarning` made their own shape
+            // CAPABLE.
             "label_replace(m{job=\"a\"}, \"x\", \"$1\", \"job\", \"(.*)\")",
             "label_join(m{job=\"a\"}, \"x\", \"-\", \"job\")",
             "histogram_count(m{job=\"a\"})",

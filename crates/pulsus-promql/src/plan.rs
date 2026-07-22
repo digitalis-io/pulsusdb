@@ -585,6 +585,18 @@ pub enum PlanExpr {
     /// An instant-vector selector — [`crate::eval::staleness`] resolves
     /// one sample per series per step from the selector's fetched samples.
     Selector(SelectorId),
+    /// Issue #154 (owner-approved): the top-level matrix selector of an
+    /// INSTANT query (`foo[5m]`) — the raw windowed samples as a matrix,
+    /// Prometheus's instant-API behaviour (upstream `matrixSelector`,
+    /// engine.go:2805-2872 at the pin). ROOT-ONLY: built exclusively by
+    /// [`plan`]'s pre-`plan_expr` lift (the `Expr::StringLiteral` carve-
+    /// out pattern), never by [`plan_expr`], whose nested rejection
+    /// stands; range-shaped params keep the type error. The fetch is the
+    /// identical [`SelectorSpec`] pushdown as `rate()`'s range source —
+    /// no new SQL shape, no extra round trip.
+    RangeVector {
+        source: RangeSource,
+    },
     RangeFn {
         func: RangeFn,
         /// Issue #83: a bare matrix selector or a subquery.
@@ -1033,6 +1045,49 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 params,
             });
         }
+        // Issue #154 (owner-approved): a TOP-LEVEL matrix selector of an
+        // INSTANT query is valid — the raw windowed samples as a matrix
+        // (Prometheus's instant API returns `resultType:"matrix"` for
+        // `foo[5m]`). Same root-only lift pattern as the string literal
+        // above: parens stripped, `plan_expr`'s nested rejection
+        // retained, and a range-shaped query falls through to that same
+        // type error (upstream rejects a range query over a range
+        // vector at query construction).
+        if matches!(stripped, Expr::MatrixSelector(_)) && params.step_ms == 0 {
+            let mut planner = Planner {
+                selectors: Vec::new(),
+                experimental: params.experimental_functions,
+                start_ms: params.start_ms,
+                end_ms: params.end_ms,
+                step_ms: params.step_ms,
+                ctx: SubqueryCtx::default(),
+                subquery_depth: 0,
+            };
+            // Through the shared range-source planner — the identical
+            // SelectorSpec fetch/pushdown as `rate()`'s argument.
+            //
+            // KNOWN DIVERGENCE, tracked in issue #166: an extended
+            // (anchored/smoothed) BARE root rejects loudly here via the
+            // #150 allow-list name below, while the pinned oracle
+            // EVALUATES it — `matrixSelector` widens the fetch by
+            // lookback and runs `extendFloats` boundary interpolation
+            // (engine.go:2818-2872, 4842-4877 at 40af9c2), erroring per
+            // series on histogram points (:2848-2858). No pinned corpus
+            // row exercises the bare shape (extended_vectors.test is
+            // entirely function-wrapped), so the loud rejection stands
+            // until #166 ports `extendFloats` with its own derived
+            // tests.
+            let source =
+                plan_range_source(&mut planner, "a top-level range-vector query", stripped)?;
+            let mut selectors = planner.selectors;
+            let root = PlanExpr::RangeVector { source };
+            detect_histogram_stats(&root, &mut selectors);
+            return Ok(QueryPlan {
+                root,
+                selectors,
+                params,
+            });
+        }
     }
 
     let mut planner = Planner {
@@ -1094,7 +1149,12 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
                     spec.histogram_stats = in_accessor && !in_stop;
                 }
             }
-            PlanExpr::RangeFn { source, .. }
+            // Issue #154: `RangeVector` (root-only) walks like the other
+            // range-source shapes — `in_accessor` is necessarily false
+            // at the root, so its selector keeps full histograms
+            // (upstream `matrixSelector` never stats-decodes).
+            PlanExpr::RangeVector { source }
+            | PlanExpr::RangeFn { source, .. }
             | PlanExpr::OverTime { source, .. }
             | PlanExpr::AbsentOverTime { source } => {
                 mark_source(source, in_accessor, in_stop, selectors);
@@ -1599,11 +1659,19 @@ fn plan_matrix_selector_id(
 /// Plans a range-vector function's argument (issue #83): a bare matrix
 /// selector (the M2 shape) or a subquery — anything else stays a named
 /// rejection. Shared by all four range-source variants' call sites.
+/// Issue #154: parens around the argument are stripped first — the pin
+/// runs `unwrapParenExpr` on every Call argument during preprocessing
+/// (`engine.go:4544-4550` at 40af9c2), so `rate((m[5m]))` is exactly
+/// `rate(m[5m])` (pinned by `operators.test:131`).
 fn plan_range_source(
     planner: &mut Planner,
     name: &str,
     arg: &Expr,
 ) -> Result<RangeSource, PromqlError> {
+    let mut arg = arg;
+    while let Expr::Paren(p) = arg {
+        arg = &p.expr;
+    }
     match arg {
         Expr::MatrixSelector(ms) => {
             let id = plan_matrix_selector_id(planner, ms)?;
@@ -2921,6 +2989,10 @@ impl<'a> StepInvariance<'a> {
             // Upstream NumberLiteral/StringLiteral: constant, never
             // wrapped.
             PlanExpr::Scalar(_) | PlanExpr::StringLiteral(_) => (true, false),
+            // Issue #154: root-only, instant-only — the instant path
+            // short-circuits before any step-invariance pass, so this
+            // node is never classified in practice; never wrapped.
+            PlanExpr::RangeVector { .. } => (false, false),
             // Upstream VectorSelector: `n.Timestamp != nil` twice over.
             PlanExpr::Selector(id) => {
                 let inv = self.selectors[*id].at_ms.is_some();
@@ -3574,12 +3646,47 @@ mod tests {
         // arm is defense-in-depth, never reachable through a query this
         // crate's own `parse()` can produce. Exercised directly here by
         // hand-constructing the AST node, bypassing `parse()`.
-        let expr = parser::Expr::MatrixSelector(parser::MatrixSelector {
-            vs: parser::VectorSelector::from("foo"),
-            range: std::time::Duration::from_secs(60),
-            range_expr: None,
+        //
+        // Issue #154 (owner-approved): the ROOT + INSTANT shape is now
+        // the `PlanExpr::RangeVector` carve-out (`foo[5m]` as a whole
+        // instant query returns a matrix) — the rejections that remain
+        // are the NESTED position (any `plan_expr` path) and a
+        // range-shaped query over a matrix-selector root.
+        let matrix = || {
+            parser::Expr::MatrixSelector(parser::MatrixSelector {
+                vs: parser::VectorSelector::from("foo"),
+                range: std::time::Duration::from_secs(60),
+                range_expr: None,
+            })
+        };
+        let p = plan(&matrix(), params()).unwrap();
+        assert!(
+            matches!(
+                p.root,
+                PlanExpr::RangeVector {
+                    source: RangeSource::Selector(0)
+                }
+            ),
+            "root + instant plans the #154 carve-out, got {:?}",
+            p.root
+        );
+        assert_eq!(p.selectors[0].range_ms, Some(60_000));
+
+        // NESTED (via the unary-minus desugar, the one hand-buildable
+        // wrapper that routes straight through `plan_expr`).
+        let nested = parser::Expr::Unary(parser::UnaryExpr {
+            expr: Box::new(matrix()),
         });
-        let err = plan(&expr, params()).unwrap_err();
+        let err = plan(&nested, params()).unwrap_err();
+        assert!(matches!(err, PromqlError::Unsupported { .. }));
+
+        // Range-shaped params keep the type error at the root too.
+        let range_params = PlanParams {
+            step_ms: 60_000,
+            end_ms: 1_600_000,
+            ..params()
+        };
+        let err = plan(&matrix(), range_params).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
     }
 

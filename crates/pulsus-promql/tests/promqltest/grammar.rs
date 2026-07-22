@@ -23,18 +23,33 @@
 //!   the pinned SHA): each line binds duration offsets to the
 //!   immediately-following sample line with the same metric and value
 //!   count (`ST = T + offset` per non-omitted position)
+//! - `load_with_nhcb <step>` (issue #154 — upstream `patLoad`,
+//!   test.go:52): a `load` block that ALSO appends NHCB-converted
+//!   twins of its classic `_bucket`/`_count`/`_sum` series (see
+//!   [`super::nhcb`])
+//! - block-form `expect ordered [msg:<s>|regex:<p>]` (issue #154 —
+//!   upstream `patExpect`, test.go:55): the ordered flag in block form;
+//!   the optional tail parses (an invalid `regex:` pattern is a parse
+//!   error, upstream `parseExpect` → `regexp.Compile`) and is then
+//!   DISCARDED — upstream stores it in `expectedCmds[Ordered]` which
+//!   nothing ever reads (`isOrdered`, test.go:1068-1070)
+//! - `expect range vector from <dur> to <dur> step <dur>` (issue #154 —
+//!   upstream `parseExpectRangeVector`, test.go:571-595,723-737):
+//!   permits a range-vector (matrix) result for an INSTANT eval; the
+//!   expected sample grid is `from + k*step` and the eval time is
+//!   OVERRIDDEN to `to` (`cmd.eval = *end`, test.go:733). In a RANGE
+//!   block the directive REPLACES the block's own from/to/step (the
+//!   same `cmd.start/end/step` writes; `cmd.eval` is unread there);
+//!   repeats overwrite (last wins) and combinations are unrestricted,
+//!   exactly like the oracle's un-gated prefix branch
 //!
-//! Everything else in the upstream grammar (`eval_warn`/`eval_info`, the
-//! block `expect ordered` form and `expect range vector`,
-//! `load_with_nhcb`) is a **deferred
-//! directive**: [`scan_deferred_directives`] detects them before grammar
-//! parsing, and the corpus test requires any file using one to be listed
-//! — loudly, wholesale — in `corpus/skip-manifest.json` with an
-//! activation issue (plan v2 Δ2's skip-manifest contract). A directive
-//! recognised by *neither* the executed subset nor the deferred scan is a
-//! hard parse error, never a silent skip. (The pre-existing `eval_ordered`
-//! PREFIX directive stays executable; only the block `expect ordered`
-//! form is deferred — issue #86 plan v2 Δ3.)
+//! Everything else in the upstream grammar (`eval_warn`/`eval_info`) is a
+//! **deferred directive**: [`scan_deferred_directives`] detects them
+//! before grammar parsing, and the corpus test requires any file using
+//! one to be listed — loudly, wholesale — in `corpus/skip-manifest.json`
+//! with an activation issue (plan v2 Δ2's skip-manifest contract). A
+//! directive recognised by *neither* the executed subset nor the deferred
+//! scan is a hard parse error, never a silent skip.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -137,6 +152,18 @@ pub enum EvalKind {
     },
 }
 
+/// An `expect range vector from <A> to <B> step <C>` directive (issue
+/// #154 — upstream `parseExpectRangeVector`, test.go:571-595): the
+/// expected matrix grid for an instant eval whose query returns a range
+/// vector. The parser also OVERRIDES the block's eval time to `to_ms`
+/// (upstream `cmd.eval = *end`, test.go:733).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeVectorExpectation {
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub step_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub enum Expected {
     /// Instant-vector result lines (possibly empty = expects an empty
@@ -203,6 +230,18 @@ pub struct EvalCmd {
     /// `true` when the block used bare `expect no_info`. Mutually
     /// exclusive with `expect_info`.
     pub expect_no_info: bool,
+    /// `true` when the block used the block-form `expect ordered`
+    /// directive (issue #154) — upgrades a `Pass` mode to
+    /// [`EvalMode::Ordered`] (upstream `isOrdered`: prefix flag OR
+    /// non-empty `expectedCmds[Ordered]`, test.go:1068-1070); counted
+    /// separately from the `eval_ordered` prefix.
+    pub expect_ordered: bool,
+    /// The `expect range vector …` directive (issue #154): on an instant
+    /// block, `Some` flips the expectation to [`Expected::Matrix`] on
+    /// this grid and the eval time to `to_ms`; on a range block it
+    /// REPLACES the block's own from/to/step (upstream's un-gated
+    /// `cmd.start/end/step` writes, test.go:730-733).
+    pub expect_range_vector: Option<RangeVectorExpectation>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,49 +250,41 @@ pub enum Command {
     Load {
         step_ms: i64,
         series: Vec<LoadSeries>,
+        /// `true` for `load_with_nhcb` (issue #154): the store ALSO
+        /// appends the NHCB-converted twins of the block's classic
+        /// `_bucket`/`_count`/`_sum` series (upstream
+        /// `appendCustomHistogram`, test.go:917-1029).
+        with_nhcb: bool,
     },
     Eval(EvalCmd),
 }
 
 /// The deferred-directive inventory (plan v2 Δ2): each variant names one
 /// upstream directive family the executed subset does not run, with a
-/// committed activation home in `corpus/skip-manifest.json`.
+/// committed activation home in `corpus/skip-manifest.json`. Issue #154
+/// dropped `ExpectLine` (block `expect ordered` + `expect range vector`)
+/// and `LoadWithNhcb` — both are executable now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeferredDirective {
-    /// The still-deferred block-`expect` forms: `expect ordered` (no
-    /// activatable file uses it — every carrier is also blocked by another
-    /// directive; plan v2 Δ3) and `expect range vector`. `expect fail`/
-    /// `expect string` (issue #86) and `expect warn|no_warn|info|no_info`
-    /// (issue #124, M7-A6) are EXECUTABLE and never route here.
-    ExpectLine,
     /// `eval_warn …` (annotation assertion).
     EvalWarn,
     /// `eval_info …` (annotation assertion).
     EvalInfo,
-    /// `load_with_nhcb …` (native-histogram-compatible bucket conversion).
-    LoadWithNhcb,
 }
 
 impl DeferredDirective {
     /// The stable name used in `corpus/skip-manifest.json`.
     pub fn name(self) -> &'static str {
         match self {
-            DeferredDirective::ExpectLine => "expect",
             DeferredDirective::EvalWarn => "eval_warn",
             DeferredDirective::EvalInfo => "eval_info",
-            DeferredDirective::LoadWithNhcb => "load_with_nhcb",
         }
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
-        [
-            DeferredDirective::ExpectLine,
-            DeferredDirective::EvalWarn,
-            DeferredDirective::EvalInfo,
-            DeferredDirective::LoadWithNhcb,
-        ]
-        .into_iter()
-        .find(|d| d.name() == name)
+        [DeferredDirective::EvalWarn, DeferredDirective::EvalInfo]
+            .into_iter()
+            .find(|d| d.name() == name)
     }
 }
 
@@ -284,26 +315,11 @@ pub fn scan_deferred_directives(text: &str) -> BTreeSet<DeferredDirective> {
             continue;
         }
         let first_word = line.split_ascii_whitespace().next().unwrap_or("");
-        if first_word == "expect" {
-            // `expect` is deferred IFF its second token is `ordered` or
-            // `range` (`expect range vector`); `expect fail`/`expect
-            // string` (issue #86) and `expect warn|no_warn|info|no_info`
-            // (issue #124, M7-A6) are part of the executed subset. Any
-            // OTHER second token is left for the grammar parser, which
-            // hard-errors on it (loud, never skipped).
-            let second = line.split_ascii_whitespace().nth(1).unwrap_or("");
-            if matches!(second, "ordered" | "range") {
-                out.insert(DeferredDirective::ExpectLine);
-            }
-        }
         if first_word == "eval_warn" {
             out.insert(DeferredDirective::EvalWarn);
         }
         if first_word == "eval_info" {
             out.insert(DeferredDirective::EvalInfo);
-        }
-        if first_word == "load_with_nhcb" {
-            out.insert(DeferredDirective::LoadWithNhcb);
         }
     }
     out
@@ -334,8 +350,8 @@ pub fn parse_file(file: &str, text: &str) -> Result<Vec<Command>, String> {
                 commands.push(Command::Clear);
                 i += 1;
             }
-            "load" => {
-                let (cmd, next) = parse_load(file, &lines, i)?;
+            "load" | "load_with_nhcb" => {
+                let (cmd, next) = parse_load(file, &lines, i, first_word)?;
                 commands.push(cmd);
                 i = next;
             }
@@ -364,13 +380,27 @@ pub fn parse_file(file: &str, text: &str) -> Result<Vec<Command>, String> {
     Ok(commands)
 }
 
-fn parse_load(file: &str, lines: &[String], start: usize) -> Result<(Command, usize), String> {
+fn parse_load(
+    file: &str,
+    lines: &[String],
+    start: usize,
+    directive: &str,
+) -> Result<(Command, usize), String> {
     let header = &lines[start];
+    // `directive` is `load` or `load_with_nhcb` (upstream `patLoad`,
+    // test.go:52 — the only two forms the regex admits).
+    let with_nhcb = directive == "load_with_nhcb";
     let step = header
-        .strip_prefix("load")
+        .strip_prefix(directive)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| err_at(file, start, "invalid load command (load <step:duration>)"))?;
+        .ok_or_else(|| {
+            err_at(
+                file,
+                start,
+                format!("invalid load command ({directive} <step:duration>)"),
+            )
+        })?;
     let step_ms = parse_duration_ms(step).map_err(|e| err_at(file, start, e))?;
 
     let mut series = Vec::new();
@@ -439,7 +469,14 @@ fn parse_load(file: &str, lines: &[String], start: usize) -> Result<(Command, us
             "@st line has no following sample line",
         ));
     }
-    Ok((Command::Load { step_ms, series }, i))
+    Ok((
+        Command::Load {
+            step_ms,
+            series,
+            with_nhcb,
+        },
+        i,
+    ))
 }
 
 /// Upstream `isSTLine` (test.go:345-354): the line's FIRST
@@ -714,6 +751,7 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
     // Result lines until the next blank line.
     let mut i = start + 1;
     let mut mode = mode;
+    let mut kind = kind;
     // The PREFIX directive's own fail mode (`eval_fail`) — kept separate
     // from a block-`expect fail` upgrade so `expected_fail_message`/
     // `expected_fail_regexp` lines stay legal ONLY under `eval_fail`
@@ -727,6 +765,8 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
     let mut expect_no_warn = false;
     let mut expect_info: Vec<AnnotationMatch> = Vec::new();
     let mut expect_no_info = false;
+    let mut expect_ordered = false;
+    let mut expect_range_vector: Option<RangeVectorExpectation> = None;
     let mut result_series: Vec<ExpectedSeries> = Vec::new();
     let mut scalar: Option<f64> = None;
 
@@ -751,41 +791,74 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
         }
 
         // Block-form `expect` directives (issue #86; issue #124 M7-A6 adds
-        // the annotation forms). Like upstream, only a line whose FIRST
+        // the annotation forms; issue #154 adds `expect ordered` and
+        // `expect range vector`). Like upstream, only a line whose FIRST
         // whitespace-delimited token is literally `expect` routes here —
         // a metric named `expect` is still writable as `expect{}`.
+        //
+        // Issue #154 (code-review round 2): the oracle's per-line loop is
+        // UNCONDITIONAL on position (test.go:723-762 — the expect
+        // branches `continue` regardless of earlier series lines), so an
+        // `expect` directive after SERIES result lines parses; the #86
+        // ordering gate that rejected it is gone. The one positional
+        // error the oracle DOES produce is after a SCALAR line:
+        // `parseNumber` BREAKs the block loop (test.go:764-767), so any
+        // following line falls out to the outer command parser and fails
+        // ("invalid command") — mirrored here as a loud block-level
+        // error.
         if line.split_ascii_whitespace().next() == Some("expect") {
-            if scalar.is_some() || !result_series.is_empty() {
+            if scalar.is_some() {
                 return Err(err_at(
                     file,
                     i,
-                    "an `expect` directive cannot follow result lines in one eval block",
+                    "no line may follow a scalar result line (upstream's parseNumber ends the \
+                     eval block there)",
                 ));
             }
-            parse_expect_line(
-                file,
-                i,
-                line,
-                &kind,
-                &mut expect_fail,
-                &mut fail_message,
-                &mut fail_regexp,
-                &mut expect_string,
-                &mut expect_warn,
-                &mut expect_no_warn,
-                &mut expect_info,
-                &mut expect_no_info,
-            )?;
+            // `expect range vector …` routes BEFORE the generic `expect`
+            // split, exactly like upstream's `rangeVectorPrefix`
+            // HasPrefix check (test.go:723). Oracle-faithful (the code-
+            // review round-1 fix, the `expect ordered` Δ1 treatment
+            // extended here): upstream's branch is NOT instant-gated, a
+            // REPEAT simply overwrites `cmd.start/end/step/eval` (last
+            // one wins), and no combination with fail/string is
+            // restricted (`validateExpectedCmds` never mentions it) —
+            // at exec time `isFail()`/`expectedString` win exactly like
+            // they do upstream, because the expectation SHAPE is decided
+            // after the loop below. The only parse-time errors are the
+            // oracle's own: a malformed definition and `to < from`
+            // (`parseExpectRangeVector`/`parseDurations`).
+            if line.starts_with("expect range vector") {
+                expect_range_vector =
+                    Some(parse_expect_range_vector(line).map_err(|e| err_at(file, i, e))?);
+            } else {
+                parse_expect_line(
+                    file,
+                    i,
+                    line,
+                    &kind,
+                    &mut expect_fail,
+                    &mut fail_message,
+                    &mut fail_regexp,
+                    &mut expect_string,
+                    &mut expect_warn,
+                    &mut expect_no_warn,
+                    &mut expect_info,
+                    &mut expect_no_info,
+                    &mut expect_ordered,
+                )?;
+            }
             i += 1;
             continue;
         }
-        if expect_fail || expect_string.is_some() {
-            return Err(err_at(
-                file,
-                i,
-                "result lines cannot follow an `expect fail`/`expect string` directive",
-            ));
-        }
+        // Issue #154 (code-review round 2): result lines AFTER an
+        // `expect fail`/`expect string` directive also parse — the
+        // oracle's loop consumes them into `cmd.expected` where the
+        // fail/string expectation shape simply never reads them (isFail/
+        // expectedString win in `compareResult`); the #86 reverse gate
+        // here was the same non-oracle ordering tightening. The
+        // expectation-shape precedence after the loop (Fail > String >
+        // Scalar > Vector/Matrix) reproduces that unread-ness exactly.
 
         // A bare number = scalar expectation (upstream tries parseNumber
         // first).
@@ -809,12 +882,19 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
         if values.contains(&SeqValue::Stale) {
             return Err(err_at(file, i, "'stale' is not valid in a result line"));
         }
-        if matches!(kind, EvalKind::Instant { .. }) && values.len() != 1 {
+        // Issue #154: `expect range vector` permits a multi-value
+        // (matrix) expectation for an instant eval — upstream's exact
+        // gate and message (test.go:773-776).
+        if matches!(kind, EvalKind::Instant { .. })
+            && values.len() != 1
+            && expect_range_vector.is_none()
+        {
             return Err(err_at(
                 file,
                 i,
-                "multiple values in an instant expectation are not allowed (upstream requires \
-                 the deferred 'expect range vector' directive for that)",
+                "expecting multiple values in instant evaluation not allowed. consider using \
+                 'expect range vector' directive to enable a range vector result for an \
+                 instant query",
             ));
         }
         result_series.push(ExpectedSeries { labels, values });
@@ -823,6 +903,30 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
 
     if expect_fail {
         mode = EvalMode::Fail;
+    }
+    // Issue #154 (plan v2 Δ1): the block `expect ordered` upgrades a
+    // plain block to Ordered exactly like the prefix (upstream
+    // `isOrdered` ORs the two flags); a Fail block stays Fail —
+    // upstream's error branch runs before any ordered comparison.
+    if expect_ordered && mode == EvalMode::Pass {
+        mode = EvalMode::Ordered;
+    }
+    // Issue #154: `expect range vector` overrides the block's grid —
+    // upstream sets `cmd.start/end/step` from the directive and the eval
+    // time to `to` (`cmd.eval = *end`, test.go:730-733) regardless of
+    // block form: an INSTANT block becomes an instant eval AT `to`
+    // (compared on the directive grid); a RANGE block's from/to/step are
+    // simply REPLACED by the directive's (`cmd.eval` is unread for a
+    // range eval).
+    if let Some(rv) = &expect_range_vector {
+        kind = match kind {
+            EvalKind::Instant { .. } => EvalKind::Instant { at_ms: rv.to_ms },
+            EvalKind::Range { .. } => EvalKind::Range {
+                from_ms: rv.from_ms,
+                to_ms: rv.to_ms,
+                step_ms: rv.step_ms,
+            },
+        };
     }
     let used_expect_string = expect_string.is_some();
     let expected = if mode == EvalMode::Fail {
@@ -836,6 +940,12 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
         Expected::Scalar(v)
     } else {
         match kind {
+            // Issue #154: under `expect range vector`, an instant
+            // block's result lines are a MATRIX expectation on the
+            // directive's grid (empty lines ⇒ an empty matrix).
+            EvalKind::Instant { .. } if expect_range_vector.is_some() => {
+                Expected::Matrix(result_series)
+            }
             EvalKind::Instant { .. } => Expected::Vector(result_series),
             EvalKind::Range { .. } => Expected::Matrix(result_series),
         }
@@ -855,19 +965,58 @@ fn parse_eval(file: &str, lines: &[String], start: usize) -> Result<(EvalCmd, us
             expect_no_warn,
             expect_info,
             expect_no_info,
+            expect_ordered,
+            expect_range_vector,
         },
         i,
     ))
 }
 
+/// Parses the tail of one `expect range vector from <dur> to <dur> step
+/// <dur>` line (issue #154 — upstream `parseExpectRangeVector` +
+/// `parseDurations`, test.go:571-620). The only errors are the oracle's
+/// own: a malformed definition, an invalid duration, and `to < from`.
+/// A zero step parses (upstream's unsigned `model.ParseDuration` admits
+/// bare `0` and never re-checks it) — the expected-grid generation is a
+/// bounded walk over the RESULT values either way, exactly like the
+/// oracle's `for i, e := range exp.vals`.
+fn parse_expect_range_vector(line: &str) -> Result<RangeVectorExpectation, String> {
+    let tail = line
+        .strip_prefix("expect range vector")
+        .expect("caller matched the prefix");
+    let toks: Vec<&str> = tail.split_ascii_whitespace().collect();
+    if toks.len() != 6 || toks[0] != "from" || toks[2] != "to" || toks[4] != "step" {
+        return Err(format!("invalid range vector definition {line:?}"));
+    }
+    let from_ms = parse_duration_ms(toks[1])
+        .map_err(|e| format!("invalid start timestamp definition {:?}: {e}", toks[1]))?;
+    let to_ms = parse_duration_ms(toks[3])
+        .map_err(|e| format!("invalid end timestamp definition {:?}: {e}", toks[3]))?;
+    if to_ms < from_ms {
+        return Err(format!(
+            "invalid test definition, end timestamp ({}) is before start timestamp ({})",
+            toks[3], toks[1]
+        ));
+    }
+    let step_ms = parse_duration_ms(toks[5])
+        .map_err(|e| format!("invalid step definition {:?}: {e}", toks[5]))?;
+    Ok(RangeVectorExpectation {
+        from_ms,
+        to_ms,
+        step_ms,
+    })
+}
+
 /// Parses one block-form `expect …` line (issue #86). Executable forms:
 /// `expect fail [msg:<s>|regex:<p>]` (upstream `patExpect`, test.go:55 —
-/// the optional tail must be `msg:`/`regex:`-tagged) and
-/// `expect string <quoted>` (upstream `parseAsStringLiteral`). The
-/// deferred forms (`ordered`/`warn`/`no_warn`/`info`/`no_info`/`range
-/// vector`) are routed to the skip-manifest by
-/// [`scan_deferred_directives`] before this parser runs — reaching here
-/// is a hard error (defense in depth), as is any unrecognised form.
+/// the optional tail must be `msg:`/`regex:`-tagged),
+/// `expect string <quoted>` (upstream `parseAsStringLiteral`),
+/// `expect warn|no_warn|info|no_info [msg:|regex:]` (issue #124), and
+/// `expect ordered [msg:|regex:]` (issue #154 — the tail parses like
+/// every other `patExpect` member and is then DISCARDED; only the flag
+/// matters, upstream `isOrdered`). `expect range vector` is routed by
+/// the caller before this parser runs. Any unrecognised form is a hard
+/// error.
 #[allow(clippy::too_many_arguments)]
 fn parse_expect_line(
     file: &str,
@@ -882,6 +1031,7 @@ fn parse_expect_line(
     expect_no_warn: &mut bool,
     expect_info: &mut Vec<AnnotationMatch>,
     expect_no_info: &mut bool,
+    expect_ordered: &mut bool,
 ) -> Result<(), String> {
     if line == "expect string" {
         return Err(err_at(
@@ -996,21 +1146,40 @@ fn parse_expect_line(
             *expect_no_info = true;
             Ok(())
         }
-        Some(deferred @ ("ordered" | "range")) => Err(err_at(
-            file,
-            line_no,
-            format!(
-                "deferred `expect {deferred}` directive reached the executed-grammar \
-                 parser — scan_deferred_directives must route this file to the \
-                 skip-manifest first"
-            ),
-        )),
+        // Issue #154 (plan v2 Δ1): oracle-faithful `expect ordered` — the
+        // optional `msg:`/`regex:` tail PARSES exactly like every other
+        // `patExpect` member (an invalid `regex:` pattern is a parse
+        // error, upstream `parseExpect` → `regexp.Compile`,
+        // test.go:543-547) and is then DISCARDED: upstream stores an
+        // `expectCmd` in `expectedCmds[Ordered]` that nothing ever reads
+        // — only `len(...) > 0` matters (`isOrdered`, test.go:1068-1070).
+        // Repeats and combinations parse freely (`validateExpectedCmds`,
+        // test.go:558-568, never restricts `ordered`); range blocks parse
+        // too — enforcement happens at COMPARE time (a matrix result
+        // fails the case with the oracle's exact message, runner.rs).
+        Some("ordered") => {
+            match parse_optional_tag(line, "ordered").map_err(|e| err_at(file, line_no, e))? {
+                AnnotationMatch::Any | AnnotationMatch::Message(_) => {}
+                AnnotationMatch::Regex(pattern) => {
+                    regex::Regex::new(&pattern).map_err(|_| {
+                        err_at(
+                            file,
+                            line_no,
+                            format!("invalid regex {pattern} for ordered"),
+                        )
+                    })?;
+                }
+            }
+            *expect_ordered = true;
+            Ok(())
+        }
         other => Err(err_at(
             file,
             line_no,
             format!(
                 "invalid expect statement {other:?} — executable forms are `expect fail`, \
-                 `expect string`, and `expect warn|no_warn|info|no_info`"
+                 `expect string`, `expect ordered`, `expect range vector`, and \
+                 `expect warn|no_warn|info|no_info`"
             ),
         )),
     }
@@ -1391,5 +1560,266 @@ mod tests {
     fn st_line_with_a_malformed_metric_part_fails_loudly() {
         let err = parse_err("load 1m\n\tm{a=\"b\"canary@st -1m\n\tm 1\n");
         assert!(err.contains("invalid @st line metric"), "got {err:?}");
+    }
+
+    // -- issue #154: `load_with_nhcb`, block `expect ordered`, and
+    //    `expect range vector` grammar --
+
+    use super::{EvalKind, EvalMode, Expected};
+
+    #[test]
+    fn load_with_nhcb_parses_as_a_load_with_the_flag_set() {
+        let cmds = parse_file("t.test", "load_with_nhcb 5m\n\tm_bucket{le=\"1\"} 1 2\n").unwrap();
+        let Command::Load {
+            step_ms,
+            series,
+            with_nhcb,
+        } = &cmds[0]
+        else {
+            panic!("expected a load command");
+        };
+        assert_eq!(*step_ms, 300_000);
+        assert_eq!(series.len(), 1);
+        assert!(*with_nhcb);
+        // The plain form still parses with the flag unset.
+        let cmds = parse_file("t.test", "load 5m\n\tm 1\n").unwrap();
+        let Command::Load { with_nhcb, .. } = &cmds[0] else {
+            panic!("expected a load command");
+        };
+        assert!(!*with_nhcb);
+    }
+
+    /// The block `expect ordered` upgrades a plain instant block to the
+    /// ordered mode; a fail block stays fail (upstream checks `isFail`
+    /// before any ordered comparison).
+    #[test]
+    fn expect_ordered_upgrades_pass_mode_and_never_downgrades_fail() {
+        let cmds = parse_file("t.test", "eval instant at 0 m\n\texpect ordered\n\tm 1\n").unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert!(cmd.expect_ordered);
+        assert_eq!(cmd.mode, EvalMode::Ordered);
+
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 0 m\n\texpect ordered\n\texpect fail\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert!(cmd.expect_ordered);
+        assert_eq!(cmd.mode, EvalMode::Fail, "fail wins over the ordered flag");
+    }
+
+    /// `expect range vector from A to B step C` flips the expectation to
+    /// a matrix on the directive's grid and OVERRIDES the eval time to
+    /// `to` (upstream `cmd.eval = *end`, test.go:733) — multi-value
+    /// instant result lines become legal under it.
+    #[test]
+    fn expect_range_vector_parses_overrides_the_eval_time_and_permits_multi_values() {
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 0 m[1m]\n\texpect range vector from 10s to 1m step 10s\n\tm 1 2 3 4 5 6\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        let rv = cmd.expect_range_vector.expect("directive parsed");
+        assert_eq!((rv.from_ms, rv.to_ms, rv.step_ms), (10_000, 60_000, 10_000));
+        assert_eq!(
+            cmd.kind,
+            EvalKind::Instant { at_ms: 60_000 },
+            "eval time overridden to `to`"
+        );
+        assert!(matches!(&cmd.expected, Expected::Matrix(series) if series.len() == 1));
+        // Empty result lines ⇒ an empty matrix expectation.
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 1m m[1m]\n\texpect range vector from 10s to 1m step 10s\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert!(matches!(&cmd.expected, Expected::Matrix(series) if series.is_empty()));
+    }
+
+    /// Without the directive, a multi-value instant expectation keeps
+    /// upstream's exact error text (test.go:773-776).
+    #[test]
+    fn multi_value_instant_expectation_without_the_directive_keeps_the_oracle_error() {
+        let err = parse_err("eval instant at 1m m[1m]\n\tm 1 2 3\n");
+        assert!(
+            err.contains(
+                "expecting multiple values in instant evaluation not allowed. consider using \
+                 'expect range vector' directive"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The only `expect range vector` parse errors are the ORACLE's own
+    /// (`parseExpectRangeVector`/`parseDurations`, test.go:571-620): a
+    /// malformed definition and `to < from`. Everything else the oracle
+    /// parses, parses here (code-review round 1 — the `expect ordered`
+    /// Δ1 treatment extended to this directive).
+    #[test]
+    fn expect_range_vector_keeps_only_the_oracle_parse_errors() {
+        let backwards =
+            parse_err("eval instant at 1m m[1m]\n\texpect range vector from 1m to 10s step 10s\n");
+        assert!(
+            backwards.contains("end timestamp (10s) is before start timestamp (1m)"),
+            "got {backwards:?}"
+        );
+        let malformed = parse_err("eval instant at 1m m[1m]\n\texpect range vector 10s 1m 10s\n");
+        assert!(
+            malformed.contains("invalid range vector definition"),
+            "got {malformed:?}"
+        );
+        // A zero step PARSES (upstream never re-checks the unsigned
+        // duration) — the expected-grid walk is bounded by the result
+        // values either way.
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 1m m[1m]\n\texpect range vector from 10s to 1m step 0\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert_eq!(cmd.expect_range_vector.unwrap().step_ms, 0);
+    }
+
+    /// Oracle-faithful non-rejections (test.go:723-737 is un-gated): a
+    /// RANGE block's grid is REPLACED by the directive, a repeat
+    /// overwrites (last wins), and fail/string combinations parse — the
+    /// expectation SHAPE is decided after the loop, so `expect fail`
+    /// wins at judge time exactly like upstream's `isFail()`.
+    #[test]
+    fn expect_range_vector_parses_everything_the_oracle_parses() {
+        // Range block: from/to/step replaced (cmd.start/end/step writes).
+        let cmds = parse_file(
+            "t.test",
+            "eval range from 0 to 5m step 5m m\n\texpect range vector from 1m to 2m step 1m\n\tm 1 2\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert_eq!(
+            cmd.kind,
+            EvalKind::Range {
+                from_ms: 60_000,
+                to_ms: 120_000,
+                step_ms: 60_000
+            },
+            "the directive replaces the range block's own grid"
+        );
+        assert!(matches!(&cmd.expected, Expected::Matrix(series) if series.len() == 1));
+
+        // Repeat: last one wins (upstream overwrites cmd.start/end/step).
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 2m m[1m]\n\texpect range vector from 0 to 1m step 10s\n\
+             \texpect range vector from 1m to 2m step 30s\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        let rv = cmd.expect_range_vector.unwrap();
+        assert_eq!(
+            (rv.from_ms, rv.to_ms, rv.step_ms),
+            (60_000, 120_000, 30_000)
+        );
+        assert_eq!(cmd.kind, EvalKind::Instant { at_ms: 120_000 });
+
+        // Combination with `expect fail`: parses; the fail mode wins the
+        // expectation shape (upstream's error branch runs first).
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 1m m[1m]\n\texpect fail\n\
+             \texpect range vector from 0 to 1m step 10s\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert_eq!(cmd.mode, EvalMode::Fail);
+        assert!(matches!(&cmd.expected, Expected::Fail { .. }));
+        assert!(cmd.expect_range_vector.is_some());
+    }
+
+    /// Issue #154 (code-review round 2): the oracle's per-line loop is
+    /// position-unconditional (test.go:723-762) — `expect` directives
+    /// parse AFTER series result lines, and result lines parse after
+    /// `expect fail`/`expect string` (they land in the oracle's
+    /// `cmd.expected`, which the fail/string shapes never read). The one
+    /// positional error the oracle keeps is after a SCALAR line
+    /// (`parseNumber` BREAKs the block, test.go:764-767).
+    #[test]
+    fn expect_directives_and_result_lines_are_position_unconditional_like_the_oracle() {
+        // `expect ordered` after a series line.
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 0 sort(m)\n\tm{env=\"a\"} 1\n\texpect ordered\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert!(cmd.expect_ordered);
+        assert_eq!(cmd.mode, EvalMode::Ordered);
+        assert!(matches!(&cmd.expected, Expected::Vector(series) if series.len() == 1));
+
+        // `expect range vector` after a (single-value) series line: the
+        // directive still flips the expectation to the matrix grid.
+        let cmds = parse_file(
+            "t.test",
+            "eval instant at 2m m[2m]\n\tm 3\n\texpect range vector from 2m to 2m step 1m\n",
+        )
+        .unwrap();
+        let Command::Eval(cmd) = &cmds[0] else {
+            panic!("expected an eval");
+        };
+        assert!(matches!(&cmd.expected, Expected::Matrix(series) if series.len() == 1));
+
+        // ...but a MULTI-value series line BEFORE the directive keeps the
+        // oracle's error — test.go:774 consults `expectRangeVector` at
+        // series-line time, so the directive must precede such lines.
+        let err = parse_err(
+            "eval instant at 1m m[1m]\n\tm 1 2\n\
+             \texpect range vector from 10s to 1m step 10s\n",
+        );
+        assert!(
+            err.contains("expecting multiple values in instant evaluation not allowed"),
+            "got {err:?}"
+        );
+
+        // `expect fail` after a series line (fail wins the shape), and a
+        // series line after `expect fail` (parsed, never read) — both
+        // orders parse.
+        for text in [
+            "eval instant at 0 m\n\tm 1\n\texpect fail\n",
+            "eval instant at 0 m\n\texpect fail\n\tm 1\n",
+        ] {
+            let cmds = parse_file("t.test", text).unwrap();
+            let Command::Eval(cmd) = &cmds[0] else {
+                panic!("expected an eval");
+            };
+            assert_eq!(cmd.mode, EvalMode::Fail);
+            assert!(matches!(&cmd.expected, Expected::Fail { .. }));
+        }
+
+        // After a SCALAR line the oracle's block is OVER (parseNumber
+        // breaks; a following line is an outer-parser error) — loud here.
+        let err = parse_err("eval instant at 0 vector(1)\n\t1\n\texpect ordered\n");
+        assert!(
+            err.contains("no line may follow a scalar result line"),
+            "got {err:?}"
+        );
     }
 }

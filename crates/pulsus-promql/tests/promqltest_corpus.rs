@@ -42,6 +42,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_08e_step_invariant.test",
     "m6_08f_subquery_step_invariant.test",
     "m6_08g_sparse_subquery_union.test",
+    "m7_a7_ordered_rangevector_nhcb.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {
@@ -115,6 +116,9 @@ fn proof_corpus_is_fully_green_and_exercises_every_executed_directive() {
         totals.expect_fail += run.counts.expect_fail;
         totals.expect_fail_tagged += run.counts.expect_fail_tagged;
         totals.expect_string += run.counts.expect_string;
+        totals.expect_ordered += run.counts.expect_ordered;
+        totals.expect_range_vector += run.counts.expect_range_vector;
+        totals.load_with_nhcb += run.counts.load_with_nhcb;
     }
 
     assert!(
@@ -165,6 +169,79 @@ fn proof_corpus_is_fully_green_and_exercises_every_executed_directive() {
         totals.expect_string > 0,
         "proof corpus never exercised `expect string`"
     );
+    assert!(
+        totals.expect_ordered > 0,
+        "proof corpus never exercised the block `expect ordered` directive (issue #154)"
+    );
+    assert!(
+        totals.expect_range_vector > 0,
+        "proof corpus never exercised `expect range vector` (issue #154)"
+    );
+    assert!(
+        totals.load_with_nhcb > 0,
+        "proof corpus never exercised `load_with_nhcb` (issue #154)"
+    );
+}
+
+/// Issue #154 (plan v2 Δ1): `expect ordered` in a RANGE block PARSES —
+/// upstream's expect branch is not instant-gated — and the enforcement
+/// happens at COMPARE time: the case (not the file) fails with the
+/// oracle's exact wording (`compareResult`, test.go:1252-1254).
+#[test]
+fn expect_ordered_in_a_range_block_fails_the_case_with_the_pinned_message() {
+    let text = "load 1m\n\tm 1 2 3\n\n\
+                eval range from 0 to 2m step 1m m\n\texpect ordered\n\tm 1 2 3\n";
+    let run = run_file("inline/ordered_range.test", text)
+        .expect("a range block with `expect ordered` must parse (oracle-faithful, plan v2 Δ1)");
+    assert_eq!(run.cases.len(), 1);
+    let case = &run.cases[0];
+    assert!(
+        !case.passed,
+        "a matrix result under ordered must fail the case"
+    );
+    assert_eq!(
+        case.detail, "expected ordered result, but query returned a matrix",
+        "the failure must carry the oracle's exact wording"
+    );
+}
+
+/// Issue #154 (code-review round 1): `expect range vector` in a RANGE
+/// block PARSES — upstream's prefix branch (test.go:723-737) is not
+/// instant-gated; it REPLACES the block's own from/to/step, so the case
+/// executes and compares on the DIRECTIVE grid end-to-end.
+#[test]
+fn expect_range_vector_in_a_range_block_replaces_the_grid_and_executes() {
+    let text = "load 1m\n\tm 0 1 2 3\n\n\
+                eval range from 0 to 3m step 3m m\n\
+                \texpect range vector from 1m to 2m step 1m\n\tm 1 2\n";
+    let run = run_file("inline/range_vector_range_block.test", text)
+        .expect("a range block with `expect range vector` must parse (oracle-faithful)");
+    assert_eq!(run.cases.len(), 1);
+    assert!(
+        run.cases[0].passed,
+        "the directive grid (1m..2m step 1m) governs both the eval and the compare: {}",
+        run.cases[0].detail
+    );
+    assert_eq!(run.counts.expect_range_vector, 1);
+}
+
+/// Issue #154 (plan v2 Δ1): the `msg:`/`regex:` tails of `expect ordered`
+/// parse and are DISCARDED (upstream stores an `expectCmd` nothing
+/// reads); an INVALID `regex:` pattern is the oracle's own parse error
+/// (`parseExpect` → `regexp.Compile`, test.go:543-547).
+#[test]
+fn expect_ordered_tails_parse_and_run_and_an_invalid_regex_is_a_parse_error() {
+    let text = "load 1m\n\tm{env=\"a\"} 1\n\n\
+                eval instant at 0 sort(m)\n\texpect ordered msg:ignored tail\n\tm{env=\"a\"} 1\n";
+    let run = run_file("inline/ordered_msg.test", text)
+        .expect("`expect ordered msg:…` must parse and execute");
+    assert!(run.cases[0].passed, "got: {}", run.cases[0].detail);
+    assert_eq!(run.counts.expect_ordered, 1);
+
+    let bad = "eval instant at 0 vector(1)\n\texpect ordered regex:(\n\t{} 1\n";
+    let err = run_file("inline/ordered_bad_regex.test", bad)
+        .expect_err("an invalid regex tail must be a parse error, like the oracle's");
+    assert!(err.contains("invalid regex"), "got {err:?}");
 }
 
 /// AC5 (issue #86): a non-UTF-8 `expect string` literal now EXECUTES

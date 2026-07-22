@@ -1,0 +1,90 @@
+# Issue #154 (M7-A7): witnesses for the three newly-executable
+# directives — block `expect ordered` (incl. the parsed-and-discarded
+# msg:/regex: tail), `expect range vector` (incl. a `_` gap and the
+# eval-time override to `to`), and `load_with_nhcb` (incl. skipped
+# unparseable/NaN `le` series proven via the converted histogram's exact
+# custom_values, and bucket-only count inference).
+
+load 1m
+	m{env="a"} 1 2 3 4 5 6
+	m{env="b"} 10 20 30 40 50 60
+
+# --- expect ordered: the block form upgrades to the ordered comparison ---
+
+eval instant at 5m sort(m)
+	expect ordered
+	m{env="a"} 6
+	m{env="b"} 60
+
+eval instant at 5m sort_desc(m)
+	expect ordered
+	m{env="b"} 60
+	m{env="a"} 6
+
+# The msg:/regex: tails parse and are DISCARDED (upstream stores them in
+# expectedCmds[Ordered], which nothing reads — test.go:1068-1070).
+eval instant at 5m topk(2, m)
+	expect ordered msg:this tail is parsed and discarded
+	m{env="b"} 60
+	m{env="a"} 6
+
+eval instant at 5m bottomk(2, m)
+	expect ordered regex:also (parsed|discarded)
+	m{env="a"} 6
+	m{env="b"} 60
+
+clear
+
+# --- expect range vector: a matrix result for an INSTANT eval ---
+
+load 1m
+	g{env="a"} 1 _ 3
+	g{env="b"} 2 4 6
+
+eval instant at 2m g[2m]
+	expect range vector from 1m to 2m step 1m
+	g{env="a"} _ 3
+	g{env="b"} 4 6
+
+# The directive OVERRIDES the eval time to `to` (upstream cmd.eval =
+# *end, test.go:733): without the override this eval at 0 would window
+# (-2m, 0] and see only the t=0 samples.
+eval instant at 0 g[2m]
+	expect range vector from 1m to 2m step 1m
+	g{env="a"} _ 3
+	g{env="b"} 4 6
+
+# An empty expectation asserts an empty matrix.
+eval instant at 2m absent_metric[2m]
+	expect range vector from 1m to 2m step 1m
+
+clear
+
+# --- load_with_nhcb: classic series as-is PLUS converted NHCB twins ---
+# The `le="garbage"` (unparseable) and `le="NaN"` series are SKIPPED by
+# the conversion (test.go:982-984); the exact custom_values assertion
+# below proves neither contributed a bucket. No h_count series: the
+# count is inferred from the highest bucket (+Inf) — convertnhcb.go's
+# count-from-last-bucket rule.
+
+load_with_nhcb 1m
+	h_bucket{le="0.1"} 0+1x3
+	h_bucket{le="2e-1"} 0+2x3
+	h_bucket{le="+Inf"} 0+3x3
+	h_bucket{le="garbage"} 0+9x3
+	h_bucket{le="NaN"} 0+9x3
+	h_sum 0+1.5x3
+
+eval instant at 3m h
+	h {{schema:-53 count:9 sum:4.5 buckets:[3 3 3] custom_values:[0.1 0.2]}}
+
+# The classic series are still appended as-is.
+eval instant at 3m h_bucket{le="+Inf"}
+	h_bucket{le="+Inf"} 9
+
+eval instant at 3m h_sum
+	h_sum 4.5
+
+# The converted twin rides the ordinary engine surface too.
+eval instant at 3m histogram_count(h)
+	{} 9

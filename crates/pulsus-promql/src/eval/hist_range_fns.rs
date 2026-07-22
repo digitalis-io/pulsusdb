@@ -897,11 +897,11 @@ fn eval_drop_set_over_time(
 /// 1600`): the same DROP-set disposition as [`eval_drop_set_over_time`]
 /// (silent on a histogram-only window, `HistogramIgnoredInMixedRangeInfo`
 /// on a mixed one), applied on top of the existing (pre-A5b, unchanged)
-/// float `quantile_over_time` — an out-of-range φ's
-/// `NewInvalidQuantileWarning` is a separate, pre-existing gap in that
-/// path (never wired for `quantile_over_time`, only for
-/// `histogram_quantile`'s φ per plan v2 OQ1(c)) and out of this item's
-/// scope to add.
+/// float `quantile_over_time`. Issue #154 closes the formerly-documented
+/// gap: an out-of-range/NaN φ adds `NewInvalidQuantileWarning`
+/// (functions.go:1589-1591 — AFTER the empty-float-window early return,
+/// so a valueless window never warns; pinned by
+/// `functions.test:1392,1399`).
 pub fn eval_quantile_over_time_hist(
     phi: f64,
     samples: &[Sample],
@@ -911,6 +911,11 @@ pub fn eval_quantile_over_time_hist(
     let floats: Vec<Sample> = samples.iter().filter(|s| s.h.is_none()).cloned().collect();
     if floats.is_empty() {
         return None;
+    }
+    // NaN is outside the range too (`contains` is false for NaN) — the
+    // pin's `IsNaN(q) || q < 0 || q > 1` collapses into one check.
+    if !(0.0..=1.0).contains(&phi) {
+        annos.warning(messages::invalid_quantile_warning(phi));
     }
     let hist_present = floats.len() != samples.len();
     let result = super::functions::eval_over_time_param(

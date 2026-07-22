@@ -588,6 +588,19 @@ pub mod messages {
         )
     }
 
+    /// **Warning** (issue #154). Upstream `SortInRangeQueryWarning`
+    /// (`util/annotations/annotations.go:159` at the pin), emitted once
+    /// per `sort`/`sort_desc`/`sort_by_label`/`sort_by_label_desc` call
+    /// node evaluated by a range-shaped evaluator (`engine.go:2165-2168`:
+    /// `ev.startTimestamp != ev.endTimestamp`). Position-independent
+    /// text, so the per-step emission in the evaluator dedups to one
+    /// entry via [`super::Annotations`]' message-keyed insert.
+    pub fn sort_in_range_query_warning() -> String {
+        "PromQL warning: sort is ineffective for range queries since results are always \
+         ordered by labels"
+            .to_string()
+    }
+
     /// **Warning** (issue #130). Upstream `NewInvalidRatioWarning`
     /// (`annotations.go:234` at the pin, over `InvalidRatioWarning`,
     /// `:150`): `limit_ratio`'s parameter fell outside `[-1, 1]` and was

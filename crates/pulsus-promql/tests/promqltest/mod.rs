@@ -21,6 +21,7 @@
 pub mod fetch;
 pub mod grammar;
 pub mod histogram_literal;
+pub mod nhcb;
 pub mod runner;
 pub mod series;
 pub mod store;

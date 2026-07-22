@@ -55,13 +55,31 @@ impl TestStorage {
         self.series.clear();
     }
 
-    /// Applies one `load <step>` block: sample `k` of a series lands at
-    /// `t = k * step_ms`. A series whose labels already exist gets its new
-    /// samples appended (then re-sorted), matching upstream's
-    /// append-to-storage behaviour across multiple `load` blocks. After
-    /// every merge+sort the storage READ-BACK hints are recomputed over
-    /// the whole series ([`readback_hints`], issue #125).
-    pub fn load(&mut self, step_ms: i64, series: &[LoadSeries]) -> Result<(), String> {
+    /// Applies one `load <step>`/`load_with_nhcb <step>` block: sample
+    /// `k` of a series lands at `t = k * step_ms`. A series whose labels
+    /// already exist gets its new samples appended (then re-sorted),
+    /// matching upstream's append-to-storage behaviour across multiple
+    /// `load` blocks. After every merge+sort the storage READ-BACK hints
+    /// are recomputed over the whole series ([`readback_hints`], issue
+    /// #125). With `with_nhcb` set (issue #154), the block's classic
+    /// series are appended as-is FIRST, then the [`super::nhcb`]
+    /// conversion's output series are appended through the SAME
+    /// merge+readback path (classic first, converted second — the
+    /// oracle's `append` then `appendCustomHistogram` order,
+    /// test.go:917-931); the readback recompute over the merged result
+    /// gives the converted histograms the same #125 hint parity as any
+    /// loaded counter series.
+    pub fn load(
+        &mut self,
+        step_ms: i64,
+        series: &[LoadSeries],
+        with_nhcb: bool,
+    ) -> Result<(), String> {
+        // The block's built classic series, retained for the NHCB
+        // conversion (cloned only under `with_nhcb`; the conversion
+        // needs the whole block after the per-series appends consumed
+        // the originals).
+        let mut classic: Vec<(BTreeMap<String, String>, Vec<Sample>)> = Vec::new();
         for s in series {
             let mut samples = Vec::new();
             let mut sts: Vec<i64> = Vec::new();
@@ -105,36 +123,60 @@ impl TestStorage {
                     }
                 }
             }
-            let has_st = s.st.is_some();
-            match self.series.iter_mut().find(|st| st.labels == s.labels) {
-                Some(existing) => {
-                    // Pair-sort `(sample, st)` by timestamp so the aligned
-                    // channel survives a multi-`load` merge (issue #155);
-                    // a side without `@st` already materialized zeros.
-                    let mut pairs: Vec<(Sample, i64)> = existing
-                        .samples
-                        .drain(..)
-                        .zip(existing.st.drain(..))
-                        .chain(samples.into_iter().zip(sts))
-                        .collect();
-                    pairs.sort_by_key(|(s, _)| s.t_ms);
-                    (existing.samples, existing.st) = pairs.into_iter().unzip();
-                    existing.readback = readback_hints(&existing.samples);
-                    existing.has_st |= has_st;
-                }
-                None => {
-                    let readback = readback_hints(&samples);
-                    self.series.push(StoredSeries {
-                        labels: s.labels.clone(),
-                        samples,
-                        readback,
-                        st: sts,
-                        has_st,
-                    });
-                }
+            if with_nhcb {
+                classic.push((s.labels.clone(), samples.clone()));
+            }
+            self.append_series(&s.labels, samples, sts, s.st.is_some());
+        }
+        if with_nhcb {
+            for (labels, samples) in super::nhcb::convert_block(&classic)? {
+                // Converted series never carry the `@st` channel
+                // (upstream appends them with `sampleST{Sample: s}` —
+                // ST = 0 = unset, test.go:1023).
+                let sts = vec![0; samples.len()];
+                self.append_series(&labels, samples, sts, false);
             }
         }
         Ok(())
+    }
+
+    /// Merges one built series into the store: pair-sorted `(sample,
+    /// st)` append with a whole-series readback-hint recompute — the
+    /// single append path shared by classic and NHCB-converted series.
+    fn append_series(
+        &mut self,
+        labels: &BTreeMap<String, String>,
+        samples: Vec<Sample>,
+        sts: Vec<i64>,
+        has_st: bool,
+    ) {
+        match self.series.iter_mut().find(|st| st.labels == *labels) {
+            Some(existing) => {
+                // Pair-sort `(sample, st)` by timestamp so the aligned
+                // channel survives a multi-`load` merge (issue #155);
+                // a side without `@st` already materialized zeros.
+                let mut pairs: Vec<(Sample, i64)> = existing
+                    .samples
+                    .drain(..)
+                    .zip(existing.st.drain(..))
+                    .chain(samples.into_iter().zip(sts))
+                    .collect();
+                pairs.sort_by_key(|(s, _)| s.t_ms);
+                (existing.samples, existing.st) = pairs.into_iter().unzip();
+                existing.readback = readback_hints(&existing.samples);
+                existing.has_st |= has_st;
+            }
+            None => {
+                let readback = readback_hints(&samples);
+                self.series.push(StoredSeries {
+                    labels: labels.clone(),
+                    samples,
+                    readback,
+                    st: sts,
+                    has_st,
+                });
+            }
+        }
     }
 
     /// Resolves and windows every selector of `plan` — the driver's stand-in
@@ -516,6 +558,7 @@ mod tests {
                     values: vec![SeqValue::Value(1.0), SeqValue::Value(2.0)],
                     st: None,
                 }],
+                false,
             )
             .unwrap();
         let plan = rate_plan(300_000);
@@ -547,6 +590,7 @@ mod tests {
                     ],
                     st: Some(vec![None, Some(-30_000), Some(0), Some(-1)]),
                 }],
+                false,
             )
             .unwrap();
         let plan = rate_plan(300_000);
@@ -578,6 +622,7 @@ mod tests {
                     ],
                     st: Some(vec![None, Some(-30_000), Some(-1_000)]),
                 }],
+                false,
             )
             .unwrap();
         // `rate(m[10m])` at 1_000_000: the fetch window `(at - range -

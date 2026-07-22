@@ -239,7 +239,7 @@
       "name": "end",
       "experimental": true,
       "status": "scheduled",
-      "issue": "M6-08"
+      "issue": "#157"
     },
     {
       "name": "exp",
@@ -551,7 +551,7 @@
       "name": "range",
       "experimental": true,
       "status": "scheduled",
-      "issue": "M6-08"
+      "issue": "#157"
     },
     {
       "name": "rate",
@@ -665,7 +665,7 @@
       "name": "start",
       "experimental": true,
       "status": "scheduled",
-      "issue": "M6-08"
+      "issue": "#157"
     },
     {
       "name": "stddev_over_time",
@@ -689,7 +689,7 @@
       "name": "step",
       "experimental": true,
       "status": "scheduled",
-      "issue": "M6-08"
+      "issue": "#157"
     },
     {
       "name": "sum_over_time",

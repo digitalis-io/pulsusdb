@@ -225,6 +225,13 @@ pub struct DirectiveCounts {
     pub expect_fail_tagged: usize,
     /// `expect string` directives (issue #86).
     pub expect_string: usize,
+    /// Block-form `expect ordered` directives (issue #154) — counted
+    /// apart from the `eval_ordered` prefix form.
+    pub expect_ordered: usize,
+    /// `expect range vector` directives (issue #154).
+    pub expect_range_vector: usize,
+    /// `load_with_nhcb` blocks (issue #154) — also counted in `load`.
+    pub load_with_nhcb: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -248,10 +255,17 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                 counts.clear += 1;
                 storage.clear();
             }
-            Command::Load { step_ms, series } => {
+            Command::Load {
+                step_ms,
+                series,
+                with_nhcb,
+            } => {
                 counts.load += 1;
+                if *with_nhcb {
+                    counts.load_with_nhcb += 1;
+                }
                 storage
-                    .load(*step_ms, series)
+                    .load(*step_ms, series, *with_nhcb)
                     .map_err(|e| format!("{file}: load failed: {e}"))?;
             }
             Command::Eval(cmd) => {
@@ -265,7 +279,11 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                     EvalKind::Range { .. } => counts.eval_range += 1,
                 }
                 match cmd.mode {
-                    EvalMode::Ordered => counts.eval_ordered += 1,
+                    // The block `expect ordered` upgrade (issue #154) is
+                    // counted on its own channel below; only the PREFIX
+                    // form counts here.
+                    EvalMode::Ordered if !cmd.expect_ordered => counts.eval_ordered += 1,
+                    EvalMode::Ordered => {}
                     EvalMode::Fail if cmd.expect_fail => {
                         counts.expect_fail += 1;
                         if let Expected::Fail { message, regexp } = &cmd.expected
@@ -289,6 +307,12 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                 }
                 if cmd.expect_string {
                     counts.expect_string += 1;
+                }
+                if cmd.expect_ordered {
+                    counts.expect_ordered += 1;
+                }
+                if cmd.expect_range_vector.is_some() {
+                    counts.expect_range_vector += 1;
                 }
                 cases.push(run_eval(&storage, cmd)?);
             }
@@ -439,6 +463,20 @@ fn judge_value(
     expected: &Expected,
     value: QueryValue,
 ) -> Result<(bool, String), String> {
+    // Issue #154 (plan v2 Δ1): the oracle's Matrix arm checks the
+    // ordered flag FIRST, before any shape/value comparison
+    // (`compareResult`, test.go:1252-1254) — a matrix result under an
+    // ordered expectation (range block with block `expect ordered`, or
+    // an instant `expect range vector` + ordered combination) fails the
+    // CASE with the oracle's exact wording.
+    if matches!(value, QueryValue::Matrix(_))
+        && (cmd.mode == EvalMode::Ordered || cmd.expect_ordered)
+    {
+        return Ok((
+            false,
+            "expected ordered result, but query returned a matrix".to_string(),
+        ));
+    }
     match (expected, value) {
         (Expected::Fail { .. }, _) => {
             unreachable!("judge() handles Expected::Fail before calling judge_value")
@@ -512,11 +550,23 @@ fn judge_value(
             }
         }
         (Expected::Matrix(expected), QueryValue::Matrix(actual)) => {
-            let EvalKind::Range {
-                from_ms, step_ms, ..
-            } = cmd.kind
-            else {
-                return Err("matrix expectation on a non-range eval".to_string());
+            // Issue #154: the expected grid comes from the range block's
+            // own from/step OR from the `expect range vector` directive
+            // of an instant block (upstream generates the expected
+            // timestamps from `cmd.start + i*cmd.step` either way,
+            // test.go:1281-1297).
+            let (from_ms, step_ms) = match cmd.kind {
+                EvalKind::Range {
+                    from_ms, step_ms, ..
+                } => (from_ms, step_ms),
+                EvalKind::Instant { .. } => {
+                    let rv = cmd.expect_range_vector.ok_or_else(|| {
+                        "matrix expectation on an instant eval without \
+                         'expect range vector'"
+                            .to_string()
+                    })?;
+                    (rv.from_ms, rv.step_ms)
+                }
             };
             Ok(compare_matrix(expected, &actual, from_ms, step_ms))
         }

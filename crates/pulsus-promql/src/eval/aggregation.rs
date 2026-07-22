@@ -172,6 +172,20 @@ struct Acc {
     /// `KahanAdd`, mirroring the pin's `nil`; every scalar AND bucket
     /// carries its own Neumaier remainder, `float_histogram_kahan.rs`).
     hist_kahan_c: Option<FloatHistogram>,
+    /// Issue #154: `avg`'s FLOAT channel — the pin's `floatValue`/
+    /// `floatMean`/`floatKahanC`/`floatIncrementalMean`
+    /// (engine.go:3783-3800 at 40af9c2, finalized :3893-3897): direct
+    /// mean (running Kahan sum seeded with the FIRST member's raw value,
+    /// group init :3604) as long as the running sum stays finite; on
+    /// overflow, switch to the incremental-mean recurrence for the rest
+    /// of the group (`aggregators.test:651-657`'s ±`big` cases — the old
+    /// shared `KahanSum` direct mean returned ±Inf there). `Sum` keeps
+    /// the pre-existing `kahan` field (a zero-seeded sum is the pin's
+    /// own SUM shape).
+    avg_sum: f64,
+    avg_mean: f64,
+    avg_kahan_c: f64,
+    avg_incremental_mean: bool,
     /// Issue #125: upstream's `counterResetSeen`/`notCounterResetSeen`
     /// (`groupedAggregation`, `engine.go:3577-3578`) — tracked over INPUT
     /// sample hints (group init `:3619-3621`, SUM fold `:3681-3683`, AVG
@@ -202,6 +216,10 @@ impl Acc {
             hist_mean: None,
             hist_incremental_mean: false,
             hist_kahan_c: None,
+            avg_sum: 0.0,
+            avg_mean: 0.0,
+            avg_kahan_c: 0.0,
+            avg_incremental_mean: false,
             counter_reset_seen: false,
             not_counter_reset_seen: false,
         }
@@ -424,12 +442,47 @@ fn aggregate_reduce(
                     fold_histogram_into_avg(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
                 }
             }
-            (AggOp::Sum | AggOp::Avg, None) => {
+            (AggOp::Sum, None) => {
                 acc.has_float = true;
-                if op == AggOp::Avg {
-                    acc.count += 1.0;
-                }
                 acc.kahan.add(s.v);
+            }
+            // Issue #154: the pin's AVG float step (engine.go:3783-3800
+            // at 40af9c2). Group init seeds `floatValue` with the first
+            // member's RAW value (:3604, no compensation); later members
+            // fold via `kahansum.Inc` while the running sum stays finite;
+            // the first overflow switches this group to the
+            // incremental-mean recurrence (`q = (n-1)/n`), which then
+            // absorbs the current member too (upstream falls through
+            // after the switch — no skip).
+            (AggOp::Avg, None) => {
+                acc.has_float = true;
+                acc.count += 1.0;
+                if is_first {
+                    acc.avg_sum = s.v;
+                } else {
+                    if !acc.avg_incremental_mean {
+                        let (new_sum, new_c) =
+                            crate::math::kahan_inc(s.v, acc.avg_sum, acc.avg_kahan_c);
+                        if !new_sum.is_infinite() {
+                            acc.avg_sum = new_sum;
+                            acc.avg_kahan_c = new_c;
+                        } else {
+                            acc.avg_incremental_mean = true;
+                            acc.avg_mean = acc.avg_sum / (acc.count - 1.0);
+                            acc.avg_kahan_c /= acc.count - 1.0;
+                        }
+                    }
+                    if acc.avg_incremental_mean {
+                        let q = (acc.count - 1.0) / acc.count;
+                        let (mean, c) = crate::math::kahan_inc(
+                            s.v / acc.count,
+                            q * acc.avg_mean,
+                            q * acc.avg_kahan_c,
+                        );
+                        acc.avg_mean = mean;
+                        acc.avg_kahan_c = c;
+                    }
+                }
             }
             (AggOp::Min | AggOp::Max, Some(_)) => {
                 annos.info(messages::histogram_ignored_in_aggregation_info(
@@ -539,7 +592,14 @@ fn aggregate_reduce(
                     result.compact();
                     (0.0, Some(Box::new(result)))
                 }
-                AggOp::Avg => (acc.kahan.value() / acc.count, None),
+                // Issue #154: the pin's AVG float readout (engine.go:
+                // 3893-3897): incremental → `floatMean + floatKahanC`;
+                // direct → sum and compensation divided SEPARATELY
+                // (`floatValue/groupCount + floatKahanC/groupCount`,
+                // never `(sum+c)/n` — the sum alone may sit at the edge
+                // of the float range).
+                AggOp::Avg if acc.avg_incremental_mean => (acc.avg_mean + acc.avg_kahan_c, None),
+                AggOp::Avg => (acc.avg_sum / acc.count + acc.avg_kahan_c / acc.count, None),
                 AggOp::Min => (acc.min, None),
                 AggOp::Max => (acc.max, None),
                 AggOp::Count => (acc.count, None),
@@ -592,8 +652,28 @@ fn aggregate_topk(
     let k = param.ok_or_else(|| PromqlError::BadMatching {
         detail: "topk/bottomk require a k parameter".to_string(),
     })?;
-    if !k.is_finite() || k < 1.0 {
+    // Issue #154: the pin's parameter gauntlet IN ORDER
+    // (engine.go:1632-1645 at 40af9c2): `params.Max() < 1` returns empty
+    // FIRST (Go `NaN < 1` is false, so NaN falls through), then NaN
+    // errors ("Parameter value is NaN", pinned by `aggregators.test:422`),
+    // then the int64 under/overflow errors. The `< 1` early return makes
+    // the underflow arm unreachable here (single-extremum instant/step
+    // shape) — kept for the message parity anyway.
+    if k < 1.0 {
         return Ok(Vec::new());
+    }
+    if k.is_nan() {
+        return Err(PromqlError::InvalidParameter {
+            detail: "Parameter value is NaN".to_string(),
+        });
+    }
+    if k >= i64::MAX as f64 {
+        return Err(PromqlError::InvalidParameter {
+            detail: format!(
+                "Scalar value {} overflows int64",
+                crate::annotations::go_float::format_g(k)
+            ),
+        });
     }
     let k = k as usize;
 
@@ -617,14 +697,32 @@ fn aggregate_topk(
     let mut group_keys: Vec<GroupKey> = groups.keys().cloned().collect();
     group_keys.sort_by(GroupKey::output_cmp);
 
+    // Issue #154: NaN is the LEAST element for topk and the GREATEST for
+    // bottomk — the pin's `vectorByValueHeap.Less`/
+    // `vectorByReverseValueHeap.Less` both return `true` when `vi` is NaN
+    // (functions.go:2690-2729 at 40af9c2), so a NaN member is displaced
+    // from the heap by any non-NaN candidate and, when it survives (fewer
+    // than k non-NaN members), sorts LAST in the reversed output — for
+    // BOTH directions. The old `partial_cmp(..).unwrap_or(Equal)`
+    // comparator was NON-TRANSITIVE in the presence of NaN (garbage order
+    // AND garbage selection — `aggregators.test:287-378`).
+    fn nan_last(a: f64, b: f64, descending: bool) -> Ordering {
+        match (a.is_nan(), b.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => {
+                let ord = a.partial_cmp(&b).expect("both values are non-NaN");
+                if descending { ord.reverse() } else { ord }
+            }
+        }
+    }
     let mut out = Vec::new();
     for key in group_keys {
         let mut members = groups.remove(&key).expect("key came from groups.keys()");
         match op {
-            AggOp::Topk => members.sort_by(|a, b| b.v.partial_cmp(&a.v).unwrap_or(Ordering::Equal)),
-            AggOp::Bottomk => {
-                members.sort_by(|a, b| a.v.partial_cmp(&b.v).unwrap_or(Ordering::Equal))
-            }
+            AggOp::Topk => members.sort_by(|a, b| nan_last(a.v, b.v, true)),
+            AggOp::Bottomk => members.sort_by(|a, b| nan_last(a.v, b.v, false)),
             _ => unreachable!("only called for Topk/Bottomk"),
         }
         out.extend(members.into_iter().take(k));
@@ -647,6 +745,19 @@ fn aggregate_quantile(
     let phi = param.ok_or_else(|| PromqlError::BadMatching {
         detail: "quantile requires a quantile parameter".to_string(),
     })?;
+
+    // Issue #154: the pin's QUANTILE parameter warning (engine.go:
+    // 1664-1674 at 40af9c2, pre-step-loop over the param extrema): NaN,
+    // > 1, and < 0 each add `NewInvalidQuantileWarning` — emitted here
+    // per step and deduped on the message text (an instant/constant-φ
+    // query is outcome-identical to the pin's once-per-query emission).
+    // Pinned by `aggregators.test:544` (`quantile without(point)(NaN,
+    // data)` + `expect warn`).
+    // NaN is outside the range too (`contains` is false for NaN) — the
+    // pin's three checks collapse into one.
+    if !(0.0..=1.0).contains(&phi) {
+        annos.warning(messages::invalid_quantile_warning(phi));
+    }
 
     // M7-A5b-iii: a histogram member is skipped + `HistogramIgnoredIn
     // AggregationInfo` (`engine.go:3648-3652,3860-3863`) — never pushed to
