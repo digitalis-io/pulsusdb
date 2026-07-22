@@ -449,9 +449,11 @@ fn render_hist_matrix_item(s: &HistMatrixSeries) -> Vec<u8> {
 /// `explain_suffix`). Empty ⇒ no bytes ⇒ float-only responses (empty
 /// `Annotations`) stay byte-identical. Caps/dedup/overflow-line contract:
 /// [`pulsus_promql::Annotations::as_strings`] (upstream `AsStrings(query, 10,
-/// 10)`, `web/api/v1/api.go`).
-fn annotations_suffix(annotations: &pulsus_promql::Annotations) -> String {
-    let (warnings, infos) = annotations.as_strings(10, 10);
+/// 10)`, `web/api/v1/api.go`). `query` is the SAME raw query text the
+/// handler parsed (issue #128): each kept line ends with the byte-exact
+/// `" (<line>:<col>)"` source-position suffix upstream renders there.
+fn annotations_suffix(query: &str, annotations: &pulsus_promql::Annotations) -> String {
+    let (warnings, infos) = annotations.as_strings(query, 10, 10);
     let mut s = String::new();
     if !warnings.is_empty() {
         s.push_str(",\"warnings\":[");
@@ -497,7 +499,9 @@ pub(crate) fn query_response(
     ordered: bool,
 ) -> Response {
     let empty = pulsus_promql::Annotations::new();
-    query_response_annotated(result, explain, at_ms, ordered, &empty)
+    // Empty annotations render zero bytes regardless of the query text,
+    // so the float-only path needs no query threading (issue #128).
+    query_response_annotated(result, explain, at_ms, ordered, "", &empty)
 }
 
 /// [`query_response`] plus the `warnings`/`infos` envelope arrays (M7-A5b-i)
@@ -512,9 +516,10 @@ pub(crate) fn query_response_annotated(
     explain: Option<PlanExplain>,
     at_ms: i64,
     ordered: bool,
+    query: &str,
     annotations: &pulsus_promql::Annotations,
 ) -> Response {
-    let annos = annotations_suffix(annotations);
+    let annos = annotations_suffix(query, annotations);
     match result {
         QueryResult::Vector(mut items) => {
             if !ordered {
@@ -1085,6 +1090,7 @@ mod tests {
             None,
             5_500,
             false,
+            "up",
             &pulsus_promql::Annotations::new(),
         );
         assert_eq!(body_string(plain).await, body_string(annotated).await);
@@ -1093,13 +1099,66 @@ mod tests {
     #[tokio::test]
     async fn annotations_envelope_adds_warnings_and_infos_as_top_level_siblings_of_data() {
         let mut annos = pulsus_promql::Annotations::new();
-        annos.warning("w1");
-        annos.info("i1");
-        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, &annos);
+        annos.warning_at(0, "w1");
+        annos.info_at(3, "i1");
+        // Issue #128: the envelope strings carry the byte-exact
+        // `" (<line>:<col>)"` source-position suffix rendered against the
+        // SAME raw query string the handler parsed.
+        let res =
+            query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, "a + b", &annos);
         let body = body_string(res).await;
         assert_eq!(
             body,
-            r#"{"status":"success","data":{"resultType":"scalar","result":[0,"1"]},"warnings":["w1"],"infos":["i1"]}"#
+            r#"{"status":"success","data":{"resultType":"scalar","result":[0,"1"]},"warnings":["w1 (1:1)"],"infos":["i1 (1:4)"]}"#
+        );
+    }
+
+    /// Issue #128 (AC 6): the byte-exact instant-query envelope for a
+    /// REAL annotation over a multi-line query — line/column derive from
+    /// byte offsets across the `\n`.
+    #[tokio::test]
+    async fn annotations_envelope_renders_the_position_suffix_for_a_multi_line_query() {
+        let query = "histogram_quantile(\n  1.5,\n  up\n)";
+        let mut annos = pulsus_promql::Annotations::new();
+        // args[0] (`1.5`) at byte 22 — one '\n' at 19 → line 2, col 3.
+        annos.warning_at(
+            22,
+            "PromQL warning: quantile value should be between 0 and 1, got 1.5",
+        );
+        let res = query_response_annotated(QueryResult::Scalar(1.5), None, 0, false, query, &annos);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"scalar","result":[0,"1.5"]},"warnings":["PromQL warning: quantile value should be between 0 and 1, got 1.5 (2:3)"]}"#
+        );
+    }
+
+    /// Issue #128 (AC 6): the range (matrix) response envelope carries
+    /// the same suffixed strings.
+    #[tokio::test]
+    async fn annotations_envelope_renders_the_position_suffix_for_a_range_response() {
+        let query = "sort(up)";
+        let mut annos = pulsus_promql::Annotations::new();
+        annos.warning_at(
+            0,
+            "PromQL warning: sort is ineffective for range queries since results are always ordered by labels",
+        );
+        let series = MatrixSeries {
+            labels: vec![("job".to_string(), "api".to_string())],
+            points: vec![(0, 1.0)],
+        };
+        let res = query_response_annotated(
+            QueryResult::Matrix(vec![series]),
+            None,
+            0,
+            false,
+            query,
+            &annos,
+        );
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"job":"api"},"values":[[0,"1"]]}]},"warnings":["PromQL warning: sort is ineffective for range queries since results are always ordered by labels (1:1)"]}"#
         );
     }
 
@@ -1107,10 +1166,12 @@ mod tests {
     async fn annotations_envelope_dedups_caps_at_10_and_appends_the_overflow_line() {
         let mut annos = pulsus_promql::Annotations::new();
         for i in 0..12 {
-            annos.warning(format!("w{i}"));
+            annos.warning_at(0, format!("w{i}"));
         }
-        annos.warning("w0"); // duplicate -- deduped, not double-counted.
-        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, &annos);
+        annos.warning_at(0, "w0"); // duplicate -- deduped, not double-counted.
+        // Issue #128: the kept lines carry suffixes; the overflow line
+        // (asserted below) never does.
+        let res = query_response_annotated(QueryResult::Scalar(1.0), None, 0, false, "up", &annos);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         let warnings = json["warnings"].as_array().expect("warnings array");

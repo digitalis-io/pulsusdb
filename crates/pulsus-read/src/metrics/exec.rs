@@ -2620,11 +2620,17 @@ mod tests {
                 })
                 .collect()
         };
+        let zero_pos = || aggregation::AggPos {
+            expr_pos: 0,
+            param_pos: 0,
+            self_pos: 0,
+        };
         let chunked_sum = aggregation::aggregate(
             pulsus_promql::AggOp::Sum,
             &to_vector(&chunked_series),
             None,
             None,
+            zero_pos(),
             &mut pulsus_promql::Annotations::new(),
         )
         .unwrap();
@@ -2633,6 +2639,7 @@ mod tests {
             &to_vector(&reference_series),
             None,
             None,
+            zero_pos(),
             &mut pulsus_promql::Annotations::new(),
         )
         .unwrap();

@@ -19,6 +19,7 @@ Unary(
                         at: None,
                         anchored: false,
                         smoothed: false,
+                        pos: AstPos(1),
                     },
                 ),
                 rhs: VectorSelector(
@@ -35,10 +36,12 @@ Unary(
                         at: None,
                         anchored: false,
                         smoothed: false,
+                        pos: AstPos(5),
                     },
                 ),
                 modifier: None,
             },
         ),
+        pos: AstPos(0),
     },
 )

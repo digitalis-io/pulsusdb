@@ -26,6 +26,7 @@ Call(
                             at: None,
                             anchored: false,
                             smoothed: false,
+                            pos: AstPos(16),
                         },
                         range: 300s,
                         range_expr: None,
@@ -33,5 +34,6 @@ Call(
                 ),
             ],
         },
+        pos: AstPos(0),
     },
 )

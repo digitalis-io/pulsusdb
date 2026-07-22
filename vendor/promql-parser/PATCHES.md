@@ -268,6 +268,57 @@ The original leaf fix is retained below for history.
   crate's v2.45 baseline, like entry #6 and G1 — recorded here as the
   divergence ledger instead).
 
+## 8. AST start-offset metadata (`AstPos`, issue #128)
+
+**Patch class: AST-metadata** — a third class alongside the leaf fixes
+and the grammar-production patches: it adds *metadata fields* to existing
+AST structs and captures them in existing semantic actions. No grammar
+production, token, alternative, or precedence declaration is touched
+(`%expect 51`/`%expect-rr 243` unchanged), and no parse accept/reject
+outcome or AST *shape* changes.
+
+- **Files:** `src/parser/ast.rs`, `src/parser/promql.y` (semantic actions
+  only), `src/util/visitor.rs`/`src/parser/function.rs` (mechanical
+  pattern/literal fixes).
+- **What:** Prometheus's annotation constructors take a
+  `posrange.PositionRange` whose **start** offset renders the HTTP API's
+  `" (<line>:<col>)"` warning/info suffix
+  (`Annotations.AsStrings(query, 10, 10)` →
+  `PositionRange.StartPosInput`, `util/annotations/annotations.go` /
+  `promql/parser/posrange/posrange.go` at PulsusDB's pinned v3.13.0
+  conformance SHA `40af9c2`). This crate tracked no position information
+  at all, so the consumer could never produce that suffix.
+- **Fix:** a new `AstPos` newtype (`Option<usize>` start byte offset;
+  `Default` = `None` for hand-built nodes) added as a `pub pos` field to
+  the seven node kinds whose `PositionRange` starts at their own first
+  token — `VectorSelector`, `NumberLiteral`, `StringLiteral`,
+  `ParenExpr`, `UnaryExpr`, `AggregateExpr`, `Call` — plus
+  `Expr::pos_start()` (recursive for `Binary` = its LHS,
+  `MatrixSelector` = its vector selector, `Subquery` = its inner
+  expression — upstream's own `PositionRange()` shapes; `None` for
+  `Extension`). Every producing grammar action records the grmtools
+  `$span.start()` via `Expr::with_pos_start`; postfix productions
+  (`offset`/`@`/`[range]`/`anchored`/`smoothed`, matrix/subquery
+  wrapping) never move a node's start, matching upstream, so they are
+  untouched. The unary productions set the position on their *result*,
+  covering upstream's sign-collapse (a parsed `-1` is a `NumberLiteral`
+  whose range starts at the `-`).
+- **Equality/serde invariants:** `AstPos::eq` is ALWAYS TRUE — position
+  is metadata, not identity — so derived `PartialEq` on the seven structs
+  is unchanged and every hand-built-vs-parsed AST equality assertion
+  (this crate's and consumers') passes unmodified. The field is
+  `serde(skip)` under the `ser` feature (wire shape unchanged) and its
+  `Debug` is a compact single line.
+- **Tests:** `src/parser/parse.rs`
+  `test_issue_128_ast_start_offsets` (exact byte offsets per node kind
+  over pinned inputs, including multi-line and the G2/G3/G4-added
+  production shapes); the CI-visible twin lives in
+  `crates/pulsus-promql/src/parser.rs` (this crate is its own cargo
+  workspace and does not ride the root `cargo test --workspace`).
+- **Upstream PR:** not yet filed (position support upstream would
+  naturally be a full `PositionRange` port, a larger API change —
+  recorded here as the divergence ledger instead).
+
 ## G1. Grammar-production patch: duration expressions (issue #84, M6-08b)
 
 - **Files:** `src/parser/promql.y`, `src/parser/token.rs`,

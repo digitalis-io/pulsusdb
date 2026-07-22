@@ -3,23 +3,28 @@
 //! response arrays), ported from `util/annotations/annotations.go` (pinned
 //! v3.13.0, `40af9c2`, via `git show 40af9c2:util/annotations/annotations.go`).
 //!
-//! **Simplification vs. the pin (documented, KISS; scope narrowed by the
-//! `#124` codex review, finding 2):** upstream annotation messages carry a
+//! **Source positions (issue #128).** Upstream annotation messages carry a
 //! query-source-text-derived position suffix (`(annoErr).Error()`,
-//! `annotations.go:194-199`: `"%s (%s)"` with `PositionRange.
-//! StartPosInput`), appended only at `AsStrings` render time via
-//! `SetQuery` — `pulsus-promql`'s parser/planner tracks no position/span
-//! information at all (grep-verified: no `PositionRange` type anywhere in
-//! this crate), so this port never had a position to carry and omits
-//! **only that suffix** (issue #128 tracks the retrofit). This does not
-//! change DEDUP cardinality: upstream's dedup key (`Annotations.Add`,
-//! `annotations.go:41`) is `err.Error()` computed at `Add` time, which is
-//! *before* any query is set (`SetQuery` runs only inside `AsStrings`,
-//! after every `Add` for the evaluation is done) — so upstream itself
-//! already dedups on the pre-suffix message. Every other message BODY
-//! constructor (the fixed wording, `maybeAddMetricName`'s `for metric name
-//! "..."` suffix, `%g`-formatted floats via [`go_float`], and the
-//! forced-monotonicity detail below) matches the pin verbatim.
+//! `annotations.go:194-199`: `"%s (%s)"` with
+//! `PositionRange.StartPosInput`), appended only at `AsStrings` render
+//! time via `SetQuery`. This port mirrors that split exactly: every
+//! [`Annotations::warning_at`]/[`Annotations::info_at`]/
+//! [`Annotations::forced_monotonicity_info_at`] call stores the emitting
+//! node's start byte offset (threaded parser→plan→eval from the vendored
+//! parser's `Expr::pos_start()`, PATCHES.md #8) beside the BASE message,
+//! and [`Annotations::as_strings`] — the HTTP-wire renderer — appends the
+//! byte-exact `" (<line>:<col>)"` tail (see [`start_pos_input`]). DEDUP
+//! cardinality is unchanged from the pin: upstream's dedup key
+//! (`Annotations.Add`, `annotations.go:41`) is `err.Error()` computed at
+//! `Add` time, *before* any query is set (`SetQuery` runs only inside
+//! `AsStrings`), so both sides dedup on the pre-suffix message; on a key
+//! collision a plain annotation keeps the NEWEST position (`Add` stores
+//! the incoming `annoErr`, `annotations.go:47-52`) while the
+//! forced-monotonicity info keeps the FIRST (its `Merge` returns the
+//! widened *previous* object, `annotations.go:353-376`). Every message
+//! BODY constructor (the fixed wording, `maybeAddMetricName`'s `for
+//! metric name "..."` suffix, `%g`-formatted floats via [`go_float`], and
+//! the forced-monotonicity detail below) matches the pin verbatim.
 //!
 //! **Forced-monotonicity detail — structured, cross-firing-merged, and
 //! rendered unconditionally.** Upstream's
@@ -45,24 +50,21 @@
 //! consumer IS the HTTP wire. Issue #124 (M7-A6) landed the promqltest
 //! `expect warn`/`expect info` harness, which needs the query-UNSET
 //! comparison instead — [`Self::base_messages`] is that second accessor
-//! (base message only, no cap, no detail), used exclusively by the
-//! corpus runner; `as_strings`/the HTTP wire are untouched.
+//! (base message only, no cap, no detail, no position), used exclusively
+//! by the corpus runner; `as_strings`/the HTTP wire are separate.
 //!
-//! **Where the position omission is and is not observable (verified at
+//! **Where the position suffix is and is not observable (verified at
 //! the pin):**
 //! - The promqltest corpus's `expect warn`/`expect info` comparisons read
 //!   `err.Error()` with NO query ever set (`promql/promqltest/test.go:
 //!   1223-1226` — `checkAnnotations` iterates the raw `Annotations` map;
 //!   `SetQuery` never runs there), i.e. the **base message without any
-//!   position suffix** — byte-identical (module note above aside) to what
-//!   [`Self::base_messages`] emits, so the A6 corpus comparison needs no
-//!   position tracking.
+//!   position suffix** — byte-identical to what [`Self::base_messages`]
+//!   emits, so the A6 corpus comparison never sees a position.
 //! - The HTTP API envelope (`web/api/v1/api.go` `AsStrings(query, 10, 10)`)
-//!   DOES set the query, so upstream's wire `warnings`/`infos` strings end
-//!   in ` (<line>:<col>)` — pulsus's wire strings omit exactly that
-//!   render-time tail. This is the one remaining place output differs
-//!   from upstream; acceptable for A5b-i (no position machinery exists to
-//!   thread) — see issue #128 for the retrofit scope.
+//!   DOES set the query, so the wire `warnings`/`infos` strings end in
+//!   ` (<line>:<col>)` — [`Self::as_strings`] takes the raw query text
+//!   the handler parsed and renders exactly that tail (issue #128).
 
 use std::collections::HashMap;
 
@@ -135,8 +137,10 @@ impl ForcedMonotonicityDetail {
 
     /// The rendered detail suffix — the query-set arm of the pin's
     /// `histogramQuantileForcedMonotonicityErr.Error()`
-    /// (`annotations.go:333-341`), minus the trailing position (issue
-    /// #128): `", from buckets %g to %g, with a max diff of %.2g, over %d
+    /// (`annotations.go:333-341`), minus the trailing position, which
+    /// [`Annotations::as_strings`] appends after this suffix (base +
+    /// detail + position, the pin's own order, `annotations.go:340`):
+    /// `", from buckets %g to %g, with a max diff of %.2g, over %d
     /// samples from %s to %s"`, with `%d` = `count + 1` and the
     /// timestamps as `time.Unix(ts/1000, 0).UTC().Format(time.RFC3339)`
     /// (Go `/` truncates toward zero — mirrored by Rust integer `/`).
@@ -154,15 +158,22 @@ impl ForcedMonotonicityDetail {
 }
 
 /// One deduplicated annotation: the BASE message (upstream's `Add`-time
-/// dedup key, always query-independent) plus, for the forced-monotonicity
+/// dedup key, always query-independent) plus the emitting node's start
+/// byte offset (issue #128 — the `annoErr.PositionRange` port, rendered
+/// only by [`Annotations::as_strings`]) and, for the forced-monotonicity
 /// info only, the structured detail whose rendering
 /// [`Annotations::as_strings`] appends — mirroring upstream, where the
-/// map value is the (merged) error object and the detail string is
-/// produced only at `AsStrings` render time.
+/// map value is the (merged) error object and both the detail string and
+/// the position suffix are produced only at `AsStrings` render time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Annotation {
     pub kind: AnnotationKind,
     pub message: String,
+    /// Start byte offset into the query source text of the AST node
+    /// upstream's constructor call site passes (`arg.PositionRange()`
+    /// etc.). Always `Some` via the `_at` adders; `None` is unreachable
+    /// through the public API and renders no suffix (defensive).
+    pub pos_start: Option<usize>,
     pub detail: Option<ForcedMonotonicityDetail>,
 }
 
@@ -191,15 +202,27 @@ impl Annotations {
         &mut self,
         kind: AnnotationKind,
         message: String,
+        pos_start: Option<usize>,
         detail: Option<ForcedMonotonicityDetail>,
     ) {
         if let Some(&i) = self.index.get(&message) {
             // Key collision — upstream `Add` (`annotations.go:42-53`):
             // a type-specific `Merge` for the detail-carrying kind,
-            // an identical-content overwrite (observable no-op) for
-            // every plain message.
-            if let (Some(prev), Some(new)) = (self.items[i].detail.as_mut(), detail.as_ref()) {
-                prev.merge_from(new);
+            // an incoming-object overwrite for every plain message.
+            match (self.items[i].detail.as_mut(), detail.as_ref()) {
+                (Some(prev), Some(new)) => {
+                    // Forced-monotonicity: the FIRST position wins — the
+                    // pin's `Merge` returns the widened *previous* object
+                    // with its own `PositionRange` (`annotations.go:
+                    // 353-376`); only the payload widens.
+                    prev.merge_from(new);
+                }
+                _ => {
+                    // Plain: the NEWEST position wins — `Add` stores the
+                    // incoming `annoErr` (its generic `Merge` ignores the
+                    // previous, `annotations.go:47-52,211-213`).
+                    self.items[i].pos_start = pos_start;
+                }
             }
             return;
         }
@@ -207,37 +230,43 @@ impl Annotations {
         self.items.push(Annotation {
             kind,
             message,
+            pos_start,
             detail,
         });
     }
 
-    /// Adds `message` under `kind`, deduplicated by the exact message text
-    /// — mirrors upstream `Annotations.Add`'s idempotent `map[string]error`
-    /// insert (`annotations.go:41`).
-    pub fn add(&mut self, kind: AnnotationKind, message: impl Into<String>) {
-        self.add_item(kind, message.into(), None);
+    /// Adds a **warning** with the emitting node's start byte offset
+    /// (issue #128 — the `pos posrange.PositionRange` every upstream
+    /// `New*Warning` constructor takes), deduplicated by the exact
+    /// message text — upstream `Annotations.Add`'s idempotent
+    /// `map[string]error` insert (`annotations.go:41`).
+    pub fn warning_at(&mut self, pos: usize, message: impl Into<String>) {
+        self.add_item(AnnotationKind::Warning, message.into(), Some(pos), None);
     }
 
-    pub fn warning(&mut self, message: impl Into<String>) {
-        self.add(AnnotationKind::Warning, message);
-    }
-
-    pub fn info(&mut self, message: impl Into<String>) {
-        self.add(AnnotationKind::Info, message);
+    /// Adds an **info** with the emitting node's start byte offset — see
+    /// [`Self::warning_at`].
+    pub fn info_at(&mut self, pos: usize, message: impl Into<String>) {
+        self.add_item(AnnotationKind::Info, message.into(), Some(pos), None);
     }
 
     /// Adds one forced-monotonicity firing (an **Info**, upstream
-    /// `NewHistogramQuantileForcedMonotonicityInfo`): `base` is the
-    /// query-independent message (the dedup key), `detail` the
-    /// occurrence's payload. Repeat firings with the same `base` (same
-    /// metric name — other steps of a range query, other bucket groups)
-    /// merge per the pin (see [`ForcedMonotonicityDetail::merge_from`]).
-    pub fn forced_monotonicity_info(
+    /// `NewHistogramQuantileForcedMonotonicityInfo`): `pos` is the
+    /// emitting `histogram_quantile` call's *second argument* offset
+    /// (`args[1].PositionRange()`, `functions.go:2116` — the
+    /// `histogram_quantiles` caller passes its string-label argument,
+    /// `:2198`), `base` the query-independent message (the dedup key),
+    /// `detail` the occurrence's payload. Repeat firings with the same
+    /// `base` (same metric name — other steps of a range query, other
+    /// bucket groups) merge per the pin, keeping the FIRST position (see
+    /// [`Self::add_item`]).
+    pub fn forced_monotonicity_info_at(
         &mut self,
+        pos: usize,
         base: impl Into<String>,
         detail: ForcedMonotonicityDetail,
     ) {
-        self.add_item(AnnotationKind::Info, base.into(), Some(detail));
+        self.add_item(AnnotationKind::Info, base.into(), Some(pos), Some(detail));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -247,10 +276,11 @@ impl Annotations {
     /// Merges `other`'s items into `self`, preserving dedup and merging
     /// detail payloads on key collision — upstream `Annotations.Merge`
     /// (`annotations.go:58-75`), which applies the same `annoError.Merge`
-    /// as `Add`.
+    /// as `Add` (so the same collision-position rules: plain = newest,
+    /// forced-monotonicity = first).
     pub fn merge(&mut self, other: Annotations) {
         for item in other.items {
-            self.add_item(item.kind, item.message, item.detail);
+            self.add_item(item.kind, item.message, item.pos_start, item.detail);
         }
     }
 
@@ -284,23 +314,46 @@ impl Annotations {
     /// "no limit" (upstream's own `maxWarnings == 0` convention,
     /// `annotations.go:101`).
     ///
+    /// `query` is the raw query source text the annotations' positions
+    /// index into (issue #128 — upstream `AsStrings`'s own first
+    /// parameter, `SetQuery` + `annoErr.Error()`'s `"%s (%s)"`,
+    /// `annotations.go:98-101,194-199`): every kept line gets the
+    /// byte-exact `" (<line>:<col>)"` suffix via [`start_pos_input`],
+    /// EXCEPT when `query` is empty (the pin's `e.Query == ""`
+    /// short-circuit — its `"unknown position"` arm is unreachable on
+    /// this path) or the item carries no position (hand-built only).
+    /// Overflow lines never carry a suffix (appended after the loop,
+    /// `annotations.go:117-122`). Forced-monotonicity renders base +
+    /// detail + position, the pin's order (`annotations.go:340`).
+    ///
     /// Ordering: upstream iterates a Go map (nondeterministic) — the caps
     /// are the byte-relevant contract, not order (plan v3 finding 4). This
     /// port pins the deterministic insertion (first-`Add`) order instead, a
     /// stricter, still-conformant choice.
-    pub fn as_strings(&self, max_warnings: usize, max_infos: usize) -> (Vec<String>, Vec<String>) {
+    pub fn as_strings(
+        &self,
+        query: &str,
+        max_warnings: usize,
+        max_infos: usize,
+    ) -> (Vec<String>, Vec<String>) {
         let mut warnings = Vec::new();
         let mut infos = Vec::new();
         let mut warn_skipped = 0usize;
         let mut info_skipped = 0usize;
         for item in &self.items {
             // The wire string = base message + (for forced-monotonicity)
-            // the merged detail suffix — upstream renders the detail only
-            // here, at `AsStrings` time, off the merged error object.
-            let rendered = match &item.detail {
+            // the merged detail suffix + the position suffix — upstream
+            // renders both tails only here, at `AsStrings` time, off the
+            // merged error object.
+            let mut rendered = match &item.detail {
                 Some(d) => format!("{}{}", item.message, d.render_suffix()),
                 None => item.message.clone(),
             };
+            if !query.is_empty()
+                && let Some(pos) = item.pos_start
+            {
+                rendered.push_str(&format!(" ({})", start_pos_input(query, pos)));
+            }
             match item.kind {
                 AnnotationKind::Info => {
                     if max_infos == 0 || infos.len() < max_infos {
@@ -326,6 +379,35 @@ impl Annotations {
         }
         (warnings, infos)
     }
+}
+
+/// The `<line>:<col>` position text — a byte-exact port of
+/// `PositionRange.StartPosInput` (`promql/parser/posrange/posrange.go:
+/// 36-53` at the pin, `lineOffset` fixed at 0 — upstream passes non-zero
+/// only in its own unit tests): 1-based `line` = 1 + the number of `'\n'`
+/// bytes in `query[..pos]`, `col` = `pos - lastLineBreakIndex` with a
+/// `-1` sentinel for "no line break yet" — a **byte** column (Go ranges
+/// runes but its `i` is a byte index and only the single-byte `'\n'` is
+/// compared, so multi-byte characters inflate the column on both sides
+/// identically). `pos > query.len()` → `"invalid position"` (the pin's
+/// guard; `pos < 0` is unrepresentable here). The caller never invokes
+/// this with an empty `query` (the pin's `"unknown position"` arm is
+/// unreachable on the annotation path — `annoErr.Error()` short-circuits
+/// first, `annotations.go:195-197`).
+fn start_pos_input(query: &str, pos: usize) -> String {
+    if pos > query.len() {
+        return "invalid position".to_string();
+    }
+    let mut last_line_break: isize = -1;
+    let mut line = 1usize;
+    for (i, b) in query.as_bytes()[..pos].iter().enumerate() {
+        if *b == b'\n' {
+            last_line_break = i as isize;
+            line += 1;
+        }
+    }
+    let col = pos as isize - last_line_break;
+    format!("{line}:{col}")
 }
 
 /// Go `%g`/`%.Ng`-equivalent float formatting for annotation message
@@ -658,12 +740,12 @@ pub mod messages {
     /// `forcedMonotonic` return, `ensureMonotonicAndIgnoreSmallDeltas`,
     /// `quantile.go`). Callers pair this with a
     /// [`crate::annotations::ForcedMonotonicityDetail`] via
-    /// [`crate::annotations::Annotations::forced_monotonicity_info`]; the
-    /// `", from buckets … over N samples …"` detail suffix is rendered
-    /// (and cross-firing-merged) by `as_strings`, mirroring upstream's
-    /// render-at-`AsStrings`-time-off-the-merged-object structure. The
-    /// trailing position suffix the pin also renders there is omitted
-    /// (module doc, issue #128).
+    /// [`crate::annotations::Annotations::forced_monotonicity_info_at`];
+    /// the `", from buckets … over N samples …"` detail suffix and the
+    /// trailing position suffix are rendered (and cross-firing-merged)
+    /// by `as_strings`, mirroring upstream's
+    /// render-at-`AsStrings`-time-off-the-merged-object structure
+    /// (issue #128).
     pub fn histogram_quantile_forced_monotonicity_info(metric_name: &str) -> String {
         maybe_add_metric_name(
             "PromQL info: input to histogram_quantile needed to be fixed for monotonicity (see https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile)"
@@ -882,18 +964,212 @@ pub mod messages {
 mod tests {
     use super::*;
 
+    /// Issue #128, byte-exactness vectors for [`start_pos_input`] — each
+    /// expectation hand-derived from `posrange.go:36-53` at the pin:
+    /// `line = lineOffset(0) + 1 + #'\n' in query[:pos]`,
+    /// `col = pos - lastLineBreakIndex` (`-1` sentinel), BYTE counts.
+    #[test]
+    fn start_pos_input_matches_the_pinned_go_semantics_byte_for_byte() {
+        // Offset 0, no newline yet: line 1, col = 0 - (-1) = 1.
+        assert_eq!(start_pos_input("up", 0), "1:1");
+        // pos == query.len() is valid (the pin guards only pos > len).
+        assert_eq!(start_pos_input("up", 2), "1:3");
+        // pos > len → the pin's "invalid position" arm.
+        assert_eq!(start_pos_input("up", 3), "invalid position");
+        // Multi-line: query = "sum(\n  up\n)"; `up` at byte 7. One '\n'
+        // in query[..7] at index 4 → line 2, col = 7 - 4 = 3.
+        assert_eq!(start_pos_input("sum(\n  up\n)", 7), "2:3");
+        // pos exactly AT a '\n' byte: the '\n' is NOT in query[..pos], so
+        // it does not count yet — line 1, col = pos + 1.
+        assert_eq!(start_pos_input("sum(\n  up\n)", 4), "1:5");
+        // Multi-byte BYTE column (the plan's unit vector): "up +\nüp" —
+        // the selector `üp` starts at byte 5 ('\n' at 4) → 2:1; a node
+        // AFTER the 2-byte 'ü' gets a byte-inflated column: `p` is at
+        // byte 7 → col = 7 - 4 = 3 (not the character column 2).
+        let q = "up +\nüp";
+        assert_eq!(start_pos_input(q, 5), "2:1");
+        assert_eq!(start_pos_input(q, 7), "2:3");
+    }
+
+    /// Issue #128 render format (`annoErr.Error()`, `annotations.go:
+    /// 194-199`): `"{base} ({line}:{col})"` when the query is set; no
+    /// suffix when the query is empty (the pin's `e.Query == ""`
+    /// short-circuit — its "unknown position" arm is unreachable on the
+    /// annotation path).
+    #[test]
+    fn as_strings_appends_the_position_suffix_only_when_a_query_is_set() {
+        let mut a = Annotations::new();
+        a.warning_at(19, messages::invalid_quantile_warning(1.5));
+        let (warnings, _) = a.as_strings("histogram_quantile(1.5, up)", 10, 10);
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: quantile value should be between 0 and 1, got 1.5 (1:20)"
+                    .to_string()
+            ]
+        );
+        // Empty query → the base message untouched.
+        let (warnings, _) = a.as_strings("", 10, 10);
+        assert_eq!(
+            warnings,
+            vec!["PromQL warning: quantile value should be between 0 and 1, got 1.5".to_string()]
+        );
+    }
+
+    /// Issue #128: an out-of-range stored position renders the pin's
+    /// `"(invalid position)"` (`StartPosInput`'s `pos > len(query)` arm —
+    /// reachable only through a hand-built mismatch of query and
+    /// annotations, kept total).
+    #[test]
+    fn as_strings_renders_invalid_position_for_an_out_of_range_offset() {
+        let mut a = Annotations::new();
+        a.warning_at(99, "w");
+        let (warnings, _) = a.as_strings("up", 10, 10);
+        assert_eq!(warnings, vec!["w (invalid position)".to_string()]);
+    }
+
+    /// Issue #128 overflow lines: the trailing `"N more … omitted"` lines
+    /// are appended AFTER the render loop (`annotations.go:117-122`) and
+    /// never carry a position suffix.
+    #[test]
+    fn overflow_lines_never_carry_a_position_suffix() {
+        let mut a = Annotations::new();
+        for i in 0..11 {
+            a.warning_at(0, format!("w{i}"));
+        }
+        let (warnings, _) = a.as_strings("up", 10, 10);
+        assert_eq!(warnings.len(), 11);
+        assert_eq!(warnings[10], "1 more warning annotations omitted");
+        for w in &warnings[..10] {
+            assert!(w.ends_with(" (1:1)"), "{w}");
+        }
+    }
+
+    /// Issue #128 dedup-collision position, plain messages: the NEWEST
+    /// position wins — upstream `Add` stores the incoming `annoErr`
+    /// (its generic `Merge` ignores the previous object,
+    /// `annotations.go:47-52,211-213`); `Annotations.Merge` applies the
+    /// same rule (`:58-75`). Both directions pinned (getting this
+    /// backwards is invisible in single-site queries).
+    #[test]
+    fn plain_dedup_collision_keeps_the_newest_position() {
+        // Direct repeated add.
+        let mut a = Annotations::new();
+        a.warning_at(0, "dup");
+        a.warning_at(5, "dup");
+        let (warnings, _) = a.as_strings("sum(\n  up\n)", 0, 0);
+        assert_eq!(warnings, vec!["dup (2:1)".to_string()]);
+
+        // The cross-`Annotations` merge path.
+        let mut a = Annotations::new();
+        a.warning_at(0, "dup");
+        let mut b = Annotations::new();
+        b.warning_at(5, "dup");
+        a.merge(b);
+        let (warnings, _) = a.as_strings("sum(\n  up\n)", 0, 0);
+        assert_eq!(warnings, vec!["dup (2:1)".to_string()]);
+    }
+
+    /// Issue #128 dedup-collision position, forced-monotonicity: the
+    /// FIRST position wins — the pin's
+    /// `histogramQuantileForcedMonotonicityErr.Merge` returns the widened
+    /// PREVIOUS object with its own `PositionRange`
+    /// (`annotations.go:353-376`), through both `Add` (`:41-53`) and
+    /// `Merge` (`:58-75`).
+    #[test]
+    fn forced_monotonicity_collision_keeps_the_first_position() {
+        let base = messages::histogram_quantile_forced_monotonicity_info("m");
+        // Direct repeated add.
+        let mut a = Annotations::new();
+        a.forced_monotonicity_info_at(
+            5,
+            base.clone(),
+            ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
+        );
+        a.forced_monotonicity_info_at(
+            0,
+            base.clone(),
+            ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
+        );
+        let (_, infos) = a.as_strings("sum(\n  up\n)", 0, 0);
+        assert_eq!(infos.len(), 1);
+        assert!(infos[0].ends_with(" (2:1)"), "{}", infos[0]);
+
+        // The cross-`Annotations` merge path.
+        let mut a = Annotations::new();
+        a.forced_monotonicity_info_at(
+            5,
+            base.clone(),
+            ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
+        );
+        let mut b = Annotations::new();
+        b.forced_monotonicity_info_at(
+            0,
+            base.clone(),
+            ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
+        );
+        a.merge(b);
+        let (_, infos) = a.as_strings("sum(\n  up\n)", 0, 0);
+        assert_eq!(infos.len(), 1);
+        assert!(infos[0].ends_with(" (2:1)"), "{}", infos[0]);
+    }
+
+    /// Issue #128: forced-monotonicity renders base + detail + position,
+    /// the pin's order (`annotations.go:340` — the position is the LAST
+    /// element of the format string).
+    #[test]
+    fn forced_monotonicity_renders_base_then_detail_then_position() {
+        let mut a = Annotations::new();
+        a.forced_monotonicity_info_at(
+            26,
+            messages::histogram_quantile_forced_monotonicity_info(""),
+            ForcedMonotonicityDetail::single(0, 0.1, 0.5, 2.0),
+        );
+        let (_, infos) = a.as_strings("histogram_quantile(0.5,\n  h_bucket)", 0, 0);
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: input to histogram_quantile needed to be fixed for monotonicity (see https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile), from buckets 0.1 to 0.5, with a max diff of 2, over 1 samples from 1970-01-01T00:00:00Z to 1970-01-01T00:00:00Z (2:3)".to_string()
+            ]
+        );
+    }
+
+    /// Issue #128 corpus-path regression (AC 7): `base_messages` of a
+    /// POSITIONED annotation carries no suffix — the promqltest corpus
+    /// comparison (query never set upstream, `promql/promqltest/test.go:
+    /// 1223-1226`) is byte-identical pre/post retrofit.
+    #[test]
+    fn base_messages_of_a_positioned_annotation_has_no_suffix() {
+        let mut a = Annotations::new();
+        a.warning_at(19, messages::invalid_quantile_warning(1.5));
+        a.forced_monotonicity_info_at(
+            23,
+            messages::histogram_quantile_forced_monotonicity_info("m"),
+            ForcedMonotonicityDetail::single(0, 0.1, 0.5, 2.0),
+        );
+        let (warnings, infos) = a.base_messages();
+        assert_eq!(
+            warnings,
+            vec!["PromQL warning: quantile value should be between 0 and 1, got 1.5".to_string()]
+        );
+        assert_eq!(
+            infos,
+            vec![messages::histogram_quantile_forced_monotonicity_info("m")]
+        );
+    }
+
     #[test]
     fn add_dedups_by_exact_message_text() {
         let mut a = Annotations::new();
-        a.warning("dup");
-        a.warning("dup");
-        a.info("dup"); // Same text, different kind — upstream dedups by the
+        a.warning_at(0, "dup");
+        a.warning_at(0, "dup");
+        a.info_at(0, "dup"); // Same text, different kind — upstream dedups by the
         // full `err.Error()`, which for different constructors differs
         // structurally (different kind text), but a hand-built identical
         // string across kinds is a contrived edge case exercised here to
         // pin the observed behavior: kind is not part of the dedup key,
         // only the message string is — the FIRST kind wins.
-        let (warnings, infos) = a.as_strings(0, 0);
+        let (warnings, infos) = a.as_strings("", 0, 0);
         assert_eq!(warnings, vec!["dup".to_string()]);
         assert!(infos.is_empty());
     }
@@ -901,9 +1177,9 @@ mod tests {
     #[test]
     fn as_strings_splits_by_kind() {
         let mut a = Annotations::new();
-        a.warning("w1");
-        a.info("i1");
-        let (warnings, infos) = a.as_strings(0, 0);
+        a.warning_at(0, "w1");
+        a.info_at(0, "i1");
+        let (warnings, infos) = a.as_strings("", 0, 0);
         assert_eq!(warnings, vec!["w1".to_string()]);
         assert_eq!(infos, vec!["i1".to_string()]);
     }
@@ -912,9 +1188,9 @@ mod tests {
     fn as_strings_caps_at_max_and_appends_the_overflow_line() {
         let mut a = Annotations::new();
         for i in 0..11 {
-            a.warning(format!("w{i}"));
+            a.warning_at(0, format!("w{i}"));
         }
-        let (warnings, _) = a.as_strings(10, 10);
+        let (warnings, _) = a.as_strings("", 10, 10);
         assert_eq!(warnings.len(), 11, "10 kept + 1 overflow line");
         assert_eq!(warnings[10], "1 more warning annotations omitted");
     }
@@ -923,9 +1199,9 @@ mod tests {
     fn as_strings_no_overflow_line_when_at_or_under_the_cap() {
         let mut a = Annotations::new();
         for i in 0..10 {
-            a.warning(format!("w{i}"));
+            a.warning_at(0, format!("w{i}"));
         }
-        let (warnings, _) = a.as_strings(10, 10);
+        let (warnings, _) = a.as_strings("", 10, 10);
         assert_eq!(warnings.len(), 10, "no overflow line at exactly the cap");
     }
 
@@ -933,9 +1209,9 @@ mod tests {
     fn as_strings_zero_limit_means_unlimited() {
         let mut a = Annotations::new();
         for i in 0..15 {
-            a.info(format!("i{i}"));
+            a.info_at(0, format!("i{i}"));
         }
-        let (_, infos) = a.as_strings(0, 0);
+        let (_, infos) = a.as_strings("", 0, 0);
         assert_eq!(infos.len(), 15);
     }
 
@@ -943,10 +1219,10 @@ mod tests {
     fn as_strings_caps_infos_independently_of_warnings() {
         let mut a = Annotations::new();
         for i in 0..11 {
-            a.info(format!("i{i}"));
+            a.info_at(0, format!("i{i}"));
         }
-        a.warning("w0");
-        let (warnings, infos) = a.as_strings(10, 10);
+        a.warning_at(0, "w0");
+        let (warnings, infos) = a.as_strings("", 10, 10);
         assert_eq!(warnings, vec!["w0".to_string()]);
         assert_eq!(infos.len(), 11);
         assert_eq!(infos[10], "1 more info annotations omitted");
@@ -955,12 +1231,12 @@ mod tests {
     #[test]
     fn merge_preserves_dedup_across_both_sides() {
         let mut a = Annotations::new();
-        a.warning("shared");
+        a.warning_at(0, "shared");
         let mut b = Annotations::new();
-        b.warning("shared");
-        b.warning("only-in-b");
+        b.warning_at(0, "shared");
+        b.warning_at(0, "only-in-b");
         a.merge(b);
-        let (warnings, _) = a.as_strings(0, 0);
+        let (warnings, _) = a.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec!["shared".to_string(), "only-in-b".to_string()]
@@ -1038,11 +1314,12 @@ mod tests {
     #[test]
     fn forced_monotonicity_info_renders_the_base_plus_single_firing_detail() {
         let mut a = Annotations::new();
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             messages::histogram_quantile_forced_monotonicity_info(""),
             ForcedMonotonicityDetail::single(0, 0.1, 0.5, 2.0),
         );
-        let (_, infos) = a.as_strings(0, 0);
+        let (_, infos) = a.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -1060,11 +1337,12 @@ mod tests {
     #[test]
     fn forced_monotonicity_info_formats_max_diff_with_two_significant_digits() {
         let mut a = Annotations::new();
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             messages::histogram_quantile_forced_monotonicity_info(""),
             ForcedMonotonicityDetail::single(1_705_314_645_000, 1.0, 100.0, 123.456),
         );
-        let (_, infos) = a.as_strings(0, 0);
+        let (_, infos) = a.as_strings("", 0, 0);
         let msg = &infos[0];
         assert!(
             msg.contains("with a max diff of 1.2e+02"),
@@ -1086,21 +1364,24 @@ mod tests {
         let base = messages::histogram_quantile_forced_monotonicity_info("m");
         let mut a = Annotations::new();
         // Step 1: buckets 0.5..1, diff 2, at t=0.
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
         );
         // Step 2: buckets 0.1..0.5, diff 7, at t=60s.
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(60_000, 0.1, 0.5, 7.0),
         );
         // Step 3: buckets 1..2, diff 3, at t=120s.
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(120_000, 1.0, 2.0, 3.0),
         );
-        let (warnings, infos) = a.as_strings(0, 0);
+        let (warnings, infos) = a.as_strings("", 0, 0);
         assert!(warnings.is_empty());
         assert_eq!(infos.len(), 1, "one merged info, not one per firing");
         assert_eq!(
@@ -1119,21 +1400,24 @@ mod tests {
     fn forced_monotonicity_detail_merges_through_annotations_merge_too() {
         let base = messages::histogram_quantile_forced_monotonicity_info("m");
         let mut a = Annotations::new();
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
         );
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(30_000, 0.5, 1.0, 2.0),
         );
         let mut b = Annotations::new();
-        b.forced_monotonicity_info(
+        b.forced_monotonicity_info_at(
+            0,
             base.clone(),
             ForcedMonotonicityDetail::single(60_000, 0.25, 1.0, 4.0),
         );
         a.merge(b);
-        let (_, infos) = a.as_strings(0, 0);
+        let (_, infos) = a.as_strings("", 0, 0);
         assert_eq!(infos.len(), 1);
         assert!(
             infos[0].contains("from buckets 0.25 to 1, with a max diff of 4, over 3 samples from 1970-01-01T00:00:00Z to 1970-01-01T00:01:00Z"),
@@ -1146,15 +1430,17 @@ mod tests {
     #[test]
     fn forced_monotonicity_infos_for_different_metric_names_stay_separate() {
         let mut a = Annotations::new();
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             messages::histogram_quantile_forced_monotonicity_info("m1"),
             ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
         );
-        a.forced_monotonicity_info(
+        a.forced_monotonicity_info_at(
+            0,
             messages::histogram_quantile_forced_monotonicity_info("m2"),
             ForcedMonotonicityDetail::single(0, 0.5, 1.0, 2.0),
         );
-        let (_, infos) = a.as_strings(0, 0);
+        let (_, infos) = a.as_strings("", 0, 0);
         assert_eq!(infos.len(), 2);
     }
 

@@ -17,6 +17,7 @@ Binary(
                 at: None,
                 anchored: false,
                 smoothed: false,
+                pos: AstPos(0),
             },
         ),
         rhs: VectorSelector(
@@ -33,6 +34,7 @@ Binary(
                 at: None,
                 anchored: false,
                 smoothed: false,
+                pos: AstPos(6),
             },
         ),
         modifier: None,

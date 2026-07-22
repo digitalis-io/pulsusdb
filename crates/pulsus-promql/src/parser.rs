@@ -150,6 +150,81 @@ mod tests {
         assert!(err.to_string().contains("non-empty matcher"), "{err}");
     }
 
+    /// Issue #128: the CI-visible twin of the vendored
+    /// `test_issue_128_ast_start_offsets` suite (vendored PATCHES.md #8,
+    /// AST-metadata class — the vendored crate is its own cargo workspace
+    /// and does not ride `cargo test --workspace`). Every parse-produced
+    /// node carries the start byte offset of its first token
+    /// (`Expr::pos_start()`), matching upstream Prometheus's
+    /// `Expr.PositionRange().Start` (v3.13.0, pin `40af9c2`) — the input
+    /// to `annotations::start_pos_input`'s `(<line>:<col>)` rendering.
+    /// Pinned over a multi-line query so byte offsets are proven to run
+    /// across `\n`s, and over every Expr kind (paren-wrapped call
+    /// argument included — upstream keeps the `ParenExpr` in `e.Args`, so
+    /// `(0.9)`'s position is the `(`).
+    #[test]
+    fn parsed_nodes_carry_exact_start_byte_offsets() {
+        // Offsets (bytes):     0123456789...
+        let input = "sum by (a) (\n  rate(foo{x=\"y\"}[5m])\n)\n+ histogram_quantile((0.9), up)";
+        // Line 1: `sum by (a) (` = bytes 0..12, `\n` at 12.
+        // Line 2: `  rate(foo{x="y"}[5m])` = bytes 13..35 (`rate` at 15,
+        //         `foo` at 20), `\n` at 35.
+        // Line 3: `)` at 36, `\n` at 37.
+        // Line 4: `+ histogram_quantile((0.9), up)` — `+` at 38,
+        //         `histogram_quantile` at 40, its `(` at 58, `(0.9)` at
+        //         59, `0.9` at 60, `up` at 66.
+        let expr = parse(input).unwrap();
+        assert_eq!(expr.pos_start(), Some(0), "binary = its lhs");
+        let (lhs, rhs) = match &expr {
+            Expr::Binary(bin) => (bin.lhs.as_ref(), bin.rhs.as_ref()),
+            other => panic!("expected Binary, got {other:?}"),
+        };
+        let agg = match lhs {
+            Expr::Aggregate(agg) => agg,
+            other => panic!("expected Aggregate, got {other:?}"),
+        };
+        assert_eq!(agg.pos.start(), Some(0), "sum");
+        assert_eq!(agg.expr.pos_start(), Some(15), "rate, across a newline");
+        let rate_args = match agg.expr.as_ref() {
+            Expr::Call(call) => &call.args.args,
+            other => panic!("expected Call, got {other:?}"),
+        };
+        assert_eq!(
+            rate_args[0].pos_start(),
+            Some(20),
+            "matrix selector starts at its vector selector"
+        );
+        assert_eq!(rhs.pos_start(), Some(40), "histogram_quantile");
+        let hq_args = match rhs {
+            Expr::Call(call) => &call.args.args,
+            other => panic!("expected Call, got {other:?}"),
+        };
+        assert_eq!(hq_args[0].pos_start(), Some(59), "(0.9) starts at the `(`");
+        match hq_args[0].as_ref() {
+            Expr::Paren(p) => assert_eq!(p.expr.pos_start(), Some(60), "0.9"),
+            other => panic!("expected Paren, got {other:?}"),
+        }
+        assert_eq!(hq_args[1].pos_start(), Some(66), "up");
+
+        // The remaining Expr kinds, single-line.
+        for (q, expected) in [
+            ("-foo", 0usize),     // Unary
+            ("-1", 0),            // sign-collapsed NumberLiteral
+            ("\"abc\"", 0),       // StringLiteral
+            ("foo[5m:1m]", 0),    // Subquery = its inner expr
+            ("foo offset 5m", 0), // offset never moves the start
+        ] {
+            match parse(q) {
+                Ok(e) => assert_eq!(e.pos_start(), Some(expected), "{q}"),
+                Err(e) => panic!("expected {q:?} to parse, got {e}"),
+            }
+        }
+
+        // Hand-built nodes carry no position (the planner's
+        // `unwrap_or(0)` fallback input).
+        assert_eq!(Expr::from(1.0).pos_start(), None);
+    }
+
     #[test]
     fn parse_rejects_invalid_syntax_with_the_parser_own_message() {
         let err = parse("up{").unwrap_err();

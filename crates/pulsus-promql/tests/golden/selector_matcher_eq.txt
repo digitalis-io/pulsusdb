@@ -18,5 +18,6 @@ VectorSelector(
         at: None,
         anchored: false,
         smoothed: false,
+        pos: AstPos(0),
     },
 )

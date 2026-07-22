@@ -59,6 +59,7 @@ pub fn eval_range_fn_hist(
     window: RangeWindow,
     start_ts: Option<&[i64]>,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
     // `irate` (`instantValue`) only ever looks at the last TWO samples in
@@ -67,7 +68,7 @@ pub fn eval_range_fn_hist(
     // `rate`/`increase`/`delta` below. `instant_value_hist` is therefore
     // self-contained and bypasses the whole-window gate entirely.
     if func == RangeFn::Irate {
-        return instant_value_hist(samples, true, start_ts, metric_name, annos);
+        return instant_value_hist(samples, true, start_ts, metric_name, pos, annos);
     }
     let hist_count = samples.iter().filter(|s| s.h.is_some()).count();
     if hist_count == 0 {
@@ -82,20 +83,41 @@ pub fn eval_range_fn_hist(
         .map(RangeValue::Float);
     }
     if hist_count != samples.len() {
-        annos.warning(messages::mixed_floats_histograms_warning(metric_name));
+        annos.warning_at(pos, messages::mixed_floats_histograms_warning(metric_name));
         return None;
     }
     match func {
         RangeFn::Irate => unreachable!("handled above"),
-        RangeFn::Rate => {
-            extrapolated_rate_hist(samples, window, true, true, start_ts, metric_name, annos)
-        }
-        RangeFn::Increase => {
-            extrapolated_rate_hist(samples, window, true, false, start_ts, metric_name, annos)
-        }
-        RangeFn::Delta => {
-            extrapolated_rate_hist(samples, window, false, false, start_ts, metric_name, annos)
-        }
+        RangeFn::Rate => extrapolated_rate_hist(
+            samples,
+            window,
+            true,
+            true,
+            start_ts,
+            metric_name,
+            pos,
+            annos,
+        ),
+        RangeFn::Increase => extrapolated_rate_hist(
+            samples,
+            window,
+            true,
+            false,
+            start_ts,
+            metric_name,
+            pos,
+            annos,
+        ),
+        RangeFn::Delta => extrapolated_rate_hist(
+            samples,
+            window,
+            false,
+            false,
+            start_ts,
+            metric_name,
+            pos,
+            annos,
+        ),
     }
 }
 
@@ -126,6 +148,7 @@ pub fn instant_value_hist(
     is_rate: bool,
     start_ts: Option<&[i64]>,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
     if samples.len() < 2 {
@@ -148,7 +171,7 @@ pub fn instant_value_hist(
         }
         (Some(l), Some(p)) => (l, p),
         _ => {
-            annos.warning(messages::mixed_floats_histograms_warning(metric_name));
+            annos.warning_at(pos, messages::mixed_floats_histograms_warning(metric_name));
             return None;
         }
     };
@@ -175,10 +198,16 @@ pub fn instant_value_hist(
     // later incompatible-schema warning, matching the pin's ordering).
     use pulsus_model::CounterResetHint::Gauge;
     if is_rate && (last_h.counter_reset_hint == Gauge || prev_h.counter_reset_hint == Gauge) {
-        annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+        annos.warning_at(
+            pos,
+            messages::native_histogram_not_counter_warning(metric_name),
+        );
     }
     if !is_rate && (last_h.counter_reset_hint != Gauge || prev_h.counter_reset_hint != Gauge) {
-        annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
+        annos.warning_at(
+            pos,
+            messages::native_histogram_not_gauge_warning(metric_name),
+        );
     }
     let should_subtract = !is_rate || (!st_reset && !last_h.detect_reset(prev_h));
     if should_subtract {
@@ -187,15 +216,19 @@ pub fn instant_value_hist(
                 result = outcome.result;
                 // `instantValue`'s reconcile info (`functions.go:863-865`).
                 if outcome.nhcb_bounds_reconciled {
-                    annos.info(messages::mismatched_custom_buckets_histograms_info(
-                        messages::HistogramOperation::Sub,
-                    ));
+                    annos.info_at(
+                        pos,
+                        messages::mismatched_custom_buckets_histograms_info(
+                            messages::HistogramOperation::Sub,
+                        ),
+                    );
                 }
             }
             Err(FloatHistogramOpError::IncompatibleSchema) => {
-                annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                    metric_name,
-                ));
+                annos.warning_at(
+                    pos,
+                    messages::mixed_exponential_custom_histograms_warning(metric_name),
+                );
                 return None;
             }
         }
@@ -229,6 +262,7 @@ fn histogram_rate(
     start_ts: Option<&[i64]>,
     is_counter: bool,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<FloatHistogram> {
     let last = points[points.len() - 1].h.as_ref()?.as_ref().clone();
@@ -240,7 +274,10 @@ fn histogram_rate(
     // the reset null-out (which replaces `prev` with an empty histogram).
     use pulsus_model::CounterResetHint::Gauge;
     if is_counter && (prev.counter_reset_hint == Gauge || last.counter_reset_hint == Gauge) {
-        annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+        annos.warning_at(
+            pos,
+            messages::native_histogram_not_counter_warning(metric_name),
+        );
     }
 
     // Null out the 1st sample if there's a counter reset between it and
@@ -283,9 +320,10 @@ fn histogram_rate(
     }
 
     if last.uses_custom_buckets() != prev.uses_custom_buckets() {
-        annos.warning(messages::mixed_exponential_custom_histograms_warning(
-            metric_name,
-        ));
+        annos.warning_at(
+            pos,
+            messages::mixed_exponential_custom_histograms_warning(metric_name),
+        );
         return None;
     }
 
@@ -297,15 +335,19 @@ fn histogram_rate(
             // the pin's per-sample check (`functions.go:649-651`; dedup
             // collapses repeats to one warning).
             if curr.counter_reset_hint == Gauge {
-                annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+                annos.warning_at(
+                    pos,
+                    messages::native_histogram_not_counter_warning(metric_name),
+                );
             }
             if curr.schema < min_schema {
                 min_schema = curr.schema;
             }
             if curr.uses_custom_buckets() != prev.uses_custom_buckets() {
-                annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                    metric_name,
-                ));
+                annos.warning_at(
+                    pos,
+                    messages::mixed_exponential_custom_histograms_warning(metric_name),
+                );
                 return None;
             }
         }
@@ -323,15 +365,19 @@ fn histogram_rate(
             h = outcome.result;
             // `histogramRate`'s Sub reconcile info (`functions.go:672-674`).
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Sub,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Sub,
+                    ),
+                );
             }
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             return None;
         }
     }
@@ -351,7 +397,7 @@ fn histogram_rate(
                 for p in &points[1..] {
                     let curr = p.h.as_ref()?;
                     if curr.detect_reset(&prev_iter) {
-                        fold_reset_add(&mut h, &prev_iter, metric_name, annos)?;
+                        fold_reset_add(&mut h, &prev_iter, metric_name, pos, annos)?;
                     }
                     prev_iter = curr.as_ref().clone();
                 }
@@ -367,7 +413,7 @@ fn histogram_rate(
                             p.t_ms,
                         );
                     if st_reset || curr.detect_reset(&prev_iter) {
-                        fold_reset_add(&mut h, &prev_iter, metric_name, annos)?;
+                        fold_reset_add(&mut h, &prev_iter, metric_name, pos, annos)?;
                     }
                     prev_iter = curr.as_ref().clone();
                 }
@@ -383,7 +429,10 @@ fn histogram_rate(
         // Sub (an incompatible-schema Sub returned above, before this
         // point, exactly like the pin's early return). Hint-conditional
         // since issue #125.
-        annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
+        annos.warning_at(
+            pos,
+            messages::native_histogram_not_gauge_warning(metric_name),
+        );
     }
     // The rate/increase/delta result is a computed difference, never a
     // counter — marked gauge unconditionally (`functions.go:699`).
@@ -402,22 +451,27 @@ fn fold_reset_add(
     h: &mut FloatHistogram,
     prev: &FloatHistogram,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<()> {
     match h.add(prev) {
         Ok(outcome) => {
             *h = outcome.result;
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Add,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Add,
+                    ),
+                );
             }
             Some(())
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             None
         }
     }
@@ -432,6 +486,7 @@ fn fold_reset_add(
 /// deliberately duplicated rather than refactoring already-reviewed,
 /// heavily-tested float code (risk-minimization convention already used
 /// elsewhere in this crate).
+#[allow(clippy::too_many_arguments)] // one-for-one port of the pin's parameter list + pos
 fn extrapolated_rate_hist(
     samples: &[Sample],
     window: RangeWindow,
@@ -439,6 +494,7 @@ fn extrapolated_rate_hist(
     is_rate: bool,
     start_ts: Option<&[i64]>,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
     let RangeWindow {
@@ -449,7 +505,7 @@ fn extrapolated_rate_hist(
     if samples.len() < 2 {
         return None;
     }
-    let mut result = histogram_rate(samples, start_ts, is_counter, metric_name, annos)?;
+    let mut result = histogram_rate(samples, start_ts, is_counter, metric_name, pos, annos)?;
 
     let first_t = samples[0].t_ms;
     let last_t = samples[samples.len() - 1].t_ms;
@@ -529,6 +585,7 @@ pub fn eval_over_time_hist(
     samples: &[Sample],
     start_ts: Option<&[i64]>,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<OverTimeValue> {
     match func {
@@ -543,9 +600,8 @@ pub fn eval_over_time_hist(
         // `funcIdelta` (`:756-758`) shares `instantValue` with `irate`.
         // ST channel deliberately NOT forwarded: `idelta` is outside the
         // four-function gate (issue #155).
-        OverTimeFn::Idelta => {
-            instant_value_hist(samples, false, None, metric_name, annos).map(OverTimeValue::from)
-        }
+        OverTimeFn::Idelta => instant_value_hist(samples, false, None, metric_name, pos, annos)
+            .map(OverTimeValue::from),
         // `funcResets`/`funcChanges` (`:2258-2327`/`:2330-2379`): an EMPTY
         // `(t-r, t]` window drops the series — upstream never invokes the
         // function for a pointless series, so emitting `Float(0.0)` here
@@ -574,11 +630,11 @@ pub fn eval_over_time_hist(
         | OverTimeFn::Mad
         | OverTimeFn::Deriv
         | OverTimeFn::TsOfMin
-        | OverTimeFn::TsOfMax => eval_drop_set_over_time(func, samples, metric_name, annos),
+        | OverTimeFn::TsOfMax => eval_drop_set_over_time(func, samples, metric_name, pos, annos),
         // M7-A5b-iii: `funcSumOverTime`/`funcAvgOverTime`'s histogram
         // (KahanAdd) path — deferred out of A5b-ii, landed here.
         OverTimeFn::Sum | OverTimeFn::Avg => {
-            eval_sum_avg_over_time_hist(func, samples, metric_name, annos)
+            eval_sum_avg_over_time_hist(func, samples, metric_name, pos, annos)
         }
     }
 }
@@ -610,6 +666,7 @@ fn eval_sum_avg_over_time_hist(
     func: OverTimeFn,
     samples: &[Sample],
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<OverTimeValue> {
     let has_float = samples.iter().any(|s| s.h.is_none());
@@ -618,7 +675,7 @@ fn eval_sum_avg_over_time_hist(
         return None;
     }
     if has_float && has_hist {
-        annos.warning(messages::mixed_floats_histograms_warning(metric_name));
+        annos.warning_at(pos, messages::mixed_floats_histograms_warning(metric_name));
         return None;
     }
     if !has_hist {
@@ -656,9 +713,10 @@ fn eval_sum_avg_over_time_hist(
 
     macro_rules! incompatible_schema {
         () => {{
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             return None;
         }};
     }
@@ -769,14 +827,16 @@ fn eval_sum_avg_over_time_hist(
     // The deferred block's order (`functions.go:1188-1195`): collision
     // warning first, then the NHCB info.
     if cr_seen && ncr_seen {
-        annos.warning(messages::histogram_counter_reset_collision_warning(
-            messages::HistogramOperation::Agg,
-        ));
+        annos.warning_at(
+            pos,
+            messages::histogram_counter_reset_collision_warning(messages::HistogramOperation::Agg),
+        );
     }
     if nhcb_seen {
-        annos.info(messages::mismatched_custom_buckets_histograms_info(
-            messages::HistogramOperation::Agg,
-        ));
+        annos.info_at(
+            pos,
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Agg),
+        );
     }
     // NO Compact — neither pinned function compacts its result (unlike
     // the engine aggregation arms' `Compact(0)`).
@@ -879,6 +939,7 @@ fn eval_drop_set_over_time(
     func: OverTimeFn,
     samples: &[Sample],
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<OverTimeValue> {
     let floats: Vec<Sample> = samples.iter().filter(|s| s.h.is_none()).cloned().collect();
@@ -888,7 +949,10 @@ fn eval_drop_set_over_time(
     let hist_present = floats.len() != samples.len();
     let result = super::functions::eval_over_time(func, &floats);
     if hist_present {
-        annos.info(messages::histogram_ignored_in_mixed_range_info(metric_name));
+        annos.info_at(
+            pos,
+            messages::histogram_ignored_in_mixed_range_info(metric_name),
+        );
     }
     result.map(OverTimeValue::Float)
 }
@@ -906,6 +970,7 @@ pub fn eval_quantile_over_time_hist(
     phi: f64,
     samples: &[Sample],
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<f64> {
     let floats: Vec<Sample> = samples.iter().filter(|s| s.h.is_none()).cloned().collect();
@@ -915,7 +980,7 @@ pub fn eval_quantile_over_time_hist(
     // NaN is outside the range too (`contains` is false for NaN) — the
     // pin's `IsNaN(q) || q < 0 || q > 1` collapses into one check.
     if !(0.0..=1.0).contains(&phi) {
-        annos.warning(messages::invalid_quantile_warning(phi));
+        annos.warning_at(pos, messages::invalid_quantile_warning(phi));
     }
     let hist_present = floats.len() != samples.len();
     let result = super::functions::eval_over_time_param(
@@ -927,7 +992,10 @@ pub fn eval_quantile_over_time_hist(
     .ok()
     .flatten();
     if hist_present {
-        annos.info(messages::histogram_ignored_in_mixed_range_info(metric_name));
+        annos.info_at(
+            pos,
+            messages::histogram_ignored_in_mixed_range_info(metric_name),
+        );
     }
     result
 }
@@ -959,6 +1027,7 @@ pub fn eval_over_time_param_hist(
     scalars: &[f64],
     eval_t_ms: i64,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<Option<f64>, crate::error::PromqlError> {
     let floats: Vec<Sample> = samples.iter().filter(|s| s.h.is_none()).cloned().collect();
@@ -968,7 +1037,10 @@ pub fn eval_over_time_param_hist(
     // factor errors BEFORE any annotation, exactly like the pin's panic.
     let result = super::functions::eval_over_time_param(func, &floats, scalars, eval_t_ms)?;
     if hist_present && !floats.is_empty() {
-        annos.info(messages::histogram_ignored_in_mixed_range_info(metric_name));
+        annos.info_at(
+            pos,
+            messages::histogram_ignored_in_mixed_range_info(metric_name),
+        );
     }
     Ok(result)
 }
@@ -1038,6 +1110,7 @@ mod tests {
             },
             None,
             "reset_in_bucket",
+            0,
             &mut annos,
         );
         assert_hist_eq(v, 9.0, 10.5, &[1.5, 3.0, 4.5]);
@@ -1075,6 +1148,7 @@ mod tests {
             },
             None,
             "incr_histogram",
+            0,
             &mut annos,
         );
         match v {
@@ -1116,10 +1190,11 @@ mod tests {
             },
             None,
             "m",
+            0,
             &mut annos,
         );
         assert!(v.is_none());
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("mix of histograms and floats"));
     }
@@ -1138,6 +1213,7 @@ mod tests {
             },
             None,
             "m",
+            0,
             &mut annos,
         );
         match v {
@@ -1168,6 +1244,7 @@ mod tests {
             },
             None,
             "m",
+            0,
             &mut annos,
         );
         match v {
@@ -1196,14 +1273,14 @@ mod tests {
             hist_sample(60_000, 3, 3.0, vec![3]),
         ];
         let mut annos = Annotations::new();
-        let v = instant_value_hist(&samples, false, None, "m", &mut annos);
+        let v = instant_value_hist(&samples, false, None, "m", 0, &mut annos);
         match v {
             Some(RangeValue::Histogram(h)) => {
                 assert!((h.count - (-7.0)).abs() < 1e-9, "count {}", h.count);
             }
             other => panic!("expected a histogram, got {other:?}"),
         }
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec!["PromQL warning: this native histogram metric is not a gauge: \"m\"".to_string()],
@@ -1219,7 +1296,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Last, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Last, &samples, None, "m", 0, &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => assert_eq!(h.count, 4.0),
             other => panic!("expected a preserved histogram, got {other:?}"),
@@ -1234,7 +1311,7 @@ mod tests {
             Sample::float(60_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::First, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::First, &samples, None, "m", 0, &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => assert_eq!(h.count, 4.0),
             other => panic!("expected a preserved histogram, got {other:?}"),
@@ -1249,7 +1326,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Count, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Count, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 3.0));
     }
 
@@ -1263,7 +1340,7 @@ mod tests {
             hist_sample(600_000, 6, 7.0, vec![1, 1, 1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1274,7 +1351,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1285,7 +1362,7 @@ mod tests {
     #[test]
     fn resets_over_an_empty_window_returns_none() {
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Resets, &[], None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Resets, &[], None, "m", 0, &mut annos);
         assert!(v.is_none(), "empty window must drop the series, got {v:?}");
         assert!(annos.is_empty());
     }
@@ -1297,7 +1374,7 @@ mod tests {
             hist_sample(60_000, 5, 6.0, vec![1, 1, 0]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
     }
 
@@ -1308,7 +1385,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 0.0));
     }
 
@@ -1318,7 +1395,7 @@ mod tests {
     #[test]
     fn changes_over_an_empty_window_returns_none() {
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Changes, &[], None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Changes, &[], None, "m", 0, &mut annos);
         assert!(v.is_none(), "empty window must drop the series, got {v:?}");
         assert!(annos.is_empty());
     }
@@ -1334,7 +1411,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", 0, &mut annos);
         assert!(v.is_none());
         assert!(annos.is_empty(), "no annotation on a histogram-only window");
     }
@@ -1350,9 +1427,9 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Min, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(infos.len(), 1);
         assert!(infos[0].contains("ignored histograms in a range"));
     }
@@ -1365,7 +1442,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::TsOfMin, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::TsOfMin, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if (f - 60.0).abs() < 1e-9));
         assert!(!annos.is_empty());
     }
@@ -1377,7 +1454,7 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_quantile_over_time_hist(0.5, &samples, "m", &mut annos);
+        let v = eval_quantile_over_time_hist(0.5, &samples, "m", 0, &mut annos);
         assert!(v.is_none());
         assert!(annos.is_empty());
     }
@@ -1390,7 +1467,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_quantile_over_time_hist(1.0, &samples, "m", &mut annos);
+        let v = eval_quantile_over_time_hist(1.0, &samples, "m", 0, &mut annos);
         assert!(matches!(v, Some(f) if (f - 3.0).abs() < 1e-9));
         assert!(!annos.is_empty());
     }
@@ -1399,7 +1476,7 @@ mod tests {
     fn idelta_over_a_float_only_window_matches_the_byte_unchanged_float_path() {
         let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 4.0)];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if (f - 3.0).abs() < 1e-9));
         assert!(annos.is_empty());
     }
@@ -1463,6 +1540,7 @@ mod tests {
             },
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1475,7 +1553,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, infos) = annos.as_strings(0, 0);
+        let (warnings, infos) = annos.as_strings("", 0, 0);
         assert!(
             warnings.is_empty(),
             "expect no_warn per the corpus: {warnings:?}"
@@ -1504,6 +1582,7 @@ mod tests {
             },
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1514,7 +1593,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert!(warnings.is_empty(), "expect no_warn per the corpus");
     }
 
@@ -1546,6 +1625,7 @@ mod tests {
             },
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1556,7 +1636,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, infos) = annos.as_strings(0, 0);
+        let (warnings, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![
@@ -1589,6 +1669,7 @@ mod tests {
             },
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1598,7 +1679,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![
@@ -1620,6 +1701,7 @@ mod tests {
             &nhcb_metric_window_at_12m(),
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 0.0));
@@ -1638,6 +1720,7 @@ mod tests {
             &nhcb_metric_window_at_12m(),
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 1.0));
@@ -1650,9 +1733,9 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Idelta, &samples, None, "m", 0, &mut annos);
         assert!(v.is_none());
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(warnings.len(), 1);
     }
 
@@ -1670,6 +1753,7 @@ mod tests {
             &nhcb_metric_window_at_12m(),
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1681,7 +1765,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, infos) = annos.as_strings(0, 0);
+        let (warnings, infos) = annos.as_strings("", 0, 0);
         assert!(warnings.is_empty(), "expect no_warn per the corpus");
         assert_eq!(
             infos,
@@ -1703,6 +1787,7 @@ mod tests {
             &nhcb_metric_window_at_12m(),
             None,
             "nhcb_metric",
+            0,
             &mut annos,
         );
         match v {
@@ -1714,7 +1799,7 @@ mod tests {
             }
             other => panic!("expected a reconciled histogram, got {other:?}"),
         }
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert!(warnings.is_empty(), "expect no_warn per the corpus");
     }
 
@@ -1729,9 +1814,9 @@ mod tests {
             hist_sample(60_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", 0, &mut annos);
         assert!(v.is_none());
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![messages::mixed_floats_histograms_warning("m")]
@@ -1744,7 +1829,7 @@ mod tests {
     fn sum_over_time_over_a_pure_float_window_is_unaffected() {
         let samples = vec![Sample::float(0, 1.0), Sample::float(60_000, 2.0)];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", 0, &mut annos);
         assert!(matches!(v, Some(OverTimeValue::Float(f)) if f == 3.0));
         assert!(annos.is_empty());
     }
@@ -1759,7 +1844,7 @@ mod tests {
             hist_sample(120_000, 4, 5.0, vec![1, 1, -1]),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", 0, &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 assert_eq!(h.count, 12.0);
@@ -1809,7 +1894,7 @@ mod tests {
             float_hist_sample(120_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Sum, &samples, None, "m", 0, &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 assert_eq!(h.positive_buckets, vec![BIG_PLUS_2]);
@@ -1839,7 +1924,7 @@ mod tests {
             float_hist_sample(120_000, 1.0),
         ];
         let mut annos = Annotations::new();
-        let v = eval_over_time_hist(OverTimeFn::Avg, &samples, None, "m", &mut annos);
+        let v = eval_over_time_hist(OverTimeFn::Avg, &samples, None, "m", 0, &mut annos);
         match v {
             Some(OverTimeValue::Histogram(h)) => {
                 let expected = BIG / 3.0 + 2.0 / 3.0;
@@ -1873,6 +1958,7 @@ mod tests {
             &[10.0],
             120_000,
             "m",
+            0,
             &mut annos,
         )
         .unwrap();
@@ -1894,13 +1980,14 @@ mod tests {
             &[0.0],
             60_000,
             "m",
+            0,
             &mut annos,
         )
         .unwrap();
         // Floats regress to slope 1/s, intercept 60 at t=60s; the
         // interleaved histogram must not perturb the regression.
         assert_eq!(v, Some(60.0));
-        let (warnings, infos) = annos.as_strings(0, 0);
+        let (warnings, infos) = annos.as_strings("", 0, 0);
         assert!(warnings.is_empty());
         assert_eq!(
             infos,
@@ -1923,12 +2010,13 @@ mod tests {
             &[10.0],
             60_000,
             "m",
+            0,
             &mut annos,
         )
         .unwrap();
         assert!(v.is_none());
         assert_eq!(
-            annos.as_strings(0, 0).1,
+            annos.as_strings("", 0, 0).1,
             vec![messages::histogram_ignored_in_mixed_range_info("m")]
         );
     }
@@ -1945,6 +2033,7 @@ mod tests {
             &[0.0],
             60_000,
             "m",
+            0,
             &mut annos,
         )
         .unwrap();
@@ -1978,6 +2067,7 @@ mod tests {
                 &[2.0, 0.5],
                 0,
                 "m",
+                0,
                 &mut annos,
             )
             .is_err()
@@ -1989,6 +2079,7 @@ mod tests {
             &[0.5, 0.5],
             0,
             "m",
+            0,
             &mut annos,
         )
         .unwrap();
@@ -2011,11 +2102,12 @@ mod tests {
             hist_sample(60_000, 7, 7.0, vec![7]),
         ];
         let mut annos = Annotations::new();
-        let none = histogram_rate(&points, None, true, "m", &mut annos).unwrap();
+        let none = histogram_rate(&points, None, true, "m", 0, &mut annos).unwrap();
         assert!((none.count - 2.0).abs() < 1e-9, "count {}", none.count);
         // st[1]=30_000 > prev_t=0 ⇒ reset: prev nulled, then the
         // reset-add loop re-adds the (empty) prev — last survives whole.
-        let with_st = histogram_rate(&points, Some(&[0, 30_000]), true, "m", &mut annos).unwrap();
+        let with_st =
+            histogram_rate(&points, Some(&[0, 30_000]), true, "m", 0, &mut annos).unwrap();
         assert!(
             (with_st.count - 7.0).abs() < 1e-9,
             "count {}",
@@ -2035,12 +2127,12 @@ mod tests {
             hist_sample(120_000, 9, 9.0, vec![9]),
         ];
         let mut annos = Annotations::new();
-        let none = histogram_rate(&points, None, true, "m", &mut annos).unwrap();
+        let none = histogram_rate(&points, None, true, "m", 0, &mut annos).unwrap();
         assert!((none.count - 4.0).abs() < 1e-9, "count {}", none.count);
         // st[2]=90_000 > points[1].t=60_000 ⇒ reset at the 3rd point:
         // (9 - 5) + prev(7) = 11.
         let with_st =
-            histogram_rate(&points, Some(&[0, 0, 90_000]), true, "m", &mut annos).unwrap();
+            histogram_rate(&points, Some(&[0, 0, 90_000]), true, "m", 0, &mut annos).unwrap();
         assert!(
             (with_st.count - 11.0).abs() < 1e-9,
             "count {}",
@@ -2060,14 +2152,14 @@ mod tests {
             hist_sample(60_000, 7, 7.0, vec![7]),
         ];
         let mut annos = Annotations::new();
-        let none = instant_value_hist(&samples, true, None, "m", &mut annos);
+        let none = instant_value_hist(&samples, true, None, "m", 0, &mut annos);
         match none {
             Some(RangeValue::Histogram(h)) => {
                 assert!((h.count - 2.0 / 60.0).abs() < 1e-12, "count {}", h.count);
             }
             other => panic!("expected a histogram, got {other:?}"),
         }
-        let with_st = instant_value_hist(&samples, true, Some(&[0, 30_000]), "m", &mut annos);
+        let with_st = instant_value_hist(&samples, true, Some(&[0, 30_000]), "m", 0, &mut annos);
         match with_st {
             Some(RangeValue::Histogram(h)) => {
                 assert!((h.count - 7.0 / 60.0).abs() < 1e-12, "count {}", h.count);
@@ -2117,6 +2209,7 @@ mod tests {
             &samples,
             Some(&[0, 30_000]),
             "m",
+            0,
             &mut annos,
         );
         match v {
@@ -2130,6 +2223,7 @@ mod tests {
             &samples,
             Some(&[0, 30_000]),
             "m",
+            0,
             &mut annos,
         );
         match v {

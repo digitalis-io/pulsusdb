@@ -17,11 +17,13 @@ Binary(
                 at: None,
                 anchored: false,
                 smoothed: false,
+                pos: AstPos(0),
             },
         ),
         rhs: NumberLiteral(
             NumberLiteral {
                 val: 2.0,
+                pos: AstPos(11),
             },
         ),
         modifier: Some(

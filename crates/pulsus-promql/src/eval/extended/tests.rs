@@ -190,29 +190,29 @@ fn smoothed_instant_exact_interpolate_carry_forward() {
     let samples = [f(0, 1.0), f(10, 2.0), f(20, 3.0)];
     // Exact match at t=10 → 2.
     assert_eq!(
-        float_of(smoothed_instant(&samples, 10, 300_000, "m", &mut annos)),
+        float_of(smoothed_instant(&samples, 10, 300_000, "m", 0, &mut annos)),
         2.0
     );
     // Interpolate at t=5 between (0,1) and (10,2) → 1.5.
     assert_eq!(
-        float_of(smoothed_instant(&samples, 5, 300_000, "m", &mut annos)),
+        float_of(smoothed_instant(&samples, 5, 300_000, "m", 0, &mut annos)),
         1.5
     );
     // Carry forward past the last sample.
     assert_eq!(
-        float_of(smoothed_instant(&samples, 25, 300_000, "m", &mut annos)),
+        float_of(smoothed_instant(&samples, 25, 300_000, "m", 0, &mut annos)),
         3.0
     );
     // Only-future data ⇒ skip.
-    assert!(smoothed_instant(&samples, 25, 5, "m", &mut annos).is_none());
+    assert!(smoothed_instant(&samples, 25, 5, "m", 0, &mut annos).is_none());
 }
 
 #[test]
 fn smoothed_instant_mixed_window_warns_and_skips() {
     let mut annos = Annotations::default();
     let samples = [f(0, 1.0), h_sample(10, 3.0, CounterResetHint::Unknown)];
-    assert!(smoothed_instant(&samples, 5, 300_000, "mixed", &mut annos).is_none());
-    let (warnings, _) = annos.as_strings(64, 64);
+    assert!(smoothed_instant(&samples, 5, 300_000, "mixed", 0, &mut annos).is_none());
+    let (warnings, _) = annos.as_strings("", 64, 64);
     assert!(
         warnings
             .iter()
@@ -230,7 +230,7 @@ fn extended_histogram_rate_result_is_gauge() {
     ];
     let mut annos = Annotations::default();
     let out = extended_histogram_rate(
-        &samples, 60_000, 0, 50_000, false, true, false, "h", &mut annos,
+        &samples, 60_000, 0, 50_000, false, true, false, "h", 0, &mut annos,
     );
     match out {
         Some(RangeValue::Histogram(h)) => {
@@ -252,9 +252,9 @@ fn extended_histogram_rate_gauge_hint_warns_not_a_counter() {
     ];
     let mut annos = Annotations::default();
     let _ = extended_histogram_rate(
-        &samples, 90_000, 0, 90_000, false, true, false, "g", &mut annos,
+        &samples, 90_000, 0, 90_000, false, true, false, "g", 0, &mut annos,
     );
-    let (warnings, _) = annos.as_strings(64, 64);
+    let (warnings, _) = annos.as_strings("", 64, 64);
     assert!(
         warnings.iter().any(|w| w.contains("not a counter")),
         "expected not-a-counter warning, got {warnings:?}"

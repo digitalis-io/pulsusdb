@@ -160,7 +160,15 @@ async fn query_impl(
         step_ms: 0,
     };
     let engine = engine_for(&state).await?;
-    run_query(&engine, &expr, &query_params, wants_explain(headers), at_ms).await
+    run_query(
+        &engine,
+        &expr,
+        query,
+        &query_params,
+        wants_explain(headers),
+        at_ms,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------
@@ -217,6 +225,7 @@ async fn query_range_impl(
     run_query(
         &engine,
         &expr,
+        query,
         &query_params,
         wants_explain(headers),
         end_ms,
@@ -226,9 +235,13 @@ async fn query_range_impl(
 
 /// Shared success path for `query`/`query_range`: run with or without the
 /// explain side channel (single execution either way), then encode.
+/// `query` is the raw query text the caller parsed `expr` from — the
+/// annotations' position offsets index into exactly this string (issue
+/// #128, upstream `AsStrings(r.FormValue("query"), 10, 10)`).
 async fn run_query(
     engine: &MetricsEngine,
     expr: &Expr,
+    query: &str,
     query_params: &MetricQueryParams,
     explain: bool,
     at_ms: i64,
@@ -247,6 +260,7 @@ async fn run_query(
             Some(plan_explain),
             at_ms,
             ordered,
+            query,
             &annotations,
         ))
     } else {
@@ -256,6 +270,7 @@ async fn run_query(
             None,
             at_ms,
             ordered,
+            query,
             &annotations,
         ))
     }

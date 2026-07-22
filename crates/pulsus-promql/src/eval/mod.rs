@@ -532,15 +532,20 @@ fn flush_ratio_warnings(caches: &EvalCaches) {
     let extrema = caches.ratio_extrema.borrow();
     let mut annos = caches.annotations.borrow_mut();
     for (_, e) in extrema.iter() {
+        // Issue #128: `aggExpr.Param.PositionRange()` (engine.go:
+        // 1657-1660) — the pos is stored in the extrema entry at record
+        // time (the dedup key alone cannot recover the node).
         if e.max > 1.0 {
-            annos.warning(crate::annotations::messages::invalid_ratio_warning(
-                e.max, 1.0,
-            ));
+            annos.warning_at(
+                e.param_pos,
+                crate::annotations::messages::invalid_ratio_warning(e.max, 1.0),
+            );
         }
         if e.min < -1.0 {
-            annos.warning(crate::annotations::messages::invalid_ratio_warning(
-                e.min, -1.0,
-            ));
+            annos.warning_at(
+                e.param_pos,
+                crate::annotations::messages::invalid_ratio_warning(e.min, -1.0),
+            );
         }
     }
 }
@@ -784,6 +789,10 @@ type InfoCache = HashMap<*const PlanExpr, PreparedInfo>;
 /// so the accumulated pair equals upstream's `params.Max()/Min()`.
 #[derive(Debug, Clone, Copy)]
 struct RatioExtrema {
+    /// Issue #128: the emitting Aggregate node's `param_pos`, stored at
+    /// record time (`aggExpr.Param.PositionRange()` — the flush site
+    /// cannot recover it from the node-address key).
+    param_pos: usize,
     max: f64,
     min: f64,
 }
@@ -1073,7 +1082,7 @@ fn prepare_subqueries(
             ),
             None => Ok(()),
         },
-        PlanExpr::HistogramQuantile { quantile, expr } => {
+        PlanExpr::HistogramQuantile { quantile, expr, .. } => {
             prepare_subqueries(
                 quantile,
                 selectors,
@@ -1132,7 +1141,9 @@ fn prepare_subqueries(
             inner_evals,
             classifier,
         ),
-        PlanExpr::HistogramFraction { lower, upper, expr } => {
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => {
             prepare_subqueries(
                 lower,
                 selectors,
@@ -1742,7 +1753,7 @@ fn expr_may_annotate(expr: &PlanExpr) -> bool {
         // reconcile infos (`hist_range_fns.rs:65-311`).
         PlanExpr::RangeFn { .. } => true,
 
-        PlanExpr::OverTime { func, source } => {
+        PlanExpr::OverTime { func, source, .. } => {
             over_time_fn_may_annotate(*func) || range_source_may_annotate(source)
         }
         // CAPABLE unconditionally: quantile/predict_linear/
@@ -2020,6 +2031,7 @@ fn prepare_step_invariant(
         PlanExpr::HistogramQuantile {
             quantile: a,
             expr: b,
+            ..
         }
         | PlanExpr::Binary { lhs: a, rhs: b, .. }
         | PlanExpr::SetOp { lhs: a, rhs: b, .. } => {
@@ -2042,7 +2054,9 @@ fn prepare_step_invariant(
                 classifier,
             )
         }
-        PlanExpr::HistogramFraction { lower, upper, expr } => {
+        PlanExpr::HistogramFraction {
+            lower, upper, expr, ..
+        } => {
             prepare_step_invariant(
                 lower,
                 selectors,
@@ -2422,6 +2436,7 @@ fn eval_extended_range_fn(
     range_end_ms: i64,
     smoothed: bool,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<hist_range_fns::RangeValue> {
     use crate::plan::RangeFn;
@@ -2433,7 +2448,11 @@ fn eval_extended_range_fn(
     };
     let hist_count = samples.iter().filter(|s| s.h.is_some()).count();
     if hist_count > 0 && hist_count < samples.len() {
-        annos.warning(crate::annotations::messages::mixed_floats_histograms_warning(metric_name));
+        // Issue #128: `args[0].PositionRange()` (functions.go:459-462).
+        annos.warning_at(
+            pos,
+            crate::annotations::messages::mixed_floats_histograms_warning(metric_name),
+        );
         return None;
     }
     if hist_count > 0 {
@@ -2446,6 +2465,7 @@ fn eval_extended_range_fn(
             is_counter,
             is_rate,
             metric_name,
+            pos,
             annos,
         )
     } else if !samples.is_empty() {
@@ -2518,6 +2538,7 @@ fn over_time_value_to_sample_fields(
 fn partition_histogram_inputs(
     v: Vec<InstantSample>,
     caches: &EvalCaches,
+    arg_pos: usize,
 ) -> (
     Vec<InstantSample>,
     HashMap<SeriesIdentity, Vec<functions::Bucket>>,
@@ -2540,7 +2561,10 @@ fn partition_histogram_inputs(
         let le_str = s.labels.get("le").unwrap_or("");
         let le: Result<f64, _> = le_str.parse();
         let Ok(le) = le else {
-            caches.annotations.borrow_mut().warning(
+            // Issue #128: `arg.PositionRange()` — resetHistograms' own
+            // vector-argument position (engine.go:1336).
+            caches.annotations.borrow_mut().warning_at(
+                arg_pos,
                 crate::annotations::messages::bad_bucket_label_warning(
                     s.metric_name.as_deref().unwrap_or(""),
                     le_str,
@@ -2561,7 +2585,9 @@ fn partition_histogram_inputs(
     native.retain(|s| {
         let key = (s.metric_name.clone(), s.labels.clone());
         if groups.get(&key).is_some_and(|b| !b.is_empty()) {
-            caches.annotations.borrow_mut().warning(
+            // Issue #128: `arg.PositionRange()` (engine.go:1362-1365).
+            caches.annotations.borrow_mut().warning_at(
+                arg_pos,
                 crate::annotations::messages::mixed_classic_native_histograms_warning(
                     s.metric_name.as_deref().unwrap_or(""),
                 ),
@@ -2714,11 +2740,16 @@ fn eval_step(
                         .or_else(|| sel.metric_name.clone());
                     let smoothed = {
                         let mut annos = caches.annotations.borrow_mut();
+                        // Issue #128: the smoothed instant selector's
+                        // annotations carry the SELECTOR's own position
+                        // (`ev.smoothSeries(e.Series, e.Offset,
+                        // e.PositionRange())`, engine.go:2540).
                         extended::smoothed_instant(
                             &series.samples,
                             eff_t,
                             lookback_ms,
                             metric_name.as_deref().unwrap_or(""),
+                            sel.pos_start,
                             &mut annos,
                         )
                     };
@@ -2772,7 +2803,11 @@ fn eval_step(
         // dispatches float-only windows to the byte-unchanged
         // `functions::eval_range_fn` internally and adds the native-
         // histogram `rate`/`increase`/`delta`/`irate` semantics.
-        PlanExpr::RangeFn { func, source } => {
+        PlanExpr::RangeFn {
+            func,
+            source,
+            arg0_start,
+        } => {
             let src = windowed_range_source(
                 source,
                 selectors,
@@ -2806,6 +2841,7 @@ fn eval_step(
                             },
                             st,
                             metric_name,
+                            *arg0_start,
                             &mut annos,
                         )
                     } else {
@@ -2821,6 +2857,7 @@ fn eval_step(
                             src.upper_incl,
                             src.mode == RangeMode::Smoothed,
                             metric_name,
+                            *arg0_start,
                             &mut annos,
                         )
                     }
@@ -2853,7 +2890,11 @@ fn eval_step(
         // The kept name is the fetched series' own per-row
         // `FetchedSeries::metric_name` (issue #85 — see the `Selector`
         // arm), threaded through `WindowedSeries::metric_name`.
-        PlanExpr::OverTime { func, source } => {
+        PlanExpr::OverTime {
+            func,
+            source,
+            arg0_start,
+        } => {
             let src = windowed_range_source(
                 source,
                 selectors,
@@ -2899,6 +2940,7 @@ fn eval_step(
                         windowed,
                         st,
                         metric_name,
+                        *arg0_start,
                         &mut annos,
                     )
                 };
@@ -2932,7 +2974,12 @@ fn eval_step(
         // regression intercept is the evaluation **step time** `t_ms`
         // (upstream `enh.Ts` — the #67 adjudication), passed through as
         // `eval_t_ms`.
-        PlanExpr::OverTimeParam { func, source, args } => {
+        PlanExpr::OverTimeParam {
+            func,
+            source,
+            args,
+            arg0_start,
+        } => {
             let mut scalars = Vec::with_capacity(args.len());
             for a in args {
                 let StepValue::Scalar(s) =
@@ -2988,6 +3035,7 @@ fn eval_step(
                         scalars[0],
                         &series.samples,
                         metric_name,
+                        *arg0_start,
                         &mut annos,
                     )
                 } else {
@@ -3003,6 +3051,7 @@ fn eval_step(
                         &scalars,
                         t_ms,
                         metric_name,
+                        *arg0_start,
                         &mut annos,
                     )?
                 };
@@ -3107,17 +3156,23 @@ fn eval_step(
         // own "sort is ineffective for range queries"); the server
         // encoder preserves this order on the wire for sort-rooted
         // instant queries (`expr_is_sort_root`).
-        PlanExpr::Sort { descending, arg } => {
+        PlanExpr::Sort {
+            descending,
+            arg,
+            call_pos,
+        } => {
             // Issue #154: `SortInRangeQueryWarning` (engine.go:2165-2168
             // at the pin) — emitted for a sort call under a range-shaped
             // horizon, BEFORE argument evaluation (upstream adds to
             // `warnings` before `rangeEval` runs); the per-step repeat
             // dedups on the message text.
             if caches.range_query.get() {
-                caches
-                    .annotations
-                    .borrow_mut()
-                    .warning(crate::annotations::messages::sort_in_range_query_warning());
+                // Issue #128: `e.PositionRange()` of the sort Call
+                // (engine.go:2167).
+                caches.annotations.borrow_mut().warning_at(
+                    *call_pos,
+                    crate::annotations::messages::sort_in_range_query_warning(),
+                );
             }
             let StepValue::Vector(mut v) =
                 eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
@@ -3141,14 +3196,16 @@ fn eval_step(
             descending,
             labels: names,
             arg,
+            call_pos,
         } => {
             // Issue #154: same `SortInRangeQueryWarning` gate as `Sort`
             // above (engine.go:2166 names all four sort functions).
             if caches.range_query.get() {
-                caches
-                    .annotations
-                    .borrow_mut()
-                    .warning(crate::annotations::messages::sort_in_range_query_warning());
+                // Issue #128: same Call position as `Sort` above.
+                caches.annotations.borrow_mut().warning_at(
+                    *call_pos,
+                    crate::annotations::messages::sort_in_range_query_warning(),
+                );
             }
             let StepValue::Vector(mut v) =
                 eval_step(arg, selectors, data, t_ms, lookback_ms, caches)?
@@ -3223,7 +3280,12 @@ fn eval_step(
         // `bucketQuantile` path (grouped by identity minus `le`,
         // `funcHistogramQuantile`, `functions.go`), which since M7-A5b-i
         // also reports upstream's forced-monotonicity info.
-        PlanExpr::HistogramQuantile { quantile, expr } => {
+        PlanExpr::HistogramQuantile {
+            quantile,
+            expr,
+            q_pos,
+            vec_pos,
+        } => {
             let StepValue::Scalar(q) =
                 eval_step(quantile, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -3241,20 +3303,24 @@ fn eval_step(
             };
 
             if q.is_nan() || !(0.0..=1.0).contains(&q) {
-                caches
-                    .annotations
-                    .borrow_mut()
-                    .warning(crate::annotations::messages::invalid_quantile_warning(q));
+                // Issue #128: `validateQuantile(q, args[0])`
+                // (functions.go:2084).
+                caches.annotations.borrow_mut().warning_at(
+                    *q_pos,
+                    crate::annotations::messages::invalid_quantile_warning(q),
+                );
             }
 
-            let (native, mut groups) = partition_histogram_inputs(v, caches);
+            let (native, mut groups) = partition_histogram_inputs(v, caches, *vec_pos);
             let mut out = Vec::new();
             for s in native {
                 let Some(h) = &s.h else { continue };
                 let metric_name = s.metric_name.as_deref().unwrap_or("");
                 let qv = {
                     let mut annos = caches.annotations.borrow_mut();
-                    histogram_fns::histogram_quantile(q, h, metric_name, &mut annos)
+                    // Issue #128: the native NaN result/skew infos carry
+                    // args[0]'s position (functions.go:2098).
+                    histogram_fns::histogram_quantile(q, h, metric_name, *q_pos, &mut annos)
                 };
                 out.push(InstantSample {
                     labels: s.labels,
@@ -3283,7 +3349,10 @@ fn eval_step(
                     // MERGE into one widened info (the pin's per-step
                     // `warnings.Merge(ws)` in `rangeEval` runs
                     // `annoError.Merge` on the key collision).
-                    caches.annotations.borrow_mut().forced_monotonicity_info(
+                    // Issue #128: forced-monotonicity carries args[1]'s
+                    // position (functions.go:2116).
+                    caches.annotations.borrow_mut().forced_monotonicity_info_at(
+                        *vec_pos,
                         crate::annotations::messages::histogram_quantile_forced_monotonicity_info(
                             metric_name.as_deref().unwrap_or(""),
                         ),
@@ -3326,6 +3395,9 @@ fn eval_step(
             expr,
             label,
             quantiles,
+            vec_pos,
+            label_pos,
+            q_pos,
         } => {
             let StepValue::Vector(v) = eval_step(expr, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -3335,7 +3407,7 @@ fn eval_step(
                 });
             };
             let mut qs: Vec<f64> = Vec::with_capacity(quantiles.len());
-            for q_expr in quantiles {
+            for (i, q_expr) in quantiles.iter().enumerate() {
                 let StepValue::Scalar(q) =
                     eval_step(q_expr, selectors, data, t_ms, lookback_ms, caches)?
                 else {
@@ -3345,17 +3417,19 @@ fn eval_step(
                                 .to_string(),
                     });
                 };
-                // `validateQuantile` per argument (`functions.go:2158`).
+                // `validateQuantile` per argument (`functions.go:2158`) —
+                // issue #128: each warning carries ITS argument's
+                // position (`args[i]`, `functions.go:2164`).
                 if q.is_nan() || !(0.0..=1.0).contains(&q) {
-                    caches
-                        .annotations
-                        .borrow_mut()
-                        .warning(crate::annotations::messages::invalid_quantile_warning(q));
+                    caches.annotations.borrow_mut().warning_at(
+                        q_pos.get(i).copied().unwrap_or(0),
+                        crate::annotations::messages::invalid_quantile_warning(q),
+                    );
                 }
                 qs.push(q);
             }
 
-            let (native, groups) = partition_histogram_inputs(v, caches);
+            let (native, groups) = partition_histogram_inputs(v, caches, *vec_pos);
             // Sort the classic group keys once (the singular arm's
             // determinism rule — upstream iterates a Go map).
             let mut keys: Vec<SeriesIdentity> = groups.keys().cloned().collect();
@@ -3369,7 +3443,9 @@ fn eval_step(
                     let metric_name = s.metric_name.as_deref().unwrap_or("");
                     let qv = {
                         let mut annos = caches.annotations.borrow_mut();
-                        histogram_fns::histogram_quantile(q, h, metric_name, &mut annos)
+                        // Issue #128: args[0] here is the VECTOR argument
+                        // (functions.go:2180).
+                        histogram_fns::histogram_quantile(q, h, metric_name, *vec_pos, &mut annos)
                     };
                     let (labels, metric_name) =
                         set_quantile_label(s.labels.clone(), s.metric_name.clone(), label, &q_str);
@@ -3390,7 +3466,11 @@ fn eval_step(
                     if report.forced {
                         // Merged exactly as the singular arm merges (see
                         // its comment on the pin's `Merge` collision).
-                        caches.annotations.borrow_mut().forced_monotonicity_info(
+                        // Issue #128: forced-monotonicity carries the
+                        // STRING-LABEL argument's position (args[1],
+                        // functions.go:2198).
+                        caches.annotations.borrow_mut().forced_monotonicity_info_at(
+                            *label_pos,
                             crate::annotations::messages::histogram_quantile_forced_monotonicity_info(
                                 metric_name.as_deref().unwrap_or(""),
                             ),
@@ -3455,7 +3535,13 @@ fn eval_step(
         // M7-A5b-i: `histogram_fraction(lower, upper, v)` — dispatches per
         // sample like `HistogramQuantile` (native vs classic `le`-labelled
         // float), `funcHistogramFraction`, `functions.go`.
-        PlanExpr::HistogramFraction { lower, upper, expr } => {
+        PlanExpr::HistogramFraction {
+            lower,
+            upper,
+            expr,
+            lower_pos,
+            vec_pos,
+        } => {
             let StepValue::Scalar(lower_v) =
                 eval_step(lower, selectors, data, t_ms, lookback_ms, caches)?
             else {
@@ -3480,14 +3566,23 @@ fn eval_step(
                 });
             };
 
-            let (native, mut groups) = partition_histogram_inputs(v, caches);
+            let (native, mut groups) = partition_histogram_inputs(v, caches, *vec_pos);
             let mut out = Vec::new();
             for s in native {
                 let Some(h) = &s.h else { continue };
                 let metric_name = s.metric_name.as_deref().unwrap_or("");
                 let fv = {
                     let mut annos = caches.annotations.borrow_mut();
-                    histogram_fns::histogram_fraction(lower_v, upper_v, h, metric_name, &mut annos)
+                    // Issue #128: the NaN info carries args[0]'s (lower's)
+                    // position (functions.go:2047).
+                    histogram_fns::histogram_fraction(
+                        lower_v,
+                        upper_v,
+                        h,
+                        metric_name,
+                        *lower_pos,
+                        &mut annos,
+                    )
                 };
                 out.push(InstantSample {
                     labels: s.labels,
@@ -3525,6 +3620,9 @@ fn eval_step(
             expr: input,
             param,
             grouping,
+            expr_pos,
+            param_pos,
+            self_pos,
         } => {
             let StepValue::Vector(v) =
                 eval_step(input, selectors, data, t_ms, lookback_ms, caches)?
@@ -3553,7 +3651,18 @@ fn eval_step(
             // count/group) — the A5a blanket reject is gone.
             let out = {
                 let mut annos = caches.annotations.borrow_mut();
-                aggregation::aggregate(*op, &v, grouping.as_ref(), param_v, &mut annos)?
+                aggregation::aggregate(
+                    *op,
+                    &v,
+                    grouping.as_ref(),
+                    param_v,
+                    aggregation::AggPos {
+                        expr_pos: *expr_pos,
+                        param_pos: param_pos.unwrap_or(0),
+                        self_pos: *self_pos,
+                    },
+                    &mut annos,
+                )?
             };
             // Issue #130 Δ2: fold the RAW (uncapped) ratio into this
             // node's evaluation-wide extrema — AFTER `aggregate` returned
@@ -3573,7 +3682,14 @@ fn eval_step(
                         e.max = e.max.max(r);
                         e.min = e.min.min(r);
                     }
-                    None => extrema.push((key, RatioExtrema { max: r, min: r })),
+                    None => extrema.push((
+                        key,
+                        RatioExtrema {
+                            param_pos: param_pos.unwrap_or(0),
+                            max: r,
+                            min: r,
+                        },
+                    )),
                 }
             }
             Ok(StepValue::Vector(out))
@@ -3908,6 +4024,7 @@ fn eval_step(
             matching,
             group,
             fill,
+            pos_start,
         } => {
             let l = eval_step(lhs, selectors, data, t_ms, lookback_ms, caches)?;
             let r = eval_step(rhs, selectors, data, t_ms, lookback_ms, caches)?;
@@ -3945,6 +4062,7 @@ fn eval_step(
                         &v,
                         s,
                         false,
+                        *pos_start,
                         &mut annos,
                     )))
                 }
@@ -3960,6 +4078,7 @@ fn eval_step(
                         &v,
                         s,
                         true,
+                        *pos_start,
                         &mut annos,
                     )))
                 }
@@ -3973,6 +4092,7 @@ fn eval_step(
                         fill,
                         &l,
                         &r,
+                        *pos_start,
                         &mut annos,
                     )?))
                 }
@@ -4724,7 +4844,7 @@ mod tests {
         let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
         let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
         assert_eq!(value, QueryValue::Vector(Vec::new()));
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -4750,7 +4870,7 @@ mod tests {
         assert!(
             annos.is_empty(),
             "a histogram-only window is silent: {:?}",
-            annos.as_strings(0, 0)
+            annos.as_strings("", 0, 0)
         );
     }
 
@@ -4785,7 +4905,7 @@ mod tests {
             }
             other => panic!("expected a float vector, got {other:?}"),
         }
-        let (warnings, infos) = annos.as_strings(0, 0);
+        let (warnings, infos) = annos.as_strings("", 0, 0);
         assert!(warnings.is_empty());
         assert_eq!(
             infos,
@@ -4814,7 +4934,7 @@ mod tests {
         );
         let (value, annos) = super::evaluate(&p, &data).unwrap();
         assert_eq!(value, QueryValue::Vector(Vec::new()));
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![crate::annotations::messages::histogram_ignored_in_mixed_range_info("up")]
@@ -4876,7 +4996,7 @@ mod tests {
             }
             other => panic!("expected a float vector, got {other:?}"),
         }
-        let (_, infos2) = annos2.as_strings(0, 0);
+        let (_, infos2) = annos2.as_strings("", 0, 0);
         assert_eq!(
             infos2,
             vec![crate::annotations::messages::histogram_ignored_in_mixed_range_info("up")]
@@ -5047,7 +5167,7 @@ mod tests {
         let p = plan(&expr, params(1_000, 1_000, 0)).unwrap();
         let (value, annos) = super::evaluate(&p, &histogram_selector_data()).unwrap();
         assert_eq!(value, QueryValue::Vector(Vec::new()));
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -5302,7 +5422,7 @@ mod tests {
                 );
             }
             let (_, annotations) = super::evaluate(&p, &data).unwrap();
-            let (warnings, infos) = annotations.as_strings(0, 0);
+            let (warnings, infos) = annotations.as_strings("", 0, 0);
             assert_eq!(warnings, vec![want.to_string()], "{query}");
             assert!(infos.is_empty(), "{query}: {infos:?}");
         }
@@ -5366,7 +5486,7 @@ mod tests {
             }
         }
         let (_, annotations) = super::evaluate(&p, &data).unwrap();
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![
@@ -5408,7 +5528,7 @@ mod tests {
             }
         }
         let (_, annotations) = super::evaluate(&p, &data).unwrap();
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![
@@ -5667,7 +5787,7 @@ mod tests {
         );
         let (value, annotations) = super::evaluate(&p, &data).unwrap();
         assert!(matches!(value, QueryValue::Vector(v) if v.len() == 1));
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
         assert_eq!(infos.len(), 1, "exactly one forced-monotonicity info");
         assert!(
@@ -5717,7 +5837,7 @@ mod tests {
         );
         let (value, annotations) = super::evaluate(&p, &data).unwrap();
         assert!(matches!(value, QueryValue::Matrix(_)));
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
         assert_eq!(
             infos,
@@ -5725,6 +5845,290 @@ mod tests {
                 "PromQL info: input to histogram_quantile needed to be fixed for monotonicity (see https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile) for metric name \"x_bucket\", from buckets 0.5 to 0.5, with a max diff of 2, over 3 samples from 1970-01-01T00:00:00Z to 1970-01-01T00:02:00Z".to_string()
             ],
             "exactly one info, merged across the 3 steps"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #128: byte-exact HTTP-wire position suffixes, end to end
+    // (parse → plan → eval → `as_strings(query, …)`), one pinned case
+    // per mapping-table family. Every expected string is the FULL wire
+    // line; offsets are hand-derived byte positions (upstream
+    // `Annotations.AsStrings(query, 10, 10)` →
+    // `PositionRange.StartPosInput`, pin `40af9c2`).
+    // -----------------------------------------------------------------
+
+    /// The suffix-rendering helper for the family tests below: evaluate
+    /// and render exactly like the HTTP handler does.
+    fn wire_strings(query: &str, p: &QueryPlan, data: &SeriesData) -> (Vec<String>, Vec<String>) {
+        let (_, annotations) = super::evaluate(p, data).expect("query evaluates");
+        annotations.as_strings(query, 10, 10)
+    }
+
+    /// `HistogramQuantile.q_pos` (args[0], `functions.go:2084`) — the
+    /// plan's worked example: `1.5` at byte 19 → `(1:20)`.
+    #[test]
+    fn wire_suffix_histogram_quantile_invalid_q_points_at_args0() {
+        let query = "histogram_quantile(1.5, up)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let (warnings, infos) = wire_strings(query, &p, &SeriesData::new());
+        assert!(infos.is_empty());
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: quantile value should be between 0 and 1, got 1.5 (1:20)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// Multi-line: byte offsets run across `\n`s and the column counts
+    /// bytes since the LAST newline — `1.5` at byte 22, one `\n` at 19
+    /// → line 2, col 22 − 19 = 3.
+    #[test]
+    fn wire_suffix_multi_line_query_counts_lines_and_byte_columns() {
+        let query = "histogram_quantile(\n  1.5,\n  up\n)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let (warnings, _) = wire_strings(query, &p, &SeriesData::new());
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: quantile value should be between 0 and 1, got 1.5 (2:3)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `HistogramQuantile.vec_pos` (args[1], `functions.go:2116`) — the
+    /// forced-monotonicity info points at the VECTOR argument:
+    /// `x_bucket` at byte 24 → `(1:25)`; rendered base + detail +
+    /// position (the pin's order, `annotations.go:340`).
+    #[test]
+    fn wire_suffix_forced_monotonicity_points_at_args1() {
+        let query = "histogram_quantile(0.5, x_bucket)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("le", "0.1")], vec![s(0, 5.0)]),
+                series(2, &[("le", "0.5")], vec![s(0, 3.0)]),
+                series(3, &[("le", "+Inf")], vec![s(0, 10.0)]),
+            ],
+        );
+        let (warnings, infos) = wire_strings(query, &p, &data);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: input to histogram_quantile needed to be fixed for monotonicity (see https://prometheus.io/docs/prometheus/latest/querying/functions/#histogram_quantile) for metric name \"x_bucket\", from buckets 0.5 to 0.5, with a max diff of 2, over 1 samples from 1970-01-01T00:00:00Z to 1970-01-01T00:00:00Z (1:25)".to_string()
+            ]
+        );
+    }
+
+    /// `Aggregate.param_pos` (`aggExpr.Param.PositionRange()`,
+    /// engine.go:1669) — `1.5` at byte 9 → `(1:10)`.
+    #[test]
+    fn wire_suffix_agg_quantile_param_points_at_the_param() {
+        let query = "quantile(1.5, up)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let (warnings, _) = wire_strings(query, &p, &SeriesData::new());
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: quantile value should be between 0 and 1, got 1.5 (1:10)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `Aggregate.expr_pos` (`e.Expr.PositionRange()`, engine.go:3652) —
+    /// the ignored-histogram info points at the INNER expression: `up`
+    /// at byte 4 → `(1:5)`.
+    #[test]
+    fn wire_suffix_agg_inner_ignored_histogram_points_at_the_inner_expr() {
+        let query = "min(up)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![Sample::hist(0, single_histogram().to_float())],
+            )],
+        );
+        let (_, infos) = wire_strings(query, &p, &data);
+        assert_eq!(
+            infos,
+            vec!["PromQL info: ignored histogram in min aggregation (1:5)".to_string()]
+        );
+    }
+
+    /// `Aggregate.self_pos` (`e.PosRange`, engine.go:4036) — topk's
+    /// ignored-histogram info points at the WHOLE aggregate expression:
+    /// byte 0 → `(1:1)`.
+    #[test]
+    fn wire_suffix_topk_ignored_histogram_points_at_the_whole_aggregate() {
+        let query = "topk(1, up)";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![Sample::hist(0, single_histogram().to_float())],
+            )],
+        );
+        let (_, infos) = wire_strings(query, &p, &data);
+        assert_eq!(
+            infos,
+            vec!["PromQL info: ignored histogram in topk aggregation (1:1)".to_string()]
+        );
+    }
+
+    /// `Binary.pos_start` (`e.PositionRange()` ≡ the LHS start,
+    /// engine.go:3512) — byte 0 → `(1:1)`.
+    #[test]
+    fn wire_suffix_binop_incompatible_types_points_at_the_expression() {
+        let query = "m + n";
+        let p = plan(&crate::parser::parse(query).unwrap(), params(0, 0, 0)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("job", "a")],
+                vec![Sample::hist(0, single_histogram().to_float())],
+            )],
+        );
+        data.insert(1, vec![series(2, &[("job", "a")], vec![s(0, 1.0)])]);
+        let (_, infos) = wire_strings(query, &p, &data);
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: incompatible sample types encountered for binary operator \"+\": histogram + float (1:1)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `Sort.call_pos` (`e.PositionRange()` of the Call, engine.go:2167)
+    /// — a range-shaped `sort` warns at the call: byte 0 → `(1:1)`.
+    #[test]
+    fn wire_suffix_sort_in_range_query_points_at_the_call() {
+        let query = "sort(up)";
+        let p = plan(
+            &crate::parser::parse(query).unwrap(),
+            params(0, 60_000, 60_000),
+        )
+        .unwrap();
+        let (warnings, _) = wire_strings(query, &p, &SeriesData::new());
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: sort is ineffective for range queries since results are always ordered by labels (1:1)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `RangeFn.arg0_start` (`args[0].PositionRange()`,
+    /// functions.go:486) — the mixed-floats warning points at the range
+    /// argument: `m[1m]` at byte 5 → `(1:6)`.
+    #[test]
+    fn wire_suffix_rate_mixed_floats_points_at_args0() {
+        let query = "rate(m[1m])";
+        let p = plan(
+            &crate::parser::parse(query).unwrap(),
+            params(60_000, 60_000, 0),
+        )
+        .unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("job", "a")],
+                vec![
+                    s(10_000, 1.0),
+                    Sample::hist(30_000, single_histogram().to_float()),
+                ],
+            )],
+        );
+        let (warnings, _) = wire_strings(query, &p, &data);
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: encountered a mix of histograms and floats for metric name \"m\" (1:6)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `OverTimeParam.arg0_start` — uniformly the FIRST call argument
+    /// (`args[0].PositionRange()`, functions.go:1590): for
+    /// `quantile_over_time` that is φ, at byte 19 → `(1:20)`.
+    #[test]
+    fn wire_suffix_quantile_over_time_invalid_phi_points_at_args0() {
+        let query = "quantile_over_time(1.5, m[1m])";
+        let p = plan(
+            &crate::parser::parse(query).unwrap(),
+            params(60_000, 60_000, 0),
+        )
+        .unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("job", "a")],
+                vec![s(10_000, 1.0), s(30_000, 2.0)],
+            )],
+        );
+        let (warnings, _) = wire_strings(query, &p, &data);
+        assert_eq!(
+            warnings,
+            vec![
+                "PromQL warning: quantile value should be between 0 and 1, got 1.5 (1:20)"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `OverTime.arg0_start` (`args[0].PositionRange()`,
+    /// functions.go:1504-1526) — a drop-set function's mixed-window info
+    /// points at the range argument: `m[1m]` at byte 14 → `(1:15)`.
+    #[test]
+    fn wire_suffix_min_over_time_mixed_window_points_at_args0() {
+        let query = "min_over_time(m[1m])";
+        let p = plan(
+            &crate::parser::parse(query).unwrap(),
+            params(60_000, 60_000, 0),
+        )
+        .unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![named_series(
+                "m",
+                1,
+                &[("job", "a")],
+                vec![
+                    s(10_000, 1.0),
+                    Sample::hist(30_000, single_histogram().to_float()),
+                ],
+            )],
+        );
+        let (_, infos) = wire_strings(query, &p, &data);
+        assert_eq!(
+            infos,
+            vec![
+                "PromQL info: ignored histograms in a range containing both floats and histograms for metric name \"m\" (1:15)"
+                    .to_string()
+            ]
         );
     }
 
@@ -5766,7 +6170,7 @@ mod tests {
             }
             other => panic!("expected Vector, got {other:?}"),
         }
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert!(infos.is_empty(), "no info expected: {infos:?}");
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -5799,7 +6203,7 @@ mod tests {
             matches!(value, QueryValue::Vector(v) if v.len() == 1),
             "the query succeeds despite the malformed bucket"
         );
-        let (warnings, infos) = annotations.as_strings(0, 0);
+        let (warnings, infos) = annotations.as_strings("", 0, 0);
         assert!(infos.is_empty(), "no info expected: {infos:?}");
         assert_eq!(warnings.len(), 1);
         assert!(
@@ -5827,7 +6231,7 @@ mod tests {
         );
         let (value, annotations) = super::evaluate(&p, &data).unwrap();
         assert!(matches!(value, QueryValue::Vector(v) if v.len() == 1));
-        let (warnings, _) = annotations.as_strings(0, 0);
+        let (warnings, _) = annotations.as_strings("", 0, 0);
         assert_eq!(warnings.len(), 1);
         assert!(
             warnings[0].contains("is missing or has a malformed value of \"\""),
@@ -5993,7 +6397,7 @@ mod tests {
         // Quantile-outer emission order (argument source order).
         let qs: Vec<_> = v.iter().map(|s| s.labels.get("q").unwrap()).collect();
         assert_eq!(qs, vec!["1.5", "-0.5", "0.5"]);
-        let (warnings, _) = annotations.as_strings(0, 0);
+        let (warnings, _) = annotations.as_strings("", 0, 0);
         assert_eq!(
             warnings.len(),
             2,

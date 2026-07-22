@@ -2937,6 +2937,155 @@ mod tests {
         assert_cases(vec![Case { input, expected }]);
     }
 
+    /// PulsusDB patch (issue #128, PATCHES.md #8 — AST-metadata class):
+    /// every parse-produced node carries its start byte offset, matching
+    /// upstream Prometheus's `Expr.PositionRange().Start` (v3.13.0, pin
+    /// `40af9c2`). Exact offsets per node kind, including the G1/G2/G3/G4
+    /// production shapes, paren-wrapped arguments, sign-collapsed
+    /// literals, and a multi-line input (offsets are BYTE offsets across
+    /// the whole input, newlines included).
+    #[test]
+    fn test_issue_128_ast_start_offsets() {
+        fn parse(input: &str) -> Expr {
+            crate::parser::parse(input)
+                .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e}"))
+        }
+
+        // Top-level start offset per node kind / production shape.
+        for (input, expected) in [
+            ("up", 0usize),                  // vector_selector
+            ("  up", 2),                     // leading whitespace is skipped
+            ("{x=\"y\"}", 0),                // name-less vector_selector
+            ("1.5", 0),                      // number_literal (NUMBER)
+            ("5m", 0),                       // number_literal (DURATION)
+            ("-1", 0),                       // sign-collapsed literal starts at `-`
+            ("+1", 0),                       // unary plus folds, start at `+`
+            ("- 1", 0),                      // sign-collapsed with whitespace
+            ("\"abc\"", 0),                  // string_literal
+            ("(up)", 0),                     // paren_expr
+            ("-foo", 0),                     // unary_expr (SUB)
+            ("sum(up)", 0),                  // aggregate_expr
+            ("sum by (a) (up)", 0),          // aggregate_expr with modifier
+            ("avg without (a) (up)", 0),     // aggregate_expr, WITHOUT
+            ("rate(foo[5m])", 0),            // function_call (IDENTIFIER)
+            ("max_of(1, 2)", 0),             // function_call (G1 max_of_min_of arm)
+            ("start()", 0),                  // function_call (G4 preprocessor arm)
+            ("step()", 0),                   // function_call (G4 STEP arm)
+            ("range()", 0),                  // function_call (G4 RANGE arm)
+            ("foo[5m]", 0),                  // matrix_selector = its selector
+            ("foo[5m:1m]", 0),               // subquery = its inner expr
+            ("foo offset 5m", 0),            // offset never moves the start
+            ("foo @ 5", 0),                  // @ never moves the start
+            ("foo[5m] anchored", 0),         // G3 modifier never moves the start
+            ("foo smoothed", 0),             // G3 modifier never moves the start
+            ("up + up", 0),                  // binary = its LHS
+            ("foo </ 0.8", 0),               // G2 trim operator, binary = LHS
+        ] {
+            assert_eq!(
+                parse(input).pos_start(),
+                Some(expected),
+                "top-level pos_start of {input:?}"
+            );
+        }
+
+        // Inner-node offsets: a binary RHS, call arguments (paren-wrapped
+        // included), and an aggregation param/expr.
+        let input = "sum by (a) (rate(foo[5m])) + histogram_quantile((0.9), up)";
+        match parse(input) {
+            Expr::Binary(bin) => {
+                assert_eq!(bin.lhs.pos_start(), Some(0), "lhs aggregate");
+                match *bin.lhs {
+                    Expr::Aggregate(agg) => {
+                        assert_eq!(agg.pos.start(), Some(0));
+                        // `rate(` starts right after `sum by (a) (`.
+                        assert_eq!(agg.expr.pos_start(), Some(12), "rate call");
+                        match *agg.expr {
+                            Expr::Call(call) => assert_eq!(
+                                call.args.args[0].pos_start(),
+                                Some(17),
+                                "matrix selector arg starts at its selector"
+                            ),
+                            other => panic!("expected Call, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Aggregate, got {other:?}"),
+                }
+                assert_eq!(bin.rhs.pos_start(), Some(29), "histogram_quantile call");
+                match *bin.rhs {
+                    Expr::Call(call) => {
+                        // The paren-wrapped scalar arg starts at its `(`
+                        // (upstream keeps the ParenExpr in e.Args).
+                        assert_eq!(call.args.args[0].pos_start(), Some(48), "(0.9)");
+                        match call.args.args[0].as_ref() {
+                            Expr::Paren(p) => assert_eq!(p.expr.pos_start(), Some(49), "0.9"),
+                            other => panic!("expected Paren, got {other:?}"),
+                        }
+                        assert_eq!(call.args.args[1].pos_start(), Some(55), "up");
+                    }
+                    other => panic!("expected Call, got {other:?}"),
+                }
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+
+        // topk's scalar param and aggregated expr.
+        match parse("topk(3, up)") {
+            Expr::Aggregate(agg) => {
+                assert_eq!(agg.param.as_ref().and_then(|p| p.pos_start()), Some(5));
+                assert_eq!(agg.expr.pos_start(), Some(8));
+            }
+            other => panic!("expected Aggregate, got {other:?}"),
+        }
+
+        // Multi-line: offsets are bytes over the WHOLE input, `\n` included.
+        let input = "sum(\n  rate(foo[5m])\n)\n+\nup";
+        match parse(input) {
+            Expr::Binary(bin) => {
+                assert_eq!(bin.lhs.pos_start(), Some(0), "sum");
+                match *bin.lhs {
+                    Expr::Aggregate(agg) => assert_eq!(agg.expr.pos_start(), Some(7), "rate"),
+                    other => panic!("expected Aggregate, got {other:?}"),
+                }
+                assert_eq!(bin.rhs.pos_start(), Some(25), "up after two newlines");
+            }
+            other => panic!("expected Binary, got {other:?}"),
+        }
+
+        // Every parse-produced node reports Some(_) — walked over a query
+        // touching every reachable Expr kind.
+        struct AllSome {
+            missing: Vec<String>,
+        }
+        impl crate::util::ExprVisitor for AllSome {
+            type Error = ();
+            fn pre_visit(&mut self, expr: &Expr) -> Result<bool, ()> {
+                if expr.pos_start().is_none() {
+                    self.missing.push(format!("{expr:?}"));
+                }
+                Ok(true)
+            }
+        }
+        let input = "sum by (a) (rate(foo{x=\"y\"}[5m]))\n+ topk(2, up offset 1m)\n\
+                     + scalar((-foo))\n+ min_over_time(up[5m:1m])\n+ 1";
+        let expr = parse(input);
+        let mut visitor = AllSome {
+            missing: Vec::new(),
+        };
+        crate::util::walk_expr(&mut visitor, &expr).unwrap();
+        assert!(
+            visitor.missing.is_empty(),
+            "nodes without a start offset: {:?}",
+            visitor.missing
+        );
+
+        // Hand-built nodes carry no position.
+        assert_eq!(Expr::from(1.0).pos_start(), None);
+        assert_eq!(
+            Expr::from(VectorSelector::from("foo")).pos_start(),
+            None
+        );
+    }
+
     #[test]
     fn test_or_filters() {
         let cases = vec![

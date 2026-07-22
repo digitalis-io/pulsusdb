@@ -17,12 +17,14 @@ Aggregate(
                 at: None,
                 anchored: false,
                 smoothed: false,
+                pos: AstPos(26),
             },
         ),
         param: Some(
             NumberLiteral(
                 NumberLiteral {
                     val: 5.0,
+                    pos: AstPos(23),
                 },
             ),
         ),
@@ -35,5 +37,6 @@ Aggregate(
                 },
             ),
         ),
+        pos: AstPos(0),
     },
 )

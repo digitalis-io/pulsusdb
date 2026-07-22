@@ -633,6 +633,52 @@ impl fmt::Display for EvalStmt {
     }
 }
 
+/// The byte offset of an expression node's first token in the query source
+/// text — PulsusDB patch (see vendor/promql-parser/PATCHES.md, AST-metadata
+/// patch class): the start half of Prometheus's `PositionRange`
+/// (`promql/parser/posrange/posrange.go`), captured from the grmtools
+/// `$span` in the producing grammar action. `None` means the node was
+/// built by hand (test fixtures, `From` impls) rather than parsed.
+///
+/// **Position is metadata, not identity:** `PartialEq` compares equal
+/// ALWAYS, so adding this field to an AST struct does not change that
+/// struct's derived equality — hand-built-vs-parsed AST assertions
+/// (this crate's and consumers') are unaffected.
+#[derive(Clone, Copy, Default)]
+pub struct AstPos(Option<usize>);
+
+impl AstPos {
+    /// A known start byte offset (parser-produced nodes).
+    pub fn at(start: usize) -> Self {
+        AstPos(Some(start))
+    }
+
+    /// The start byte offset, if the node came from the parser.
+    pub fn start(&self) -> Option<usize> {
+        self.0
+    }
+}
+
+impl PartialEq for AstPos {
+    /// Always true — see the type doc: position is metadata, not identity.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for AstPos {}
+
+impl fmt::Debug for AstPos {
+    /// Compact single-line form (`AstPos(19)` / `AstPos(None)`) so
+    /// `{:#?}` AST snapshots stay one line per node.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(start) => write!(f, "AstPos({start})"),
+            None => write!(f, "AstPos(None)"),
+        }
+    }
+}
+
 /// Grammar:
 /// ``` norust
 /// <aggr-op> [without|by (<label list>)] ([parameter,] <vector expression>)
@@ -653,6 +699,10 @@ pub struct AggregateExpr {
     #[cfg_attr(feature = "ser", serde(flatten))]
     #[cfg_attr(feature = "ser", serde(serialize_with = "serialize_grouping"))]
     pub modifier: Option<LabelModifier>,
+    /// Start byte offset of the aggregation op token (PulsusDB patch,
+    /// PATCHES.md AST-metadata class).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub pos: AstPos,
 }
 
 impl AggregateExpr {
@@ -709,6 +759,9 @@ impl Prettier for AggregateExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnaryExpr {
     pub expr: Box<Expr>,
+    /// Start byte offset of the sign token (PulsusDB patch, PATCHES.md
+    /// AST-metadata class).
+    pub pos: AstPos,
 }
 
 impl fmt::Display for UnaryExpr {
@@ -824,6 +877,10 @@ impl Prettier for BinaryExpr {
 #[cfg_attr(feature = "ser", derive(serde::Serialize))]
 pub struct ParenExpr {
     pub expr: Box<Expr>,
+    /// Start byte offset of the opening `(` (PulsusDB patch, PATCHES.md
+    /// AST-metadata class).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub pos: AstPos,
 }
 
 impl fmt::Display for ParenExpr {
@@ -930,11 +987,18 @@ impl Prettier for SubqueryExpr {
 #[derive(Debug, Clone)]
 pub struct NumberLiteral {
     pub val: f64,
+    /// Start byte offset of the literal (or its collapsed sign — a
+    /// parsed `-1` starts at the `-`; PulsusDB patch, PATCHES.md
+    /// AST-metadata class).
+    pub pos: AstPos,
 }
 
 impl NumberLiteral {
     pub fn new(val: f64) -> Self {
-        Self { val }
+        Self {
+            val,
+            pos: AstPos::default(),
+        }
     }
 }
 
@@ -950,7 +1014,10 @@ impl Neg for NumberLiteral {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
-        NumberLiteral { val: -self.val }
+        NumberLiteral {
+            val: -self.val,
+            pos: self.pos,
+        }
     }
 }
 
@@ -992,6 +1059,10 @@ impl Prettier for NumberLiteral {
 #[cfg_attr(feature = "ser", derive(serde::Serialize))]
 pub struct StringLiteral {
     pub val: String,
+    /// Start byte offset of the opening quote (PulsusDB patch, PATCHES.md
+    /// AST-metadata class).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub pos: AstPos,
 }
 
 impl fmt::Display for StringLiteral {
@@ -1032,6 +1103,10 @@ pub struct VectorSelector {
     /// `ser` JSON shape (the experimental gate lives at plan time).
     #[cfg_attr(feature = "ser", serde(skip))]
     pub smoothed: bool,
+    /// Start byte offset of the selector's first token (PulsusDB patch,
+    /// PATCHES.md AST-metadata class).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub pos: AstPos,
 }
 
 impl VectorSelector {
@@ -1044,6 +1119,7 @@ impl VectorSelector {
             at: None,
             anchored: false,
             smoothed: false,
+            pos: AstPos::default(),
         }
     }
 }
@@ -1058,6 +1134,7 @@ impl Default for VectorSelector {
             at: None,
             anchored: false,
             smoothed: false,
+            pos: AstPos::default(),
         }
     }
 }
@@ -1072,6 +1149,7 @@ impl From<String> for VectorSelector {
             anchored: false,
             smoothed: false,
             matchers: Matchers::empty(),
+            pos: AstPos::default(),
         }
     }
 }
@@ -1094,6 +1172,7 @@ impl From<String> for VectorSelector {
 ///     anchored: false,
 ///     smoothed: false,
 ///     matchers: Matchers::empty(),
+///     pos: promql_parser::parser::ast::AstPos::default(),
 /// };
 ///
 /// assert_eq!(VectorSelector::from("foo"), vs);
@@ -1109,7 +1188,10 @@ impl Neg for VectorSelector {
 
     fn neg(self) -> Self::Output {
         let ex = Expr::VectorSelector(self);
-        UnaryExpr { expr: Box::new(ex) }
+        UnaryExpr {
+            expr: Box::new(ex),
+            pos: AstPos::default(),
+        }
     }
 }
 
@@ -1256,6 +1338,10 @@ pub struct Call {
     pub func: Function,
     #[cfg_attr(feature = "ser", serde(flatten))]
     pub args: FunctionArgs,
+    /// Start byte offset of the function-name token (PulsusDB patch,
+    /// PATCHES.md AST-metadata class).
+    #[cfg_attr(feature = "ser", serde(skip))]
+    pub pos: AstPos,
 }
 
 impl fmt::Display for Call {
@@ -1389,6 +1475,7 @@ impl Expr {
     pub(crate) fn new_paren_expr(expr: Expr) -> Result<Self, String> {
         let ex = Expr::Paren(ParenExpr {
             expr: Box::new(expr),
+            pos: AstPos::default(),
         });
         Ok(ex)
     }
@@ -1567,7 +1654,11 @@ impl Expr {
     }
 
     pub(crate) fn new_call(func: Function, args: FunctionArgs) -> Result<Expr, String> {
-        Ok(Expr::Call(Call { func, args }))
+        Ok(Expr::Call(Call {
+            func,
+            args,
+            pos: AstPos::default(),
+        }))
     }
 
     pub(crate) fn new_binary_expr(
@@ -1616,6 +1707,7 @@ impl Expr {
                 expr,
                 param,
                 modifier,
+                pos: AstPos::default(),
             })),
             None => Err(
                 "aggregate operation needs a single instant vector parameter, but found none"
@@ -1656,6 +1748,84 @@ impl Expr {
         }
     }
 
+    /// The start byte offset of this expression in the query source text
+    /// (PulsusDB patch, PATCHES.md AST-metadata class) — the start half
+    /// of upstream Prometheus's `Expr.PositionRange()` (`promql/parser/
+    /// ast.go`). Seven node kinds carry their own captured offset; the
+    /// three wrapper kinds whose range starts at their inner expression
+    /// recurse (`Binary` starts at its LHS, `MatrixSelector` at its
+    /// vector selector, `Subquery` at its inner expression — upstream's
+    /// own `PositionRange()` shapes). `None` for hand-built nodes and
+    /// `Extension`.
+    pub fn pos_start(&self) -> Option<usize> {
+        match self {
+            Expr::Aggregate(ex) => ex.pos.start(),
+            Expr::Unary(ex) => ex.pos.start(),
+            Expr::Binary(ex) => ex.lhs.pos_start(),
+            Expr::Paren(ex) => ex.pos.start(),
+            Expr::Subquery(ex) => ex.expr.pos_start(),
+            Expr::NumberLiteral(ex) => ex.pos.start(),
+            Expr::StringLiteral(ex) => ex.pos.start(),
+            Expr::VectorSelector(ex) => ex.pos.start(),
+            Expr::MatrixSelector(ex) => ex.vs.pos.start(),
+            Expr::Call(ex) => ex.pos.start(),
+            Expr::Extension(_) => None,
+        }
+    }
+
+    /// Sets the start byte offset on the node whose position field
+    /// defines this expression's start (the inverse of
+    /// [`Expr::pos_start`]'s dispatch) — called by the producing grammar
+    /// actions with `$span.start()`. For the recursive kinds this
+    /// overwrites the start-defining descendant's own offset, which is
+    /// exactly upstream's sign-collapse behaviour (`-1` is a
+    /// `NumberLiteral` whose range starts at the `-`).
+    pub(crate) fn with_pos_start(self, start: usize) -> Expr {
+        match self {
+            Expr::Aggregate(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::Aggregate(ex)
+            }
+            Expr::Unary(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::Unary(ex)
+            }
+            Expr::Binary(mut ex) => {
+                ex.lhs = Box::new(ex.lhs.with_pos_start(start));
+                Expr::Binary(ex)
+            }
+            Expr::Paren(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::Paren(ex)
+            }
+            Expr::Subquery(mut ex) => {
+                ex.expr = Box::new(ex.expr.with_pos_start(start));
+                Expr::Subquery(ex)
+            }
+            Expr::NumberLiteral(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::NumberLiteral(ex)
+            }
+            Expr::StringLiteral(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::StringLiteral(ex)
+            }
+            Expr::VectorSelector(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::VectorSelector(ex)
+            }
+            Expr::MatrixSelector(mut ex) => {
+                ex.vs.pos = AstPos::at(start);
+                Expr::MatrixSelector(ex)
+            }
+            Expr::Call(mut ex) => {
+                ex.pos = AstPos::at(start);
+                Expr::Call(ex)
+            }
+            ex @ Expr::Extension(_) => ex,
+        }
+    }
+
     pub fn prettify(&self) -> String {
         self.pretty(0, MAX_CHARACTERS_PER_LINE)
     }
@@ -1663,19 +1833,25 @@ impl Expr {
 
 impl From<String> for Expr {
     fn from(val: String) -> Self {
-        Expr::StringLiteral(StringLiteral { val })
+        Expr::StringLiteral(StringLiteral {
+            val,
+            pos: AstPos::default(),
+        })
     }
 }
 
 impl From<&str> for Expr {
     fn from(s: &str) -> Self {
-        Expr::StringLiteral(StringLiteral { val: s.into() })
+        Expr::StringLiteral(StringLiteral {
+            val: s.into(),
+            pos: AstPos::default(),
+        })
     }
 }
 
 impl From<f64> for Expr {
     fn from(val: f64) -> Self {
-        Expr::NumberLiteral(NumberLiteral { val })
+        Expr::NumberLiteral(NumberLiteral::new(val))
     }
 }
 
@@ -1708,6 +1884,7 @@ impl Neg for Expr {
             Expr::NumberLiteral(nl) => Expr::NumberLiteral(-nl),
             _ => Expr::Unary(UnaryExpr {
                 expr: Box::new(self),
+                pos: AstPos::default(),
             }),
         }
     }
@@ -2349,7 +2526,8 @@ mod tests {
         assert_eq!(
             -VectorSelector::from("foo"),
             UnaryExpr {
-                expr: Box::new(Expr::from(VectorSelector::from("foo")))
+                expr: Box::new(Expr::from(VectorSelector::from("foo"))),
+                pos: AstPos::default(),
             }
         )
     }
@@ -3375,6 +3553,7 @@ or
         Call {
             func,
             args: FunctionArgs { args },
+            pos: AstPos::default(),
         }
     }
 

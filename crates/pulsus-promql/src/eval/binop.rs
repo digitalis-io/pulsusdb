@@ -122,14 +122,16 @@ fn vector_elem_binop_hist(
     lh: Option<&FloatHistogram>,
     rv: f64,
     rh: Option<&FloatHistogram>,
+    pos: usize,
     annos: &mut Annotations,
 ) -> ElemBinopResult {
     let drop_incompatible_types = |lhs_type: &str, rhs_type: &str, annos: &mut Annotations| {
-        annos.info(messages::incompatible_types_in_binop_info(
-            lhs_type,
-            op.item_type_str(),
-            rhs_type,
-        ));
+        // Issue #128: `e.PositionRange()` threaded from the Binary node
+        // (engine.go:3488-3552's `pos`).
+        annos.info_at(
+            pos,
+            messages::incompatible_types_in_binop_info(lhs_type, op.item_type_str(), rhs_type),
+        );
         ElemBinopResult {
             v: 0.0,
             h: None,
@@ -228,14 +230,20 @@ fn vector_elem_binop_hist(
                     // Issue #125: a CR/NCR hint collision during `+`
                     // (`engine.go:3522-3524`).
                     if outcome.counter_reset_collision {
-                        annos.warning(messages::histogram_counter_reset_collision_warning(
-                            messages::HistogramOperation::Add,
-                        ));
+                        annos.warning_at(
+                            pos,
+                            messages::histogram_counter_reset_collision_warning(
+                                messages::HistogramOperation::Add,
+                            ),
+                        );
                     }
                     if outcome.nhcb_bounds_reconciled {
-                        annos.info(messages::mismatched_custom_buckets_histograms_info(
-                            messages::HistogramOperation::Add,
-                        ));
+                        annos.info_at(
+                            pos,
+                            messages::mismatched_custom_buckets_histograms_info(
+                                messages::HistogramOperation::Add,
+                            ),
+                        );
                     }
                     let mut result = outcome.result;
                     result.compact();
@@ -247,9 +255,10 @@ fn vector_elem_binop_hist(
                     }
                 }
                 Err(FloatHistogramOpError::IncompatibleSchema) => {
-                    annos.warning(messages::incompatible_bucket_layout_in_binop_warning(
-                        op.item_type_str(),
-                    ));
+                    annos.warning_at(
+                        pos,
+                        messages::incompatible_bucket_layout_in_binop_warning(op.item_type_str()),
+                    );
                     // The pin surfaces this through the error channel too
                     // (`hlhs.Copy().Add/Sub(hrhs)` err -> `doBinOp` early
                     // return, issue #154) - though `bool` can never reach
@@ -267,14 +276,20 @@ fn vector_elem_binop_hist(
                     // Issue #125: a CR/NCR hint collision during `-`
                     // (`engine.go:3533-3535`).
                     if outcome.counter_reset_collision {
-                        annos.warning(messages::histogram_counter_reset_collision_warning(
-                            messages::HistogramOperation::Sub,
-                        ));
+                        annos.warning_at(
+                            pos,
+                            messages::histogram_counter_reset_collision_warning(
+                                messages::HistogramOperation::Sub,
+                            ),
+                        );
                     }
                     if outcome.nhcb_bounds_reconciled {
-                        annos.info(messages::mismatched_custom_buckets_histograms_info(
-                            messages::HistogramOperation::Sub,
-                        ));
+                        annos.info_at(
+                            pos,
+                            messages::mismatched_custom_buckets_histograms_info(
+                                messages::HistogramOperation::Sub,
+                            ),
+                        );
                     }
                     let mut result = outcome.result;
                     // "The result must be marked as gauge"
@@ -290,9 +305,10 @@ fn vector_elem_binop_hist(
                     }
                 }
                 Err(FloatHistogramOpError::IncompatibleSchema) => {
-                    annos.warning(messages::incompatible_bucket_layout_in_binop_warning(
-                        op.item_type_str(),
-                    ));
+                    annos.warning_at(
+                        pos,
+                        messages::incompatible_bucket_layout_in_binop_warning(op.item_type_str()),
+                    );
                     // The pin surfaces this through the error channel too
                     // (`hlhs.Copy().Add/Sub(hrhs)` err -> `doBinOp` early
                     // return, issue #154) - though `bool` can never reach
@@ -348,6 +364,7 @@ pub fn vector_scalar(
     vector: &[InstantSample],
     scalar: f64,
     scalar_on_left: bool,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Vec<InstantSample> {
     vector
@@ -363,7 +380,7 @@ pub fn vector_scalar(
             } else {
                 (s.h.as_deref(), None)
             };
-            let result = vector_elem_binop_hist(op, l, lh, r, rh, annos);
+            let result = vector_elem_binop_hist(op, l, lh, r, rh, pos, annos);
             // Issue #154: an incompatible-types pair is dropped BEFORE
             // the `bool` rewrite — upstream `VectorscalarBinop` skips the
             // sample when `vectorElemBinop` errored (engine.go:3388-3393
@@ -627,6 +644,7 @@ fn emit_pair(
     ls: &InstantSample,
     rs: &InstantSample,
     key: &MatchKey,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<(), PromqlError> {
     // Restore source operand order for the value (upstream swap-back).
@@ -640,7 +658,7 @@ fn emit_pair(
     } else {
         (ls.h.as_deref(), rs.h.as_deref())
     };
-    let elem = vector_elem_binop_hist(ctx.op, vl, hl, vr, hr, annos);
+    let elem = vector_elem_binop_hist(ctx.op, vl, hl, vr, hr, pos, annos);
     // Issue #154: an incompatible-types pair takes upstream's ERROR
     // channel — `doBinOp` returns on `err != nil` BEFORE the
     // `returnBool` rewrite, before `resultMetric`, and before any
@@ -887,6 +905,7 @@ pub fn vector_vector(
     fill: &FillValues,
     lhs: &[InstantSample],
     rhs: &[InstantSample],
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     // Upstream short-circuit, at the upstream-equivalent position —
@@ -946,11 +965,11 @@ pub fn vector_vector(
     for l in many {
         let key = matching_key(&l.labels, &l.metric_name, matching);
         match one_by_key.get(&key) {
-            Some(r) => emit_pair(&ctx, &mut state, l, r, &key, annos)?,
+            Some(r) => emit_pair(&ctx, &mut state, l, r, &key, pos, annos)?,
             None => {
                 let Some(fill_value) = fill_one else { continue };
                 let synthetic = synthetic_fill_sample(&key, l, fill_value);
-                emit_pair(&ctx, &mut state, l, &synthetic, &key, annos)?;
+                emit_pair(&ctx, &mut state, l, &synthetic, &key, pos, annos)?;
             }
         }
     }
@@ -965,7 +984,7 @@ pub fn vector_vector(
                 continue;
             }
             let synthetic = synthetic_fill_sample(&key, r, fill_value);
-            emit_pair(&ctx, &mut state, &synthetic, r, &key, annos)?;
+            emit_pair(&ctx, &mut state, &synthetic, r, &key, pos, annos)?;
         }
     }
 
@@ -1024,6 +1043,7 @@ mod tests {
             &FillValues::default(),
             lhs,
             rhs,
+            0,
             &mut Annotations::new(),
         )
     }
@@ -1049,6 +1069,7 @@ mod tests {
             &vector,
             10.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].v, 20.0);
@@ -1064,6 +1085,7 @@ mod tests {
             &vector,
             3.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out.len(), 1);
@@ -1080,6 +1102,7 @@ mod tests {
             &vector,
             3.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out.len(), 2);
@@ -1091,7 +1114,15 @@ mod tests {
     fn vector_scalar_with_scalar_on_left_flips_the_comparison_operands() {
         let vector = vec![sample(&[("job", "a")], 5.0)];
         // 3 < vector value (5), scalar_on_left => op applied as (3 < 5).
-        let out = vector_scalar(BinOp::Lt, true, &vector, 3.0, true, &mut Annotations::new());
+        let out = vector_scalar(
+            BinOp::Lt,
+            true,
+            &vector,
+            3.0,
+            true,
+            0,
+            &mut Annotations::new(),
+        );
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -1200,6 +1231,7 @@ mod tests {
             &vector,
             10.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
@@ -1215,6 +1247,7 @@ mod tests {
             &vector,
             3.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
@@ -1236,6 +1269,7 @@ mod tests {
             &[marked],
             3.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out.len(), 1);
@@ -1256,6 +1290,7 @@ mod tests {
             &vector,
             3.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].metric_name.as_deref(), Some("test_metric"));
@@ -1485,6 +1520,7 @@ mod tests {
             &vector,
             5.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out.len(), 1, "NaN != 5 must keep (upstream: keep=true)");
@@ -1500,6 +1536,7 @@ mod tests {
             &vector,
             5.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert!(out.is_empty(), "NaN == 5 must drop (upstream: keep=false)");
@@ -1514,6 +1551,7 @@ mod tests {
             &vector,
             5.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].v, 1.0);
@@ -1528,6 +1566,7 @@ mod tests {
             &vector,
             5.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].v, 0.0);
@@ -1543,6 +1582,7 @@ mod tests {
             &vector,
             5.0,
             true,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out.len(), 1, "5 != NaN must keep (upstream: keep=true)");
@@ -1557,6 +1597,7 @@ mod tests {
             &vector,
             5.0,
             true,
+            0,
             &mut Annotations::new(),
         );
         assert!(out.is_empty(), "5 == NaN must drop (upstream: keep=false)");
@@ -1711,6 +1752,7 @@ mod tests {
             &lhs,
             2.0,
             false,
+            0,
             &mut Annotations::new(),
         );
         assert_eq!(out[0].v, 10.0_f64.atan2(2.0));
@@ -2124,10 +2166,26 @@ mod tests {
         // Same output identity under two distinct signatures -> both
         // accepted, two separate outer buckets. A hashed outer key that
         // collided would wrongly reject the second as a duplicate.
-        emit_pair(&ctx, &mut state, &ls, &rs, &sig_a, &mut Annotations::new())
-            .expect("first signature accepted");
-        emit_pair(&ctx, &mut state, &ls, &rs, &sig_b, &mut Annotations::new())
-            .expect("a distinct signature is not a duplicate");
+        emit_pair(
+            &ctx,
+            &mut state,
+            &ls,
+            &rs,
+            &sig_a,
+            0,
+            &mut Annotations::new(),
+        )
+        .expect("first signature accepted");
+        emit_pair(
+            &ctx,
+            &mut state,
+            &ls,
+            &rs,
+            &sig_b,
+            0,
+            &mut Annotations::new(),
+        )
+        .expect("a distinct signature is not a duplicate");
         assert_eq!(
             state.many_matched.len(),
             2,
@@ -2140,8 +2198,16 @@ mod tests {
         // The SAME (signature, output identity) again IS the duplicate
         // error — the inner 64-bit output-identity dedup (upstream
         // `metric.Hash()`).
-        let err = emit_pair(&ctx, &mut state, &ls, &rs, &sig_a, &mut Annotations::new())
-            .expect_err("a repeated output identity under one signature is a duplicate");
+        let err = emit_pair(
+            &ctx,
+            &mut state,
+            &ls,
+            &rs,
+            &sig_a,
+            0,
+            &mut Annotations::new(),
+        )
+        .expect_err("a repeated output identity under one signature is a duplicate");
         assert!(matches!(err, PromqlError::BadMatching { .. }), "got {err}");
     }
 
@@ -2167,6 +2233,7 @@ mod tests {
             &fill,
             &lhs,
             &rhs,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2200,6 +2267,7 @@ mod tests {
             &fill,
             &lhs,
             &rhs,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2245,6 +2313,7 @@ mod tests {
             &fill,
             &many,
             &one,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2287,6 +2356,7 @@ mod tests {
             &fill,
             &many,
             &one,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2333,6 +2403,7 @@ mod tests {
             &fill,
             &node_meta,
             &cpu_info,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2364,6 +2435,7 @@ mod tests {
             &fill,
             &node_meta,
             &cpu_info,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2402,6 +2474,7 @@ mod tests {
             &fill,
             &lhs,
             &rhs,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2442,6 +2515,7 @@ mod tests {
             &fill,
             &[],
             &[],
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2467,6 +2541,7 @@ mod tests {
             &fill,
             &[],
             &one,
+            0,
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2485,6 +2560,7 @@ mod tests {
             &fill,
             &[],
             &one_dup,
+            0,
             &mut Annotations::new(),
         )
         .unwrap_err();
@@ -2616,6 +2692,7 @@ mod tests {
             &no_fill(),
             lhs,
             rhs,
+            0,
             &mut Annotations::new(),
         )
     }
@@ -2689,11 +2766,12 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
         assert!(out.is_empty(), "the mixed-type pair is dropped: {out:?}");
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -2722,11 +2800,12 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
         assert!(out.is_empty());
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -2754,6 +2833,7 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
@@ -2779,11 +2859,12 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
         assert!(out.is_empty());
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![crate::annotations::messages::incompatible_bucket_layout_in_binop_warning("+")]
@@ -2806,6 +2887,7 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
@@ -2831,6 +2913,7 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
@@ -2845,7 +2928,7 @@ mod tests {
     fn vector_scalar_mul_over_a_histogram_computes_the_scaled_histogram() {
         let mut annos = Annotations::new();
         let vector = vec![hist_sample(&[], exp_hist(30.0, 33.0, vec![3.0, 3.0, 3.0]))];
-        let out = vector_scalar(BinOp::Mul, false, &vector, 3.0, false, &mut annos);
+        let out = vector_scalar(BinOp::Mul, false, &vector, 3.0, false, 0, &mut annos);
         assert_eq!(out.len(), 1);
         let h = out[0]
             .h
@@ -2866,7 +2949,7 @@ mod tests {
         let mut annos = Annotations::new();
         let h = exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]);
         let vector = vec![hist_sample(&[], h.clone())];
-        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, &mut annos);
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, 0, &mut annos);
         assert_eq!(out.len(), 1);
         assert!(
             out[0]
@@ -2892,7 +2975,15 @@ mod tests {
         let h = exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]);
         let mut marked = hist_sample(&[], h.clone());
         marked.drop_name = true;
-        let out = vector_scalar(BinOp::TrimLower, false, &[marked], 2.0, false, &mut annos);
+        let out = vector_scalar(
+            BinOp::TrimLower,
+            false,
+            &[marked],
+            2.0,
+            false,
+            0,
+            &mut annos,
+        );
         assert_eq!(out.len(), 1);
         assert!(
             out[0]
@@ -2910,9 +3001,9 @@ mod tests {
     fn vector_scalar_trim_over_a_plain_float_vector_drops_with_info() {
         let mut annos = Annotations::new();
         let vector = vec![sample(&[], 5.0)];
-        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, &mut annos);
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 2.0, false, 0, &mut annos);
         assert!(out.is_empty());
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -2932,9 +3023,9 @@ mod tests {
     fn vector_scalar_trim_with_scalar_on_left_and_histogram_rhs_drops_as_float_histogram() {
         let mut annos = Annotations::new();
         let vector = vec![hist_sample(&[], exp_hist(4.0, 5.0, vec![1.0, 2.0, 1.0]))];
-        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 5.0, true, &mut annos);
+        let out = vector_scalar(BinOp::TrimUpper, false, &vector, 5.0, true, 0, &mut annos);
         assert!(out.is_empty());
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -2962,11 +3053,12 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();
         assert!(out.is_empty());
-        let (_, infos) = annos.as_strings(0, 0);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(
             infos,
             vec![
@@ -2997,6 +3089,7 @@ mod tests {
             &no_fill(),
             &lhs,
             &rhs,
+            0,
             &mut annos,
         )
         .unwrap();

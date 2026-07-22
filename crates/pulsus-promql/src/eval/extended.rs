@@ -166,6 +166,7 @@ pub(crate) fn extended_rate(
 
 /// `interpolateHistograms` (functions.go:104-149). NHCB reconciliation infos
 /// are pushed onto `annos`; `Err` is the incompatible-schema case.
+#[allow(clippy::too_many_arguments)] // one-for-one port of the pin's parameter list + pos
 fn interpolate_histograms(
     h1: &FloatHistogram,
     t1: i64,
@@ -173,6 +174,7 @@ fn interpolate_histograms(
     t2: i64,
     t: i64,
     is_counter: bool,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<FloatHistogram, FloatHistogramOpError> {
     if t == t1 {
@@ -196,17 +198,19 @@ fn interpolate_histograms(
     let outcome = result.sub(h1)?;
     result = outcome.result;
     if outcome.nhcb_bounds_reconciled {
-        annos.info(messages::mismatched_custom_buckets_histograms_info(
-            messages::HistogramOperation::Sub,
-        ));
+        annos.info_at(
+            pos,
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Sub),
+        );
     }
     result.mul(fraction);
     let outcome = result.add(h1)?;
     result = outcome.result;
     if outcome.nhcb_bounds_reconciled {
-        annos.info(messages::mismatched_custom_buckets_histograms_info(
-            messages::HistogramOperation::Add,
-        ));
+        annos.info_at(
+            pos,
+            messages::mismatched_custom_buckets_histograms_info(messages::HistogramOperation::Add),
+        );
     }
     Ok(result)
 }
@@ -218,6 +222,7 @@ fn pick_or_interpolate_left_hist(
     range_start: i64,
     smoothed: bool,
     is_counter: bool,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<FloatHistogram, FloatHistogramOpError> {
     if smoothed && h[first].t_ms < range_start {
@@ -228,6 +233,7 @@ fn pick_or_interpolate_left_hist(
             h[first + 1].t_ms,
             range_start,
             is_counter,
+            pos,
             annos,
         )
     } else {
@@ -242,6 +248,7 @@ fn pick_or_interpolate_right_hist(
     range_end: i64,
     smoothed: bool,
     is_counter: bool,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<FloatHistogram, FloatHistogramOpError> {
     if smoothed && last > 0 && h[last].t_ms > range_end {
@@ -252,6 +259,7 @@ fn pick_or_interpolate_right_hist(
             h[last].t_ms,
             range_end,
             is_counter,
+            pos,
             annos,
         )
     } else {
@@ -266,6 +274,7 @@ fn pick_or_interpolate_right_hist(
 fn validate_histogram_range(
     h: &[Sample],
     is_counter: bool,
+    pos: usize,
     annos: &mut Annotations,
     metric_name: &str,
 ) -> bool {
@@ -273,13 +282,17 @@ fn validate_histogram_range(
     for p in h {
         let ph = hist(p);
         if ph.uses_custom_buckets() != using_custom {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             return false;
         }
         if is_counter && ph.counter_reset_hint == Gauge {
-            annos.warning(messages::native_histogram_not_counter_warning(metric_name));
+            annos.warning_at(
+                pos,
+                messages::native_histogram_not_counter_warning(metric_name),
+            );
         }
     }
     true
@@ -291,6 +304,7 @@ fn validate_histogram_range(
 fn add_hist_annos(
     base: &mut FloatHistogram,
     other: &FloatHistogram,
+    pos: usize,
     annos: &mut Annotations,
     metric_name: &str,
 ) -> bool {
@@ -298,16 +312,20 @@ fn add_hist_annos(
         Ok(outcome) => {
             *base = outcome.result;
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Add,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Add,
+                    ),
+                );
             }
             true
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             false
         }
     }
@@ -318,6 +336,7 @@ fn add_hist_annos(
 fn sub_hist_annos(
     base: &mut FloatHistogram,
     other: &FloatHistogram,
+    pos: usize,
     annos: &mut Annotations,
     metric_name: &str,
 ) -> bool {
@@ -325,16 +344,20 @@ fn sub_hist_annos(
         Ok(outcome) => {
             *base = outcome.result;
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Sub,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Sub,
+                    ),
+                );
             }
             true
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(metric_name),
+            );
             false
         }
     }
@@ -342,10 +365,11 @@ fn sub_hist_annos(
 
 /// `annosFromInterpolationError` (functions.go:181-185): the only classified
 /// error is an incompatible schema → the mixed exp/custom warning.
-fn annos_from_interpolation_error(annos: &mut Annotations, metric_name: &str) {
-    annos.warning(messages::mixed_exponential_custom_histograms_warning(
-        metric_name,
-    ));
+fn annos_from_interpolation_error(pos: usize, annos: &mut Annotations, metric_name: &str) {
+    annos.warning_at(
+        pos,
+        messages::mixed_exponential_custom_histograms_warning(metric_name),
+    );
 }
 
 /// `correctForCounterResetsHistogram` (functions.go:247-303): the histogram
@@ -363,6 +387,7 @@ fn correct_for_counter_resets_hist(
     right: &FloatHistogram,
     range_start: i64,
     smoothed: bool,
+    pos: usize,
     annos: &mut Annotations,
     metric_name: &str,
 ) -> Result<Option<FloatHistogram>, ()> {
@@ -391,7 +416,7 @@ fn correct_for_counter_resets_hist(
             match &mut correction {
                 None => correction = Some(prev.clone()),
                 Some(c) => {
-                    if !add_hist_annos(c, prev, annos, metric_name) {
+                    if !add_hist_annos(c, prev, pos, annos, metric_name) {
                         return Err(());
                     }
                 }
@@ -403,7 +428,7 @@ fn correct_for_counter_resets_hist(
         match &mut correction {
             None => correction = Some(prev.clone()),
             Some(c) => {
-                if !add_hist_annos(c, prev, annos, metric_name) {
+                if !add_hist_annos(c, prev, pos, annos, metric_name) {
                     return Err(());
                 }
             }
@@ -424,6 +449,7 @@ pub(crate) fn extended_histogram_rate(
     is_counter: bool,
     is_rate: bool,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<RangeValue> {
     let h = samples;
@@ -449,6 +475,7 @@ pub(crate) fn extended_histogram_rate(
     if !validate_histogram_range(
         &h[first_sample_index..=last_sample_index],
         is_counter,
+        pos,
         annos,
         metric_name,
     ) {
@@ -461,11 +488,12 @@ pub(crate) fn extended_histogram_rate(
         range_start_ms,
         smoothed,
         is_counter,
+        pos,
         annos,
     ) {
         Ok(v) => v,
         Err(_) => {
-            annos_from_interpolation_error(annos, metric_name);
+            annos_from_interpolation_error(pos, annos, metric_name);
             return None;
         }
     };
@@ -475,23 +503,27 @@ pub(crate) fn extended_histogram_rate(
         range_end_ms,
         smoothed,
         is_counter,
+        pos,
         annos,
     ) {
         Ok(v) => v,
         Err(_) => {
-            annos_from_interpolation_error(annos, metric_name);
+            annos_from_interpolation_error(pos, annos, metric_name);
             return None;
         }
     };
 
     if !is_counter && (left.counter_reset_hint != Gauge || right.counter_reset_hint != Gauge) {
-        annos.warning(messages::native_histogram_not_gauge_warning(metric_name));
+        annos.warning_at(
+            pos,
+            messages::native_histogram_not_gauge_warning(metric_name),
+        );
     }
 
     // Copy right so correctForCounterResetsHistogram can still call
     // right.detect_reset without observing the subtraction's mutation.
     let mut result = right.clone();
-    if !sub_hist_annos(&mut result, &left, annos, metric_name) {
+    if !sub_hist_annos(&mut result, &left, pos, annos, metric_name) {
         return None;
     }
 
@@ -504,12 +536,13 @@ pub(crate) fn extended_histogram_rate(
             &right,
             range_start_ms,
             smoothed,
+            pos,
             annos,
             metric_name,
         ) {
             Err(()) => return None,
             Ok(Some(correction)) => {
-                if !add_hist_annos(&mut result, &correction, annos, metric_name) {
+                if !add_hist_annos(&mut result, &correction, pos, annos, metric_name) {
                     return None;
                 }
             }
@@ -559,6 +592,7 @@ pub(crate) fn smoothed_instant(
     eff_t: i64,
     lookback_ms: i64,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> Option<(f64, Option<Box<FloatHistogram>>)> {
     let start = samples.partition_point(|s| s.t_ms <= eff_t - lookback_ms);
@@ -573,7 +607,7 @@ pub(crate) fn smoothed_instant(
     let has_hist = window.iter().any(|s| s.h.is_some());
     let has_float = window.iter().any(|s| s.h.is_none());
     if has_hist && has_float {
-        annos.warning(messages::mixed_floats_histograms_warning(metric_name));
+        annos.warning_at(pos, messages::mixed_floats_histograms_warning(metric_name));
         return None;
     }
 
@@ -591,18 +625,21 @@ pub(crate) fn smoothed_instant(
             let ph = hist(prev);
             let nh = hist(next);
             if ph.uses_custom_buckets() != nh.uses_custom_buckets() {
-                annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                    metric_name,
-                ));
+                annos.warning_at(
+                    pos,
+                    messages::mixed_exponential_custom_histograms_warning(metric_name),
+                );
                 return None;
             }
             // Treat as counter unless BOTH neighbours carry the gauge hint
             // (engine.go:1786).
             let is_counter = ph.counter_reset_hint != Gauge || nh.counter_reset_hint != Gauge;
-            match interpolate_histograms(ph, prev.t_ms, nh, next.t_ms, eff_t, is_counter, annos) {
+            match interpolate_histograms(
+                ph, prev.t_ms, nh, next.t_ms, eff_t, is_counter, pos, annos,
+            ) {
                 Ok(h) => return Some((0.0, Some(Box::new(h)))),
                 Err(_) => {
-                    annos_from_interpolation_error(annos, metric_name);
+                    annos_from_interpolation_error(pos, annos, metric_name);
                     return None;
                 }
             }

@@ -13,6 +13,7 @@ MatrixSelector(
             at: None,
             anchored: false,
             smoothed: false,
+            pos: AstPos(0),
         },
         range: 300s,
         range_expr: None,

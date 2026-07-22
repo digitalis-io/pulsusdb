@@ -99,14 +99,36 @@ pub fn aggregate(
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    pos: AggPos,
     annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     match op {
-        AggOp::Topk | AggOp::Bottomk => aggregate_topk(op, vector, grouping, param, annos),
+        // Issue #128: topk/bottomk's ignored-histogram info carries the
+        // WHOLE aggregate expression's position (`e.PosRange`,
+        // engine.go:4036-4077).
+        AggOp::Topk | AggOp::Bottomk => {
+            aggregate_topk(op, vector, grouping, param, pos.self_pos, annos)
+        }
         AggOp::LimitK | AggOp::LimitRatio => aggregate_limit(op, vector, grouping, param),
-        AggOp::Quantile => aggregate_quantile(vector, grouping, param, annos),
-        _ => Ok(aggregate_reduce(op, vector, grouping, annos)),
+        AggOp::Quantile => {
+            aggregate_quantile(vector, grouping, param, pos.param_pos, pos.expr_pos, annos)
+        }
+        _ => Ok(aggregate_reduce(op, vector, grouping, pos.expr_pos, annos)),
     }
+}
+
+/// Issue #128: the three annotation positions an aggregation node can
+/// emit at — the upstream per-site split (see [`aggregate`]'s arms):
+/// `e.Expr.PositionRange()` for the inner-expression sites
+/// (engine.go:3630-3940), `e.Param.PositionRange()` for the
+/// quantile/ratio parameter warnings (:1657-1672), and the whole node's
+/// `e.PosRange` for topk/bottomk's ignored-histogram info (:4036-4077).
+#[derive(Debug, Clone, Copy)]
+pub struct AggPos {
+    pub expr_pos: usize,
+    /// 0 when the operator has no parameter (never read then).
+    pub param_pos: usize,
+    pub self_pos: usize,
 }
 
 /// The aggregation-op name upstream's `NewHistogramIgnoredInAggregationInfo`
@@ -272,6 +294,7 @@ fn fold_histogram_into_sum(
     acc: &mut Acc,
     sample_metric_name: &str,
     h: &FloatHistogram,
+    pos: usize,
     annos: &mut Annotations,
 ) {
     let Some(current) = acc.hist_value.clone() else {
@@ -280,17 +303,21 @@ fn fold_histogram_into_sum(
     match current.kahan_add(h, acc.hist_kahan_c.as_ref()) {
         Ok(outcome) => {
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Agg,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Agg,
+                    ),
+                );
             }
             acc.hist_value = Some(outcome.result);
             acc.hist_kahan_c = Some(outcome.compensation);
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                sample_metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(sample_metric_name),
+            );
             acc.incompatible_histograms = true;
         }
     }
@@ -307,6 +334,7 @@ fn fold_histogram_into_avg(
     acc: &mut Acc,
     sample_metric_name: &str,
     h: &FloatHistogram,
+    pos: usize,
     annos: &mut Annotations,
 ) {
     let Some(current) = acc.hist_value.clone() else {
@@ -316,17 +344,21 @@ fn fold_histogram_into_avg(
         let outcome = match current.kahan_add(h, acc.hist_kahan_c.as_ref()) {
             Ok(o) => o,
             Err(FloatHistogramOpError::IncompatibleSchema) => {
-                annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                    sample_metric_name,
-                ));
+                annos.warning_at(
+                    pos,
+                    messages::mixed_exponential_custom_histograms_warning(sample_metric_name),
+                );
                 acc.incompatible_histograms = true;
                 return;
             }
         };
         if outcome.nhcb_bounds_reconciled {
-            annos.info(messages::mismatched_custom_buckets_histograms_info(
-                messages::HistogramOperation::Agg,
-            ));
+            annos.info_at(
+                pos,
+                messages::mismatched_custom_buckets_histograms_info(
+                    messages::HistogramOperation::Agg,
+                ),
+            );
         }
         if !outcome.result.has_overflow() {
             acc.hist_value = Some(outcome.result);
@@ -366,17 +398,21 @@ fn fold_histogram_into_avg(
     match scaled_mean.kahan_add(&to_add, acc.hist_kahan_c.as_ref()) {
         Ok(outcome) => {
             if outcome.nhcb_bounds_reconciled {
-                annos.info(messages::mismatched_custom_buckets_histograms_info(
-                    messages::HistogramOperation::Agg,
-                ));
+                annos.info_at(
+                    pos,
+                    messages::mismatched_custom_buckets_histograms_info(
+                        messages::HistogramOperation::Agg,
+                    ),
+                );
             }
             acc.hist_mean = Some(outcome.result);
             acc.hist_kahan_c = Some(outcome.compensation);
         }
         Err(FloatHistogramOpError::IncompatibleSchema) => {
-            annos.warning(messages::mixed_exponential_custom_histograms_warning(
-                sample_metric_name,
-            ));
+            annos.warning_at(
+                pos,
+                messages::mixed_exponential_custom_histograms_warning(sample_metric_name),
+            );
             acc.incompatible_histograms = true;
         }
     }
@@ -386,6 +422,9 @@ fn aggregate_reduce(
     op: AggOp,
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
+    // Issue #128: every aggregate_reduce site is an inner-expression
+    // position (`e.Expr.PositionRange()`, engine.go:3630-3940).
+    pos: usize,
     annos: &mut Annotations,
 ) -> Vec<InstantSample> {
     let mut groups: HashMap<GroupKey, Acc> = HashMap::new();
@@ -426,7 +465,13 @@ fn aggregate_reduce(
                     if acc.hist_value.is_some() {
                         track_counter_reset(acc, h);
                     }
-                    fold_histogram_into_sum(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
+                    fold_histogram_into_sum(
+                        acc,
+                        s.metric_name.as_deref().unwrap_or(""),
+                        h,
+                        pos,
+                        annos,
+                    );
                 }
             }
             (AggOp::Avg, Some(h)) => {
@@ -439,7 +484,13 @@ fn aggregate_reduce(
                     if acc.hist_value.is_some() {
                         track_counter_reset(acc, h);
                     }
-                    fold_histogram_into_avg(acc, s.metric_name.as_deref().unwrap_or(""), h, annos);
+                    fold_histogram_into_avg(
+                        acc,
+                        s.metric_name.as_deref().unwrap_or(""),
+                        h,
+                        pos,
+                        annos,
+                    );
                 }
             }
             (AggOp::Sum, None) => {
@@ -485,9 +536,12 @@ fn aggregate_reduce(
                 }
             }
             (AggOp::Min | AggOp::Max, Some(_)) => {
-                annos.info(messages::histogram_ignored_in_aggregation_info(
-                    ignored_in_aggregation_name(op),
-                ));
+                annos.info_at(
+                    pos,
+                    messages::histogram_ignored_in_aggregation_info(ignored_in_aggregation_name(
+                        op,
+                    )),
+                );
                 if is_first {
                     acc.seen = false;
                 }
@@ -500,9 +554,12 @@ fn aggregate_reduce(
                 acc.count += 1.0;
             }
             (AggOp::Stddev | AggOp::Stdvar, Some(_)) => {
-                annos.info(messages::histogram_ignored_in_aggregation_info(
-                    ignored_in_aggregation_name(op),
-                ));
+                annos.info_at(
+                    pos,
+                    messages::histogram_ignored_in_aggregation_info(ignored_in_aggregation_name(
+                        op,
+                    )),
+                );
                 if is_first {
                     acc.seen = false;
                 }
@@ -531,7 +588,7 @@ fn aggregate_reduce(
             // (`engine.go:3862-3865,3907-3910`) — checked before the
             // incompatible-schema drop, matching the pin's order.
             if (op == AggOp::Sum || op == AggOp::Avg) && acc.has_float && acc.has_histogram {
-                annos.warning(messages::mixed_floats_histograms_agg_warning());
+                annos.warning_at(pos, messages::mixed_floats_histograms_agg_warning());
                 return None;
             }
             if acc.incompatible_histograms {
@@ -542,9 +599,12 @@ fn aggregate_reduce(
             // drops, exactly like the pin (a dropped group `continue`s
             // before its check runs). Only sum/avg ever set the booleans.
             if acc.counter_reset_seen && acc.not_counter_reset_seen {
-                annos.warning(messages::histogram_counter_reset_collision_warning(
-                    messages::HistogramOperation::Agg,
-                ));
+                annos.warning_at(
+                    pos,
+                    messages::histogram_counter_reset_collision_warning(
+                        messages::HistogramOperation::Agg,
+                    ),
+                );
             }
             let (v, h) = match op {
                 // The pin's SUM output arm (`engine.go:3893-3901`): flush
@@ -647,6 +707,8 @@ fn aggregate_topk(
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    // Issue #128: `e.PosRange` — the whole aggregate expression.
+    pos: usize,
     annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     let k = param.ok_or_else(|| PromqlError::BadMatching {
@@ -685,9 +747,10 @@ fn aggregate_topk(
     let mut groups: HashMap<GroupKey, Vec<InstantSample>> = HashMap::new();
     for s in vector {
         if s.h.is_some() {
-            annos.info(messages::histogram_ignored_in_aggregation_info(
-                ignored_in_aggregation_name(op),
-            ));
+            annos.info_at(
+                pos,
+                messages::histogram_ignored_in_aggregation_info(ignored_in_aggregation_name(op)),
+            );
             continue;
         }
         let key = group_key(s, grouping);
@@ -740,6 +803,10 @@ fn aggregate_quantile(
     vector: &[InstantSample],
     grouping: Option<&Grouping>,
     param: Option<f64>,
+    // Issue #128: `e.Param.PositionRange()` (engine.go:1666-1672).
+    param_pos: usize,
+    // Issue #128: `e.Expr.PositionRange()` (engine.go:3642,3849).
+    expr_pos: usize,
     annos: &mut Annotations,
 ) -> Result<Vec<InstantSample>, PromqlError> {
     let phi = param.ok_or_else(|| PromqlError::BadMatching {
@@ -756,7 +823,7 @@ fn aggregate_quantile(
     // NaN is outside the range too (`contains` is false for NaN) — the
     // pin's three checks collapse into one.
     if !(0.0..=1.0).contains(&phi) {
-        annos.warning(messages::invalid_quantile_warning(phi));
+        annos.warning_at(param_pos, messages::invalid_quantile_warning(phi));
     }
 
     // M7-A5b-iii: a histogram member is skipped + `HistogramIgnoredIn
@@ -769,7 +836,10 @@ fn aggregate_quantile(
     let mut groups: HashMap<GroupKey, (Vec<f64>, bool, i64)> = HashMap::new();
     for s in vector {
         if s.h.is_some() {
-            annos.info(messages::histogram_ignored_in_aggregation_info("quantile"));
+            annos.info_at(
+                expr_pos,
+                messages::histogram_ignored_in_aggregation_info("quantile"),
+            );
             continue;
         }
         let key = group_key(s, grouping);
@@ -1025,6 +1095,16 @@ fn ratio_includes(r: f64, offset: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #128: tests exercise message content; positions are pinned
+    /// by the engine-level suffix tests in eval/mod.rs.
+    fn zero_pos() -> AggPos {
+        AggPos {
+            expr_pos: 0,
+            param_pos: 0,
+            self_pos: 0,
+        }
+    }
+
     use super::*;
 
     fn sample(labels: &[(&str, &str)], v: f64) -> InstantSample {
@@ -1120,11 +1200,14 @@ mod tests {
             ),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert_eq!(out.len(), 1);
         let h = out[0].h.as_ref().unwrap();
         assert!(h.bits_eq(&exp_hist(5.0, 7.0, vec![2.0, 3.0, 2.0])));
-        assert!(annos.as_strings(0, 0).0.is_empty(), "no warning expected");
+        assert!(
+            annos.as_strings("", 0, 0).0.is_empty(),
+            "no warning expected"
+        );
     }
 
     /// `native_histograms.test:1214-1216` T=12 column: the same group ALSO
@@ -1153,9 +1236,9 @@ mod tests {
             ),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert!(out.is_empty(), "the mixed-schema group is dropped: {out:?}");
-        let (warnings, _) = annos.as_strings(0, 0);
+        let (warnings, _) = annos.as_strings("", 0, 0);
         assert_eq!(
             warnings,
             vec![messages::mixed_exponential_custom_histograms_warning(
@@ -1185,13 +1268,16 @@ mod tests {
             ),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert_eq!(out.len(), 1);
         let h = out[0].h.as_ref().unwrap();
         assert!(h.bits_eq(&nhcb_hist(2.0, 2.0, vec![10.0], vec![2.0])));
-        assert!(annos.as_strings(0, 0).0.is_empty(), "no warning expected");
+        assert!(
+            annos.as_strings("", 0, 0).0.is_empty(),
+            "no warning expected"
+        );
         assert_eq!(
-            annos.as_strings(0, 0).1,
+            annos.as_strings("", 0, 0).1,
             vec![messages::mismatched_custom_buckets_histograms_info(
                 messages::HistogramOperation::Agg
             )]
@@ -1209,11 +1295,11 @@ mod tests {
         ];
         let mut annos = Annotations::new();
         assert_eq!(
-            aggregate(AggOp::Count, &vector, None, None, &mut annos).unwrap()[0].v,
+            aggregate(AggOp::Count, &vector, None, None, zero_pos(), &mut annos).unwrap()[0].v,
             2.0
         );
         assert_eq!(
-            aggregate(AggOp::Group, &vector, None, None, &mut annos).unwrap()[0].v,
+            aggregate(AggOp::Group, &vector, None, None, zero_pos(), &mut annos).unwrap()[0].v,
             1.0
         );
     }
@@ -1226,10 +1312,10 @@ mod tests {
     fn min_over_a_pure_histogram_group_produces_no_output_and_infos() {
         let vector = vec![hist_sample(&[("s", "1")], exp_hist(1.0, 1.0, vec![1.0]))];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Min, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Min, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert!(out.is_empty());
         assert_eq!(
-            annos.as_strings(0, 0).1,
+            annos.as_strings("", 0, 0).1,
             vec![messages::histogram_ignored_in_aggregation_info("min")]
         );
     }
@@ -1243,12 +1329,12 @@ mod tests {
             hist_sample(&[("s", "1")], exp_hist(1.0, 1.0, vec![1.0])),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Max, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Max, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 5.0);
         assert!(out[0].h.is_none());
         assert_eq!(
-            annos.as_strings(0, 0).1,
+            annos.as_strings("", 0, 0).1,
             vec![messages::histogram_ignored_in_aggregation_info("max")]
         );
     }
@@ -1263,11 +1349,19 @@ mod tests {
             hist_sample(&[("s", "2")], exp_hist(1.0, 1.0, vec![1.0])),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Topk, &vector, None, Some(2.0), &mut annos).unwrap();
+        let out = aggregate(
+            AggOp::Topk,
+            &vector,
+            None,
+            Some(2.0),
+            zero_pos(),
+            &mut annos,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 5.0);
         assert_eq!(
-            annos.as_strings(0, 0).1,
+            annos.as_strings("", 0, 0).1,
             vec![messages::histogram_ignored_in_aggregation_info("topk")]
         );
     }
@@ -1305,7 +1399,7 @@ mod tests {
         };
         let vector = vec![mk("1", BIG), mk("2", 1.0), mk("3", 1.0)];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Sum, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert_eq!(out.len(), 1);
         let h = out[0].h.as_ref().unwrap();
         assert_eq!(h.positive_buckets, vec![BIG_PLUS_2]);
@@ -1333,7 +1427,7 @@ mod tests {
             hist_sample(&[("s", "3")], exp_hist(1.0, 1.0, vec![1.0])),
         ];
         let mut annos = Annotations::new();
-        let out = aggregate(AggOp::Avg, &vector, None, None, &mut annos).unwrap();
+        let out = aggregate(AggOp::Avg, &vector, None, None, zero_pos(), &mut annos).unwrap();
         assert_eq!(out.len(), 1);
         let h = out[0].h.as_ref().unwrap();
         // The pin's exact arithmetic: value/3 + comp/3 (both compensations
@@ -1351,7 +1445,15 @@ mod tests {
     #[test]
     fn sum_with_no_grouping_reduces_to_one_series() {
         let vector = vec![sample(&[("job", "a")], 1.0), sample(&[("job", "b")], 2.0)];
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 3.0);
         assert!(out[0].labels.is_empty());
@@ -1365,7 +1467,15 @@ mod tests {
             sample(&[("job", "b"), ("inst", "1")], 5.0),
         ];
         let g = grouping(false, &["job"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            Some(&g),
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].labels.get("job"), Some("a"));
         assert_eq!(out[0].v, 3.0);
@@ -1380,7 +1490,15 @@ mod tests {
             sample(&[("s", "2")], 1.0),
             sample(&[("s", "3")], -1e100),
         ];
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -1391,7 +1509,15 @@ mod tests {
             sample(&[("job", "a"), ("inst", "2")], 2.0),
         ];
         let g = grouping(true, &["inst"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            Some(&g),
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].v, 3.0);
     }
@@ -1399,7 +1525,15 @@ mod tests {
     #[test]
     fn avg_divides_by_group_member_count() {
         let vector = vec![sample(&[("job", "a")], 2.0), sample(&[("job", "a")], 4.0)];
-        let out = aggregate(AggOp::Avg, &vector, None, None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Avg,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].v, 3.0);
     }
 
@@ -1411,11 +1545,29 @@ mod tests {
             sample(&[("job", "a")], 3.0),
         ];
         assert_eq!(
-            aggregate(AggOp::Min, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Min,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             1.0
         );
         assert_eq!(
-            aggregate(AggOp::Max, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Max,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             5.0
         );
     }
@@ -1433,6 +1585,7 @@ mod tests {
             &vector,
             Some(&g),
             None,
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1443,7 +1596,15 @@ mod tests {
     #[test]
     fn group_always_yields_one() {
         let vector = vec![sample(&[("job", "a")], 42.0)];
-        let out = aggregate(AggOp::Group, &vector, None, None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Group,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].v, 1.0);
     }
 
@@ -1459,6 +1620,7 @@ mod tests {
             &vector,
             None,
             Some(2.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1479,6 +1641,7 @@ mod tests {
             &vector,
             None,
             Some(2.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1495,6 +1658,7 @@ mod tests {
             &vector,
             None,
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1506,7 +1670,15 @@ mod tests {
     #[test]
     fn sum_drops_metric_name() {
         let vector = vec![sample(&[("job", "a")], 1.0), sample(&[("job", "b")], 2.0)];
-        let out = aggregate(AggOp::Sum, &vector, None, None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out[0].metric_name, None);
     }
 
@@ -1522,7 +1694,8 @@ mod tests {
             AggOp::Stddev,
             AggOp::Stdvar,
         ] {
-            let out = aggregate(op, &vector, None, None, &mut Annotations::new()).unwrap();
+            let out =
+                aggregate(op, &vector, None, None, zero_pos(), &mut Annotations::new()).unwrap();
             assert_eq!(out[0].metric_name, None, "{op:?} must drop __name__");
         }
     }
@@ -1538,6 +1711,7 @@ mod tests {
             &vector,
             None,
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1547,6 +1721,7 @@ mod tests {
             &vector,
             None,
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1556,7 +1731,15 @@ mod tests {
     #[test]
     fn topk_without_a_k_parameter_is_bad_matching() {
         let vector = vec![sample(&[("s", "1")], 1.0)];
-        let err = aggregate(AggOp::Topk, &vector, None, None, &mut Annotations::new()).unwrap_err();
+        let err = aggregate(
+            AggOp::Topk,
+            &vector,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PromqlError::BadMatching { .. }));
     }
 
@@ -1573,6 +1756,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1585,9 +1769,16 @@ mod tests {
     #[test]
     fn an_empty_vector_aggregates_to_an_empty_result() {
         assert!(
-            aggregate(AggOp::Sum, &[], None, None, &mut Annotations::new())
-                .unwrap()
-                .is_empty()
+            aggregate(
+                AggOp::Sum,
+                &[],
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -1613,11 +1804,29 @@ mod tests {
             sample(&[("label", "b")], 2.0),
         ];
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stdvar,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.25
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stddev,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.5
         );
     }
@@ -1628,11 +1837,29 @@ mod tests {
     fn stddev_and_stdvar_of_a_single_finite_sample_are_exactly_zero() {
         let vector = vec![sample(&[("label", "a")], 42.5)];
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stdvar,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.0
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stddev,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.0
         );
     }
@@ -1645,12 +1872,28 @@ mod tests {
         for v in [f64::INFINITY, f64::NEG_INFINITY] {
             let vector = vec![sample(&[("label", "a")], v)];
             assert!(
-                aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0]
+                aggregate(
+                    AggOp::Stdvar,
+                    &vector,
+                    None,
+                    None,
+                    zero_pos(),
+                    &mut Annotations::new()
+                )
+                .unwrap()[0]
                     .v
                     .is_nan()
             );
             assert!(
-                aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
+                aggregate(
+                    AggOp::Stddev,
+                    &vector,
+                    None,
+                    None,
+                    zero_pos(),
+                    &mut Annotations::new()
+                )
+                .unwrap()[0]
                     .v
                     .is_nan()
             );
@@ -1662,12 +1905,28 @@ mod tests {
     fn stddev_and_stdvar_of_a_single_nan_sample_are_nan() {
         let vector = vec![sample(&[("label", "a")], f64::NAN)];
         assert!(
-            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0]
+            aggregate(
+                AggOp::Stdvar,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
                 .v
                 .is_nan()
         );
         assert!(
-            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
+            aggregate(
+                AggOp::Stddev,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
                 .v
                 .is_nan()
         );
@@ -1682,11 +1941,29 @@ mod tests {
             .map(|i| sample(&[("s", &i.to_string())], 0.1 + 0.2))
             .collect();
         assert_eq!(
-            aggregate(AggOp::Stdvar, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stdvar,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.0
         );
         assert_eq!(
-            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0].v,
+            aggregate(
+                AggOp::Stddev,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
+                .v,
             0.0
         );
     }
@@ -1701,7 +1978,15 @@ mod tests {
             sample(&[("label", "c")], f64::NAN),
         ];
         assert!(
-            aggregate(AggOp::Stddev, &vector, None, None, &mut Annotations::new()).unwrap()[0]
+            aggregate(
+                AggOp::Stddev,
+                &vector,
+                None,
+                None,
+                zero_pos(),
+                &mut Annotations::new()
+            )
+            .unwrap()[0]
                 .v
                 .is_nan()
         );
@@ -1711,6 +1996,7 @@ mod tests {
             &vector,
             Some(&g),
             None,
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1733,7 +2019,15 @@ mod tests {
             named_sample(Some("metric_b"), &[("env", "1")], 32.0),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            Some(&g),
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 2, "two names, two groups: {out:?}");
         assert_eq!(out[0].metric_name.as_deref(), Some("metric_a"));
         assert_eq!(out[0].v, 10.0);
@@ -1762,7 +2056,15 @@ mod tests {
             named_sample(None, &[("env", "2")], 0.2),
         ];
         let g = grouping(false, &["__name__"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            Some(&g),
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].metric_name, None);
         assert_eq!(out[0].v, 0.4);
@@ -1778,7 +2080,15 @@ mod tests {
             named_sample(Some("metric_b"), &[("job", "b")], 2.0),
         ];
         let g = grouping(true, &["job"]);
-        let out = aggregate(AggOp::Sum, &vector, Some(&g), None, &mut Annotations::new()).unwrap();
+        let out = aggregate(
+            AggOp::Sum,
+            &vector,
+            Some(&g),
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].metric_name, None);
         assert_eq!(out[0].v, 3.0);
@@ -1799,6 +2109,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1888,8 +2199,15 @@ mod tests {
         assert_eq!(seven.v, 1.0);
         // Downstream evaluation: count(count_values("__name__", v)) — the
         // synthesized names group away again without tripping anything.
-        let downstream =
-            aggregate(AggOp::Count, &out, None, None, &mut Annotations::new()).unwrap();
+        let downstream = aggregate(
+            AggOp::Count,
+            &out,
+            None,
+            None,
+            zero_pos(),
+            &mut Annotations::new(),
+        )
+        .unwrap();
         assert_eq!(downstream.len(), 1);
         assert_eq!(downstream[0].v, 2.0);
     }
@@ -1964,6 +2282,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(0.8),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -1979,6 +2298,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(0.2),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2000,6 +2320,7 @@ mod tests {
             &vector,
             None,
             Some(-0.5),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2009,6 +2330,7 @@ mod tests {
             &vector,
             None,
             Some(1.5),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2018,6 +2340,7 @@ mod tests {
             &vector,
             None,
             Some(f64::NAN),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2036,6 +2359,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(0.5),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2052,6 +2376,7 @@ mod tests {
             &vector,
             None,
             None,
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap_err();
@@ -2081,6 +2406,7 @@ mod tests {
                 &vector,
                 None,
                 Some(k),
+                zero_pos(),
                 &mut Annotations::new(),
             )
             .unwrap();
@@ -2093,6 +2419,7 @@ mod tests {
             &vector,
             Some(&g),
             Some(3.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2109,6 +2436,7 @@ mod tests {
             &vector,
             None,
             Some(3.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2132,6 +2460,7 @@ mod tests {
                     &vector,
                     None,
                     Some(k),
+                    zero_pos(),
                     &mut Annotations::new()
                 )
                 .unwrap()
@@ -2144,6 +2473,7 @@ mod tests {
             &vector,
             None,
             Some(2.9),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2160,6 +2490,7 @@ mod tests {
                 &vector,
                 None,
                 Some(f64::NAN),
+                zero_pos(),
                 &mut Annotations::new(),
             )
             .unwrap_err();
@@ -2180,6 +2511,7 @@ mod tests {
             &six_series(),
             None,
             None,
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap_err();
@@ -2205,6 +2537,7 @@ mod tests {
             &vector,
             None,
             Some(3.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap()
@@ -2216,6 +2549,7 @@ mod tests {
             &later,
             None,
             Some(3.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap()
@@ -2239,6 +2573,7 @@ mod tests {
                 &vector,
                 None,
                 Some(0.0),
+                zero_pos(),
                 &mut Annotations::new()
             )
             .unwrap()
@@ -2249,6 +2584,7 @@ mod tests {
             &vector,
             None,
             Some(-1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2260,6 +2596,7 @@ mod tests {
             &vector,
             None,
             Some(1.1),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2268,6 +2605,7 @@ mod tests {
             &vector,
             None,
             Some(1.0),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2277,6 +2615,7 @@ mod tests {
             &vector,
             None,
             Some(-1.1),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap();
@@ -2293,6 +2632,7 @@ mod tests {
                 &vector,
                 None,
                 Some(f64::NAN),
+                zero_pos(),
                 &mut Annotations::new(),
             )
             .unwrap_err();
@@ -2313,6 +2653,7 @@ mod tests {
             &six_series(),
             None,
             None,
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap_err();
@@ -2334,6 +2675,7 @@ mod tests {
                 &vector,
                 None,
                 Some(r),
+                zero_pos(),
                 &mut Annotations::new(),
             )
             .unwrap();
@@ -2342,6 +2684,7 @@ mod tests {
                 &vector,
                 None,
                 Some(-(1.0 - r)),
+                zero_pos(),
                 &mut Annotations::new(),
             )
             .unwrap();
@@ -2384,6 +2727,7 @@ mod tests {
             &vector,
             None,
             Some(0.5),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap()
@@ -2395,6 +2739,7 @@ mod tests {
             &later,
             None,
             Some(0.5),
+            zero_pos(),
             &mut Annotations::new(),
         )
         .unwrap()

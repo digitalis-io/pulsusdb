@@ -618,12 +618,14 @@ mod tests {
         let arg1 = Expr::NumberLiteral(NumberLiteral::new(1.0));
         let arg2 = Expr::StringLiteral(StringLiteral {
             val: "prometheus".into(),
+            pos: Default::default(),
         });
         let args1 = FunctionArgs::new_args(arg1).append_args(arg2);
 
         let arg1 = Expr::NumberLiteral(NumberLiteral::new(0.5 + 0.5));
         let arg2 = Expr::StringLiteral(StringLiteral {
             val: String::from("prometheus"),
+            pos: Default::default(),
         });
         let args2 = FunctionArgs::new_args(arg1).append_args(arg2);
 

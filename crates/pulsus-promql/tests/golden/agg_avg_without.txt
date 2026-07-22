@@ -17,6 +17,7 @@ Aggregate(
                 at: None,
                 anchored: false,
                 smoothed: false,
+                pos: AstPos(19),
             },
         ),
         param: None,
@@ -29,5 +30,6 @@ Aggregate(
                 },
             ),
         ),
+        pos: AstPos(0),
     },
 )

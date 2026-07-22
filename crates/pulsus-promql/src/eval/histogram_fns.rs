@@ -23,6 +23,7 @@ pub fn histogram_quantile(
     q: f64,
     h: &FloatHistogram,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> f64 {
     if q < 0.0 {
@@ -109,9 +110,13 @@ pub fn histogram_quantile(
     // observations (Sum is then also NaN).
     if count < rank {
         if h.sum.is_nan() {
-            annos.info(messages::native_histogram_quantile_nan_result_info(
-                metric_name,
-            ));
+            // Issue #128: the caller's args[0] position
+            // (`HistogramQuantile(q, …, args[0].PositionRange())`,
+            // functions.go:2098/2180).
+            annos.info_at(
+                pos,
+                messages::native_histogram_quantile_nan_result_info(metric_name),
+            );
             return f64::NAN;
         }
         return bucket.upper;
@@ -130,9 +135,10 @@ pub fn histogram_quantile(
             count += b.count;
         }
         if count < h.count {
-            annos.info(messages::native_histogram_quantile_nan_skew_info(
-                metric_name,
-            ));
+            annos.info_at(
+                pos,
+                messages::native_histogram_quantile_nan_skew_info(metric_name),
+            );
         }
     }
 
@@ -193,6 +199,7 @@ pub fn histogram_fraction(
     upper: f64,
     h: &FloatHistogram,
     metric_name: &str,
+    pos: usize,
     annos: &mut Annotations,
 ) -> f64 {
     if h.count == 0.0 || lower.is_nan() || upper.is_nan() {
@@ -266,7 +273,12 @@ pub fn histogram_fraction(
             count += b.count;
         }
         if count < h.count {
-            annos.info(messages::native_histogram_fraction_nans_info(metric_name));
+            // Issue #128: args[0]'s (lower's) position
+            // (functions.go:2047).
+            annos.info_at(
+                pos,
+                messages::native_histogram_fraction_nans_info(metric_name),
+            );
         }
     } else {
         count = h.count;
@@ -398,7 +410,7 @@ mod tests {
     fn quantile_below_zero_is_negative_infinity() {
         let mut annos = Annotations::new();
         assert_eq!(
-            histogram_quantile(-0.1, &single_histogram(), "", &mut annos),
+            histogram_quantile(-0.1, &single_histogram(), "", 0, &mut annos),
             f64::NEG_INFINITY
         );
         assert!(annos.is_empty(), "clamping alone adds no annotation here");
@@ -408,7 +420,7 @@ mod tests {
     fn quantile_above_one_is_positive_infinity() {
         let mut annos = Annotations::new();
         assert_eq!(
-            histogram_quantile(1.1, &single_histogram(), "", &mut annos),
+            histogram_quantile(1.1, &single_histogram(), "", 0, &mut annos),
             f64::INFINITY
         );
     }
@@ -416,7 +428,7 @@ mod tests {
     #[test]
     fn quantile_of_nan_is_nan() {
         let mut annos = Annotations::new();
-        assert!(histogram_quantile(f64::NAN, &single_histogram(), "", &mut annos).is_nan());
+        assert!(histogram_quantile(f64::NAN, &single_histogram(), "", 0, &mut annos).is_nan());
     }
 
     #[test]
@@ -424,7 +436,7 @@ mod tests {
         let mut h = single_histogram();
         h.count = 0.0;
         let mut annos = Annotations::new();
-        assert!(histogram_quantile(0.5, &h, "", &mut annos).is_nan());
+        assert!(histogram_quantile(0.5, &h, "", 0, &mut annos).is_nan());
     }
 
     #[test]
@@ -435,7 +447,7 @@ mod tests {
         // Positive bucket exponential interp: 2^(log2(1)+(log2(2)-log2(1))*0.5)
         // = 2^0.5.
         let mut annos = Annotations::new();
-        let v = histogram_quantile(0.5, &single_histogram(), "", &mut annos);
+        let v = histogram_quantile(0.5, &single_histogram(), "", 0, &mut annos);
         assert!((v - std::f64::consts::SQRT_2).abs() < 1e-12, "got {v}");
         assert!(annos.is_empty());
     }
@@ -449,7 +461,7 @@ mod tests {
         // (count=3>=2), bucket=(5,10], rank=count-rank=3-2=1, fraction=0.5,
         // linear: 5 + (10-5)*0.5 = 7.5.
         let mut annos = Annotations::new();
-        let v = histogram_quantile(0.5, &custom_buckets_histogram(), "req", &mut annos);
+        let v = histogram_quantile(0.5, &custom_buckets_histogram(), "req", 0, &mut annos);
         assert!((v - 7.5).abs() < 1e-12, "got {v}");
     }
 
@@ -480,7 +492,7 @@ mod tests {
         let mut annos = Annotations::new();
         // Force the forward iterator deterministically (q < 0.5):
         // rank = 0.1*10 = 1.
-        let v = histogram_quantile(0.1, &h, "", &mut annos);
+        let v = histogram_quantile(0.1, &h, "", 0, &mut annos);
         // Only the zero bucket has observations; fraction = rank/count =
         // 1/10 = 0.1; clamped lower=0, upper=0.5: 0 + 0.5*0.1 = 0.05.
         assert!((v - 0.05).abs() < 1e-12, "got {v}");
@@ -493,25 +505,25 @@ mod tests {
         let mut h = single_histogram();
         h.count = 0.0;
         let mut annos = Annotations::new();
-        assert!(histogram_fraction(0.0, 1.0, &h, "", &mut annos).is_nan());
+        assert!(histogram_fraction(0.0, 1.0, &h, "", 0, &mut annos).is_nan());
     }
 
     #[test]
     fn fraction_of_nan_bounds_is_nan() {
         let mut annos = Annotations::new();
-        assert!(histogram_fraction(f64::NAN, 1.0, &single_histogram(), "", &mut annos).is_nan());
-        assert!(histogram_fraction(0.0, f64::NAN, &single_histogram(), "", &mut annos).is_nan());
+        assert!(histogram_fraction(f64::NAN, 1.0, &single_histogram(), "", 0, &mut annos).is_nan());
+        assert!(histogram_fraction(0.0, f64::NAN, &single_histogram(), "", 0, &mut annos).is_nan());
     }
 
     #[test]
     fn fraction_lower_greater_or_equal_upper_is_zero() {
         let mut annos = Annotations::new();
         assert_eq!(
-            histogram_fraction(1.0, 1.0, &single_histogram(), "", &mut annos),
+            histogram_fraction(1.0, 1.0, &single_histogram(), "", 0, &mut annos),
             0.0
         );
         assert_eq!(
-            histogram_fraction(2.0, 1.0, &single_histogram(), "", &mut annos),
+            histogram_fraction(2.0, 1.0, &single_histogram(), "", 0, &mut annos),
             0.0
         );
     }
@@ -524,6 +536,7 @@ mod tests {
             f64::INFINITY,
             &single_histogram(),
             "",
+            0,
             &mut annos,
         );
         assert!((v - 1.0).abs() < 1e-12, "got {v}");
@@ -533,8 +546,8 @@ mod tests {
     fn fraction_is_inverse_of_quantile_at_the_same_point() {
         let h = single_histogram();
         let mut annos = Annotations::new();
-        let q = histogram_quantile(0.5, &h, "", &mut annos);
-        let f = histogram_fraction(f64::NEG_INFINITY, q, &h, "", &mut annos);
+        let q = histogram_quantile(0.5, &h, "", 0, &mut annos);
+        let f = histogram_fraction(f64::NEG_INFINITY, q, &h, "", 0, &mut annos);
         assert!((f - 0.5).abs() < 1e-9, "got quantile={q} fraction={f}");
     }
 
@@ -547,8 +560,8 @@ mod tests {
         h.sum = f64::NAN;
         h.count = 5.0; // buckets sum to 4 < 5 -> NaN observations present.
         let mut annos = Annotations::new();
-        let _ = histogram_fraction(f64::NEG_INFINITY, f64::INFINITY, &h, "m", &mut annos);
-        let (_, infos) = annos.as_strings(0, 0);
+        let _ = histogram_fraction(f64::NEG_INFINITY, f64::INFINITY, &h, "m", 0, &mut annos);
+        let (_, infos) = annos.as_strings("", 0, 0);
         assert_eq!(infos.len(), 1);
         assert!(infos[0].contains("histogram_fraction") && infos[0].contains("NaN"));
     }
@@ -559,7 +572,7 @@ mod tests {
         h.sum = f64::NAN;
         // count already equals the bucket total (4) -- no NaN observations.
         let mut annos = Annotations::new();
-        let _ = histogram_fraction(f64::NEG_INFINITY, f64::INFINITY, &h, "m", &mut annos);
+        let _ = histogram_fraction(f64::NEG_INFINITY, f64::INFINITY, &h, "m", 0, &mut annos);
         assert!(annos.is_empty());
     }
 

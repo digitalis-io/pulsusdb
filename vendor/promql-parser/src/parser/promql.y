@@ -268,19 +268,28 @@ smoothed_expr -> Result<Expr, String>:
 
 /*
  * Aggregations.
+ *
+ * PulsusDB patch (issue #128, PATCHES.md AST-metadata class): every
+ * action producing one of the seven start-carrying node kinds
+ * (AggregateExpr, Call, ParenExpr, UnaryExpr, VectorSelector,
+ * NumberLiteral, StringLiteral) records `$span.start()` — the byte
+ * offset of the production's first token — via `Expr::with_pos_start`.
+ * Postfix productions (offset/@/[range]/anchored/smoothed, matrix and
+ * subquery wrapping) never move a node's start, matching upstream
+ * Prometheus `PositionRange` semantics, so they need no edits.
  */
 aggregate_expr -> Result<Expr, String>:
                 aggregate_op aggregate_modifier function_call_body
                 {
-                        Expr::new_aggregate_expr($1?.id(), Some($2?), $3?)
+                        Expr::new_aggregate_expr($1?.id(), Some($2?), $3?).map(|e| e.with_pos_start($span.start()))
                 }
         |       aggregate_op function_call_body aggregate_modifier
                 {
-                        Expr::new_aggregate_expr($1?.id(), Some($3?), $2?)
+                        Expr::new_aggregate_expr($1?.id(), Some($3?), $2?).map(|e| e.with_pos_start($span.start()))
                 }
         |       aggregate_op function_call_body
                 {
-                        Expr::new_aggregate_expr($1?.id(), None, $2?)
+                        Expr::new_aggregate_expr($1?.id(), None, $2?).map(|e| e.with_pos_start($span.start()))
                 }
 ;
 
@@ -452,7 +461,7 @@ function_call -> Result<Expr, String>:
                         let name = lexeme_to_string($lexer, &$1)?;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func, $2?).map(|e| e.with_pos_start($span.start()))
                         }
                 }
         // PulsusDB patch (docs/decisions/0003, grammar patch G1): now that
@@ -464,7 +473,7 @@ function_call -> Result<Expr, String>:
                         let name = $1?.val;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func, $2?).map(|e| e.with_pos_start($span.start()))
                         }
                 }
         // PulsusDB patch (docs/decisions/0003, grammar patch G4 — see
@@ -481,7 +490,7 @@ function_call -> Result<Expr, String>:
                         let name = $1?.val;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func, $2?).map(|e| e.with_pos_start($span.start()))
                         }
                 }
         |       STEP function_call_body
@@ -489,7 +498,7 @@ function_call -> Result<Expr, String>:
                         let name = lexeme_to_string($lexer, &$1)?;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func, $2?).map(|e| e.with_pos_start($span.start()))
                         }
                 }
         |       RANGE function_call_body
@@ -497,7 +506,7 @@ function_call -> Result<Expr, String>:
                         let name = lexeme_to_string($lexer, &$1)?;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func, $2?).map(|e| e.with_pos_start($span.start()))
                         }
                 }
 ;
@@ -517,7 +526,7 @@ function_call_args -> Result<FunctionArgs, String>:
  * Expressions inside parentheses.
  */
 paren_expr -> Result<Expr, String>:
-                LEFT_PAREN expr RIGHT_PAREN { Expr::new_paren_expr($2?) }
+                LEFT_PAREN expr RIGHT_PAREN { Expr::new_paren_expr($2?).map(|e| e.with_pos_start($span.start())) }
 ;
 
 /*
@@ -697,8 +706,11 @@ subquery_expr -> Result<Expr, String>:
  * Unary expressions.
  */
 unary_expr -> Result<Expr, String>:
-                ADD expr %prec MUL { $2 }
-        |       SUB expr %prec MUL { Expr::new_unary_expr($2?) }
+                /* PulsusDB patch (issue #128): the result's start is the
+                 * sign token, covering upstream's sign-collapse (a parsed
+                 * `-1` is a NumberLiteral starting at the `-`). */
+                ADD expr %prec MUL { Ok($2?.with_pos_start($span.start())) }
+        |       SUB expr %prec MUL { Expr::new_unary_expr($2?).map(|e| e.with_pos_start($span.start())) }
 ;
 
 /*
@@ -707,15 +719,15 @@ unary_expr -> Result<Expr, String>:
 vector_selector -> Result<Expr, String>:
                 metric_identifier label_matchers
                 {
-                        Expr::new_vector_selector(Some($1?.val), $2?)
+                        Expr::new_vector_selector(Some($1?.val), $2?).map(|e| e.with_pos_start($span.start()))
                 }
         |       metric_identifier
                 {
-                        Expr::new_vector_selector(Some($1?.val), Matchers::empty())
+                        Expr::new_vector_selector(Some($1?.val), Matchers::empty()).map(|e| e.with_pos_start($span.start()))
                 }
         |       label_matchers
                 {
-                        Expr::new_vector_selector(None, $1?)
+                        Expr::new_vector_selector(None, $1?).map(|e| e.with_pos_start($span.start()))
                 }
 ;
 
@@ -936,17 +948,17 @@ number_literal -> Result<Expr, String>:
                 NUMBER
                 {
                         let num = parse_str_radix($lexer.span_str($span))?;
-                        Ok(Expr::from(num))
+                        Ok(Expr::from(num).with_pos_start($span.start()))
                 }
         |       DURATION
                 {
                         let duration = parse_duration($lexer.span_str($span))?;
-                        Ok(Expr::from(duration.as_secs_f64()))
+                        Ok(Expr::from(duration.as_secs_f64()).with_pos_start($span.start()))
                 }
 ;
 
 string_literal -> Result<Expr, String>:
-                STRING { Ok(Expr::from(unquote_string(&span_to_string($lexer, $span))?)) }
+                STRING { Ok(Expr::from(unquote_string(&span_to_string($lexer, $span))?).with_pos_start($span.start())) }
 ;
 
 string_identifier -> Result<String, String>:

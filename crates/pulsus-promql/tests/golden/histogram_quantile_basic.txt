@@ -15,6 +15,7 @@ Call(
                 NumberLiteral(
                     NumberLiteral {
                         val: 0.9,
+                        pos: AstPos(19),
                     },
                 ),
                 Call(
@@ -45,6 +46,7 @@ Call(
                                             at: None,
                                             anchored: false,
                                             smoothed: false,
+                                            pos: AstPos(29),
                                         },
                                         range: 300s,
                                         range_expr: None,
@@ -52,9 +54,11 @@ Call(
                                 ),
                             ],
                         },
+                        pos: AstPos(24),
                     },
                 ),
             ],
         },
+        pos: AstPos(0),
     },
 )

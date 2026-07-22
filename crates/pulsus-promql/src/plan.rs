@@ -32,7 +32,7 @@ use pulsus_model::{LabelMatcher, MatchOp};
 use crate::error::PromqlError;
 use crate::parser::{
     self, AggregateExpr, BinaryExpr, Call, DurationExpr, Expr, LabelModifier, MatrixSelector,
-    Offset, PLabelMatchOp, SubqueryExpr, UnaryExpr, VectorMatchCardinality, VectorSelector, token,
+    Offset, PLabelMatchOp, SubqueryExpr, VectorMatchCardinality, VectorSelector, token,
 };
 
 /// Instant query = `start_ms == end_ms`, `step_ms == 0` (a single-step
@@ -143,6 +143,12 @@ pub struct SelectorSpec {
     /// modifier. Eval AND fetch: [`SelectorSpec::fetch_window`] widens the
     /// upper bound by one `lookback_ms` (engine.go's `end += LookbackDelta`).
     pub smoothed: bool,
+    /// Issue #128: the selector's own start byte offset — the smoothed
+    /// instant selector's interpolation annotations carry
+    /// `e.PositionRange()` of the VectorSelector
+    /// (`ev.smoothSeries(e.Series, e.Offset, e.PositionRange())`,
+    /// engine.go:2540). Eval only.
+    pub pos_start: usize,
 }
 
 /// The fetch-window context accumulated over a selector's enclosing
@@ -601,10 +607,21 @@ pub enum PlanExpr {
         func: RangeFn,
         /// Issue #83: a bare matrix selector or a subquery.
         source: RangeSource,
+        /// Issue #128: start byte offset of the call's first argument —
+        /// upstream passes `args[0].PositionRange()` to every annotation
+        /// this family emits (`functions.go:385,459,486,612-696`;
+        /// `irate`/`idelta`'s `args.PositionRange()` ≡ args[0] for one
+        /// argument, `ast.go:519`).
+        arg0_start: usize,
     },
     OverTime {
         func: OverTimeFn,
         source: RangeSource,
+        /// Issue #128: start byte offset of the call's first argument
+        /// (`args[0].PositionRange()` at every over-time emission site —
+        /// `functions.go:936,959,1154,1192-1195,1262,1378,1465,
+        /// 1504-1526,1560,1612,1903-1938`).
+        arg0_start: usize,
     },
     /// Issue #67 (M6-04): a parameterized range-window function. `args`
     /// carries the scalar parameter expression(s) in registry order —
@@ -616,6 +633,11 @@ pub enum PlanExpr {
         func: OverTimeParamFn,
         source: RangeSource,
         args: Vec<Box<PlanExpr>>,
+        /// Issue #128: start byte offset of the call's FIRST argument as
+        /// written — uniformly `args[0].PositionRange()` upstream:
+        /// `quantile_over_time`'s φ (`functions.go:1590,1593`),
+        /// `predict_linear`/`double_exponential_smoothing`'s range arg.
+        arg0_start: usize,
     },
     /// Issue #67 (M6-04): `absent_over_time(m[r])` — emits one synthetic
     /// series (value `1`, labels ported from upstream
@@ -643,6 +665,10 @@ pub enum PlanExpr {
     Sort {
         descending: bool,
         arg: Box<PlanExpr>,
+        /// Issue #128: start byte offset of the `sort`/`sort_desc` call —
+        /// `e.PositionRange()` of the Call at the range-query warning
+        /// site (`engine.go:2167`).
+        call_pos: usize,
     },
     /// Issue #68 (M6-05, experimental): `sort_by_label(v, names…)`/
     /// `sort_by_label_desc(v, names…)` — natural (numeric-aware) label
@@ -651,6 +677,9 @@ pub enum PlanExpr {
         descending: bool,
         labels: Vec<String>,
         arg: Box<PlanExpr>,
+        /// Issue #128: start byte offset of the call — see
+        /// [`PlanExpr::Sort::call_pos`].
+        call_pos: usize,
     },
     /// Issue #68 (M6-05): `label_replace(v, dst, replacement, src,
     /// regex)`. `regex` is validated at plan time (compiled with
@@ -677,6 +706,15 @@ pub enum PlanExpr {
     HistogramQuantile {
         quantile: Box<PlanExpr>,
         expr: Box<PlanExpr>,
+        /// Issue #128: start byte offset of args[0] (the φ expression) —
+        /// the invalid-quantile warning and the native NaN result/skew
+        /// infos (`functions.go:2084,2098,2136`).
+        q_pos: usize,
+        /// Issue #128: start byte offset of args[1] (the vector) — the
+        /// forced-monotonicity info (`functions.go:2116`) and
+        /// `resetHistograms`' bad-bucket/mixed-classic-native warnings
+        /// (`functions.go:2087`; `engine.go:1336-1365`).
+        vec_pos: usize,
     },
     /// Issue #153: `histogram_quantiles(v, label, q0, qs…)` — the
     /// experimental multi-quantile variant (`parser/functions.go:214-220`,
@@ -692,6 +730,18 @@ pub enum PlanExpr {
         label: String,
         /// Args 2.. — 1..=10 scalar expressions, source order.
         quantiles: Vec<Box<PlanExpr>>,
+        /// Issue #128: start byte offset of args[0] (the vector) —
+        /// `resetHistograms` and the native-quantile annos
+        /// (`functions.go:2158,2168,2180`).
+        vec_pos: usize,
+        /// Issue #128: start byte offset of args[1] (the string label) —
+        /// the forced-monotonicity info uses the STRING-LABEL argument's
+        /// position (`functions.go:2198`).
+        label_pos: usize,
+        /// Issue #128: start byte offsets of args[2+i], aligned 1:1 with
+        /// `quantiles` — the per-quantile invalid-quantile warnings
+        /// (`functions.go:2164` via `validateQuantile(q, args[i])`).
+        q_pos: Vec<usize>,
     },
     /// M7-A5b-i: the single-vector-argument native-histogram accessors
     /// (`histogram_count`/`_sum`/`_avg`/`_stddev`/`_stdvar`,
@@ -710,6 +760,12 @@ pub enum PlanExpr {
         lower: Box<PlanExpr>,
         upper: Box<PlanExpr>,
         expr: Box<PlanExpr>,
+        /// Issue #128: start byte offset of args[0] (lower) — the NaN
+        /// info from `HistogramFraction` (`functions.go:2047`).
+        lower_pos: usize,
+        /// Issue #128: start byte offset of args[2] (the vector) —
+        /// `resetHistograms` (`functions.go:2036`).
+        vec_pos: usize,
     },
     Aggregate {
         op: AggOp,
@@ -718,6 +774,19 @@ pub enum PlanExpr {
         /// `limit_ratio`'s `r` — always a scalar expression.
         param: Option<Box<PlanExpr>>,
         grouping: Option<Grouping>,
+        /// Issue #128: start byte offset of the aggregated inner
+        /// expression — `e.Expr.PositionRange()` at the ignored-histogram
+        /// /mixed-floats-agg/collision/mismatched sites
+        /// (`engine.go:3630-3940`).
+        expr_pos: usize,
+        /// Issue #128: start byte offset of the parameter expression —
+        /// `e.Param.PositionRange()` at the quantile/ratio warnings
+        /// (`engine.go:1657-1672`). `None` iff `param` is `None`.
+        param_pos: Option<usize>,
+        /// Issue #128: start byte offset of the WHOLE aggregate
+        /// expression — `e.PosRange` at the `topk`/`bottomk`/`limitk`
+        /// ignored-histogram sites (`engine.go:4036-4077`).
+        self_pos: usize,
     },
     /// Issue #69 (M6-06): `count_values(label, v)` — the one aggregation
     /// whose parameter is a *string* (the injected value-label name), so
@@ -745,6 +814,11 @@ pub enum PlanExpr {
         /// always [`FillValues::default`] (no filling) unless
         /// [`PlanParams::experimental_functions`] is set.
         fill: FillValues,
+        /// Issue #128: start byte offset of the whole binary expression
+        /// (≡ its LHS start) — `e.PositionRange()` at every binop
+        /// annotation site (`engine.go:2506-2519` →
+        /// `vectorElemBinop` `:3488-3552`, hist add/sub `:4346,4362`).
+        pos_start: usize,
     },
     /// Issue #70 (M6-07): `and`/`or`/`unless` — set membership on the
     /// matching signature, both operands instant vectors (the vendored
@@ -919,6 +993,7 @@ impl Planner {
     /// `gate_duration_expr`/`experimental` precedent for a plain `bool`
     /// param on a narrow, internal, few-call-site helper.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // internal builder; mirrors SelectorSpec's fields
     fn push_selector(
         &mut self,
         metric_name: Option<String>,
@@ -930,6 +1005,7 @@ impl Planner {
         info_family: bool,
         anchored: bool,
         smoothed: bool,
+        pos_start: usize,
     ) -> SelectorId {
         // Own `@` dominates and discards the accumulated subquery context
         // (the sub-tree is step-invariant at that fixed time); otherwise
@@ -964,6 +1040,7 @@ impl Planner {
             histogram_stats: false,
             anchored,
             smoothed,
+            pos_start,
         });
         id
     }
@@ -1179,7 +1256,7 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
             // Whole-histogram functions stop-and-clear; every argument
             // position (φ/bound scalars included) lies under the call in
             // the pin's path walk.
-            PlanExpr::HistogramQuantile { quantile, expr } => {
+            PlanExpr::HistogramQuantile { quantile, expr, .. } => {
                 walk(quantile, in_accessor, true, selectors);
                 walk(expr, in_accessor, true, selectors);
             }
@@ -1195,7 +1272,9 @@ fn detect_histogram_stats(root: &PlanExpr, selectors: &mut [SelectorSpec]) {
                     walk(q, in_accessor, true, selectors);
                 }
             }
-            PlanExpr::HistogramFraction { lower, upper, expr } => {
+            PlanExpr::HistogramFraction {
+                lower, upper, expr, ..
+            } => {
                 walk(lower, in_accessor, true, selectors);
                 walk(upper, in_accessor, true, selectors);
                 walk(expr, in_accessor, true, selectors);
@@ -1623,6 +1702,7 @@ fn plan_vector_selector(
         false,
         vs.anchored,
         vs.smoothed,
+        vs.pos.start().unwrap_or(0),
     );
     Ok(PlanExpr::Selector(id))
 }
@@ -1653,6 +1733,7 @@ fn plan_matrix_selector_id(
         false,
         ms.vs.anchored,
         ms.vs.smoothed,
+        ms.vs.pos.start().unwrap_or(0),
     ))
 }
 
@@ -1780,7 +1861,17 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
             return Err(unsupported(format!("{name}() with != 1 argument")));
         };
         let source = plan_range_source(planner, name, arg)?;
-        return Ok(PlanExpr::RangeFn { func, source });
+        // Issue #128: captured from the UNSTRIPPED arg AST (a
+        // paren-wrapped arg's position is its `(` — upstream keeps the
+        // ParenExpr in `e.Args`); `unwrap_or(0)` covers hand-built ASTs
+        // only (every parse-produced node carries an offset — the
+        // parser.rs twin test).
+        let arg0_start = arg.pos_start().unwrap_or(0);
+        return Ok(PlanExpr::RangeFn {
+            func,
+            source,
+            arg0_start,
+        });
     }
 
     let over_time_fn = match name {
@@ -1817,7 +1908,12 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
             return Err(unsupported(format!("{name}() with != 1 argument")));
         };
         let source = plan_range_source(planner, name, arg)?;
-        return Ok(PlanExpr::OverTime { func, source });
+        let arg0_start = arg.pos_start().unwrap_or(0);
+        return Ok(PlanExpr::OverTime {
+            func,
+            source,
+            arg0_start,
+        });
     }
 
     // Issue #67 (M6-04): `absent_over_time(m[r])` — the selector's own
@@ -1837,49 +1933,11 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
     // `histogram_quantile` quantile-arg shape), in source-argument order
     // so any selector a parameter expression contains keeps its id in
     // source order.
-    if name == "quantile_over_time" {
-        let [phi_arg, matrix_arg] = args.as_slice() else {
-            return Err(unsupported("quantile_over_time() with != 2 arguments"));
-        };
-        let phi = plan_expr(planner, phi_arg)?;
-        let source = plan_range_source(planner, name, matrix_arg)?;
-        return Ok(PlanExpr::OverTimeParam {
-            func: OverTimeParamFn::Quantile,
-            source,
-            args: vec![Box::new(phi)],
-        });
-    }
-    if name == "predict_linear" {
-        let [matrix_arg, t_arg] = args.as_slice() else {
-            return Err(unsupported("predict_linear() with != 2 arguments"));
-        };
-        let source = plan_range_source(planner, name, matrix_arg)?;
-        let t = plan_expr(planner, t_arg)?;
-        return Ok(PlanExpr::OverTimeParam {
-            func: OverTimeParamFn::PredictLinear,
-            source,
-            args: vec![Box::new(t)],
-        });
-    }
-    if name == "double_exponential_smoothing" {
-        if !planner.experimental {
-            return Err(unsupported(format!(
-                "experimental function {name}() (requires promql-experimental-functions)"
-            )));
-        }
-        let [matrix_arg, sf_arg, tf_arg] = args.as_slice() else {
-            return Err(unsupported(
-                "double_exponential_smoothing() with != 3 arguments",
-            ));
-        };
-        let source = plan_range_source(planner, name, matrix_arg)?;
-        let sf = plan_expr(planner, sf_arg)?;
-        let tf = plan_expr(planner, tf_arg)?;
-        return Ok(PlanExpr::OverTimeParam {
-            func: OverTimeParamFn::DoubleExpSmoothing,
-            source,
-            args: vec![Box::new(sf), Box::new(tf)],
-        });
+    if matches!(
+        name,
+        "quantile_over_time" | "predict_linear" | "double_exponential_smoothing"
+    ) {
+        return plan_over_time_param(planner, name, args);
     }
 
     if name == "histogram_quantile" {
@@ -2115,6 +2173,9 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         return Ok(PlanExpr::Sort {
             descending,
             arg: Box::new(arg),
+            // Issue #128: the Call node's own start (`e.PositionRange()`,
+            // engine.go:2167).
+            call_pos: call.pos.start().unwrap_or(0),
         });
     }
     if let Some(descending) = match name {
@@ -2139,6 +2200,7 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
             descending,
             labels,
             arg: Box::new(arg),
+            call_pos: call.pos.start().unwrap_or(0),
         });
     }
 
@@ -2382,6 +2444,8 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             true,
             false,
             false,
+            // The synthetic info-family selector never annotates.
+            0,
         );
         Ok(PlanExpr::Info {
             base: Box::new(base),
@@ -2390,6 +2454,67 @@ fn plan_info(planner: &mut Planner, args: &[Box<Expr>]) -> Result<PlanExpr, Prom
             data_matchers,
         })
     }
+}
+
+/// The parameterized range-window planning arms (issue #67) — out of
+/// line since issue #128 (the `resolve_subquery_fields`/`plan_info`
+/// precedent): `plan_call` sits on the plan recursion cycle whose
+/// per-level debug-build frame budget sizes [`MAX_SUBQUERY_DEPTH`] —
+/// these arms' locals must not ride every recursion frame.
+#[inline(never)]
+fn plan_over_time_param(
+    planner: &mut Planner,
+    name: &str,
+    args: &[Box<Expr>],
+) -> Result<PlanExpr, PromqlError> {
+    if name == "quantile_over_time" {
+        let [phi_arg, matrix_arg] = args else {
+            return Err(unsupported("quantile_over_time() with != 2 arguments"));
+        };
+        let phi = plan_expr(planner, phi_arg)?;
+        let source = plan_range_source(planner, name, matrix_arg)?;
+        return Ok(PlanExpr::OverTimeParam {
+            func: OverTimeParamFn::Quantile,
+            source,
+            args: vec![Box::new(phi)],
+            // Issue #128: the first CALL argument as written — φ here.
+            arg0_start: phi_arg.pos_start().unwrap_or(0),
+        });
+    }
+    if name == "predict_linear" {
+        let [matrix_arg, t_arg] = args else {
+            return Err(unsupported("predict_linear() with != 2 arguments"));
+        };
+        let source = plan_range_source(planner, name, matrix_arg)?;
+        let t = plan_expr(planner, t_arg)?;
+        return Ok(PlanExpr::OverTimeParam {
+            func: OverTimeParamFn::PredictLinear,
+            source,
+            args: vec![Box::new(t)],
+            // Issue #128: the first CALL argument — the range arg here.
+            arg0_start: matrix_arg.pos_start().unwrap_or(0),
+        });
+    }
+    if !planner.experimental {
+        return Err(unsupported(format!(
+            "experimental function {name}() (requires promql-experimental-functions)"
+        )));
+    }
+    let [matrix_arg, sf_arg, tf_arg] = args else {
+        return Err(unsupported(
+            "double_exponential_smoothing() with != 3 arguments",
+        ));
+    };
+    let source = plan_range_source(planner, name, matrix_arg)?;
+    let sf = plan_expr(planner, sf_arg)?;
+    let tf = plan_expr(planner, tf_arg)?;
+    Ok(PlanExpr::OverTimeParam {
+        func: OverTimeParamFn::DoubleExpSmoothing,
+        source,
+        args: vec![Box::new(sf), Box::new(tf)],
+        // Issue #128: the first CALL argument — the range arg here.
+        arg0_start: matrix_arg.pos_start().unwrap_or(0),
+    })
 }
 
 /// The `histogram_quantile(q, v)` planning arm (issue #37) — out of line
@@ -2412,6 +2537,10 @@ fn plan_histogram_quantile(
     Ok(PlanExpr::HistogramQuantile {
         quantile: Box::new(quantile),
         expr: Box::new(expr),
+        // Issue #128: captured from the UNSTRIPPED arg ASTs, before any
+        // paren-strip (upstream's `args[0/1].PositionRange()`).
+        q_pos: quantile_arg.pos_start().unwrap_or(0),
+        vec_pos: expr_arg.pos_start().unwrap_or(0),
     })
 }
 
@@ -2458,6 +2587,12 @@ fn plan_histogram_quantiles(
         expr: Box::new(expr),
         label,
         quantiles,
+        // Issue #128 (`functions.go:2158-2198`): the vector arg for
+        // resetHistograms + native-quantile annos, the STRING-LABEL arg
+        // for forced-monotonicity, args[2+i] per quantile.
+        vec_pos: expr_arg.pos_start().unwrap_or(0),
+        label_pos: label_arg.pos_start().unwrap_or(0),
+        q_pos: q_args.iter().map(|q| q.pos_start().unwrap_or(0)).collect(),
     })
 }
 
@@ -2516,6 +2651,9 @@ fn plan_histogram_fraction(
         lower: Box::new(lower),
         upper: Box::new(upper),
         expr: Box::new(expr),
+        // Issue #128: `functions.go:2047` (lower) / `:2036` (vector).
+        lower_pos: lower_arg.pos_start().unwrap_or(0),
+        vec_pos: expr_arg.pos_start().unwrap_or(0),
     })
 }
 
@@ -2673,6 +2811,11 @@ fn plan_aggregate(planner: &mut Planner, agg: &AggregateExpr) -> Result<PlanExpr
         expr: Box::new(expr),
         param,
         grouping,
+        // Issue #128: inner-expr / param / whole-node positions — see
+        // the variant doc for the upstream per-site split.
+        expr_pos: agg.expr.pos_start().unwrap_or(0),
+        param_pos: agg.param.as_ref().map(|p| p.pos_start().unwrap_or(0)),
+        self_pos: agg.pos.start().unwrap_or(0),
     })
 }
 
@@ -2865,6 +3008,8 @@ fn plan_binary(planner: &mut Planner, bin: &BinaryExpr) -> Result<PlanExpr, Prom
         matching,
         group,
         fill,
+        // Issue #128: `e.PositionRange().Start` ≡ the LHS start.
+        pos_start: bin.lhs.pos_start().unwrap_or(0),
     })
 }
 
@@ -2914,8 +3059,8 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
         // preserves the same arithmetic-class `__name__`-drop semantics
         // (`eval/binop.rs::vector_scalar` drops uniformly across every
         // non-comparison operator, not `Sub`-specific).
-        Expr::Unary(UnaryExpr { expr }) => {
-            let operand = plan_expr(planner, expr)?;
+        Expr::Unary(u) => {
+            let operand = plan_expr(planner, &u.expr)?;
             Ok(PlanExpr::Binary {
                 op: BinOp::Mul,
                 lhs: Box::new(operand),
@@ -2924,6 +3069,12 @@ fn plan_expr(planner: &mut Planner, expr: &Expr) -> Result<PlanExpr, PromqlError
                 matching: Matching::default_ignoring_none(),
                 group: Group::OneToOne,
                 fill: FillValues::default(),
+                // Issue #128: the desugared node's position is the unary
+                // expression's own start (its sign token) — upstream's
+                // dedicated UnaryExpr engine case never annotates, but
+                // this desugar routes through the binop path, so the
+                // nearest-node position is the honest one.
+                pos_start: u.pos.start().unwrap_or(0),
             })
         }
         // Issue #83: subqueries plan only as range-function arguments
@@ -3042,7 +3193,9 @@ impl<'a> StepInvariance<'a> {
                 let inv = range_source_invariant(source, self.selectors);
                 (inv, inv)
             }
-            PlanExpr::OverTimeParam { func, source, args } => {
+            PlanExpr::OverTimeParam {
+                func, source, args, ..
+            } => {
                 let inv = !over_time_param_fn_is_at_modifier_unsafe(*func)
                     && range_source_invariant(source, self.selectors)
                     && args.iter().all(|a| self.classify(a).0);
@@ -3071,7 +3224,7 @@ impl<'a> StepInvariance<'a> {
                 Some(id) if self.selectors[*id].at_ms.is_some() => (true, true),
                 _ => (false, false),
             },
-            PlanExpr::HistogramQuantile { quantile, expr } => {
+            PlanExpr::HistogramQuantile { quantile, expr, .. } => {
                 let inv = self.classify(quantile).0 && self.classify(expr).0;
                 (inv, inv)
             }
@@ -3085,7 +3238,9 @@ impl<'a> StepInvariance<'a> {
                 let inv = self.classify(arg).0;
                 (inv, inv)
             }
-            PlanExpr::HistogramFraction { lower, upper, expr } => {
+            PlanExpr::HistogramFraction {
+                lower, upper, expr, ..
+            } => {
                 let inv = self.classify(lower).0 && self.classify(upper).0 && self.classify(expr).0;
                 (inv, inv)
             }
@@ -3664,7 +3819,8 @@ mod tests {
             p.root,
             PlanExpr::RangeFn {
                 func: RangeFn::Rate,
-                source: RangeSource::Selector(0)
+                source: RangeSource::Selector(0),
+                arg0_start: 5,
             }
         );
     }
@@ -3709,6 +3865,7 @@ mod tests {
         // wrapper that routes straight through `plan_expr`).
         let nested = parser::Expr::Unary(parser::UnaryExpr {
             expr: Box::new(matrix()),
+            pos: Default::default(),
         });
         let err = plan(&nested, params()).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
@@ -3733,6 +3890,7 @@ mod tests {
             PlanExpr::RangeFn {
                 func: RangeFn::Rate,
                 source: RangeSource::Subquery(sq),
+                ..
             } => {
                 assert_eq!(sq.range_ms, 300_000);
                 assert_eq!(sq.step_ms, 60_000);
@@ -4354,6 +4512,7 @@ mod tests {
         // stays pinned by synthesizing a `Call` under an UNREGISTERED
         // name directly through the vendor crate's public constructors.
         let call = Call {
+            pos: Default::default(),
             func: promql_parser::parser::Function::new(
                 "no_such_function",
                 vec![],
@@ -4467,6 +4626,7 @@ mod tests {
         // Parser-unreachable (check_call_arity enforces zero arity); the
         // arm stays total for synthesized Calls.
         let call = Call {
+            pos: Default::default(),
             func: promql_parser::parser::Function::new(
                 "start",
                 vec![],
@@ -4505,6 +4665,16 @@ mod tests {
         }
     }
 
+    /// Issue #128: the byte-identical selector-set gates compare FETCH
+    /// inputs; `pos_start` is eval-only annotation metadata whose value
+    /// legitimately differs with the selector's byte offset in the query
+    /// text, so it is normalized out before comparing.
+    fn strip_pos(mut selectors: Vec<SelectorSpec>) -> Vec<SelectorSpec> {
+        for s in &mut selectors {
+            s.pos_start = 0;
+        }
+        selectors
+    }
     #[test]
     fn a_unary_math_fn_keeps_the_wrapped_selector_set_byte_identical() {
         // Perf Tier-1 gate (issue #65 plan; standing query-performance
@@ -4521,7 +4691,7 @@ mod tests {
             params(),
         )
         .unwrap();
-        assert_eq!(wrapped.selectors, bare.selectors);
+        assert_eq!(strip_pos(wrapped.selectors), strip_pos(bare.selectors));
     }
 
     #[test]
@@ -4971,7 +5141,7 @@ mod tests {
         let expr = parse("histogram_quantile(0.9, rate(x_bucket[5m]))").unwrap();
         let p = plan(&expr, params()).unwrap();
         match &p.root {
-            PlanExpr::HistogramQuantile { quantile, expr } => {
+            PlanExpr::HistogramQuantile { quantile, expr, .. } => {
                 assert_eq!(**quantile, PlanExpr::Scalar(0.9));
                 assert!(matches!(
                     **expr,
@@ -5017,6 +5187,7 @@ mod tests {
                 expr,
                 label,
                 quantiles,
+                ..
             } => {
                 assert_eq!(**expr, PlanExpr::Selector(0));
                 assert_eq!(label, "q");
@@ -5082,6 +5253,7 @@ mod tests {
             id: 0,
             metric_name: Some("up".to_string()),
             name_matchers: Vec::new(),
+            pos_start: 0,
             matchers: Vec::new(),
             range_ms: Some(300_000),
             offset_ms: 60_000,
@@ -5208,6 +5380,7 @@ mod tests {
             expr: Box::new(matrix),
             param: None,
             modifier: None,
+            pos: Default::default(),
         });
         let err = plan(&group_expr, params()).unwrap_err();
         match err {
@@ -5290,12 +5463,14 @@ mod tests {
         });
         let paren_wrapped = parser::Expr::Paren(parser::ParenExpr {
             expr: Box::new(matrix),
+            pos: Default::default(),
         });
         let group_expr = parser::Expr::Aggregate(parser::AggregateExpr {
             op: token::TokenType::new(token::T_GROUP),
             expr: Box::new(paren_wrapped),
             param: None,
             modifier: None,
+            pos: Default::default(),
         });
         let err = plan(&group_expr, params()).unwrap_err();
         match err {
@@ -5572,6 +5747,7 @@ mod tests {
                 PlanExpr::OverTime {
                     func,
                     source: RangeSource::Selector(selector),
+                    ..
                 } => {
                     assert_eq!(*func, want, "{query}");
                     assert_eq!(p.selectors[*selector].range_ms, Some(300_000), "{query}");
@@ -5653,6 +5829,7 @@ mod tests {
                 func,
                 source: RangeSource::Selector(selector),
                 args,
+                ..
             } => {
                 assert_eq!(*func, OverTimeParamFn::Quantile);
                 assert_eq!(p.selectors[*selector].range_ms, Some(300_000));
@@ -5758,7 +5935,11 @@ mod tests {
             r#"double_exponential_smoothing(mem_usage_bytes{service="svc-1"}[5m], 0.5, 0.5)"#,
         ] {
             let p = plan(&parse(query).unwrap(), params_experimental()).unwrap();
-            assert_eq!(p.selectors, bare.selectors, "{query}");
+            assert_eq!(
+                strip_pos(p.selectors),
+                strip_pos(bare.selectors.clone()),
+                "{query}"
+            );
         }
     }
 
@@ -5781,7 +5962,11 @@ mod tests {
             r#"timestamp(timestamp(mem_usage_bytes{service="svc-1"}))"#,
         ] {
             let wrapped = plan(&parse(query).unwrap(), params()).unwrap();
-            assert_eq!(wrapped.selectors, bare.selectors, "{query}");
+            assert_eq!(
+                strip_pos(wrapped.selectors),
+                strip_pos(bare.selectors.clone()),
+                "{query}"
+            );
         }
         for query in ["time()", "month()", "vector(1)", "vector(time())"] {
             let p = plan(&parse(query).unwrap(), params()).unwrap();
@@ -5814,7 +5999,11 @@ mod tests {
             r#"absent(mem_usage_bytes{service="svc-1"})"#,
         ] {
             let wrapped = plan(&parse(query).unwrap(), params_experimental()).unwrap();
-            assert_eq!(wrapped.selectors, bare.selectors, "{query}");
+            assert_eq!(
+                strip_pos(wrapped.selectors),
+                strip_pos(bare.selectors.clone()),
+                "{query}"
+            );
         }
     }
 
