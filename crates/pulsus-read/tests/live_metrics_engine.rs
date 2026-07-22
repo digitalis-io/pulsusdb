@@ -192,6 +192,7 @@ fn engine_config(db: &str) -> MetricsConfig {
         max_metric_fanout: 1_000,
         max_cache_scan: 200_000,
         max_info_series: 100_000,
+        max_samples: 50_000_000,
         distributed: false,
     }
 }
@@ -1450,6 +1451,133 @@ async fn info_cardinality_cap_rejects_over_cap_on_the_degraded_sql_fallback_path
         msg.contains("info()") && msg.contains("cardinality") && msg.contains('2'),
         "named info() cardinality rejection naming the cap, got {msg:?}"
     );
+
+    drop_database(&bootstrap, db).await;
+}
+
+/// Issue #138 AC8: the per-query evaluation sample budget
+/// (`reader.promql_max_samples` → `MetricsConfig::max_samples`) fires on
+/// the real read path. One series with N=5 samples, routed through the
+/// degraded `SqlFallback` path (out-of-cache-window query) so the label
+/// HYDRATION fetch also runs and returns rows:
+///
+/// - `max_samples: 4` (N−1) → the fetch's 5th drained row breaches →
+///   `QueryTooBroad(MetricSamples)` naming the knob;
+/// - `max_samples: 5` (N, exactly-cap) → the identical query SUCCEEDS —
+///   proving both that exactly-cap admits AND that the hydration rows
+///   (≥1 returned, uncharged) and the zero-row histogram read never
+///   charge the budget (charging either would push 5 admitted + extra
+///   over a cap of 5).
+#[tokio::test]
+async fn sample_budget_rejects_over_cap_fetch_and_admits_exactly_at_cap() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_metrics_sample_budget";
+    init_db(&bootstrap, db).await;
+    let client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (target db)");
+    let cache_client = ChClient::new(test_config(db))
+        .await
+        .expect("connect (cache client)");
+
+    let now = now_ms();
+    let bucket = DEFAULT_ACTIVITY_BUCKET_MS;
+    // 2 days ago: outside the 24h cache window below (forcing
+    // `SqlFallback`, whose label hydration must NOT charge), inside the
+    // 7-day raw retention — the info-cardinality fallback test's routing
+    // precedent.
+    let two_days_ms = 2 * 24 * 3_600_000;
+    let b0 = ((now - two_days_ms) / bucket) * bucket;
+
+    let series = SeedSeriesRow {
+        metric_name: "metric".to_string(),
+        fingerprint: 900_000_000_000_002_000,
+        unix_milli: b0,
+        labels: r#"{"instance":"i0","job":"j"}"#.to_string(),
+    };
+    seed_series(&client, std::slice::from_ref(&series)).await;
+    // N=5 samples, 1s apart, all inside the instant query's 5m lookback
+    // window ending at b0 + 4s.
+    let samples: Vec<SeedSampleRow> = (0..5i64)
+        .map(|i| SeedSampleRow {
+            metric_name: series.metric_name.clone(),
+            fingerprint: series.fingerprint,
+            unix_milli: b0 + i * 1_000,
+            value: i as f64,
+        })
+        .collect();
+    seed_samples(&client, &samples).await;
+
+    let cache = Arc::new(LabelCache::new(
+        cache_client,
+        cache_config(db, 24 * 3_600_000),
+    ));
+    cache.refresh().await.expect("refresh");
+    assert!(cache.is_warm());
+
+    let expr = parse("metric").expect("parse");
+    let params = MetricQueryParams {
+        start_ms: b0 + 4_000,
+        end_ms: b0 + 4_000,
+        step_ms: 0,
+    };
+
+    // Cap N−1 = 4: the 5th drained sample row breaches the budget.
+    let capped_engine = MetricsEngine::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (capped engine client)"),
+        Arc::clone(&cache),
+        MetricsConfig {
+            max_samples: 4,
+            ..engine_config(db)
+        },
+    );
+    let err = capped_engine
+        .query(&expr, &params)
+        .await
+        .expect_err("5 fetched sample rows over a budget of 4 must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("query too broad")
+            && msg.contains("more than 4 samples")
+            && msg.contains("reader.promql_max_samples"),
+        "named sample-budget rejection naming the knob and cap, got {msg:?}"
+    );
+
+    // Cap N = 5 (exactly-cap): the identical query succeeds, and the
+    // hydrated labels prove the (uncharged) hydration fetch ran.
+    let at_cap_engine = MetricsEngine::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (at-cap engine client)"),
+        cache,
+        MetricsConfig {
+            max_samples: 5,
+            ..engine_config(db)
+        },
+    );
+    let (result, _annotations) = at_cap_engine
+        .query(&expr, &params)
+        .await
+        .expect("exactly-cap (5 rows, budget 5) must succeed");
+    match result {
+        QueryResult::Vector(v) => {
+            assert_eq!(v.len(), 1, "one series, got {v:?}");
+            assert_eq!(v[0].value, 4.0, "latest sample value");
+            assert!(
+                v[0].labels
+                    .contains(&("instance".to_string(), "i0".to_string())),
+                "hydrated labels must be present (hydration ran, uncharged): {:?}",
+                v[0].labels
+            );
+        }
+        other => panic!("expected Vector, got {other:?}"),
+    }
 
     drop_database(&bootstrap, db).await;
 }

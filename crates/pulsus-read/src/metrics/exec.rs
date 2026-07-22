@@ -121,6 +121,21 @@ pub struct MetricsConfig {
     /// always return complete results. Identifying-label VALUE
     /// narrowing of the fetch routes to issue #25.
     pub max_info_series: u64,
+    /// Issue #138: `ReaderConfig::promql_max_samples` — the per-query
+    /// evaluation sample budget (default 50_000_000). One [`SampleBudget`]
+    /// per `query_inner` call, shared across ALL of the query's selector
+    /// fetches; a "sample" is one fetched row from `metric_samples` or
+    /// `metric_hist_samples` (float and histogram rows each count 1,
+    /// pre-dedup/pre-merge — the actual materialization cost), charged
+    /// per row inside the drain loop so the guard bounds materialization
+    /// itself, not a post-hoc total. Hydration/probe/discovery fetches
+    /// never charge. Breach →
+    /// [`crate::logql::error::TooBroadReason::MetricSamples`]. Fetched-row
+    /// semantics, not Prometheus's per-step in-eval peak accounting: here
+    /// the whole fetch drains before the offloaded eval, so the fetch IS
+    /// the memory event (docs/configuration.md §6 documents the
+    /// divergence). Operator-scale tuning routes to issue #25.
+    pub max_samples: u64,
     /// Issue #136: mirrors [`crate::traces::exec::TraceReadConfig::
     /// distributed`] — `true` iff `Config::cluster` is configured
     /// (`pulsus-server`'s `metrics_config_from`). Gates
@@ -309,6 +324,54 @@ impl Drop for ProbeGuard<'_> {
         self.0
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Issue #138: the per-query fetched-sample budget
+/// ([`MetricsConfig::max_samples`] ← `reader.promql_max_samples`). One
+/// instance per [`MetricsEngine::query_inner`] call, shared by reference
+/// across every selector's concurrent sample fetch — so the cap bounds
+/// the QUERY's total materialized sample rows, not each fetch's. Each
+/// drain errors on its first over-cap row and drops its `ChRowStream`;
+/// sibling drains (`join_all`) hit the exhausted budget on their own next
+/// row, so total materialization stays ≤ cap + one row per in-flight
+/// drain. Charging must stay per-row inside the drain loop — a post-drain
+/// total would reopen the unbounded single-fetch hole this guard closes.
+#[derive(Debug)]
+struct SampleBudget {
+    used: std::sync::atomic::AtomicU64,
+    cap: u64,
+}
+
+impl SampleBudget {
+    fn new(cap: u64) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicU64::new(0),
+            cap,
+        }
+    }
+
+    /// `Ok` admits the row; `Err(MetricSamples { cap })` once `cap` rows
+    /// are already admitted — exactly-cap succeeds, the (cap+1)-th row
+    /// errors. `fetch_add(1, Relaxed)` hands every concurrent caller a
+    /// unique prior count, so admission is exact under concurrency
+    /// (exactly `cap` charges ever succeed); `Relaxed` suffices because
+    /// only the counter itself is synchronized — no other memory is
+    /// published through it.
+    fn charge_one(&self) -> Result<(), TooBroadReason> {
+        let prior = self.used.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prior >= self.cap {
+            return Err(TooBroadReason::MetricSamples { cap: self.cap });
+        }
+        Ok(())
+    }
+
+    /// TEST SEAM: pre-loads the admitted count so ceiling-scale boundary
+    /// tests never iterate 5×10^10 charges (`eval_gate`'s seeded-counter
+    /// precedent).
+    #[cfg(test)]
+    fn seed(&self, used: u64) {
+        self.used.store(used, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -624,12 +687,15 @@ impl MetricsEngine {
 
         // Phase 2 (async, concurrent across the full selector set — the
         // ratified binop-concurrency contract): execute every selector's
-        // already-built fetch plan at once via `join_all`.
+        // already-built fetch plan at once via `join_all`. ONE sample
+        // budget (issue #138) spans the whole set — the per-query bound,
+        // not a per-selector one.
+        let sample_budget = SampleBudget::new(self.config.max_samples);
         let fetches = plan
             .selectors
             .iter()
             .zip(fetch_plans)
-            .map(|(sel, fetch_plan)| self.execute_fetch_plan(sel, fetch_plan));
+            .map(|(sel, fetch_plan)| self.execute_fetch_plan(sel, fetch_plan, &sample_budget));
         let fetched: Vec<Result<Vec<FetchedSeries>, ReadError>> = join_all(fetches).await;
 
         let mut data = SeriesData::new();
@@ -810,10 +876,17 @@ impl MetricsEngine {
     /// fetch, then hydrates labels for just the fingerprints that returned
     /// samples; the `Multi` path (issue #85) issues its single flat
     /// IN-set fetch and groups rows per `(metric_name, fingerprint)`.
+    ///
+    /// Issue #138: `budget` is the query-wide [`SampleBudget`] — exactly
+    /// the SIX sample dispatches below (Chunks/Fallback/Multi × float +
+    /// histogram) charge it; the info-cardinality probe and the fallback
+    /// label hydration do not (charging them would spuriously reject
+    /// legitimate queries whose sample volume is under budget).
     async fn execute_fetch_plan(
         &self,
         sel: &SelectorSpec,
         fetch_plan: SelectorFetchPlan,
+        budget: &SampleBudget,
     ) -> Result<Vec<FetchedSeries>, ReadError> {
         // Issue #135 TEST SEAM: when a probe is installed, park here until
         // released — proving (via `FetchProbe::max_in_flight`) that
@@ -840,8 +913,12 @@ impl MetricsEngine {
                 // single-type complementary read is zero-granule but must
                 // not add a serial round trip).
                 let (rows, hist_rows) = fetch_dual_concurrently(
-                    fetch_all_concurrently(sqls, |sql| self.fetch_rows::<SampleRow>(sql)),
-                    fetch_all_concurrently(hist_sqls, |sql| self.fetch_rows::<HistSampleRow>(sql)),
+                    fetch_all_concurrently(sqls, |sql| {
+                        self.fetch_sample_rows::<SampleRow>(sql, budget)
+                    }),
+                    fetch_all_concurrently(hist_sqls, |sql| {
+                        self.fetch_sample_rows::<HistSampleRow>(sql, budget)
+                    }),
                 )
                 .await?;
                 group_merged_rows(rows, hist_rows, &labels_by_fp, metric_name)
@@ -877,8 +954,8 @@ impl MetricsEngine {
                 let settings = fallback_fetch_settings(self.config.distributed);
                 let (rows, hist_rows): (Vec<SampleRow>, Vec<HistSampleRow>) =
                     fetch_dual_concurrently(
-                        self.fetch_rows_with(sql, &settings),
-                        self.fetch_rows_with(hist_sql, &settings),
+                        self.fetch_rows_with(sql, &settings, Some(budget)),
+                        self.fetch_rows_with(hist_sql, &settings, Some(budget)),
                     )
                     .await?;
                 if rows.is_empty() && hist_rows.is_empty() {
@@ -913,8 +990,11 @@ impl MetricsEngine {
                 labels_by_fp,
             } => {
                 let (rows, hist_rows): (Vec<MultiSampleRow>, Vec<MultiHistSampleRow>) =
-                    fetch_dual_concurrently(self.fetch_rows(sql), self.fetch_rows(hist_sql))
-                        .await?;
+                    fetch_dual_concurrently(
+                        self.fetch_sample_rows(sql, budget),
+                        self.fetch_sample_rows(hist_sql, budget),
+                    )
+                    .await?;
                 group_merged_multi_rows(rows, hist_rows, &labels_by, &labels_by_fp)
             }
         }
@@ -922,9 +1002,28 @@ impl MetricsEngine {
 
     /// [`Self::fetch_rows_with`] under the standard [`metrics_read_settings`]
     /// — every dispatch except the `SqlFallback` sample fetches (issue
-    /// #136), which instead carry [`fallback_fetch_settings`].
+    /// #136), which instead carry [`fallback_fetch_settings`]. Never
+    /// charges the sample budget (issue #138): this is the probe/
+    /// hydration/discovery dispatch — sample fetches go through
+    /// [`Self::fetch_sample_rows`] (or `fetch_rows_with` with
+    /// `Some(budget)` on the fallback path).
     async fn fetch_rows<R: ChRow>(&self, sql: String) -> Result<Vec<R>, ReadError> {
-        self.fetch_rows_with(sql, &metrics_read_settings()).await
+        self.fetch_rows_with(sql, &metrics_read_settings(), None)
+            .await
+    }
+
+    /// Issue #138: [`Self::fetch_rows_with`] under the standard
+    /// [`metrics_read_settings`], charging `budget` per drained row — the
+    /// Chunks and Multi sample dispatches' fetch. The `SqlFallback` sample
+    /// dispatches call `fetch_rows_with` directly (they carry
+    /// [`fallback_fetch_settings`]) with `Some(budget)`.
+    async fn fetch_sample_rows<R: ChRow>(
+        &self,
+        sql: String,
+        budget: &SampleBudget,
+    ) -> Result<Vec<R>, ReadError> {
+        self.fetch_rows_with(sql, &metrics_read_settings(), Some(budget))
+            .await
     }
 
     /// Wraps [`ChClient::query_stream`] with the placeholder-escaping fix
@@ -946,10 +1045,21 @@ impl MetricsEngine {
     /// [`metrics_read_settings`] internally) so the `SqlFallback` fetches
     /// can carry the extra `distributed_product_mode` setting without a
     /// second, near-duplicate dispatch method.
+    ///
+    /// Issue #138: `budget` is `Some` on the six sample dispatches only
+    /// (the same `Option` seam precedent as [`FetchProbe`]) and is charged
+    /// per row INSIDE the drain loop, before the push — the guard bounds
+    /// actual materialization, aborting (and dropping the `ChRowStream`,
+    /// releasing its pooled-connection lease) on the first over-cap row,
+    /// never a post-hoc total. Cost when charged: one relaxed `fetch_add`
+    /// and compare per row, dwarfed by the poll, RowBinary decode, and
+    /// `Vec` push already on this loop; when `None`, one predictable
+    /// branch.
     async fn fetch_rows_with<R: ChRow>(
         &self,
         sql: String,
         settings: &QuerySettings,
+        budget: Option<&SampleBudget>,
     ) -> Result<Vec<R>, ReadError> {
         let sql = escape_query_placeholders(&sql);
         if let Err(reason) = crate::querytext::ensure_query_text_fits(&sql) {
@@ -962,7 +1072,11 @@ impl MetricsEngine {
             .map_err(ReadError::Clickhouse)?;
         let mut out = Vec::new();
         while let Some(row) = stream.next().await {
-            out.push(row.map_err(ReadError::Clickhouse)?);
+            let row = row.map_err(ReadError::Clickhouse)?;
+            if let Some(b) = budget {
+                b.charge_one().map_err(ReadError::QueryTooBroad)?;
+            }
+            out.push(row);
         }
         Ok(out)
     }
@@ -2241,6 +2355,77 @@ mod tests {
             })
         );
         assert_eq!(info_cardinality_bound(cap as usize, cap), None);
+    }
+
+    // --- SampleBudget: issue #138 (the per-query evaluation sample
+    // budget, `reader.promql_max_samples`) ---
+
+    /// AC6 (exactness): cap = 3 admits charges 1–3 and rejects the 4th
+    /// with the named `MetricSamples` reason — exactly-cap succeeds, the
+    /// (cap+1)-th row errors.
+    #[test]
+    fn sample_budget_admits_exactly_cap_charges_and_rejects_the_next() {
+        let budget = SampleBudget::new(3);
+        for i in 1..=3 {
+            assert!(budget.charge_one().is_ok(), "charge {i} of 3 must admit");
+        }
+        assert_eq!(
+            budget.charge_one(),
+            Err(TooBroadReason::MetricSamples { cap: 3 }),
+            "the cap+1-th charge must reject with the named reason"
+        );
+        assert_eq!(
+            budget.charge_one(),
+            Err(TooBroadReason::MetricSamples { cap: 3 }),
+            "an exhausted budget stays exhausted"
+        );
+    }
+
+    /// AC6 (concurrency): two threads hammering one shared budget admit
+    /// exactly `cap` charges in total — `fetch_add`'s unique prior count
+    /// per caller makes admission exact, never approximately-cap.
+    #[test]
+    fn sample_budget_admits_exactly_cap_across_two_threads() {
+        let cap: u64 = 10_000;
+        let budget = SampleBudget::new(cap);
+        let admitted = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..cap {
+                        if budget.charge_one().is_ok() {
+                            admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            admitted.load(std::sync::atomic::Ordering::Relaxed),
+            cap,
+            "exactly cap admissions across concurrent chargers"
+        );
+    }
+
+    /// AC5 (#133-class use-site proof): the guard still fires at the
+    /// maximum config-accepted `reader.promql_max_samples`
+    /// (`pulsus_config::PROMQL_MAX_SAMPLES_CEILING`) — not disable-able by
+    /// any value config load accepts. Seeded counter (`eval_gate`'s
+    /// precedent), never a 5×10^10-iteration loop.
+    #[test]
+    fn sample_budget_still_trips_at_the_max_accepted_cap() {
+        let ceiling = pulsus_config::PROMQL_MAX_SAMPLES_CEILING;
+        let budget = SampleBudget::new(ceiling);
+        budget.seed(ceiling - 1);
+        assert!(
+            budget.charge_one().is_ok(),
+            "the ceiling-th row itself must still admit (exactly-cap succeeds)"
+        );
+        assert_eq!(
+            budget.charge_one(),
+            Err(TooBroadReason::MetricSamples { cap: ceiling }),
+            "the ceiling+1-th row must reject even at the max accepted cap"
+        );
     }
 
     // --- Issue #35: full-shape parse bound (metrics read path) ---

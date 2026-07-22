@@ -111,6 +111,15 @@ pub const INGEST_QUEUE_BYTES_CEILING: u64 = 256 * 1024 * 1024 * 1024;
 /// cover a max-sized cache.
 pub const CACHE_MAX_SERIES_CEILING: u64 = 50_000_000;
 
+/// `reader.promql_max_samples` — issue #138: the per-query evaluation
+/// sample budget on the metrics read path (`metrics/exec.rs`'s
+/// `SampleBudget`, charged per drained `metric_samples`/
+/// `metric_hist_samples` row). A value at/near `u64::MAX` makes the
+/// budget's admission check unreachable, silently disabling the only
+/// fetch-volume bound the metrics path has. 1000x the default of
+/// 50_000_000 (the #96/#133-adjudicated count-knob multiplier).
+pub const PROMQL_MAX_SAMPLES_CEILING: u64 = 50_000_000_000;
+
 /// `reader.promql_max_cache_scan` — the examined-entry walk budget
 /// (`metrics/labels.rs`'s `examined > scan_budget`). 1000x the default
 /// of 200_000; >= [`PROMQL_MAX_METRIC_FANOUT_CEILING`] so the #96
@@ -343,6 +352,17 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         cfg.reader.series_activity_bucket,
     )?;
     positive_u64("reader.promql_max_samples", cfg.reader.promql_max_samples)?;
+    // Issue #138: a budget at/near u64::MAX makes the per-query
+    // evaluation-sample admission check unreachable — the metrics fetch
+    // would drain unbounded row volume before eval.
+    if cfg.reader.promql_max_samples > PROMQL_MAX_SAMPLES_CEILING {
+        return Err(ceiling_err(
+            "reader.promql_max_samples",
+            PROMQL_MAX_SAMPLES_CEILING,
+            1,
+            "the per-query evaluation sample budget",
+        ));
+    }
     positive_u64(
         "reader.promql_max_metric_fanout",
         cfg.reader.promql_max_metric_fanout,
@@ -972,6 +992,30 @@ mod tests {
             |c, v| c.reader.cache_max_series = v,
             u64::MAX,
             CACHE_MAX_SERIES_CEILING,
+        );
+    }
+
+    /// Issue #138: the evaluation sample budget follows the sibling
+    /// count-knob validation shape — zero is rejected (a zero budget
+    /// admits no sample at all), and the #133-class ceiling rejects
+    /// `u64::MAX`/ceiling+1 while the ceiling itself and the documented
+    /// default (50_000_000) stay accepted.
+    #[test]
+    fn promql_max_samples_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        assert_eq!(Config::default().reader.promql_max_samples, 50_000_000);
+        let mut cfg = Config::default();
+        cfg.reader.promql_max_samples = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.promql_max_samples");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.promql_max_samples",
+            |c, v| c.reader.promql_max_samples = v,
+            u64::MAX,
+            PROMQL_MAX_SAMPLES_CEILING,
         );
     }
 

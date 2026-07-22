@@ -325,6 +325,7 @@ fn engine_config_dist(db: &str) -> MetricsConfig {
         max_metric_fanout: 1_000,
         max_cache_scan: 200_000,
         max_info_series: 100_000,
+        max_samples: 50_000_000,
         distributed: true,
     }
 }

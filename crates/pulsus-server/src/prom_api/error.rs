@@ -281,6 +281,28 @@ mod tests {
         assert_eq!(json["errorType"], "execution");
     }
 
+    /// Issue #138 AC7: the per-query evaluation sample budget's breach
+    /// (`TooBroadReason::MetricSamples`) rides the existing
+    /// `QueryTooBroad(_)` wildcard arm — 422 `execution`, no mapper
+    /// change was needed, and this test proves it (mirrors the #35
+    /// query-text precedent above).
+    #[tokio::test]
+    async fn read_error_metric_samples_maps_to_422_execution() {
+        let err = pulsus_read::logql::ReadError::QueryTooBroad(
+            pulsus_read::logql::TooBroadReason::MetricSamples { cap: 50_000_000 },
+        );
+        let (status, json) = envelope(ApiError::Read(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("promql_max_samples"),
+            "{json}"
+        );
+    }
+
     #[tokio::test]
     async fn promql_parse_error_maps_to_400_bad_data_and_embeds_the_message() {
         let err = PromqlError::Parse("unexpected token at char 3".to_string());

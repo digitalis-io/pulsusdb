@@ -284,6 +284,10 @@ pub(crate) fn metrics_config_from(config: &Config) -> MetricsConfig {
         // cardinality cap's production carrier — `ReaderConfig ->
         // MetricsConfig -> MetricsEngine::query_inner`'s info_family cap.
         max_info_series: config.reader.promql_max_info_series,
+        // Issue #138: the per-query evaluation sample budget's production
+        // carrier — `ReaderConfig -> MetricsConfig -> MetricsEngine::
+        // query_inner`'s `SampleBudget` (charged per drained sample row).
+        max_samples: config.reader.promql_max_samples,
         // Issue #136: mirrors `trace_read_config_from`'s own `distributed`
         // flag — gates `distributed_product_mode='local'` on the
         // `SqlFallback` sample fetches, the fix for the double-distributed
@@ -688,6 +692,17 @@ mod tests {
         assert_eq!(metrics_config_from(&config).max_cache_scan, 200_000);
         config.reader.promql_max_cache_scan = 500;
         assert_eq!(metrics_config_from(&config).max_cache_scan, 500);
+    }
+
+    /// Issue #138 AC2: `reader.promql_max_samples` maps into
+    /// `MetricsConfig.max_samples` — the documented 50_000_000 default
+    /// and a non-default override both survive the production carrier.
+    #[test]
+    fn metrics_config_from_maps_the_sample_budget() {
+        let mut config = Config::default();
+        assert_eq!(metrics_config_from(&config).max_samples, 50_000_000);
+        config.reader.promql_max_samples = 1_234;
+        assert_eq!(metrics_config_from(&config).max_samples, 1_234);
     }
 
     /// Issue #65 (M6-02) plan v2 Δ4: the hermetic production-path

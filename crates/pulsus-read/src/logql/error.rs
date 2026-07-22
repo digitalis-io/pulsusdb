@@ -161,6 +161,14 @@ pub enum TooBroadReason {
     /// [`crate::querytext::ensure_query_text_fits`], never by a ClickHouse
     /// server error code.
     QueryTextBytes { rendered_bytes: u64, cap: u64 },
+    /// Issue #138: the per-query fetched-sample budget
+    /// (`reader.promql_max_samples`) was exceeded while draining
+    /// `metric_samples`/`metric_hist_samples` rows. Rust-side, per-row,
+    /// pre-materialization (the drain aborts on the first over-cap row);
+    /// never produced from a ClickHouse error code. Produced **only** by
+    /// `metrics::exec`'s `SampleBudget` on the six sample-fetch dispatches
+    /// — hydration/probe/discovery fetches never charge it.
+    MetricSamples { cap: u64 },
 }
 
 impl fmt::Display for TooBroadReason {
@@ -263,6 +271,16 @@ impl fmt::Display for TooBroadReason {
                     "rendered query text is {rendered_bytes} bytes, exceeding the {cap}-byte \
                      query-text cap — narrow the selector (fewer streams/metric names) or \
                      shorten the query"
+                )
+            }
+            // Lower-bound wording, like `MetricFanout`: the drain aborts
+            // on the first over-cap row, so no exact final tally exists.
+            TooBroadReason::MetricSamples { cap } => {
+                write!(
+                    f,
+                    "query would fetch more than {cap} samples, exceeding the evaluation \
+                     sample budget (reader.promql_max_samples) — narrow the selector or \
+                     the time range"
                 )
             }
         }
@@ -548,6 +566,22 @@ mod tests {
         let msg = reason.to_string();
         assert!(msg.contains("1048576"), "{msg}");
         assert!(msg.contains("generator memory"), "{msg}");
+    }
+
+    /// Issue #138 AC1: the sample-budget breach message names the knob
+    /// (`reader.promql_max_samples`) and the cap, with lower-bound
+    /// wording — the drain aborts on the first over-cap row, so no exact
+    /// final tally exists.
+    #[test]
+    fn metric_samples_display_names_the_cap_and_the_knob() {
+        let msg =
+            ReadError::QueryTooBroad(TooBroadReason::MetricSamples { cap: 50_000_000 }).to_string();
+        assert!(msg.contains("query too broad"), "{msg}");
+        assert!(msg.contains("more than 50000000 samples"), "{msg}");
+        assert!(
+            msg.contains("sample budget (reader.promql_max_samples)"),
+            "{msg}"
+        );
     }
 
     /// Issue #35: the query-text guard's message names both the rendered
