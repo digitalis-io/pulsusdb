@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::ingest::metrics::{HistogramPoint, MetricMetadata, MetricPoint, SeriesRef};
 use crate::ingest::traces::{AttrRecord, SpanRecord};
 use crate::protocols::otlp_logs::{LogRow, StreamRow};
+use crate::writer::backfill::BackfillRow;
+use crate::writer::registration::StreamKey;
 use crate::writer::spool::SpoolEncode;
 
 /// One `log_samples` row (docs/schemas.md §3.1). `structured_metadata` is a
@@ -135,6 +137,26 @@ impl SpoolEncode for LogStreamRow {
     fn to_spool_value(&self) -> serde_json::Value {
         serde_json::to_value(self)
             .expect("LogStreamRow has no non-finite float fields: JSON encoding cannot fail")
+    }
+}
+
+/// `log_streams` backfill identity (issue #134, unchanged semantics under
+/// the #139 generalization): keyed `(fingerprint, month)` — the
+/// `ReplacingMergeTree(updated_ns)` dedup key — versioned on `updated_ns`
+/// (larger wins, mirroring the merge's winner).
+impl BackfillRow for LogStreamRow {
+    type Key = StreamKey;
+
+    fn backfill_key(&self) -> StreamKey {
+        (self.fingerprint, self.month)
+    }
+
+    fn backfill_version(&self) -> i64 {
+        self.updated_ns
+    }
+
+    fn backfill_bytes(&self) -> u64 {
+        self.est_bytes()
     }
 }
 
@@ -316,6 +338,40 @@ impl SpoolEncode for MetricSeriesRow {
     fn to_spool_value(&self) -> serde_json::Value {
         serde_json::to_value(self)
             .expect("MetricSeriesRow has no non-finite float fields: JSON encoding cannot fail")
+    }
+}
+
+/// `metric_series` backfill identity (issue #139): keyed `(metric_name,
+/// fingerprint, bucket unix_milli, value_type)` — the same scoping as the
+/// admission-time `SeriesKey` (`writer::registration`), including
+/// `value_type` (#120). VERSIONLESS (constant `0`): the key determines
+/// `labels` up to fingerprint identity (collisions are already accepted
+/// system-wide, `collisions_total`), so a "newer" enqueue mid-attempt
+/// carries byte-identical content and #134's version-checked-removal race
+/// fix degenerates safely to always-remove. Re-insert idempotency: the
+/// table is plain `MergeTree` but duplicate-tolerant by design — every
+/// read-side consumer dedups with `LIMIT 1 BY metric_name, fingerprint`
+/// (docs/schemas.md §2.1) and the writer already re-emits on LRU false
+/// miss; duplicates are bounded (one per poisoned generation per key) and
+/// collapse at read.
+impl BackfillRow for MetricSeriesRow {
+    type Key = (String, u64, i64, u8);
+
+    fn backfill_key(&self) -> Self::Key {
+        (
+            self.metric_name.clone(),
+            self.fingerprint,
+            self.unix_milli,
+            self.value_type,
+        )
+    }
+
+    fn backfill_version(&self) -> i64 {
+        0
+    }
+
+    fn backfill_bytes(&self) -> u64 {
+        self.est_bytes()
     }
 }
 
@@ -523,6 +579,27 @@ impl SpoolEncode for MetricMetadataRow {
     }
 }
 
+/// `metric_metadata` backfill identity (issue #139): keyed `metric_name`
+/// (the `ReplacingMergeTree(updated_ns) ORDER BY metric_name` key),
+/// versioned on `updated_ns` — larger-wins replacement keeps the row that
+/// would win the merge, so a stale re-insert deterministically loses to a
+/// newer descriptor.
+impl BackfillRow for MetricMetadataRow {
+    type Key = String;
+
+    fn backfill_key(&self) -> String {
+        self.metric_name.clone()
+    }
+
+    fn backfill_version(&self) -> i64 {
+        self.updated_ns
+    }
+
+    fn backfill_bytes(&self) -> u64 {
+        self.est_bytes()
+    }
+}
+
 /// One `trace_spans` row (docs/schemas.md §4.1, issue #54). `[u8; N]` ↔
 /// `FixedString(N)` (serde arrays serialize as N raw bytes on the RowBinary
 /// wire — no length prefix); `payload` is a **binary** protobuf blob stored
@@ -685,6 +762,40 @@ impl SpoolEncode for TraceAttrRow {
             "span_id": hex_lower(&self.span_id),
             "duration_ns": self.duration_ns,
         })
+    }
+}
+
+/// `trace_attrs_idx` backfill identity (issue #139): keyed on the full
+/// `ReplacingMergeTree ORDER BY (key, val, scope, timestamp_ns, trace_id,
+/// span_id)` tuple. VERSIONLESS (constant `0`): the non-key columns
+/// (`date`, `val_num`, `duration_ns`) are deterministic functions of the
+/// same attr record/span, so a re-inserted row is the same logical row
+/// (`FINAL` collapses to 1) and the equal-version mid-attempt removal is
+/// safe — see `MetricSeriesRow`'s impl note. Byte-accounting caveat: the
+/// backlog map key clones this row's three strings, so the true footprint
+/// is ~2× `est_bytes` for this backlog — the 32 MiB cap still bounds it
+/// within a small constant (conservative-estimate ethos; no key-byte
+/// accounting by design).
+impl BackfillRow for TraceAttrRow {
+    type Key = (String, String, String, i64, [u8; 16], [u8; 8]);
+
+    fn backfill_key(&self) -> Self::Key {
+        (
+            self.key.clone(),
+            self.val.clone(),
+            self.scope.clone(),
+            self.timestamp_ns,
+            self.trace_id,
+            self.span_id,
+        )
+    }
+
+    fn backfill_version(&self) -> i64 {
+        0
+    }
+
+    fn backfill_bytes(&self) -> u64 {
+        self.est_bytes()
     }
 }
 

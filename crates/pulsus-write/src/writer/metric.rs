@@ -55,6 +55,7 @@ use tracing::warn;
 use crate::error::LogsIngestError;
 use crate::ingest::metrics::{MetricMetadata, MetricSink, ParsedMetrics, SeriesRef};
 use crate::ingest::{Backpressure, FlushWait};
+use crate::writer::backfill::{self, BackfillHealedHook, RegistrationBacklog};
 use crate::writer::buffer;
 use crate::writer::config::WriterRuntime;
 use crate::writer::error::WriteError;
@@ -137,6 +138,35 @@ struct Shared {
     series_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     metadata_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     hist_samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    series_backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    metadata_backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// The production `metric_metadata` heal hook (issue #139) — the ONE hook
+/// body the writer wires (`with_inserters_with_tables` calls exactly
+/// this); extracted so the eviction-interleaving regression test (M7a)
+/// drives the real hook, not a reimplementation.
+///
+/// **Invalidate-only by design (#139): a heal must never install a
+/// descriptor.** The backfill task confirms out of order with the flush
+/// task, and after an LRU eviction there is no stored version left to
+/// gate on — any upsert-like hook (plain or version-gated) would install
+/// a stale descriptor A over the durable winner B and permanently
+/// suppress a client revert to A while `ReplacingMergeTree(updated_ns)`
+/// serves B. Invalidation is unconditionally sound under every
+/// interleaving: post-heal the cache asserts nothing for the name, so the
+/// next admission's decision degrades to *emit* — the safe direction; a
+/// redundant row collapses under `ReplacingMergeTree(updated_ns)`.
+pub(crate) fn metadata_healed_hook(
+    cache: Arc<Mutex<MetadataCache>>,
+) -> BackfillHealedHook<MetricMetadataRow> {
+    Arc::new(move |rows: &[MetricMetadataRow]| {
+        let mut guard = cache.lock().expect("metadata cache mutex poisoned");
+        for row in rows {
+            let name: Arc<str> = Arc::from(row.metric_name.as_str());
+            guard.invalidate(&name);
+        }
+    })
 }
 
 /// Implements issue #26's `MetricSink` over a generic per-table columnar
@@ -266,7 +296,11 @@ impl MetricWriter {
 
         // `metric_metadata`'s success-only last-value promotion (architect
         // plan amendment 1, finding 2): populated ONLY here, after a
-        // confirmed flush.
+        // confirmed flush. The single flush task confirms in admission
+        // order (monotone `updated_ns` per name), so this unconditional
+        // upsert is safe; the backfill task — the only out-of-order
+        // confirmer — never upserts (issue #139: `metadata_healed_hook`
+        // is invalidate-only).
         let metadata_cache_for_hook = metadata_cache.clone();
         let on_metadata_flush_success: table::FlushSuccessHook<MetricMetadataRow> =
             Arc::new(move |rows: &[MetricMetadataRow]| {
@@ -281,6 +315,67 @@ impl MetricWriter {
                     );
                 }
             });
+
+        // Poisoned-only registration backfill for `metric_series` and
+        // `metric_metadata` (issue #139, extending #134's log-family
+        // mechanism): a definitely-failed registration flush enqueues its
+        // rows for the 5s re-insert cadence. `metric_samples`/
+        // `metric_hist_samples` keep `on_flush_poisoned: None` — the
+        // structural append-only #9 exclusion.
+        let series_backlog = Arc::new(Mutex::new(RegistrationBacklog::<MetricSeriesRow>::new(
+            runtime.backfill_max_bytes,
+        )));
+        let series_backlog_for_hook = series_backlog.clone();
+        let series_backfill_metrics = metrics.series_backfill.clone();
+        let on_series_flush_poisoned: table::FlushPoisonedHook<MetricSeriesRow> =
+            Arc::new(move |rows: &[MetricSeriesRow]| {
+                backfill::enqueue_failed(&series_backlog_for_hook, &series_backfill_metrics, rows);
+            });
+
+        let metadata_backlog = Arc::new(Mutex::new(RegistrationBacklog::<MetricMetadataRow>::new(
+            runtime.backfill_max_bytes,
+        )));
+        let metadata_backlog_for_hook = metadata_backlog.clone();
+        let metadata_backfill_metrics = metrics.metadata_backfill.clone();
+        let on_metadata_flush_poisoned: table::FlushPoisonedHook<MetricMetadataRow> =
+            Arc::new(move |rows: &[MetricMetadataRow]| {
+                backfill::enqueue_failed(
+                    &metadata_backlog_for_hook,
+                    &metadata_backfill_metrics,
+                    rows,
+                );
+            });
+
+        // Success-only `SeriesLru` promotion on a confirmed HEAL — safe
+        // under any eviction interleaving: a pure membership set over the
+        // FULL logical identity `(metric_name, fingerprint, bucket,
+        // value_type)`, so promoting on heal asserts only "this row is
+        // durable" (unconditionally true at that point); there is no
+        // value to go stale. Same cold-path `Arc::from` allocation note
+        // as the flush-success hook above.
+        let series_lru_for_heal = series_lru.clone();
+        let on_series_healed: BackfillHealedHook<MetricSeriesRow> =
+            Arc::new(move |rows: &[MetricSeriesRow]| {
+                let mut guard = series_lru_for_heal
+                    .lock()
+                    .expect("series lru mutex poisoned");
+                for row in rows {
+                    let key: SeriesKey = (
+                        Arc::from(row.metric_name.as_str()),
+                        row.fingerprint,
+                        row.unix_milli,
+                        row.value_type,
+                    );
+                    guard.insert(key);
+                }
+            });
+
+        // Clone the inserter/table Arcs the backfill tasks need before
+        // the ctxs below move them.
+        let series_inserter_for_backfill = series_inserter.clone();
+        let series_table_for_backfill = tables.series.clone();
+        let metadata_inserter_for_backfill = metadata_inserter.clone();
+        let metadata_table_for_backfill = tables.metadata.clone();
 
         let samples_ctx = TableContext {
             table: tables.samples,
@@ -304,7 +399,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_series_flush_success),
-            on_flush_poisoned: None,
+            on_flush_poisoned: Some(on_series_flush_poisoned),
         };
         let metadata_ctx = TableContext {
             table: tables.metadata,
@@ -316,7 +411,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_metadata_flush_success),
-            on_flush_poisoned: None,
+            on_flush_poisoned: Some(on_metadata_flush_poisoned),
         };
         // `metric_hist_samples` (M7-A4, issue #120): no flush-success hook —
         // `metric_series` registration (the only success-gated cache) is
@@ -339,7 +434,25 @@ impl MetricWriter {
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
         let series_task = table::spawn(series_ctx, shutdown_rx.clone());
         let metadata_task = table::spawn(metadata_ctx, shutdown_rx.clone());
-        let hist_samples_task = table::spawn(hist_samples_ctx, shutdown_rx);
+        let hist_samples_task = table::spawn(hist_samples_ctx, shutdown_rx.clone());
+        let series_backfill_task = backfill::spawn_backfill(
+            series_backlog,
+            series_inserter_for_backfill,
+            series_table_for_backfill,
+            Some(on_series_healed),
+            metrics.series_backfill.clone(),
+            runtime.clone(),
+            shutdown_rx.clone(),
+        );
+        let metadata_backfill_task = backfill::spawn_backfill(
+            metadata_backlog,
+            metadata_inserter_for_backfill,
+            metadata_table_for_backfill,
+            Some(metadata_healed_hook(metadata_cache.clone())),
+            metrics.metadata_backfill.clone(),
+            runtime.clone(),
+            shutdown_rx,
+        );
 
         let shared = Arc::new(Shared {
             samples,
@@ -362,6 +475,8 @@ impl MetricWriter {
             series_task: Mutex::new(Some(series_task)),
             metadata_task: Mutex::new(Some(metadata_task)),
             hist_samples_task: Mutex::new(Some(hist_samples_task)),
+            series_backfill_task: Mutex::new(Some(series_backfill_task)),
+            metadata_backfill_task: Mutex::new(Some(metadata_backfill_task)),
         });
 
         MetricWriter { shared }
@@ -681,6 +796,18 @@ impl MetricWriter {
             .lock()
             .expect("task handle mutex poisoned")
             .take();
+        let series_backfill_task = self
+            .shared
+            .series_backfill_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
+        let metadata_backfill_task = self
+            .shared
+            .metadata_backfill_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
 
         if let Some(task) = samples_task
             && let Err(e) = task.await
@@ -702,6 +829,24 @@ impl MetricWriter {
         {
             warn!(error = %e, table = HIST_SAMPLES_TABLE, "flush task panicked during shutdown");
         }
+        if let Some(task) = series_backfill_task
+            && let Err(e) = task.await
+        {
+            warn!(
+                error = %e,
+                table = SERIES_TABLE,
+                "registration backfill task panicked during shutdown"
+            );
+        }
+        if let Some(task) = metadata_backfill_task
+            && let Err(e) = task.await
+        {
+            warn!(
+                error = %e,
+                table = METADATA_TABLE,
+                "registration backfill task panicked during shutdown"
+            );
+        }
     }
 }
 
@@ -717,5 +862,99 @@ impl MetricSink for MetricWriter {
                 .await
                 .map_err(|e| LogsIngestError::FlushFailed(e.to_string()))
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata_row(name: &str, metric_type: &str, updated_ns: i64) -> MetricMetadataRow {
+        MetricMetadataRow {
+            metric_name: name.to_string(),
+            metric_type: metric_type.to_string(),
+            help: String::new(),
+            unit: String::new(),
+            updated_ns,
+        }
+    }
+
+    /// Issue #139 M7a (plan v3 delta 2) — the eviction-resurrection
+    /// regression, pinned against the REAL production hook body
+    /// ([`metadata_healed_hook`]) at the component seam (writer-level
+    /// capacity is the documented 1M constant, so the interleaving is
+    /// forced with `MetadataCache::new(1)`):
+    ///
+    /// confirm newer B@2 for name X (`upsert`) → force X's eviction by
+    /// upserting a second name Y (capacity 1) → the heal of stale A@1
+    /// fires through the real hook → `get(X)` MUST be `None` (the
+    /// emission decision given `None` is *emit* — B re-emitted on the
+    /// next push, stale A never installed).
+    ///
+    /// Fails under ANY upsert-like reverted hook: with B evicted there is
+    /// no stored version to gate on, so both a plain upsert and a
+    /// version-gated upsert (whose gate is vacuous after eviction) would
+    /// install stale A → `get(X) == Some(A)` → the `None` assertion
+    /// fails.
+    #[test]
+    fn m7a_heal_after_eviction_never_installs_the_stale_descriptor() {
+        let cache = Arc::new(Mutex::new(MetadataCache::new(1)));
+        let x: Arc<str> = Arc::from("metric_x");
+        let y: Arc<str> = Arc::from("metric_y");
+
+        {
+            let mut guard = cache.lock().expect("metadata cache mutex poisoned");
+            // Newer B@2 confirmed for X (flush-success path).
+            guard.upsert(
+                x.clone(),
+                ("gauge".to_string(), "B".to_string(), String::new()),
+            );
+            // Capacity-1 pressure: Y's confirmation evicts X.
+            guard.upsert(
+                y.clone(),
+                ("counter".to_string(), String::new(), String::new()),
+            );
+            assert_eq!(guard.get(&x), None, "precondition: X evicted");
+        }
+
+        // The stale A@1 row heals through the REAL production hook.
+        let hook = metadata_healed_hook(cache.clone());
+        hook(&[metadata_row("metric_x", "counter", 1)]);
+
+        let guard = cache.lock().expect("metadata cache mutex poisoned");
+        assert_eq!(
+            guard.get(&x),
+            None,
+            "a heal must never install a descriptor — stale A would suppress a client \
+             revert while ReplacingMergeTree(updated_ns) serves B"
+        );
+        // The admission emission-decision given `None` is *emit*: the
+        // next push of B (or anything) for X re-emits a redundant,
+        // RMT-collapsed row — the safe direction.
+        assert!(guard.get(&y).is_some(), "unrelated entries untouched");
+    }
+
+    /// Companion pin: the hook invalidates a RESIDENT entry too (the
+    /// heal's own name), never rewrites it — the resident-interleaving
+    /// writer-level counterpart is M7b in `tests/metric_writer.rs`.
+    #[test]
+    fn metadata_healed_hook_invalidates_a_resident_entry_and_never_writes() {
+        let cache = Arc::new(Mutex::new(MetadataCache::new(10)));
+        let x: Arc<str> = Arc::from("metric_x");
+        cache.lock().expect("metadata cache mutex poisoned").upsert(
+            x.clone(),
+            ("gauge".to_string(), "B".to_string(), String::new()),
+        );
+
+        let hook = metadata_healed_hook(cache.clone());
+        hook(&[metadata_row("metric_x", "counter", 1)]);
+
+        let guard = cache.lock().expect("metadata cache mutex poisoned");
+        assert_eq!(
+            guard.get(&x),
+            None,
+            "resident entry invalidated, not rewritten"
+        );
+        assert!(guard.is_empty());
     }
 }

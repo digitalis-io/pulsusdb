@@ -45,20 +45,25 @@ const METADATA_LRU_CAPACITY: usize = 1_000_000;
 /// `uncertain/{table}/` subdirectories, created on first use.
 const SPOOL_DIR: &str = "./spool";
 
-/// Cadence of the `log_streams` registration-backfill re-insert task
-/// (issue #134): every interval, any Poisoned-flush registration rows
-/// still pending in the in-memory backlog are re-inserted once. A
-/// documented constant per the issue-#9 constants-not-env-vars precedent
-/// ([`LRU_CAPACITY`]); promote to a `PULSUS_*` var if a deployment needs
-/// to tune it.
+/// Cadence of every registration-backfill re-insert task (issues
+/// #134/#139: `log_streams`, `metric_series`, `metric_metadata`,
+/// `trace_attrs_idx`): every interval, any Poisoned-flush registration
+/// rows still pending in that table's in-memory backlog are re-inserted
+/// once. A documented constant per the issue-#9 constants-not-env-vars
+/// precedent ([`LRU_CAPACITY`]); promote to a `PULSUS_*` var if a
+/// deployment needs to tune it.
 const REGISTRATION_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Byte cap (`LogStreamRow::est_bytes` accounting) on the in-memory
-/// registration backfill backlog (issue #134). New keys that would exceed
-/// this cap are rejected and counted via `backfill_dropped_total` — under
-/// sustained ClickHouse failure the sample path is failing too, so few new
-/// orphans are being minted in that state. Same documented-constant
-/// precedent as [`REGISTRATION_BACKFILL_RETRY_INTERVAL`].
+/// Byte cap (row `est_bytes` accounting) on each in-memory registration
+/// backfill backlog (issues #134/#139). PER-BACKLOG: with four backlogs
+/// (`log_streams`, `metric_series`, `metric_metadata`,
+/// `trace_attrs_idx`), the worst-case process-wide footprint under total
+/// ClickHouse failure is 4 × 32 MiB = 128 MiB — acceptable, since the
+/// sample/span paths are failing too in that state, minting few new
+/// orphans. New keys that would exceed a backlog's cap are rejected and
+/// counted via its `BackfillMetrics::dropped_total`. Same
+/// documented-constant precedent as
+/// [`REGISTRATION_BACKFILL_RETRY_INTERVAL`].
 const REGISTRATION_BACKFILL_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// The resolved set of tunables a `LogWriter` and its per-table flush
@@ -85,11 +90,13 @@ pub struct WriterRuntime {
     /// capacity — unused by [`crate::writer::LogWriter`].
     pub metadata_lru_capacity: usize,
     pub spool_dir: PathBuf,
-    /// [`crate::writer::LogWriter`]'s registration-backfill re-insert
-    /// cadence (issue #134) — unused by the metric/trace writers.
+    /// The registration-backfill re-insert cadence (issues #134/#139),
+    /// shared by all four backfill tasks (`log_streams`, `metric_series`,
+    /// `metric_metadata`, `trace_attrs_idx`).
     pub backfill_retry_interval: Duration,
-    /// [`crate::writer::LogWriter`]'s registration-backfill backlog byte
-    /// cap (issue #134) — unused by the metric/trace writers.
+    /// The PER-BACKLOG registration-backfill byte cap (issues #134/#139)
+    /// — four backlogs ⇒ 128 MiB worst-case process-wide (see
+    /// [`REGISTRATION_BACKFILL_MAX_BYTES`]).
     pub backfill_max_bytes: u64,
 }
 

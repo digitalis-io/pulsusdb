@@ -135,6 +135,19 @@ impl<K: Clone + Eq + Hash> LruSet<K> {
         evicted
     }
 
+    /// Removes `key` if present (unlink + slot free + index removal — the
+    /// keyed form of `evict_lru`). Returns whether it was present. Issue
+    /// #139: backs [`MetadataCache::invalidate`], the heal-path
+    /// invalidation that must never install a value.
+    pub(crate) fn remove(&mut self, key: &K) -> bool {
+        let Some(idx) = self.index.remove(key) else {
+            return false;
+        };
+        self.unlink(idx);
+        self.free.push(idx);
+        true
+    }
+
     fn alloc_slot(&mut self, key: K) -> usize {
         let slot = Slot {
             key,
@@ -253,6 +266,21 @@ impl MetadataCache {
             self.values.remove(&evicted);
         }
         self.values.insert(metric_name, value);
+    }
+
+    /// Heal-path invalidation (issue #139): drops the entry so the next
+    /// admission re-evaluates against a miss — whose decision is *emit*,
+    /// the safe direction (a redundant row collapses under
+    /// `ReplacingMergeTree(updated_ns)`). The metadata backfill hook
+    /// (`writer::metric::metadata_healed_hook`) calls ONLY this — never
+    /// [`Self::upsert`]: the backfill task confirms out of order with the
+    /// flush task, and after an eviction there is no stored version left
+    /// to gate on, so any heal-installed value could resurrect a stale
+    /// descriptor and permanently suppress a client revert. Keeps `order`
+    /// and `values` in sync via [`LruSet::remove`].
+    pub fn invalidate(&mut self, metric_name: &Arc<str>) {
+        self.order.remove(metric_name);
+        self.values.remove(metric_name);
     }
 }
 
@@ -409,6 +437,100 @@ mod tests {
             Some(&("counter".to_string(), "".to_string(), "".to_string()))
         );
         assert_eq!(cache.len(), 1, "one name, overwritten in place");
+    }
+
+    // -- issue #139 (M7c): LruSet::remove / MetadataCache::invalidate --
+
+    #[test]
+    fn lru_remove_of_a_present_key_reports_true_and_forgets_it() {
+        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        lru.insert((1, 1));
+        assert!(lru.remove(&(1, 1)));
+        assert!(!lru.contains(&(1, 1)));
+        assert_eq!(lru.len(), 0);
+    }
+
+    #[test]
+    fn lru_remove_of_an_absent_key_reports_false_and_changes_nothing() {
+        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        lru.insert((1, 1));
+        assert!(!lru.remove(&(2, 2)));
+        assert!(lru.contains(&(1, 1)));
+        assert_eq!(lru.len(), 1);
+    }
+
+    /// Removal must free the slot for reuse — no ghost entries shrinking
+    /// the effective capacity (issue #139 M7c).
+    #[test]
+    fn lru_reinsert_after_remove_works_and_capacity_is_not_shrunk_by_ghosts() {
+        let mut lru: LruSet<StreamKey> = LruSet::new(2);
+        lru.insert((1, 1));
+        lru.insert((2, 1));
+        assert!(lru.remove(&(1, 1)));
+
+        // Re-insert the removed key, then fill to capacity again: both
+        // survivors fit — the freed slot was genuinely reclaimed.
+        lru.insert((1, 1));
+        assert_eq!(lru.len(), 2);
+        lru.insert((3, 1));
+        assert_eq!(lru.len(), 2, "capacity 2 holds exactly 2 entries");
+        assert!(lru.contains(&(1, 1)));
+        assert!(lru.contains(&(3, 1)));
+        assert!(!lru.contains(&(2, 1)), "(2,1) was the LRU victim");
+    }
+
+    #[test]
+    fn lru_remove_of_head_middle_and_tail_keeps_the_list_consistent() {
+        let mut lru: LruSet<StreamKey> = LruSet::new(10);
+        lru.insert((1, 1)); // tail after the next two inserts
+        lru.insert((2, 1)); // middle
+        lru.insert((3, 1)); // head
+        assert!(lru.remove(&(2, 1)), "middle");
+        assert!(lru.remove(&(3, 1)), "head");
+        assert!(lru.remove(&(1, 1)), "tail (now the only entry)");
+        assert!(lru.is_empty());
+        // The structure is still usable afterwards.
+        lru.insert((4, 1));
+        assert!(lru.contains(&(4, 1)));
+    }
+
+    #[test]
+    fn metadata_cache_invalidate_drops_the_entry_and_keeps_order_values_in_sync() {
+        let mut cache = MetadataCache::new(2);
+        let a: Arc<str> = Arc::from("metric_a");
+        let b: Arc<str> = Arc::from("metric_b");
+        cache.upsert(
+            a.clone(),
+            ("counter".to_string(), "".to_string(), "".to_string()),
+        );
+        cache.upsert(
+            b.clone(),
+            ("gauge".to_string(), "".to_string(), "".to_string()),
+        );
+
+        cache.invalidate(&a);
+        assert_eq!(cache.get(&a), None);
+        assert_eq!(cache.len(), 1);
+
+        // No ghost in `order`: two more names fit alongside b at
+        // capacity 2 only if a's slot was genuinely freed — the second
+        // upsert below must evict b (the LRU), not a phantom.
+        let c: Arc<str> = Arc::from("metric_c");
+        cache.upsert(
+            c.clone(),
+            ("counter".to_string(), "".to_string(), "".to_string()),
+        );
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&b).is_some(), "b survives — no phantom eviction");
+        assert!(cache.get(&c).is_some());
+    }
+
+    #[test]
+    fn metadata_cache_invalidate_of_an_absent_name_is_a_no_op() {
+        let mut cache = MetadataCache::new(2);
+        let a: Arc<str> = Arc::from("metric_a");
+        cache.invalidate(&a);
+        assert!(cache.is_empty());
     }
 
     #[test]

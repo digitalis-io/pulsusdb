@@ -18,16 +18,23 @@
 //! (`ReplacingMergeTree` collapses it) — see `writer::registration`'s doc
 //! comment.
 //!
-//! **Registration backfill** (issue #134): a `log_streams` flush that
-//! fails *definitely* (`Poisoned` — provably not-committed) enqueues its
-//! rows into a bounded in-memory backlog (`writer::backfill`) that a
+//! **Registration backfill** (issues #134/#139): a registration flush
+//! that fails *definitely* (`Poisoned` — provably not-committed) enqueues
+//! its rows into a bounded in-memory backlog (`writer::backfill`) that a
 //! dedicated task re-inserts every
 //! `WriterRuntime::backfill_retry_interval` (5s) until confirmed, capped
-//! at `backfill_max_bytes` (32 MiB), with success-only `StreamLru`
-//! promotion on a confirmed heal — so a "samples committed, registration
-//! lost" orphan self-heals while the process lives. Uncertain-fate flushes
-//! are NEVER backfilled (issue #9: an `InsertUncertain` batch is never
-//! auto-replayed), and a backfill re-insert that itself returns
+//! at `backfill_max_bytes` (32 MiB) per backlog — so a "samples/spans
+//! committed, registration lost" orphan self-heals while the process
+//! lives. One generic mechanism serves all four registration tables:
+//! `log_streams` (here, with success-only `StreamLru` promotion on a
+//! confirmed heal), `metric_series`/`metric_metadata`
+//! (`writer::metric` — `SeriesLru` promotion / invalidate-only
+//! `MetadataCache` heal respectively), and `trace_attrs_idx`
+//! (`writer::trace`, no cache). The append-only tables (`log_samples`,
+//! `metric_samples`, `metric_hist_samples`, `trace_spans`) are
+//! structurally excluded (`on_flush_poisoned: None`). Uncertain-fate
+//! flushes are NEVER backfilled (issue #9: an `InsertUncertain` batch is
+//! never auto-replayed), and a backfill re-insert that itself returns
 //! `InsertUncertain` is terminally abandoned, not retried. Honest
 //! residuals — every spool write is best-effort (`finish_generation` only
 //! logs and counts `spool_write_failures_total` on spool I/O failure), so
@@ -95,8 +102,9 @@ pub use config::WriterRuntime;
 pub use error::WriteError;
 pub use metric::{MetricWriter, MetricWriterTables};
 pub use metrics::{
-    MetricWriterMetrics, MetricWriterMetricsSnapshot, TableMetricsSnapshot, TraceWriterMetrics,
-    TraceWriterMetricsSnapshot, WriterMetrics, WriterMetricsSnapshot,
+    BackfillMetricsSnapshot, MetricWriterMetrics, MetricWriterMetricsSnapshot,
+    TableMetricsSnapshot, TraceWriterMetrics, TraceWriterMetricsSnapshot, WriterMetrics,
+    WriterMetricsSnapshot,
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
@@ -272,10 +280,24 @@ impl LogWriter {
             runtime.backfill_max_bytes,
         )));
         let backlog_for_hook = backlog.clone();
-        let metrics_for_hook = metrics.clone();
+        let backfill_metrics_for_hook = metrics.backfill.clone();
         let on_stream_flush_poisoned: table::FlushPoisonedHook<LogStreamRow> =
             Arc::new(move |rows: &[LogStreamRow]| {
-                backfill::enqueue_failed(&backlog_for_hook, &metrics_for_hook, rows);
+                backfill::enqueue_failed(&backlog_for_hook, &backfill_metrics_for_hook, rows);
+            });
+
+        // Success-only `StreamLru` promotion on a confirmed HEAL (issue
+        // #134; an `on_healed` hook since the #139 generalization — same
+        // semantics: a confirmed backfill re-insert is a confirmed
+        // flush). Safe under any eviction interleaving: a pure membership
+        // set over the full logical identity — no value to go stale.
+        let lru_for_heal = lru.clone();
+        let on_stream_healed: backfill::BackfillHealedHook<LogStreamRow> =
+            Arc::new(move |rows: &[LogStreamRow]| {
+                let mut guard = lru_for_heal.lock().expect("stream lru mutex poisoned");
+                for row in rows {
+                    guard.insert((row.fingerprint, row.month));
+                }
             });
 
         let samples_ctx = TableContext {
@@ -309,8 +331,8 @@ impl LogWriter {
             backlog,
             streams_inserter,
             tables.streams,
-            lru.clone(),
-            metrics.clone(),
+            Some(on_stream_healed),
+            metrics.backfill.clone(),
             runtime.clone(),
             shutdown_rx,
         );

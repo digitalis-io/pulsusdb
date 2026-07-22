@@ -26,13 +26,17 @@ const BUCKET_MS: i64 = DEFAULT_ACTIVITY_BUCKET_MS;
 
 /// Scriptable mock [`BlockInserter`] — see `tests/writer.rs`'s identical
 /// mock for the full rationale; duplicated here (rather than shared)
-/// because each `tests/*.rs` file compiles as its own crate.
+/// because each `tests/*.rs` file compiles as its own crate. The
+/// `*Then*` variants (issue #139, ported from #134's harness) fail
+/// `fail_remaining` calls with a deterministic poison error first.
 #[derive(Clone, Copy, Debug)]
 enum MockBehavior {
     Ok,
     Poison,
     Uncertain,
     Hang,
+    PoisonThenOk,
+    PoisonThenUncertain,
 }
 
 struct MockInserter {
@@ -43,16 +47,34 @@ struct MockInserter {
     /// row *contents* (e.g. a bucket-floored `unix_milli`) without needing
     /// a row-shape-specific mock per test.
     last_rows_json: Mutex<String>,
+    /// Only consulted under the `*Then*` behaviors: the number of
+    /// remaining calls that must fail before the second phase begins.
+    fail_remaining: AtomicUsize,
 }
 
 impl MockInserter {
     fn new(behavior: MockBehavior) -> Arc<Self> {
+        Self::new_with_fail_budget(behavior, 0)
+    }
+
+    /// A mock whose `behavior` consults a budget of `n` initial failures
+    /// (the `*Then*` variants' first phase).
+    fn new_with_fail_budget(behavior: MockBehavior, n: usize) -> Arc<Self> {
         Arc::new(MockInserter {
             behavior: Mutex::new(behavior),
             calls: AtomicUsize::new(0),
             last_row_count: Mutex::new(0),
             last_rows_json: Mutex::new(String::new()),
+            fail_remaining: AtomicUsize::new(n),
         })
+    }
+
+    /// Consumes one unit of the remaining-failures budget; `true` while
+    /// budget remains.
+    fn consume_fail_budget(&self) -> bool {
+        self.fail_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     fn call_count(&self) -> usize {
@@ -90,6 +112,20 @@ impl<R: ChRow> BlockInserter<R> for MockInserter {
                     Err(ChError::InsertUncertain("mock uncertain".to_string()))
                 }
                 MockBehavior::Hang => std::future::pending::<Result<(), ChError>>().await,
+                MockBehavior::PoisonThenOk => {
+                    if self.consume_fail_budget() {
+                        Err(ChError::Decode("mock poison".to_string()))
+                    } else {
+                        Ok(())
+                    }
+                }
+                MockBehavior::PoisonThenUncertain => {
+                    if self.consume_fail_budget() {
+                        Err(ChError::Decode("mock poison".to_string()))
+                    } else {
+                        Err(ChError::InsertUncertain("mock uncertain".to_string()))
+                    }
+                }
             }
         })
     }
@@ -475,6 +511,453 @@ async fn metadata_repeated_identical_descriptor_flushes_once_then_a_change_flush
         "a repeated identical descriptor must never re-flush"
     );
     assert_eq!(writer.metrics().metadata_upserts_total, 1);
+}
+
+/// Paused-time poll: yields to the scheduler (auto-advancing the paused
+/// clock) until `cond` holds — bounded so a regression fails loudly
+/// instead of hanging. Mirrors `tests/writer.rs`'s helper.
+async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..600 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("condition not reached within the paused-time budget: {what}");
+}
+
+/// A metadata-only batch: one descriptor for `name`.
+fn metadata_batch(name: &str, metric_type: &str, help: &str, updated_ns: i64) -> ParsedMetrics {
+    ParsedMetrics {
+        metadata: vec![MetricMetadata {
+            metric_name: Arc::from(name),
+            metric_type: metric_type.to_string(),
+            help: help.to_string(),
+            unit: String::new(),
+            updated_ns,
+        }],
+        ..Default::default()
+    }
+}
+
+// -- metric registration backfill (issue #139) ------------------------
+
+/// Issue #139 M1 (hermetic heal — fails with `metric_series`'s
+/// `on_flush_poisoned` reverted to `None`): a Poisoned `metric_series`
+/// flush resolves the sync waiter `Err` (samples committed — the orphan),
+/// then the backfill task re-inserts the registration on its 5s tick and
+/// confirms the heal. The only spool write is the original generation
+/// failure — the backfill itself never spools.
+#[tokio::test(start_paused = true)]
+async fn series_backfill_reinserts_a_failed_series_registration_until_durable() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1; // flush on the very next append
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenOk, 1);
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with(cfg, samples.clone(), series.clone(), metadata);
+
+    let wait = writer
+        .admit_flush(batch_for("http_requests_total", 51, 0, true))
+        .expect("queue has room");
+    let result = tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout");
+    assert!(
+        result.is_err(),
+        "the poisoned series generation must still resolve the sync waiter Err"
+    );
+    assert_eq!(samples.call_count(), 1, "the samples generation committed");
+    assert_eq!(series.call_count(), 1);
+    assert_eq!(writer.metrics().series_backfill.enqueued_total, 1);
+
+    // The 5s backfill tick re-inserts exactly the one pending row —
+    // without the fix there is no second series insert, ever.
+    wait_until(
+        "the backfill re-insert heals the series registration",
+        || writer.metrics().series_backfill.healed_total == 1,
+    )
+    .await;
+
+    assert_eq!(series.call_count(), 2, "exactly one re-insert");
+    assert_eq!(
+        series.last_row_count(),
+        1,
+        "the re-insert carries exactly the one backlogged row"
+    );
+    let metrics = writer.metrics();
+    assert_eq!(metrics.series_backfill.enqueued_total, 1);
+    assert_eq!(metrics.series_backfill.healed_total, 1);
+    assert_eq!(metrics.series_backfill.pending, 0);
+    assert_eq!(
+        metrics.spool_poison_total, 1,
+        "the only spool write is the original generation failure"
+    );
+    assert_eq!(
+        metrics.spool_uncertain_total, 0,
+        "the backfill path never spools"
+    );
+}
+
+/// Issue #139 M2 (`SeriesLru` promotion on heal): a confirmed backfill
+/// re-insert promotes the `(name, fingerprint, bucket, value_type)` into
+/// the success-only `SeriesLru`, so a later admit of the same key is an
+/// LRU hit, never a re-emitted series row.
+#[tokio::test(start_paused = true)]
+async fn series_backfill_heal_promotes_the_series_lru() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenOk, 1);
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with(cfg, samples, series.clone(), metadata);
+
+    let wait = writer
+        .admit_flush(batch_for("http_requests_total", 52, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned series generation resolves Err");
+
+    wait_until(
+        "the backfill re-insert heals the series registration",
+        || writer.metrics().series_backfill.healed_total == 1,
+    )
+    .await;
+    assert_eq!(writer.metrics().series_registrations_total, 1);
+
+    // Re-admit the identical `(name, fp, bucket, value_type)`: promoted
+    // by the confirmed heal, it must hit the LRU — no new series row.
+    writer
+        .admit(batch_for("http_requests_total", 52, 0, true))
+        .expect("queue has room");
+
+    let metrics = writer.metrics();
+    assert_eq!(
+        metrics.series_lru_hits_total, 1,
+        "the healed key must be a confirmed-flush LRU hit"
+    );
+    assert_eq!(
+        metrics.series_registrations_total, 1,
+        "no re-emitted series row after the heal"
+    );
+    assert_eq!(series.call_count(), 2, "generation + heal, nothing more");
+}
+
+/// Issue #139 M3 (#9 pin, generation path): an Uncertain `metric_series`
+/// generation failure is NEVER enqueued or replayed — the hook exists
+/// only in the Poisoned arm, so the backfill task has nothing to do.
+#[tokio::test(start_paused = true)]
+async fn series_uncertain_generation_failure_is_never_enqueued_or_replayed() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Uncertain);
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with(cfg, samples, series.clone(), metadata);
+
+    let wait = writer
+        .admit_flush(batch_for("http_requests_total", 53, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("an insert-uncertain series flush resolves Err");
+
+    // Advance well past three backfill tick intervals (5s each).
+    tokio::time::sleep(Duration::from_secs(16)).await;
+
+    let metrics = writer.metrics();
+    assert_eq!(
+        series.call_count(),
+        1,
+        "an uncertain generation failure must never be re-inserted (#9)"
+    );
+    assert_eq!(metrics.series_backfill.enqueued_total, 0);
+    assert_eq!(
+        metrics.series_backfill.pending, 0,
+        "the backlog stays empty"
+    );
+}
+
+/// Issue #139 M4 (#9 pin, tick path): a series backfill re-insert whose
+/// OWN outcome is `InsertUncertain` is terminal — abandoned, never
+/// retried. Spool counters are unchanged across the abandonment.
+#[tokio::test(start_paused = true)]
+async fn series_uncertain_backfill_outcome_is_terminally_abandoned_never_retried() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenUncertain, 1);
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with(cfg, samples, series.clone(), metadata);
+
+    let wait = writer
+        .admit_flush(batch_for("http_requests_total", 54, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned series generation resolves Err");
+
+    let before = writer.metrics();
+    assert_eq!(before.spool_poison_total, 1);
+    assert_eq!(before.spool_uncertain_total, 0);
+
+    wait_until("the uncertain re-insert outcome is abandoned", || {
+        writer.metrics().series_backfill.abandoned_total == 1
+    })
+    .await;
+    assert_eq!(writer.metrics().series_backfill.pending, 0);
+    assert_eq!(series.call_count(), 2);
+
+    // Further paused-time advance: no retry of the uncertain outcome.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let metrics = writer.metrics();
+    assert_eq!(
+        series.call_count(),
+        2,
+        "an uncertain backfill outcome must never be retried (#9)"
+    );
+    assert_eq!(metrics.series_backfill.abandoned_total, 1);
+    assert_eq!(
+        metrics.spool_poison_total, 1,
+        "spool counters unchanged across the abandonment"
+    );
+    assert_eq!(metrics.spool_uncertain_total, 0);
+}
+
+/// Issue #139 M5 (no poison spin): a deterministic series backfill
+/// re-insert failure abandons the pending batch — the tick never spins
+/// on a poisoned backlog, and never double-spools.
+#[tokio::test(start_paused = true)]
+async fn series_deterministic_backfill_failure_abandons_without_spinning() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Poison);
+    let metadata = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with(cfg, samples, series.clone(), metadata);
+
+    let wait = writer
+        .admit_flush(batch_for("http_requests_total", 55, 0, true))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned series generation resolves Err");
+
+    wait_until("the deterministic re-insert failure is abandoned", || {
+        writer.metrics().series_backfill.abandoned_total == 1
+    })
+    .await;
+    assert_eq!(writer.metrics().series_backfill.pending, 0);
+
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let metrics = writer.metrics();
+    assert_eq!(
+        series.call_count(),
+        2,
+        "one generation insert plus exactly one abandoned re-insert — no spin"
+    );
+    assert_eq!(metrics.series_backfill.abandoned_total, 1);
+    assert_eq!(
+        metrics.spool_poison_total, 1,
+        "the backfill abandonment never double-spools"
+    );
+    assert_eq!(metrics.spool_uncertain_total, 0);
+}
+
+/// Issue #139 M6 (REWRITTEN, plan v3 delta 1 — the v1 heal-promotes-cache
+/// assertion is retired as contradicting invalidate-on-heal): a Poisoned
+/// `metric_metadata` flush heals on the backfill tick (row durability:
+/// the second insert carries exactly the failed row), and post-heal the
+/// cache holds NO entry for the name — so a subsequent admission of the
+/// SAME descriptor RE-EMITS one redundant row (the safe direction,
+/// collapsed by `ReplacingMergeTree(updated_ns)`).
+#[tokio::test(start_paused = true)]
+async fn metadata_heal_invalidates_the_cache_so_an_identical_readmission_reemits() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Ok);
+    let metadata = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenOk, 1);
+    let writer = writer_with(cfg, samples, series, metadata.clone());
+
+    let wait = writer
+        .admit_flush(metadata_batch("up", "gauge", "help", 1))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned metadata generation resolves Err");
+    assert_eq!(metadata.call_count(), 1);
+    assert_eq!(writer.metrics().metadata_backfill.enqueued_total, 1);
+
+    wait_until("the backfill re-insert heals the metadata row", || {
+        writer.metrics().metadata_backfill.healed_total == 1
+    })
+    .await;
+    assert_eq!(metadata.call_count(), 2, "exactly one re-insert");
+    assert_eq!(
+        metadata.last_row_count(),
+        1,
+        "the re-insert carries exactly the failed row"
+    );
+    assert_eq!(writer.metrics().metadata_backfill.pending, 0);
+
+    // Post-heal the cache asserts NOTHING for the name (invalidated, not
+    // promoted): admitting the IDENTICAL descriptor must RE-EMIT a
+    // redundant, RMT-collapsed row — never be suppressed.
+    let wait = writer
+        .admit_flush(metadata_batch("up", "gauge", "help", 2))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect("the re-emitted row flushes Ok");
+
+    assert_eq!(
+        writer.metrics().metadata_upserts_total,
+        2,
+        "the identical descriptor re-emits after the heal (cache was invalidated)"
+    );
+    assert_eq!(
+        metadata.call_count(),
+        3,
+        "generation + heal + the re-emitted row's flush"
+    );
+}
+
+/// Issue #139 M7b (plan v3 delta 2 — the resident interleaving, full
+/// production pipeline): stale A@1 metadata generation Poisoned (real
+/// `on_flush_poisoned` → backlog) → newer B@2 confirmed (cache holds B)
+/// → the backfill tick heals stale A through the writer-installed hook →
+/// a subsequent admission of descriptor A must EMIT a metadata row (the
+/// cache was invalidated, not repopulated with A).
+///
+/// Fails under a reverted upsert-like hook: the heal would install A →
+/// the subsequent A admission is suppressed as an equal descriptor → the
+/// awaited re-emit insert (4th mock call) never arrives. (The
+/// evicted-interleaving counterpart — which also kills v1's version-gated
+/// upsert — is M7a, a unit test against the real hook body in
+/// `writer::metric`.)
+#[tokio::test(start_paused = true)]
+async fn m7b_stale_metadata_heal_never_installs_over_a_resident_newer_descriptor() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let series = MockInserter::new(MockBehavior::Ok);
+    let metadata = MockInserter::new_with_fail_budget(MockBehavior::PoisonThenOk, 1);
+    let writer = writer_with(cfg, samples, series, metadata.clone());
+
+    // A@1 poisons: the stale row enters the backlog through the real
+    // production hook.
+    let wait = writer
+        .admit_flush(metadata_batch("up", "counter", "A", 1))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned A@1 metadata generation resolves Err");
+    assert_eq!(writer.metrics().metadata_backfill.enqueued_total, 1);
+
+    // B@2 confirms while stale A is still pending: the cache now holds B
+    // (flush-success upsert).
+    let wait = writer
+        .admit_flush(metadata_batch("up", "gauge", "B", 2))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect("B@2 flushes Ok");
+    assert_eq!(metadata.call_count(), 2);
+    assert_eq!(writer.metrics().metadata_upserts_total, 2);
+
+    // The backfill tick heals stale A@1 through the writer-installed
+    // hook — which must ONLY invalidate, never install A.
+    wait_until("the stale A@1 re-insert heals", || {
+        writer.metrics().metadata_backfill.healed_total == 1
+    })
+    .await;
+    assert_eq!(metadata.call_count(), 3);
+
+    // Admit descriptor A again (A@3): with the cache invalidated it MUST
+    // emit — under an upsert-like hook A would be resident and the
+    // admission suppressed, so this 4th insert would never arrive.
+    let wait = writer
+        .admit_flush(metadata_batch("up", "counter", "A", 3))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect("the A@3 re-emit flushes Ok");
+    wait_until("the A@3 re-emit insert arrives", || {
+        metadata.call_count() == 4
+    })
+    .await;
+
+    assert_eq!(
+        writer.metrics().metadata_upserts_total,
+        3,
+        "the post-heal A admission re-emits (cache asserted nothing for the name)"
+    );
+    let json = metadata.last_rows_json();
+    assert!(
+        json.contains("\"metric_type\":\"counter\"") && json.contains("\"help\":\"A\""),
+        "the re-emitted row is descriptor A, got {json}"
+    );
+}
+
+/// Issue #139 M8 (structural append-only exclusion, #9 in full):
+/// Poisoned `metric_samples` AND `metric_hist_samples` flushes leave BOTH
+/// backfill counter sets at zero — the sample tables have no
+/// `on_flush_poisoned` hook at all.
+#[tokio::test(start_paused = true)]
+async fn poisoned_sample_and_hist_flushes_never_touch_any_backfill_backlog() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Poison);
+    let series = MockInserter::new(MockBehavior::Ok);
+    let hist = MockInserter::new(MockBehavior::Poison);
+    let writer = hist_writer_with(cfg, samples.clone(), series, hist.clone());
+
+    // One float sample + one histogram sample (both tables poison).
+    let mut batch = batch_for("http_request_duration_seconds", 58, 0, true);
+    batch.hist_samples = hist_batch_for("http_request_duration_seconds", 58, 0, false).hist_samples;
+
+    let wait = writer.admit_flush(batch).expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(60), wait)
+        .await
+        .expect("flush settles within the test timeout")
+        .expect_err("the poisoned sample generations resolve Err");
+
+    // Advance well past three backfill tick intervals.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+
+    let metrics = writer.metrics();
+    let zero = pulsus_write::writer::BackfillMetricsSnapshot::default();
+    assert_eq!(
+        metrics.series_backfill, zero,
+        "a poisoned metric_samples/metric_hist_samples flush must never touch the \
+         series backlog (structural #9 exclusion)"
+    );
+    assert_eq!(metrics.metadata_backfill, zero, "…nor the metadata backlog");
+    assert_eq!(samples.call_count(), 1, "no sample re-insert, ever");
+    assert_eq!(hist.call_count(), 1, "no hist-sample re-insert, ever");
+    assert_eq!(
+        metrics.spool_poison_total, 2,
+        "both generations spooled once"
+    );
 }
 
 // -- native histogram write path (M7-A4, issue #120) -----------------

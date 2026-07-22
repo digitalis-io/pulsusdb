@@ -1,48 +1,92 @@
-//! `log_streams` registration backfill (issue #134): heals ONLY
-//! definitely-failed (`FlushOutcome::Poisoned`) registration flushes. A
-//! Poisoned outcome is provably not-committed (see
-//! `writer::table::FlushPoisonedHook`'s doc comment), so re-inserting the
-//! rows replays nothing that could have committed — the issue-#9
-//! "`InsertUncertain` is never replayed" invariant is not engaged:
-//! uncertain-fate generation failures never enter this backlog (the hook
-//! exists only in the Poisoned arm), and this task's own `InsertUncertain`
-//! outcome is terminal-abandon, never retried.
+//! Registration backfill (issues #134/#139): heals ONLY definitely-failed
+//! (`FlushOutcome::Poisoned`) registration flushes. A Poisoned outcome is
+//! provably not-committed (see `writer::table::FlushPoisonedHook`'s doc
+//! comment), so re-inserting the rows replays nothing that could have
+//! committed — the issue-#9 "`InsertUncertain` is never replayed"
+//! invariant is not engaged: uncertain-fate generation failures never
+//! enter this backlog (the hook exists only in the Poisoned arm), and
+//! this task's own `InsertUncertain` outcome is terminal-abandon, never
+//! retried.
 //!
-//! The backlog is bounded (keyed dedup on `(fingerprint, month)` plus a
-//! byte cap) and memory-only: no spool reads or writes happen here, ever
-//! — `uncertain/` stays audit-only per #9, and the poison-spool file (when
-//! its write succeeded; `spool_write_failures_total` otherwise) remains
-//! the manual-repair record. `StreamLru` promotion happens only on a
-//! confirmed re-insert (`Ok`), preserving the success-only-promotion
-//! invariant.
+//! Generic over [`BackfillRow`] (issue #139): one mechanism serves all
+//! four registration tables —
+//! - `log_streams` (`LogStreamRow`): keyed `(fingerprint, month)`,
+//!   versioned on `updated_ns` (`ReplacingMergeTree(updated_ns)`);
+//! - `metric_series` (`MetricSeriesRow`): keyed `(metric_name,
+//!   fingerprint, bucket, value_type)`, versionless — duplicate-tolerant
+//!   by design (read-side `LIMIT 1 BY` collapse);
+//! - `metric_metadata` (`MetricMetadataRow`): keyed `metric_name`,
+//!   versioned on `updated_ns` (`ReplacingMergeTree(updated_ns)`);
+//! - `trace_attrs_idx` (`TraceAttrRow`): keyed on the full RMT ORDER BY
+//!   tuple, versionless — the key determines the whole logical row.
+//!
+//! The append-only tables (`log_samples`, `metric_samples`,
+//! `metric_hist_samples`, `trace_spans`) are structurally excluded: their
+//! `TableContext`s pass `on_flush_poisoned: None`, and each backlog is
+//! typed to exactly one registration row shape bound to one table name —
+//! cross-table replay is unrepresentable (#9 applies in full to every
+//! sample/span/rollup target).
+//!
+//! Each backlog is bounded (keyed dedup plus a byte cap) and memory-only:
+//! no spool reads or writes happen here, ever — `uncertain/` stays
+//! audit-only per #9, and the poison-spool file (when its write
+//! succeeded; `spool_write_failures_total` otherwise) remains the manual
+//! repair record. Cache promotion on heal is family-specific via the
+//! `on_healed` hook: `StreamLru`/`SeriesLru` membership promotion is safe
+//! (pure membership over the full logical identity); the metadata hook
+//! only ever *invalidates* its value cache (issue #139: a heal must never
+//! install a descriptor — see `writer::metric::metadata_healed_hook`);
+//! traces have no cache (`on_healed: None`).
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use pulsus_clickhouse::ChError;
+use pulsus_clickhouse::{ChError, ChRow};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tracing::warn;
 
 use crate::writer::config::WriterRuntime;
-use crate::writer::metrics::WriterMetrics;
-use crate::writer::registration::{StreamKey, StreamLru};
-use crate::writer::rows::LogStreamRow;
+use crate::writer::metrics::BackfillMetrics;
 use crate::writer::table::{BlockInserter, bound_by_deadline};
 
-/// Bounded, keyed backlog of Poisoned-flush `log_streams` rows awaiting
-/// re-insert. Keyed dedup on `(fingerprint, month)`: an existing key is
-/// replaced iff the incoming `updated_ns` is larger; a new key that would
-/// exceed `max_bytes` is rejected and counted dropped.
-pub(crate) struct RegistrationBacklog {
-    entries: HashMap<StreamKey, LogStreamRow>,
-    /// Sum of `est_bytes` over `entries`.
+/// A registration row a [`RegistrationBacklog`] can hold: a logical key,
+/// a monotone-per-key version, and a byte estimate (delegating to the
+/// row's `est_bytes`).
+pub(crate) trait BackfillRow: Clone + Send + Sync + 'static {
+    type Key: Eq + std::hash::Hash + Clone + Send;
+
+    fn backfill_key(&self) -> Self::Key;
+
+    /// Monotone-per-key version driving larger-wins replacement
+    /// ([`RegistrationBacklog::enqueue`]) and version-checked removal
+    /// ([`RegistrationBacklog::remove_if_version`]). Versionless families
+    /// (`metric_series`, `trace_attrs_idx`) return a constant `0`:
+    /// equality always holds, which is correct because their key
+    /// determines the full logical row — a "newer" enqueue mid-attempt
+    /// carries byte-identical content, so #134's in-flight-race fix
+    /// degenerates safely to always-remove (see each impl's doc comment
+    /// in `writer::rows`).
+    fn backfill_version(&self) -> i64;
+
+    /// Byte estimate for the backlog cap — delegates to the row's
+    /// `est_bytes()`.
+    fn backfill_bytes(&self) -> u64;
+}
+
+/// Bounded, keyed backlog of Poisoned-flush registration rows awaiting
+/// re-insert. Keyed dedup on [`BackfillRow::backfill_key`]: an existing
+/// key is replaced iff the incoming version is larger; a new key that
+/// would exceed `max_bytes` is rejected and counted dropped.
+pub(crate) struct RegistrationBacklog<R: BackfillRow> {
+    entries: HashMap<R::Key, R>,
+    /// Sum of `backfill_bytes` over `entries`.
     bytes: u64,
     max_bytes: u64,
 }
 
-impl RegistrationBacklog {
+impl<R: BackfillRow> RegistrationBacklog<R> {
     pub(crate) fn new(max_bytes: u64) -> Self {
         RegistrationBacklog {
             entries: HashMap::new(),
@@ -52,27 +96,27 @@ impl RegistrationBacklog {
     }
 
     /// Enqueues `rows`, returning `(accepted, dropped)` row counts.
-    /// Keyed dedup on `(fingerprint, month)`: an existing key is replaced
-    /// iff the incoming `updated_ns` is larger (byte accounting adjusted;
-    /// replacement — and a stale duplicate left in place — counts as
-    /// accepted, never dropped). A new key whose bytes would exceed
-    /// `max_bytes` is rejected and counted dropped.
-    pub(crate) fn enqueue(&mut self, rows: &[LogStreamRow]) -> (u64, u64) {
+    /// Keyed dedup: an existing key is replaced iff the incoming version
+    /// is larger (byte accounting adjusted; replacement — and a stale
+    /// duplicate left in place — counts as accepted, never dropped). A
+    /// new key whose bytes would exceed `max_bytes` is rejected and
+    /// counted dropped.
+    pub(crate) fn enqueue(&mut self, rows: &[R]) -> (u64, u64) {
         let mut accepted = 0u64;
         let mut dropped = 0u64;
         for row in rows {
-            let key: StreamKey = (row.fingerprint, row.month);
+            let key = row.backfill_key();
             match self.entries.get(&key) {
                 Some(existing) => {
-                    if row.updated_ns > existing.updated_ns {
-                        let old_bytes = existing.est_bytes();
-                        self.bytes = self.bytes - old_bytes + row.est_bytes();
+                    if row.backfill_version() > existing.backfill_version() {
+                        let old_bytes = existing.backfill_bytes();
+                        self.bytes = self.bytes - old_bytes + row.backfill_bytes();
                         self.entries.insert(key, row.clone());
                     }
                     accepted += 1;
                 }
                 None => {
-                    let row_bytes = row.est_bytes();
+                    let row_bytes = row.backfill_bytes();
                     if self.bytes + row_bytes > self.max_bytes {
                         dropped += 1;
                     } else {
@@ -88,35 +132,38 @@ impl RegistrationBacklog {
 
     /// A snapshot of every pending row — cloned out so the caller never
     /// holds the backlog lock across the re-insert `.await`. The rows'
-    /// `updated_ns` doubles as the attempt's version for
+    /// versions double as the attempt's versions for
     /// [`Self::remove_if_version`]'s compare-and-remove.
-    pub(crate) fn pending_rows(&self) -> Vec<LogStreamRow> {
+    pub(crate) fn pending_rows(&self) -> Vec<R> {
         self.entries.values().cloned().collect()
     }
 
     /// Version-checked removal (compare-and-remove), the symmetric
-    /// counterpart of [`Self::enqueue`]'s larger-`updated_ns`-wins
+    /// counterpart of [`Self::enqueue`]'s larger-version-wins
     /// replacement: for each attempted row, the entry is removed (byte
-    /// accounting restored) only if the backlog's CURRENT `updated_ns`
-    /// for that key equals the attempted row's — i.e. the entry the
-    /// attempt actually carried. A NEWER entry enqueued by a concurrent
-    /// Poisoned flush while the attempt was in flight is left in place
-    /// (that newer row was never inserted; the next tick retries it).
-    /// Returns the keys actually removed — the only ones a caller may
-    /// count healed/abandoned or promote into the LRU.
-    pub(crate) fn remove_if_version(&mut self, attempted: &[LogStreamRow]) -> Vec<StreamKey> {
+    /// accounting restored) only if the backlog's CURRENT version for
+    /// that key equals the attempted row's — i.e. the entry the attempt
+    /// actually carried. A NEWER entry enqueued by a concurrent Poisoned
+    /// flush while the attempt was in flight is left in place (that newer
+    /// row was never inserted; the next tick retries it). For versionless
+    /// families the compare is always-equal — safe because the key
+    /// determines the full logical row. Returns the entries actually
+    /// removed — the only ones a caller may count healed/abandoned or
+    /// pass to an `on_healed` hook (issue #139: the metadata hook needs
+    /// row values, not just keys).
+    pub(crate) fn remove_if_version(&mut self, attempted: &[R]) -> Vec<R> {
         let mut removed = Vec::new();
         for row in attempted {
-            let key: StreamKey = (row.fingerprint, row.month);
+            let key = row.backfill_key();
             if let Some(current) = self.entries.get(&key)
-                && current.updated_ns == row.updated_ns
+                && current.backfill_version() == row.backfill_version()
             {
                 let entry = self
                     .entries
                     .remove(&key)
                     .expect("entry present under the same lock");
-                self.bytes -= entry.est_bytes();
-                removed.push(key);
+                self.bytes -= entry.backfill_bytes();
+                removed.push(entry);
             }
         }
         removed
@@ -127,47 +174,50 @@ impl RegistrationBacklog {
     }
 }
 
-/// The `on_flush_poisoned` hook body for `log_streams`
-/// (`writer::mod`'s closure delegates here verbatim): enqueues `rows`
+/// A confirmed-heal callback, invoked with exactly the entries a
+/// successful re-insert attempt removed from the backlog (issue #139):
+/// `log_streams` promotes `StreamLru`, `metric_series` promotes
+/// `SeriesLru` (both pure membership sets — safe), `metric_metadata`
+/// ONLY invalidates its value cache (never installs — see
+/// `writer::metric::metadata_healed_hook`), `trace_attrs_idx` has none.
+pub(crate) type BackfillHealedHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
+
+/// The `on_flush_poisoned` hook body shared by every registration table
+/// (the per-writer closures delegate here verbatim): enqueues `rows`
 /// into the backlog and bumps the enqueued/dropped totals plus the
 /// pending gauge.
-pub(crate) fn enqueue_failed(
-    backlog: &Mutex<RegistrationBacklog>,
-    metrics: &WriterMetrics,
-    rows: &[LogStreamRow],
+pub(crate) fn enqueue_failed<R: BackfillRow>(
+    backlog: &Mutex<RegistrationBacklog<R>>,
+    metrics: &BackfillMetrics,
+    rows: &[R],
 ) {
     let mut guard = backlog.lock().expect("registration backlog mutex poisoned");
     let (accepted, dropped) = guard.enqueue(rows);
     metrics
-        .backfill_enqueued_total
+        .enqueued_total
         .fetch_add(accepted, Ordering::Relaxed);
-    metrics
-        .backfill_dropped_total
-        .fetch_add(dropped, Ordering::Relaxed);
-    metrics
-        .backfill_pending
-        .store(guard.len() as u64, Ordering::Relaxed);
+    metrics.dropped_total.fetch_add(dropped, Ordering::Relaxed);
+    metrics.pending.store(guard.len() as u64, Ordering::Relaxed);
 }
 
-/// Spawns the registration-backfill task: every
+/// Spawns a registration-backfill task: every
 /// `runtime.backfill_retry_interval` (no immediate first tick —
 /// `interval_at` starts one interval out), a non-empty backlog is
-/// re-inserted through `inserter` (the same `WriterTables.streams` name
-/// the flush path uses — the `_dist` wrapper in cluster mode) and the
+/// re-inserted through `inserter` (the same table name the flush path
+/// uses — the `_dist` wrapper in cluster mode where one exists) and the
 /// outcome classified:
 ///
-/// - `Ok` → version-checked remove, promote each removed key into the
-///   success-only `StreamLru` (a confirmed flush),
-///   `backfill_healed_total += removed`;
-/// - pre-send retryable error → keep all entries,
-///   `backfill_retries_total += 1` (retried next tick);
+/// - `Ok` → version-checked remove, invoke `on_healed` with exactly the
+///   removed entries (a confirmed flush), `healed_total += removed`;
+/// - pre-send retryable error → keep all entries, `retries_total += 1`
+///   (retried next tick);
 /// - `InsertUncertain` → **terminal**: version-checked remove,
-///   `backfill_abandoned_total += removed`, warn-log — commit fate
-///   unknown, never retried (#9 discipline);
+///   `abandoned_total += removed`, warn-log — commit fate unknown, never
+///   retried (#9 discipline);
 /// - any other (deterministic) error → version-checked remove,
-///   `backfill_abandoned_total += removed` (no poison spin; a
-///   poison-spool record of the abandoned rows exists iff the
-///   generation's spool write succeeded — residual R5 otherwise).
+///   `abandoned_total += removed` (no poison spin; a poison-spool record
+///   of the abandoned rows exists iff the generation's spool write
+///   succeeded — residual R5 otherwise).
 ///
 /// "Version-checked remove" ([`RegistrationBacklog::remove_if_version`]):
 /// an entry replaced by a NEWER Poisoned flush while the attempt was in
@@ -181,15 +231,18 @@ pub(crate) fn enqueue_failed(
 /// [`bound_by_deadline`] and dropped on elapse (safe: a backfill insert
 /// holds no waiters and no byte reservation), then the task exits with
 /// the backlog untouched — no final drain.
-pub(crate) fn spawn_backfill(
-    backlog: Arc<Mutex<RegistrationBacklog>>,
-    inserter: Arc<dyn BlockInserter<LogStreamRow>>,
+pub(crate) fn spawn_backfill<R>(
+    backlog: Arc<Mutex<RegistrationBacklog<R>>>,
+    inserter: Arc<dyn BlockInserter<R>>,
     table: Arc<str>,
-    lru: Arc<Mutex<StreamLru>>,
-    metrics: Arc<WriterMetrics>,
+    on_healed: Option<BackfillHealedHook<R>>,
+    metrics: Arc<BackfillMetrics>,
     runtime: Arc<WriterRuntime>,
     mut shutdown_rx: watch::Receiver<Option<Instant>>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<()>
+where
+    R: BackfillRow + ChRow,
+{
     tokio::spawn(async move {
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + runtime.backfill_retry_interval,
@@ -253,7 +306,14 @@ pub(crate) fn spawn_backfill(
                 // and exit, backlog untouched — the process is exiting.
                 Err(_elapsed) => return,
                 Ok(result) => {
-                    classify_attempt(&backlog, &lru, &metrics, &table, &pending, result);
+                    classify_attempt(
+                        &backlog,
+                        on_healed.as_ref(),
+                        &metrics,
+                        &table,
+                        &pending,
+                        result,
+                    );
                 }
             }
 
@@ -267,7 +327,7 @@ pub(crate) fn spawn_backfill(
     })
 }
 
-/// Applies one re-insert attempt's outcome to the backlog/LRU/counters —
+/// Applies one re-insert attempt's outcome to the backlog/hook/counters —
 /// see [`spawn_backfill`]'s doc comment for the classification contract.
 ///
 /// Every terminal branch removes via the version-checked
@@ -275,35 +335,35 @@ pub(crate) fn spawn_backfill(
 /// fix): the `attempted` snapshot was taken BEFORE the `.await`, so a
 /// NEWER Poisoned flush for the same key may have replaced the entry
 /// while the attempt was in flight — that newer row was never inserted
-/// and must survive for the next tick, never falsely healed/LRU-promoted
+/// and must survive for the next tick, never falsely healed/promoted
 /// (success arm) or silently abandoned (failure arms). Heal/abandon
-/// counting and LRU promotion apply only to the keys actually removed.
-fn classify_attempt(
-    backlog: &Mutex<RegistrationBacklog>,
-    lru: &Mutex<StreamLru>,
-    metrics: &WriterMetrics,
+/// counting and the `on_healed` invocation apply only to the entries
+/// actually removed.
+fn classify_attempt<R: BackfillRow>(
+    backlog: &Mutex<RegistrationBacklog<R>>,
+    on_healed: Option<&BackfillHealedHook<R>>,
+    metrics: &BackfillMetrics,
     table: &str,
-    attempted: &[LogStreamRow],
+    attempted: &[R],
     result: Result<(), ChError>,
 ) {
     match result {
         Ok(()) => {
             let removed = remove_matching_and_update_gauge(backlog, metrics, attempted);
+            if let Some(hook) = on_healed
+                && !removed.is_empty()
             {
-                let mut guard = lru.lock().expect("stream lru mutex poisoned");
-                for key in &removed {
-                    guard.insert(*key);
-                }
+                hook(&removed);
             }
             metrics
-                .backfill_healed_total
+                .healed_total
                 .fetch_add(removed.len() as u64, Ordering::Relaxed);
         }
         Err(ChError::InsertUncertain(msg)) => {
             // Terminal: commit fate unknown; not retried (#9 discipline).
             let removed = remove_matching_and_update_gauge(backlog, metrics, attempted);
             metrics
-                .backfill_abandoned_total
+                .abandoned_total
                 .fetch_add(removed.len() as u64, Ordering::Relaxed);
             warn!(
                 table = %table,
@@ -317,9 +377,7 @@ fn classify_attempt(
             // Pre-send retryable (the only retryable class that can reach
             // this task — see `writer::table::attempt_insert_with_retry`'s
             // doc comment): keep every entry for the next tick.
-            metrics
-                .backfill_retries_total
-                .fetch_add(1, Ordering::Relaxed);
+            metrics.retries_total.fetch_add(1, Ordering::Relaxed);
             warn!(
                 table = %table,
                 rows = attempted.len(),
@@ -335,7 +393,7 @@ fn classify_attempt(
             // otherwise).
             let removed = remove_matching_and_update_gauge(backlog, metrics, attempted);
             metrics
-                .backfill_abandoned_total
+                .abandoned_total
                 .fetch_add(removed.len() as u64, Ordering::Relaxed);
             warn!(
                 table = %table,
@@ -348,23 +406,23 @@ fn classify_attempt(
 }
 
 /// Version-checked compare-and-remove under the backlog lock, keeping
-/// the pending gauge in sync. Returns the keys actually removed.
-fn remove_matching_and_update_gauge(
-    backlog: &Mutex<RegistrationBacklog>,
-    metrics: &WriterMetrics,
-    attempted: &[LogStreamRow],
-) -> Vec<StreamKey> {
+/// the pending gauge in sync. Returns the entries actually removed.
+fn remove_matching_and_update_gauge<R: BackfillRow>(
+    backlog: &Mutex<RegistrationBacklog<R>>,
+    metrics: &BackfillMetrics,
+    attempted: &[R],
+) -> Vec<R> {
     let mut guard = backlog.lock().expect("registration backlog mutex poisoned");
     let removed = guard.remove_if_version(attempted);
-    metrics
-        .backfill_pending
-        .store(guard.len() as u64, Ordering::Relaxed);
+    metrics.pending.store(guard.len() as u64, Ordering::Relaxed);
     removed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::writer::registration::StreamKey;
+    use crate::writer::rows::{LogStreamRow, MetricSeriesRow};
 
     fn row(fingerprint: u64, month: u16, updated_ns: i64) -> LogStreamRow {
         LogStreamRow {
@@ -374,6 +432,10 @@ mod tests {
             labels: "{\"service_name\":\"svc\"}".to_string(),
             updated_ns,
         }
+    }
+
+    fn keys_of(rows: &[LogStreamRow]) -> Vec<StreamKey> {
+        rows.iter().map(|r| (r.fingerprint, r.month)).collect()
     }
 
     #[test]
@@ -429,7 +491,10 @@ mod tests {
         // Full: a second key is rejected.
         assert_eq!(backlog.enqueue(&[row(2, 10, 100)]), (0, 1));
 
-        assert_eq!(backlog.remove_if_version(&[row(1, 10, 100)]), vec![(1, 10)]);
+        assert_eq!(
+            keys_of(&backlog.remove_if_version(&[row(1, 10, 100)])),
+            vec![(1, 10)]
+        );
         assert_eq!(backlog.len(), 0);
         // Bytes restored: the previously rejected key now fits.
         assert_eq!(backlog.enqueue(&[row(2, 10, 100)]), (1, 0));
@@ -451,15 +516,15 @@ mod tests {
         // in flight.
         assert_eq!(backlog.enqueue(&[row(1, 10, 200)]), (1, 0));
 
-        assert_eq!(
-            backlog.remove_if_version(&attempted),
-            Vec::<StreamKey>::new()
-        );
+        assert!(backlog.remove_if_version(&attempted).is_empty());
         assert_eq!(backlog.len(), 1, "the newer entry must survive");
         assert_eq!(backlog.pending_rows()[0].updated_ns, 200);
 
         // The newer version's own attempt removes it.
-        assert_eq!(backlog.remove_if_version(&[row(1, 10, 200)]), vec![(1, 10)]);
+        assert_eq!(
+            keys_of(&backlog.remove_if_version(&[row(1, 10, 200)])),
+            vec![(1, 10)]
+        );
         assert_eq!(backlog.len(), 0);
     }
 
@@ -467,11 +532,20 @@ mod tests {
     fn remove_if_version_of_an_absent_key_is_a_no_op() {
         let mut backlog = RegistrationBacklog::new(u64::MAX);
         backlog.enqueue(&[row(1, 10, 100)]);
-        assert_eq!(
-            backlog.remove_if_version(&[row(9, 9, 100)]),
-            Vec::<StreamKey>::new()
-        );
+        assert!(backlog.remove_if_version(&[row(9, 9, 100)]).is_empty());
         assert_eq!(backlog.len(), 1);
+    }
+
+    #[test]
+    fn remove_if_version_returns_the_removed_entries_values() {
+        // Issue #139: callers (the metadata heal hook) need the removed
+        // ROW VALUES, not just keys.
+        let mut backlog = RegistrationBacklog::new(u64::MAX);
+        backlog.enqueue(&[row(1, 10, 100)]);
+        let removed = backlog.remove_if_version(&[row(1, 10, 100)]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].service, "svc");
+        assert_eq!(removed[0].updated_ns, 100);
     }
 
     #[test]
@@ -490,12 +564,53 @@ mod tests {
     fn enqueue_failed_bumps_totals_and_the_pending_gauge() {
         let one_row_bytes = row(1, 10, 100).est_bytes();
         let backlog = Mutex::new(RegistrationBacklog::new(one_row_bytes));
-        let metrics = WriterMetrics::default();
+        let metrics = BackfillMetrics::default();
 
         enqueue_failed(&backlog, &metrics, &[row(1, 10, 100), row(2, 10, 100)]);
 
-        assert_eq!(metrics.backfill_enqueued_total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.backfill_dropped_total.load(Ordering::Relaxed), 1);
-        assert_eq!(metrics.backfill_pending.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.enqueued_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.dropped_total.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.pending.load(Ordering::Relaxed), 1);
+    }
+
+    fn series_row(metric_name: &str, fingerprint: u64, bucket: i64) -> MetricSeriesRow {
+        MetricSeriesRow {
+            metric_name: metric_name.to_string(),
+            fingerprint,
+            unix_milli: bucket,
+            labels: "{\"job\":\"checkout\"}".to_string(),
+            value_type: 0,
+        }
+    }
+
+    /// Issue #139 edge case 2: a versionless family's (constant-0) version
+    /// makes the mid-attempt compare always-equal — the entry IS removed,
+    /// which is safe because the key determines the full logical row (a
+    /// "newer" enqueue carried byte-identical content).
+    #[test]
+    fn versionless_family_removal_degenerates_to_always_remove() {
+        let mut backlog = RegistrationBacklog::new(u64::MAX);
+        let attempted = vec![series_row("up", 1, 0)];
+        backlog.enqueue(&attempted);
+        // A re-enqueue mid-attempt for the same key is byte-identical
+        // content ("accepted" but nothing to replace: version 0 == 0).
+        assert_eq!(backlog.enqueue(&[series_row("up", 1, 0)]), (1, 0));
+        assert_eq!(backlog.len(), 1);
+
+        let removed = backlog.remove_if_version(&attempted);
+        assert_eq!(removed.len(), 1, "the equal-version entry is removed");
+        assert_eq!(backlog.len(), 0);
+    }
+
+    /// The versionless series key is the FULL logical identity: same
+    /// `(name, fingerprint)` at a different bucket or `value_type` is a
+    /// distinct entry, never a replacement.
+    #[test]
+    fn versionless_series_keys_distinguish_bucket_and_value_type() {
+        let mut backlog = RegistrationBacklog::new(u64::MAX);
+        let mut hist = series_row("up", 1, 0);
+        hist.value_type = 1;
+        backlog.enqueue(&[series_row("up", 1, 0), series_row("up", 1, 3_600_000), hist]);
+        assert_eq!(backlog.len(), 3);
     }
 }

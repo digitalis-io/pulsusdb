@@ -34,6 +34,7 @@ use tracing::warn;
 use crate::error::LogsIngestError;
 use crate::ingest::traces::{ParsedTraces, TraceSink};
 use crate::ingest::{Backpressure, FlushWait};
+use crate::writer::backfill::{self, RegistrationBacklog};
 use crate::writer::buffer;
 use crate::writer::config::WriterRuntime;
 use crate::writer::error::WriteError;
@@ -84,6 +85,7 @@ struct Shared {
     shutting_down: AtomicBool,
     spans_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     attrs_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    attrs_backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Implements issue #54's `TraceSink` over the generic per-table columnar
@@ -133,9 +135,30 @@ impl TraceWriter {
         let spans_notify = Arc::new(Notify::new());
         let attrs_notify = Arc::new(Notify::new());
 
+        // `trace_attrs_idx`'s Poisoned-only registration backfill (issue
+        // #139): a definitely-failed attr-index flush enqueues its rows
+        // for the 5s re-insert cadence — without it, a span whose attrs
+        // insert failed is fetchable by ID but invisible to
+        // attribute-scoped search forever (traces have no LRU, so no
+        // later re-registration exists). `trace_spans` keeps
+        // `on_flush_poisoned: None` — the structural append-only #9
+        // exclusion.
+        let attrs_backlog = Arc::new(Mutex::new(RegistrationBacklog::<TraceAttrRow>::new(
+            runtime.backfill_max_bytes,
+        )));
+        let attrs_backlog_for_hook = attrs_backlog.clone();
+        let attrs_backfill_metrics = metrics.attrs_backfill.clone();
+        let on_attrs_flush_poisoned: table::FlushPoisonedHook<TraceAttrRow> =
+            Arc::new(move |rows: &[TraceAttrRow]| {
+                backfill::enqueue_failed(&attrs_backlog_for_hook, &attrs_backfill_metrics, rows);
+            });
+        let attrs_inserter_for_backfill = attrs_inserter.clone();
+        let attrs_table_for_backfill = tables.attrs.clone();
+
         // No `on_flush_success` hook on either table: nothing to promote —
         // spans are never deduplicated and `trace_tag_catalog` is
-        // MV-populated (issue #53), so the writer holds no caches.
+        // MV-populated (issue #53), so the writer holds no caches (and
+        // the backfill's `on_healed` is likewise `None`).
         let spans_ctx = TableContext {
             table: tables.spans,
             buffer: spans.clone(),
@@ -158,11 +181,20 @@ impl TraceWriter {
             spool,
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
-            on_flush_poisoned: None,
+            on_flush_poisoned: Some(on_attrs_flush_poisoned),
         };
 
         let spans_task = table::spawn(spans_ctx, shutdown_rx.clone());
-        let attrs_task = table::spawn(attrs_ctx, shutdown_rx);
+        let attrs_task = table::spawn(attrs_ctx, shutdown_rx.clone());
+        let attrs_backfill_task = backfill::spawn_backfill(
+            attrs_backlog,
+            attrs_inserter_for_backfill,
+            attrs_table_for_backfill,
+            None, // traces have no cache — nothing to promote on heal
+            metrics.attrs_backfill.clone(),
+            runtime.clone(),
+            shutdown_rx,
+        );
 
         let shared = Arc::new(Shared {
             spans,
@@ -176,6 +208,7 @@ impl TraceWriter {
             shutting_down: AtomicBool::new(false),
             spans_task: Mutex::new(Some(spans_task)),
             attrs_task: Mutex::new(Some(attrs_task)),
+            attrs_backfill_task: Mutex::new(Some(attrs_backfill_task)),
         });
 
         TraceWriter { shared }
@@ -297,6 +330,12 @@ impl TraceWriter {
             .lock()
             .expect("task handle mutex poisoned")
             .take();
+        let attrs_backfill_task = self
+            .shared
+            .attrs_backfill_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
 
         if let Some(task) = spans_task
             && let Err(e) = task.await
@@ -307,6 +346,15 @@ impl TraceWriter {
             && let Err(e) = task.await
         {
             warn!(error = %e, table = ATTRS_TABLE, "flush task panicked during shutdown");
+        }
+        if let Some(task) = attrs_backfill_task
+            && let Err(e) = task.await
+        {
+            warn!(
+                error = %e,
+                table = ATTRS_TABLE,
+                "registration backfill task panicked during shutdown"
+            );
         }
     }
 }

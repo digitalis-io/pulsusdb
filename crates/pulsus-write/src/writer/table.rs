@@ -101,16 +101,19 @@ impl ShutdownSignal {
 /// Clippy's `type_complexity` lint.
 pub(crate) type FlushSuccessHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
-/// A definitely-failed-flush callback (issue #134): invoked ONLY from
-/// [`finish_generation`]'s `FlushOutcome::Poisoned` arm — a Poisoned
+/// A definitely-failed-flush callback (issues #134/#139): invoked ONLY
+/// from [`finish_generation`]'s `FlushOutcome::Poisoned` arm — a Poisoned
 /// outcome is provably not-committed (a non-retryable error surfaced
 /// unchanged by `insert_block`, or a pre-send retryable exhausted in the
 /// writer's retry loop; every post-send retryable is downgraded to
 /// `InsertUncertain` before it reaches this module), so re-inserting the
-/// rows replays nothing that could have committed. `log_streams`'s
-/// registration-backfill enqueue hooks in here; every other table passes
-/// `None` — an Uncertain generation failure structurally cannot reach
-/// this hook.
+/// rows replays nothing that could have committed. The registration
+/// tables' backfill enqueues hook in here (`log_streams`,
+/// `metric_series`, `metric_metadata`, `trace_attrs_idx`); every
+/// append-only table (`log_samples`, `metric_samples`,
+/// `metric_hist_samples`, `trace_spans`) passes `None` — the structural
+/// #9 exclusion — and an Uncertain generation failure structurally
+/// cannot reach this hook on any table.
 pub(crate) type FlushPoisonedHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
 /// Per-table wiring the flush task closes over.
@@ -135,8 +138,10 @@ pub(crate) struct TableContext<R> {
     /// Invoked with a Poisoned (definitely-not-committed) generation's
     /// rows after the spool attempt (regardless of the spool I/O result —
     /// the heal path must not depend on audit-file I/O) and before the
-    /// generation settles `Err`. `Some` ONLY for `log_streams` (issue
-    /// #134 registration backfill); `None` everywhere else.
+    /// generation settles `Err`. `Some` ONLY for the registration tables
+    /// (`log_streams`, `metric_series`, `metric_metadata`,
+    /// `trace_attrs_idx` — issues #134/#139); `None` on every append-only
+    /// table.
     pub on_flush_poisoned: Option<FlushPoisonedHook<R>>,
 }
 
@@ -604,9 +609,9 @@ mod tests {
         // Cap of 1 byte: any real row is a byte-cap drop.
         let backlog = Arc::new(Mutex::new(RegistrationBacklog::new(1)));
         let backlog_for_hook = backlog.clone();
-        let metrics_for_hook = metrics.clone();
+        let backfill_metrics_for_hook = metrics.backfill.clone();
         let hook: FlushPoisonedHook<LogStreamRow> = Arc::new(move |rows: &[LogStreamRow]| {
-            enqueue_failed(&backlog_for_hook, &metrics_for_hook, rows);
+            enqueue_failed(&backlog_for_hook, &backfill_metrics_for_hook, rows);
         });
         let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
 
@@ -629,8 +634,8 @@ mod tests {
                 .load(Ordering::SeqCst),
             1
         );
-        assert_eq!(metrics.backfill_dropped_total.load(Ordering::SeqCst), 1);
-        assert_eq!(metrics.backfill_enqueued_total.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.backfill.dropped_total.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.backfill.enqueued_total.load(Ordering::SeqCst), 0);
         assert_eq!(
             backlog
                 .lock()
@@ -639,8 +644,8 @@ mod tests {
             0,
             "the dropped row must not linger in the backlog"
         );
-        assert_eq!(metrics.backfill_pending.load(Ordering::SeqCst), 0);
-        assert_eq!(metrics.backfill_healed_total.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.backfill.pending.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.backfill.healed_total.load(Ordering::SeqCst), 0);
         assert!(
             matches!(
                 rx.await.expect("generation settled"),

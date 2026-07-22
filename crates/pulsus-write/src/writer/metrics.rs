@@ -77,6 +77,49 @@ impl TableMetrics {
     }
 }
 
+/// Per-backlog registration-backfill counters (issues #134/#139): rows
+/// entering the in-memory backlog after a Poisoned registration flush
+/// (`enqueued`), rows rejected by the backlog byte cap (`dropped`),
+/// re-insert attempts kept-for-retry on a pre-send retryable failure
+/// (`retries`), rows confirmed re-inserted (`healed`), rows terminally
+/// abandoned on a deterministic or uncertain re-insert outcome
+/// (`abandoned`), and the `pending` gauge (rows currently in the backlog,
+/// updated under the backlog lock). One instance per backlog:
+/// `log_streams`, `metric_series`, `metric_metadata`, `trace_attrs_idx`.
+#[derive(Debug, Default)]
+pub struct BackfillMetrics {
+    pub enqueued_total: AtomicU64,
+    pub dropped_total: AtomicU64,
+    pub retries_total: AtomicU64,
+    pub healed_total: AtomicU64,
+    pub abandoned_total: AtomicU64,
+    pub pending: AtomicU64,
+}
+
+/// A point-in-time, plain-value copy of [`BackfillMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackfillMetricsSnapshot {
+    pub enqueued_total: u64,
+    pub dropped_total: u64,
+    pub retries_total: u64,
+    pub healed_total: u64,
+    pub abandoned_total: u64,
+    pub pending: u64,
+}
+
+impl BackfillMetrics {
+    pub fn snapshot(&self) -> BackfillMetricsSnapshot {
+        BackfillMetricsSnapshot {
+            enqueued_total: self.enqueued_total.load(Ordering::Relaxed),
+            dropped_total: self.dropped_total.load(Ordering::Relaxed),
+            retries_total: self.retries_total.load(Ordering::Relaxed),
+            healed_total: self.healed_total.load(Ordering::Relaxed),
+            abandoned_total: self.abandoned_total.load(Ordering::Relaxed),
+            pending: self.pending.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// The whole writer's atomics. `samples`/`streams` are behind their own
 /// `Arc` so each table's flush task can hold a cheap clone without
 /// needing the rest of this struct.
@@ -92,22 +135,12 @@ pub struct WriterMetrics {
     pub lru_misses_total: AtomicU64,
     pub collisions_total: AtomicU64,
     pub rejected_total: AtomicU64,
-    /// Registration-backfill counters (issue #134): rows entering the
-    /// in-memory backlog after a Poisoned `log_streams` flush
-    /// (`enqueued`), rows rejected by the backlog byte cap (`dropped`),
-    /// re-insert attempts kept-for-retry on a pre-send retryable failure
-    /// (`retries`), rows confirmed re-inserted (`healed`), and rows
-    /// terminally abandoned on a deterministic or uncertain re-insert
-    /// outcome (`abandoned`).
-    pub backfill_enqueued_total: AtomicU64,
-    pub backfill_dropped_total: AtomicU64,
-    pub backfill_retries_total: AtomicU64,
-    pub backfill_healed_total: AtomicU64,
-    pub backfill_abandoned_total: AtomicU64,
-    /// Gauge: rows currently pending in the backfill backlog — updated
-    /// under the backlog lock, so `snapshot(queue_bytes)`'s signature is
-    /// unchanged.
-    pub backfill_pending: AtomicU64,
+    /// The `log_streams` registration-backfill counters (issue #134;
+    /// generalized to the [`BackfillMetrics`] embed by issue #139 — the
+    /// snapshot keeps the original flat `backfill_*` fields, filled from
+    /// this embed, so #134's committed assertions are unchanged). Its own
+    /// `Arc` so the backfill task holds a cheap clone.
+    pub backfill: Arc<BackfillMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -158,12 +191,12 @@ impl WriterMetrics {
             lru_misses_total: self.lru_misses_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
-            backfill_enqueued_total: self.backfill_enqueued_total.load(Ordering::Relaxed),
-            backfill_dropped_total: self.backfill_dropped_total.load(Ordering::Relaxed),
-            backfill_retries_total: self.backfill_retries_total.load(Ordering::Relaxed),
-            backfill_healed_total: self.backfill_healed_total.load(Ordering::Relaxed),
-            backfill_abandoned_total: self.backfill_abandoned_total.load(Ordering::Relaxed),
-            backfill_pending: self.backfill_pending.load(Ordering::Relaxed),
+            backfill_enqueued_total: self.backfill.enqueued_total.load(Ordering::Relaxed),
+            backfill_dropped_total: self.backfill.dropped_total.load(Ordering::Relaxed),
+            backfill_retries_total: self.backfill.retries_total.load(Ordering::Relaxed),
+            backfill_healed_total: self.backfill.healed_total.load(Ordering::Relaxed),
+            backfill_abandoned_total: self.backfill.abandoned_total.load(Ordering::Relaxed),
+            backfill_pending: self.backfill.pending.load(Ordering::Relaxed),
         }
     }
 }
@@ -193,6 +226,11 @@ pub struct MetricWriterMetrics {
     pub metadata_upserts_total: AtomicU64,
     pub collisions_total: AtomicU64,
     pub rejected_total: AtomicU64,
+    /// `metric_series` registration-backfill counters (issue #139) —
+    /// their own `Arc`s so each backfill task holds a cheap clone.
+    pub series_backfill: Arc<BackfillMetrics>,
+    /// `metric_metadata` registration-backfill counters (issue #139).
+    pub metadata_backfill: Arc<BackfillMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -215,6 +253,12 @@ pub struct MetricWriterMetricsSnapshot {
     pub metadata_upserts_total: u64,
     pub collisions_total: u64,
     pub rejected_total: u64,
+    /// `metric_series` registration-backfill counters (issue #139 —
+    /// additive fields; no pre-existing consumer reads this snapshot's
+    /// full shape).
+    pub series_backfill: BackfillMetricsSnapshot,
+    /// `metric_metadata` registration-backfill counters (issue #139).
+    pub metadata_backfill: BackfillMetricsSnapshot,
 }
 
 impl SpoolCounters for MetricWriterMetrics {
@@ -244,6 +288,8 @@ impl MetricWriterMetrics {
             metadata_upserts_total: self.metadata_upserts_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
+            series_backfill: self.series_backfill.snapshot(),
+            metadata_backfill: self.metadata_backfill.snapshot(),
         }
     }
 }
@@ -262,6 +308,9 @@ pub struct TraceWriterMetrics {
     pub spool_poison_total: AtomicU64,
     pub spool_uncertain_total: AtomicU64,
     pub rejected_total: AtomicU64,
+    /// `trace_attrs_idx` registration-backfill counters (issue #139) —
+    /// its own `Arc` so the backfill task holds a cheap clone.
+    pub attrs_backfill: Arc<BackfillMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -276,6 +325,9 @@ pub struct TraceWriterMetricsSnapshot {
     pub spool_poison_total: u64,
     pub spool_uncertain_total: u64,
     pub rejected_total: u64,
+    /// `trace_attrs_idx` registration-backfill counters (issue #139 —
+    /// additive field).
+    pub attrs_backfill: BackfillMetricsSnapshot,
 }
 
 impl SpoolCounters for TraceWriterMetrics {
@@ -298,6 +350,7 @@ impl TraceWriterMetrics {
             spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),
             spool_uncertain_total: self.spool_uncertain_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
+            attrs_backfill: self.attrs_backfill.snapshot(),
         }
     }
 }
@@ -355,6 +408,73 @@ mod tests {
         assert_eq!(snap.queue_bytes, 4096);
         assert_eq!(snap.backpressure_total, 2);
         assert_eq!(snap.rejected_total, 5);
+    }
+
+    #[test]
+    fn backfill_metrics_snapshot_reflects_every_counter_and_the_gauge() {
+        let metrics = BackfillMetrics::default();
+        metrics.enqueued_total.fetch_add(1, Ordering::Relaxed);
+        metrics.dropped_total.fetch_add(2, Ordering::Relaxed);
+        metrics.retries_total.fetch_add(3, Ordering::Relaxed);
+        metrics.healed_total.fetch_add(4, Ordering::Relaxed);
+        metrics.abandoned_total.fetch_add(5, Ordering::Relaxed);
+        metrics.pending.store(6, Ordering::Relaxed);
+        assert_eq!(
+            metrics.snapshot(),
+            BackfillMetricsSnapshot {
+                enqueued_total: 1,
+                dropped_total: 2,
+                retries_total: 3,
+                healed_total: 4,
+                abandoned_total: 5,
+                pending: 6,
+            }
+        );
+    }
+
+    /// Issue #139: `WriterMetricsSnapshot`'s flat `backfill_*` fields are
+    /// PRESERVED (filled from the embedded `BackfillMetrics`) so #134's
+    /// committed snapshot assertions do not churn.
+    #[test]
+    fn writer_metrics_snapshot_flat_backfill_fields_mirror_the_embed() {
+        let metrics = WriterMetrics::default();
+        metrics
+            .backfill
+            .enqueued_total
+            .fetch_add(7, Ordering::Relaxed);
+        metrics
+            .backfill
+            .healed_total
+            .fetch_add(3, Ordering::Relaxed);
+        metrics.backfill.pending.store(4, Ordering::Relaxed);
+        let snap = metrics.snapshot(0);
+        assert_eq!(snap.backfill_enqueued_total, 7);
+        assert_eq!(snap.backfill_healed_total, 3);
+        assert_eq!(snap.backfill_pending, 4);
+        assert_eq!(snap.backfill_dropped_total, 0);
+    }
+
+    #[test]
+    fn metric_and_trace_writer_snapshots_carry_their_backfill_embeds() {
+        let metrics = MetricWriterMetrics::default();
+        metrics
+            .series_backfill
+            .healed_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .metadata_backfill
+            .abandoned_total
+            .fetch_add(2, Ordering::Relaxed);
+        let snap = metrics.snapshot(0);
+        assert_eq!(snap.series_backfill.healed_total, 1);
+        assert_eq!(snap.metadata_backfill.abandoned_total, 2);
+
+        let trace_metrics = TraceWriterMetrics::default();
+        trace_metrics
+            .attrs_backfill
+            .enqueued_total
+            .fetch_add(3, Ordering::Relaxed);
+        assert_eq!(trace_metrics.snapshot(0).attrs_backfill.enqueued_total, 3);
     }
 
     #[test]
