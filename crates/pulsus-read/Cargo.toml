@@ -59,6 +59,14 @@ tracing.workspace = true
 
 [dev-dependencies]
 pulsus-schema = { path = "../pulsus-schema" }
+# DEV-ONLY, and must stay dev-only (issue #167): the deferred #139 L-T1
+# executor proof (`tests/traces_search_heal_live.rs`) drives the real
+# `TraceWriter` + registration backfill against a live ClickHouse and
+# then searches through this crate's own executor. pulsus-write's normal
+# dependencies contain no pulsus-read, so the production graph stays
+# unchanged and acyclic — `cargo tree -p pulsus-read -e normal` must
+# never show pulsus-write.
+pulsus-write = { path = "../pulsus-write" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Unique per-invocation run-database naming for the #90 query_log gates
 # (strict `CREATE DATABASE`), so concurrent/repeat live runs never collide.

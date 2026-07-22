@@ -1756,6 +1756,7 @@ dependencies = [
  "pulsus-promql",
  "pulsus-schema",
  "pulsus-traceql",
+ "pulsus-write",
  "regex",
  "serde",
  "serde_bytes",
