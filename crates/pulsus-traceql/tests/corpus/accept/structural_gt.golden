@@ -1,0 +1,38 @@
+Query {
+    spanset: Structural {
+        op: Child,
+        lhs: Filter(
+            SpansetFilter {
+                body: Some(
+                    Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                        op: Eq,
+                        value: Number(
+                            "1",
+                        ),
+                    },
+                ),
+            },
+        ),
+        rhs: Filter(
+            SpansetFilter {
+                body: Some(
+                    Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "b",
+                        },
+                        op: Eq,
+                        value: Number(
+                            "2",
+                        ),
+                    },
+                ),
+            },
+        ),
+    },
+    pipeline: [],
+}

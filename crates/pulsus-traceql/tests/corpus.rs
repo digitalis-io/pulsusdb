@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 use pulsus_traceql::{
     AggregateOp, BOUNDARY_CONSTRUCTS, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
-    PipelineStage, Query, SpansetExpr, TokenKind, TraceQlError, parse,
+    PipelineStage, Query, SpansetExpr, StructuralOp, TokenKind, TraceQlError, parse,
 };
 
 const SUBDIRS: [&str; 3] = ["accept", "reject", "unsupported"];
@@ -178,12 +178,15 @@ fn accept_cases_round_trip_through_display() {
     }
 }
 
-/// Every token kind reachable by the accepted M4 grammar. Boundary-only
-/// tokens (`>>`, `<<`, `~`, `!`, `&`, `+`, `-`, `*`, `/`, `[`, `]`) are
-/// deliberately absent: they never appear in an accept case.
+/// Every token kind reachable by the accepted grammar (M4 + the issue
+/// #172 structural operators `>>`/`~`; `>` was already reachable as a
+/// comparison). Boundary-only tokens (`<<`, `!`, `&`, `+`, `-`, `*`,
+/// `/`, `[`, `]`) are deliberately absent: they never appear in an
+/// accept case.
 const EXPECTED_ACCEPT_TOKENS: &[&str] = &[
     "LBrace", "RBrace", "LParen", "RParen", "Comma", "Dot", "Eq", "Neq", "Re", "Nre", "Gt", "Gte",
-    "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Ident", "String", "Duration", "Number", "Eof",
+    "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Tilde", "Ident", "String", "Duration", "Number",
+    "Eof",
 ];
 
 /// Exhaustive by construction: adding a `TokenKind` variant fails to
@@ -299,20 +302,15 @@ enum AcceptRole {
     RateMetric,
 }
 
-/// F6c: context-dependent tokens pinned in BOTH roles — `>`/`>=`/`<`/`<=`
-/// as field-level comparisons and spanset-level structural rejects;
-/// `Ident` as an intrinsic (accept) and as the `parent.` scope (reject);
-/// `Ident` as a search aggregate (accept) and as a T7 metrics function
-/// (reject). Each entry: (token, accept case, required AST role,
-/// boundary case, exact `NotYetSupported` construct).
+/// F6c: context-dependent tokens pinned in BOTH roles — `>=`/`<`/`<=`
+/// as field-level comparisons and spanset-level structural rejects
+/// (`>`'s two roles are now BOTH grammar since issue #172 — pinned by
+/// `gt_token_appears_in_both_grammar_roles` below); `Ident` as an
+/// intrinsic (accept) and as the `parent.` scope (reject); `Ident` as a
+/// search aggregate (accept) and as a T7 metrics function (reject). Each
+/// entry: (token, accept case, required AST role, boundary case, exact
+/// `NotYetSupported` construct).
 const DUAL_ROLE_CASES: &[(&str, &str, AcceptRole, &str, &str)] = &[
-    (
-        ">",
-        "accept/duration_gt",
-        AcceptRole::FieldComparison(ComparisonOp::Gt),
-        "unsupported/structural_gt",
-        "structural operator '>'",
-    ),
     (
         ">=",
         "accept/attr_span_number_gte",
@@ -366,9 +364,24 @@ fn collect_comparisons<'q>(expr: &'q SpansetExpr, out: &mut Vec<(&'q Field, Comp
                 collect_field_comparisons(body, out);
             }
         }
-        SpansetExpr::Binary { lhs, rhs, .. } => {
+        SpansetExpr::Binary { lhs, rhs, .. } | SpansetExpr::Structural { lhs, rhs, .. } => {
             collect_comparisons(lhs, out);
             collect_comparisons(rhs, out);
+        }
+    }
+}
+
+/// Whether the spanset tree contains a structural node with the given
+/// operator (issue #172 — the grammar-role oracle for `>`'s second
+/// accepted role).
+fn contains_structural(expr: &SpansetExpr, want: StructuralOp) -> bool {
+    match expr {
+        SpansetExpr::Filter(_) => false,
+        SpansetExpr::Binary { lhs, rhs, .. } => {
+            contains_structural(lhs, want) || contains_structural(rhs, want)
+        }
+        SpansetExpr::Structural { op, lhs, rhs } => {
+            *op == want || contains_structural(lhs, want) || contains_structural(rhs, want)
         }
     }
 }
@@ -465,6 +478,48 @@ fn dual_role_tokens_appear_in_both_grammar_and_boundary_roles() {
                 "dual-role token {token}: {boundary_case} must be NotYetSupported, got {other:?}"
             ),
         }
+    }
+}
+
+/// Issue #172: `>` now has TWO grammar roles (F6c successor to its old
+/// accept-vs-boundary pin) — a field-level `Comparison(Gt)` node and the
+/// spanset-level `Structural(Child)` node — each proven from its corpus
+/// case's parsed AST, not merely from parse success. `>>`/`~` get the
+/// same structural-node pin from their moved accept cases.
+#[test]
+fn gt_token_appears_in_both_grammar_roles() {
+    let cases = verify_corpus_layout();
+    for case in [
+        "accept/duration_gt",
+        "accept/structural_gt",
+        "accept/structural_shr",
+        "accept/structural_tilde",
+    ] {
+        assert!(cases.contains(case), "{case} is missing from the corpus");
+    }
+
+    // Role 1: a field-level comparison.
+    let query = parse(&read_input("accept/duration_gt")).expect("accept/duration_gt parses");
+    let mut comparisons = Vec::new();
+    collect_comparisons(&query.spanset, &mut comparisons);
+    assert!(
+        comparisons.iter().any(|(_, op)| *op == ComparisonOp::Gt),
+        "accept/duration_gt must contain a field-level Gt comparison, got {comparisons:?}"
+    );
+
+    // Role 2: the spanset-level structural node (and the same pin for
+    // the other two implemented operators).
+    for (case, op) in [
+        ("accept/structural_gt", StructuralOp::Child),
+        ("accept/structural_shr", StructuralOp::Descendant),
+        ("accept/structural_tilde", StructuralOp::Sibling),
+    ] {
+        let query = parse(&read_input(case)).unwrap_or_else(|e| panic!("{case} must parse: {e}"));
+        assert!(
+            contains_structural(&query.spanset, op),
+            "{case} must contain a Structural({op:?}) node, got {:?}",
+            query.spanset
+        );
     }
 }
 

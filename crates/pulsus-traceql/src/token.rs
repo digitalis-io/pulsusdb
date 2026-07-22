@@ -51,9 +51,9 @@ pub enum TokenKind {
     Re,
     /// `!~` — negated regex comparison.
     Nre,
-    /// `>` — a comparison *inside* a field expression, a structural
-    /// operator (M7 boundary) *between* spansets. Disambiguated purely by
-    /// parser position.
+    /// `>` — a comparison *inside* a field expression, the structural
+    /// child operator (issue #172) *between* spansets. Disambiguated
+    /// purely by parser position.
     Gt,
     /// `>=` — dual-role like [`TokenKind::Gt`].
     Gte,
@@ -69,13 +69,12 @@ pub enum TokenKind {
     /// `|` — introduces a pipeline stage (aggregate filter or `select`).
     Pipe,
 
-    /// `>>` — structural descendant operator (M7 boundary, recognition
-    /// only).
+    /// `>>` — structural descendant operator (issue #172).
     Shr,
     /// `<<` — structural ancestor operator (M7 boundary, recognition
     /// only).
     Shl,
-    /// `~` — structural sibling operator (M7 boundary, recognition only).
+    /// `~` — structural sibling operator (issue #172).
     Tilde,
     /// `!` — negation (M7 boundary, recognition only). `!=`/`!~` are
     /// their own tokens.

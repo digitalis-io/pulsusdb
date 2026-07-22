@@ -1,7 +1,0 @@
-NotYetSupported {
-    construct: "structural operator '~'",
-    span: Span {
-        start: 11,
-        end: 12,
-    },
-}

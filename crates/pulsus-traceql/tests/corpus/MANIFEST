@@ -47,6 +47,13 @@ accept/string_escape_hex
 accept/string_escape_octal
 accept/string_escape_unicode
 accept/string_escapes_short
+accept/structural_chain
+accept/structural_gt
+accept/structural_parens
+accept/structural_pipeline
+accept/structural_precedence
+accept/structural_shr
+accept/structural_tilde
 reject/aggregate_empty
 reject/aggregate_non_numeric
 reject/attr_bare_keyword_value
@@ -100,10 +107,7 @@ unsupported/metrics_min_over_time
 unsupported/metrics_quantile_over_time
 unsupported/negation
 unsupported/parent_scope
-unsupported/structural_gt
 unsupported/structural_gte
 unsupported/structural_lt
 unsupported/structural_lte
 unsupported/structural_shl
-unsupported/structural_shr
-unsupported/structural_tilde

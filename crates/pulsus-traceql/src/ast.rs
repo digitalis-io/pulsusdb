@@ -33,8 +33,9 @@ impl fmt::Display for Query {
     }
 }
 
-/// A spanset expression: a single filter, or `&&`/`||` composition
-/// *across* spansets (`{...} && {...}`). Parentheses are structural only
+/// A spanset expression: a single filter, `&&`/`||` composition *across*
+/// spansets (`{...} && {...}`), or a structural relation (`>`/`>>`/`~` —
+/// issue #172, the additive M7 variant). Parentheses are structural only
 /// — `( expr )` is a valid primary and produces no AST node, so the
 /// fully-parenthesized `Display` rendering always reparses to an equal
 /// AST.
@@ -46,6 +47,15 @@ pub enum SpansetExpr {
         lhs: Box<SpansetExpr>,
         rhs: Box<SpansetExpr>,
     },
+    /// `{A} > {B}` / `{A} >> {B}` / `{A} ~ {B}` — parent/descendant/
+    /// sibling relations evaluated over one trace's span graph. Binds
+    /// tighter than `&&`/`||`, left-associative; the result set is the
+    /// RIGHT-hand side's matching spans only (docs/api.md §4.2).
+    Structural {
+        op: StructuralOp,
+        lhs: Box<SpansetExpr>,
+        rhs: Box<SpansetExpr>,
+    },
 }
 
 impl fmt::Display for SpansetExpr {
@@ -53,7 +63,34 @@ impl fmt::Display for SpansetExpr {
         match self {
             SpansetExpr::Filter(filter) => write!(f, "{filter}"),
             SpansetExpr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+            SpansetExpr::Structural { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
         }
+    }
+}
+
+/// The implemented structural relations (issue #172). `<` (parent), `<<`
+/// (ancestor), and the negated/union forms stay in
+/// [`BOUNDARY_CONSTRUCTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructuralOp {
+    /// `>` — spans matching the RHS whose direct parent matches the LHS.
+    Child,
+    /// `>>` — spans matching the RHS with any transitive ancestor
+    /// matching the LHS.
+    Descendant,
+    /// `~` — spans matching the RHS sharing a parent with a *distinct*
+    /// span matching the LHS (all-zero `parent_id` roots never match).
+    Sibling,
+}
+
+impl fmt::Display for StructuralOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            StructuralOp::Child => ">",
+            StructuralOp::Descendant => ">>",
+            StructuralOp::Sibling => "~",
+        };
+        write!(f, "{s}")
     }
 }
 
@@ -195,7 +232,8 @@ impl fmt::Display for AttrScope {
 
 /// The full M4 comparison-operator set. `>`/`>=`/`<`/`<=` are comparisons
 /// only *inside* a field expression — the same characters between
-/// spansets are structural operators, recognized and rejected
+/// spansets are structural operators: `>` is the implemented child
+/// relation (issue #172), while `>=`/`<`/`<=` stay recognized-and-rejected
 /// (`NotYetSupported`, M7). Disambiguated purely by parser position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComparisonOp {
@@ -535,13 +573,10 @@ pub(crate) const UNSUPPORTED_METRIC_FNS: &[&str] = &[
 /// (both directions asserted mechanically in `tests/corpus.rs`), so
 /// scope drift in either direction fails CI.
 pub const BOUNDARY_CONSTRUCTS: &[(&str, &str)] = &[
-    ("structural operator '>'", "M7"),
-    ("structural operator '>>'", "M7"),
     ("structural operator '<'", "M7"),
     ("structural operator '<<'", "M7"),
     ("structural operator '>='", "M7"),
     ("structural operator '<='", "M7"),
-    ("structural operator '~'", "M7"),
     ("negation operator '!'", "M7"),
     ("arithmetic operator '+'", "M7"),
     ("arithmetic operator '-'", "M7"),

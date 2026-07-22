@@ -48,6 +48,14 @@
 //!   SQL shape is unchanged by the re-audit.
 //! - **AC6 (c)** — a per-trace span overflow (> `MAX_SPANS_PER_TRACE`
 //!   in-window spans) truncates and marks the response partial.
+//! - **Issue #172 (structural operators)** — S1: `>`/`>>`/`~` e2e
+//!   correctness (direct-child vs descendant discrimination, sibling
+//!   pair, RHS-only spanSets, the zero-parent sibling pin); S2: the
+//!   structural plan's generators keep the shipped index classes
+//!   (`service_time` projection / attr `(key, val)` prefix — SQL is
+//!   byte-identical to `&&`, pinned hermetically in `search_plan`); S3:
+//!   a structural search under a tiny `scan_budget_rows` trips
+//!   `TraceScanBudgetRows` → 422.
 //!
 //! Corpus: ≥100k time-spread spans, ≤5% low-frequency target service
 //! (issue #53's binding fixture requirements for the data-dependent 24.8
@@ -1303,4 +1311,215 @@ async fn two_phase_search_explain_and_budget_gates() {
         overflow_start + (overflow_spans as i64 - 1),
         "root metadata comes from the true root span"
     );
+
+    // ---- Issue #172 gate S1: structural correctness e2e ----------------
+    // Disjoint future window. Trace T1: root A (checkout) → child B
+    // (span.foo=x) → grandchild C (status=error), plus D (child of A,
+    // B's sibling) and a second zero-parent root E. Control trace T2:
+    // the same B-shape span (foo=x) and an error span exist, but under a
+    // NON-checkout root — `>`/`>>` must not match them.
+    let st = now + 30 * 3_600_000_000_000;
+    const T1: &str = "00000000000000000000000000517201";
+    const T2: &str = "00000000000000000000000000517202";
+    /// `(span_hex, parent_hex, name, service, ts, status_code)`.
+    type StructuralSpanSpec<'a> = (&'a str, &'a str, &'a str, &'a str, i64, i8);
+    async fn insert_structural_span(
+        client: &ChClient,
+        trace_hex: &str,
+        spec: StructuralSpanSpec<'_>,
+    ) {
+        let (span_hex, parent_hex, name, service, ts, status) = spec;
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_spans \
+                 (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                  status_code, kind, payload_type, payload) \
+                 SELECT toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), \
+                        toFixedString(unhex('{parent_hex}'), 8), \
+                        '{name}', '{service}', {ts}, 1000, {status}, 1, 1, 'p'"
+            ),
+        )
+        .await;
+    }
+    async fn insert_structural_attr(client: &ChClient, trace_hex: &str, span_hex: &str, ts: i64) {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_attrs_idx \
+                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), 'foo', 'x', 'span', NULL, {ts}, \
+                        toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), 1000"
+            ),
+        )
+        .await;
+    }
+    const ZERO8: &str = "0000000000000000";
+    const A: &str = "00000000000000a1";
+    const B: &str = "00000000000000b1";
+    const C: &str = "00000000000000c1";
+    const D: &str = "00000000000000d1";
+    for spec in [
+        (A, ZERO8, "root-a", "checkout", st, 0),
+        (B, A, "child-b", "websvc", st + 10, 0),
+        (C, B, "grand-c", "websvc", st + 20, 2),
+        (D, A, "sib-d", "websvc", st + 30, 0),
+        ("00000000000000e1", ZERO8, "root-b", "websvc", st + 40, 0),
+    ] {
+        insert_structural_span(&client, T1, spec).await;
+    }
+    for spec in [
+        ("00000000000000f1", ZERO8, "root-f", "othersvc", st + 50, 0),
+        (
+            "00000000000000f2",
+            "00000000000000f1",
+            "child-g",
+            "websvc",
+            st + 60,
+            0,
+        ),
+        (
+            "00000000000000f3",
+            "00000000000000f1",
+            "err-h",
+            "websvc",
+            st + 70,
+            2,
+        ),
+    ] {
+        insert_structural_span(&client, T2, spec).await;
+    }
+    insert_structural_attr(&client, T1, B, st + 10).await;
+    insert_structural_attr(&client, T2, "00000000000000f2", st + 60).await;
+
+    let (s_start, s_end) = (st - 1, st + 3_600_000_000_000);
+
+    // `>`: the direct child only, RHS spans only.
+    let plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } > { span.foo = "x" }"#,
+        s_start,
+        s_end,
+    );
+    let output = engine.search(&plan).await.expect("child search executes");
+    assert_eq!(
+        output.returned, 1,
+        "only the trace whose foo=x span sits under a checkout parent"
+    );
+    assert_eq!(output.traces[0].matched, 1, "RHS result set only");
+    assert_eq!(output.traces[0].spans.len(), 1);
+    assert_eq!(
+        output.traces[0].spans[0].name, "child-b",
+        "the spanSet holds the RHS span, never the checkout LHS span"
+    );
+
+    // `>` does NOT reach the grandchild…
+    let plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } > { status = error }"#,
+        s_start,
+        s_end,
+    );
+    let output = engine.search(&plan).await.expect("search executes");
+    assert_eq!(
+        output.returned, 0,
+        "the error span is a grandchild, not a child"
+    );
+
+    // …while `>>` does.
+    let plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } >> { status = error }"#,
+        s_start,
+        s_end,
+    );
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("descendant search executes");
+    assert_eq!(
+        output.returned, 1,
+        "T2's error span has no checkout ancestor"
+    );
+    assert_eq!(output.traces[0].matched, 1);
+    assert_eq!(output.traces[0].spans[0].name, "grand-c");
+
+    // `~`: the sibling pair under the shared parent, RHS side returned.
+    let plan = plan_for(
+        &engine,
+        r#"{ span.foo = "x" } ~ { name = "sib-d" }"#,
+        s_start,
+        s_end,
+    );
+    let output = engine.search(&plan).await.expect("sibling search executes");
+    assert_eq!(output.returned, 1);
+    assert_eq!(output.traces[0].matched, 1);
+    assert_eq!(output.traces[0].spans[0].name, "sib-d");
+
+    // Adjudicated pin 2: zero-parent roots never match `~`.
+    let plan = plan_for(
+        &engine,
+        r#"{ name = "root-a" } ~ { name = "root-b" }"#,
+        s_start,
+        s_end,
+    );
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("root-sibling search executes");
+    assert_eq!(
+        output.returned, 0,
+        "all-zero parent_id spans share no parent — never siblings"
+    );
+
+    // ---- Issue #172 gate S2: structural generators keep the shipped
+    // index classes (no new unindexed SQL shape exists) -------------------
+    let plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } >> { .env = "prod" }"#,
+        base,
+        now,
+    );
+    assert_eq!(
+        plan.generator_sqls.len(),
+        2,
+        "superset union of both operands' generators — the && shape"
+    );
+    let raw = explain_raw(&client, &plan.generator_sqls[0]).await;
+    assert!(
+        raw.contains("service_time"),
+        "the structural LHS's service-equality generator must still select the \
+         service_time projection:\n{raw}"
+    );
+    let raw = explain_raw(&client, &plan.generator_sqls[1]).await;
+    let (sel, total) = primary_key_granules(&raw);
+    assert!(
+        sel < total,
+        "the structural RHS's attr generator must still prune on its (key, val) \
+         prefix ({sel}/{total}):\n{raw}"
+    );
+
+    // ---- Issue #172 gate S3: the scan budget trips on a structural
+    // search exactly like the shipped classes (AC6a shape reused) ---------
+    let mut tight = engine_config();
+    tight.scan_budget_rows = 1_000;
+    let tight_engine = TraceEngine::new(data_client().await, tight);
+    let plan = plan_for(
+        &tight_engine,
+        r#"{ resource.service.name = "checkout" } >> { status = error }"#,
+        base,
+        now,
+    );
+    let err = tight_engine
+        .search(&plan)
+        .await
+        .expect_err("the structural RHS's span-scan generator must exceed a 1k-row budget");
+    match err {
+        ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows }) => {
+            assert_eq!(budget_rows, 1_000);
+        }
+        other => panic!("expected TraceScanBudgetRows, got {other:?}"),
+    }
 }

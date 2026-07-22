@@ -135,6 +135,30 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Structural child (issue #172): the relation is Phase-2 engine
+        // work — the emitted SQL is the superset union of both operands'
+        // generators, byte-identical to the `&&` form (the AC4 identity
+        // pin lives in `search_plan`'s unit tests; this golden freezes
+        // the shape itself).
+        name: "structural_child",
+        q: r#"{ resource.service.name = "checkout" } > { span.foo = "x" }"#,
+        distributed: false,
+    },
+    Case {
+        // Structural descendant: same no-new-SQL contract with a
+        // physical (span-scan) RHS generator class.
+        name: "structural_descendant",
+        q: r#"{ resource.service.name = "checkout" } >> { status = error }"#,
+        distributed: false,
+    },
+    Case {
+        // Structural sibling: two attr-equality generators + two
+        // membership probes, exactly the && shape.
+        name: "structural_sibling",
+        q: r#"{ span.a = "1" } ~ { span.b = "2" }"#,
+        distributed: false,
+    },
+    Case {
         // The clustered form of the worked example: `_dist` tables; the
         // §7 clustered-reader + budget settings ride as HTTP settings,
         // never SQL text (pinned separately in `traces::exec` tests).

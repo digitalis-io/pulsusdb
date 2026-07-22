@@ -342,7 +342,13 @@ fn validate_probe(probe: &AttrProbe) -> Result<(), PlanError> {
 fn collect_filters<'q>(expr: &'q SpansetExpr, out: &mut Vec<&'q SpansetFilter>) {
     match expr {
         SpansetExpr::Filter(f) => out.push(f),
-        SpansetExpr::Binary { lhs, rhs, .. } => {
+        // Structural relations (issue #172) plan exactly like `&&`/`||`:
+        // lhs-then-rhs pre-order — the same traversal `search_eval`
+        // replays — and the superset union of both operands' generators
+        // (the relation itself is Phase-2 engine work over hydrated
+        // spans, so the emitted SQL is byte-identical to the equivalent
+        // `{A} && {B}` plan — the AC4 identity pin).
+        SpansetExpr::Binary { lhs, rhs, .. } | SpansetExpr::Structural { lhs, rhs, .. } => {
             collect_filters(lhs, out);
             collect_filters(rhs, out);
         }
@@ -739,6 +745,41 @@ mod tests {
             plan_search(&query, &PARAMS, &ctx()),
             Err(PlanError::TypeMismatch(_))
         ));
+    }
+
+    /// AC4 (issue #172): a structural plan's Phase-1 SQL is BYTE-IDENTICAL
+    /// to the equivalent `{A} && {B}` plan's — no new SQL shape exists, so
+    /// the shipped shard-locality/index evidence covers structural plans
+    /// verbatim.
+    #[test]
+    fn structural_generator_sql_is_byte_identical_to_the_and_plan() {
+        for op in [">", ">>", "~"] {
+            let structural = plan(&format!(
+                r#"{{ resource.service.name = "checkout" }} {op} {{ span.foo = "x" }}"#
+            ));
+            let and_plan = plan(r#"{ resource.service.name = "checkout" } && { span.foo = "x" }"#);
+            assert_eq!(
+                structural.generator_sqls, and_plan.generator_sqls,
+                "{op}: generator SQL must be byte-identical to the && plan"
+            );
+            assert_eq!(
+                structural.probes.len(),
+                and_plan.probes.len(),
+                "{op}: same membership probes"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_registers_both_operands_generators_and_probes() {
+        let p = plan(r#"{ span.a = "1" } > { span.b = "2" }"#);
+        assert_eq!(
+            p.generator_sqls.len(),
+            2,
+            "superset union of both operands' generators"
+        );
+        assert_eq!(p.probes.len(), 2);
+        assert_eq!(p.filters.len(), 2, "lhs-then-rhs pre-order filters");
     }
 
     #[test]

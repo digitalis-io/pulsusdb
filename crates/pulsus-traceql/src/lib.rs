@@ -11,11 +11,14 @@
 //! across spansets (with parentheses), aggregate filters
 //! (`count()`/`sum`/`avg`/`min`/`max`), and `select(...)`.
 //!
-//! Every documented-but-unimplemented construct — structural operators
-//! (`>`/`>>`/`<`/`<<`/`~`), negation, arithmetic, `parent.`, bracketed
-//! attributes, bare-attribute existence, the deferred metrics pipeline
-//! functions (`avg`/`min`/`max`/`quantile`/`histogram` `_over_time`),
-//! and metrics grouping `by` (all M7) — is recognized and named in
+//! The structural operators `>` (child), `>>` (descendant), and `~`
+//! (sibling) parse to [`SpansetExpr::Structural`] (issue #172): tighter
+//! than `&&`/`||`, left-associative. Every documented-but-unimplemented
+//! construct — the remaining structural operators (`<`/`<<`/`>=`/`<=`),
+//! negation, arithmetic, `parent.`, bracketed attributes, bare-attribute
+//! existence, the deferred metrics pipeline functions
+//! (`avg`/`min`/`max`/`quantile`/`histogram` `_over_time`), and metrics
+//! grouping `by` (all M7) — is recognized and named in
 //! [`TraceQlError::NotYetSupported`] rather than failing as a generic
 //! syntax error; the frozen registry is [`BOUNDARY_CONSTRUCTS`]. The
 //! committed M4 metrics functions `rate()`/`count_over_time()` parse to
@@ -41,7 +44,7 @@ mod token;
 pub use ast::{
     AggregateOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field, FieldExpr,
     Intrinsic, MetricFn, PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter,
-    StatusValue, Value,
+    StatusValue, StructuralOp, Value,
 };
 pub use error::TraceQlError;
 pub use parser::parse;

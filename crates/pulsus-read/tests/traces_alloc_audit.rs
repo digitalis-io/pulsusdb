@@ -81,6 +81,13 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "matched_spans ref list covered by the transients envelope (ref width per matched id)"),
     ("search_eval.rs", "evaluate_batch", "Vec::with_capacity", 1,
      "summaries buffer: base charge (take x size_of<SpanSummary>) before the reservation"),
+    // ---- issue #172: structural relation intermediates ------------------
+    ("search_eval.rs", "descendant_set", "HashMap::", 1,
+     "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),
+    ("search_eval.rs", "descendant_set", "Vec::with_capacity", 1,
+     "BFS queue: covered by the same DESCENDANT_TRANSIENT_BYTES envelope (<= 2 slots per span; sized so it never reallocates)"),
+    ("search_eval.rs", "sibling_set", "HashMap::", 1,
+     "parent map: spans x SIBLING_ENTRY_BYTES charged before with_capacity, released after the pass"),
 ];
 
 fn source(file: &str) -> String {

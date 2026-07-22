@@ -100,7 +100,7 @@ gzip/snappy/zstd request decompression · sync/async insert selection per reques
 | Compat query aliases (trace-datasource surface) | flag-gated | M4 |
 | Service graph data | span-metrics MVs feeding service-graph panels | M7 |
 
-**TraceQL coverage (M4):** span attribute selectors (`span.`, `resource.`, and the unscoped `.attr` form), intrinsics `name`, `duration`, `status`, `kind` (`service` is not an intrinsic — it is the `resource.service.name` attribute), comparison operators incl. regex, `&&`/`||` within and across spansets (`{...} && {...}`), aggregate filters (`count()`, `avg(duration)` etc.), `select()`. Structural operators (`>`, `>>`, sibling) are M7.
+**TraceQL coverage (M4 + M7 structural):** span attribute selectors (`span.`, `resource.`, and the unscoped `.attr` form), intrinsics `name`, `duration`, `status`, `kind` (`service` is not an intrinsic — it is the `resource.service.name` attribute), comparison operators incl. regex, `&&`/`||` within and across spansets (`{...} && {...}`), aggregate filters (`count()`, `avg(duration)` etc.), `select()`, and the structural operators `>` (child), `>>` (descendant), `~` (sibling) (M7, issue #172 — RHS-result semantics, docs/api.md §4.2). `<` (parent), `<<` (ancestor), negated/union structural forms, and negation stay unsupported.
 
 ## 5. Query — profiles
 

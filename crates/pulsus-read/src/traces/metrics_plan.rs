@@ -142,11 +142,13 @@ pub fn plan_trace_metrics(
 
     let func = single_metric_stage(query)?;
 
-    // Cross-spanset metrics are out of scope for M4 (plan v1 edge 4: the
-    // compiler is per-SpansetFilter) — an explicit caller error.
+    // Cross-spanset and structural metrics are out of scope (plan v1
+    // edge 4: the compiler is per-SpansetFilter; issue #172's structural
+    // relations are two-phase-search-only) — an explicit caller error.
     let SpansetExpr::Filter(spanset_filter) = &query.spanset else {
         return Err(PlanError::TypeMismatch(
-            "cross-spanset expressions ({A} && {B}) are not supported by metrics queries in M4"
+            "cross-spanset and structural expressions ({A} && {B}, {A} > {B}) are not supported \
+             by metrics queries"
                 .to_string(),
         ));
     };
@@ -338,6 +340,26 @@ mod tests {
         )
         .expect_err("cross-spanset metrics are M4 out of scope");
         assert!(matches!(err, PlanError::TypeMismatch(_)), "{err}");
+    }
+
+    /// Issue #172: a structural `q` parses now, but the metrics planner
+    /// rejects it as a caller error (→ 400) exactly like cross-spanset.
+    #[test]
+    fn a_structural_metrics_query_is_a_plan_error() {
+        for q in [
+            r#"{ .a = "1" } > { .b = "2" } | rate()"#,
+            r#"{ .a = "1" } >> { .b = "2" } | count_over_time()"#,
+            r#"{ .a = "1" } ~ { .b = "2" } | rate()"#,
+        ] {
+            let err = plan_trace_metrics(&parse(q).unwrap(), &PARAMS, &ctx())
+                .expect_err("structural metrics are out of scope");
+            match err {
+                PlanError::TypeMismatch(msg) => {
+                    assert!(msg.contains("structural"), "{q}: {msg}");
+                }
+                other => panic!("{q}: expected TypeMismatch, got {other:?}"),
+            }
+        }
     }
 
     #[test]

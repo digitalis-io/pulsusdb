@@ -17,18 +17,24 @@
 //! Grammar (plan v2 F1 / v3 F5):
 //!
 //! ```text
-//! Query          := SpansetExpr ("|" PipelineStage)*
-//! SpansetExpr    := SpansetAnd ("||" SpansetAnd)*
-//! SpansetAnd     := SpansetPrimary ("&&" SpansetPrimary)*
-//! SpansetPrimary := SpansetFilter | "(" SpansetExpr ")"
-//! SpansetFilter  := "{" FieldExpr? "}"
-//! FieldExpr      := FieldAnd ("||" FieldAnd)*
-//! FieldAnd       := FieldPrimary ("&&" FieldPrimary)*
-//! FieldPrimary   := "(" FieldExpr ")" | Field CmpOp Value
-//! PipelineStage  := "count" "(" ")" CmpOp Value
-//!                 | ("avg"|"sum"|"min"|"max") "(" AggField ")" CmpOp Value
-//!                 | "select" "(" Field { "," Field } ")"
+//! Query             := SpansetExpr ("|" PipelineStage)*
+//! SpansetExpr       := SpansetAnd ("||" SpansetAnd)*
+//! SpansetAnd        := SpansetStructural ("&&" SpansetStructural)*
+//! SpansetStructural := SpansetPrimary ((">"|">>"|"~") SpansetPrimary)*
+//! SpansetPrimary    := SpansetFilter | "(" SpansetExpr ")"
+//! SpansetFilter     := "{" FieldExpr? "}"
+//! FieldExpr         := FieldAnd ("||" FieldAnd)*
+//! FieldAnd          := FieldPrimary ("&&" FieldPrimary)*
+//! FieldPrimary      := "(" FieldExpr ")" | Field CmpOp Value
+//! PipelineStage     := "count" "(" ")" CmpOp Value
+//!                    | ("avg"|"sum"|"min"|"max") "(" AggField ")" CmpOp Value
+//!                    | "select" "(" Field { "," Field } ")"
 //! ```
+//!
+//! Structural operators (`>`/`>>`/`~`, issue #172) bind TIGHTER than
+//! `&&`/`||` and are left-associative (`{a} && {b} > {c}` ≡
+//! `{a} && ({b} > {c})`; `{a} > {b} > {c}` ≡ `({a} > {b}) > {c}`) — the
+//! adjudicated precedence pin, frozen into the corpus goldens.
 //!
 //! Disambiguation of the dual-role `>`/`>=`/`<`/`<=` tokens (comparison
 //! inside a field expression, structural operator between spansets) is
@@ -39,7 +45,8 @@
 
 use crate::ast::{
     self, AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
-    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, Value,
+    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralOp,
+    Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -229,39 +236,62 @@ fn parse_spanset_and(
     depth: usize,
     binary_nodes: &mut usize,
 ) -> Result<SpansetExpr, TraceQlError> {
+    let mut lhs = parse_spanset_structural(cursor, depth, binary_nodes)?;
+    while matches!(cursor.peek().kind, TokenKind::AndAnd) {
+        charge_binary_node(binary_nodes, cursor.peek().span)?;
+        cursor.advance();
+        let rhs = parse_spanset_structural(cursor, depth, binary_nodes)?;
+        lhs = SpansetExpr::Binary {
+            op: BoolOp::And,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+    }
+    Ok(lhs)
+}
+
+/// `SpansetStructural := SpansetPrimary ((">"|">>"|"~") SpansetPrimary)*`
+/// — the implemented structural relations (issue #172): tighter than
+/// `&&`/`||`, left-associative. Each structural node charges the shared
+/// binary-node budget exactly like `&&`/`||`.
+fn parse_spanset_structural(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+    binary_nodes: &mut usize,
+) -> Result<SpansetExpr, TraceQlError> {
     let mut lhs = parse_spanset_primary(cursor, depth, binary_nodes)?;
     loop {
-        check_no_structural_op(cursor)?;
-        if matches!(cursor.peek().kind, TokenKind::AndAnd) {
-            charge_binary_node(binary_nodes, cursor.peek().span)?;
-            cursor.advance();
-            let rhs = parse_spanset_primary(cursor, depth, binary_nodes)?;
-            lhs = SpansetExpr::Binary {
-                op: BoolOp::And,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        } else {
-            return Ok(lhs);
-        }
+        check_no_unsupported_spanset_op(cursor)?;
+        let op = match &cursor.peek().kind {
+            TokenKind::Gt => StructuralOp::Child,
+            TokenKind::Shr => StructuralOp::Descendant,
+            TokenKind::Tilde => StructuralOp::Sibling,
+            _ => return Ok(lhs),
+        };
+        charge_binary_node(binary_nodes, cursor.peek().span)?;
+        cursor.advance();
+        let rhs = parse_spanset_primary(cursor, depth, binary_nodes)?;
+        lhs = SpansetExpr::Structural {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
     }
 }
 
 /// After a complete spanset operand, checks whether the next token is a
-/// structural operator — valid Tempo, out of the committed M4 surface
-/// (docs/features.md §4: "Structural operators are M7") — and names it.
-/// This runs after *every* operand, so structural operators are caught
-/// both at the top level and inside parentheses.
-fn check_no_structural_op(cursor: &Cursor<'_>) -> Result<(), TraceQlError> {
+/// still-unsupported structural/negation operator — valid Tempo, out of
+/// the committed surface (issue #172 implements `>`/`>>`/`~`; `<`/`<<`/
+/// `>=`/`<=`/`!` remain M7 boundaries) — and names it. This runs after
+/// *every* operand, so these are caught both at the top level and inside
+/// parentheses.
+fn check_no_unsupported_spanset_op(cursor: &Cursor<'_>) -> Result<(), TraceQlError> {
     let tok = cursor.peek();
     let construct = match &tok.kind {
-        TokenKind::Gt => "structural operator '>'",
-        TokenKind::Shr => "structural operator '>>'",
         TokenKind::Lt => "structural operator '<'",
         TokenKind::Shl => "structural operator '<<'",
         TokenKind::Gte => "structural operator '>='",
         TokenKind::Lte => "structural operator '<='",
-        TokenKind::Tilde => "structural operator '~'",
         TokenKind::Bang => "negation operator '!'",
         _ => return Ok(()),
     };
@@ -1029,6 +1059,162 @@ mod tests {
         ] {
             let err = parse(&query).unwrap_err();
             assert!(matches!(err, TraceQlError::RecursionLimitExceeded { .. }));
+        }
+    }
+
+    // -- issue #172: structural operators ------------------------------
+
+    fn filter_key(expr: &SpansetExpr) -> &str {
+        match expr {
+            SpansetExpr::Filter(SpansetFilter {
+                body:
+                    Some(FieldExpr::Comparison {
+                        field: Field::Attribute { key, .. },
+                        ..
+                    }),
+            }) => key,
+            other => panic!("expected a single-attr filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structural_operators_parse_to_structural_nodes() {
+        for (query, op) in [
+            ("{ .a = 1 } > { .b = 2 }", StructuralOp::Child),
+            ("{ .a = 1 } >> { .b = 2 }", StructuralOp::Descendant),
+            ("{ .a = 1 } ~ { .b = 2 }", StructuralOp::Sibling),
+        ] {
+            let parsed = parse(query).unwrap();
+            match &parsed.spanset {
+                SpansetExpr::Structural {
+                    op: got, lhs, rhs, ..
+                } => {
+                    assert_eq!(*got, op, "{query}");
+                    assert_eq!(filter_key(lhs), "a");
+                    assert_eq!(filter_key(rhs), "b");
+                }
+                other => panic!("{query} -> expected Structural, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn structural_binds_tighter_than_and_and_or() {
+        // Adjudicated pin 1: `{a} && {b} > {c}` ≡ `{a} && ({b} > {c})`.
+        let parsed = parse("{ .a = 1 } && { .b = 2 } > { .c = 3 }").unwrap();
+        match &parsed.spanset {
+            SpansetExpr::Binary {
+                op: BoolOp::And,
+                lhs,
+                rhs,
+            } => {
+                assert_eq!(filter_key(lhs), "a");
+                match rhs.as_ref() {
+                    SpansetExpr::Structural {
+                        op: StructuralOp::Child,
+                        lhs,
+                        rhs,
+                    } => {
+                        assert_eq!(filter_key(lhs), "b");
+                        assert_eq!(filter_key(rhs), "c");
+                    }
+                    other => panic!("expected the structural node under &&, got {other:?}"),
+                }
+            }
+            other => panic!("expected && at the root, got {other:?}"),
+        }
+        // And under `||`.
+        let parsed = parse("{ .a = 1 } > { .b = 2 } || { .c = 3 }").unwrap();
+        match &parsed.spanset {
+            SpansetExpr::Binary {
+                op: BoolOp::Or,
+                lhs,
+                ..
+            } => assert!(matches!(lhs.as_ref(), SpansetExpr::Structural { .. })),
+            other => panic!("expected || at the root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chained_structural_is_left_associative() {
+        // Adjudicated pin 1: `{a} > {b} >> {c}` ≡ `({a} > {b}) >> {c}`.
+        let parsed = parse("{ .a = 1 } > { .b = 2 } >> { .c = 3 }").unwrap();
+        match &parsed.spanset {
+            SpansetExpr::Structural {
+                op: StructuralOp::Descendant,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(
+                    lhs.as_ref(),
+                    SpansetExpr::Structural {
+                        op: StructuralOp::Child,
+                        ..
+                    }
+                ));
+                assert_eq!(filter_key(rhs), "c");
+            }
+            other => panic!("expected left-assoc structural chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parentheses_override_structural_precedence() {
+        // `({a} && {b}) > {c}` puts the && UNDER the structural node.
+        let parsed = parse("({ .a = 1 } && { .b = 2 }) > { .c = 3 }").unwrap();
+        match &parsed.spanset {
+            SpansetExpr::Structural {
+                op: StructuralOp::Child,
+                lhs,
+                rhs,
+            } => {
+                assert!(matches!(
+                    lhs.as_ref(),
+                    SpansetExpr::Binary {
+                        op: BoolOp::And,
+                        ..
+                    }
+                ));
+                assert_eq!(filter_key(rhs), "c");
+            }
+            other => panic!("expected structural at the root, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structural_nodes_charge_the_shared_binary_budget() {
+        let mut q = String::from("{}");
+        for _ in 0..MAX_DEPTH {
+            q.push_str(" > {}");
+        }
+        let err = parse(&q).unwrap_err();
+        assert!(matches!(err, TraceQlError::RecursionLimitExceeded { .. }));
+        let mut under = String::from("{}");
+        for _ in 0..MAX_DEPTH - 1 {
+            under.push_str(" > {}");
+        }
+        assert!(parse(&under).is_ok());
+    }
+
+    #[test]
+    fn remaining_structural_operators_stay_positioned_not_yet_supported() {
+        for (query, construct) in [
+            ("{ .a = 1 } < { .b = 2 }", "structural operator '<'"),
+            ("{ .a = 1 } << { .b = 2 }", "structural operator '<<'"),
+            ("{ .a = 1 } >= { .b = 2 }", "structural operator '>='"),
+            ("{ .a = 1 } <= { .b = 2 }", "structural operator '<='"),
+        ] {
+            let err = parse(query).unwrap_err();
+            match err {
+                TraceQlError::NotYetSupported {
+                    construct: got,
+                    span,
+                } => {
+                    assert_eq!(got, construct, "{query}");
+                    assert_eq!(span.start, 11, "{query}");
+                }
+                other => panic!("{query} -> unexpected {other:?}"),
+            }
         }
     }
 
