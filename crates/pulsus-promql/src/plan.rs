@@ -1130,7 +1130,9 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
         // retained, and a range-shaped query falls through to that same
         // type error (upstream rejects a range query over a range
         // vector at query construction).
-        if matches!(stripped, Expr::MatrixSelector(_)) && params.step_ms == 0 {
+        if let Expr::MatrixSelector(ms) = stripped
+            && params.step_ms == 0
+        {
             let mut planner = Planner {
                 selectors: Vec::new(),
                 experimental: params.experimental_functions,
@@ -1140,22 +1142,26 @@ pub fn plan(expr: &Expr, params: PlanParams) -> Result<QueryPlan, PromqlError> {
                 ctx: SubqueryCtx::default(),
                 subquery_depth: 0,
             };
-            // Through the shared range-source planner — the identical
-            // SelectorSpec fetch/pushdown as `rate()`'s argument.
+            // Directly through the matrix-selector planner — the
+            // identical `SelectorSpec` fetch/pushdown as `rate()`'s
+            // argument (the experimental gate inside still fires
+            // first, so gate-off behaviour is unchanged).
             //
-            // KNOWN DIVERGENCE, tracked in issue #166: an extended
-            // (anchored/smoothed) BARE root rejects loudly here via the
-            // #150 allow-list name below, while the pinned oracle
-            // EVALUATES it — `matrixSelector` widens the fetch by
-            // lookback and runs `extendFloats` boundary interpolation
-            // (engine.go:2818-2872, 4842-4877 at 40af9c2), erroring per
-            // series on histogram points (:2848-2858). No pinned corpus
-            // row exercises the bare shape (extended_vectors.test is
-            // entirely function-wrapped), so the loud rejection stands
-            // until #166 ports `extendFloats` with its own derived
-            // tests.
-            let source =
-                plan_range_source(&mut planner, "a top-level range-vector query", stripped)?;
+            // Issue #166: an extended (anchored/smoothed) BARE root
+            // is EVALUATED, not rejected — the pinned oracle's
+            // `matrixSelector` widens the fetch by lookback and runs
+            // `extendFloats` boundary interpolation (engine.go:
+            // 2806-2872, 4841-4877 at 40af9c2), erroring per series
+            // on histogram points (:2849-2857); see `eval::
+            // eval_range_vector_root` and `eval::extended::
+            // extend_floats`. The #150 allow-list
+            // (`check_extended_allow_list`) is deliberately skipped
+            // for the root only — upstream's check hangs off the
+            // ENCLOSING range function (engine.go:2192-2201), which
+            // a bare root doesn't have; every function-argument
+            // caller of `plan_range_source` keeps it.
+            let id = plan_matrix_selector_id(&mut planner, ms)?;
+            let source = RangeSource::Selector(id);
             let mut selectors = planner.selectors;
             let root = PlanExpr::RangeVector { source };
             detect_histogram_stats(&root, &mut selectors);
@@ -3878,6 +3884,52 @@ mod tests {
         };
         let err = plan(&matrix(), range_params).unwrap_err();
         assert!(matches!(err, PromqlError::Unsupported { .. }));
+    }
+
+    /// Issue #166: a bare anchored/smoothed matrix-selector ROOT plans to
+    /// `PlanExpr::RangeVector` under the experimental gate — the #150
+    /// allow-list is a FUNCTION-argument check (upstream's hangs off the
+    /// enclosing Call, engine.go:2192-2201) and no longer fires for the
+    /// root lift; the pinned oracle evaluates the bare shape
+    /// (engine.go:2806-2872).
+    #[test]
+    fn extended_bare_matrix_root_plans_to_range_vector_under_the_gate() {
+        for (query, anchored, smoothed) in [
+            ("m[1m] anchored", true, false),
+            ("m[1m] smoothed", false, true),
+        ] {
+            let expr = parse(query).unwrap();
+            let p = plan(&expr, params_experimental())
+                .unwrap_or_else(|e| panic!("{query} should plan: {e}"));
+            assert!(
+                matches!(
+                    p.root,
+                    PlanExpr::RangeVector {
+                        source: RangeSource::Selector(0)
+                    }
+                ),
+                "{query}: expected the RangeVector root, got {:?}",
+                p.root
+            );
+            assert_eq!(p.selectors.len(), 1, "{query} emits exactly one selector");
+            assert_eq!(p.selectors[0].anchored, anchored, "{query}");
+            assert_eq!(p.selectors[0].smoothed, smoothed, "{query}");
+        }
+    }
+
+    /// Issue #166: gate-off behaviour is unchanged — the experimental gate
+    /// inside `plan_matrix_selector_id` still fires first for the bare
+    /// root, with parse.go's verbatim message.
+    #[test]
+    fn extended_bare_matrix_root_still_rejects_with_the_gate_off() {
+        assert!(
+            plan_err("m[1m] anchored", params())
+                .contains("anchored modifier is experimental and not enabled")
+        );
+        assert!(
+            plan_err("m[1m] smoothed", params())
+                .contains("smoothed modifier is experimental and not enabled")
+        );
     }
 
     #[test]

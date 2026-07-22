@@ -241,6 +241,116 @@ fn extended_histogram_rate_result_is_gauge() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `extend_floats` (issue #166, engine.go:4841-4877 @ 40af9c2). Zero corpus
+// rows pin the bare anchored/smoothed root (extended_vectors.test is
+// entirely function-wrapped), so each case below cites its derivation from
+// the pinned algorithm with hand-computed expectations.
+// ---------------------------------------------------------------------------
+
+/// The `(t_ms, v)` view of an extension, asserting every point is a float.
+fn points_of(out: &[Sample]) -> Vec<(i64, f64)> {
+    out.iter()
+        .map(|s| {
+            assert!(s.h.is_none(), "extend_floats output is all-float");
+            (s.t_ms, s.v)
+        })
+        .collect()
+}
+
+#[test]
+fn extend_floats_anchored_picks_the_pre_mint_anchor_at_the_left_boundary() {
+    // (a) Anchored: firstSampleIndex = max(0, Search(T > mint) - 1) lands
+    // on the pre-mint anchor (-10, 5); pickOrInterpolateLeft with
+    // smoothed=false PICKS f[first].v (functions.go:72-79, no
+    // interpolation). The anchor itself is filtered (T <= mint,
+    // engine.go:4861-4863) in favour of the {mint, left} boundary point;
+    // the in-window samples follow; right picks f[last].v.
+    let f_in = [f(-10, 5.0), f(10, 6.0), f(15, 6.5)];
+    let out = extend_floats(&f_in, 0, 20, false);
+    assert_eq!(
+        points_of(&out),
+        vec![(0, 5.0), (10, 6.0), (15, 6.5), (20, 6.5)]
+    );
+}
+
+#[test]
+fn extend_floats_smoothed_interpolates_both_boundaries() {
+    // (b) Smoothed: left interpolates (-10,0)→(10,20) at t=0 →
+    // 0 + 20·(10/20) = 10 exactly (functions.go:89-101, is_counter=false);
+    // lastSampleIndex recomputes to Search(T >= maxt) = 2, and right
+    // interpolates (10,20)→(30,40) at t=20 → 20 + 20·(10/20) = 30 exactly.
+    // Both straddling samples are filtered to their boundary points.
+    let f_in = [f(-10, 0.0), f(10, 20.0), f(30, 40.0)];
+    let out = extend_floats(&f_in, 0, 20, true);
+    assert_eq!(points_of(&out), vec![(0, 10.0), (10, 20.0), (20, 30.0)]);
+}
+
+#[test]
+fn extend_floats_filters_samples_exactly_at_the_boundaries() {
+    // (c) Samples exactly AT mint and AT maxt: both are excluded from the
+    // interior (engine.go:4860-4866, `<= mint` / `>= maxt`) and replaced
+    // by boundary points of equal value — left picks f[first].v (the
+    // t=mint sample), right picks f[last].v (the t=maxt sample).
+    let f_in = [f(0, 1.0), f(10, 2.0), f(20, 3.0)];
+    let out = extend_floats(&f_in, 0, 20, false);
+    assert_eq!(points_of(&out), vec![(0, 1.0), (10, 2.0), (20, 3.0)]);
+}
+
+#[test]
+fn extend_floats_all_samples_at_or_before_mint_is_empty() {
+    // (d) `floats[lastSampleIndex].T <= mint` → `[]` (engine.go:4851-4853):
+    // every sample at/before the range start extends to nothing and the
+    // caller omits the series (totalSize == 0, engine.go:2864-2868).
+    let f_in = [f(-20, 1.0), f(-10, 2.0)];
+    assert!(extend_floats(&f_in, 0, 20, false).is_empty());
+    // A lone sample exactly at mint hits the same arm.
+    let f_in = [f(0, 1.0)];
+    assert!(extend_floats(&f_in, 0, 20, false).is_empty());
+    assert!(extend_floats(&f_in, 0, 20, true).is_empty());
+}
+
+#[test]
+fn extend_floats_empty_input_is_empty() {
+    // (e) Documented divergence from the pin: upstream indexes
+    // `floats[len-1]` on an empty slice (Go `sort.Search(n<=0)` returns 0)
+    // — a runtime panic through `ev.recover`, not a defined result. The
+    // port guards to an empty extension (`extended_rate`'s empty-window
+    // precedent) so the series is omitted.
+    assert!(extend_floats(&[], 0, 20, false).is_empty());
+    assert!(extend_floats(&[], 0, 20, true).is_empty());
+}
+
+#[test]
+fn extend_floats_smoothed_all_future_carries_the_first_value_to_both_boundaries() {
+    // (f) The pinned smoothed all-future quirk: samples only in
+    // (maxt, maxt+lb]. Search(T > mint) over f[..len-1] = 0 → first = 0;
+    // Search(T >= maxt) = 0 → last = 0; f[0].T > mint passes the empty
+    // check; left falls through to f[0].v (f[0].T ≮ mint); right needs
+    // `last > 0` to interpolate (functions.go:81-88) so it also picks
+    // f[0].v; the interior is empty (f[0].T >= maxt). Result: the first
+    // FUTURE value carried to both boundary points.
+    let f_in = [f(30, 7.0), f(40, 9.0)];
+    let out = extend_floats(&f_in, 0, 20, true);
+    assert_eq!(points_of(&out), vec![(0, 7.0), (20, 7.0)]);
+}
+
+#[test]
+fn extend_floats_single_in_window_sample_yields_three_points() {
+    // (g) One strictly-interior sample: first = last = 0, both boundary
+    // picks carry f[0].v, and the sample survives the interior filter —
+    // {mint, v}, the sample, {maxt, v}.
+    let f_in = [f(10, 5.0)];
+    let out = extend_floats(&f_in, 0, 20, false);
+    assert_eq!(points_of(&out), vec![(0, 5.0), (10, 5.0), (20, 5.0)]);
+    // Anchored lone sample exactly at maxt (risk 3): upstream's
+    // `lastSampleIndex--` goes transiently to -1; the exclusive-end port
+    // yields the two boundary points, both carrying the sample's value.
+    let f_in = [f(20, 5.0)];
+    let out = extend_floats(&f_in, 0, 20, false);
+    assert_eq!(points_of(&out), vec![(0, 5.0), (20, 5.0)]);
+}
+
 #[test]
 fn extended_histogram_rate_gauge_hint_warns_not_a_counter() {
     // A mid gauge-hinted sample under a counter function warns (issue #125

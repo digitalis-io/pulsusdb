@@ -307,7 +307,8 @@ fn evaluate_counted_with(
         if cancel.is_cancelled() {
             return Err(PromqlError::Cancelled);
         }
-        let value = eval_range_vector_root(source, &plan.selectors, data, p.start_ms)?;
+        let value =
+            eval_range_vector_root(source, &plan.selectors, data, p.start_ms, p.lookback_ms)?;
         return Ok((value, EvalCounts::default(), Annotations::default()));
     }
 
@@ -2328,11 +2329,21 @@ fn windowed_range_source(
 /// `drop_name`), output sorted `(labels, metric_name)`. A no-match or
 /// all-empty selection is `Matrix(vec![])`. Single pass over the fetched
 /// samples — no per-step loop, no extra allocation beyond the output.
+///
+/// Issue #166: an extended (anchored/smoothed) root widens the slice by
+/// lookback (anchored: `(lower−lb, eff_t]`; smoothed: `(lower−lb,
+/// eff_t+lb]` — the [`windowed_range_source`] mode rules, mirroring
+/// upstream `matrixSelector`'s mint/maxt widening, engine.go:2821-2828),
+/// aborts the whole query on any histogram point in a widened window
+/// (`ev.errorf`, :2849-2857), then runs [`extended::extend_floats`]
+/// against the ORIGINAL bounds — still omitting series whose extension
+/// comes back empty. The `Plain` path is byte-identical to #154's.
 fn eval_range_vector_root(
     source: &RangeSource,
     selectors: &[SelectorSpec],
     data: &EvalData<'_>,
     t_ms: i64,
+    lookback_ms: i64,
 ) -> Result<QueryValue, PromqlError> {
     let RangeSource::Selector(id) = source else {
         // `plan()` only ever lifts a bare MATRIX selector into this
@@ -2348,9 +2359,46 @@ fn eval_range_vector_root(
         .range_ms
         .expect("plan() only ever builds a range source over a matrix selector");
     let lower_excl = eff_t - range_ms;
+    let mode = if sel.anchored {
+        RangeMode::Anchored
+    } else if sel.smoothed {
+        RangeMode::Smoothed
+    } else {
+        RangeMode::Plain
+    };
+    let (slice_lower, slice_upper) = match mode {
+        RangeMode::Plain => (lower_excl, eff_t),
+        RangeMode::Anchored => (lower_excl - lookback_ms, eff_t),
+        RangeMode::Smoothed => (lower_excl - lookback_ms, eff_t + lookback_ms),
+    };
     let mut out: Vec<RangeSeries> = Vec::new();
     for series in data.get(*id) {
-        let samples = windowed_non_stale(&series.samples, lower_excl, eff_t);
+        let samples = windowed_non_stale(&series.samples, slice_lower, slice_upper);
+        let samples = match mode {
+            RangeMode::Plain => samples,
+            RangeMode::Anchored | RangeMode::Smoothed => {
+                // Per series, in the pin's order (engine.go:2846-2868):
+                // any histogram point in the widened, stale-filtered
+                // window aborts the WHOLE query (`ev.errorf`; a lone
+                // stale histogram marker was already dropped above, like
+                // `matrixIterSlice`'s stale skip), then `extendFloats`
+                // runs against the ORIGINAL selector bounds.
+                if samples.iter().any(|s| s.h.is_some()) {
+                    return Err(PromqlError::ExtendedHistogram {
+                        modifier: match mode {
+                            RangeMode::Anchored => "anchored",
+                            _ => "smoothed",
+                        },
+                    });
+                }
+                extended::extend_floats(
+                    &samples,
+                    lower_excl,
+                    eff_t,
+                    matches!(mode, RangeMode::Smoothed),
+                )
+            }
+        };
         if samples.is_empty() {
             continue;
         }
@@ -4655,6 +4703,161 @@ mod tests {
         assert!(
             err.to_string().contains("range vector used outside"),
             "range-shaped params keep the type error, got {err}"
+        );
+    }
+
+    // --- issue #166: the extended (anchored/smoothed) matrix-selector root ---
+
+    /// `PlanParams` for an extended-root query: the #166 shape is gated
+    /// on `experimental_functions` (the #150 gate inside
+    /// `plan_matrix_selector_id` still fires first).
+    fn params_experimental(start_ms: i64) -> PlanParams {
+        PlanParams {
+            experimental_functions: true,
+            ..params(start_ms, start_ms, 0)
+        }
+    }
+
+    /// `foo[1m] anchored` as a whole instant query: the slice widens to
+    /// `(lower−lb, eff_t]` (engine.go:2821-2823) and `extendFloats` emits
+    /// a boundary point exactly AT the plain window's excluded left edge
+    /// carrying the pre-mint anchor's value (engine.go:4841-4877); the
+    /// sample at `eff_t` is filtered to the right boundary point of equal
+    /// value. An all-at-or-before-mint series extends to nothing and is
+    /// omitted (totalSize == 0, engine.go:2864-2868); a stale HISTOGRAM
+    /// marker in the widened window is dropped BEFORE the histogram check
+    /// (`matrixIterSlice`'s stale skip) and does not error.
+    #[test]
+    fn anchored_matrix_root_extends_the_window_with_boundary_points() {
+        let expr = crate::parser::parse("foo[1m] anchored").unwrap();
+        let p = plan(&expr, params_experimental(120_000)).unwrap();
+        assert!(matches!(p.root, PlanExpr::RangeVector { .. }));
+        let mut stale_hist = single_histogram().to_float();
+        stale_hist.sum = f64::from_bits(STALE_NAN_BITS);
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(
+                    1,
+                    &[("env", "a")],
+                    vec![
+                        s(30_000, 1.0),
+                        s(90_000, 2.0),
+                        Sample::hist(100_000, stale_hist),
+                        s(120_000, 3.0),
+                    ],
+                ),
+                // Only at/before mint (60s): extends to nothing → omitted.
+                series(2, &[("env", "b")], vec![s(30_000, 5.0), s(60_000, 6.0)]),
+            ],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1, "the all-at-or-before-mint series is omitted");
+                assert_eq!(m[0].labels.get("env"), Some("a"));
+                assert_eq!(m[0].metric_name.as_deref(), Some("foo"));
+                assert!(!m[0].drop_name);
+                assert_eq!(
+                    m[0].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(60_000, 1.0), (90_000, 2.0), (120_000, 3.0)],
+                    "left boundary at mint carries the t=30s anchor's value"
+                );
+                assert!(m[0].points.iter().all(|p| p.h.is_none()));
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// `foo[1m] smoothed`: the slice widens BOTH ways (engine.go:
+    /// 2824-2828) and both boundaries interpolate — left between
+    /// (30s, 1) and (90s, 2) at t=60s → 1.5; right between (90s, 2) and
+    /// the post-window (150s, 4) at t=120s → 3.0 (functions.go:89-101,
+    /// is_counter=false). An all-empty selection stays `Matrix(vec![])`.
+    #[test]
+    fn smoothed_matrix_root_interpolates_both_boundaries() {
+        let expr = crate::parser::parse("foo[1m] smoothed").unwrap();
+        let p = plan(&expr, params_experimental(120_000)).unwrap();
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("env", "a")],
+                vec![s(30_000, 1.0), s(90_000, 2.0), s(150_000, 4.0)],
+            )],
+        );
+        match evaluate(&p, &data).unwrap() {
+            QueryValue::Matrix(m) => {
+                assert_eq!(m.len(), 1);
+                assert_eq!(
+                    m[0].points
+                        .iter()
+                        .map(|p| (p.t_ms, p.v))
+                        .collect::<Vec<_>>(),
+                    vec![(60_000, 1.5), (90_000, 2.0), (120_000, 3.0)]
+                );
+            }
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+        let empty = SeriesData::new();
+        match evaluate(&p, &empty).unwrap() {
+            QueryValue::Matrix(m) => assert!(m.is_empty(), "no match ⇒ empty matrix"),
+            other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    /// Issue #166 AC4: a live (non-stale) histogram point anywhere in the
+    /// WIDENED window aborts the whole query with upstream's `ev.errorf`
+    /// text verbatim (engine.go:2849-2857) — the smoothed case plants the
+    /// histogram BEYOND `eff_t` (inside the `+lb` widening only) to prove
+    /// the check runs over the widened slice, and errors even though
+    /// another series is clean.
+    #[test]
+    fn extended_matrix_root_rejects_histogram_points_verbatim() {
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![
+                series(1, &[("env", "a")], vec![s(90_000, 1.0)]),
+                series(
+                    2,
+                    &[("env", "b")],
+                    vec![Sample::hist(90_000, single_histogram().to_float())],
+                ),
+            ],
+        );
+        let expr = crate::parser::parse("foo[1m] anchored").unwrap();
+        let p = plan(&expr, params_experimental(120_000)).unwrap();
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "anchored modifier is not supported with histograms"
+        );
+
+        // Smoothed twin: the histogram sits at 200s — outside the plain
+        // `(60s, 120s]` window, inside the smoothed `(−240s, 420s]` one.
+        let mut data = SeriesData::new();
+        data.insert(
+            0,
+            vec![series(
+                1,
+                &[("env", "a")],
+                vec![
+                    s(90_000, 1.0),
+                    Sample::hist(200_000, single_histogram().to_float()),
+                ],
+            )],
+        );
+        let expr = crate::parser::parse("foo[1m] smoothed").unwrap();
+        let p = plan(&expr, params_experimental(120_000)).unwrap();
+        let err = evaluate(&p, &data).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "smoothed modifier is not supported with histograms"
         );
     }
 

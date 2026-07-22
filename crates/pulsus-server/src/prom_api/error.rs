@@ -93,7 +93,7 @@ impl IntoResponse for ApiError {
 /// | source | HTTP | `errorType` |
 /// |---|---|---|
 /// | `PromqlError::Parse` (position **in** the message) | 400 | `bad_data` |
-/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp}` | 422 | `execution` |
+/// | `PromqlError::{Unsupported,BadMatching,HistogramBucket,InvalidParameter,LabelSet,ScalarOp,ExtendedHistogram}` | 422 | `execution` |
 /// | `ChError::Timeout` | 503 | `timeout` |
 /// | `ChError::Connect` | 503 | `unavailable` |
 /// | `ChError::{Io,Server,Decode,Config,InsertUncertain}` | 500 | `internal` |
@@ -112,12 +112,16 @@ fn promql_error_parts(e: &PromqlError) -> (StatusCode, &'static str, String) {
         // #129: a native-histogram trim operator between two scalars)
         // rides the same mapping — upstream surfaces its `scalarBinop`
         // panic as a query execution error (`ev.recover`), never a 5xx.
+        // `ExtendedHistogram` (issue #166: a bare anchored/smoothed
+        // matrix-selector root over histogram samples) is upstream's
+        // `ev.errorf` whole-query abort — the same execution class.
         PromqlError::Unsupported { .. }
         | PromqlError::BadMatching { .. }
         | PromqlError::HistogramBucket { .. }
         | PromqlError::InvalidParameter { .. }
         | PromqlError::LabelSet { .. }
-        | PromqlError::ScalarOp { .. } => {
+        | PromqlError::ScalarOp { .. }
+        | PromqlError::ExtendedHistogram { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, "execution", e.to_string())
         }
         // Issue #93: a live `CancelToken` fired because the awaiting
@@ -415,6 +419,24 @@ mod tests {
         assert_eq!(
             json["error"],
             "operator \"</\" not allowed for Scalar operations"
+        );
+    }
+
+    /// Issue #166: a bare anchored/smoothed matrix-selector root over
+    /// histogram samples — upstream's `ev.errorf` text verbatim, mapped
+    /// like every other well-formed-query eval rejection: 422
+    /// `execution`, never a 5xx.
+    #[tokio::test]
+    async fn promql_extended_histogram_error_maps_to_422_execution_with_the_raw_message() {
+        let err = PromqlError::ExtendedHistogram {
+            modifier: "anchored",
+        };
+        let (status, json) = envelope(ApiError::Promql(err)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "execution");
+        assert_eq!(
+            json["error"],
+            "anchored modifier is not supported with histograms"
         );
     }
 

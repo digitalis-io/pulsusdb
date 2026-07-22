@@ -93,6 +93,17 @@ pub enum PromqlError {
     #[error("operator \"{op}\" not allowed for Scalar operations")]
     ScalarOp { op: &'static str },
 
+    /// A bare anchored/smoothed matrix-selector root (issue #166)
+    /// evaluated over a window containing native-histogram samples —
+    /// upstream `matrixSelector` aborts the whole query via `ev.errorf`
+    /// (`promql/engine.go:2849-2857` at the pinned 40af9c2), mirrored
+    /// here as a typed error with the upstream text verbatim (the
+    /// `ScalarOp`/issue #129 precedent: a dedicated variant per pinned
+    /// eval-time message, never `Unsupported`'s prefixed rendering).
+    /// `modifier` is `"anchored"` or `"smoothed"`.
+    #[error("{modifier} modifier is not supported with histograms")]
+    ExtendedHistogram { modifier: &'static str },
+
     /// The evaluation was cancelled by a live [`crate::eval::CancelToken`]
     /// (issue #93) — observed at a per-step/per-grid-point checkpoint after
     /// the awaiting request future was dropped (client disconnect, or the
@@ -164,6 +175,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid function parameter: invalid smoothing factor: expected 0 < sf < 1, got 2"
+        );
+    }
+
+    /// Issue #166: verbatim upstream `ev.errorf` text
+    /// (`engine.go:2851`/`:2856`), for both modifiers — no added prefix.
+    #[test]
+    fn extended_histogram_display_carries_the_upstream_error_text_verbatim() {
+        let err = PromqlError::ExtendedHistogram {
+            modifier: "anchored",
+        };
+        assert_eq!(
+            err.to_string(),
+            "anchored modifier is not supported with histograms"
+        );
+        let err = PromqlError::ExtendedHistogram {
+            modifier: "smoothed",
+        };
+        assert_eq!(
+            err.to_string(),
+            "smoothed modifier is not supported with histograms"
         );
     }
 

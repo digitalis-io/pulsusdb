@@ -5,7 +5,8 @@
 //! `pickOrInterpolate{Left,Right}{,Histogram}`, `correctForCounterResets`
 //! (`Histogram`), `validateHistogramRange`, `extendedRate`,
 //! `extendedHistogramRate`, `pickFirstSampleIndices`) and
-//! `promql/engine.go` (`smoothSeries`).
+//! `promql/engine.go` (`smoothSeries`, and issue #166's `extendFloats` —
+//! the bare anchored/smoothed matrix-selector root).
 //!
 //! Window contract: the caller ([`super::windowed_range_source`]) widens
 //! the fetched sample slice (anchored: `(lower−lb, upper]`; smoothed:
@@ -158,6 +159,64 @@ pub(crate) fn extended_rate(
         result /= range_ms as f64 / 1000.0;
     }
     Some(result)
+}
+
+/// `extendFloats` (engine.go:4841-4877, issue #166): the bare
+/// anchored/smoothed matrix-selector root's boundary extension. `f` is the
+/// mode-widened, stale-filtered, ALL-FLOAT window (the caller has already
+/// rejected histogram points per engine.go:2849-2857); `mint`/`maxt` are
+/// the ORIGINAL selector bounds (`lower_excl`/`eff_t`, `mint < maxt`).
+/// Output: `[{mint, left}] ++ interior ++ [{maxt, right}]` — boundary
+/// points sit exactly AT `mint` and `maxt` (yes, `mint` is the plain
+/// window's excluded left edge; upstream emits a point there), and any
+/// input sample at/outside those bounds is filtered in favour of its
+/// boundary point. All output samples carry `h: None`.
+pub(crate) fn extend_floats(f: &[Sample], mint: i64, maxt: i64, smoothed: bool) -> Vec<Sample> {
+    if f.is_empty() {
+        // Documented divergence from the pin: upstream indexes
+        // `floats[lastSampleIndex]` (= `floats[-1]`, Go `sort.Search(n<=0)`
+        // returning 0) — a runtime panic surfaced by `ev.recover`, not a
+        // defined result. Guarding to an empty extension (series omitted)
+        // is `extended_rate`'s exact empty-window precedent above.
+        return Vec::new();
+    }
+    let mut last_sample_index = f.len() - 1;
+    let first_sample_index =
+        search_first(f, last_sample_index, |s| s.t_ms > mint).saturating_sub(1);
+    if smoothed {
+        last_sample_index = search_first(f, last_sample_index, |s| s.t_ms >= maxt);
+    }
+
+    if f[last_sample_index].t_ms <= mint {
+        // Every sample at/before the range start — nothing to extend.
+        return Vec::new();
+    }
+
+    // `is_counter = false` exactly — the pin's TODO (engine.go:4855,
+    // "detect if the sample is a counter") is NOT resolved here.
+    let left = pick_or_interpolate_left(f, first_sample_index, mint, smoothed, false);
+    let right = pick_or_interpolate_right(f, last_sample_index, maxt, smoothed, false);
+
+    // Filter out samples at boundaries or outside the range
+    // (engine.go:4860-4866). Upstream decrements `lastSampleIndex` to a
+    // transient `-1` for a lone sample at/after `maxt`; compute the
+    // EXCLUSIVE upper bound directly instead (`extended_rate`'s underflow
+    // pattern above). The invariant `interior_start <= interior_end`
+    // holds: with `mint < maxt` a single sample cannot be both `<= mint`
+    // and `>= maxt`, and the `f[last].t_ms <= mint` return above already
+    // handled every all-at-or-before-mint window.
+    let interior_start = first_sample_index + usize::from(f[first_sample_index].t_ms <= mint);
+    let interior_end = if f[last_sample_index].t_ms >= maxt {
+        last_sample_index
+    } else {
+        last_sample_index + 1
+    };
+
+    let mut out = Vec::with_capacity(interior_end - interior_start + 2);
+    out.push(Sample::float(mint, left));
+    out.extend_from_slice(&f[interior_start..interior_end]);
+    out.push(Sample::float(maxt, right));
+    out
 }
 
 // ---------------------------------------------------------------------------
