@@ -97,7 +97,7 @@ use crate::protocols::otlp_prescan::{
 };
 
 use super::{
-    AggCharge, InstrumentationScopeSeed, JsonAggregates, OptionSeed, ResourceSeed,
+    AggCharge, ByteBudget, InstrumentationScopeSeed, JsonAggregates, OptionSeed, ResourceSeed,
     accumulate_attributes, accumulate_msgs, buffer_scalar_or_skip, finish_via_derive,
 };
 
@@ -249,16 +249,18 @@ impl<'de> serde::Deserialize<'de> for ScalarToken {
 fn accumulate_bounded_scalar_array<'de, A>(
     map: &mut A,
     per_level: (usize, &'static str),
+    bytes: ByteBudget<'_>,
 ) -> Result<serde_json::Value, A::Error>
 where
     A: MapAccess<'de>,
 {
-    struct BoundedArraySeed {
+    struct BoundedArraySeed<'a> {
         cap: usize,
         field: &'static str,
+        bytes: ByteBudget<'a>,
     }
 
-    impl<'de> DeserializeSeed<'de> for BoundedArraySeed {
+    impl<'de> DeserializeSeed<'de> for BoundedArraySeed<'_> {
         type Value = serde_json::Value;
 
         fn deserialize<D>(self, deserializer: D) -> Result<serde_json::Value, D::Error>
@@ -269,7 +271,7 @@ where
         }
     }
 
-    impl<'de> Visitor<'de> for BoundedArraySeed {
+    impl<'de> Visitor<'de> for BoundedArraySeed<'_> {
         type Value = serde_json::Value;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -280,6 +282,12 @@ where
         where
             A2: SeqAccess<'de>,
         {
+            // Each buffered element weighs one `serde_json::Value` (issue
+            // #127): the buffered-`Value` vector dominates the final decoded
+            // `Vec<u64/f64>`, and per-level caps alone admit ~33.5M two-char
+            // `bucketCounts` elements (~1 GiB of buffered `Value`s) from a
+            // 64 MiB body — the byte budget is what bounds the total.
+            let weight = std::mem::size_of::<serde_json::Value>();
             let mut out: Vec<serde_json::Value> = Vec::new();
             loop {
                 if out.len() >= self.cap {
@@ -291,8 +299,17 @@ where
                     }
                     return Ok(serde_json::Value::Array(out));
                 }
+                if self.bytes.would_exceed(weight) {
+                    if seq.next_element::<IgnoredAny>()?.is_some() {
+                        return Err(ByteBudget::reject());
+                    }
+                    return Ok(serde_json::Value::Array(out));
+                }
                 match seq.next_element::<ScalarToken>()? {
-                    Some(ScalarToken(v)) => out.push(v),
+                    Some(ScalarToken(v)) => {
+                        self.bytes.commit(weight);
+                        out.push(v);
+                    }
                     None => return Ok(serde_json::Value::Array(out)),
                 }
             }
@@ -302,6 +319,7 @@ where
     map.next_value_seed(BoundedArraySeed {
         cap: per_level.0,
         field: per_level.1,
+        bytes,
     })
 }
 
@@ -358,6 +376,7 @@ impl<'de> Visitor<'de> for ExportMetricsServiceRequestSeed<'_> {
                     &mut resource_metrics,
                     (MAX_RESOURCE_METRICS, "resourceMetrics"),
                     None,
+                    agg.byte_budget(),
                     || ResourceMetricsSeed { agg },
                 )?,
                 _ => {
@@ -420,6 +439,7 @@ impl<'de> Visitor<'de> for ResourceMetricsSeed<'_> {
                     &mut scope_metrics,
                     (MAX_SCOPE_METRICS, "scopeMetrics"),
                     None,
+                    agg.byte_budget(),
                     || ScopeMetricsSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, RESOURCE_METRICS_SCALARS, &mut map, &mut pairs)?,
@@ -477,6 +497,7 @@ impl<'de> Visitor<'de> for ScopeMetricsSeed<'_> {
                     &mut metrics,
                     (MAX_METRICS, "metrics"),
                     None,
+                    agg.byte_budget(),
                     || MetricSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SCOPE_METRICS_SCALARS, &mut map, &mut pairs)?,
@@ -632,6 +653,7 @@ impl<'de> Visitor<'de> for GaugeSeed<'_> {
                         cap: MAX_TOTAL_DATA_POINTS,
                         field: "total data points",
                     }),
+                    agg.byte_budget(),
                     || NumberDataPointSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, GAUGE_SCALARS, &mut map, &mut pairs)?,
@@ -687,6 +709,7 @@ impl<'de> Visitor<'de> for SumSeed<'_> {
                         cap: MAX_TOTAL_DATA_POINTS,
                         field: "total data points",
                     }),
+                    agg.byte_budget(),
                     || NumberDataPointSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SUM_SCALARS, &mut map, &mut pairs)?,
@@ -742,6 +765,7 @@ impl<'de> Visitor<'de> for HistogramSeed<'_> {
                         cap: MAX_TOTAL_DATA_POINTS,
                         field: "total data points",
                     }),
+                    agg.byte_budget(),
                     || HistogramDataPointSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, HISTOGRAM_SCALARS, &mut map, &mut pairs)?,
@@ -797,6 +821,7 @@ impl<'de> Visitor<'de> for ExponentialHistogramSeed<'_> {
                         cap: MAX_TOTAL_DATA_POINTS,
                         field: "total data points",
                     }),
+                    agg.byte_budget(),
                     || ExponentialHistogramDataPointSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, EXP_HISTOGRAM_SCALARS, &mut map, &mut pairs)?,
@@ -852,6 +877,7 @@ impl<'de> Visitor<'de> for SummarySeed<'_> {
                         cap: MAX_TOTAL_DATA_POINTS,
                         field: "total data points",
                     }),
+                    agg.byte_budget(),
                     || SummaryDataPointSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SUMMARY_SCALARS, &mut map, &mut pairs)?,
@@ -913,6 +939,7 @@ impl<'de> Visitor<'de> for NumberDataPointSeed<'_> {
                         cap: MAX_TOTAL_EXEMPLARS,
                         field: "total exemplars",
                     }),
+                    agg.byte_budget(),
                     || ExemplarSeed { agg },
                 )?,
                 // `value` (P6, `asDouble`/`asInt`): a pure scalar oneof — NO
@@ -966,13 +993,19 @@ impl<'de> Visitor<'de> for HistogramDataPointSeed<'_> {
             match key.as_str() {
                 "attributes" => accumulate_attributes(&mut map, &mut attributes, agg)?,
                 "bucketCounts" | "bucket_counts" => {
-                    let v =
-                        accumulate_bounded_scalar_array(&mut map, (MAX_BUCKETS, "bucketCounts"))?;
+                    let v = accumulate_bounded_scalar_array(
+                        &mut map,
+                        (MAX_BUCKETS, "bucketCounts"),
+                        agg.byte_budget(),
+                    )?;
                     pairs.push(("bucketCounts".to_string(), v));
                 }
                 "explicitBounds" | "explicit_bounds" => {
-                    let v =
-                        accumulate_bounded_scalar_array(&mut map, (MAX_BUCKETS, "explicitBounds"))?;
+                    let v = accumulate_bounded_scalar_array(
+                        &mut map,
+                        (MAX_BUCKETS, "explicitBounds"),
+                        agg.byte_budget(),
+                    )?;
                     pairs.push(("explicitBounds".to_string(), v));
                 }
                 "exemplars" => accumulate_msgs(
@@ -984,6 +1017,7 @@ impl<'de> Visitor<'de> for HistogramDataPointSeed<'_> {
                         cap: MAX_TOTAL_EXEMPLARS,
                         field: "total exemplars",
                     }),
+                    agg.byte_budget(),
                     || ExemplarSeed { agg },
                 )?,
                 _ => {
@@ -1049,14 +1083,18 @@ impl<'de> Visitor<'de> for ExponentialHistogramDataPointSeed<'_> {
                         return Err(de::Error::duplicate_field("positive"));
                     }
                     positive_seen = true;
-                    positive = map.next_value_seed(OptionSeed(BucketsSeed))?;
+                    positive = map.next_value_seed(OptionSeed(BucketsSeed {
+                        bytes: agg.byte_budget(),
+                    }))?;
                 }
                 "negative" => {
                     if negative_seen {
                         return Err(de::Error::duplicate_field("negative"));
                     }
                     negative_seen = true;
-                    negative = map.next_value_seed(OptionSeed(BucketsSeed))?;
+                    negative = map.next_value_seed(OptionSeed(BucketsSeed {
+                        bytes: agg.byte_budget(),
+                    }))?;
                 }
                 "exemplars" => accumulate_msgs(
                     &mut map,
@@ -1067,6 +1105,7 @@ impl<'de> Visitor<'de> for ExponentialHistogramDataPointSeed<'_> {
                         cap: MAX_TOTAL_EXEMPLARS,
                         field: "total exemplars",
                     }),
+                    agg.byte_budget(),
                     || ExemplarSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(
@@ -1094,9 +1133,11 @@ impl<'de> Visitor<'de> for ExponentialHistogramDataPointSeed<'_> {
 /// (repeated uint64-as-string, [`MAX_BUCKETS`], both spellings, NO
 /// aggregate — matches the protobuf pre-scan's `ExponentialHistogramBuckets`
 /// cap exactly). `offset` is a plain scalar.
-struct BucketsSeed;
+struct BucketsSeed<'a> {
+    bytes: ByteBudget<'a>,
+}
 
-impl<'de> DeserializeSeed<'de> for BucketsSeed {
+impl<'de> DeserializeSeed<'de> for BucketsSeed<'_> {
     type Value = Buckets;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Buckets, D::Error>
@@ -1107,7 +1148,7 @@ impl<'de> DeserializeSeed<'de> for BucketsSeed {
     }
 }
 
-impl<'de> Visitor<'de> for BucketsSeed {
+impl<'de> Visitor<'de> for BucketsSeed<'_> {
     type Value = Buckets;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1122,8 +1163,11 @@ impl<'de> Visitor<'de> for BucketsSeed {
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "bucketCounts" | "bucket_counts" => {
-                    let v =
-                        accumulate_bounded_scalar_array(&mut map, (MAX_BUCKETS, "bucketCounts"))?;
+                    let v = accumulate_bounded_scalar_array(
+                        &mut map,
+                        (MAX_BUCKETS, "bucketCounts"),
+                        self.bytes,
+                    )?;
                     pairs.push(("bucketCounts".to_string(), v));
                 }
                 _ => buffer_scalar_or_skip(key, BUCKETS_SCALARS, &mut map, &mut pairs)?,
@@ -1174,6 +1218,7 @@ impl<'de> Visitor<'de> for SummaryDataPointSeed<'_> {
                     &mut quantile_values,
                     (MAX_QUANTILES, "quantileValues"),
                     None,
+                    agg.byte_budget(),
                     || std::marker::PhantomData::<ValueAtQuantile>,
                 )?,
                 _ => buffer_scalar_or_skip(key, SUMMARY_DATA_POINT_SCALARS, &mut map, &mut pairs)?,

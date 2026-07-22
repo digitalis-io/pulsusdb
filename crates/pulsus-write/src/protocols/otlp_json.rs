@@ -47,6 +47,18 @@
 //! snake_case leaf would be a conformance change beyond the DoS fix. Current
 //! conformance behaviour is preserved exactly.
 //!
+//! # Decode-time byte budget (issue #127)
+//!
+//! Beside the count caps, every bounded sequence charges a shared per-request
+//! **decoded-byte estimate** — `size_of` of the element type it materializes,
+//! the JSON mirror of the protobuf pre-scan's weight table — and rejects
+//! (before building the offending element) once the estimate exceeds
+//! [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`]. See
+//! [`JsonAggregates::decoded_bytes`] / [`ByteBudget`]: the count caps bound
+//! element COUNTS, not decoded MEMORY (per-level-only kinds have no aggregate
+//! at all), and the byte budget closes that hole at identical thresholds on
+//! both encodings.
+//!
 //! # Shared across signals
 //!
 //! [`JsonAggregates`], [`AnyValueSeed`], [`ResourceSeed`],
@@ -74,10 +86,11 @@ use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Sta
 
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_prescan::{
-    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_ENTITY_REF_KEYS,
-    MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN, MAX_LOG_RECORDS, MAX_RESOURCE_LOGS,
-    MAX_RESOURCE_SPANS, MAX_SCOPE_LOGS, MAX_SCOPE_SPANS, MAX_SPANS, MAX_TOTAL_ATTRIBUTES,
-    MAX_TOTAL_EVENTS, MAX_TOTAL_LINKS, MAX_TOTAL_LOG_RECORDS, MAX_TOTAL_SPANS,
+    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_DECODED_BYTES,
+    MAX_ENTITY_REF_KEYS, MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN, MAX_LOG_RECORDS,
+    MAX_RESOURCE_LOGS, MAX_RESOURCE_SPANS, MAX_SCOPE_LOGS, MAX_SCOPE_SPANS, MAX_SPANS,
+    MAX_TOTAL_ATTRIBUTES, MAX_TOTAL_EVENTS, MAX_TOTAL_LINKS, MAX_TOTAL_LOG_RECORDS,
+    MAX_TOTAL_SPANS,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,6 +126,24 @@ pub(crate) struct JsonAggregates {
     /// of the protobuf pre-scan's `AggKind::LogRecords` — charged once per
     /// accumulated `LogRecord`, capped at [`MAX_TOTAL_LOG_RECORDS`].
     pub(crate) log_records: Cell<usize>,
+    /// Running estimate of the bytes the accumulated elements materialize
+    /// (issue #127), the JSON analog of the protobuf pre-scan's
+    /// `decoded_bytes`: every bounded sequence charges `size_of` of its
+    /// element type per accumulated element (via [`ByteBudget`]) and rejects
+    /// past [`MAX_DECODED_BYTES`] — closing the memory-amplification hole the
+    /// count caps leave (per-level-only kinds like `Metric`/`ScopeSpans`/
+    /// `ScopeLogs` have no aggregate at all).
+    pub(crate) decoded_bytes: Cell<usize>,
+}
+
+impl JsonAggregates {
+    /// The shared decode-time byte budget carrier for this request (issue
+    /// #127), threaded into every bounded sequence.
+    pub(crate) fn byte_budget(&self) -> ByteBudget<'_> {
+        ByteBudget {
+            cell: &self.decoded_bytes,
+        }
+    }
 }
 
 /// One shared aggregate charge: the counter cell, its cap, and the error label.
@@ -121,6 +152,42 @@ pub(crate) struct AggCharge<'a> {
     cell: &'a Cell<usize>,
     cap: usize,
     field: &'static str,
+}
+
+/// The decode-time byte budget carrier (issue #127): the request's shared
+/// `decoded_bytes` cell; the cap is the const [`MAX_DECODED_BYTES`]. A
+/// MANDATORY field of every bounded sequence ([`AccumSeq`] and the metrics
+/// scalar-array accumulator), so a construction site cannot forget to thread
+/// it. Reject-before-materialize with strictly-greater semantics: an element
+/// whose weight would push the running estimate PAST the budget is probed with
+/// [`IgnoredAny`] and rejected before it is built; charges summing to exactly
+/// [`MAX_DECODED_BYTES`] are admitted.
+#[derive(Clone, Copy)]
+pub(crate) struct ByteBudget<'a> {
+    cell: &'a Cell<usize>,
+}
+
+impl ByteBudget<'_> {
+    /// Would charging `weight` more estimated bytes exceed
+    /// [`MAX_DECODED_BYTES`] (strictly greater)?
+    pub(crate) fn would_exceed(&self, weight: usize) -> bool {
+        self.cell.get().saturating_add(weight) > MAX_DECODED_BYTES
+    }
+
+    /// Commits `weight` estimated bytes to the running total (call only after
+    /// [`Self::would_exceed`] returned `false` for it).
+    pub(crate) fn commit(&self, weight: usize) {
+        self.cell.set(self.cell.get().saturating_add(weight));
+    }
+
+    /// The budget-reject error, named identically on every charge site so the
+    /// reject is attributable ("decoded bytes (estimated)" is the protobuf /
+    /// remote-write twins' `OversizeMessage` field).
+    fn reject<E: de::Error>() -> E {
+        de::Error::custom(format!(
+            "decoded bytes (estimated) exceed the request decode budget of {MAX_DECODED_BYTES}"
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,11 +342,17 @@ const LOG_RECORD_SCALARS: &[&str] = &[
 /// Reject-before-materialize: when a cap is reached the visitor probes for the
 /// next element with [`IgnoredAny`] (which walks but never *builds* it) and
 /// rejects on the first over-cap element — so neither the offending element nor
-/// the array tail behind it is materialized.
+/// the array tail behind it is materialized. The mandatory `bytes` budget
+/// (issue #127) applies the same discipline to estimated decoded BYTES: each
+/// element weighs `size_of::<T>()` (the exact struct the seed materializes,
+/// matching the protobuf pre-scan's `materialized_weight` table), and the
+/// element that would push the request past [`MAX_DECODED_BYTES`] is rejected
+/// before it is built.
 pub(crate) struct AccumSeq<'a, T, Mk> {
     target: &'a mut Vec<T>,
     per_level: Option<(usize, &'static str)>,
     agg: Option<AggCharge<'a>>,
+    bytes: ByteBudget<'a>,
     make_seed: Mk,
 }
 
@@ -298,6 +371,7 @@ where
             target: self.target,
             per_level: self.per_level,
             agg: self.agg,
+            bytes: self.bytes,
             make_seed: self.make_seed,
         })
     }
@@ -307,6 +381,7 @@ struct AccumSeqVisitor<'a, T, Mk> {
     target: &'a mut Vec<T>,
     per_level: Option<(usize, &'static str)>,
     agg: Option<AggCharge<'a>>,
+    bytes: ByteBudget<'a>,
     make_seed: Mk,
 }
 
@@ -351,11 +426,21 @@ where
                 }
                 return Ok(());
             }
+            // Decode-time byte budget (issue #127): a further element would
+            // materialize `size_of::<T>()` more bytes — reject it before it is
+            // built once that would push the request past MAX_DECODED_BYTES.
+            if self.bytes.would_exceed(std::mem::size_of::<T>()) {
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(ByteBudget::reject());
+                }
+                return Ok(());
+            }
             match seq.next_element_seed((self.make_seed)())? {
                 Some(elem) => {
                     if let Some(a) = self.agg {
                         a.cell.set(a.cell.get() + 1);
                     }
+                    self.bytes.commit(std::mem::size_of::<T>());
                     self.target.push(elem);
                 }
                 None => return Ok(()),
@@ -372,6 +457,7 @@ fn accumulate_msgs<'de, A, T, Mk, S>(
     target: &mut Vec<T>,
     per_level: (usize, &'static str),
     agg: Option<AggCharge<'_>>,
+    bytes: ByteBudget<'_>,
     make_seed: Mk,
 ) -> Result<(), A::Error>
 where
@@ -383,6 +469,7 @@ where
         target,
         per_level: Some(per_level),
         agg,
+        bytes,
         make_seed,
     })
 }
@@ -614,6 +701,7 @@ impl<'de> Visitor<'de> for BoundedArrayValueVisitor<'_> {
                         target: &mut values,
                         per_level: None,
                         agg: Some(self.elem_agg),
+                        bytes: agg.byte_budget(),
                         make_seed: || AnyValueSeed {
                             agg,
                             depth: elem_depth,
@@ -690,6 +778,7 @@ impl<'de> Visitor<'de> for BoundedKvlistValueVisitor<'_> {
                         target: &mut values,
                         per_level: None,
                         agg: Some(self.elem_agg),
+                        bytes: agg.byte_budget(),
                         make_seed: || KeyValueSeed { agg, value_depth },
                     })?;
                 }
@@ -788,6 +877,7 @@ where
             cap: MAX_TOTAL_ATTRIBUTES,
             field: "total attributes",
         }),
+        agg.byte_budget(),
         || KeyValueSeed {
             agg,
             value_depth: 1,
@@ -844,7 +934,10 @@ impl<'de> Visitor<'de> for ResourceSeed<'_> {
                     &mut entity_refs,
                     (MAX_ENTITY_REFS, "entityRefs"),
                     None,
-                    || EntityRefSeed,
+                    self.agg.byte_budget(),
+                    || EntityRefSeed {
+                        bytes: self.agg.byte_budget(),
+                    },
                 )?,
                 _ => buffer_scalar_or_skip(key, RESOURCE_SCALARS, &mut map, &mut pairs)?,
             }
@@ -858,9 +951,13 @@ impl<'de> Visitor<'de> for ResourceSeed<'_> {
 
 /// Bounded seed for an `EntityRef`: `idKeys`/`descriptionKeys` (repeated strings,
 /// `MAX_ENTITY_REF_KEYS`, both spellings). `schemaUrl`/`type` are plain scalars.
-pub(crate) struct EntityRefSeed;
+/// Carries the shared byte budget so its repeated-string keys charge
+/// `size_of::<String>()` each (issue #127).
+pub(crate) struct EntityRefSeed<'a> {
+    pub(crate) bytes: ByteBudget<'a>,
+}
 
-impl<'de> DeserializeSeed<'de> for EntityRefSeed {
+impl<'de> DeserializeSeed<'de> for EntityRefSeed<'_> {
     type Value = EntityRef;
 
     fn deserialize<D>(self, deserializer: D) -> Result<EntityRef, D::Error>
@@ -871,7 +968,7 @@ impl<'de> DeserializeSeed<'de> for EntityRefSeed {
     }
 }
 
-impl<'de> Visitor<'de> for EntityRefSeed {
+impl<'de> Visitor<'de> for EntityRefSeed<'_> {
     type Value = EntityRef;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -893,13 +990,17 @@ impl<'de> Visitor<'de> for EntityRefSeed {
         let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
-                "idKeys" | "id_keys" => {
-                    accumulate_strings(&mut map, &mut id_keys, (MAX_ENTITY_REF_KEYS, "idKeys"))?
-                }
+                "idKeys" | "id_keys" => accumulate_strings(
+                    &mut map,
+                    &mut id_keys,
+                    (MAX_ENTITY_REF_KEYS, "idKeys"),
+                    self.bytes,
+                )?,
                 "descriptionKeys" | "description_keys" => accumulate_strings(
                     &mut map,
                     &mut description_keys,
                     (MAX_ENTITY_REF_KEYS, "descriptionKeys"),
+                    self.bytes,
                 )?,
                 _ => buffer_scalar_or_skip(key, ENTITY_REF_SCALARS, &mut map, &mut pairs)?,
             }
@@ -924,16 +1025,20 @@ impl<'de> Visitor<'de> for EntityRefSeed {
     }
 }
 
-/// Charges a repeated `string` field (no aggregate; per-level only).
+/// Charges a repeated `string` field (no aggregate; per-level only). Each
+/// element charges a `String` header into the byte budget (issue #127; the
+/// string CONTENT is bounded by the 64 MiB body cap, matching the protobuf
+/// pre-scan's `RepeatedString` weight).
 fn accumulate_strings<'de, A>(
     map: &mut A,
     target: &mut Vec<String>,
     per_level: (usize, &'static str),
+    bytes: ByteBudget<'_>,
 ) -> Result<(), A::Error>
 where
     A: MapAccess<'de>,
 {
-    accumulate_msgs(map, target, per_level, None, || {
+    accumulate_msgs(map, target, per_level, None, bytes, || {
         std::marker::PhantomData::<String>
     })
 }
@@ -1039,6 +1144,7 @@ impl<'de> Visitor<'de> for ExportTraceServiceRequestSeed<'_> {
                     &mut resource_spans,
                     (MAX_RESOURCE_SPANS, "resourceSpans"),
                     None,
+                    agg.byte_budget(),
                     || ResourceSpansSeed { agg },
                 )?,
                 _ => {
@@ -1102,6 +1208,7 @@ impl<'de> Visitor<'de> for ResourceSpansSeed<'_> {
                     &mut scope_spans,
                     (MAX_SCOPE_SPANS, "scopeSpans"),
                     None,
+                    agg.byte_budget(),
                     || ScopeSpansSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SPANS_ENVELOPE_SCALARS, &mut map, &mut pairs)?,
@@ -1168,6 +1275,7 @@ impl<'de> Visitor<'de> for ScopeSpansSeed<'_> {
                         cap: MAX_TOTAL_SPANS,
                         field: "total spans",
                     }),
+                    agg.byte_budget(),
                     || SpanSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SPANS_ENVELOPE_SCALARS, &mut map, &mut pairs)?,
@@ -1279,6 +1387,7 @@ impl<'de> Visitor<'de> for SpanSeed<'_> {
                         cap: MAX_TOTAL_EVENTS,
                         field: "total span events",
                     }),
+                    agg.byte_budget(),
                     || EventSeed { agg },
                 )?,
                 "links" => accumulate_msgs(
@@ -1290,6 +1399,7 @@ impl<'de> Visitor<'de> for SpanSeed<'_> {
                         cap: MAX_TOTAL_LINKS,
                         field: "total span links",
                     }),
+                    agg.byte_budget(),
                     || LinkSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SPAN_SCALARS, &mut map, &mut pairs)?,
@@ -1459,6 +1569,7 @@ impl<'de> Visitor<'de> for ExportLogsServiceRequestSeed<'_> {
                     &mut resource_logs,
                     (MAX_RESOURCE_LOGS, "resourceLogs"),
                     None,
+                    agg.byte_budget(),
                     || ResourceLogsSeed { agg },
                 )?,
                 _ => {
@@ -1520,6 +1631,7 @@ impl<'de> Visitor<'de> for ResourceLogsSeed<'_> {
                     &mut scope_logs,
                     (MAX_SCOPE_LOGS, "scopeLogs"),
                     None,
+                    agg.byte_budget(),
                     || ScopeLogsSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, RESOURCE_LOGS_SCALARS, &mut map, &mut pairs)?,
@@ -1586,6 +1698,7 @@ impl<'de> Visitor<'de> for ScopeLogsSeed<'_> {
                         cap: MAX_TOTAL_LOG_RECORDS,
                         field: "total log records",
                     }),
+                    agg.byte_budget(),
                     || LogRecordSeed { agg },
                 )?,
                 _ => buffer_scalar_or_skip(key, SCOPE_LOGS_SCALARS, &mut map, &mut pairs)?,

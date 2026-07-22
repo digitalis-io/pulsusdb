@@ -7,9 +7,10 @@
 
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_prescan::{
-    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_ENTITY_REF_KEYS,
-    MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN, MAX_RESOURCE_SPANS, MAX_SCOPE_SPANS,
-    MAX_SPANS, MAX_TOTAL_ATTRIBUTES, MAX_TOTAL_EVENTS, MAX_TOTAL_LINKS, MAX_TOTAL_SPANS,
+    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_DECODED_BYTES,
+    MAX_ENTITY_REF_KEYS, MAX_ENTITY_REFS, MAX_EVENTS_PER_SPAN, MAX_LINKS_PER_SPAN,
+    MAX_RESOURCE_SPANS, MAX_SCOPE_SPANS, MAX_SPANS, MAX_TOTAL_ATTRIBUTES, MAX_TOTAL_EVENTS,
+    MAX_TOTAL_LINKS, MAX_TOTAL_SPANS,
 };
 use crate::protocols::otlp_traces::decode_json;
 
@@ -236,7 +237,12 @@ fn spans_over_aggregate_cap_rejects() {
         r#"{{"resourceSpans":[{{"scopeSpans":{}}}]}}"#,
         arr(&scope, scopes)
     );
-    assert_rejects_with(&body, "total spans");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 #[test]
@@ -246,7 +252,12 @@ fn events_over_aggregate_cap_rejects() {
     let events = arr("{}", per_span);
     let span = format!(r#"{{"events":{events}}}"#);
     let body = one_scope(&arr(&span, spans));
-    assert_rejects_with(&body, "total span events");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 #[test]
@@ -256,7 +267,12 @@ fn links_over_aggregate_cap_rejects() {
     let links = arr("{}", per_span);
     let span = format!(r#"{{"links":{links}}}"#);
     let body = one_scope(&arr(&span, spans));
-    assert_rejects_with(&body, "total span links");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 #[test]
@@ -266,7 +282,12 @@ fn attributes_over_aggregate_cap_rejects() {
     let attrs = arr(r#"{"key":"k"}"#, per_span);
     let span = format!(r#"{{"attributes":{attrs}}}"#);
     let body = one_scope(&arr(&span, spans));
-    assert_rejects_with(&body, "total attributes");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 // --------------------------------------------------------------------------
@@ -281,7 +302,11 @@ fn anyvalue_over_wide_kvlist_rejects() {
     let entries = arr(r#"{"key":"a"}"#, MAX_ANYVALUE_ELEMENTS + 1);
     let attr = format!(r#"{{"key":"big","value":{{"kvlistValue":{{"values":{entries}}}}}}}"#);
     let body = one_span(&format!(r#"{{"attributes":[{attr}]}}"#));
-    assert_rejects_with(&body, "AnyValue elements");
+    // Since issue #127 the byte budget fires first here: kvlist entries are
+    // `KeyValue`s (64 bytes each), heavier than `MAX_DECODED_BYTES / 5M`, so
+    // the byte estimate crosses before the AnyValue-element count aggregate
+    // (the wide-ARRAY twin's 32-byte `AnyValue` elements still reach it).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 /// A value nested `levels` deep in `arrayValue` wrappers with a scalar leaf.
@@ -616,4 +641,137 @@ fn unknown_key_with_wide_value_is_ignored_matching_vendored() {
            "spans":[{{"unkSp":{wide}}}]}}]}}]}}"#
     );
     assert_ok(&body);
+}
+
+// --------------------------------------------------------------------------
+// Decode-time byte budget (issue #127)
+// --------------------------------------------------------------------------
+
+/// AC 2a (JSON twin): exact-boundary identity, driven DIRECTLY at the shared
+/// `decoded_bytes` cell / probe seam every bounded sequence charges through.
+/// `size_of`-derived charges summing to EXACTLY `MAX_DECODED_BYTES` are
+/// admitted; one further byte would reject — pinning the strictly-greater
+/// semantics, byte-identical to the protobuf `charge` seam.
+#[test]
+fn byte_budget_exact_boundary_at_the_shared_cell_seam() {
+    use opentelemetry_proto::tonic::trace::v1::Span;
+
+    let agg = super::JsonAggregates::default();
+    let budget = agg.byte_budget();
+    let span = std::mem::size_of::<Span>();
+    let full_spans = MAX_DECODED_BYTES / span;
+    let remainder = MAX_DECODED_BYTES - full_spans * span;
+
+    assert!(!budget.would_exceed(full_spans * span));
+    budget.commit(full_spans * span);
+    assert!(!budget.would_exceed(remainder));
+    budget.commit(remainder);
+    // Exactly at the budget: admitted; one more byte is strictly greater.
+    assert!(!budget.would_exceed(0));
+    assert!(
+        budget.would_exceed(1),
+        "strictly-greater semantics: MAX_DECODED_BYTES + 1 must reject"
+    );
+}
+
+// Minimal local protobuf wire builders for the cross-encoding parity fixture
+// (the full builder set lives in `otlp_prescan/tests.rs`; this module is
+// JSON-side, so only the three primitives the parity test needs are mirrored).
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn wire_ld(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    put_varint(&mut out, (u64::from(field) << 3) | 2);
+    put_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn wire_empty_repeated(field: u32, n: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(n * 2);
+    for _ in 0..n {
+        put_varint(&mut out, (u64::from(field) << 3) | 2);
+        out.push(0);
+    }
+    out
+}
+
+/// The AC 2b derived fixture chunks: leaves split so no per-level count cap
+/// can fire before the byte budget.
+fn parity_chunks(total: usize, per_container: usize) -> Vec<usize> {
+    let mut chunks = Vec::with_capacity(total.div_ceil(per_container));
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(per_container);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    chunks
+}
+
+/// AC 7 (issue #127): cross-encoding parity. One logical payload (the AC 2b
+/// derived sizing: `MAX_DECODED_BYTES / size_of::<Span>() + 1024` empty spans,
+/// auto-split at 900k per scope) rejects on BOTH encodings with each track's
+/// byte-budget error — `DecodeJson` naming the budget here, `OversizeMessage
+/// { field: "decoded bytes (estimated)" }` on the protobuf pre-scan — and a
+/// scaled-down in-budget twin admits identically on both.
+#[test]
+fn cross_encoding_byte_budget_parity_for_spans() {
+    use opentelemetry_proto::tonic::trace::v1::Span;
+
+    const PER_CONTAINER: usize = 900_000;
+    let total = MAX_DECODED_BYTES / std::mem::size_of::<Span>() + 1024;
+    let chunks = parity_chunks(total, PER_CONTAINER);
+    // Self-asserted preconditions: only the BYTE budget can fire.
+    const { assert!(PER_CONTAINER < MAX_SPANS) }
+    assert!(total < MAX_TOTAL_SPANS);
+    assert!(chunks.len() < MAX_SCOPE_SPANS);
+
+    // JSON encoding.
+    let mut scopes_json = String::from("[");
+    for (i, &chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            scopes_json.push(',');
+        }
+        scopes_json.push_str(&format!(r#"{{"spans":{}}}"#, arr("{}", chunk)));
+    }
+    scopes_json.push(']');
+    let json_body = format!(r#"{{"resourceSpans":[{{"scopeSpans":{scopes_json}}}]}}"#);
+    assert_rejects_with(&json_body, "decoded bytes (estimated)");
+
+    // Protobuf encoding of the same logical payload.
+    let mut scopes_wire = Vec::new();
+    for &chunk in &chunks {
+        scopes_wire.extend_from_slice(&wire_ld(2, &wire_empty_repeated(2, chunk)));
+    }
+    let wire_body = wire_ld(1, &scopes_wire);
+    match crate::protocols::otlp_traces::decode(&wire_body) {
+        Err(LogsIngestError::OversizeMessage { field, .. }) => {
+            assert_eq!(field, "decoded bytes (estimated)");
+        }
+        other => panic!("protobuf twin must reject at the byte budget, got {other:?}"),
+    }
+
+    // Scaled-down in-budget twin admits on both encodings.
+    const SMALL: usize = 1_000;
+    let small_json = one_scope(&arr("{}", SMALL));
+    let by_json = decode_json(small_json.as_bytes()).expect("in-budget JSON twin decodes");
+    let small_wire = wire_ld(1, &wire_ld(2, &wire_empty_repeated(2, SMALL)));
+    let by_wire =
+        crate::protocols::otlp_traces::decode(&small_wire).expect("in-budget wire twin decodes");
+    assert_eq!(by_json.resource_spans[0].scope_spans[0].spans.len(), SMALL);
+    assert_eq!(
+        by_json, by_wire,
+        "both encodings decode the twin identically"
+    );
 }

@@ -14,8 +14,8 @@
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_logs::decode_json;
 use crate::protocols::otlp_prescan::{
-    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_LOG_RECORDS,
-    MAX_RESOURCE_LOGS, MAX_SCOPE_LOGS, MAX_TOTAL_LOG_RECORDS,
+    MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_DECODED_BYTES,
+    MAX_LOG_RECORDS, MAX_RESOURCE_LOGS, MAX_SCOPE_LOGS, MAX_TOTAL_LOG_RECORDS,
 };
 
 // --------------------------------------------------------------------------
@@ -228,7 +228,12 @@ fn log_records_over_aggregate_cap_rejects() {
         r#"{{"resourceLogs":[{{"scopeLogs":{}}}]}}"#,
         arr(&scope, scopes)
     );
-    assert_rejects_with(&body, "total log records");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 // --------------------------------------------------------------------------
@@ -243,7 +248,11 @@ fn log_record_body_anyvalue_over_wide_kvlist_rejects() {
     let body = one_record(&format!(
         r#"{{"body":{{"kvlistValue":{{"values":{entries}}}}}}}"#
     ));
-    assert_rejects_with(&body, "AnyValue elements");
+    // Since issue #127 the byte budget fires first here: kvlist entries are
+    // `KeyValue`s (64 bytes each), heavier than `MAX_DECODED_BYTES / 5M`, so
+    // the byte estimate crosses before the AnyValue-element count aggregate
+    // (the wide-ARRAY twin's 32-byte `AnyValue` elements still reach it).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 #[test]
@@ -386,4 +395,40 @@ fn unknown_key_with_wide_value_is_ignored_matching_vendored() {
            "logRecords":[{{"unkLr":{wide}}}]}}]}}]}}"#
     );
     assert_ok(&body);
+}
+
+// --------------------------------------------------------------------------
+// Decode-time byte budget (issue #127)
+// --------------------------------------------------------------------------
+
+/// AC 6 (issue #127), logs signal: an over-budget body (the AC 2b derived
+/// sizing — `MAX_DECODED_BYTES / size_of::<LogRecord>() + 1024` empty records,
+/// auto-split at 900k per scope so NO count cap fires) rejects as `DecodeJson`
+/// whose message names the decode budget.
+#[test]
+fn over_budget_log_records_reject_names_the_decode_budget() {
+    use opentelemetry_proto::tonic::logs::v1::LogRecord;
+
+    const PER_CONTAINER: usize = 900_000;
+    let total = MAX_DECODED_BYTES / std::mem::size_of::<LogRecord>() + 1024;
+    // Self-asserted preconditions: only the BYTE budget can fire.
+    const { assert!(PER_CONTAINER < MAX_LOG_RECORDS) }
+    assert!(total < MAX_TOTAL_LOG_RECORDS);
+    assert!(total.div_ceil(PER_CONTAINER) < MAX_SCOPE_LOGS);
+
+    let mut scopes = String::from("[");
+    let mut remaining = total;
+    let mut first = true;
+    while remaining > 0 {
+        let chunk = remaining.min(PER_CONTAINER);
+        remaining -= chunk;
+        if !first {
+            scopes.push(',');
+        }
+        first = false;
+        scopes.push_str(&format!(r#"{{"logRecords":{}}}"#, arr("{}", chunk)));
+    }
+    scopes.push(']');
+    let body = format!(r#"{{"resourceLogs":[{{"scopeLogs":{scopes}}}]}}"#);
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }

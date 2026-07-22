@@ -860,7 +860,14 @@ fn a_very_deep_wire_chain_is_rejected_without_stack_overflow() {
 #[test]
 fn total_spans_aggregate_cap_across_scopes() {
     // Each ScopeSpans stays at MAX_SPANS (per-level OK), but their sum exceeds
-    // MAX_TOTAL_SPANS — only the shared aggregate counter catches it.
+    // MAX_TOTAL_SPANS — no per-level cap catches it. Since issue #127 the
+    // FIRST bound this fixture crosses is the decode-time BYTE budget: at
+    // `size_of::<Span>()` per span, `MAX_DECODED_BYTES / size_of::<Span>()`
+    // (~1M) spans charge past 256 MiB long before the 5M count aggregate — the
+    // aggregate remains a backstop (a kind lighter than
+    // `MAX_DECODED_BYTES / MAX_TOTAL_*` could still reach it first; see
+    // `total_anyvalue_elements_aggregate_cap`), and first-violation-wins keeps
+    // protobuf and JSON classifying this fixture identically.
     let full_scope = ld(F_RS_SCOPE_SPANS, &empty_repeated(F_SS_SPANS, MAX_SPANS));
     let scopes = MAX_TOTAL_SPANS / MAX_SPANS + 1;
     let resource_spans = full_scope.repeat(scopes);
@@ -868,7 +875,7 @@ fn total_spans_aggregate_cap_across_scopes() {
     assert!(matches!(
         prescan_traces(&request),
         Err(LogsIngestError::OversizeMessage {
-            field: "total spans",
+            field: "decoded bytes (estimated)",
             ..
         })
     ));
@@ -877,7 +884,9 @@ fn total_spans_aggregate_cap_across_scopes() {
 #[test]
 fn total_attributes_aggregate_cap_across_spans() {
     // Each span carries MAX_ATTRIBUTES_PER_ELEMENT attrs (per-level OK); their
-    // sum over enough spans exceeds MAX_TOTAL_ATTRIBUTES.
+    // sum over enough spans exceeds MAX_TOTAL_ATTRIBUTES. As above (issue
+    // #127), the byte budget (`size_of::<KeyValue>()` per attribute, tighter
+    // than 5M attrs) is the first bound this fixture crosses.
     let span = ld(
         F_SS_SPANS,
         &attributes(F_SPAN_ATTRS, MAX_ATTRIBUTES_PER_ELEMENT, b"k"),
@@ -887,7 +896,7 @@ fn total_attributes_aggregate_cap_across_spans() {
     assert!(matches!(
         prescan_traces(&request),
         Err(LogsIngestError::OversizeMessage {
-            field: "total attributes",
+            field: "decoded bytes (estimated)",
             ..
         })
     ));
@@ -895,6 +904,8 @@ fn total_attributes_aggregate_cap_across_spans() {
 
 #[test]
 fn total_data_points_aggregate_cap_across_metrics() {
+    // As above (issue #127): the byte budget (`size_of::<NumberDataPoint>()`
+    // per point) is tighter than the 5M count aggregate and fires first.
     let metric = ld(
         F_SM_METRICS,
         &ld(
@@ -907,7 +918,7 @@ fn total_data_points_aggregate_cap_across_metrics() {
     assert!(matches!(
         prescan_metrics(&request),
         Err(LogsIngestError::OversizeMessage {
-            field: "total data points",
+            field: "decoded bytes (estimated)",
             ..
         })
     ));
@@ -1293,4 +1304,391 @@ fn legitimate_traces_request_passes_and_decodes() {
     prescan_traces(&bytes).expect("legitimate request pre-scans clean");
     let decoded = ExportTraceServiceRequest::decode(bytes.as_slice()).expect("decodes");
     assert_eq!(decoded.resource_spans.len(), 1);
+}
+
+// ===========================================================================
+// Decode-time byte budget (issue #127)
+// ===========================================================================
+
+/// AC 1: the budget is the sibling derivation of the landed
+/// `MAX_EXPANDED_BYTES` family — 4× the 64 MiB decompressed body cap.
+#[test]
+fn max_decoded_bytes_pins_the_sibling_derivation() {
+    assert_eq!(
+        MAX_DECODED_BYTES,
+        4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES
+    );
+    assert_eq!(MAX_DECODED_BYTES, 256 * 1024 * 1024);
+}
+
+/// AC 2a: exact-boundary identity, driven at the `charge`-level seam (no wire
+/// body, no count cap in play). Synthetic `size_of`-derived charges summing to
+/// EXACTLY `MAX_DECODED_BYTES` are admitted; one further minimal (1-byte)
+/// charge unit rejects with field `"decoded bytes (estimated)"` — pinning the
+/// strictly-greater (`> limit`) semantics.
+#[test]
+fn byte_budget_exact_boundary_admits_then_rejects_at_the_charge_seam() {
+    // A count with neither a per-level nor an aggregate cap, so ONLY the byte
+    // budget can reject.
+    let uncounted = Count {
+        slot: 0,
+        per_level: None,
+        agg: None,
+    };
+    let mut counts = [0u32; SLOTS];
+    let mut agg = Aggregates::default();
+
+    let span_weight = materialized_weight(MsgType::Span);
+    let full_spans = MAX_DECODED_BYTES / span_weight;
+    let remainder = MAX_DECODED_BYTES - full_spans * span_weight;
+
+    charge(&uncounted, full_spans, span_weight, &mut counts, &mut agg)
+        .unwrap_or_else(|_| panic!("{full_spans} span-weight charges stay within the budget"));
+    charge(&uncounted, remainder, 1, &mut counts, &mut agg)
+        .unwrap_or_else(|_| panic!("topping up to exactly MAX_DECODED_BYTES is admitted"));
+    assert_eq!(agg.decoded_bytes, MAX_DECODED_BYTES as u64);
+
+    match charge(&uncounted, 1, 1, &mut counts, &mut agg) {
+        Err(ScanErr::Reject(LogsIngestError::OversizeMessage {
+            field,
+            limit,
+            actual,
+        })) => {
+            assert_eq!(field, "decoded bytes (estimated)");
+            assert_eq!(limit, MAX_DECODED_BYTES);
+            assert_eq!(actual, MAX_DECODED_BYTES + 1);
+        }
+        other => panic!("one byte past the budget must reject, got {other:?}"),
+    }
+}
+
+/// AC 2b fixture arithmetic (#127 plan v6, binding): leaves alone exceed the
+/// budget by at least `1024 × size_of::<Leaf>()` bytes for ANY nonzero leaf
+/// size; container charges only add margin.
+fn over_budget_leaf_total(leaf_weight: usize) -> usize {
+    (MAX_DECODED_BYTES / leaf_weight) + 1024
+}
+
+/// Per-container fan-out for the AC 2b fixtures — comfortably under the 1M
+/// per-level leaf caps, so the BYTE budget (never a count cap) is what fires.
+const BUDGET_PER_CONTAINER: usize = 900_000;
+
+/// Splits `total` leaves into `div_ceil(BUDGET_PER_CONTAINER)` chunks, each
+/// `<= BUDGET_PER_CONTAINER`.
+fn budget_chunks(total: usize) -> Vec<usize> {
+    let mut chunks = Vec::with_capacity(total.div_ceil(BUDGET_PER_CONTAINER));
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(BUDGET_PER_CONTAINER);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    chunks
+}
+
+/// Asserts the AC 2b rejection contract on a full `decode()` entry-point
+/// result: the byte-budget field fires — explicitly NOT a count-cap field.
+fn assert_decoded_bytes_reject<T: std::fmt::Debug>(result: Result<T, LogsIngestError>) {
+    match result {
+        Err(LogsIngestError::OversizeMessage {
+            field,
+            limit,
+            actual,
+        }) => {
+            assert_eq!(
+                field, "decoded bytes (estimated)",
+                "the BYTE budget must fire, not a count cap"
+            );
+            assert_eq!(limit, MAX_DECODED_BYTES);
+            assert!(actual > limit);
+        }
+        other => panic!("expected the decoded-bytes reject, got {other:?}"),
+    }
+}
+
+/// AC 2b, traces: a real wire body over `MAX_DECODED_BYTES` in decoded bytes
+/// while UNDER every count cap rejects through the full `decode()` entry point
+/// with the byte-budget field.
+#[test]
+fn over_budget_spans_body_rejects_decoded_bytes_through_decode() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::Span));
+    let chunks = budget_chunks(total);
+    // Self-asserted preconditions: no count cap can fire first.
+    assert!(chunks.iter().all(|&c| c <= BUDGET_PER_CONTAINER));
+    const { assert!(BUDGET_PER_CONTAINER < MAX_SPANS) }
+    assert!(total < MAX_TOTAL_SPANS);
+    assert!(chunks.len() < MAX_SCOPE_SPANS);
+
+    let mut scopes = Vec::new();
+    for &chunk in &chunks {
+        scopes.extend_from_slice(&ld(F_RS_SCOPE_SPANS, &empty_repeated(F_SS_SPANS, chunk)));
+    }
+    let body = ld(F_REQ_ROOT, &scopes);
+    assert_decoded_bytes_reject(crate::protocols::otlp_traces::decode(&body));
+}
+
+/// AC 2b, logs: the `LogRecord` analog.
+#[test]
+fn over_budget_log_records_body_rejects_decoded_bytes_through_decode() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::LogRecord));
+    let chunks = budget_chunks(total);
+    assert!(chunks.iter().all(|&c| c <= BUDGET_PER_CONTAINER));
+    const { assert!(BUDGET_PER_CONTAINER < MAX_LOG_RECORDS) }
+    assert!(total < MAX_TOTAL_LOG_RECORDS);
+    assert!(chunks.len() < MAX_SCOPE_LOGS);
+
+    let mut scopes = Vec::new();
+    for &chunk in &chunks {
+        scopes.extend_from_slice(&ld(
+            F_RL_SCOPE_LOGS,
+            &empty_repeated(F_SL_LOG_RECORDS, chunk),
+        ));
+    }
+    let body = ld(F_REQ_ROOT, &scopes);
+    assert_decoded_bytes_reject(crate::protocols::otlp_logs::decode(&body));
+}
+
+/// AC 2b, metrics: the `HistogramDataPoint` analog (a heavier data-point arm;
+/// its per-metric container charges only ADD margin).
+#[test]
+fn over_budget_histogram_data_points_body_rejects_decoded_bytes_through_decode() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::HistogramDataPoint));
+    let chunks = budget_chunks(total);
+    assert!(chunks.iter().all(|&c| c <= BUDGET_PER_CONTAINER));
+    const { assert!(BUDGET_PER_CONTAINER < MAX_DATA_POINTS) }
+    assert!(total < MAX_TOTAL_DATA_POINTS);
+    assert!(chunks.len() < MAX_METRICS);
+
+    let mut metrics = Vec::new();
+    for &chunk in &chunks {
+        let histogram = ld(F_METRIC_HISTOGRAM, &empty_repeated(F_DATA_POINTS, chunk));
+        metrics.extend_from_slice(&one_metric(&histogram));
+    }
+    let body = metrics_with_metrics(&metrics);
+    assert_decoded_bytes_reject(crate::protocols::otlp_metrics::decode(&body));
+}
+
+/// AC 3: the per-level-only kinds have NO aggregate count cap — `Metric` is
+/// `repeated_msg(.., MAX_METRICS, "metrics", None)` — so before #127 a 64 MiB
+/// body of ~33.5M two-byte empty `Metric`s admitted ~4 GiB of structs. The
+/// byte budget now charges every counted kind: a body over budget PURELY via
+/// `Metric` elements (per-level caps never exceeded) rejects at the budget.
+#[test]
+fn metric_elements_without_aggregate_cap_are_byte_budget_bounded() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::Metric));
+    let chunks = budget_chunks(total);
+    assert!(chunks.iter().all(|&c| c <= BUDGET_PER_CONTAINER));
+    const { assert!(BUDGET_PER_CONTAINER < MAX_METRICS) }
+    assert!(chunks.len() < MAX_SCOPE_METRICS);
+
+    let mut scopes = Vec::new();
+    for &chunk in &chunks {
+        scopes.extend_from_slice(&ld(
+            F_RM_SCOPE_METRICS,
+            &empty_repeated(F_SM_METRICS, chunk),
+        ));
+    }
+    let body = ld(F_REQ_ROOT, &scopes);
+    match prescan_metrics(&body) {
+        Err(LogsIngestError::OversizeMessage { field, .. }) => {
+            assert_eq!(field, "decoded bytes (estimated)");
+        }
+        other => panic!("empty-Metric fan-out must trip the byte budget, got {other:?}"),
+    }
+}
+
+/// AC 3, same shape for `ScopeSpans` (per-level 65,536, no aggregate): the
+/// leaves split across enough `ResourceSpans` that no per-level cap fires.
+#[test]
+fn scope_spans_without_aggregate_cap_are_byte_budget_bounded() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::ScopeSpans));
+    // ScopeSpans' per-level cap is 65,536 — chunk under it.
+    let per_resource = 60_000;
+    assert!(per_resource < MAX_SCOPE_SPANS);
+    assert!(total.div_ceil(per_resource) < MAX_RESOURCE_SPANS);
+
+    let mut body = Vec::new();
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(per_resource);
+        remaining -= chunk;
+        body.extend_from_slice(&ld(F_REQ_ROOT, &empty_repeated(F_RS_SCOPE_SPANS, chunk)));
+    }
+    match prescan_traces(&body) {
+        Err(LogsIngestError::OversizeMessage { field, .. }) => {
+            assert_eq!(field, "decoded bytes (estimated)");
+        }
+        other => panic!("empty-ScopeSpans fan-out must trip the byte budget, got {other:?}"),
+    }
+}
+
+/// AC 3, same shape for `ScopeLogs`.
+#[test]
+fn scope_logs_without_aggregate_cap_are_byte_budget_bounded() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::ScopeLogs));
+    let per_resource = 60_000;
+    assert!(per_resource < MAX_SCOPE_LOGS);
+    assert!(total.div_ceil(per_resource) < MAX_RESOURCE_LOGS);
+
+    let mut body = Vec::new();
+    let mut remaining = total;
+    while remaining > 0 {
+        let chunk = remaining.min(per_resource);
+        remaining -= chunk;
+        body.extend_from_slice(&ld(F_REQ_ROOT, &empty_repeated(F_RL_SCOPE_LOGS, chunk)));
+    }
+    match prescan_logs(&body) {
+        Err(LogsIngestError::OversizeMessage { field, .. }) => {
+            assert_eq!(field, "decoded bytes (estimated)");
+        }
+        other => panic!("empty-ScopeLogs fan-out must trip the byte budget, got {other:?}"),
+    }
+}
+
+/// AC 4 fixture: a metrics body whose total byte charge is EXACTLY
+/// `MAX_DECODED_BYTES + 8 × extra_bucket_elements`, with the bucket vector
+/// encoded packed or unpacked. Three filler scopes of empty `Metric`s consume
+/// the bulk of the budget; the fourth scope carries one exponential-histogram
+/// metric whose `Buckets.bucket_counts` supplies the last `k` 8-byte charges.
+fn parity_metrics_body(n_fill: usize, k: usize, packed: bool) -> Vec<u8> {
+    let mut scopes = Vec::new();
+    let mut remaining = n_fill;
+    for _ in 0..3 {
+        let chunk = remaining.min(BUDGET_PER_CONTAINER);
+        remaining -= chunk;
+        scopes.extend_from_slice(&ld(
+            F_RM_SCOPE_METRICS,
+            &empty_repeated(F_SM_METRICS, chunk),
+        ));
+    }
+    assert_eq!(remaining, 0, "filler must fit three per-level-safe scopes");
+    let buckets = if packed {
+        packed_varint(F_EH_BUCKETS_COUNTS, k)
+    } else {
+        let mut out = Vec::new();
+        for _ in 0..k {
+            put_varint(&mut out, tag(F_EH_BUCKETS_COUNTS, 0)); // unpacked varint
+            out.push(0);
+        }
+        out
+    };
+    let dp = ld(F_EHDP_POSITIVE, &buckets);
+    let metric = ld(F_METRIC_EXP_HISTOGRAM, &ld(F_DATA_POINTS, &dp));
+    scopes.extend_from_slice(&ld(F_RM_SCOPE_METRICS, &one_metric(&metric)));
+    ld(F_REQ_ROOT, &scopes)
+}
+
+/// AC 4: packed/unpacked scalar parity — the same `bucket_counts` vector
+/// charges 8 B/element whichever wire encoding carries it, proven by an
+/// exact-boundary admit/reject pair identical across both encodings. All
+/// arithmetic derives from the same `size_of` expressions as the weight
+/// table (no literals), so the boundary cannot drift from the implementation.
+#[test]
+fn packed_and_unpacked_bucket_counts_charge_identical_bytes() {
+    let w_rm = materialized_weight(MsgType::ResourceMetrics);
+    let w_sm = materialized_weight(MsgType::ScopeMetrics);
+    let w_metric = materialized_weight(MsgType::Metric);
+    let w_dp = materialized_weight(MsgType::ExponentialHistogramDataPoint);
+    let elem = SCALAR_ELEMENT_WEIGHT;
+
+    // Fixed charges: one ResourceMetrics, four ScopeMetrics (three filler +
+    // one histogram), the histogram data point. The singular
+    // ExponentialHistogram arm and the mergeable Buckets are uncharged
+    // (inline in / merged into their parents).
+    let fixed = w_rm + 4 * w_sm + w_dp;
+    let available = MAX_DECODED_BYTES - fixed;
+    // Choose k so the remaining budget divides exactly into Metric weights:
+    // every struct size is 8-aligned, so `available % w_metric` is a multiple
+    // of the 8-byte element weight; `+ w_metric` keeps k comfortably nonzero.
+    let k = (available % w_metric) / elem + w_metric;
+    let n_fill = (available - k * elem) / w_metric - 1; // -1: the histogram Metric
+    assert!(k < MAX_BUCKETS, "bucket vector stays under its count cap");
+    assert_eq!(
+        fixed + (n_fill + 1) * w_metric + k * elem,
+        MAX_DECODED_BYTES,
+        "fixture charge must sum to exactly the budget"
+    );
+
+    for packed in [true, false] {
+        let at_budget = parity_metrics_body(n_fill, k, packed);
+        prescan_metrics(&at_budget).unwrap_or_else(|err| {
+            panic!("packed={packed}: exactly MAX_DECODED_BYTES must admit, got {err:?}")
+        });
+        let over = parity_metrics_body(n_fill, k + 1, packed);
+        match prescan_metrics(&over) {
+            Err(LogsIngestError::OversizeMessage { field, .. }) => assert_eq!(
+                field, "decoded bytes (estimated)",
+                "packed={packed}: one more element must trip the byte budget"
+            ),
+            other => panic!("packed={packed}: expected the budget reject, got {other:?}"),
+        }
+    }
+}
+
+/// AC 5: malformed-wire precedence is preserved for the byte budget exactly as
+/// for every count cap — an over-BUDGET body with trailing malformed wire
+/// records the budget reject but keeps scanning, meets the malformed tail, and
+/// DEFERS to prost (per signal); the full `decode()` entry point then yields
+/// the canonical `LogsIngestError::Decode`, never the budget reject.
+#[test]
+fn over_budget_traces_with_malformed_tail_defers_to_prost() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::Span));
+    let mut scopes = Vec::new();
+    for &chunk in &budget_chunks(total) {
+        scopes.extend_from_slice(&ld(F_RS_SCOPE_SPANS, &empty_repeated(F_SS_SPANS, chunk)));
+    }
+    let mut body = ld(F_REQ_ROOT, &scopes);
+    put_varint(&mut body, tag(F_REQ_ROOT, 2));
+    put_varint(&mut body, 100); // claims 100 bytes, provides none (malformed)
+
+    assert!(
+        prescan_traces(&body).is_ok(),
+        "over-budget prefix + malformed tail must defer to prost"
+    );
+    match crate::protocols::otlp_traces::decode(&body) {
+        Err(LogsIngestError::Decode(_)) => {}
+        other => panic!("full decode must classify as prost Decode, got {other:?}"),
+    }
+}
+
+/// AC 5, logs analog.
+#[test]
+fn over_budget_logs_with_malformed_tail_defers_to_prost() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::LogRecord));
+    let mut scopes = Vec::new();
+    for &chunk in &budget_chunks(total) {
+        scopes.extend_from_slice(&ld(
+            F_RL_SCOPE_LOGS,
+            &empty_repeated(F_SL_LOG_RECORDS, chunk),
+        ));
+    }
+    let mut body = ld(F_REQ_ROOT, &scopes);
+    put_varint(&mut body, tag(F_REQ_ROOT, 2));
+    put_varint(&mut body, 100);
+
+    assert!(prescan_logs(&body).is_ok());
+    match crate::protocols::otlp_logs::decode(&body) {
+        Err(LogsIngestError::Decode(_)) => {}
+        other => panic!("full decode must classify as prost Decode, got {other:?}"),
+    }
+}
+
+/// AC 5, metrics analog.
+#[test]
+fn over_budget_metrics_with_malformed_tail_defers_to_prost() {
+    let total = over_budget_leaf_total(materialized_weight(MsgType::HistogramDataPoint));
+    let mut metrics = Vec::new();
+    for &chunk in &budget_chunks(total) {
+        let histogram = ld(F_METRIC_HISTOGRAM, &empty_repeated(F_DATA_POINTS, chunk));
+        metrics.extend_from_slice(&one_metric(&histogram));
+    }
+    let mut body = metrics_with_metrics(&metrics);
+    put_varint(&mut body, tag(F_REQ_ROOT, 2));
+    put_varint(&mut body, 100);
+
+    assert!(prescan_metrics(&body).is_ok());
+    match crate::protocols::otlp_metrics::decode(&body) {
+        Err(LogsIngestError::Decode(_)) => {}
+        other => panic!("full decode must classify as prost Decode, got {other:?}"),
+    }
 }

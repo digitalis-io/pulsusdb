@@ -92,7 +92,28 @@
 //! `bytes_value`) carry no per-field cap: each occurs at most once per an
 //! already-capped repeated ancestor, and their aggregate size is bounded by the
 //! 64 MiB `read_capped_body` backstop that runs before decode. The pre-scan
-//! bounds *counts and depth*, not scalar sizes.
+//! bounds *counts, depth, and estimated decoded bytes*, not scalar sizes.
+//!
+//! # Decode-time byte budget (issue #127)
+//!
+//! The count caps bound how MANY elements decode, not how much MEMORY they
+//! decode into: 5M spans at ~264 B each is ~1.3 GiB, the independent aggregates
+//! (spans + events + links + attributes) stack, and the per-level-only kinds
+//! (`Metric`, `ScopeSpans`, `ScopeLogs`, …) have no aggregate at all — ~33.5M
+//! two-wire-byte empty `Metric`s fit a 64 MiB body inside every count cap yet
+//! decode to ~4 GiB of structs. So alongside every count charge the walk keeps a
+//! running **decoded-byte estimate**: each counted element charges
+//! `size_of::<vendored prost struct>()` (see [`materialized_weight`]) — packed /
+//! unpacked scalar vector elements charge their 8-byte element size, repeated
+//! strings a `String` header — and the request is rejected once the estimate
+//! exceeds [`MAX_DECODED_BYTES`] (strictly greater), with the same
+//! record-and-continue / malformed-precedence contract as every count cap.
+//! Singular (`SingularMessage`/`MergeableMessage`) children charge nothing:
+//! prost stores them inline in (or merges duplicates into) the parent's own
+//! `size_of`, which the parent's charge already covered; their repeated
+//! sub-fields charge per element as usual. String/bytes CONTENT is not charged —
+//! it is bounded 1:1 by the 64 MiB body cap; the budget bounds the *structural*
+//! amplification the count caps leave open.
 
 use crate::error::LogsIngestError;
 
@@ -183,6 +204,26 @@ pub const MAX_ENTITY_REF_KEYS: usize = 65_536;
 /// the fan-out width of a nested `AnyValue` tree (complements the
 /// [`MAX_ANYVALUE_DEPTH`] nesting-depth bound).
 pub const MAX_ANYVALUE_ELEMENTS: usize = 5_000_000;
+
+/// Per-request cap on the **estimated decoded bytes** a body's counted elements
+/// materialize (issue #127) — the shared decode-time byte budget for the OTLP
+/// protobuf pre-scan, the OTLP/JSON bounded seeds
+/// ([`crate::protocols::otlp_json`]), and the remote-write bounded decoder
+/// ([`crate::protocols::remote_write`]). Derivation: 4× the 64 MiB decompressed
+/// body cap ([`crate::ingest::decompress::MAX_DECOMPRESSED_BYTES`]) = 256 MiB —
+/// the exact sibling of the three landed parse-time `MAX_EXPANDED_BYTES`
+/// budgets (`otlp_traces` / `otlp_metrics` / `remote_write`): a legitimate
+/// batch's decoded structure is at most a few× its wire size, while the
+/// near-empty-element attack shapes the count caps admit (GiB-class struct
+/// fan-outs from a ≤64 MiB body) trip within their first quarter. An
+/// order-of-magnitude DoS bound on the ESTIMATE (`size_of`-based, not RSS —
+/// actual peak can exceed it by Vec growth plus ≤64 MiB of string/bytes
+/// content), like every budget in this family. A documented constant, not a
+/// config knob (the decompress.rs resolution): promote to a config variable
+/// only when a deployment actually needs a different limit. The Loki and
+/// Zipkin decode paths (budget-scale residuals) adopt this convention in the
+/// follow-up issue #168.
+pub const MAX_DECODED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES;
 
 /// Hard cap on the wire-walk frame stack, an explicit backstop that bounds the
 /// pre-scan's own recursion independently of the semantic depth reject. The
@@ -723,6 +764,76 @@ fn anyvalue_elements() -> Count {
     }
 }
 
+/// The decode-time byte weight of ONE materialized element of a counted
+/// repeated-message field (issue #127): `size_of` of the **vendored prost
+/// struct** the element decodes into, so the [`MAX_DECODED_BYTES`] estimate
+/// tracks exactly what `Export*::decode` materializes — no magic numbers, and
+/// the table re-derives if a vendored struct ever changes shape. EXHAUSTIVE by
+/// design (no wildcard arm): adding a [`MsgType`] without deciding its weight
+/// must not compile. The root request types never occur as a charged child but
+/// carry their true weights for uniformity.
+fn materialized_weight(child: MsgType) -> usize {
+    use std::mem::size_of;
+
+    use opentelemetry_proto::tonic::collector::logs::v1 as clogs;
+    use opentelemetry_proto::tonic::collector::metrics::v1 as cmetrics;
+    use opentelemetry_proto::tonic::collector::trace::v1 as ctrace;
+    use opentelemetry_proto::tonic::common::v1 as common;
+    use opentelemetry_proto::tonic::logs::v1 as logs;
+    use opentelemetry_proto::tonic::metrics::v1 as metrics;
+    use opentelemetry_proto::tonic::resource::v1 as resource;
+    use opentelemetry_proto::tonic::trace::v1 as trace;
+
+    match child {
+        // traces
+        MsgType::ExportTraceServiceRequest => size_of::<ctrace::ExportTraceServiceRequest>(),
+        MsgType::ResourceSpans => size_of::<trace::ResourceSpans>(),
+        MsgType::ScopeSpans => size_of::<trace::ScopeSpans>(),
+        MsgType::Span => size_of::<trace::Span>(),
+        MsgType::SpanEvent => size_of::<trace::span::Event>(),
+        MsgType::SpanLink => size_of::<trace::span::Link>(),
+        // metrics
+        MsgType::ExportMetricsServiceRequest => size_of::<cmetrics::ExportMetricsServiceRequest>(),
+        MsgType::ResourceMetrics => size_of::<metrics::ResourceMetrics>(),
+        MsgType::ScopeMetrics => size_of::<metrics::ScopeMetrics>(),
+        MsgType::Metric => size_of::<metrics::Metric>(),
+        MsgType::Gauge => size_of::<metrics::Gauge>(),
+        MsgType::Sum => size_of::<metrics::Sum>(),
+        MsgType::Histogram => size_of::<metrics::Histogram>(),
+        MsgType::ExponentialHistogram => size_of::<metrics::ExponentialHistogram>(),
+        MsgType::Summary => size_of::<metrics::Summary>(),
+        MsgType::NumberDataPoint => size_of::<metrics::NumberDataPoint>(),
+        MsgType::HistogramDataPoint => size_of::<metrics::HistogramDataPoint>(),
+        MsgType::ExponentialHistogramDataPoint => {
+            size_of::<metrics::ExponentialHistogramDataPoint>()
+        }
+        MsgType::ExponentialHistogramBuckets => {
+            size_of::<metrics::exponential_histogram_data_point::Buckets>()
+        }
+        MsgType::SummaryDataPoint => size_of::<metrics::SummaryDataPoint>(),
+        MsgType::ValueAtQuantile => size_of::<metrics::summary_data_point::ValueAtQuantile>(),
+        MsgType::Exemplar => size_of::<metrics::Exemplar>(),
+        // logs
+        MsgType::ExportLogsServiceRequest => size_of::<clogs::ExportLogsServiceRequest>(),
+        MsgType::ResourceLogs => size_of::<logs::ResourceLogs>(),
+        MsgType::ScopeLogs => size_of::<logs::ScopeLogs>(),
+        MsgType::LogRecord => size_of::<logs::LogRecord>(),
+        // shared
+        MsgType::Resource => size_of::<resource::Resource>(),
+        MsgType::InstrumentationScope => size_of::<common::InstrumentationScope>(),
+        MsgType::EntityRef => size_of::<common::EntityRef>(),
+        MsgType::KeyValue => size_of::<common::KeyValue>(),
+        MsgType::AnyValue => size_of::<common::AnyValue>(),
+        MsgType::ArrayValue => size_of::<common::ArrayValue>(),
+        MsgType::KeyValueList => size_of::<common::KeyValueList>(),
+    }
+}
+
+/// The decode-time byte weight of one packed / unpacked scalar vector element
+/// (`fixed64` bucket counts, `double` bounds, varint `uint64` bucket counts):
+/// every such vector materializes 8-byte elements.
+const SCALAR_ELEMENT_WEIGHT: usize = std::mem::size_of::<u64>();
+
 // ---------------------------------------------------------------------------
 // Walk
 // ---------------------------------------------------------------------------
@@ -769,11 +880,17 @@ impl<'a> Frame<'a> {
 #[derive(Default)]
 struct Aggregates {
     totals: [u64; AGG_KINDS],
+    /// Running estimate of the bytes the counted elements materialize on
+    /// decode (issue #127), charged in [`charge`] at `n × weight` per counted
+    /// occurrence and rejected past [`MAX_DECODED_BYTES`]. Monotonic and
+    /// request-wide like `totals`.
+    decoded_bytes: u64,
 }
 
 /// Internal walk failure: either a genuine cap/depth rejection to surface as a
 /// 400, or a benign wire anomaly on which the scan bails and defers to
 /// `prost`'s own decode error.
+#[derive(Debug)]
 enum ScanErr {
     /// A per-level or aggregate cap, or the depth bound, was exceeded.
     Reject(LogsIngestError),
@@ -828,10 +945,16 @@ fn record(recorded: &mut Option<LogsIngestError>, err: LogsIngestError) {
 }
 
 /// Charges `count` against the top frame's per-level slot and the shared
-/// aggregate by `n` occurrences, rejecting on either overflow.
+/// aggregate by `n` occurrences — and `n × weight` estimated decoded bytes
+/// against the shared [`MAX_DECODED_BYTES`] budget (issue #127) — rejecting on
+/// any overflow (strictly greater than the limit; exactly at the limit is
+/// admitted). The FIRST violated bound wins; a per-level/aggregate reject skips
+/// the byte charge for that occurrence, which cannot change the outcome (the
+/// walk records only the first violation).
 fn charge(
     count: &Count,
     n: usize,
+    weight: usize,
     counts: &mut [u32; SLOTS],
     agg: &mut Aggregates,
 ) -> Result<(), ScanErr> {
@@ -858,6 +981,18 @@ fn charge(
                 actual: (*total).min(usize::MAX as u64) as usize,
             }));
         }
+    }
+    // Decode-time byte budget (issue #127): every counted kind charges its
+    // materialized weight, closing the memory-amplification hole the count
+    // caps leave (module doc, "Decode-time byte budget").
+    let bytes = &mut agg.decoded_bytes;
+    *bytes = bytes.saturating_add((n as u64).saturating_mul(weight as u64));
+    if *bytes > MAX_DECODED_BYTES as u64 {
+        return Err(ScanErr::Reject(LogsIngestError::OversizeMessage {
+            field: "decoded bytes (estimated)",
+            limit: MAX_DECODED_BYTES,
+            actual: (*bytes).min(usize::MAX as u64) as usize,
+        }));
     }
     Ok(())
 }
@@ -946,7 +1081,7 @@ fn step<'a>(
             frame.pos = after;
             // A packed field may arrive unpacked: one varint = one element.
             if let Action::PackedVarint { count } = action {
-                charge(&count, 1, &mut frame.counts, agg)?;
+                charge(&count, 1, SCALAR_ELEMENT_WEIGHT, &mut frame.counts, agg)?;
             }
             Ok(Outcome::Advanced)
         }
@@ -958,7 +1093,7 @@ fn step<'a>(
             }
             frame.pos = after;
             if let Action::PackedFixed64 { count } = action {
-                charge(&count, 1, &mut frame.counts, agg)?;
+                charge(&count, 1, SCALAR_ELEMENT_WEIGHT, &mut frame.counts, agg)?;
             }
             Ok(Outcome::Advanced)
         }
@@ -1001,7 +1136,13 @@ fn step_length_delimited<'a>(
     match action {
         Action::Skip => Ok(Outcome::Advanced),
         Action::RepeatedString { count } => {
-            charge(&count, 1, &mut frame.counts, agg)?;
+            charge(
+                &count,
+                1,
+                std::mem::size_of::<String>(),
+                &mut frame.counts,
+                agg,
+            )?;
             Ok(Outcome::Advanced)
         }
         Action::PackedFixed64 { count } => {
@@ -1010,7 +1151,13 @@ fn step_length_delimited<'a>(
             if !value.len().is_multiple_of(8) {
                 return Err(ScanErr::Malformed);
             }
-            charge(&count, value.len() / 8, &mut frame.counts, agg)?;
+            charge(
+                &count,
+                value.len() / 8,
+                SCALAR_ELEMENT_WEIGHT,
+                &mut frame.counts,
+                agg,
+            )?;
             Ok(Outcome::Advanced)
         }
         Action::PackedVarint { count } => {
@@ -1022,11 +1169,11 @@ fn step_length_delimited<'a>(
             // clean, exactly like every other charge path.
             match count_packed_varints(value, count.per_level.map_or(usize::MAX, |(l, _)| l)) {
                 Some(CountOutcome::Exact(n)) => {
-                    charge(&count, n, &mut frame.counts, agg)?;
+                    charge(&count, n, SCALAR_ELEMENT_WEIGHT, &mut frame.counts, agg)?;
                     Ok(Outcome::Advanced)
                 }
                 Some(CountOutcome::OverLimit(n)) => {
-                    charge(&count, n, &mut frame.counts, agg)?;
+                    charge(&count, n, SCALAR_ELEMENT_WEIGHT, &mut frame.counts, agg)?;
                     // `OverLimit` implies a per-level cap was present, so `charge`
                     // rejected above; a capless field never reports `OverLimit`.
                     Ok(Outcome::Advanced)
@@ -1042,7 +1189,8 @@ fn step_length_delimited<'a>(
             // `prost`. The descent decodes nothing and stays within
             // `MAX_WIRE_DEPTH`, so the over-cap structure is walked, never
             // materialized.
-            if let Err(ScanErr::Reject(err)) = charge(&count, 1, &mut frame.counts, agg) {
+            let weight = materialized_weight(child);
+            if let Err(ScanErr::Reject(err)) = charge(&count, 1, weight, &mut frame.counts, agg) {
                 record(recorded, err);
             }
             descend(frame, child, value)
@@ -1060,7 +1208,8 @@ fn step_length_delimited<'a>(
             // The descent decodes nothing, is allocation-free, and stays within
             // `MAX_WIRE_DEPTH`, so completing it adds no asymptotic cost — the
             // over-cap structure is walked, never materialized.
-            if let Err(ScanErr::Reject(err)) = charge(&count, 1, &mut frame.counts, agg) {
+            let weight = materialized_weight(child);
+            if let Err(ScanErr::Reject(err)) = charge(&count, 1, weight, &mut frame.counts, agg) {
                 record(recorded, err);
             }
             descend(frame, child, value)

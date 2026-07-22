@@ -49,6 +49,7 @@ use crate::error::LogsIngestError;
 use crate::ingest::metrics::{
     HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
 };
+use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 
 /// `prompb.WriteRequest` (RW-1.0): `timeseries` at tag 1, `metadata` at tag
 /// 3 (tag 2 is reserved on the wire for a Cortex-specific source marker,
@@ -267,6 +268,19 @@ impl prost::Message for WriteRequest {
 ///    review of issue #140, high finding). Once a total exceeds its cap,
 ///    further histograms in the same series — and then whole further series —
 ///    are drained.
+/// 4. A transient `decoded_bytes` accumulator (issue #127) estimates the BYTES
+///    the materialized elements cost — `size_of::<TimeSeries>()`/`Label`/
+///    `Sample`/`MetricMetadataProto` per element (charged at the series /
+///    metadata boundary) plus `size_of::<Histogram>()`/`BucketSpan`/8-byte
+///    bucket elements (charged incrementally per histogram, alongside guard 3's
+///    count charges). The element-COUNT caps above bound how many elements
+///    decode, not how much memory: minimal 2-wire-byte empty labels are ~48
+///    heap bytes each, so the counts alone still admit hundreds of MiB of
+///    structs from a small body. Once the estimate exceeds the shared
+///    [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget (256 MiB),
+///    further series / histograms / metadata are drained without
+///    materializing, and the deferred [`validate_bounds`] re-sum rejects the
+///    whole request with the family-wide `"decoded bytes (estimated)"` field.
 ///
 /// Kept separate from [`WriteRequest`] so the value type carries no
 /// decode-scratch field and preserves derived round-trip equality — the
@@ -281,6 +295,56 @@ struct BoundedWriteRequest {
     total_histograms: usize,
     total_hist_spans: usize,
     total_hist_buckets: usize,
+    decoded_bytes: usize,
+}
+
+/// Estimated decoded bytes of ONE native histogram (issue #127): the
+/// `Histogram` struct itself plus its decoded `BucketSpan`s and 8-byte bucket
+/// elements — `size_of`-derived, no magic numbers, exactly what the decoder
+/// materializes.
+fn decoded_histogram_bytes(h: &Histogram) -> usize {
+    std::mem::size_of::<Histogram>()
+        .saturating_add(
+            h.span_count()
+                .saturating_mul(std::mem::size_of::<BucketSpan>()),
+        )
+        .saturating_add(
+            h.bucket_element_count()
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+}
+
+/// Estimated decoded bytes of one series' NON-histogram structs (issue #127):
+/// the `TimeSeries` struct plus its labels and samples. Histograms are charged
+/// separately — incrementally per histogram DURING the series' decode (see
+/// [`BoundedWriteRequest::merge_one_time_series`]) — so the two never double
+/// count.
+fn decoded_series_shell_bytes(ts: &TimeSeries) -> usize {
+    std::mem::size_of::<TimeSeries>()
+        .saturating_add(ts.labels.len().saturating_mul(std::mem::size_of::<Label>()))
+        .saturating_add(
+            ts.samples
+                .len()
+                .saturating_mul(std::mem::size_of::<Sample>()),
+        )
+}
+
+/// Re-sums the whole request's decoded-byte estimate from materialized data —
+/// the SAME function of the materialized content as the incremental
+/// `decoded_bytes` charges, so the deferred [`validate_bounds`] re-check and
+/// the decode-time drain can never disagree (a drained request always re-sums
+/// past the budget).
+fn decoded_request_bytes(timeseries: &[TimeSeries], metadata: &[MetricMetadataProto]) -> usize {
+    let mut total = metadata
+        .len()
+        .saturating_mul(std::mem::size_of::<MetricMetadataProto>());
+    for ts in timeseries {
+        total = total.saturating_add(decoded_series_shell_bytes(ts));
+        for h in &ts.histograms {
+            total = total.saturating_add(decoded_histogram_bytes(h));
+        }
+    }
+    total
 }
 
 impl BoundedWriteRequest {
@@ -305,6 +369,11 @@ impl BoundedWriteRequest {
                     .saturating_add(h.bucket_element_count());
             }
         }
+        // The decoded-byte estimate is re-summed with the same shared function
+        // the deferred validate_bounds re-check uses (issue #127), so a merge
+        // INTO an existing request charges the pre-existing materialization
+        // too — no budget bypass through repeated raw merges.
+        seed.decoded_bytes = decoded_request_bytes(&seed.timeseries, &seed.metadata);
         seed
     }
 
@@ -339,25 +408,29 @@ impl BoundedWriteRequest {
     ) -> Result<(), prost::DecodeError> {
         prost::encoding::check_wire_type(prost::encoding::WireType::LengthDelimited, wire_type)?;
         // (TimeSeries under construction, total_histograms, total_hist_spans,
-        // total_hist_buckets) — one tuple so `merge_loop` can thread every
-        // running total through its single `&mut T`.
+        // total_hist_buckets, decoded_bytes) — one tuple so `merge_loop` can
+        // thread every running total through its single `&mut T`.
         let mut scratch = (
             TimeSeries::default(),
             self.total_histograms,
             self.total_hist_spans,
             self.total_hist_buckets,
+            self.decoded_bytes,
         );
         prost::encoding::merge_loop(
             &mut scratch,
             buf,
             ctx,
-            |(ts, total_histograms, total_hist_spans, total_hist_buckets), buf, ctx| {
+            |(ts, total_histograms, total_hist_spans, total_hist_buckets, decoded_bytes),
+             buf,
+             ctx| {
                 let (tag, wire_type) = prost::encoding::decode_key(buf)?;
                 if tag == 4u32 {
                     if ts.histograms.len() > MAX_HISTOGRAMS_PER_SERIES
                         || *total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
                         || *total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
                         || *total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
+                        || *decoded_bytes > MAX_DECODED_BYTES
                     {
                         // Cap reached (per-series count OR a request-wide
                         // aggregate): drain this histogram WITHOUT
@@ -381,12 +454,16 @@ impl BoundedWriteRequest {
                         // own fields are already capped per side/field by
                         // `Histogram::merge_field`, so one over-aggregate
                         // step grows the fan-out by at most one histogram's
-                        // per-field caps.
+                        // per-field caps. The byte estimate (issue #127) is
+                        // charged at the same site with the same bounded
+                        // over-step.
                         if let Some(h) = ts.histograms.last() {
                             *total_histograms = total_histograms.saturating_add(1);
                             *total_hist_spans = total_hist_spans.saturating_add(h.span_count());
                             *total_hist_buckets =
                                 total_hist_buckets.saturating_add(h.bucket_element_count());
+                            *decoded_bytes =
+                                decoded_bytes.saturating_add(decoded_histogram_bytes(h));
                         }
                         Ok(())
                     }
@@ -395,10 +472,11 @@ impl BoundedWriteRequest {
                 }
             },
         )?;
-        let (ts, total_histograms, total_hist_spans, total_hist_buckets) = scratch;
+        let (ts, total_histograms, total_hist_spans, total_hist_buckets, decoded_bytes) = scratch;
         self.total_histograms = total_histograms;
         self.total_hist_spans = total_hist_spans;
         self.total_hist_buckets = total_hist_buckets;
+        self.decoded_bytes = decoded_bytes;
         self.timeseries.push(ts);
         Ok(())
     }
@@ -428,6 +506,7 @@ impl prost::Message for BoundedWriteRequest {
                     || self.total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
                     || self.total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
                     || self.total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
+                    || self.decoded_bytes > MAX_DECODED_BYTES
                 {
                     // Cap reached (series count OR aggregate labels/samples):
                     // drain the excess series WITHOUT materializing it, while
@@ -458,16 +537,24 @@ impl prost::Message for BoundedWriteRequest {
                     // single series' label/sample fan-out (256 / 100k) sits
                     // far below the 5M aggregates, so charging THOSE at the
                     // series boundary bounds the over-aggregate step to one
-                    // series' per-series cap.
+                    // series' per-series cap. The byte estimate (issue #127)
+                    // charges the series shell (struct + labels + samples) at
+                    // the same boundary with the same bounded over-step (~1.6
+                    // MiB worst case, far under the 256 MiB budget).
                     if let Some(last) = self.timeseries.last() {
                         self.total_labels = self.total_labels.saturating_add(last.labels.len());
                         self.total_samples = self.total_samples.saturating_add(last.samples.len());
+                        self.decoded_bytes = self
+                            .decoded_bytes
+                            .saturating_add(decoded_series_shell_bytes(last));
                     }
                     Ok(())
                 }
             }
             3u32 => {
-                if self.metadata.len() > MAX_METADATA_PER_REQUEST {
+                if self.metadata.len() > MAX_METADATA_PER_REQUEST
+                    || self.decoded_bytes > MAX_DECODED_BYTES
+                {
                     prost::encoding::check_wire_type(
                         prost::encoding::WireType::LengthDelimited,
                         wire_type,
@@ -479,7 +566,13 @@ impl prost::Message for BoundedWriteRequest {
                         &mut self.metadata,
                         buf,
                         ctx,
-                    )
+                    )?;
+                    // One `merge_repeated` call materializes exactly one
+                    // metadata record — charge it (issue #127).
+                    self.decoded_bytes = self
+                        .decoded_bytes
+                        .saturating_add(std::mem::size_of::<MetricMetadataProto>());
+                    Ok(())
                 }
             }
             _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
@@ -1023,6 +1116,11 @@ pub struct MetricMetadataProto {
 /// `MAX + 1` without materializing), then re-checked by [`validate_bounds`] in
 /// [`decode`] — before [`parse`] performs any further per-element allocation
 /// (label-set construction, fingerprinting, output row materialization).
+/// These are element-COUNT caps; the residual decoded-MEMORY amplification
+/// they leave (many minimal elements, each cheap on the wire but tens-to-
+/// hundreds of heap bytes decoded) is bounded by the complementary decode-time
+/// byte budget [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`], charged
+/// per materialized element in the same drains (issue #127).
 pub const MAX_TIMESERIES_PER_REQUEST: usize = 1_000_000;
 /// See [`MAX_TIMESERIES_PER_REQUEST`]'s doc comment.
 pub const MAX_LABELS_PER_SERIES: usize = 256;
@@ -1301,6 +1399,18 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
             field: "total_hist_buckets",
             limit: MAX_TOTAL_HIST_BUCKETS_PER_REQUEST,
             actual: total_hist_buckets,
+        });
+    }
+    // Decode-time byte budget (issue #127), re-summed from the materialized
+    // request with the SAME function the incremental drain charges — the
+    // deferred whole-request reject for a decode the twin drained past
+    // MAX_DECODED_BYTES (bytes, complementing every element-COUNT cap above).
+    let decoded_bytes = decoded_request_bytes(&req.timeseries, &req.metadata);
+    if decoded_bytes > MAX_DECODED_BYTES {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "decoded bytes (estimated)",
+            limit: MAX_DECODED_BYTES,
+            actual: decoded_bytes,
         });
     }
     Ok(())

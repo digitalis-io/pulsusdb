@@ -407,3 +407,98 @@ fn malformed_protobuf_after_valid_snappy_is_a_whole_request_decode_error() {
     let err = decode(&decompressed).expect_err("not a valid WriteRequest");
     assert!(matches!(err, pulsus_write::LogsIngestError::Decode(_)));
 }
+
+// ---------------------------------------------------------------------
+// Decode-time byte budget (issue #127, AC 8).
+// ---------------------------------------------------------------------
+
+/// Appends a base-128 varint.
+fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Hand-rolls one `WriteRequest.timeseries` (tag 1) wire occurrence carrying
+/// `labels` empty labels and `samples` empty samples (2 wire bytes each) —
+/// the amplified wire is built WITHOUT materializing the equivalent structs,
+/// so the test itself stays cheap while the decoder faces the fan-out.
+fn wire_series(labels: usize, samples: usize) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 * (labels + samples));
+    for _ in 0..labels {
+        payload.extend_from_slice(&[0x0A, 0x00]); // TimeSeries.labels (tag 1), len 0
+    }
+    for _ in 0..samples {
+        payload.extend_from_slice(&[0x12, 0x00]); // TimeSeries.samples (tag 2), len 0
+    }
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    out.push(0x0A); // WriteRequest.timeseries (tag 1), length-delimited
+    put_uvarint(&mut out, payload.len() as u64);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// Issue #127 AC 8: a request whose decoded-byte estimate exceeds
+/// `MAX_DECODED_BYTES` while EVERY element-count cap is respected (labels and
+/// samples both at — never over — their per-series and aggregate caps)
+/// rejects whole-request with the byte-budget `OversizeMessage` before
+/// `parse` runs. All sizing is derived from the caps and `size_of` (no
+/// literals) and the over-budget precondition is self-asserted.
+#[test]
+fn over_budget_decode_rejects_decoded_bytes_before_parse() {
+    use pulsus_write::LogsIngestError;
+    use pulsus_write::protocols::otlp_prescan::MAX_DECODED_BYTES;
+    use pulsus_write::protocols::remote_write::{
+        MAX_LABELS_PER_SERIES, MAX_SAMPLES_PER_SERIES, MAX_TIMESERIES_PER_REQUEST,
+        MAX_TOTAL_LABELS_PER_REQUEST, MAX_TOTAL_SAMPLES_PER_REQUEST,
+    };
+
+    // As many full-to-the-per-series-cap series as the aggregates admit.
+    let label_series = MAX_TOTAL_LABELS_PER_REQUEST / MAX_LABELS_PER_SERIES;
+    let sample_series = MAX_TOTAL_SAMPLES_PER_REQUEST / MAX_SAMPLES_PER_SERIES;
+    // Self-asserted preconditions: no count cap can fire...
+    assert!(label_series * MAX_LABELS_PER_SERIES <= MAX_TOTAL_LABELS_PER_REQUEST);
+    assert!(sample_series * MAX_SAMPLES_PER_SERIES <= MAX_TOTAL_SAMPLES_PER_REQUEST);
+    assert!(label_series + sample_series <= MAX_TIMESERIES_PER_REQUEST);
+    // ...while the decoded-byte estimate is over budget by construction.
+    let estimate = label_series
+        * (std::mem::size_of::<TimeSeries>()
+            + MAX_LABELS_PER_SERIES * std::mem::size_of::<Label>())
+        + sample_series
+            * (std::mem::size_of::<TimeSeries>()
+                + MAX_SAMPLES_PER_SERIES * std::mem::size_of::<Sample>());
+    assert!(
+        estimate > MAX_DECODED_BYTES,
+        "fixture must exceed the byte budget by construction (estimate {estimate})"
+    );
+
+    let mut body = Vec::new();
+    for _ in 0..label_series {
+        body.extend_from_slice(&wire_series(MAX_LABELS_PER_SERIES, 0));
+    }
+    for _ in 0..sample_series {
+        body.extend_from_slice(&wire_series(0, MAX_SAMPLES_PER_SERIES));
+    }
+
+    match decode(&body) {
+        Err(LogsIngestError::OversizeMessage {
+            field,
+            limit,
+            actual,
+        }) => {
+            assert_eq!(
+                field, "decoded bytes (estimated)",
+                "the BYTE budget must fire, not a count cap"
+            );
+            assert_eq!(limit, MAX_DECODED_BYTES);
+            assert!(actual > limit);
+        }
+        other => panic!("over-budget request must reject whole-request, got {other:?}"),
+    }
+}

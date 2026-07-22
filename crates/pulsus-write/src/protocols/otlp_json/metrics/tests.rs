@@ -28,8 +28,8 @@ use crate::error::LogsIngestError;
 use crate::protocols::otlp_metrics::decode_json;
 use crate::protocols::otlp_prescan::{
     MAX_ANYVALUE_DEPTH, MAX_ANYVALUE_ELEMENTS, MAX_ATTRIBUTES_PER_ELEMENT, MAX_BUCKETS,
-    MAX_DATA_POINTS, MAX_EXEMPLARS, MAX_METRICS, MAX_QUANTILES, MAX_RESOURCE_METRICS,
-    MAX_SCOPE_METRICS, MAX_TOTAL_DATA_POINTS, MAX_TOTAL_EXEMPLARS,
+    MAX_DATA_POINTS, MAX_DECODED_BYTES, MAX_EXEMPLARS, MAX_METRICS, MAX_QUANTILES,
+    MAX_RESOURCE_METRICS, MAX_SCOPE_METRICS, MAX_TOTAL_DATA_POINTS, MAX_TOTAL_EXEMPLARS,
 };
 
 // --------------------------------------------------------------------------
@@ -549,7 +549,12 @@ fn data_points_over_aggregate_cap_rejects() {
     let metrics_needed = MAX_TOTAL_DATA_POINTS / per_metric + 1;
     let one = gauge_metric_with_points(per_metric);
     let body = one_scope(&arr(&one, metrics_needed));
-    assert_rejects_with(&body, "total data points");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&body, "decoded bytes (estimated)");
 }
 
 #[test]
@@ -563,7 +568,12 @@ fn exemplars_over_aggregate_cap_rejects() {
         r#"{{"name":"m","gauge":{{"dataPoints":{}}}}}"#,
         arr(&point, points_needed)
     );
-    assert_rejects_with(&one_metric(&metric), "total exemplars");
+    // Since issue #127 the decode-time byte budget (`size_of` per element)
+    // is strictly tighter than the 5M count aggregate for this element
+    // weight, so it is the FIRST bound this fixture crosses; the count
+    // aggregate remains a backstop for lighter kinds (see the wide-array
+    // AnyValue test, whose 32-byte elements still reach their aggregate).
+    assert_rejects_with(&one_metric(&metric), "decoded bytes (estimated)");
 }
 
 // --------------------------------------------------------------------------
@@ -575,7 +585,14 @@ fn data_point_attribute_anyvalue_over_wide_kvlist_rejects() {
     let entries = arr(r#"{"key":"k"}"#, MAX_ANYVALUE_ELEMENTS + 1);
     let attr = format!(r#"{{"key":"wide","value":{{"kvlistValue":{{"values":{entries}}}}}}}"#);
     let point = format!(r#"{{"attributes":[{attr}]}}"#);
-    assert_rejects_with(&one_metric(&one_gauge_point(&point)), "AnyValue elements");
+    // Since issue #127 the byte budget fires first here: kvlist entries are
+    // `KeyValue`s (64 bytes each), heavier than `MAX_DECODED_BYTES / 5M`, so
+    // the byte estimate crosses before the AnyValue-element count aggregate
+    // (the wide-ARRAY twin's 32-byte `AnyValue` elements still reach it).
+    assert_rejects_with(
+        &one_metric(&one_gauge_point(&point)),
+        "decoded bytes (estimated)",
+    );
 }
 
 #[test]
@@ -796,4 +813,74 @@ fn unknown_key_with_wide_value_is_ignored_matching_vendored() {
     let wide = arr("1", 10_000);
     let metric = format!(r#"{{"name":"m","somethingUnknown":{wide}}}"#);
     assert_ok(&one_metric(&metric));
+}
+
+// --------------------------------------------------------------------------
+// Decode-time byte budget (issue #127)
+// --------------------------------------------------------------------------
+
+/// AC 6 (issue #127), metrics signal: an over-budget body (the AC 2b derived
+/// sizing — `MAX_DECODED_BYTES / size_of::<HistogramDataPoint>() + 1024`
+/// empty histogram points, auto-split at 900k per metric so NO count cap
+/// fires) rejects as `DecodeJson` whose message names the decode budget.
+#[test]
+fn over_budget_histogram_data_points_reject_names_the_decode_budget() {
+    use opentelemetry_proto::tonic::metrics::v1::HistogramDataPoint;
+
+    const PER_CONTAINER: usize = 900_000;
+    let total = MAX_DECODED_BYTES / std::mem::size_of::<HistogramDataPoint>() + 1024;
+    // Self-asserted preconditions: only the BYTE budget can fire.
+    const { assert!(PER_CONTAINER < MAX_DATA_POINTS) }
+    assert!(total < MAX_TOTAL_DATA_POINTS);
+    assert!(total.div_ceil(PER_CONTAINER) < MAX_METRICS);
+
+    let mut metrics = String::from("[");
+    let mut remaining = total;
+    let mut first = true;
+    while remaining > 0 {
+        let chunk = remaining.min(PER_CONTAINER);
+        remaining -= chunk;
+        if !first {
+            metrics.push(',');
+        }
+        first = false;
+        metrics.push_str(&format!(
+            r#"{{"name":"m","histogram":{{"dataPoints":{}}}}}"#,
+            arr("{}", chunk)
+        ));
+    }
+    metrics.push(']');
+    assert_rejects_with(&one_scope(&metrics), "decoded bytes (estimated)");
+}
+
+/// AC 6 (issue #127), `bucketCounts` scalar-array charge: each buffered
+/// element weighs one `serde_json::Value`, so the per-level caps alone would
+/// admit ~33.5M two-char elements (~1 GiB of buffered `Value`s) from a 64 MiB
+/// body — the byte budget is what bounds the total. At-cap arrays (never over
+/// the per-level `MAX_BUCKETS`) across enough data points cross the budget
+/// and reject naming it.
+#[test]
+fn over_budget_bucket_counts_scalar_arrays_reject_names_the_decode_budget() {
+    let total = MAX_DECODED_BYTES / std::mem::size_of::<serde_json::Value>() + 1024;
+    let points = total.div_ceil(MAX_BUCKETS);
+    // Self-asserted preconditions: per-array at (never over) MAX_BUCKETS; the
+    // data-point count nowhere near its caps.
+    assert!(points < MAX_DATA_POINTS);
+    assert!(points < MAX_TOTAL_DATA_POINTS);
+
+    let mut dps = String::from("[");
+    let mut remaining = total;
+    let mut first = true;
+    while remaining > 0 {
+        let chunk = remaining.min(MAX_BUCKETS);
+        remaining -= chunk;
+        if !first {
+            dps.push(',');
+        }
+        first = false;
+        dps.push_str(&format!(r#"{{"bucketCounts":{}}}"#, arr("0", chunk)));
+    }
+    dps.push(']');
+    let metric = format!(r#"{{"name":"m","histogram":{{"dataPoints":{dps}}}}}"#);
+    assert_rejects_with(&one_metric(&metric), "decoded bytes (estimated)");
 }
