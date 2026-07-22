@@ -892,10 +892,15 @@ fn ensure_monotonic_and_ignore_small_deltas(
 /// `le`, coalesces duplicate bounds, forces cumulative monotonicity
 /// (independent scrapes can produce non-monotonic buckets), requires a
 /// `+Inf` bucket, then linearly interpolates within the bucket the
-/// requested quantile's rank falls into. The float-value verdicts are
-/// [`histogram_quantile_with_monotonicity_report`]'s (all pre-M7 tests
-/// unchanged); this thin wrapper drops the forced-monotonicity report for
-/// callers that don't report the info annotation.
+/// requested quantile's rank falls into. Lowest-bucket rules (the pinned
+/// switch, quantile.go:151-168): a lowest bucket with a nonpositive upper
+/// bound returns that bound as-is (negative allowed); a lowest bucket with
+/// a positive upper bound interpolates linearly from a 0 lower bound; an
+/// interior bucket's lower bound is the previous bucket's `le` unclamped
+/// (negative boundaries pass through). The float-value verdicts are
+/// [`histogram_quantile_with_monotonicity_report`]'s; this thin wrapper
+/// drops the forced-monotonicity report for callers that don't report the
+/// info annotation.
 pub fn histogram_quantile(quantile: f64, buckets: Vec<Bucket>) -> Result<f64, PromqlError> {
     histogram_quantile_with_monotonicity_report(quantile, buckets).map(|(q, _report)| q)
 }
@@ -965,26 +970,37 @@ pub fn histogram_quantile_with_monotonicity_report(
         .position(|b| b.count >= rank)
         .unwrap_or(buckets.len() - 1);
 
-    if b_idx == buckets.len() - 1 {
+    // The pinned `BucketQuantile` three-way switch (quantile.go:151-168),
+    // branch order preserved: +Inf bucket first, then the nonpositive-upper
+    // lowest bucket, then linear interpolation. A lowest bucket with a
+    // POSITIVE upper bound falls through to the default arm and interpolates
+    // from an implicit 0 lower bound; bucket bounds are never clamped to 0
+    // (negative boundaries pass through as-is, quantile.go:154-155/163).
+    let quantile = if b_idx == buckets.len() - 1 {
         // The rank falls in the +Inf bucket itself — Prometheus reports
         // the previous (highest finite) bucket boundary rather than +Inf.
-        return Ok((buckets[buckets.len() - 2].le, report));
-    }
-    if b_idx == 0 {
-        return Ok((buckets[0].le.max(0.0), report));
-    }
-
-    let bucket_start = buckets[b_idx - 1].le.max(0.0);
-    let bucket_end = buckets[b_idx].le;
-    let count = buckets[b_idx].count - buckets[b_idx - 1].count;
-    let rank_in_bucket = rank - buckets[b_idx - 1].count;
-    if count <= 0.0 {
-        return Ok((bucket_end, report));
-    }
-    Ok((
-        bucket_start + (bucket_end - bucket_start) * (rank_in_bucket / count),
-        report,
-    ))
+        buckets[buckets.len() - 2].le
+    } else if b_idx == 0 && buckets[0].le <= 0.0 {
+        // Lowest bucket with a nonpositive upper bound: return the bound
+        // as-is (negative allowed).
+        buckets[0].le
+    } else {
+        let mut bucket_start = 0.0;
+        let bucket_end = buckets[b_idx].le;
+        let mut count = buckets[b_idx].count;
+        let mut rank = rank;
+        if b_idx > 0 {
+            bucket_start = buckets[b_idx - 1].le;
+            count -= buckets[b_idx - 1].count;
+            rank -= buckets[b_idx - 1].count;
+        }
+        // No count<=0 guard, matching the pin: for b_idx > 0 the rank
+        // search guarantees an in-bucket count > 0; at b_idx == 0 with a
+        // zero-count lowest bucket (only reachable at q=0) the oracle
+        // computes 0/0 = NaN.
+        bucket_start + (bucket_end - bucket_start) * (rank / count)
+    };
+    Ok((quantile, report))
 }
 
 /// Merges buckets sharing the same `le` — mirrors upstream `coalesceBuckets`
@@ -1577,6 +1593,73 @@ mod tests {
             f64::NEG_INFINITY
         );
         assert_eq!(histogram_quantile(1.5, bs).unwrap(), f64::INFINITY);
+    }
+
+    // --- histogram_quantile lowest-bucket rules (#164): the pinned
+    //     BucketQuantile switch, quantile.go:148-168 @ 40af9c2 (v3.13.0) ---
+
+    #[test]
+    fn histogram_quantile_lowest_bucket_nonpositive_upper_returns_the_upper_bound() {
+        // quantile.go:154-155: b == 0 with a nonpositive upper bound
+        // returns buckets[0].UpperBound AS-IS — negative allowed, never
+        // clamped to 0. Also covers a zero-count first bucket at rank 0
+        // (testhistogram3-negative shape).
+        let bs = buckets(&[
+            (-0.25, 0.0),
+            (-0.2, 10.0),
+            (-0.1, 20.0),
+            (0.3, 20.0),
+            (f64::INFINITY, 20.0),
+        ]);
+        let q = histogram_quantile(0.0, bs).unwrap();
+        assert_eq!(q, -0.25, "got {q}");
+    }
+
+    #[test]
+    fn histogram_quantile_lowest_positive_bucket_interpolates_from_a_zero_lower_bound() {
+        // quantile.go:156-167: b == 0 with a POSITIVE upper bound falls
+        // through to the default arm and interpolates from bucketStart = 0
+        // (testhistogram-positive shape). rank = 0.2*120 = 24 ->
+        // 0 + 0.1*(24/50) = 0.048.
+        let bs = buckets(&[
+            (0.1, 50.0),
+            (0.2, 70.0),
+            (1.0, 110.0),
+            (f64::INFINITY, 120.0),
+        ]);
+        let q = histogram_quantile(0.2, bs).unwrap();
+        assert!((q - 0.048).abs() < 1e-12, "got {q}");
+    }
+
+    #[test]
+    fn histogram_quantile_interior_bucket_keeps_a_negative_lower_bound() {
+        // quantile.go:163: bucketStart = buckets[b-1].UpperBound UNCLAMPED
+        // — a negative lower bound passes through (testhistogram3-negative
+        // shape). q=0.25: rank=5 in (-0.25,-0.2] -> -0.25 + 0.05*(5/10) =
+        // -0.225. q=0.75: rank=15 in (-0.2,-0.1] -> -0.2 + 0.1*(5/10) =
+        // -0.15.
+        let shape = [
+            (-0.25, 0.0),
+            (-0.2, 10.0),
+            (-0.1, 20.0),
+            (0.3, 20.0),
+            (f64::INFINITY, 20.0),
+        ];
+        let q25 = histogram_quantile(0.25, buckets(&shape)).unwrap();
+        assert!((q25 - (-0.225)).abs() < 1e-12, "got {q25}");
+        let q75 = histogram_quantile(0.75, buckets(&shape)).unwrap();
+        assert!((q75 - (-0.15)).abs() < 1e-12, "got {q75}");
+    }
+
+    #[test]
+    fn histogram_quantile_zero_rank_in_an_empty_positive_lowest_bucket_is_nan() {
+        // Pins the removed count<=0 guard as oracle-faithful: at q=0 a
+        // zero-count lowest bucket with a positive bound reaches the
+        // default arm (quantile.go:156-167) and computes 0 + 0.1*(0/0) =
+        // NaN — the pin has no count guard.
+        let bs = buckets(&[(0.1, 0.0), (f64::INFINITY, 10.0)]);
+        let q = histogram_quantile(0.0, bs).unwrap();
+        assert!(q.is_nan(), "got {q}");
     }
 
     // --- ensure_monotonic_and_ignore_small_deltas (M7-A5b-i: the
