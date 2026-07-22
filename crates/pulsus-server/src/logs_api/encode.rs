@@ -37,8 +37,8 @@ use futures::StreamExt;
 use serde::Serialize;
 
 use pulsus_read::{
-    ExplainStage, LogStats, MatrixSeries, PlanExplain, QueryResult, RouteChoice, StreamResult,
-    VectorSample, VolumeEntry,
+    DetectedFieldOut, DetectedFields, DetectedLabelOut, ExplainStage, LogStats, MatrixSeries,
+    PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -307,6 +307,79 @@ pub(crate) fn volume_response(
                 value: e.bytes as f64,
             };
             render_vector_item(&sample, end_ns)
+        },
+        suffix,
+    ))
+}
+
+/// Encodes a `/api/logs/v1/detected_labels` result (issue #170,
+/// docs/api.md §2.6): the bare `{"detectedLabels":[...]}` object (the
+/// reference wire shape; no status/data envelope), entries already sorted
+/// by key (the SQL's `ORDER BY key`), `explain` as a sibling key when
+/// requested. Top-level key always present (deterministic-shape
+/// divergence from the reference's `omitempty`); no `sketch` (we have no
+/// HLL sketch — valid under the reference's own `omitempty` tag).
+pub(crate) fn detected_labels_response(
+    labels: Vec<DetectedLabelOut>,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let prefix = b"{\"detectedLabels\":[".to_vec();
+    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = format!("{suffix}}}").into_bytes();
+    json_response(stream_array(
+        prefix,
+        labels,
+        |l: &DetectedLabelOut| {
+            format!(
+                "{{\"label\":{},\"cardinality\":{}}}",
+                json_string(&l.label),
+                l.cardinality
+            )
+            .into_bytes()
+        },
+        suffix,
+    ))
+}
+
+/// Encodes a `/api/logs/v1/detected_fields` result (issue #170,
+/// docs/api.md §2.6): the bare `{"fields":[...],"limit":N}` object,
+/// fields already label-sorted by the engine, `parsers` always an array
+/// (`[]` when unattributed — deterministic-shape divergence from the
+/// reference's nil-slice marshaling). `pulsus_partial: true` is the
+/// additive #90-convention truncation signal, **omitted when false** so
+/// complete responses stay byte-identical to the reference shape;
+/// `explain` joins as a sibling key when requested.
+pub(crate) fn detected_fields_response(
+    out: DetectedFields,
+    limit: u32,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let prefix = b"{\"fields\":[".to_vec();
+    let mut tail = format!("],\"limit\":{limit}");
+    if out.truncated {
+        tail.push_str(",\"pulsus_partial\":true");
+    }
+    let suffix = explain_suffix(tail, explain.as_ref());
+    let suffix = format!("{suffix}}}").into_bytes();
+    json_response(stream_array(
+        prefix,
+        out.fields,
+        |f: &DetectedFieldOut| {
+            let mut parsers = String::new();
+            for (i, p) in f.parsers.iter().enumerate() {
+                if i > 0 {
+                    parsers.push(',');
+                }
+                parsers.push_str(&json_string(p));
+            }
+            format!(
+                "{{\"label\":{},\"type\":{},\"cardinality\":{},\"parsers\":[{}]}}",
+                json_string(&f.label),
+                json_string(f.field_type),
+                f.cardinality,
+                parsers
+            )
+            .into_bytes()
         },
         suffix,
     ))
@@ -816,6 +889,143 @@ mod tests {
         assert_eq!(json["data"]["stats"]["series"], 0);
         assert_eq!(json["data"]["explain"]["result_type"], "volume");
         assert_eq!(json["data"]["explain"]["stages"][0]["name"], "volume_read");
+    }
+
+    /// Issue #170 byte-exact detected_labels golden: the bare reference
+    /// wire shape, no envelope, entries verbatim in engine (key-sorted)
+    /// order.
+    #[tokio::test]
+    async fn detected_labels_envelope_is_byte_exact() {
+        let labels = vec![
+            DetectedLabelOut {
+                label: "env".to_string(),
+                cardinality: 3,
+            },
+            DetectedLabelOut {
+                label: "namespace".to_string(),
+                cardinality: 1,
+            },
+        ];
+        let res = detected_labels_response(labels, None);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"detectedLabels":[{"label":"env","cardinality":3},{"label":"namespace","cardinality":1}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_labels_empty_result_keeps_the_top_level_key() {
+        let res = detected_labels_response(Vec::new(), None);
+        let body = body_string(res).await;
+        assert_eq!(body, r#"{"detectedLabels":[]}"#);
+    }
+
+    #[tokio::test]
+    async fn detected_labels_envelope_carries_explain_as_a_sibling_key() {
+        let mut explain = PlanExplain::new("detected_labels");
+        explain.push("detected_labels", "SELECT 1", None);
+        let res = detected_labels_response(Vec::new(), Some(explain));
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["detectedLabels"], serde_json::json!([]));
+        assert_eq!(json["explain"]["result_type"], "detected_labels");
+    }
+
+    /// Issue #170 byte-exact detected_fields golden: label/type/
+    /// cardinality/parsers per field (the proto field order), `parsers`
+    /// always an array, `limit` as the trailing key — and NO
+    /// `pulsus_partial` key on a complete result (byte-identity to the
+    /// reference shape).
+    #[tokio::test]
+    async fn detected_fields_envelope_is_byte_exact_and_omits_pulsus_partial_when_complete() {
+        let out = DetectedFields {
+            fields: vec![
+                DetectedFieldOut {
+                    label: "count".to_string(),
+                    field_type: "int",
+                    cardinality: 2,
+                    parsers: vec!["json"],
+                },
+                DetectedFieldOut {
+                    label: "trace_id".to_string(),
+                    field_type: "string",
+                    cardinality: 1,
+                    parsers: Vec::new(),
+                },
+            ],
+            truncated: false,
+        };
+        let res = detected_fields_response(out, 1000, None);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"fields":[{"label":"count","type":"int","cardinality":2,"parsers":["json"]},{"label":"trace_id","type":"string","cardinality":1,"parsers":[]}],"limit":1000}"#
+        );
+    }
+
+    /// Issue #170 plan v2: a budget-truncated sample carries the additive
+    /// `pulsus_partial: true` key (the #90 wire convention).
+    #[tokio::test]
+    async fn detected_fields_envelope_carries_pulsus_partial_true_on_truncation() {
+        let out = DetectedFields {
+            fields: Vec::new(),
+            truncated: true,
+        };
+        let res = detected_fields_response(out, 1000, None);
+        let body = body_string(res).await;
+        assert_eq!(body, r#"{"fields":[],"limit":1000,"pulsus_partial":true}"#);
+    }
+
+    #[tokio::test]
+    async fn detected_fields_envelope_carries_explain_as_a_sibling_key() {
+        let mut explain = PlanExplain::new("detected_fields");
+        explain.push("stage1_stream_resolution", "SELECT 1", None);
+        let out = DetectedFields {
+            fields: Vec::new(),
+            truncated: false,
+        };
+        let res = detected_fields_response(out, 500, Some(explain));
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["fields"], serde_json::json!([]));
+        assert_eq!(json["limit"], 500);
+        assert!(json.get("pulsus_partial").is_none());
+        assert_eq!(json["explain"]["result_type"], "detected_fields");
+    }
+
+    #[tokio::test]
+    async fn gzip_detected_labels_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            detected_labels_response(
+                vec![DetectedLabelOut {
+                    label: "env".to_string(),
+                    cardinality: 3,
+                }],
+                None,
+            )
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
+    }
+
+    #[tokio::test]
+    async fn gzip_detected_fields_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            detected_fields_response(
+                DetectedFields {
+                    fields: vec![DetectedFieldOut {
+                        label: "level".to_string(),
+                        field_type: "string",
+                        cardinality: 4,
+                        parsers: vec!["logfmt"],
+                    }],
+                    truncated: false,
+                },
+                1000,
+                None,
+            )
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
 
     #[tokio::test]

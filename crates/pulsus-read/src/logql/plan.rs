@@ -1017,8 +1017,10 @@ pub(crate) fn year_month(ts_ns: i64) -> (i64, u32) {
 /// `log_streams`/`log_streams_idx` partition monthly (docs/schemas.md
 /// §3.1); a range spanning a month boundary must resolve every partition it
 /// touches or streams silently vanish (architect plan edge case:
-/// "Multi-month ranges").
-pub(crate) fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
+/// "Multi-month ranges"). `pub` (issue #170): the `detected_labels`
+/// aggregation builder takes pre-rendered months, and the EXPLAIN gate
+/// (`tests/explain_indexes.rs`) renders them the same way the engine does.
+pub fn months_overlapping(start_ns: i64, end_ns: i64) -> Vec<String> {
     let (mut y, mut m) = year_month(start_ns);
     let (end_y, end_m) = year_month(end_ns.max(start_ns));
     let mut out = Vec::new();

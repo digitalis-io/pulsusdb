@@ -724,6 +724,37 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 "{ctx}: stats is the bare object, never the status envelope, body {json}"
             );
         }
+        (Surface::LogsDetectedLabels, _) => {
+            // Issue #170, docs/api.md §2.6.2: the bare reference wire
+            // shape — exact empty-DB JSON equality is the mounting
+            // oracle (an unmounted path would be an empty 404 instead).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: detected_labels content-type"
+            );
+            assert_eq!(
+                res.json(ctx),
+                serde_json::json!({ "detectedLabels": [] }),
+                "{ctx}: exact empty-DB detected_labels body"
+            );
+        }
+        (Surface::LogsDetectedFields, _) => {
+            // Issue #170, docs/api.md §2.6.3: exact empty-DB equality —
+            // the default field limit (1000) and NO `pulsus_partial` key
+            // (complete responses stay byte-identical to the reference
+            // shape).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: detected_fields content-type"
+            );
+            assert_eq!(
+                res.json(ctx),
+                serde_json::json!({ "fields": [], "limit": 1000 }),
+                "{ctx}: exact empty-DB detected_fields body"
+            );
+        }
         (Surface::TracesFetch, _) => {
             // Against this suite's empty databases the documented outcome
             // of a well-formed fetch is the mounted-but-absent `404

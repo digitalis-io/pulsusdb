@@ -755,6 +755,203 @@ async fn fetch_until_limit_zero_budget_terminates_partial_without_unlimited_page
     );
 }
 
+// ---------------------------------------------------------------------
+// Issue #170 — detected_fields post-pipeline paged sampling (plan v2's
+// review fix): a sparse parser/label filter whose ONLY matching rows sit
+// after the first `line_limit` raw rows of the Backward walk must still
+// have its fields detected (window-exhausted branch), a mid-paging budget
+// hit returns the fields so far as `truncated = true`, and a first-page
+// budget overflow stays `QueryTooBroad` — the three #90 terminal
+// branches, on this endpoint.
+// ---------------------------------------------------------------------
+
+/// 30,000 rows, one stream; ONLY the OLDEST [`DETECTED_MATCH_COUNT`] rows
+/// are JSON matching `| json | level="rare"` — with `line_limit = 100`
+/// and the default scan factor 10 the paged walk (page size 1,000,
+/// newest-first) reaches them only on the FINAL page, long after the
+/// first `line_limit` raw rows.
+const DETECTED_CORPUS_ROWS: u64 = 30_000;
+const DETECTED_MATCH_COUNT: u64 = 5;
+
+/// Drops + re-creates `db`, seeds the detected-fields corpus, and returns
+/// `(client, ts_ns)` (`ts_ns` = corpus start, 1h ago — the
+/// [`seed_corpus`] convention).
+async fn setup_detected_corpus(db: &str) -> (ChClient, i64) {
+    let admin = ChClient::new(test_config()).await.expect("connect admin");
+    admin
+        .execute(
+            &format!("DROP DATABASE IF EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("drop test database");
+    run_init(&admin, &test_ctx(db)).await.expect("run_init");
+
+    let mut data_cfg = test_config();
+    data_cfg.database = db.to_string();
+    let client = ChClient::new(data_cfg)
+        .await
+        .expect("connect (data client)");
+
+    let ts_ns = now_ns() - 3_600_000_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_streams (month, fingerprint, service, labels, updated_ns) \
+                 VALUES (toStartOfMonth(fromUnixTimestamp64Nano(toInt64({ts_ns}))), {FP_CORPUS}, \
+                 '{SERVICE}', '{{\"service_name\":\"{SERVICE}\"}}', 0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("seed log_streams");
+
+    let mut rows = Vec::with_capacity(DETECTED_CORPUS_ROWS as usize);
+    for i in 0..DETECTED_CORPUS_ROWS {
+        let timestamp_ns = ts_ns + (i as i64) * 36_000_000;
+        let body = if i < DETECTED_MATCH_COUNT {
+            // The oldest rows are the ONLY `| json | level="rare"` matches.
+            format!(r#"{{"level":"rare","code":7,"seq":"{i}"}}"#)
+        } else {
+            // Non-JSON: the json stage tags `__error__` (line kept), then
+            // `level="rare"` drops it in-engine — the dropping pipeline.
+            format!(
+                "row {i} routine request completed padding_{}",
+                "x".repeat(120)
+            )
+        };
+        rows.push(SeedSampleRow {
+            service: SERVICE.to_string(),
+            fingerprint: FP_CORPUS,
+            timestamp_ns,
+            severity: 0,
+            body,
+        });
+    }
+    client
+        .insert_block("log_samples", &rows)
+        .await
+        .expect("bulk insert detected corpus");
+    (client, ts_ns)
+}
+
+fn detected_bounds(ts_ns: i64) -> pulsus_read::TimeBounds {
+    pulsus_read::TimeBounds {
+        start_ns: ts_ns - 3_600_000_000_000,
+        end_ns: ts_ns + 3_600_000_000_000,
+    }
+}
+
+/// Branch 2 (the review-fix branch): matches occurring only AFTER the
+/// first `line_limit` raw rows of the walk ARE found — the loop pages to
+/// window exhaustion and returns complete (`truncated = false`).
+#[tokio::test]
+async fn detected_fields_sparse_filter_finds_late_matches_window_exhausted() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_qlg_detected_late";
+    let (client, ts_ns) = setup_detected_corpus(db).await;
+    drop(client);
+
+    let engine = LogQlEngine::new(
+        data_client(db).await,
+        engine_config(db, 50 * 1024 * 1024 * 1024),
+    );
+    let expr = parse(&format!(
+        r#"{{service_name="{SERVICE}"}} | json | level="rare""#
+    ))
+    .expect("parse");
+
+    let out = engine
+        .detected_fields(&expr, detected_bounds(ts_ns), 100, 1000)
+        .await
+        .unwrap_or_else(|e| panic!("detected_fields err: {e:?}"));
+    assert!(
+        !out.truncated,
+        "window exhaustion is a COMPLETE result, never partial"
+    );
+    let level = out
+        .fields
+        .iter()
+        .find(|f| f.label == "level")
+        .expect("late-occurring `level` field must be detected (the pre-pipeline LIMIT bug)");
+    assert_eq!(level.field_type, "string");
+    assert_eq!(level.cardinality, 1);
+    assert_eq!(level.parsers, vec!["json"]);
+    let code = out
+        .fields
+        .iter()
+        .find(|f| f.label == "code")
+        .expect("code field");
+    assert_eq!(code.field_type, "int");
+    let seq = out.fields.iter().find(|f| f.label == "seq").expect("seq");
+    assert_eq!(
+        seq.cardinality, DETECTED_MATCH_COUNT,
+        "every late-occurring match must be sampled, not just the first page"
+    );
+}
+
+/// Branch 4: a budget spent after >= 1 page returns the fields
+/// accumulated so far with `truncated = true` (surfaced as
+/// `pulsus_partial`), never an error and never a silently-complete shape.
+#[tokio::test]
+async fn detected_fields_budget_exhaustion_mid_paging_returns_truncated() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_qlg_detected_budget";
+    let (client, ts_ns) = setup_detected_corpus(db).await;
+    drop(client);
+
+    // Sized to this ~5 MiB corpus: the FIRST keyset page (whole-window
+    // scan — the keyset ORDER BY defeats optimize_read_in_order, so the
+    // LIMIT does not short-circuit) fits, but page 2's remaining cap is
+    // smaller than its ~whole-remaining-window scan ⇒ mid-paging abort.
+    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 8 * 1024 * 1024));
+    let expr = parse(&format!(
+        r#"{{service_name="{SERVICE}"}} | json | level="rare""#
+    ))
+    .expect("parse");
+
+    let out = engine
+        .detected_fields(&expr, detected_bounds(ts_ns), 100, 1000)
+        .await
+        .unwrap_or_else(|e| panic!("detected_fields err: {e:?}"));
+    assert!(
+        out.truncated,
+        "budget exhaustion mid-paging MUST signal a truncated result"
+    );
+    assert!(
+        !out.fields.iter().any(|f| f.label == "level"),
+        "the matches sit at the window's oldest edge — a budget-truncated walk \
+         cannot have reached them (fields so far only)"
+    );
+}
+
+/// Branch 3: the FIRST page alone overflowing the budget stays a
+/// `QueryTooBroad` error — exactly as every other read path.
+#[tokio::test]
+async fn detected_fields_first_page_over_budget_stays_query_too_broad() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_qlg_detected_tight";
+    let (client, ts_ns) = setup_detected_corpus(db).await;
+    drop(client);
+
+    let engine = LogQlEngine::new(data_client(db).await, engine_config(db, 64 * 1024));
+    let expr = parse(&format!(
+        r#"{{service_name="{SERVICE}"}} | json | level="rare""#
+    ))
+    .expect("parse");
+
+    let err = engine
+        .detected_fields(&expr, detected_bounds(ts_ns), 100, 1000)
+        .await
+        .expect_err("a first-page-over-budget sample must error, not partial-return");
+    assert!(
+        matches!(err, ReadError::QueryTooBroad(_)),
+        "first-page budget overflow must be QueryTooBroad, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn fetch_until_limit_first_page_over_budget_stays_query_too_broad() {
     skip_unless_live!();

@@ -1324,8 +1324,11 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             Surface::LogsQuery => matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader),
             // Issue #74: tail/stats follow the LogsQuery precedent —
             // native under ReaderMode, `/loki` aliases under
-            // CompatAndReader.
-            Surface::LogsTail | Surface::LogsStats => {
+            // CompatAndReader. Issue #170: detected labels/fields ditto.
+            Surface::LogsTail
+            | Surface::LogsStats
+            | Surface::LogsDetectedLabels
+            | Surface::LogsDetectedFields => {
                 matches!(spec.gate, Gate::ReaderMode | Gate::CompatAndReader)
             }
             Surface::PromApi => spec.gate == Gate::ReaderMode,

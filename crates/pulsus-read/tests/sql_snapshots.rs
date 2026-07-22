@@ -683,6 +683,60 @@ fn log_volume_rollup_is_byte_exact() {
 }
 
 // ---------------------------------------------------------------------
+// /detected_labels stream-index aggregation (issue #170, docs/api.md §2.6).
+// ---------------------------------------------------------------------
+
+/// The rendered ClickHouse literal for the four `uuid.Parse` forms
+/// (hyphenated, `urn:uuid:` + hyphenated, `{hyphenated}`, bare 32-hex) —
+/// `ch_string` escapes the regex's `\{`/`\}` backslashes, hence `\\{`.
+const UUID_LITERAL: &str = r"'(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\}|[0-9a-f]{32})$'";
+
+/// Byte-exact unscoped `detected_labels` snapshot: ONE aggregation over
+/// `log_streams_idx` — month-partition-pruned, one output row per key,
+/// `uniqExact` cardinality plus the server-side `containsAllIDTypes`
+/// predicate — and no `log_samples`/body reference anywhere (the
+/// detected_labels endpoint never reads samples by construction).
+#[test]
+fn detected_labels_unscoped_is_byte_exact() {
+    let sql = sql::detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\n\
+             FROM log_streams_idx\n\
+             WHERE month = '2026-07-01'\n\
+             GROUP BY key\n\
+             ORDER BY key"
+        )
+    );
+    assert!(!sql.contains("log_samples"), "never touches log_samples");
+    assert!(!sql.contains("body"), "zero body reads by construction");
+}
+
+/// Byte-exact scoped `detected_labels` snapshot: the identical idx-months
+/// scan plus only the `fingerprint IN` filter (the `query=` scoping runs
+/// stage-1 resolution first; this is the follow-up aggregation).
+#[test]
+fn detected_labels_scoped_is_byte_exact() {
+    let sql = sql::detected_labels(
+        "log_streams_idx",
+        &["'2026-07-01'".to_string(), "'2026-08-01'".to_string()],
+        Some(&[101, 205]),
+    );
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {UUID_LITERAL})) AS non_id_values\n\
+             FROM log_streams_idx\n\
+             WHERE month IN ('2026-07-01', '2026-08-01')\n\
+             \x20 AND fingerprint IN (101, 205)\n\
+             GROUP BY key\n\
+             ORDER BY key"
+        )
+    );
+}
+
+// ---------------------------------------------------------------------
 // Instant vs Range QuerySpec shapes (task-manager resolution #3).
 // ---------------------------------------------------------------------
 

@@ -17,11 +17,13 @@
 //! adds the first drilldown endpoint, `/volume` (§2.6), with its
 //! `/loki/api/v1/index/volume` alias. Neither alias suffix is a prefix
 //! swap of its native path (`/index/stats` vs `/stats`, `/index/volume`
-//! vs `/volume`), so these routes mount explicitly below rather than
-//! through [`mount_log_query_routes`]. Still out of scope: the remaining
-//! §2.6 drilldown endpoints (`/detected_labels`, `/detected_fields`,
-//! `/patterns`) and their aliases.
+//! vs `/volume`), so those routes mount explicitly below rather than
+//! through [`mount_log_query_routes`]. Issue #170 (M7) adds
+//! `/detected_labels` + `/detected_fields` (§2.6) — both aliases ARE pure
+//! prefix swaps, mounted via [`mount_detected_routes`] on both surfaces.
+//! Still out of scope: `/patterns` and its alias.
 
+mod detected;
 mod encode;
 mod error;
 mod handlers;
@@ -68,15 +70,35 @@ fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppS
         )
 }
 
+/// Mounts the two detected-labels/fields drilldown routes under `prefix`
+/// (issue #170, docs/api.md §2.6): `GET|POST` form-encoded on both (the
+/// `/labels`/`/series` precedent). Unlike `/index/stats`/`/index/volume`,
+/// both `/loki/api/v1` aliases ARE pure prefix swaps, so one helper
+/// serves both surfaces — the same cannot-drift-apart rationale as
+/// [`mount_log_query_routes`].
+fn mount_detected_routes(router: Router<AppState>, prefix: &str) -> Router<AppState> {
+    router
+        .route(
+            &format!("{prefix}/detected_labels"),
+            get(detected::detected_labels).post(detected::detected_labels_post),
+        )
+        .route(
+            &format!("{prefix}/detected_fields"),
+            get(detected::detected_fields).post(detected::detected_fields_post),
+        )
+}
+
 /// The native `/api/logs/v1` surface (docs/api.md §2.1-2.6): the five
-/// query routes via [`mount_log_query_routes`], plus `/tail` (WebSocket,
-/// issue #74), `/stats`, and `/volume` (issue #169) mounted explicitly
-/// (all `GET`-only).
+/// query routes via [`mount_log_query_routes`], the two detected
+/// drilldown routes via [`mount_detected_routes`] (issue #170), plus
+/// `/tail` (WebSocket, issue #74), `/stats`, and `/volume` (issue #169)
+/// mounted explicitly (all `GET`-only).
 pub(crate) fn router() -> Router<AppState> {
-    mount_log_query_routes(Router::new(), "/api/logs/v1")
+    let router = mount_log_query_routes(Router::new(), "/api/logs/v1")
         .route("/api/logs/v1/tail", get(tail::tail))
         .route("/api/logs/v1/stats", get(stats::stats))
-        .route("/api/logs/v1/volume", get(volume::volume))
+        .route("/api/logs/v1/volume", get(volume::volume));
+    mount_detected_routes(router, "/api/logs/v1")
 }
 
 /// The `/loki/api/v1/*` compat alias surface (docs/api.md §8.1, issue #14).
@@ -86,14 +108,15 @@ pub(crate) fn router() -> Router<AppState> {
 /// Mounting this router at all is `compat.rs`'s job (flag + Reader-mode
 /// gated); this fn just builds the route set.
 pub(crate) fn compat_router() -> Router<AppState> {
-    mount_log_query_routes(Router::new(), "/loki/api/v1")
+    let router = mount_log_query_routes(Router::new(), "/loki/api/v1")
         // Issue #74: the M6 aliases. `/index/stats` is deliberately NOT
         // derived from the native `/stats` path — the alias suffix is not
         // a prefix swap (docs/api.md §8.1's M6 row). Issue #169: the M7
         // `/index/volume` alias follows the same irregular-suffix rule.
         .route("/loki/api/v1/tail", get(tail::tail))
         .route("/loki/api/v1/index/stats", get(stats::stats))
-        .route("/loki/api/v1/index/volume", get(volume::volume))
+        .route("/loki/api/v1/index/volume", get(volume::volume));
+    mount_detected_routes(router, "/loki/api/v1")
 }
 
 #[cfg(test)]

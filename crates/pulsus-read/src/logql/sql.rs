@@ -104,6 +104,45 @@ pub fn label_values(streams_idx_table: &str, months: &[String], key_literal: &st
     )
 }
 
+/// The four textual forms Go's `uuid.Parse` accepts (issue #170,
+/// `/detected_labels`' ID-likeness reference, grafana/loki:3.4.2
+/// `containsAllIDTypes`): plain hyphenated 8-4-4-4-12 (optionally
+/// `urn:uuid:`-prefixed), `{hyphenated}` (both braces required), and bare
+/// 32-hex. Case-insensitive (`(?i)`), fully anchored — rendered through
+/// [`super::escape::ch_string`] into [`detected_labels`]' `match(val, ...)`
+/// predicate, the single implementation (SQL only, no Rust twin to drift).
+const UUID_RE: &str = r"(?i)^(?:(?:urn:uuid:)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}|[0-9a-f]{32})$";
+
+/// Detected-labels aggregation over the stream index (issue #170,
+/// docs/api.md §2.6): one output row per distinct key within `months`,
+/// with `uniqExact(val)` as the exact cardinality (documented improvement
+/// over the reference's hyperloglog estimate) and `non_id_values` counting
+/// values that are neither a float (`toFloat64OrNull`) nor a UUID
+/// ([`UUID_RE`]) — the server-side half of the reference's
+/// `containsAllIDTypes` relevance filter (the keep rule — static label OR
+/// `non_id_values > 0` — applies client-side in `exec`). `fingerprints` =
+/// `None` for the unscoped form; `Some` appends the same `fingerprint IN`
+/// filter to the identical idx-months scan. **Never touches
+/// `log_samples`** — same table and scan class as [`label_names`],
+/// month-partition-pruned, server-side aggregated (fan-in is one row per
+/// key, never per value).
+pub fn detected_labels(
+    streams_idx_table: &str,
+    months: &[String],
+    fingerprints: Option<&[u64]>,
+) -> String {
+    let month_clause = month_clause(months);
+    let uuid_literal = super::escape::ch_string(UUID_RE);
+    let mut sql = format!(
+        "SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, {uuid_literal})) AS non_id_values\nFROM {streams_idx_table}\nWHERE {month_clause}"
+    );
+    if let Some(fps) = fingerprints {
+        sql.push_str(&format!("\n  AND fingerprint IN ({})", fp_list(fps)));
+    }
+    sql.push_str("\nGROUP BY key\nORDER BY key");
+    sql
+}
+
 /// The `month = '...'` / `month IN (...)` clause shared by every stage-1-
 /// style `log_streams_idx` scan in this module (`months` is at least one
 /// pre-rendered `'YYYY-MM-01'` date literal).
@@ -511,6 +550,31 @@ mod tests {
         assert_eq!(
             label_values("log_streams_idx", &["'2026-07-01'".to_string()], "'env'"),
             "SELECT DISTINCT val AS value\nFROM log_streams_idx\nWHERE month = '2026-07-01' AND key = 'env'\nORDER BY value"
+        );
+    }
+
+    #[test]
+    fn detected_labels_unscoped_renders_one_row_per_key_with_the_id_predicate() {
+        let sql = detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+        assert!(sql.starts_with("SELECT key, uniqExact(val) AS cardinality, countIf(toFloat64OrNull(val) IS NULL AND NOT match(val, "));
+        assert!(sql.contains("WHERE month = '2026-07-01'"));
+        assert!(!sql.contains("fingerprint"));
+        assert!(sql.ends_with("GROUP BY key\nORDER BY key"));
+    }
+
+    #[test]
+    fn detected_labels_scoped_appends_the_fingerprint_filter_to_the_same_scan() {
+        let scoped = detected_labels(
+            "log_streams_idx",
+            &["'2026-07-01'".to_string()],
+            Some(&[7, 9]),
+        );
+        assert!(scoped.contains("WHERE month = '2026-07-01'\n  AND fingerprint IN (7, 9)"));
+        let unscoped = detected_labels("log_streams_idx", &["'2026-07-01'".to_string()], None);
+        assert_eq!(
+            scoped.replace("\n  AND fingerprint IN (7, 9)", ""),
+            unscoped,
+            "scoped form must be the unscoped scan plus only the fingerprint filter"
         );
     }
 

@@ -17,14 +17,15 @@ use pulsus_logql::{
     StreamSelector, VectorAggOp, VectorMatching,
 };
 
+use super::detected::{self, DetectedFields, DetectedLabelOut, FieldAccumulator};
 use super::error::{ReadError, TooBroadReason};
 use super::explain::PlanExplain;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
 use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
-    LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow, MetricScanRow,
-    SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
+    DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
+    MetricScanRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
@@ -1729,6 +1730,455 @@ impl LogQlEngine {
             !q.target_labels.is_empty(),
             q.limit,
         ))
+    }
+
+    /// `/api/logs/v1/detected_labels` (issue #170, docs/api.md §2.6):
+    /// indexed stream labels ONLY, served by one server-side aggregation
+    /// over `log_streams_idx` ([`super::sql::detected_labels`]) — never
+    /// touching `log_samples`. `selector` is the optional `query=`
+    /// scoping (matchers only, enforced at the API layer); `None` = the
+    /// unscoped form. The reference's relevance filter applies here:
+    /// static labels (`cluster`/`namespace`/`instance`/`pod`) always
+    /// keep; any other key keeps iff at least one value is neither a
+    /// float nor a UUID (`non_id_values > 0`).
+    pub async fn detected_labels(
+        &self,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+    ) -> Result<Vec<DetectedLabelOut>, ReadError> {
+        self.detected_labels_inner(selector, b, None).await
+    }
+
+    /// [`LogQlEngine::detected_labels`] plus its `X-Pulsus-Explain`
+    /// trace, in the same single pass (no second scan) — the
+    /// `query_explained` contract.
+    pub async fn detected_labels_explained(
+        &self,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+    ) -> Result<(Vec<DetectedLabelOut>, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("detected_labels");
+        let labels = self
+            .detected_labels_inner(selector, b, Some(&mut explain))
+            .await?;
+        Ok((labels, explain))
+    }
+
+    async fn detected_labels_inner(
+        &self,
+        selector: Option<&Expr>,
+        b: TimeBounds,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<DetectedLabelOut>, ReadError> {
+        // Always >= 1 literal (`months_overlapping` never returns empty),
+        // so the aggregation's month IN-list has no empty-IN hazard.
+        let months = plan::months_overlapping(b.start_ns, b.end_ns);
+        let fingerprints: Option<Vec<u64>> = match selector {
+            None => None,
+            Some(expr) => {
+                let ctx = self.config.plan_ctx();
+                // `limit`/`direction`/`step` are unused placeholders —
+                // detected_labels never reads samples (the stats idiom).
+                let qp = QueryParams {
+                    spec: QuerySpec::Range {
+                        start_ns: b.start_ns,
+                        end_ns: b.end_ns,
+                        step_ns: 1_000_000_000,
+                    },
+                    limit: 1,
+                    direction: Direction::Forward,
+                };
+                let sp = match plan::plan(expr, &qp, &ctx)? {
+                    Plan::Streams(sp) => sp,
+                    // Unreachable via the API layer (it parses `query`
+                    // with `parse_selector`) — kept as a structured
+                    // rejection, never a panic.
+                    Plan::Metric(_) | Plan::MetricBinary(_) => {
+                        return Err(ReadError::PipelineInvalid {
+                            reason: "detected_labels requires a log stream selector (matchers \
+                                     only)"
+                                .to_string(),
+                        });
+                    }
+                };
+                if let Some(e) = explain.as_mut() {
+                    e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+                }
+                let fps = self.resolve_fingerprints(&sp.stage1_sql).await?;
+                if fps.is_empty() {
+                    // No matching streams — skip the aggregation query
+                    // entirely (an empty fingerprint IN-list must never
+                    // render).
+                    return Ok(Vec::new());
+                }
+                Some(fps)
+            }
+        };
+        let sql =
+            super::sql::detected_labels(&self.config.streams_idx, &months, fingerprints.as_deref());
+        if let Some(e) = explain.as_mut() {
+            e.push("detected_labels", sql.clone(), None);
+        }
+        let mut out = Vec::new();
+        let mut stream = self
+            .query_stream::<DetectedLabelRow>(&sql, &self.budget_settings())
+            .await?;
+        while let Some(row) = stream.next().await {
+            let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+            // The reference keep rule: static labels always; anything
+            // else only when NOT every value is float-or-UUID.
+            if detected::is_static_detected_label(&row.key) || row.non_id_values > 0 {
+                out.push(DetectedLabelOut {
+                    label: row.key,
+                    cardinality: row.cardinality,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// `/api/logs/v1/detected_fields` (issue #170, docs/api.md §2.6):
+    /// per-entry fields from a <= `line_limit` sample of **post-pipeline
+    /// matching** entries (issue #170 plan v2, reusing the #90
+    /// fetch-until-limit contract):
+    ///
+    /// - no unpushed dropping stage ([`StreamsPlan::fetch_until_limit`]
+    ///   false — bare selectors, line filters, non-dropping transforms):
+    ///   ONE byte-identical [`super::sql::stage3`] scan with `LIMIT
+    ///   line_limit` is provably the newest `line_limit` post-pipeline
+    ///   matches (line-filter pushdown carries the exact predicate), the
+    ///   O(line_limit) fast path;
+    /// - a dropping stage (label filter / post-`line_format` line
+    ///   filter): [`LogQlEngine::run_detected_fields_paged`] keyset-pages
+    ///   until `line_limit` post-pipeline matches, window exhaustion, or
+    ///   byte-budget exhaustion (`truncated = true`, surfaced as the
+    ///   additive `pulsus_partial` response key).
+    pub async fn detected_fields(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        field_limit: u32,
+    ) -> Result<DetectedFields, ReadError> {
+        self.detected_fields_inner(expr, b, line_limit, field_limit, None)
+            .await
+    }
+
+    /// [`LogQlEngine::detected_fields`] plus its `X-Pulsus-Explain`
+    /// trace, in the same single pass (no second scan) — the
+    /// `query_explained` contract.
+    pub async fn detected_fields_explained(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        field_limit: u32,
+    ) -> Result<(DetectedFields, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("detected_fields");
+        let fields = self
+            .detected_fields_inner(expr, b, line_limit, field_limit, Some(&mut explain))
+            .await?;
+        Ok((fields, explain))
+    }
+
+    async fn detected_fields_inner(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        line_limit: u32,
+        field_limit: u32,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<DetectedFields, ReadError> {
+        let ctx = self.config.plan_ctx();
+        // `limit = line_limit` drives the plan's scan/result sizing
+        // exactly as a `/query_range` with the same limit would
+        // (`scan_limit = line_limit × pipeline_scan_factor` on the
+        // dropping path); newest-first sampling per the reference.
+        let qp = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: b.start_ns,
+                end_ns: b.end_ns,
+                step_ns: 1_000_000_000,
+            },
+            limit: line_limit,
+            direction: Direction::Backward,
+        };
+        let sp = match plan::plan(expr, &qp, &ctx)? {
+            Plan::Streams(sp) => sp,
+            Plan::Metric(_) | Plan::MetricBinary(_) => {
+                return Err(ReadError::PipelineInvalid {
+                    reason: "detected_fields requires a log stream selector query (a metric \
+                             query has no per-entry fields)"
+                        .to_string(),
+                });
+            }
+        };
+        // Compile before any I/O: a bad regex/template is a 400-class
+        // rejection, never a wasted scan.
+        let compiled = CompiledPipeline::compile(&sp.pipeline)?;
+
+        if let Some(e) = explain.as_mut() {
+            e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+        }
+        let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
+        if fingerprints.is_empty() {
+            return Ok(DetectedFields {
+                fields: Vec::new(),
+                truncated: false,
+            });
+        }
+        if let Some(e) = explain.as_mut() {
+            e.push(
+                "stage2_hydration",
+                super::sql::stage2(&sp.streams_table, &fingerprints),
+                None,
+            );
+        }
+        let meta = self.hydrate(&sp.streams_table, &fingerprints).await?;
+        let services = distinct_escaped_services(&meta);
+        // Base labels parsed once per fingerprint, not per row (the
+        // `StreamAccumulator` idiom).
+        let base_labels: HashMap<u64, Vec<(String, String)>> = meta
+            .iter()
+            .map(|(fp, m)| (*fp, parse_flat_labels(&m.labels)))
+            .collect();
+        let window = super::sql::TimeWindow {
+            start_ns: sp.start_ns,
+            end_ns: sp.end_ns,
+        };
+        let mut acc = FieldAccumulator::new(field_limit);
+
+        if !sp.fetch_until_limit {
+            // Fast path — provably complete, not just fast: with no
+            // unpushed dropping stage the pipeline cannot drop a line the
+            // SQL didn't already filter exactly (line-filter pushdown
+            // carries the exact predicate), so this single scan's
+            // `LIMIT line_limit` rows ARE the newest `line_limit`
+            // post-pipeline matches (`scan_limit == line_limit` by
+            // construction). Never partial.
+            let sql = super::sql::stage3(
+                &sp.samples_table,
+                &services,
+                &fingerprints,
+                window,
+                &sp.line_filters,
+                sp.direction,
+                sp.scan_limit,
+            );
+            if let Some(e) = explain.as_mut() {
+                e.push(
+                    "detected_fields_read",
+                    sql.clone(),
+                    Some("single-scan: no unpushed dropping stage".to_string()),
+                );
+            }
+            let mut rows: Vec<SampleRow> = Vec::new();
+            {
+                // Scoped so the stream's pooled-connection lease drops
+                // before the (pure-CPU) field detection below.
+                let mut stream = self
+                    .query_stream::<SampleRow>(&sql, &self.budget_settings())
+                    .await?;
+                while let Some(row) = stream.next().await {
+                    rows.push(row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?);
+                }
+            }
+            let mut matched = 0u32;
+            feed_detected_rows(
+                &rows,
+                &base_labels,
+                &compiled,
+                &mut acc,
+                &mut matched,
+                line_limit,
+            );
+            return Ok(DetectedFields {
+                fields: acc.finish(),
+                truncated: false,
+            });
+        }
+
+        // Dropping sub-case: the pipeline can drop lines in-engine, so a
+        // single pre-pipeline LIMIT could silently miss fields that match
+        // only after the first `line_limit` raw rows (issue #170 plan v2's
+        // review fix) — keyset-page until `line_limit` post-pipeline
+        // matches, window exhaustion, or budget exhaustion.
+        if let Some(e) = explain.as_mut() {
+            let first_page_sql = super::sql::stage3_keyset(
+                &sp.samples_table,
+                &services,
+                &fingerprints,
+                window,
+                super::sql::KeysetLower::First,
+                sp.direction,
+                &sp.line_filters,
+                sp.scan_limit.max(1),
+            );
+            e.push(
+                "detected_fields_read",
+                first_page_sql,
+                Some("paged: unpushed dropping stage".to_string()),
+            );
+        }
+        let truncated = self
+            .run_detected_fields_paged(
+                &sp,
+                &compiled,
+                &base_labels,
+                &services,
+                &fingerprints,
+                line_limit,
+                &mut acc,
+            )
+            .await?;
+        Ok(DetectedFields {
+            fields: acc.finish(),
+            truncated,
+        })
+    }
+
+    /// The detected_fields fetch-until-limit paging loop (issue #170 plan
+    /// v2) — a structural sibling of [`LogQlEngine::run_streams_paged`]
+    /// feeding a [`FieldAccumulator`] + a post-pipeline matched-entry
+    /// counter instead of a `StreamAccumulator`. Shares the #90 pieces
+    /// verbatim: [`super::sql::stage3_keyset`] pages (PK-pruned,
+    /// skip-index prefilters, keyset total order), [`advance_tail_cursor`]
+    /// over the **raw** page (a page fully discarded by the pipeline never
+    /// stalls the walk), [`LogQlEngine::paging_settings`]`(budget − spent)`
+    /// with `wait_end_of_query = 1`, and the [`scan_budget_spent`]
+    /// top-of-loop guard. Page row-bound = `sp.scan_limit` (`line_limit ×
+    /// reader.logql_pipeline_scan_factor`). Returns `truncated`, per the
+    /// #90 terminal branches:
+    ///
+    /// 1. `line_limit` post-pipeline matches collected → `false`;
+    /// 2. page returns `< page_size` rows (window exhausted) → `false` —
+    ///    the branch that reaches matches occurring after the first
+    ///    `line_limit` raw rows;
+    /// 3. first page alone overflows the budget → `QueryTooBroad`;
+    /// 4. budget spent after >= 1 page → `true` (the fields accumulated so
+    ///    far are returned, surfaced as `pulsus_partial`).
+    ///
+    /// The budget is `reader.logql_scan_budget_bytes` — deliberately the
+    /// SAME bound a `/query_range` with the same dropping pipeline pays
+    /// (detected_fields never scans more than the equivalent log query
+    /// would), an approximate best-effort scan guard exactly as
+    /// documented on [`LogQlEngine::run_streams_paged`].
+    #[allow(clippy::too_many_arguments)]
+    async fn run_detected_fields_paged(
+        &self,
+        sp: &StreamsPlan,
+        compiled: &CompiledPipeline,
+        base_labels: &HashMap<u64, Vec<(String, String)>>,
+        services: &[String],
+        fingerprints: &[u64],
+        line_limit: u32,
+        acc: &mut FieldAccumulator,
+    ) -> Result<bool, ReadError> {
+        let budget = self.config.scan_budget_bytes;
+        let window = super::sql::TimeWindow {
+            start_ns: sp.start_ns,
+            end_ns: sp.end_ns,
+        };
+        let page_size = sp.scan_limit.max(1);
+        let mut cursor: Option<TailCursor> = None;
+        let mut spent: u64 = 0;
+        let mut matched: u32 = 0;
+
+        loop {
+            // Never issue a zero cap (ClickHouse's *unlimited* sentinel) —
+            // once the budget is spent, return partial (the first-page
+            // `spent == 0` case never reaches here).
+            if scan_budget_spent(spent, budget) {
+                return Ok(true);
+            }
+            let page_cap = budget.saturating_sub(spent); // now always > 0
+            let ks_lower = match cursor {
+                None => super::sql::KeysetLower::First,
+                Some(c) => super::sql::KeysetLower::After {
+                    tuple: c.tuple,
+                    offset: c.seen,
+                },
+            };
+            let sql = super::sql::stage3_keyset(
+                &sp.samples_table,
+                services,
+                fingerprints,
+                window,
+                ks_lower,
+                sp.direction,
+                &sp.line_filters,
+                page_size,
+            );
+
+            // Fetch and fully drain one page; `read_bytes` is meaningful
+            // only after the drain (wait_end_of_query=1). Scoped so the
+            // stream's pooled-connection lease releases before the next
+            // page.
+            let mut rows: Vec<TailSampleRow> = Vec::new();
+            let page_result: Result<Option<u64>, ReadError> = async {
+                let mut stream = self
+                    .query_stream::<TailSampleRow>(&sql, &self.paging_settings(page_cap))
+                    .await?;
+                while let Some(row) = stream.next().await {
+                    rows.push(row.map_err(|e| map_read_error(e, budget))?);
+                }
+                Ok(stream.read_bytes())
+            }
+            .await;
+
+            let read = match page_result {
+                Ok(rb) => rb.unwrap_or(page_cap),
+                Err(mapped) => {
+                    if matches!(
+                        mapped,
+                        ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
+                    ) {
+                        // The #90 branch split: the FIRST page overflowing
+                        // the FULL budget is a genuinely too-broad query ⇒
+                        // propagate; a later page's positive-cap overflow
+                        // keeps the fields so far and signals partial.
+                        if spent == 0 {
+                            return Err(mapped);
+                        }
+                        return Ok(true);
+                    }
+                    return Err(mapped);
+                }
+            };
+            spent = spent.saturating_add(read);
+
+            let fetched = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+            // Advance over the RAW page, not survivors — a page entirely
+            // dropped by the pipeline must never stall the walk.
+            cursor = advance_tail_cursor(cursor, &rows);
+            let sample_rows: Vec<SampleRow> = rows
+                .into_iter()
+                .map(|r| SampleRow {
+                    fingerprint: r.fingerprint,
+                    timestamp_ns: r.timestamp_ns,
+                    body: r.body,
+                    structured_metadata: r.structured_metadata,
+                })
+                .collect();
+            feed_detected_rows(
+                &sample_rows,
+                base_labels,
+                compiled,
+                acc,
+                &mut matched,
+                line_limit,
+            );
+
+            if matched >= line_limit {
+                // Post-pipeline limit filled — complete, never partial.
+                return Ok(false);
+            }
+            if fetched < page_size {
+                // Window exhausted — complete over the whole window (this
+                // is the branch that finds late-occurring matches).
+                return Ok(false);
+            }
+        }
     }
 
     /// Builds a tail connection's [`TailSetup`] — plan + compiled
@@ -3460,6 +3910,98 @@ fn recycle_label_scratch(mut scratch: LabelScratch<'_>) -> LabelScratch<'static>
         .collect()
 }
 
+/// Feeds one page of sampled rows through the query pipeline into a
+/// detected-fields accumulator (issue #170): `matched` counts
+/// **post-pipeline survivors only** — a pipeline-dropped row never counts
+/// toward `line_limit` (the plan-v2 contract; unit-tested below). Merge/
+/// scratch buffers are reused across the page's rows (the
+/// `StreamAccumulator::feed` allocation discipline); rows whose
+/// fingerprint failed to hydrate are skipped.
+fn feed_detected_rows(
+    rows: &[SampleRow],
+    base_labels: &HashMap<u64, Vec<(String, String)>>,
+    compiled: &super::pipeline::CompiledPipeline,
+    acc: &mut FieldAccumulator,
+    matched: &mut u32,
+    line_limit: u32,
+) {
+    let mut merge_buf: Vec<(String, String)> = Vec::new();
+    let mut sm_buf: Vec<(String, String)> = Vec::new();
+    // The SM pairs kept for `observe_structured_metadata` — parsed
+    // separately because `merge_labels_with_structured_metadata` drains
+    // its own parse scratch into the merged set. Field detection is
+    // bounded by the page (and survivors by `line_limit`), so the second
+    // parse per SM-bearing row is fine here.
+    let mut sm_obs: Vec<(String, String)> = Vec::new();
+    // Reused across rows via the by-value recycle (see
+    // `eval_structured_metadata_row` for why a hoisted `&mut` cannot
+    // provide the per-row lifetime).
+    let mut scratch: LabelScratch<'static> = Vec::new();
+    for row in rows {
+        if *matched >= line_limit {
+            break;
+        }
+        let Some(base) = base_labels.get(&row.fingerprint) else {
+            continue;
+        };
+        let has_sm = !row.structured_metadata.is_empty();
+        if has_sm {
+            sm_obs.clear();
+            parse_flat_labels_into(&row.structured_metadata, &mut sm_obs);
+            merge_labels_with_structured_metadata(
+                base,
+                &row.structured_metadata,
+                &mut merge_buf,
+                &mut sm_buf,
+            );
+        }
+        let run_base: &[(String, String)] = if has_sm { &merge_buf } else { base };
+        let sm_pairs: &[(String, String)] = if has_sm { &sm_obs } else { &[] };
+        let (survived, used) =
+            observe_detected_row(compiled, &row.body, run_base, sm_pairs, acc, scratch);
+        scratch = recycle_label_scratch(used);
+        if survived {
+            *matched += 1;
+        }
+    }
+}
+
+/// Runs one sampled row through the query pipeline and, when it
+/// survives, feeds the [`FieldAccumulator`] (issue #170): structured-
+/// metadata pairs (no parser attribution), pipeline-extracted keys not
+/// present in the merged base (no parser attribution;
+/// `__error__`/`__error_details__` excluded inside `observe_parsed`),
+/// then json-first/logfmt-fallback auto-detection on the POST-pipeline
+/// line. `scratch` is taken by value and returned for recycling — same
+/// per-row-lifetime rationale as [`eval_structured_metadata_row`].
+fn observe_detected_row<'a>(
+    compiled: &'a super::pipeline::CompiledPipeline,
+    body: &'a str,
+    run_base: &'a [(String, String)],
+    sm_pairs: &[(String, String)],
+    acc: &mut FieldAccumulator,
+    mut scratch: LabelScratch<'a>,
+) -> (bool, LabelScratch<'a>) {
+    let survived = if let Some(line) = compiled.run_into(body, run_base, &mut scratch) {
+        acc.observe_structured_metadata(sm_pairs);
+        let added: Vec<(String, String)> = scratch
+            .iter()
+            .filter(|(k, _)| !run_base.iter().any(|(bk, _)| bk.as_str() == k.as_ref()))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        acc.observe_parsed(&added, None);
+        if let Some((parser, pairs)) = detected::auto_parse(line.as_ref()) {
+            acc.observe_parsed(&pairs, Some(parser));
+        }
+        true
+    } else {
+        false
+    };
+    // Drop every borrow of `run_base` before the buffer is recycled.
+    scratch.clear();
+    (survived, scratch)
+}
+
 /// Fan-out for structured-metadata-bearing rows on the line-filter-only fast
 /// path (issue #97). All filtering is already applied in SQL and no pipeline
 /// runs, so each SM row's response label set is its stream's base labels merged
@@ -4236,6 +4778,90 @@ mod tests {
     use pulsus_clickhouse::ChError;
 
     use super::*;
+
+    /// Issue #170 plan v2 test delta 3: the detected-fields matched-entry
+    /// count is POST-pipeline — rows the pipeline drops never count toward
+    /// `line_limit`, and their fields are never observed.
+    #[test]
+    fn detected_fields_matched_count_is_post_pipeline_dropped_rows_do_not_count() {
+        let expr = pulsus_logql::parse(r#"{app="x"} | json | level="rare""#).expect("parse");
+        let pulsus_logql::Expr::Log(le) = expr else {
+            panic!("log expr");
+        };
+        let compiled = super::super::pipeline::CompiledPipeline::compile(&le.pipeline)
+            .expect("compile pipeline");
+        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        base_labels.insert(1, vec![("app".to_string(), "x".to_string())]);
+        let rows = vec![
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 3,
+                body: r#"{"level":"common","code":1}"#.to_string(),
+                structured_metadata: String::new(),
+            },
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 2,
+                body: "not json at all".to_string(),
+                structured_metadata: String::new(),
+            },
+            SampleRow {
+                fingerprint: 1,
+                timestamp_ns: 1,
+                body: r#"{"level":"rare","code":7}"#.to_string(),
+                structured_metadata: String::new(),
+            },
+        ];
+        let mut acc = super::super::detected::FieldAccumulator::new(1000);
+        let mut matched = 0u32;
+        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 100);
+        assert_eq!(
+            matched, 1,
+            "only the post-pipeline surviving row counts toward line_limit"
+        );
+        let fields = acc.finish();
+        let labels: Vec<&str> = fields.iter().map(|f| f.label.as_str()).collect();
+        assert_eq!(labels, vec!["code", "level"]);
+        let code = fields.iter().find(|f| f.label == "code").expect("code");
+        assert_eq!(code.field_type, "int");
+        assert_eq!(
+            code.cardinality, 1,
+            "dropped rows' values are never observed"
+        );
+        assert_eq!(code.parsers, vec!["json"]);
+    }
+
+    /// Issue #170: the post-pipeline matched count stops feeding once
+    /// `line_limit` survivors are collected (the fast path's cap).
+    #[test]
+    fn detected_fields_feed_stops_at_the_line_limit() {
+        let expr = pulsus_logql::parse(r#"{app="x"}"#).expect("parse");
+        let pulsus_logql::Expr::Log(le) = expr else {
+            panic!("log expr");
+        };
+        let compiled = super::super::pipeline::CompiledPipeline::compile(&le.pipeline)
+            .expect("compile pipeline");
+        let mut base_labels: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+        base_labels.insert(1, vec![("app".to_string(), "x".to_string())]);
+        let rows: Vec<SampleRow> = (0..5)
+            .map(|i| SampleRow {
+                fingerprint: 1,
+                timestamp_ns: i,
+                body: format!(r#"{{"seq":"{i}"}}"#),
+                structured_metadata: String::new(),
+            })
+            .collect();
+        let mut acc = super::super::detected::FieldAccumulator::new(1000);
+        let mut matched = 0u32;
+        feed_detected_rows(&rows, &base_labels, &compiled, &mut acc, &mut matched, 2);
+        assert_eq!(matched, 2);
+        let fields = acc.finish();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields[0].cardinality, 2,
+            "rows past the line_limit are never sampled"
+        );
+    }
 
     #[test]
     fn code_307_maps_to_scan_budget_bytes() {

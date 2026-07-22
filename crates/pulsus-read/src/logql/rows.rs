@@ -87,6 +87,18 @@ pub struct VolumeRow {
     pub bytes: u64,
 }
 
+/// One `/api/logs/v1/detected_labels` aggregation row (issue #170): a
+/// distinct `log_streams_idx` key with its exact value cardinality and the
+/// count of values that are neither float nor UUID (`non_id_values` — the
+/// server-side half of the reference's `containsAllIDTypes` filter; the
+/// engine keeps a key iff it is a static label or `non_id_values > 0`).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct DetectedLabelRow {
+    pub key: String,
+    pub cardinality: u64,
+    pub non_id_values: u64,
+}
+
 /// Labels discovery (`log_streams_idx`): one distinct label key.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LabelNameRow {

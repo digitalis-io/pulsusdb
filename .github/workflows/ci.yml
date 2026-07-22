@@ -637,6 +637,21 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run logs_volume_live -p pulsus-server --test logs_volume_live
 
+      # Issue #170: /api/logs/v1/{detected_labels,detected_fields} —
+      # detected_labels' ID-filter + static-label keep + exact
+      # cardinalities + query= scoping (log_streams_idx-only, proven via
+      # X-Pulsus-Explain); detected_fields' SM/json/logfmt fields, the
+      # pinned six types, limit/line_limit, the sparse-filter
+      # post-pipeline paging fix (late matches found, complete), the
+      # budget-truncated pulsus_partial spawn, and /loki alias
+      # byte-identity. Ports 31155-31156. Reuses this job's ClickHouse
+      # 24.8 container.
+      - name: Live logs detected labels/fields suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run logs_detected_live -p pulsus-server --test logs_detected_live
+
       # Issue #77 (M6-14): spawns the real `pulsusdb` binary with
       # PULSUS_COMPAT_ENDPOINTS on, pushes a stream to /loki/api/v1/push in
       # BOTH encodings (JSON + snappy-protobuf), then proves the load-bearing

@@ -800,6 +800,57 @@ async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
     assert!(!usage.iter().any(|l| l.contains("service")));
 }
 
+/// Issue #170 Tier-1 gate: the `/detected_labels` aggregation is ONE
+/// `log_streams_idx` scan with the month partition pruned (MinMax +
+/// Partition on `month` — the same scan class as the shipped `/labels`
+/// discovery query) and never references `log_samples`/body anywhere.
+/// The `(key, val, fingerprint)` primary key legitimately reports
+/// `Condition: true` — the aggregation groups over every key, so the
+/// pruning story is the partition, not the PK prefix.
+///
+/// `/detected_fields` deliberately has NO case here: it adds no new SQL
+/// shape — its fast path is the byte-identical `sql::stage3` builder and
+/// its paged path is `sql::stage3_keyset`, both already full-extract-
+/// gated above (`stage3_*`/`keyset_*` cases); `sql_snapshots.rs` pins the
+/// text and `logs_detected_live.rs` adds the endpoint-level pushdown
+/// evidence.
+#[tokio::test]
+async fn detected_labels_aggregation_prunes_on_the_month_partition() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_detected_labels";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let params = range_params(ts_ns);
+    let (start_ns, end_ns) = match params.spec {
+        QuerySpec::Range {
+            start_ns, end_ns, ..
+        } => (start_ns, end_ns),
+        QuerySpec::Instant { .. } => unreachable!("range_params builds a Range spec"),
+    };
+    let months = pulsus_read::logql::plan::months_overlapping(start_ns, end_ns);
+    let table = format!("{db}.log_streams_idx");
+    let sql = sql::detected_labels(&table, &months, None);
+    assert!(!sql.contains("log_samples"), "never touches log_samples");
+
+    let usage = explain(&client, &sql).await;
+    assert_eq!(
+        usage,
+        v(&[
+            "MinMax",
+            "Keys:",
+            "month",
+            "Condition: (month in [#, #])",
+            "Partition",
+            "Keys:",
+            "month",
+            "Condition: (month in [#, #])",
+            "PrimaryKey",
+            "Condition: true",
+        ])
+    );
+}
+
 /// The `(fingerprint, bucket_ns)` primary key on `log_metrics_5s` — shared
 /// by the range and instant rollup cases, which differ only in `SELECT`/
 /// `GROUP BY` shape (`sql_snapshots.rs`'s job), not in the `WHERE`

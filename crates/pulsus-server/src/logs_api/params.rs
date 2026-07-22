@@ -108,6 +108,17 @@ pub(crate) enum ParamError {
     /// same pre-planning stage as [`ParamError::TooManyTargetLabels`].
     #[error("'targetLabels' entry of {len} bytes exceeds the maximum of {max}")]
     TargetLabelTooLong { len: usize, max: usize },
+    /// Issue #170: `/detected_fields`' `line_limit` (sampled entries) —
+    /// default 100 (the reference's `defaultQueryLimit`); zero or
+    /// non-numeric input is a 400 (the house no-clamp rule; the cap
+    /// breach reuses [`ParamError::LimitTooLarge`]).
+    #[error("invalid 'line_limit' {0:?}: expected a positive integer")]
+    InvalidLineLimit(String),
+    /// Issue #170: `/detected_fields`' field-count cap — `limit` with the
+    /// reference's legacy alias `field_limit`, default 1000
+    /// (`defaultLimit`); zero or non-numeric input is a 400.
+    #[error("invalid 'limit' {0:?}: expected a positive integer")]
+    InvalidFieldLimit(String),
 }
 
 /// Nanoseconds since the Unix epoch, right now. Matches the rest of the
@@ -214,6 +225,63 @@ pub(crate) fn parse_target_labels(raw: Option<&str>) -> Result<Vec<String>, Para
         }
     }
     Ok(out)
+}
+
+/// Default `line_limit` for `/detected_fields` (issue #170) — the
+/// reference's `defaultQueryLimit`.
+pub(crate) const DEFAULT_LINE_LIMIT: u32 = 100;
+/// Default field-count `limit` for `/detected_fields` (issue #170) — the
+/// reference's `defaultLimit`.
+pub(crate) const DEFAULT_FIELD_LIMIT: u32 = 1000;
+
+/// `/detected_fields`' `line_limit` (issue #170, docs/api.md §2.6):
+/// absent → 100; `0` or non-numeric → 400 (never clamped, never reset —
+/// unlike the volume `limit`'s explicit-zero reset); above [`MAX_LIMIT`]
+/// → 400 (the house cap rule).
+pub(crate) fn parse_line_limit(raw: Option<&str>) -> Result<u32, ParamError> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_LINE_LIMIT);
+    };
+    let n: u64 = raw
+        .parse()
+        .map_err(|_| ParamError::InvalidLineLimit(raw.to_string()))?;
+    if n == 0 {
+        return Err(ParamError::InvalidLineLimit(raw.to_string()));
+    }
+    if n > u64::from(MAX_LIMIT) {
+        return Err(ParamError::LimitTooLarge {
+            limit: n,
+            max: MAX_LIMIT,
+        });
+    }
+    // `n <= MAX_LIMIT` (a `u32`) was just checked, so this narrowing
+    // conversion is always exact.
+    Ok(n as u32)
+}
+
+/// `/detected_fields`' field-count cap (issue #170): reads `limit` first,
+/// then the reference's legacy alias `field_limit`; absent → 1000; `0` or
+/// non-numeric → 400; above [`MAX_LIMIT`] → 400 (never clamped).
+pub(crate) fn parse_field_limit(
+    limit: Option<&str>,
+    field_limit: Option<&str>,
+) -> Result<u32, ParamError> {
+    let Some(raw) = limit.or(field_limit) else {
+        return Ok(DEFAULT_FIELD_LIMIT);
+    };
+    let n: u64 = raw
+        .parse()
+        .map_err(|_| ParamError::InvalidFieldLimit(raw.to_string()))?;
+    if n == 0 {
+        return Err(ParamError::InvalidFieldLimit(raw.to_string()));
+    }
+    if n > u64::from(MAX_LIMIT) {
+        return Err(ParamError::LimitTooLarge {
+            limit: n,
+            max: MAX_LIMIT,
+        });
+    }
+    Ok(n as u32)
 }
 
 /// `direction`: `forward`|`backward`, default `backward` (docs/api.md
@@ -575,6 +643,69 @@ mod tests {
             parse_target_labels(Some(&raw)).unwrap(),
             vec!["env".to_string()]
         );
+    }
+
+    // -- Issue #170: /detected_fields params ------------------------------
+
+    #[test]
+    fn parse_line_limit_defaults_to_100_when_absent() {
+        assert_eq!(parse_line_limit(None).unwrap(), DEFAULT_LINE_LIMIT);
+    }
+
+    #[test]
+    fn parse_line_limit_rejects_zero_and_non_numeric() {
+        assert!(matches!(
+            parse_line_limit(Some("0")).unwrap_err(),
+            ParamError::InvalidLineLimit(_)
+        ));
+        assert!(matches!(
+            parse_line_limit(Some("abc")).unwrap_err(),
+            ParamError::InvalidLineLimit(_)
+        ));
+    }
+
+    #[test]
+    fn parse_line_limit_accepts_the_cap_and_rejects_one_above_it() {
+        assert_eq!(parse_line_limit(Some("5000")).unwrap(), 5000);
+        assert!(matches!(
+            parse_line_limit(Some("5001")).unwrap_err(),
+            ParamError::LimitTooLarge {
+                limit: 5001,
+                max: 5000
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_field_limit_defaults_to_1000_when_both_params_are_absent() {
+        assert_eq!(parse_field_limit(None, None).unwrap(), DEFAULT_FIELD_LIMIT);
+    }
+
+    /// The reference reads `limit` first and only falls back to the
+    /// legacy `field_limit` alias.
+    #[test]
+    fn parse_field_limit_prefers_limit_over_the_legacy_field_limit_alias() {
+        assert_eq!(parse_field_limit(Some("7"), Some("9")).unwrap(), 7);
+        assert_eq!(parse_field_limit(None, Some("9")).unwrap(), 9);
+    }
+
+    #[test]
+    fn parse_field_limit_rejects_zero_non_numeric_and_over_cap() {
+        assert!(matches!(
+            parse_field_limit(Some("0"), None).unwrap_err(),
+            ParamError::InvalidFieldLimit(_)
+        ));
+        assert!(matches!(
+            parse_field_limit(None, Some("abc")).unwrap_err(),
+            ParamError::InvalidFieldLimit(_)
+        ));
+        assert!(matches!(
+            parse_field_limit(Some("999999"), None).unwrap_err(),
+            ParamError::LimitTooLarge {
+                limit: 999_999,
+                max: 5000
+            }
+        ));
     }
 
     #[test]

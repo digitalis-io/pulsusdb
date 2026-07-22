@@ -107,6 +107,24 @@ pub enum Surface {
     /// — the mounting oracle. Errors are the LogsQuery JSON envelope
     /// (`position` present exactly on LogQL parse errors).
     LogsStats,
+    /// `GET|POST /api/logs/v1/detected_labels` and its
+    /// `/loki/api/v1/detected_labels` alias (issue #170, docs/api.md
+    /// §2.6) — success is the bare `{"detectedLabels":[...]}` object (the
+    /// reference wire shape, no status/data envelope); against this
+    /// suite's empty databases the exact body is `{"detectedLabels":[]}`
+    /// — the mounting oracle. Errors are the LogsQuery JSON envelope
+    /// (`position` present exactly on LogQL parse errors — including a
+    /// pipeline in `query`, which the matchers-only parse rejects).
+    LogsDetectedLabels,
+    /// `GET|POST /api/logs/v1/detected_fields` and its
+    /// `/loki/api/v1/detected_fields` alias (issue #170, docs/api.md
+    /// §2.6) — success is the bare `{"fields":[...],"limit":N}` object;
+    /// against this suite's empty databases the exact body is
+    /// `{"fields":[],"limit":1000}` (the default field limit; the
+    /// additive `pulsus_partial` key is absent on complete results) —
+    /// the mounting oracle. Errors are the LogsQuery JSON envelope
+    /// (`position` present exactly on LogQL parse errors).
+    LogsDetectedFields,
     /// `/api/v1/*` — the Prometheus HTTP API JSON query envelope
     /// (`{"status","errorType","error"}`, no `position`).
     PromApi,
@@ -550,6 +568,109 @@ const LOGS_VOLUME_CASES: &[CaseClass] = &[
     CaseClass {
         name: "target_labels_too_many",
         build: logs_volume_too_many_target_labels,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
+// -- logs detected labels/fields (issue #170, docs/api.md §2.6) ----------
+
+fn logs_detected_labels_pipeline_in_query(req: &mut Req) {
+    // detected_labels' `query` is matchers-only (`parse_selector`): a
+    // pipeline is a parse error WITH a position, before any pool work.
+    req.query = format!("query={}", enc(r#"{service_name="checkout"} |= "err""#));
+}
+
+fn logs_detected_fields_line_limit_zero(req: &mut Req) {
+    req.query = format!("query={}&line_limit=0", enc(r#"{service_name="checkout"}"#));
+}
+
+fn logs_detected_fields_limit_over_cap(req: &mut Req) {
+    req.query = format!("query={}&limit=999999", enc(r#"{service_name="checkout"}"#));
+}
+
+const LOGS_DETECTED_LABELS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "pipeline_in_query_rejected",
+        build: logs_detected_labels_pipeline_in_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "wrong_content_type",
+        build: logs_wrong_content_type,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
+const LOGS_DETECTED_FIELDS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_query",
+        build: logs_missing_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "metric_query_rejected",
+        build: logs_stats_metric_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "line_limit_zero",
+        build: logs_detected_fields_line_limit_zero,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "limit_over_cap",
+        build: logs_detected_fields_limit_over_cap,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "wrong_content_type",
+        build: logs_wrong_content_type,
         expect_status: 400,
         expect: ExpectedError::Json {
             error_type: "bad_data",
@@ -1460,6 +1581,32 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_VOLUME_CASES,
     },
+    // -- Logs detected labels/fields, native (ReaderMode, issue #170,
+    //    docs/api.md §2.6). GET|POST form-encoded (the /labels+/series
+    //    precedent). detected_labels' empty base_query is the UNSCOPED
+    //    form (a valid request); detected_fields requires `query`.
+    RouteSpec {
+        path: "/api/logs/v1/detected_labels",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedLabels,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: LOGS_DETECTED_LABELS_CASES,
+    },
+    RouteSpec {
+        path: "/api/logs/v1/detected_fields",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedFields,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_DETECTED_FIELDS_CASES,
+    },
     // -- Logs query, `/loki/api/v1` compat alias (CompatAndReader) -------
     RouteSpec {
         path: "/loki/api/v1/query_range",
@@ -1566,6 +1713,36 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_VOLUME_CASES,
+    },
+    // -- Logs detected labels/fields, M7 compat aliases (CompatAndReader,
+    //    issue #170). Pure prefix swaps of the native paths (unlike
+    //    `/index/stats`/`/index/volume`), mounted via the shared
+    //    `mount_detected_routes` helper; reusing the native routes' exact
+    //    `CaseClass` lists (the #36 alias pattern — an alias wired to the
+    //    wrong handler fails this matrix, not just a byte-identity smoke
+    //    test). `DocRef::Verbatim`: the §8.1 M7 row spells both alias
+    //    paths out in full.
+    RouteSpec {
+        path: "/loki/api/v1/detected_labels",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedLabels,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "",
+        cases: LOGS_DETECTED_LABELS_CASES,
+    },
+    RouteSpec {
+        path: "/loki/api/v1/detected_fields",
+        methods: &[Method::Get, Method::Post],
+        surface: Surface::LogsDetectedFields,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_DETECTED_FIELDS_CASES,
     },
     // -- Loki push receiver, `/loki/api/v1` compat alias (CompatAndWriter,
     //    issue #77) -------------------------------------------------------
@@ -2033,28 +2210,9 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
-    RouteSpec {
-        path: "/api/logs/v1/detected_labels",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
-        path: "/api/logs/v1/detected_fields",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
+    // Issue #170: the former Planned detected_labels/detected_fields rows
+    // flipped to Mounted and moved up into the logs section above;
+    // `/patterns` stays planned.
     RouteSpec {
         path: "/api/logs/v1/patterns",
         methods: &[Method::Get],
@@ -2119,7 +2277,10 @@ pub fn route_manifest() -> &'static [RouteSpec] {
 /// scan — that heuristic would itself be exactly the kind of semantic
 /// inference round 1-4 kept losing to (task-manager adjudication, issue
 /// #36 round 5).
-pub const ROUTE_MOUNTING_HELPERS: &[&str] = &["mount_log_query_routes"];
+/// Issue #170 adds `mount_detected_routes` (the detected_labels/fields
+/// family, docs/api.md §2.6 — same `&format!("{prefix}...")` shape,
+/// called for both the native and `/loki/api/v1` prefixes).
+pub const ROUTE_MOUNTING_HELPERS: &[&str] = &["mount_log_query_routes", "mount_detected_routes"];
 
 /// One pinned function whose *entire body* is exact-pinned — round-5
 /// finding: per-call-site pinning (round 4) collapsed distinct call sites
@@ -2177,20 +2338,19 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "reader_router",
         body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
     },
-    // Re-pinned for issue #169 (M7-C1): `/volume` + its `/index/volume`
-    // alias join tail/stats as explicit mounts on both surfaces (the
-    // alias suffix is not a prefix swap, so neither route goes through
-    // `mount_log_query_routes`). (Previously re-pinned for issue #74's
-    // tail + stats mounts.)
+    // Re-pinned for issue #170 (M7-C2): both surfaces now finish through
+    // `mount_detected_routes` (the detected_labels/fields prefix-swap
+    // family). (Previously re-pinned for issue #169's `/volume` +
+    // `/index/volume` explicit mounts, and #74's tail + stats mounts.)
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "router",
-        body: "mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume))",
+        body: "let router = mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume)); mount_detected_routes(router, \"/api/logs/v1\")",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "compat_router",
-        body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume))",
+        body: "let router = mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume)); mount_detected_routes(router, \"/loki/api/v1\")",
     },
     // NOT a router-composition function — this is the Loki-push `PushRequest`'s
     // hand-written `prost::Message::merge` (issue #115 round 2), which routes the

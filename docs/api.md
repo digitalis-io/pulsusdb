@@ -144,10 +144,10 @@ Delivery: tail polls ClickHouse (there is no push channel) with a deterministic 
 ### 2.6 Drilldown (M7)
 
 ```
-GET /api/logs/v1/volume             ?query=&start=&end=&limit=&targetLabels=&aggregateBy=
-GET /api/logs/v1/detected_labels    ?query=&start=&end=
-GET /api/logs/v1/detected_fields    ?query=&start=&end=
-GET /api/logs/v1/patterns           ?query=&start=&end=
+GET      /api/logs/v1/volume             ?query=&start=&end=&limit=&targetLabels=&aggregateBy=
+GET|POST /api/logs/v1/detected_labels    ?query=&start=&end=
+GET|POST /api/logs/v1/detected_fields    ?query=&start=&end=&line_limit=&limit=
+GET      /api/logs/v1/patterns           ?query=&start=&end=
 ```
 
 #### 2.6.1 `GET /api/logs/v1/volume`
@@ -167,6 +167,41 @@ Without `targetLabels`, the aggregation keys on the selector's **own matcher nam
 Response `200`: the §2.2 vector envelope evaluated at `end` — `{"status":"success","data":{"resultType":"vector","result":[{"metric":{...},"value":[<end_unix_seconds>,"<bytes>"]},...],"stats":{"series":N}}}`. **Result order is bytes-desc (tie-break: label set asc), truncated to `limit` — NOT label-sorted** (the top-N presentation is the contract; deliberately different from §2.2's label-sorted vectors). `stats` is a PulsusDB-additive key (same clients-ignore-extras precedent as §2.4's `dropped_total`). `bytes` is the sum of line-body bytes (the same basis as §2.5's `bytes`), 5s-bucket-granular at window edges (the same rollup caveat as §2.5/`count_over_time`). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `volume_read` stage always targets `log_metrics_5s`.
 
 Errors: `400 bad_data` (missing/malformed `query`, metric query, any pipeline stage, invalid `aggregateBy`/`limit`, oversized `targetLabels`, `end < start`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+
+#### 2.6.2 `GET|POST /api/logs/v1/detected_labels`
+
+Indexed stream labels with exact per-key value cardinalities — the drilldown UI's label picker. **Reads ONLY the stream index (`log_streams_idx`)**, via one month-partition-pruned server-side aggregation (one row per distinct key crosses the network, never one per value); it never touches `log_samples`. Structured metadata is deliberately absent (it never enters the stream index — matching the reference, whose detected-labels reads only the label index). `GET|POST` form-encoded (the §2.3 `/labels` precedent; a documented deviation from this section's earlier GET-only sketch, ratified on issue #170).
+
+| Param | Notes |
+|-------|-------|
+| `query` | **optional, matchers only** — absent or empty is the unscoped form (every stream in the window, matching the reference's empty-string handling); when present, stage-1 resolution scopes the same aggregation with `fingerprint IN`. A pipeline stage or metric expression is a `400` parse error carrying `position` (the selector-only grammar rejects it) |
+| `start`, `end` | ns / RFC3339; default `end = now`, `start = end - 1h` (§2.1) |
+
+Relevance filter (reference-pinned): labels named `cluster`/`namespace`/`instance`/`pod` are always kept; any other label is dropped iff **every** one of its values parses as a float or a UUID (all four `uuid.Parse` forms — hyphenated, `urn:uuid:`-prefixed, `{hyphenated}`, bare 32-hex — case-insensitive). The float test is ClickHouse `toFloat64OrNull` (single SQL implementation, no Rust twin to drift); margins vs Go `ParseFloat` (hex floats like `0x1p-2`, underscore literals) are accepted, documented divergences.
+
+Response `200`: `{"detectedLabels":[{"label":"…","cardinality":N},…]}`, sorted by label. Documented divergences from the reference, all deliberate: `cardinality` is **exact** (`uniqExact`) rather than a hyperloglog estimate; no `sketch` key is emitted (valid under the reference's own `omitempty`); the top-level key is always present (never omitted when empty); deterministic label-sorted order vs Go map order. With `X-Pulsus-Explain: 1`, `explain` (the §2.1 shape) is added as a sibling key — its `detected_labels` stage always targets `log_streams_idx`.
+
+Errors: `400 bad_data` (malformed/piped `query`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+
+#### 2.6.3 `GET|POST /api/logs/v1/detected_fields`
+
+Per-entry **fields** detected from a bounded sample of matching log entries: structured-metadata keys (no parser attribution), the query pipeline's own extracted labels, and automatic json-first/logfmt-fallback parsing of each (post-pipeline) line — a parser counts as successful only when it sets no `__error__`. `GET|POST` form-encoded.
+
+| Param | Notes |
+|-------|-------|
+| `query` | **required** — a full LogQL log-selector expression including pipeline stages; metric queries are rejected `400` |
+| `start`, `end` | ns / RFC3339; §2.1 defaults |
+| `line_limit` | entries sampled (default 100). `0` or non-numeric → `400`; above 5000 → `400`, never clamped (§2.1's cap rule) |
+| `limit` (legacy alias `field_limit`) | max distinct field **names**, first-seen wins — later names are skipped entirely (default 1000; `0`/non-numeric → `400`; above 5000 → `400`). `limit` is read first, then the alias |
+| `step`, `since` | accepted and **ignored** (documented deviation: the reference validates `step` only as a shared-codec artifact and neither param affects detection) |
+
+Sampling contract (issue #170 plan v2): the sample is up to `line_limit` **post-pipeline matching** entries, newest first. With no in-engine dropping stage (a bare selector, line filters, non-dropping transforms — the dominant drilldown shape) one index-served `LIMIT line_limit` scan is provably that sample (line-filter pushdown carries the exact predicate). A dropping stage (a label filter, or a line filter after `line_format`) engages the §2.1 fetch-until-limit keyset paging under the **same byte scan budget an equivalent `/query_range` would pay** (`reader.logql_scan_budget_bytes`), so matches occurring long after the first `line_limit` raw rows are still found. If the budget is spent mid-paging, the response returns the fields found so far and adds the additive `"pulsus_partial": true` key — **omitted** on complete responses (the §2.1 `stats.pulsus_partial` convention), so complete responses stay byte-identical to the reference shape. A first page alone overflowing the budget is `422 query_too_broad`.
+
+Type detection: `type` ∈ `string`\|`int`\|`float`\|`boolean`\|`duration`\|`bytes`, detected in the reference's pinned order int → float → boolean → duration → bytes → string, re-detected per observation (the last sampled entry wins). Duration/bytes reuse the §2.1 label-filter unit parsers; margins vs the reference (Go hex/underscore float literals; `d`/`w` duration suffixes accepted here but not by Go's `time.ParseDuration`; spaced byte quantities like `"42 MB"` accepted there but not here) are accepted, documented divergences.
+
+Response `200`: `{"fields":[{"label":"…","type":"…","cardinality":N,"parsers":["json"|"logfmt",…]},…],"limit":N}`, sorted by label. `parsers` is always an array (`[]` for fields observed only from structured metadata or the query's own pipeline — deterministic-shape divergence from the reference's nil-slice marshaling); `cardinality` is exact over the sampled values (vs the reference's sketch estimate); the empty result is `{"fields":[],"limit":N}` where the reference returns `{}`; `__error__`/`__error_details__` never surface as fields. With `X-Pulsus-Explain: 1`, `explain` is added as a sibling key — its `detected_fields_read` stage carries the single stage-3 scan (note `single-scan: no unpushed dropping stage`) or the first keyset page (note `paged: unpushed dropping stage`).
+
+Errors: `400 bad_data` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
 
 ---
 
@@ -424,7 +459,8 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 | `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
 | `/loki/api/v1/tail`, `/loki/api/v1/index/stats` | `/api/logs/v1/{tail,stats}` | M6 |
 | `/loki/api/v1/index/volume` | `/api/logs/v1/volume` | M7 |
-| `/loki/api/v1/detected_labels`, `/detected_fields`, `/patterns` | `/api/logs/v1/{detected_labels,detected_fields,patterns}` | M7 |
+| `/loki/api/v1/detected_labels`, `/loki/api/v1/detected_fields` | `/api/logs/v1/detected_labels`, `/api/logs/v1/detected_fields` (pure prefix swaps, `GET|POST` like native) | M7 |
+| `/loki/api/v1/patterns` | `/api/logs/v1/patterns` | M7 |
 | `/api/traces/{traceId}`, `/api/traces/{traceId}/json`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}`, `/api/traces/v1/trace/{traceId}/json` | M4 |
 | `/api/search` | `/api/traces/v1/search` | M4 |
 | `/api/search/tags`, `/api/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (Tempo v1 flat projection) | M4 |

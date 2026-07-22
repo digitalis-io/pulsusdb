@@ -58,7 +58,9 @@ pub(super) fn parse_bounds(pairs: &[(String, String)]) -> Result<(i64, i64), Par
     Ok((start_ns, end_ns))
 }
 
-async fn read_form_pairs(
+/// `pub(super)` (issue #170): the detected_labels/detected_fields POST
+/// handlers (`detected.rs`) reuse the same form-decode core.
+pub(super) async fn read_form_pairs(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Vec<(String, String)>, ApiError> {

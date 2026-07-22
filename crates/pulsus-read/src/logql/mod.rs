@@ -56,6 +56,7 @@
 //! [`plan::ProbePlan`]'s doc comment for the deferral rationale
 //! (code-review fix-plan amendment §2).
 
+pub mod detected;
 pub mod error;
 pub mod escape;
 pub mod exec;
@@ -66,6 +67,7 @@ pub mod plan;
 pub mod rows;
 pub mod sql;
 
+pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
     ClientWindow, EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
