@@ -198,6 +198,29 @@ mod tests {
         }
     }
 
+    /// Issue #133: the tail connection cap still fires at the maximum
+    /// config-accepted `reader.tail_max_connections` — `TailRuntime`
+    /// construction at the ceiling must not panic (tokio
+    /// `Semaphore::MAX_PERMITS`), exactly `ceiling` slots are admitted,
+    /// and the next acquisition is denied (the pre-upgrade 429 guard
+    /// fires at the accepted max). Synchronous permit probes only.
+    #[test]
+    fn tail_slots_at_the_max_accepted_connections_cap_deny_the_next_permit() {
+        let ceiling = pulsus_config::TAIL_MAX_CONNECTIONS_CEILING;
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let runtime = TailRuntime::new(rx, ceiling);
+        let held = runtime
+            .slots
+            .try_acquire_many(u32::try_from(ceiling).expect("ceiling fits u32"))
+            .expect("the ceiling-slot semaphore must admit exactly ceiling permits");
+        assert!(
+            runtime.slots.try_acquire().is_err(),
+            "the ceiling+1-th tail connection must be denied (429) at the accepted max"
+        );
+        drop(held);
+        assert_eq!(runtime.slots.available_permits(), ceiling);
+    }
+
     #[test]
     fn build_info_from_build_env_has_four_non_empty_fields() {
         let build = BuildInfo::from_build_env();

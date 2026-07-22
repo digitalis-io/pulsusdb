@@ -754,7 +754,7 @@ impl LogQlEngine {
             // as a partial result (a later page's positive-cap overflow is
             // handled below; the first-page `spent == 0` case never reaches
             // here). This makes `page_cap` always > 0.
-            if spent >= budget {
+            if scan_budget_spent(spent, budget) {
                 return Ok((acc.into_streams(), true));
             }
             let page_cap = budget.saturating_sub(spent); // now always > 0
@@ -3423,6 +3423,21 @@ pub fn read_query_settings(scan_budget_bytes: u64) -> QuerySettings {
         .set("max_query_size", crate::querytext::MAX_QUERY_TEXT_BYTES)
 }
 
+/// Pure paging-termination decision (issue #133, the #96
+/// `probe_fanout_bound` extraction shape): `true` once the cumulative
+/// per-page `read_bytes` has consumed the whole
+/// `reader.logql_scan_budget_bytes` budget — the fetch-until-limit loop
+/// must return its survivors as partial rather than issue another page
+/// (a zero remaining cap would be ClickHouse's *unlimited* sentinel).
+/// Extracted from [`LogQlEngine::run_streams_paged`]'s top-of-loop guard
+/// so the termination is provable at the max config-accepted budget
+/// (`pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING`) with synthetic
+/// byte counts. Behavior-identical to the inline `spent >= budget`.
+#[inline]
+fn scan_budget_spent(spent: u64, budget: u64) -> bool {
+    spent >= budget
+}
+
 /// Maps a ClickHouse error to [`ReadError`], translating the byte-budget
 /// overflow code to a structured [`TooBroadReason::ScanBudgetBytes`] and
 /// leaving every other server code (including 158 `TOO_MANY_ROWS`, which
@@ -3984,6 +3999,35 @@ mod tests {
             s.get("max_query_size"),
             Some(crate::querytext::MAX_QUERY_TEXT_BYTES.to_string().as_str())
         );
+    }
+
+    /// Issue #133: the read settings carry the byte scan budget VERBATIM
+    /// at the accepted minimum (1) and at the maximum config-accepted
+    /// `reader.logql_scan_budget_bytes` — never ClickHouse's `0`
+    /// (unlimited) sentinel.
+    #[test]
+    fn read_query_settings_carry_the_budget_verbatim_at_the_accepted_min_and_ceiling() {
+        assert_eq!(read_query_settings(1).get("max_bytes_to_read"), Some("1"));
+        let cap = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
+        let s = read_query_settings(cap);
+        assert_eq!(
+            s.get("max_bytes_to_read"),
+            Some(cap.to_string().as_str()),
+            "the ceiling budget must pass through verbatim"
+        );
+        assert_ne!(s.get("max_bytes_to_read"), Some("0"));
+    }
+
+    /// Issue #133: the paging loop's termination guard still fires at the
+    /// maximum config-accepted budget — `spent == budget` terminates
+    /// (never issues a zero/unlimited remaining cap), one byte under
+    /// does not. Synthetic counts; the extracted decision IS the
+    /// top-of-loop guard in `run_streams_paged`.
+    #[test]
+    fn paging_termination_still_fires_at_the_max_accepted_scan_budget() {
+        let cap = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
+        assert!(scan_budget_spent(cap, cap));
+        assert!(!scan_budget_spent(cap - 1, cap));
     }
 
     /// Issue #35 acceptance criterion 2: the full-shape admission

@@ -19,3 +19,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Issue #133: test-only — the pool-size ceiling test references
+# `pulsus_config::POOL_SIZE_CEILING` rather than duplicating the literal.
+pulsus-config = { path = "../pulsus-config" }

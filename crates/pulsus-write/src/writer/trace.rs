@@ -207,20 +207,12 @@ impl TraceWriter {
 
         // Atomic reservation (mirrors `LogWriter::admit_batch`): reserve
         // first, roll back on overflow.
-        let previous = self
-            .shared
-            .queued_bytes
-            .fetch_add(total_bytes, Ordering::AcqRel);
-        if previous + total_bytes > self.shared.runtime.queue_bytes_limit {
-            self.shared
-                .queued_bytes
-                .fetch_sub(total_bytes, Ordering::AcqRel);
-            self.shared
-                .metrics
-                .backpressure_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(Backpressure);
-        }
+        super::reserve_queued_bytes(
+            &self.shared.queued_bytes,
+            &self.shared.metrics.backpressure_total,
+            total_bytes,
+            self.shared.runtime.queue_bytes_limit,
+        )?;
 
         if self.shared.shutting_down.load(Ordering::Acquire) {
             self.shared

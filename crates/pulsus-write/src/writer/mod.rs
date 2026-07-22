@@ -141,6 +141,31 @@ impl WriterTables {
     }
 }
 
+/// The atomic queue-bytes admission reservation shared by the log,
+/// metric, and trace writers (issue #133 extraction — behavior-identical
+/// to the three inline blocks it replaced): reserve first, roll back and
+/// count a backpressure rejection on overflow. The counter may
+/// transiently over-reserve under concurrent admits (a race loser
+/// subtracts back) but never under-reserves, so the memory bound holds.
+/// Extracted so the 503 backpressure guard is provable at the maximum
+/// config-accepted `writer.ingest_queue_bytes`
+/// (`pulsus_config::INGEST_QUEUE_BYTES_CEILING`) with synthetic
+/// counters — no real queue is allocated.
+pub(crate) fn reserve_queued_bytes(
+    queued_bytes: &AtomicU64,
+    backpressure_total: &AtomicU64,
+    total_bytes: u64,
+    queue_bytes_limit: u64,
+) -> Result<(), Backpressure> {
+    let previous = queued_bytes.fetch_add(total_bytes, Ordering::AcqRel);
+    if previous + total_bytes > queue_bytes_limit {
+        queued_bytes.fetch_sub(total_bytes, Ordering::AcqRel);
+        backpressure_total.fetch_add(1, Ordering::Relaxed);
+        return Err(Backpressure);
+    }
+    Ok(())
+}
+
 struct Shared {
     samples: Arc<buffer::TableBuffer<LogSampleRow>>,
     streams: Arc<buffer::TableBuffer<LogStreamRow>>,
@@ -379,20 +404,12 @@ impl LogWriter {
         // over-reserve (a race loser subtracts back) but never
         // under-reserves, so the memory bound holds under concurrent
         // admits.
-        let previous = self
-            .shared
-            .queued_bytes
-            .fetch_add(total_bytes, Ordering::AcqRel);
-        if previous + total_bytes > self.shared.runtime.queue_bytes_limit {
-            self.shared
-                .queued_bytes
-                .fetch_sub(total_bytes, Ordering::AcqRel);
-            self.shared
-                .metrics
-                .backpressure_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(Backpressure);
-        }
+        reserve_queued_bytes(
+            &self.shared.queued_bytes,
+            &self.shared.metrics.backpressure_total,
+            total_bytes,
+            self.shared.runtime.queue_bytes_limit,
+        )?;
 
         if self.shared.shutting_down.load(Ordering::Acquire) {
             // Lost the race with `shutdown()`: give the bytes back rather
@@ -572,4 +589,45 @@ async fn join_generations(
     }))
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #133 (plan v6 delta 2): the 503 backpressure guard still
+    /// fires at the maximum config-accepted `writer.ingest_queue_bytes` —
+    /// a reservation landing exactly at the ceiling admits; the next
+    /// byte crosses and is rejected LOUDLY (`Err(Backpressure)`, counted
+    /// in `backpressure_total`, reservation rolled back). Synthetic
+    /// counters only — nothing is allocated; the extracted
+    /// [`reserve_queued_bytes`] IS the three writers' admission gate.
+    #[test]
+    fn queue_reservation_still_fires_at_the_max_accepted_ingest_queue_bytes() {
+        let limit = pulsus_config::INGEST_QUEUE_BYTES_CEILING;
+        let queued = AtomicU64::new(0);
+        let backpressure = AtomicU64::new(0);
+
+        assert!(
+            reserve_queued_bytes(&queued, &backpressure, limit, limit).is_ok(),
+            "a reservation landing exactly at the ceiling must admit"
+        );
+        assert_eq!(queued.load(Ordering::Acquire), limit);
+        assert_eq!(backpressure.load(Ordering::Relaxed), 0);
+
+        assert!(
+            reserve_queued_bytes(&queued, &backpressure, 1, limit).is_err(),
+            "the guard must fire at the accepted maximum"
+        );
+        assert_eq!(
+            queued.load(Ordering::Acquire),
+            limit,
+            "a failed reservation rolls its bytes back"
+        );
+        assert_eq!(
+            backpressure.load(Ordering::Relaxed),
+            1,
+            "the rejection is counted"
+        );
+    }
 }

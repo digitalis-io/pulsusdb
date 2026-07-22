@@ -730,14 +730,10 @@ impl MetricsEngine {
         // `LIMIT` probe — unlike the concrete-name `SqlFallback` path),
         // so the cap is a plain in-memory count check, mirroring the
         // warm labelled path's own `pairs.len()` check.
-        if sel.info_family {
-            let cap = self.config.max_info_series;
-            if total_series as u64 > cap {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::InfoCardinality {
-                    matched: total_series,
-                    cap,
-                }));
-            }
+        if sel.info_family
+            && let Some(reason) = info_cardinality_bound(total_series, self.config.max_info_series)
+        {
+            return Err(ReadError::QueryTooBroad(reason));
         }
 
         if let Some(e) = explain.as_mut() {
@@ -1399,6 +1395,20 @@ fn fallback_fetch_settings(distributed: bool) -> QuerySettings {
 fn probe_fanout_bound(returned: usize, cap: u64) -> Option<TooBroadReason> {
     (returned as u64 > cap).then_some(TooBroadReason::MetricFanout {
         matched: returned,
+        cap,
+    })
+}
+
+/// Pure `info()` cardinality bound decision (issue #133, mirroring
+/// [`probe_fanout_bound`]): `Some(reason)` when the cache-resolved
+/// `*_info` family matched more series than `reader.promql_max_info_series`
+/// admits. Extracted from the fully-in-memory pre-fetch check so the
+/// guard — `total_series as u64 > cap` — is provable at the max
+/// config-accepted cap (`pulsus_config::PROMQL_MAX_INFO_SERIES_CEILING`)
+/// with a synthetic count.
+fn info_cardinality_bound(total_series: usize, cap: u64) -> Option<TooBroadReason> {
+    (total_series as u64 > cap).then_some(TooBroadReason::InfoCardinality {
+        matched: total_series,
         cap,
     })
 }
@@ -2213,6 +2223,24 @@ mod tests {
             })
         );
         assert_eq!(probe_fanout_bound(cap as usize, cap), None);
+    }
+
+    /// Issue #133: the `info()` cardinality backstop still fires at the
+    /// maximum config-accepted `promql_max_info_series` — the guard is
+    /// not disable-able by any value config load accepts. Hermetic:
+    /// exercises the exact `total_series as u64 > cap` decision
+    /// extracted from the name-less-selector fetch plan.
+    #[test]
+    fn info_cardinality_bound_still_trips_at_the_max_accepted_cap() {
+        let cap = pulsus_config::PROMQL_MAX_INFO_SERIES_CEILING;
+        assert_eq!(
+            info_cardinality_bound(cap as usize + 1, cap),
+            Some(TooBroadReason::InfoCardinality {
+                matched: cap as usize + 1,
+                cap,
+            })
+        );
+        assert_eq!(info_cardinality_bound(cap as usize, cap), None);
     }
 
     // --- Issue #35: full-shape parse bound (metrics read path) ---

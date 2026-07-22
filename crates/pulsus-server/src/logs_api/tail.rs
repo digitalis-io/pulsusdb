@@ -898,6 +898,66 @@ mod tests {
         assert!(sql.ends_with("LIMIT 5000"), "{sql}");
     }
 
+    /// Issue #133: the pre-SQL fetch clamp still fires at the maximum
+    /// config-accepted `reader.tail_max_fetch_limit` — a client limit one
+    /// past the ceiling cap is clamped, and the ceiling itself passes
+    /// through unclamped. The guard is not disable-able by any value
+    /// config load accepts.
+    #[test]
+    fn fetch_clamp_still_fires_at_the_max_accepted_cap() {
+        let cap = pulsus_config::TAIL_MAX_FETCH_LIMIT_CEILING;
+        assert_eq!(clamped_fetch_limit(u64::from(cap) + 1, cap), cap);
+        assert_eq!(clamped_fetch_limit(u64::from(cap), cap), cap);
+    }
+
+    /// Issue #133: the frame-buffer eviction still fires at the maximum
+    /// config-accepted `reader.tail_channel_depth` — ceiling+1 pushes
+    /// into a ceiling-deep buffer retain exactly `ceiling` frames with
+    /// the one evicted (oldest) frame's entry absorbed into the exact
+    /// drop accounting. 4_001 one-entry pushes — trivially CI-cheap.
+    #[test]
+    fn frame_eviction_still_fires_at_the_max_accepted_channel_depth() {
+        let depth = pulsus_config::TAIL_CHANNEL_DEPTH_CEILING;
+        let mut buf = FrameBuf::new(depth, 8);
+        for i in 0..=(depth as i64) {
+            buf.push_evicting(vec![stream(r#"{"app":"x"}"#, vec![(i, "line")])]);
+        }
+        assert_eq!(
+            buf.frames.len(),
+            depth,
+            "the buffer must hold exactly the depth ceiling"
+        );
+        assert_eq!(buf.dropped.total, 1, "exactly one frame's entry evicted");
+        assert_eq!(
+            buf.dropped.sample[0].timestamp_ns, 0,
+            "the OLDEST frame is the one evicted"
+        );
+    }
+
+    /// Issue #133 AC10: `DroppedAcc` at the maximum config-accepted
+    /// `reader.tail_max_entries_per_frame` — absorbing ceiling+1 entries
+    /// retains exactly `ceiling` sampled rows while the cumulative total
+    /// stays exact at ceiling+1. The sample bound is not disable-able by
+    /// any value config load accepts.
+    #[test]
+    fn dropped_sample_bound_still_fires_at_the_max_accepted_entries_per_frame() {
+        let cap = pulsus_config::TAIL_MAX_ENTRIES_PER_FRAME_CEILING;
+        let mut acc = DroppedAcc {
+            sample: VecDeque::new(),
+            total: 0,
+            cap,
+        };
+        // One entry per absorb — bounds transient memory to the retained
+        // sample itself (never an O(ceiling) input Vec on top of it).
+        for i in 0..=(cap as i64) {
+            acc.absorb(&[stream(r#"{"app":"x"}"#, vec![(i, "line")])]);
+        }
+        assert_eq!(acc.sample.len(), cap, "sample bounded at the ceiling");
+        assert_eq!(acc.total, cap as u64 + 1, "cumulative count stays exact");
+        // Drop-oldest: the retained sample starts at the second entry.
+        assert_eq!(acc.sample[0].timestamp_ns, 1);
+    }
+
     // -- retention clamp (issue #94 item 1) -----------------------------
 
     const DAY_NS: i64 = 86_400_000_000_000;

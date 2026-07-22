@@ -325,6 +325,24 @@ mod tests {
         assert!(sql.ends_with("LIMIT 101"));
     }
 
+    /// Issue #133 AC3: at the maximum config-accepted
+    /// `reader.traceql_max_candidates` the rendered truncation probe is
+    /// `LIMIT 1000001` — the `gen_cap + 1` arithmetic is overflow-free at
+    /// every accepted cap (the load-time ceiling is what makes a
+    /// `u64::MAX + 1` wrap to `LIMIT 0` — a silently empty search —
+    /// unreachable; no saturating-add masking anywhere).
+    #[test]
+    fn generator_sql_at_the_max_accepted_candidates_cap_renders_limit_1000001() {
+        let sql = generator_sql(
+            &super::super::filter::LeafGenerator::time_range(),
+            W,
+            "trace_spans",
+            "trace_attrs_idx",
+            pulsus_config::TRACEQL_MAX_CANDIDATES_CEILING,
+        );
+        assert!(sql.ends_with("LIMIT 1000001"), "got: {sql}");
+    }
+
     #[test]
     fn hydration_sql_carries_the_overflow_probe_limit_by() {
         // (root_sql, by contrast, is deliberately uncapped — see below.)

@@ -453,6 +453,28 @@ mod tests {
         assert_eq!(gate.snapshot().contended_total, 1);
     }
 
+    /// Issue #133: the eval-concurrency bound still fires at the maximum
+    /// config-accepted `reader.query_eval_concurrency`. Construction at
+    /// the ceiling must not panic (tokio `Semaphore::MAX_PERMITS`),
+    /// exactly `ceiling` permits are admitted, and the next acquisition
+    /// is denied — the bound is not disable-able by any value config
+    /// load accepts. Synchronous permit probes, no runtime needed.
+    #[test]
+    fn gate_at_the_max_accepted_concurrency_admits_exactly_the_ceiling() {
+        let ceiling = pulsus_config::QUERY_EVAL_CONCURRENCY_CEILING;
+        let gate = EvalGate::new(ceiling);
+        let held = gate
+            .sem
+            .try_acquire_many(u32::try_from(ceiling).expect("ceiling fits u32"))
+            .expect("the ceiling-permit gate must admit exactly ceiling permits");
+        assert!(
+            gate.sem.try_acquire().is_err(),
+            "the ceiling+1-th eval must be denied at the accepted max"
+        );
+        drop(held);
+        assert_eq!(gate.snapshot().available, ceiling);
+    }
+
     /// Issue #101 (plan v2 — saturating wait accumulator). Two legs, both
     /// clock-free / deterministic:
     ///

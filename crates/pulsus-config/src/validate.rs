@@ -39,6 +39,21 @@ fn positive_u64(field: &str, v: u64) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Issue #133: the shared ceiling rejection — `ConfigError::Value` naming
+/// the field, with the accepted range in `expected` (`{floor}..={ceiling}`)
+/// and the disabled guard named in the message. Callers compare in the
+/// knob's NATIVE type (u64/u32/usize — never round-tripped through a
+/// cast); `ceiling`/`floor` here are display-only.
+fn ceiling_err(field: &str, ceiling: u64, floor: u64, disables: &str) -> ConfigError {
+    value_err(
+        field,
+        &format!(
+            "exceeds the representable ceiling ({ceiling}): a larger value disables {disables}"
+        ),
+        &format!("{floor}..={ceiling}"),
+    )
+}
+
 /// Issue #96 (retroactive re-review): `reader.promql_max_metric_fanout`
 /// bounds a returned distinct-metric-name set (`metrics/exec.rs`'s
 /// `rows.len() as u64 > cap`) and a resolved-group count (`metrics/
@@ -50,6 +65,124 @@ fn positive_u64(field: &str, v: u64) -> Result<(), ConfigError> {
 /// resolution false-rejects, and small enough that `cap + 1` is always
 /// representable) — not derived from any ClickHouse session setting.
 pub const PROMQL_MAX_METRIC_FANOUT_CEILING: u64 = 1_000_000;
+
+// ---------------------------------------------------------------------
+// Issue #133 (follow-up to #96): representable ceilings for every
+// remaining positive-integer / byte-size knob whose guard a value at or
+// near its type's MAX would silently disable — a `LIMIT {n}`,
+// `len() as u64 > cap`, semaphore permit count, or ClickHouse resource
+// setting fed an absurd value stops being a guard without ever failing.
+// Policy multipliers: 1000x the documented default for counts / permits /
+// milliseconds, the 1024x power-of-two analogue for byte quantities, with
+// two derived exceptions documented on their consts
+// (`TRACEQL_MAX_CANDIDATES_CEILING`, budget-derived, and the generator
+// memory ceiling's 512 GiB byte analogue). Scale tuning routes to #25.
+// ---------------------------------------------------------------------
+
+/// `clickhouse.pool_size` — feeds `Semaphore::new(pool_size as usize)`
+/// (`pulsus-clickhouse`'s pool). 1000x the default of 8. On 32-bit
+/// targets tokio's `Semaphore::MAX_PERMITS` is `usize::MAX >> 3`
+/// (536_870_911) < `u32::MAX`, so an unbounded u32 could panic at
+/// startup; the ceiling sits five orders of magnitude below that bound
+/// (pinned by a unit test in `pulsus-clickhouse`).
+pub const POOL_SIZE_CEILING: u32 = 8_000;
+
+/// `writer.batch_bytes` — the byte-flush trigger (`should_flush`'s
+/// `bytes >= max_bytes`). A huge value defeats the byte trigger, leaving
+/// batch size bounded only by time x ingest rate. 1024x the 16 MiB
+/// default (the power-of-two byte analogue of the 1000x policy).
+pub const BATCH_BYTES_CEILING: u64 = 16 * 1024 * 1024 * 1024;
+
+/// `writer.batch_ms` — the age-flush trigger. A huge value disables the
+/// staleness/loss-window guard for a trickle stream (the byte trigger
+/// does not bound AGE). 1000x the default of 200 ms.
+pub const BATCH_MS_CEILING: u64 = 200_000;
+
+/// `writer.ingest_queue_bytes` — the 503 backpressure admission bound
+/// (`previous + total_bytes > queue_bytes_limit`). A huge limit defeats
+/// the memory backpressure guard before physical exhaustion. 1024x the
+/// 256 MiB default.
+pub const INGEST_QUEUE_BYTES_CEILING: u64 = 256 * 1024 * 1024 * 1024;
+
+/// `reader.cache_max_series` — the matched-set / IN-list cardinality
+/// guards (`metrics/labels.rs`'s `matched.len() as u64 > cap` sites).
+/// 1000x the default of 50_000; kept below
+/// [`PROMQL_MAX_CACHE_SCAN_CEILING`] so a max scan budget can still
+/// cover a max-sized cache.
+pub const CACHE_MAX_SERIES_CEILING: u64 = 50_000_000;
+
+/// `reader.promql_max_cache_scan` — the examined-entry walk budget
+/// (`metrics/labels.rs`'s `examined > scan_budget`). 1000x the default
+/// of 200_000; >= [`PROMQL_MAX_METRIC_FANOUT_CEILING`] so the #96
+/// ordering rationale (scan budget above the fan-out cap) holds at the
+/// ceilings too.
+pub const PROMQL_MAX_CACHE_SCAN_CEILING: u64 = 200_000_000;
+
+/// `reader.promql_max_info_series` — the `info()` cardinality backstop
+/// (`metrics/exec.rs`'s `total_series as u64 > cap`). 1000x the default
+/// of 100_000.
+pub const PROMQL_MAX_INFO_SERIES_CEILING: u64 = 100_000_000;
+
+/// `reader.logql_scan_budget_bytes` — the per-query byte scan budget
+/// (`max_bytes_to_read`, and the paging loop's `spent >= budget`
+/// termination). A huge budget defeats the guard before any realistic
+/// scan could trip it. 1024x the 50 GiB default.
+pub const LOGQL_SCAN_BUDGET_BYTES_CEILING: u64 = 50 * 1024 * 1024 * 1024 * 1024;
+
+/// `reader.traceql_max_candidates` — per-generator top-K depth and the
+/// merged consumption ceiling. NOT the 1000x policy multiplier:
+/// budget-derived — `2 x (cap + 1) x CANDIDATE_TUPLE_BYTES` (88 B) at
+/// this cap is ~176 MB, fitting the 256 MiB `HYDRATION_BYTE_BUDGET` for
+/// a single generator, where a 1000x-default cap would make every
+/// cap-reaching search fail the byte budget and bloat ClickHouse
+/// `ORDER BY .. LIMIT` top-K state. The ceiling also keeps the rendered
+/// `LIMIT {cap + 1}` overflow-free for every accepted value.
+pub const TRACEQL_MAX_CANDIDATES_CEILING: u64 = 1_000_000;
+
+/// `reader.traceql_scan_budget_rows` — `max_rows_to_read` (throw) on
+/// every trace search/catalog query. ClickHouse treats `0` as
+/// *unlimited*, so zero is rejected too (the floor check below). 1000x
+/// the default of 50_000_000.
+pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
+
+/// `reader.traceql_generator_max_memory_bytes` — the phase-1 candidate
+/// generator's `max_memory_usage` (throw-not-OOM) ceiling. ClickHouse
+/// treats `0` as *unlimited*, so zero is rejected too. 1024x the
+/// 512 MiB default (512 GiB, the power-of-two byte analogue).
+pub const TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
+
+/// `reader.query_eval_concurrency` — feeds `Semaphore::new` directly
+/// (`pulsus-read`'s `EvalGate`); `usize::MAX` exceeds tokio's
+/// `MAX_PERMITS` (`usize::MAX >> 3`) and panics at startup, and any huge
+/// value disables the eval-concurrency bound protecting the blocking
+/// pool. 1000x the default of 256.
+pub const QUERY_EVAL_CONCURRENCY_CEILING: usize = 256_000;
+
+/// `reader.tail_max_connections` — feeds `Semaphore::new` (the tail
+/// connection slots); same `MAX_PERMITS` panic shape as
+/// [`QUERY_EVAL_CONCURRENCY_CEILING`], and a huge value disables the
+/// 429 connection cap. 1000x the default of 100.
+pub const TAIL_MAX_CONNECTIONS_CEILING: usize = 100_000;
+
+/// `reader.tail_max_entries_per_frame` — bounds the dropped-entry
+/// sample a slow tail consumer accumulates (`DroppedAcc`'s sample cap).
+/// `0` stays ACCEPTED (totals-only mode: the cumulative drop count is
+/// exact with an empty sample), so the accepted range is
+/// `0..=` ceiling. 1000x the default of 1_000.
+pub const TAIL_MAX_ENTRIES_PER_FRAME_CEILING: usize = 1_000_000;
+
+/// `reader.tail_channel_depth` — the producer→writer frame buffer's
+/// eviction bound (`frames.len() > cap`); a huge depth is an unbounded
+/// frame queue under a slow WebSocket consumer. Exactly 1000x the
+/// default of 4 (the power-of-two analogue stays reserved for
+/// byte-quantity knobs).
+pub const TAIL_CHANNEL_DEPTH_CEILING: usize = 4_000;
+
+/// `reader.tail_max_fetch_limit` — the pre-SQL per-poll `LIMIT` clamp;
+/// `u32::MAX` makes the clamp inert (a per-poll `LIMIT 4294967295`).
+/// 1000x the default of 5_000; small enough that every accepted cap
+/// stays representable in u32.
+pub const TAIL_MAX_FETCH_LIMIT_CEILING: u32 = 5_000_000;
 
 /// Validates cross-field startup invariants on an already-parsed [`Config`].
 /// Enum values are already rejected at parse time (invalid `--mode`,
@@ -74,6 +207,17 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 10: at least one ClickHouse connection per process.
     if cfg.clickhouse.pool_size < 1 {
         return Err(value_err("clickhouse.pool_size", "must be >= 1", ">= 1"));
+    }
+    // Issue #133: on 32-bit targets tokio's `Semaphore::MAX_PERMITS`
+    // (`usize::MAX >> 3`) is below `u32::MAX`, so an unbounded pool size
+    // could panic pool construction at startup.
+    if cfg.clickhouse.pool_size > POOL_SIZE_CEILING {
+        return Err(ceiling_err(
+            "clickhouse.pool_size",
+            u64::from(POOL_SIZE_CEILING),
+            1,
+            "the connection cap (and can panic 32-bit semaphore construction)",
+        ));
     }
 
     // Issue #43: each multi-endpoint entry must name a non-empty host and,
@@ -147,9 +291,48 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
     // Rule 14: positive-value guards.
     positive_duration("query_timeout", cfg.query_timeout)?;
     positive_bytes("writer.batch_bytes", cfg.writer.batch_bytes)?;
+    // Issue #133: a huge byte trigger defeats the byte-flush guard,
+    // leaving batch size bounded only by time x ingest rate.
+    if cfg.writer.batch_bytes.0 > BATCH_BYTES_CEILING {
+        return Err(ceiling_err(
+            "writer.batch_bytes",
+            BATCH_BYTES_CEILING,
+            1,
+            "the byte-flush trigger",
+        ));
+    }
     positive_u64("writer.batch_ms", cfg.writer.batch_ms)?;
+    // Issue #133: a huge age defeats the age-flush (staleness) guard for
+    // a trickle stream.
+    if cfg.writer.batch_ms > BATCH_MS_CEILING {
+        return Err(ceiling_err(
+            "writer.batch_ms",
+            BATCH_MS_CEILING,
+            1,
+            "the age-flush trigger",
+        ));
+    }
     positive_bytes("writer.ingest_queue_bytes", cfg.writer.ingest_queue_bytes)?;
+    // Issue #133: a huge queue limit defeats the 503 backpressure guard.
+    if cfg.writer.ingest_queue_bytes.0 > INGEST_QUEUE_BYTES_CEILING {
+        return Err(ceiling_err(
+            "writer.ingest_queue_bytes",
+            INGEST_QUEUE_BYTES_CEILING,
+            1,
+            "the ingest backpressure guard",
+        ));
+    }
     positive_u64("reader.cache_max_series", cfg.reader.cache_max_series)?;
+    // Issue #133: a huge cap makes the matched-set cardinality guards
+    // unreachable.
+    if cfg.reader.cache_max_series > CACHE_MAX_SERIES_CEILING {
+        return Err(ceiling_err(
+            "reader.cache_max_series",
+            CACHE_MAX_SERIES_CEILING,
+            1,
+            "the series-cardinality guard",
+        ));
+    }
     // The `metric_series` activity-bucket floor (docs/schemas.md §2.1) is a
     // divisor in `pulsus_model::floor_to_activity_bucket` — a zero bucket
     // would panic that function's `debug_assert!` (or divide by zero in a
@@ -181,16 +364,45 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.promql_max_cache_scan",
         cfg.reader.promql_max_cache_scan,
     )?;
+    // Issue #133: a budget at/near u64::MAX makes `ScanBudgetExceeded`
+    // unreachable — an O(resident cache) walk per degraded-path query.
+    if cfg.reader.promql_max_cache_scan > PROMQL_MAX_CACHE_SCAN_CEILING {
+        return Err(ceiling_err(
+            "reader.promql_max_cache_scan",
+            PROMQL_MAX_CACHE_SCAN_CEILING,
+            1,
+            "the cache scan budget",
+        ));
+    }
     // Issue #82 (retroactive re-review): a zero cap would reject every
     // `info()` query before a single `*_info` series could resolve.
     positive_u64(
         "reader.promql_max_info_series",
         cfg.reader.promql_max_info_series,
     )?;
+    // Issue #133: a huge cap makes the info() cardinality backstop
+    // unreachable.
+    if cfg.reader.promql_max_info_series > PROMQL_MAX_INFO_SERIES_CEILING {
+        return Err(ceiling_err(
+            "reader.promql_max_info_series",
+            PROMQL_MAX_INFO_SERIES_CEILING,
+            1,
+            "the info() cardinality backstop",
+        ));
+    }
     positive_bytes(
         "reader.logql_scan_budget_bytes",
         cfg.reader.logql_scan_budget_bytes,
     )?;
+    // Issue #133: a huge budget defeats the per-query byte scan guard.
+    if cfg.reader.logql_scan_budget_bytes.0 > LOGQL_SCAN_BUDGET_BYTES_CEILING {
+        return Err(ceiling_err(
+            "reader.logql_scan_budget_bytes",
+            LOGQL_SCAN_BUDGET_BYTES_CEILING,
+            1,
+            "the per-query byte scan budget",
+        ));
+    }
     // Issue M6-09 plan v3 delta 2: a zero factor would render the stage-3
     // SQL as `LIMIT 0` whenever a pipeline oversamples — silently empty
     // responses. Floor of 1, catching both YAML and env (`0`).
@@ -202,6 +414,49 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.traceql_max_candidates",
         cfg.reader.traceql_max_candidates,
     )?;
+    // Issue #133: past the ceiling the consumption guard is unreachable
+    // and the rendered `LIMIT {cap + 1}` could wrap at u64::MAX; the
+    // budget-derived ceiling keeps `cap + 1` overflow-free for every
+    // accepted value.
+    if cfg.reader.traceql_max_candidates > TRACEQL_MAX_CANDIDATES_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_max_candidates",
+            TRACEQL_MAX_CANDIDATES_CEILING,
+            1,
+            "the candidate consumption ceiling (and overflows the LIMIT probe)",
+        ));
+    }
+    // Issue #133: previously unvalidated. ClickHouse treats
+    // `max_rows_to_read = 0` as UNLIMITED, so zero would silently disable
+    // the trace scan budget — floor and ceiling both enforced.
+    positive_u64(
+        "reader.traceql_scan_budget_rows",
+        cfg.reader.traceql_scan_budget_rows,
+    )?;
+    if cfg.reader.traceql_scan_budget_rows > TRACEQL_SCAN_BUDGET_ROWS_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_scan_budget_rows",
+            TRACEQL_SCAN_BUDGET_ROWS_CEILING,
+            1,
+            "the trace row scan budget",
+        ));
+    }
+    // Issue #133: previously unvalidated. ClickHouse treats
+    // `max_memory_usage = 0` as UNLIMITED, so zero would silently disable
+    // the generator throw-not-OOM memory guard — floor and ceiling both
+    // enforced.
+    positive_u64(
+        "reader.traceql_generator_max_memory_bytes",
+        cfg.reader.traceql_generator_max_memory_bytes,
+    )?;
+    if cfg.reader.traceql_generator_max_memory_bytes > TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_generator_max_memory_bytes",
+            TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
+            1,
+            "the generator memory guard",
+        ));
+    }
     // Issue #101: a zero eval-concurrency bound would admit no eval at all
     // (the semaphore starts with 0 permits — every query would queue
     // forever until the 408 timeout).
@@ -209,6 +464,16 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.query_eval_concurrency",
         cfg.reader.query_eval_concurrency as u64,
     )?;
+    // Issue #133: `usize::MAX` exceeds tokio's `Semaphore::MAX_PERMITS`
+    // (startup panic); a huge bound disables the eval-concurrency guard.
+    if cfg.reader.query_eval_concurrency > QUERY_EVAL_CONCURRENCY_CEILING {
+        return Err(ceiling_err(
+            "reader.query_eval_concurrency",
+            QUERY_EVAL_CONCURRENCY_CEILING as u64,
+            1,
+            "the eval-concurrency bound (and can panic semaphore construction)",
+        ));
+    }
     // Issue #74 (M6-11) plan v3 delta 6 (+ v4's slice floor): the live-tail
     // floors. A zero poll interval busy-spins the poll loop; a zero
     // connection cap makes every tail a 429; a zero channel depth is a
@@ -221,14 +486,55 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         "reader.tail_max_connections",
         cfg.reader.tail_max_connections as u64,
     )?;
+    // Issue #133: `usize::MAX` exceeds tokio's `Semaphore::MAX_PERMITS`
+    // (startup panic); a huge cap disables the 429 connection guard.
+    if cfg.reader.tail_max_connections > TAIL_MAX_CONNECTIONS_CEILING {
+        return Err(ceiling_err(
+            "reader.tail_max_connections",
+            TAIL_MAX_CONNECTIONS_CEILING as u64,
+            1,
+            "the tail connection cap (and can panic semaphore construction)",
+        ));
+    }
+    // Issue #133: an extreme sample cap unbounds the dropped-entry sample
+    // retained under sustained slow-consumer drops. `0` stays accepted —
+    // totals-only mode (exact cumulative count, empty sample).
+    if cfg.reader.tail_max_entries_per_frame > TAIL_MAX_ENTRIES_PER_FRAME_CEILING {
+        return Err(ceiling_err(
+            "reader.tail_max_entries_per_frame",
+            TAIL_MAX_ENTRIES_PER_FRAME_CEILING as u64,
+            0,
+            "the dropped-entry sample bound",
+        ));
+    }
     positive_u64(
         "reader.tail_channel_depth",
         cfg.reader.tail_channel_depth as u64,
     )?;
+    // Issue #133: a huge depth is an unbounded frame queue under a slow
+    // WebSocket consumer — the eviction guard never fires.
+    if cfg.reader.tail_channel_depth > TAIL_CHANNEL_DEPTH_CEILING {
+        return Err(ceiling_err(
+            "reader.tail_channel_depth",
+            TAIL_CHANNEL_DEPTH_CEILING as u64,
+            1,
+            "the frame-buffer eviction bound",
+        ));
+    }
     positive_u64(
         "reader.tail_max_fetch_limit",
         u64::from(cfg.reader.tail_max_fetch_limit),
     )?;
+    // Issue #133: `u32::MAX` makes the pre-SQL clamp inert (a per-poll
+    // `LIMIT 4294967295`).
+    if cfg.reader.tail_max_fetch_limit > TAIL_MAX_FETCH_LIMIT_CEILING {
+        return Err(ceiling_err(
+            "reader.tail_max_fetch_limit",
+            u64::from(TAIL_MAX_FETCH_LIMIT_CEILING),
+            1,
+            "the per-poll fetch clamp",
+        ));
+    }
     positive_duration("reader.tail_catchup_slice", cfg.reader.tail_catchup_slice)?;
     positive_duration("rotation_interval", cfg.rotation_interval)?;
     positive_duration("log_rollup_resolution", cfg.log_rollup_resolution)?;
@@ -585,6 +891,230 @@ mod tests {
 
         cfg.reader.promql_max_metric_fanout = 1_000;
         assert!(validate(&cfg).is_ok());
+    }
+
+    /// Issue #133 shared boundary harness: the knob's native-type MAX and
+    /// ceiling+1 are both rejected as `ConfigError::Value` naming exactly
+    /// `field`; the ceiling itself and the container default are accepted.
+    /// Each per-knob test below fails if its range check is removed.
+    fn assert_ceiling_boundary(
+        field: &str,
+        set: impl Fn(&mut Config, u64),
+        native_max: u64,
+        ceiling: u64,
+    ) {
+        for bad in [native_max, ceiling + 1] {
+            let mut cfg = Config::default();
+            set(&mut cfg, bad);
+            match validate(&cfg) {
+                Err(ConfigError::Value { field: got, .. }) => {
+                    assert_eq!(got, field, "wrong field named for {field} at {bad}");
+                }
+                other => panic!("{field} at {bad}: expected a Value error, got {other:?}"),
+            }
+        }
+        let mut cfg = Config::default();
+        set(&mut cfg, ceiling);
+        assert!(
+            validate(&cfg).is_ok(),
+            "{field} must accept its ceiling ({ceiling})"
+        );
+        assert!(
+            validate(&Config::default()).is_ok(),
+            "{field}: the container default must stay accepted"
+        );
+    }
+
+    #[test]
+    fn pool_size_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "clickhouse.pool_size",
+            |c, v| c.clickhouse.pool_size = v as u32,
+            u64::from(u32::MAX),
+            u64::from(POOL_SIZE_CEILING),
+        );
+    }
+
+    #[test]
+    fn batch_bytes_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "writer.batch_bytes",
+            |c, v| c.writer.batch_bytes = ByteSize(v),
+            u64::MAX,
+            BATCH_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn batch_ms_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "writer.batch_ms",
+            |c, v| c.writer.batch_ms = v,
+            u64::MAX,
+            BATCH_MS_CEILING,
+        );
+    }
+
+    #[test]
+    fn ingest_queue_bytes_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "writer.ingest_queue_bytes",
+            |c, v| c.writer.ingest_queue_bytes = ByteSize(v),
+            u64::MAX,
+            INGEST_QUEUE_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn cache_max_series_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.cache_max_series",
+            |c, v| c.reader.cache_max_series = v,
+            u64::MAX,
+            CACHE_MAX_SERIES_CEILING,
+        );
+    }
+
+    #[test]
+    fn promql_max_cache_scan_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.promql_max_cache_scan",
+            |c, v| c.reader.promql_max_cache_scan = v,
+            u64::MAX,
+            PROMQL_MAX_CACHE_SCAN_CEILING,
+        );
+    }
+
+    #[test]
+    fn promql_max_info_series_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.promql_max_info_series",
+            |c, v| c.reader.promql_max_info_series = v,
+            u64::MAX,
+            PROMQL_MAX_INFO_SERIES_CEILING,
+        );
+    }
+
+    #[test]
+    fn logql_scan_budget_bytes_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.logql_scan_budget_bytes",
+            |c, v| c.reader.logql_scan_budget_bytes = ByteSize(v),
+            u64::MAX,
+            LOGQL_SCAN_BUDGET_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn traceql_max_candidates_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.traceql_max_candidates",
+            |c, v| c.reader.traceql_max_candidates = v,
+            u64::MAX,
+            TRACEQL_MAX_CANDIDATES_CEILING,
+        );
+    }
+
+    /// Issue #133 AC2: `traceql_scan_budget_rows` was previously
+    /// UNVALIDATED — `0` loaded fine and flowed verbatim into ClickHouse
+    /// `max_rows_to_read`, whose `0` means *unlimited* (a silently
+    /// disabled scan budget). Both the new floor and the ceiling reject.
+    #[test]
+    fn traceql_scan_budget_rows_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.traceql_scan_budget_rows = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.traceql_scan_budget_rows");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.traceql_scan_budget_rows",
+            |c, v| c.reader.traceql_scan_budget_rows = v,
+            u64::MAX,
+            TRACEQL_SCAN_BUDGET_ROWS_CEILING,
+        );
+    }
+
+    /// Issue #133 AC9: same shape as the row budget —
+    /// `max_memory_usage = 0` is ClickHouse-unlimited, so zero is a
+    /// silently disabled generator memory guard.
+    #[test]
+    fn traceql_generator_max_memory_bytes_rejects_zero_and_the_absurd_and_accepts_the_max() {
+        let mut cfg = Config::default();
+        cfg.reader.traceql_generator_max_memory_bytes = 0;
+        match validate(&cfg) {
+            Err(ConfigError::Value { field, .. }) => {
+                assert_eq!(field, "reader.traceql_generator_max_memory_bytes");
+            }
+            other => panic!("expected a Value error for zero, got {other:?}"),
+        }
+        assert_ceiling_boundary(
+            "reader.traceql_generator_max_memory_bytes",
+            |c, v| c.reader.traceql_generator_max_memory_bytes = v,
+            u64::MAX,
+            TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
+        );
+    }
+
+    #[test]
+    fn query_eval_concurrency_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.query_eval_concurrency",
+            |c, v| c.reader.query_eval_concurrency = usize::try_from(v).unwrap_or(usize::MAX),
+            u64::MAX,
+            QUERY_EVAL_CONCURRENCY_CEILING as u64,
+        );
+    }
+
+    #[test]
+    fn tail_max_connections_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.tail_max_connections",
+            |c, v| c.reader.tail_max_connections = usize::try_from(v).unwrap_or(usize::MAX),
+            u64::MAX,
+            TAIL_MAX_CONNECTIONS_CEILING as u64,
+        );
+    }
+
+    /// Issue #133 AC10: the dropped-entry sample cap's ceiling — and the
+    /// explicit pin that `0` STAYS accepted (totals-only mode: exact
+    /// cumulative drop count, empty sample).
+    #[test]
+    fn tail_max_entries_per_frame_ceiling_rejects_absurd_and_zero_stays_accepted() {
+        assert_ceiling_boundary(
+            "reader.tail_max_entries_per_frame",
+            |c, v| c.reader.tail_max_entries_per_frame = usize::try_from(v).unwrap_or(usize::MAX),
+            u64::MAX,
+            TAIL_MAX_ENTRIES_PER_FRAME_CEILING as u64,
+        );
+        let mut cfg = Config::default();
+        cfg.reader.tail_max_entries_per_frame = 0;
+        assert!(
+            validate(&cfg).is_ok(),
+            "0 is totals-only mode, deliberately accepted"
+        );
+    }
+
+    #[test]
+    fn tail_channel_depth_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.tail_channel_depth",
+            |c, v| c.reader.tail_channel_depth = usize::try_from(v).unwrap_or(usize::MAX),
+            u64::MAX,
+            TAIL_CHANNEL_DEPTH_CEILING as u64,
+        );
+    }
+
+    #[test]
+    fn tail_max_fetch_limit_ceiling_rejects_absurd_and_accepts_the_max() {
+        assert_ceiling_boundary(
+            "reader.tail_max_fetch_limit",
+            |c, v| c.reader.tail_max_fetch_limit = u32::try_from(v).unwrap_or(u32::MAX),
+            u64::from(u32::MAX),
+            u64::from(TAIL_MAX_FETCH_LIMIT_CEILING),
+        );
     }
 
     /// Issue #89 (retroactive re-review): the cache-scan budget follows the

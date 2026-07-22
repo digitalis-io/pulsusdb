@@ -308,6 +308,28 @@ fn cached_name_matches(
 /// bounded by `scan_budget + 1` examined entries regardless of resident
 /// cache size — the fan-out/`cache_max_series` guards still bound the
 /// matched result, `scan_budget` bounds the examined universe.
+/// Pure scan-budget decision (issue #133, mirroring #96's
+/// `probe_fanout_bound` extraction): `true` when the walk has examined
+/// more entries than the budget admits. Extracted so the bound is
+/// provable at the max config-accepted `promql_max_cache_scan`
+/// (`pulsus_config::PROMQL_MAX_CACHE_SCAN_CEILING`) without an
+/// O(ceiling) resident cache. Behavior-identical to the inline
+/// `examined > scan_budget` it replaced.
+#[inline]
+fn scan_budget_exhausted(examined: u64, scan_budget: u64) -> bool {
+    examined > scan_budget
+}
+
+/// Pure matched-series cardinality decision (issue #133): `true` when a
+/// matched set exceeds `cache_max_series`. One decision point for the
+/// three guard sites (multi-metric total, fingerprint resolve, labelled
+/// resolve), provable at the max config-accepted cap
+/// (`pulsus_config::CACHE_MAX_SERIES_CEILING`) with synthetic counts.
+#[inline]
+fn match_exceeds_series_cap(count: usize, cap: u64) -> bool {
+    count as u64 > cap
+}
+
 #[allow(clippy::too_many_arguments)] // mirrors resolve_over/resolve_labelled_over's shape
 pub(crate) fn resolve_multi_metric_over(
     snapshot: &CacheSnapshot,
@@ -364,7 +386,7 @@ pub(crate) fn resolve_multi_metric_over(
     let mut examined: u64 = 0;
     for (name, candidates) in &snapshot.by_metric {
         examined += 1;
-        if examined > scan_budget {
+        if scan_budget_exhausted(examined, scan_budget) {
             metrics
                 .miss_scan_budget_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -386,7 +408,7 @@ pub(crate) fn resolve_multi_metric_over(
         let mut matched: Vec<(Fingerprint, LabelSet)> = Vec::new();
         for &fp in candidates {
             examined += 1;
-            if examined > scan_budget {
+            if scan_budget_exhausted(examined, scan_budget) {
                 metrics
                     .miss_scan_budget_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -413,7 +435,7 @@ pub(crate) fn resolve_multi_metric_over(
             continue;
         }
         total_series += matched.len();
-        if total_series as u64 > config.cache_max_series {
+        if match_exceeds_series_cap(total_series, config.cache_max_series) {
             metrics
                 .miss_over_cardinality_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -691,7 +713,7 @@ pub(crate) fn resolve_over(
         }
     }
 
-    if matched.len() as u64 > config.cache_max_series {
+    if match_exceeds_series_cap(matched.len(), config.cache_max_series) {
         metrics
             .miss_over_cardinality_total
             .fetch_add(1, Ordering::Relaxed);
@@ -797,7 +819,7 @@ pub(crate) fn resolve_labelled_over(
         }
     }
 
-    if matched.len() as u64 > config.cache_max_series {
+    if match_exceeds_series_cap(matched.len(), config.cache_max_series) {
         metrics
             .miss_over_cardinality_total
             .fetch_add(1, Ordering::Relaxed);
@@ -1132,6 +1154,30 @@ impl MultiMetricScanProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Issue #133: guard-fires-at-the-accepted-max boundary proofs ---
+    // Synthetic counts (the #96 `probe_fanout_bound` shape) — no
+    // O(ceiling) resident cache is built; the extracted pure decisions
+    // ARE the guard sites' comparisons.
+
+    /// The examined-entry walk budget still trips at the maximum
+    /// config-accepted `reader.promql_max_cache_scan` — the guard is not
+    /// disable-able by any value config load accepts.
+    #[test]
+    fn scan_budget_still_trips_at_the_max_accepted_cache_scan() {
+        let cap = pulsus_config::PROMQL_MAX_CACHE_SCAN_CEILING;
+        assert!(scan_budget_exhausted(cap + 1, cap));
+        assert!(!scan_budget_exhausted(cap, cap));
+    }
+
+    /// The matched-series cardinality guard still trips at the maximum
+    /// config-accepted `reader.cache_max_series`.
+    #[test]
+    fn series_cap_still_trips_at_the_max_accepted_cache_max_series() {
+        let cap = pulsus_config::CACHE_MAX_SERIES_CEILING;
+        assert!(match_exceeds_series_cap(cap as usize + 1, cap));
+        assert!(!match_exceeds_series_cap(cap as usize, cap));
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> LabelSet {
         LabelSet::from_verbatim(

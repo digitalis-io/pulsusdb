@@ -1539,6 +1539,90 @@ mod tests {
         assert!(clustered.contains("local"));
     }
 
+    /// Issue #133 AC5: `search_settings` and `catalog_settings` carry
+    /// `max_rows_to_read` VERBATIM at the accepted minimum (1) and at the
+    /// maximum config-accepted `reader.traceql_scan_budget_rows` — never
+    /// ClickHouse's `0` (unlimited) sentinel, which would silently
+    /// disable the trace scan budget.
+    #[test]
+    fn scan_budget_rows_pass_through_verbatim_at_the_accepted_min_and_ceiling() {
+        for budget in [1u64, pulsus_config::TRACEQL_SCAN_BUDGET_ROWS_CEILING] {
+            let mut c = cfg();
+            c.scan_budget_rows = budget;
+            let expected = budget.to_string();
+            for s in [search_settings(&c), catalog_settings(&c)] {
+                assert_eq!(
+                    s.get("max_rows_to_read"),
+                    Some(expected.as_str()),
+                    "the row budget must pass through verbatim"
+                );
+                assert_ne!(s.get("max_rows_to_read"), Some("0"));
+            }
+        }
+    }
+
+    /// Issue #133 AC9: `generator_settings` carries `max_memory_usage`
+    /// VERBATIM at the accepted minimum (1) and at the maximum
+    /// config-accepted `reader.traceql_generator_max_memory_bytes` —
+    /// never `0` (ClickHouse-unlimited, a silently disabled
+    /// throw-not-OOM guard).
+    #[test]
+    fn generator_memory_passes_through_verbatim_at_the_accepted_min_and_ceiling() {
+        for bytes in [
+            1u64,
+            pulsus_config::TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
+        ] {
+            let mut c = cfg();
+            c.generator_max_memory_bytes = bytes;
+            let s = generator_settings(&c);
+            assert_eq!(
+                s.get("max_memory_usage"),
+                Some(bytes.to_string().as_str()),
+                "the generator memory ceiling must pass through verbatim"
+            );
+            assert_ne!(s.get("max_memory_usage"), Some("0"));
+        }
+    }
+
+    /// Issue #133 AC12 (plan v3 delta 3): both sides of the
+    /// budget-derived `TRACEQL_MAX_CANDIDATES_CEILING`, via the committed
+    /// P10 pre-hydration charge formula
+    /// (`2 x generators x (cap + 1) x CANDIDATE_TUPLE_BYTES`): a
+    /// single-generator search at the ceiling cap FITS
+    /// [`HYDRATION_BYTE_BUDGET`] (a cap-reaching search can complete),
+    /// while two generators at the ceiling EXCEED it — and that
+    /// aggregate retention fails LOUDLY through [`ByteBudget::charge`]
+    /// (the mapped 422 `query_too_broad` path), never by silent
+    /// truncation or OOM. Arithmetic identity + charge counters only —
+    /// no O(ceiling) allocation.
+    #[test]
+    fn multi_generator_retention_at_the_candidates_ceiling_fails_loud_through_the_byte_budget() {
+        let cap = usize::try_from(pulsus_config::TRACEQL_MAX_CANDIDATES_CEILING)
+            .expect("the candidates ceiling fits usize");
+        let one_generator = 2 * (cap + 1) * CANDIDATE_TUPLE_BYTES;
+        assert!(
+            one_generator <= HYDRATION_BYTE_BUDGET,
+            "a single generator at the ceiling cap must fit the retention budget \
+             ({one_generator} B vs {HYDRATION_BYTE_BUDGET} B)"
+        );
+        let two_generators = 2 * 2 * (cap + 1) * CANDIDATE_TUPLE_BYTES;
+        assert!(
+            two_generators > HYDRATION_BYTE_BUDGET,
+            "two generators at the ceiling cap must exceed the retention budget \
+             ({two_generators} B vs {HYDRATION_BYTE_BUDGET} B)"
+        );
+
+        let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
+        match budget.charge(two_generators) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })) => {}
+            other => panic!("expected a loud ScanBudgetBytes rejection, got {other:?}"),
+        }
+        // A failed charge never mutates the counter, and the fitting
+        // single-generator charge still admits.
+        assert_eq!(budget.used(), 0);
+        assert!(budget.charge(one_generator).is_ok());
+    }
+
     #[test]
     fn metric_values_convert_at_the_encode_boundary() {
         assert_eq!(metric_value(MetricFunc::Rate, 120, 60), 2.0);

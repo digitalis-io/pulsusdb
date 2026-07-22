@@ -756,6 +756,35 @@ mod tests {
         assert!(STALE_AFTER > Duration::ZERO);
     }
 
+    /// Issue #133 AC16: the pool-size ceiling's 32-bit reasoning is
+    /// EXECUTABLE — on 32-bit targets tokio's `Semaphore::MAX_PERMITS` is
+    /// `usize::MAX >> 3` = 536_870_911 (< `u32::MAX`), so `connect`'s
+    /// `Semaphore::new(cfg.pool_size)` would panic at startup for an
+    /// unbounded u32; the config ceiling must stay below that bound. The
+    /// second leg proves the connection cap still FIRES at the accepted
+    /// maximum: a ceiling-permit semaphore (the exact construction shape)
+    /// admits exactly `POOL_SIZE_CEILING` permits and denies the next.
+    #[test]
+    fn pool_size_ceiling_fits_32_bit_max_permits_and_admits_exactly_the_ceiling() {
+        assert!(
+            u64::from(pulsus_config::POOL_SIZE_CEILING) <= 536_870_911,
+            "the ceiling must sit below 32-bit Semaphore::MAX_PERMITS (usize::MAX >> 3)"
+        );
+        let sem = Semaphore::new(pulsus_config::POOL_SIZE_CEILING as usize);
+        let held = sem
+            .try_acquire_many(pulsus_config::POOL_SIZE_CEILING)
+            .expect("the pool must admit exactly ceiling connections");
+        assert!(
+            sem.try_acquire().is_err(),
+            "the ceiling+1-th connection must be denied at the accepted max"
+        );
+        drop(held);
+        assert_eq!(
+            sem.available_permits(),
+            pulsus_config::POOL_SIZE_CEILING as usize
+        );
+    }
+
     fn state(zone: Option<&'static str>, healthy: bool, probe_ok: bool) -> EndpointState<'static> {
         EndpointState {
             zone,

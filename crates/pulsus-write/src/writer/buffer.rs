@@ -178,6 +178,59 @@ mod tests {
         assert!(buf.should_flush(u64::MAX, Duration::from_millis(0)));
     }
 
+    /// Issue #133 (plan v6 delta 2): the byte-flush trigger still fires
+    /// at the maximum config-accepted `writer.batch_bytes` — synthetic
+    /// buffered-byte COUNTERS only (the `bytes` argument is bookkeeping;
+    /// no 16 GiB is allocated), age held below its own trigger. Holds
+    /// one byte under the ceiling, fires at it.
+    #[test]
+    fn byte_flush_still_fires_at_the_max_accepted_batch_bytes() {
+        let cap = pulsus_config::BATCH_BYTES_CEILING;
+        let no_age = Duration::from_secs(3600);
+        let buf: TableBuffer<u32> = TableBuffer::new();
+        buf.append(vec![1], cap - 1, u64::MAX);
+        assert!(
+            !buf.should_flush(cap, no_age),
+            "one byte under the ceiling must hold"
+        );
+        buf.append(vec![2], 1, u64::MAX);
+        assert!(
+            buf.should_flush(cap, no_age),
+            "the flush decision must fire at the accepted maximum"
+        );
+    }
+
+    /// Issue #133 (plan v6 delta 2): the age-flush trigger still fires at
+    /// the maximum config-accepted `writer.batch_ms` (200_000 ms) — a
+    /// SYNTHETIC generation birth instant (no real waiting), bytes held
+    /// below their own trigger. The hold leg sits half the ceiling under
+    /// the trigger so a scheduler stall can never flake it; the fire leg
+    /// is deterministic (elapsed time only grows past the threshold).
+    #[test]
+    fn age_flush_still_fires_at_the_max_accepted_batch_ms() {
+        let max_age = Duration::from_millis(pulsus_config::BATCH_MS_CEILING);
+        let buf: TableBuffer<u32> = TableBuffer::new();
+        buf.append(vec![1], 1, u64::MAX);
+
+        // Monotonic history is measured from boot on Linux; the build
+        // preceding this test run is already far longer than 200 s.
+        let synthetic = |age: Duration| {
+            Instant::now()
+                .checked_sub(age)
+                .expect("monotonic clock history exceeds the synthetic age")
+        };
+        buf.lock().oldest = Some(synthetic(max_age / 2));
+        assert!(
+            !buf.should_flush(u64::MAX, max_age),
+            "a generation younger than the ceiling must hold"
+        );
+        buf.lock().oldest = Some(synthetic(max_age));
+        assert!(
+            buf.should_flush(u64::MAX, max_age),
+            "the age flush must fire at the accepted maximum"
+        );
+    }
+
     #[test]
     fn swap_out_of_an_empty_buffer_returns_none() {
         let buf: TableBuffer<u32> = TableBuffer::new();
