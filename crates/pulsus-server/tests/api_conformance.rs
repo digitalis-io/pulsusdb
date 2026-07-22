@@ -482,6 +482,7 @@ fn valid_remote_write_body() -> Vec<u8> {
                 value: 1.0,
                 timestamp: 1_700_000_000_000,
             }],
+            histograms: vec![],
         }],
         metadata: vec![],
     };

@@ -279,6 +279,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test live_metric_hist_writer
 
+      # Issue #140: remote-write native-histogram ingest — a real snappy
+      # prompb body with a GAUGE-hint and an UNKNOWN-hint integer native
+      # histogram through ingest_remote_write (sync) -> MetricWriter ->
+      # ClickHouse: counter_reset_hint lands 3 and 0 respectively, the
+      # stored row decodes to a Gauge FloatHistogram, and the
+      # histograms-only series register value_type = 1 metric_series rows.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Remote-write gauge-hint native histogram (counter_reset_hint e2e)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_remote_write_hist
+
       # Issue #134: the log_streams registration-backfill live failure
       # injection — L1 "lost registration" (first streams insert swallowed
       # with a deterministic error; the backfill heals it and the

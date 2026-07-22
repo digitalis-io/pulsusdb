@@ -47,6 +47,38 @@ renamed `up` to `up_ratio` (OTel unit `"1"` → a `_ratio` suffix) — left
 as-is rather than "corrected", since it is exactly what a real sender
 produces.
 
+### `native_histogram.bin` (issue #140)
+
+A third **real capture**: a snappy-compressed RW-1.0 `prompb.WriteRequest`
+carrying one integer **native histogram**, recorded from a real
+**Prometheus 3.13.0** sender (`User-Agent: Prometheus/3.13.0`,
+`X-Prometheus-Remote-Write-Version: 0.1.0`, `Content-Encoding: snappy`):
+
+1. Prometheus 3.13.0 was started via `podman run --network host
+   prom/prometheus:v3.13.0` with `--enable-feature=native-histograms
+   --web.enable-otlp-receiver`, no scrape targets, and a `remote_write`
+   block (`send_native_histograms: true`) pointed at the same local
+   body-dumping HTTP server as above.
+2. A hand-built OTLP `ExportMetricsServiceRequest` (one cumulative
+   `ExponentialHistogram` `rw_capture_latency`, scale −2, count 6,
+   sum 10.5, zero_count 1, positive buckets `[1, 0, 2]` at offset −3,
+   negative buckets `[2]` at offset 0, under a `service.name=checkout`
+   resource) was POSTed to Prometheus's OTLP receiver
+   (`/api/v1/otlp/v1/metrics`), which ingests exponential histograms as
+   native histograms.
+3. Prometheus's own remote-write sender forwarded the sample as a
+   `TimeSeries` tag-4 `Histogram` — captured exactly as sent.
+
+This pins the hand-rolled `Histogram` (tags 1–16) / `BucketSpan` layout
+against genuine wire bytes, and specifically every **zigzag** declaration
+at a negative value (`schema` −2 = sint32, positive span `offset` −2 =
+sint32, positive delta −1 = packed sint64) — the fields a self-consistent
+plain-int mis-declaration would silently corrupt. The GAUGE reset-hint
+variant has no ready real-sender equivalent (common senders emit
+UNKNOWN/YES/NO; only the enum value at tag 14 differs), so it is built
+programmatically in `remote_write_fixtures.rs` per the precedent below
+(issue #140 OQ1 resolution).
+
 The remaining cases below have no real-collector equivalent — a standard
 sender never omits `__name__`, sends labels a spec-conformant client would
 already emit in whatever order, or ships malformed wire data — so they are
@@ -73,3 +105,4 @@ they are not derived from a builder function committed to this repository.
 |------|--------|
 | `basic_series.bin` | three real `TimeSeries` (`cpu_usage_ratio` gauge with a `host` label, `http_requests_total` counter with a `method` label, `up_ratio` gauge) sharing `job`/`service_name` labels — exact sample rows, independently-recomputed fingerprints, and (via `up_ratio`) a real collector's OTLP-stale-flag-to-remote-write translation, asserted bit-exact via `.to_bits()`. |
 | `metadata.bin` | three real `MetricMetadata` records (`cpu_usage_ratio` gauge, `http_requests_total` counter, `up_ratio` gauge) with `help` text — proves the hand-rolled tag layout (`type`=1, `metric_family_name`=2, `help`=4, `unit`=5, gap at 3) against real wire bytes, and pins `metric_type` string parity with `otlp_metrics::parse`'s own type table. |
+| `native_histogram.bin` | one real integer native histogram (`rw_capture_latency`, schema −2) from a Prometheus 3.13.0 sender — pins the `Histogram`/`BucketSpan` tag layout (tags 1–16) and the sint32/sint64 zigzag fields at negative values against genuine wire bytes (issue #140). |

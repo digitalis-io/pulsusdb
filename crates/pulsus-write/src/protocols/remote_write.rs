@@ -16,13 +16,18 @@
 //! `ingest/http.rs` — no protoc/build-dep, no new crate dependency
 //! (`prost`/`snap` are already `pulsus-write` deps). The leaf messages
 //! (`Label`, `Sample`, `MetricMetadataProto`) carry no repeated field and keep
-//! their derived `#[derive(::prost::Message)]`. The two repeated-bearing
-//! messages (`WriteRequest`, `TimeSeries`) instead carry a **hand-written**
+//! their derived `#[derive(::prost::Message)]`, as does the repeated-free
+//! [`BucketSpan`] leaf. The repeated-bearing
+//! messages (`WriteRequest`, `TimeSeries`, `Histogram`) instead carry a
+//! **hand-written**
 //! `impl prost::Message` that caps their repeated fields **during**
 //! `merge_field` (issue #115, finding #62) — see their doc comments and the
-//! [`BoundedWriteRequest`] twin. `exemplars` (`TimeSeries` tag 3) and
-//! native/RW-2.0 histograms (`TimeSeries` tag 4) are intentionally undeclared:
-//! unknown fields are skipped on decode, and both are out of scope (M7).
+//! [`BoundedWriteRequest`] twin. Native histograms (`TimeSeries` tag 4) are
+//! decoded since issue #140 — the RW-1.0 wire form IS the stored integer
+//! `NativeHistogram` shape (spans + delta-encoded buckets), copied verbatim,
+//! with the wire `ResetHint` mapped GAUGE→`Gauge`, everything else→`Unknown`.
+//! `exemplars` (`TimeSeries` tag 3) and RW-2.0 stay intentionally
+//! undeclared/out of scope: unknown fields are skipped on decode.
 //!
 //! Tag layout is pinned by the architect plan and cross-checked against a
 //! real capture from the OpenTelemetry Collector's `prometheusremotewrite`
@@ -35,10 +40,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use prost::Message;
-use pulsus_model::{Date, Fingerprint, LabelSet, METRIC_NAME_LABEL, metric_fingerprint};
+use pulsus_model::{
+    CounterResetHint, Date, Fingerprint, LabelSet, METRIC_NAME_LABEL, NativeHistogram, Span,
+    metric_fingerprint,
+};
 
 use crate::error::LogsIngestError;
-use crate::ingest::metrics::{MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef};
+use crate::ingest::metrics::{
+    HistogramPoint, MetricMetadata, MetricPoint, ParsedMetrics, SeriesRef,
+};
 
 /// `prompb.WriteRequest` (RW-1.0): `timeseries` at tag 1, `metadata` at tag
 /// 3 (tag 2 is reserved on the wire for a Cortex-specific source marker,
@@ -190,18 +200,17 @@ impl prost::Message for WriteRequest {
         // `WriteRequest::default().merge(buf)` would fan out past the
         // cross-series aggregate caps. Route the merge through the fully-bounded
         // twin (the single enforcing chokepoint). Seed the twin with self's
-        // current fields (and the aggregate re-sum) so merge-INTO-existing
-        // semantics are preserved, then move the aggregate-bounded result back
+        // current fields (and the aggregate re-sum, histograms included) so
+        // merge-INTO-existing semantics are preserved, then move the
+        // aggregate-bounded result back
         // on BOTH the Ok AND Err paths — do NOT `?` while self's fields are
         // moved out, or a decode error would leave the caller's request empty
         // (data-loss regression). Restoring first gives prost-consistent
         // partial-merge semantics.
-        let mut bounded = BoundedWriteRequest {
-            total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(),
-            total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(),
-            timeseries: std::mem::take(&mut self.timeseries),
-            metadata: std::mem::take(&mut self.metadata),
-        };
+        let mut bounded = BoundedWriteRequest::seeded_from(
+            std::mem::take(&mut self.timeseries),
+            std::mem::take(&mut self.metadata),
+        );
         let result = bounded.merge(buf);
         self.timeseries = bounded.timeseries;
         self.metadata = bounded.metadata;
@@ -215,12 +224,10 @@ impl prost::Message for WriteRequest {
         // `merge_length_delimited` likewise loops through `merge_field` directly
         // (it does not funnel through `merge`), so it needs the same bounded-twin
         // routing and the same both-paths field restoration as `merge` above.
-        let mut bounded = BoundedWriteRequest {
-            total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(),
-            total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(),
-            timeseries: std::mem::take(&mut self.timeseries),
-            metadata: std::mem::take(&mut self.metadata),
-        };
+        let mut bounded = BoundedWriteRequest::seeded_from(
+            std::mem::take(&mut self.timeseries),
+            std::mem::take(&mut self.metadata),
+        );
         let result = bounded.merge_length_delimited(buf);
         self.timeseries = bounded.timeseries;
         self.metadata = bounded.metadata;
@@ -249,6 +256,17 @@ impl prost::Message for WriteRequest {
 ///    second-amplification the per-dimension caps cannot catch: many series each
 ///    under [`MAX_LABELS_PER_SERIES`]/[`MAX_SAMPLES_PER_SERIES`] but collectively
 ///    over the aggregate.
+/// 3. Three more transient accumulators for native histograms (issue #140),
+///    `total_histograms`/`total_hist_spans`/`total_hist_buckets` — charged
+///    **incrementally per histogram DURING each series' decode** via
+///    [`Self::merge_one_time_series`], not at the between-series boundary:
+///    unlike labels/samples, one series' per-series histogram fan-out
+///    ([`MAX_HISTOGRAMS_PER_SERIES`] × the per-histogram field caps) exceeds
+///    the request-wide aggregates on its own, so a boundary-only charge would
+///    let ONE crafted series fully materialize before any check ran (codex
+///    review of issue #140, high finding). Once a total exceeds its cap,
+///    further histograms in the same series — and then whole further series —
+///    are drained.
 ///
 /// Kept separate from [`WriteRequest`] so the value type carries no
 /// decode-scratch field and preserves derived round-trip equality — the
@@ -260,6 +278,130 @@ struct BoundedWriteRequest {
     metadata: Vec<MetricMetadataProto>,
     total_labels: usize,
     total_samples: usize,
+    total_histograms: usize,
+    total_hist_spans: usize,
+    total_hist_buckets: usize,
+}
+
+impl BoundedWriteRequest {
+    /// Re-sums every cross-series aggregate from already-materialized series
+    /// — the seeding [`WriteRequest::merge`]/`merge_length_delimited` need so
+    /// a merge INTO an existing request charges the pre-existing fan-out too
+    /// (no aggregate-cap bypass through repeated raw merges).
+    fn seeded_from(timeseries: Vec<TimeSeries>, metadata: Vec<MetricMetadataProto>) -> Self {
+        let mut seed = Self {
+            timeseries,
+            metadata,
+            ..Self::default()
+        };
+        for ts in &seed.timeseries {
+            seed.total_labels = seed.total_labels.saturating_add(ts.labels.len());
+            seed.total_samples = seed.total_samples.saturating_add(ts.samples.len());
+            seed.total_histograms = seed.total_histograms.saturating_add(ts.histograms.len());
+            for h in &ts.histograms {
+                seed.total_hist_spans = seed.total_hist_spans.saturating_add(h.span_count());
+                seed.total_hist_buckets = seed
+                    .total_hist_buckets
+                    .saturating_add(h.bucket_element_count());
+            }
+        }
+        seed
+    }
+
+    /// Decodes ONE `TimeSeries` submessage (a `WriteRequest` tag-1 field
+    /// occurrence) while charging the request-wide histogram aggregates
+    /// **incrementally, per decoded histogram** — the fix for the codex
+    /// review's high finding on issue #140: the per-series histogram caps'
+    /// product (up to [`MAX_HISTOGRAMS_PER_SERIES`] histograms × ~8k spans /
+    /// ~330k bucket elements each) exceeds the request-wide aggregates by
+    /// orders of magnitude, so charging them only at the BETWEEN-series
+    /// boundary would let one crafted series fully materialize ~82M spans
+    /// (or blow the bucket aggregate from a ~5 MB body) before any check
+    /// ran.
+    ///
+    /// Structurally this replicates `prost::encoding::message::merge` for
+    /// the submessage (a [`prost::encoding::merge_loop`] over
+    /// `decode_key` + `merge_field`), but interposes on tag 4: once the
+    /// running `total_histograms`/`total_hist_spans`/`total_hist_buckets`
+    /// (or the per-series histogram count) exceeds its cap, further
+    /// histograms in THIS series are drained without materializing —
+    /// bounding the fan-out to `≤ aggregate cap + one histogram's per-field
+    /// caps` — and the deferred [`validate_bounds`] re-sum then rejects the
+    /// whole request. All other tags delegate to `TimeSeries::merge_field`
+    /// (which keeps the per-series label/sample/histogram-count drains).
+    /// The scratch totals commit back to `self` only on `Ok`; on a decode
+    /// error the whole request fails anyway.
+    fn merge_one_time_series(
+        &mut self,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        prost::encoding::check_wire_type(prost::encoding::WireType::LengthDelimited, wire_type)?;
+        // (TimeSeries under construction, total_histograms, total_hist_spans,
+        // total_hist_buckets) — one tuple so `merge_loop` can thread every
+        // running total through its single `&mut T`.
+        let mut scratch = (
+            TimeSeries::default(),
+            self.total_histograms,
+            self.total_hist_spans,
+            self.total_hist_buckets,
+        );
+        prost::encoding::merge_loop(
+            &mut scratch,
+            buf,
+            ctx,
+            |(ts, total_histograms, total_hist_spans, total_hist_buckets), buf, ctx| {
+                let (tag, wire_type) = prost::encoding::decode_key(buf)?;
+                if tag == 4u32 {
+                    if ts.histograms.len() > MAX_HISTOGRAMS_PER_SERIES
+                        || *total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
+                        || *total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
+                        || *total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
+                    {
+                        // Cap reached (per-series count OR a request-wide
+                        // aggregate): drain this histogram WITHOUT
+                        // materializing it, wire-type-checked exactly like
+                        // every other drain arm. The vec is allowed to reach
+                        // the `+ 1` over-cap state so `validate_bounds` still
+                        // rejects the request.
+                        prost::encoding::check_wire_type(
+                            prost::encoding::WireType::LengthDelimited,
+                            wire_type,
+                        )?;
+                        prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                    } else {
+                        prost::encoding::message::merge_repeated(
+                            wire_type,
+                            &mut ts.histograms,
+                            buf,
+                            ctx,
+                        )?;
+                        // Charge the just-merged histogram immediately: its
+                        // own fields are already capped per side/field by
+                        // `Histogram::merge_field`, so one over-aggregate
+                        // step grows the fan-out by at most one histogram's
+                        // per-field caps.
+                        if let Some(h) = ts.histograms.last() {
+                            *total_histograms = total_histograms.saturating_add(1);
+                            *total_hist_spans = total_hist_spans.saturating_add(h.span_count());
+                            *total_hist_buckets =
+                                total_hist_buckets.saturating_add(h.bucket_element_count());
+                        }
+                        Ok(())
+                    }
+                } else {
+                    ts.merge_field(tag, wire_type, buf, ctx)
+                }
+            },
+        )?;
+        let (ts, total_histograms, total_hist_spans, total_hist_buckets) = scratch;
+        self.total_histograms = total_histograms;
+        self.total_hist_spans = total_hist_spans;
+        self.total_hist_buckets = total_hist_buckets;
+        self.timeseries.push(ts);
+        Ok(())
+    }
 }
 
 impl prost::Message for BoundedWriteRequest {
@@ -283,6 +425,9 @@ impl prost::Message for BoundedWriteRequest {
                 if self.timeseries.len() > MAX_TIMESERIES_PER_REQUEST
                     || self.total_labels > MAX_TOTAL_LABELS_PER_REQUEST
                     || self.total_samples > MAX_TOTAL_SAMPLES_PER_REQUEST
+                    || self.total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST
+                    || self.total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST
+                    || self.total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST
                 {
                     // Cap reached (series count OR aggregate labels/samples):
                     // drain the excess series WITHOUT materializing it, while
@@ -296,16 +441,23 @@ impl prost::Message for BoundedWriteRequest {
                     )?;
                     prost::encoding::skip_field(wire_type, tag, buf, ctx)
                 } else {
-                    prost::encoding::message::merge_repeated(
-                        wire_type,
-                        &mut self.timeseries,
-                        buf,
-                        ctx,
-                    )?;
+                    // Decode this ONE series through the interposing
+                    // [`Self::merge_one_time_series`], which charges the
+                    // request-wide histogram aggregates (`total_histograms`/
+                    // `total_hist_spans`/`total_hist_buckets`) INCREMENTALLY
+                    // per histogram DURING the series' own decode — a single
+                    // crafted series of many individually-legal histograms
+                    // (10k × ~8k spans / ~330k bucket elements each) must not
+                    // fully materialize before a between-series boundary
+                    // check runs (codex review of issue #140, high finding).
+                    self.merge_one_time_series(wire_type, buf, ctx)?;
                     // Charge the just-merged series' labels/samples into the
-                    // aggregates. Its own vecs are already capped at
-                    // `MAX_*_PER_SERIES + 1` by `TimeSeries::merge_field`, so one
-                    // over-aggregate step grows the fan-out by at most one
+                    // aggregates (histogram totals were already charged
+                    // incrementally above). Its own vecs are capped at
+                    // `MAX_*_PER_SERIES + 1` by the per-series drains, and a
+                    // single series' label/sample fan-out (256 / 100k) sits
+                    // far below the 5M aggregates, so charging THOSE at the
+                    // series boundary bounds the over-aggregate step to one
                     // series' per-series cap.
                     if let Some(last) = self.timeseries.last() {
                         self.total_labels = self.total_labels.saturating_add(last.labels.len());
@@ -344,13 +496,16 @@ impl prost::Message for BoundedWriteRequest {
     }
 }
 
-/// `prompb.TimeSeries`: `labels` at tag 1, `samples` at tag 2.
+/// `prompb.TimeSeries`: `labels` at tag 1, `samples` at tag 2, `histograms`
+/// at tag 4 (issue #140; `exemplars` at tag 3 stays intentionally
+/// undeclared/skipped — out of scope).
 ///
 /// Like [`WriteRequest`] it does **not** derive `::prost::Message`; a
 /// hand-written impl (below) caps the repeated `labels` field at
-/// [`MAX_LABELS_PER_SERIES`]` + 1` and `samples` at [`MAX_SAMPLES_PER_SERIES`]`
-/// + 1` **inside the decoder** (issue #115), draining excess records without
-/// allocating — so a single series carrying millions of minimal labels/samples
+/// [`MAX_LABELS_PER_SERIES`]` + 1`, `samples` at [`MAX_SAMPLES_PER_SERIES`]`
+/// + 1`, and `histograms` at [`MAX_HISTOGRAMS_PER_SERIES`]` + 1` **inside the
+/// decoder** (issue #115), draining excess records without allocating — so a
+/// single series carrying millions of minimal labels/samples/histograms
 /// cannot unpack past the cap. The caps therefore hold whether a series decodes
 /// via [`BoundedWriteRequest`] (the ingest path) or via a direct
 /// `TimeSeries::decode`/`merge` (all route through this `merge_field`).
@@ -358,12 +513,14 @@ impl prost::Message for BoundedWriteRequest {
 pub struct TimeSeries {
     pub labels: Vec<Label>,
     pub samples: Vec<Sample>,
+    pub histograms: Vec<Histogram>,
 }
 
 impl prost::Message for TimeSeries {
     fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
         prost::encoding::message::encode_repeated(1u32, &self.labels, buf);
         prost::encoding::message::encode_repeated(2u32, &self.samples, buf);
+        prost::encoding::message::encode_repeated(4u32, &self.histograms, buf);
     }
 
     fn merge_field(
@@ -396,6 +553,22 @@ impl prost::Message for TimeSeries {
                     prost::encoding::message::merge_repeated(wire_type, &mut self.samples, buf, ctx)
                 }
             }
+            4u32 => {
+                if self.histograms.len() > MAX_HISTOGRAMS_PER_SERIES {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.histograms,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
             _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
         }
     }
@@ -403,11 +576,13 @@ impl prost::Message for TimeSeries {
     fn encoded_len(&self) -> usize {
         prost::encoding::message::encoded_len_repeated(1u32, &self.labels)
             + prost::encoding::message::encoded_len_repeated(2u32, &self.samples)
+            + prost::encoding::message::encoded_len_repeated(4u32, &self.histograms)
     }
 
     fn clear(&mut self) {
         self.labels.clear();
         self.samples.clear();
+        self.histograms.clear();
     }
 }
 
@@ -428,6 +603,392 @@ pub struct Sample {
     pub value: f64,
     #[prost(int64, tag = "2")]
     pub timestamp: i64,
+}
+
+/// One alternative of the `prompb.Histogram` `count`/`zero_count` protobuf
+/// `oneof` pairs (tags 1|2 and 6|7 — issue #140 plan v2 finding 2). Modeled
+/// as a real oneof, NOT two independent optionals: a valid wire message may
+/// repeat oneof alternatives with the **last occurrence winning**, so
+/// retaining a stale float alternative after a later integer one would
+/// misclassify an integer histogram as float-flavor. `merge_field` overwrites
+/// the whole `Option` on every occurrence of either tag, and flavor
+/// classification keys off the actually-decoded case.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum HistogramCount {
+    /// The integer alternative (`count_int` tag 1 / `zero_count_int` tag 6).
+    Int(u64),
+    /// The float alternative (`count_float` tag 2 / `zero_count_float` tag
+    /// 7) — presence ⇒ float-flavor histogram, structurally unstorable in the
+    /// integer-delta `metric_hist_samples` columns and rejected per-point.
+    Float(f64),
+}
+
+/// `prompb.BucketSpan`: `offset` at tag 1 (**sint32**, zigzag — a plain
+/// int32 declaration would decode self-consistent garbage for negative
+/// offsets), `length` at tag 2 (uint32). A leaf message with no repeated
+/// field, so the derive is safe (the span-count caps live on the containing
+/// [`Histogram`]'s hand-written `merge_field`).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct BucketSpan {
+    #[prost(sint32, tag = "1")]
+    pub offset: i32,
+    #[prost(uint32, tag = "2")]
+    pub length: u32,
+}
+
+/// `prompb.Histogram` (RW-1.0 native histogram, `TimeSeries` tag 4 — issue
+/// #140). Tag layout pinned against the published Prometheus remote-write
+/// 1.0 protobuf schema (`prompb/types.proto`) and cross-checked by the real
+/// capture `tests/fixtures/remote-write/native_histogram.bin`:
+///
+/// | tag | field             | wire type                    |
+/// |-----|-------------------|------------------------------|
+/// | 1   | `count_int`       | uint64 (oneof `count`)       |
+/// | 2   | `count_float`     | double (oneof `count`)       |
+/// | 3   | `sum`             | double                       |
+/// | 4   | `schema`          | **sint32** (zigzag)          |
+/// | 5   | `zero_threshold`  | double                       |
+/// | 6   | `zero_count_int`  | uint64 (oneof `zero_count`)  |
+/// | 7   | `zero_count_float`| double (oneof `zero_count`)  |
+/// | 8   | `negative_spans`  | repeated [`BucketSpan`]      |
+/// | 9   | `negative_deltas` | **sint64** packed (zigzag)   |
+/// | 10  | `negative_counts` | double packed                |
+/// | 11  | `positive_spans`  | repeated [`BucketSpan`]      |
+/// | 12  | `positive_deltas` | **sint64** packed (zigzag)   |
+/// | 13  | `positive_counts` | double packed                |
+/// | 14  | `reset_hint`      | enum (int32 varint)          |
+/// | 15  | `timestamp`       | int64 (milliseconds)         |
+/// | 16  | `custom_values`   | double packed                |
+///
+/// Hand-written [`prost::Message`] impl (no derive) for two reasons:
+/// 1. the `count`/`zero_count` [`HistogramCount`] oneofs (last occurrence
+///    wins across both alternatives' tags), and
+/// 2. decode-time DoS caps (issue #115 pattern): spans are capped at
+///    [`MAX_SPANS_PER_HISTOGRAM_SIDE`]` + 1` per side and each delta/count/
+///    `custom_values` array at [`MAX_BUCKETS_PER_HISTOGRAM_SIDE`]` + 1` per
+///    field. Packed runs are decoded **element-by-element** so the cap holds
+///    mid-run (one packed field can carry millions of ~1-wire-byte varints
+///    that decode to 8 heap bytes each — the fan-out the byte cap alone does
+///    not bound): elements materialize while under the cap, the rest of the
+///    run is decoded-and-discarded, and the deferred [`validate_bounds`]
+///    re-check turns the `+ 1` sentinel into a whole-request reject.
+///
+/// `encode_raw` emits proto3 default-skipping for plain fields (nonzero
+/// only) and by-case for the oneofs (a set oneof alternative is always
+/// emitted, even at its default value), so tests can construct both flavors.
+#[derive(Clone, PartialEq, Default, Debug)]
+pub struct Histogram {
+    /// `count` oneof (tags 1|2), last occurrence wins; `None` = proto3
+    /// absent ⇒ 0 observations.
+    pub count: Option<HistogramCount>,
+    /// Sum of observations; also the stale-marker carrier (may be NaN —
+    /// never gate on it).
+    pub sum: f64,
+    /// Bucket schema (sint32 on the wire).
+    pub schema: i32,
+    /// Width of the zero bucket.
+    pub zero_threshold: f64,
+    /// `zero_count` oneof (tags 6|7), last occurrence wins.
+    pub zero_count: Option<HistogramCount>,
+    /// Spans for negative buckets.
+    pub negative_spans: Vec<BucketSpan>,
+    /// Delta-encoded negative bucket counts (integer flavor).
+    pub negative_deltas: Vec<i64>,
+    /// Absolute negative bucket counts (float flavor — non-empty ⇒ reject).
+    pub negative_counts: Vec<f64>,
+    /// Spans for positive buckets.
+    pub positive_spans: Vec<BucketSpan>,
+    /// Delta-encoded positive bucket counts (integer flavor).
+    pub positive_deltas: Vec<i64>,
+    /// Absolute positive bucket counts (float flavor — non-empty ⇒ reject).
+    pub positive_counts: Vec<f64>,
+    /// `Histogram.ResetHint` enum: UNKNOWN=0 / YES=1 / NO=2 / GAUGE=3.
+    pub reset_hint: i32,
+    /// Milliseconds since the Unix epoch — independent of any
+    /// `Sample.timestamp` on the same series.
+    pub timestamp: i64,
+    /// NHCB custom bounds (schema −53).
+    pub custom_values: Vec<f64>,
+}
+
+impl Histogram {
+    /// Total decoded spans across both sides — the unit the request-wide
+    /// [`MAX_TOTAL_HIST_SPANS_PER_REQUEST`] aggregate counts (plan v2
+    /// finding 1).
+    fn span_count(&self) -> usize {
+        self.negative_spans.len() + self.positive_spans.len()
+    }
+
+    /// Total decoded bucket-array elements (deltas + float counts +
+    /// `custom_values`) — the unit [`MAX_TOTAL_HIST_BUCKETS_PER_REQUEST`]
+    /// counts. All five arrays hold 8-byte elements, so this is the whole
+    /// packed fan-out in one number.
+    fn bucket_element_count(&self) -> usize {
+        self.negative_deltas.len()
+            + self.negative_counts.len()
+            + self.positive_deltas.len()
+            + self.positive_counts.len()
+            + self.custom_values.len()
+    }
+}
+
+/// Merges one wire occurrence of a packed-capable **sint64** field into
+/// `values`, capped at `cap + 1` materialized elements. A length-delimited
+/// occurrence is a packed run decoded element-by-element (materialize while
+/// under the cap, decode-and-discard the rest of the run — the cap holds
+/// MID-run); any other wire type is a single unpacked varint. Mirrors
+/// `prost::encoding::sint64::merge_repeated` plus the cap.
+fn merge_capped_sint64(
+    values: &mut Vec<i64>,
+    cap: usize,
+    wire_type: prost::encoding::WireType,
+    buf: &mut impl bytes::Buf,
+    ctx: prost::encoding::DecodeContext,
+) -> Result<(), prost::DecodeError> {
+    if wire_type == prost::encoding::WireType::LengthDelimited {
+        prost::encoding::merge_loop(values, buf, ctx, |values, buf, ctx| {
+            let mut value = 0i64;
+            prost::encoding::sint64::merge(
+                prost::encoding::WireType::Varint,
+                &mut value,
+                buf,
+                ctx,
+            )?;
+            if values.len() <= cap {
+                values.push(value);
+            }
+            Ok(())
+        })
+    } else {
+        let mut value = 0i64;
+        prost::encoding::sint64::merge(wire_type, &mut value, buf, ctx)?;
+        if values.len() <= cap {
+            values.push(value);
+        }
+        Ok(())
+    }
+}
+
+/// [`merge_capped_sint64`]'s **double** analog (packed fixed64 runs or a
+/// single unpacked value), same `cap + 1` mid-run materialization bound.
+fn merge_capped_double(
+    values: &mut Vec<f64>,
+    cap: usize,
+    wire_type: prost::encoding::WireType,
+    buf: &mut impl bytes::Buf,
+    ctx: prost::encoding::DecodeContext,
+) -> Result<(), prost::DecodeError> {
+    if wire_type == prost::encoding::WireType::LengthDelimited {
+        prost::encoding::merge_loop(values, buf, ctx, |values, buf, ctx| {
+            let mut value = 0f64;
+            prost::encoding::double::merge(
+                prost::encoding::WireType::SixtyFourBit,
+                &mut value,
+                buf,
+                ctx,
+            )?;
+            if values.len() <= cap {
+                values.push(value);
+            }
+            Ok(())
+        })
+    } else {
+        let mut value = 0f64;
+        prost::encoding::double::merge(wire_type, &mut value, buf, ctx)?;
+        if values.len() <= cap {
+            values.push(value);
+        }
+        Ok(())
+    }
+}
+
+impl prost::Message for Histogram {
+    fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
+        match self.count {
+            Some(HistogramCount::Int(v)) => prost::encoding::uint64::encode(1u32, &v, buf),
+            Some(HistogramCount::Float(v)) => prost::encoding::double::encode(2u32, &v, buf),
+            None => {}
+        }
+        if self.sum != 0.0 {
+            prost::encoding::double::encode(3u32, &self.sum, buf);
+        }
+        if self.schema != 0 {
+            prost::encoding::sint32::encode(4u32, &self.schema, buf);
+        }
+        if self.zero_threshold != 0.0 {
+            prost::encoding::double::encode(5u32, &self.zero_threshold, buf);
+        }
+        match self.zero_count {
+            Some(HistogramCount::Int(v)) => prost::encoding::uint64::encode(6u32, &v, buf),
+            Some(HistogramCount::Float(v)) => prost::encoding::double::encode(7u32, &v, buf),
+            None => {}
+        }
+        prost::encoding::message::encode_repeated(8u32, &self.negative_spans, buf);
+        prost::encoding::sint64::encode_packed(9u32, &self.negative_deltas, buf);
+        prost::encoding::double::encode_packed(10u32, &self.negative_counts, buf);
+        prost::encoding::message::encode_repeated(11u32, &self.positive_spans, buf);
+        prost::encoding::sint64::encode_packed(12u32, &self.positive_deltas, buf);
+        prost::encoding::double::encode_packed(13u32, &self.positive_counts, buf);
+        if self.reset_hint != 0 {
+            prost::encoding::int32::encode(14u32, &self.reset_hint, buf);
+        }
+        if self.timestamp != 0 {
+            prost::encoding::int64::encode(15u32, &self.timestamp, buf);
+        }
+        prost::encoding::double::encode_packed(16u32, &self.custom_values, buf);
+    }
+
+    fn merge_field(
+        &mut self,
+        tag: u32,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        match tag {
+            // oneof `count` (tags 1|2): every occurrence of either tag
+            // overwrites the whole Option — last occurrence wins.
+            1u32 => {
+                let mut v = 0u64;
+                prost::encoding::uint64::merge(wire_type, &mut v, buf, ctx)?;
+                self.count = Some(HistogramCount::Int(v));
+                Ok(())
+            }
+            2u32 => {
+                let mut v = 0f64;
+                prost::encoding::double::merge(wire_type, &mut v, buf, ctx)?;
+                self.count = Some(HistogramCount::Float(v));
+                Ok(())
+            }
+            3u32 => prost::encoding::double::merge(wire_type, &mut self.sum, buf, ctx),
+            4u32 => prost::encoding::sint32::merge(wire_type, &mut self.schema, buf, ctx),
+            5u32 => prost::encoding::double::merge(wire_type, &mut self.zero_threshold, buf, ctx),
+            // oneof `zero_count` (tags 6|7), same last-wins rule.
+            6u32 => {
+                let mut v = 0u64;
+                prost::encoding::uint64::merge(wire_type, &mut v, buf, ctx)?;
+                self.zero_count = Some(HistogramCount::Int(v));
+                Ok(())
+            }
+            7u32 => {
+                let mut v = 0f64;
+                prost::encoding::double::merge(wire_type, &mut v, buf, ctx)?;
+                self.zero_count = Some(HistogramCount::Float(v));
+                Ok(())
+            }
+            8u32 => {
+                if self.negative_spans.len() > MAX_SPANS_PER_HISTOGRAM_SIDE {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.negative_spans,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            9u32 => merge_capped_sint64(
+                &mut self.negative_deltas,
+                MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                wire_type,
+                buf,
+                ctx,
+            ),
+            10u32 => merge_capped_double(
+                &mut self.negative_counts,
+                MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                wire_type,
+                buf,
+                ctx,
+            ),
+            11u32 => {
+                if self.positive_spans.len() > MAX_SPANS_PER_HISTOGRAM_SIDE {
+                    prost::encoding::check_wire_type(
+                        prost::encoding::WireType::LengthDelimited,
+                        wire_type,
+                    )?;
+                    prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                } else {
+                    prost::encoding::message::merge_repeated(
+                        wire_type,
+                        &mut self.positive_spans,
+                        buf,
+                        ctx,
+                    )
+                }
+            }
+            12u32 => merge_capped_sint64(
+                &mut self.positive_deltas,
+                MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                wire_type,
+                buf,
+                ctx,
+            ),
+            13u32 => merge_capped_double(
+                &mut self.positive_counts,
+                MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                wire_type,
+                buf,
+                ctx,
+            ),
+            14u32 => prost::encoding::int32::merge(wire_type, &mut self.reset_hint, buf, ctx),
+            15u32 => prost::encoding::int64::merge(wire_type, &mut self.timestamp, buf, ctx),
+            16u32 => merge_capped_double(
+                &mut self.custom_values,
+                MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                wire_type,
+                buf,
+                ctx,
+            ),
+            _ => prost::encoding::skip_field(wire_type, tag, buf, ctx),
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        let mut len = 0usize;
+        match self.count {
+            Some(HistogramCount::Int(v)) => len += prost::encoding::uint64::encoded_len(1u32, &v),
+            Some(HistogramCount::Float(v)) => len += prost::encoding::double::encoded_len(2u32, &v),
+            None => {}
+        }
+        if self.sum != 0.0 {
+            len += prost::encoding::double::encoded_len(3u32, &self.sum);
+        }
+        if self.schema != 0 {
+            len += prost::encoding::sint32::encoded_len(4u32, &self.schema);
+        }
+        if self.zero_threshold != 0.0 {
+            len += prost::encoding::double::encoded_len(5u32, &self.zero_threshold);
+        }
+        match self.zero_count {
+            Some(HistogramCount::Int(v)) => len += prost::encoding::uint64::encoded_len(6u32, &v),
+            Some(HistogramCount::Float(v)) => len += prost::encoding::double::encoded_len(7u32, &v),
+            None => {}
+        }
+        len += prost::encoding::message::encoded_len_repeated(8u32, &self.negative_spans);
+        len += prost::encoding::sint64::encoded_len_packed(9u32, &self.negative_deltas);
+        len += prost::encoding::double::encoded_len_packed(10u32, &self.negative_counts);
+        len += prost::encoding::message::encoded_len_repeated(11u32, &self.positive_spans);
+        len += prost::encoding::sint64::encoded_len_packed(12u32, &self.positive_deltas);
+        len += prost::encoding::double::encoded_len_packed(13u32, &self.positive_counts);
+        if self.reset_hint != 0 {
+            len += prost::encoding::int32::encoded_len(14u32, &self.reset_hint);
+        }
+        if self.timestamp != 0 {
+            len += prost::encoding::int64::encoded_len(15u32, &self.timestamp);
+        }
+        len += prost::encoding::double::encoded_len_packed(16u32, &self.custom_values);
+        len
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// `prompb.MetricMetadata`: `type` at tag 1, `metric_family_name` at tag 2,
@@ -469,6 +1030,44 @@ pub const MAX_LABELS_PER_SERIES: usize = 256;
 pub const MAX_SAMPLES_PER_SERIES: usize = 100_000;
 /// See [`MAX_TIMESERIES_PER_REQUEST`]'s doc comment.
 pub const MAX_METADATA_PER_REQUEST: usize = 10_000;
+/// Per-series cap on decoded native histograms (`TimeSeries` tag 4, issue
+/// #140) — same doctrine as [`MAX_SAMPLES_PER_SERIES`]: generous (Prometheus'
+/// `max_samples_per_send` default is 2,000 for the whole request), enforced
+/// during decode by [`TimeSeries::merge_field`]'s drain.
+pub const MAX_HISTOGRAMS_PER_SERIES: usize = 10_000;
+/// Cross-series **aggregate** cap on total decoded histograms (issue #140),
+/// analogous to [`MAX_TOTAL_SAMPLES_PER_REQUEST`]: N series each under
+/// [`MAX_HISTOGRAMS_PER_SERIES`] cannot sum past this ceiling during decode
+/// (an empty wire `Histogram` is 2 bytes but a decoded entry is hundreds of
+/// heap bytes). Enforced by [`BoundedWriteRequest`]'s drain + the deferred
+/// [`validate_bounds`] re-sum.
+pub const MAX_TOTAL_HISTOGRAMS_PER_REQUEST: usize = 500_000;
+/// Per-side cap on one histogram's decoded `BucketSpan`s (issue #140) — a
+/// span is 2 minimal wire bytes but 8 decoded bytes plus vec bookkeeping;
+/// 4,096 spans per side is orders of magnitude beyond any real exporter's
+/// bucket layout.
+pub const MAX_SPANS_PER_HISTOGRAM_SIDE: usize = 4_096;
+/// Per-field cap on one histogram's decoded bucket-array elements (each of
+/// `negative_deltas`/`negative_counts`/`positive_deltas`/`positive_counts`/
+/// `custom_values` independently, issue #140). Packed varint deltas are the
+/// second-amplification: ~1 wire byte → 8 heap bytes, so the cap must hold
+/// MID-run ([`merge_capped_sint64`]/[`merge_capped_double`] decode
+/// element-by-element and discard past the cap).
+pub const MAX_BUCKETS_PER_HISTOGRAM_SIDE: usize = 65_536;
+/// Cross-histogram aggregate span cap (issue #140 plan v2 finding 1): many
+/// individually-legal histograms (each under
+/// [`MAX_SPANS_PER_HISTOGRAM_SIDE`]) must not sum to millions of decoded
+/// `BucketSpan` structs (a minimal empty `BucketSpan` is 2 wire bytes).
+/// ≈40 MiB of span structs worst case — same ceiling class as the label
+/// aggregate. Element-COUNT cap; complements (does not duplicate) the
+/// decode-time byte budget.
+pub const MAX_TOTAL_HIST_SPANS_PER_REQUEST: usize = 5_000_000;
+/// Cross-histogram aggregate bucket-element cap (issue #140): bounds the sum
+/// of every histogram's delta/count/`custom_values` element counts across the
+/// whole request (≈40 MiB of i64/f64 worst case) — the packed-run fan-out a
+/// 64 MiB body could otherwise decode into ~67M i64s ≈ 536 MiB. Enforced by
+/// [`BoundedWriteRequest`]'s drain + the deferred [`validate_bounds`] re-sum.
+pub const MAX_TOTAL_HIST_BUCKETS_PER_REQUEST: usize = 5_000_000;
 
 /// Cross-series **aggregate** cap on total decoded labels (issue #115, finding
 /// #62). The per-dimension caps bound each series in isolation
@@ -533,6 +1132,22 @@ const LABEL_ROW_OVERHEAD: usize = 128;
 /// Estimated fixed heap cost of one [`MetricMetadata`] beyond its
 /// name/help/unit bytes.
 const META_ROW_OVERHEAD: usize = 64;
+/// Estimated fixed heap cost of one emitted [`HistogramPoint`] beyond its
+/// per-element arrays: identity triplet + the `NativeHistogram` scalar
+/// fields + five vec headers, floored to a round constant (issue #140,
+/// mirroring `otlp_metrics`' native-path charge shape).
+const HIST_ROW_OVERHEAD: usize = 256;
+/// Per-element heap floor for a histogram's variable-length arrays: a
+/// decoded span (`i32`+`u32`), bucket delta (`i64`), or custom value
+/// (`f64`) each cost 8 bytes once materialized into the
+/// [`NativeHistogram`]. Charged BEFORE the copy (issue #62).
+const HIST_ELEMENT_BYTES: usize = 8;
+/// Estimated per-entry heap cost of the transient histogram-wins dedup key
+/// set [`dedup_histogram_wins`] builds — one `(&str, Fingerprint, i64)` slot
+/// per native-histogram sample plus `HashSet` bookkeeping. Same constant and
+/// rationale as `otlp_metrics::HIST_DEDUP_KEY_BYTES` (the dedup itself is a
+/// private mirror, not a shared helper — issue #140 plan).
+const HIST_DEDUP_KEY_BYTES: usize = 48;
 
 /// Adds `amount` to the running expansion estimate and fails the whole
 /// request the moment it exceeds [`MAX_EXPANDED_BYTES`] (issue #62) — the
@@ -595,6 +1210,9 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
     }
     let mut total_labels: usize = 0;
     let mut total_samples: usize = 0;
+    let mut total_histograms: usize = 0;
+    let mut total_hist_spans: usize = 0;
+    let mut total_hist_buckets: usize = 0;
     for ts in &req.timeseries {
         if ts.labels.len() > MAX_LABELS_PER_SERIES {
             return Err(LogsIngestError::OversizeMessage {
@@ -610,8 +1228,42 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
                 actual: ts.samples.len(),
             });
         }
+        if ts.histograms.len() > MAX_HISTOGRAMS_PER_SERIES {
+            return Err(LogsIngestError::OversizeMessage {
+                field: "histograms",
+                limit: MAX_HISTOGRAMS_PER_SERIES,
+                actual: ts.histograms.len(),
+            });
+        }
+        for h in &ts.histograms {
+            let max_side_spans = h.negative_spans.len().max(h.positive_spans.len());
+            if max_side_spans > MAX_SPANS_PER_HISTOGRAM_SIDE {
+                return Err(LogsIngestError::OversizeMessage {
+                    field: "histogram spans",
+                    limit: MAX_SPANS_PER_HISTOGRAM_SIDE,
+                    actual: max_side_spans,
+                });
+            }
+            let max_bucket_field = h
+                .negative_deltas
+                .len()
+                .max(h.negative_counts.len())
+                .max(h.positive_deltas.len())
+                .max(h.positive_counts.len())
+                .max(h.custom_values.len());
+            if max_bucket_field > MAX_BUCKETS_PER_HISTOGRAM_SIDE {
+                return Err(LogsIngestError::OversizeMessage {
+                    field: "histogram buckets",
+                    limit: MAX_BUCKETS_PER_HISTOGRAM_SIDE,
+                    actual: max_bucket_field,
+                });
+            }
+            total_hist_spans = total_hist_spans.saturating_add(h.span_count());
+            total_hist_buckets = total_hist_buckets.saturating_add(h.bucket_element_count());
+        }
         total_labels = total_labels.saturating_add(ts.labels.len());
         total_samples = total_samples.saturating_add(ts.samples.len());
+        total_histograms = total_histograms.saturating_add(ts.histograms.len());
     }
     // Cross-series aggregates last: a request whose series are each individually
     // in-bounds can still sum past these ceilings (the second-amplification the
@@ -628,6 +1280,27 @@ fn validate_bounds(req: &WriteRequest) -> Result<(), LogsIngestError> {
             field: "total_samples",
             limit: MAX_TOTAL_SAMPLES_PER_REQUEST,
             actual: total_samples,
+        });
+    }
+    if total_histograms > MAX_TOTAL_HISTOGRAMS_PER_REQUEST {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "total_histograms",
+            limit: MAX_TOTAL_HISTOGRAMS_PER_REQUEST,
+            actual: total_histograms,
+        });
+    }
+    if total_hist_spans > MAX_TOTAL_HIST_SPANS_PER_REQUEST {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "total_hist_spans",
+            limit: MAX_TOTAL_HIST_SPANS_PER_REQUEST,
+            actual: total_hist_spans,
+        });
+    }
+    if total_hist_buckets > MAX_TOTAL_HIST_BUCKETS_PER_REQUEST {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "total_hist_buckets",
+            limit: MAX_TOTAL_HIST_BUCKETS_PER_REQUEST,
+            actual: total_hist_buckets,
         });
     }
     Ok(())
@@ -654,6 +1327,31 @@ fn metric_type_name(t: i32) -> &'static str {
     }
 }
 
+/// Maps a wire `Histogram.ResetHint` to the stored [`CounterResetHint`]
+/// (issue #140; the issue body pins the mapping: "Gauge for gauge
+/// histograms; Unknown otherwise"). YES(1)/NO(2) are deliberately degraded
+/// to `Unknown` — RW per-sample reset hints are not reliable across sender
+/// resharding, and the read side re-detects counter resets; only the
+/// series-level GAUGE property is safe to persist. Out-of-range values →
+/// `Unknown` (forward-compatible, mirrors [`metric_type_name`]).
+fn reset_hint_to_counter_reset_hint(v: i32) -> CounterResetHint {
+    match v {
+        3 => CounterResetHint::Gauge,
+        _ => CounterResetHint::Unknown,
+    }
+}
+
+/// The integer value of a decoded `count`/`zero_count` oneof: `None` is
+/// proto3 absent ⇒ 0; the `Float` alternative never reaches this (the
+/// float-flavor per-point reject fires first in [`parse_time_series`]), and
+/// degrades to 0 defensively rather than panicking if it ever did.
+fn histogram_count_int(count: Option<HistogramCount>) -> u64 {
+    match count {
+        Some(HistogramCount::Int(v)) => v,
+        Some(HistogramCount::Float(_)) | None => 0,
+    }
+}
+
 /// Parses a decoded `WriteRequest` into normalized rows. Pure: a function
 /// of `req` and `now_ns` only, no I/O, no clock reads — the caller (the
 /// ingest handler) is the only clock/IO boundary. `now_ns` becomes every
@@ -676,6 +1374,14 @@ pub fn parse(req: &WriteRequest, now_ns: i64) -> Result<ParsedMetrics, LogsInges
     for ts in &req.timeseries {
         parse_time_series(&mut out, &mut expanded_bytes, &mut seen_series, ts)?;
     }
+
+    // Within-request histogram-wins dedup (issue #140, mirroring
+    // `otlp_metrics::parse`'s issue-#120 rule): a native histogram and a
+    // float sample at the same `(metric_name, fingerprint, unix_milli)` must
+    // never both be written — the histogram wins, matching the read-side
+    // tie-break. RW wire allows both on one series; cross-request collisions
+    // are resolved by the read path, not here.
+    dedup_histogram_wins(&mut out, &mut expanded_bytes)?;
 
     // Metadata dedup within-request by family name, last-wins (architect
     // plan) — a later entry for the same name overwrites an earlier one
@@ -761,9 +1467,12 @@ fn parse_time_series(
 
     // A sampleless series (legal on the wire, e.g. a metadata-only push)
     // registers no `SeriesRef` — the writer derives `metric_series` rows
-    // from `ParsedMetrics::samples`' timestamps, so a series with zero
-    // accepted samples would yield no row anyway (architect plan).
-    if !ts.samples.is_empty() && seen_series.insert((Arc::clone(&metric_name), fingerprint)) {
+    // from `ParsedMetrics::samples`'/`hist_samples`' timestamps, so a series
+    // with zero accepted samples would yield no row anyway (architect plan;
+    // a histograms-only series must register too, issue #140).
+    if (!ts.samples.is_empty() || !ts.histograms.is_empty())
+        && seen_series.insert((Arc::clone(&metric_name), fingerprint))
+    {
         out.series.push(SeriesRef {
             metric_name: Arc::clone(&metric_name),
             fingerprint,
@@ -811,6 +1520,154 @@ fn parse_time_series(
             value: sample.value,
         });
     }
+
+    for h in &ts.histograms {
+        // Charge this histogram's expanded output BEFORE materializing
+        // anything (issue #62): the fixed row floor plus a per-element floor
+        // for every span/delta/count/custom_value array the verbatim copy
+        // allocates. Allocation-free; aborts here before the
+        // `NativeHistogram` is built (mirrors `otlp_metrics`' native-path
+        // charge shape).
+        let hist_charge = HIST_ROW_OVERHEAD.saturating_add(
+            h.span_count()
+                .saturating_add(h.bucket_element_count())
+                .saturating_mul(HIST_ELEMENT_BYTES),
+        );
+        charge_budget(expanded_bytes, hist_charge)?;
+
+        // Float-flavor histograms (`count_float`/`zero_count_float`/
+        // `*_counts`) are structurally unstorable — `metric_hist_samples`'
+        // bucket columns are integer deltas — so the point is rejected, never
+        // lossily converted. Classification keys off the actually-decoded
+        // oneof case (plan v2 finding 2): a reordered float-then-int oneof
+        // decodes as `Int` and is accepted.
+        let float_flavor = matches!(h.count, Some(HistogramCount::Float(_)))
+            || matches!(h.zero_count, Some(HistogramCount::Float(_)))
+            || !h.positive_counts.is_empty()
+            || !h.negative_counts.is_empty();
+        if float_flavor {
+            out.rejected += 1;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(
+                    "float-flavor native histogram is not storable (integer bucket-delta \
+                     columns): point dropped"
+                        .to_string(),
+                );
+            }
+            continue;
+        }
+
+        // Same `Date`-range gate as float samples above (issues #126/#137):
+        // per-histogram timestamps are independent of `Sample.timestamp`;
+        // out-of-range drops are per-point, never a whole-request error.
+        if Date::start_of_day_utc_ms_datetime_safe(h.timestamp).is_none() {
+            out.rejected += 1;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(format!(
+                    "histogram timestamp {}ms is outside the supported storage time range \
+                     (1970-01-01 to 2106-02-06 UTC)",
+                    h.timestamp
+                ));
+            }
+            continue;
+        }
+
+        // Verbatim field copy: the wire form and the stored form share the
+        // delta encoding (spans + delta-encoded buckets + custom_values), so
+        // any transformation here would be a bug — no bucket math, unlike
+        // the OTLP exponential path.
+        let histogram = NativeHistogram {
+            counter_reset_hint: reset_hint_to_counter_reset_hint(h.reset_hint),
+            schema: h.schema,
+            zero_threshold: h.zero_threshold,
+            zero_count: histogram_count_int(h.zero_count),
+            count: histogram_count_int(h.count),
+            sum: h.sum,
+            positive_spans: h
+                .positive_spans
+                .iter()
+                .map(|s| Span {
+                    offset: s.offset,
+                    length: s.length,
+                })
+                .collect(),
+            negative_spans: h
+                .negative_spans
+                .iter()
+                .map(|s| Span {
+                    offset: s.offset,
+                    length: s.length,
+                })
+                .collect(),
+            positive_buckets: h.positive_deltas.clone(),
+            negative_buckets: h.negative_deltas.clone(),
+            custom_values: h.custom_values.clone(),
+        };
+
+        // A3 `validate()` at the seam (mirrors `otlp_metrics`' native path):
+        // a structurally-invalid histogram is a per-point drop, never a
+        // whole-request error. No NaN gate on `sum` — a native-histogram
+        // stale marker arrives as the stale NaN there and must pass through
+        // bit-exact.
+        if let Err(err) = histogram.validate() {
+            out.rejected += 1;
+            if out.rejected_message.is_none() {
+                out.rejected_message = Some(format!("invalid native histogram: {err}"));
+            }
+            continue;
+        }
+
+        out.hist_samples.push(HistogramPoint {
+            metric_name: Arc::clone(&metric_name),
+            fingerprint,
+            unix_milli: h.timestamp,
+            histogram,
+        });
+    }
+    Ok(())
+}
+
+/// Drops any float sample whose `(metric_name, fingerprint, unix_milli)`
+/// coincides with a native-histogram sample in the same request, counting
+/// each drop in `rejected` (histogram-wins). A private mirror of
+/// `otlp_metrics::dedup_histogram_wins` — deliberately NOT hoisted into a
+/// shared helper (issue #140 plan: no new abstraction). The transient dedup
+/// key set is charged against the expansion budget BEFORE it is
+/// materialized: one [`HIST_DEDUP_KEY_BYTES`] slot per native-histogram
+/// sample; the keys borrow `metric_name` as `&str` (no per-sample refcount
+/// churn).
+fn dedup_histogram_wins(
+    out: &mut ParsedMetrics,
+    expanded_bytes: &mut usize,
+) -> Result<(), LogsIngestError> {
+    if out.hist_samples.is_empty() {
+        return Ok(());
+    }
+    charge_budget(
+        expanded_bytes,
+        out.hist_samples.len().saturating_mul(HIST_DEDUP_KEY_BYTES),
+    )?;
+    // Borrow the two disjoint fields separately so the borrow checker permits
+    // the immutable `hist_keys` borrow of `hist_samples` to coexist with the
+    // `retain` mutation of `samples`.
+    let hist_samples = &out.hist_samples;
+    let samples = &mut out.samples;
+    let hist_keys: HashSet<(&str, Fingerprint, i64)> = hist_samples
+        .iter()
+        .map(|h| (h.metric_name.as_ref(), h.fingerprint, h.unix_milli))
+        .collect();
+    let before = samples.len();
+    samples.retain(|s| !hist_keys.contains(&(s.metric_name.as_ref(), s.fingerprint, s.unix_milli)));
+    let dropped = (before - samples.len()) as u64;
+    if dropped > 0 {
+        out.rejected += dropped;
+        if out.rejected_message.is_none() {
+            out.rejected_message = Some(
+                "float sample dropped: native histogram present at the same series and timestamp"
+                    .to_string(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -844,6 +1701,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -860,6 +1718,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -873,6 +1732,7 @@ mod tests {
                 TimeSeries {
                     labels: vec![],
                     samples: vec![],
+                    histograms: vec![],
                 };
                 MAX_TIMESERIES_PER_REQUEST + 1
             ],
@@ -895,6 +1755,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("k", "v"); MAX_LABELS_PER_SERIES + 1],
                 samples: vec![],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -914,6 +1775,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![],
                 samples: vec![sample(1.0, 1); MAX_SAMPLES_PER_SERIES + 1],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -960,6 +1822,7 @@ mod tests {
                 TimeSeries {
                     labels: vec![],
                     samples: vec![],
+                    histograms: vec![],
                 };
                 MAX_TIMESERIES_PER_REQUEST + 1
             ],
@@ -1274,6 +2137,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![MetricMetadataProto {
                 r#type: 1,
@@ -1328,10 +2192,12 @@ mod tests {
                 TimeSeries {
                     labels: vec![label("__name__", "up"), label("job", "checkout")],
                     samples: vec![sample(1.0, 1), sample(2.0, 2)],
+                    histograms: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                     samples: vec![sample(3.0, 1)],
+                    histograms: vec![],
                 },
             ],
             metadata: vec![MetricMetadataProto {
@@ -1367,6 +2233,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up"), label("job", "checkout")],
                 samples: vec![sample(1.0, 1_700_000_000_000)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1385,6 +2252,7 @@ mod tests {
                     label("method", "GET"),
                 ],
                 samples: vec![sample(42.0, 1_700_000_000_000)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1406,6 +2274,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 1), sample(2.0, 2), sample(3.0, 3)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1420,6 +2289,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1436,6 +2306,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("job", "checkout")],
                 samples: vec![sample(1.0, 1), sample(2.0, 2)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1452,6 +2323,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1467,10 +2339,12 @@ mod tests {
                 TimeSeries {
                     labels: vec![label("job", "checkout")],
                     samples: vec![sample(1.0, 1)],
+                    histograms: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "up")],
                     samples: vec![sample(1.0, 1)],
+                    histograms: vec![],
                 },
             ],
             metadata: vec![],
@@ -1490,6 +2364,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 0)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1508,6 +2383,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, -1_000)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1531,6 +2407,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 4_294_943_999_999)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1549,6 +2426,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(1.0, 4_294_944_000_000)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1574,6 +2452,7 @@ mod tests {
                     sample(1.0, 1_700_000_000_000),
                     sample(2.0, 5_662_310_400_000),
                 ],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1596,6 +2475,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples: vec![sample(f64::from_bits(STALE_NAN_BITS), 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1615,6 +2495,7 @@ mod tests {
                     label("a_label", "2"),
                 ],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1626,6 +2507,7 @@ mod tests {
                     label("z_label", "1"),
                 ],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1644,6 +2526,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up"), label("service.name", "checkout")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1651,6 +2534,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up"), label("service_name", "checkout")],
                 samples: vec![sample(1.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1668,6 +2552,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                 samples: vec![sample(3.0, 1)],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1772,6 +2657,7 @@ mod tests {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
                 samples,
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -1819,6 +2705,7 @@ mod tests {
             .map(|_| TimeSeries {
                 labels: vec![label("", ""); MAX_LABELS_PER_SERIES],
                 samples: vec![],
+                histograms: vec![],
             })
             .collect();
         let req = WriteRequest {
@@ -1853,10 +2740,12 @@ mod tests {
                 TimeSeries {
                     labels: vec![label("__name__", "up"), label("job", "checkout")],
                     samples: vec![sample(1.0, 1), sample(2.0, 2)],
+                    histograms: vec![],
                 },
                 TimeSeries {
                     labels: vec![label("__name__", "latency_bucket"), label("le", "0.5")],
                     samples: vec![sample(3.0, 1)],
+                    histograms: vec![],
                 },
             ],
             metadata: vec![MetricMetadataProto {
@@ -1870,5 +2759,766 @@ mod tests {
         assert_eq!(out.samples.len(), 3);
         assert_eq!(out.series.len(), 2);
         assert_eq!(out.metadata.len(), 1);
+    }
+
+    // -- native histograms (issue #140) ------------------------------------
+
+    /// A valid integer native histogram carrying both bucket sides:
+    /// positive absolute counts [1, 0, 2] (deltas [1, -1, 2]), negative
+    /// absolute [2] (delta [2]), zero_count 1 ⇒ count 6.
+    fn wire_hist(reset_hint: i32, timestamp: i64) -> Histogram {
+        Histogram {
+            count: Some(HistogramCount::Int(6)),
+            sum: 10.5,
+            schema: 0,
+            zero_threshold: 0.001,
+            zero_count: Some(HistogramCount::Int(1)),
+            negative_spans: vec![BucketSpan {
+                offset: 0,
+                length: 1,
+            }],
+            negative_deltas: vec![2],
+            positive_spans: vec![BucketSpan {
+                offset: 1,
+                length: 3,
+            }],
+            positive_deltas: vec![1, -1, 2],
+            reset_hint,
+            timestamp,
+            ..Default::default()
+        }
+    }
+
+    fn one_hist_series(histograms: Vec<Histogram>) -> WriteRequest {
+        WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "latency"), label("job", "checkout")],
+                samples: vec![],
+                histograms,
+            }],
+            metadata: vec![],
+        }
+    }
+
+    // AC 1: the wire ResetHint → stored CounterResetHint mapping.
+    #[test]
+    fn reset_hint_maps_gauge_to_gauge_and_everything_else_to_unknown() {
+        assert_eq!(
+            reset_hint_to_counter_reset_hint(0),
+            CounterResetHint::Unknown
+        );
+        assert_eq!(
+            reset_hint_to_counter_reset_hint(1),
+            CounterResetHint::Unknown,
+            "YES is deliberately degraded to Unknown (issue body pins Gauge-or-Unknown)"
+        );
+        assert_eq!(
+            reset_hint_to_counter_reset_hint(2),
+            CounterResetHint::Unknown,
+            "NO is deliberately degraded to Unknown"
+        );
+        assert_eq!(reset_hint_to_counter_reset_hint(3), CounterResetHint::Gauge);
+        assert_eq!(
+            reset_hint_to_counter_reset_hint(4),
+            CounterResetHint::Unknown,
+            "forward-compatible out-of-range value degrades to Unknown"
+        );
+        assert_eq!(
+            reset_hint_to_counter_reset_hint(-1),
+            CounterResetHint::Unknown
+        );
+    }
+
+    // AC 2: verbatim field copy + Gauge hint + SeriesRef registration for a
+    // histograms-only series.
+    #[test]
+    fn gauge_hint_histogram_parses_verbatim_and_registers_its_series_ref() {
+        let req = one_hist_series(vec![wire_hist(3, 1_700_000_000_000)]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+
+        assert_eq!(out.rejected, 0);
+        assert!(out.samples.is_empty());
+        assert_eq!(out.hist_samples.len(), 1);
+        let point = &out.hist_samples[0];
+        assert_eq!(&*point.metric_name, "latency");
+        assert_eq!(point.unix_milli, 1_700_000_000_000);
+        let h = &point.histogram;
+        assert_eq!(h.counter_reset_hint, CounterResetHint::Gauge);
+        assert_eq!(h.schema, 0);
+        assert_eq!(h.zero_threshold.to_bits(), 0.001f64.to_bits());
+        assert_eq!(h.zero_count, 1);
+        assert_eq!(h.count, 6);
+        assert_eq!(h.sum.to_bits(), 10.5f64.to_bits());
+        assert_eq!(
+            h.positive_spans,
+            vec![pulsus_model::Span {
+                offset: 1,
+                length: 3
+            }]
+        );
+        assert_eq!(
+            h.negative_spans,
+            vec![pulsus_model::Span {
+                offset: 0,
+                length: 1
+            }]
+        );
+        assert_eq!(h.positive_buckets, vec![1, -1, 2]);
+        assert_eq!(h.negative_buckets, vec![2]);
+        assert!(h.custom_values.is_empty());
+
+        // A histograms-only series (no float samples) still registers its
+        // SeriesRef, with `__name__` excluded and the fingerprint
+        // independently recomputable.
+        assert_eq!(out.series.len(), 1);
+        assert_eq!(out.series[0].labels.get("job"), Some("checkout"));
+        assert_eq!(out.series[0].labels.get("__name__"), None);
+        assert_eq!(
+            pulsus_model::metric_fingerprint(&out.series[0].labels),
+            point.fingerprint
+        );
+    }
+
+    #[test]
+    fn unknown_hint_histogram_parses_with_unknown_reset_hint() {
+        let req = one_hist_series(vec![wire_hist(0, 1_700_000_000_000)]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.hist_samples[0].histogram.counter_reset_hint,
+            CounterResetHint::Unknown
+        );
+    }
+
+    // AC 3: float-flavor histograms are per-point rejects; integer siblings
+    // in the same request are still accepted.
+    #[test]
+    fn float_flavor_histogram_is_rejected_per_point_integer_sibling_kept() {
+        let float_count = Histogram {
+            count: Some(HistogramCount::Float(6.0)),
+            ..wire_hist(0, 1_700_000_000_000)
+        };
+        let float_zero_count = Histogram {
+            zero_count: Some(HistogramCount::Float(1.0)),
+            ..wire_hist(0, 1_700_000_000_000)
+        };
+        let float_buckets = Histogram {
+            positive_spans: vec![BucketSpan {
+                offset: 1,
+                length: 1,
+            }],
+            positive_deltas: vec![],
+            positive_counts: vec![5.0],
+            ..wire_hist(0, 1_700_000_000_000)
+        };
+        let req = one_hist_series(vec![
+            float_count,
+            float_zero_count,
+            float_buckets,
+            wire_hist(0, 1_700_000_000_000),
+        ]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 3, "every float-flavor variant is dropped");
+        assert_eq!(
+            out.hist_samples.len(),
+            1,
+            "the integer sibling in the same request is still emitted"
+        );
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("float-flavor native histogram")
+        );
+    }
+
+    // AC 4: the per-histogram Date-range timestamp gate.
+    #[test]
+    fn out_of_range_histogram_timestamp_is_rejected_in_range_sibling_kept() {
+        // Day 49_710 = 2106-02-07: first DateTime-unsafe day (issue #137).
+        let req = one_hist_series(vec![
+            wire_hist(3, 4_294_944_000_000),
+            wire_hist(3, 1_700_000_000_000),
+        ]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert_eq!(out.hist_samples.len(), 1);
+        assert_eq!(out.hist_samples[0].unix_milli, 1_700_000_000_000);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("outside the supported storage time range")
+        );
+    }
+
+    #[test]
+    fn negative_histogram_timestamp_is_rejected() {
+        let req = one_hist_series(vec![wire_hist(0, -1_000)]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert!(out.hist_samples.is_empty());
+    }
+
+    // AC 5: histogram-wins dedup at the same `(name, fp, ms)`.
+    #[test]
+    fn float_sample_at_the_same_series_and_timestamp_loses_to_the_histogram() {
+        let ms = 1_700_000_000_000;
+        let req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![label("__name__", "latency"), label("job", "checkout")],
+                samples: vec![sample(1.0, ms), sample(2.0, ms + 1)],
+                histograms: vec![wire_hist(0, ms)],
+            }],
+            metadata: vec![],
+        };
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1, "the colliding float sample is dropped");
+        assert_eq!(out.hist_samples.len(), 1, "the histogram wins");
+        assert_eq!(
+            out.samples.len(),
+            1,
+            "the non-colliding float sample survives"
+        );
+        assert_eq!(out.samples[0].unix_milli, ms + 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("native histogram present at the same series and timestamp")
+        );
+    }
+
+    // Seam validation: a structurally-invalid histogram is a per-point drop.
+    #[test]
+    fn histogram_failing_seam_validation_is_rejected_per_point() {
+        let bad_count = Histogram {
+            count: Some(HistogramCount::Int(99)), // buckets sum to 6
+            ..wire_hist(0, 1_700_000_000_000)
+        };
+        let req = one_hist_series(vec![bad_count, wire_hist(0, 1_700_000_000_000)]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 1);
+        assert_eq!(out.hist_samples.len(), 1);
+        assert!(
+            out.rejected_message
+                .as_deref()
+                .unwrap()
+                .contains("invalid native histogram")
+        );
+    }
+
+    // Edge case 2 (plan): a native-histogram stale marker (stale NaN in
+    // `sum`) passes validation and survives bit-exact — no NaN gate on sum.
+    #[test]
+    fn stale_nan_histogram_sum_survives_bit_exact() {
+        let stale = Histogram {
+            sum: f64::from_bits(STALE_NAN_BITS),
+            ..wire_hist(0, 1_700_000_000_000)
+        };
+        let req = one_hist_series(vec![stale]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 0);
+        assert_eq!(
+            out.hist_samples[0].histogram.sum.to_bits(),
+            STALE_NAN_BITS,
+            "the stale marker must round-trip bit-for-bit"
+        );
+    }
+
+    // NHCB (schema −53 + custom_values) is accepted verbatim.
+    #[test]
+    fn nhcb_histogram_with_custom_values_is_accepted_verbatim() {
+        let nhcb = Histogram {
+            count: Some(HistogramCount::Int(4)),
+            sum: 5.0,
+            schema: -53,
+            positive_spans: vec![BucketSpan {
+                offset: 0,
+                length: 3,
+            }],
+            positive_deltas: vec![1, 1, -1],
+            custom_values: vec![5.0, 10.0],
+            reset_hint: 3,
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        };
+        let req = one_hist_series(vec![nhcb]);
+        let out = parse(&req, 0).expect("within the expansion budget");
+        assert_eq!(out.rejected, 0);
+        let h = &out.hist_samples[0].histogram;
+        assert_eq!(h.schema, -53);
+        assert_eq!(h.custom_values, vec![5.0, 10.0]);
+        assert_eq!(h.counter_reset_hint, CounterResetHint::Gauge);
+    }
+
+    // Wire round-trip through the hand-written encode/decode, including the
+    // zigzag fields at their extremes (negative schema/offset/deltas).
+    #[test]
+    fn histogram_round_trips_through_encode_and_the_public_decode() {
+        let req = one_hist_series(vec![Histogram {
+            count: Some(HistogramCount::Int(6)),
+            sum: -2.5,
+            schema: -4,
+            zero_threshold: 1e-128,
+            zero_count: Some(HistogramCount::Int(1)),
+            negative_spans: vec![BucketSpan {
+                offset: -3,
+                length: 1,
+            }],
+            negative_deltas: vec![-2, 4],
+            positive_spans: vec![BucketSpan {
+                offset: 2,
+                length: 2,
+            }],
+            positive_deltas: vec![3, -3],
+            reset_hint: 3,
+            timestamp: 1_700_000_000_000,
+            ..Default::default()
+        }]);
+        let bytes = req.encode_to_vec();
+        let decoded = decode(&bytes).expect("valid protobuf decodes");
+        assert_eq!(decoded, req);
+    }
+
+    // AC 12 (plan v2 finding 2): a reordered/repeated oneof — the float
+    // alternative emitted BEFORE the int alternative — decodes with the int
+    // case winning (proto3 last-occurrence-wins) and parses as an ACCEPTED
+    // integer histogram, never misclassified as float-flavor.
+    #[test]
+    fn reordered_oneof_float_then_int_decodes_as_integer_and_is_accepted() {
+        let mut hist_payload = Vec::new();
+        // count oneof: tag 2 (float) then tag 1 (int) — int wins.
+        prost::encoding::double::encode(2u32, &99.5f64, &mut hist_payload);
+        prost::encoding::uint64::encode(1u32, &6u64, &mut hist_payload);
+        // zero_count oneof: tag 7 (float) then tag 6 (int) — int wins.
+        prost::encoding::double::encode(7u32, &1.5f64, &mut hist_payload);
+        prost::encoding::uint64::encode(6u32, &1u64, &mut hist_payload);
+        prost::encoding::double::encode(3u32, &10.5f64, &mut hist_payload);
+        let neg_span = BucketSpan {
+            offset: 0,
+            length: 1,
+        };
+        prost::encoding::message::encode(8u32, &neg_span, &mut hist_payload);
+        prost::encoding::sint64::encode_packed(9u32, &[2i64], &mut hist_payload);
+        let pos_span = BucketSpan {
+            offset: 1,
+            length: 3,
+        };
+        prost::encoding::message::encode(11u32, &pos_span, &mut hist_payload);
+        prost::encoding::sint64::encode_packed(12u32, &[1i64, -1, 2], &mut hist_payload);
+        prost::encoding::int64::encode(15u32, &1_700_000_000_000i64, &mut hist_payload);
+
+        let mut ts_payload = Vec::new();
+        let name = label("__name__", "latency");
+        prost::encoding::message::encode(1u32, &name, &mut ts_payload);
+        ts_payload.extend_from_slice(&field_ld(4, &hist_payload));
+        let body = field_ld(1, &ts_payload);
+
+        let decoded = decode(&body).expect("reordered oneof still decodes");
+        let h = &decoded.timeseries[0].histograms[0];
+        assert_eq!(
+            h.count,
+            Some(HistogramCount::Int(6)),
+            "the LAST count oneof occurrence (int) must win"
+        );
+        assert_eq!(
+            h.zero_count,
+            Some(HistogramCount::Int(1)),
+            "the LAST zero_count oneof occurrence (int) must win"
+        );
+
+        let out = parse(&decoded, 0).expect("within the expansion budget");
+        assert_eq!(
+            out.rejected, 0,
+            "a reordered oneof must never misfire the float-flavor reject"
+        );
+        assert_eq!(out.hist_samples.len(), 1);
+        assert_eq!(out.hist_samples[0].histogram.count, 6);
+        assert_eq!(out.hist_samples[0].histogram.zero_count, 1);
+    }
+
+    // -- decode-time histogram DoS caps (issue #140, #115 pattern) ---------
+
+    #[test]
+    fn decode_caps_histogram_materialization_and_rejects_too_many_histograms() {
+        // One series carrying more than MAX_HISTOGRAMS_PER_SERIES empty
+        // histograms caps at MAX + 1 during decode.
+        let encoded = MAX_HISTOGRAMS_PER_SERIES + 8;
+        let mut ts_payload = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            ts_payload.extend_from_slice(&field_ld(4, &[])); // empty Histogram
+        }
+        let body = field_ld(1, &ts_payload);
+        let decoded = WriteRequest::decode(body.as_slice()).expect("one-series decode");
+        assert_eq!(
+            decoded.timeseries[0].histograms.len(),
+            MAX_HISTOGRAMS_PER_SERIES + 1,
+            "the decoder must cap per-series histogram materialization at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "histograms",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_span_materialization_per_side_and_rejects_too_many_spans() {
+        // One histogram carrying more than MAX_SPANS_PER_HISTOGRAM_SIDE
+        // spans on one side caps at MAX + 1 during decode.
+        let encoded = MAX_SPANS_PER_HISTOGRAM_SIDE + 8;
+        let mut hist_payload = Vec::with_capacity(encoded * 2);
+        for _ in 0..encoded {
+            hist_payload.extend_from_slice(&field_ld(11, &[])); // empty BucketSpan
+        }
+        let ts_payload = field_ld(4, &hist_payload);
+        let body = field_ld(1, &ts_payload);
+        let decoded = WriteRequest::decode(body.as_slice()).expect("one-series decode");
+        assert_eq!(
+            decoded.timeseries[0].histograms[0].positive_spans.len(),
+            MAX_SPANS_PER_HISTOGRAM_SIDE + 1,
+            "the decoder must cap per-side span materialization at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "histogram spans",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_caps_a_single_over_cap_packed_delta_run_mid_run() {
+        // ONE packed sint64 run carrying more than
+        // MAX_BUCKETS_PER_HISTOGRAM_SIDE elements (each zigzag zero is a
+        // single wire byte) must cap MID-run: materialize MAX + 1, then
+        // decode-and-discard the rest of the run.
+        let encoded = MAX_BUCKETS_PER_HISTOGRAM_SIDE + 8;
+        let run = vec![0u8; encoded]; // sint64 zigzag(0) == one 0x00 varint each
+        let hist_payload = field_ld(12, &run); // positive_deltas, packed
+        let ts_payload = field_ld(4, &hist_payload);
+        let body = field_ld(1, &ts_payload);
+        let decoded = WriteRequest::decode(body.as_slice()).expect("one-series decode");
+        assert_eq!(
+            decoded.timeseries[0].histograms[0].positive_deltas.len(),
+            MAX_BUCKETS_PER_HISTOGRAM_SIDE + 1,
+            "a single packed run must be capped mid-run at MAX + 1"
+        );
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "histogram buckets",
+                ..
+            }
+        ));
+    }
+
+    /// A body of `series` in-bounds `TimeSeries`, each carrying one
+    /// histogram with `spans_each` empty positive spans — drives the
+    /// request-wide span aggregate past its cap while every histogram stays
+    /// within [`MAX_SPANS_PER_HISTOGRAM_SIDE`].
+    fn hist_span_aggregate_body(series: usize, spans_each: usize) -> Vec<u8> {
+        let mut hist_payload = Vec::with_capacity(spans_each * 2);
+        for _ in 0..spans_each {
+            hist_payload.extend_from_slice(&field_ld(11, &[]));
+        }
+        let ts_record = field_ld(1, &field_ld(4, &hist_payload));
+        let mut body = Vec::with_capacity(ts_record.len() * series);
+        for _ in 0..series {
+            body.extend_from_slice(&ts_record);
+        }
+        body
+    }
+
+    fn materialized_spans(req: &WriteRequest) -> usize {
+        req.timeseries
+            .iter()
+            .flat_map(|ts| &ts.histograms)
+            .map(|h| h.span_count())
+            .sum()
+    }
+
+    // AC 11 (plan v2 finding 1): the request-wide aggregate span cap.
+    #[test]
+    fn decode_drains_series_once_the_cross_histogram_span_aggregate_is_exceeded() {
+        // Every histogram stays within MAX_SPANS_PER_HISTOGRAM_SIDE, but the
+        // span counts SUM past MAX_TOTAL_HIST_SPANS_PER_REQUEST — drained
+        // during decode (strictly fewer spans materialized than encoded),
+        // then rejected whole-request by the deferred re-sum.
+        let spans_each = MAX_SPANS_PER_HISTOGRAM_SIDE; // 4_096, in-bounds
+        let series = MAX_TOTAL_HIST_SPANS_PER_REQUEST / spans_each + 2;
+        let body = hist_span_aggregate_body(series, spans_each);
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("aggregate decode");
+        assert!(
+            decoded.timeseries.len() < series,
+            "the decoder must drain series once the span aggregate is exceeded \
+             (materialized {} of {series} encoded series)",
+            decoded.timeseries.len()
+        );
+        let materialized = materialized_spans(&decoded);
+        assert!(
+            materialized <= MAX_TOTAL_HIST_SPANS_PER_REQUEST + spans_each,
+            "aggregate span fan-out must be bounded to MAX_TOTAL + one series' worth, \
+             got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_hist_spans",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn write_request_merge_enforces_the_cross_histogram_span_aggregate() {
+        let spans_each = MAX_SPANS_PER_HISTOGRAM_SIDE;
+        let encoded_series = MAX_TOTAL_HIST_SPANS_PER_REQUEST / spans_each + 2;
+        let body = hist_span_aggregate_body(encoded_series, spans_each);
+
+        let mut req = WriteRequest::default();
+        req.merge(body.as_slice()).expect("bounded raw merge");
+        assert!(
+            req.timeseries.len() < encoded_series,
+            "the raw merge path must drain series once the span aggregate is exceeded"
+        );
+        assert!(materialized_spans(&req) <= MAX_TOTAL_HIST_SPANS_PER_REQUEST + spans_each);
+    }
+
+    #[test]
+    fn write_request_merge_length_delimited_enforces_the_cross_histogram_span_aggregate() {
+        let spans_each = MAX_SPANS_PER_HISTOGRAM_SIDE;
+        let encoded_series = MAX_TOTAL_HIST_SPANS_PER_REQUEST / spans_each + 2;
+        let framed = length_delimited(&hist_span_aggregate_body(encoded_series, spans_each));
+
+        let mut req = WriteRequest::default();
+        req.merge_length_delimited(framed.as_slice())
+            .expect("bounded raw merge_length_delimited");
+        assert!(
+            req.timeseries.len() < encoded_series,
+            "the raw merge_length_delimited path must drain series once the span aggregate \
+             is exceeded"
+        );
+        assert!(
+            materialized_spans(&req)
+                <= MAX_TOTAL_HIST_SPANS_PER_REQUEST + MAX_SPANS_PER_HISTOGRAM_SIDE
+        );
+    }
+
+    #[test]
+    fn raw_merge_seeding_counts_pre_existing_histogram_spans() {
+        // Merge INTO a request whose pre-existing series already exceed the
+        // span aggregate: the seeding re-sum must count them, so every newly
+        // merged series is drained. Non-vacuous: were the seed ignored, all 8
+        // encoded series would materialize.
+        let mut req = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![],
+                samples: vec![],
+                histograms: vec![Histogram {
+                    positive_spans: vec![
+                        BucketSpan::default();
+                        MAX_TOTAL_HIST_SPANS_PER_REQUEST + 1
+                    ],
+                    ..Default::default()
+                }],
+            }],
+            metadata: vec![],
+        };
+        let body = hist_span_aggregate_body(8, MAX_SPANS_PER_HISTOGRAM_SIDE);
+        req.merge(body.as_slice()).expect("bounded raw merge");
+        assert_eq!(
+            req.timeseries.len(),
+            1,
+            "with the seed re-sum already over the aggregate, every merged series is drained"
+        );
+    }
+
+    // Codex review (high): the request-wide aggregates must trip WITHIN one
+    // series, not only at the between-series boundary — one crafted series
+    // (each histogram individually legal) could otherwise fully materialize
+    // its entire span/bucket fan-out before any cross-series check ran.
+
+    #[test]
+    fn decode_drains_histograms_mid_series_once_the_span_aggregate_is_exceeded() {
+        // A SINGLE TimeSeries whose histograms (each at exactly
+        // MAX_SPANS_PER_HISTOGRAM_SIDE spans, in-bounds) sum past
+        // MAX_TOTAL_HIST_SPANS_PER_REQUEST on their own: the incremental
+        // per-histogram charge must drain the excess histograms DURING the
+        // series' decode (strictly fewer spans materialized than encoded),
+        // then the deferred re-sum rejects the whole request.
+        let spans_each = MAX_SPANS_PER_HISTOGRAM_SIDE; // 4_096, in-bounds
+        let hists = MAX_TOTAL_HIST_SPANS_PER_REQUEST / spans_each + 2;
+        let mut hist_payload = Vec::with_capacity(spans_each * 2);
+        for _ in 0..spans_each {
+            hist_payload.extend_from_slice(&field_ld(11, &[]));
+        }
+        let hist_record = field_ld(4, &hist_payload);
+        let mut ts_payload = Vec::with_capacity(hist_record.len() * hists);
+        for _ in 0..hists {
+            ts_payload.extend_from_slice(&hist_record);
+        }
+        let body = field_ld(1, &ts_payload); // ONE TimeSeries
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("single-series decode");
+        assert_eq!(decoded.timeseries.len(), 1);
+        let materialized = materialized_spans(&decoded);
+        assert!(
+            materialized < hists * spans_each,
+            "the decoder must drain histograms mid-series once the span aggregate is \
+             exceeded (materialized all {materialized} encoded spans)"
+        );
+        assert!(
+            materialized <= MAX_TOTAL_HIST_SPANS_PER_REQUEST + spans_each,
+            "single-series span fan-out must be bounded to MAX_TOTAL + one histogram's \
+             worth, got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_hist_spans",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_drains_histograms_mid_series_once_the_bucket_aggregate_is_exceeded() {
+        // The bucket analog: ONE series of histograms each carrying a
+        // MAX_BUCKETS_PER_HISTOGRAM_SIDE packed delta run (in-bounds per
+        // field) whose element counts sum past
+        // MAX_TOTAL_HIST_BUCKETS_PER_REQUEST — ~5 MB of wire bytes that
+        // would otherwise materialize the whole ~40 MiB fan-out before the
+        // between-series boundary.
+        let buckets_each = MAX_BUCKETS_PER_HISTOGRAM_SIDE; // 65_536, in-bounds
+        let hists = MAX_TOTAL_HIST_BUCKETS_PER_REQUEST / buckets_each + 2;
+        let run = vec![0u8; buckets_each];
+        let hist_record = field_ld(4, &field_ld(12, &run));
+        let mut ts_payload = Vec::with_capacity(hist_record.len() * hists);
+        for _ in 0..hists {
+            ts_payload.extend_from_slice(&hist_record);
+        }
+        let body = field_ld(1, &ts_payload); // ONE TimeSeries
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("single-series decode");
+        assert_eq!(decoded.timeseries.len(), 1);
+        let materialized: usize = decoded.timeseries[0]
+            .histograms
+            .iter()
+            .map(|h| h.bucket_element_count())
+            .sum();
+        assert!(
+            materialized < hists * buckets_each,
+            "the decoder must drain histograms mid-series once the bucket aggregate is \
+             exceeded (materialized all {materialized} encoded bucket elements)"
+        );
+        assert!(
+            materialized <= MAX_TOTAL_HIST_BUCKETS_PER_REQUEST + buckets_each,
+            "single-series bucket fan-out must be bounded to MAX_TOTAL + one histogram's \
+             worth, got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_hist_buckets",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_drains_series_once_the_cross_series_histogram_aggregate_is_exceeded() {
+        // Every series stays within MAX_HISTOGRAMS_PER_SERIES, but the
+        // histogram counts SUM past MAX_TOTAL_HISTOGRAMS_PER_REQUEST.
+        let hists_each = MAX_HISTOGRAMS_PER_SERIES; // 10_000, in-bounds
+        let series = MAX_TOTAL_HISTOGRAMS_PER_REQUEST / hists_each + 2;
+        let mut ts_payload = Vec::with_capacity(hists_each * 2);
+        for _ in 0..hists_each {
+            ts_payload.extend_from_slice(&field_ld(4, &[]));
+        }
+        let ts_record = field_ld(1, &ts_payload);
+        let mut body = Vec::with_capacity(ts_record.len() * series);
+        for _ in 0..series {
+            body.extend_from_slice(&ts_record);
+        }
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("aggregate decode");
+        let materialized: usize = decoded
+            .timeseries
+            .iter()
+            .map(|ts| ts.histograms.len())
+            .sum();
+        assert!(
+            decoded.timeseries.len() < series,
+            "the decoder must drain series once the histogram aggregate is exceeded"
+        );
+        assert!(
+            materialized <= MAX_TOTAL_HISTOGRAMS_PER_REQUEST + MAX_HISTOGRAMS_PER_SERIES,
+            "aggregate histogram fan-out must be bounded to MAX_TOTAL + one series' cap, \
+             got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_histograms",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn decode_drains_series_once_the_cross_histogram_bucket_aggregate_is_exceeded() {
+        // Every packed run stays within MAX_BUCKETS_PER_HISTOGRAM_SIDE, but
+        // the bucket-element counts SUM past
+        // MAX_TOTAL_HIST_BUCKETS_PER_REQUEST.
+        let buckets_each = MAX_BUCKETS_PER_HISTOGRAM_SIDE; // 65_536, in-bounds
+        let series = MAX_TOTAL_HIST_BUCKETS_PER_REQUEST / buckets_each + 2;
+        let run = vec![0u8; buckets_each];
+        let ts_record = field_ld(1, &field_ld(4, &field_ld(12, &run)));
+        let mut body = Vec::with_capacity(ts_record.len() * series);
+        for _ in 0..series {
+            body.extend_from_slice(&ts_record);
+        }
+
+        let decoded = WriteRequest::decode(body.as_slice()).expect("aggregate decode");
+        let materialized: usize = decoded
+            .timeseries
+            .iter()
+            .flat_map(|ts| &ts.histograms)
+            .map(|h| h.bucket_element_count())
+            .sum();
+        assert!(
+            decoded.timeseries.len() < series,
+            "the decoder must drain series once the bucket aggregate is exceeded"
+        );
+        assert!(
+            materialized <= MAX_TOTAL_HIST_BUCKETS_PER_REQUEST + buckets_each,
+            "aggregate bucket fan-out must be bounded to MAX_TOTAL + one series' worth, \
+             got {materialized}"
+        );
+
+        let err = decode(&body).unwrap_err();
+        assert!(matches!(
+            err,
+            LogsIngestError::OversizeMessage {
+                field: "total_hist_buckets",
+                ..
+            }
+        ));
     }
 }

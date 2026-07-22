@@ -2093,10 +2093,14 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     // (The `merge_length_delimited` sibling needs no pin: its body's
     // `bounded.merge_length_delimited(buf)` does not contain the `.merge(`
     // scanner token.)
+    // Re-derived for issue #140: the inline aggregate re-sum seeding was
+    // hoisted into `BoundedWriteRequest::seeded_from` so the histogram
+    // span/bucket aggregates are re-summed alongside labels/samples on both
+    // raw merge entry points.
     PinnedFunctionBody {
         file: "crates/pulsus-write/src/protocols/remote_write.rs",
         function: "merge",
-        body: "let mut bounded = BoundedWriteRequest {total_labels: self.timeseries.iter().map(|ts| ts.labels.len()).sum(), total_samples: self.timeseries.iter().map(|ts| ts.samples.len()).sum(), timeseries: std::mem::take(&mut self.timeseries), metadata: std::mem::take(&mut self.metadata),}; let result = bounded.merge(buf); self.timeseries = bounded.timeseries; self.metadata = bounded.metadata; result",
+        body: "let mut bounded = BoundedWriteRequest::seeded_from(std::mem::take(&mut self.timeseries), std::mem::take(&mut self.metadata)); let result = bounded.merge(buf); self.timeseries = bounded.timeseries; self.metadata = bounded.metadata; result",
     },
 ];
 

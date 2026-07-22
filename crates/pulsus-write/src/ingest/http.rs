@@ -2054,6 +2054,7 @@ mod tests {
                     value: 1.0,
                     timestamp: 1_700_000_000_000,
                 }],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -2200,6 +2201,7 @@ mod tests {
                     };
                     MAX_SAMPLES_PER_SERIES
                 ],
+                histograms: vec![],
             })
             .collect();
         let req = WriteRequest {
@@ -2236,6 +2238,7 @@ mod tests {
                     value: 1.0,
                     timestamp: 1,
                 }],
+                histograms: vec![],
             }],
             metadata: vec![],
         };
@@ -2269,6 +2272,7 @@ mod tests {
                     // The first millisecond of day 49_710 (2106-02-07).
                     timestamp: 4_294_944_000_000,
                 }],
+                histograms: vec![],
             }],
             metadata: vec![],
         };

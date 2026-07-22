@@ -88,6 +88,7 @@ fn rw_request(metric_name: &str, host: &str, service: &str) -> WriteRequest {
                 // only on the series' label identity).
                 timestamp: 1_800_000_000_000,
             }],
+            histograms: vec![],
         }],
         metadata: vec![],
     }

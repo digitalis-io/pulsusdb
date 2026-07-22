@@ -13,10 +13,11 @@
 
 use std::path::{Path, PathBuf};
 
-use pulsus_model::STALE_NAN_BITS;
+use prost::Message;
+use pulsus_model::{CounterResetHint, STALE_NAN_BITS};
 use pulsus_write::ingest::decompress::{Encoding, decompress};
 use pulsus_write::protocols::remote_write::{
-    Label, Sample, TimeSeries, WriteRequest, decode, parse,
+    BucketSpan, Histogram, HistogramCount, Label, Sample, TimeSeries, WriteRequest, decode, parse,
 };
 
 fn fixtures_dir() -> PathBuf {
@@ -185,6 +186,129 @@ fn parse_of_the_real_capture_is_pure_repeated_calls_are_identical() {
     assert_eq!(a.rejected_message, b.rejected_message);
 }
 
+/// Issue #140 AC 7: `native_histogram.bin` is a **real capture** from
+/// Prometheus 3.13.0's own remote-write sender (`send_native_histograms:
+/// true`, provenance: `tests/fixtures/remote-write/README.md`) carrying one
+/// integer native histogram. It pins the hand-rolled `prompb.Histogram`/
+/// `BucketSpan` tag layout — including every zigzag field at a NEGATIVE
+/// value (`schema` −2 sint32, positive span `offset` −2 sint32, a −1
+/// positive delta sint64) — against genuine wire bytes: a self-consistent
+/// wrong tag or a plain-int mis-declaration of a sint field would decode
+/// without error but corrupt exactly these values, which a synthetic
+/// round-trip through the same structs cannot catch.
+#[test]
+fn native_histogram_fixture_decodes_the_real_prometheus_wire_layout_exactly() {
+    let req = decode_fixture("native_histogram.bin");
+    assert_eq!(req.timeseries.len(), 1);
+    let ts = &req.timeseries[0];
+    assert!(ts.samples.is_empty(), "a histogram-only series on the wire");
+    assert_eq!(ts.histograms.len(), 1);
+    let h = &ts.histograms[0];
+
+    // Pinned decoded values (recorded at capture time; the OTLP →
+    // Prometheus ingest translation shifts each exponential bucket offset
+    // by +1 and the negative-side sign flip mirrors it).
+    assert_eq!(h.count, Some(HistogramCount::Int(6)));
+    assert_eq!(h.sum.to_bits(), 10.5f64.to_bits());
+    assert_eq!(
+        h.schema, -2,
+        "sint32 zigzag schema decodes to its negative value"
+    );
+    assert_eq!(h.zero_threshold.to_bits(), 1e-128f64.to_bits());
+    assert_eq!(h.zero_count, Some(HistogramCount::Int(1)));
+    assert_eq!(
+        h.positive_spans,
+        vec![BucketSpan {
+            offset: -2,
+            length: 3
+        }],
+        "sint32 zigzag span offset decodes to its negative value"
+    );
+    assert_eq!(
+        h.positive_deltas,
+        vec![1, -1, 2],
+        "sint64 zigzag packed deltas decode signed values exactly"
+    );
+    assert_eq!(
+        h.negative_spans,
+        vec![BucketSpan {
+            offset: 1,
+            length: 1
+        }]
+    );
+    assert_eq!(h.negative_deltas, vec![2]);
+    assert!(
+        h.positive_counts.is_empty(),
+        "integer flavor: no float counts"
+    );
+    assert!(h.negative_counts.is_empty());
+    assert!(h.custom_values.is_empty());
+    assert_eq!(h.reset_hint, 0);
+    assert_eq!(h.timestamp, 1_784_717_351_135);
+
+    // Through `parse`: one HistogramPoint, hint Unknown (wire UNKNOWN), the
+    // series registered from its histogram alone.
+    let out = parse(&req, 0).expect("within the expansion budget");
+    assert_eq!(out.rejected, 0);
+    assert_eq!(out.hist_samples.len(), 1);
+    let point = &out.hist_samples[0];
+    assert_eq!(&*point.metric_name, "rw_capture_latency");
+    assert_eq!(point.unix_milli, 1_784_717_351_135);
+    assert_eq!(
+        point.histogram.counter_reset_hint,
+        CounterResetHint::Unknown
+    );
+    assert_eq!(point.histogram.count, 6);
+    assert_eq!(point.histogram.positive_buckets, vec![1, -1, 2]);
+    assert_eq!(out.series.len(), 1);
+    assert_eq!(out.series[0].labels.get("job"), Some("checkout"));
+}
+
+/// Issue #140 AC 7 (gauge variant, OQ1 resolution): common senders do not
+/// readily emit gauge-hint native histograms, so the GAUGE variant is built
+/// programmatically (this file's established "no real-sender equivalent →
+/// built in-test" precedent) and pushed through the same
+/// `snappy → decompress → decode → parse` path the real capture takes; the
+/// tag layout itself is pinned by the real capture above (only the enum
+/// value at tag 14 differs).
+#[test]
+fn synthetic_gauge_hint_body_lands_counter_reset_hint_gauge_through_the_full_path() {
+    let req = WriteRequest {
+        timeseries: vec![TimeSeries {
+            labels: vec![label("__name__", "queue_depth"), label("job", "checkout")],
+            samples: vec![],
+            histograms: vec![Histogram {
+                count: Some(HistogramCount::Int(4)),
+                sum: 5.0,
+                schema: 0,
+                zero_count: Some(HistogramCount::Int(0)),
+                positive_spans: vec![BucketSpan {
+                    offset: 0,
+                    length: 3,
+                }],
+                positive_deltas: vec![1, 1, -1],
+                reset_hint: 3, // GAUGE
+                timestamp: 1_700_000_000_000,
+                ..Default::default()
+            }],
+        }],
+        metadata: vec![],
+    };
+    let compressed = snappy_compress(&req.encode_to_vec());
+
+    let decompressed = decompress(Encoding::Snappy, &compressed).expect("valid snappy");
+    let decoded = decode(&decompressed).expect("valid WriteRequest");
+    let out = parse(&decoded, 0).expect("within the expansion budget");
+
+    assert_eq!(out.rejected, 0);
+    assert_eq!(out.hist_samples.len(), 1);
+    assert_eq!(
+        out.hist_samples[0].histogram.counter_reset_hint,
+        CounterResetHint::Gauge,
+        "a wire GAUGE reset hint must land CounterResetHint::Gauge"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Synthetic edge cases (no real-collector equivalent — see module doc).
 // ---------------------------------------------------------------------
@@ -199,6 +323,7 @@ fn missing_name_label_drops_the_series_request_still_succeeds_as_partial() {
                     value: 1.0,
                     timestamp: 1,
                 }],
+                histograms: vec![],
             },
             TimeSeries {
                 labels: vec![label("__name__", "up")],
@@ -206,6 +331,7 @@ fn missing_name_label_drops_the_series_request_still_succeeds_as_partial() {
                     value: 1.0,
                     timestamp: 1,
                 }],
+                histograms: vec![],
             },
         ],
         metadata: vec![],
@@ -233,6 +359,7 @@ fn out_of_order_wire_labels_are_accepted_and_fingerprint_identically_to_sorted()
                 value: 1.0,
                 timestamp: 1,
             }],
+            histograms: vec![],
         }],
         metadata: vec![],
     };
@@ -247,6 +374,7 @@ fn out_of_order_wire_labels_are_accepted_and_fingerprint_identically_to_sorted()
                 value: 1.0,
                 timestamp: 1,
             }],
+            histograms: vec![],
         }],
         metadata: vec![],
     };
