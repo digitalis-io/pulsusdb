@@ -21,13 +21,15 @@
 //! through [`mount_log_query_routes`]. Issue #170 (M7) adds
 //! `/detected_labels` + `/detected_fields` (§2.6) — both aliases ARE pure
 //! prefix swaps, mounted via [`mount_detected_routes`] on both surfaces.
-//! Still out of scope: `/patterns` and its alias.
+//! Issue #171 (M7-C3) adds `/patterns` (§2.6) with its `/loki/api/v1/patterns`
+//! alias (also a pure prefix swap, mounted explicitly on both surfaces).
 
 mod detected;
 mod encode;
 mod error;
 mod handlers;
 mod params;
+mod patterns;
 mod stats;
 mod tail;
 mod volume;
@@ -97,7 +99,8 @@ pub(crate) fn router() -> Router<AppState> {
     let router = mount_log_query_routes(Router::new(), "/api/logs/v1")
         .route("/api/logs/v1/tail", get(tail::tail))
         .route("/api/logs/v1/stats", get(stats::stats))
-        .route("/api/logs/v1/volume", get(volume::volume));
+        .route("/api/logs/v1/volume", get(volume::volume))
+        .route("/api/logs/v1/patterns", get(patterns::patterns));
     mount_detected_routes(router, "/api/logs/v1")
 }
 
@@ -115,7 +118,11 @@ pub(crate) fn compat_router() -> Router<AppState> {
         // `/index/volume` alias follows the same irregular-suffix rule.
         .route("/loki/api/v1/tail", get(tail::tail))
         .route("/loki/api/v1/index/stats", get(stats::stats))
-        .route("/loki/api/v1/index/volume", get(volume::volume));
+        .route("/loki/api/v1/index/volume", get(volume::volume))
+        // Issue #171: `/loki/api/v1/patterns` IS a pure prefix swap of the
+        // native `/patterns` (docs/api.md §8.1's M7 row), unlike the irregular
+        // `/index/stats`/`/index/volume` aliases.
+        .route("/loki/api/v1/patterns", get(patterns::patterns));
     mount_detected_routes(router, "/loki/api/v1")
 }
 

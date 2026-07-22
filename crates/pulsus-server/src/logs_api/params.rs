@@ -119,6 +119,18 @@ pub(crate) enum ParamError {
     /// (`defaultLimit`); zero or non-numeric input is a 400.
     #[error("invalid 'limit' {0:?}: expected a positive integer")]
     InvalidFieldLimit(String),
+    /// Issue #171: `/patterns`' `(end - start) / step` bucket grid (after the
+    /// 10s floor) exceeded [`PATTERN_MAX_GRID_BUCKETS`] — rejected before any
+    /// engine/SQL work (the same bucket-grid discipline as the metrics
+    /// endpoints).
+    #[error("bucket grid too large: {buckets} steps exceeds the maximum of {max}")]
+    PatternGridTooLarge { buckets: u64, max: u64 },
+    /// Issue #171: `/patterns` serves precomputed templates from
+    /// `log_patterns` — the bodies are gone, so ANY pipeline stage (line
+    /// filters included, like `/volume`) would be meaningless; all are
+    /// rejected.
+    #[error("'query' must be a bare stream selector on the patterns endpoint (no pipeline stages)")]
+    PatternsPipelineUnsupported,
 }
 
 /// Nanoseconds since the Unix epoch, right now. Matches the rest of the
@@ -312,6 +324,41 @@ pub(crate) fn parse_step(raw: Option<&str>, start_ns: i64, end_ns: i64) -> Resul
             Ok(ns)
         }
     }
+}
+
+/// The `log_patterns` ingest bucket resolution (M7-C3, issue #171): the
+/// `/patterns` `step` is floored to this (and is never smaller than it),
+/// matching the write-side `patterns::PATTERN_BUCKET_NS` — a finer step would
+/// invent sub-bucket granularity the stored data does not carry.
+pub(crate) const PATTERN_STEP_FLOOR_NS: u64 = 10_000_000_000;
+/// The `/patterns` `(end - start) / step` bucket-grid cap (issue #171) — the
+/// same 11,000 bound the metrics endpoints use.
+pub(crate) const PATTERN_MAX_GRID_BUCKETS: u64 = 11_000;
+
+/// `/patterns`' effective `step`: [`parse_step`], then floored to the 10s
+/// ingest bucket (never below it), then the `(end - start) / step` grid is
+/// rejected past [`PATTERN_MAX_GRID_BUCKETS`] (400) — all in pure param
+/// parsing, before any engine/SQL work. `start_ns <= end_ns` is the caller's
+/// precondition (checked separately as `EndBeforeStart`).
+pub(crate) fn parse_pattern_step(
+    raw: Option<&str>,
+    start_ns: i64,
+    end_ns: i64,
+) -> Result<u64, ParamError> {
+    let requested = parse_step(raw, start_ns, end_ns)?;
+    // Floor to the 10s bucket, but never below it (a sub-10s step would floor
+    // to 0).
+    let step =
+        (requested / PATTERN_STEP_FLOOR_NS * PATTERN_STEP_FLOOR_NS).max(PATTERN_STEP_FLOOR_NS);
+    let span_ns = end_ns.saturating_sub(start_ns).max(0) as u64;
+    let buckets = span_ns / step;
+    if buckets > PATTERN_MAX_GRID_BUCKETS {
+        return Err(ParamError::PatternGridTooLarge {
+            buckets,
+            max: PATTERN_MAX_GRID_BUCKETS,
+        });
+    }
+    Ok(step)
 }
 
 fn derive_step_ns(start_ns: i64, end_ns: i64) -> u64 {
@@ -767,6 +814,58 @@ mod tests {
     fn parse_step_rejects_garbage() {
         let err = parse_step(Some("banana"), 0, 0).unwrap_err();
         assert!(matches!(err, ParamError::InvalidStep { .. }));
+    }
+
+    // -- Issue #171: /patterns step floor + grid ------------------------
+
+    #[test]
+    fn parse_pattern_step_floors_a_finer_step_up_to_the_10s_bucket() {
+        // 3s requested → floors to the 10s bucket resolution.
+        assert_eq!(
+            parse_pattern_step(Some("3"), 0, 60_000_000_000).unwrap(),
+            PATTERN_STEP_FLOOR_NS
+        );
+        // 25s requested → floors DOWN to 20s (a multiple of 10s).
+        assert_eq!(
+            parse_pattern_step(Some("25"), 0, 60_000_000_000).unwrap(),
+            20_000_000_000
+        );
+    }
+
+    #[test]
+    fn parse_pattern_step_derived_default_is_at_least_the_10s_floor() {
+        // A short window derives a sub-10s step; it floors up to 10s.
+        assert_eq!(
+            parse_pattern_step(None, 0, 1_000_000_000).unwrap(),
+            PATTERN_STEP_FLOOR_NS
+        );
+    }
+
+    #[test]
+    fn parse_pattern_step_rejects_an_over_11k_grid() {
+        // 11_001 × 10s window at the 10s floor step ⇒ 11_001 buckets > 11_000.
+        let end = 11_001 * PATTERN_STEP_FLOOR_NS as i64;
+        assert!(matches!(
+            parse_pattern_step(Some("10"), 0, end).unwrap_err(),
+            ParamError::PatternGridTooLarge {
+                buckets: 11_001,
+                max: 11_000
+            }
+        ));
+        // Exactly at the cap passes.
+        let end_ok = 11_000 * PATTERN_STEP_FLOOR_NS as i64;
+        assert_eq!(
+            parse_pattern_step(Some("10"), 0, end_ok).unwrap(),
+            PATTERN_STEP_FLOOR_NS
+        );
+    }
+
+    #[test]
+    fn parse_pattern_step_rejects_a_non_positive_explicit_step() {
+        assert!(matches!(
+            parse_pattern_step(Some("0"), 0, 0).unwrap_err(),
+            ParamError::InvalidStep { .. }
+        ));
     }
 
     #[test]

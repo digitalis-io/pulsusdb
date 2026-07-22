@@ -270,10 +270,14 @@ async fn l1_lost_registration_backfill_resolves_the_stream_in_the_samples_month(
     let streams = InjectingInserter::new(client.clone(), InjectMode::Swallow);
     let mut cfg = WriterConfig::default();
     cfg.batch_bytes.0 = 1; // flush on the very next append
+    // Focused on the stream backfill path; the M7-C3 pattern path is tested
+    // separately (log_patterns_fidelity.rs).
+    cfg.log_patterns = false;
 
     let writer = LogWriter::with_inserters_with_tables(
         Arc::new(ChBlockInserter::new(client.clone())),
         streams.clone(),
+        Arc::new(ChBlockInserter::new(client.clone())),
         &cfg,
         WriterTables::logs_default(),
     );
@@ -336,10 +340,14 @@ async fn l2_false_poisoned_duplicate_reinsert_collapses_on_final_read() {
     let streams = InjectingInserter::new(client.clone(), InjectMode::ForwardThenFail);
     let mut cfg = WriterConfig::default();
     cfg.batch_bytes.0 = 1;
+    // Focused on the stream backfill path; the M7-C3 pattern path is tested
+    // separately (log_patterns_fidelity.rs).
+    cfg.log_patterns = false;
 
     let writer = LogWriter::with_inserters_with_tables(
         Arc::new(ChBlockInserter::new(client.clone())),
         streams.clone(),
+        Arc::new(ChBlockInserter::new(client.clone())),
         &cfg,
         WriterTables::logs_default(),
     );

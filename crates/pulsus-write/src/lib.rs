@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod ingest;
+pub mod patterns;
 pub mod protocols;
 pub mod writer;
 
@@ -30,9 +31,9 @@ pub use protocols::zipkin::{
     decode as decode_zipkin, to_otlp as zipkin_to_otlp,
 };
 pub use writer::{
-    LogWriter, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow, MetricSeriesRow,
-    MetricWriter, MetricWriterTables, TraceAttrRow, TraceSpanRow, TraceWriter, TraceWriterTables,
-    WriteError, WriterTables,
+    LogPatternRow, LogWriter, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow,
+    MetricSeriesRow, MetricWriter, MetricWriterTables, TraceAttrRow, TraceSpanRow, TraceWriter,
+    TraceWriterTables, WriteError, WriterTables,
 };
 
 #[cfg(test)]

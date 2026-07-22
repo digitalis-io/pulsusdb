@@ -338,7 +338,29 @@ ORDER BY (fingerprint, bucket_ns);
 -- populated by MV over log_samples
 ```
 
+```sql
+-- Log patterns (M7-C3, issue #171): ingest-extracted log templates, batch-pre-
+-- aggregated per (fingerprint, bucket_ns, pattern) by the WRITER (not an MV —
+-- extraction is Rust, not SQL; and not per-line rows). The fixed 10s ingest
+-- bucket is a code constant (patterns::PATTERN_BUCKET_NS). `count` is a
+-- mergeable SimpleAggregateFunction(sum) — the template identity is a pure
+-- function of the line, so counts sum correctly across batches, shards,
+-- replicas, and retries. Kill-switch: PULSUS_LOG_PATTERNS (default true).
+CREATE TABLE log_patterns (
+    fingerprint  UInt64,
+    bucket_ns    Int64,                          -- intDiv(timestamp_ns, 10s) * 10s
+    pattern      String  CODEC(ZSTD(1)),
+    count        SimpleAggregateFunction(sum, UInt64)
+) ENGINE = AggregatingMergeTree
+PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))
+ORDER BY (fingerprint, bucket_ns, pattern)
+TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1;
+```
+
 Raw log timestamps in `log_samples` are stored verbatim at nanosecond precision — the rollup is derived, and only eligible when the query step is a multiple of the configured rollup resolution; otherwise the planner counts raw rows.
+
+- **`log_patterns` primary-key order is `(fingerprint, bucket_ns, pattern)`** (issue #171, `bucket_ns` **before** `pattern`): a `/api/logs/v1/patterns` read is a `fingerprint IN (...)` + bounded `bucket_ns` window, so putting `bucket_ns` second prunes at the PK level inside each fingerprint's key range, not only via daily partitions. The template is a **deterministic, stateless** token-class rendering of the line body (digit/length classification, `key=value`/`key:value` awareness, 1 KiB prefix / 64-token / 512-byte caps, whitespace runs collapse) — NOT a drain-style online clusterer, whose order-dependent per-stream mutable state would emit different templates on different shards/replicas/retries and break both the mergeable `sum` and idempotent re-inserts. Templates are normalized (whitespace-collapsed), documented as "not round-trip matchable". **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with `log_metrics` (§2.2's tier caveat): the writer never auto-replays a block that could have committed (an `InsertUncertain` batch is spooled audit-only, never re-inserted), so the only over-count vector is a client-level re-send after a 5xx/timeout ack (steady-state zero), and the only under-count vector is a patterns-flush failure (patterns are excluded from the sync-durability ack — a `log_patterns` insert failure never 500s an ingest whose log lines landed). A single request that emits more than 10 000 distinct templates (pathological — the extraction caps make templates low-cardinality by construction) drops the excess from pattern accounting only (log lines untouched, counted via the writer's `patterns_dropped_total`), an under-count event folded into the same approximate semantics; the next batch resumes discovery.
 
 - **`service` leads the samples ordering key.** This is the one label promoted to a physical column (populated from resource `service.name`; user-visible as the `service_name` label per the canonical label model), and it earns it three ways: (a) OpenTelemetry guarantees `service.name` on every resource (the collector defaults it to `unknown_service`), so it is never missing; (b) it is the natural clustering dimension — a service's streams sit contiguously, so service-scoped searches (the human default) read a compact range instead of granules scattered across all tenants of the table; (c) **the planner can always supply it**: stream resolution returns full label sets, so even a query that never mentions `service` gets `service IN (...)` injected from the resolved streams, keeping the primary index engaged. No other label is materialized — finding #9's counter-argument (row width, schema coupling) applies to everything else.
 - **`(service, fingerprint, timestamp_ns)` is fixed** (finding #4). Per-stream time reads are sequential; multi-stream reads within one service are near-sequential.
@@ -390,6 +412,24 @@ GROUP BY fingerprint, step
 ```
 
 The engine maps fingerprints to `service` from stage 2 and finishes the `sum by`.
+
+**`GET /api/logs/v1/patterns`** (M7-C3, issue #171) — stage-1 fingerprint resolution (selector only; line filters are rejected — templates are precomputed, bodies are gone), then ONE pushed-down aggregate over `log_patterns` with no hydration (the response carries no labels), top-1000 by total count:
+
+```sql
+SELECT pattern, sum(cnt) AS total,
+       arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples
+FROM (
+    SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt
+    FROM log_patterns
+    WHERE fingerprint IN (...) AND bucket_ns >= {start} AND bucket_ns < {end}
+    GROUP BY pattern, ts_ns
+)
+GROUP BY pattern
+ORDER BY total DESC, pattern ASC
+LIMIT 1000
+```
+
+`fingerprint IN` engages the `(fingerprint, bucket_ns, pattern)` primary-key prefix (granule pruning), daily partitions prune the window, and the aggregation + top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000 already-assembled series. `step` is floored to the 10s ingest bucket; the `(end-start)/step` grid is capped at 11,000 (else 400), and the response is the Loki-interop envelope (docs/api.md §2.6).
 
 **Live tail** polls stage 3's shape with a monotonic `timestamp_ns >` cursor; line-filter pushdown identical.
 
@@ -635,7 +675,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 | Table | Sharding key | Why |
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster |
-| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, and each shard's stage-3 read is against its own streams |
+| `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in) |
 | `trace_spans`, `trace_attrs_idx` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections and trace assembly are shard-local |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |

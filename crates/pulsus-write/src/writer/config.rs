@@ -98,6 +98,11 @@ pub struct WriterRuntime {
     /// — four backlogs ⇒ 128 MiB worst-case process-wide (see
     /// [`REGISTRATION_BACKFILL_MAX_BYTES`]).
     pub backfill_max_bytes: u64,
+    /// `PULSUS_LOG_PATTERNS` (M7-C3, issue #171): the ingest-time log-pattern
+    /// extraction kill-switch. `false` ⇒ zero extraction work and zero
+    /// `log_patterns` appends; the read endpoint stays mounted and serves
+    /// empty data.
+    pub log_patterns: bool,
 }
 
 impl WriterRuntime {
@@ -114,6 +119,7 @@ impl WriterRuntime {
             spool_dir: PathBuf::from(SPOOL_DIR),
             backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
             backfill_max_bytes: REGISTRATION_BACKFILL_MAX_BYTES,
+            log_patterns: cfg.log_patterns,
         }
     }
 }
@@ -143,5 +149,16 @@ mod tests {
     #[test]
     fn retry_budget_is_bounded() {
         const { assert!(RETRY_MAX_ATTEMPTS > 0 && RETRY_MAX_ATTEMPTS <= 10) };
+    }
+
+    #[test]
+    fn from_config_carries_the_log_patterns_kill_switch_both_states() {
+        // Default ON (M7-C3, issue #171).
+        assert!(WriterRuntime::from_config(&WriterConfig::default()).log_patterns);
+        let off = WriterConfig {
+            log_patterns: false,
+            ..Default::default()
+        };
+        assert!(!WriterRuntime::from_config(&off).log_patterns);
     }
 }

@@ -108,19 +108,24 @@ pub use metrics::{
 };
 pub use registration::{MetadataCache, SeriesLru, StreamLru};
 pub use rows::{
-    LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricMetadataRow, MetricSampleRow,
-    MetricSeriesRow, TraceAttrRow, TraceSpanRow,
+    LogPatternRow, LogSampleRow, LogStreamRow, MetricHistSampleRow, MetricMetadataRow,
+    MetricSampleRow, MetricSeriesRow, TraceAttrRow, TraceSpanRow,
 };
 pub use table::{BlockInserter, ChBlockInserter};
 pub use trace::{TraceWriter, TraceWriterTables};
 
 use crate::error::LogsIngestError;
 use crate::ingest::{Backpressure, FlushWait, LogSink};
+use crate::patterns::{
+    AGG_BASE_OVERHEAD, MAX_DISTINCT_PATTERNS_PER_BATCH, PATTERN_ROW_OVERHEAD, aggregate_patterns,
+    est_template_bound,
+};
 use crate::protocols::otlp_logs::{ParsedLogs, StreamRow};
 use table::{ShutdownSignal, TableContext};
 
 const SAMPLES_TABLE: &str = "log_samples";
 const STREAMS_TABLE: &str = "log_streams";
+const PATTERNS_TABLE: &str = "log_patterns";
 
 /// The two target table names a [`LogWriter`] inserts into (issue #15
 /// architect plan, Design A): cluster-mode deployments write through the
@@ -134,6 +139,10 @@ const STREAMS_TABLE: &str = "log_streams";
 pub struct WriterTables {
     pub samples: Arc<str>,
     pub streams: Arc<str>,
+    /// `log_patterns` (M7-C3, issue #171) — a fourth Logs-family table,
+    /// `_dist`-aware exactly like `samples`/`streams` (co-sharded on
+    /// `fingerprint`).
+    pub patterns: Arc<str>,
 }
 
 impl WriterTables {
@@ -145,6 +154,7 @@ impl WriterTables {
         WriterTables {
             samples: Arc::from(SAMPLES_TABLE),
             streams: Arc::from(STREAMS_TABLE),
+            patterns: Arc::from(PATTERNS_TABLE),
         }
     }
 }
@@ -177,8 +187,14 @@ pub(crate) fn reserve_queued_bytes(
 struct Shared {
     samples: Arc<buffer::TableBuffer<LogSampleRow>>,
     streams: Arc<buffer::TableBuffer<LogStreamRow>>,
+    /// `log_patterns` buffer (M7-C3, issue #171). Derived data: appended in
+    /// async mode only (never joins the `admit_flush` durability ack), so a
+    /// `log_patterns` insert failure never 500s an ingest whose log lines
+    /// landed.
+    patterns: Arc<buffer::TableBuffer<LogPatternRow>>,
     samples_notify: Arc<Notify>,
     streams_notify: Arc<Notify>,
+    patterns_notify: Arc<Notify>,
     queued_bytes: Arc<AtomicU64>,
     runtime: Arc<WriterRuntime>,
     metrics: Arc<WriterMetrics>,
@@ -187,6 +203,7 @@ struct Shared {
     shutting_down: AtomicBool,
     samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    patterns_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -215,21 +232,24 @@ impl LogWriter {
         tables: WriterTables,
     ) -> Self {
         let inserter: Arc<ChBlockInserter> = Arc::new(ChBlockInserter::new(client));
-        Self::with_inserters_with_tables(inserter.clone(), inserter, cfg, tables)
+        Self::with_inserters_with_tables(inserter.clone(), inserter.clone(), inserter, cfg, tables)
     }
 
-    /// Test/mock constructor: any [`BlockInserter`] pair — e.g. a
+    /// Test/mock constructor: any [`BlockInserter`] triple — e.g. a
     /// scriptable mock that can fail/hang on demand (architect plan: "no
     /// real ClickHouse in unit tests") — against the unclustered default
-    /// table names. Delegates to [`Self::with_inserters_with_tables`].
+    /// table names. Delegates to [`Self::with_inserters_with_tables`]. The
+    /// third inserter is `log_patterns`' (M7-C3, issue #171).
     pub fn with_inserters(
         samples_inserter: Arc<dyn BlockInserter<LogSampleRow>>,
         streams_inserter: Arc<dyn BlockInserter<LogStreamRow>>,
+        patterns_inserter: Arc<dyn BlockInserter<LogPatternRow>>,
         cfg: &WriterConfig,
     ) -> Self {
         Self::with_inserters_with_tables(
             samples_inserter,
             streams_inserter,
+            patterns_inserter,
             cfg,
             WriterTables::logs_default(),
         )
@@ -240,6 +260,7 @@ impl LogWriter {
     pub fn with_inserters_with_tables(
         samples_inserter: Arc<dyn BlockInserter<LogSampleRow>>,
         streams_inserter: Arc<dyn BlockInserter<LogStreamRow>>,
+        patterns_inserter: Arc<dyn BlockInserter<LogPatternRow>>,
         cfg: &WriterConfig,
         tables: WriterTables,
     ) -> Self {
@@ -255,8 +276,10 @@ impl LogWriter {
 
         let samples = Arc::new(buffer::TableBuffer::new());
         let streams = Arc::new(buffer::TableBuffer::new());
+        let patterns = Arc::new(buffer::TableBuffer::new());
         let samples_notify = Arc::new(Notify::new());
         let streams_notify = Arc::new(Notify::new());
+        let patterns_notify = Arc::new(Notify::new());
 
         // `log_streams`'s success-only LRU promotion (architect plan
         // amendment 1): populated ONLY here, after a confirmed flush —
@@ -325,8 +348,26 @@ impl LogWriter {
             on_flush_poisoned: Some(on_stream_flush_poisoned),
         };
 
+        // `log_patterns` (M7-C3, issue #171): a fourth generic flush task,
+        // append-only like `log_samples` — no success/poison hook (derived
+        // data is never backfilled; patterns re-arrive continuously), no
+        // sync-ack waiter (registered in async mode only in `admit_batch`).
+        let patterns_ctx = TableContext {
+            table: tables.patterns,
+            buffer: patterns.clone(),
+            notify: patterns_notify.clone(),
+            inserter: patterns_inserter,
+            runtime: runtime.clone(),
+            table_metrics: metrics.patterns.clone(),
+            spool: spool.clone(),
+            queued_bytes: queued_bytes.clone(),
+            on_flush_success: None,
+            on_flush_poisoned: None,
+        };
+
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
         let streams_task = table::spawn(streams_ctx, shutdown_rx.clone());
+        let patterns_task = table::spawn(patterns_ctx, shutdown_rx.clone());
         let backfill_task = backfill::spawn_backfill(
             backlog,
             streams_inserter,
@@ -340,8 +381,10 @@ impl LogWriter {
         let shared = Arc::new(Shared {
             samples,
             streams,
+            patterns,
             samples_notify,
             streams_notify,
+            patterns_notify,
             queued_bytes,
             runtime,
             metrics,
@@ -350,6 +393,7 @@ impl LogWriter {
             shutting_down: AtomicBool::new(false),
             samples_task: Mutex::new(Some(samples_task)),
             streams_task: Mutex::new(Some(streams_task)),
+            patterns_task: Mutex::new(Some(patterns_task)),
             backfill_task: Mutex::new(Some(backfill_task)),
         });
 
@@ -419,7 +463,26 @@ impl LogWriter {
             .copied()
             .map(LogStreamRow::est_source_bytes)
             .sum();
-        let total_bytes = sample_bytes + stream_bytes;
+
+        // Log-pattern reservation (M7-C3, issue #171, the fixed-ceiling model):
+        // reserve = Σ template_bound(row) + AGG_BASE_OVERHEAD
+        //         + min(rows, CAP) × PATTERN_ROW_OVERHEAD
+        // charged off the source `LogRow` refs BEFORE any extraction, so a
+        // request that loses the reservation race below never pays for
+        // extraction/aggregation. The map is a per-request-batch structure over
+        // this request's already-decode-capped rows (never the flush buffer);
+        // the base + capped-per-entry terms upper-bound its peak plus the
+        // materialized rows. Disabled ⇒ zero charge and zero work
+        // (`PULSUS_LOG_PATTERNS=false`).
+        let pattern_reserve: u64 = if self.shared.runtime.log_patterns && !batch.rows.is_empty() {
+            let template_bounds: u64 = batch.rows.iter().map(est_template_bound).sum();
+            let distinct_cap = batch.rows.len().min(MAX_DISTINCT_PATTERNS_PER_BATCH) as u64;
+            template_bounds + AGG_BASE_OVERHEAD + distinct_cap * PATTERN_ROW_OVERHEAD
+        } else {
+            0
+        };
+
+        let total_bytes = sample_bytes + stream_bytes + pattern_reserve;
 
         // Atomic reservation (architect plan amendment 1): reserve first,
         // roll back on overflow — the counter may transiently
@@ -500,6 +563,46 @@ impl LogWriter {
             }
         }
 
+        // Log patterns (M7-C3, issue #171): extract + aggregate this batch,
+        // append the pre-aggregated rows in ASYNC mode (no waiter — patterns
+        // never join the `admit_flush` durability ack), then release the
+        // reservation surplus back to `queued_bytes` immediately. `count`
+        // inserts as a plain `UInt64` into the `SimpleAggregateFunction(sum)`
+        // column. Runs only after the reservation succeeded above, so a
+        // reservation-race loser pays for no extraction. `pattern_reserve == 0`
+        // covers both the kill-switch-off and the empty-batch cases.
+        if pattern_reserve > 0 {
+            let agg = aggregate_patterns(&batch.rows);
+            if agg.dropped > 0 {
+                self.shared
+                    .metrics
+                    .patterns_dropped_total
+                    .fetch_add(agg.dropped, Ordering::Relaxed);
+            }
+            // The buffered charge is the actual materialized rows' footprint,
+            // clamped by the reservation (the D1/D3 bound guarantees
+            // `actual <= pattern_reserve`; the clamp is defensive). The buffer
+            // releases this charge when its flush generation settles; the
+            // surplus is released here and now — so `queued_bytes` stays
+            // exactly balanced (reserve = buffered charge + released surplus).
+            let actual_bytes: u64 = agg.rows.iter().map(LogPatternRow::est_bytes).sum();
+            let charge = actual_bytes.min(pattern_reserve);
+            let surplus = pattern_reserve - charge;
+            if surplus > 0 {
+                self.shared
+                    .queued_bytes
+                    .fetch_sub(surplus, Ordering::AcqRel);
+            }
+            if !agg.rows.is_empty()
+                && self
+                    .shared
+                    .patterns
+                    .append(agg.rows, charge, self.shared.runtime.batch_bytes)
+            {
+                self.shared.patterns_notify.notify_one();
+            }
+        }
+
         Ok(receivers)
     }
 
@@ -540,6 +643,12 @@ impl LogWriter {
             .lock()
             .expect("task handle mutex poisoned")
             .take();
+        let patterns_task = self
+            .shared
+            .patterns_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
         let backfill_task = self
             .shared
             .backfill_task
@@ -556,6 +665,11 @@ impl LogWriter {
             && let Err(e) = task.await
         {
             warn!(error = %e, table = STREAMS_TABLE, "flush task panicked during shutdown");
+        }
+        if let Some(task) = patterns_task
+            && let Err(e) = task.await
+        {
+            warn!(error = %e, table = PATTERNS_TABLE, "flush task panicked during shutdown");
         }
         if let Some(task) = backfill_task
             && let Err(e) = task.await

@@ -99,6 +99,17 @@ pub struct DetectedLabelRow {
     pub non_id_values: u64,
 }
 
+/// One `/api/logs/v1/patterns` aggregation row (M7-C3, issue #171): a
+/// distinct template, its total count across the window, and the ascending
+/// `(ts_ns, count)` per-step samples the server-side `groupArray` assembled.
+/// `samples` maps to `Array(Tuple(Int64, UInt64))` on the RowBinary wire.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct PatternFetchRow {
+    pub pattern: String,
+    pub total: u64,
+    pub samples: Vec<(i64, u64)>,
+}
+
 /// Labels discovery (`log_streams_idx`): one distinct label key.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LabelNameRow {

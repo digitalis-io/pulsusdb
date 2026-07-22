@@ -25,7 +25,7 @@ use super::pipeline::{CompiledPipeline, ERROR_LABEL, MetricRun};
 use super::plan::{self, ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, StreamsPlan};
 use super::rows::{
     DetectedLabelRow, LabelNameRow, LabelValueRow, LogStatsRow, MetricBucketRow, MetricInstantRow,
-    MetricScanRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
+    MetricScanRow, PatternFetchRow, SampleRow, StreamMetaRow, StreamRow, TailSampleRow, VolumeRow,
 };
 
 /// ClickHouse server exception code for `TOO_MANY_BYTES` — the
@@ -51,6 +51,10 @@ pub struct EngineConfig {
     pub streams: String,
     pub samples: String,
     pub rollup_table: String,
+    /// `log_patterns` (M7-C3, issue #171), `_dist`-aware exactly like the
+    /// other Logs-family tables. Only the `/api/logs/v1/patterns` read
+    /// targets it.
+    pub patterns_table: String,
     pub rollup_res_ns: u64,
     pub scan_budget_bytes: u64,
     pub max_streams: usize,
@@ -1278,6 +1282,18 @@ pub struct LogStats {
     pub bytes: u64,
 }
 
+/// One `/api/logs/v1/patterns` series (M7-C3, issue #171): a distinct log
+/// template and its per-step counts, `(unix_seconds, count)` ascending
+/// (zero-count steps omitted). The engine preserves ClickHouse's
+/// total-count-desc-then-pattern-asc order (the pushed-down `ORDER BY`), so
+/// the top-1000 presentation IS the contract — the response encoder must not
+/// re-sort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternSeries {
+    pub pattern: String,
+    pub samples: Vec<(i64, u64)>,
+}
+
 // ---------------------------------------------------------------------
 // Issue #169 (M7-C1): `/api/logs/v1/volume`.
 // ---------------------------------------------------------------------
@@ -1586,6 +1602,125 @@ impl LogQlEngine {
             };
         }
         Ok(result)
+    }
+
+    /// `/api/logs/v1/patterns` (M7-C3, issue #171, docs/api.md §2.6): stage-1
+    /// fingerprint resolution, then ONE pushed-down aggregate over
+    /// `log_patterns` (no hydration — the response carries no labels). `expr`
+    /// must be a bare log stream selector; a metric query or ANY pipeline
+    /// stage (line filters included — templates are precomputed, bodies are
+    /// gone) is a 400-class rejection. `step_ns` is the caller-floored (10s)
+    /// bucket resolution.
+    pub async fn patterns(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        step_ns: u64,
+    ) -> Result<Vec<PatternSeries>, ReadError> {
+        self.patterns_inner(expr, b, step_ns, None).await
+    }
+
+    /// [`LogQlEngine::patterns`] plus its `X-Pulsus-Explain` trace, in the
+    /// same single pass (no second scan) — the `query_explained` contract.
+    pub async fn patterns_explained(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        step_ns: u64,
+    ) -> Result<(Vec<PatternSeries>, PlanExplain), ReadError> {
+        let mut explain = PlanExplain::new("patterns");
+        let series = self
+            .patterns_inner(expr, b, step_ns, Some(&mut explain))
+            .await?;
+        Ok((series, explain))
+    }
+
+    async fn patterns_inner(
+        &self,
+        expr: &Expr,
+        b: TimeBounds,
+        step_ns: u64,
+        mut explain: Option<&mut PlanExplain>,
+    ) -> Result<Vec<PatternSeries>, ReadError> {
+        let ctx = self.config.plan_ctx();
+        // `limit`/`direction`/`step` are unused placeholders — patterns never
+        // reads samples through stage 3 (the `stats_inner`/`volume_inner`
+        // idiom); its aggregation targets `log_patterns` directly.
+        let qp = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: b.start_ns,
+                end_ns: b.end_ns,
+                step_ns: 1_000_000_000,
+            },
+            limit: 1,
+            direction: Direction::Forward,
+        };
+        let sp = match plan::plan(expr, &qp, &ctx)? {
+            Plan::Streams(sp) => sp,
+            Plan::Metric(_) | Plan::MetricBinary(_) => {
+                return Err(ReadError::PipelineInvalid {
+                    reason: "patterns requires a log stream selector query (a metric query has no \
+                             log patterns)"
+                        .to_string(),
+                });
+            }
+        };
+        // Selector only: templates are precomputed and the bodies are gone, so
+        // even a line filter has no meaning here (defense in depth — the API
+        // layer rejects any pipeline stage before parsing reaches the engine).
+        if !sp.pipeline.is_empty() {
+            return Err(ReadError::PipelineInvalid {
+                reason: "patterns supports a bare stream selector only (no pipeline stages)"
+                    .to_string(),
+            });
+        }
+
+        if let Some(e) = explain.as_mut() {
+            e.push("stage1_stream_resolution", sp.stage1_sql.clone(), None);
+        }
+        let fingerprints = self.resolve_fingerprints(&sp.stage1_sql).await?;
+        if fingerprints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let window = super::sql::TimeWindow {
+            start_ns: b.start_ns,
+            end_ns: b.end_ns,
+        };
+        let sql = super::sql::log_patterns_read(
+            &self.config.patterns_table,
+            &fingerprints,
+            window,
+            step_ns,
+        );
+        if let Some(e) = explain.as_mut() {
+            e.push("patterns_read", sql.clone(), None);
+        }
+
+        let mut series: Vec<PatternSeries> = Vec::new();
+        {
+            // Scoped so the stream's pooled-connection lease drops before the
+            // (pure-CPU) ns→seconds mapping below.
+            let mut stream = self
+                .query_stream::<PatternFetchRow>(&sql, &self.budget_settings())
+                .await?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_read_error(e, self.config.scan_budget_bytes))?;
+                // ClickHouse already ordered by (total desc, pattern asc) and
+                // arraySorted the samples ascending by ts_ns; each ts_ns is a
+                // multiple of step_ns (≥ 10s), so ns→unix-seconds is exact.
+                let samples = row
+                    .samples
+                    .into_iter()
+                    .map(|(ts_ns, count)| (ts_ns / 1_000_000_000, count))
+                    .collect();
+                series.push(PatternSeries {
+                    pattern: row.pattern,
+                    samples,
+                });
+            }
+        }
+        Ok(series)
     }
 
     /// `/api/logs/v1/volume` (issue #169, docs/api.md §2.6): per-label-set

@@ -576,6 +576,66 @@ const LOGS_VOLUME_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- logs patterns (M7-C3, issue #171, docs/api.md §2.6) ----------------
+
+fn logs_patterns_pipeline(req: &mut Req) {
+    // Like /volume, even a LINE FILTER is rejected on /patterns: the stored
+    // templates are body-content-blind and patterns has no raw fallback.
+    req.query = format!("query={}", enc(r#"{service_name="checkout"} |= "err""#));
+}
+
+fn logs_patterns_bad_step(req: &mut Req) {
+    req.query = format!("query={}&step=0", enc(r#"{service_name="checkout"}"#));
+}
+
+const LOGS_PATTERNS_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_query",
+        build: logs_missing_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "metric_query_rejected",
+        build: logs_stats_metric_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "pipeline_rejected",
+        build: logs_patterns_pipeline,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "bad_step",
+        build: logs_patterns_bad_step,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
 // -- logs detected labels/fields (issue #170, docs/api.md §2.6) ----------
 
 fn logs_detected_labels_pipeline_in_query(req: &mut Req) {
@@ -1581,6 +1641,21 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_VOLUME_CASES,
     },
+    // -- Logs patterns, native (ReaderMode, M7-C3 issue #171, docs/api.md
+    //    §2.6). `Surface::LogsQuery` with a `data` ARRAY (the Loki-interop
+    //    `{"status":"success","data":[...]}` envelope — `expected_data_is_array`
+    //    matches `patterns`), which the empty-DB matrix asserts as `[]`.
+    RouteSpec {
+        path: "/api/logs/v1/patterns",
+        methods: &[Method::Get],
+        surface: Surface::LogsQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_PATTERNS_CASES,
+    },
     // -- Logs detected labels/fields, native (ReaderMode, issue #170,
     //    docs/api.md §2.6). GET|POST form-encoded (the /labels+/series
     //    precedent). detected_labels' empty base_query is the UNSCOPED
@@ -1743,6 +1818,22 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_DETECTED_FIELDS_CASES,
+    },
+    // -- Logs patterns, M7 compat alias (CompatAndReader, M7-C3 #171) -----
+    // A pure prefix swap of the native `/patterns` (docs/api.md §8.1's M7
+    // patterns row spells the alias path out in full — `DocRef::Verbatim`,
+    // matching the volume/detected M7 rows; the `LokiAliasSuffix` form is
+    // scoped to the M1 alias row only). Reuses the native `CaseClass` list.
+    RouteSpec {
+        path: "/loki/api/v1/patterns",
+        methods: &[Method::Get],
+        surface: Surface::LogsQuery,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_PATTERNS_CASES,
     },
     // -- Loki push receiver, `/loki/api/v1` compat alias (CompatAndWriter,
     //    issue #77) -------------------------------------------------------
@@ -2210,20 +2301,10 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "",
         cases: &[],
     },
-    // Issue #170: the former Planned detected_labels/detected_fields rows
-    // flipped to Mounted and moved up into the logs section above;
-    // `/patterns` stays planned.
-    RouteSpec {
-        path: "/api/logs/v1/patterns",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
+    // Issue #171 (M7-C3): the former Planned `/patterns` row flips to Mounted
+    // and moves up into the native logs section above; the compat alias joins
+    // the `/loki/api/v1` block. (The detected_labels/detected_fields rows
+    // flipped similarly in #170.)
     RouteSpec {
         path: "/api/profiles/v1/types",
         methods: &[Method::Get],
@@ -2345,12 +2426,12 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "router",
-        body: "let router = mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume)); mount_detected_routes(router, \"/api/logs/v1\")",
+        body: "let router = mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume)).route(\"/api/logs/v1/patterns\", get(patterns::patterns)); mount_detected_routes(router, \"/api/logs/v1\")",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "compat_router",
-        body: "let router = mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume)); mount_detected_routes(router, \"/loki/api/v1\")",
+        body: "let router = mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume)).route(\"/loki/api/v1/patterns\", get(patterns::patterns)); mount_detected_routes(router, \"/loki/api/v1\")",
     },
     // NOT a router-composition function — this is the Loki-push `PushRequest`'s
     // hand-written `prost::Message::merge` (issue #115 round 2), which routes the

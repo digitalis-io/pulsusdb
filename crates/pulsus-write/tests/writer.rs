@@ -202,7 +202,31 @@ fn writer_with(
     samples: Arc<MockInserter>,
     streams: Arc<MockInserter>,
 ) -> LogWriter {
-    LogWriter::with_inserters(samples, streams, &cfg)
+    // The pre-#171 tests assert byte-balance/flush behavior over the two log
+    // tables only; disable pattern extraction here so their accounting is
+    // unchanged (the M7-C3 pattern path has its own dedicated tests below,
+    // which enable it and supply their own patterns inserter).
+    let cfg = WriterConfig {
+        log_patterns: false,
+        ..cfg
+    };
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    LogWriter::with_inserters(samples, streams, patterns, &cfg)
+}
+
+/// [`writer_with`], but with pattern extraction ENABLED (M7-C3, issue #171)
+/// and a scriptable `log_patterns` inserter.
+fn writer_with_patterns(
+    cfg: WriterConfig,
+    samples: Arc<MockInserter>,
+    streams: Arc<MockInserter>,
+    patterns: Arc<MockInserter>,
+) -> LogWriter {
+    let cfg = WriterConfig {
+        log_patterns: true,
+        ..cfg
+    };
+    LogWriter::with_inserters(samples, streams, patterns, &cfg)
 }
 
 /// Required test (review cycle, "concurrent-admit bound"): many
@@ -1008,6 +1032,8 @@ impl<R: ChRow> BlockInserter<R> for ScriptedInserter {
 async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_success() {
     let mut cfg = WriterConfig::default();
     cfg.batch_bytes.0 = 1;
+    // Focused on the backfill path; the M7-C3 pattern path is tested separately.
+    cfg.log_patterns = false;
 
     // Calls in order: generation 1 (Poison, enqueues T1), backfill
     // re-insert of T1 (blocked in flight), generation 2 (Poison,
@@ -1019,7 +1045,8 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_success(
         ScriptStep::Poison,
         ScriptStep::Succeed,
     ]);
-    let writer = LogWriter::with_inserters(samples, streams.clone(), &cfg);
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    let writer = LogWriter::with_inserters(samples, streams.clone(), patterns, &cfg);
 
     let t1 = 1_700_000_000_000_000_000i64;
     let wait = writer
@@ -1086,6 +1113,8 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_success(
 async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_failure() {
     let mut cfg = WriterConfig::default();
     cfg.batch_bytes.0 = 1;
+    // Focused on the backfill path; the M7-C3 pattern path is tested separately.
+    cfg.log_patterns = false;
 
     let samples = MockInserter::new(MockBehavior::Ok);
     let streams = ScriptedInserter::new([
@@ -1094,7 +1123,8 @@ async fn newer_entry_enqueued_during_inflight_backfill_survives_a_stale_failure(
         ScriptStep::Poison,
         ScriptStep::Succeed,
     ]);
-    let writer = LogWriter::with_inserters(samples, streams.clone(), &cfg);
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    let writer = LogWriter::with_inserters(samples, streams.clone(), patterns, &cfg);
 
     let t1 = 1_700_000_000_000_000_000i64;
     let wait = writer
@@ -1176,4 +1206,250 @@ async fn shutdown_completes_with_a_hanging_backfill_insert_in_flight() {
     )
     .await
     .expect("shutdown must complete despite the hanging in-flight backfill insert");
+}
+
+// ---------------------------------------------------------------------
+// Log patterns (M7-C3, issue #171)
+// ---------------------------------------------------------------------
+
+/// A batch of log rows for one `(fingerprint, month)`, one row per body, all
+/// at `timestamp_ns` (same 10s pattern bucket). Registers the stream once.
+fn pattern_batch(
+    fingerprint: u64,
+    service: &str,
+    timestamp_ns: i64,
+    bodies: &[&str],
+) -> ParsedLogs {
+    let rows = bodies
+        .iter()
+        .map(|body| LogRow {
+            service: service.to_string(),
+            fingerprint,
+            timestamp_ns: UnixNano(timestamp_ns),
+            severity: 0,
+            body: (*body).to_string(),
+            structured_metadata: String::new(),
+        })
+        .collect();
+    ParsedLogs {
+        rows,
+        streams: vec![StreamRow {
+            month: Date::start_of_month_utc(timestamp_ns).unwrap(),
+            fingerprint,
+            service: service.to_string(),
+            labels: labels_with_service(service),
+            updated_ns: timestamp_ns,
+        }],
+        ..Default::default()
+    }
+}
+
+/// AC 5b: with `PULSUS_LOG_PATTERNS=false`, extraction and every
+/// `log_patterns` append are skipped entirely — the patterns inserter is
+/// never called — while samples/streams flush normally.
+#[tokio::test]
+async fn kill_switch_off_appends_no_pattern_rows() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1; // flush immediately
+    cfg.log_patterns = false;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    let writer = LogWriter::with_inserters(samples.clone(), streams, patterns.clone(), &cfg);
+
+    writer
+        .admit(pattern_batch(
+            1,
+            "svc",
+            0,
+            &["user 1 login", "user 2 login"],
+        ))
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert!(samples.call_count() >= 1, "samples still flush");
+    assert_eq!(
+        patterns.call_count(),
+        0,
+        "the patterns inserter must never be called with the kill-switch off"
+    );
+    assert_eq!(writer.metrics().patterns.rows_total, 0);
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        0,
+        "no pattern bytes were ever reserved"
+    );
+}
+
+/// AC 1/5c (write side): a batch of identical-template lines aggregates to
+/// ONE `log_patterns` row whose `count` sums the lines, and `queued_bytes`
+/// returns to exactly zero after the flush drains (reservation surplus +
+/// buffered charge balance).
+#[tokio::test]
+async fn identical_lines_aggregate_to_one_summed_pattern_row_and_balance_queue_bytes() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
+
+    writer
+        .admit(pattern_batch(
+            7,
+            "svc",
+            0,
+            &["user 1 login", "user 2 login", "user 3 login"],
+        ))
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        patterns.last_row_count(),
+        1,
+        "three identical templates aggregate to one row"
+    );
+    assert_eq!(writer.metrics().patterns.rows_total, 1);
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        0,
+        "reservation surplus + buffered charge must balance to zero after flush"
+    );
+}
+
+/// AC 5c: the all-distinct-template batch (every line a distinct literal)
+/// still balances `queued_bytes` to zero — the surplus release accounts for
+/// the aggregation-buffer charge exactly under the three-term reservation.
+#[tokio::test]
+async fn all_distinct_template_batch_balances_queue_bytes_to_zero() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    let patterns = MockInserter::new(MockBehavior::Ok);
+    let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
+
+    // Distinct digit-free literals ⇒ distinct templates, one row each.
+    let bodies: Vec<String> = (0..64)
+        .map(|i| format!("alpha bravo charlie {}", (b'a' + i) as char))
+        .collect();
+    let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+    writer
+        .admit(pattern_batch(9, "svc", 0, &refs))
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        patterns.last_row_count(),
+        64,
+        "each distinct line is its own row"
+    );
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        0,
+        "the all-distinct batch's surplus release must balance the queue exactly"
+    );
+}
+
+/// AC 5a: a `log_patterns` flush FAILURE (poison) must NOT fail
+/// `admit_flush` — patterns are derived data, excluded from the durability
+/// ack; the samples/streams ack still resolves `Ok`.
+#[tokio::test]
+async fn patterns_flush_failure_does_not_fail_admit_flush() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    let patterns = MockInserter::new(MockBehavior::Poison);
+    let writer = writer_with_patterns(cfg, samples, streams, patterns);
+
+    let wait = writer
+        .admit_flush(pattern_batch(1, "svc", 0, &["user 1 login"]))
+        .expect("queue has room");
+    let result = tokio::time::timeout(Duration::from_secs(5), wait)
+        .await
+        .expect("the samples/streams ack resolves");
+    assert!(
+        result.is_ok(),
+        "a patterns insert poison must not fail an ingest whose log lines landed: {result:?}"
+    );
+    writer.shutdown(Duration::from_secs(2)).await;
+}
+
+/// AC 2b(i): a pre-send-retryable patterns flush failure followed by success
+/// yields exactly-once counts — the writer retries the SAME whole block (no
+/// shrink/partial), and aggregation ran once per admit (never per retry), so
+/// the committed row set carries the single summed count.
+#[tokio::test]
+async fn patterns_pre_send_retry_then_success_is_exactly_once() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    // Fail twice with a retryable pre-send error, then commit.
+    let patterns = MockInserter::new_failing_n_times_then_ok(2);
+    let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
+
+    writer
+        .admit(pattern_batch(
+            7,
+            "svc",
+            0,
+            &["user 1 login", "user 2 login", "user 3 login"],
+        ))
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(5)).await;
+
+    // Every attempt resent the identical one-row block (whole-batch resend,
+    // never a partial/doubled state), and the final attempt committed exactly
+    // one aggregated row.
+    let counts = patterns.row_counts();
+    assert_eq!(
+        counts,
+        vec![1, 1, 1],
+        "two retries then commit, same block each time"
+    );
+    assert_eq!(
+        writer.metrics().patterns.rows_total,
+        1,
+        "committed exactly once"
+    );
+    assert_eq!(writer.metrics().queue_bytes, 0);
+}
+
+/// AC 2b(ii): an uncertain-classified patterns flush is spooled audit-only
+/// and NEVER re-inserted (the #9 no-auto-replay invariant) — `sum` inflation
+/// is impossible within the writer's own machinery. The patterns inserter is
+/// called exactly once (the uncertain attempt), never again.
+#[tokio::test]
+async fn patterns_uncertain_flush_is_spooled_never_replayed() {
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+
+    let samples = MockInserter::new(MockBehavior::Ok);
+    let streams = MockInserter::new(MockBehavior::Ok);
+    let patterns = MockInserter::new(MockBehavior::Uncertain);
+    let writer = writer_with_patterns(cfg, samples, streams, patterns.clone());
+
+    writer
+        .admit(pattern_batch(1, "svc", 0, &["user 1 login"]))
+        .expect("queue has room");
+    writer.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        patterns.call_count(),
+        1,
+        "an InsertUncertain patterns batch is spooled audit-only, never auto-replayed"
+    );
+    assert_eq!(writer.metrics().spool_uncertain_total, 1);
+    assert_eq!(
+        writer.metrics().queue_bytes,
+        0,
+        "the uncertain generation still releases its reservation exactly once"
+    );
 }

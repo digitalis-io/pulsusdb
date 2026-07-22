@@ -519,6 +519,7 @@ fn engine_for_db(client: ChClient) -> LogQlEngine {
             streams: "log_streams".to_string(),
             samples: "log_samples".to_string(),
             rollup_table: "log_metrics_5s".to_string(),
+            patterns_table: "log_patterns".to_string(),
             rollup_res_ns: 5_000_000_000,
             scan_budget_bytes: 50 * 1024 * 1024 * 1024,
             max_streams: 100_000,

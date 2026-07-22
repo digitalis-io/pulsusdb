@@ -250,6 +250,12 @@ pub struct WriterConfig {
     pub batch_ms: u64,
     pub insert_mode: InsertMode,
     pub ingest_queue_bytes: ByteSize,
+    /// `PULSUS_LOG_PATTERNS` (M7-C3, issue #171): the ingest-time log-pattern
+    /// extraction kill-switch. Default `true` — patterns are M7 product
+    /// behavior; setting it `false` disables all extraction/aggregation and
+    /// every `log_patterns` append (zero write-path work), while the read
+    /// endpoint stays mounted and serves empty data.
+    pub log_patterns: bool,
 }
 
 impl Default for WriterConfig {
@@ -259,6 +265,7 @@ impl Default for WriterConfig {
             batch_ms: 200,
             insert_mode: InsertMode::Sync,
             ingest_queue_bytes: ByteSize(256 * 1024 * 1024),
+            log_patterns: true,
         }
     }
 }

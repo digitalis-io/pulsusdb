@@ -127,6 +127,15 @@ impl BackfillMetrics {
 pub struct WriterMetrics {
     pub samples: Arc<TableMetrics>,
     pub streams: Arc<TableMetrics>,
+    /// `log_patterns` per-table counters (M7-C3, issue #171). Its own `Arc`
+    /// so the patterns flush task holds a cheap clone.
+    pub patterns: Arc<TableMetrics>,
+    /// Rows whose (unseen) template was refused at
+    /// `patterns::MAX_DISTINCT_PATTERNS_PER_BATCH` per request batch (M7-C3,
+    /// issue #171) — pattern accounting only; the log lines themselves are
+    /// untouched. Bumped in `admit_batch` from
+    /// `patterns::PatternAggregation::dropped`.
+    pub patterns_dropped_total: AtomicU64,
     pub backpressure_total: AtomicU64,
     pub spool_poison_total: AtomicU64,
     pub spool_uncertain_total: AtomicU64,
@@ -147,6 +156,11 @@ pub struct WriterMetrics {
 pub struct WriterMetricsSnapshot {
     pub samples: TableMetricsSnapshot,
     pub streams: TableMetricsSnapshot,
+    /// `log_patterns` per-table counters (M7-C3, issue #171 — additive; no
+    /// pre-existing consumer reads this snapshot's full shape).
+    pub patterns: TableMetricsSnapshot,
+    /// Distinct-pattern-cap drops (M7-C3, issue #171).
+    pub patterns_dropped_total: u64,
     /// The live `queued_bytes` gauge — passed in by the caller
     /// ([`crate::writer::LogWriter::metrics`]), which owns the
     /// authoritative `AtomicU64` (not duplicated here).
@@ -182,6 +196,8 @@ impl WriterMetrics {
         WriterMetricsSnapshot {
             samples: self.samples.snapshot(),
             streams: self.streams.snapshot(),
+            patterns: self.patterns.snapshot(),
+            patterns_dropped_total: self.patterns_dropped_total.load(Ordering::Relaxed),
             queue_bytes,
             backpressure_total: self.backpressure_total.load(Ordering::Relaxed),
             spool_poison_total: self.spool_poison_total.load(Ordering::Relaxed),

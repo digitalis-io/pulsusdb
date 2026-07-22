@@ -380,6 +380,36 @@ pub fn log_volume_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeW
     )
 }
 
+/// The maximum number of pattern series `/api/logs/v1/patterns` returns — the
+/// top-`N`-by-total-count LIMIT pushed into ClickHouse (M7-C3, issue #171).
+pub const MAX_PATTERNS: usize = 1000;
+
+/// The `/api/logs/v1/patterns` aggregation (M7-C3, issue #171, docs/schemas.md
+/// §3.2): stage-1 fingerprints → ONE pushed-down aggregate over `log_patterns`
+/// with no hydration (the response carries no labels). The inner query
+/// re-buckets `bucket_ns` to `step_ns` and sums per `(pattern, ts_ns)`; the
+/// outer sums per pattern and emits the ascending `(ts_ns, cnt)` samples array,
+/// ordered total-count desc then pattern asc, top-[`MAX_PATTERNS`].
+///
+/// **Pushdown/pruning:** `fingerprint IN` engages the `(fingerprint, bucket_ns,
+/// pattern)` primary-key prefix (granule pruning), daily partitions prune the
+/// window (`tests/explain_indexes.rs`' Tier-1 gate), and the aggregation +
+/// top-K + LIMIT all execute in ClickHouse — the client decodes ≤ 1000
+/// already-assembled series. Half-open window `[start, end)` (D4).
+pub fn log_patterns_read(
+    patterns_table: &str,
+    fingerprints: &[u64],
+    window: TimeWindow,
+    step_ns: u64,
+) -> String {
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    let limit = MAX_PATTERNS;
+    format!(
+        "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\nFROM (\n  SELECT pattern, intDiv(bucket_ns, {step_ns}) * {step_ns} AS ts_ns, sum(count) AS cnt\n  FROM {patterns_table}\n  WHERE fingerprint IN ({fp_list}) AND bucket_ns >= {start_ns} AND bucket_ns < {end_ns}\n  GROUP BY pattern, ts_ns\n)\nGROUP BY pattern\nORDER BY total DESC, pattern ASC\nLIMIT {limit}"
+    )
+}
+
 /// A range metric query bucketed by `step_ns` (`intDiv(bucket_col, step) *
 /// step`, docs/schemas.md §3.2). `extra_predicates` carries line-filter
 /// pushdown for the (line-filter-forced) raw fallback.
@@ -834,6 +864,37 @@ mod tests {
              WHERE fingerprint IN (18374, 99120) AND bucket_ns > 1000 AND bucket_ns <= 2000"
         );
         assert!(!sql.contains("body"), "rollup stats must never read body");
+    }
+
+    /// Issue #171 (M7-C3): the `/api/logs/v1/patterns` aggregation is
+    /// byte-exact — the pushed-down top-1000 with the `fingerprint IN` PK
+    /// prefix, half-open `[start, end)` window, `step_ns` re-bucketing, and the
+    /// `groupArray((ts_ns, cnt))` samples array. Never reads `body`.
+    #[test]
+    fn log_patterns_read_is_byte_exact() {
+        let sql = log_patterns_read(
+            "log_patterns",
+            &[18374, 99120],
+            TimeWindow {
+                start_ns: 1_000,
+                end_ns: 2_000,
+            },
+            10_000_000_000,
+        );
+        assert_eq!(
+            sql,
+            "SELECT pattern, sum(cnt) AS total, arraySort(x -> x.1, groupArray((ts_ns, cnt))) AS samples\n\
+             FROM (\n  \
+               SELECT pattern, intDiv(bucket_ns, 10000000000) * 10000000000 AS ts_ns, sum(count) AS cnt\n  \
+               FROM log_patterns\n  \
+               WHERE fingerprint IN (18374, 99120) AND bucket_ns >= 1000 AND bucket_ns < 2000\n  \
+               GROUP BY pattern, ts_ns\n\
+             )\n\
+             GROUP BY pattern\n\
+             ORDER BY total DESC, pattern ASC\n\
+             LIMIT 1000"
+        );
+        assert!(!sql.contains("body"), "patterns must never read body");
     }
 
     /// Issue #74 AC6 (hermetic half): the line-filtered stats fallback

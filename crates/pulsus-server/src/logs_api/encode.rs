@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use pulsus_read::{
     DetectedFieldOut, DetectedFields, DetectedLabelOut, ExplainStage, LogStats, MatrixSeries,
-    PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
+    PatternSeries, PlanExplain, QueryResult, RouteChoice, StreamResult, VectorSample, VolumeEntry,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -378,6 +378,43 @@ pub(crate) fn detected_fields_response(
                 json_string(f.field_type),
                 f.cardinality,
                 parsers
+            )
+            .into_bytes()
+        },
+        suffix,
+    ))
+}
+
+/// Encodes a `/api/logs/v1/patterns` result (M7-C3, issue #171, docs/api.md
+/// §2.6): the Loki-interop envelope `{"status":"success","data":[{"pattern":
+/// "<_> ...","samples":[[<unix_seconds>,<count>],...]}]}`. `data` is
+/// **order-preserving** — the engine returns series already ordered
+/// total-count-desc then pattern-asc (the pushed-down top-1000), and that
+/// presentation IS the contract, so this deliberately does NOT re-sort.
+/// `samples` are ascending by second, zero-count steps already omitted; both
+/// elements are bare JSON integers. `explain` joins as a sibling of `data`
+/// when requested.
+pub(crate) fn patterns_response(
+    series: Vec<PatternSeries>,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let prefix = b"{\"status\":\"success\",\"data\":[".to_vec();
+    let suffix = explain_suffix("]".to_string(), explain.as_ref());
+    let suffix = format!("{suffix}}}").into_bytes();
+    json_response(stream_array(
+        prefix,
+        series,
+        |s: &PatternSeries| {
+            let mut samples = String::new();
+            for (i, (secs, count)) in s.samples.iter().enumerate() {
+                if i > 0 {
+                    samples.push(',');
+                }
+                samples.push_str(&format!("[{secs},{count}]"));
+            }
+            format!(
+                "{{\"pattern\":{},\"samples\":[{samples}]}}",
+                json_string(&s.pattern)
             )
             .into_bytes()
         },

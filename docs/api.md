@@ -147,7 +147,7 @@ Delivery: tail polls ClickHouse (there is no push channel) with a deterministic 
 GET      /api/logs/v1/volume             ?query=&start=&end=&limit=&targetLabels=&aggregateBy=
 GET|POST /api/logs/v1/detected_labels    ?query=&start=&end=
 GET|POST /api/logs/v1/detected_fields    ?query=&start=&end=&line_limit=&limit=
-GET      /api/logs/v1/patterns           ?query=&start=&end=
+GET      /api/logs/v1/patterns           ?query=&start=&end=&step=
 ```
 
 #### 2.6.1 `GET /api/logs/v1/volume`
@@ -202,6 +202,20 @@ Type detection: `type` ∈ `string`\|`int`\|`float`\|`boolean`\|`duration`\|`byt
 Response `200`: `{"fields":[{"label":"…","type":"…","cardinality":N,"parsers":["json"|"logfmt",…]},…],"limit":N}`, sorted by label. `parsers` is always an array (`[]` for fields observed only from structured metadata or the query's own pipeline — deterministic-shape divergence from the reference's nil-slice marshaling); `cardinality` is exact over the sampled values (vs the reference's sketch estimate); the empty result is `{"fields":[],"limit":N}` where the reference returns `{}`; `__error__`/`__error_details__` never surface as fields. With `X-Pulsus-Explain: 1`, `explain` is added as a sibling key — its `detected_fields_read` stage carries the single stage-3 scan (note `single-scan: no unpushed dropping stage`) or the first keyset page (note `paged: unpushed dropping stage`).
 
 Errors: `400 bad_data` (missing/malformed `query`, metric query, invalid `line_limit`/`limit`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
+
+#### 2.6.4 `GET /api/logs/v1/patterns`
+
+Detected **log patterns** — the drilldown UI's "group these lines by shape" view. Each pattern is a **deterministic, stateless** token-class template of the line body (extracted at ingest, aggregated per `(fingerprint, 10s-bucket, template)` into `log_patterns`; docs/schemas.md §3.1): digit/length classification (a fragment with an ASCII digit, or longer than 64 bytes, becomes `<_>`), `key=value`/`key:value` awareness (only the value is classified), wrapper-punctuation preservation, and 1 KiB-prefix / 64-token / 512-byte caps. Templates are **normalized (whitespace-collapsed), not round-trip matchable**; grouping is deliberately coarser than an online clusterer (a digit-free variable word stays literal) in exchange for identity that survives merges across batches, shards, replicas, and retries. Served by ONE pushed-down aggregate over `log_patterns` with `fingerprint` primary-key prefix pruning and a server-side top-1000 — **no hydration, no body read** (the response carries no labels). **GET-only.**
+
+| Param | Notes |
+|-------|-------|
+| `query` | LogQL **stream selector, matchers only** — required. ANY pipeline stage is rejected `400` (line filters included, like §2.6.1: templates are precomputed and the bodies are gone), as are metric queries |
+| `start`, `end` | ns / RFC3339; default `end = now`, `start = end - 1h` (§2.1). Half-open `[start, end)` over the pattern buckets |
+| `step` | optional bucket size; a duration string or bare seconds. Absent → derived `clamp((end-start)/250, ≥1s)`. **Floored to the 10s ingest bucket** (never smaller — a finer step would invent sub-bucket granularity the stored data lacks). The `(end-start)/step` grid is capped at **11,000** (else `400`), the same bound as the metrics endpoints |
+
+Response `200`: the Loki-interop envelope `{"status":"success","data":[{"pattern":"<_> ...","samples":[[<unix_seconds>,<count>],...]},...]}`. `samples` are ascending by second, zero-count steps omitted, both elements bare integers (`unix_seconds` is the floor of the bucket ns). **`data` is ordered total-count desc then pattern asc, truncated to the top 1000 — NOT re-sorted client-side** (the top-N presentation is the contract; a PulsusDB determinism pin — upstream order is unspecified). **Count semantics** are exact on the clean ingest path and **best-effort approximate under ingest-failure re-sends**, at parity with §2.2's `log_metrics` (the writer never auto-replays a block that could have committed; a per-request burst of >10 000 distinct templates is an under-count event, folded into the same approximate semantics — see docs/schemas.md §3.1). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `patterns_read` stage always targets `log_patterns`.
+
+Errors: `400 bad_data` (missing/malformed `query`, metric query, any pipeline stage, non-positive `step`, over-11k grid), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
 
 ---
 

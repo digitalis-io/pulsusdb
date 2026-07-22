@@ -178,6 +178,42 @@ fn estimate_canonical_json_len(labels: &LabelSet) -> usize {
     len
 }
 
+/// One `log_patterns` row (docs/schemas.md §3.1, M7-C3 issue #171). Field
+/// names/order match the DDL column list exactly (`fingerprint`, `bucket_ns`,
+/// `pattern`, `count`). Produced by [`crate::patterns::aggregate_patterns`]
+/// (batch pre-aggregation), never from a per-line `From` — one row is already
+/// a `(fingerprint, bucket_ns, template) -> count` aggregate over the batch.
+/// `count` inserts as a plain `UInt64` into the table's
+/// `SimpleAggregateFunction(sum, UInt64)` column (the `log_metrics` idiom).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct LogPatternRow {
+    pub fingerprint: u64,
+    pub bucket_ns: i64,
+    pub pattern: String,
+    pub count: u64,
+}
+
+impl LogPatternRow {
+    /// A conservative in-memory byte estimate (own-fields, not RowBinary): the
+    /// `pattern` String's byte length plus the fixed-width columns — the same
+    /// "conservative, not wire-exact" intent as [`LogSampleRow::est_bytes`].
+    /// Used by the flush-size threshold; the admission reservation charges the
+    /// [`crate::patterns::est_template_bound`] upper bound instead (the pattern
+    /// String cannot be measured before extraction).
+    pub fn est_bytes(&self) -> u64 {
+        (self.pattern.len() + 8 /* fingerprint */ + 8 /* bucket_ns */ + 8/* count */) as u64
+    }
+}
+
+impl SpoolEncode for LogPatternRow {
+    /// No non-finite-float hazard (no `f64` field) — a plain `serde_json`
+    /// value is exact.
+    fn to_spool_value(&self) -> serde_json::Value {
+        serde_json::to_value(self)
+            .expect("LogPatternRow has no non-finite float fields: JSON encoding cannot fail")
+    }
+}
+
 /// One `metric_samples` row (docs/schemas.md §2.1). `value` is a raw `f64`
 /// carried verbatim from [`MetricPoint`] — never routed through plain
 /// `serde_json` (which would destroy a stale-NaN payload's exact bit

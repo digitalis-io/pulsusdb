@@ -227,6 +227,11 @@ const ROWS: &[Row] = &[
         check: |c| c.writer.ingest_queue_bytes == ByteSize(8 * 1024 * 1024),
     },
     Row {
+        var: "PULSUS_LOG_PATTERNS",
+        value: "false",
+        check: |c| !c.writer.log_patterns,
+    },
+    Row {
         var: "PULSUS_METRICS_EXP_HISTOGRAM_MODE",
         value: "native",
         check: |c| c.exp_histogram_mode == ExpHistogramMode::Native,
@@ -386,8 +391,8 @@ fn matrix_rows_exactly_match_all_env_vars() {
     );
     assert_eq!(
         declared.len(),
-        67,
-        "docs/configuration.md §§1-8 document exactly 67 variables"
+        68,
+        "docs/configuration.md §§1-8 document exactly 68 variables"
     );
 
     let mut canonical: Vec<&str> = pulsus_config::ALL_ENV_VARS.to_vec();

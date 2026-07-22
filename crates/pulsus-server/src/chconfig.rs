@@ -134,6 +134,9 @@ pub(crate) fn engine_config_from(config: &Config) -> EngineConfig {
             "log_metrics_{}{dist}",
             pulsus_schema::rollup_suffix(config.log_rollup_resolution.0)
         ),
+        // `log_patterns` (M7-C3, issue #171), `_dist`-aware like the other
+        // Logs-family tables.
+        patterns_table: format!("log_patterns{dist}"),
         rollup_res_ns: config.log_rollup_resolution.0.as_nanos() as u64,
         scan_budget_bytes: config.reader.logql_scan_budget_bytes.0,
         max_streams: pulsus_read::DEFAULT_MAX_STREAMS,
@@ -159,6 +162,8 @@ pub(crate) fn writer_tables_from(config: &Config) -> WriterTables {
     WriterTables {
         samples: Arc::from(format!("log_samples{dist}")),
         streams: Arc::from(format!("log_streams{dist}")),
+        // `log_patterns` (M7-C3, issue #171) co-shards on `fingerprint`.
+        patterns: Arc::from(format!("log_patterns{dist}")),
     }
 }
 
@@ -514,6 +519,7 @@ mod tests {
         assert_eq!(engine_cfg.streams, "log_streams");
         assert_eq!(engine_cfg.samples, "log_samples");
         assert_eq!(engine_cfg.rollup_table, "log_metrics_5s");
+        assert_eq!(engine_cfg.patterns_table, "log_patterns");
     }
 
     #[test]
@@ -527,6 +533,7 @@ mod tests {
         assert_eq!(engine_cfg.streams, "log_streams_dist");
         assert_eq!(engine_cfg.samples, "log_samples_dist");
         assert_eq!(engine_cfg.rollup_table, "log_metrics_5s_dist");
+        assert_eq!(engine_cfg.patterns_table, "log_patterns_dist");
     }
 
     #[test]
@@ -535,6 +542,7 @@ mod tests {
         let tables = writer_tables_from(&config);
         assert_eq!(&*tables.samples, "log_samples");
         assert_eq!(&*tables.streams, "log_streams");
+        assert_eq!(&*tables.patterns, "log_patterns");
     }
 
     #[test]
@@ -546,6 +554,7 @@ mod tests {
         let tables = writer_tables_from(&config);
         assert_eq!(&*tables.samples, "log_samples_dist");
         assert_eq!(&*tables.streams, "log_streams_dist");
+        assert_eq!(&*tables.patterns, "log_patterns_dist");
     }
 
     #[test]

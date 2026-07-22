@@ -595,7 +595,12 @@ fn valid_request(spec: &RouteSpec, method: Method) -> manifest::Req {
 /// type) must fail the cell, not merely "data key present".
 fn expected_data_is_array(path: &str) -> bool {
     let last = path.rsplit('/').next().unwrap_or(path);
-    matches!(last, "labels" | "values" | "series" | "query_exemplars")
+    // `patterns` (M7-C3, issue #171): the Loki-interop
+    // `{"status":"success","data":[...]}` envelope carries a bare array.
+    matches!(
+        last,
+        "labels" | "values" | "series" | "query_exemplars" | "patterns"
+    )
 }
 
 fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {

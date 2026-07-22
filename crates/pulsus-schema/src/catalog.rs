@@ -583,6 +583,55 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- log patterns (M7-C3, issue #171) ---
+    // A fourth Logs-family table storing ingest-extracted log templates,
+    // batch-pre-aggregated per `(fingerprint, bucket_ns, pattern)` in the
+    // writer (NOT a materialized view — extraction is Rust, not SQL — and NOT
+    // per-line rows, which would double `log_samples` write volume). The
+    // `SimpleAggregateFunction(sum, UInt64)` `count` merges across batches,
+    // shards, replicas, and retries because the template identity is a pure
+    // function of the line (`patterns::extract_template`). `ORDER BY
+    // (fingerprint, bucket_ns, pattern)` (bucket_ns BEFORE pattern) so a
+    // bounded time range prunes at the PK level inside each fingerprint's key
+    // range, not only via daily partitions — the `/api/logs/v1/patterns` read
+    // (a `fingerprint IN (...)` + `bucket_ns` window) engages the PK prefix.
+    // Same tokenized delete-TTL / part-level drops as `log_samples` (id 8):
+    // patterns follow raw retention, being a drilldown over raw lines. The
+    // fixed 10s ingest bucket is a code constant
+    // (`patterns::PATTERN_BUCKET_NS`), not a config-resolved name, so this is
+    // checksum-gated like every other structural table (unlike the
+    // config-named `log_metrics_<res>`, id 9).
+    Migration {
+        id: 29,
+        name: "log_patterns",
+        family: Some(Family::Logs),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.log_patterns{{on_cluster}} (\n\
+                 fingerprint  UInt64,\n\
+                 bucket_ns    Int64,\n\
+                 pattern      String  CODEC(ZSTD(1)),\n\
+                 count        SimpleAggregateFunction(sum, UInt64)\n\
+             ) ENGINE = AggregatingMergeTree\n\
+             PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))\n\
+             ORDER BY (fingerprint, bucket_ns, pattern)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper co-shards `log_patterns` with
+    // `log_samples`/`log_streams`/`log_metrics_<res>` on the same
+    // `cityHash64(fingerprint)` Logs-family expression (render.rs), so the
+    // fingerprint-pruned read is the already-graduated shard-local shape.
+    Migration {
+        id: 30,
+        name: "log_patterns",
+        family: Some(Family::Logs),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1068,6 +1117,50 @@ mod tests {
             !static_tmpl(23).contains("counter_reset_hint"),
             "counter_reset_hint must arrive via the additive ALTER (id 27), not id 23's CREATE"
         );
+    }
+
+    /// Issue #171 (M7-C3): `log_patterns` (id 29) is an AggregatingMergeTree
+    /// keyed `(fingerprint, bucket_ns, pattern)` — bucket_ns BEFORE pattern
+    /// (v2 finding-2 PK order) so a bounded time range prunes at the PK level
+    /// inside each fingerprint's key range. Same tokenized delete-TTL /
+    /// part-level drops as `log_samples`; `count` is a mergeable
+    /// `SimpleAggregateFunction(sum, UInt64)`.
+    #[test]
+    fn log_patterns_ddl_is_a_time_pruned_aggregating_mergetree() {
+        let ddl = rendered_static(29);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.log_patterns"));
+        assert!(ddl.contains("fingerprint  UInt64,"));
+        assert!(ddl.contains("bucket_ns    Int64,"));
+        assert!(ddl.contains("pattern      String  CODEC(ZSTD(1)),"));
+        assert!(ddl.contains("count        SimpleAggregateFunction(sum, UInt64)"));
+        assert!(ddl.contains("ENGINE = AggregatingMergeTree"));
+        assert!(ddl.contains("PARTITION BY toDate(fromUnixTimestamp64Nano(bucket_ns))"));
+        // v2 finding 2: bucket_ns BEFORE pattern (PK-level time pruning).
+        assert!(ddl.contains("ORDER BY (fingerprint, bucket_ns, pattern)"));
+        assert!(ddl.contains(
+            "TTL toDateTime(fromUnixTimestamp64Nano(bucket_ns)) + INTERVAL 7 DAY DELETE"
+        ));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1;"));
+        // Retention stays mutable operational config, excluded from identity.
+        assert!(static_tmpl(29).contains("INTERVAL {{retention_days}} DAY DELETE"));
+    }
+
+    /// Issue #171: the `log_patterns` `_dist` wrapper (id 30) carries the Logs
+    /// family, so `dist_ddl_template` renders the byte-identical `fingerprint`
+    /// co-shard expression it shares with
+    /// `log_samples`/`log_streams`/`log_metrics_<res>`.
+    #[test]
+    fn log_patterns_dist_wrapper_reuses_the_logs_family_co_shard() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 30).expect("id 30");
+        assert_eq!(m.name, "log_patterns");
+        assert!(matches!(m.ddl, Ddl::Dist));
+        assert_eq!(m.family, Some(Family::Logs));
+        assert_eq!(m.scope, MigrationScope::Checksum);
+        assert_eq!(m.replication, Replication::PerShard);
+        let tmpl = render::dist_ddl_template("log_patterns", Family::Logs);
+        let out = render::render(&tmpl, "log_patterns", &ctx(), false);
+        assert!(out.contains("pulsus.log_patterns_dist"));
+        assert!(out.contains("Distributed('', pulsus, log_patterns, fingerprint)"));
     }
 
     /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping
