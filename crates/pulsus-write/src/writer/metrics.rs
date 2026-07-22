@@ -27,6 +27,12 @@ pub struct TableMetrics {
     /// counter, so a snapshot can read it without inferring from
     /// flushes-in-progress).
     pub inflight: AtomicU64,
+    /// Spool *I/O* failures (issue #134, residual R5): a poison/uncertain
+    /// batch whose audit-file write itself failed — no durable record
+    /// exists for that batch. Bumped in both spool-error branches of
+    /// `writer::table::finish_generation`; the batch's settlement is
+    /// unaffected (spool writes are best-effort by design).
+    pub spool_write_failures_total: AtomicU64,
 }
 
 /// A point-in-time, plain-value copy of [`TableMetrics`] — cheap to pass
@@ -40,6 +46,7 @@ pub struct TableMetricsSnapshot {
     pub flush_latency_count: u64,
     pub retries_total: u64,
     pub inflight: u64,
+    pub spool_write_failures_total: u64,
 }
 
 impl TableMetrics {
@@ -65,6 +72,7 @@ impl TableMetrics {
             flush_latency_count: self.flush_latency_count.load(Ordering::Relaxed),
             retries_total: self.retries_total.load(Ordering::Relaxed),
             inflight: self.inflight.load(Ordering::Relaxed),
+            spool_write_failures_total: self.spool_write_failures_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -84,6 +92,22 @@ pub struct WriterMetrics {
     pub lru_misses_total: AtomicU64,
     pub collisions_total: AtomicU64,
     pub rejected_total: AtomicU64,
+    /// Registration-backfill counters (issue #134): rows entering the
+    /// in-memory backlog after a Poisoned `log_streams` flush
+    /// (`enqueued`), rows rejected by the backlog byte cap (`dropped`),
+    /// re-insert attempts kept-for-retry on a pre-send retryable failure
+    /// (`retries`), rows confirmed re-inserted (`healed`), and rows
+    /// terminally abandoned on a deterministic or uncertain re-insert
+    /// outcome (`abandoned`).
+    pub backfill_enqueued_total: AtomicU64,
+    pub backfill_dropped_total: AtomicU64,
+    pub backfill_retries_total: AtomicU64,
+    pub backfill_healed_total: AtomicU64,
+    pub backfill_abandoned_total: AtomicU64,
+    /// Gauge: rows currently pending in the backfill backlog — updated
+    /// under the backlog lock, so `snapshot(queue_bytes)`'s signature is
+    /// unchanged.
+    pub backfill_pending: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -102,6 +126,12 @@ pub struct WriterMetricsSnapshot {
     pub lru_misses_total: u64,
     pub collisions_total: u64,
     pub rejected_total: u64,
+    pub backfill_enqueued_total: u64,
+    pub backfill_dropped_total: u64,
+    pub backfill_retries_total: u64,
+    pub backfill_healed_total: u64,
+    pub backfill_abandoned_total: u64,
+    pub backfill_pending: u64,
 }
 
 impl SpoolCounters for WriterMetrics {
@@ -128,6 +158,12 @@ impl WriterMetrics {
             lru_misses_total: self.lru_misses_total.load(Ordering::Relaxed),
             collisions_total: self.collisions_total.load(Ordering::Relaxed),
             rejected_total: self.rejected_total.load(Ordering::Relaxed),
+            backfill_enqueued_total: self.backfill_enqueued_total.load(Ordering::Relaxed),
+            backfill_dropped_total: self.backfill_dropped_total.load(Ordering::Relaxed),
+            backfill_retries_total: self.backfill_retries_total.load(Ordering::Relaxed),
+            backfill_healed_total: self.backfill_healed_total.load(Ordering::Relaxed),
+            backfill_abandoned_total: self.backfill_abandoned_total.load(Ordering::Relaxed),
+            backfill_pending: self.backfill_pending.load(Ordering::Relaxed),
         }
     }
 }

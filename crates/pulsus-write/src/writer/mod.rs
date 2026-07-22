@@ -18,6 +18,44 @@
 //! (`ReplacingMergeTree` collapses it) — see `writer::registration`'s doc
 //! comment.
 //!
+//! **Registration backfill** (issue #134): a `log_streams` flush that
+//! fails *definitely* (`Poisoned` — provably not-committed) enqueues its
+//! rows into a bounded in-memory backlog (`writer::backfill`) that a
+//! dedicated task re-inserts every
+//! `WriterRuntime::backfill_retry_interval` (5s) until confirmed, capped
+//! at `backfill_max_bytes` (32 MiB), with success-only `StreamLru`
+//! promotion on a confirmed heal — so a "samples committed, registration
+//! lost" orphan self-heals while the process lives. Uncertain-fate flushes
+//! are NEVER backfilled (issue #9: an `InsertUncertain` batch is never
+//! auto-replayed), and a backfill re-insert that itself returns
+//! `InsertUncertain` is terminally abandoned, not retried. Honest
+//! residuals — every spool write is best-effort (`finish_generation` only
+//! logs and counts `spool_write_failures_total` on spool I/O failure), so
+//! no spool record is ever guaranteed to exist:
+//! - R1: an uncertain-fate registration whose samples committed is not
+//!   healed; an `uncertain/` audit record exists iff that batch's spool
+//!   write succeeded (audit-only per #9, never replayed).
+//! - R2: a backfill re-insert returning `InsertUncertain` is terminally
+//!   abandoned (counted + warn-logged) — same residual class as R1.
+//! - R3: the backlog is memory-only — an orphan persists across a crash
+//!   only if the stream also never pushes again in that month (a restart
+//!   empties the LRU, so any later push re-registers naturally). A
+//!   poison-spool repair record exists only when the spool write
+//!   succeeded; manually re-inserting a poison-spooled `log_streams`
+//!   batch is safe (definitely-not-committed + `ReplacingMergeTree`
+//!   collapse), unlike `uncertain/`.
+//! - R4: byte-cap drops under sustained failure are counted
+//!   (`backfill_dropped_total`); a poison-spool record for the dropped
+//!   batch exists iff that batch's spool write succeeded.
+//! - R5: on spool-write failure there is no durable record — the
+//!   in-memory backlog is the only (best-effort) remedy; surfaced via the
+//!   error log + `spool_write_failures_total`.
+//! - R4∧R5 compound: a byte-cap-dropped entry whose generation's spool
+//!   write also failed is lost entirely (counters + logs are the sole
+//!   evidence) — acknowledged-lost by design, never claimed healed; the
+//!   same compound applies to every backlog exit without heal (tick
+//!   deterministic/uncertain abandons ∧ R5).
+//!
 //! **Backpressure** (architect plan amendment 1): `queued_bytes` is
 //! reserved atomically at admission (`fetch_add` first, roll back on
 //! overflow) and counts buffered *and* in-flight bytes, decremented
@@ -31,6 +69,7 @@
 //! at the deadline is force-settled with [`WriteError::ShuttingDown`]
 //! through the same settle path flush success/failure use.
 
+mod backfill;
 mod buffer;
 mod config;
 mod error;
@@ -115,6 +154,7 @@ struct Shared {
     shutting_down: AtomicBool,
     samples_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     streams_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    backfill_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// Implements issue #8's `LogSink` over a generic per-table columnar
@@ -197,6 +237,22 @@ impl LogWriter {
                 }
             });
 
+        // `log_streams`'s Poisoned-only registration backfill (issue
+        // #134): a definitely-failed registration flush enqueues its rows
+        // for the backfill task's 5s re-insert cadence. The closure
+        // delegates to `backfill::enqueue_failed` verbatim (the one seam
+        // the compound-failure unit test exercises against production
+        // logic).
+        let backlog = Arc::new(Mutex::new(backfill::RegistrationBacklog::new(
+            runtime.backfill_max_bytes,
+        )));
+        let backlog_for_hook = backlog.clone();
+        let metrics_for_hook = metrics.clone();
+        let on_stream_flush_poisoned: table::FlushPoisonedHook<LogStreamRow> =
+            Arc::new(move |rows: &[LogStreamRow]| {
+                backfill::enqueue_failed(&backlog_for_hook, &metrics_for_hook, rows);
+            });
+
         let samples_ctx = TableContext {
             table: tables.samples,
             buffer: samples.clone(),
@@ -207,21 +263,32 @@ impl LogWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
+            on_flush_poisoned: None,
         };
         let streams_ctx = TableContext {
-            table: tables.streams,
+            table: tables.streams.clone(),
             buffer: streams.clone(),
             notify: streams_notify.clone(),
-            inserter: streams_inserter,
+            inserter: streams_inserter.clone(),
             runtime: runtime.clone(),
             table_metrics: metrics.streams.clone(),
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_stream_flush_success),
+            on_flush_poisoned: Some(on_stream_flush_poisoned),
         };
 
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());
-        let streams_task = table::spawn(streams_ctx, shutdown_rx);
+        let streams_task = table::spawn(streams_ctx, shutdown_rx.clone());
+        let backfill_task = backfill::spawn_backfill(
+            backlog,
+            streams_inserter,
+            tables.streams,
+            lru.clone(),
+            metrics.clone(),
+            runtime.clone(),
+            shutdown_rx,
+        );
 
         let shared = Arc::new(Shared {
             samples,
@@ -236,6 +303,7 @@ impl LogWriter {
             shutting_down: AtomicBool::new(false),
             samples_task: Mutex::new(Some(samples_task)),
             streams_task: Mutex::new(Some(streams_task)),
+            backfill_task: Mutex::new(Some(backfill_task)),
         });
 
         LogWriter { shared }
@@ -411,10 +479,12 @@ impl LogWriter {
     /// `deadline`. Any generation still unsettled at the deadline is
     /// force-settled with [`WriteError::ShuttingDown`] through the same
     /// single settle path flush success/failure use. Returns once both
-    /// per-table flush tasks have exited — bounded by `deadline` plus
-    /// whatever bounded work happens after each task observes the
-    /// signal. Idempotent: a second call after the first has completed is
-    /// a no-op.
+    /// per-table flush tasks and the registration-backfill task have
+    /// exited — bounded by `deadline` plus whatever bounded work happens
+    /// after each task observes the signal (an in-flight backfill insert
+    /// is deadline-bounded and dropped on elapse, issue #134 plan §A).
+    /// Idempotent: a second call after the first has completed is a
+    /// no-op.
     pub async fn shutdown(&self, deadline: Duration) {
         self.shared.shutting_down.store(true, Ordering::Release);
         self.shared.shutdown.begin(Instant::now() + deadline);
@@ -431,6 +501,12 @@ impl LogWriter {
             .lock()
             .expect("task handle mutex poisoned")
             .take();
+        let backfill_task = self
+            .shared
+            .backfill_task
+            .lock()
+            .expect("task handle mutex poisoned")
+            .take();
 
         if let Some(task) = samples_task
             && let Err(e) = task.await
@@ -441,6 +517,15 @@ impl LogWriter {
             && let Err(e) = task.await
         {
             warn!(error = %e, table = STREAMS_TABLE, "flush task panicked during shutdown");
+        }
+        if let Some(task) = backfill_task
+            && let Err(e) = task.await
+        {
+            warn!(
+                error = %e,
+                table = STREAMS_TABLE,
+                "registration backfill task panicked during shutdown"
+            );
         }
     }
 }

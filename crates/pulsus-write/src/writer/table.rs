@@ -101,6 +101,18 @@ impl ShutdownSignal {
 /// Clippy's `type_complexity` lint.
 pub(crate) type FlushSuccessHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
 
+/// A definitely-failed-flush callback (issue #134): invoked ONLY from
+/// [`finish_generation`]'s `FlushOutcome::Poisoned` arm — a Poisoned
+/// outcome is provably not-committed (a non-retryable error surfaced
+/// unchanged by `insert_block`, or a pre-send retryable exhausted in the
+/// writer's retry loop; every post-send retryable is downgraded to
+/// `InsertUncertain` before it reaches this module), so re-inserting the
+/// rows replays nothing that could have committed. `log_streams`'s
+/// registration-backfill enqueue hooks in here; every other table passes
+/// `None` — an Uncertain generation failure structurally cannot reach
+/// this hook.
+pub(crate) type FlushPoisonedHook<R> = Arc<dyn Fn(&[R]) + Send + Sync>;
+
 /// Per-table wiring the flush task closes over.
 pub(crate) struct TableContext<R> {
     /// The target ClickHouse table name to insert into — `Arc<str>` (not
@@ -120,6 +132,12 @@ pub(crate) struct TableContext<R> {
     /// generation's waiters are resolved `Ok`. `None` for `log_samples`,
     /// which has no such hook.
     pub on_flush_success: Option<FlushSuccessHook<R>>,
+    /// Invoked with a Poisoned (definitely-not-committed) generation's
+    /// rows after the spool attempt (regardless of the spool I/O result —
+    /// the heal path must not depend on audit-file I/O) and before the
+    /// generation settles `Err`. `Some` ONLY for `log_streams` (issue
+    /// #134 registration backfill); `None` everywhere else.
+    pub on_flush_poisoned: Option<FlushPoisonedHook<R>>,
 }
 
 /// Spawns this table's dedicated flush task: `select!{size/age-triggered
@@ -266,14 +284,17 @@ async fn settle_generation<R>(
 
 /// Awaits an already-in-progress, pinned `attempt` bounded by the time
 /// remaining until `deadline`; `Err` (the deadline elapsed first) is the
-/// caller's cue to force-settle with `ShuttingDown` instead of using the
-/// insert's outcome.
-async fn bound_by_deadline<F>(
+/// caller's cue to abandon the attempt (force-settle with `ShuttingDown`
+/// here; drop-and-exit in `writer::backfill`'s tick) instead of using its
+/// outcome. Generic over the future's output (issue #134) so the
+/// registration-backfill task can reuse the exact shutdown-race pattern
+/// [`settle_generation`] uses — this module's call sites are unchanged.
+pub(crate) async fn bound_by_deadline<F>(
     attempt: &mut F,
     deadline: Instant,
-) -> Result<FlushOutcome, tokio::time::error::Elapsed>
+) -> Result<F::Output, tokio::time::error::Elapsed>
 where
-    F: Future<Output = FlushOutcome> + Unpin,
+    F: Future + Unpin,
 {
     let remaining = deadline.saturating_duration_since(Instant::now());
     tokio::time::timeout(remaining, attempt).await
@@ -366,6 +387,9 @@ async fn finish_generation<R>(
                 .write(SpoolKind::Uncertain, &ctx.table, &generation.rows, &msg)
                 .await
             {
+                ctx.table_metrics
+                    .spool_write_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
                 error!(
                     table = %ctx.table,
                     error = %spool_err,
@@ -382,11 +406,22 @@ async fn finish_generation<R>(
                 .write(SpoolKind::Poison, &ctx.table, &generation.rows, &msg)
                 .await
             {
+                ctx.table_metrics
+                    .spool_write_failures_total
+                    .fetch_add(1, Ordering::Relaxed);
                 error!(
                     table = %ctx.table,
                     error = %spool_err,
                     "failed to spool a poison batch to disk"
                 );
+            }
+            // Issue #134: fires regardless of the spool I/O result (the
+            // heal path must not depend on audit-file I/O), before the
+            // generation settles. This is the ONLY hook invocation site —
+            // the Uncertain arm above deliberately has none (#9: an
+            // uncertain-fate batch is never auto-replayed).
+            if let Some(hook) = &ctx.on_flush_poisoned {
+                hook(&generation.rows);
             }
             ctx.queued_bytes
                 .fetch_sub(generation.bytes, Ordering::AcqRel);
@@ -439,7 +474,183 @@ fn backoff_delay(base: Duration, max: Duration, attempt: u32, rng: &mut XorShift
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use pulsus_config::WriterConfig;
+
     use super::*;
+    use crate::writer::backfill::{RegistrationBacklog, enqueue_failed};
+    use crate::writer::buffer::TableBuffer;
+    use crate::writer::error::WriteError;
+    use crate::writer::metrics::WriterMetrics;
+    use crate::writer::rows::LogStreamRow;
+
+    /// A stub inserter: `finish_generation` (the unit under test below)
+    /// never inserts, but `TableContext` requires one.
+    struct OkInserter;
+
+    impl<R: ChRow> BlockInserter<R> for OkInserter {
+        fn insert<'a>(
+            &'a self,
+            _table: &'a str,
+            _rows: &'a [R],
+        ) -> Pin<Box<dyn Future<Output = Result<(), ChError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn stream_row() -> LogStreamRow {
+        LogStreamRow {
+            month: 19662,
+            fingerprint: 42,
+            service: "svc".to_string(),
+            labels: "{\"service_name\":\"svc\"}".to_string(),
+            updated_ns: 1,
+        }
+    }
+
+    /// A spool root that is a plain FILE, so `SpoolWriter::write`'s
+    /// `create_dir_all` fails deterministically (issue #134 AC15/AC16).
+    fn plain_file_spool_root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pulsus-write-table-test-spool-root-{}-{:?}",
+            std::process::id(),
+            std::time::Instant::now()
+        ));
+        std::fs::write(&path, b"not a directory").expect("create the plain-file spool root");
+        path
+    }
+
+    fn streams_ctx_with(
+        metrics: &Arc<WriterMetrics>,
+        spool_root: PathBuf,
+        on_flush_poisoned: Option<FlushPoisonedHook<LogStreamRow>>,
+    ) -> TableContext<LogStreamRow> {
+        TableContext {
+            table: Arc::from("log_streams"),
+            buffer: Arc::new(TableBuffer::new()),
+            notify: Arc::new(Notify::new()),
+            inserter: Arc::new(OkInserter),
+            runtime: Arc::new(WriterRuntime::from_config(&WriterConfig::default())),
+            table_metrics: metrics.streams.clone(),
+            spool: Arc::new(SpoolWriter::new(spool_root, metrics.clone())),
+            queued_bytes: Arc::new(AtomicU64::new(0)),
+            on_flush_success: None,
+            on_flush_poisoned,
+        }
+    }
+
+    /// Issue #134 AC15: a Poisoned generation whose spool write fails
+    /// (root is a plain file) must bump `spool_write_failures_total` AND
+    /// still fire the `on_flush_poisoned` hook — the heal path is
+    /// independent of audit-file I/O.
+    #[tokio::test]
+    async fn poisoned_spool_write_failure_bumps_the_counter_and_still_fires_the_hook() {
+        let spool_root = plain_file_spool_root();
+        let metrics = Arc::new(WriterMetrics::default());
+
+        let hook_rows = Arc::new(AtomicU64::new(0));
+        let hook_rows_for_hook = hook_rows.clone();
+        let hook: FlushPoisonedHook<LogStreamRow> = Arc::new(move |rows: &[LogStreamRow]| {
+            hook_rows_for_hook.fetch_add(rows.len() as u64, Ordering::SeqCst);
+        });
+        let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
+
+        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        ctx.queued_bytes.store(10, Ordering::SeqCst);
+        let generation = ctx.buffer.swap_out().expect("non-empty generation");
+
+        finish_generation(
+            &ctx,
+            generation,
+            FlushOutcome::Poisoned("boom".to_string()),
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(
+            metrics
+                .streams
+                .spool_write_failures_total
+                .load(Ordering::SeqCst),
+            1,
+            "the failed spool write must be counted"
+        );
+        assert_eq!(
+            hook_rows.load(Ordering::SeqCst),
+            1,
+            "the on_flush_poisoned hook must fire despite the spool I/O failure"
+        );
+        assert!(matches!(
+            rx.await.expect("generation settled"),
+            Err(WriteError::Poisoned(_))
+        ));
+        assert_eq!(metrics.spool_poison_total.load(Ordering::SeqCst), 0);
+
+        std::fs::remove_file(&spool_root).ok();
+    }
+
+    /// Issue #134 AC16 (compound R4∧R5): spool write fails AND the
+    /// byte-capped backlog drops the row — acknowledged-lost, surfaced
+    /// only by counters, with no false durability or heal claim, and the
+    /// generation still settles `Err` (waiter contract intact). The hook
+    /// delegates to the production `enqueue_failed` seam.
+    #[tokio::test]
+    async fn compound_spool_write_failure_and_byte_cap_drop_is_acknowledged_lost() {
+        let spool_root = plain_file_spool_root();
+        let metrics = Arc::new(WriterMetrics::default());
+
+        // Cap of 1 byte: any real row is a byte-cap drop.
+        let backlog = Arc::new(Mutex::new(RegistrationBacklog::new(1)));
+        let backlog_for_hook = backlog.clone();
+        let metrics_for_hook = metrics.clone();
+        let hook: FlushPoisonedHook<LogStreamRow> = Arc::new(move |rows: &[LogStreamRow]| {
+            enqueue_failed(&backlog_for_hook, &metrics_for_hook, rows);
+        });
+        let ctx = streams_ctx_with(&metrics, spool_root.clone(), Some(hook));
+
+        let (_, rx) = ctx.buffer.append_and_wait(vec![stream_row()], 10, u64::MAX);
+        ctx.queued_bytes.store(10, Ordering::SeqCst);
+        let generation = ctx.buffer.swap_out().expect("non-empty generation");
+
+        finish_generation(
+            &ctx,
+            generation,
+            FlushOutcome::Poisoned("boom".to_string()),
+            Instant::now(),
+        )
+        .await;
+
+        assert_eq!(
+            metrics
+                .streams
+                .spool_write_failures_total
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(metrics.backfill_dropped_total.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.backfill_enqueued_total.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            backlog
+                .lock()
+                .expect("registration backlog mutex poisoned")
+                .len(),
+            0,
+            "the dropped row must not linger in the backlog"
+        );
+        assert_eq!(metrics.backfill_pending.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.backfill_healed_total.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(
+                rx.await.expect("generation settled"),
+                Err(WriteError::Poisoned(_))
+            ),
+            "the generation must still settle Err — no false heal claim"
+        );
+
+        std::fs::remove_file(&spool_root).ok();
+    }
 
     #[test]
     fn backoff_delay_never_exceeds_the_cap() {

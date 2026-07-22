@@ -292,6 +292,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
+            on_flush_poisoned: None,
         };
         let series_ctx = TableContext {
             table: tables.series,
@@ -303,6 +304,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_series_flush_success),
+            on_flush_poisoned: None,
         };
         let metadata_ctx = TableContext {
             table: tables.metadata,
@@ -314,6 +316,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: Some(on_metadata_flush_success),
+            on_flush_poisoned: None,
         };
         // `metric_hist_samples` (M7-A4, issue #120): no flush-success hook —
         // `metric_series` registration (the only success-gated cache) is
@@ -330,6 +333,7 @@ impl MetricWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
+            on_flush_poisoned: None,
         };
 
         let samples_task = table::spawn(samples_ctx, shutdown_rx.clone());

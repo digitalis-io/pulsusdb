@@ -31,5 +31,7 @@ zstd.workspace = true
 # assert both ingest paths against a live ClickHouse, test-only (same
 # pattern as `pulsus-read`'s `explain_indexes.rs`).
 pulsus-schema = { path = "../pulsus-schema" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the issue
+# #134 backfill tests (5s-cadence ticks without wall-clock waits).
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tower = { workspace = true, features = ["util"] }

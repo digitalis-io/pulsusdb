@@ -279,6 +279,20 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-write --test live_metric_hist_writer
 
+      # Issue #134: the log_streams registration-backfill live failure
+      # injection — L1 "lost registration" (first streams insert swallowed
+      # with a deterministic error; the backfill heals it and the
+      # stage-1-shaped query resolves the fingerprint in the sample's
+      # month) and L2 "false Poisoned" (the first insert genuinely lands;
+      # the backfill's duplicate re-insert provably occurs and collapses
+      # to one row on a FINAL read — no inflation). Reuses this job's
+      # ClickHouse 24.8 container.
+      - name: Log stream registration backfill (live L1/L2 failure injection)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-write --test live_log_stream_backfill
+
       # Issue #34: the M2 label-resolution benchmark's `--profile ci` smoke
       # step — reproducibility + a committed CI-scale evidence artifact
       # only (task-manager resolution #2: no asserted `system.query_log`

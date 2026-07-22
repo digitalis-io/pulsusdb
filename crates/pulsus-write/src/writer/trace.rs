@@ -146,6 +146,7 @@ impl TraceWriter {
             spool: spool.clone(),
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
+            on_flush_poisoned: None,
         };
         let attrs_ctx = TableContext {
             table: tables.attrs,
@@ -157,6 +158,7 @@ impl TraceWriter {
             spool,
             queued_bytes: queued_bytes.clone(),
             on_flush_success: None,
+            on_flush_poisoned: None,
         };
 
         let spans_task = table::spawn(spans_ctx, shutdown_rx.clone());

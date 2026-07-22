@@ -45,6 +45,22 @@ const METADATA_LRU_CAPACITY: usize = 1_000_000;
 /// `uncertain/{table}/` subdirectories, created on first use.
 const SPOOL_DIR: &str = "./spool";
 
+/// Cadence of the `log_streams` registration-backfill re-insert task
+/// (issue #134): every interval, any Poisoned-flush registration rows
+/// still pending in the in-memory backlog are re-inserted once. A
+/// documented constant per the issue-#9 constants-not-env-vars precedent
+/// ([`LRU_CAPACITY`]); promote to a `PULSUS_*` var if a deployment needs
+/// to tune it.
+const REGISTRATION_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Byte cap (`LogStreamRow::est_bytes` accounting) on the in-memory
+/// registration backfill backlog (issue #134). New keys that would exceed
+/// this cap are rejected and counted via `backfill_dropped_total` — under
+/// sustained ClickHouse failure the sample path is failing too, so few new
+/// orphans are being minted in that state. Same documented-constant
+/// precedent as [`REGISTRATION_BACKFILL_RETRY_INTERVAL`].
+const REGISTRATION_BACKFILL_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// The resolved set of tunables a `LogWriter` and its per-table flush
 /// tasks read from on every admit/flush — computed once at construction,
 /// never re-read from the environment afterward.
@@ -69,6 +85,12 @@ pub struct WriterRuntime {
     /// capacity — unused by [`crate::writer::LogWriter`].
     pub metadata_lru_capacity: usize,
     pub spool_dir: PathBuf,
+    /// [`crate::writer::LogWriter`]'s registration-backfill re-insert
+    /// cadence (issue #134) — unused by the metric/trace writers.
+    pub backfill_retry_interval: Duration,
+    /// [`crate::writer::LogWriter`]'s registration-backfill backlog byte
+    /// cap (issue #134) — unused by the metric/trace writers.
+    pub backfill_max_bytes: u64,
 }
 
 impl WriterRuntime {
@@ -83,6 +105,8 @@ impl WriterRuntime {
             lru_capacity: LRU_CAPACITY,
             metadata_lru_capacity: METADATA_LRU_CAPACITY,
             spool_dir: PathBuf::from(SPOOL_DIR),
+            backfill_retry_interval: REGISTRATION_BACKFILL_RETRY_INTERVAL,
+            backfill_max_bytes: REGISTRATION_BACKFILL_MAX_BYTES,
         }
     }
 }
