@@ -22,6 +22,8 @@ auth_password: null              # secret: never appears in redacted output
 compat_endpoints: false
 cors_origin: "*"
 query_timeout: 2m
+tls_cert: null                   # PEM cert chain path; with tls_key set, the one listener is TLS-only
+tls_key: null                    # PEM private key path; one-sided => startup error
 skip_ddl: false
 retention_days: 7
 storage_policy: null

@@ -47,6 +47,8 @@ pub(crate) enum ServeError {
         addr: String,
         source: std::io::Error,
     },
+    #[error("failed to initialize TLS: {0}")]
+    Tls(#[from] crate::tls::TlsError),
 }
 
 /// The bound on [`LogWriter::shutdown`]'s drain, run between graceful HTTP
@@ -169,6 +171,29 @@ pub async fn run(config: Config) -> ExitCode {
         }
     };
 
+    // Inbound TLS (issue #174): load the cert/key pair *before* the bind,
+    // so a missing/unreadable/malformed pair is a clean pre-listen startup
+    // failure (the exact `build_router`-failure shape above) — never a
+    // half-started server. `pulsus_config::validate` already rejected any
+    // one-sided config (Rule 16), so `tls_paths` is all-or-nothing here.
+    let tls_config = match tls_paths(&config) {
+        Some((cert_path, key_path)) => match crate::tls::load_server_config(cert_path, key_path) {
+            Ok(tls_config) => Some(tls_config),
+            Err(source) => {
+                eprintln!("pulsusdb: {}", ServeError::Tls(source));
+                shutdown_background_tasks(
+                    reconnect_handle,
+                    rotation_rx,
+                    label_cache_refresh_rx,
+                    reprobe_rx,
+                )
+                .await;
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let addr = format!("{}:{}", config.host, config.port);
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,
@@ -185,18 +210,43 @@ pub async fn run(config: Config) -> ExitCode {
         }
     };
 
-    tracing::info!(%addr, mode = ?config.mode, "pulsusdb listening");
+    let proto = if tls_config.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    tracing::info!(%addr, mode = ?config.mode, proto, "pulsusdb listening");
 
-    if let Err(err) = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            // Break every live-tail loop first (issue #74): axum's
-            // graceful stop waits for in-flight connections, and an
-            // upgraded WebSocket is in-flight until its handler returns.
-            let _ = tail_shutdown_tx.send(true);
-        })
-        .await
-    {
+    // Both arms share the identical graceful-shutdown future and ordering
+    // contract; only the listener differs. The `None` arm is today's
+    // plaintext path, unchanged.
+    let serve_result = match tls_config {
+        Some(tls_config) => {
+            axum::serve(crate::tls::TlsListener::new(listener, tls_config), router)
+                .with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    // Break every live-tail loop first (issue #74): axum's
+                    // graceful stop waits for in-flight connections, and an
+                    // upgraded WebSocket is in-flight until its handler
+                    // returns.
+                    let _ = tail_shutdown_tx.send(true);
+                })
+                .await
+        }
+        None => {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    shutdown_signal().await;
+                    // Break every live-tail loop first (issue #74): axum's
+                    // graceful stop waits for in-flight connections, and an
+                    // upgraded WebSocket is in-flight until its handler
+                    // returns.
+                    let _ = tail_shutdown_tx.send(true);
+                })
+                .await
+        }
+    };
+    if let Err(err) = serve_result {
         tracing::error!(error = %err, "server exited with an error");
     }
 
@@ -489,6 +539,19 @@ fn writer_enabled(cfg: &Config) -> bool {
     matches!(cfg.mode, Mode::All | Mode::Writer)
 }
 
+/// `Some((cert, key))` iff BOTH `tls_cert` and `tls_key` are set — the
+/// inbound-TLS selection rule (issue #174): both set ⇒ the one listener is
+/// TLS-only, both unset ⇒ plaintext. One-sided configs never reach here
+/// (`pulsus_config::validate` Rule 16 rejects them at startup), so mapping
+/// them to `None` is defensive, not a reachable third mode. Pure so the
+/// selection is unit-tested, mirroring [`writer_enabled`]'s idiom.
+fn tls_paths(cfg: &Config) -> Option<(&str, &str)> {
+    match (cfg.tls_cert.as_deref(), cfg.tls_key.as_deref()) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
+    }
+}
+
 /// Whether this process mounts the reader subsystem (`docs/architecture.md
 /// §1`'s mode table: `all`/`reader` mount query APIs, `writer` does not) —
 /// the reconnect loop's gate on constructing a [`LabelCache`] at all (issue
@@ -753,6 +816,111 @@ mod tests {
             };
             assert!(!reader_enabled(&cfg), "{mode:?} must not mount the reader");
         }
+    }
+
+    /// Issue #174: the plaintext-selection pin — a default config (no TLS
+    /// keys) must resolve to `None`, keeping today's raw-`TcpListener`
+    /// branch, and only a complete pair selects TLS.
+    #[test]
+    fn tls_paths_selects_tls_only_when_both_fields_are_set() {
+        assert_eq!(tls_paths(&Config::default()), None);
+
+        let both = Config {
+            tls_cert: Some("/etc/pulsus/server.crt".to_string()),
+            tls_key: Some("/etc/pulsus/server.key".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            tls_paths(&both),
+            Some(("/etc/pulsus/server.crt", "/etc/pulsus/server.key"))
+        );
+
+        // One-sided configs are rejected by `pulsus_config::validate`
+        // (Rule 16) before `run()` is ever reached; the `None` mapping
+        // here is defensive, never a reachable third mode.
+        let cert_only = Config {
+            tls_cert: Some("/etc/pulsus/server.crt".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(tls_paths(&cert_only), None);
+        let key_only = Config {
+            tls_key: Some("/etc/pulsus/server.key".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(tls_paths(&key_only), None);
+    }
+
+    /// Codex re-review finding (issue #174): branch *selection* alone is
+    /// not a plaintext regression proof — with no TLS configured, the raw
+    /// `TcpListener` path must still actually serve an HTTP request end
+    /// to end. Hermetic: the same `build_router` + `axum::serve(listener,
+    /// router)` shape `run()`'s `None` arm uses, driven by a bare
+    /// loopback HTTP/1.1 GET against `/buildinfo` (a route that is 200
+    /// with no ClickHouse behind it).
+    #[tokio::test]
+    async fn plaintext_listener_still_serves_http_when_tls_is_unset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = Config::default();
+        assert_eq!(
+            tls_paths(&config),
+            None,
+            "the default config must select the plaintext branch"
+        );
+
+        let (_tail_tx, tail_rx) = tokio::sync::watch::channel(false);
+        let state = AppState {
+            pool: Arc::new(RwLock::new(None)),
+            config: Arc::new(config.clone()),
+            // A standalone handle, not the process-global recorder — this
+            // test must not fight `install_metrics_recorder`'s singleton.
+            metrics: PrometheusBuilder::new().build_recorder().handle(),
+            build: BuildInfo::from_build_env(),
+            writer: Arc::new(WriterSink::new(Arc::new(OnceLock::new()))),
+            metric_writer: Arc::new(MetricWriterSink::new(Arc::new(OnceLock::new()))),
+            trace_writer: Arc::new(TraceWriterSink::new(Arc::new(OnceLock::new()))),
+            label_cache: Arc::new(OnceLock::new()),
+            eval_gate: Arc::new(pulsus_read::EvalGate::new(
+                config.reader.query_eval_concurrency,
+            )),
+            started_at: std::time::SystemTime::now(),
+            tail: Arc::new(crate::app::TailRuntime::new(
+                tail_rx,
+                config.reader.tail_max_connections,
+            )),
+        };
+        let router = app::build_router(state, &config).expect("router builds for defaults");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(b"GET /buildinfo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("a response within 5s")
+            .expect("read response");
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 200"),
+            "the plaintext listener must serve /buildinfo with 200, got: {text}"
+        );
+        assert!(
+            text.contains("version"),
+            "the /buildinfo body must arrive intact over plaintext, got: {text}"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 
     /// Load-bearing regression test for the round-3 review finding: a

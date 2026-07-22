@@ -14,6 +14,8 @@ PulsusDB is configured by environment variables, optionally layered over a YAML 
 | `PULSUS_COMPAT_ENDPOINTS` | `false` | mount third-party-compatible query aliases and ingest receivers ([api.md §8](api.md)); the PulsusDB API and OTLP ingestion are always on |
 | `PULSUS_CORS_ORIGIN` | `*` | `Access-Control-Allow-Origin` value |
 | `PULSUS_QUERY_TIMEOUT` | `2m` | hard per-query timeout |
+| `PULSUS_TLS_CERT` | unset | path to a PEM certificate chain (leaf first) for the HTTP listener. Both `PULSUS_TLS_CERT` and `PULSUS_TLS_KEY` set ⇒ the single `PULSUS_HOST:PULSUS_PORT` listener terminates TLS and is **TLS-only** (health probes and every client must use `https`); both unset ⇒ plaintext; exactly one set ⇒ startup error (fail closed). Policy is rustls's safe defaults — TLS 1.2 minimum, safe ciphers, ALPN `http/1.1` — with no tuning knobs; certificate rotation requires a restart. An empty-string value counts as unset, like every variable |
+| `PULSUS_TLS_KEY` | unset | path to the matching PEM private key (PKCS#8, PKCS#1, or SEC1). Missing/unreadable/malformed cert or key — or a key that doesn't match the certificate — fails startup before the listener binds. See `PULSUS_TLS_CERT` for the pairing rule |
 
 ## 2. ClickHouse connection
 
@@ -180,6 +182,8 @@ auth_password: null              # secret: never appears in redacted output
 compat_endpoints: false
 cors_origin: "*"
 query_timeout: 2m
+tls_cert: null                   # PEM cert chain path; with tls_key set, the one listener is TLS-only
+tls_key: null                    # PEM private key path; one-sided => startup error
 skip_ddl: false
 retention_days: 7
 storage_policy: null

@@ -23,6 +23,8 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_COMPAT_ENDPOINTS",
     "PULSUS_CORS_ORIGIN",
     "PULSUS_QUERY_TIMEOUT",
+    "PULSUS_TLS_CERT",
+    "PULSUS_TLS_KEY",
     "CLICKHOUSE_SERVER",
     "CLICKHOUSE_SERVERS",
     "CLICKHOUSE_PORT",
@@ -170,6 +172,12 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     }
     if let Some(v) = read("PULSUS_QUERY_TIMEOUT") {
         cfg.query_timeout = parse_dur("PULSUS_QUERY_TIMEOUT", &v)?;
+    }
+    if let Some(v) = read("PULSUS_TLS_CERT") {
+        cfg.tls_cert = Some(v);
+    }
+    if let Some(v) = read("PULSUS_TLS_KEY") {
+        cfg.tls_key = Some(v);
     }
     if let Some(v) = read("CLICKHOUSE_SERVER") {
         cfg.clickhouse.server = v;
@@ -375,8 +383,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            65,
-            "docs/configuration.md §§1-8 document exactly 65 variables"
+            67,
+            "docs/configuration.md §§1-8 document exactly 67 variables"
         );
     }
 

@@ -282,6 +282,31 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
         (None, None) | (Some(_), Some(_)) => {}
     }
 
+    // Rule 16 (issue #174): one-sided inbound TLS is a hard startup error
+    // (fail closed, the Rule-12 shape — the error names the MISSING
+    // field). Pairing only: this function performs no filesystem I/O
+    // (none anywhere in this file, by review adjudication) —
+    // readability/PEM-parse/key-mismatch failures are owned by the
+    // mandatory pre-bind `load_server_config` call in `pulsus-server`'s
+    // `serve::run`, which fails the process before any listener exists.
+    match (&cfg.tls_cert, &cfg.tls_key) {
+        (Some(_), None) => {
+            return Err(value_err(
+                "tls_key",
+                "PULSUS_TLS_CERT is set but PULSUS_TLS_KEY is not",
+                "both PULSUS_TLS_CERT and PULSUS_TLS_KEY set to enable TLS on the listener",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(value_err(
+                "tls_cert",
+                "PULSUS_TLS_KEY is set but PULSUS_TLS_CERT is not",
+                "both PULSUS_TLS_CERT and PULSUS_TLS_KEY set to enable TLS on the listener",
+            ));
+        }
+        (None, None) | (Some(_), Some(_)) => {}
+    }
+
     // Rule 13: retention_days.
     if cfg.retention_days < 1 {
         return Err(value_err("retention_days", "must be >= 1", ">= 1"));
@@ -806,6 +831,46 @@ mod tests {
         let cfg = Config {
             auth_user: Some("alice".to_string()),
             auth_password: Some(crate::secret::Secret::new("hunter2")),
+            ..Config::default()
+        };
+        assert!(validate(&cfg).is_ok());
+    }
+
+    /// Issue #174 Rule 16: cert without key is rejected naming the
+    /// *missing* field (fail closed, the Rule-12 shape).
+    #[test]
+    fn one_sided_tls_cert_only_is_a_hard_error() {
+        let cfg = Config {
+            tls_cert: Some("/etc/pulsus/server.crt".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "tls_key")
+        );
+    }
+
+    /// Issue #174 Rule 16: key without cert is rejected naming the
+    /// *missing* field.
+    #[test]
+    fn one_sided_tls_key_only_is_a_hard_error() {
+        let cfg = Config {
+            tls_key: Some("/etc/pulsus/server.key".to_string()),
+            ..Config::default()
+        };
+        assert!(
+            matches!(validate(&cfg), Err(ConfigError::Value { field, .. }) if field == "tls_cert")
+        );
+    }
+
+    /// Issue #174: both paths set passes `validate()` regardless of what
+    /// (if anything) exists at those paths — the pairing rule is I/O-free
+    /// (no filesystem I/O in this file); readability/PEM errors are owned by
+    /// the pre-bind loader in `pulsus-server::serve::run`.
+    #[test]
+    fn both_tls_fields_set_is_valid_without_touching_the_filesystem() {
+        let cfg = Config {
+            tls_cert: Some("/nonexistent/path/server.crt".to_string()),
+            tls_key: Some("/nonexistent/path/server.key".to_string()),
             ..Config::default()
         };
         assert!(validate(&cfg).is_ok());

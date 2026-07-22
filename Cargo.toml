@@ -42,6 +42,13 @@ clickhouse = { version = "0.15", features = ["rustls-tls-webpki-roots", "futures
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
 hyper-rustls = { version = "0.27", features = ["ring", "http1"] }
+# Inbound TLS termination on the HTTP listener (issue #174): tokio-rustls
+# wraps accepted TCP streams, rustls-pemfile loads the operator-supplied
+# PEM cert/key (`PULSUS_TLS_CERT`/`PULSUS_TLS_KEY`). Both were already in
+# Cargo.lock via xtask's own pins; this only promotes them to shared
+# workspace entries for `pulsus-server`.
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 
 # Winners of the M0 pulsus-model hashing spike (issue #4). `xxhash-rust`

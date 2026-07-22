@@ -60,6 +60,14 @@ reqwest = { version = "0.12", default-features = false }
 # real dependencies.
 opentelemetry-proto.workspace = true
 prost.workspace = true
+# Inbound TLS termination on the listener (issue #174, `tls.rs`): rustls
+# server config (explicit `ring` provider — see the `builder_with_provider`
+# note there), tokio-rustls for the async accept-side handshake, and
+# rustls-pemfile for loading `PULSUS_TLS_CERT`/`PULSUS_TLS_KEY`.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -87,3 +95,11 @@ flate2.workspace = true
 # fixtures use the `opentelemetry-proto`/`prost` real dependencies above,
 # promoted from dev-only by issue #55's trace-fetch assembly).
 snap.workspace = true
+# Issue #174: self-signed cert/key generation at test run time for the
+# `tls.rs` loader unit tests and `tests/tls_live.rs` — no private key is
+# ever committed to this (public) repo, and generated material never
+# expires under CI's clock.
+rcgen = "0.13"
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the issue
+# #174 accept-error backoff test in `tls.rs` (the pulsus-write precedent).
+tokio = { workspace = true, features = ["test-util"] }

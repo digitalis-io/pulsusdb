@@ -23,6 +23,7 @@ mod prom_api;
 mod schema_init;
 mod serve;
 mod subsystems;
+mod tls;
 mod traces_api;
 
 /// Long version string: build version + build git SHA (issue #23:

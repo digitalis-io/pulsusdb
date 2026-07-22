@@ -37,6 +37,17 @@ pub struct Config {
     pub compat_endpoints: bool,
     pub cors_origin: String,
     pub query_timeout: HumanDuration,
+    /// `PULSUS_TLS_CERT` (issue #174): path to a PEM certificate chain
+    /// (leaf first) for the HTTP listener. Both `tls_cert` and `tls_key`
+    /// set ⇒ the single `host:port` listener terminates TLS; both unset ⇒
+    /// plaintext; exactly one set ⇒ hard startup error (fail closed, the
+    /// `auth_user`/`auth_password` pairing precedent). A plain path — key
+    /// material never enters `Config`, so no `Secret` wrapper is needed
+    /// and the redacted `/config` dump shows it verbatim.
+    pub tls_cert: Option<String>,
+    /// `PULSUS_TLS_KEY` (issue #174): path to the matching PEM private key
+    /// (PKCS#8/PKCS#1/SEC1). See [`Config::tls_cert`] for the pairing rule.
+    pub tls_key: Option<String>,
     // §3 Schema & retention
     pub skip_ddl: bool,
     pub retention_days: u32,
@@ -83,6 +94,8 @@ impl Default for Config {
             compat_endpoints: false,
             cors_origin: "*".to_string(),
             query_timeout: HumanDuration(Duration::from_secs(120)),
+            tls_cert: None,
+            tls_key: None,
             skip_ddl: false,
             retention_days: 7,
             storage_policy: None,
