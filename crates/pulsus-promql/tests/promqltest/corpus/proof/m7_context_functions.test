@@ -1,0 +1,79 @@
+# Issue #157 proof corpus — hand-authored witnesses for the experimental
+# query-context functions start()/end()/step()/range() (grammar patch G4
+# + plan-time constant folding). Semantics ported from Prometheus v3.13.0
+# @ 40af9c2: the four calls fold to NumberLiterals in PreprocessExpr
+# (engine.go:4436-4481 foldQueryContextFunctions) — start() = query start
+# seconds, end() = query end seconds, range() = end - start, and step() =
+# 0 when start == end, else step seconds. Instant queries preprocess with
+# (ts, ts, 0) (engine.go:558), so all four are the instant timestamp /
+# zero there. The values are query-window constants: identical at every
+# step of a range query (the step-invariance upstream folds to obtain,
+# which PulsusDB gets from PlanExpr::Scalar).
+#
+# The corpus-gated home for the upstream rows is functions.test (oracle
+# lines 2053-2189), skip-manifested until its activation issue (#163);
+# this file is the manifest-witness path in the meantime.
+
+# --- Bare instant calls (start == end == ts; range and step are 0). ---
+
+eval instant at 100s start()
+	100
+
+eval instant at 100s end()
+	100
+
+eval instant at 100s step()
+	0
+
+eval instant at 100s range()
+	0
+
+# --- Bare range calls: query-window constants at every step. ---
+
+eval range from 0 to 30s step 10s start()
+	{} 0 0 0 0
+
+eval range from 0 to 30s step 10s end()
+	{} 30 30 30 30
+
+eval range from 0 to 10s step 5s step()
+	{} 5 5 5
+
+eval range from 0 to 30s step 10s range()
+	{} 30 30 30 30
+
+# --- Nonzero-`from` ranges: start()/end()/range() are query boundaries,
+# --- never evaluation timestamps.
+
+eval range from 100s to 130s step 10s start()
+	{} 100 100 100 100
+
+eval range from 100s to 130s step 10s end()
+	{} 130 130 130 130
+
+eval range from 10s to 50s step 10s range()
+	{} 40 40 40 40 40
+
+# --- Compositions (scalar arithmetic over the folded constants). ---
+
+eval range from 10s to 20s step 5s end() - start()
+	{} 10 10 10
+
+eval range from 0s to 20s step 10s start() + range()
+	{} 20 20 20
+
+eval range from 0s to 30s step 10s (end() + start()) / 2
+	{} 15 15 15 15
+
+# --- vector() wrapping. ---
+
+eval range from 0 to 10s step 5s vector(step())
+	{} 5 5 5
+
+# --- Load-backed arithmetic: a real fetch multiplied by the constant. ---
+
+load 1s
+	metric 1 2 3 4 5
+
+eval range from 0s to 4s step 1s metric * step()
+	{} 1 2 3 4 5

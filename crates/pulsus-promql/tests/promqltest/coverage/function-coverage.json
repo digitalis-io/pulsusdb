@@ -238,8 +238,11 @@
     {
       "name": "end",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "#157"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m7_context_functions.test",
+        "query": "end()"
+      }
     },
     {
       "name": "exp",
@@ -550,8 +553,11 @@
     {
       "name": "range",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "#157"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m7_context_functions.test",
+        "query": "range()"
+      }
     },
     {
       "name": "rate",
@@ -664,8 +670,11 @@
     {
       "name": "start",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "#157"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m7_context_functions.test",
+        "query": "start()"
+      }
     },
     {
       "name": "stddev_over_time",
@@ -688,8 +697,11 @@
     {
       "name": "step",
       "experimental": true,
-      "status": "scheduled",
-      "issue": "#157"
+      "status": "implemented",
+      "witness": {
+        "file": "proof/m7_context_functions.test",
+        "query": "step()"
+      }
     },
     {
       "name": "sum_over_time",

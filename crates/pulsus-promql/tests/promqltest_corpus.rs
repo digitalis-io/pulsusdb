@@ -43,6 +43,7 @@ const PROOF_FILES: &[&str] = &[
     "m6_08f_subquery_step_invariant.test",
     "m6_08g_sparse_subquery_union.test",
     "m7_a7_ordered_rangevector_nhcb.test",
+    "m7_context_functions.test",
 ];
 
 fn proof_dir() -> std::path::PathBuf {

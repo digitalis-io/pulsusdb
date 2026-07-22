@@ -449,6 +449,61 @@ The original leaf fix is retained below for history.
   v3.13 grammar past the crate's v2.45 baseline; recorded here as the
   divergence ledger instead.
 
+## G4. Grammar-production patch: query-context function calls (issue #157)
+
+- **Files:** `src/parser/promql.y`
+- **What:** Prometheus v3.13.0's experimental query-context functions —
+  `start()`, `end()`, `step()`, `range()` — in *expression* position, as
+  ordinary zero-arity scalar calls. Ported from `generated_parser.y`'s
+  three `function_call` alternatives (`at_modifier_preprocessors
+  function_call_body`, `STEP function_call_body`, `RANGE
+  function_call_body`, `:477/:495/:513`) at PulsusDB's pinned v3.13.0
+  conformance SHA (`40af9c2`), where the four are registered
+  `Experimental` (`parser/functions.go`). Grammar-only: the tokens,
+  keyword lexing, and the zero-arity function-table registrations
+  (`function.rs`) already landed with G1 — before G4 the registrations
+  were reachable only through the `@` preprocessor rule and the duration
+  positions, never as calls.
+- **Grammar (`promql.y`):** three new `function_call` alternatives after
+  the G1 `max_of_min_of` arm, semantic actions shaped exactly like it
+  (raw-lexeme `get_function` lookup → `Expr::new_call`; arity is enforced
+  by the shared `check_call_arity` path, so `start(1)` errors "expected 0
+  argument(s)..."). Raw-lexeme lookup keeps upstream's case behaviour:
+  keywords lex case-insensitively but `START()` looks up `"START"` and
+  stays "unknown function" — both sides agree. `%expect 51`/`%expect-rr
+  243` are UNCHANGED (measured — the grmtools build fails on any
+  mismatch): no other expression-position production begins with
+  START/END/STEP/RANGE, so keyword-then-`(` at expression start has
+  exactly one continuation; the `metric_identifier`/`maybe_label` arms,
+  the duration positions (`[step()]`, `offset range()`), and the
+  `expr AT at_modifier_preprocessors LEFT_PAREN RIGHT_PAREN` rule
+  (`foo @ start()` stays an @-modifier — at_expr has no `expr AT expr`
+  production, so the preprocessor rule remains the only continuation
+  after AT, exactly as upstream) sit in states G1/G3 already accounted
+  for.
+- **Experimental gate:** deliberately NOT in this crate (the G1/G3
+  precedent — the parser has no options plumbing). PulsusDB gates at plan
+  time on `PlanParams::experimental_functions`, folding the four calls to
+  plan-time scalar constants (the analogue of upstream's
+  `foldQueryContextFunctions`, `engine.go:4436-4481`).
+- **Gate-off wording divergence** (a G3-precedent class, not
+  corpus-visible — the harness always gates on): with the experimental
+  gate OFF, upstream rejects at *parse* time with `function "start" is
+  not enabled`; PulsusDB rejects at *plan* time with the established
+  planner text (`experimental function start() (requires
+  promql-experimental-functions)` — the `max_of`/
+  `double_exponential_smoothing` precedent). Both reject the query before
+  any data is touched; the corpus-visible behaviour class is identical.
+- **Corpus inputs fixed:** parse-corpus rows 294/295 (`start()`, `end()`)
+  flip from allowlisted rejects to genuine accepts — their two
+  `accept_reject` rows leave
+  `crates/pulsus-promql/tests/corpus/expected-divergences.jsonl`; the 33
+  context-function eval rows in `functions.test` (oracle lines 2057-2174)
+  unblock for that file's activation (#163).
+- **Upstream PR:** not applicable — as with G1/G2/G3, this targets
+  Prometheus v3.13 grammar past the crate's v2.45 baseline; recorded here
+  as the divergence ledger instead.
+
 ## Upstream PR status
 
 None of the 5 leaf fixes above have been filed as upstream PRs against

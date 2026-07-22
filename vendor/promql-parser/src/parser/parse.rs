@@ -1940,6 +1940,97 @@ mod tests {
         assert_cases(Case::new_fail_cases(fail_cases));
     }
 
+    /// PulsusDB patch (docs/decisions/0003, grammar patch G4): the
+    /// experimental query-context function calls `start()`/`end()`/
+    /// `step()`/`range()` in expression position — call AST + Display
+    /// round-trip, zero-arity enforcement, and the neighbouring uses of
+    /// the same keyword tokens (@-modifier preprocessors, metric/label
+    /// names, duration positions), all of which must be unchanged.
+    #[test]
+    fn test_context_function_calls() {
+        // Each call parses to Expr::Call over the registered zero-arity
+        // function, and `parse -> Display -> parse` round-trips exactly.
+        for name in ["start", "end", "step", "range"] {
+            let input = format!("{name}()");
+            let expected =
+                Expr::new_call(get_function(name).unwrap(), FunctionArgs::empty_args()).unwrap();
+            let parsed = crate::parser::parse(&input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(expected, parsed, "{input}");
+            assert_eq!(input, parsed.to_string(), "{input} Display");
+            assert_eq!(
+                parsed,
+                crate::parser::parse(&parsed.to_string()).unwrap(),
+                "{input} round-trip"
+            );
+        }
+
+        // check_call_arity enforces the registered zero arity.
+        let fail_cases = vec![
+            (
+                "start(1)",
+                "expected 0 argument(s) in call to 'start', got 1",
+            ),
+            ("end(m)", "expected 0 argument(s) in call to 'end', got 1"),
+            (
+                "step(1, 2)",
+                "expected 0 argument(s) in call to 'step', got 2",
+            ),
+            (
+                "range(\"s\")",
+                "expected 0 argument(s) in call to 'range', got 1",
+            ),
+            // Raw-lexeme function lookup keeps upstream's case behaviour:
+            // keyword tokens lex case-insensitively, but `START` is not a
+            // registered function name.
+            ("START()", "unknown function with name 'START'"),
+        ];
+        assert_cases(Case::new_fail_cases(fail_cases));
+
+        // `foo @ start()` stays an @-modifier preprocessor, never a call
+        // argument (at_expr has no `expr AT expr` production).
+        assert_eq!(
+            Expr::from(VectorSelector::from("foo")).at_expr(At::Start),
+            crate::parser::parse("foo @ start()")
+        );
+        assert_eq!(
+            Expr::from(VectorSelector::from("foo")).at_expr(At::End),
+            crate::parser::parse("foo @ end()")
+        );
+
+        // The four keywords stay usable as metric and label names (the G1
+        // metric_identifier/maybe_label arms).
+        assert_eq!(
+            Ok(Expr::from(VectorSelector::from("range"))),
+            crate::parser::parse("range")
+        );
+        let name = String::from("start");
+        let matchers = Matchers::one(Matcher::new(MatchOp::Equal, "job", "x"));
+        assert_eq!(
+            Expr::new_vector_selector(Some(name), matchers),
+            crate::parser::parse(r#"start{job="x"}"#)
+        );
+        assert!(crate::parser::parse("sum by (step) (m)").is_ok());
+
+        // Duration positions are untouched: `step()`/`range()` inside
+        // brackets and after `offset` stay DurationExpr, never calls.
+        {
+            use crate::parser::DurationExpr as De;
+            assert_eq!(
+                Expr::new_matrix_selector(
+                    Expr::from(VectorSelector::from("foo")),
+                    Duration::ZERO,
+                    Some(De::Step),
+                ),
+                crate::parser::parse("foo[step()]")
+            );
+            let parsed = crate::parser::parse("foo offset range()").unwrap();
+            match &parsed {
+                Expr::VectorSelector(vs) => assert_eq!(Some(De::Range), vs.offset_expr),
+                other => panic!("foo offset range(): expected VectorSelector, got {other:?}"),
+            }
+        }
+    }
+
     /// PulsusDB patch (docs/decisions/0003, grammar patch G1): duration
     /// expressions in the range-selector, subquery range/step, and offset
     /// positions — AST shape, literal folding, guard messages, and the
@@ -2611,11 +2702,10 @@ mod tests {
         ];
         assert_cases(Case::new_result_cases(cases));
 
-        let cases = vec![
-            ("start()", INVALID_QUERY_INFO),
-            ("end()", INVALID_QUERY_INFO),
-        ];
-        assert_cases(Case::new_fail_cases(cases));
+        // PulsusDB patch (docs/decisions/0003, grammar patch G4): bare
+        // `start()`/`end()` in expression position are no longer parse
+        // errors — they are the experimental query-context function calls
+        // (upstream v3.13), pinned in test_context_function_calls below.
     }
 
     #[test]

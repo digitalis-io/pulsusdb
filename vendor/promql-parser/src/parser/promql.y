@@ -37,6 +37,19 @@
 // <unary-literal>`/`offset step()` before a trailing operator, so
 // `foo offset 100 + 2` parses as `(foo offset 100) + 2` (upstream
 // semantics, pinned by the eval corpus).
+//
+// PulsusDB patch (docs/decisions/0003, grammar patch G4 — see
+// vendor/promql-parser/PATCHES.md): `function_call` gains the three
+// upstream v3.13 query-context arms (`at_modifier_preprocessors
+// function_call_body`, `STEP function_call_body`, `RANGE
+// function_call_body`) so `start()`/`end()`/`step()`/`range()` parse as
+// ordinary zero-arity calls in expression position. The
+// `metric_identifier`/`maybe_label` arms and every duration-position use
+// of STEP/RANGE are unchanged, as is the `expr AT
+// at_modifier_preprocessors LEFT_PAREN RIGHT_PAREN` preprocessor rule
+// (`foo @ start()` stays an @-modifier, never a call argument — at_expr
+// has no `expr AT expr` production, so the preprocessor rule remains the
+// only continuation after AT, exactly as upstream).
 
 %token EQL
 BLANK
@@ -175,6 +188,16 @@ START_METRIC_SELECTOR
 // earlier-defined production — upstream goyacc's default resolution,
 // pinned by the parse corpus (`m[1m] anchored`, `anchored{job="test"}`,
 // `sum by (smoothed)`) and the crate's own grammar tests.
+//
+// PulsusDB patch (docs/decisions/0003, grammar patch G4): the three
+// query-context `function_call` arms leave BOTH counts unchanged
+// (measured: 51 shift/reduce, 243 reduce/reduce — the %expect gate fails
+// on any mismatch, so these are build-verified, never guessed). No other
+// expression-position production begins with START/END/STEP/RANGE, so a
+// keyword followed by `(` at expression start has exactly one
+// continuation (the call form); the duration-position and
+// metric/label-name uses of the same tokens sit in states G1 already
+// accounted for.
 %expect 51
 %expect-rr 243
 
@@ -439,6 +462,39 @@ function_call -> Result<Expr, String>:
         |       max_of_min_of function_call_body
                 {
                         let name = $1?.val;
+                        match get_function(&name) {
+                            None => Err(format!("unknown function with name '{name}'")),
+                            Some(func) => Expr::new_call(func, $2?)
+                        }
+                }
+        // PulsusDB patch (docs/decisions/0003, grammar patch G4 — see
+        // vendor/promql-parser/PATCHES.md): the query-context function
+        // calls `start()`/`end()`/`step()`/`range()` — upstream v3.13's
+        // `at_modifier_preprocessors function_call_body`,
+        // `STEP function_call_body`, and `RANGE function_call_body`
+        // alternatives (generated_parser.y:477/495/513 at the pinned
+        // conformance SHA). Raw-lexeme lookup keeps upstream's case
+        // behaviour: keywords lex case-insensitively, but `START()` looks
+        // up "START" and stays "unknown function" — both sides agree.
+        |       at_modifier_preprocessors function_call_body
+                {
+                        let name = $1?.val;
+                        match get_function(&name) {
+                            None => Err(format!("unknown function with name '{name}'")),
+                            Some(func) => Expr::new_call(func, $2?)
+                        }
+                }
+        |       STEP function_call_body
+                {
+                        let name = lexeme_to_string($lexer, &$1)?;
+                        match get_function(&name) {
+                            None => Err(format!("unknown function with name '{name}'")),
+                            Some(func) => Expr::new_call(func, $2?)
+                        }
+                }
+        |       RANGE function_call_body
+                {
+                        let name = lexeme_to_string($lexer, &$1)?;
                         match get_function(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
                             Some(func) => Expr::new_call(func, $2?)

@@ -2248,6 +2248,39 @@ fn plan_call(planner: &mut Planner, call: &Call) -> Result<PlanExpr, PromqlError
         return plan_info(planner, args);
     }
 
+    // Issue #157: the experimental query-context functions — folded to
+    // constants at plan time, the analogue of upstream
+    // foldQueryContextFunctions (engine.go:4436-4481): parents classify
+    // step-invariant through PlanExpr::Scalar exactly as upstream's
+    // NumberLiteral rewrite intends.
+    if matches!(name, "start" | "end" | "range" | "step") {
+        if !planner.experimental {
+            return Err(unsupported(format!(
+                "experimental function {name}() (requires promql-experimental-functions)"
+            )));
+        }
+        if !args.is_empty() {
+            // Parser-unreachable (check_call_arity enforces 0); kept total
+            // for synthesized Calls, matching every other arm's style.
+            return Err(unsupported(format!("{name}() with != 0 arguments")));
+        }
+        let secs = match name {
+            "start" => planner.start_ms as f64 / 1000.0,
+            "end" => planner.end_ms as f64 / 1000.0,
+            "range" => planner.query_range_ms() as f64 / 1000.0,
+            // step() = 0 whenever start == end, regardless of step_ms
+            // (engine.go:4448-4453) — not "instant iff step_ms == 0".
+            _ => {
+                if planner.start_ms == planner.end_ms {
+                    0.0
+                } else {
+                    planner.step_ms as f64 / 1000.0
+                }
+            }
+        };
+        return Ok(PlanExpr::Scalar(secs));
+    }
+
     Err(unsupported(format!("function {name}()")))
 }
 
@@ -4312,20 +4345,17 @@ mod tests {
 
     #[test]
     fn a_function_outside_the_implemented_list_is_unsupported() {
-        // Issue #153 moved the last parseable stand-in
-        // (`histogram_quantiles` — succession: `abs` → `sort` →
-        // `histogram_count` → `histogram_quantiles`) into the implemented
-        // set. No parser-accepted function remains planner-unmapped
-        // today: the manifest's non-implemented functions are exactly
-        // `start`/`end`/`range`/`step`, which the VENDORED parser rejects
-        // in expression position (a grammar arm not yet ported — at the
-        // pin they parse as ordinary experimental calls), so the planner
-        // fall-through (`function {name}()`) is unreachable from query
-        // text and is pinned here by synthesizing the `Call` AST directly
-        // through the vendor crate's public constructors.
+        // Issue #157 moved the previous stand-in (`start` — succession:
+        // `abs` → `sort` → `histogram_count` → `histogram_quantiles` →
+        // #153's synthesized `start()`) into the plan-time context-fold
+        // arm, completing the registry: every registered function now has
+        // a planner mapping, so the fall-through (`function {name}()`) is
+        // unreachable from query text AND from any registered name. It
+        // stays pinned by synthesizing a `Call` under an UNREGISTERED
+        // name directly through the vendor crate's public constructors.
         let call = Call {
             func: promql_parser::parser::Function::new(
-                "start",
+                "no_such_function",
                 vec![],
                 0,
                 crate::parser::ValueType::Scalar,
@@ -4336,7 +4366,120 @@ mod tests {
         let err = plan(&Expr::Call(call), params()).unwrap_err();
         match err {
             PromqlError::Unsupported { construct } => {
-                assert!(construct.contains("start"), "got {construct:?}");
+                assert!(construct.contains("no_such_function"), "got {construct:?}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // --- issue #157: the query-context functions start()/end()/step()/
+    // range(), folded to PlanExpr::Scalar at plan time (upstream
+    // foldQueryContextFunctions, engine.go:4436-4481) ---
+
+    #[test]
+    fn context_functions_gate_off_reject_with_the_experimental_message() {
+        for name in ["start", "end", "step", "range"] {
+            let expr = parse(&format!("{name}()")).unwrap();
+            let err = plan(&expr, params()).unwrap_err();
+            match err {
+                PromqlError::Unsupported { construct } => assert_eq!(
+                    construct,
+                    format!(
+                        "experimental function {name}() \
+                         (requires promql-experimental-functions)"
+                    )
+                ),
+                other => panic!("{name}(): expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn context_functions_fold_to_the_query_window_on_a_range_query() {
+        // Range query 100s..130s step 10s: start 100, end 130, range 30,
+        // step 10 (all in seconds, the oracle's engine.go:4436-4481).
+        let p = PlanParams {
+            start_ms: 100_000,
+            end_ms: 130_000,
+            step_ms: 10_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
+        };
+        for (query, expected) in [
+            ("start()", 100.0),
+            ("end()", 130.0),
+            ("range()", 30.0),
+            ("step()", 10.0),
+        ] {
+            let expr = parse(query).unwrap();
+            let planned = plan(&expr, p).unwrap();
+            assert_eq!(
+                planned.root,
+                PlanExpr::Scalar(expected),
+                "{query} on 100s..130s/10s"
+            );
+            assert!(planned.selectors.is_empty(), "{query}: no fetch");
+        }
+    }
+
+    #[test]
+    fn context_functions_fold_to_the_instant_on_an_instant_query() {
+        // Instant at 100s (upstream preprocesses with (ts, ts, 0),
+        // engine.go:558): start 100, end 100, range 0, step 0.
+        let p = PlanParams {
+            start_ms: 100_000,
+            end_ms: 100_000,
+            step_ms: 0,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
+        };
+        for (query, expected) in [
+            ("start()", 100.0),
+            ("end()", 100.0),
+            ("range()", 0.0),
+            ("step()", 0.0),
+        ] {
+            let expr = parse(query).unwrap();
+            let planned = plan(&expr, p).unwrap();
+            assert_eq!(planned.root, PlanExpr::Scalar(expected), "{query} at 100s");
+        }
+    }
+
+    #[test]
+    fn step_folds_to_zero_when_start_equals_end_regardless_of_step_ms() {
+        // The oracle rule is `start == end` (engine.go:4448-4453), NOT
+        // "step_ms == 0" — the promqltest runner's instant convention
+        // ((at, at, 0)) masks the difference, so this pins it directly.
+        let p = PlanParams {
+            start_ms: 100_000,
+            end_ms: 100_000,
+            step_ms: 10_000,
+            lookback_ms: DEFAULT_LOOKBACK_MS,
+            experimental_functions: true,
+        };
+        let expr = parse("step()").unwrap();
+        let planned = plan(&expr, p).unwrap();
+        assert_eq!(planned.root, PlanExpr::Scalar(0.0));
+    }
+
+    #[test]
+    fn a_synthesized_context_call_with_arguments_is_rejected_totally() {
+        // Parser-unreachable (check_call_arity enforces zero arity); the
+        // arm stays total for synthesized Calls.
+        let call = Call {
+            func: promql_parser::parser::Function::new(
+                "start",
+                vec![],
+                0,
+                crate::parser::ValueType::Scalar,
+                true,
+            ),
+            args: promql_parser::parser::FunctionArgs::new_args(Expr::from(1.0)),
+        };
+        let err = plan(&Expr::Call(call), params_experimental()).unwrap_err();
+        match err {
+            PromqlError::Unsupported { construct } => {
+                assert_eq!(construct, "start() with != 0 arguments");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
