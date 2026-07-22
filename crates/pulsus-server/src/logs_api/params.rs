@@ -14,13 +14,25 @@
 
 use thiserror::Error;
 
-use pulsus_read::Direction;
+use pulsus_read::{Direction, VolumeAggregateBy};
 
 /// Default `limit` when the param is absent (docs/api.md §2.1).
 pub(crate) const DEFAULT_LIMIT: u32 = 100;
 /// Hard cap on `limit`; values above this are rejected with `400`, never
 /// silently clamped (task-manager resolution #6 on issue #13).
 pub(crate) const MAX_LIMIT: u32 = 5000;
+/// Cap on the POST-DEDUPE `targetLabels` count (issue #169 plan v2,
+/// docs/api.md §2.6): each target injects at most one `.+` matcher before
+/// planning, so this bounds the injected matchers/stage-1 OR-branches at
+/// 32 on top of the parsed selector — far beyond any real aggregation-key
+/// dimensionality, and trivial against the 8 MiB rendered-SQL admission
+/// envelope. Rejected `400`, never clamped (the `MAX_LIMIT` discipline);
+/// a deliberate deviation from the cap-less oracle (grafana/loki:3.4.2).
+pub(crate) const MAX_TARGET_LABELS: usize = 32;
+/// Per-entry byte-length cap on a `targetLabels` label name
+/// (post-percent-decode) — bounds each injected matcher's escaped SQL
+/// fragment (issue #169 plan v2; same 400-not-clamp rule as above).
+pub(crate) const MAX_TARGET_LABEL_BYTES: usize = 256;
 /// Default lookback window (`end - start`) when `start` is omitted
 /// (docs/api.md §2.1: "default: last hour").
 const DEFAULT_LOOKBACK_NS: i64 = 3_600_000_000_000;
@@ -74,6 +86,28 @@ pub(crate) enum ParamError {
     /// input is a 400.
     #[error("invalid 'delay_for' {0:?}: expected a non-negative integer number of seconds")]
     InvalidDelayFor(String),
+    /// Issue #169: `/volume` aggregates via the body-content-blind rollup
+    /// only — ANY pipeline stage (line filters included, unlike `/stats`)
+    /// would silently over-count, so all are rejected.
+    #[error("'query' must be a bare stream selector on the volume endpoint (no pipeline stages)")]
+    VolumePipelineUnsupported,
+    /// Issue #169: `aggregateBy` accepts `series`/`labels` only (oracle
+    /// `volumeAggregateBy`).
+    #[error("invalid 'aggregateBy' {0:?}: expected 'series' or 'labels'")]
+    InvalidAggregateBy(String),
+    /// Issue #169: `end < start` is an explicit 400 on the volume
+    /// endpoint (oracle `errEndBeforeStart`).
+    #[error("invalid time range: 'end' precedes 'start'")]
+    EndBeforeStart,
+    /// Issue #169 plan v2: the post-dedupe `targetLabels` count cap —
+    /// enforced in pure param parsing, BEFORE any AST mutation, planning,
+    /// or SQL rendering.
+    #[error("too many 'targetLabels': {count} exceeds the maximum of {max}")]
+    TooManyTargetLabels { count: usize, max: usize },
+    /// Issue #169 plan v2: the per-entry `targetLabels` byte-length cap —
+    /// same pre-planning stage as [`ParamError::TooManyTargetLabels`].
+    #[error("'targetLabels' entry of {len} bytes exceeds the maximum of {max}")]
+    TargetLabelTooLong { len: usize, max: usize },
 }
 
 /// Nanoseconds since the Unix epoch, right now. Matches the rest of the
@@ -124,6 +158,62 @@ pub(crate) fn parse_limit(raw: Option<&str>) -> Result<u32, ParamError> {
     // `n <= MAX_LIMIT` (a `u32`) was just checked above, so this narrowing
     // conversion is always exact.
     Ok(n as u32)
+}
+
+/// The volume `limit` (issue #169, docs/api.md §2.6): absent **or 0** →
+/// [`DEFAULT_LIMIT`] (the oracle's `volumeLimit` resets 0 to its default,
+/// unlike [`parse_limit`], where 0 is taken literally); above
+/// [`MAX_LIMIT`] → 400, never clamped; non-numeric → 400.
+pub(crate) fn parse_volume_limit(raw: Option<&str>) -> Result<u32, ParamError> {
+    match parse_limit(raw)? {
+        0 => Ok(DEFAULT_LIMIT),
+        n => Ok(n),
+    }
+}
+
+/// `aggregateBy` (issue #169): `series` (default) | `labels`; anything
+/// else is a 400 (oracle `volumeAggregateBy`).
+pub(crate) fn parse_aggregate_by(raw: Option<&str>) -> Result<VolumeAggregateBy, ParamError> {
+    match raw {
+        None | Some("series") => Ok(VolumeAggregateBy::Series),
+        Some("labels") => Ok(VolumeAggregateBy::Labels),
+        Some(other) => Err(ParamError::InvalidAggregateBy(other.to_string())),
+    }
+}
+
+/// `targetLabels` (issue #169): comma-separated label names. Pinned parse
+/// order (plan v2): split on `,` → drop empties → dedupe (order-
+/// preserving) → per-entry length cap ([`MAX_TARGET_LABEL_BYTES`]) →
+/// post-dedupe count cap ([`MAX_TARGET_LABELS`]). Both caps reject 400
+/// here, in PURE param parsing — before any AST mutation, planning, or
+/// SQL rendering ever sees the values.
+pub(crate) fn parse_target_labels(raw: Option<&str>) -> Result<Vec<String>, ParamError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = Vec::new();
+    for label in raw.split(',') {
+        if label.is_empty() || out.iter().any(|seen| seen == label) {
+            continue;
+        }
+        if label.len() > MAX_TARGET_LABEL_BYTES {
+            return Err(ParamError::TargetLabelTooLong {
+                len: label.len(),
+                max: MAX_TARGET_LABEL_BYTES,
+            });
+        }
+        out.push(label.to_string());
+        // The post-dedupe count can only grow — reject as soon as it
+        // passes the cap (bounds the dedupe scan at cap+1 entries, so a
+        // hostile parameter never buys O(n²) work here).
+        if out.len() > MAX_TARGET_LABELS {
+            return Err(ParamError::TooManyTargetLabels {
+                count: out.len(),
+                max: MAX_TARGET_LABELS,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// `direction`: `forward`|`backward`, default `backward` (docs/api.md
@@ -365,6 +455,126 @@ mod tests {
             parse_limit(Some("abc")).unwrap_err(),
             ParamError::InvalidLimit(_)
         ));
+    }
+
+    // -- Issue #169: /volume params --------------------------------------
+
+    #[test]
+    fn parse_volume_limit_defaults_to_100_when_absent() {
+        assert_eq!(parse_volume_limit(None).unwrap(), DEFAULT_LIMIT);
+    }
+
+    /// Issue #169 plan v2 test gap (a): the oracle's `volumeLimit` resets
+    /// an explicit 0 to the default (100 — `seriesvolume.DefaultLimit`),
+    /// unlike the query endpoints' literal `limit=0`.
+    #[test]
+    fn parse_volume_limit_resets_an_explicit_zero_to_the_default() {
+        assert_eq!(parse_volume_limit(Some("0")).unwrap(), 100);
+    }
+
+    #[test]
+    fn parse_volume_limit_accepts_the_cap_and_rejects_one_above_it() {
+        assert_eq!(parse_volume_limit(Some("5000")).unwrap(), 5000);
+        assert!(matches!(
+            parse_volume_limit(Some("5001")).unwrap_err(),
+            ParamError::LimitTooLarge {
+                limit: 5001,
+                max: 5000
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_volume_limit_rejects_non_numeric_input() {
+        assert!(matches!(
+            parse_volume_limit(Some("abc")).unwrap_err(),
+            ParamError::InvalidLimit(_)
+        ));
+    }
+
+    #[test]
+    fn parse_aggregate_by_defaults_to_series_and_accepts_labels() {
+        assert_eq!(parse_aggregate_by(None).unwrap(), VolumeAggregateBy::Series);
+        assert_eq!(
+            parse_aggregate_by(Some("series")).unwrap(),
+            VolumeAggregateBy::Series
+        );
+        assert_eq!(
+            parse_aggregate_by(Some("labels")).unwrap(),
+            VolumeAggregateBy::Labels
+        );
+    }
+
+    #[test]
+    fn parse_aggregate_by_rejects_anything_else() {
+        assert!(matches!(
+            parse_aggregate_by(Some("both")).unwrap_err(),
+            ParamError::InvalidAggregateBy(_)
+        ));
+    }
+
+    #[test]
+    fn parse_target_labels_absent_is_empty() {
+        assert!(parse_target_labels(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_target_labels_splits_on_commas_dropping_empties() {
+        assert_eq!(
+            parse_target_labels(Some(",env,,team,")).unwrap(),
+            vec!["env".to_string(), "team".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_target_labels_dedupes_preserving_first_appearance_order() {
+        assert_eq!(
+            parse_target_labels(Some("team,env,team,env")).unwrap(),
+            vec!["team".to_string(), "env".to_string()]
+        );
+    }
+
+    /// Issue #169 plan v2 boundary: exactly [`MAX_TARGET_LABELS`]
+    /// post-dedupe targets pass; one more is a 400.
+    #[test]
+    fn parse_target_labels_accepts_exactly_the_count_cap_and_rejects_one_more() {
+        let at_cap = (0..MAX_TARGET_LABELS)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_target_labels(Some(&at_cap)).unwrap().len(),
+            MAX_TARGET_LABELS
+        );
+        let over = format!("{at_cap},one_more");
+        assert!(matches!(
+            parse_target_labels(Some(&over)).unwrap_err(),
+            ParamError::TooManyTargetLabels { count: 33, max: 32 }
+        ));
+    }
+
+    /// Issue #169 plan v2 boundary: exactly [`MAX_TARGET_LABEL_BYTES`]
+    /// bytes pass; one more byte is a 400.
+    #[test]
+    fn parse_target_labels_accepts_exactly_the_length_cap_and_rejects_one_more_byte() {
+        let at_cap = "x".repeat(MAX_TARGET_LABEL_BYTES);
+        assert_eq!(parse_target_labels(Some(&at_cap)).unwrap(), vec![at_cap]);
+        let over = "x".repeat(MAX_TARGET_LABEL_BYTES + 1);
+        assert!(matches!(
+            parse_target_labels(Some(&over)).unwrap_err(),
+            ParamError::TargetLabelTooLong { len: 257, max: 256 }
+        ));
+    }
+
+    /// Issue #169 plan v2 pin: dedupe runs BEFORE the count cap — 10k
+    /// duplicates of one label collapse to 1 and pass.
+    #[test]
+    fn parse_target_labels_dedupes_before_the_count_cap() {
+        let raw = vec!["env"; 10_000].join(",");
+        assert_eq!(
+            parse_target_labels(Some(&raw)).unwrap(),
+            vec!["env".to_string()]
+        );
     }
 
     #[test]

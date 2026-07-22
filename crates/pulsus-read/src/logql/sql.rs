@@ -325,6 +325,22 @@ pub fn log_stats_raw(
     sql
 }
 
+/// The `/api/logs/v1/volume` aggregation (issue #169, docs/api.md §2.6):
+/// per-fingerprint byte volume off `log_metrics_<res>` (PK `(fingerprint,
+/// bucket_ns)`) — rollup-ONLY, zero body reads (the endpoint accepts a
+/// matchers-only selector, so there is no raw fallback at all, unlike
+/// [`log_stats_rollup`]'s line-filtered sibling). Same half-open bucket
+/// predicate family as [`log_stats_rollup`]/[`metric_range`], so the
+/// identical MinMax + `(fingerprint, bucket_ns)` primary-key pruning
+/// applies (`tests/explain_indexes.rs`' Tier-1 gate).
+pub fn log_volume_rollup(rollup_table: &str, fingerprints: &[u64], window: TimeWindow) -> String {
+    let fp_list = fp_list(fingerprints);
+    let TimeWindow { start_ns, end_ns } = window;
+    format!(
+        "SELECT fingerprint, sum(bytes) AS bytes\nFROM {rollup_table}\nWHERE fingerprint IN ({fp_list}) AND bucket_ns > {start_ns} AND bucket_ns <= {end_ns}\nGROUP BY fingerprint"
+    )
+}
+
 /// A range metric query bucketed by `step_ns` (`intDiv(bucket_col, step) *
 /// step`, docs/schemas.md §3.2). `extra_predicates` carries line-filter
 /// pushdown for the (line-filter-forced) raw fallback.

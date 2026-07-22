@@ -459,6 +459,105 @@ const LOGS_STATS_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- logs volume (issue #169, docs/api.md §2.6) --------------------------
+
+fn logs_volume_pipeline(req: &mut Req) {
+    // Unlike /stats, even a LINE FILTER is rejected on /volume: the
+    // rollup is body-content-blind and volume has no raw fallback.
+    req.query = format!("query={}", enc(r#"{service_name="checkout"} |= "err""#));
+}
+
+fn logs_volume_invalid_aggregate_by(req: &mut Req) {
+    req.query = format!(
+        "query={}&aggregateBy=both",
+        enc(r#"{service_name="checkout"}"#)
+    );
+}
+
+fn logs_volume_limit_too_large(req: &mut Req) {
+    req.query = format!("query={}&limit=5001", enc(r#"{service_name="checkout"}"#));
+}
+
+fn logs_volume_too_many_target_labels(req: &mut Req) {
+    // 33 distinct labels — one past the documented MAX_TARGET_LABELS=32
+    // post-dedupe cap (issue #169 plan v2), rejected in pure param
+    // parsing before any matcher injection.
+    let labels = (0..33)
+        .map(|i| format!("l{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    req.query = format!(
+        "query={}&targetLabels={labels}",
+        enc(r#"{service_name="checkout"}"#)
+    );
+}
+
+const LOGS_VOLUME_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_query",
+        build: logs_missing_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "malformed_logql",
+        build: logs_malformed_logql,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: true,
+        },
+    },
+    CaseClass {
+        name: "metric_query_rejected",
+        build: logs_stats_metric_query,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "pipeline_rejected",
+        build: logs_volume_pipeline,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "invalid_aggregate_by",
+        build: logs_volume_invalid_aggregate_by,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "limit_too_large",
+        build: logs_volume_limit_too_large,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "target_labels_too_many",
+        build: logs_volume_too_many_target_labels,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
 const LOGS_SERIES_CASES: &[CaseClass] = &[
     CaseClass {
         name: "missing_match",
@@ -1344,6 +1443,23 @@ static MANIFEST: &[RouteSpec] = &[
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_STATS_CASES,
     },
+    // -- Logs volume, native (ReaderMode, issue #169, docs/api.md §2.6) --
+    // `Surface::LogsQuery`: success is the standard §2.2 vector envelope
+    // (`data` is an object — `expected_data_is_array` does not match
+    // `volume`), which the empty-DB matrix asserts as
+    // `{"resultType":"vector","result":[]}` via the generic
+    // data-is-object check.
+    RouteSpec {
+        path: "/api/logs/v1/volume",
+        methods: &[Method::Get],
+        surface: Surface::LogsQuery,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_VOLUME_CASES,
+    },
     // -- Logs query, `/loki/api/v1` compat alias (CompatAndReader) -------
     RouteSpec {
         path: "/loki/api/v1/query_range",
@@ -1435,6 +1551,21 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
         cases: LOGS_STATS_CASES,
+    },
+    // -- Logs volume, M7 compat alias (CompatAndReader, issue #169) ------
+    // `DocRef::Verbatim`: the §8.1 M7 volume row spells the alias path
+    // out in full — and like `/index/stats`, `/index/volume` is NOT a
+    // prefix swap of the native `/volume`.
+    RouteSpec {
+        path: "/loki/api/v1/index/volume",
+        methods: &[Method::Get],
+        surface: Surface::LogsQuery,
+        gate: Gate::CompatAndReader,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: "query=%7Bservice_name%3D%22checkout%22%7D",
+        cases: LOGS_VOLUME_CASES,
     },
     // -- Loki push receiver, `/loki/api/v1` compat alias (CompatAndWriter,
     //    issue #77) -------------------------------------------------------
@@ -1903,17 +2034,6 @@ static MANIFEST: &[RouteSpec] = &[
         cases: &[],
     },
     RouteSpec {
-        path: "/api/logs/v1/volume",
-        methods: &[Method::Get],
-        surface: Surface::LogsQuery,
-        gate: Gate::ReaderMode,
-        status: RouteStatus::Planned { milestone: "M7" },
-        doc_ref: DocRef::Skip,
-        success_status: 0,
-        base_query: "",
-        cases: &[],
-    },
-    RouteSpec {
         path: "/api/logs/v1/detected_labels",
         methods: &[Method::Get],
         surface: Surface::LogsQuery,
@@ -2057,19 +2177,20 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
         function: "reader_router",
         body: "crate::logs_api::router().merge(crate::prom_api::router()).merge(crate::traces_api::router())",
     },
-    // Re-pinned for issue #74 (M6-11): tail + stats mount explicitly on
-    // both surfaces (the stats alias suffix `/index/stats` is not a
-    // prefix swap, so neither route goes through
-    // `mount_log_query_routes`).
+    // Re-pinned for issue #169 (M7-C1): `/volume` + its `/index/volume`
+    // alias join tail/stats as explicit mounts on both surfaces (the
+    // alias suffix is not a prefix swap, so neither route goes through
+    // `mount_log_query_routes`). (Previously re-pinned for issue #74's
+    // tail + stats mounts.)
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "router",
-        body: "mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats))",
+        body: "mount_log_query_routes(Router::new(), \"/api/logs/v1\").route(\"/api/logs/v1/tail\", get(tail::tail)).route(\"/api/logs/v1/stats\", get(stats::stats)).route(\"/api/logs/v1/volume\", get(volume::volume))",
     },
     PinnedFunctionBody {
         file: "crates/pulsus-server/src/logs_api/mod.rs",
         function: "compat_router",
-        body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats))",
+        body: "mount_log_query_routes(Router::new(), \"/loki/api/v1\").route(\"/loki/api/v1/tail\", get(tail::tail)).route(\"/loki/api/v1/index/stats\", get(stats::stats)).route(\"/loki/api/v1/index/volume\", get(volume::volume))",
     },
     // NOT a router-composition function — this is the Loki-push `PushRequest`'s
     // hand-written `prost::Message::merge` (issue #115 round 2), which routes the

@@ -13,7 +13,7 @@ pub use logql::{
     HistVectorSample, LogQlEngine, LogStats, MatrixSeries, PlanCtx, PlanExplain, QueryParams,
     QueryResult, QuerySpec, ReadError, RouteChoice, RoutingDecision, StreamResult,
     TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, TimeBounds,
-    VectorSample,
+    VectorSample, VolumeAggregateBy, VolumeEntry, VolumeQuery,
 };
 pub use metrics::{
     CacheMetricsSnapshot, DEFAULT_STALENESS_MULTIPLIER, DataWindow, DiscoveryFilter,

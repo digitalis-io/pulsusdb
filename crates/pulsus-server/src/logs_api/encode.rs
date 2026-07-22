@@ -38,7 +38,7 @@ use serde::Serialize;
 
 use pulsus_read::{
     ExplainStage, LogStats, MatrixSeries, PlanExplain, QueryResult, RouteChoice, StreamResult,
-    VectorSample,
+    VectorSample, VolumeEntry,
 };
 
 /// Builds a streaming JSON body: `prefix`, then `render(item)` for each
@@ -271,6 +271,45 @@ pub(crate) fn stats_response(stats: LogStats, explain: Option<PlanExplain>) -> R
     }
     body.push('}');
     json_response(Body::from(body))
+}
+
+/// Encodes a `/api/logs/v1/volume` result (issue #169, docs/api.md §2.6):
+/// the §2.2 vector envelope evaluated at `end_ns`, **order-preserving** —
+/// the engine's entries arrive already sorted `(bytes desc, labels asc)`
+/// and truncated to `limit`, and that top-N presentation IS the contract,
+/// so this deliberately does NOT route through [`query_response`]'s
+/// `Vector` arm (which re-sorts by label set and would scramble it).
+/// `stats.series` is the PulsusDB-additive key (same clients-ignore-extras
+/// precedent as §2.4's `dropped_total`); `explain` joins it inside `data`
+/// when requested. `bytes` converts u64 → f64 only here at render (values
+/// past 2^53 lose precision exactly as the oracle's own `float64` cast).
+pub(crate) fn volume_response(
+    entries: Vec<VolumeEntry>,
+    end_ns: i64,
+    explain: Option<PlanExplain>,
+) -> Response {
+    let stats = SeriesStats {
+        series: entries.len(),
+    };
+    let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+    let prefix =
+        b"{\"status\":\"success\",\"data\":{\"resultType\":\"vector\",\"result\":[".to_vec();
+    let suffix = explain_suffix(format!("],\"stats\":{stats_json}"), explain.as_ref());
+    let suffix = format!("{suffix}}}}}").into_bytes();
+    json_response(stream_array(
+        prefix,
+        entries,
+        move |e: &VolumeEntry| {
+            // Per-item adapter to reuse `render_vector_item` verbatim —
+            // the clone is O(limit)-bounded label pairs, never row data.
+            let sample = VectorSample {
+                labels: e.labels.clone(),
+                value: e.bytes as f64,
+            };
+            render_vector_item(&sample, end_ns)
+        },
+        suffix,
+    ))
 }
 
 /// Encodes one live-tail WebSocket frame (issue #74, docs/api.md §2.4):
@@ -724,6 +763,74 @@ mod tests {
             body,
             r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"service_name":"checkout"},"value":[5.500,"42"]}],"stats":{"series":1}}}"#
         );
+    }
+
+    /// Issue #169 byte-exact volume golden: the vector envelope at
+    /// timestamp `end` (3dp seconds), entries in the ENGINE's bytes-desc
+    /// order — "zeta" (9 bytes) stays FIRST despite sorting after "alpha"
+    /// lexically, proving the encoder never re-sorts by label set.
+    #[tokio::test]
+    async fn volume_envelope_is_byte_exact_and_preserves_bytes_desc_order() {
+        let entries = vec![
+            VolumeEntry {
+                labels: vec![("env".to_string(), "zeta".to_string())],
+                bytes: 9,
+            },
+            VolumeEntry {
+                labels: vec![("env".to_string(), "alpha".to_string())],
+                bytes: 4,
+            },
+        ];
+        let res = volume_response(entries, 5_500_000_000, None);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"env":"zeta"},"value":[5.500,"9"]},{"metric":{"env":"alpha"},"value":[5.500,"4"]}],"stats":{"series":2}}}"#
+        );
+    }
+
+    /// Issue #169: labels-mode entries render the oracle's
+    /// `{"<name>":""}` empty-value metric object.
+    #[tokio::test]
+    async fn volume_envelope_renders_the_labels_mode_empty_value_metric() {
+        let entries = vec![VolumeEntry {
+            labels: vec![("env".to_string(), String::new())],
+            bytes: 7,
+        }];
+        let res = volume_response(entries, 0, None);
+        let body = body_string(res).await;
+        assert_eq!(
+            body,
+            r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"env":""},"value":[0.000,"7"]}],"stats":{"series":1}}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn volume_envelope_carries_data_explain_when_requested() {
+        let mut explain = PlanExplain::new("volume");
+        explain.push("volume_read", "SELECT 1", None);
+        let res = volume_response(Vec::new(), 0, Some(explain));
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["data"]["result"], serde_json::json!([]));
+        assert_eq!(json["data"]["stats"]["series"], 0);
+        assert_eq!(json["data"]["explain"]["result_type"], "volume");
+        assert_eq!(json["data"]["explain"]["stages"][0]["name"], "volume_read");
+    }
+
+    #[tokio::test]
+    async fn gzip_volume_response_matches_identity_byte_for_byte() {
+        fn build() -> Response {
+            volume_response(
+                vec![VolumeEntry {
+                    labels: vec![("service_name".to_string(), "checkout".to_string())],
+                    bytes: 42,
+                }],
+                5_500_000_000,
+                None,
+            )
+        }
+        assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
 
     #[tokio::test]

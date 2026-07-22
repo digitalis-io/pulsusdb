@@ -770,6 +770,36 @@ async fn metric_rollup_range_read_uses_the_fingerprint_bucket_primary_key() {
     assert!(!usage.iter().any(|l| l.contains("service")));
 }
 
+/// Issue #169 Tier-1 gate: the `/volume` rollup aggregation carries the
+/// identical `(fingerprint IN, bucket_ns > s AND <= e)` predicate family
+/// as the rollup metric reads, so its `EXPLAIN indexes = 1` extract must
+/// equal [`expected_metric_rollup_usage`] in full — MinMax prune on
+/// `bucket_ns` plus the `(fingerprint, bucket_ns)` primary key with both
+/// predicates in its `Condition:` — and reference no `service`/body
+/// column anywhere (primary-key pruning, never a full scan; the
+/// query-performance mandate).
+#[tokio::test]
+async fn volume_rollup_read_uses_the_fingerprint_bucket_primary_key() {
+    skip_unless_live!();
+    let db = "pulsus_read_it_volume_rollup";
+    let ts_ns = now_ns();
+    let client = setup(db, ts_ns).await;
+
+    let table = format!("{db}.log_metrics_5s");
+    let sql = sql::log_volume_rollup(
+        &table,
+        &[FP_PROD],
+        TimeWindow {
+            start_ns: ts_ns - 6 * 3_600_000_000_000,
+            end_ns: ts_ns + 3_600_000_000_000,
+        },
+    );
+
+    let usage = explain(&client, &sql).await;
+    assert_eq!(usage, expected_metric_rollup_usage());
+    assert!(!usage.iter().any(|l| l.contains("service")));
+}
+
 /// The `(fingerprint, bucket_ns)` primary key on `log_metrics_5s` — shared
 /// by the range and instant rollup cases, which differ only in `SELECT`/
 /// `GROUP BY` shape (`sql_snapshots.rs`'s job), not in the `WHERE`

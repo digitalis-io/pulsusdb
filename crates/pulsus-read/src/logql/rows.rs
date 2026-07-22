@@ -78,6 +78,15 @@ pub struct LogStatsRow {
     pub bytes: u64,
 }
 
+/// One `/api/logs/v1/volume` aggregation row (issue #169): a fingerprint's
+/// summed byte volume over the query window, off `log_metrics_<res>`
+/// (rollup-only — the volume endpoint has no raw fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct VolumeRow {
+    pub fingerprint: u64,
+    pub bytes: u64,
+}
+
 /// Labels discovery (`log_streams_idx`): one distinct label key.
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct LabelNameRow {

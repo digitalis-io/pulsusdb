@@ -144,11 +144,29 @@ Delivery: tail polls ClickHouse (there is no push channel) with a deterministic 
 ### 2.6 Drilldown (M7)
 
 ```
-GET /api/logs/v1/volume             ?query=&start=&end=&limit=&aggregateBy=
+GET /api/logs/v1/volume             ?query=&start=&end=&limit=&targetLabels=&aggregateBy=
 GET /api/logs/v1/detected_labels    ?query=&start=&end=
 GET /api/logs/v1/detected_fields    ?query=&start=&end=
 GET /api/logs/v1/patterns           ?query=&start=&end=
 ```
+
+#### 2.6.1 `GET /api/logs/v1/volume`
+
+Per-label-set log byte volumes over `[start, end]` — the drilldown UI's "which streams are loud" aggregation. **GET-only** (the reference also mounts POST; additive later if a client demands it). Served **entirely from the 5s rollup with zero body reads** — the endpoint accepts a matchers-only selector, so unlike §2.5 there is no raw fallback at all.
+
+| Param | Notes |
+|-------|-------|
+| `query` | LogQL **stream selector, matchers only** — required. ANY pipeline stage is rejected `400` (line filters included, unlike §2.5: the rollup is body-content-blind and volume has no raw scan to fall back on), as are metric queries. The match-all `{}` is rejected `400` (PulsusDB's ≥1-positive-matcher rule; the reference accepts `{}` here — documented deviation; `targetLabels` remains fully usable with any non-empty selector, e.g. `{env=~".+"}`) |
+| `start`, `end` | ns / RFC3339; default `end = now`, `start = end - 1h` (§2.1). `end < start` is `400` |
+| `limit` | top-N entries kept **after** the bytes-desc sort. Absent **or `0`** → 100 (the reference resets an explicit 0 to its default); above 5000 → `400`, never clamped (§2.1's cap rule) |
+| `aggregateBy` | `series` (default): group by the matched label **pairs**. `labels`: group by bare label **names** — each entry's metric is `{"<name>":""}` (the reference's empty-value shape) |
+| `targetLabels` | comma-separated label names re-keying the aggregation. When supplied, entries key on these names alone (both modes); each target with no matcher of its name in the selector is injected as `name=~".+"` before planning, so negative-only or unrelated selectors still resolve target-keyed streams. **Bounded** (documented deviation — the reference has no caps; same defensive 400-not-clamp posture as `limit`): at most **32** names post-dedupe, each at most **256** bytes (post-percent-decode) — oversized requests are rejected `400` in pure param parsing, before any planning or SQL |
+
+Without `targetLabels`, the aggregation keys on the selector's **own matcher names** — every operator, including `!=`/`!~` (so `{env!="dev"}` keys results by each stream's `env` value); a stream lacking a keyed label omits that pair from its key, and a stream matching none of the names groups under `{}`.
+
+Response `200`: the §2.2 vector envelope evaluated at `end` — `{"status":"success","data":{"resultType":"vector","result":[{"metric":{...},"value":[<end_unix_seconds>,"<bytes>"]},...],"stats":{"series":N}}}`. **Result order is bytes-desc (tie-break: label set asc), truncated to `limit` — NOT label-sorted** (the top-N presentation is the contract; deliberately different from §2.2's label-sorted vectors). `stats` is a PulsusDB-additive key (same clients-ignore-extras precedent as §2.4's `dropped_total`). `bytes` is the sum of line-body bytes (the same basis as §2.5's `bytes`), 5s-bucket-granular at window edges (the same rollup caveat as §2.5/`count_over_time`). With `X-Pulsus-Explain: 1`, `data.explain` (the §2.1 shape) is added — its `volume_read` stage always targets `log_metrics_5s`.
+
+Errors: `400 bad_data` (missing/malformed `query`, metric query, any pipeline stage, invalid `aggregateBy`/`limit`, oversized `targetLabels`, `end < start`), `422 query_too_broad`, and `503`/`504`/`500` per §2.3's table.
 
 ---
 
@@ -405,7 +423,8 @@ When `PULSUS_AUTH_*` is set, the perimeter returns 401 to every unauthenticated 
 |--------------------|-------------------|------------|
 | `/loki/api/v1/query_range`, `/query`, `/labels`, `/label/{name}/values`, `/series` | `/api/logs/v1/{query_range,query,labels,label/*/values,series}` | M1 |
 | `/loki/api/v1/tail`, `/loki/api/v1/index/stats` | `/api/logs/v1/{tail,stats}` | M6 |
-| `/loki/api/v1/index/volume`, `/detected_labels`, `/detected_fields`, `/patterns` | `/api/logs/v1/{volume,detected_labels,detected_fields,patterns}` | M7 |
+| `/loki/api/v1/index/volume` | `/api/logs/v1/volume` | M7 |
+| `/loki/api/v1/detected_labels`, `/detected_fields`, `/patterns` | `/api/logs/v1/{detected_labels,detected_fields,patterns}` | M7 |
 | `/api/traces/{traceId}`, `/api/traces/{traceId}/json`, `/tempo/api/traces/{traceId}` | `/api/traces/v1/trace/{traceId}`, `/api/traces/v1/trace/{traceId}/json` | M4 |
 | `/api/search` | `/api/traces/v1/search` | M4 |
 | `/api/search/tags`, `/api/search/tag/{tag}/values` | `/api/traces/v1/tags`, `/api/traces/v1/tag/{tag}/values` (Tempo v1 flat projection) | M4 |

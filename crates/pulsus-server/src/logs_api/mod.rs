@@ -13,11 +13,14 @@
 //! (flag + mode gating) — it never duplicates the route list itself.
 //!
 //! Issue #74 (M6-11) adds `/tail` (WebSocket, §2.4) and `/stats` (§2.5)
-//! plus their `/loki/api/v1/{tail,index/stats}` aliases. The stats alias
-//! suffix is **not** a prefix swap of the native path (`/index/stats` vs
-//! `/stats`), so both new routes mount explicitly below rather than
-//! through [`mount_log_query_routes`]. Still out of scope: the drilldown
-//! endpoints (§2.6, M7) and their aliases.
+//! plus their `/loki/api/v1/{tail,index/stats}` aliases. Issue #169 (M7)
+//! adds the first drilldown endpoint, `/volume` (§2.6), with its
+//! `/loki/api/v1/index/volume` alias. Neither alias suffix is a prefix
+//! swap of its native path (`/index/stats` vs `/stats`, `/index/volume`
+//! vs `/volume`), so these routes mount explicitly below rather than
+//! through [`mount_log_query_routes`]. Still out of scope: the remaining
+//! §2.6 drilldown endpoints (`/detected_labels`, `/detected_fields`,
+//! `/patterns`) and their aliases.
 
 mod encode;
 mod error;
@@ -25,6 +28,7 @@ mod handlers;
 mod params;
 mod stats;
 mod tail;
+mod volume;
 
 use axum::Router;
 use axum::routing::get;
@@ -64,13 +68,15 @@ fn mount_log_query_routes(router: Router<AppState>, prefix: &str) -> Router<AppS
         )
 }
 
-/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.5): the five
+/// The native `/api/logs/v1` surface (docs/api.md §2.1-2.6): the five
 /// query routes via [`mount_log_query_routes`], plus `/tail` (WebSocket,
-/// issue #74) and `/stats` mounted explicitly (both `GET`-only).
+/// issue #74), `/stats`, and `/volume` (issue #169) mounted explicitly
+/// (all `GET`-only).
 pub(crate) fn router() -> Router<AppState> {
     mount_log_query_routes(Router::new(), "/api/logs/v1")
         .route("/api/logs/v1/tail", get(tail::tail))
         .route("/api/logs/v1/stats", get(stats::stats))
+        .route("/api/logs/v1/volume", get(volume::volume))
 }
 
 /// The `/loki/api/v1/*` compat alias surface (docs/api.md §8.1, issue #14).
@@ -83,9 +89,11 @@ pub(crate) fn compat_router() -> Router<AppState> {
     mount_log_query_routes(Router::new(), "/loki/api/v1")
         // Issue #74: the M6 aliases. `/index/stats` is deliberately NOT
         // derived from the native `/stats` path — the alias suffix is not
-        // a prefix swap (docs/api.md §8.1's M6 row).
+        // a prefix swap (docs/api.md §8.1's M6 row). Issue #169: the M7
+        // `/index/volume` alias follows the same irregular-suffix rule.
         .route("/loki/api/v1/tail", get(tail::tail))
         .route("/loki/api/v1/index/stats", get(stats::stats))
+        .route("/loki/api/v1/index/volume", get(volume::volume))
 }
 
 #[cfg(test)]

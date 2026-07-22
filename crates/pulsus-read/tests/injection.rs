@@ -193,6 +193,44 @@ fn a_line_filter_payload_stays_inside_one_literal_in_the_exact_predicate() {
     assert_no_unescaped_quote_or_backslash(&ch_string(PAYLOAD_PAREN));
 }
 
+/// Issue #169: a hostile `targetLabels` value enters the plan as an
+/// injected `Matcher { name: <target>, op: Re, value: ".+" }` — the exact
+/// shape `LogQlEngine`'s volume path appends before planning — so the
+/// hostile NAME must come out of stage 1 as one escaped `key = '...'`
+/// literal (the injected matcher rides `plan`'s normal `escape` boundary
+/// by construction; this proves it for both quote and backslash payloads).
+#[test]
+fn an_injected_target_label_matcher_with_a_hostile_name_stays_escaped_in_stage1() {
+    for payload in [PAYLOAD_QUOTE, PAYLOAD_BACKSLASH_QUOTE, PAYLOAD_COMMENT] {
+        let selector = StreamSelector {
+            matchers: vec![
+                Matcher {
+                    name: "service_name".to_string(),
+                    op: MatchOp::Eq,
+                    value: "checkout".to_string(),
+                },
+                Matcher {
+                    name: payload.to_string(),
+                    op: MatchOp::Re,
+                    value: ".+".to_string(),
+                },
+            ],
+        };
+        let sp = plan_streams(selector);
+        let escaped = ch_string(payload);
+        assert_no_unescaped_quote_or_backslash(&escaped);
+        assert!(
+            sp.stage1_sql.contains(&format!("key = {escaped}")),
+            "hostile target-label name must render as one escaped key literal: {}",
+            sp.stage1_sql
+        );
+        // The statement's trailing structure survives — no truncation,
+        // no injected branch escaping the HAVING count.
+        assert!(sp.stage1_sql.contains("GROUP BY fingerprint"));
+        assert!(sp.stage1_sql.contains("HAVING uniqExact(key, val) = 2"));
+    }
+}
+
 #[test]
 fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_formed() {
     let filters = vec![pulsus_logql::Stage::LineFilter(LineFilter {

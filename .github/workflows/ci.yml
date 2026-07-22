@@ -625,6 +625,18 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run logs_stats_live -p pulsus-server --test logs_stats_live
 
+      # Issue #169: /api/logs/v1/volume — seeded exact per-key bytes in
+      # series/labels modes, targetLabels regroup, post-sort limit
+      # truncation, the zero-body-read pushdown proof from
+      # X-Pulsus-Explain stage SQL (log_metrics_5s only, never
+      # log_samples), and /loki/api/v1/index/volume byte-identity.
+      # Port 31148. Reuses this job's ClickHouse 24.8 container.
+      - name: Live logs volume suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run logs_volume_live -p pulsus-server --test logs_volume_live
+
       # Issue #77 (M6-14): spawns the real `pulsusdb` binary with
       # PULSUS_COMPAT_ENDPOINTS on, pushes a stream to /loki/api/v1/push in
       # BOTH encodings (JSON + snappy-protobuf), then proves the load-bearing

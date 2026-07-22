@@ -655,6 +655,34 @@ fn metric_instant_sql_has_no_intdiv_bucket_expression() {
 }
 
 // ---------------------------------------------------------------------
+// /volume rollup aggregation (issue #169, docs/api.md §2.6).
+// ---------------------------------------------------------------------
+
+/// Byte-exact `log_volume_rollup` snapshot: the same half-open
+/// `(fingerprint IN, bucket_ns > s AND <= e)` predicate family as the
+/// rollup metric reads above — rollup-ONLY, no body/`log_samples`
+/// reference anywhere (the volume endpoint has no raw fallback).
+#[test]
+fn log_volume_rollup_is_byte_exact() {
+    let sql = sql::log_volume_rollup(
+        "log_metrics_5s",
+        &[101, 205],
+        TimeWindow {
+            start_ns: START_NS,
+            end_ns: END_NS,
+        },
+    );
+    assert_eq!(
+        sql,
+        "SELECT fingerprint, sum(bytes) AS bytes\n\
+         FROM log_metrics_5s\n\
+         WHERE fingerprint IN (101, 205) AND bucket_ns > 1782907200000000000 AND bucket_ns <= 1782928800000000000\n\
+         GROUP BY fingerprint"
+    );
+    assert!(!sql.contains("body"), "zero body reads by construction");
+}
+
+// ---------------------------------------------------------------------
 // Instant vs Range QuerySpec shapes (task-manager resolution #3).
 // ---------------------------------------------------------------------
 
