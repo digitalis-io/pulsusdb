@@ -43,7 +43,7 @@ Content-Type: application/x-protobuf   (default; OTLP/JSON via application/json 
 
 - Resource + scope attributes flatten into labels under the canonical label model ([architecture.md §2.3](architecture.md)): for logs and metrics, attribute keys are normalized to Prometheus-style names at ingest (`service.name` → `service_name`); trace attributes keep their OTel names verbatim and are queried as such in TraceQL. Log body → line; spans → trace tables with original protobuf retained as payload; metric data points → metric samples with `__name__` from the metric name; profiles → pprof-equivalent tree precomputation.
 - Responses: `200` with OTLP partial-success message when applicable; `429` on backpressure.
-- A metric data point whose `time_unix_nano` resolves to a UTC day outside the representable ClickHouse `Date` range (before 1970-01-01 or after 2149-06-06) is rejected per-point as OTLP partial success, matching the Zipkin unrepresentable-timestamp precedent (§8.2) — the day is what `metric_samples`/`metric_hist_samples` partition on, so an out-of-range day can never be stored.
+- A metric data point whose `time_unix_nano` resolves to a UTC day outside the supported storage time range (before 1970-01-01 or after 2106-02-06) is rejected per-point as OTLP partial success, matching the Zipkin unrepresentable-timestamp precedent (§8.2) — a day past 2106-02-06 would wrap in the 32-bit `DateTime` domain the `metric_samples`/`metric_hist_samples` delete-TTL evaluates in (and a day past 2149-06-06 additionally falls outside the `Date` domain the tables partition on), so such a point cannot be stored safely (docs/schemas.md §2.1, issue #137).
 - The `/v1development/profiles` path tracks the OTLP spec's experimental profiles signal and will follow it to `/v1/profiles` on stabilization (the old path remains as an alias).
 
 ### 1.2 Prometheus remote write
@@ -53,7 +53,7 @@ POST /api/v1/write
 Content-Type: application/x-protobuf, Content-Encoding: snappy
 ```
 
-`prompb.WriteRequest`. Supported as a first-class alternative for metrics because the OTel Collector's `prometheusremotewrite` exporter is a common metrics pipeline. `__name__` becomes `metric_name`; remaining labels are fingerprinted (xxhash64, sorted `k\xffv\xff` serialization). Stale markers (NaN `0x7FF0000000000002`) stored verbatim. A sample whose timestamp resolves to a UTC day outside the representable ClickHouse `Date` range (before 1970-01-01 or after 2149-06-06, same cutoff as OTLP metrics above) is dropped and counted in `rejected_total`, not surfaced in the response body. Success: `204`.
+`prompb.WriteRequest`. Supported as a first-class alternative for metrics because the OTel Collector's `prometheusremotewrite` exporter is a common metrics pipeline. `__name__` becomes `metric_name`; remaining labels are fingerprinted (xxhash64, sorted `k\xffv\xff` serialization). Stale markers (NaN `0x7FF0000000000002`) stored verbatim. A sample whose timestamp resolves to a UTC day outside the supported storage time range (before 1970-01-01 or after 2106-02-06, same cutoff and 32-bit-`DateTime` delete-TTL rationale as OTLP metrics above; docs/schemas.md §2.1, issue #137) is dropped and counted in `rejected_total`, not surfaced in the response body. Success: `204`.
 
 ### 1.3 Profile ingest (native)
 

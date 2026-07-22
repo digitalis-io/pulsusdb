@@ -174,19 +174,24 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
                 };
 
                 // `log_samples` is partitioned by the RAW sample day
-                // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`), so a
-                // record whose day falls outside the ClickHouse `Date` range
-                // (before 1970-01-01 or at/after 2149-06-07) cannot land in a
-                // valid partition even when its month-start still can — e.g.
-                // 2149-06-07 = day 65536 (unrepresentable) has month-start
-                // 2149-06-01 = day 65530 (representable). Gate acceptance on
+                // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`) and its
+                // delete-TTL evaluates `intDiv(timestamp_ns, 1000000000)` in
+                // the 32-bit `DateTime` domain (issue #137, mirroring #131's
+                // trace fix), so a record is storage-safe only when its day
+                // lies in `0..=49_709` (1970-01-01 to 2106-02-06): a day in
+                // `49_710..=65_535` partitions correctly but exceeds
+                // `u32::MAX` in the TTL seconds arithmetic, and a later day
+                // falls outside the `Date` range entirely — even when its
+                // month-start still fits (e.g. 2149-06-07 = day 65536 has
+                // month-start 2149-06-01 = day 65530). Gate acceptance on
                 // the DAY, then derive the month for the `log_streams`
                 // registration (guaranteed `Some` once the day is in range,
                 // but kept fallible — no `.unwrap()` on untrusted input).
-                // Saturating either would orphan the sample into the wrong
-                // partition, so the record is rejected into partial success.
+                // Saturating either would orphan or silently early-expire
+                // the sample, so the record is rejected into partial
+                // success.
                 let month = match (
-                    Date::start_of_day_utc(timestamp_ns),
+                    Date::start_of_day_utc_datetime_safe(timestamp_ns),
                     Date::start_of_month_utc(timestamp_ns),
                 ) {
                     (Some(_day), Some(month)) => month,
@@ -195,7 +200,7 @@ pub fn parse(req: &ExportLogsServiceRequest, now_ns: i64) -> Result<ParsedLogs, 
                         if out.rejected_message.is_none() {
                             out.rejected_message = Some(format!(
                                 "log record timestamp {timestamp_ns} is outside the \
-                                 representable ClickHouse Date range"
+                                 supported storage time range (1970-01-01 to 2106-02-06 UTC)"
                             ));
                         }
                         continue;
@@ -1142,9 +1147,11 @@ mod tests {
     #[test]
     fn parse_rejects_a_far_future_record_instead_of_orphaning_it_into_the_max_date_partition() {
         // Representable as i64 ns but ~year 2200 — past the 2149-06-06
-        // ClickHouse `Date` cutoff. Before #8's fix this saturated the month
-        // to day 65535, silently orphaning the sample; now it is a clean
-        // per-record rejection (partial success), contributing no stream row.
+        // ClickHouse `Date` cutoff (and past the tighter 2106-02-06
+        // DateTime-safe cutoff, issue #137). Before #8's fix this saturated
+        // the month to day 65535, silently orphaning the sample; now it is a
+        // clean per-record rejection (partial success), contributing no
+        // stream row.
         let far_future_ns: i64 = 86_400_000_000_000 * 84_000;
         let bad = LogRecord {
             time_unix_nano: far_future_ns as u64,
@@ -1166,10 +1173,9 @@ mod tests {
         );
         assert_eq!(out.rejected, 1);
         assert!(
-            out.rejected_message
-                .as_deref()
-                .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+            out.rejected_message.as_deref().unwrap().contains(
+                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
+            )
         );
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.rows[0].body, "good");
@@ -1183,27 +1189,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_the_last_representable_day_but_rejects_the_first_unrepresentable_one() {
-        // The exact record #8's round-2 review flagged: `log_samples`
-        // partitions by the RAW sample day
-        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`). Day 65535 =
-        // 2149-06-06 is the last day ClickHouse `Date` can represent; day
-        // 65536 = 2149-06-07 is the first it cannot — yet its month-start
-        // (2149-06-01 = day 65530) IS representable, so the prior month-only
-        // gate wrongly ACCEPTED it into a partition it can never store. The
-        // day-65536 record must now be rejected while the day-65535 record
-        // stays accepted (no over-rejection).
+    fn parse_accepts_the_last_datetime_safe_day_but_rejects_the_first_unsafe_one() {
+        // Issue #137 (re-pointing #8's round-2 boundary pair from the `Date`
+        // horizon to the DateTime-safe one): `log_samples` partitions by the
+        // RAW sample day and its delete-TTL evaluates the row timestamp in
+        // the 32-bit `DateTime` domain. Day 49_709 = 2106-02-06 is the last
+        // UTC day fully inside that domain; day 49_710 = 2106-02-07 still
+        // partitions correctly (inside the u16 `Date` range) but its TTL
+        // seconds value exceeds u32::MAX — before #137 such a record was
+        // accepted with a wrap-prone timestamp. The day-49_710 record must
+        // now be rejected while the day-49_709 record stays accepted (no
+        // over-rejection).
         const NANOS_PER_DAY: i64 = 86_400_000_000_000;
-        let last_ok_ns = NANOS_PER_DAY * 65_535; // 2149-06-06 00:00 UTC
-        let first_bad_ns = NANOS_PER_DAY * 65_536; // 2149-06-07 00:00 UTC
+        let last_ok_ns = NANOS_PER_DAY * 49_709; // 2106-02-06 00:00 UTC
+        let first_bad_ns = NANOS_PER_DAY * 49_710; // 2106-02-07 00:00 UTC
         let accepted = LogRecord {
             time_unix_nano: last_ok_ns as u64,
-            body: string_body("last-representable-day"),
+            body: string_body("last-datetime-safe-day"),
             ..Default::default()
         };
         let rejected = LogRecord {
             time_unix_nano: first_bad_ns as u64,
-            body: string_body("first-unrepresentable-day"),
+            body: string_body("first-datetime-unsafe-day"),
             ..Default::default()
         };
         let out = parse(
@@ -1216,17 +1223,16 @@ mod tests {
         );
         assert_eq!(out.rejected, 1);
         assert!(
-            out.rejected_message
-                .as_deref()
-                .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+            out.rejected_message.as_deref().unwrap().contains(
+                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
+            )
         );
         // Only the in-range record survives, unchanged.
         assert_eq!(out.rows.len(), 1);
-        assert_eq!(out.rows[0].body, "last-representable-day");
-        // Its stream registers exactly its representable month (2149-06-01).
+        assert_eq!(out.rows[0].body, "last-datetime-safe-day");
+        // Its stream registers exactly its month (2106-02-01 = day 49_704).
         assert_eq!(out.streams.len(), 1);
-        assert_eq!(out.streams[0].month.days_since_epoch(), 65_530);
+        assert_eq!(out.streams[0].month.days_since_epoch(), 49_704);
     }
 
     #[test]

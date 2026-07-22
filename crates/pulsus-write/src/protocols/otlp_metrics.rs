@@ -1368,13 +1368,17 @@ fn base64_encode(input: &[u8]) -> String {
 /// "verbatim at millisecond precision"). `Err` when `time_unix_nano == 0`
 /// (task-manager resolution: a metric sample with no timestamp is
 /// malformed, unlike a log record's `now_ns` fallback) or when the
-/// resulting day falls outside the ClickHouse `Date` range (before
-/// 1970-01-01 or after 2149-06-06): `metric_samples` /
+/// resulting day falls outside the supported storage range (before
+/// 1970-01-01 or after 2106-02-06, day 49_709): `metric_samples` /
 /// `metric_hist_samples` partition on
 /// `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126, mirroring
-/// #8's log/trace-path fix), so a day that range can't represent would
-/// otherwise silently orphan the sample into the wrong partition. Both are
-/// a per-point rejection (partial success), not a whole-request failure.
+/// #8's log/trace-path fix), so a day past the `Date` range would
+/// silently orphan the sample into the wrong partition — and their
+/// delete-TTL evaluates `intDiv(unix_milli, 1000)` in the 32-bit
+/// `DateTime` domain (issue #137, mirroring #131's trace fix), so a day
+/// in `49_710..=65_535` would partition correctly but exceed `u32::MAX`
+/// in the TTL seconds arithmetic. Both are a per-point rejection (partial
+/// success), not a whole-request failure.
 ///
 /// The division-then-cast is infallible: `u64::MAX / 1_000_000 <
 /// i64::MAX`, so any `u64` nanosecond value converts without truncation or
@@ -1386,9 +1390,10 @@ fn resolve_timestamp_ms(time_unix_nano: u64) -> Result<i64, String> {
     let millis = time_unix_nano / 1_000_000;
     let millis = i64::try_from(millis)
         .expect("u64::MAX / 1_000_000 fits in i64 (see this fn's doc comment)");
-    if Date::start_of_day_utc_ms(millis).is_none() {
+    if Date::start_of_day_utc_ms_datetime_safe(millis).is_none() {
         return Err(format!(
-            "data point timestamp {millis}ms is outside the representable ClickHouse Date range"
+            "data point timestamp {millis}ms is outside the supported storage time range \
+             (1970-01-01 to 2106-02-06 UTC)"
         ));
     }
     Ok(millis)
@@ -1656,30 +1661,32 @@ mod tests {
     }
 
     #[test]
-    fn number_data_point_at_the_last_representable_day_is_accepted() {
-        // Day 65535 = 2149-06-06, the last day ClickHouse `Date` can
-        // represent. Last ms within it (5_662_310_399_999) at ns scale.
-        let ns: u64 = 5_662_310_399_999_000_000;
+    fn number_data_point_at_the_last_datetime_safe_day_is_accepted() {
+        // Day 49_709 = 2106-02-06, the last UTC day fully inside the
+        // 32-bit DateTime domain the metric delete-TTL evaluates in
+        // (issue #137). Last ms within it (4_294_943_999_999) at ns scale.
+        let ns: u64 = 4_294_943_999_999_000_000;
         let req = one_metric_request(None, gauge_metric("up", number_dp(ns, 1.0, vec![])));
         let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
         assert_eq!(out.samples.len(), 1);
-        assert_eq!(out.samples[0].unix_milli, 5_662_310_399_999);
+        assert_eq!(out.samples[0].unix_milli, 4_294_943_999_999);
     }
 
     #[test]
-    fn number_data_point_at_the_first_unrepresentable_day_is_rejected_as_partial_success() {
-        // Day 65536 = 2149-06-07, the first day past the u16 `Date` range.
-        let ns: u64 = 5_662_310_400_000_000_000;
+    fn number_data_point_at_the_first_datetime_unsafe_day_is_rejected_as_partial_success() {
+        // Day 49_710 = 2106-02-07: partitions correctly (inside the u16
+        // `Date` range) but its TTL seconds value exceeds u32::MAX — before
+        // issue #137 this point was accepted with a wrap-prone timestamp.
+        let ns: u64 = 4_294_944_000_000_000_000;
         let req = one_metric_request(None, gauge_metric("up", number_dp(ns, 1.0, vec![])));
         let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
         assert!(
-            out.rejected_message
-                .as_deref()
-                .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+            out.rejected_message.as_deref().unwrap().contains(
+                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
+            )
         );
     }
 
@@ -2588,9 +2595,10 @@ mod tests {
 
     #[test]
     fn native_mode_rejects_a_far_future_exp_histogram_point_and_writes_no_hist_sample() {
-        // Same day-65536 boundary as the number-point test, proving the
-        // gate also covers the `metric_hist_samples` path (issue #126).
-        let far_future_ns: u64 = 5_662_310_400_000_000_000;
+        // Same day-49_710 boundary as the number-point test, proving the
+        // DateTime-safe gate also covers the `metric_hist_samples` path
+        // (issues #126/#137).
+        let far_future_ns: u64 = 4_294_944_000_000_000_000;
         let dp = ExponentialHistogramDataPoint {
             time_unix_nano: far_future_ns,
             count: 4,

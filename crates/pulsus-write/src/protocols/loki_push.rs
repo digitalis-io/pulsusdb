@@ -809,26 +809,30 @@ fn append_stream(
     for entry in entries {
         let (timestamp_ns, line, structured_metadata) = entry?;
         // `log_samples` is partitioned by the RAW sample day
-        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`), so a timestamp
-        // whose day falls outside the ClickHouse `Date` range (before
-        // 1970-01-01 or at/after 2149-06-07) cannot land in a valid partition
-        // even when its month-start still can — e.g. 2149-06-07 = day 65536
-        // (unrepresentable) has month-start 2149-06-01 = day 65530
-        // (representable). Gate on the DAY, then derive the month for the
-        // stream registration (guaranteed `Some` once the day is in range, but
-        // kept fallible — no `.unwrap()` on untrusted input). Saturating would
-        // orphan the sample; like a timestamp overflow above, this aborts the
-        // whole request (Loki is all-or-nothing).
-        if Date::start_of_day_utc(timestamp_ns).is_none() {
+        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`) and its
+        // delete-TTL evaluates `intDiv(timestamp_ns, 1000000000)` in the
+        // 32-bit `DateTime` domain (issue #137, mirroring #131's trace fix),
+        // so an entry is storage-safe only when its day lies in `0..=49_709`
+        // (1970-01-01 to 2106-02-06): a day in `49_710..=65_535` partitions
+        // correctly but exceeds `u32::MAX` in the TTL seconds arithmetic,
+        // and a later day falls outside the `Date` range entirely — even
+        // when its month-start still fits (e.g. 2149-06-07 = day 65536 has
+        // month-start 2149-06-01 = day 65530). Gate on the DAY, then derive
+        // the month for the stream registration (guaranteed `Some` once the
+        // day is in range, but kept fallible — no `.unwrap()` on untrusted
+        // input). Saturating would orphan or silently early-expire the
+        // sample; like a timestamp overflow above, this aborts the whole
+        // request (Loki is all-or-nothing).
+        if Date::start_of_day_utc_datetime_safe(timestamp_ns).is_none() {
             return Err(LogsIngestError::LokiDecode(format!(
-                "log entry timestamp {timestamp_ns} is outside the representable \
-                 ClickHouse Date range"
+                "log entry timestamp {timestamp_ns} is outside the supported \
+                 storage time range (1970-01-01 to 2106-02-06 UTC)"
             )));
         }
         let month = Date::start_of_month_utc(timestamp_ns).ok_or_else(|| {
             LogsIngestError::LokiDecode(format!(
-                "log entry timestamp {timestamp_ns} is outside the representable \
-                 ClickHouse Date range"
+                "log entry timestamp {timestamp_ns} is outside the supported \
+                 storage time range (1970-01-01 to 2106-02-06 UTC)"
             ))
         })?;
         if seen_streams.insert((fingerprint, month)) {
@@ -2204,10 +2208,12 @@ mod tests {
     #[test]
     fn parse_protobuf_far_future_month_is_a_whole_request_error_not_a_saturated_row() {
         // ~year 2200 (84_000 days after the epoch) in seconds: representable
-        // as i64 ns but past the 2149-06-06 ClickHouse `Date` cutoff. Before
-        // #8's fix the month saturated to day 65535, silently orphaning the
-        // sample; now it is a whole-request `LokiDecode` failure (Loki is
-        // all-or-nothing on a bad timestamp), never a stored row.
+        // as i64 ns but past the 2149-06-06 ClickHouse `Date` cutoff (and
+        // past the tighter 2106-02-06 DateTime-safe cutoff, issue #137).
+        // Before #8's fix the month saturated to day 65535, silently
+        // orphaning the sample; now it is a whole-request `LokiDecode`
+        // failure (Loki is all-or-nothing on a bad timestamp), never a
+        // stored row.
         let far_future_secs = 86_400i64 * 84_000;
         let req = PushRequest {
             streams: vec![StreamAdapter {
@@ -2219,44 +2225,47 @@ mod tests {
         let LogsIngestError::LokiDecode(msg) = err else {
             panic!("expected LokiDecode, got {err:?}");
         };
-        assert!(msg.contains("outside the representable ClickHouse Date range"));
+        assert!(msg.contains("outside the supported storage time range"));
     }
 
     #[test]
-    fn parse_protobuf_last_representable_day_accepted_first_unrepresentable_day_rejected() {
-        // The exact record #8's round-2 review flagged: `log_samples`
-        // partitions by the RAW sample day
-        // (`toDate(fromUnixTimestamp64Nano(timestamp_ns))`). Day 65535 =
-        // 2149-06-06 is the last representable ClickHouse `Date`; day 65536 =
-        // 2149-06-07 is the first it cannot store — yet its month-start
-        // (2149-06-01 = day 65530) IS representable, so the prior month-only
-        // gate wrongly accepted it. Loki is all-or-nothing, so the day-65536
-        // entry fails the whole request while the day-65535 request still
-        // parses (no over-rejection).
+    fn parse_protobuf_last_datetime_safe_day_accepted_first_unsafe_day_rejected() {
+        // Issue #137 (re-pointing #8's round-2 boundary pair from the `Date`
+        // horizon to the DateTime-safe one): `log_samples` partitions by the
+        // RAW sample day and its delete-TTL evaluates the row timestamp in
+        // the 32-bit `DateTime` domain. Day 49_709 = 2106-02-06 is the last
+        // UTC day fully inside that domain; day 49_710 = 2106-02-07 still
+        // partitions correctly (inside the u16 `Date` range) but its TTL
+        // seconds value exceeds u32::MAX — accepted (wrap-prone) before
+        // #137. Loki is all-or-nothing, so the day-49_710 entry fails the
+        // whole request while the day-49_709 request still parses (no
+        // over-rejection).
         const SECS_PER_DAY: i64 = 86_400;
         let last_ok = PushRequest {
             streams: vec![StreamAdapter {
                 labels: r#"{a="b"}"#.to_string(),
-                entries: vec![entry(SECS_PER_DAY * 65_535, 0, "ok")],
+                entries: vec![entry(SECS_PER_DAY * 49_709, 0, "ok")],
             }],
         };
-        let out = parse_protobuf(&last_ok, 0).expect("day 65535 is representable");
+        let out = parse_protobuf(&last_ok, 0).expect("day 49_709 is storage-safe");
         assert_eq!(out.rows.len(), 1);
         assert_eq!(out.streams.len(), 1);
-        // Registers exactly its representable month (2149-06-01 = day 65530).
-        assert_eq!(out.streams[0].month.days_since_epoch(), 65_530);
+        // Registers exactly its month (2106-02-01 = day 49_704).
+        assert_eq!(out.streams[0].month.days_since_epoch(), 49_704);
 
         let first_bad = PushRequest {
             streams: vec![StreamAdapter {
                 labels: r#"{a="b"}"#.to_string(),
-                entries: vec![entry(SECS_PER_DAY * 65_536, 0, "bad")],
+                entries: vec![entry(SECS_PER_DAY * 49_710, 0, "bad")],
             }],
         };
         let err = parse_protobuf(&first_bad, 0).unwrap_err();
         let LogsIngestError::LokiDecode(msg) = err else {
             panic!("expected LokiDecode, got {err:?}");
         };
-        assert!(msg.contains("outside the representable ClickHouse Date range"));
+        assert!(
+            msg.contains("outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)")
+        );
     }
 
     #[test]

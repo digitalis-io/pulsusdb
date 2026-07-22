@@ -1462,15 +1462,16 @@ mod tests {
         assert!(!partial.error_message.is_empty());
     }
 
-    /// Issue #126: a data point whose day falls outside the ClickHouse
-    /// `Date` range (day 65536 = 2149-06-07, one day past the last
-    /// representable day) is rejected as partial success, exactly like the
+    /// Issues #126/#137: a data point whose day falls outside the supported
+    /// storage range (day 49_710 = 2106-02-07, one day past the last UTC day
+    /// fully inside the 32-bit DateTime domain the metric delete-TTL
+    /// evaluates in) is rejected as partial success, exactly like the
     /// zero-timestamp case above — and the admitted batch reaching the sink
-    /// carries no sample for it (nothing can land in `metric_samples`'
-    /// clamped partition).
+    /// carries no sample for it.
     #[tokio::test]
     async fn metrics_far_future_data_point_is_rejected_and_never_reaches_the_admitted_batch() {
-        let far_future_ns: u64 = 5_662_310_400_000_000_000;
+        // The first nanosecond of day 49_710 (2106-02-07 00:00:00 UTC).
+        let far_future_ns: u64 = 4_294_944_000_000_000_000;
         let req = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
                 resource: None,
@@ -2248,11 +2249,13 @@ mod tests {
         assert!(admitted[0].samples.is_empty());
     }
 
-    /// Issue #126: same reject-boundary contract as the missing-`__name__`
-    /// case above, but for a sample whose day falls outside the ClickHouse
-    /// `Date` range (day 65536 = 2149-06-07) — a per-sample drop, still a
-    /// `204`, and nothing reaches `metric_samples`' clamped partition
-    /// because the admitted batch carries no sample for it.
+    /// Issues #126/#137: same reject-boundary contract as the
+    /// missing-`__name__` case above, but for a sample whose day falls
+    /// outside the supported storage range (day 49_710 = 2106-02-07, one day
+    /// past the last UTC day fully inside the 32-bit DateTime domain the
+    /// metric delete-TTL evaluates in) — a per-sample drop, still a `204`,
+    /// and nothing reaches `metric_samples` because the admitted batch
+    /// carries no sample for it.
     #[tokio::test]
     async fn remote_write_far_future_timestamp_still_returns_204_sample_never_admitted() {
         let req = WriteRequest {
@@ -2263,7 +2266,8 @@ mod tests {
                 }],
                 samples: vec![Sample {
                     value: 1.0,
-                    timestamp: 5_662_310_400_000,
+                    // The first millisecond of day 49_710 (2106-02-07).
+                    timestamp: 4_294_944_000_000,
                 }],
             }],
             metadata: vec![],

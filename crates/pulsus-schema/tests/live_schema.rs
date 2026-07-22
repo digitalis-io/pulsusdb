@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
-use pulsus_schema::{Family, RenderCtx, SchemaParams, check_version, reconcile, run_init};
+use pulsus_schema::{
+    Family, RenderCtx, SchemaParams, apply_ttl, check_version, reconcile, run_init,
+};
 
 fn should_run() -> bool {
     std::env::var("PULSUS_TEST_CLICKHOUSE").as_deref() == Ok("1")
@@ -178,6 +180,19 @@ struct LegacyLogSampleRow {
 #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ExplainRow {
     explain: String,
+}
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct CountRow {
+    n: u64,
+}
+
+async fn count(client: &ChClient, sql: &str) -> u64 {
+    let mut stream = client
+        .query_stream::<CountRow>(sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("count query failed: {e}\nSQL:\n{sql}"));
+    stream.next().await.expect("one row").expect("decode").n
 }
 
 /// The core M0 acceptance contract (issue #5): `run_init` on a fresh
@@ -590,8 +605,13 @@ fn family_sharding_expr_is_the_single_source_of_truth() {
 
 /// Issue #5 fix plan F1: `PULSUS_RETENTION_DAYS` is mutable operational
 /// config, excluded from migration identity — a re-init after it changes
-/// must succeed (not `MigrationDrift`) and must actually update the TTL on
-/// both raw sample tables (`apply_ttl`'s job, run every `run_init`).
+/// must succeed (not `MigrationDrift`) and must actually update the TTL
+/// (`apply_ttl`'s job, run every `run_init`). Issue #137 re-points the TTL
+/// asserts at the saturating expression `apply_ttl` now renders for the
+/// metric/log tables, and extends coverage to `metric_hist_samples` — the
+/// hist assert fails on pre-#137 main, where the table is absent from
+/// `apply_ttl` and its TTL stays CREATE-static (the retention-propagation
+/// gap #137 closes).
 #[tokio::test]
 async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     skip_unless_live!();
@@ -604,13 +624,25 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
     run_init(&client, &ctx)
         .await
         .expect("run_init (retention_days=7)");
-    let before = create_table_query(&client, db, "metric_samples").await;
-    // ClickHouse normalizes `INTERVAL n DAY` to `toIntervalDay(n)` in the
-    // `CREATE TABLE` it reports back — assert against that canonical form,
-    // not the literal DDL text we sent.
+    // `apply_ttl` (issues #131/#137) supersedes the CREATE-time TTL with the
+    // saturating expression; ClickHouse normalizes the rendered
+    // `{{retention_days}} * 86400` product by wrapping it in parens
+    // (live_traces.rs pins the same 24.8 normalization for the ns form).
+    let before_metric = create_table_query(&client, db, "metric_samples").await;
     assert!(
-        before.contains("toIntervalDay(7)"),
-        "initial TTL must reflect retention_days=7: {before}"
+        before_metric.contains("least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295)"),
+        "metric_samples' initial TTL must reflect retention_days=7: {before_metric}"
+    );
+    let before_hist = create_table_query(&client, db, "metric_hist_samples").await;
+    assert!(
+        before_hist.contains("least(intDiv(unix_milli, 1000) + (7 * 86400), 4294967295)"),
+        "metric_hist_samples' initial TTL must be the runtime saturating form (fails on \
+         pre-#137 main, where the table is absent from apply_ttl): {before_hist}"
+    );
+    let before_log = create_table_query(&client, db, "log_samples").await;
+    assert!(
+        before_log.contains("least(intDiv(timestamp_ns, 1000000000) + (7 * 86400), 4294967295)"),
+        "log_samples' initial TTL must reflect retention_days=7: {before_log}"
     );
 
     ctx.retention_days = 30;
@@ -618,18 +650,21 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
         .await
         .expect("re-init after a PULSUS_RETENTION_DAYS change must succeed, not MigrationDrift");
 
-    let after = create_table_query(&client, db, "metric_samples").await;
-    assert!(
-        after.contains("toIntervalDay(30)"),
-        "TTL must be updated to the new retention_days: {after}"
-    );
-    assert!(!after.contains("toIntervalDay(7)"));
-
-    let log_after = create_table_query(&client, db, "log_samples").await;
-    assert!(
-        log_after.contains("toIntervalDay(30)"),
-        "log_samples TTL must also be updated: {log_after}"
-    );
+    for table in ["metric_samples", "log_samples", "metric_hist_samples"] {
+        let after = create_table_query(&client, db, table).await;
+        assert!(
+            after.contains("(30 * 86400)"),
+            "{table}'s TTL must be updated to the new retention_days: {after}"
+        );
+        assert!(
+            !after.contains("(7 * 86400)"),
+            "{table}: stale retention_days=7 TTL: {after}"
+        );
+        assert!(
+            !after.contains("toIntervalDay("),
+            "{table}: the wrap-prone INTERVAL form must be superseded: {after}"
+        );
+    }
 }
 
 /// Issue #5 fix plan F1: `PULSUS_LOG_ROLLUP_RESOLUTION` is config-derived
@@ -675,4 +710,248 @@ async fn run_init_after_log_rollup_resolution_change_creates_new_table_and_retai
         names_after.contains(&"log_metrics_5s_mv".to_string()),
         "the old-resolution rollup MV must be retained, not dropped: {names_after:?}"
     );
+}
+
+/// The last admitted metric millisecond (issue #137): the final millisecond
+/// of day 49_709 (2106-02-06), whose floor-seconds value `4_294_943_999` is
+/// the last whole second of the last fully u32-representable UTC day.
+const BOUNDARY_TS_MS: i64 = 49_710 * 86_400_000 - 1;
+
+/// A day-50_000 (2106-11-22) instant, inside `(2106-02-07, 2149-06-06]`:
+/// partitions correctly (u16 `Date` range) but its seconds value
+/// `4_320_000_000` exceeds `u32::MAX`, so the pre-#137 TTL expression wraps
+/// for it.
+const DAY_50_000_MS: i64 = 50_000 * 86_400_000;
+
+/// The saturating metric TTL expression `apply_ttl` renders (issue #137,
+/// the millisecond sibling of #131's trace form), as a SELECT-able snippet
+/// over a literal `ts`.
+fn new_ms_ttl_expr(ts_ms: i64, retention_days: u32) -> String {
+    format!(
+        "toDateTime(least(intDiv(toInt64({ts_ms}), 1000) + {retention_days} * 86400, 4294967295))"
+    )
+}
+
+/// Issue #137 (mirroring #131 AC10a/b/d for the millisecond form): semantics
+/// of the saturating metric TTL expression on a live 24.8 server —
+/// (a) for a normal-range timestamp it is value-identical to the pre-#137
+///     `toDateTime(fromUnixTimestamp64Milli(ts)) + INTERVAL n DAY` form;
+/// (b) at the last admitted millisecond it clamps exactly to
+///     `toDateTime(4294967295)` (2106-02-07T06:28:15Z);
+/// (d) `apply_ttl` with `retention_days = u32::MAX` is accepted by the
+///     server, both millisecond tables' DDL carries the extreme retention
+///     product, the expression clamps an admitted present-day timestamp
+///     exactly to `toDateTime(4294967295)`, and the un-clamped seconds
+///     arithmetic stays Int64.
+#[tokio::test]
+async fn metric_ttl_expression_is_equivalent_in_range_and_saturates_at_the_boundary() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_metric_ttl_expr";
+    drop_database(&client, db).await;
+    let mut ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init");
+
+    // (a) Equivalence for a normal-range timestamp (2023-11-14T22:13:20Z).
+    let normal_ts_ms: i64 = 1_700_000_000_123;
+    let new_expr = new_ms_ttl_expr(normal_ts_ms, 7);
+    let equal = count(
+        &client,
+        &format!(
+            "SELECT toUInt64({new_expr} = \
+             (toDateTime(fromUnixTimestamp64Milli(toInt64({normal_ts_ms}))) + INTERVAL 7 DAY)) AS n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        equal, 1,
+        "new expression must equal the pre-#137 expiry for a normal-range ts"
+    );
+
+    // (b) Saturation at the last admitted millisecond.
+    let boundary_expr = new_ms_ttl_expr(BOUNDARY_TS_MS, 7);
+    let saturated = count(
+        &client,
+        &format!("SELECT toUInt64({boundary_expr} = toDateTime(4294967295)) AS n"),
+    )
+    .await;
+    assert_eq!(
+        saturated, 1,
+        "last-admitted ms + 7d must clamp exactly to toDateTime(4294967295)"
+    );
+
+    // (d) Extreme retention: the rendered ALTER is accepted at
+    // retention_days = u32::MAX on both millisecond tables, and the
+    // expression clamps an admitted present-day ts exactly to the u32::MAX
+    // instant. Also pin the arithmetic type: the un-clamped sum stays Int64
+    // on the server.
+    ctx.retention_days = u32::MAX;
+    apply_ttl(&client, &ctx)
+        .await
+        .expect("apply_ttl at retention_days = u32::MAX must be accepted");
+    for table in ["metric_samples", "metric_hist_samples"] {
+        let ddl = create_table_query(&client, db, table).await;
+        assert!(
+            ddl.contains("(4294967295 * 86400)"),
+            "{table}'s TTL must carry the extreme retention product: {ddl}"
+        );
+    }
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("post-epoch clock")
+            .as_millis(),
+    )
+    .expect("present-day ms fits in i64");
+    let extreme_expr = new_ms_ttl_expr(now_ms, u32::MAX);
+    let clamped = count(
+        &client,
+        &format!("SELECT toUInt64({extreme_expr} = toDateTime(4294967295)) AS n"),
+    )
+    .await;
+    assert_eq!(
+        clamped, 1,
+        "an admitted present-day ts must clamp exactly to toDateTime(4294967295) \
+         at retention_days = u32::MAX"
+    );
+    let int64_type = count(
+        &client,
+        &format!(
+            "SELECT toUInt64(toTypeName(intDiv(toInt64({now_ms}), 1000) + \
+             4294967295 * 86400) = 'Int64') AS n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        int64_type, 1,
+        "the un-clamped seconds arithmetic must resolve to Int64 on the server"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #137 (survival, non-vacuous — mirroring #131 AC10c): directly
+/// inserted day-50_000 rows in `metric_samples`, `log_samples`, and
+/// `metric_hist_samples` — inside `(2106-02-07, 2149-06-06]`, deliberately
+/// bypassing ingest to model pre-existing/non-ingest rows (post-#137
+/// ingest rejects the range) — survive `MATERIALIZE TTL` +
+/// `OPTIMIZE ... FINAL` under the saturating expression `apply_ttl`
+/// installed (retention 7): their expiry clamps to
+/// `toDateTime(4294967295)` = 2106-02-07T06:28:15Z, the horizon, not an
+/// already-past instant. The same millisecond-table rows DROP once the
+/// pre-#137 wrapping expression is re-installed — the wrapped expiry is
+/// ~1970-10, so the part reads as long-expired (`ttl_only_drop_parts = 1`).
+/// The second phase pins the pre-fix defect in-test: on pre-#137
+/// `apply_ttl` text the first phase fails on all three tables
+/// (`metric_hist_samples` included: pre-#137 it kept its wrap-prone
+/// CREATE-time TTL, being absent from the runtime ALTER list).
+#[tokio::test]
+async fn day_50_000_rows_survive_saturating_ttl_and_drop_under_the_wrapping_ttl() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_ttl_boundary_2106";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db); // retention_days = 7; run_init applies the new TTL
+    run_init(&client, &ctx).await.expect("run_init");
+
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_samples (metric_name, fingerprint, unix_milli, value) \
+                 VALUES ('m_boundary', 1, {DAY_50_000_MS}, 1.0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert day-50_000 metric sample");
+    let day_50_000_ns: i64 = DAY_50_000_MS * 1_000_000;
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.log_samples (service, fingerprint, timestamp_ns, severity, body) \
+                 VALUES ('svc-boundary', 1, {day_50_000_ns}, 0, 'body-boundary')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert day-50_000 log sample");
+    // Unspecified `metric_hist_samples` columns (spans/deltas/custom_values,
+    // zero_*, counter_reset_hint) fill with their type defaults — the TTL
+    // only reads `unix_milli`.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.metric_hist_samples \
+                     (metric_name, fingerprint, unix_milli, schema, count, sum) \
+                 VALUES ('h_boundary', 1, {DAY_50_000_MS}, 0, 4, 2.0)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert day-50_000 hist sample");
+
+    let materialize_and_optimize = |table: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .execute(
+                    &format!(
+                        "ALTER TABLE {db}.{table} MATERIALIZE TTL SETTINGS mutations_sync = 2"
+                    ),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("MATERIALIZE TTL");
+            client
+                .execute(
+                    &format!("OPTIMIZE TABLE {db}.{table} FINAL"),
+                    &QuerySettings::new(),
+                    Idempotency::Idempotent,
+                )
+                .await
+                .expect("OPTIMIZE FINAL");
+        }
+    };
+
+    for table in ["metric_samples", "log_samples", "metric_hist_samples"] {
+        materialize_and_optimize(table).await;
+        let survived = count(&client, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        assert_eq!(
+            survived, 1,
+            "{table}'s day-50_000 row must survive MATERIALIZE TTL + OPTIMIZE FINAL under \
+             the saturating expression (fails on the pre-#137 wrapping expression)"
+        );
+    }
+
+    // Re-install the pre-#137 wrapping expression verbatim on both
+    // millisecond tables (for `metric_hist_samples` it is the CREATE-time
+    // TTL the table kept pre-#137, being absent from `apply_ttl`): the same
+    // rows' expiry wraps past u32::MAX to ~1970-10 and the parts are
+    // dropped.
+    for table in ["metric_samples", "metric_hist_samples"] {
+        client
+            .execute(
+                &format!(
+                    "ALTER TABLE {db}.{table} MODIFY TTL \
+                     toDateTime(fromUnixTimestamp64Milli(unix_milli)) + INTERVAL 7 DAY DELETE"
+                ),
+                &QuerySettings::new(),
+                Idempotency::Idempotent,
+            )
+            .await
+            .expect("re-install the pre-#137 wrapping TTL");
+        materialize_and_optimize(table).await;
+        let dropped = count(&client, &format!("SELECT count() AS n FROM {db}.{table}")).await;
+        assert_eq!(
+            dropped, 0,
+            "{table}'s row must drop under the pre-#137 wrapping expression — this pins \
+             the defect the saturating expression closes"
+        );
+    }
+
+    drop_database(&client, db).await;
 }

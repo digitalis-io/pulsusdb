@@ -774,17 +774,21 @@ fn parse_time_series(
     for sample in &ts.samples {
         // `metric_samples` partitions on
         // `toDate(fromUnixTimestamp64Milli(unix_milli))` (issue #126,
-        // mirroring #8's log/trace-path fix): a sample whose UTC day falls
-        // outside the ClickHouse `Date` range (before 1970-01-01 or after
-        // 2149-06-06) cannot be stored in a valid partition, so it is
-        // dropped here rather than accepted verbatim into the wrong one.
-        // Zero (1970-01-01, no sentinel meaning) still passes; a negative
-        // timestamp is now rejected too, per #8's pre-1970 `None` contract.
-        if Date::start_of_day_utc_ms(sample.timestamp).is_none() {
+        // mirroring #8's log/trace-path fix) and its delete-TTL evaluates
+        // `intDiv(unix_milli, 1000)` in the 32-bit `DateTime` domain
+        // (issue #137, mirroring #131's trace fix): a sample whose UTC day
+        // falls outside the supported storage range (before 1970-01-01 or
+        // after 2106-02-06, day 49_709) either cannot be stored in a valid
+        // partition or would wrap in the TTL seconds arithmetic, so it is
+        // dropped here rather than accepted verbatim. Zero (1970-01-01, no
+        // sentinel meaning) still passes; a negative timestamp is rejected
+        // too, per #8's pre-1970 `None` contract.
+        if Date::start_of_day_utc_ms_datetime_safe(sample.timestamp).is_none() {
             out.rejected += 1;
             if out.rejected_message.is_none() {
                 out.rejected_message = Some(format!(
-                    "sample timestamp {}ms is outside the representable ClickHouse Date range",
+                    "sample timestamp {}ms is outside the supported storage time range \
+                     (1970-01-01 to 2106-02-06 UTC)",
                     sample.timestamp
                 ));
             }
@@ -1514,34 +1518,37 @@ mod tests {
             out.rejected_message
                 .as_deref()
                 .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+                .contains("outside the supported storage time range")
         );
     }
 
     #[test]
-    fn sample_at_the_last_representable_day_is_accepted_verbatim() {
-        // Day 65535 = 2149-06-06, the last day ClickHouse `Date` can
-        // represent.
+    fn sample_at_the_last_datetime_safe_day_is_accepted_verbatim() {
+        // Day 49_709 = 2106-02-06, the last UTC day fully inside the
+        // 32-bit DateTime domain the metric delete-TTL evaluates in
+        // (issue #137); its last millisecond.
         let req = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
-                samples: vec![sample(1.0, 5_662_310_399_999)],
+                samples: vec![sample(1.0, 4_294_943_999_999)],
             }],
             metadata: vec![],
         };
         let out = parse(&req, 0).expect("within the expansion budget");
         assert_eq!(out.rejected, 0);
         assert_eq!(out.samples.len(), 1);
-        assert_eq!(out.samples[0].unix_milli, 5_662_310_399_999);
+        assert_eq!(out.samples[0].unix_milli, 4_294_943_999_999);
     }
 
     #[test]
-    fn sample_at_the_first_unrepresentable_day_is_rejected() {
-        // Day 65536 = 2149-06-07, the first day past the u16 `Date` range.
+    fn sample_at_the_first_datetime_unsafe_day_is_rejected() {
+        // Day 49_710 = 2106-02-07: inside the u16 `Date` range but its TTL
+        // seconds value exceeds u32::MAX — accepted (wrap-prone) before
+        // issue #137, a per-sample drop now.
         let req = WriteRequest {
             timeseries: vec![TimeSeries {
                 labels: vec![label("__name__", "up")],
-                samples: vec![sample(1.0, 5_662_310_400_000)],
+                samples: vec![sample(1.0, 4_294_944_000_000)],
             }],
             metadata: vec![],
         };
@@ -1549,10 +1556,9 @@ mod tests {
         assert_eq!(out.rejected, 1);
         assert!(out.samples.is_empty());
         assert!(
-            out.rejected_message
-                .as_deref()
-                .unwrap()
-                .contains("outside the representable ClickHouse Date range")
+            out.rejected_message.as_deref().unwrap().contains(
+                "outside the supported storage time range (1970-01-01 to 2106-02-06 UTC)"
+            )
         );
     }
 

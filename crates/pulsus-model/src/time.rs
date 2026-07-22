@@ -156,6 +156,20 @@ impl Date {
     pub fn start_of_day_utc_datetime_safe(timestamp_ns: i64) -> Option<Date> {
         Date::start_of_day_utc(timestamp_ns).filter(|d| d.0 <= Date::LAST_DATETIME_SAFE_DAY)
     }
+
+    /// [`Date::start_of_day_utc_ms`], additionally rejecting days past
+    /// [`Date::LAST_DATETIME_SAFE_DAY`] — the millisecond sibling of
+    /// [`Date::start_of_day_utc_datetime_safe`] (issue #137; #131
+    /// precedent) for `metric_samples` / `metric_hist_samples`, whose
+    /// delete-TTL evaluates `intDiv(unix_milli, 1000)` in the 32-bit
+    /// `DateTime` domain: a day in `49_710..=65_535` partitions correctly
+    /// (inside the `Date` range) but its TTL seconds value exceeds
+    /// `u32::MAX`, so the caller must reject the sample rather than store
+    /// it with a wrap-prone timestamp. Same full-day granularity rationale
+    /// as the nanosecond variant.
+    pub fn start_of_day_utc_ms_datetime_safe(unix_milli: i64) -> Option<Date> {
+        Date::start_of_day_utc_ms(unix_milli).filter(|d| d.0 <= Date::LAST_DATETIME_SAFE_DAY)
+    }
 }
 
 /// Converts a day count since the Unix epoch (1970-01-01) to a proleptic
@@ -460,6 +474,62 @@ mod tests {
         assert_eq!(
             Date::start_of_day_utc_ms(ms).unwrap(),
             Date::start_of_day_utc(ns).unwrap()
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_datetime_safe_accepts_the_last_datetime_safe_day() {
+        // The last millisecond of day 49_709 (2106-02-06), the last UTC day
+        // fully inside the 32-bit DateTime domain (issue #137).
+        let last_safe_ms = 49_710 * MILLIS_PER_DAY - 1;
+        assert_eq!(last_safe_ms, 4_294_943_999_999);
+        assert_eq!(
+            Date::start_of_day_utc_ms_datetime_safe(last_safe_ms)
+                .unwrap()
+                .days_since_epoch(),
+            Date::LAST_DATETIME_SAFE_DAY
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_datetime_safe_rejects_the_first_datetime_unsafe_day() {
+        // The first millisecond of day 49_710 (2106-02-07): still inside
+        // the u16 `Date` range (start_of_day_utc_ms accepts it) but its
+        // TTL seconds value exceeds u32::MAX partway through the day.
+        let first_unsafe_ms = 49_710 * MILLIS_PER_DAY;
+        assert_eq!(
+            Date::start_of_day_utc_ms_datetime_safe(first_unsafe_ms),
+            None
+        );
+        assert_eq!(
+            Date::start_of_day_utc_ms(first_unsafe_ms)
+                .unwrap()
+                .days_since_epoch(),
+            49_710,
+            "the plain Date-range helper must still accept it — only the DateTime-safe gate rejects"
+        );
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_datetime_safe_rejects_negative_and_i64_extremes() {
+        assert_eq!(
+            Date::start_of_day_utc_ms_datetime_safe(-MILLIS_PER_DAY * 200),
+            None
+        );
+        assert_eq!(Date::start_of_day_utc_ms_datetime_safe(-1), None);
+        assert_eq!(Date::start_of_day_utc_ms_datetime_safe(i64::MIN), None);
+        assert_eq!(Date::start_of_day_utc_ms_datetime_safe(i64::MAX), None);
+    }
+
+    #[test]
+    fn start_of_day_utc_ms_datetime_safe_agrees_with_the_ns_sibling_on_an_in_range_instant() {
+        // 2024-03-15T12:34:56.123Z at both scales: same day out of both
+        // DateTime-safe helpers.
+        let ms = 1_710_505_996_123;
+        let ns = ms * 1_000_000;
+        assert_eq!(
+            Date::start_of_day_utc_ms_datetime_safe(ms).unwrap(),
+            Date::start_of_day_utc_datetime_safe(ns).unwrap()
         );
     }
 
