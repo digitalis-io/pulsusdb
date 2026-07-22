@@ -312,6 +312,41 @@ fn start_timestamps_all_18_rows_pass() {
     );
 }
 
+/// Issue #163: `functions.test` — activated after #157 landed the
+/// query-context functions — replays 426 of its 427 eval rows green.
+/// The single residual is the line-523 `\xff` byte-escape row (the
+/// vendored parser decodes `\xHH` to a Unicode code point, so the
+/// upstream invalid-UTF-8-label failure cannot occur), owner-ledgered
+/// per the #165 ruling. Manifest-state-independent: calls `run_file`
+/// directly, so it holds regardless of skip-manifest/ledger contents
+/// and fails loudly if line 523 ever starts failing-as-expected.
+#[test]
+fn functions_test_replays_426_of_427_with_only_the_byte_escape_row_failing() {
+    let (_, contents) = load_upstream_verified();
+    let text = contents
+        .get("functions.test")
+        .expect("pinned upstream corpus file");
+    assert!(scan_deferred_directives(text).is_empty());
+    let run = run_file("upstream/functions.test", text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        run.cases.len(),
+        427,
+        "functions.test carries exactly 427 eval rows at the pin"
+    );
+    let failures: Vec<&_> = run.cases.iter().filter(|c| !c.passed).collect();
+    assert_eq!(failures.len(), 1, "exactly one residual row (#165)");
+    assert_eq!(failures[0].line, 523);
+    assert_eq!(
+        failures[0].query,
+        r#"label_replace(testmetric, "\xff", "", "src", "(.*)")"#
+    );
+    assert!(
+        failures[0]
+            .detail
+            .contains("expected an error but the query succeeded")
+    );
+}
+
 /// AC2 + AC9: the pinned upstream corpus replays with zero unclassified
 /// failures, the skip-manifest matches reality in both directions, and
 /// the eval-divergence ledger carries no stale entries.

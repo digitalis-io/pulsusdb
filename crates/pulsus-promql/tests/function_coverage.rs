@@ -550,9 +550,9 @@ fn implemented_set_is_exactly_the_m2_surface_today() {
             // M7 (issue #157): the experimental query-context functions —
             // grammar patch G4 + plan-time constant folding (planner-gated
             // behind promql-experimental-functions), corpus-witnessed via
-            // `proof/m7_context_functions.test` (functions.test is
-            // skip-manifested until #163). This completes the 89-function
-            // registry surface.
+            // `proof/m7_context_functions.test` (functions.test activated
+            // by #163: 426/427, the one \xHH row ledgered per #165). This
+            // completes the 89-function registry surface.
             "start",
             "end",
             "step",
