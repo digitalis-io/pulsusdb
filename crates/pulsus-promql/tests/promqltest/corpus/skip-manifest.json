@@ -1,12 +1,4 @@
 {
-  "_comment": "Issue #64 plan v2 Δ2: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Issue #154 made the block-expect forms (expect ordered, expect range vector) and load_with_nhcb EXECUTABLE — the only deferred directives left are eval_warn/eval_info (no pinned file uses them). The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest. `manual_skip` (issue #124, M7-A6) is the non-directive lever: a file with ZERO deferred directives that still fails on replay for reasons outside any tracked directive — no drift check applies to it, unlike blocking_directives. Current users (issue #154 triage): aggregators.test (159/160 locally green; 1 row pending the #165 byte-escape ledger adjudication). functions.test was de-listed and activated by #163 (426/427; the one \\xHH row ledgered per #165). The classic-histogram corpus file was de-listed and activated by #164 (classic-bucket histogram_quantile lowest-bucket interpolation ported).",
-  "files": [
-    {
-      "file": "aggregators.test",
-      "manual_skip": {
-        "reason": "159/160 rows green after #154; line 481 (count_values(\"a\\xc5z\", version)) expects upstream's invalid-UTF-8 label-name failure, which the vendored parser's code-point \\xHH decoding cannot reproduce — awaiting the owner-adjudicated ledger entry",
-        "activation_issue": "#165"
-      }
-    }
-  ]
+  "_comment": "Issue #64 plan v2 Δ2: a vendored file using any deferred directive is skipped loudly and wholesale, with a concrete activation issue per blocking directive. Issue #154 made the block-expect forms (expect ordered, expect range vector) and load_with_nhcb EXECUTABLE — the only deferred directives left are eval_warn/eval_info (no pinned file uses them). The corpus test fails if a listed directive disappears from its file (activate the file!), if an unlisted deferred directive appears, or if a file is absent from both the executed set and this manifest. `manual_skip` (issue #124, M7-A6) is the non-directive lever: a file with ZERO deferred directives that still fails on replay for reasons outside any tracked directive — no drift check applies to it, unlike blocking_directives. Current users: none — all 21 pinned upstream files are active. The final three were de-listed by #164 (classic-bucket histogram_quantile lowest-bucket interpolation ported) and by #163/#165, whose two \\xHH byte-escape rows are recorded in eval-divergences.jsonl per the #165 owner ruling.",
+  "files": []
 }

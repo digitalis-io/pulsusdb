@@ -347,6 +347,38 @@ fn functions_test_replays_426_of_427_with_only_the_byte_escape_row_failing() {
     );
 }
 
+/// Issue #165: `aggregators.test` — the final pinned corpus file —
+/// replays 159 of its 160 eval rows green. The single residual is the
+/// line-481 `\xc5` byte-escape row (the vendored parser decodes `\xHH`
+/// to a Unicode code point, so the upstream invalid-UTF-8-label failure
+/// cannot occur), owner-ledgered per the #165 ruling.
+/// Manifest-state-independent: calls `run_file` directly, so it holds
+/// regardless of skip-manifest/ledger contents and fails loudly if
+/// line 481 ever starts failing-as-expected.
+#[test]
+fn aggregators_test_replays_159_of_160_with_only_the_byte_escape_row_failing() {
+    let (_, contents) = load_upstream_verified();
+    let text = contents
+        .get("aggregators.test")
+        .expect("pinned upstream corpus file");
+    assert!(scan_deferred_directives(text).is_empty());
+    let run = run_file("upstream/aggregators.test", text).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        run.cases.len(),
+        160,
+        "aggregators.test carries exactly 160 eval rows at the pin"
+    );
+    let failures: Vec<&_> = run.cases.iter().filter(|c| !c.passed).collect();
+    assert_eq!(failures.len(), 1, "exactly one residual row (#165)");
+    assert_eq!(failures[0].line, 481);
+    assert_eq!(failures[0].query, r#"count_values("a\xc5z", version)"#);
+    assert!(
+        failures[0]
+            .detail
+            .contains("expected an error but the query succeeded")
+    );
+}
+
 /// AC2 + AC9: the pinned upstream corpus replays with zero unclassified
 /// failures, the skip-manifest matches reality in both directions, and
 /// the eval-divergence ledger carries no stale entries.
