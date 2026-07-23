@@ -1181,18 +1181,14 @@ async fn assert_metrics_roundtrip(
         .json()
         .await
         .context("metrics/query_range body was not JSON")?;
-    if body["data"]["resultType"] != "matrix" {
-        bail!("metrics/query_range resultType was not matrix: {body}");
+    // Issue #182: the traces metrics endpoints emit the Tempo-native
+    // `{series, metrics}` body (docs/api.md §4.4), not the Prometheus
+    // matrix/vector envelope. `series[].samples[]` carry `{timestampMs
+    // (jsonpb string), value (omitted at zero)}`.
+    if body.get("series").and_then(|s| s.as_array()).is_none() {
+        bail!("metrics/query_range missing Tempo-native series: {body}");
     }
-    let total: f64 = body["data"]["result"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|series| series["values"].as_array())
-        .flatten()
-        .filter_map(|point| point[1].as_str())
-        .filter_map(|s| s.parse::<f64>().ok())
-        .sum();
+    let total: f64 = tempo_metrics_points(&body).values().sum();
     if total != expected {
         bail!("metrics/query_range count_over_time summed to {total}, expected {expected}: {body}");
     }
@@ -1216,16 +1212,12 @@ async fn assert_metrics_roundtrip(
         .json()
         .await
         .context("metrics/query body was not JSON")?;
-    if body["data"]["resultType"] != "vector" {
-        bail!("metrics/query resultType was not vector: {body}");
+    // Issue #182: the instant `query` form also emits the Tempo-native
+    // `{series, metrics}` body — one `samples[]` entry per series.
+    if body.get("series").and_then(|s| s.as_array()).is_none() {
+        bail!("metrics/query missing Tempo-native series: {body}");
     }
-    let instant: f64 = body["data"]["result"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|sample| sample["value"][1].as_str())
-        .filter_map(|s| s.parse::<f64>().ok())
-        .sum();
+    let instant: f64 = tempo_metrics_points(&body).values().sum();
     if instant != expected {
         bail!("metrics/query count_over_time returned {instant}, expected {expected}: {body}");
     }
@@ -1617,39 +1609,12 @@ async fn run_search_case(
 }
 
 /// PulsusDB's Prometheus-matrix metrics response normalized to
-/// `bucket-ms -> summed value` (docs/api.md §4.4: matrix envelope,
-/// `values: [[ts_seconds, "value"], …]`; series are summed per bucket —
-/// both stores return a single series for the run-scoped informational
-/// queries, so summing is a stable normalization either way).
-fn pulsus_metrics_points(body: &serde_json::Value) -> std::collections::BTreeMap<i64, f64> {
-    let mut out = std::collections::BTreeMap::new();
-    for series in body["data"]["result"].as_array().into_iter().flatten() {
-        for point in series["values"].as_array().into_iter().flatten() {
-            let Some(ts_ms) = point[0]
-                .as_f64()
-                .map(|s| (s * 1000.0).round() as i64)
-                .or_else(|| {
-                    point[0]
-                        .as_str()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|s| (s * 1000.0).round() as i64)
-                })
-            else {
-                continue;
-            };
-            let Some(val) = point[1].as_str().and_then(|s| s.parse::<f64>().ok()) else {
-                continue;
-            };
-            *out.entry(ts_ms).or_insert(0.0) += val;
-        }
-    }
-    out
-}
-
-/// Tempo's `/api/metrics/query_range` response normalized the same way
-/// (`series[].samples[]` of `{timestampMs, value}` — jsonpb, so
-/// `timestampMs` is a string, and a zero `value` may be omitted
-/// entirely).
+/// Both stores' `/api/…/metrics/query_range` responses normalized to
+/// `bucket-ms -> summed value` (issue #182: PulsusDB's traces metrics
+/// endpoint now emits the **Tempo-native** body, so both sides use this
+/// one reader). `series[].samples[]` of `{timestampMs, value}` — jsonpb,
+/// so `timestampMs` is a string and a zero `value` may be omitted
+/// entirely.
 fn tempo_metrics_points(body: &serde_json::Value) -> std::collections::BTreeMap<i64, f64> {
     let mut out = std::collections::BTreeMap::new();
     for series in body["series"].as_array().into_iter().flatten() {
@@ -1831,7 +1796,10 @@ async fn run_informational_comparisons(
         let mut delta_json = serde_json::Value::Null;
         match (&pulsus, &tempo) {
             (Ok(p), Ok(t)) => {
-                let ours = pulsus_metrics_points(p);
+                // Issue #182: our traces metrics endpoint now emits the
+                // Tempo-native `{series, metrics}` body — read both sides
+                // with the same jsonpb-samples reader.
+                let ours = tempo_metrics_points(p);
                 let theirs = tempo_metrics_points(t);
                 let delta = metrics_points_delta(&ours, &theirs);
                 deltas.push(format!("metrics {q:?}: {}", delta.summary()));
@@ -2226,16 +2194,6 @@ mod tests {
             search_raw_result_count(&serde_json::json!({"metrics":{}})),
             0
         );
-    }
-
-    #[test]
-    fn pulsus_metrics_points_reads_the_prometheus_matrix_shape() {
-        let body = serde_json::json!({"data":{"resultType":"matrix","result":[
-            {"metric":{},"values":[[1784170200, "3"],[1784170260, "5"]]}
-        ]}});
-        let points = pulsus_metrics_points(&body);
-        assert_eq!(points.get(&1_784_170_200_000), Some(&3.0));
-        assert_eq!(points.get(&1_784_170_260_000), Some(&5.0));
     }
 
     #[test]

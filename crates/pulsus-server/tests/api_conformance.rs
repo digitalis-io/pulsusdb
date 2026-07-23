@@ -802,44 +802,52 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
             );
         }
         (Surface::TracesMetrics, path) => {
-            // Issue #59: success is the shared Prometheus query envelope
-            // (`prom_api::encode::query_response`). Against this suite's
-            // empty databases the well-formed match-all metrics request
-            // is the mounting oracle: `query_range` → an empty matrix;
-            // `query` → exactly one label-less `"0"` vector sample (a
-            // `uniqExact` with no `GROUP BY` always returns one row).
+            // Issue #182: success is the Tempo-native `{series, metrics}`
+            // body (docs/api.md §4.4), replacing the Prometheus query
+            // envelope (these endpoints are Tempo-datasource-only). Against
+            // this suite's empty databases the well-formed match-all
+            // request is the mounting oracle: `query_range` → an empty
+            // `series` list; `query` → exactly one `__name__`-labelled
+            // series with one sample whose zero `value` is omitted
+            // (protojson default-omission) — a `uniqExact` with no
+            // `GROUP BY` always returns one row.
             assert!(
                 res.content_type()
                     .is_some_and(|ct| ct.starts_with("application/json")),
                 "{ctx}: metrics envelope content-type"
             );
             let json = res.json(ctx);
-            assert_eq!(json["status"], "success", "{ctx}: body {json}");
+            assert!(
+                json["metrics"].is_object(),
+                "{ctx}: Tempo-native body carries a metrics object, body {json}"
+            );
             if path.ends_with("/query_range") {
-                assert_eq!(json["data"]["resultType"], "matrix", "{ctx}: body {json}");
                 assert_eq!(
-                    json["data"]["result"],
+                    json["series"],
                     serde_json::json!([]),
-                    "{ctx}: empty DB must return an empty matrix, body {json}"
+                    "{ctx}: empty DB must return an empty series list, body {json}"
                 );
             } else {
-                assert_eq!(json["data"]["resultType"], "vector", "{ctx}: body {json}");
-                let result = json["data"]["result"]
+                let series = json["series"]
                     .as_array()
-                    .unwrap_or_else(|| panic!("{ctx}: vector result must be an array: {json}"));
+                    .unwrap_or_else(|| panic!("{ctx}: series must be an array: {json}"));
                 assert_eq!(
-                    result.len(),
+                    series.len(),
                     1,
-                    "{ctx}: an instant metrics query always returns one sample, body {json}"
+                    "{ctx}: an instant metrics query always returns one series, body {json}"
                 );
+                let samples = series[0]["samples"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{ctx}: samples must be an array: {json}"));
                 assert_eq!(
-                    result[0]["metric"],
-                    serde_json::json!({}),
-                    "{ctx}: single-series M4 output is label-less, body {json}"
+                    samples.len(),
+                    1,
+                    "{ctx}: the instant series carries exactly one sample, body {json}"
                 );
-                assert_eq!(
-                    result[0]["value"][1], "0",
-                    "{ctx}: empty DB instant value is the quoted \"0\", body {json}"
+                // The zero value is omitted (protojson default-omission).
+                assert!(
+                    samples[0].get("value").is_none(),
+                    "{ctx}: empty DB instant value is zero → omitted, body {json}"
                 );
             }
         }

@@ -147,14 +147,14 @@ pub enum Surface {
     /// which doubles as the mounting oracle. Errors are the JSON envelope
     /// with `position` present exactly on TraceQL parse errors.
     TracesSearch,
-    /// `GET /api/traces/v1/metrics/{query_range,query}` (issue #59,
-    /// docs/api.md §4.4) — success is the Prometheus query envelope
-    /// (`{"status":"success","data":{"resultType","result"}}`), shared
-    /// byte-for-byte with `prom_api` via its `encode::query_response`.
-    /// Against this suite's empty databases a well-formed request is the
-    /// mounting oracle: `query_range` → 200 with `resultType:"matrix"`,
-    /// `result:[]`; `query` → 200 with `resultType:"vector"` and exactly
-    /// one label-less sample of value `"0"` (a `uniqExact` with no
+    /// `GET /api/traces/v1/metrics/{query_range,query}` (issue #59/#182,
+    /// docs/api.md §4.4) — success is the **Tempo-native** `{series,
+    /// metrics}` body (issue #182 replaced the Prometheus query envelope;
+    /// these endpoints are Tempo-datasource-only). Against this suite's
+    /// empty databases a well-formed request is the mounting oracle:
+    /// `query_range` → 200 with an empty `series` list; `query` → 200 with
+    /// exactly one `__name__`-labelled series whose single sample omits its
+    /// zero `value` (protojson default-omission; a `uniqExact` with no
     /// `GROUP BY` always returns one row). Errors are the JSON envelope
     /// with `position` present exactly on TraceQL parse errors; the
     /// static point-cap rejection is a 422 `query_too_broad` (the

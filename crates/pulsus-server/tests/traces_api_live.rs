@@ -731,9 +731,12 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
     );
 
     // -- Routes 7-10 (TraceQL metrics, both prefixes): seeded range +
-    // instant windows returning a non-empty matrix / a non-zero vector
-    // sample (the shared Prometheus envelope — the documented §8.1
-    // delta from Tempo's own metrics wire format).
+    // instant windows returning the **Tempo-native** `{series, metrics}`
+    // body (issue #182 replaced the Prometheus matrix/vector envelope on
+    // the traces metrics endpoints — docs/api.md §4.4; these endpoints are
+    // Tempo-datasource-only). The alias-vs-native byte-identity is checked
+    // by `assert_alias_native_identity` (shape-agnostic); here we assert
+    // the new shape on both sides.
     let metrics_query = format!("?q=%7B%7D%20%7C%20rate()&{window}&step=60");
     for alias_prefix in ["/api/metrics", "/tempo/api/metrics"] {
         let ctx = format!("{alias_prefix}/query_range seeded");
@@ -746,12 +749,9 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
         );
         assert_eq!(res.status, 200, "{ctx}");
         let json = res.json(&ctx);
-        assert_eq!(json["data"]["resultType"], "matrix", "{ctx}: body {json}");
         assert!(
-            json["data"]["result"]
-                .as_array()
-                .is_some_and(|r| !r.is_empty()),
-            "{ctx}: the seeded window must produce a non-empty matrix, body {json}"
+            json["series"].as_array().is_some_and(|s| !s.is_empty()),
+            "{ctx}: the seeded window must produce a non-empty Tempo-native series set, body {json}"
         );
 
         let ctx = format!("{alias_prefix}/query seeded");
@@ -764,25 +764,18 @@ async fn tempo_query_aliases_are_byte_identical_to_native_on_seeded_data() {
         );
         assert_eq!(res.status, 200, "{ctx}");
         let json = res.json(&ctx);
-        assert_eq!(json["data"]["resultType"], "vector", "{ctx}: body {json}");
-        // Code review (issue #61): guard non-emptiness BEFORE indexing —
-        // serde_json indexing into an empty `result` yields `Null`, and
-        // `Null != "0"` would pass vacuously.
+        // Guard non-emptiness BEFORE indexing (issue #61 pattern): the
+        // instant form carries one `samples[]` entry per series.
         assert!(
-            json["data"]["result"]
-                .as_array()
-                .is_some_and(|r| !r.is_empty()),
-            "{ctx}: the seeded window must produce a non-empty vector, body {json}"
+            json["series"].as_array().is_some_and(|s| !s.is_empty()),
+            "{ctx}: the seeded window must produce a non-empty instant series, body {json}"
         );
-        // Round-2 review (issue #61): parse the rendered value instead of
-        // string-comparing against "0" — a string compare could in theory
-        // pass on an alternate zero rendering; the seeded window
-        // guarantees a strictly positive, finite rate.
-        let value = json["data"]["result"][0]["value"][1]
-            .as_str()
-            .and_then(|v| v.parse::<f64>().ok())
+        // The Tempo-native sample `value` is a JSON number (omitted at
+        // zero); the seeded window guarantees a strictly positive rate.
+        let value = json["series"][0]["samples"][0]["value"]
+            .as_f64()
             .unwrap_or_else(|| {
-                panic!("{ctx}: the vector value must be a numeric string, body {json}")
+                panic!("{ctx}: the instant sample value must be a number, body {json}")
             });
         assert!(
             value.is_finite() && value > 0.0,
