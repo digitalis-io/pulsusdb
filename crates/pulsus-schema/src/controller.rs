@@ -404,8 +404,10 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// for the trace tables; issue #137 extends it to the metric/log tables):
 /// `toDateTime(least(<seconds> + {{retention_days}} * 86400, 4294967295))`
 /// where `<seconds>` is `intDiv(timestamp_ns, 1000000000)` for the
-/// nanosecond tables (`log_samples`, `trace_spans`, `trace_attrs_idx`)
-/// and `intDiv(unix_milli, 1000)` for the millisecond tables
+/// nanosecond tables (`log_samples`, `trace_spans`, `trace_attrs_idx`),
+/// `intDiv(bucket_ns, 1000000000)` for `log_patterns` (its nanosecond
+/// column is `bucket_ns`), and `intDiv(unix_milli, 1000)` for the
+/// millisecond tables
 /// (`metric_samples`, `metric_hist_samples`). The arithmetic is Int64
 /// (max operand sum ≈ 3.71e14 at `retention_days = u32::MAX`, far below
 /// `i64::MAX`), clamped to `u32::MAX` **before** `toDateTime`, so the
@@ -431,7 +433,7 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// deliberately appended LAST so an operator-managed schema lacking the
 /// table cannot block the eight pre-existing statements (rotation
 /// warns-and-continues).
-const TTL_STMTS: [&str; 12] = [
+const TTL_STMTS: [&str; 14] = [
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(unix_milli, 1000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
@@ -456,6 +458,17 @@ const TTL_STMTS: [&str; 12] = [
     "ALTER TABLE {{db}}.trace_edges{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.trace_edges{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    // `log_patterns` (M7-C3, issue #171) — the drain-pattern rollup's `bucket_ns`
+    // is a plain nanosecond column, so it carries the same saturating row-granular
+    // delete-TTL as `log_samples` (nanosecond scale, `intDiv(bucket_ns, ...)`).
+    // Absent from this list until issue #187 (its TTL was render-time-static from
+    // migration 29's CREATE, so a `PULSUS_RETENTION_DAYS` change did not propagate
+    // to it). Appended LAST so an operator-managed schema lacking the table cannot
+    // block the pre-existing statements (rotation warns-and-continues), the
+    // #137 `metric_hist_samples` / #173 `trace_edges` precedent.
+    "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(bucket_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.log_patterns{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
 ];
 
 /// Applies the current `{{retention_days}}`-derived TTL ([`TTL_STMTS`]) to
@@ -563,7 +576,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY TTL"))
             .collect();
-        assert_eq!(ttl_stmts.len(), 6, "six retained tables carry a TTL");
+        assert_eq!(ttl_stmts.len(), 7, "seven retained tables carry a TTL");
         for stmt in &ttl_stmts {
             assert!(
                 stmt.contains("least(intDiv("),
@@ -616,7 +629,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY SETTING ttl_only_drop_parts = 1"))
             .collect();
-        assert_eq!(setting_stmts.len(), 6, "one MODIFY SETTING per table");
+        assert_eq!(setting_stmts.len(), 7, "one MODIFY SETTING per table");
         assert_eq!(
             ttl_stmts
                 .iter()
@@ -632,6 +645,37 @@ mod tests {
                 .count(),
             1,
             "exactly one MODIFY SETTING targets metric_hist_samples"
+        );
+
+        // Issue #187: `log_patterns` renders exactly one saturating MODIFY TTL
+        // on its `bucket_ns` nanosecond column + one MODIFY SETTING pair.
+        let log_patterns_ttl = ttl_stmts
+            .iter()
+            .find(|s| s.contains(".log_patterns "))
+            .unwrap_or_else(|| panic!("no MODIFY TTL for log_patterns"));
+        assert!(
+            log_patterns_ttl.contains("least(intDiv(bucket_ns, 1000000000) + "),
+            "log_patterns TTL divides its bucket_ns column: {log_patterns_ttl}"
+        );
+        assert!(
+            log_patterns_ttl.contains(", 4294967295))"),
+            "log_patterns TTL clamps to u32::MAX before toDateTime: {log_patterns_ttl}"
+        );
+        assert_eq!(
+            ttl_stmts
+                .iter()
+                .filter(|s| s.contains(".log_patterns "))
+                .count(),
+            1,
+            "exactly one MODIFY TTL targets log_patterns"
+        );
+        assert_eq!(
+            setting_stmts
+                .iter()
+                .filter(|s| s.contains(".log_patterns "))
+                .count(),
+            1,
+            "exactly one MODIFY SETTING targets log_patterns"
         );
     }
 

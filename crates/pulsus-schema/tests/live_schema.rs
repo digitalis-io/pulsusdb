@@ -644,13 +644,27 @@ async fn run_init_after_retention_days_change_succeeds_and_updates_ttl() {
         before_log.contains("least(intDiv(timestamp_ns, 1000000000) + (7 * 86400), 4294967295)"),
         "log_samples' initial TTL must reflect retention_days=7: {before_log}"
     );
+    // Issue #187: `log_patterns` (nanosecond `bucket_ns`) must carry the runtime
+    // saturating form too — fails on pre-#187 main, where the table is absent
+    // from apply_ttl and keeps its CREATE-time INTERVAL TTL.
+    let before_patterns = create_table_query(&client, db, "log_patterns").await;
+    assert!(
+        before_patterns.contains("least(intDiv(bucket_ns, 1000000000) + (7 * 86400), 4294967295)"),
+        "log_patterns' initial TTL must be the runtime saturating form (fails on pre-#187 main, \
+         where the table is absent from apply_ttl): {before_patterns}"
+    );
 
     ctx.retention_days = 30;
     run_init(&client, &ctx)
         .await
         .expect("re-init after a PULSUS_RETENTION_DAYS change must succeed, not MigrationDrift");
 
-    for table in ["metric_samples", "log_samples", "metric_hist_samples"] {
+    for table in [
+        "metric_samples",
+        "log_samples",
+        "metric_hist_samples",
+        "log_patterns",
+    ] {
         let after = create_table_query(&client, db, table).await;
         assert!(
             after.contains("(30 * 86400)"),
