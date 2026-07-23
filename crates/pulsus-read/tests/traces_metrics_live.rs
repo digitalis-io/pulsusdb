@@ -108,7 +108,9 @@ async fn exec(client: &ChClient, sql: &str) {
 }
 
 /// Seeds `CORPUS_SPANS` single-span traces, one per second from
-/// `base_s()`: `checkout` every 5th span, `http.status_code = 500` every
+/// `base_s()`: `checkout` every 5th span, `status_message = 'deadline
+/// exceeded'` every 6th (empty otherwise — the issue #189 compare()
+/// `statusMessage` fixture), `http.status_code = 500` every
 /// 4th (span scope), `env = prod` at RESOURCE scope every 3rd and at
 /// SPAN scope every 7th (the dual-scope negation fixture — spans with no
 /// `env` row in either scope are the absent-key population). Running it
@@ -119,14 +121,15 @@ async fn seed_corpus(client: &ChClient, db: &str) {
         client,
         &format!(
             "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
-              status_code, kind, payload_type, payload) \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) \
              SELECT \
                toFixedString(unhex(leftPad(lower(hex(number)), 32, '0')), 16), \
                toFixedString(unhex(leftPad(lower(hex(number)), 16, '0')), 8), \
                toFixedString(unhex('0000000000000000'), 8), \
                'op', \
                if(number % 5 = 0, 'checkout', 'svc-x'), \
+               if(number % 6 = 0, 'deadline exceeded', ''), \
                {base_ns} + toInt64(number) * {NS}, \
                1000000, \
                0, 1, 1, 'p' \
@@ -795,13 +798,16 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
     // Review Fix 3: the well-known-absent-attribute universe — every
     // well-known key Tempo enumerates appears as `key=nil` even when no
     // span carries it; a fully-absent key's baseline/selection nil counts
-    // equal the totals.
+    // equal the totals. `rootServiceName` is NO LONGER here (issue #189:
+    // now data-driven, asserted below); `instrumentation:name`/
+    // `instrumentation:version` stay absent (value deferred to #179).
     for wk in [
         "resource.cluster",
         "resource.k8s.pod.name",
         "span.http.method",
         "span.url.path",
-        "rootServiceName",
+        "instrumentation:name",
+        "instrumentation:version",
     ] {
         assert_eq!(
             value("baseline", wk, "nil"),
@@ -818,6 +824,39 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
             "{wk}: well-known key carries a baseline_total series"
         );
     }
+
+    // Issue #189: `rootName`/`rootServiceName`/`statusMessage` emit REAL
+    // per-value series (no longer well-known-`nil`). All 600 spans are
+    // single-span roots named `op`, so `rootName=op` == the whole
+    // population; `rootServiceName` follows the `checkout`/`svc-x` split;
+    // `statusMessage='deadline exceeded'` is every 6th span (empty → the
+    // nil complement, matching TraceQL's absent→nil).
+    assert_eq!(value("selection", "rootName", "op"), Some(150.0));
+    assert_eq!(value("baseline", "rootName", "op"), Some(450.0));
+    assert_eq!(
+        value("selection", "rootServiceName", "checkout"),
+        Some(30.0)
+    );
+    assert_eq!(value("selection", "rootServiceName", "svc-x"), Some(120.0));
+    assert_eq!(value("baseline", "rootServiceName", "checkout"), Some(90.0));
+    assert_eq!(value("baseline", "rootServiceName", "svc-x"), Some(360.0));
+    assert_eq!(
+        value("selection", "statusMessage", "deadline exceeded"),
+        Some(50.0)
+    );
+    assert_eq!(
+        value("baseline", "statusMessage", "deadline exceeded"),
+        Some(50.0)
+    );
+    // Empty status messages fold into the nil complement.
+    assert_eq!(value("baseline", "statusMessage", "nil"), Some(400.0));
+    assert_eq!(value("selection", "statusMessage", "nil"), Some(100.0));
+    // Every in-window span has a root, so rootName/rootServiceName have NO
+    // nil complement (dropped by the all-zero `retain`).
+    assert_eq!(value("baseline", "rootName", "nil"), None);
+    assert_eq!(value("selection", "rootName", "nil"), None);
+    assert_eq!(value("baseline", "rootServiceName", "nil"), None);
+    assert_eq!(value("selection", "rootServiceName", "nil"), None);
 
     // ---- result comparison (`> N`): a client-side sample post-filter. ---
     // count_over_time per 60s bucket == 60 (one span/second).
@@ -848,6 +887,123 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
         dropped.series.is_empty(),
         "60 > 100 drops every sample → no series"
     );
+}
+
+/// Isolated DB for the trace-wide-roots gate (issue #189 adjudication #1).
+const DB_TW: &str = "pulsus_traces_metrics_tw_it";
+
+/// Issue #189 AC5 — the trace-wide (window-free) roots gate. A single
+/// 2-span trace: the root (`parent_id=0`, `name='root-op'`) sits an hour
+/// BEFORE the compare window; its child (`name='child-op'`) sits inside
+/// it. `compare()` over a window covering ONLY the child must still
+/// resolve `rootName='root-op'`/`rootServiceName='root-svc'` (the root is
+/// pulled in by the window-free `argMin` roots read), never the in-window
+/// `child-op`/`child-svc`. A window-SCOPED read would have produced the
+/// child's own values — this mechanically distinguishes the two.
+#[tokio::test]
+async fn compare_roots_resolve_trace_wide() {
+    if !should_run() {
+        eprintln!(
+            "skipping: set PULSUS_TEST_CLICKHOUSE=1 with a live ClickHouse to run this test \
+             (see crates/pulsus-read/tests/traces_metrics_live.rs for setup)"
+        );
+        return;
+    }
+
+    let admin = ChClient::new(test_config()).await.expect("connect");
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_TW}")).await;
+    run_init(&admin, &test_ctx(DB_TW)).await.expect("run_init");
+
+    let client = {
+        let mut cfg = test_config();
+        cfg.database = DB_TW.to_string();
+        ChClient::new(cfg).await.expect("connect data client")
+    };
+
+    // Aligned single-bucket window; the child is inside, the root is not.
+    let window_start = base_s();
+    let window_end = base_s() + CORPUS_SPANS;
+    let child_ns = (window_start + 300) * NS;
+    let root_ns = (window_start - 3600) * NS; // out of window
+    const TID: &str = "000000000000000000000000000000aa";
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB_TW}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+              duration_ns, status_code, kind, payload_type, payload) VALUES \
+             (toFixedString(unhex('{TID}'), 16), toFixedString(unhex('0000000000000001'), 8), \
+              toFixedString(unhex('0000000000000000'), 8), 'root-op', 'root-svc', '', {root_ns}, \
+              1000000, 0, 1, 1, 'p'), \
+             (toFixedString(unhex('{TID}'), 16), toFixedString(unhex('0000000000000002'), 8), \
+              toFixedString(unhex('0000000000000001'), 8), 'child-op', 'child-svc', '', {child_ns}, \
+              1000000, 0, 1, 1, 'p')"
+        ),
+    )
+    .await;
+
+    let engine = TraceEngine::new(
+        {
+            let mut cfg = test_config();
+            cfg.database = DB_TW.to_string();
+            ChClient::new(cfg).await.expect("connect engine")
+        },
+        engine_config(),
+    );
+    // A selection matching nothing keeps the child in the baseline.
+    let plan = plan_for(
+        &engine,
+        r#"{} | compare({ name = "no-match" })"#,
+        window_start,
+        window_end,
+        CORPUS_SPANS,
+    );
+    let res = engine.metrics_range(&plan).await.expect("compare executes");
+
+    let meta_of = |s: &pulsus_read::TraceMetricSeries| -> String {
+        match &s
+            .labels
+            .iter()
+            .find(|l| l.key == "__meta_type")
+            .unwrap()
+            .value
+        {
+            pulsus_read::MetricLabelValue::Str(v) => v.clone(),
+            other => panic!("__meta_type must be a string: {other:?}"),
+        }
+    };
+    let value = |meta: &str, key: &str, val: &str| -> Option<f64> {
+        res.series
+            .iter()
+            .find(|s| {
+                meta_of(s) == meta
+                    && s.labels.iter().any(|l| {
+                        l.key == key
+                            && matches!(&l.value, pulsus_read::MetricLabelValue::Str(v) if v == val)
+                    })
+            })
+            .map(|s| s.samples.iter().map(|(_, v)| v).sum())
+    };
+
+    // The window contains only the child; its root is resolved trace-wide.
+    assert_eq!(
+        value("baseline", "rootName", "root-op"),
+        Some(1.0),
+        "rootName resolves the out-of-window root, not the in-window child"
+    );
+    assert_eq!(
+        value("baseline", "rootName", "child-op"),
+        None,
+        "a window-scoped read would (wrongly) have produced child-op"
+    );
+    assert_eq!(
+        value("baseline", "rootServiceName", "root-svc"),
+        Some(1.0),
+        "rootServiceName resolves the out-of-window root's service"
+    );
+    assert_eq!(value("baseline", "rootServiceName", "child-svc"), None);
+
+    exec(&admin, &format!("DROP DATABASE IF EXISTS {DB_TW}")).await;
 }
 
 /// The `resource.service.name` string label value of a series.

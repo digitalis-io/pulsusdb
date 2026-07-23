@@ -295,7 +295,13 @@ pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
 /// class the earliest `(timestamp_ns, span_id)` wins — so the co-load's
 /// winning span is term-for-term the span `pick_roots` would pick from
 /// the same (trace-wide) rows.
-fn root_ordering_tuple() -> String {
+///
+/// `pub(crate)` for one out-of-module consumer (issue #189): the
+/// `compare()` cross-tab's window-free per-trace roots read
+/// ([`super::metrics_sql::metrics_compare_sql`]) reuses this exact
+/// ordering tuple so its `rootName`/`rootServiceName` selection is
+/// byte-identical to this search path's.
+pub(crate) fn root_ordering_tuple() -> String {
     format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id)")
 }
 

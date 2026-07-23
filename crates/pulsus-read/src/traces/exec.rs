@@ -778,6 +778,15 @@ impl TraceEngine {
     /// `selection` (`is_sel`) series; per key a `key=nil` complement
     /// (`total − Σ present`) and the `baseline_total`/`selection_total`
     /// denominators (`__meta_type` label + one attribute label).
+    ///
+    /// Fully data-driven: this loop enumerates whatever `(key, value)` the
+    /// cross-tab emits and the well-known loop below only fills in keys with
+    /// zero present rows. Issue #189 wires the cross-tab to emit real values
+    /// for `statusMessage`/`rootName`/`rootServiceName` (see
+    /// [`super::metrics_sql::metrics_compare_sql`]) — those keys are now
+    /// data-driven-when-present here with no per-key branch, and only remain
+    /// well-known-`nil` when fully absent (`instrumentation:name`/
+    /// `instrumentation:version` still always `nil` pending #179).
     async fn frame_compare(
         &self,
         cross_tab_sql: &str,
@@ -891,7 +900,11 @@ impl TraceEngine {
         // semconv keys even when no span carries them, as `key=nil`. For a
         // fully-absent key every span lacks it, so `baseline`/`selection`
         // `key=nil` equal the totals. Captured black-box + OTLP semconv
-        // (see [`WELL_KNOWN_COMPARE_KEYS`]).
+        // (see [`WELL_KNOWN_COMPARE_KEYS`]). The `continue` below is what
+        // lets a now-data-driven well-known key (issue #189:
+        // `statusMessage`/`rootName`/`rootServiceName`) render its real
+        // present values instead — it is enumerated as `key=nil` here only
+        // when NO span carried it.
         for &wk in super::metrics_plan::WELL_KNOWN_COMPARE_KEYS {
             if keys.contains(wk) {
                 continue; // already enumerated from present data

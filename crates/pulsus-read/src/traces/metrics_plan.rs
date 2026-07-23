@@ -419,6 +419,12 @@ pub fn plan_trace_metrics(
         // The fixed well-known-absent-attribute set contributes 4 series
         // per key on top of the data-driven cross-tab; fold it into the
         // cap so the probe bounds the true materialized output count.
+        // Issue #189: three well-known keys (`statusMessage`/`rootName`/
+        // `rootServiceName`) are now ALSO data-driven when present, so this
+        // fixed term conservatively over-counts by ≤4 per such key (its
+        // present rows are counted by the probe AND its 4 slots are
+        // reserved here). Safe: over-counting can only reject earlier, never
+        // under-cap — do not "tighten" it away.
         let fixed_series = 4 * WELL_KNOWN_COMPARE_KEYS.len() as u64;
         let range_bucket = metrics_sql::compare_range_bucket_expr(params.step_s);
         let r = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
@@ -983,10 +989,43 @@ mod tests {
         // The cross-tab enumerates intrinsics + index attrs and counts
         // baseline (count()) and selection (countIf(is_sel)).
         assert!(cross.contains("countIf(is_sel) AS sel_n"), "{cross}");
-        assert!(cross.contains("arrayJoin(["), "intrinsic pivot: {cross}");
+        assert!(
+            cross.contains("arrayJoin(arrayFilter("),
+            "intrinsic pivot: {cross}"
+        );
         assert!(
             cross.contains("concat(a.scope, '.', a.key)"),
             "attr pivot: {cross}"
+        );
+        // Issue #189: the 3 data-driven well-known keys are emitted, with an
+        // empty statusMessage folded to the nil complement, and the roots
+        // resolved by a WINDOW-FREE per-trace argMin LEFT JOIN (no time
+        // predicate inside the roots subquery — trace-wide exactness).
+        for tuple in [
+            "('statusMessage', i_status_message)",
+            "('rootName', r.root_name)",
+            "('rootServiceName', r.root_service)",
+        ] {
+            assert!(cross.contains(tuple), "missing {tuple}: {cross}");
+        }
+        assert!(
+            cross.contains("NOT (x.1 = 'statusMessage' AND x.2 = '')"),
+            "empty statusMessage → nil complement: {cross}"
+        );
+        // The roots read scans `trace_spans` keyed ONLY on the DISTINCT
+        // in-window trace_id IN-set (no time predicate on its own scan —
+        // trace-wide exactness) and is LEFT JOINed into the intrinsics
+        // branch. The byte-exact window-free render is pinned by the golden.
+        assert!(
+            cross.contains("argMin(if(length(name)")
+                && cross.contains("AS root_name")
+                && cross.contains("AS root_service"),
+            "window-free roots argMin projections: {cross}"
+        );
+        assert!(
+            cross.contains("WHERE trace_id IN (SELECT DISTINCT trace_id FROM")
+                && cross.contains("LEFT JOIN"),
+            "roots resolved over the DISTINCT trace_id IN-set, LEFT JOINed: {cross}"
         );
         // The selection predicate is the inner filter compiled to a bool.
         assert!(cross.contains("key = 'http.status_code'"), "{cross}");

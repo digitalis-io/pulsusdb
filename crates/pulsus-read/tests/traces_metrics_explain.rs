@@ -250,6 +250,24 @@ fn extract_semi_join_subquery(sql: &str) -> String {
     panic!("unbalanced semi-join parens in SQL:\n{sql}");
 }
 
+/// Isolates the DATE-BOUNDED base `trace_spans` scan (the `raw` inner
+/// select) from a compare cross-tab SQL — the first bucketed
+/// `SELECT … FROM trace_spans WHERE timestamp_ns …` up to its dedup
+/// `GROUP BY t, trace_id, span_id`. Deliberately the base read, NOT the
+/// window-free roots `argMin` read (which is intentionally unpruned): the
+/// two are distinct trace_spans reads and only the base one is gated for
+/// window pruning. The extracted scan explains cleanly standalone (its
+/// `is_sel` semi-join is a `CreatingSets` child).
+fn extract_compare_base_scan(cross: &str) -> String {
+    let start = cross
+        .find("SELECT toUnixTimestamp64Milli")
+        .unwrap_or_else(|| panic!("no base scan in compare SQL:\n{cross}"));
+    let rel_end = cross[start..]
+        .find("\n  )\n  GROUP BY t, trace_id, span_id")
+        .unwrap_or_else(|| panic!("no base-scan terminator in compare SQL:\n{cross}"));
+    cross[start..start + rel_end].to_string()
+}
+
 fn engine_config() -> TraceReadConfig {
     TraceReadConfig {
         spans_table: "trace_spans".to_string(),
@@ -552,10 +570,53 @@ async fn metrics_explain_and_budget_gates() {
         now,
     );
     let (cross, _totals) = cmp_plan.compare_range().expect("compare range SQL");
+    // Issue #189: the window-free per-trace roots read is LEFT JOINed into
+    // the intrinsics branch (trace-wide `argMin`, no time predicate).
+    assert!(
+        cross.contains("AS root_name") && cross.contains("AS root_service"),
+        "the compare cross-tab carries the roots argMin projections:\n{cross}"
+    );
+    assert!(
+        cross.contains("LEFT JOIN"),
+        "the roots read is LEFT JOINed on trace_id into the intrinsics branch:\n{cross}"
+    );
     let cmp_raw = explain_raw(&client, cross).await;
     assert!(
         cmp_raw.contains("Aggregating"),
         "compare cross-tab GROUP BY must push down:\n{cmp_raw}"
+    );
+    // The added roots LEFT JOIN must not regress the DATE-BOUNDED base
+    // trace_spans scan (distinct from the deliberately window-free roots
+    // read — don't gate that one). Isolate the base scan and EXPLAIN it
+    // standalone under the whole-corpus window vs a narrow window: a real
+    // pruning read selects STRICTLY FEWER granules for the narrow window
+    // (the issue #53 AC3b / gate-2 discriminator). A base read degraded to
+    // a full scan would select the same granules either way → this fails.
+    let narrow_cmp = plan_for(
+        &engine,
+        r#"{} | compare({ span.http.status_code = "500" })"#,
+        now - 30 * 60 * NS_PER_S,
+        now,
+    );
+    let (narrow_cross, _) = narrow_cmp
+        .compare_range()
+        .expect("narrow compare range SQL");
+    let base_full = extract_compare_base_scan(cross);
+    let base_narrow = extract_compare_base_scan(narrow_cross);
+    let (full_sel, full_total) =
+        table_primary_key_granules(&explain_raw(&client, &base_full).await, "trace_spans");
+    let (narrow_sel, _) =
+        table_primary_key_granules(&explain_raw(&client, &base_narrow).await, "trace_spans");
+    assert!(
+        full_sel > 0 && full_sel <= full_total,
+        "the compare base trace_spans scan must engage the primary key \
+         ({full_sel}/{full_total})"
+    );
+    assert!(
+        narrow_sel < full_sel,
+        "the compare base trace_spans scan must prune strictly harder on a narrow window \
+         (narrow {narrow_sel} vs full {full_sel}/{full_total}) — the roots LEFT JOIN must not \
+         degrade it to a window-independent full scan"
     );
     let cmp_res = engine
         .metrics_range(&cmp_plan)

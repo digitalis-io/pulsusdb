@@ -35,7 +35,7 @@ use crate::logql::escape;
 
 use super::filter::{self, AttrProbe, LeafEval, PlanError, ValuePred};
 use super::search_plan::compile_anchored;
-use super::search_sql::date_literal;
+use super::search_sql::{byte_cap_expr, date_literal, root_ordering_tuple};
 
 /// The snapped, left-closed/right-open metrics evaluation window
 /// `[start_ns, end_ns)` — produced by `metrics_plan`'s epoch snapping,
@@ -722,7 +722,8 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     } = *input;
     let mut raw = format!(
         "SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
-         status_code AS i_status, service AS i_service, ({inner_bool}) AS is_sel\n    FROM {spans_table}\n    "
+         status_code AS i_status, service AS i_service, status_message AS i_status_message, \
+         ({inner_bool}) AS is_sel\n    FROM {spans_table}\n    "
     );
     push_prewhere_where_indented(&mut raw, outer, window);
     // Replay-dedup: one row per (t, trace_id, span_id) so at-least-once
@@ -730,12 +731,25 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // `uniqExact` rule on the count path).
     let base = format!(
         "SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, \
-         any(i_status) AS i_status, any(i_service) AS i_service, max(is_sel) AS is_sel\n  FROM (\n  {raw}\n  )\n  GROUP BY t, trace_id, span_id"
+         any(i_status) AS i_status, any(i_service) AS i_service, \
+         any(i_status_message) AS i_status_message, max(is_sel) AS is_sel\n  FROM (\n  {raw}\n  )\n  GROUP BY t, trace_id, span_id"
     );
+    // Issue #189: `rootName`/`rootServiceName` are trace-level intrinsics —
+    // resolved WINDOW-FREE (trace-wide) so they never disagree with the
+    // #184 search path's roots, then LEFT JOINed on trace_id into the
+    // intrinsics branch only. `statusMessage` sources the per-span
+    // `status_message` column already carried in `base`; the `arrayFilter`
+    // drops it when empty so an absent status message falls to the nil
+    // complement (matching TraceQL's absent→nil), leaving `name`/`kind`/
+    // `status`/`resource.service.name` semantics byte-unchanged.
+    let roots_cte = compare_roots_cte(spans_table, &base);
     let intrinsics = format!(
-        "SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (\n    SELECT t, is_sel, arrayJoin([\
+        "SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (\n    \
+         SELECT t, is_sel, arrayJoin(arrayFilter(x -> NOT (x.1 = 'statusMessage' AND x.2 = ''), [\
          ('name', i_name), ('kind', {KIND_MAP}), ('status', {STATUS_MAP}), \
-         ('resource.service.name', i_service)]) AS kv\n    FROM (\n  {base}\n    )\n  )"
+         ('resource.service.name', i_service), ('statusMessage', i_status_message), \
+         ('rootName', r.root_name), ('rootServiceName', r.root_service)])) AS kv\n    \
+         FROM (\n  {base}\n    ) b\n    LEFT JOIN (\n  {roots_cte}\n    ) r ON b.trace_id = r.trace_id\n  )"
     );
     let index_attrs = format!(
         "SELECT b.t AS t, b.is_sel AS is_sel, concat(a.scope, '.', a.key) AS akey, a.val AS aval\n  \
@@ -776,6 +790,28 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
         totals,
         probe,
     }
+}
+
+/// The window-free per-trace roots read for `compare()` (issue #189): one
+/// `argMin(byte_cap_expr(col), root_ordering_tuple())` per trace over
+/// `spans_table`, restricted to the in-window `SELECT DISTINCT trace_id
+/// FROM base` IN-set but carrying **no date/time predicate** — the whole
+/// point of the trace-wide contract (docs/schemas.md §Phase-2
+/// trace-context co-load; [`super::search_sql::trace_ctx_sql`]). Both
+/// projections reuse the search path's [`byte_cap_expr`] and its
+/// [`root_ordering_tuple`], so `rootName`/`rootServiceName` here are
+/// byte-identical to what search returns. Bounded by the metrics IN-set
+/// (`max_rows_in_set`) and scan (`max_rows_to_read`) throw budgets; scale
+/// routes to #25.
+fn compare_roots_cte(spans_table: &str, base: &str) -> String {
+    let ordering = root_ordering_tuple();
+    format!(
+        "SELECT trace_id, argMin({}, {ordering}) AS root_name, \
+         argMin({}, {ordering}) AS root_service\n  FROM {spans_table}\n  \
+         WHERE trace_id IN (SELECT DISTINCT trace_id FROM (\n  {base}\n  ))\n  GROUP BY trace_id",
+        byte_cap_expr("name"),
+        byte_cap_expr("service"),
+    )
 }
 
 /// The range-form bucket-start expression (`toStartOfInterval` → ms) for
