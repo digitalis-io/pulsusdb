@@ -83,12 +83,16 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "matched_spans ref list covered by the transients envelope (ref width per matched id)"),
     ("search_eval.rs", "evaluate_batch", "Vec::with_capacity", 1,
      "summaries buffer: base charge (take x size_of<SpanSummary>) before the reservation"),
-    // ---- issue #172: structural relation intermediates ------------------
-    ("search_eval.rs", "descendant_set", "HashMap::", 1,
+    // ---- issue #172 + #183: structural relation intermediates -----------
+    ("search_eval.rs", "rel_descendants", "HashMap::", 1,
      "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),
-    ("search_eval.rs", "descendant_set", "Vec::with_capacity", 1,
+    ("search_eval.rs", "rel_descendants", "Vec::with_capacity", 1,
      "BFS queue: covered by the same DESCENDANT_TRANSIENT_BYTES envelope (<= 2 slots per span; sized so it never reallocates)"),
-    ("search_eval.rs", "sibling_set", "HashMap::", 1,
+    ("search_eval.rs", "rel_ancestors", "HashMap::", 1,
+     "span_id->parent_id map + upward BFS queue: spans x (ANCESTOR_ENTRY_BYTES + 2 queue slots) charged before with_capacity, released after the upward walk (reached + out sets go through charged_set)"),
+    ("search_eval.rs", "rel_ancestors", "Vec::with_capacity", 1,
+     "upward BFS queue: covered by the same spans x (... + 2 queue slots) charge (seeds + <= one discovered ancestor per span; sized so it never reallocates)"),
+    ("search_eval.rs", "rel_siblings", "HashMap::", 1,
      "parent map: spans x SIBLING_ENTRY_BYTES charged before with_capacity, released after the pass"),
     // ---- issue #181: nested-set numbering transients --------------------
     ("search_eval.rs", "compute_nested_set", "HashMap::", 2,

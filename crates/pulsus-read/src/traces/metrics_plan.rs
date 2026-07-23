@@ -350,6 +350,10 @@ mod tests {
             r#"{ .a = "1" } > { .b = "2" } | rate()"#,
             r#"{ .a = "1" } >> { .b = "2" } | count_over_time()"#,
             r#"{ .a = "1" } ~ { .b = "2" } | rate()"#,
+            // Issue #183 forms: `<` (parent), negated, and union.
+            r#"{ .a = "1" } < { .b = "2" } | rate()"#,
+            r#"{ .a = "1" } !> { .b = "2" } | rate()"#,
+            r#"{ .a = "1" } &> { .b = "2" } | count_over_time()"#,
         ] {
             let err = plan_trace_metrics(&parse(q).unwrap(), &PARAMS, &ctx())
                 .expect_err("structural metrics are out of scope");

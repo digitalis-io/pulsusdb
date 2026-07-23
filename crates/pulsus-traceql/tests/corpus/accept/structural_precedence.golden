@@ -21,6 +21,7 @@ Query {
             ),
             rhs: Structural {
                 op: Descendant,
+                modifier: Plain,
                 lhs: Filter(
                     SpansetFilter {
                         body: Some(

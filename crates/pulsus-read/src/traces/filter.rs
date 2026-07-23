@@ -175,6 +175,24 @@ pub enum NestedSetField {
     Right,
 }
 
+/// One operand of a field-vs-field comparison (issue #183
+/// `comparison.rhs_attribute`): a physical intrinsic (read from the
+/// hydrated span columns) or an attribute (read from `trace_attrs_idx`
+/// via `val`/`val_num`). `resource.service.name` lowers to the physical
+/// `service` column, like everywhere else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareOperand {
+    Name,
+    Service,
+    Duration,
+    Status,
+    Kind,
+    Attr {
+        key: String,
+        scope: Option<&'static str>,
+    },
+}
+
 /// How Phase 2 evaluates one leaf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeafEval {
@@ -193,6 +211,13 @@ pub enum LeafEval {
         field: NestedSetField,
         op: ComparisonOp,
         value: f64,
+    },
+    /// A field-vs-field comparison (issue #183 `comparison.rhs_attribute`):
+    /// both operands resolved per candidate span and compared engine-side.
+    FieldCompare {
+        lhs: CompareOperand,
+        rhs: CompareOperand,
+        op: ComparisonOp,
     },
 }
 
@@ -601,6 +626,82 @@ fn compile_nested_set_leaf(
     })
 }
 
+/// Maps one comparison operand `Field` to its [`CompareOperand`]
+/// resolution (issue #183). Nested-set intrinsics have no comparable
+/// value on the field-vs-field path and are rejected.
+fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
+    match field {
+        Field::Intrinsic(Intrinsic::Name) => Ok(CompareOperand::Name),
+        Field::Intrinsic(Intrinsic::Duration) => Ok(CompareOperand::Duration),
+        Field::Intrinsic(Intrinsic::Status) => Ok(CompareOperand::Status),
+        Field::Intrinsic(Intrinsic::Kind) => Ok(CompareOperand::Kind),
+        Field::Intrinsic(
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
+        ) => Err(PlanError::TypeMismatch(
+            "nested-set intrinsics are not supported in a field-vs-field comparison".to_string(),
+        )),
+        Field::Attribute { scope, key }
+            if *scope == AttrScope::Resource && key == "service.name" =>
+        {
+            Ok(CompareOperand::Service)
+        }
+        Field::Attribute { scope, key } => Ok(CompareOperand::Attr {
+            key: key.clone(),
+            scope: attr_scope_literal(*scope),
+        }),
+    }
+}
+
+/// A key-existence Phase-1 generator for a field-vs-field comparison
+/// (issue #183): a `key = '<k>'` (+ scope) key-only `(key)` prefix scan —
+/// an index-served SUPERSET (a matching span must possess the key), never
+/// a bare time-range fallback.
+fn key_existence_generator(key: &str, scope: Option<&'static str>) -> LeafGenerator {
+    let mut predicate = format!("key = {}", escape::ch_string(key));
+    if let Some(s) = scope {
+        predicate.push_str(&format!(" AND scope = {}", escape::ch_string(s)));
+    }
+    LeafGenerator {
+        class: GenClass::AttrKeyScan,
+        table: GenTable::Attrs,
+        predicate,
+        prewhere: None,
+    }
+}
+
+/// Compiles a field-vs-field comparison leaf (issue #183
+/// `comparison.rhs_attribute`). Regex operators never reach here (the
+/// parser rejects a field RHS for `=~`/`!~`), but `compile` is a public
+/// surface over any AST, so they are rejected defensively. Phase-1
+/// pruning is the key-existence scan of an attribute operand (a matching
+/// span must possess that key); if both operands are physical intrinsics
+/// there is no attr key to prune on, so the leaf pairs with the complete
+/// time-range superset.
+fn compile_field_compare(
+    lhs: &Field,
+    op: ComparisonOp,
+    rhs: &Field,
+) -> Result<CompiledLeaf, PlanError> {
+    if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+        return Err(PlanError::TypeMismatch(
+            "a field-vs-field comparison does not support regex operators".to_string(),
+        ));
+    }
+    let lhs = compare_operand(lhs)?;
+    let rhs = compare_operand(rhs)?;
+    // Prune on whichever operand carries an attribute key (the LHS wins a
+    // tie — deterministic). Both-intrinsic compares have no index to prune.
+    let generator = match (&lhs, &rhs) {
+        (CompareOperand::Attr { key, scope }, _) => key_existence_generator(key, *scope),
+        (_, CompareOperand::Attr { key, scope }) => key_existence_generator(key, *scope),
+        _ => LeafGenerator::time_range(),
+    };
+    Ok(CompiledLeaf {
+        generator,
+        eval: LeafEval::FieldCompare { lhs, rhs, op },
+    })
+}
+
 /// `name`/`status`/`kind` generators: no selective index — a bounded
 /// time-window span scan with the predicate applied (complete over the
 /// window; the scan budget bounds its cost — docs/schemas.md §4.2).
@@ -656,6 +757,28 @@ fn collect(
             let generator = leaf.generator.clone();
             leaves.push(leaf);
             Ok(vec![generator])
+        }
+        // Field-vs-field comparison (issue #183): one leaf, one generator
+        // (the key-existence scan of an attribute operand — or the
+        // time-range superset when both are physical intrinsics).
+        FieldExpr::FieldCompare { lhs, op, rhs } => {
+            let leaf = compile_field_compare(lhs, *op, rhs)?;
+            let generator = leaf.generator.clone();
+            leaves.push(leaf);
+            Ok(vec![generator])
+        }
+        // A bare boolean static (issue #183): no leaf and no positive
+        // index — `{ true }`/`{ false }` are as broad as `{}` in Phase 1
+        // (exactness is Phase-2's job), so the time-range superset covers
+        // both. `{ false }` returns no spans in Phase 2 (never a match).
+        FieldExpr::BoolStatic(_) => Ok(vec![LeafGenerator::time_range()]),
+        // Unary field negation (issue #183 `logic.not`): the inner leaves
+        // are compiled (Phase-2 alignment) but negation is not positively
+        // indexable — the ratified `!=` rule generalizes — so the leaf
+        // pairs with the time-range superset.
+        FieldExpr::Not(inner) => {
+            collect(inner, leaves)?;
+            Ok(vec![LeafGenerator::time_range()])
         }
         FieldExpr::Binary { op, lhs, rhs } => {
             // Both sides are always compiled (leaf order is the pre-order

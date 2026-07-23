@@ -17,8 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, AttrProbe, LeafEval, NestedSetField, PhysicalPredicate, PlanError, SpanFilterCtx,
-    ValuePred,
+    self, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate, PlanError,
+    SpanFilterCtx, ValuePred,
 };
 use super::search_sql;
 
@@ -78,6 +78,20 @@ pub(crate) enum PhysicalEval {
     Kind { op: ComparisonOp, code: i8 },
 }
 
+/// One resolved operand of a field-vs-field comparison (issue #183). An
+/// attribute operand is interned into BOTH `agg_fields` (its `val_num`
+/// read) and `select_attrs` (its `val` read) so Phase 2 has a typed value
+/// with no new hydration SQL builder.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedOperand {
+    Name,
+    Service,
+    Duration,
+    Status,
+    Kind,
+    Attr { str_idx: usize, num_idx: usize },
+}
+
 /// One planned leaf — pre-order within its spanset filter, exactly the
 /// traversal `search_eval` replays.
 #[derive(Debug, Clone)]
@@ -95,6 +109,13 @@ pub(crate) enum PlannedLeafEval {
         field: NestedSetField,
         op: ComparisonOp,
         value: f64,
+    },
+    /// A field-vs-field comparison (issue #183 `comparison.rhs_attribute`),
+    /// evaluated per candidate span from both operands' resolved values.
+    FieldCompare {
+        lhs: PlannedOperand,
+        rhs: PlannedOperand,
+        op: ComparisonOp,
     },
 }
 
@@ -390,6 +411,34 @@ fn attr_field_ref(field: &Field) -> Option<AttrFieldRef> {
     }
 }
 
+/// Plans one field-vs-field comparison operand (issue #183): a physical
+/// intrinsic resolves from the hydrated columns (no read registered); an
+/// attribute is interned into BOTH the `val` (`select_attrs`) and the
+/// `val_num` (`agg_fields`) reads so Phase 2 has a typed value.
+fn plan_operand(
+    operand: &CompareOperand,
+    agg_fields: &mut Vec<AttrFieldRef>,
+    select_attrs: &mut Vec<AttrFieldRef>,
+) -> PlannedOperand {
+    match operand {
+        CompareOperand::Name => PlannedOperand::Name,
+        CompareOperand::Service => PlannedOperand::Service,
+        CompareOperand::Duration => PlannedOperand::Duration,
+        CompareOperand::Status => PlannedOperand::Status,
+        CompareOperand::Kind => PlannedOperand::Kind,
+        CompareOperand::Attr { key, scope } => {
+            let field_ref = AttrFieldRef {
+                key: key.clone(),
+                scope: *scope,
+            };
+            PlannedOperand::Attr {
+                str_idx: intern(select_attrs, &field_ref),
+                num_idx: intern(agg_fields, &field_ref),
+            }
+        }
+    }
+}
+
 fn aggregate_threshold(
     op: AggregateOp,
     field: &Option<Field>,
@@ -563,6 +612,13 @@ pub fn plan_search(
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
     let mut nested_set = false;
+    // Attribute value reads (`val_num` / `val`): declared before the
+    // filter loop because a field-vs-field comparison leaf interns its
+    // attribute operands here (issue #183), then `plan_pipeline` appends
+    // the aggregate/`select()` reads — interning only ever appends, so
+    // indices stay stable.
+    let mut agg_fields: Vec<AttrFieldRef> = Vec::new();
+    let mut select_attrs: Vec<AttrFieldRef> = Vec::new();
     for spanset_filter in spanset_filters {
         let compiled = filter::compile_span_filter(spanset_filter)?;
         let mut leaves = Vec::with_capacity(compiled.leaves.len());
@@ -584,6 +640,11 @@ pub fn plan_search(
                         value: *value,
                     }
                 }
+                LeafEval::FieldCompare { lhs, rhs, op } => PlannedLeafEval::FieldCompare {
+                    lhs: plan_operand(lhs, &mut agg_fields, &mut select_attrs),
+                    rhs: plan_operand(rhs, &mut agg_fields, &mut select_attrs),
+                    op: *op,
+                },
             };
             leaves.push(planned);
         }
@@ -605,8 +666,6 @@ pub fn plan_search(
         }
     }
 
-    let mut agg_fields = Vec::new();
-    let mut select_attrs = Vec::new();
     let (aggregates, select_fields) = plan_pipeline(query, &mut agg_fields, &mut select_attrs)?;
 
     Ok(SearchPlan {
@@ -788,7 +847,14 @@ mod tests {
     /// verbatim.
     #[test]
     fn structural_generator_sql_is_byte_identical_to_the_and_plan() {
-        for op in [">", ">>", "~"] {
+        // All 5 base operators × 3 modifiers (issue #183): every structural
+        // form's Phase-1 SQL is byte-identical to the equivalent `{A} && {B}`
+        // plan — no new SQL shape exists, so the shipped shard-locality /
+        // #57 scan-budget / index evidence covers all 15 verbatim (AC4).
+        for op in [
+            ">", ">>", "<", "<<", "~", "!>", "!>>", "!<", "!<<", "!~", "&>", "&>>", "&<", "&<<",
+            "&~",
+        ] {
             let structural = plan(&format!(
                 r#"{{ resource.service.name = "checkout" }} {op} {{ span.foo = "x" }}"#
             ));
@@ -803,6 +869,27 @@ mod tests {
                 "{op}: same membership probes"
             );
         }
+    }
+
+    #[test]
+    fn field_vs_field_attr_compare_prunes_on_the_key_only_scan() {
+        // `{ .a = .b }` (issue #183): the Phase-1 generator is the
+        // LHS-attribute key-existence `(key)` scan (an index-served
+        // superset), NOT a bare time-range fallback.
+        let p = plan(r#"{ .a = .b }"#);
+        assert_eq!(p.generator_sqls.len(), 1);
+        let sql = &p.generator_sqls[0];
+        assert!(
+            sql.contains("key = 'a'"),
+            "must prune on the LHS key: {sql}"
+        );
+        assert!(
+            sql.contains("FROM trace_attrs_idx"),
+            "must read the attr index, not the spans table: {sql}"
+        );
+        // Both operands are interned into val + val_num reads for Phase 2.
+        assert_eq!(p.select_attrs.len(), 2, "both operands read `val`");
+        assert_eq!(p.agg_fields.len(), 2, "both operands read `val_num`");
     }
 
     #[test]

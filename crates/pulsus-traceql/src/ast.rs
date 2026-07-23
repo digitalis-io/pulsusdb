@@ -47,12 +47,16 @@ pub enum SpansetExpr {
         lhs: Box<SpansetExpr>,
         rhs: Box<SpansetExpr>,
     },
-    /// `{A} > {B}` / `{A} >> {B}` / `{A} ~ {B}` — parent/descendant/
-    /// sibling relations evaluated over one trace's span graph. Binds
-    /// tighter than `&&`/`||`, left-associative; the result set is the
-    /// RIGHT-hand side's matching spans only (docs/api.md §4.2).
+    /// `{A} op {B}` — a structural relation evaluated over one trace's
+    /// span graph (issue #172 shipped `>`/`>>`/`~`; issue #183 completes
+    /// the surface with `<`/`<<` and the negated/union modifiers). Binds
+    /// tighter than `&&`/`||`, left-associative. The result set depends on
+    /// the [`StructuralModifier`]: Plain returns the RHS spans satisfying
+    /// the relation, Negated returns the RHS spans NOT satisfying it, and
+    /// Union returns both participating sides (docs/api.md §4.2).
     Structural {
         op: StructuralOp,
+        modifier: StructuralModifier,
         lhs: Box<SpansetExpr>,
         rhs: Box<SpansetExpr>,
     },
@@ -63,14 +67,19 @@ impl fmt::Display for SpansetExpr {
         match self {
             SpansetExpr::Filter(filter) => write!(f, "{filter}"),
             SpansetExpr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
-            SpansetExpr::Structural { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+            SpansetExpr::Structural {
+                op,
+                modifier,
+                lhs,
+                rhs,
+            } => write!(f, "({lhs} {}{op} {rhs})", modifier.prefix()),
         }
     }
 }
 
-/// The implemented structural relations (issue #172). `<` (parent), `<<`
-/// (ancestor), and the negated/union forms stay in
-/// [`BOUNDARY_CONSTRUCTS`].
+/// The direction/kind of a structural relation (issue #172 + #183). The
+/// [`StructuralModifier`] is orthogonal: it selects which spans of the
+/// relation are returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StructuralOp {
     /// `>` — spans matching the RHS whose direct parent matches the LHS.
@@ -78,6 +87,12 @@ pub enum StructuralOp {
     /// `>>` — spans matching the RHS with any transitive ancestor
     /// matching the LHS.
     Descendant,
+    /// `<` — spans matching the RHS that are the direct parent of an
+    /// LHS-matching span (issue #183).
+    Parent,
+    /// `<<` — spans matching the RHS that are a transitive ancestor of an
+    /// LHS-matching span (issue #183).
+    Ancestor,
     /// `~` — spans matching the RHS sharing a parent with a *distinct*
     /// span matching the LHS (all-zero `parent_id` roots never match).
     Sibling,
@@ -88,9 +103,37 @@ impl fmt::Display for StructuralOp {
         let s = match self {
             StructuralOp::Child => ">",
             StructuralOp::Descendant => ">>",
+            StructuralOp::Parent => "<",
+            StructuralOp::Ancestor => "<<",
             StructuralOp::Sibling => "~",
         };
         write!(f, "{s}")
+    }
+}
+
+/// Which spans of a structural relation are returned (issue #183). The
+/// modifier is spelled as a prefix on the operator: none for Plain, `!`
+/// for Negated (`!>`, `!~`, …), `&` for Union (`&>`, `&~`, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StructuralModifier {
+    /// The RHS spans satisfying the relation (the shipped #172 semantics).
+    Plain,
+    /// The RHS spans NOT satisfying the relation (`!>`, `!>>`, `!<`,
+    /// `!<<`, `!~`). With an empty LHS every RHS span is a match.
+    Negated,
+    /// Both participating sides of the relation (`&>`, `&>>`, `&<`, `&<<`,
+    /// `&~`).
+    Union,
+}
+
+impl StructuralModifier {
+    /// The operator prefix this modifier renders with (`Display` oracle).
+    fn prefix(self) -> &'static str {
+        match self {
+            StructuralModifier::Plain => "",
+            StructuralModifier::Negated => "!",
+            StructuralModifier::Union => "&",
+        }
     }
 }
 
@@ -121,6 +164,23 @@ pub enum FieldExpr {
         op: ComparisonOp,
         value: Value,
     },
+    /// `{lhs} op {rhs}` — a field-vs-field comparison (issue #183,
+    /// `comparison.rhs_attribute`): either side an attribute or an
+    /// intrinsic, compared per-span. Regex operators are rejected at parse
+    /// time (a field RHS never carries a regex).
+    FieldCompare {
+        lhs: Field,
+        op: ComparisonOp,
+        rhs: Field,
+    },
+    /// A bare boolean static (`{ true }` / `{ false }` — issue #183,
+    /// `static.bare_boolean`): matches every span or no span.
+    BoolStatic(bool),
+    /// Unary field negation (`!(.a = 1)`, `!.a` — issue #183,
+    /// `logic.not`): the per-span boolean inverse of the inner expression.
+    /// `Display` fully parenthesizes the inner so the round-trip oracle
+    /// holds.
+    Not(Box<FieldExpr>),
     Binary {
         op: BoolOp,
         lhs: Box<FieldExpr>,
@@ -132,6 +192,9 @@ impl fmt::Display for FieldExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FieldExpr::Comparison { field, op, value } => write!(f, "{field} {op} {value}"),
+            FieldExpr::FieldCompare { lhs, op, rhs } => write!(f, "{lhs} {op} {rhs}"),
+            FieldExpr::BoolStatic(b) => write!(f, "{b}"),
+            FieldExpr::Not(inner) => write!(f, "!({inner})"),
             FieldExpr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
         }
     }
@@ -247,9 +310,9 @@ impl fmt::Display for AttrScope {
 }
 
 /// The full M4 comparison-operator set. `>`/`>=`/`<`/`<=` are comparisons
-/// only *inside* a field expression — the same characters between
-/// spansets are structural operators: `>` is the implemented child
-/// relation (issue #172), while `>=`/`<`/`<=` stay recognized-and-rejected
+/// *inside* a field expression; the same characters between spansets are
+/// structural operators (`>` child, `<` parent — issue #172/#183), while
+/// `>=`/`<=` stay recognized-and-rejected between spansets
 /// (`NotYetSupported`, M7). Disambiguated purely by parser position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ComparisonOp {
@@ -589,11 +652,8 @@ pub(crate) const UNSUPPORTED_METRIC_FNS: &[&str] = &[
 /// (both directions asserted mechanically in `tests/corpus.rs`), so
 /// scope drift in either direction fails CI.
 pub const BOUNDARY_CONSTRUCTS: &[(&str, &str)] = &[
-    ("structural operator '<'", "M7"),
-    ("structural operator '<<'", "M7"),
     ("structural operator '>='", "M7"),
     ("structural operator '<='", "M7"),
-    ("negation operator '!'", "M7"),
     ("arithmetic operator '+'", "M7"),
     ("arithmetic operator '-'", "M7"),
     ("arithmetic operator '*'", "M7"),

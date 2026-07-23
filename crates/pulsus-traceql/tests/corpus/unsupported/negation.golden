@@ -1,7 +1,0 @@
-NotYetSupported {
-    construct: "negation operator '!'",
-    span: Span {
-        start: 2,
-        end: 3,
-    },
-}

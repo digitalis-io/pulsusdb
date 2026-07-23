@@ -189,13 +189,14 @@ fn accept_cases_round_trip_through_display() {
 
 /// Every token kind reachable by the accepted grammar (M4 + the issue
 /// #172 structural operators `>>`/`~`; `>` was already reachable as a
-/// comparison). Boundary-only tokens (`<<`, `!`, `&`, `+`, `-`, `*`,
-/// `/`, `[`, `]`) are deliberately absent: they never appear in an
-/// accept case.
+/// comparison; issue #183 adds `<<` (Shl), `!` (Bang, negated structural +
+/// `logic.not`) and `&` (Amp, union structural)). Boundary-only tokens
+/// (`+`, `-`, `*`, `/`, `[`, `]`) are deliberately absent: they never
+/// appear in an accept case.
 const EXPECTED_ACCEPT_TOKENS: &[&str] = &[
     "LBrace", "RBrace", "LParen", "RParen", "Comma", "Dot", "Eq", "Neq", "Re", "Nre", "Gt", "Gte",
-    "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Tilde", "Ident", "String", "Duration", "Number",
-    "Eof",
+    "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Shl", "Tilde", "Bang", "Amp", "Ident", "String",
+    "Duration", "Number", "Eof",
 ];
 
 /// Exhaustive by construction: adding a `TokenKind` variant fails to
@@ -328,13 +329,6 @@ const DUAL_ROLE_CASES: &[(&str, &str, AcceptRole, &str, &str)] = &[
         "structural operator '>='",
     ),
     (
-        "<",
-        "accept/duration_lt",
-        AcceptRole::FieldComparison(ComparisonOp::Lt),
-        "unsupported/structural_lt",
-        "structural operator '<'",
-    ),
-    (
         "<=",
         "accept/duration_lte",
         AcceptRole::FieldComparison(ComparisonOp::Lte),
@@ -389,7 +383,7 @@ fn contains_structural(expr: &SpansetExpr, want: StructuralOp) -> bool {
         SpansetExpr::Binary { lhs, rhs, .. } => {
             contains_structural(lhs, want) || contains_structural(rhs, want)
         }
-        SpansetExpr::Structural { op, lhs, rhs } => {
+        SpansetExpr::Structural { op, lhs, rhs, .. } => {
             *op == want || contains_structural(lhs, want) || contains_structural(rhs, want)
         }
     }
@@ -398,6 +392,9 @@ fn contains_structural(expr: &SpansetExpr, want: StructuralOp) -> bool {
 fn collect_field_comparisons<'q>(expr: &'q FieldExpr, out: &mut Vec<(&'q Field, ComparisonOp)>) {
     match expr {
         FieldExpr::Comparison { field, op, .. } => out.push((field, *op)),
+        FieldExpr::FieldCompare { lhs, op, .. } => out.push((lhs, *op)),
+        FieldExpr::BoolStatic(_) => {}
+        FieldExpr::Not(inner) => collect_field_comparisons(inner, out),
         FieldExpr::Binary { lhs, rhs, .. } => {
             collect_field_comparisons(lhs, out);
             collect_field_comparisons(rhs, out);
@@ -500,28 +497,39 @@ fn gt_token_appears_in_both_grammar_roles() {
     let cases = verify_corpus_layout();
     for case in [
         "accept/duration_gt",
+        "accept/duration_lt",
         "accept/structural_gt",
         "accept/structural_shr",
         "accept/structural_tilde",
+        "accept/structural_lt",
+        "accept/structural_shl",
     ] {
         assert!(cases.contains(case), "{case} is missing from the corpus");
     }
 
-    // Role 1: a field-level comparison.
-    let query = parse(&read_input("accept/duration_gt")).expect("accept/duration_gt parses");
-    let mut comparisons = Vec::new();
-    collect_comparisons(&query.spanset, &mut comparisons);
-    assert!(
-        comparisons.iter().any(|(_, op)| *op == ComparisonOp::Gt),
-        "accept/duration_gt must contain a field-level Gt comparison, got {comparisons:?}"
-    );
+    // Role 1: field-level comparisons — `>` and `<` (issue #183 makes `<`
+    // dual-grammar like `>`: a field comparison AND a structural operator).
+    for (case, op) in [
+        ("accept/duration_gt", ComparisonOp::Gt),
+        ("accept/duration_lt", ComparisonOp::Lt),
+    ] {
+        let query = parse(&read_input(case)).unwrap_or_else(|e| panic!("{case} parses: {e}"));
+        let mut comparisons = Vec::new();
+        collect_comparisons(&query.spanset, &mut comparisons);
+        assert!(
+            comparisons.iter().any(|(_, got)| *got == op),
+            "{case} must contain a field-level {op:?} comparison, got {comparisons:?}"
+        );
+    }
 
-    // Role 2: the spanset-level structural node (and the same pin for
-    // the other two implemented operators).
+    // Role 2: the spanset-level structural node (`>`/`>>`/`~` from #172,
+    // `<`/`<<` from #183).
     for (case, op) in [
         ("accept/structural_gt", StructuralOp::Child),
         ("accept/structural_shr", StructuralOp::Descendant),
         ("accept/structural_tilde", StructuralOp::Sibling),
+        ("accept/structural_lt", StructuralOp::Parent),
+        ("accept/structural_shl", StructuralOp::Ancestor),
     ] {
         let query = parse(&read_input(case)).unwrap_or_else(|e| panic!("{case} must parse: {e}"));
         assert!(

@@ -180,8 +180,27 @@ fn render_expr(
                 LeafEval::NestedSet { .. } => Err(PlanError::TypeMismatch(
                     "nested-set intrinsics are not supported in metrics filters".to_string(),
                 )),
+                // `compile_leaf` never yields a field-vs-field leaf (that
+                // is `compile_field_compare`, only reached via the
+                // `FieldCompare` AST arm below) — keep the match exhaustive.
+                LeafEval::FieldCompare { .. } => Err(PlanError::TypeMismatch(
+                    "field-vs-field comparisons are not supported in metrics filters".to_string(),
+                )),
             }
         }
+        // Field-vs-field comparison, bare boolean statics and unary field
+        // negation (issue #183) are search-surface constructs; the metrics
+        // filter path does not support them yet (a clean 400, tracked as a
+        // follow-up — mirrors the nested-set metrics rejection above).
+        FieldExpr::FieldCompare { .. } => Err(PlanError::TypeMismatch(
+            "field-vs-field comparisons are not supported in metrics filters".to_string(),
+        )),
+        FieldExpr::BoolStatic(_) => Err(PlanError::TypeMismatch(
+            "bare boolean statics are not supported in metrics filters".to_string(),
+        )),
+        FieldExpr::Not(_) => Err(PlanError::TypeMismatch(
+            "field negation is not supported in metrics filters".to_string(),
+        )),
         FieldExpr::Binary { op, lhs, rhs } => {
             let l = render_expr(lhs, attrs_table, window)?;
             let r = render_expr(rhs, attrs_table, window)?;

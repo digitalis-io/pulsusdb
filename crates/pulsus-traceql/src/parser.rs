@@ -45,8 +45,8 @@
 
 use crate::ast::{
     self, AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
-    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralOp,
-    Value,
+    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue,
+    StructuralModifier, StructuralOp, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -250,10 +250,17 @@ fn parse_spanset_and(
     Ok(lhs)
 }
 
-/// `SpansetStructural := SpansetPrimary ((">"|">>"|"~") SpansetPrimary)*`
-/// — the implemented structural relations (issue #172): tighter than
-/// `&&`/`||`, left-associative. Each structural node charges the shared
-/// binary-node budget exactly like `&&`/`||`.
+/// `SpansetStructural := SpansetPrimary (StructOp SpansetPrimary)*` — all
+/// fifteen structural relations (issue #172 `>`/`>>`/`~`; issue #183
+/// completes the surface with `<`/`<<` and the negated/union modifiers):
+/// tighter than `&&`/`||`, left-associative. Each structural node charges
+/// the shared binary-node budget exactly like `&&`/`||`.
+///
+/// The operator is recognized by parser POSITION from one or two tokens:
+/// a single `Gt`/`Shr`/`Lt`/`Shl`/`Tilde` is Plain, `Nre` (`!~`) is a
+/// negated sibling, `Bang` + `{Gt,Shr,Lt,Shl}` is Negated, and
+/// `Amp` + `{Gt,Shr,Lt,Shl,Tilde}` is Union. `>=`/`<=` between spansets
+/// stay recognized-but-M7 boundaries (Tempo rejects them too).
 fn parse_spanset_structural(
     cursor: &mut Cursor<'_>,
     depth: usize,
@@ -261,44 +268,60 @@ fn parse_spanset_structural(
 ) -> Result<SpansetExpr, TraceQlError> {
     let mut lhs = parse_spanset_primary(cursor, depth, binary_nodes)?;
     loop {
-        check_no_unsupported_spanset_op(cursor)?;
-        let op = match &cursor.peek().kind {
-            TokenKind::Gt => StructuralOp::Child,
-            TokenKind::Shr => StructuralOp::Descendant,
-            TokenKind::Tilde => StructuralOp::Sibling,
+        let start = cursor.peek().span;
+        let (op, modifier, tokens) = match &cursor.peek().kind {
+            TokenKind::Gt => (StructuralOp::Child, StructuralModifier::Plain, 1),
+            TokenKind::Shr => (StructuralOp::Descendant, StructuralModifier::Plain, 1),
+            TokenKind::Lt => (StructuralOp::Parent, StructuralModifier::Plain, 1),
+            TokenKind::Shl => (StructuralOp::Ancestor, StructuralModifier::Plain, 1),
+            TokenKind::Tilde => (StructuralOp::Sibling, StructuralModifier::Plain, 1),
+            TokenKind::Nre => (StructuralOp::Sibling, StructuralModifier::Negated, 1),
+            TokenKind::Gte => {
+                return Err(TraceQlError::NotYetSupported {
+                    construct: "structural operator '>='".to_string(),
+                    span: start,
+                });
+            }
+            TokenKind::Lte => {
+                return Err(TraceQlError::NotYetSupported {
+                    construct: "structural operator '<='".to_string(),
+                    span: start,
+                });
+            }
+            TokenKind::Bang => match &cursor.peek2().kind {
+                TokenKind::Gt => (StructuralOp::Child, StructuralModifier::Negated, 2),
+                TokenKind::Shr => (StructuralOp::Descendant, StructuralModifier::Negated, 2),
+                TokenKind::Lt => (StructuralOp::Parent, StructuralModifier::Negated, 2),
+                TokenKind::Shl => (StructuralOp::Ancestor, StructuralModifier::Negated, 2),
+                // A `!` not introducing a negated structural operator
+                // (`!{…}` is Tempo-rejected) falls through to a generic
+                // error at the outer levels.
+                _ => return Ok(lhs),
+            },
+            TokenKind::Amp => match &cursor.peek2().kind {
+                TokenKind::Gt => (StructuralOp::Child, StructuralModifier::Union, 2),
+                TokenKind::Shr => (StructuralOp::Descendant, StructuralModifier::Union, 2),
+                TokenKind::Lt => (StructuralOp::Parent, StructuralModifier::Union, 2),
+                TokenKind::Shl => (StructuralOp::Ancestor, StructuralModifier::Union, 2),
+                TokenKind::Tilde => (StructuralOp::Sibling, StructuralModifier::Union, 2),
+                // A lone `&` (not `&&`, not a union structural op) is a
+                // generic error downstream (the `lone_amp` corpus case).
+                _ => return Ok(lhs),
+            },
             _ => return Ok(lhs),
         };
-        charge_binary_node(binary_nodes, cursor.peek().span)?;
-        cursor.advance();
+        charge_binary_node(binary_nodes, start)?;
+        for _ in 0..tokens {
+            cursor.advance();
+        }
         let rhs = parse_spanset_primary(cursor, depth, binary_nodes)?;
         lhs = SpansetExpr::Structural {
             op,
+            modifier,
             lhs: Box::new(lhs),
             rhs: Box::new(rhs),
         };
     }
-}
-
-/// After a complete spanset operand, checks whether the next token is a
-/// still-unsupported structural/negation operator — valid Tempo, out of
-/// the committed surface (issue #172 implements `>`/`>>`/`~`; `<`/`<<`/
-/// `>=`/`<=`/`!` remain M7 boundaries) — and names it. This runs after
-/// *every* operand, so these are caught both at the top level and inside
-/// parentheses.
-fn check_no_unsupported_spanset_op(cursor: &Cursor<'_>) -> Result<(), TraceQlError> {
-    let tok = cursor.peek();
-    let construct = match &tok.kind {
-        TokenKind::Lt => "structural operator '<'",
-        TokenKind::Shl => "structural operator '<<'",
-        TokenKind::Gte => "structural operator '>='",
-        TokenKind::Lte => "structural operator '<='",
-        TokenKind::Bang => "negation operator '!'",
-        _ => return Ok(()),
-    };
-    Err(TraceQlError::NotYetSupported {
-        construct: construct.to_string(),
-        span: tok.span,
-    })
 }
 
 /// `SpansetPrimary := SpansetFilter | "(" SpansetExpr ")"` — the paren
@@ -322,10 +345,6 @@ fn parse_spanset_primary(
             cursor.expect(&TokenKind::RParen, "')'")?;
             Ok(expr)
         }
-        TokenKind::Bang => Err(TraceQlError::NotYetSupported {
-            construct: "negation operator '!'".to_string(),
-            span: tok.span,
-        }),
         TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
             expected: "a spanset filter ('{') or '('".to_string(),
             span: tok.span,
@@ -446,10 +465,28 @@ fn parse_field_primary(
             cursor.expect(&TokenKind::RParen, "')'")?;
             Ok(expr)
         }
-        TokenKind::Bang => Err(TraceQlError::NotYetSupported {
-            construct: "negation operator '!'".to_string(),
-            span: tok.span,
-        }),
+        // `logic.not` (issue #183): unary field negation binds tighter
+        // than `&&`/`||` — a primary. `depth` bounds `!`-chain nesting
+        // (`{ !!!…!.a }`) so the recursive walk never overflows the stack.
+        TokenKind::Bang => {
+            if depth >= MAX_DEPTH {
+                return Err(TraceQlError::RecursionLimitExceeded { span: tok.span });
+            }
+            cursor.advance();
+            let inner = parse_field_primary(cursor, depth + 1, binary_nodes)?;
+            Ok(FieldExpr::Not(Box::new(inner)))
+        }
+        // A bare boolean static (`static.bare_boolean`, issue #183): a
+        // lone `true`/`false` at field-primary position, not the scope of
+        // a dotted attribute.
+        TokenKind::Ident(ref name)
+            if (name == "true" || name == "false")
+                && !matches!(cursor.peek2().kind, TokenKind::Dot) =>
+        {
+            let b = name == "true";
+            cursor.advance();
+            Ok(FieldExpr::BoolStatic(b))
+        }
         _ => {
             let (field, field_span) = parse_field(cursor)?;
             let op = match &cursor.peek().kind {
@@ -489,9 +526,44 @@ fn parse_field_primary(
                 }
             };
             cursor.advance();
+            // `comparison.rhs_attribute` (issue #183): when the value
+            // position begins a field (attribute or intrinsic) the RHS is
+            // a `Field`, not a literal. Regex operators (`=~`/`!~`) never
+            // accept a field RHS — they fall through to `parse_value`,
+            // which rejects the field-start (Tempo rejects `{ .a =~ .b }`).
+            if !matches!(op, ComparisonOp::Re | ComparisonOp::Nre) && rhs_begins_field(cursor) {
+                let (rhs, _) = parse_field(cursor)?;
+                return Ok(FieldExpr::FieldCompare {
+                    lhs: field,
+                    op,
+                    rhs,
+                });
+            }
             let value = parse_value(cursor, &field)?;
             Ok(FieldExpr::Comparison { field, op, value })
         }
+    }
+}
+
+/// Whether the token at the value position begins a `Field` right-hand
+/// side (issue #183 `comparison.rhs_attribute`): the unscoped `.attr`
+/// form, a `span.`/`resource.`/`parent.` scoped attribute, or a bare
+/// intrinsic keyword. Boolean/status/kind value keywords (`true`, `ok`,
+/// `server`, …) are NOT intrinsics, so they stay literal values.
+fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
+    match &cursor.peek().kind {
+        TokenKind::Dot => true,
+        TokenKind::Ident(name) => {
+            if (name == "span" || name == "resource" || name == "parent")
+                && matches!(cursor.peek2().kind, TokenKind::Dot)
+            {
+                true
+            } else {
+                Intrinsic::from_ident(name).is_some()
+                    && !matches!(cursor.peek2().kind, TokenKind::Dot)
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1140,6 +1212,7 @@ mod tests {
                         op: StructuralOp::Child,
                         lhs,
                         rhs,
+                        ..
                     } => {
                         assert_eq!(filter_key(lhs), "b");
                         assert_eq!(filter_key(rhs), "c");
@@ -1170,6 +1243,7 @@ mod tests {
                 op: StructuralOp::Descendant,
                 lhs,
                 rhs,
+                ..
             } => {
                 assert!(matches!(
                     lhs.as_ref(),
@@ -1193,6 +1267,7 @@ mod tests {
                 op: StructuralOp::Child,
                 lhs,
                 rhs,
+                ..
             } => {
                 assert!(matches!(
                     lhs.as_ref(),
@@ -1224,9 +1299,9 @@ mod tests {
 
     #[test]
     fn remaining_structural_operators_stay_positioned_not_yet_supported() {
+        // `<`/`<<` are implemented in issue #183; only `>=`/`<=` between
+        // spansets remain recognized-but-M7 boundaries.
         for (query, construct) in [
-            ("{ .a = 1 } < { .b = 2 }", "structural operator '<'"),
-            ("{ .a = 1 } << { .b = 2 }", "structural operator '<<'"),
             ("{ .a = 1 } >= { .b = 2 }", "structural operator '>='"),
             ("{ .a = 1 } <= { .b = 2 }", "structural operator '<='"),
         ] {
@@ -1242,6 +1317,110 @@ mod tests {
                 other => panic!("{query} -> unexpected {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn all_fifteen_structural_operators_parse_with_their_modifiers() {
+        use StructuralModifier::*;
+        use StructuralOp::*;
+        for (query, want_op, want_mod) in [
+            ("{ .a = 1 } < { .b = 2 }", Parent, Plain),
+            ("{ .a = 1 } << { .b = 2 }", Ancestor, Plain),
+            ("{ .a = 1 } !> { .b = 2 }", Child, Negated),
+            ("{ .a = 1 } !>> { .b = 2 }", Descendant, Negated),
+            ("{ .a = 1 } !< { .b = 2 }", Parent, Negated),
+            ("{ .a = 1 } !<< { .b = 2 }", Ancestor, Negated),
+            ("{ .a = 1 } !~ { .b = 2 }", Sibling, Negated),
+            ("{ .a = 1 } &> { .b = 2 }", Child, Union),
+            ("{ .a = 1 } &>> { .b = 2 }", Descendant, Union),
+            ("{ .a = 1 } &< { .b = 2 }", Parent, Union),
+            ("{ .a = 1 } &<< { .b = 2 }", Ancestor, Union),
+            ("{ .a = 1 } &~ { .b = 2 }", Sibling, Union),
+        ] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            match &parsed.spanset {
+                SpansetExpr::Structural { op, modifier, .. } => {
+                    assert_eq!(*op, want_op, "{query}");
+                    assert_eq!(*modifier, want_mod, "{query}");
+                }
+                other => panic!("{query} -> expected Structural, got {other:?}"),
+            }
+            // Display round-trips through a reparse for every form.
+            let reparsed = parse(&parsed.to_string()).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert_eq!(reparsed, parsed, "{query}");
+        }
+    }
+
+    #[test]
+    fn nre_token_is_a_field_regex_and_a_structural_neg_sibling() {
+        // `!~` inside `{…}` is a field regex; between spansets it is the
+        // negated sibling — disambiguated purely by parser position.
+        let field = parse(r#"{ .a !~ "x" }"#).unwrap();
+        match &field.spanset {
+            SpansetExpr::Filter(SpansetFilter {
+                body: Some(FieldExpr::Comparison { op, .. }),
+            }) => assert_eq!(*op, ComparisonOp::Nre),
+            other => panic!("expected a field !~ comparison, got {other:?}"),
+        }
+        let structural = parse(r#"{ .a = 1 } !~ { .b = 2 }"#).unwrap();
+        assert!(matches!(
+            &structural.spanset,
+            SpansetExpr::Structural {
+                op: StructuralOp::Sibling,
+                modifier: StructuralModifier::Negated,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn logic_not_parses_and_bare_boolean_statics_parse() {
+        for query in ["{ !(.a = 1) }", "{ !(.a = 1 && .b = 2) }"] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            assert!(matches!(
+                &parsed.spanset,
+                SpansetExpr::Filter(SpansetFilter {
+                    body: Some(FieldExpr::Not(_))
+                })
+            ));
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
+        }
+        for (query, want) in [("{ true }", true), ("{ false }", false)] {
+            let parsed = parse(query).unwrap();
+            assert_eq!(
+                parsed.spanset,
+                SpansetExpr::Filter(SpansetFilter {
+                    body: Some(FieldExpr::BoolStatic(want))
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn field_vs_field_comparison_parses_and_regex_field_rhs_rejects() {
+        for query in [
+            r#"{ .a = .b }"#,
+            r#"{ .a != span.b }"#,
+            r#"{ .a > .b }"#,
+            r#"{ duration = .b }"#,
+            r#"{ .a = status }"#,
+        ] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            match &parsed.spanset {
+                SpansetExpr::Filter(SpansetFilter {
+                    body: Some(FieldExpr::FieldCompare { .. }),
+                }) => {}
+                other => panic!("{query} -> expected FieldCompare, got {other:?}"),
+            }
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
+        }
+        // A regex against a field RHS is rejected (Tempo rejects it too).
+        assert!(parse(r#"{ .a =~ .b }"#).is_err());
+        // A spanset-level `!{…}` is a plain parse error (not a construct).
+        assert!(matches!(
+            parse(r#"!{ .a = 1 }"#),
+            Err(TraceQlError::UnexpectedToken { .. })
+        ));
     }
 
     #[test]

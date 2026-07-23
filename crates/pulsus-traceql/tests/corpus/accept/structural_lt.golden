@@ -1,6 +1,6 @@
 Query {
     spanset: Structural {
-        op: Descendant,
+        op: Parent,
         modifier: Plain,
         lhs: Filter(
             SpansetFilter {

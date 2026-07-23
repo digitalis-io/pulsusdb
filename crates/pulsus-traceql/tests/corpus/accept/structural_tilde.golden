@@ -1,6 +1,7 @@
 Query {
     spanset: Structural {
         op: Sibling,
+        modifier: Plain,
         lhs: Filter(
             SpansetFilter {
                 body: Some(

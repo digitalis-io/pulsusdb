@@ -1,8 +1,8 @@
 UnexpectedToken {
-    found: "identifier \"true\"",
-    expected: "an intrinsic (name, duration, status, kind) or a scoped attribute (span., resource., or the unscoped . form)",
+    found: "identifier \"nil\"",
+    expected: "a value (string, number, boolean, or duration)",
     span: Span {
-        start: 22,
-        end: 26,
+        start: 55,
+        end: 58,
     },
 }

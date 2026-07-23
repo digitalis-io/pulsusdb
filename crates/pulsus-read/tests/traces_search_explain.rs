@@ -1523,4 +1523,284 @@ async fn two_phase_search_explain_and_budget_gates() {
         }
         other => panic!("expected TraceScanBudgetRows, got {other:?}"),
     }
+
+    // ---- Issue #183 AC6: the complete 15-combination structural matrix
+    // (all 5 base ops × 3 modifiers + the 2 empty-LHS negation edges) over
+    // the byte-frozen fixture T1, with a control trace T2 that matches none
+    // of them (per-trace scoping). ---------------------------------------
+    // T1: A root (.k=a, .h=hg) → B (.k=b, .g=gg, .h=hg) → C (.k=c, .g=gg),
+    // plus B2 (.k=b2, .g=gg, .h=hg) — a second child of A. So .g="gg"
+    // selects {B,C,B2} and .h="hg" selects {A,B,B2}. T2: lone root D (.k=d).
+    let ac6_st = now + 33 * 3_600_000_000_000;
+    const AC6_T1: &str = "00000000000000000000000000ac6001";
+    const AC6_T2: &str = "00000000000000000000000000ac6002";
+    const AC6_A: &str = "00000000000000a6";
+    const AC6_B: &str = "00000000000000b6";
+    const AC6_C: &str = "00000000000000c6";
+    const AC6_B2: &str = "00000000000000d6";
+    const AC6_D: &str = "00000000000000e6";
+    // Spans (name carries the label so the assertions read the returned set).
+    for spec in [
+        (AC6_A, ZERO8, "ac6-a", "svc", ac6_st, 0),
+        (AC6_B, AC6_A, "ac6-b", "svc", ac6_st + 10, 0),
+        (AC6_C, AC6_B, "ac6-c", "svc", ac6_st + 20, 0),
+        (AC6_B2, AC6_A, "ac6-b2", "svc", ac6_st + 30, 0),
+    ] {
+        insert_structural_span(&client, AC6_T1, spec).await;
+    }
+    insert_structural_span(
+        &client,
+        AC6_T2,
+        (AC6_D, ZERO8, "ac6-d", "svc", ac6_st + 40, 0),
+    )
+    .await;
+    // Attribute rows: (span, key, val).
+    async fn insert_ac6_attr(
+        client: &ChClient,
+        trace_hex: &str,
+        span_hex: &str,
+        key: &str,
+        val: &str,
+        ts: i64,
+    ) {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_attrs_idx \
+                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', NULL, {ts}, \
+                        toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), 1000"
+            ),
+        )
+        .await;
+    }
+    for (span_hex, rows) in [
+        (AC6_A, &[("k", "a"), ("h", "hg")][..]),
+        (AC6_B, &[("k", "b"), ("g", "gg"), ("h", "hg")][..]),
+        (AC6_C, &[("k", "c"), ("g", "gg")][..]),
+        (AC6_B2, &[("k", "b2"), ("g", "gg"), ("h", "hg")][..]),
+    ] {
+        for (key, val) in rows {
+            insert_ac6_attr(&client, AC6_T1, span_hex, key, val, ac6_st).await;
+        }
+    }
+    insert_ac6_attr(&client, AC6_T2, AC6_D, "k", "d", ac6_st + 40).await;
+
+    let (ac6_start, ac6_end) = (ac6_st - 1, ac6_st + 3_600_000_000_000);
+    async fn ac6_search_names(
+        engine: &TraceEngine,
+        q: &str,
+        start_ns: i64,
+        end_ns: i64,
+    ) -> Vec<String> {
+        let plan = plan_for_with(engine, q, start_ns, end_ns, 20, 16);
+        let output = engine
+            .search(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        if output.returned == 0 {
+            return vec![];
+        }
+        assert_eq!(output.returned, 1, "{q}: only T1 matches (T2 is a control)");
+        let mut names: Vec<String> = output.traces[0]
+            .spans
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+    // sorted order of the labels: ac6-a < ac6-b < ac6-b2 < ac6-c.
+    let matrix: &[(&str, &[&str])] = &[
+        // Plain
+        (r#"{ .k = "a" } > { .g = "gg" }"#, &["ac6-b", "ac6-b2"]),
+        (
+            r#"{ .k = "a" } >> { .g = "gg" }"#,
+            &["ac6-b", "ac6-b2", "ac6-c"],
+        ),
+        (r#"{ .k = "b" } < { .h = "hg" }"#, &["ac6-a"]),
+        (r#"{ .k = "c" } << { .h = "hg" }"#, &["ac6-a", "ac6-b"]),
+        (r#"{ .k = "b" } ~ { .g = "gg" }"#, &["ac6-b2"]),
+        // Negated (incl. the empty-LHS edges)
+        (r#"{ .k = "a" } !> { .g = "gg" }"#, &["ac6-c"]),
+        (
+            r#"{ .k = "none" } !> { .g = "gg" }"#,
+            &["ac6-b", "ac6-b2", "ac6-c"],
+        ),
+        (r#"{ .k = "b" } !>> { .g = "gg" }"#, &["ac6-b", "ac6-b2"]),
+        (r#"{ .k = "c" } !< { .h = "hg" }"#, &["ac6-a", "ac6-b2"]),
+        (r#"{ .k = "c" } !<< { .h = "hg" }"#, &["ac6-b2"]),
+        (
+            r#"{ .k = "none" } !<< { .h = "hg" }"#,
+            &["ac6-a", "ac6-b", "ac6-b2"],
+        ),
+        (r#"{ .k = "b" } !~ { .g = "gg" }"#, &["ac6-b", "ac6-c"]),
+        // Union
+        (
+            r#"{ .k = "a" } &> { .g = "gg" }"#,
+            &["ac6-a", "ac6-b", "ac6-b2"],
+        ),
+        (
+            r#"{ .k = "a" } &>> { .g = "gg" }"#,
+            &["ac6-a", "ac6-b", "ac6-b2", "ac6-c"],
+        ),
+        (r#"{ .k = "b" } &< { .h = "hg" }"#, &["ac6-a", "ac6-b"]),
+        (
+            r#"{ .k = "c" } &<< { .h = "hg" }"#,
+            &["ac6-a", "ac6-b", "ac6-c"],
+        ),
+        (r#"{ .k = "b" } &~ { .g = "gg" }"#, &["ac6-b", "ac6-b2"]),
+        // Self-relating (codex #183 Finding 1): both sides = .g="gg"
+        // ({B,C,B2}). C is a proper descendant of a DIFFERENT set member
+        // (B), so C is yielded — NOT blanket-excluded for being an LHS
+        // match; symmetrically B is a proper ancestor of C.
+        (r#"{ .g = "gg" } >> { .g = "gg" }"#, &["ac6-c"]),
+        (r#"{ .g = "gg" } << { .g = "gg" }"#, &["ac6-b"]),
+        (r#"{ .g = "gg" } !>> { .g = "gg" }"#, &["ac6-b", "ac6-b2"]),
+    ];
+    for (q, expected) in matrix {
+        let names = ac6_search_names(&engine, q, ac6_start, ac6_end).await;
+        assert_eq!(&names, expected, "AC6 matrix: {q}");
+    }
+
+    // ---- Issue #183 AC9: field-vs-field value correctness --------------
+    // The field-compare coercion matrix, VERIFIED against
+    // grafana/tempo:3.0.2 for the cross-type case (a string vs a numeric
+    // with COINCIDENT text "5" is no match under `=` AND `!=` — Tempo
+    // type-gates every operator). Spans: fc-eq (a=b=5 numeric-equal), fc-ne
+    // (a=9,b=1 numeric), fc-xt (a="5" STRING vs b=5 numeric — the
+    // adversarial coincident-text case ⇒ no match), fc-ab (a=5, b absent ⇒
+    // no match), fc-sx (g="apple",h="banana" — both strings, gating LEXICAL
+    // string ordering). Broader value-parity vs a data-loaded Tempo remains
+    // a #185 close condition (the #180 differential is parse-only), but the
+    // cross-type rule is Tempo-verified and correct HERE.
+    let fc_st = now + 36 * 3_600_000_000_000;
+    const FC_T: &str = "00000000000000000000000000fc0001";
+    for spec in [
+        ("00000000000000f1", ZERO8, "fc-eq", "svc", fc_st, 0),
+        ("00000000000000f2", ZERO8, "fc-ne", "svc", fc_st + 10, 0),
+        ("00000000000000f3", ZERO8, "fc-xt", "svc", fc_st + 20, 0),
+        ("00000000000000f4", ZERO8, "fc-ab", "svc", fc_st + 30, 0),
+        ("00000000000000f5", ZERO8, "fc-sx", "svc", fc_st + 40, 0),
+    ] {
+        insert_structural_span(&client, FC_T, spec).await;
+    }
+    // fc-eq: a=5, b=5 (val_num set → numeric-comparable, and equal).
+    async fn insert_num_attr(
+        client: &ChClient,
+        trace_hex: &str,
+        span_hex: &str,
+        key: &str,
+        val: &str,
+        num: f64,
+        ts: i64,
+    ) {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_attrs_idx \
+                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', 'span', {num}, {ts}, \
+                        toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), 1000"
+            ),
+        )
+        .await;
+    }
+    insert_num_attr(&client, FC_T, "00000000000000f1", "a", "5", 5.0, fc_st).await;
+    insert_num_attr(&client, FC_T, "00000000000000f1", "b", "5", 5.0, fc_st).await;
+    insert_num_attr(&client, FC_T, "00000000000000f2", "a", "9", 9.0, fc_st + 10).await;
+    insert_num_attr(&client, FC_T, "00000000000000f2", "b", "1", 1.0, fc_st + 10).await;
+    // fc-xt: a is a STRING "5" (val_num NULL), b is numeric 5 — the
+    // adversarial COINCIDENT-text cross-type case; Tempo type-gates ⇒ no
+    // match under `=` or `!=`.
+    insert_ac6_attr(&client, FC_T, "00000000000000f3", "a", "5", fc_st + 20).await;
+    insert_num_attr(&client, FC_T, "00000000000000f3", "b", "5", 5.0, fc_st + 20).await;
+    // fc-ab: a present, b absent ⇒ no match (absent key).
+    insert_num_attr(&client, FC_T, "00000000000000f4", "a", "5", 5.0, fc_st + 30).await;
+    // fc-sx: two string attrs for lexical ordering (apple < banana).
+    insert_ac6_attr(&client, FC_T, "00000000000000f5", "g", "apple", fc_st + 40).await;
+    insert_ac6_attr(&client, FC_T, "00000000000000f5", "h", "banana", fc_st + 40).await;
+    let (fc_start, fc_end) = (fc_st - 1, fc_st + 3_600_000_000_000);
+    let plan = plan_for(&engine, r#"{ .a = .b }"#, fc_start, fc_end);
+    let output = engine.search(&plan).await.expect("field-compare eq search");
+    assert_eq!(
+        output.returned, 1,
+        "{{ .a = .b }} matches only fc-eq — cross-type coincident text (fc-xt) and absent key \
+         (fc-ab) never match"
+    );
+    assert_eq!(output.traces[0].matched, 1, "only fc-eq, never fc-xt/fc-ab");
+    assert_eq!(output.traces[0].spans[0].name, "fc-eq");
+    // The demonstrable-bug guard: `!=` must ALSO reject the cross-type
+    // coincident-text span (fc-xt), matching only the genuinely-unequal
+    // numeric fc-ne (9 != 1).
+    let plan = plan_for(&engine, r#"{ .a != .b }"#, fc_start, fc_end);
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("field-compare neq search");
+    assert_eq!(
+        output.returned, 1,
+        "{{ .a != .b }} matches only fc-ne — cross-type (fc-xt) never matches != either"
+    );
+    assert_eq!(output.traces[0].spans[0].name, "fc-ne");
+    let plan = plan_for(&engine, r#"{ .a > .b }"#, fc_start, fc_end);
+    let output = engine.search(&plan).await.expect("field-compare gt search");
+    assert_eq!(output.returned, 1);
+    assert_eq!(
+        output.traces[0].matched, 1,
+        "only fc-ne (9 > 1); fc-xt's cross-type operands block ordering"
+    );
+    assert_eq!(
+        output.traces[0].spans[0].name, "fc-ne",
+        "9 > 1 numeric ordering"
+    );
+    // Lexical string ordering (Tempo-verified): apple < banana matches fc-sx.
+    let plan = plan_for(&engine, r#"{ .g < .h }"#, fc_start, fc_end);
+    let output = engine.search(&plan).await.expect("string-ordering search");
+    assert_eq!(
+        output.returned, 1,
+        "{{ .g < .h }} matches fc-sx (apple < banana lexically)"
+    );
+    assert_eq!(output.traces[0].spans[0].name, "fc-sx");
+
+    // ---- Issue #183: the field-vs-field generator granule-prunes on the
+    // attribute `(key)` prefix (EXPLAIN indexes=1), never a bare scan.
+    let plan = plan_for(&engine, r#"{ .env = .env }"#, base, now);
+    let generator = &plan.generator_sqls[0];
+    assert!(
+        generator.contains("FROM trace_attrs_idx") && generator.contains("key = 'env'"),
+        "the field-compare generator must be the key-existence scan:\n{generator}"
+    );
+    let raw = explain_raw(&client, generator).await;
+    let (sel, total) = primary_key_granules(&raw);
+    assert!(
+        sel < total,
+        "the field-compare key-existence generator must prune on the (key) prefix \
+         ({sel}/{total}):\n{raw}"
+    );
+
+    // ---- Issue #183: a structural search under a tiny scan_budget_rows
+    // trips TraceScanBudgetRows for the new forms exactly like #172. ------
+    let mut tight183 = engine_config();
+    tight183.scan_budget_rows = 1_000;
+    let tight183_engine = TraceEngine::new(data_client().await, tight183);
+    let plan = plan_for(
+        &tight183_engine,
+        r#"{ resource.service.name = "checkout" } !> { status = error }"#,
+        base,
+        now,
+    );
+    let err = tight183_engine
+        .search(&plan)
+        .await
+        .expect_err("a negated structural span-scan must exceed a 1k-row budget");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::TraceScanBudgetRows { budget_rows: 1_000 })
+        ),
+        "got {err:?}"
+    );
 }

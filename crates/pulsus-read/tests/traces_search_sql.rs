@@ -159,6 +159,42 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Structural ancestor `<` (issue #183): the relation is Phase-2
+        // engine work — the emitted SQL is byte-identical to `&&`
+        // (cross_spanset) past the header.
+        name: "structural_ancestor",
+        q: r#"{ resource.service.name = "checkout" } < { span.foo = "x" }"#,
+        distributed: false,
+    },
+    Case {
+        // Structural ancestors `<<` (issue #183): same no-new-SQL contract.
+        name: "structural_ancestors",
+        q: r#"{ resource.service.name = "checkout" } << { span.foo = "x" }"#,
+        distributed: false,
+    },
+    Case {
+        // Negated structural `!>` (issue #183): the negation is Phase-2
+        // engine work over hydrated spans — the Phase-1 SQL is unchanged.
+        name: "structural_not_child",
+        q: r#"{ resource.service.name = "checkout" } !> { span.foo = "x" }"#,
+        distributed: false,
+    },
+    Case {
+        // Union structural `&>` (issue #183): same no-new-SQL contract.
+        name: "structural_union_child",
+        q: r#"{ resource.service.name = "checkout" } &> { span.foo = "x" }"#,
+        distributed: false,
+    },
+    Case {
+        // Field-vs-field comparison (issue #183 `comparison.rhs_attribute`):
+        // the Phase-1 generator is the LHS-attribute key-existence `(key)`
+        // scan (an index-served superset), NOT a time-range fallback; both
+        // operands' `val`/`val_num` reads are registered for Phase 2.
+        name: "rhs_attr",
+        q: r#"{ .a = .b }"#,
+        distributed: false,
+    },
+    Case {
         // Nested-set root selection (issue #181): a nested-set-only
         // filter has NO column pushdown — its generator is the complete
         // time-range superset, byte-identical to the `{}` match-all
@@ -401,6 +437,61 @@ fn shipped_shapes_and_limits_are_documented() {
             "docs/api.md §4.2 must document {needle:?}"
         );
     }
+}
+
+/// Issue #183: every structural form's Phase-1 SQL is byte-identical to
+/// the `&&` (cross_spanset) plan past the two header lines — the AC4
+/// no-new-SQL identity extended to `<`/`<<`/`!>`/`&>`.
+#[test]
+fn structural_183_goldens_match_cross_spanset_past_the_header() {
+    let dir = golden_dir();
+    let base =
+        std::fs::read_to_string(dir.join("cross_spanset.sql")).expect("cross_spanset golden");
+    let base_body = base
+        .splitn(3, '\n')
+        .nth(2)
+        .expect("body past 2 header lines");
+    for name in [
+        "structural_ancestor",
+        "structural_ancestors",
+        "structural_not_child",
+        "structural_union_child",
+    ] {
+        let golden = std::fs::read_to_string(dir.join(format!("{name}.sql")))
+            .unwrap_or_else(|e| panic!("{name} golden: {e}"));
+        let body = golden
+            .splitn(3, '\n')
+            .nth(2)
+            .expect("body past 2 header lines");
+        assert_eq!(
+            body, base_body,
+            "{name}: Phase-1 SQL must be byte-identical to cross_spanset past the header"
+        );
+    }
+}
+
+/// Issue #183: the field-vs-field generator prunes on the LHS attribute's
+/// key-only `(key)` scan — an index-served superset, never the time-range
+/// fallback.
+#[test]
+fn rhs_attr_generator_is_the_key_only_scan_not_a_fallback() {
+    let plan = plan_for(
+        CASES
+            .iter()
+            .find(|c| c.name == "rhs_attr")
+            .expect("rhs_attr case"),
+    );
+    assert_eq!(plan.generator_sqls.len(), 1);
+    let sql = &plan.generator_sqls[0];
+    assert!(
+        sql.contains("FROM trace_attrs_idx"),
+        "reads the attr index: {sql}"
+    );
+    assert!(sql.contains("key = 'a'"), "prunes on the LHS key: {sql}");
+    assert!(
+        !sql.contains("val ="),
+        "a key-existence scan carries no value predicate: {sql}"
+    );
 }
 
 /// Regenerates every committed golden. `#[ignore]`d: run explicitly

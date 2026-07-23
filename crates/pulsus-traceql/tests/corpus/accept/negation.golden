@@ -1,0 +1,21 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Not(
+                    Comparison {
+                        field: Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                        op: Eq,
+                        value: Number(
+                            "1",
+                        ),
+                    },
+                ),
+            ),
+        },
+    ),
+    pipeline: [],
+}

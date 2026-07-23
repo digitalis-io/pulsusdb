@@ -42,10 +42,11 @@
 //! | each attribute `(display, value)` clone | per-pair string-length charge immediately before the clone |
 //! | scalar renders (`duration`/`status`/`kind`, ≤ ~20 B) | stated residual: transiently rendered to learn the length, charged before entering the buffer |
 //! | `out: Vec<TraceMatch>` slots | covered by each match's `size_of::<TraceMatch>` base charge + overhead envelope (growth doubling) |
-//! | structural result set (`child_set`/`descendant_set`/`sibling_set`) | [`charged_set`] pre-charge at the spans upper bound; released when empty/merged/after summaries like any operand set |
-//! | descendant adjacency map + BFS queue (`descendant_set`) | `spans × DESCENDANT_TRANSIENT_BYTES` envelope (map key + `Vec` header + child slot with doubling slack + ≤ 2 queue slots per span; the queue never reallocates by construction) charged before allocation, released after the walk |
-//! | descendant visited set (`descendant_set`) | [`charged_set`] pre-charge; released after the RHS intersection |
-//! | sibling parent map (`sibling_set`) | `spans × SIBLING_ENTRY_BYTES` charged before allocation, released after the pass |
+//! | structural result / participant sets (`rel_children`/`rel_parents`/`rel_descendants`/`rel_ancestors`/`rel_siblings`, plus the Negated complement + Union `union_sets`) | [`charged_set`] pre-charge at the spans upper bound; released when empty/merged/after summaries like any operand set |
+//! | descendant adjacency map + BFS queue (`rel_descendants`) | `spans × DESCENDANT_TRANSIENT_BYTES` envelope (map key + `Vec` header + child slot with doubling slack + ≤ 2 queue slots per span; the queue never reallocates by construction) charged before allocation, released after the walk |
+//! | descendant/ancestor `reached` set (`rel_descendants`/`rel_ancestors`) | [`charged_set`] pre-charge; released after the walk |
+//! | ancestor `span_id → parent_id` map + upward BFS queue (`rel_ancestors`) | `spans × (ANCESTOR_ENTRY_BYTES + 2 queue slots)` charged before allocation, released after the upward walk |
+//! | sibling parent map (`rel_siblings`) | `spans × SIBLING_ENTRY_BYTES` charged before allocation, released after the pass |
 //! | nested-set index (`compute_nested_set`) | `spans × NESTED_SET_ENTRY_BYTES` charged before allocation; retained for the trace's `eval_spanset`, released right after |
 //! | nested-set numbering transients — span-id set + children map (key + `Vec` header + child-`Vec` first-push capacity of 4 slots) + sorted view + Euler stack (`compute_nested_set`) | `spans × NESTED_SET_TRANSIENT_BYTES` envelope charged before allocation, released after numbering |
 //!
@@ -57,13 +58,15 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pulsus_traceql::{AggregateOp, ComparisonOp, FieldExpr, SpansetExpr, StructuralOp};
+use pulsus_traceql::{
+    AggregateOp, ComparisonOp, FieldExpr, SpansetExpr, StructuralModifier, StructuralOp,
+};
 
 use super::exec::ByteBudget;
 use super::filter::NestedSetField;
 use super::search_plan::{
-    AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, SearchPlan,
-    SelectField,
+    AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, PlannedOperand,
+    SearchPlan, SelectField,
 };
 use crate::logql::error::ReadError;
 
@@ -198,6 +201,120 @@ fn eval_physical(p: &PhysicalEval, span: &HydratedSpan) -> bool {
     }
 }
 
+/// One resolved field-vs-field operand value (issue #183). Both fields
+/// are borrowed from the hydrated span / attribute reads — no allocation
+/// happens in the compare (keeping it out of the per-span hot loop).
+struct ResolvedVal<'a> {
+    num: Option<f64>,
+    text: Option<&'a str>,
+}
+
+/// Resolves one comparison operand to its typed value for a span, or
+/// `None` when an attribute operand's key is absent (absent key ⇒ no
+/// match). Physical intrinsics are always present.
+fn resolve_operand<'a>(
+    operand: &PlannedOperand,
+    trace_id: [u8; 16],
+    span: &'a HydratedSpan,
+    attrs: &'a BatchAttrs,
+) -> Option<ResolvedVal<'a>> {
+    match operand {
+        PlannedOperand::Name => Some(ResolvedVal {
+            num: None,
+            text: Some(&span.name),
+        }),
+        PlannedOperand::Service => Some(ResolvedVal {
+            num: None,
+            text: Some(&span.service),
+        }),
+        PlannedOperand::Duration => Some(ResolvedVal {
+            num: Some(span.duration_ns as f64),
+            text: None,
+        }),
+        PlannedOperand::Status => Some(ResolvedVal {
+            num: Some(span.status_code as f64),
+            text: None,
+        }),
+        PlannedOperand::Kind => Some(ResolvedVal {
+            num: Some(span.kind as f64),
+            text: None,
+        }),
+        PlannedOperand::Attr { str_idx, num_idx } => {
+            let key = (trace_id, span.span_id);
+            let text = attrs.select_values[*str_idx].get(&key).map(String::as_str);
+            let num = attrs.agg_values[*num_idx].get(&key).copied();
+            if text.is_none() && num.is_none() {
+                None
+            } else {
+                Some(ResolvedVal { num, text })
+            }
+        }
+    }
+}
+
+/// Lexicographic string comparison for the six ordering/equality
+/// operators (Tempo compares string statics byte-lexicographically, which
+/// matches Rust's `str` `Ord` — verified against grafana/tempo:3.0.2:
+/// `apple < banana`, `"5" <= "5"`).
+fn cmp_str(op: ComparisonOp, l: &str, r: &str) -> bool {
+    match op {
+        ComparisonOp::Eq => l == r,
+        ComparisonOp::Neq => l != r,
+        ComparisonOp::Gt => l > r,
+        ComparisonOp::Gte => l >= r,
+        ComparisonOp::Lt => l < r,
+        ComparisonOp::Lte => l <= r,
+        ComparisonOp::Re | ComparisonOp::Nre => false,
+    }
+}
+
+/// Evaluates a field-vs-field comparison for one span (issue #183),
+/// matching the coercion rule VERIFIED against grafana/tempo:3.0.2
+/// (value-parity broadly remains a #185 close condition, but this
+/// cross-type rule is Tempo-verified here):
+///
+/// - **type gate** — the two operands must be the same type; a cross-type
+///   pair (one numeric, one string) is **no match for EVERY operator**,
+///   even on coincident text (`.a = "5"` string vs `.b = 5` int is NOT a
+///   match, and neither is `!=`);
+/// - both numeric ⇒ numeric compare (all 6 operators);
+/// - both string ⇒ lexicographic string compare (all 6 operators);
+/// - an absent attribute key on either side ⇒ no match.
+///
+/// An operand is numeric-typed iff it resolves a numeric value (`val_num`
+/// for an attribute, the physical column for `duration`/`status`/`kind`);
+/// otherwise it is string-typed (`name`, `resource.service.name`, a
+/// string/bool attribute). The text `val` a numeric attribute row ALSO
+/// carries is deliberately NOT used as a fallback — the gate keys on
+/// genuine numeric-typedness, so coincident text can never cross the type
+/// boundary.
+fn eval_field_compare(
+    lhs: &PlannedOperand,
+    rhs: &PlannedOperand,
+    op: ComparisonOp,
+    trace_id: [u8; 16],
+    span: &HydratedSpan,
+    attrs: &BatchAttrs,
+) -> bool {
+    let (Some(l), Some(r)) = (
+        resolve_operand(lhs, trace_id, span, attrs),
+        resolve_operand(rhs, trace_id, span, attrs),
+    ) else {
+        return false; // absent key on either side ⇒ no match
+    };
+    match (l.num, r.num) {
+        // Both numeric-typed ⇒ numeric compare.
+        (Some(ln), Some(rn)) => cmp_f64(op, ln, rn),
+        // Both string-typed ⇒ lexicographic string compare.
+        (None, None) => match (l.text, r.text) {
+            (Some(lt), Some(rt)) => cmp_str(op, lt, rt),
+            _ => false,
+        },
+        // Cross-type (numeric vs string) ⇒ no match for every operator.
+        _ => false,
+    }
+}
+
 /// Evaluates one filter's boolean tree for one span. Deliberately never
 /// short-circuits: `leaf_idx` must advance through every comparison so
 /// the pre-order leaf registry stays aligned with the AST walk.
@@ -211,7 +328,7 @@ fn eval_expr(
     nested_set: Option<&NestedSetIndex>,
 ) -> bool {
     match expr {
-        FieldExpr::Comparison { .. } => {
+        FieldExpr::Comparison { .. } | FieldExpr::FieldCompare { .. } => {
             let leaf = &filter.leaves[*leaf_idx];
             *leaf_idx += 1;
             match leaf {
@@ -227,7 +344,17 @@ fn eval_expr(
                     .and_then(|idx| idx.get(&span.span_id))
                     .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
                     .unwrap_or(false),
+                PlannedLeafEval::FieldCompare { lhs, rhs, op } => {
+                    eval_field_compare(lhs, rhs, *op, trace_id, span, attrs)
+                }
             }
+        }
+        // A bare boolean static (issue #183) consumes no leaf.
+        FieldExpr::BoolStatic(b) => *b,
+        // Unary field negation (issue #183): the inner walk advances
+        // `leaf_idx` through the inner subtree, then the result is negated.
+        FieldExpr::Not(inner) => {
+            !eval_expr(inner, filter, leaf_idx, trace_id, span, attrs, nested_set)
         }
         FieldExpr::Binary { op, lhs, rhs } => {
             let l = eval_expr(lhs, filter, leaf_idx, trace_id, span, attrs, nested_set);
@@ -363,24 +490,19 @@ fn eval_spanset(
                 },
             }
         }
-        // Structural relations (issue #172): both operands must match
-        // within the trace before the relation is worth computing; an
-        // empty side releases the other and yields no result.
-        SpansetExpr::Structural { op, lhs, rhs } => {
+        // Structural relations (issue #172 + #183): the empty-side
+        // handling is modifier-aware, so both operand sets are passed
+        // through to `eval_structural` (a Negated relation with an empty
+        // LHS returns the whole RHS set — the single most error-prone edge).
+        SpansetExpr::Structural {
+            op,
+            modifier,
+            lhs,
+            rhs,
+        } => {
             let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
             let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
-            match (l, r) {
-                (Some(a), Some(b)) => eval_structural(*op, a, b, trace, budget),
-                (Some(a), None) => {
-                    release_set(a, budget);
-                    Ok(None)
-                }
-                (None, Some(b)) => {
-                    release_set(b, budget);
-                    Ok(None)
-                }
-                (None, None) => Ok(None),
-            }
+            eval_structural(*op, *modifier, l, r, trace, budget)
         }
     }
 }
@@ -405,26 +527,93 @@ const SIBLING_ENTRY_BYTES: usize = std::mem::size_of::<[u8; 8]>()
     + std::mem::size_of::<(u32, [u8; 8])>()
     + super::exec::RETAINED_ENTRY_OVERHEAD;
 
-/// Evaluates one structural relation (issue #172) over the trace's
+/// Per-entry cost of the ancestor-walk `span_id → parent_id` map.
+const ANCESTOR_ENTRY_BYTES: usize = std::mem::size_of::<[u8; 8]>()
+    + std::mem::size_of::<[u8; 8]>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD;
+
+/// Evaluates one structural relation (issue #172 + #183) over the trace's
 /// hydrated spans — O(spans), bounded by `MAX_SPANS_PER_TRACE`.
-/// Consumes (and releases) both operand sets and
-/// returns the RHS-only result set (adjudicated pin 3), `None` when it
-/// is empty. Every intermediate is charge-before-allocate; on an error
-/// the request's budget dies whole (the standing error-path convention).
+///
+/// The [`StructuralModifier`] selects which spans are returned:
+/// - **Plain** — the RHS spans satisfying the relation (`rhs_participants`);
+/// - **Negated** — the RHS spans NOT satisfying it (`rhs.set \ participants`);
+///   with an EMPTY LHS but a non-empty RHS the whole RHS set matches
+///   (nothing satisfies the relation, so every RHS span is a `!`-match);
+/// - **Union** — both participating sides (`rhs_participants ∪ lhs_participants`).
+///
+/// Consumes (and releases) both operand sets; `None` when the result is
+/// empty. Every intermediate is charge-before-allocate; on an error the
+/// request's budget dies whole (the standing error-path convention).
 fn eval_structural(
     op: StructuralOp,
-    lhs: ChargedSet,
-    rhs: ChargedSet,
+    modifier: StructuralModifier,
+    l: Option<ChargedSet>,
+    r: Option<ChargedSet>,
     trace: &TraceSpans,
     budget: &mut ByteBudget,
 ) -> Result<Option<ChargedSet>, ReadError> {
-    let result = match op {
-        StructuralOp::Child => child_set(&lhs, &rhs, trace, budget)?,
-        StructuralOp::Descendant => descendant_set(&lhs, &rhs, trace, budget)?,
-        StructuralOp::Sibling => sibling_set(&lhs, &rhs, trace, budget)?,
-    };
-    release_set(lhs, budget);
-    release_set(rhs, budget);
+    match modifier {
+        // Plain and Union both require BOTH sides non-empty: the relation
+        // needs an LHS and an RHS to participate.
+        StructuralModifier::Plain | StructuralModifier::Union => match (l, r) {
+            (Some(a), Some(b)) => {
+                let result = match modifier {
+                    StructuralModifier::Plain => rhs_participants(op, &a, &b, trace, budget)?,
+                    _ => {
+                        let rp = rhs_participants(op, &a, &b, trace, budget)?;
+                        let lp = lhs_participants(op, &a, &b, trace, budget)?;
+                        union_sets(rp, lp, trace, budget)?
+                    }
+                };
+                release_set(a, budget);
+                release_set(b, budget);
+                finish_structural(result, budget)
+            }
+            (Some(a), None) => {
+                release_set(a, budget);
+                Ok(None)
+            }
+            (None, Some(b)) => {
+                release_set(b, budget);
+                Ok(None)
+            }
+            (None, None) => Ok(None),
+        },
+        StructuralModifier::Negated => match (l, r) {
+            // Empty RHS: no span to return regardless of the LHS.
+            (l_opt, None) => {
+                if let Some(a) = l_opt {
+                    release_set(a, budget);
+                }
+                Ok(None)
+            }
+            // Empty LHS, non-empty RHS: nothing satisfies the relation, so
+            // EVERY RHS span is a negated match — return the whole RHS set.
+            (None, Some(b)) => Ok(Some(b)),
+            (Some(a), Some(b)) => {
+                let participants = rhs_participants(op, &a, &b, trace, budget)?;
+                let mut result = charged_set(trace.spans.len(), budget)?;
+                for id in &b.set {
+                    if !participants.set.contains(id) {
+                        result.set.insert(*id);
+                    }
+                }
+                release_set(participants, budget);
+                release_set(a, budget);
+                release_set(b, budget);
+                finish_structural(result, budget)
+            }
+        },
+    }
+}
+
+/// Releases an empty structural result set (returning `None`) or hands it
+/// back charged.
+fn finish_structural(
+    result: ChargedSet,
+    budget: &mut ByteBudget,
+) -> Result<Option<ChargedSet>, ReadError> {
     if result.set.is_empty() {
         release_set(result, budget);
         Ok(None)
@@ -433,21 +622,64 @@ fn eval_structural(
     }
 }
 
-/// `{A} > {B}`: spans matching B whose **direct parent** matches A.
-/// All-zero `parent_id` spans have no parent and never match; orphans
-/// (non-zero `parent_id` with no hydrated parent) never match because
-/// every LHS id is a hydrated span's id.
-fn child_set(
+/// The RHS spans satisfying the relation `{lhs} op {rhs}` — the Plain
+/// result set (adjudicated pin 3 for #172's `>`/`>>`/`~`; #183 adds `<`
+/// (direct parent) and `<<` (ancestor)).
+fn rhs_participants(
+    op: StructuralOp,
     lhs: &ChargedSet,
     rhs: &ChargedSet,
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedSet, ReadError> {
+    match op {
+        StructuralOp::Child => rel_children(lhs, rhs, trace, budget),
+        StructuralOp::Parent => rel_parents(lhs, rhs, trace, budget),
+        StructuralOp::Descendant => rel_descendants(lhs, rhs, trace, budget),
+        StructuralOp::Ancestor => rel_ancestors(lhs, rhs, trace, budget),
+        StructuralOp::Sibling => rel_siblings(lhs, rhs, trace, budget),
+    }
+}
+
+/// The LHS spans participating in the relation (the LHS-side of a Union
+/// modifier). It is the mirror of [`rhs_participants`] with the roles of
+/// the operands swapped: for `>` (RHS is a child of LHS) the participating
+/// LHS spans are the ones that are the PARENT of some RHS span, and so on.
+fn lhs_participants(
+    op: StructuralOp,
+    lhs: &ChargedSet,
+    rhs: &ChargedSet,
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedSet, ReadError> {
+    match op {
+        StructuralOp::Child => rel_parents(rhs, lhs, trace, budget),
+        StructuralOp::Parent => rel_children(rhs, lhs, trace, budget),
+        StructuralOp::Descendant => rel_ancestors(rhs, lhs, trace, budget),
+        StructuralOp::Ancestor => rel_descendants(rhs, lhs, trace, budget),
+        StructuralOp::Sibling => rel_siblings(rhs, lhs, trace, budget),
+    }
+}
+
+/// `cand` spans whose **direct parent** matches `seed`. All-zero
+/// `parent_id` spans have no parent and never match; a self-loop edge
+/// (`parent_id == span_id`) never makes a span its own child. Orphans
+/// (non-zero `parent_id` with no hydrated parent) never match because
+/// every seed id is a hydrated span's id. A `cand` span that is ALSO a
+/// seed is included when its parent is a *different* seed span (per-pair
+/// self-exclusion, not a blanket LHS exclusion — codex review #183).
+fn rel_children(
+    seed: &ChargedSet,
+    cand: &ChargedSet,
     trace: &TraceSpans,
     budget: &mut ByteBudget,
 ) -> Result<ChargedSet, ReadError> {
     let mut out = charged_set(trace.spans.len(), budget)?;
     for span in &trace.spans {
         if span.parent_id != ZERO_ID
-            && rhs.set.contains(&span.span_id)
-            && lhs.set.contains(&span.parent_id)
+            && span.parent_id != span.span_id
+            && cand.set.contains(&span.span_id)
+            && seed.set.contains(&span.parent_id)
         {
             out.set.insert(span.span_id);
         }
@@ -455,20 +687,41 @@ fn child_set(
     Ok(out)
 }
 
-/// `{A} >> {B}`: spans matching B **strictly below** an A-matching span
-/// in the parent chain — an O(spans) BFS over a `parent_id → children`
-/// adjacency map (the documented spike shape, docs/schemas.md §4.2)
-/// seeded from A's matched ids. The visited set is pre-seeded with the
-/// LHS spans: they are traversed *through* but can never be
-/// re-discovered, so an LHS-matching span is never yielded as a
-/// descendant — including through a malformed/self-referential parent
-/// cycle (codex review on issue #172: "a span is never its own
-/// descendant") — and the same guard terminates every cycle. An
-/// out-of-window (never hydrated) intermediate hop breaks the chain —
-/// docs/api.md §4.2.
-fn descendant_set(
-    lhs: &ChargedSet,
-    rhs: &ChargedSet,
+/// `cand` spans that are the **direct parent** of some `seed` span (issue
+/// #183's `<` in the RHS direction). All-zero parents and self-loops never
+/// match.
+fn rel_parents(
+    seed: &ChargedSet,
+    cand: &ChargedSet,
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedSet, ReadError> {
+    let mut out = charged_set(trace.spans.len(), budget)?;
+    for span in &trace.spans {
+        if span.parent_id != ZERO_ID
+            && span.parent_id != span.span_id
+            && seed.set.contains(&span.span_id)
+            && cand.set.contains(&span.parent_id)
+        {
+            out.set.insert(span.parent_id);
+        }
+    }
+    Ok(out)
+}
+
+/// `cand` spans that are a **proper descendant** of *some* `seed` span — a
+/// multi-source O(spans) BFS down a `parent_id → children` adjacency map
+/// (the documented spike shape, docs/schemas.md §4.2) seeded from `seed`'s
+/// matched ids. Only the seed spans themselves are the (distance-0) BFS
+/// sources; every node reached across ≥ 1 edge is a proper descendant, so
+/// a span that is BOTH a seed and a genuine descendant of a *different*
+/// seed IS yielded (per-pair self-exclusion — codex review #183). Self-loop
+/// edges are dropped (a span is never its own descendant) and the
+/// `reached` set terminates every cycle. An out-of-window (never hydrated)
+/// intermediate hop breaks the chain (docs/api.md §4.2).
+fn rel_descendants(
+    seed: &ChargedSet,
+    cand: &ChargedSet,
     trace: &TraceSpans,
     budget: &mut ByteBudget,
 ) -> Result<ChargedSet, ReadError> {
@@ -476,52 +729,106 @@ fn descendant_set(
     budget.charge(transients)?;
     let mut children: HashMap<[u8; 8], Vec<[u8; 8]>> = HashMap::with_capacity(trace.spans.len());
     for span in &trace.spans {
-        if span.parent_id != ZERO_ID {
+        if span.parent_id != ZERO_ID && span.parent_id != span.span_id {
             children
                 .entry(span.parent_id)
                 .or_default()
                 .push(span.span_id);
         }
     }
-    // Pushes are bounded by seeds (≤ spans) + one visited-guarded
-    // discovery per non-seed span, so the reservation is never exceeded.
-    let mut queue: Vec<[u8; 8]> = Vec::with_capacity(lhs.set.len() + trace.spans.len());
-    queue.extend(lhs.set.iter().copied());
-    let mut visited = charged_set(trace.spans.len(), budget)?;
-    visited.set.extend(lhs.set.iter().copied());
+    // Seeds are the distance-0 sources; each discovered node is enqueued
+    // exactly once, so pushes are bounded by seeds (≤ spans) + one per
+    // discovered node (≤ spans) and the reservation is never exceeded.
+    let mut queue: Vec<[u8; 8]> = Vec::with_capacity(seed.set.len() + trace.spans.len());
+    queue.extend(seed.set.iter().copied());
+    let mut reached = charged_set(trace.spans.len(), budget)?;
+    let mut out = charged_set(trace.spans.len(), budget)?;
     let mut cursor = 0;
     while cursor < queue.len() {
-        let parent = queue[cursor];
+        let node = queue[cursor];
         cursor += 1;
-        if let Some(kids) = children.get(&parent) {
+        if let Some(kids) = children.get(&node) {
             for child in kids {
-                if visited.set.insert(*child) {
+                // Every child is a PROPER descendant (distance ≥ 1) of a
+                // seed source — including a child that is itself a seed.
+                if reached.set.insert(*child) {
                     queue.push(*child);
+                    if cand.set.contains(child) {
+                        out.set.insert(*child);
+                    }
                 }
             }
         }
     }
-    let mut out = charged_set(trace.spans.len(), budget)?;
-    for id in &visited.set {
-        if !lhs.set.contains(id) && rhs.set.contains(id) {
-            out.set.insert(*id);
-        }
-    }
-    release_set(visited, budget);
+    release_set(reached, budget);
     drop(children);
     budget.release(transients);
     Ok(out)
 }
 
-/// `{A} ~ {B}`: spans matching B sharing a `parent_id` with a
-/// **distinct** span matching A (self excluded). Adjudicated pin 2:
-/// all-zero `parent_id` (root) spans have no parent to share and never
-/// match. One pass builds `parent_id → (LHS count, representative)`;
-/// a group of one only matches when its sole LHS member is a different
-/// span.
-fn sibling_set(
-    lhs: &ChargedSet,
-    rhs: &ChargedSet,
+/// `cand` spans that are a **proper ancestor** of *some* `seed` span (issue
+/// #183's `<<` in the RHS direction) — a multi-source O(spans) BFS UP a
+/// `span_id → parent_id` map from the seed sources. Every node reached
+/// across ≥ 1 up-edge is a proper ancestor, so a seed span that is also a
+/// proper ancestor of a *different* seed IS yielded (per-pair
+/// self-exclusion). Self-loop edges are skipped (a span is never its own
+/// ancestor), the `reached` set terminates every cycle, and an
+/// out-of-window parent breaks the chain.
+fn rel_ancestors(
+    seed: &ChargedSet,
+    cand: &ChargedSet,
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedSet, ReadError> {
+    // The `span_id → parent_id` map plus the upward BFS queue (≤ 2 slots
+    // per span: seeds + one discovered ancestor each; sized so it never
+    // reallocates). The `reached`/`out` sets go through `charged_set`.
+    let map_charge =
+        trace.spans.len() * (ANCESTOR_ENTRY_BYTES + 2 * std::mem::size_of::<[u8; 8]>());
+    budget.charge(map_charge)?;
+    let mut parent_of: HashMap<[u8; 8], [u8; 8]> = HashMap::with_capacity(trace.spans.len());
+    for span in &trace.spans {
+        parent_of.insert(span.span_id, span.parent_id);
+    }
+    // Seeds are the distance-0 sources; each discovered ancestor is
+    // enqueued exactly once (≤ spans distinct parent ids), so pushes stay
+    // within the reservation.
+    let mut queue: Vec<[u8; 8]> = Vec::with_capacity(seed.set.len() + trace.spans.len());
+    queue.extend(seed.set.iter().copied());
+    let mut reached = charged_set(trace.spans.len(), budget)?;
+    let mut out = charged_set(trace.spans.len(), budget)?;
+    let mut cursor = 0;
+    while cursor < queue.len() {
+        let node = queue[cursor];
+        cursor += 1;
+        let Some(parent) = parent_of.get(&node).copied() else {
+            continue;
+        };
+        if parent == ZERO_ID || parent == node {
+            continue; // no parent / self-loop
+        }
+        // `parent` is a PROPER ancestor (distance ≥ 1) of a seed source.
+        if reached.set.insert(parent) {
+            queue.push(parent);
+            if cand.set.contains(&parent) {
+                out.set.insert(parent);
+            }
+        }
+    }
+    release_set(reached, budget);
+    drop(parent_of);
+    budget.release(map_charge);
+    Ok(out)
+}
+
+/// `cand` spans sharing a `parent_id` with a **distinct** `seed` span
+/// (self excluded). Adjudicated pin 2: all-zero `parent_id` (root) spans
+/// have no parent to share and never match. One pass builds
+/// `parent_id → (seed count, representative)`; a group of one only matches
+/// when its sole seed member is a different span.
+fn rel_siblings(
+    seed: &ChargedSet,
+    cand: &ChargedSet,
     trace: &TraceSpans,
     budget: &mut ByteBudget,
 ) -> Result<ChargedSet, ReadError> {
@@ -529,7 +836,7 @@ fn sibling_set(
     budget.charge(map_charge)?;
     let mut parents: HashMap<[u8; 8], (u32, [u8; 8])> = HashMap::with_capacity(trace.spans.len());
     for span in &trace.spans {
-        if span.parent_id != ZERO_ID && lhs.set.contains(&span.span_id) {
+        if span.parent_id != ZERO_ID && seed.set.contains(&span.span_id) {
             parents
                 .entry(span.parent_id)
                 .and_modify(|(count, _)| *count += 1)
@@ -538,7 +845,7 @@ fn sibling_set(
     }
     let mut out = charged_set(trace.spans.len(), budget)?;
     for span in &trace.spans {
-        if span.parent_id == ZERO_ID || !rhs.set.contains(&span.span_id) {
+        if span.parent_id == ZERO_ID || !cand.set.contains(&span.span_id) {
             continue;
         }
         if let Some((count, representative)) = parents.get(&span.parent_id)
@@ -1549,22 +1856,66 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_seeds_are_never_their_own_descendants() {
-        // Codex review (issue #172): a malformed 2-cycle where BOTH
-        // spans match both operands. Neither may be yielded — an
-        // LHS-matching span is never returned as a descendant, even when
-        // the cycle makes it "reachable" from the other seed — and the
-        // traversal must terminate.
+    fn a_span_is_never_its_own_descendant_through_a_self_loop() {
+        // A self-referential edge (parent_id == span_id) must never make a
+        // span its own descendant; the traversal must terminate.
+        let p = plan(r#"{ name = "p" } >> { name = "p" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![child_span(1, 1, "p", 10)],
+        };
+        let attrs = membership(&p, &[]);
+        assert!(
+            eval(&p, &[trace], &attrs).is_empty(),
+            "a self-loop span is not its own descendant"
+        );
+    }
+
+    #[test]
+    fn a_two_cycle_yields_each_span_via_the_other() {
+        // Codex review (issue #183): a malformed 2-cycle where BOTH spans
+        // match both operands. Correct per-pair semantics — each span is a
+        // descendant of the OTHER (a different span), so BOTH are yielded;
+        // the exclusion is per-pair-self, not a blanket LHS exclusion. The
+        // traversal must still terminate.
         let p = plan(r#"{ name = "p" } >> { name = "p" }"#);
         let trace = TraceSpans {
             trace_id: tid(1),
             spans: vec![child_span(1, 2, "p", 10), child_span(2, 1, "p", 20)],
         };
         let attrs = membership(&p, &[]);
-        assert!(
-            eval(&p, &[trace], &attrs).is_empty(),
-            "a span is never its own descendant, including through a parent cycle"
-        );
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matched_ids(&matches), vec![1, 2]);
+    }
+
+    #[test]
+    fn self_relating_transitive_ops_include_other_lhs_matches() {
+        // Codex review #183 Finding 1: parent A → child B, BOTH matching
+        // `{x}`. `{x} >> {x}` must return B (B is a genuine descendant of a
+        // DIFFERENT `{x}`-match, A), and `{x} << {x}` must return A. The
+        // negated forms return the complementary set.
+        let a_and_b = || TraceSpans {
+            trace_id: tid(1),
+            // A (id1) root, B (id2) child of A; both carry span.x = "1".
+            spans: vec![child_span(1, 0, "a", 10), child_span(2, 1, "b", 20)],
+        };
+        let cases: &[(&str, &[u8])] = &[
+            (r#"{ span.x = "1" } >> { span.x = "1" }"#, &[2]),
+            (r#"{ span.x = "1" } << { span.x = "1" }"#, &[1]),
+            (r#"{ span.x = "1" } > { span.x = "1" }"#, &[2]),
+            (r#"{ span.x = "1" } < { span.x = "1" }"#, &[1]),
+            // Negated complements over the RHS = {A, B}.
+            (r#"{ span.x = "1" } !>> { span.x = "1" }"#, &[1]),
+            (r#"{ span.x = "1" } !<< { span.x = "1" }"#, &[2]),
+        ];
+        for (q, expected) in cases {
+            let p = plan(q);
+            // Both sides are the identical `span.x = "1"` probe, deduped to
+            // one membership read holding {A, B}; both filters reference it.
+            let attrs = membership(&p, &[(0, tid(1), sid(1)), (0, tid(1), sid(2))]);
+            let matches = eval(&p, &[a_and_b()], &attrs);
+            assert_eq!(&matched_ids(&matches), expected, "{q}");
+        }
     }
 
     #[test]
@@ -1661,6 +2012,316 @@ mod tests {
                 ReadError::QueryTooBroad(crate::logql::TooBroadReason::ScanBudgetBytes { .. })
             ),
             "got {err:?}"
+        );
+    }
+
+    // -- issue #183: `<`/`<<`, negated/union modifiers, field compare -----
+
+    /// AC6 fixture T1: A root, B child of A, C child of B, B2 child of A.
+    /// Attributes: A{.k=a,.h=hg} B{.k=b,.g=gg,.h=hg} C{.k=c,.g=gg}
+    /// B2{.k=b2,.g=gg,.h=hg}. Span ids: A=1, B=2, C=3, B2=4.
+    fn ac6_trace() -> TraceSpans {
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                child_span(1, 0, "a", 100),
+                child_span(2, 1, "b", 10),
+                child_span(3, 2, "c", 20),
+                child_span(4, 1, "b2", 30),
+            ],
+        }
+    }
+
+    /// Builds the membership reads for the AC6 fixture by matching each
+    /// registered probe against T1's `(key, val)` attribute rows.
+    fn ac6_membership(p: &SearchPlan) -> BatchAttrs {
+        use super::super::filter::ValuePred;
+        const ROWS: &[(u8, &str, &str)] = &[
+            (1, "k", "a"),
+            (1, "h", "hg"),
+            (2, "k", "b"),
+            (2, "g", "gg"),
+            (2, "h", "hg"),
+            (3, "k", "c"),
+            (3, "g", "gg"),
+            (4, "k", "b2"),
+            (4, "g", "gg"),
+            (4, "h", "hg"),
+        ];
+        let mut attrs = BatchAttrs {
+            membership: vec![HashSet::new(); p.probes_len()],
+            agg_values: vec![HashMap::new(); p.agg_fields_len()],
+            select_values: vec![HashMap::new(); p.select_attrs_len()],
+        };
+        for (i, probe) in p.probes.iter().enumerate() {
+            if let ValuePred::StringEq(val) = &probe.pred {
+                for (sb, k, v) in ROWS {
+                    if probe.key == *k && val == v {
+                        attrs.membership[i].insert((tid(1), sid(*sb)));
+                    }
+                }
+            }
+        }
+        attrs
+    }
+
+    /// Plans with a large `spss` so the full result span-set survives the
+    /// cap (the AC6 union results reach 4 spans).
+    fn plan_wide(q: &str) -> SearchPlan {
+        plan_search(
+            &parse(q).expect("parse"),
+            &SearchParams {
+                start_ns: 0,
+                end_ns: 1_000_000,
+                limit: 20,
+                spss: 16,
+            },
+            &SearchCtx {
+                filter: SpanFilterCtx {
+                    spans_table: "trace_spans",
+                    attrs_table: "trace_attrs_idx",
+                },
+                max_candidates: 100,
+                distributed: false,
+            },
+        )
+        .expect("plan")
+    }
+
+    fn matched_ids(matches: &[TraceMatch]) -> Vec<u8> {
+        if matches.is_empty() {
+            return vec![];
+        }
+        let mut ids: Vec<u8> = matches[0].spans.iter().map(|s| s.span_id[7]).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn ac6_complete_structural_matrix_is_correct_hermetically() {
+        // The Plan v4 AC6 matrix (all 15 op×modifier + the 2 empty-LHS
+        // edges), evaluated hermetically over the byte-frozen T1 fixture —
+        // the same expected span-sets the live `traces_search_explain`
+        // gate asserts against ClickHouse.
+        let cases: &[(&str, &[u8])] = &[
+            // Plain
+            (r#"{ .k = "a" } > { .g = "gg" }"#, &[2, 4]),
+            (r#"{ .k = "a" } >> { .g = "gg" }"#, &[2, 3, 4]),
+            (r#"{ .k = "b" } < { .h = "hg" }"#, &[1]),
+            (r#"{ .k = "c" } << { .h = "hg" }"#, &[1, 2]),
+            (r#"{ .k = "b" } ~ { .g = "gg" }"#, &[4]),
+            // Negated (incl. empty-LHS edges)
+            (r#"{ .k = "a" } !> { .g = "gg" }"#, &[3]),
+            (r#"{ .k = "none" } !> { .g = "gg" }"#, &[2, 3, 4]),
+            (r#"{ .k = "b" } !>> { .g = "gg" }"#, &[2, 4]),
+            (r#"{ .k = "c" } !< { .h = "hg" }"#, &[1, 4]),
+            (r#"{ .k = "c" } !<< { .h = "hg" }"#, &[4]),
+            (r#"{ .k = "none" } !<< { .h = "hg" }"#, &[1, 2, 4]),
+            (r#"{ .k = "b" } !~ { .g = "gg" }"#, &[2, 3]),
+            // Union
+            (r#"{ .k = "a" } &> { .g = "gg" }"#, &[1, 2, 4]),
+            (r#"{ .k = "a" } &>> { .g = "gg" }"#, &[1, 2, 3, 4]),
+            (r#"{ .k = "b" } &< { .h = "hg" }"#, &[1, 2]),
+            (r#"{ .k = "c" } &<< { .h = "hg" }"#, &[1, 2, 3]),
+            (r#"{ .k = "b" } &~ { .g = "gg" }"#, &[2, 4]),
+        ];
+        for (q, expected) in cases {
+            let p = plan_wide(q);
+            let attrs = ac6_membership(&p);
+            let matches = eval(&p, &[ac6_trace()], &attrs);
+            assert_eq!(&matched_ids(&matches), expected, "{q}");
+        }
+    }
+
+    #[test]
+    fn negated_and_union_structural_release_every_intermediate() {
+        // AC7 (hermetic): the negated/union modifiers charge every
+        // intermediate before allocation and release all but the result.
+        for q in [
+            r#"{ .k = "a" } !> { .g = "gg" }"#,
+            r#"{ .k = "none" } !> { .g = "gg" }"#,
+            r#"{ .k = "a" } &> { .g = "gg" }"#,
+            r#"{ .k = "c" } &<< { .h = "hg" }"#,
+        ] {
+            let p = plan_wide(q);
+            let attrs = ac6_membership(&p);
+            let mut budget = ByteBudget::new(usize::MAX);
+            let matches =
+                evaluate_batch(&p, &[ac6_trace()], &attrs, &mut budget).expect("in budget");
+            let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
+            assert_eq!(budget.used(), retained, "{q}: intermediates all released");
+        }
+    }
+
+    #[test]
+    fn field_vs_field_string_equality_matches_same_valued_spans() {
+        // `{ .a = .b }` — span 1 has equal string values, span 2 unequal,
+        // span 3 is missing `.b` (absent key ⇒ no match).
+        let p = plan(r#"{ .a = .b }"#);
+        assert_eq!(p.select_attrs_len(), 2);
+        assert_eq!(p.agg_fields_len(), 2);
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "x".to_string());
+        attrs.select_values[1].insert((tid(1), sid(1)), "x".to_string());
+        attrs.select_values[0].insert((tid(1), sid(2)), "x".to_string());
+        attrs.select_values[1].insert((tid(1), sid(2)), "y".to_string());
+        attrs.select_values[0].insert((tid(1), sid(3)), "x".to_string());
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "s", "a", 10, 1),
+                span(2, "s", "b", 20, 1),
+                span(3, "s", "c", 30, 1),
+            ],
+        };
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matched_ids(&matches), vec![1]);
+    }
+
+    #[test]
+    fn field_vs_field_ordering_is_numeric_or_lexical_by_type() {
+        // `{ .a > .b }` — VERIFIED against grafana/tempo:3.0.2: numeric
+        // ordering when both are `val_num`; LEXICAL string ordering when
+        // both are strings (Tempo matched `apple < banana`); a cross-type
+        // pair never matches (even on coincident text).
+        let p = plan(r#"{ .a > .b }"#);
+        let mut attrs = membership(&p, &[]);
+        // span 1: a=5, b=3 (both numeric) → 5 > 3 matches.
+        attrs.select_values[0].insert((tid(1), sid(1)), "5".to_string());
+        attrs.select_values[1].insert((tid(1), sid(1)), "3".to_string());
+        attrs.agg_values[0].insert((tid(1), sid(1)), 5.0);
+        attrs.agg_values[1].insert((tid(1), sid(1)), 3.0);
+        // span 2: a="z", b="a" (both string, no val_num) → "z" > "a"
+        // lexically matches.
+        attrs.select_values[0].insert((tid(1), sid(2)), "z".to_string());
+        attrs.select_values[1].insert((tid(1), sid(2)), "a".to_string());
+        // span 3: a="5" string vs b=5 numeric (coincident text) → cross-type
+        // ⇒ no match even though "5" > ... would be false anyway; the point
+        // is the type gate blocks any string-vs-numeric ordering.
+        attrs.select_values[0].insert((tid(1), sid(3)), "9".to_string());
+        attrs.select_values[1].insert((tid(1), sid(3)), "5".to_string());
+        attrs.agg_values[1].insert((tid(1), sid(3)), 5.0); // b numeric, a string
+        // span 4: a=1, b=9 (both numeric) → 1 > 9 false.
+        attrs.select_values[0].insert((tid(1), sid(4)), "1".to_string());
+        attrs.select_values[1].insert((tid(1), sid(4)), "9".to_string());
+        attrs.agg_values[0].insert((tid(1), sid(4)), 1.0);
+        attrs.agg_values[1].insert((tid(1), sid(4)), 9.0);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: (1..=4).map(|n| span(n, "s", "x", n as i64, 1)).collect(),
+        };
+        let matches = eval(&p, &[trace], &attrs);
+        // span1 (numeric 5>3) and span2 (lexical "z">"a"); NOT span3
+        // (cross-type) nor span4 (1>9 false).
+        assert_eq!(matched_ids(&matches), vec![1, 2]);
+    }
+
+    #[test]
+    fn field_vs_field_cross_type_coincident_text_never_matches() {
+        // Codex #183 round-2 (the demonstrable bug): a string-typed `.a`
+        // and a numeric-typed `.b` with COINCIDENT text "5" must NOT match
+        // under `=` (a naive text fallback would wrongly match) AND must
+        // NOT match under `!=` either — the Tempo type gate blocks
+        // cross-type comparison for every operator (verified live:
+        // `{ .a = .b }` and `{ .a != .b }` both returned empty).
+        for q in [r#"{ .a = .b }"#, r#"{ .a != .b }"#] {
+            let p = plan(q);
+            let mut attrs = membership(&p, &[]);
+            // a: string "5" (text only, no val_num).
+            attrs.select_values[0].insert((tid(1), sid(1)), "5".to_string());
+            // b: numeric 5 (val_num set AND the text "5" a real numeric row
+            // also carries — the exact adversarial shape).
+            attrs.select_values[1].insert((tid(1), sid(1)), "5".to_string());
+            attrs.agg_values[1].insert((tid(1), sid(1)), 5.0);
+            let trace = TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "a", 10, 1)],
+            };
+            assert!(
+                eval(&p, &[trace], &attrs).is_empty(),
+                "{q}: cross-type coincident text must never match"
+            );
+        }
+    }
+
+    #[test]
+    fn field_vs_field_cross_type_and_absent_key_do_not_match() {
+        // Authored coercion rule (value-parity-to-#185): a string LHS vs a
+        // numeric-only RHS is no match under `=`; an absent key on either
+        // side is no match.
+        let p = plan(r#"{ .a = .b }"#);
+        let mut attrs = membership(&p, &[]);
+        // span 1: a is string-only ("x"), b is numeric-only (val_num=5, no
+        // string val) → no common comparable type → no match.
+        attrs.select_values[0].insert((tid(1), sid(1)), "x".to_string());
+        attrs.agg_values[1].insert((tid(1), sid(1)), 5.0);
+        // span 2: a present, b absent → no match (absent key).
+        attrs.select_values[0].insert((tid(1), sid(2)), "y".to_string());
+        attrs.agg_values[0].insert((tid(1), sid(2)), 1.0);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+        };
+        assert!(
+            eval(&p, &[trace], &attrs).is_empty(),
+            "cross-type and absent-key operands never match"
+        );
+    }
+
+    #[test]
+    fn field_vs_field_intrinsic_operand_reads_the_physical_column() {
+        // `{ duration = .b }` — duration is numeric; span matches when the
+        // attribute's val_num equals the hydrated duration.
+        let p = plan(r#"{ duration = .b }"#);
+        let mut attrs = membership(&p, &[]);
+        attrs.select_values[0].insert((tid(1), sid(1)), "100".to_string());
+        attrs.agg_values[0].insert((tid(1), sid(1)), 100.0);
+        attrs.select_values[0].insert((tid(1), sid(2)), "999".to_string());
+        attrs.agg_values[0].insert((tid(1), sid(2)), 999.0);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 100), span(2, "s", "b", 20, 100)],
+        };
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matched_ids(&matches), vec![1], "only span1's dur == .b");
+    }
+
+    #[test]
+    fn logic_not_inverts_the_inner_predicate_per_span() {
+        // `{ !(.env = "prod") }` — matches spans WITHOUT env=prod (absent
+        // or different), exactly the ratified negation rule.
+        let p = plan(r#"{ !(.env = "prod") }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "s", "absent", 10, 1),
+                span(2, "s", "prod", 20, 1),
+                span(3, "s", "staging", 30, 1),
+            ],
+        };
+        // Only span 2 has env=prod.
+        let attrs = membership(&p, &[(0, tid(1), sid(2))]);
+        let matches = eval(&p, &[trace], &attrs);
+        assert_eq!(matched_ids(&matches), vec![1, 3]);
+    }
+
+    #[test]
+    fn bare_boolean_statics_match_all_or_none() {
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+        };
+        let p_true = plan("{ true }");
+        let m = eval(
+            &p_true,
+            std::slice::from_ref(&trace),
+            &membership(&p_true, &[]),
+        );
+        assert_eq!(m[0].matched, 2, "{{ true }} matches every span");
+        let p_false = plan("{ false }");
+        assert!(
+            eval(&p_false, &[trace], &membership(&p_false, &[])).is_empty(),
+            "{{ false }} matches no span"
         );
     }
 

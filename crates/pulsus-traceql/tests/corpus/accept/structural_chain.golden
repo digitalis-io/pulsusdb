@@ -1,8 +1,10 @@
 Query {
     spanset: Structural {
         op: Child,
+        modifier: Plain,
         lhs: Structural {
             op: Child,
+            modifier: Plain,
             lhs: Filter(
                 SpansetFilter {
                     body: Some(

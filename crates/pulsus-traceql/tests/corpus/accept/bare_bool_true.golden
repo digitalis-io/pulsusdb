@@ -1,0 +1,12 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                BoolStatic(
+                    true,
+                ),
+            ),
+        },
+    ),
+    pipeline: [],
+}

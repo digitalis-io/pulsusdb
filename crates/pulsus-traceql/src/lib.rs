@@ -44,7 +44,7 @@ mod token;
 pub use ast::{
     AggregateOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field, FieldExpr,
     Intrinsic, MetricFn, PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter,
-    StatusValue, StructuralOp, Value,
+    StatusValue, StructuralModifier, StructuralOp, Value,
 };
 pub use error::TraceQlError;
 pub use parser::parse;
