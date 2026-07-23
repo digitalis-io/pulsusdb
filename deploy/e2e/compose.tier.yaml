@@ -1,0 +1,98 @@
+# Local-only distributed-tracing demo: layers on top of the base
+# `docker-compose.yaml` + `deploy/e2e/compose.single.yaml` +
+# `deploy/e2e/compose.grafana.yaml` (reuses that overlay's Tempo/
+# Prometheus/Loki-compat Grafana datasources, trimmed pulsusdb-only
+# otel-collector config, and dashboard provisioning mount). Adds a
+# proper three-tier HTTP service (`frontend` -> `middletier` -> `backend`,
+# vendored under `deploy/e2e/otel-tier/` from the
+# `terraform-google-monitoring` repo's `traffic-gen/loaders/otel-tier`)
+# so Tempo/trace-view exploration has real distributed traces to look
+# at — W3C `traceparent` propagation across three real HTTP hops, nested
+# child spans, injected ~20% slow "db-query orders" spans and ~14% hard
+# failures at the backend — instead of firehose's single-service,
+# synthetic-timing traces (deploy/e2e/compose.grafana.yaml).
+#
+# `firehose` (compose.grafana.yaml) is unaffected and keeps running
+# alongside this if both overlays are combined; this file adds signal,
+# it doesn't replace anything.
+#
+# NOT wired into `cargo run -p pulsus-e2e` / CI: manual local demo stack
+# only, same rationale as compose.grafana.yaml.
+#
+# Part of the default `make grafana-up` stack (repo-root Makefile) —
+# requires compose.grafana.yaml's `-f` too since this file depends on its
+# otel-collector config/network. Driven by hand:
+#   export PULSUS_E2E_ROOT=/path/to/pulsusdb
+#   export WINDOW_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)   # compose.grafana.yaml's firehose still needs this
+#   docker compose -f docker-compose.yaml -f deploy/e2e/compose.single.yaml -f deploy/e2e/compose.grafana.yaml -f deploy/e2e/compose.tier.yaml -p pulsus-e2e-grafana up -d --build
+#
+# Grafana: http://127.0.0.1:3000 — search Tempo for service.name
+# "otel-tier-frontend"/"otel-tier-middletier"/"otel-tier-backend".
+# Tear down: `make grafana-down` (tears down every overlay in the project).
+
+services:
+  tier-backend:
+    build:
+      context: ${PULSUS_E2E_ROOT}/deploy/e2e/otel-tier
+    image: pulsusdb-otel-tier:e2e
+    pull_policy: build
+    environment:
+      ROLE: "backend"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://172.29.0.12:4317"
+      OTEL_SERVICE_NAME: "otel-tier-backend"
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.20
+    depends_on: [ otel-collector ]
+
+  tier-middletier:
+    build:
+      context: ${PULSUS_E2E_ROOT}/deploy/e2e/otel-tier
+    image: pulsusdb-otel-tier:e2e
+    pull_policy: build
+    environment:
+      ROLE: "middletier"
+      DOWNSTREAM_URL: "http://172.29.0.20:8080/api/checkout"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://172.29.0.12:4317"
+      OTEL_SERVICE_NAME: "otel-tier-middletier"
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.19
+    depends_on: [ tier-backend ]
+
+  tier-frontend:
+    build:
+      context: ${PULSUS_E2E_ROOT}/deploy/e2e/otel-tier
+    image: pulsusdb-otel-tier:e2e
+    pull_policy: build
+    environment:
+      ROLE: "frontend"
+      DOWNSTREAM_URL: "http://172.29.0.19:8080/api/checkout"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://172.29.0.12:4317"
+      OTEL_SERVICE_NAME: "otel-tier-frontend"
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.18
+    depends_on: [ tier-middletier ]
+
+  # otel-tier ships no load generator of its own (unlike firehose) — it's
+  # a plain HTTP server, so something has to call it. A minimal curl loop
+  # is simplest here; not worth vendoring a whole Go binary for "POST
+  # every ~1s".
+  tier-load:
+    image: curlimages/curl:8.11.1
+    entrypoint: [ "/bin/sh", "-c" ]
+    command:
+      - |
+        i=0
+        while true; do
+          i=$$((i + 1))
+          curl -s -o /dev/null -X POST \
+            -H "X-Order-Id: ord-$$(printf '%05d' "$$i")" \
+            http://172.29.0.18:8080/api/checkout || true
+          sleep 1
+        done
+    networks:
+      pulsus-e2e-single:
+        ipv4_address: 172.29.0.21
+    depends_on: [ tier-frontend ]

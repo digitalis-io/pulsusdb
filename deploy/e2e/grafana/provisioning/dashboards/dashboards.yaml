@@ -1,0 +1,15 @@
+# Provisions the local `grafana` overlay's dashboards folder
+# (deploy/e2e/compose.grafana.yaml). Mirrors this directory's
+# datasources/ provisioning convention: file-based, no Grafana API calls,
+# picked up on container start from the read-only provisioning mount
+# (compose.single.yaml's `grafana` service).
+apiVersion: 1
+
+providers:
+  - name: firehose
+    type: file
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/provisioning/dashboards/files
+      foldersFromFilesStructure: false
