@@ -17,7 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, AttrProbe, LeafEval, PhysicalPredicate, PlanError, SpanFilterCtx, ValuePred,
+    self, AttrProbe, LeafEval, NestedSetField, PhysicalPredicate, PlanError, SpanFilterCtx,
+    ValuePred,
 };
 use super::search_sql;
 
@@ -87,6 +88,13 @@ pub(crate) enum PlannedLeafEval {
     Attr {
         probe_idx: usize,
         negated: bool,
+    },
+    /// A nested-set structural intrinsic comparison (issue #181),
+    /// evaluated against the per-trace query-time numbering.
+    NestedSet {
+        field: NestedSetField,
+        op: ComparisonOp,
+        value: f64,
     },
 }
 
@@ -165,6 +173,10 @@ pub struct SearchPlan {
     pub(crate) spanset: SpansetExpr,
     /// Per-filter leaf evaluations, pre-order over `spanset`.
     pub(crate) filters: Vec<PlannedFilter>,
+    /// Whether any planned leaf is a nested-set structural intrinsic
+    /// (issue #181) — gates the per-trace query-time numbering in Phase 2
+    /// so non-nested-set queries pay nothing.
+    pub(crate) nested_set: bool,
     /// Distinct attribute membership probes (batch reads).
     pub(crate) probes: Vec<AttrProbe>,
     /// Distinct attribute aggregate `val_num` reads.
@@ -493,6 +505,19 @@ fn plan_pipeline(
                             display,
                             column: PhysicalSelect::Kind,
                         },
+                        // `select(nestedSet*)` is out of scope for #181
+                        // (filter-only): a clean 400, tracked as a
+                        // follow-up (registry `pipeline.select` stays
+                        // generic, owned by #182).
+                        Field::Intrinsic(
+                            Intrinsic::NestedSetParent
+                            | Intrinsic::NestedSetLeft
+                            | Intrinsic::NestedSetRight,
+                        ) => {
+                            return Err(PlanError::TypeMismatch(
+                                "select() of a nested-set intrinsic is not supported".to_string(),
+                            ));
+                        }
                         Field::Attribute { scope, key }
                             if *scope == pulsus_traceql::AttrScope::Resource
                                 && key == "service.name" =>
@@ -537,6 +562,7 @@ pub fn plan_search(
     let mut probes: Vec<AttrProbe> = Vec::new();
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
+    let mut nested_set = false;
     for spanset_filter in spanset_filters {
         let compiled = filter::compile_span_filter(spanset_filter)?;
         let mut leaves = Vec::with_capacity(compiled.leaves.len());
@@ -548,6 +574,14 @@ pub fn plan_search(
                     PlannedLeafEval::Attr {
                         probe_idx: intern(&mut probes, probe),
                         negated: *negated,
+                    }
+                }
+                LeafEval::NestedSet { field, op, value } => {
+                    nested_set = true;
+                    PlannedLeafEval::NestedSet {
+                        field: *field,
+                        op: *op,
+                        value: *value,
                     }
                 }
             };
@@ -586,6 +620,7 @@ pub fn plan_search(
         generator_sqls,
         spanset: query.spanset.clone(),
         filters,
+        nested_set,
         probes,
         agg_fields,
         select_attrs,
@@ -780,6 +815,33 @@ mod tests {
         );
         assert_eq!(p.probes.len(), 2);
         assert_eq!(p.filters.len(), 2, "lhs-then-rhs pre-order filters");
+    }
+
+    #[test]
+    fn nested_set_leaf_sets_the_plan_flag_and_uses_the_time_range_generator() {
+        let p = plan("{ nestedSetParent < 0 }");
+        assert!(p.nested_set);
+        // No column pushdown: the generator is the time-range superset,
+        // byte-identical to `{}`.
+        let match_all = plan("{}");
+        assert_eq!(p.generator_sqls, match_all.generator_sqls);
+        assert!(!match_all.nested_set);
+        assert!(matches!(
+            p.filters[0].leaves[0],
+            PlannedLeafEval::NestedSet {
+                field: NestedSetField::Parent,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn select_of_a_nested_set_intrinsic_is_a_type_mismatch() {
+        let query = parse(r#"{ .k = "v" } | select(nestedSetLeft)"#).expect("parse");
+        match plan_search(&query, &PARAMS, &ctx()) {
+            Err(PlanError::TypeMismatch(msg)) => assert!(msg.contains("nested-set"), "{msg}"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 
     #[test]

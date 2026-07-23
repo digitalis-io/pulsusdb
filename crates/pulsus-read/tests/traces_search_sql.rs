@@ -159,6 +159,16 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Nested-set root selection (issue #181): a nested-set-only
+        // filter has NO column pushdown — its generator is the complete
+        // time-range superset, byte-identical to the `{}` match-all
+        // shape. The numbering is query-time Phase-2 engine work, so no
+        // new SQL shape exists.
+        name: "nested_set_root",
+        q: "{ nestedSetParent < 0 }",
+        distributed: false,
+    },
+    Case {
         // The clustered form of the worked example: `_dist` tables; the
         // §7 clustered-reader + budget settings ride as HTTP settings,
         // never SQL text (pinned separately in `traces::exec` tests).

@@ -1,5 +1,5 @@
 {
-  "interim_count_pin": 76,
+  "interim_count_pin": 73,
   "entries": [
     { "construct": "intrinsic.name", "status": "supported", "evidence": [], "tempo": "accept" },
     { "construct": "intrinsic.duration", "status": "supported", "evidence": [], "tempo": "accept" },
@@ -27,9 +27,9 @@
     { "construct": "intrinsic.link.traceID", "status": "interim-generic", "evidence": [], "owning_issue": 184, "tempo": "accept" },
     { "construct": "intrinsic.instrumentation.name", "status": "interim-generic", "evidence": [], "owning_issue": 184, "tempo": "accept" },
     { "construct": "intrinsic.instrumentation.version", "status": "interim-generic", "evidence": [], "owning_issue": 184, "tempo": "accept" },
-    { "construct": "intrinsic.nestedSetLeft", "status": "interim-generic", "evidence": [], "owning_issue": 181, "tempo": "accept" },
-    { "construct": "intrinsic.nestedSetRight", "status": "interim-generic", "evidence": [], "owning_issue": 181, "tempo": "accept" },
-    { "construct": "intrinsic.nestedSetParent", "status": "interim-generic", "evidence": [], "owning_issue": 181, "tempo": "accept" },
+    { "construct": "intrinsic.nestedSetLeft", "status": "supported", "evidence": [], "tempo": "accept" },
+    { "construct": "intrinsic.nestedSetRight", "status": "supported", "evidence": [], "tempo": "accept" },
+    { "construct": "intrinsic.nestedSetParent", "status": "supported", "evidence": [], "tempo": "accept" },
     { "construct": "scope.unscoped", "status": "supported", "evidence": [], "tempo": "accept" },
     { "construct": "scope.span", "status": "supported", "evidence": [], "tempo": "accept" },
     { "construct": "scope.resource", "status": "supported", "evidence": [], "tempo": "accept" },

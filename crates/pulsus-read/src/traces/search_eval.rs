@@ -46,6 +46,8 @@
 //! | descendant adjacency map + BFS queue (`descendant_set`) | `spans × DESCENDANT_TRANSIENT_BYTES` envelope (map key + `Vec` header + child slot with doubling slack + ≤ 2 queue slots per span; the queue never reallocates by construction) charged before allocation, released after the walk |
 //! | descendant visited set (`descendant_set`) | [`charged_set`] pre-charge; released after the RHS intersection |
 //! | sibling parent map (`sibling_set`) | `spans × SIBLING_ENTRY_BYTES` charged before allocation, released after the pass |
+//! | nested-set index (`compute_nested_set`) | `spans × NESTED_SET_ENTRY_BYTES` charged before allocation; retained for the trace's `eval_spanset`, released right after |
+//! | nested-set numbering transients — span-id set + children map (key + `Vec` header + child-`Vec` first-push capacity of 4 slots) + sorted view + Euler stack (`compute_nested_set`) | `spans × NESTED_SET_TRANSIENT_BYTES` envelope charged before allocation, released after numbering |
 //!
 //! The engine-side (exec.rs) sites are audited in that module's doc;
 //! BOTH tables are enforced mechanically by `tests/traces_alloc_audit.rs`
@@ -58,6 +60,7 @@ use std::collections::{HashMap, HashSet};
 use pulsus_traceql::{AggregateOp, ComparisonOp, FieldExpr, SpansetExpr, StructuralOp};
 
 use super::exec::ByteBudget;
+use super::filter::NestedSetField;
 use super::search_plan::{
     AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, SearchPlan,
     SelectField,
@@ -205,6 +208,7 @@ fn eval_expr(
     trace_id: [u8; 16],
     span: &HydratedSpan,
     attrs: &BatchAttrs,
+    nested_set: Option<&NestedSetIndex>,
 ) -> bool {
     match expr {
         FieldExpr::Comparison { .. } => {
@@ -216,11 +220,18 @@ fn eval_expr(
                     let member = attrs.membership[*probe_idx].contains(&(trace_id, span.span_id));
                     member != *negated
                 }
+                // The numbering covers every hydrated span, so the lookup
+                // succeeds whenever the plan flagged nested-set (index is
+                // `Some`); an absent index/entry is a non-match.
+                PlannedLeafEval::NestedSet { field, op, value } => nested_set
+                    .and_then(|idx| idx.get(&span.span_id))
+                    .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
+                    .unwrap_or(false),
             }
         }
         FieldExpr::Binary { op, lhs, rhs } => {
-            let l = eval_expr(lhs, filter, leaf_idx, trace_id, span, attrs);
-            let r = eval_expr(rhs, filter, leaf_idx, trace_id, span, attrs);
+            let l = eval_expr(lhs, filter, leaf_idx, trace_id, span, attrs, nested_set);
+            let r = eval_expr(rhs, filter, leaf_idx, trace_id, span, attrs, nested_set);
             match op {
                 pulsus_traceql::BoolOp::And => l && r,
                 pulsus_traceql::BoolOp::Or => l || r,
@@ -271,6 +282,7 @@ fn eval_filter(
     filter: &PlannedFilter,
     trace: &TraceSpans,
     attrs: &BatchAttrs,
+    nested_set: Option<&NestedSetIndex>,
     budget: &mut ByteBudget,
 ) -> Result<Option<ChargedSet>, ReadError> {
     let mut matched = charged_set(trace.spans.len(), budget)?;
@@ -279,7 +291,15 @@ fn eval_filter(
             None => true,
             Some(expr) => {
                 let mut leaf_idx = 0;
-                eval_expr(expr, filter, &mut leaf_idx, trace.trace_id, span, attrs)
+                eval_expr(
+                    expr,
+                    filter,
+                    &mut leaf_idx,
+                    trace.trace_id,
+                    span,
+                    attrs,
+                    nested_set,
+                )
             }
         };
         if is_match {
@@ -307,17 +327,18 @@ fn eval_spanset(
     filter_idx: &mut usize,
     trace: &TraceSpans,
     attrs: &BatchAttrs,
+    nested_set: Option<&NestedSetIndex>,
     budget: &mut ByteBudget,
 ) -> Result<Option<ChargedSet>, ReadError> {
     match expr {
         SpansetExpr::Filter(f) => {
             let filter = &plan.filters[*filter_idx];
             *filter_idx += 1;
-            eval_filter(f.body.as_ref(), filter, trace, attrs, budget)
+            eval_filter(f.body.as_ref(), filter, trace, attrs, nested_set, budget)
         }
         SpansetExpr::Binary { op, lhs, rhs } => {
-            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, budget)?;
-            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, budget)?;
+            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
+            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
             match op {
                 // Trace-level intersection: the trace qualifies iff both
                 // operands matched within it; its spanset is the union of
@@ -346,8 +367,8 @@ fn eval_spanset(
         // within the trace before the relation is worth computing; an
         // empty side releases the other and yields no result.
         SpansetExpr::Structural { op, lhs, rhs } => {
-            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, budget)?;
-            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, budget)?;
+            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
+            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
             match (l, r) {
                 (Some(a), Some(b)) => eval_structural(*op, a, b, trace, budget),
                 (Some(a), None) => {
@@ -529,6 +550,229 @@ fn sibling_set(
     drop(parents);
     budget.release(map_charge);
     Ok(out)
+}
+
+// -- issue #181: nested-set structural intrinsics -----------------------
+
+/// One span's nested-set (modified-preorder) numbering — matched to
+/// Tempo v3.0.2's observed scheme (base 1): `left` on Euler-tour enter,
+/// `right` on exit (shared counter), and `parent` = the parent span's
+/// `left`, or `-1` for a root/orphan.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NestedSetValues {
+    left: i64,
+    right: i64,
+    parent: i64,
+}
+
+impl NestedSetValues {
+    fn value(&self, field: NestedSetField) -> i64 {
+        match field {
+            NestedSetField::Parent => self.parent,
+            NestedSetField::Left => self.left,
+            NestedSetField::Right => self.right,
+        }
+    }
+}
+
+/// The per-trace numbering, keyed by span_id — total over the hydrated
+/// forest (every span gets an entry).
+type NestedSetIndex = HashMap<[u8; 8], NestedSetValues>;
+
+/// An explicit Euler-tour frame: the numbering is iterative (a
+/// 10 000-deep linear chain — `MAX_SPANS_PER_TRACE` — must never recurse).
+#[derive(Clone, Copy)]
+enum EulerFrame {
+    Enter([u8; 8]),
+    Exit([u8; 8]),
+}
+
+/// The retained nested-set index, charged against the request budget for
+/// as long as it lives (mirrors [`ChargedSet`]).
+struct ChargedNestedSet {
+    index: NestedSetIndex,
+    charge: usize,
+}
+
+/// Per-entry cost of the retained index (key + values + overhead).
+const NESTED_SET_ENTRY_BYTES: usize = std::mem::size_of::<[u8; 8]>()
+    + std::mem::size_of::<NestedSetValues>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD;
+
+/// Per-span transient cost envelope for the numbering pass: the span-id
+/// set (id + overhead), the children adjacency map (key + `Vec` header +
+/// the child-`Vec` first-push capacity + overhead), the sorted span view
+/// (one reference), up to two Euler-stack frames per span (the stack is
+/// sized so it never reallocates), and the promoted-cycle-root set (id +
+/// overhead — empty for well-formed data, bounded by spans for a pure
+/// cycle).
+///
+/// Child-`Vec` capacity ceiling — the load-bearing term. A parent's child
+/// list is an `or_default()`-created `Vec<[u8; 8]>` filled by `push`.
+/// Rust's `Vec` first push jumps to `MIN_NON_ZERO_CAP = 4` (for element
+/// sizes in `(1, 1024]`), so it must be charged **4** slots, not 2 — 2
+/// would under-book every single-child parent's real 32-byte allocation
+/// by 16 bytes. 4 slots makes the term a genuine AGGREGATE ceiling
+/// independent of the other terms' slack: a parent with `c` children
+/// allocates `max(4, next_pow2(c)) * 8` bytes, and `max(4, next_pow2(c)) ≤
+/// 4·c` for every `c ≥ 1`, so the total child-`Vec` bytes across all
+/// parents is `≤ 8 · Σ 4·c_p = 32 · (children) ≤ 32·spans` — exactly the
+/// `spans × 4 × size_of::<[u8; 8]>()` this term books. (With 2 slots the
+/// worst case — a linear chain, `spans − 1` single-child parents each at
+/// cap 4 — allocates `≈ 32·spans` against a `16·spans` charge.)
+const NESTED_SET_TRANSIENT_BYTES: usize = std::mem::size_of::<[u8; 8]>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD
+    + std::mem::size_of::<[u8; 8]>()
+    + std::mem::size_of::<Vec<[u8; 8]>>()
+    + 4 * std::mem::size_of::<[u8; 8]>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD
+    + std::mem::size_of::<&HydratedSpan>()
+    + 2 * std::mem::size_of::<EulerFrame>()
+    + std::mem::size_of::<[u8; 8]>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD;
+
+fn release_nested_set(charged: ChargedNestedSet, budget: &mut ByteBudget) {
+    budget.release(charged.charge);
+}
+
+/// Drains the Euler-tour stack: on `Enter(id)` skip an already-numbered
+/// span (the cycle guard = visited set is the index itself), else assign
+/// `left`, push the matching `Exit`, and push the node's children in
+/// reverse so they pop in ascending (sibling) order; on `Exit(id)` assign
+/// `right`. The shared `counter` produces the contiguous `1..=2·spans`
+/// permutation.
+fn euler_drain(
+    stack: &mut Vec<EulerFrame>,
+    children: &HashMap<[u8; 8], Vec<[u8; 8]>>,
+    index: &mut NestedSetIndex,
+    counter: &mut i64,
+) {
+    while let Some(frame) = stack.pop() {
+        match frame {
+            EulerFrame::Enter(id) => {
+                if index.contains_key(&id) {
+                    continue;
+                }
+                index.insert(
+                    id,
+                    NestedSetValues {
+                        left: *counter,
+                        right: 0,
+                        parent: -1,
+                    },
+                );
+                *counter += 1;
+                stack.push(EulerFrame::Exit(id));
+                if let Some(kids) = children.get(&id) {
+                    for kid in kids.iter().rev() {
+                        stack.push(EulerFrame::Enter(*kid));
+                    }
+                }
+            }
+            EulerFrame::Exit(id) => {
+                if let Some(v) = index.get_mut(&id) {
+                    v.right = *counter;
+                    *counter += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Computes one candidate trace's nested-set numbering over the hydrated
+/// `parent_id` forest (issue #181) — iterative modified-preorder, base 1,
+/// siblings ordered by our deterministic `(timestamp_ns, span_id)` proxy.
+/// Every intermediate is charge-before-allocate; the retained index is
+/// returned charged and released by the caller after `eval_spanset`.
+fn compute_nested_set(
+    trace: &TraceSpans,
+    budget: &mut ByteBudget,
+) -> Result<ChargedNestedSet, ReadError> {
+    let n = trace.spans.len();
+    let index_charge = n * NESTED_SET_ENTRY_BYTES;
+    budget.charge(index_charge)?;
+    let transient_charge = n * NESTED_SET_TRANSIENT_BYTES;
+    budget.charge(transient_charge)?;
+
+    let mut index: NestedSetIndex = HashMap::with_capacity(n);
+    let mut span_ids: HashSet<[u8; 8]> = HashSet::with_capacity(n);
+    for span in &trace.spans {
+        span_ids.insert(span.span_id);
+    }
+
+    // A deterministic ascending view — our sibling/root ordering proxy.
+    // Building the children lists and seeding roots from this view keeps
+    // every child list and the root seeds in ascending order without a
+    // per-list sort.
+    let mut ordered: Vec<&HydratedSpan> = trace.spans.iter().collect();
+    ordered.sort_by(|a, b| (a.timestamp_ns, a.span_id).cmp(&(b.timestamp_ns, b.span_id)));
+
+    // A span is a child iff its parent is a hydrated span; otherwise
+    // (all-zero parent, or an out-of-window/orphan parent) it is a root
+    // of the hydrated forest (the #172 windowed-forest precedent).
+    let mut children: HashMap<[u8; 8], Vec<[u8; 8]>> = HashMap::with_capacity(n);
+    for span in &ordered {
+        if span.parent_id != ZERO_ID && span_ids.contains(&span.parent_id) {
+            children
+                .entry(span.parent_id)
+                .or_default()
+                .push(span.span_id);
+        }
+    }
+
+    let mut counter: i64 = 1;
+    // Sized so it never reallocates: at most two live frames per span.
+    let mut stack: Vec<EulerFrame> = Vec::with_capacity(2 * n);
+    // Seed roots in reverse ascending order so they pop ascending.
+    for span in ordered.iter().rev() {
+        if span.parent_id == ZERO_ID || !span_ids.contains(&span.parent_id) {
+            stack.push(EulerFrame::Enter(span.span_id));
+        }
+    }
+    euler_drain(&mut stack, &children, &mut index, &mut counter);
+    // Total coverage: any span still unvisited is part of a pure cycle
+    // (no forest root) — promote it to a root in ascending order,
+    // guaranteeing termination and the full `1..=2·spans` numbering. A
+    // promoted span is the root of its (cyclic) component and MUST keep
+    // the root sentinel even though its `parent_id` points at another
+    // numbered cycle member — otherwise a pure cycle would have no
+    // `nestedSetParent < 0` root at all (mirrors #172's cycle handling:
+    // a malformed cycle still yields a well-defined result). Empty for
+    // well-formed data, so it allocates nothing then.
+    let mut promoted_roots: HashSet<[u8; 8]> = HashSet::new();
+    for span in &ordered {
+        if !index.contains_key(&span.span_id) {
+            promoted_roots.insert(span.span_id);
+            stack.push(EulerFrame::Enter(span.span_id));
+            euler_drain(&mut stack, &children, &mut index, &mut counter);
+        }
+    }
+
+    // Parent pass: a root/orphan and a promoted cycle-root keep the `-1`
+    // sentinel; any other span's `parent` is its parent span's `left`
+    // (assigned by construction).
+    for span in &trace.spans {
+        if span.parent_id == ZERO_ID || promoted_roots.contains(&span.span_id) {
+            continue;
+        }
+        let Some(parent_left) = index.get(&span.parent_id).map(|v| v.left) else {
+            continue;
+        };
+        if let Some(v) = index.get_mut(&span.span_id) {
+            v.parent = parent_left;
+        }
+    }
+
+    drop(span_ids);
+    drop(promoted_roots);
+    drop(ordered);
+    drop(children);
+    drop(stack);
+    budget.release(transient_charge);
+    Ok(ChargedNestedSet {
+        index,
+        charge: index_charge,
+    })
 }
 
 /// Merges two charged operand sets into a freshly charged union set —
@@ -725,10 +969,31 @@ pub(crate) fn evaluate_batch(
 ) -> Result<Vec<TraceMatch>, ReadError> {
     let mut out = Vec::new();
     'traces: for trace in traces {
+        // The query-time nested-set numbering (issue #181) is computed
+        // once per candidate trace, only when the plan uses a nested-set
+        // intrinsic, and released the moment `eval_spanset` is done (the
+        // aggregate/select phases never read it). On an error path the
+        // request budget dies whole (standing convention), so no explicit
+        // release is required there.
+        let nested_set = if plan.nested_set {
+            Some(compute_nested_set(trace, budget)?)
+        } else {
+            None
+        };
         let mut filter_idx = 0;
-        let Some(matched) =
-            eval_spanset(&plan.spanset, plan, &mut filter_idx, trace, attrs, budget)?
-        else {
+        let spanset = eval_spanset(
+            &plan.spanset,
+            plan,
+            &mut filter_idx,
+            trace,
+            attrs,
+            nested_set.as_ref().map(|c| &c.index),
+            budget,
+        )?;
+        if let Some(charged) = nested_set {
+            release_nested_set(charged, budget);
+        }
+        let Some(matched) = spanset else {
             continue;
         };
         // Post-match transients (per-aggregate `Vec<f64>` buffers + the
@@ -1649,6 +1914,290 @@ mod tests {
                 .map(TraceMatch::retained_bytes)
                 .sum::<usize>(),
             "operand and union intermediates were all released"
+        );
+    }
+
+    // -- issue #181: nested-set structural intrinsics ---------------------
+
+    /// The observed Tempo v3.0.2 aa tree under our `(timestamp_ns,
+    /// span_id)` sibling order: root R with children A then B (A sorts
+    /// first), B with grandchild C. Expected numbering
+    /// `R(1,8,-1) A(2,3,1) B(4,7,1) C(5,6,4)`.
+    fn nested_set_aa() -> TraceSpans {
+        TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                child_span(1, 0, "R", 100),
+                child_span(2, 1, "A", 10),
+                child_span(3, 1, "B", 20),
+                child_span(4, 3, "C", 30),
+            ],
+        }
+    }
+
+    /// A `depth`-span linear chain (span `i+1` is the child of span `i`) —
+    /// span ids carry a 4-byte counter so a genuinely deep (10 000) chain
+    /// has distinct ids; recursion would overflow the stack here.
+    fn deep_chain(depth: usize) -> TraceSpans {
+        let mut spans = Vec::with_capacity(depth);
+        for i in 0..depth {
+            let mut span_id = [0u8; 8];
+            span_id[..4].copy_from_slice(&((i as u32) + 1).to_be_bytes());
+            let mut parent_id = [0u8; 8];
+            if i > 0 {
+                parent_id[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            }
+            spans.push(HydratedSpan {
+                span_id,
+                parent_id,
+                service: "s".to_string(),
+                name: "n".to_string(),
+                timestamp_ns: i as i64,
+                duration_ns: 1,
+                status_code: 0,
+                kind: 1,
+            });
+        }
+        TraceSpans {
+            trace_id: tid(1),
+            spans,
+        }
+    }
+
+    /// Total coverage + the contiguous `1..=2·spans` permutation — the
+    /// invariants that hold even for a malformed cycle.
+    fn assert_contiguous_and_total(trace: &TraceSpans, idx: &NestedSetIndex) {
+        let n = trace.spans.len();
+        assert_eq!(idx.len(), n, "every span is numbered (total coverage)");
+        let mut nums: Vec<i64> = idx.values().flat_map(|v| [v.left, v.right]).collect();
+        nums.sort_unstable();
+        assert_eq!(
+            nums,
+            (1..=2 * n as i64).collect::<Vec<_>>(),
+            "left ∪ right is the contiguous 1..=2n permutation"
+        );
+    }
+
+    /// The full nested-set invariants for a well-formed (acyclic) forest.
+    fn assert_tree_invariants(trace: &TraceSpans, idx: &NestedSetIndex) {
+        assert_contiguous_and_total(trace, idx);
+        let span_ids: HashSet<[u8; 8]> = trace.spans.iter().map(|s| s.span_id).collect();
+        let has_child: HashSet<[u8; 8]> = trace
+            .spans
+            .iter()
+            .filter(|s| s.parent_id != ZERO_ID && span_ids.contains(&s.parent_id))
+            .map(|s| s.parent_id)
+            .collect();
+        for s in &trace.spans {
+            let v = idx[&s.span_id];
+            assert!(v.left < v.right, "containment: left < right");
+            if s.parent_id == ZERO_ID || !span_ids.contains(&s.parent_id) {
+                assert_eq!(v.parent, -1, "root/orphan parent sentinel");
+            } else {
+                let p = idx[&s.parent_id];
+                assert_eq!(v.parent, p.left, "non-root parent == parent.left");
+                assert!(
+                    p.left < v.left && v.right < p.right,
+                    "ancestor strictly contains descendant"
+                );
+            }
+            if !has_child.contains(&s.span_id) {
+                assert_eq!(v.right, v.left + 1, "a leaf's right == left + 1");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_set_numbering_matches_the_observed_tempo_values() {
+        let trace = nested_set_aa();
+        let mut budget = ByteBudget::new(usize::MAX);
+        let charged = compute_nested_set(&trace, &mut budget).expect("in budget");
+        let get = |n: u8| charged.index[&sid(n)];
+        let r = get(1);
+        assert_eq!((r.left, r.right, r.parent), (1, 8, -1), "R");
+        let a = get(2);
+        assert_eq!((a.left, a.right, a.parent), (2, 3, 1), "A");
+        let b = get(3);
+        assert_eq!((b.left, b.right, b.parent), (4, 7, 1), "B");
+        let c = get(4);
+        assert_eq!((c.left, c.right, c.parent), (5, 6, 4), "C");
+        release_nested_set(charged, &mut budget);
+        assert_eq!(budget.used(), 0, "index released");
+    }
+
+    #[test]
+    fn nested_set_invariants_hold_on_multi_child_and_deep_chain_trees() {
+        // A 10 000-span chain proves the numbering is iterative (a
+        // recursive DFS would overflow the stack).
+        for trace in [nested_set_aa(), deep_chain(10_000)] {
+            let mut budget = ByteBudget::new(usize::MAX);
+            let charged = compute_nested_set(&trace, &mut budget).expect("in budget");
+            assert_tree_invariants(&trace, &charged.index);
+            release_nested_set(charged, &mut budget);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn nested_set_numbering_handles_a_wide_fan_out_and_releases_exactly() {
+        // A star (one root, 200 children) grows the child-adjacency `Vec`
+        // well past the MIN_NON_ZERO_CAP=4 first push (4 → 8 → … → 256),
+        // exercising the term the transient envelope books at 4 slots/span.
+        // The exact post-release `used() == 0` confirms the (bumped)
+        // transient charge is released in full.
+        let mut spans = vec![child_span(1, 0, "root", 0)];
+        for i in 2..=201u8 {
+            spans.push(child_span(i, 1, "c", i as i64));
+        }
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans,
+        };
+        let mut budget = ByteBudget::new(usize::MAX);
+        let charged = compute_nested_set(&trace, &mut budget).expect("in budget");
+        assert_tree_invariants(&trace, &charged.index);
+        let root = charged.index[&sid(1)];
+        assert_eq!(
+            (root.left, root.right, root.parent),
+            (1, 402, -1),
+            "root spans 1..=2·201"
+        );
+        release_nested_set(charged, &mut budget);
+        assert_eq!(budget.used(), 0, "index + all transients released exactly");
+    }
+
+    #[test]
+    fn nested_set_numbering_terminates_and_covers_a_parent_cycle() {
+        // P(id 1, parent 2) ↔ Q(id 2, parent 1): malformed, no root. The
+        // promotion-to-root pass numbers both, contiguously, and the walk
+        // terminates.
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![child_span(1, 2, "p", 10), child_span(2, 1, "q", 20)],
+        };
+        let mut budget = ByteBudget::new(usize::MAX);
+        let charged = compute_nested_set(&trace, &mut budget).expect("in budget");
+        assert_contiguous_and_total(&trace, &charged.index);
+        // A pure cycle must still yield a well-defined root: the promoted
+        // component root keeps the `-1` sentinel even though its parent_id
+        // points at the other (numbered) cycle member (Finding 2). Exactly
+        // one root here (the ascending-first span, P), so
+        // `{ nestedSetParent < 0 }` is non-empty.
+        let roots: Vec<[u8; 8]> = charged
+            .index
+            .iter()
+            .filter(|(_, v)| v.parent < 0)
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            roots,
+            vec![sid(1)],
+            "the promoted cycle-root keeps parent == -1"
+        );
+        release_nested_set(charged, &mut budget);
+    }
+
+    #[test]
+    fn nested_set_parent_lt_zero_selects_the_promoted_root_of_a_cycle() {
+        // End-to-end through the evaluator: `{ nestedSetParent < 0 }` must
+        // select the promoted root of a pure parent cycle (Finding 2).
+        let p = plan("{ nestedSetParent < 0 }");
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![child_span(1, 2, "p", 10), child_span(2, 1, "q", 20)],
+        };
+        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched, 1, "exactly one cycle root");
+        assert_eq!(matches[0].spans[0].span_id, sid(1));
+    }
+
+    #[test]
+    fn nested_set_parent_lt_zero_selects_exactly_the_roots() {
+        let p = plan("{ nestedSetParent < 0 }");
+        assert!(p.nested_set);
+        // Single-root aa tree: only R.
+        let matches = eval(&p, &[nested_set_aa()], &membership(&p, &[]));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].matched, 1);
+        assert_eq!(matches[0].spans[0].span_id, sid(1), "the root R");
+    }
+
+    #[test]
+    fn nested_set_parent_lt_zero_selects_every_root_in_a_forest() {
+        let p = plan("{ nestedSetParent < 0 }");
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                child_span(1, 0, "r1", 10),
+                child_span(2, 1, "c", 20),
+                child_span(3, 0, "r2", 30),
+            ],
+        };
+        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        assert_eq!(matches[0].matched, 2, "both roots R1 and R2");
+        let mut ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![sid(1), sid(3)]);
+    }
+
+    #[test]
+    fn nested_set_left_comparisons_follow_cmp_semantics() {
+        // aa lefts: R(sid1)=1, A(sid2)=2, B(sid3)=4, C(sid4)=5.
+        let cases: &[(&str, &[u8])] = &[
+            ("{ nestedSetLeft = 1 }", &[1]),
+            ("{ nestedSetLeft > 3 }", &[3, 4]),
+            ("{ nestedSetLeft >= 4 }", &[3, 4]),
+            ("{ nestedSetLeft < 4 }", &[1, 2]),
+            ("{ nestedSetLeft != 1 }", &[2, 3, 4]),
+        ];
+        for (q, expected) in cases {
+            let p = plan(q);
+            let matches = eval(&p, &[nested_set_aa()], &membership(&p, &[]));
+            let mut ids: Vec<u8> = matches[0].spans.iter().map(|s| s.span_id[7]).collect();
+            ids.sort_unstable();
+            assert_eq!(&ids, expected, "{q}");
+        }
+    }
+
+    #[test]
+    fn nested_set_query_releases_the_index_and_all_transients() {
+        // AC6: post-batch the budget holds byte-for-byte only the returned
+        // matches' retained bytes — the index and every numbering
+        // transient are released.
+        let p = plan("{ nestedSetParent < 0 }");
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &[nested_set_aa()], &membership(&p, &[]), &mut budget)
+            .expect("fits");
+        let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
+        assert_eq!(
+            budget.used(),
+            retained,
+            "index + numbering transients all released"
+        );
+    }
+
+    #[test]
+    fn nested_set_numbering_breaches_the_budget_before_allocation() {
+        // A budget below the numbering envelope breaches with the 422
+        // ScanBudgetBytes class at the pre-charge — before the index or
+        // any transient is allocated.
+        let p = plan("{ nestedSetParent < 0 }");
+        let trace = deep_chain(2_000);
+        let mut budget = ByteBudget::new(NESTED_SET_ENTRY_BYTES);
+        let err = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &membership(&p, &[]),
+            &mut budget,
+        )
+        .expect_err("the numbering pre-charge must breach");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(crate::logql::TooBroadReason::ScanBudgetBytes { .. })
+            ),
+            "got {err:?}"
         );
     }
 }

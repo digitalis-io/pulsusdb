@@ -90,6 +90,15 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "BFS queue: covered by the same DESCENDANT_TRANSIENT_BYTES envelope (<= 2 slots per span; sized so it never reallocates)"),
     ("search_eval.rs", "sibling_set", "HashMap::", 1,
      "parent map: spans x SIBLING_ENTRY_BYTES charged before with_capacity, released after the pass"),
+    // ---- issue #181: nested-set numbering transients --------------------
+    ("search_eval.rs", "compute_nested_set", "HashMap::", 2,
+     "retained index + children adjacency map: index via spans x NESTED_SET_ENTRY_BYTES (retained, released after eval_spanset); children map via the spans x NESTED_SET_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack), released after numbering - both charged before with_capacity"),
+    ("search_eval.rs", "compute_nested_set", "HashSet::", 2,
+     "span-id set + promoted-cycle-root set: both covered by the NESTED_SET_TRANSIENT_BYTES envelope (id + overhead per span) charged before allocation, released after numbering (the promoted set is empty for well-formed data)"),
+    ("search_eval.rs", "compute_nested_set", ".collect", 1,
+     "sorted span view (Vec<&HydratedSpan>, exact-capacity from iter): covered by the NESTED_SET_TRANSIENT_BYTES envelope (one reference per span), released after numbering"),
+    ("search_eval.rs", "compute_nested_set", "Vec::with_capacity", 1,
+     "Euler-tour stack: covered by the NESTED_SET_TRANSIENT_BYTES envelope (<= 2 frames per span; sized so it never reallocates), released after numbering"),
 ];
 
 fn source(file: &str) -> String {

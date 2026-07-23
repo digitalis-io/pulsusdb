@@ -1,0 +1,8 @@
+UnexpectedToken {
+    found: "string \"x\"",
+    expected: "a number",
+    span: Span {
+        start: 19,
+        end: 22,
+    },
+}

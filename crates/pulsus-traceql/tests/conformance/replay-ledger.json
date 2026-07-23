@@ -1,7 +1,7 @@
 {
   "comment": "Generic-failure ledger for observed grafana/ corpus queries: cases that hit an unregistered/unsupported construct BEFORE any NotYetSupported boundary, so the parser can only surface a generic error today. Each entry names the first blocking construct (registry id) and the sub-issues that must land before the query parses. Monotone-shrink only: an entry whose case starts parsing Ok or reaching a named NotYetSupported boundary is stale and fails the harness (conformance.rs::grafana_cases_are_ok_named_or_ledgered).",
   "entries": [
-    { "case": "grafana/explore_root_rate_by_service", "first_blocking_construct": "intrinsic.nestedSetParent", "owning_issues": [181, 182] },
-    { "case": "grafana/explore_root_rate_sample", "first_blocking_construct": "intrinsic.nestedSetParent", "owning_issues": [181, 182] }
+    { "case": "grafana/explore_root_rate_by_service", "first_blocking_construct": "static.bare_boolean", "owning_issues": [182, 183] },
+    { "case": "grafana/explore_root_rate_sample", "first_blocking_construct": "static.bare_boolean", "owning_issues": [182, 183] }
   ]
 }

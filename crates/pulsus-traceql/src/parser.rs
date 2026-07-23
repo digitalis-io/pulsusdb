@@ -702,6 +702,32 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
                 }),
             }
         }
+        // The nested-set intrinsics (issue #181) are numeric span
+        // properties: `nestedSetParent`/`nestedSetLeft`/`nestedSetRight`
+        // compare against a bare number (`< 0`, `> 0`, `>= 1`). A regex
+        // string (`=~ "x"`) is a positioned `UnexpectedToken` here — the
+        // value must be a number.
+        Field::Intrinsic(
+            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
+        ) => {
+            let tok = cursor.peek().clone();
+            match &tok.kind {
+                TokenKind::Number(raw) => {
+                    let raw = raw.clone();
+                    cursor.advance();
+                    Ok(Value::Number(raw))
+                }
+                TokenKind::Eof => Err(TraceQlError::UnexpectedEof {
+                    expected: "a number".to_string(),
+                    span: tok.span,
+                }),
+                _ => Err(TraceQlError::UnexpectedToken {
+                    found: describe(&tok.kind),
+                    expected: "a number".to_string(),
+                    span: tok.span,
+                }),
+            }
+        }
         Field::Attribute { .. } => {
             const EXPECTED: &str = "a value (string, number, boolean, or duration)";
             let tok = cursor.peek().clone();
@@ -1274,6 +1300,47 @@ mod tests {
     fn a_bare_intrinsic_at_end_of_input_is_unexpected_eof() {
         let err = parse("{ kind").unwrap_err();
         assert!(matches!(err, TraceQlError::UnexpectedEof { .. }), "{err}");
+    }
+
+    // -- issue #181: nested-set intrinsics --------------------------------
+
+    #[test]
+    fn nested_set_intrinsics_parse_to_numeric_comparisons() {
+        for (query, intrinsic) in [
+            ("{ nestedSetParent < 0 }", Intrinsic::NestedSetParent),
+            ("{ nestedSetLeft > 0 }", Intrinsic::NestedSetLeft),
+            ("{ nestedSetRight >= 1 }", Intrinsic::NestedSetRight),
+        ] {
+            let parsed = parse(query).unwrap();
+            match &parsed.spanset {
+                SpansetExpr::Filter(SpansetFilter {
+                    body: Some(FieldExpr::Comparison { field, value, .. }),
+                }) => {
+                    assert_eq!(*field, Field::Intrinsic(intrinsic), "{query}");
+                    assert!(matches!(value, Value::Number(_)), "{query}");
+                }
+                other => panic!("{query} -> unexpected {other:?}"),
+            }
+            // Display round-trips through a reparse.
+            let reparsed = parse(&parsed.to_string()).unwrap();
+            assert_eq!(reparsed, parsed, "{query}");
+        }
+    }
+
+    #[test]
+    fn nested_set_regex_string_is_a_positioned_unexpected_token() {
+        let err = parse(r#"{ nestedSetLeft =~ "x" }"#).unwrap_err();
+        match err {
+            TraceQlError::UnexpectedToken { expected, span, .. } => {
+                assert!(expected.contains("number"), "{expected}");
+                // The string value sits after `nestedSetLeft =~ `.
+                assert_eq!(
+                    &r#"{ nestedSetLeft =~ "x" }"#[span.start..span.end],
+                    r#""x""#
+                );
+            }
+            other => panic!("unexpected {other}"),
+        }
     }
 
     #[test]

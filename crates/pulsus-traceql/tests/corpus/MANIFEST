@@ -25,6 +25,9 @@ accept/intrinsic_kind_eq_server
 accept/intrinsic_kind_neq_producer
 accept/intrinsic_name_eq
 accept/intrinsic_name_regex
+accept/intrinsic_nested_set_left_gt
+accept/intrinsic_nested_set_parent_lt
+accept/intrinsic_nested_set_right_gte
 accept/intrinsic_status_eq_error
 accept/intrinsic_status_eq_unset
 accept/intrinsic_status_neq_ok
@@ -83,6 +86,7 @@ reject/kind_invalid_keyword
 reject/lone_amp
 reject/missing_rbrace
 reject/missing_value
+reject/nested_set_regex_string
 reject/rhs_field
 reject/select_empty
 reject/spanset_chain_over_limit

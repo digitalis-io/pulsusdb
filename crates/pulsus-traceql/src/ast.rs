@@ -173,13 +173,23 @@ impl fmt::Display for Field {
     }
 }
 
-/// The four M4 intrinsics (docs/features.md §4).
+/// The span intrinsics: the four M4 intrinsics (docs/features.md §4) plus
+/// the nested-set structural intrinsics (issue #181) — numeric span
+/// properties used in field comparisons (`{ nestedSetParent < 0 }`), not
+/// new operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Intrinsic {
     Name,
     Duration,
     Status,
     Kind,
+    /// `nestedSetParent` — the nested-set `left` value of a span's parent,
+    /// or a negative sentinel for a root span (issue #181).
+    NestedSetParent,
+    /// `nestedSetLeft` — a span's modified-preorder `left` boundary.
+    NestedSetLeft,
+    /// `nestedSetRight` — a span's modified-preorder `right` boundary.
+    NestedSetRight,
 }
 
 impl Intrinsic {
@@ -189,6 +199,9 @@ impl Intrinsic {
             "duration" => Some(Self::Duration),
             "status" => Some(Self::Status),
             "kind" => Some(Self::Kind),
+            "nestedSetParent" => Some(Self::NestedSetParent),
+            "nestedSetLeft" => Some(Self::NestedSetLeft),
+            "nestedSetRight" => Some(Self::NestedSetRight),
             _ => None,
         }
     }
@@ -199,6 +212,9 @@ impl Intrinsic {
             Intrinsic::Duration => "duration",
             Intrinsic::Status => "status",
             Intrinsic::Kind => "kind",
+            Intrinsic::NestedSetParent => "nestedSetParent",
+            Intrinsic::NestedSetLeft => "nestedSetLeft",
+            Intrinsic::NestedSetRight => "nestedSetRight",
         }
     }
 }
@@ -625,11 +641,15 @@ mod tests {
             ("duration", Intrinsic::Duration),
             ("status", Intrinsic::Status),
             ("kind", Intrinsic::Kind),
+            ("nestedSetParent", Intrinsic::NestedSetParent),
+            ("nestedSetLeft", Intrinsic::NestedSetLeft),
+            ("nestedSetRight", Intrinsic::NestedSetRight),
         ] {
             assert_eq!(Intrinsic::from_ident(name), Some(intrinsic));
             assert_eq!(intrinsic.to_string(), name);
         }
         assert_eq!(Intrinsic::from_ident("service"), None);
+        assert_eq!(Intrinsic::from_ident("nestedSet"), None);
     }
 
     #[test]

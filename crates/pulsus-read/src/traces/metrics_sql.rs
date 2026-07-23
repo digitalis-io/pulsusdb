@@ -173,6 +173,13 @@ fn render_expr(
                     validate_probe_regex(probe)?;
                     Ok(semi_join_sql(probe, *negated, attrs_table, window))
                 }
+                // Nested-set intrinsics (issue #181) are query-time
+                // structural properties with no SQL column — unsupported
+                // on the metrics filter path (a clean 400, tracked as a
+                // follow-up). Search remains the surface for nested-set.
+                LeafEval::NestedSet { .. } => Err(PlanError::TypeMismatch(
+                    "nested-set intrinsics are not supported in metrics filters".to_string(),
+                )),
             }
         }
         FieldExpr::Binary { op, lhs, rhs } => {

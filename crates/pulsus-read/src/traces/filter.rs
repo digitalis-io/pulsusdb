@@ -161,6 +161,20 @@ pub enum PhysicalPredicate {
     Kind { op: ComparisonOp, code: i8 },
 }
 
+/// Which nested-set structural intrinsic a leaf compares (issue #181).
+/// The value is computed query-time from the hydrated `parent_id` forest
+/// (`traces::search_eval`), so there is no physical column and no
+/// Phase-1 pushdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NestedSetField {
+    /// `nestedSetParent` — the parent span's `left`, or `-1` for a root.
+    Parent,
+    /// `nestedSetLeft` — the span's modified-preorder `left` boundary.
+    Left,
+    /// `nestedSetRight` — the span's modified-preorder `right` boundary.
+    Right,
+}
+
 /// How Phase 2 evaluates one leaf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeafEval {
@@ -170,6 +184,15 @@ pub enum LeafEval {
     Attr {
         probe: AttrProbe,
         negated: bool,
+    },
+    /// A nested-set structural intrinsic comparison (issue #181),
+    /// evaluated engine-side against the query-time numbering. No
+    /// generator column exists, so the leaf pairs with the time-range
+    /// candidate generator.
+    NestedSet {
+        field: NestedSetField,
+        op: ComparisonOp,
+        value: f64,
     },
 }
 
@@ -530,6 +553,15 @@ pub fn compile_leaf(
                 eval: LeafEval::Physical(physical),
             })
         }
+        Field::Intrinsic(Intrinsic::NestedSetParent) => {
+            compile_nested_set_leaf(NestedSetField::Parent, op, value)
+        }
+        Field::Intrinsic(Intrinsic::NestedSetLeft) => {
+            compile_nested_set_leaf(NestedSetField::Left, op, value)
+        }
+        Field::Intrinsic(Intrinsic::NestedSetRight) => {
+            compile_nested_set_leaf(NestedSetField::Right, op, value)
+        }
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {
                 compile_service_leaf(op, value)
@@ -538,6 +570,35 @@ pub fn compile_leaf(
             }
         }
     }
+}
+
+/// Compiles one nested-set intrinsic leaf (issue #181): a numeric
+/// comparison against the query-time modified-preorder numbering. The
+/// six ordering/equality operators are allowed; regex operators are a
+/// [`PlanError::TypeMismatch`]. There is no candidate generator column,
+/// so the leaf pairs with the complete time-range superset generator
+/// (evaluation is exact in Phase 2) — a nested-set-only query is as broad
+/// as `{}`, bounded by the scan budget.
+fn compile_nested_set_leaf(
+    field: NestedSetField,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<CompiledLeaf, PlanError> {
+    if sql_op(op).is_none() {
+        return Err(PlanError::TypeMismatch(
+            "nested-set intrinsics do not support regex operators".to_string(),
+        ));
+    }
+    let Value::Number(raw) = value else {
+        return Err(PlanError::TypeMismatch(
+            "nested-set intrinsics require a numeric value".to_string(),
+        ));
+    };
+    let value = parse_num(raw)?;
+    Ok(CompiledLeaf {
+        generator: LeafGenerator::time_range(),
+        eval: LeafEval::NestedSet { field, op, value },
+    })
 }
 
 /// `name`/`status`/`kind` generators: no selective index — a bounded
@@ -818,6 +879,46 @@ mod tests {
             &Field::Intrinsic(Intrinsic::Duration),
             ComparisonOp::Re,
             &value,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn nested_set_root_compiles_to_the_time_range_generator_and_a_nested_set_eval() {
+        for (q, field) in [
+            ("{ nestedSetParent < 0 }", NestedSetField::Parent),
+            ("{ nestedSetLeft > 0 }", NestedSetField::Left),
+            ("{ nestedSetRight >= 1 }", NestedSetField::Right),
+        ] {
+            let f = first_filter(q);
+            let compiled = compile_span_filter(&f).unwrap();
+            assert_eq!(
+                compiled.generators,
+                vec![LeafGenerator::time_range()],
+                "{q}"
+            );
+            match &compiled.leaves[0].eval {
+                LeafEval::NestedSet {
+                    field: got, value, ..
+                } => {
+                    assert_eq!(*got, field, "{q}");
+                    assert!(value.is_finite());
+                }
+                other => panic!("{q}: expected a nested-set eval, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn regex_on_a_nested_set_intrinsic_is_a_type_mismatch() {
+        // The parser rejects `nestedSetLeft =~ "x"` (string not a number),
+        // but `compile_leaf` is a public API over any AST — feed it a
+        // number value with a regex operator.
+        let err = compile_leaf(
+            &Field::Intrinsic(Intrinsic::NestedSetLeft),
+            ComparisonOp::Re,
+            &Value::Number("5".to_string()),
         )
         .unwrap_err();
         assert!(matches!(err, PlanError::TypeMismatch(_)));

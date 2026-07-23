@@ -497,9 +497,9 @@ fn differential_categories_are_pinned() {
     );
     // Exact pins — every T2–T5 landing flips a tracked gap to `supported`
     // and must re-pin these deliberately.
-    assert_eq!(supported, 40, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 43, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 72,
+        tracked_interim, 69,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(
@@ -669,8 +669,10 @@ fn interim_generic_without_owning_issue_is_red() {
         owner_escalation: None,
     };
     // A probe that genuinely produces a generic error, so only the missing
-    // owning_issue can fail it.
-    assert!(check_status(&d, "{ nestedSetParent < 0 }").is_err());
+    // owning_issue can fail it. (`{ nestedSetParent < 0 }` now parses since
+    // issue #181, so it is no longer a generic-error probe — use a bare
+    // unknown word, which is a plain positioned syntax error.)
+    assert!(check_status(&d, "{ zzz = 1 }").is_err());
 }
 
 #[test]
