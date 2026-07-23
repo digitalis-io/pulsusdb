@@ -616,13 +616,29 @@ fn eval_spanset(
 const ZERO_ID: [u8; 8] = [0u8; 8];
 
 /// Per-span transient cost envelope for the descendant BFS: one
-/// adjacency-map contribution (map key + `Vec` header + a child slot
-/// with its growth-doubling slack) plus up to two queue slots (an LHS
-/// seed and one discovery per span — the queue is sized so it never
-/// reallocates), plus the container-overhead envelope.
+/// adjacency-map contribution (map key + `Vec` header + the child-`Vec`
+/// first-push capacity) plus up to two queue slots (an LHS seed and one
+/// discovery per span — the queue is sized so it never reallocates),
+/// plus the container-overhead envelope.
+///
+/// Child-`Vec` capacity ceiling — the load-bearing term. A parent's
+/// child list is an `entry().or_default()`-created `Vec<[u8; 8]>` filled
+/// by `push`. Rust's `Vec` first push jumps to `MIN_NON_ZERO_CAP = 4`
+/// (for element sizes in `(1, 1024]`), so it must be charged **4** slots,
+/// not 2 — 2 would under-book every single-child parent's real 32-byte
+/// allocation by 16 bytes. 4 slots makes the term a genuine AGGREGATE
+/// ceiling independent of the other terms' slack: a parent with `c`
+/// children allocates `max(4, next_pow2(c)) * 8` bytes, and `max(4,
+/// next_pow2(c)) ≤ 4·c` for every `c ≥ 1`, so the total child-`Vec` bytes
+/// across all parents is `≤ 8 · Σ 4·c_p = 32 · (children) ≤ 32·spans` —
+/// exactly the `spans × 4 × size_of::<[u8; 8]>()` this term books.
+///
+/// The queue-slot term stays at 2: the BFS queue is pre-sized to
+/// `seeds + spans` and never reallocates, so ≤ 2 slots/span is exact
+/// (unlike the child `Vec`, it has no `or_default()` first-push jump).
 const DESCENDANT_TRANSIENT_BYTES: usize = std::mem::size_of::<[u8; 8]>()
     + std::mem::size_of::<Vec<[u8; 8]>>()
-    + 2 * std::mem::size_of::<[u8; 8]>()
+    + 4 * std::mem::size_of::<[u8; 8]>()
     + 2 * std::mem::size_of::<[u8; 8]>()
     + super::exec::RETAINED_ENTRY_OVERHEAD;
 
@@ -1847,6 +1863,43 @@ mod tests {
         let mut ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![sid(2), sid(3)]);
+    }
+
+    #[test]
+    fn descendant_walk_handles_a_wide_fan_out_and_releases_exactly() {
+        // A star (one root, 200 children under a single parent) grows the
+        // children-adjacency `Vec` well past MIN_NON_ZERO_CAP=4 first push
+        // (4 → 8 → … → 256), exercising the child-slot term the transient
+        // envelope now books at 4 slots/span. The direct `rel_descendants`
+        // call sidesteps the `spss` cap so the full 200-descendant result
+        // is asserted, and `used() == 0` after releasing the operand sets
+        // confirms the (bumped) transient charge is released in full.
+        let mut spans = vec![child_span(1, 0, "root", 0)];
+        for i in 2..=201u8 {
+            spans.push(child_span(i, 1, "c", i as i64));
+        }
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans,
+        };
+        let mut budget = ByteBudget::new(usize::MAX);
+        // Seed = the root; candidates = all 200 children.
+        let mut seed = charged_set(1, &mut budget).expect("seed");
+        seed.set.insert(sid(1));
+        let mut cand = charged_set(200, &mut budget).expect("cand");
+        for i in 2..=201u8 {
+            cand.set.insert(sid(i));
+        }
+        let out = rel_descendants(&seed, &cand, &trace, &mut budget).expect("in budget");
+        assert_eq!(
+            out.set.len(),
+            200,
+            "every child is a proper descendant of the root"
+        );
+        release_set(out, &mut budget);
+        release_set(seed, &mut budget);
+        release_set(cand, &mut budget);
+        assert_eq!(budget.used(), 0, "all transients + sets released exactly");
     }
 
     #[test]
