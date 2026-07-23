@@ -1,0 +1,32 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                ArithCompare {
+                    lhs: Field(
+                        Attribute {
+                            scope: Unscoped,
+                            key: "a",
+                        },
+                    ),
+                    op: Eq,
+                    rhs: Arith {
+                        op: Mod,
+                        lhs: Literal(
+                            Number(
+                                "5",
+                            ),
+                        ),
+                        rhs: Literal(
+                            Number(
+                                "2",
+                            ),
+                        ),
+                    },
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

@@ -22,6 +22,11 @@ use std::fmt;
 pub struct Query {
     pub spanset: SpansetExpr,
     pub pipeline: Vec<PipelineStage>,
+    /// Trailing `with(...)` hints on a non-metric query (issue #185 —
+    /// `hints.most_recent`): `{ … } with(most_recent=true)`. Empty when
+    /// absent. Reuses [`MetricHint`]/[`HintValue`]; `most_recent` is a
+    /// recognized key.
+    pub hints: Vec<MetricHint>,
 }
 
 impl fmt::Display for Query {
@@ -29,6 +34,16 @@ impl fmt::Display for Query {
         write!(f, "{}", self.spanset)?;
         for stage in &self.pipeline {
             write!(f, " | {stage}")?;
+        }
+        if !self.hints.is_empty() {
+            write!(f, " with(")?;
+            for (i, hint) in self.hints.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{hint}")?;
+            }
+            write!(f, ")")?;
         }
         Ok(())
     }
@@ -177,6 +192,22 @@ pub enum FieldExpr {
     /// A bare boolean static (`{ true }` / `{ false }` — issue #183,
     /// `static.bare_boolean`): matches every span or no span.
     BoolStatic(bool),
+    /// Attribute existence (issue #185, `existence.*`): the span possesses
+    /// the field. The bare-attribute form (`{ .foo }`) and the `!= nil`
+    /// spelling (`{ .a != nil }`) both parse to `Exists`; `{ .a = nil }`
+    /// parses to `Not(Exists)`. Canonical `Display` is the bare form, so
+    /// the round-trip oracle holds.
+    Exists(Field),
+    /// A comparison with an arithmetic operand on either side (issue #185,
+    /// `arith.*`): `{ .a = 1 + 2 }`, `{ .a = -1 }`, `{ duration * 2 > 1s }`.
+    /// The parser only routes here when an arithmetic operator (`+ - * / %
+    /// ^`) or a unary minus is present, so the frozen literal/field
+    /// comparison goldens do not churn. `Display` fully parenthesizes.
+    ArithCompare {
+        lhs: Operand,
+        op: ComparisonOp,
+        rhs: Operand,
+    },
     /// Unary field negation (`!(.a = 1)`, `!.a` — issue #183,
     /// `logic.not`): the per-span boolean inverse of the inner expression.
     /// `Display` fully parenthesizes the inner so the round-trip oracle
@@ -195,6 +226,17 @@ impl fmt::Display for FieldExpr {
             FieldExpr::Comparison { field, op, value } => write!(f, "{field} {op} {value}"),
             FieldExpr::FieldCompare { lhs, op, rhs } => write!(f, "{lhs} {op} {rhs}"),
             FieldExpr::BoolStatic(b) => write!(f, "{b}"),
+            FieldExpr::Exists(field) => write!(f, "{field}"),
+            FieldExpr::ArithCompare { lhs, op, rhs } => {
+                // The comparison operator binds looser than every arithmetic
+                // operator, so the outermost operand needs no wrapping parens
+                // (which would otherwise reparse as a grouped field
+                // expression). Inner operands keep their parens via
+                // `Operand`'s own `Display`.
+                fmt_operand_bare(f, lhs)?;
+                write!(f, " {op} ")?;
+                fmt_operand_bare(f, rhs)
+            }
             FieldExpr::Not(inner) => write!(f, "!({inner})"),
             FieldExpr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
         }
@@ -218,6 +260,69 @@ impl fmt::Display for BoolOp {
     }
 }
 
+/// A field-expression arithmetic operator (issue #185, `arith.*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+}
+
+impl fmt::Display for ArithOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+            ArithOp::Pow => "^",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// One operand of an [`FieldExpr::ArithCompare`] (issue #185): a field, a
+/// numeric literal (number or duration), a unary negation, or a binary
+/// arithmetic composition. `Display` fully parenthesizes binary nodes and
+/// prefixes negation so the round-trip oracle holds.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Operand {
+    Field(Field),
+    Literal(Value),
+    Neg(Box<Operand>),
+    Arith {
+        op: ArithOp,
+        lhs: Box<Operand>,
+        rhs: Box<Operand>,
+    },
+}
+
+impl fmt::Display for Operand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operand::Field(field) => write!(f, "{field}"),
+            Operand::Literal(value) => write!(f, "{value}"),
+            Operand::Neg(inner) => write!(f, "-{inner}"),
+            Operand::Arith { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+        }
+    }
+}
+
+/// Renders an operand at the outermost position of an
+/// [`FieldExpr::ArithCompare`], where a top-level arithmetic node needs no
+/// wrapping parens (the comparison operator binds looser). Nested operands
+/// still parenthesize via [`Operand`]'s `Display`.
+fn fmt_operand_bare(f: &mut fmt::Formatter<'_>, operand: &Operand) -> fmt::Result {
+    match operand {
+        Operand::Arith { op, lhs, rhs } => write!(f, "{lhs} {op} {rhs}"),
+        other => write!(f, "{other}"),
+    }
+}
+
 /// The left-hand side of a comparison: an intrinsic or a (scoped or
 /// unscoped) attribute. `service` is *not* an intrinsic — it is the
 /// `resource.service.name` attribute, which the T5 planner maps to the
@@ -232,8 +337,26 @@ impl fmt::Display for Field {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Field::Intrinsic(intrinsic) => write!(f, "{intrinsic}"),
-            Field::Attribute { scope, key } => write!(f, "{scope}{key}"),
+            Field::Attribute { scope, key } => write!(f, "{scope}{}", render_attr_key(key)),
         }
+    }
+}
+
+/// Renders an attribute key back to a TraceQL spelling that reparses to the
+/// same key. A "simple" dotted-identifier key (`http.status_code`, `foo`)
+/// re-emits verbatim; any key with a segment that is not a bare identifier
+/// (spaces, punctuation, empty — the `scope.quoted`/`scope.bracketed`
+/// forms, issue #185) re-emits in the canonical bracketed form
+/// (`["…"]`), so `parse(ast.to_string()) == ast` holds for every key.
+fn render_attr_key(key: &str) -> String {
+    let simple = !key.is_empty()
+        && key.split('.').all(|seg| {
+            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    if simple {
+        key.to_string()
+    } else {
+        format!("[{}]", quote(key))
     }
 }
 
@@ -530,6 +653,14 @@ pub enum PipelineStage {
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
+    /// `by(field, ...)` — a spanset-level grouping stage (issue #185,
+    /// `pipeline.by`): regroups the matched spans into per-key spansets.
+    /// Distinct from the metric `by(...)` clause carried by
+    /// [`MetricStage`]. Empty `by()` is a positioned parse error.
+    By { fields: Vec<Field> },
+    /// `coalesce()` — a spanset-level stage (issue #185, `pipeline.coalesce`)
+    /// that merges the spanset arrays. Zero-arity.
+    Coalesce,
     /// A first-stage metrics function (`rate()`, `count_over_time()`, the
     /// `*_over_time` family) with its optional `by(...)` grouping and
     /// trailing `with(...)` hints. Served exclusively by the
@@ -573,6 +704,17 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
+            PipelineStage::By { fields } => {
+                write!(f, "by(")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{field}")?;
+                }
+                write!(f, ")")
+            }
+            PipelineStage::Coalesce => write!(f, "coalesce()"),
             PipelineStage::Metric(stage) => write!(f, "{stage}"),
             PipelineStage::MetricSecondStage(stage) => write!(f, "{stage}"),
             PipelineStage::Compare { selection, hints } => {
@@ -868,13 +1010,11 @@ fn quote(value: &str) -> String {
 pub const BOUNDARY_CONSTRUCTS: &[(&str, &str)] = &[
     ("structural operator '>='", "M7"),
     ("structural operator '<='", "M7"),
-    ("arithmetic operator '+'", "M7"),
-    ("arithmetic operator '-'", "M7"),
-    ("arithmetic operator '*'", "M7"),
-    ("arithmetic operator '/'", "M7"),
-    ("parent scope", "M7"),
-    ("bracketed attribute", "M7"),
-    ("bare attribute expression", "M7"),
+    // `parent.` is a PERMANENT reject-parity construct (issue #185, Cat B):
+    // the pinned reference rejects it too, so agreement — not an interim
+    // gap owned by any sub-issue. The second element is the disposition
+    // class, not an owning issue.
+    ("parent scope", "reject-parity"),
 ];
 
 #[cfg(test)]
@@ -1098,6 +1238,7 @@ mod tests {
                 }),
                 hints: vec![],
             }],
+            hints: vec![],
         };
         assert_eq!(
             compare.to_string(),
@@ -1143,6 +1284,7 @@ mod tests {
         let query = Query {
             spanset: SpansetExpr::Filter(SpansetFilter { body: Some(body) }),
             pipeline: vec![],
+            hints: vec![],
         };
         assert_eq!(query.to_string(), "{ (.a = 1 && (.b = 1 || .c = 1)) }");
     }

@@ -1,0 +1,76 @@
+# Single-binary Tempo config used as the black-box oracle for BOTH
+# TraceQL differential legs (issue #185, M7-TQ6):
+#
+#   1. the syntax differential (tempo_differential.rs) — sends TraceQL query
+#      strings and observes only the HTTP status (2xx accept / 400 reject);
+#   2. the compare() VALUE differential (compare_value_differential.rs) —
+#      pushes OTLP spans over the HTTP receiver, then queries the metrics
+#      API's compare() and asserts byte-parity on statusMessage / rootName /
+#      rootServiceName against PulsusDB.
+#
+# It stores nothing meaningful and serves no production role — pure runtime
+# use of the unmodified upstream image. No Tempo source is copied.
+#
+# Ingest is tuned aggressively so freshly-pushed OTLP spans become
+# compare()-queryable within a few seconds (well inside the test's bounded
+# 120 s poll): trace_idle_period 1s + max_block_duration 2s ⇒ ~3–6 s
+# steady-state visibility; complete_block_timeout 30m keeps completed
+# blocks queryable for the whole test window.
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+# The OTLP HTTP receiver the compare() leg pushes fixture spans to.
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  trace_idle_period: 1s
+  max_block_duration: 2s
+  flush_check_period: 1s
+  complete_block_timeout: 30m
+
+# The local-blocks metrics processor answers TraceQL metrics/compare() over
+# recent spans. `filter_server_spans: false` is REQUIRED: the reference's
+# local-blocks default restricts metrics aggregation to SERVER-kind spans,
+# but the compare() fixture pushes INTERNAL (kind=1) spans (OTLP SpanKind
+# internal=1, matching PulsusDB's own mapping) — with the default they would
+# be excluded and silently zero the baseline/selection counts. Harmless
+# no-op if the default is already permissive; pinned unconditionally.
+metrics_generator:
+  processor:
+    local_blocks:
+      flush_check_period: 1s
+      max_block_duration: 2s
+      complete_block_timeout: 30m
+      filter_server_spans: false
+  storage:
+    path: /var/tempo/generator/wal
+  traces_storage:
+    path: /var/tempo/generator/traces
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+# Per-tenant default: enable the local-blocks metrics processor so the
+# metrics API answers compare() over locally-ingested spans.
+overrides:
+  defaults:
+    metrics_generator:
+      processors:
+        - local-blocks
+
+# Allow unbounded TraceQL-metrics query windows so the wide compare() test
+# window is not range-rejected.
+query_frontend:
+  metrics:
+    max_duration: 0s

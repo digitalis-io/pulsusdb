@@ -1,8 +1,48 @@
-UnexpectedToken {
-    found: "identifier \"nil\"",
-    expected: "a value (string, number, boolean, or duration)",
-    span: Span {
-        start: 55,
-        end: 58,
-    },
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: And,
+                    lhs: Binary {
+                        op: And,
+                        lhs: Comparison {
+                            field: Intrinsic(
+                                NestedSetParent,
+                            ),
+                            op: Lt,
+                            value: Number(
+                                "0",
+                            ),
+                        },
+                        rhs: BoolStatic(
+                            true,
+                        ),
+                    },
+                    rhs: Exists(
+                        Attribute {
+                            scope: Resource,
+                            key: "service.name",
+                        },
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Metric(
+            MetricStage {
+                func: Rate,
+                by: [
+                    Attribute {
+                        scope: Resource,
+                        key: "service.name",
+                    },
+                ],
+                hints: [],
+                result_filter: None,
+            },
+        ),
+    ],
+    hints: [],
 }

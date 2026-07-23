@@ -203,14 +203,47 @@ fn render_expr(
                 LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
                     "trace-level intrinsics are not supported in metrics filters".to_string(),
                 )),
-                // `compile_leaf` never yields a field-vs-field leaf (that
-                // is `compile_field_compare`, only reached via the
-                // `FieldCompare` AST arm below) — keep the match exhaustive.
+                // `compile_leaf` never yields a field-vs-field or arithmetic
+                // leaf (those come via the `FieldCompare`/`ArithCompare` AST
+                // arms) — keep the match exhaustive.
                 LeafEval::FieldCompare { .. } => Err(PlanError::TypeMismatch(
                     "field-vs-field comparisons are not supported in metrics filters".to_string(),
                 )),
+                LeafEval::Arith { .. } => Err(PlanError::TypeMismatch(
+                    "arithmetic comparisons are not supported in metrics filters".to_string(),
+                )),
             }
         }
+        // Attribute existence (issue #185 `existence.*`): a key-only
+        // membership semi-join. `resource.service.name != nil` and the
+        // like are answerable on the metrics surface (the grafana
+        // `rate() by(service)` case). The absent form (`= nil`) parses to
+        // `Not(Exists)` and is rejected below with the other negations.
+        FieldExpr::Exists(field) => {
+            let probe = match field {
+                Field::Attribute { scope, key } => AttrProbe {
+                    key: key.clone(),
+                    scope: match scope {
+                        AttrScope::Span => Some("span"),
+                        AttrScope::Resource => Some("resource"),
+                        AttrScope::Unscoped => None,
+                    },
+                    pred: ValuePred::KeyExists,
+                },
+                Field::Intrinsic(_) => {
+                    return Err(PlanError::TypeMismatch(
+                        "existence checks are only supported on attributes".to_string(),
+                    ));
+                }
+            };
+            Ok(semi_join_sql(&probe, false, attrs_table, window))
+        }
+        // Arithmetic comparisons (issue #185) are a search-surface
+        // construct; the metrics filter path does not support them yet
+        // (a clean 400, mirroring the field-vs-field rejection).
+        FieldExpr::ArithCompare { .. } => Err(PlanError::TypeMismatch(
+            "arithmetic comparisons are not supported in metrics filters".to_string(),
+        )),
         // Field-vs-field comparison, bare boolean statics and unary field
         // negation (issue #183) are search-surface constructs; the metrics
         // filter path does not support them yet (a clean 400, tracked as a
@@ -666,6 +699,33 @@ pub fn metrics_series_probe_sql(
     format!("SELECT count() AS n FROM (\n  {inner}\n)")
 }
 
+/// The spanset-level search `| by(...)` cardinality pre-flight probe
+/// (issue #185): the SAME distinct-by-key `GROUP BY <keys> LIMIT cap+1`
+/// mechanism as the metric `by()` cap, over the search filter + window.
+/// `group_col` is the grouping column expression (currently `service` for
+/// `resource.service.name`). The engine counts its rows; `cap+1` is a
+/// static `422 query_too_broad` before the main search runs.
+pub fn search_by_probe_sql(
+    spans_table: &str,
+    attrs_table: &str,
+    body: Option<&FieldExpr>,
+    window: SnappedWindow,
+    group_col: &str,
+    cap: u64,
+) -> Result<String, PlanError> {
+    // `trace_spans` prunes on `timestamp_ns` only (no `date` column — that
+    // partition column lives on `trace_attrs_idx`, and each attr semi-join
+    // inside `filter_bool` carries its own date/time pruning internally).
+    let filter_bool = compile_filter_bool(body, attrs_table, window)?;
+    let inner = format!(
+        "SELECT {group_col} AS g0\n  FROM {spans_table}\n  WHERE {} AND ({filter_bool})\
+         \n  GROUP BY g0\n  LIMIT {}",
+        time_clause(window),
+        cap + 1
+    );
+    Ok(format!("SELECT count() AS n FROM (\n  {inner}\n)"))
+}
+
 /// The three SQL forms `compare()` needs (issue #182 P6b): the
 /// per-`(bucket, attr_key, attr_value)` baseline/selection cross-tab, the
 /// per-bucket totals (the `*_total` denominators + the `key=nil`
@@ -898,6 +958,46 @@ mod tests {
             f.where_expr.as_deref(),
             Some("(duration_ns > 1000000000 AND status_code = 2)")
         );
+    }
+
+    fn compile_bool(q: &str) -> String {
+        compile_filter_bool(Some(&body(q)), "trace_attrs_idx", W).expect("compiles")
+    }
+
+    #[test]
+    fn attribute_existence_renders_a_key_only_semi_join_on_the_metrics_surface() {
+        // Issue #185: `resource.service.name != nil` (the grafana
+        // `rate() by(service)` idiom, the code path the replay-ledger
+        // deletion depends on) renders a key-only membership semi-join into
+        // the attr index — NOT a value predicate.
+        let sql = compile_bool(r#"{ resource.service.name != nil }"#);
+        assert!(sql.contains("(trace_id, span_id) IN"), "{sql}");
+        assert!(sql.contains("FROM trace_attrs_idx"), "{sql}");
+        assert!(sql.contains("key = 'service.name'"), "{sql}");
+        assert!(sql.contains("scope = 'resource'"), "{sql}");
+        assert!(
+            sql.contains("AND 1"),
+            "the key-only (no value) predicate: {sql}"
+        );
+        // Unscoped existence: no scope predicate.
+        let unscoped = compile_bool(r#"{ .a != nil }"#);
+        assert!(unscoped.contains("key = 'a' AND 1"), "{unscoped}");
+        assert!(!unscoped.contains("scope ="), "{unscoped}");
+    }
+
+    #[test]
+    fn absent_existence_and_intrinsic_existence_are_metrics_filter_type_mismatches() {
+        // `= nil` is `Not(Exists)` — negation is unsupported on the metrics
+        // filter path (a clean 400).
+        assert!(matches!(
+            compile_filter_bool(Some(&body(r#"{ .a = nil }"#)), "trace_attrs_idx", W),
+            Err(PlanError::TypeMismatch(_))
+        ));
+        // Intrinsic existence is not an attribute — rejected.
+        assert!(matches!(
+            compile_filter_bool(Some(&body(r#"{ name != nil }"#)), "trace_attrs_idx", W),
+            Err(PlanError::TypeMismatch(_))
+        ));
     }
 
     #[test]

@@ -65,8 +65,8 @@ use pulsus_traceql::{
 use super::exec::ByteBudget;
 use super::filter::NestedSetField;
 use super::search_plan::{
-    AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, PlannedOperand,
-    SearchPlan, SelectField, TraceCtxEval,
+    AggSource, PhysicalEval, PhysicalSelect, PlannedArith, PlannedFilter, PlannedLeafEval,
+    PlannedOperand, SearchPlan, SelectField, TraceCtxEval,
 };
 use crate::logql::error::ReadError;
 
@@ -366,6 +366,29 @@ fn resolve_operand<'a>(
     }
 }
 
+/// Resolves an arithmetic operand tree to a number for a span (issue
+/// #185). A field operand that is absent or string-typed, or a
+/// division/modulo by zero, yields `None` (no match).
+fn resolve_arith(
+    node: &PlannedArith,
+    trace_id: [u8; 16],
+    span: &HydratedSpan,
+    attrs: &BatchAttrs,
+) -> Option<f64> {
+    match node {
+        PlannedArith::Value(v) => Some(*v),
+        PlannedArith::Operand(operand) => {
+            resolve_operand(operand, trace_id, span, attrs).and_then(|r| r.num)
+        }
+        PlannedArith::Neg(inner) => resolve_arith(inner, trace_id, span, attrs).map(|v| -v),
+        PlannedArith::Bin { op, lhs, rhs } => {
+            let l = resolve_arith(lhs, trace_id, span, attrs)?;
+            let r = resolve_arith(rhs, trace_id, span, attrs)?;
+            super::filter::apply_arith(*op, l, r)
+        }
+    }
+}
+
 /// Lexicographic string comparison for the six ordering/equality
 /// operators (Tempo compares string statics byte-lexicographically, which
 /// matches Rust's `str` `Ord` — verified against grafana/tempo:3.0.2:
@@ -440,7 +463,12 @@ fn eval_expr(
     env: &EvalEnv<'_>,
 ) -> bool {
     match expr {
-        FieldExpr::Comparison { .. } | FieldExpr::FieldCompare { .. } => {
+        // Every leaf-bearing field expression consumes exactly one planned
+        // leaf, in pre-order (issue #185 adds `Exists` and `ArithCompare`).
+        FieldExpr::Comparison { .. }
+        | FieldExpr::FieldCompare { .. }
+        | FieldExpr::Exists(_)
+        | FieldExpr::ArithCompare { .. } => {
             let leaf = &filter.leaves[*leaf_idx];
             *leaf_idx += 1;
             match leaf {
@@ -464,6 +492,18 @@ fn eval_expr(
                 // Trace-level intrinsics (issue #184): evaluated against
                 // the trace-wide co-load context.
                 PlannedLeafEval::TraceCtx(tc) => eval_trace_ctx(tc, &env.ctx, span),
+                // Arithmetic comparison (issue #185): resolve both operand
+                // trees to numbers per span, then compare. An absent /
+                // non-numeric operand or a division-by-zero is no match.
+                PlannedLeafEval::Arith { lhs, op, rhs } => {
+                    match (
+                        resolve_arith(lhs, env.ctx.trace_id, span, env.attrs),
+                        resolve_arith(rhs, env.ctx.trace_id, span, env.attrs),
+                    ) {
+                        (Some(l), Some(r)) => cmp_f64(*op, l, r),
+                        _ => false,
+                    }
+                }
             }
         }
         // A bare boolean static (issue #183) consumes no leaf.
@@ -1514,6 +1554,7 @@ mod tests {
                     attrs_table: "trace_attrs_idx",
                 },
                 max_candidates: 100,
+                max_series: 1_000,
                 distributed: false,
             },
         )
@@ -2247,6 +2288,7 @@ mod tests {
                     attrs_table: "trace_attrs_idx",
                 },
                 max_candidates: 100,
+                max_series: 1_000,
                 distributed: false,
             },
         )

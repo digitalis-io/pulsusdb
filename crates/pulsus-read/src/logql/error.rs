@@ -96,6 +96,14 @@ pub enum TooBroadReason {
     /// Complete-or-error: a breach is a static reject, never a silent
     /// subset. Operator scale tuning routes to issue #25.
     TraceMetricsSeriesCap { count: u64, cap: u64 },
+    /// Issue #185: a TraceQL SEARCH `| by(...)` spanset-grouping stage
+    /// resolved more distinct groups than `reader.traceql_max_series` — the
+    /// SAME cap and the SAME distinct-by-key `GROUP BY <keys> LIMIT cap+1`
+    /// pre-flight probe as the metric `by(...)` cap
+    /// ([`TooBroadReason::TraceMetricsSeriesCap`]), applied before the main
+    /// search runs. A breach is a static `422 query_too_broad`, never a
+    /// silent subset. Operator scale tuning routes to issue #25.
+    TraceSearchSeriesCap { count: u64, cap: u64 },
     /// Issue #57 re-audit (sub-problem B): the traces phase-1 candidate-
     /// generator read's memory ceiling (`max_memory_usage` +
     /// `max_bytes_before_external_group_by = 0`, throw — server code 241
@@ -212,6 +220,13 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace metrics by() resolved at least {count} series, exceeding the \
+                     {cap}-series cap"
+                )
+            }
+            TooBroadReason::TraceSearchSeriesCap { count, cap } => {
+                write!(
+                    f,
+                    "trace search by() resolved at least {count} groups, exceeding the \
                      {cap}-series cap"
                 )
             }

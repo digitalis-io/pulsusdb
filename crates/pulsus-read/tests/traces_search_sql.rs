@@ -253,6 +253,70 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Attribute existence present (issue #185, `existence.neq_nil` /
+        // bare-attr): an index-served key-only `(key)` scan with the no-op
+        // `1` value predicate + a key-existence membership probe.
+        name: "existence_present",
+        q: r#"{ .a != nil }"#,
+        distributed: false,
+    },
+    Case {
+        // Attribute existence absent (issue #185, `existence.eq_nil`): the
+        // positive key-existence probe negated over the time-range superset
+        // (absent-key spans match).
+        name: "existence_absent",
+        q: r#"{ .a = nil }"#,
+        distributed: false,
+    },
+    Case {
+        // All-literal arithmetic (issue #185, `arith.add`): constant-folds
+        // at plan time to a plain numeric `val_num` comparison (`.a = 3`) —
+        // the literal fold erases the arithmetic.
+        name: "arith_fold",
+        q: r#"{ .a = 1 + 2 }"#,
+        distributed: false,
+    },
+    Case {
+        // Single-attribute arithmetic with literal coefficients (issue
+        // #185): a column-side `val_num` predicate on the attr index (the
+        // query-performance mandate), NOT Rust post-hydration.
+        name: "arith_attr_pushdown",
+        q: r#"{ .duration_ms * 1000 > 5000 }"#,
+        distributed: false,
+    },
+    Case {
+        // Single physical-intrinsic arithmetic (issue #185): a column-side
+        // `SpanScan` predicate on `duration_ns` that prunes candidates;
+        // Phase 2 confirms the same arithmetic in Rust.
+        name: "arith_physical",
+        q: r#"{ duration * 2 > 1s }"#,
+        distributed: false,
+    },
+    Case {
+        // Spanset `| by(resource.service.name)` (issue #185): the Phase-1
+        // generators are unchanged (by() is a grouping stage); the plan
+        // carries the distinct-by-key `GROUP BY g0 LIMIT cap+1` cardinality
+        // probe the executor runs before the main search (`422` on breach).
+        name: "spanset_by_service",
+        q: r#"{ .a = "1" } | by(resource.service.name)"#,
+        distributed: false,
+    },
+    Case {
+        // Spanset `| coalesce()` (issue #185): a Phase-2 spanset-merge
+        // stage — the Phase-1 SQL is byte-identical to the plain filter
+        // (regression guard; response reshaping is #193).
+        name: "spanset_coalesce",
+        q: r#"{ .a = "1" } | coalesce()"#,
+        distributed: false,
+    },
+    Case {
+        // `with(most_recent=true)` (issue #185): a search hint honored by
+        // the default recency ordering — no change to the emitted SQL.
+        name: "hints_most_recent",
+        q: r#"{ .a = "1" } with(most_recent=true)"#,
+        distributed: false,
+    },
+    Case {
         // The clustered form of the worked example: `_dist` tables; the
         // §7 clustered-reader + budget settings ride as HTTP settings,
         // never SQL text (pinned separately in `traces::exec` tests).
@@ -278,6 +342,7 @@ fn plan_for(case: &Case) -> SearchPlan {
                 attrs_table: attrs,
             },
             max_candidates: MAX_CANDIDATES,
+            max_series: 1_000,
             distributed: case.distributed,
         },
     )
@@ -327,6 +392,11 @@ fn composite(case: &Case) -> String {
             "\n== phase2 child counts (sample batch) ==\n{}\n",
             plan.child_count_sql_for(&BATCH)
         ));
+    }
+    // Issue #185: the spanset `| by(...)` cardinality pre-flight probe,
+    // only when the plan carries one.
+    if let Some(probe) = plan.by_probe_sql() {
+        out.push_str(&format!("\n== by() cardinality probe ==\n{probe}\n"));
     }
     out.push_str(&format!(
         "\n== root hydration (sample winners) ==\n{}\n",

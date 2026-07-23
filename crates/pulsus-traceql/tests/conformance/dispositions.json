@@ -1,5 +1,6 @@
 {
-  "interim_count_pin": 28,
+  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. The 9 residual interim constructs (event/link/instrumentation scope + intrinsics) are schema-blocked, owned by #192.",
+  "interim_count_pin": 9,
   "entries": [
     {
       "construct": "intrinsic.name",
@@ -157,42 +158,42 @@
       "construct": "intrinsic.event.name",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.event.timeSinceStart",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.link.spanID",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.link.traceID",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.instrumentation.name",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.instrumentation.version",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
@@ -233,70 +234,57 @@
     },
     {
       "construct": "scope.parent",
-      "status": "interim-named",
-      "error_construct": "parent scope",
-      "evidence": [
-        "unsupported/parent_scope"
-      ],
-      "owning_issue": 179,
+      "status": "reject-parity",
+      "evidence": [],
       "tempo": "reject"
     },
     {
       "construct": "scope.parent.span",
-      "status": "interim-named",
-      "error_construct": "parent scope",
-      "evidence": [
-        "unsupported/parent_scope"
-      ],
-      "owning_issue": 179,
+      "status": "reject-parity",
+      "evidence": [],
       "tempo": "reject"
     },
     {
       "construct": "scope.parent.resource",
-      "status": "interim-named",
-      "error_construct": "parent scope",
-      "evidence": [
-        "unsupported/parent_scope"
-      ],
-      "owning_issue": 179,
+      "status": "reject-parity",
+      "evidence": [],
       "tempo": "reject"
     },
     {
       "construct": "scope.event",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "scope.link",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "scope.instrumentation",
       "status": "interim-generic",
       "evidence": [],
-      "owning_issue": 179,
+      "owning_issue": 192,
       "tempo": "accept"
     },
     {
       "construct": "scope.quoted",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 183,
+      "status": "supported",
+      "evidence": [
+        "accept/scope_quoted"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "scope.bracketed",
-      "status": "interim-named",
-      "error_construct": "bracketed attribute",
+      "status": "supported",
       "evidence": [
-        "unsupported/bracketed_attribute"
+        "accept/bracketed_attribute"
       ],
-      "owning_issue": 183,
       "tempo": "accept"
     },
     {
@@ -369,16 +357,18 @@
     },
     {
       "construct": "existence.eq_nil",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 179,
+      "status": "supported",
+      "evidence": [
+        "accept/existence_eq_nil"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "existence.neq_nil",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 179,
+      "status": "supported",
+      "evidence": [
+        "accept/existence_neq_nil"
+      ],
       "tempo": "accept"
     },
     {
@@ -391,73 +381,66 @@
     },
     {
       "construct": "existence.bare_attr",
-      "status": "interim-named",
-      "error_construct": "bare attribute expression",
+      "status": "supported",
       "evidence": [
-        "unsupported/bare_attribute"
+        "accept/bare_attribute"
       ],
-      "owning_issue": 179,
       "tempo": "accept"
     },
     {
       "construct": "arith.add",
-      "status": "interim-named",
-      "error_construct": "arithmetic operator '+'",
+      "status": "supported",
       "evidence": [
-        "unsupported/arith_plus"
+        "accept/arith_plus"
       ],
-      "owning_issue": 183,
       "tempo": "accept"
     },
     {
       "construct": "arith.sub",
-      "status": "interim-named",
-      "error_construct": "arithmetic operator '-'",
+      "status": "supported",
       "evidence": [
-        "unsupported/arith_minus"
+        "accept/arith_minus"
       ],
-      "owning_issue": 183,
       "tempo": "accept"
     },
     {
       "construct": "arith.mul",
-      "status": "interim-named",
-      "error_construct": "arithmetic operator '*'",
+      "status": "supported",
       "evidence": [
-        "unsupported/arith_star"
+        "accept/arith_star"
       ],
-      "owning_issue": 183,
       "tempo": "accept"
     },
     {
       "construct": "arith.div",
-      "status": "interim-named",
-      "error_construct": "arithmetic operator '/'",
+      "status": "supported",
       "evidence": [
-        "unsupported/arith_slash"
+        "accept/arith_slash"
       ],
-      "owning_issue": 183,
       "tempo": "accept"
     },
     {
       "construct": "arith.mod",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 183,
+      "status": "supported",
+      "evidence": [
+        "accept/arith_mod"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "arith.pow",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 183,
+      "status": "supported",
+      "evidence": [
+        "accept/arith_pow"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "arith.unary_neg",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 183,
+      "status": "supported",
+      "evidence": [
+        "accept/arith_unary_neg"
+      ],
       "tempo": "accept"
     },
     {
@@ -700,23 +683,24 @@
     },
     {
       "construct": "pipeline.by",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 182,
+      "status": "supported",
+      "evidence": [
+        "accept/pipeline_by"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "pipeline.coalesce",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 182,
+      "status": "supported",
+      "evidence": [
+        "accept/pipeline_coalesce"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "pipeline.scalar_expr",
-      "status": "interim-generic",
+      "status": "reject-parity",
       "evidence": [],
-      "owning_issue": 183,
       "tempo": "reject"
     },
     {
@@ -849,9 +833,10 @@
     },
     {
       "construct": "hints.most_recent",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 182,
+      "status": "supported",
+      "evidence": [
+        "accept/hints_most_recent"
+      ],
       "tempo": "accept"
     },
     {

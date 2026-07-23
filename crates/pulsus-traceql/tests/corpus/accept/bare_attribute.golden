@@ -1,0 +1,16 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Exists(
+                    Attribute {
+                        scope: Unscoped,
+                        key: "foo",
+                    },
+                ),
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

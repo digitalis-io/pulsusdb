@@ -35,8 +35,8 @@
 //! through [`crate::logql::escape`] before it reaches a SQL fragment.
 
 use pulsus_traceql::{
-    AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, SpanKindValue, SpansetFilter,
-    StatusValue, Value,
+    ArithOp, AttrScope, ComparisonOp, Field, FieldExpr, Intrinsic, Operand, SpanKindValue,
+    SpansetFilter, StatusValue, Value,
 };
 
 use crate::logql::escape;
@@ -131,6 +131,18 @@ pub enum ValuePred {
     Regex(String),
     /// `val_num <op> <n>` — numeric comparison (key-only scan).
     Num { op: ComparisonOp, value: f64 },
+    /// Key existence only — any value for the key satisfies it (issue #185
+    /// `existence.*`). Renders as the no-op `1` predicate so a matching
+    /// span is any span carrying the key (key-only `(key)` prefix scan).
+    KeyExists,
+    /// A pre-rendered boolean arithmetic predicate over `val_num` (issue
+    /// #185 `arith.*`): single-attribute arithmetic with literal
+    /// coefficients (e.g. `.duration_ms * 1000 > 5000` renders as
+    /// `(val_num * 1000) > 5000`) pushed column-side onto the numeric attr
+    /// column, like the metric path — not post-hydration. Built only from
+    /// `val_num`, numeric literals, and total operators (`+ - *`), so it
+    /// carries no user text and cannot diverge from the Rust evaluator.
+    NumExpr(String),
 }
 
 /// One distinct attribute-index membership read: the positive `(key
@@ -232,6 +244,27 @@ pub enum TraceCtxPred {
     TraceId { op: ComparisonOp, value: String },
 }
 
+/// A compiled arithmetic operand tree (issue #185 `arith.*`): numeric
+/// literals fold to `f64`; field operands (an attribute's `val_num`, or a
+/// numeric physical intrinsic) resolve engine-side per candidate span, so
+/// no per-row work reaches the client for constant subexpressions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArithNode {
+    /// A folded numeric literal (a number, or a duration in nanoseconds).
+    Value(f64),
+    /// A field operand resolved per span (`val_num` for an attribute, the
+    /// physical numeric column for `duration`/`status`/`kind`).
+    Operand(CompareOperand),
+    /// Unary negation.
+    Neg(Box<ArithNode>),
+    /// A binary arithmetic composition.
+    Bin {
+        op: ArithOp,
+        lhs: Box<ArithNode>,
+        rhs: Box<ArithNode>,
+    },
+}
+
 /// How Phase 2 evaluates one leaf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeafEval {
@@ -260,6 +293,14 @@ pub enum LeafEval {
         lhs: CompareOperand,
         rhs: CompareOperand,
         op: ComparisonOp,
+    },
+    /// An arithmetic comparison (issue #185 `arith.*`): both operand trees
+    /// resolve to a numeric value per candidate span and are compared
+    /// engine-side.
+    Arith {
+        lhs: ArithNode,
+        op: ComparisonOp,
+        rhs: ArithNode,
     },
 }
 
@@ -420,6 +461,11 @@ pub(crate) fn value_pred_sql(pred: &ValuePred) -> String {
             let sym = sql_op(*op).expect("numeric ops are ordering/equality by construction");
             format!("val_num {sym} {}", render_num(*value))
         }
+        // Key existence: any value satisfies it — the no-op `1` predicate
+        // leaves a pure `(key)` prefix scan (issue #185).
+        ValuePred::KeyExists => "1".to_string(),
+        // A pre-rendered `val_num` arithmetic predicate (issue #185).
+        ValuePred::NumExpr(sql) => sql.clone(),
     }
 }
 
@@ -1006,6 +1052,354 @@ fn compile_field_compare(
     })
 }
 
+/// Compiles an attribute-existence leaf (issue #185 `existence.*`): the
+/// span possesses the attribute key. Served by the scoped attribute index
+/// as a key-only `(key)` prefix scan (PREWHERE-eligible, granule-pruning).
+/// `resource.service.name` existence goes through the index like any other
+/// resource attribute (the writer indexes it). Intrinsic existence
+/// (`name`, `duration`, …) is always trivially true and out of scope — a
+/// clean `400`.
+fn compile_exists(field: &Field) -> Result<CompiledLeaf, PlanError> {
+    let (scope, key) = match field {
+        Field::Attribute { scope, key } => (*scope, key.clone()),
+        Field::Intrinsic(_) => {
+            return Err(PlanError::TypeMismatch(
+                "existence checks are only supported on attributes".to_string(),
+            ));
+        }
+    };
+    let probe = AttrProbe {
+        key,
+        scope: attr_scope_literal(scope),
+        pred: ValuePred::KeyExists,
+    };
+    let generator = LeafGenerator {
+        class: GenClass::AttrKeyScan,
+        table: GenTable::Attrs,
+        predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan),
+        prewhere: None,
+    };
+    Ok(CompiledLeaf {
+        generator,
+        eval: LeafEval::Attr {
+            probe,
+            negated: false,
+        },
+    })
+}
+
+/// Compiles an arithmetic operand tree (issue #185 `arith.*`): numeric
+/// literals fold, field operands resolve engine-side. A `Value` literal
+/// that is not numeric (string/bool/status/kind) is a type mismatch.
+fn compile_arith_node(operand: &Operand) -> Result<ArithNode, PlanError> {
+    match operand {
+        Operand::Literal(Value::Number(raw)) => Ok(ArithNode::Value(parse_num(raw)?)),
+        Operand::Literal(Value::Duration(d)) => Ok(ArithNode::Value(d.as_nanos() as f64)),
+        Operand::Literal(_) => Err(PlanError::TypeMismatch(
+            "arithmetic operands must be numeric (a number, duration, or numeric field)"
+                .to_string(),
+        )),
+        Operand::Field(field) => Ok(ArithNode::Operand(compare_operand(field)?)),
+        Operand::Neg(inner) => Ok(ArithNode::Neg(Box::new(compile_arith_node(inner)?))),
+        Operand::Arith { op, lhs, rhs } => Ok(ArithNode::Bin {
+            op: *op,
+            lhs: Box::new(compile_arith_node(lhs)?),
+            rhs: Box::new(compile_arith_node(rhs)?),
+        }),
+    }
+}
+
+/// Constant-folds an operand tree to a scalar when it references no field
+/// (all-literal subexpressions fold at plan time — no column work).
+/// Returns `None` when a field operand is present, or when a division /
+/// modulo by zero makes the fold undefined.
+fn fold_operand(operand: &Operand) -> Option<f64> {
+    match operand {
+        Operand::Literal(Value::Number(raw)) => raw.parse::<f64>().ok().filter(|n| n.is_finite()),
+        Operand::Literal(Value::Duration(d)) => Some(d.as_nanos() as f64),
+        Operand::Literal(_) => None,
+        Operand::Field(_) => None,
+        Operand::Neg(inner) => fold_operand(inner).map(|v| -v),
+        Operand::Arith { op, lhs, rhs } => {
+            let l = fold_operand(lhs)?;
+            let r = fold_operand(rhs)?;
+            apply_arith(*op, l, r)
+        }
+    }
+}
+
+/// Applies one arithmetic operator to two finite operands. A division or
+/// modulo by zero yields `None` (no match), never an infinity/NaN
+/// predicate.
+pub(crate) fn apply_arith(op: ArithOp, l: f64, r: f64) -> Option<f64> {
+    let v = match op {
+        ArithOp::Add => l + r,
+        ArithOp::Sub => l - r,
+        ArithOp::Mul => l * r,
+        ArithOp::Div => {
+            if r == 0.0 {
+                return None;
+            }
+            l / r
+        }
+        ArithOp::Mod => {
+            if r == 0.0 {
+                return None;
+            }
+            l % r
+        }
+        ArithOp::Pow => l.powf(r),
+    };
+    v.is_finite().then_some(v)
+}
+
+/// Compiles an arithmetic comparison leaf (issue #185 `arith.*`). A lone
+/// attribute compared with an all-literal folded scalar (the common probe
+/// form `{ .a = 1 + 2 }`) lowers to the ordinary numeric attribute leaf
+/// (`val_num` pushdown, index-served) — the literal fold erases the
+/// arithmetic. Any other shape (a field inside the arithmetic) keeps the
+/// operand trees and evaluates engine-side, pruning on a referenced
+/// attribute key when one exists.
+fn compile_field_arith(
+    lhs: &Operand,
+    op: ComparisonOp,
+    rhs: &Operand,
+) -> Result<CompiledLeaf, PlanError> {
+    if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
+        return Err(PlanError::TypeMismatch(
+            "arithmetic comparisons do not support regex operators".to_string(),
+        ));
+    }
+    // Fold `attr <op> <all-literal>` (and the mirror) to a numeric attr
+    // leaf so the common probe forms get the `val_num` pushdown + goldens
+    // of a plain numeric comparison.
+    if let Operand::Field(field @ Field::Attribute { .. }) = lhs
+        && let Some(n) = fold_operand(rhs)
+    {
+        return compile_leaf(field, op, &Value::Number(render_num(n)));
+    }
+    if let Operand::Field(field @ Field::Attribute { .. }) = rhs
+        && let Some(n) = fold_operand(lhs)
+    {
+        return compile_leaf(field, flip_comparison(op), &Value::Number(render_num(n)));
+    }
+    let lhs_node = compile_arith_node(lhs)?;
+    let rhs_node = compile_arith_node(rhs)?;
+
+    // Classify the operands across both sides.
+    let mut attrs: Vec<(String, Option<&'static str>)> = Vec::new();
+    let mut has_physical = false;
+    let mut has_string = false;
+    analyze_arith(&lhs_node, &mut attrs, &mut has_physical, &mut has_string);
+    analyze_arith(&rhs_node, &mut attrs, &mut has_physical, &mut has_string);
+    // Only total operators (`+ - *`) push column-side: `/ % ^` can produce
+    // a division-by-zero / NaN the Rust evaluator maps to no-match, so
+    // rendering them into SQL would diverge — those stay post-hydration.
+    let total = arith_is_total(&lhs_node) && arith_is_total(&rhs_node);
+
+    // Single-attribute arithmetic with literal coefficients → a column-side
+    // `val_num` predicate (the query-performance mandate): index-served,
+    // no per-row client work — like the metric path.
+    if total
+        && !has_string
+        && !has_physical
+        && attrs.len() == 1
+        && let Some(lhs_sql) = render_arith_sql(&lhs_node, &val_num_col)
+        && let Some(rhs_sql) = render_arith_sql(&rhs_node, &val_num_col)
+    {
+        let (key, scope) = attrs[0].clone();
+        // `!=` keeps the ratified absent-key rule: the positive (`=`) probe
+        // negated over the time-range superset (absent-key spans match).
+        let (pred_sql, negated) = if op == ComparisonOp::Neq {
+            (format!("{lhs_sql} = {rhs_sql}"), true)
+        } else {
+            let sym = sql_op(op).expect("arith comparison ops are the six by construction");
+            (format!("{lhs_sql} {sym} {rhs_sql}"), false)
+        };
+        let probe = AttrProbe {
+            key,
+            scope,
+            pred: ValuePred::NumExpr(pred_sql),
+        };
+        let generator = if negated {
+            LeafGenerator::time_range()
+        } else {
+            LeafGenerator {
+                class: GenClass::AttrKeyScan,
+                table: GenTable::Attrs,
+                predicate: attr_generator_predicate(&probe, GenClass::AttrKeyScan),
+                prewhere: None,
+            }
+        };
+        return Ok(CompiledLeaf {
+            generator,
+            eval: LeafEval::Attr { probe, negated },
+        });
+    }
+
+    // Single physical-intrinsic arithmetic (`duration * 2 > 1s`) → a
+    // column-side `SpanScan` predicate that prunes candidates; Phase 2
+    // confirms the same arithmetic in Rust over the hydrated span.
+    if total
+        && !has_string
+        && attrs.is_empty()
+        && has_physical
+        && let Some(lhs_sql) = render_arith_sql(&lhs_node, &physical_col)
+        && let Some(rhs_sql) = render_arith_sql(&rhs_node, &physical_col)
+    {
+        let sym = sql_op(op).expect("arith comparison ops are the six by construction");
+        return Ok(CompiledLeaf {
+            generator: LeafGenerator {
+                class: GenClass::SpanScan,
+                table: GenTable::Spans,
+                predicate: format!("{lhs_sql} {sym} {rhs_sql}"),
+                prewhere: None,
+            },
+            eval: LeafEval::Arith {
+                lhs: lhs_node,
+                op,
+                rhs: rhs_node,
+            },
+        });
+    }
+
+    // General case (genuinely cross-attribute `.a + .b`, mixed attr +
+    // intrinsic, or a non-total `/ % ^` operator): resolve both operand
+    // trees engine-side. Prune on the first referenced attribute key (an
+    // index-served superset) when one exists; else the time-range superset.
+    let generator = match first_attr_key(&lhs_node).or_else(|| first_attr_key(&rhs_node)) {
+        Some((key, scope)) => key_existence_generator(&key, scope),
+        None => LeafGenerator::time_range(),
+    };
+    Ok(CompiledLeaf {
+        generator,
+        eval: LeafEval::Arith {
+            lhs: lhs_node,
+            op,
+            rhs: rhs_node,
+        },
+    })
+}
+
+/// The `val_num` column for an attribute operand (single-attribute
+/// arithmetic pushdown, issue #185); non-attribute operands are not
+/// pushable to the attr index.
+fn val_num_col(operand: &CompareOperand) -> Option<&'static str> {
+    match operand {
+        CompareOperand::Attr { .. } => Some("val_num"),
+        _ => None,
+    }
+}
+
+/// The physical numeric column for an intrinsic operand (single-physical
+/// arithmetic pushdown, issue #185); attributes and string intrinsics are
+/// not pushable to the spans table.
+fn physical_col(operand: &CompareOperand) -> Option<&'static str> {
+    match operand {
+        CompareOperand::Duration => Some("duration_ns"),
+        CompareOperand::Status => Some("status_code"),
+        CompareOperand::Kind => Some("kind"),
+        CompareOperand::Name | CompareOperand::Service | CompareOperand::Attr { .. } => None,
+    }
+}
+
+/// Renders a total (`+ - *`) arithmetic operand tree to a ClickHouse
+/// expression, mapping field operands to columns via `col`. Returns `None`
+/// if any operand is not mappable (falls back to the Rust evaluator).
+fn render_arith_sql(
+    node: &ArithNode,
+    col: &impl Fn(&CompareOperand) -> Option<&'static str>,
+) -> Option<String> {
+    match node {
+        ArithNode::Value(v) => Some(render_num(*v)),
+        ArithNode::Operand(operand) => col(operand).map(str::to_string),
+        ArithNode::Neg(inner) => render_arith_sql(inner, col).map(|s| format!("-({s})")),
+        ArithNode::Bin { op, lhs, rhs } => {
+            let sym = match op {
+                ArithOp::Add => "+",
+                ArithOp::Sub => "-",
+                ArithOp::Mul => "*",
+                // Non-total ops never reach here (guarded by `arith_is_total`).
+                ArithOp::Div | ArithOp::Mod | ArithOp::Pow => return None,
+            };
+            let l = render_arith_sql(lhs, col)?;
+            let r = render_arith_sql(rhs, col)?;
+            Some(format!("({l} {sym} {r})"))
+        }
+    }
+}
+
+/// Collects the distinct attribute `(key, scope)` operands and flags
+/// whether any physical numeric intrinsic (`duration`/`status`/`kind`) or
+/// string operand (`name`/`resource.service.name`) is present in an
+/// arithmetic operand tree (issue #185 pushdown classification).
+fn analyze_arith(
+    node: &ArithNode,
+    attrs: &mut Vec<(String, Option<&'static str>)>,
+    has_physical: &mut bool,
+    has_string: &mut bool,
+) {
+    match node {
+        ArithNode::Value(_) => {}
+        ArithNode::Operand(operand) => match operand {
+            CompareOperand::Attr { key, scope } => {
+                let entry = (key.clone(), *scope);
+                if !attrs.contains(&entry) {
+                    attrs.push(entry);
+                }
+            }
+            CompareOperand::Duration | CompareOperand::Status | CompareOperand::Kind => {
+                *has_physical = true
+            }
+            CompareOperand::Name | CompareOperand::Service => *has_string = true,
+        },
+        ArithNode::Neg(inner) => analyze_arith(inner, attrs, has_physical, has_string),
+        ArithNode::Bin { lhs, rhs, .. } => {
+            analyze_arith(lhs, attrs, has_physical, has_string);
+            analyze_arith(rhs, attrs, has_physical, has_string);
+        }
+    }
+}
+
+/// Whether every binary operator in the tree is total (`+ - *`) — safe to
+/// render column-side (no division-by-zero / NaN that would diverge from
+/// the Rust evaluator). `/ % ^` are not total and stay post-hydration.
+fn arith_is_total(node: &ArithNode) -> bool {
+    match node {
+        ArithNode::Value(_) | ArithNode::Operand(_) => true,
+        ArithNode::Neg(inner) => arith_is_total(inner),
+        ArithNode::Bin { op, lhs, rhs } => {
+            matches!(op, ArithOp::Add | ArithOp::Sub | ArithOp::Mul)
+                && arith_is_total(lhs)
+                && arith_is_total(rhs)
+        }
+    }
+}
+
+/// The first attribute `(key, scope)` referenced in an operand tree (for
+/// the key-existence pruning generator).
+fn first_attr_key(node: &ArithNode) -> Option<(String, Option<&'static str>)> {
+    match node {
+        ArithNode::Operand(CompareOperand::Attr { key, scope }) => Some((key.clone(), *scope)),
+        ArithNode::Operand(_) | ArithNode::Value(_) => None,
+        ArithNode::Neg(inner) => first_attr_key(inner),
+        ArithNode::Bin { lhs, rhs, .. } => first_attr_key(lhs).or_else(|| first_attr_key(rhs)),
+    }
+}
+
+/// Reflects a comparison operator across its operands (`a < b` ⇒ `b > a`)
+/// so a folded `<scalar> <op> <attr>` becomes an `<attr>`-first numeric
+/// leaf. Equality/inequality are symmetric.
+fn flip_comparison(op: ComparisonOp) -> ComparisonOp {
+    match op {
+        ComparisonOp::Gt => ComparisonOp::Lt,
+        ComparisonOp::Gte => ComparisonOp::Lte,
+        ComparisonOp::Lt => ComparisonOp::Gt,
+        ComparisonOp::Lte => ComparisonOp::Gte,
+        other => other,
+    }
+}
+
 /// `name`/`status`/`kind` generators: no selective index — a bounded
 /// time-window span scan with the predicate applied (complete over the
 /// window; the scan budget bounds its cost — docs/schemas.md §4.2).
@@ -1067,6 +1461,23 @@ fn collect(
         // time-range superset when both are physical intrinsics).
         FieldExpr::FieldCompare { lhs, op, rhs } => {
             let leaf = compile_field_compare(lhs, *op, rhs)?;
+            let generator = leaf.generator.clone();
+            leaves.push(leaf);
+            Ok(vec![generator])
+        }
+        // Attribute existence (issue #185): one leaf, one index-served
+        // key-only generator.
+        FieldExpr::Exists(field) => {
+            let leaf = compile_exists(field)?;
+            let generator = leaf.generator.clone();
+            leaves.push(leaf);
+            Ok(vec![generator])
+        }
+        // An arithmetic comparison (issue #185): one leaf, one generator
+        // (a numeric attr scan for the folded probe form, else the
+        // key-existence / time-range superset).
+        FieldExpr::ArithCompare { lhs, op, rhs } => {
+            let leaf = compile_field_arith(lhs, *op, rhs)?;
             let generator = leaf.generator.clone();
             leaves.push(leaf);
             Ok(vec![generator])
@@ -1550,6 +1961,153 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, PlanError::TypeMismatch(_)), "{intrinsic:?}");
         }
+    }
+
+    // -- issue #185: existence + arithmetic --------------------------------
+
+    #[test]
+    fn attribute_existence_compiles_to_a_key_only_index_scan() {
+        // `.a != nil` / bare `.a` — present ⇒ key-only AttrKeyScan.
+        for q in [r#"{ .a != nil }"#, r#"{ .a }"#] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+            assert_eq!(compiled.generators[0].predicate, "key = 'a' AND 1");
+            match &compiled.leaves[0].eval {
+                LeafEval::Attr { probe, negated } => {
+                    assert_eq!(probe.pred, ValuePred::KeyExists);
+                    assert!(!negated, "{q}");
+                }
+                other => panic!("{q}: expected an attr existence eval, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn absent_attribute_existence_is_the_negated_time_range_form() {
+        // `.a = nil` ⇒ absence ⇒ `Not(Exists)`: the inner existence leaf is
+        // a positive key-existence probe (the `Not` negates it at eval
+        // time), and negation forces the time-range superset generator.
+        let compiled = compile_span_filter(&first_filter(r#"{ .a = nil }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::TimeRange);
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert_eq!(probe.pred, ValuePred::KeyExists);
+                assert!(!negated, "the inner existence probe stays positive");
+            }
+            other => panic!("expected an attr existence eval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scoped_service_name_existence_uses_the_resource_scoped_index() {
+        let compiled =
+            compile_span_filter(&first_filter(r#"{ resource.service.name != nil }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'service.name' AND 1 AND scope = 'resource'"
+        );
+    }
+
+    #[test]
+    fn intrinsic_existence_is_a_type_mismatch() {
+        let err = compile_exists(&Field::Intrinsic(Intrinsic::Name)).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)));
+    }
+
+    #[test]
+    fn all_literal_arithmetic_folds_to_a_numeric_attr_leaf() {
+        // `{ .a = 1 + 2 }` ≡ `{ .a = 3 }`: a folded numeric attr leaf with
+        // the `val_num = 3` key-scan pushdown of a plain numeric comparison.
+        for (q, sql) in [
+            (r#"{ .a = 1 + 2 }"#, "key = 'a' AND val_num = 3"),
+            (r#"{ .a = 2 * 3 }"#, "key = 'a' AND val_num = 6"),
+            (r#"{ .a = 5 % 2 }"#, "key = 'a' AND val_num = 1"),
+            (r#"{ .a = 2 ^ 3 }"#, "key = 'a' AND val_num = 8"),
+            (r#"{ .a = -1 }"#, "key = 'a' AND val_num = -1"),
+        ] {
+            let compiled = compile_span_filter(&first_filter(q)).unwrap();
+            assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan, "{q}");
+            assert_eq!(compiled.generators[0].predicate, sql, "{q}");
+        }
+    }
+
+    #[test]
+    fn single_attribute_arithmetic_pushes_to_a_val_num_column_predicate() {
+        // `{ .duration_ms * 1000 > 5000 }` (issue #185): ONE attr with
+        // literal coefficients → a column-side `val_num` predicate on the
+        // attr index (index-served, no per-row client work), NOT a Rust
+        // post-hydration Arith leaf.
+        let compiled =
+            compile_span_filter(&first_filter(r#"{ .duration_ms * 1000 > 5000 }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'duration_ms' AND (val_num * 1000) > 5000"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert_eq!(
+                    probe.pred,
+                    ValuePred::NumExpr("(val_num * 1000) > 5000".to_string())
+                );
+                assert!(!negated);
+            }
+            other => panic!("expected a pushed val_num attr leaf, got {other:?}"),
+        }
+        // `!=` keeps the absent-key rule: positive `=` probe, negated over
+        // the time-range superset.
+        let neq = compile_span_filter(&first_filter(r#"{ .duration_ms * 1000 != 5000 }"#)).unwrap();
+        assert_eq!(neq.generators[0].class, GenClass::TimeRange);
+        match &neq.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert_eq!(
+                    probe.pred,
+                    ValuePred::NumExpr("(val_num * 1000) = 5000".to_string())
+                );
+                assert!(*negated);
+            }
+            other => panic!("expected a negated val_num attr leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_physical_intrinsic_arithmetic_pushes_to_a_span_scan_predicate() {
+        // `{ duration * 2 > 1s }` (issue #185): one physical intrinsic with
+        // literal coefficients → a column-side `SpanScan` predicate that
+        // prunes candidates; Phase 2 confirms the same arithmetic in Rust.
+        let compiled = compile_span_filter(&first_filter(r#"{ duration * 2 > 1s }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::SpanScan);
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "(duration_ns * 2) > 1000000000"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Arith { op, .. } => assert_eq!(*op, ComparisonOp::Gt),
+            other => panic!("expected an Arith leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_total_division_arithmetic_stays_post_hydration() {
+        // `{ .a / 2 > 5 }`: division can divide by zero (Rust ⇒ no match),
+        // so it is NOT pushed column-side — it stays an engine-side Arith
+        // leaf pruning on the attr key.
+        let compiled = compile_span_filter(&first_filter(r#"{ .a / 2 > 5 }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+        assert!(compiled.generators[0].predicate.contains("key = 'a'"));
+        assert!(matches!(compiled.leaves[0].eval, LeafEval::Arith { .. }));
+    }
+
+    #[test]
+    fn cross_attribute_arithmetic_prunes_on_a_referenced_attribute_key() {
+        // `{ .a * 2 = span.b }`: two distinct attributes cannot resolve to a
+        // single attr-index row, so it stays a Rust Arith leaf pruning on
+        // the first attribute key (an index-served superset).
+        let compiled = compile_span_filter(&first_filter(r#"{ .a * 2 = span.b }"#)).unwrap();
+        assert_eq!(compiled.generators[0].class, GenClass::AttrKeyScan);
+        assert!(compiled.generators[0].predicate.contains("key = 'a'"));
+        assert!(matches!(compiled.leaves[0].eval, LeafEval::Arith { .. }));
     }
 
     #[test]

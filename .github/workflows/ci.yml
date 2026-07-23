@@ -208,16 +208,19 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: cargo test -p pulsus-read --test traces_point_read
 
-      # Issue #180 (M7-TQ1): env-gated black-box TraceQL differential leg.
-      # Boots an UNMODIFIED, digest-pinned grafana/tempo v3.0.2 as a language
-      # oracle and replays the corpus + registry interim probes, observing
-      # only the HTTP status (2xx accept vs 400 reject) — no Tempo source is
-      # copied or vendored. The hermetic `ci` job runs the same test with the
-      # gate off (PULSUSDB_TEMPO_DIFF_URL unset), where it skips cleanly.
+      # Issue #180/#185 (M7-TQ1/TQ6): the black-box TraceQL differential
+      # oracle. ONE UNMODIFIED, digest-pinned grafana/tempo v3.0.2 serves
+      # BOTH the syntax leg (observes only HTTP status) and the compare()
+      # VALUE leg (issue #185/#189). The augmented `tempo-compare.yaml`
+      # config adds the OTLP HTTP receiver (:4318) + the local-blocks
+      # metrics processor with aggressive ingest flush so freshly-pushed
+      # spans become compare()-queryable within the test's bounded poll —
+      # without affecting the syntax leg. No Tempo source is copied. The
+      # hermetic `ci` job runs both tests with their gates off, skipping.
       - name: Start Tempo v3.0.2 (differential oracle)
         run: |
-          docker run -d --name pulsus-tempo-diff -p 13200:3200 \
-            -v "$GITHUB_WORKSPACE"/ci/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro \
+          docker run -d --name pulsus-tempo-diff -p 13200:3200 -p 4318:4318 \
+            -v "$GITHUB_WORKSPACE"/ci/tempo/tempo-compare.yaml:/etc/tempo/tempo.yaml:ro \
             grafana/tempo@sha256:aa8df8d069f77b82e978464daf55169bb8d135852ad58700aa96880653c3d8f7 \
             -config.file=/etc/tempo/tempo.yaml
           for _ in $(seq 1 40); do
@@ -226,10 +229,23 @@ jobs:
           done
           curl -sf http://localhost:13200/ready
 
-      - name: TraceQL Tempo differential leg
+      - name: TraceQL Tempo differential leg (syntax)
         env:
           PULSUSDB_TEMPO_DIFF_URL: "http://localhost:13200"
         run: cargo test -p pulsus-traceql --test tempo_differential
+
+      # Issue #185/#189 (M7-TQ6): the compare() VALUE differential, ENFORCED
+      # (non-skipped). Pushes fixture OTLP spans to the reference's :4318
+      # receiver, waits for them to become metrics-queryable, then asserts
+      # byte-parity of compare()'s statusMessage / rootName / rootServiceName
+      # values against PulsusDB (over this job's ClickHouse 24.8 on 19123).
+      - name: TraceQL Tempo differential leg (compare values)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_COMPARE_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_COMPARE_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test compare_value_differential
 
       - name: Stop Tempo differential oracle
         if: always()

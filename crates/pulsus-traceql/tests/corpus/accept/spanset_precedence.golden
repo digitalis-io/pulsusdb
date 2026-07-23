@@ -54,4 +54,5 @@ Query {
         },
     },
     pipeline: [],
+    hints: [],
 }

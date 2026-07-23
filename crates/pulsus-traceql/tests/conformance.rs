@@ -37,10 +37,17 @@ use sha2::{Digest, Sha256};
 
 use pulsus_traceql::{TraceQlError, parse};
 
-// #179 is the epic that provisionally owns the 15 event/link/instrumentation/
-// parent/existence constructs re-homed off #184 (issue #184, Plan v7 Δ2)
-// pending the owner's dedicated split-issue ruling.
-const VALID_ISSUES: [u64; 5] = [179, 181, 182, 183, 184];
+// #192 owns the 9 schema-blocked event/link/instrumentation-scope
+// constructs (the residual interim set after the M7-TQ6 closeout, issue
+// #185). Every interim disposition must name it; a construct owned by a
+// now-closed sub-issue (179/181–184) is RED. The closeout gate
+// (`interim_entries_are_allowlisted`) is the forcing function that drives
+// the interim set to zero once #192 lands.
+const VALID_ISSUES: [u64; 1] = [192];
+// The committed open-issue allowlist the strict closeout gate enforces:
+// every interim entry's owning_issue must be in it (auto-tightening to
+// `interim_count == 0` when #192 flips its 9 to `supported`).
+const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[192];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/tempo/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 
@@ -112,6 +119,12 @@ enum Status {
     Supported,
     InterimNamed,
     InterimGeneric,
+    /// We reject the construct AND the pinned reference rejects it — parity,
+    /// not a compatibility gap (issue #185). Requires the probe to error
+    /// (Named|Generic); the live differential separately confirms the
+    /// reference also rejects. An oracle flip to Accept turns it into an
+    /// unescalated divergence ⇒ RED.
+    RejectParity,
     Divergence,
 }
 
@@ -292,6 +305,17 @@ fn check_status(d: &Disposition, probe: &str) -> Result<(), String> {
                 )),
             }
         }
+        // Reject-parity: we reject the probe (a named boundary or a generic
+        // error) AND the reference rejects it. It is NOT a compat gap, so it
+        // needs no owning issue; the live differential enforces that the
+        // reference still rejects.
+        Status::RejectParity => match class {
+            ProbeClass::Named(_) | ProbeClass::Generic => Ok(()),
+            ProbeClass::Parses => Err(format!(
+                "{}: reject-parity but probe {probe:?} now parses (we no longer reject it)",
+                d.construct
+            )),
+        },
         Status::Divergence => check_divergence(d),
     }
 }
@@ -459,7 +483,7 @@ fn evidence_pointers_resolve_and_reproduce_their_class() {
                     "{}: interim-named evidence {ev:?} must be an unsupported/ NotYetSupported case, got {outcome:?}",
                     d.construct
                 ),
-                Status::InterimGeneric | Status::Divergence => {}
+                Status::InterimGeneric | Status::RejectParity | Status::Divergence => {}
             }
         }
     }
@@ -471,7 +495,34 @@ fn interim_disposition_count_is_pinned() {
     assert_eq!(
         interim_count(&disp.entries),
         disp.interim_count_pin,
-        "interim_count_pin drift — a status flip must re-pin it (T2–T5 lower it; #185 -> 0)"
+        "interim_count_pin drift — a status flip must re-pin it (#185 lowers it to 9; #192 -> 0)"
+    );
+}
+
+/// The strict closeout gate (issue #185): every interim entry must be owned
+/// by an OPEN issue in the committed allowlist. An interim owned by a
+/// now-closed sub-issue (179/181–184) is RED — the forcing function that
+/// made #185 finish the 19 language-complete constructs. When #192 flips
+/// its 9 to `supported`, the interim set empties and this passes at
+/// `interim_count == 0` with no #185-side edit.
+#[test]
+fn interim_entries_are_allowlisted() {
+    let disp = load_dispositions();
+    let stray: Vec<String> = disp
+        .entries
+        .iter()
+        .filter(|d| matches!(d.status, Status::InterimNamed | Status::InterimGeneric))
+        .filter(|d| {
+            d.owning_issue
+                .map(|i| !CLOSEOUT_INTERIM_ALLOWLIST.contains(&i))
+                .unwrap_or(true)
+        })
+        .map(|d| format!("{} (owning_issue {:?})", d.construct, d.owning_issue))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "interim dispositions not owned by an allowlisted open issue \
+         {CLOSEOUT_INTERIM_ALLOWLIST:?}: {stray:?}"
     );
 }
 
@@ -481,11 +532,17 @@ fn differential_categories_are_pinned() {
     let mut supported = 0usize;
     let mut tracked_interim = 0usize; // interim ∧ Tempo accepts (a real gap)
     let mut both_reject = 0usize; // interim ∧ Tempo rejects (agreement)
+    let mut reject_parity = 0usize; // reject-parity ∧ Tempo rejects (agreement)
     let mut unescalated_divergence = Vec::new(); // supported ∧ Tempo rejects
+    let mut oracle_flipped_reject_parity = Vec::new(); // reject-parity ∧ Tempo accepts
     for d in &disp.entries {
         match (d.status, d.tempo) {
             (Status::Supported, Tempo::Accept) => supported += 1,
             (Status::Supported, Tempo::Reject) => unescalated_divergence.push(&d.construct),
+            (Status::RejectParity, Tempo::Reject) => reject_parity += 1,
+            (Status::RejectParity, Tempo::Accept) => {
+                oracle_flipped_reject_parity.push(&d.construct)
+            }
             (Status::Divergence, _) => {}
             (_, Tempo::Accept) => tracked_interim += 1,
             (_, Tempo::Reject) => both_reject += 1,
@@ -493,21 +550,38 @@ fn differential_categories_are_pinned() {
     }
     // A `supported` construct Tempo rejects would be an unrecorded
     // divergence (we are more permissive than the oracle) — never allowed
-    // to slip in silently at T1.
+    // to slip in silently.
     assert!(
         unescalated_divergence.is_empty(),
         "supported constructs Tempo rejects (unescalated divergences): {unescalated_divergence:?}"
     );
-    // Exact pins — every T2–T5 landing flips a tracked gap to `supported`
-    // and must re-pin these deliberately.
-    assert_eq!(supported, 88, "supported (both-accept agreement) count pin");
+    // A reject-parity construct the oracle now ACCEPTS is an unescalated
+    // divergence in the other direction (we reject, the reference does not).
+    assert!(
+        oracle_flipped_reject_parity.is_empty(),
+        "reject-parity constructs the reference now accepts (unescalated divergences): \
+         {oracle_flipped_reject_parity:?}"
+    );
+    // Exact pins — the M7-TQ6 closeout (issue #185) flips 15 tracked gaps
+    // to `supported` (88 → 103), moves the 4 both-reject constructs into
+    // the new reject-parity bucket (both_reject 4 → 0, reject_parity = 4),
+    // and leaves the 9 schema-blocked Cat-C constructs as the residual
+    // tracked interim (24 → 9).
     assert_eq!(
-        tracked_interim, 24,
+        supported, 103,
+        "supported (both-accept agreement) count pin"
+    );
+    assert_eq!(
+        tracked_interim, 9,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(
-        both_reject, 4,
+        both_reject, 0,
         "both-reject agreement count pin (interim ∧ Tempo rejects)"
+    );
+    assert_eq!(
+        reject_parity, 4,
+        "reject-parity count pin (reject-parity ∧ Tempo rejects)"
     );
 
     // Every tracked interim gap must name an owning sub-issue and cite a
@@ -681,18 +755,21 @@ fn interim_generic_without_owning_issue_is_red() {
 #[test]
 fn interim_named_mislabelled_as_generic_is_red() {
     // A probe that names a boundary cannot be dispositioned interim-generic.
+    // `{ .foo }` now parses (existence, issue #185), so the fixture probes a
+    // still-named boundary (`parent scope`) and is owned by the allowlisted
+    // #192.
     let d = Disposition {
         construct: "fixture.named-as-generic".to_string(),
         status: Status::InterimGeneric,
         tempo: Tempo::Accept,
         error_construct: None,
         evidence: vec![],
-        owning_issue: Some(183),
+        owning_issue: Some(192),
         justification: None,
         oracle_citation: None,
         owner_escalation: None,
     };
-    assert!(check_status(&d, "{ .foo }").is_err());
+    assert!(check_status(&d, r#"{ parent.foo = "x" }"#).is_err());
 }
 
 #[test]

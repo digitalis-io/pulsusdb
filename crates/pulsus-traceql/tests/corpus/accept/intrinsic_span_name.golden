@@ -15,4 +15,5 @@ Query {
         },
     ),
     pipeline: [],
+    hints: [],
 }

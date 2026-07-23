@@ -190,13 +190,15 @@ fn accept_cases_round_trip_through_display() {
 /// Every token kind reachable by the accepted grammar (M4 + the issue
 /// #172 structural operators `>>`/`~`; `>` was already reachable as a
 /// comparison; issue #183 adds `<<` (Shl), `!` (Bang, negated structural +
-/// `logic.not`) and `&` (Amp, union structural)). Boundary-only tokens
-/// (`+`, `-`, `*`, `/`, `[`, `]`) are deliberately absent: they never
-/// appear in an accept case.
+/// `logic.not`) and `&` (Amp, union structural); issue #185 adds the
+/// arithmetic operators `+ - * / % ^` (`Plus`/`Minus`/`Star`/`Slash`/
+/// `Percent`/`Caret`) and the bracketed-attribute delimiters `[ ]`
+/// (`LBracket`/`RBracket`), all now grammar-reachable in accept cases).
 const EXPECTED_ACCEPT_TOKENS: &[&str] = &[
-    "LBrace", "RBrace", "LParen", "RParen", "Comma", "Dot", "Colon", "Eq", "Neq", "Re", "Nre",
-    "Gt", "Gte", "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Shl", "Tilde", "Bang", "Amp",
-    "Ident", "String", "Duration", "Number", "Eof",
+    "LBrace", "RBrace", "LParen", "RParen", "LBracket", "RBracket", "Comma", "Dot", "Colon", "Eq",
+    "Neq", "Re", "Nre", "Gt", "Gte", "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Shl", "Tilde",
+    "Bang", "Amp", "Plus", "Minus", "Star", "Slash", "Percent", "Caret", "Ident", "String",
+    "Duration", "Number", "Eof",
 ];
 
 /// Exhaustive by construction: adding a `TokenKind` variant fails to
@@ -233,6 +235,8 @@ fn kind_name(kind: &TokenKind) -> &'static str {
         TokenKind::Minus => "Minus",
         TokenKind::Star => "Star",
         TokenKind::Slash => "Slash",
+        TokenKind::Percent => "Percent",
+        TokenKind::Caret => "Caret",
         TokenKind::Ident(_) => "Ident",
         TokenKind::String(_) => "String",
         TokenKind::Duration(_) => "Duration",
@@ -373,6 +377,10 @@ fn collect_field_comparisons<'q>(expr: &'q FieldExpr, out: &mut Vec<(&'q Field, 
         FieldExpr::Comparison { field, op, .. } => out.push((field, *op)),
         FieldExpr::FieldCompare { lhs, op, .. } => out.push((lhs, *op)),
         FieldExpr::BoolStatic(_) => {}
+        // Existence (`{ .foo }`) and arithmetic comparisons (issue #185)
+        // are not the field-vs-literal/field pairs the dual-role token
+        // gates reason about, so they contribute nothing here.
+        FieldExpr::Exists(_) | FieldExpr::ArithCompare { .. } => {}
         FieldExpr::Not(inner) => collect_field_comparisons(inner, out),
         FieldExpr::Binary { lhs, rhs, .. } => {
             collect_field_comparisons(lhs, out);
