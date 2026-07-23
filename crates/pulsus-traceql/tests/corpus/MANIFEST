@@ -54,6 +54,8 @@ accept/structural_pipeline
 accept/structural_precedence
 accept/structural_shr
 accept/structural_tilde
+grafana/explore_root_rate_by_service
+grafana/explore_root_rate_sample
 reject/aggregate_empty
 reject/aggregate_non_numeric
 reject/attr_bare_keyword_value

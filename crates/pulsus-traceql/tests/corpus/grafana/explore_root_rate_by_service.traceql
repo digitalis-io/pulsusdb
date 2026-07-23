@@ -1,0 +1,1 @@
+{nestedSetParent<0 && true && resource.service.name != nil} | rate() by(resource.service.name)

@@ -28,7 +28,7 @@ use pulsus_traceql::{
     PipelineStage, Query, SpansetExpr, StructuralOp, TokenKind, TraceQlError, parse,
 };
 
-const SUBDIRS: [&str; 3] = ["accept", "reject", "unsupported"];
+const SUBDIRS: [&str; 4] = ["accept", "reject", "unsupported", "grafana"];
 
 fn corpus_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -148,6 +148,15 @@ fn every_case_reproduces_its_pinned_golden() {
                 matches!(outcome, Err(TraceQlError::NotYetSupported { .. })),
                 "{case} must be NotYetSupported, got {outcome:?}"
             );
+        } else if case.starts_with("grafana/") {
+            // Observed real-Grafana queries (issue #180): the outcome class
+            // is intentionally NOT constrained here — a `grafana/` case may
+            // parse `Ok`, hit a named `NotYetSupported` boundary, or (today)
+            // surface a generic error at an unregistered construct. The
+            // golden pins whatever it is; the *class invariant* (generic
+            // failures must be ledgered and monotonically shrink) needs the
+            // JSON ledger and lives in `tests/conformance.rs`, keeping this
+            // file std-only.
         } else {
             assert!(
                 matches!(

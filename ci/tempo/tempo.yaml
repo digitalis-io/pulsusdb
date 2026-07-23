@@ -1,0 +1,25 @@
+# Minimal single-binary Tempo config used ONLY as a black-box TraceQL
+# syntax oracle for the env-gated differential leg
+# (crates/pulsus-traceql/tests/tempo_differential.rs, issue #180).
+#
+# It stores nothing meaningful and serves no production role: the leg sends
+# TraceQL query strings to the read APIs and observes only the HTTP status
+# (2xx accept vs 400 reject). No Tempo source is copied — this is pure
+# runtime use of the unmodified upstream image.
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+# Allow unbounded TraceQL-metrics query windows so a syntactically valid
+# metrics query answers (empty) instead of being rejected on range limits.
+query_frontend:
+  metrics:
+    max_duration: 0s

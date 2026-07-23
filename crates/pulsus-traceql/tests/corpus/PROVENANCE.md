@@ -15,6 +15,32 @@ subset). Three case classes:
   These cases map one-to-one onto the frozen registry
   `pulsus_traceql::BOUNDARY_CONSTRUCTS` — both directions are asserted
   mechanically by `tests/corpus.rs`, so scope drift either way fails CI.
+- `grafana/<case>.traceql` — a real, observed Grafana-emitted TraceQL
+  query (issue #180), captured like an observed HTTP request. Its `.golden`
+  pins today's outcome, whatever it is — `Ok`, a named `NotYetSupported`
+  boundary, or (today) a generic error at an unregistered construct. The
+  outcome class is intentionally *unconstrained* by `tests/corpus.rs` (the
+  golden-match still applies); the class invariant for these cases —
+  generic failures must be recorded in `tests/conformance/replay-ledger.json`
+  and that ledger only ever shrinks — lives in `tests/conformance.rs`,
+  keeping `corpus.rs` std-only. These queries are observed *inputs*, never
+  lifted from any upstream test file (see `tests/conformance/PROVENANCE.md`
+  for the clean-room statement).
+
+### `grafana/` capture provenance
+
+Each `grafana/` case is captured from a real Grafana request; record its
+provenance in this file when adding one:
+
+- `explore_root_rate_by_service` — Grafana Explore Traces "Rate by service"
+  root-span panel; the `nestedSetParent<0` root-filter idiom Grafana emits
+  for root-only rate series, grouped `by(resource.service.name)`.
+- `explore_root_rate_sample` — the same root-rate idiom with the
+  `with(sample=true)` query hint Grafana appends when sampling is enabled.
+
+Both hit `nestedSetParent` (a nested-set intrinsic, #181) before any named
+boundary, so today they can only surface a generic parser error; both are
+ledgered in `replay-ledger.json` with `owning_issues` {181, 182}.
 
 `MANIFEST` is the declared newline list of every `<class>/<stem>`;
 `tests/corpus.rs` compares it against `read_dir` output before any case
