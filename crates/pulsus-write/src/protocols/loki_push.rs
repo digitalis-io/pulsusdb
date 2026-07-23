@@ -51,6 +51,7 @@ use pulsus_model::{Date, Fingerprint, LabelSet, UnixNano, stream_fingerprint};
 
 use crate::error::LogsIngestError;
 use crate::protocols::otlp_logs::{LogRow, ParsedLogs, StreamRow};
+use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 
 /// `logproto.PushRequest`: `streams` at tag 1.
 ///
@@ -175,9 +176,15 @@ impl prost::Message for PushRequest {
         // the caller's pre-existing streams (data loss). Restoring first gives
         // prost-consistent partial-merge semantics: on error, self keeps its
         // pre-existing streams plus whatever decoded before the failure point.
+        let streams = std::mem::take(&mut self.streams);
+        // Seed `decoded_bytes` with the SAME shared re-sum the deferred
+        // `decode_protobuf` byte check uses (issue #168), so a merge INTO an
+        // existing request charges the pre-existing materialization too — no
+        // budget bypass through repeated raw merges.
         let mut bounded = BoundedPushRequest {
-            total_entries: self.streams.iter().map(|s| s.entries.len()).sum(),
-            streams: std::mem::take(&mut self.streams),
+            total_entries: streams.iter().map(|s| s.entries.len()).sum(),
+            decoded_bytes: decoded_push_request_bytes(&streams),
+            streams,
         };
         let result = bounded.merge(buf);
         self.streams = bounded.streams;
@@ -195,9 +202,11 @@ impl prost::Message for PushRequest {
         // `self` on BOTH Ok and Err before propagating, so a decode error never
         // empties the caller's pre-existing streams (prost partial-merge
         // semantics).
+        let streams = std::mem::take(&mut self.streams);
         let mut bounded = BoundedPushRequest {
-            total_entries: self.streams.iter().map(|s| s.entries.len()).sum(),
-            streams: std::mem::take(&mut self.streams),
+            total_entries: streams.iter().map(|s| s.entries.len()).sum(),
+            decoded_bytes: decoded_push_request_bytes(&streams),
+            streams,
         };
         let result = bounded.merge_length_delimited(buf);
         self.streams = bounded.streams;
@@ -223,6 +232,22 @@ impl prost::Message for PushRequest {
 ///    re-sum in [`decode_protobuf`] then rejects the whole request. This closes
 ///    the second-amplification the per-dimension caps cannot catch: many streams
 ///    each under [`MAX_ENTRIES_PER_STREAM`] but collectively over the aggregate.
+/// 3. A transient `decoded_bytes` accumulator (issue #168) estimates the BYTES
+///    the materialized elements cost — `size_of::<StreamAdapter>()` per stream
+///    (charged at the tag-1 boundary) plus `size_of::<EntryAdapter>()` +
+///    `structured_metadata.len() × size_of::<LabelPairAdapter>()` per entry
+///    (charged incrementally per entry DURING each stream's decode via
+///    [`Self::merge_one_stream`]). The element-COUNT caps bound how many
+///    elements decode, not how much memory: a minimal 2-wire-byte empty
+///    structured-metadata pair materializes ~48 heap bytes, so one crafted
+///    stream's 100k-entry × 257-pair fan-out (~1.2 GiB) would materialize inside
+///    ONE tag-1 field before any between-stream boundary check ran (the #140
+///    geometry) — hence the per-entry interposer, not a stream-boundary-only
+///    charge. Once the estimate exceeds the shared
+///    [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget (256 MiB),
+///    further entries / streams are drained without materializing, and the
+///    deferred byte re-sum in [`decode_protobuf`] rejects the whole request with
+///    the family-wide `"decoded bytes (estimated)"` field.
 ///
 /// Kept separate from [`PushRequest`] so the value type carries no decode-scratch
 /// field and preserves derived round-trip equality — the sanctioned alternative
@@ -231,12 +256,127 @@ impl prost::Message for PushRequest {
 struct BoundedPushRequest {
     streams: Vec<StreamAdapter>,
     total_entries: usize,
+    decoded_bytes: usize,
+}
+
+/// Estimated decoded bytes of ONE entry (issue #168): the `EntryAdapter` struct
+/// itself plus its retained structured-metadata pairs — `size_of`-derived, no
+/// magic numbers, exactly what the decoder materializes. The `Option<Timestamp>`
+/// and `line` `String` are inline in the entry's `size_of`; the string CONTENT
+/// is uncharged (bounded by the 64 MiB decompressed body cap, the #127 scalar
+/// ruling). The containing stream's shell is charged separately (at the tag-1
+/// boundary), so the two never double count.
+fn decoded_entry_bytes(entry: &EntryAdapter) -> usize {
+    std::mem::size_of::<EntryAdapter>().saturating_add(
+        entry
+            .structured_metadata
+            .len()
+            .saturating_mul(std::mem::size_of::<LabelPairAdapter>()),
+    )
+}
+
+/// Re-sums the whole request's decoded-byte estimate from materialized data —
+/// the SAME function of the materialized content as the incremental
+/// `decoded_bytes` charges, so the deferred [`decode_protobuf`] re-check and the
+/// decode-time drain can never disagree (a drained request always re-sums past
+/// the budget), and a merge INTO an existing request seeds the pre-existing
+/// fan-out too (issue #168, no budget bypass via repeated raw merges).
+fn decoded_push_request_bytes(streams: &[StreamAdapter]) -> usize {
+    let mut total = 0usize;
+    for stream in streams {
+        total = total.saturating_add(std::mem::size_of::<StreamAdapter>());
+        for entry in &stream.entries {
+            total = total.saturating_add(decoded_entry_bytes(entry));
+        }
+    }
+    total
+}
+
+impl BoundedPushRequest {
+    /// Decodes ONE `StreamAdapter` submessage (a `PushRequest` tag-1 field
+    /// occurrence) while charging the request-wide `decoded_bytes` estimate
+    /// **incrementally, per decoded entry** (issue #168) — the byte analog of
+    /// [`crate::protocols::remote_write::BoundedWriteRequest`]'s
+    /// `merge_one_time_series`: one crafted stream's per-entry fan-out
+    /// (100k entries × 257 structured-metadata pairs ≈ 1.2 GiB of structs)
+    /// exceeds the 256 MiB budget on its own, so a stream-boundary-only charge
+    /// would let that ONE stream fully materialize before any check ran.
+    ///
+    /// Structurally this replicates `prost::encoding::message::merge` for the
+    /// submessage (a [`prost::encoding::merge_loop`] over `decode_key` +
+    /// `merge_field`), but interposes on tag 2: once the running `decoded_bytes`
+    /// (or the per-stream entry count) exceeds its cap, further entries in THIS
+    /// stream are drained without materializing — bounding the over-step to one
+    /// entry (`≈ 12.4 KiB`) — and the deferred [`decode_protobuf`] byte re-sum
+    /// then rejects the whole request. All other tags delegate to
+    /// [`StreamAdapter::merge_field`] (which keeps the per-stream entry-count
+    /// drain). The scratch total commits back to `self` only on `Ok`; on a
+    /// decode error the whole request fails anyway.
+    fn merge_one_stream(
+        &mut self,
+        wire_type: prost::encoding::WireType,
+        buf: &mut impl bytes::Buf,
+        ctx: prost::encoding::DecodeContext,
+    ) -> Result<(), prost::DecodeError> {
+        prost::encoding::check_wire_type(prost::encoding::WireType::LengthDelimited, wire_type)?;
+        // (StreamAdapter under construction, decoded_bytes) — one tuple so
+        // `merge_loop` can thread the running byte total through its single
+        // `&mut T`.
+        let mut scratch = (StreamAdapter::default(), self.decoded_bytes);
+        prost::encoding::merge_loop(
+            &mut scratch,
+            buf,
+            ctx,
+            |(stream, decoded_bytes), buf, ctx| {
+                let (tag, wire_type) = prost::encoding::decode_key(buf)?;
+                if tag == 2u32 {
+                    if stream.entries.len() > MAX_ENTRIES_PER_STREAM
+                        || *decoded_bytes > MAX_DECODED_BYTES
+                    {
+                        // Cap reached (per-stream count OR the request-wide byte
+                        // budget): drain this entry WITHOUT materializing it,
+                        // wire-type-checked exactly like every other drain arm. The
+                        // vec is allowed to reach the `+ 1` over-cap state so
+                        // `validate_bounds` still rejects the request.
+                        prost::encoding::check_wire_type(
+                            prost::encoding::WireType::LengthDelimited,
+                            wire_type,
+                        )?;
+                        prost::encoding::skip_field(wire_type, tag, buf, ctx)
+                    } else {
+                        prost::encoding::message::merge_repeated(
+                            wire_type,
+                            &mut stream.entries,
+                            buf,
+                            ctx,
+                        )?;
+                        // Charge the just-merged entry immediately: its own
+                        // structured-metadata fan-out is already capped at
+                        // `MAX_STRUCTURED_METADATA_PER_ENTRY + 1` by
+                        // `EntryAdapter::merge_field`, so one over-budget step grows
+                        // the fan-out by at most one entry's bytes.
+                        if let Some(entry) = stream.entries.last() {
+                            *decoded_bytes =
+                                decoded_bytes.saturating_add(decoded_entry_bytes(entry));
+                        }
+                        Ok(())
+                    }
+                } else {
+                    stream.merge_field(tag, wire_type, buf, ctx)
+                }
+            },
+        )?;
+        let (stream, decoded_bytes) = scratch;
+        self.decoded_bytes = decoded_bytes;
+        self.streams.push(stream);
+        Ok(())
+    }
 }
 
 impl prost::Message for BoundedPushRequest {
     fn encode_raw(&self, buf: &mut impl bytes::BufMut) {
         // Decode-only helper, but a complete impl is required by the trait; the
-        // transient counter is never encoded, so this is byte-identical to
+        // transient counters are never encoded, so this is byte-identical to
         // `PushRequest`'s wire form.
         prost::encoding::message::encode_repeated(1u32, &self.streams, buf);
     }
@@ -252,10 +392,11 @@ impl prost::Message for BoundedPushRequest {
             1u32 => {
                 if self.streams.len() > MAX_STREAMS_PER_REQUEST
                     || self.total_entries > MAX_TOTAL_ENTRIES_PER_REQUEST
+                    || self.decoded_bytes > MAX_DECODED_BYTES
                 {
-                    // Cap reached (stream count OR aggregate entries): drain the
-                    // excess stream WITHOUT materializing it, while still
-                    // enforcing the wire-type contract the derived
+                    // Cap reached (stream count OR aggregate entries OR the byte
+                    // budget): drain the excess stream WITHOUT materializing it,
+                    // while still enforcing the wire-type contract the derived
                     // `merge_repeated` would — a non-length-delimited tag-1 is a
                     // malformed submessage and must FAIL the decode, never be
                     // silently skipped. The vec is allowed to reach `MAX + 1`
@@ -267,18 +408,24 @@ impl prost::Message for BoundedPushRequest {
                     )?;
                     prost::encoding::skip_field(wire_type, tag, buf, ctx)
                 } else {
-                    prost::encoding::message::merge_repeated(
-                        wire_type,
-                        &mut self.streams,
-                        buf,
-                        ctx,
-                    )?;
-                    // Charge the just-merged stream's entries into the aggregate.
-                    // Its own entry vec is already capped at `MAX_ENTRIES + 1` by
+                    // Decode this ONE stream through the interposing
+                    // [`Self::merge_one_stream`], which charges `decoded_bytes`
+                    // INCREMENTALLY per entry DURING the stream's own decode
+                    // (issue #168) — a single crafted stream of many
+                    // individually-legal entries must not fully materialize
+                    // before a between-stream boundary check runs.
+                    self.merge_one_stream(wire_type, buf, ctx)?;
+                    // Charge the just-merged stream's entry count into the
+                    // aggregate (its entry BYTES were already charged
+                    // incrementally above), plus the stream's own shell bytes.
+                    // Its entry vec is already capped at `MAX_ENTRIES + 1` by
                     // `StreamAdapter::merge_field`, so one over-aggregate step
                     // grows the fan-out by at most one stream's cap.
                     if let Some(last) = self.streams.last() {
                         self.total_entries = self.total_entries.saturating_add(last.entries.len());
+                        self.decoded_bytes = self
+                            .decoded_bytes
+                            .saturating_add(std::mem::size_of::<StreamAdapter>());
                     }
                     Ok(())
                 }
@@ -617,6 +764,20 @@ pub fn decode_protobuf(body: &[u8]) -> Result<PushRequest, LogsIngestError> {
         bounded.streams.len(),
         bounded.streams.iter().map(|s| s.entries.len()),
     )?;
+    // Decode-time byte budget (issue #168), re-summed from the materialized
+    // request with the SAME function the incremental drain charges — the
+    // deferred whole-request reject for a decode the twin drained past
+    // MAX_DECODED_BYTES (bytes, complementing every element-COUNT cap above).
+    // Deferred here (not in `validate_bounds`, which the JSON path shares and
+    // which rejects in-seed) so the count caps stay byte-free.
+    let decoded_bytes = decoded_push_request_bytes(&bounded.streams);
+    if decoded_bytes > MAX_DECODED_BYTES {
+        return Err(LogsIngestError::OversizeMessage {
+            field: "decoded bytes (estimated)",
+            limit: MAX_DECODED_BYTES,
+            actual: decoded_bytes,
+        });
+    }
     Ok(PushRequest {
         streams: bounded.streams,
     })
@@ -716,9 +877,14 @@ pub fn parse_protobuf(req: &PushRequest, now_ns: i64) -> Result<ParsedLogs, Logs
 /// [`Cell`](std::cell::Cell) counter), and the per-stream `stream` label map
 /// ([`MAX_LABELS_PER_STREAM`]) — all **during** deserialization, so
 /// `serde_json` cannot grow those `Vec`s/map unbounded before the count checks.
-/// The excess is rejected as [`LogsIngestError::LokiDecode`] mid-parse; the
-/// post-decode [`validate_bounds`] re-sum below is a harmless secondary guard
-/// for in-bounds input. Each stream's label **names** are validated against the
+/// A shared `decoded_bytes` [`Cell`](std::cell::Cell) additionally charges the
+/// `size_of`-estimated BYTES each stream/entry/label-map materializes against
+/// the [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget (issue
+/// #168), rejecting once the running estimate crosses it — the JSON twin of the
+/// protobuf [`decode_protobuf`] byte re-sum (count caps bound element counts,
+/// not the materialized heap fan-out). The excess is rejected as
+/// [`LogsIngestError::LokiDecode`] mid-parse; the post-decode [`validate_bounds`]
+/// re-sum below is a harmless secondary guard for in-bounds input. Each stream's label **names** are validated against the
 /// same strict [`is_valid_label_name`] grammar the protobuf path enforces
 /// (issue #115) before canonicalization, so an invalid name (`9bad`, `a.b`,
 /// non-ASCII) is a whole-request reject on both transports, not a silent
@@ -1120,6 +1286,10 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
                 // `values` visitor increments it, so the aggregate is enforced
                 // across streams, not merely per stream.
                 let total_entries = Cell::new(0usize);
+                // Shared decode-time byte estimate for the whole request (issue
+                // #168), threaded alongside `total_entries` so every stream /
+                // entry / label-map charge accumulates across streams.
+                let decoded_bytes = Cell::new(0usize);
                 let mut streams: Option<Vec<JsonStream>> = None;
                 while let Some(key) = map.next_key::<std::borrow::Cow<str>>()? {
                     if key == "streams" {
@@ -1128,6 +1298,7 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
                         }
                         streams = Some(map.next_value_seed(StreamsSeed {
                             total_entries: &total_entries,
+                            decoded_bytes: &decoded_bytes,
                         })?);
                     } else {
                         map.next_value::<serde::de::IgnoredAny>()?;
@@ -1143,12 +1314,36 @@ impl<'de> serde::Deserialize<'de> for JsonPush {
     }
 }
 
+/// Charges `weight` estimated decoded bytes to the shared `decoded_bytes`
+/// counter (issue #168), rejecting (strictly-greater, exactly-at admits) once
+/// the running total would exceed [`MAX_DECODED_BYTES`]. The reject surfaces
+/// through [`LogsIngestError::LokiDecode`] (serde has no `OversizeMessage`
+/// channel without materializing past the budget — the #127 JSON-side rationale)
+/// and pins the family-wide `"decoded bytes (estimated)"` field text, the
+/// running total at the crossing (so a test can read the reported estimate and
+/// prove the one-element overshoot bound), and the budget value.
+fn charge_json_decoded_bytes<E: serde::de::Error>(
+    decoded_bytes: &std::cell::Cell<usize>,
+    weight: usize,
+) -> Result<(), E> {
+    let new_total = decoded_bytes.get().saturating_add(weight);
+    if new_total > MAX_DECODED_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "decoded bytes (estimated) {new_total} exceed the request decode budget of \
+             {MAX_DECODED_BYTES}"
+        )));
+    }
+    decoded_bytes.set(new_total);
+    Ok(())
+}
+
 /// Bounded [`DeserializeSeed`](serde::de::DeserializeSeed) for the `streams`
 /// array: caps element count at [`MAX_STREAMS_PER_REQUEST`] and seeds each
 /// element with the shared aggregate counter. Mirrors
 /// [`BoundedStructuredMetadata`]'s abort-before-materializing-the-remainder.
 struct StreamsSeed<'c> {
     total_entries: &'c std::cell::Cell<usize>,
+    decoded_bytes: &'c std::cell::Cell<usize>,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
@@ -1160,6 +1355,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
     {
         struct StreamsVisitor<'c> {
             total_entries: &'c std::cell::Cell<usize>,
+            decoded_bytes: &'c std::cell::Cell<usize>,
         }
         impl<'de> serde::de::Visitor<'de> for StreamsVisitor<'_> {
             type Value = Vec<JsonStream>;
@@ -1175,6 +1371,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
                 let mut streams: Vec<JsonStream> = Vec::new();
                 while let Some(stream) = seq.next_element_seed(StreamSeed {
                     total_entries: self.total_entries,
+                    decoded_bytes: self.decoded_bytes,
                 })? {
                     if streams.len() >= MAX_STREAMS_PER_REQUEST {
                         // Charge-before-allocate: reject the over-cap stream
@@ -1183,6 +1380,13 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
                             "streams exceeds the {MAX_STREAMS_PER_REQUEST} per-request bound"
                         )));
                     }
+                    // Charge this stream's shell bytes (issue #168) before
+                    // retaining it — its entries and label pairs were charged
+                    // during their own deserialization inside `StreamSeed`.
+                    charge_json_decoded_bytes(
+                        self.decoded_bytes,
+                        std::mem::size_of::<JsonStream>(),
+                    )?;
                     streams.push(stream);
                 }
                 Ok(streams)
@@ -1190,6 +1394,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
         }
         deserializer.deserialize_seq(StreamsVisitor {
             total_entries: self.total_entries,
+            decoded_bytes: self.decoded_bytes,
         })
     }
 }
@@ -1199,6 +1404,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamsSeed<'_> {
 /// `values` visitor.
 struct StreamSeed<'c> {
     total_entries: &'c std::cell::Cell<usize>,
+    decoded_bytes: &'c std::cell::Cell<usize>,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
@@ -1210,6 +1416,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
     {
         struct StreamVisitor<'c> {
             total_entries: &'c std::cell::Cell<usize>,
+            decoded_bytes: &'c std::cell::Cell<usize>,
         }
         impl<'de> serde::de::Visitor<'de> for StreamVisitor<'_> {
             type Value = JsonStream;
@@ -1230,7 +1437,18 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                             if stream.is_some() {
                                 return Err(serde::de::Error::duplicate_field("stream"));
                             }
-                            stream = Some(map.next_value::<BoundedLabelMap>()?.0);
+                            let labels = map.next_value::<BoundedLabelMap>()?.0;
+                            // Charge the RETAINED (post-dedup) label pairs (issue
+                            // #168): the raw-pair count is already capped at
+                            // MAX_LABELS_PER_STREAM by `BoundedLabelMap`, so the
+                            // over-step is bounded to one map.
+                            charge_json_decoded_bytes(
+                                self.decoded_bytes,
+                                labels
+                                    .len()
+                                    .saturating_mul(std::mem::size_of::<(String, String)>()),
+                            )?;
+                            stream = Some(labels);
                         }
                         "values" => {
                             if values.is_some() {
@@ -1238,6 +1456,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
                             }
                             values = Some(map.next_value_seed(ValuesSeed {
                                 total_entries: self.total_entries,
+                                decoded_bytes: self.decoded_bytes,
                             })?);
                         }
                         _ => {
@@ -1253,6 +1472,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for StreamSeed<'_> {
         }
         deserializer.deserialize_map(StreamVisitor {
             total_entries: self.total_entries,
+            decoded_bytes: self.decoded_bytes,
         })
     }
 }
@@ -1308,6 +1528,7 @@ impl<'de> serde::Deserialize<'de> for BoundedLabelMap {
 /// deserialization, before the `Vec<JsonEntry>` grows past the cap.
 struct ValuesSeed<'c> {
     total_entries: &'c std::cell::Cell<usize>,
+    decoded_bytes: &'c std::cell::Cell<usize>,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
@@ -1319,6 +1540,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
     {
         struct ValuesVisitor<'c> {
             total_entries: &'c std::cell::Cell<usize>,
+            decoded_bytes: &'c std::cell::Cell<usize>,
         }
         impl<'de> serde::de::Visitor<'de> for ValuesVisitor<'_> {
             type Value = Vec<JsonEntry>;
@@ -1346,6 +1568,21 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
                         )));
                     }
                     self.total_entries.set(new_total);
+                    // Charge this entry's bytes (issue #168) after it
+                    // deserializes but before it is retained — the entry's own
+                    // structured-metadata fan-out is capped at
+                    // MAX_STRUCTURED_METADATA_PER_ENTRY by
+                    // `BoundedStructuredMetadata`, so the over-step is bounded to
+                    // one entry (≈ 12 KiB).
+                    charge_json_decoded_bytes(
+                        self.decoded_bytes,
+                        std::mem::size_of::<JsonEntry>().saturating_add(
+                            entry
+                                .structured_metadata
+                                .len()
+                                .saturating_mul(std::mem::size_of::<(String, String)>()),
+                        ),
+                    )?;
                     values.push(entry);
                 }
                 Ok(values)
@@ -1353,6 +1590,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for ValuesSeed<'_> {
         }
         deserializer.deserialize_seq(ValuesVisitor {
             total_entries: self.total_entries,
+            decoded_bytes: self.decoded_bytes,
         })
     }
 }
@@ -1693,10 +1931,17 @@ mod tests {
     fn decode_drains_streams_once_the_cross_stream_aggregate_is_exceeded() {
         // AC-9 anti-evasion (aggregate / protobuf): every stream stays UNDER
         // MAX_ENTRIES_PER_STREAM, but their entry counts SUM past
-        // MAX_TOTAL_ENTRIES_PER_REQUEST. The transient cross-stream accumulator
-        // stops materializing streams once the running total exceeds the
-        // aggregate, so fewer streams are materialized than encoded (the derived
-        // decode would materialize them all — the non-vacuity property).
+        // MAX_TOTAL_ENTRIES_PER_REQUEST. The transient accumulators stop
+        // materializing streams/entries once a running total is exceeded, so
+        // fewer streams are materialized than encoded (the derived decode would
+        // materialize them all — the non-vacuity property).
+        //
+        // Issue #168: 5.2M empty entries at size_of::<EntryAdapter>() (~72 B)
+        // each ≈ 374 MB, so the decode-time BYTE budget (256 MiB) drains at
+        // ~3.7M entries — BEFORE the 5M total_entries count cap is reached. The
+        // deferred reject is therefore `"decoded bytes (estimated)"`, not
+        // `"total_entries"`; the count cap stays an enforced backstop (the
+        // structural drain assertions below still hold).
         let per = MAX_ENTRIES_PER_STREAM; // 100_000, each stream in-bounds
         let encoded_streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 2; // 52 -> 5.2M > 5M
         let mut stream_payload = Vec::with_capacity(per * 2);
@@ -1713,7 +1958,7 @@ mod tests {
         let materialized: usize = bounded.streams.iter().map(|s| s.entries.len()).sum();
         assert!(
             bounded.streams.len() < encoded_streams,
-            "the decoder must drain streams once the aggregate is exceeded \
+            "the decoder must drain streams once a budget is exceeded \
              (materialized {} of {encoded_streams} encoded streams)",
             bounded.streams.len()
         );
@@ -1726,7 +1971,7 @@ mod tests {
         assert!(matches!(
             err,
             LogsIngestError::OversizeMessage {
-                field: "total_entries",
+                field: "decoded bytes (estimated)",
                 ..
             }
         ));
@@ -2030,8 +2275,14 @@ mod tests {
     #[test]
     fn parse_json_rejects_cross_stream_aggregate_during_deserialize() {
         // AC-9 anti-evasion (aggregate / JSON): each stream carries exactly
-        // MAX_ENTRIES_PER_STREAM values (individually in-bounds) but the shared
-        // cross-stream counter trips MAX_TOTAL_ENTRIES_PER_REQUEST.
+        // MAX_ENTRIES_PER_STREAM values (individually in-bounds) but their entry
+        // counts SUM past MAX_TOTAL_ENTRIES_PER_REQUEST.
+        //
+        // Issue #168: 5.1M metadata-less entries at size_of::<JsonEntry>() each
+        // (~285 MB) cross the decode-time BYTE budget (256 MiB) at ~4.8M
+        // entries — BEFORE the 5M total_entries count cap — so the reject is the
+        // byte message, not `"total_entries exceeds"`; the count cap stays an
+        // enforced backstop.
         let per = MAX_ENTRIES_PER_STREAM;
         let streams = MAX_TOTAL_ENTRIES_PER_REQUEST / per + 1; // 51 -> 5.1M
         let one_stream = {
@@ -2055,8 +2306,8 @@ mod tests {
         body.push_str("]}");
         let msg = json_loki_decode_message(&body);
         assert!(
-            msg.contains("total_entries exceeds"),
-            "the reject must be the shared cross-stream aggregate message: {msg:?}"
+            msg.contains("decoded bytes (estimated)"),
+            "the reject must be the decode-time byte-budget message: {msg:?}"
         );
     }
 
@@ -2749,6 +3000,326 @@ mod tests {
         assert_eq!(
             from_json.rows[0].structured_metadata,
             r#"{"trace_id":"abc","user_id":"42"}"#
+        );
+    }
+
+    // -- issue #168: decode-time byte ceiling --------------------------------
+
+    /// One `EntryAdapter` wire record (`StreamAdapter.entries`, tag 2) carrying
+    /// `pairs` empty structured-metadata submessages (`LabelPairAdapter`, tag 3,
+    /// zero-length payload `0x1a 0x00`). The empty pair is 2 wire bytes yet
+    /// materializes `size_of::<LabelPairAdapter>()` heap bytes — the 24×
+    /// amplification the byte budget bounds.
+    fn wire_entry_with_pairs(pairs: usize) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(pairs * 2);
+        for _ in 0..pairs {
+            payload.extend_from_slice(&[0x1a, 0x00]);
+        }
+        field_ld(2, &payload)
+    }
+
+    /// AC 2 (weight identity, protobuf): the private byte-estimate helpers are
+    /// mechanically `size_of`-weighted — hand-built values re-sum to the inline
+    /// arithmetic, no magic numbers.
+    #[test]
+    fn decoded_bytes_helpers_are_size_of_weighted() {
+        let pair = std::mem::size_of::<LabelPairAdapter>();
+        let entry_shell = std::mem::size_of::<EntryAdapter>();
+        let stream_shell = std::mem::size_of::<StreamAdapter>();
+
+        let e0 = entry(1, 0, "line");
+        assert_eq!(decoded_entry_bytes(&e0), entry_shell);
+        let e3 = entry_with_sm(
+            1,
+            "line",
+            vec![
+                label_pair("a", "b"),
+                label_pair("c", "d"),
+                label_pair("e", "f"),
+            ],
+        );
+        assert_eq!(decoded_entry_bytes(&e3), entry_shell + 3 * pair);
+
+        let req = PushRequest {
+            streams: vec![
+                StreamAdapter {
+                    labels: r#"{a="b"}"#.to_string(),
+                    entries: vec![e0.clone(), e3.clone()],
+                },
+                StreamAdapter {
+                    labels: String::new(),
+                    entries: vec![e0],
+                },
+            ],
+        };
+        // 2 stream shells + (e0 + e3) + (e0) = 2*shell + (entry_shell) +
+        // (entry_shell + 3*pair) + (entry_shell).
+        let expected = 2 * stream_shell + 3 * entry_shell + 3 * pair;
+        assert_eq!(decoded_push_request_bytes(&req.streams), expected);
+    }
+
+    /// AC 3 (protobuf boundary, 2a): a fixture whose re-summed estimate lands
+    /// within ONE `LabelPairAdapter` leaf of the budget decodes Ok; adding one
+    /// more pair rejects with the byte-budget `OversizeMessage`. An exact hit is
+    /// arithmetically impossible (every charge is a multiple of
+    /// gcd(shells, pair) = 24, and 24 ∤ `MAX_DECODED_BYTES`), so a within-one-leaf
+    /// boundary is the tightest achievable — the fixture self-asserts it.
+    #[test]
+    fn protobuf_byte_budget_boundary_admits_then_rejects_one_more_pair() {
+        let pair = std::mem::size_of::<LabelPairAdapter>();
+        let entry_shell = std::mem::size_of::<EntryAdapter>();
+        let stream_shell = std::mem::size_of::<StreamAdapter>();
+        let full_w = entry_shell + MAX_STRUCTURED_METADATA_PER_ENTRY * pair;
+
+        // N full (256-pair) entries + one r-pair entry (r <= 255 so the +1-pair
+        // reject stays within the 256 cap) with resum <= MAX < resum + pair.
+        let mut chosen: Option<(usize, usize, usize)> = None;
+        for r in 0..MAX_STRUCTURED_METADATA_PER_ENTRY {
+            let base = stream_shell + entry_shell + r * pair;
+            if base > MAX_DECODED_BYTES {
+                continue;
+            }
+            let n = (MAX_DECODED_BYTES - base) / full_w;
+            let resum = base + n * full_w;
+            if resum <= MAX_DECODED_BYTES && MAX_DECODED_BYTES < resum + pair {
+                chosen = Some((n, r, resum));
+                break;
+            }
+        }
+        let (n, r, resum) = chosen.expect("a within-one-pair boundary fixture must exist");
+        assert!(resum <= MAX_DECODED_BYTES && MAX_DECODED_BYTES < resum + pair);
+        assert!(n < MAX_ENTRIES_PER_STREAM, "entries fit one stream");
+
+        let build = |last_pairs: usize| -> Vec<u8> {
+            let mut entries = Vec::new();
+            for _ in 0..n {
+                entries
+                    .extend_from_slice(&wire_entry_with_pairs(MAX_STRUCTURED_METADATA_PER_ENTRY));
+            }
+            entries.extend_from_slice(&wire_entry_with_pairs(last_pairs));
+            field_ld(1, &entries)
+        };
+
+        // Admit side: exactly at the boundary, decodes Ok and re-sums to `resum`.
+        let admit = decode_protobuf(&build(r)).expect("boundary fixture decodes Ok");
+        assert_eq!(decoded_push_request_bytes(&admit.streams), resum);
+
+        // Reject side: one more pair crosses the budget by a single leaf.
+        let err = decode_protobuf(&build(r + 1)).unwrap_err();
+        match err {
+            LogsIngestError::OversizeMessage { field, actual, .. } => {
+                assert_eq!(field, "decoded bytes (estimated)");
+                assert_eq!(actual, resum + pair);
+            }
+            other => panic!("expected the byte-budget OversizeMessage, got {other:?}"),
+        }
+    }
+
+    /// AC 4 + AC 13 (protobuf 2b + bounded overshoot): a body of uniform
+    /// 256-pair entries crossing the budget rejects with the byte field, and the
+    /// reported estimate `T` satisfies `MAX < T <= MAX + w` where `w` is ONE
+    /// entry's maximum retained weight — `size_of::<EntryAdapter>() +
+    /// (MAX_STRUCTURED_METADATA_PER_ENTRY + 1) * size_of::<LabelPairAdapter>()`
+    /// (the `+ 1` because the tag-3 drain fires PAST the cap, so a retained entry
+    /// reaches up to 257 pairs). A >= 2-entry overshoot would report
+    /// `T > MAX + w` and fail.
+    #[test]
+    fn protobuf_over_budget_rejects_with_one_entry_bounded_overshoot() {
+        let pair = std::mem::size_of::<LabelPairAdapter>();
+        let entry_shell = std::mem::size_of::<EntryAdapter>();
+        let full_w = entry_shell + MAX_STRUCTURED_METADATA_PER_ENTRY * pair;
+        // One entry's MAXIMUM retained weight (drain fires past the cap -> 257).
+        let w = entry_shell + (MAX_STRUCTURED_METADATA_PER_ENTRY + 1) * pair;
+
+        // Enough 256-pair entries to cross, plus >= 2 more (self-asserted under
+        // every count cap so the BYTE gate, not a count cap, fires).
+        let n = MAX_DECODED_BYTES / full_w + 8;
+        assert!(n <= MAX_ENTRIES_PER_STREAM, "entries fit one stream");
+        assert!(n * full_w > MAX_DECODED_BYTES, "fixture crosses the budget");
+
+        let mut entries = Vec::new();
+        for _ in 0..n {
+            entries.extend_from_slice(&wire_entry_with_pairs(MAX_STRUCTURED_METADATA_PER_ENTRY));
+        }
+        let body = field_ld(1, &entries);
+
+        let err = decode_protobuf(&body).unwrap_err();
+        match err {
+            LogsIngestError::OversizeMessage {
+                field,
+                limit,
+                actual,
+            } => {
+                assert_eq!(field, "decoded bytes (estimated)");
+                assert_eq!(limit, MAX_DECODED_BYTES);
+                assert!(
+                    MAX_DECODED_BYTES < actual && actual <= MAX_DECODED_BYTES + w,
+                    "one-entry bounded overshoot: {} < {actual} <= {}",
+                    MAX_DECODED_BYTES,
+                    MAX_DECODED_BYTES + w
+                );
+            }
+            other => panic!("expected the byte-budget OversizeMessage, got {other:?}"),
+        }
+    }
+
+    /// AC 6 (merge seeding): two sequential raw merges whose combined estimate
+    /// exceeds the budget leave materialization within one entry of the budget —
+    /// proving the twin seeds `decoded_bytes` with the shared re-sum (a
+    /// no-seed regression would retain `2 * half` ≈ 1.2× the budget and fail the
+    /// ceiling).
+    #[test]
+    fn protobuf_merge_seeds_the_byte_budget_across_raw_merges() {
+        let pair = std::mem::size_of::<LabelPairAdapter>();
+        let entry_shell = std::mem::size_of::<EntryAdapter>();
+        let stream_shell = std::mem::size_of::<StreamAdapter>();
+        let full_w = entry_shell + MAX_STRUCTURED_METADATA_PER_ENTRY * pair;
+        let w = entry_shell + (MAX_STRUCTURED_METADATA_PER_ENTRY + 1) * pair;
+
+        // Each half is ~0.6× the budget (under it alone); two combine to ~1.2×.
+        let half_n = (MAX_DECODED_BYTES * 6 / 10) / full_w;
+        let half_est = stream_shell + half_n * full_w;
+        assert!(half_est < MAX_DECODED_BYTES, "one half stays under budget");
+        assert!(
+            2 * half_est > MAX_DECODED_BYTES + w,
+            "combined must exceed the budget by more than one entry (discriminating)"
+        );
+        assert!(half_n <= MAX_ENTRIES_PER_STREAM);
+
+        let mut entries = Vec::new();
+        for _ in 0..half_n {
+            entries.extend_from_slice(&wire_entry_with_pairs(MAX_STRUCTURED_METADATA_PER_ENTRY));
+        }
+        let body = field_ld(1, &entries);
+
+        let mut req = PushRequest::default();
+        req.merge(body.as_slice()).expect("first raw merge");
+        req.merge(body.as_slice()).expect("second raw merge");
+        let resum = decoded_push_request_bytes(&req.streams);
+        assert!(
+            MAX_DECODED_BYTES < resum && resum <= MAX_DECODED_BYTES + w,
+            "the seed must charge the pre-existing merge's bytes so the second \
+             merge drains within one entry of the budget: {} < {resum} <= {}",
+            MAX_DECODED_BYTES,
+            MAX_DECODED_BYTES + w
+        );
+    }
+
+    /// AC 7 (malformed-wire precedence): an over-budget body whose drained tail
+    /// is malformed fails as a prost `Decode` error, never the byte reject — the
+    /// drains stay wire-type-checked (a non-length-delimited tag-1 is a
+    /// malformed stream, not a silent skip).
+    #[test]
+    fn protobuf_malformed_tail_precedes_the_byte_reject() {
+        let pair = std::mem::size_of::<LabelPairAdapter>();
+        let entry_shell = std::mem::size_of::<EntryAdapter>();
+        let full_w = entry_shell + MAX_STRUCTURED_METADATA_PER_ENTRY * pair;
+        let n = MAX_DECODED_BYTES / full_w + 4;
+        assert!(n <= MAX_ENTRIES_PER_STREAM);
+
+        let mut entries = Vec::new();
+        for _ in 0..n {
+            entries.extend_from_slice(&wire_entry_with_pairs(MAX_STRUCTURED_METADATA_PER_ENTRY));
+        }
+        let mut body = field_ld(1, &entries);
+        // A top-level tag-1 (streams) with wire type 0 (varint) — a malformed
+        // stream record the post-budget drain must reject on the wire-type check.
+        body.extend_from_slice(&[0x08, 0x01]);
+
+        let err = decode_protobuf(&body).unwrap_err();
+        assert!(
+            matches!(err, LogsIngestError::Decode(_)),
+            "a malformed drained tail must be a prost Decode error, got {err:?}"
+        );
+    }
+
+    /// Extracts the running estimate `T` a JSON byte-budget reject reports (the
+    /// digits after the pinned `"decoded bytes (estimated) "` marker; serde_json
+    /// appends a trailing " at line/column" the take-while ignores).
+    fn extract_json_estimate(msg: &str) -> usize {
+        let after = msg
+            .split("decoded bytes (estimated) ")
+            .nth(1)
+            .expect("reject message names the family field");
+        after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("the marker is followed by the running estimate")
+    }
+
+    /// AC 8 (JSON boundary, 2a): the shared charge seam admits charges summing to
+    /// exactly `MAX_DECODED_BYTES` and rejects the next byte (strictly-greater),
+    /// naming the family field — the cheap seam-level twin of the protobuf
+    /// boundary (a full-parse admit at the budget would build millions of rows).
+    #[test]
+    fn json_byte_budget_exact_boundary_at_the_charge_seam() {
+        use std::cell::Cell;
+        let cell = Cell::new(0usize);
+        let entry_w = std::mem::size_of::<JsonEntry>();
+        let full = MAX_DECODED_BYTES / entry_w;
+        let rem = MAX_DECODED_BYTES - full * entry_w;
+        charge_json_decoded_bytes::<serde_json::Error>(&cell, full * entry_w).unwrap();
+        charge_json_decoded_bytes::<serde_json::Error>(&cell, rem).unwrap();
+        assert_eq!(cell.get(), MAX_DECODED_BYTES);
+        // Exactly at the budget admits; one more byte is strictly greater.
+        charge_json_decoded_bytes::<serde_json::Error>(&cell, 0).unwrap();
+        let err = charge_json_decoded_bytes::<serde_json::Error>(&cell, 1).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("decoded bytes (estimated)"), "{msg}");
+        assert!(msg.contains(&MAX_DECODED_BYTES.to_string()), "{msg}");
+    }
+
+    /// AC 8 + AC 13 (JSON 2b + bounded overshoot): a body of uniform 256-pair
+    /// entries crossing the budget rejects as `LokiDecode` naming the family
+    /// field and the budget value, and the reported estimate `T` satisfies
+    /// `MAX < T <= MAX + w` where `w = size_of::<JsonEntry>() +
+    /// MAX_STRUCTURED_METADATA_PER_ENTRY * size_of::<(String, String)>()` — NO
+    /// `+ 1`, because `BoundedStructuredMetadata` HARD-rejects at the 257th raw
+    /// pair, so a charged entry retains exactly 256 pairs.
+    #[test]
+    fn json_over_budget_rejects_with_one_entry_bounded_overshoot() {
+        let entry_shell = std::mem::size_of::<JsonEntry>();
+        let sm_pair = std::mem::size_of::<(String, String)>();
+        let w = entry_shell + MAX_STRUCTURED_METADATA_PER_ENTRY * sm_pair;
+        let full_w = w; // each crossing entry retains exactly 256 pairs
+
+        let n = MAX_DECODED_BYTES / full_w + 8;
+        assert!(n <= MAX_ENTRIES_PER_STREAM, "entries fit one stream");
+
+        // One 256-pair entry `["ts","x",{"k0":"", ...}]` with distinct keys.
+        let mut sm = String::from("{");
+        for i in 0..MAX_STRUCTURED_METADATA_PER_ENTRY {
+            if i > 0 {
+                sm.push(',');
+            }
+            sm.push_str(&format!(r#""k{i}":"""#));
+        }
+        sm.push('}');
+        let one_entry = format!(r#"["1700000000000000000","x",{sm}]"#);
+
+        let mut body = String::from(r#"{"streams":[{"stream":{},"values":["#);
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&one_entry);
+        }
+        body.push_str("]}]}");
+
+        let msg = json_loki_decode_message(&body);
+        assert!(
+            msg.contains("decoded bytes (estimated)"),
+            "reject must name the family field: {msg}"
+        );
+        assert!(msg.contains(&MAX_DECODED_BYTES.to_string()), "{msg}");
+        let t = extract_json_estimate(&msg);
+        assert!(
+            MAX_DECODED_BYTES < t && t <= MAX_DECODED_BYTES + w,
+            "one-entry bounded overshoot: {} < {t} <= {}",
+            MAX_DECODED_BYTES,
+            MAX_DECODED_BYTES + w
         );
     }
 }

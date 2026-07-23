@@ -2441,10 +2441,13 @@ static PINNED_FUNCTION_BODIES: &[PinnedFunctionBody] = &[
     // Re-derived for issue #115 round 3: the error-path restoration (assign the
     // twin's streams back on both Ok and Err rather than early-`?`) changed the
     // last three statements of this body.
+    // Re-derived for issue #168: the twin now additionally seeds `decoded_bytes`
+    // with the shared `decoded_push_request_bytes` re-sum (decode-time byte
+    // budget), which hoisted the `std::mem::take` into a `let streams` binding.
     PinnedFunctionBody {
         file: "crates/pulsus-write/src/protocols/loki_push.rs",
         function: "merge",
-        body: "let mut bounded = BoundedPushRequest {total_entries: self.streams.iter().map(|s| s.entries.len()).sum(), streams: std::mem::take(&mut self.streams),}; let result = bounded.merge(buf); self.streams = bounded.streams; result",
+        body: "let streams = std::mem::take(&mut self.streams); let mut bounded = BoundedPushRequest {total_entries: streams.iter().map(|s| s.entries.len()).sum(), decoded_bytes: decoded_push_request_bytes(&streams), streams,}; let result = bounded.merge(buf); self.streams = bounded.streams; result",
     },
     // NOT a router-composition function — this is the remote-write
     // `WriteRequest`'s hand-written `prost::Message::merge` (issue #115 track 3,

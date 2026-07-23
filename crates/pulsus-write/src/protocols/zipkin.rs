@@ -28,6 +28,15 @@
 //! 3`). [`to_otlp`] validates every id/timestamp up front, so the adapted
 //! request that reaches `otlp_traces::parse` never triggers that parser's
 //! per-span rejection path.
+//!
+//! **Decode-time byte budget (issue #168):** [`BoundedSpans`] additionally
+//! charges each span's `size_of`-estimated bytes against the shared
+//! [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget the moment it
+//! deserializes, rejecting with [`LogsIngestError::ZipkinDecode`] — the byte
+//! sibling of the [`MAX_SPANS_PER_REQUEST`]/[`MAX_TAGS_PER_SPAN`] count caps
+//! (which bound element counts, not the materialized `ZipkinSpan` fan-out) and
+//! distinct from [`to_otlp`]'s parse-time [`otlp_traces::MAX_EXPANDED_BYTES`]
+//! charge.
 
 use std::collections::BTreeMap;
 
@@ -39,6 +48,7 @@ use opentelemetry_proto::tonic::trace::v1::span::{Event, SpanKind};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
 use crate::error::LogsIngestError;
+use crate::protocols::otlp_prescan::MAX_DECODED_BYTES;
 use crate::protocols::otlp_traces;
 
 /// Decode-time cap on the number of spans in one request's array — the
@@ -147,11 +157,44 @@ pub fn decode(body: &[u8]) -> Result<Vec<ZipkinSpan>, LogsIngestError> {
     Ok(spans)
 }
 
+/// Estimated decoded bytes of ONE span (issue #168): the `ZipkinSpan` struct
+/// itself plus its retained `tags` and `annotations` — `size_of`-derived, no
+/// magic numbers, exactly what the decoder materializes. The endpoints and the
+/// scalar `Option<String>` fields are inline in the span's `size_of`; string
+/// CONTENT is uncharged (bounded by the 64 MiB decompressed body cap, the #127
+/// scalar ruling); duplicate tag keys are transient (freed per iteration by the
+/// `BTreeMap`), so charging the retained (post-dedup) map length is correct.
+fn decoded_span_bytes(span: &ZipkinSpan) -> usize {
+    std::mem::size_of::<ZipkinSpan>()
+        .saturating_add(
+            span.tags
+                .len()
+                .saturating_mul(std::mem::size_of::<(String, String)>()),
+        )
+        .saturating_add(
+            span.annotations
+                .len()
+                .saturating_mul(std::mem::size_of::<Annotation>()),
+        )
+}
+
 /// The top-level span array with its element count bounded at
 /// [`MAX_SPANS_PER_REQUEST`] **during** deserialization: the `SeqAccess`
 /// visitor rejects the moment the accumulated count would exceed the cap, so
 /// the `Vec<ZipkinSpan>` never grows past it (the DoS bound the derived
 /// `Vec<ZipkinSpan>` deserialize lacked). Mirrors `loki_push::StreamsSeed`.
+///
+/// It additionally charges a transient `decoded_bytes` estimate (issue #168):
+/// each span's [`decoded_span_bytes`] is charged the moment it deserializes, and
+/// once the running total would exceed the shared
+/// [`crate::protocols::otlp_prescan::MAX_DECODED_BYTES`] budget (256 MiB) the
+/// request is rejected — the element-COUNT caps
+/// ([`MAX_SPANS_PER_REQUEST`]/[`MAX_TAGS_PER_SPAN`]) bound how many spans/tags
+/// decode, not how much memory (a 1M minimal-span batch materializes ~370 MiB of
+/// `ZipkinSpan` structs from a ~23 MiB body). The over-step is bounded to one
+/// span (`≈ 3 MiB`, capped by [`MAX_TAGS_PER_SPAN`]). This is a distinct budget
+/// from [`to_otlp`]'s [`otlp_traces::MAX_EXPANDED_BYTES`] parse-time charge,
+/// which stays untouched.
 struct BoundedSpans(Vec<ZipkinSpan>);
 
 impl<'de> serde::Deserialize<'de> for BoundedSpans {
@@ -172,12 +215,27 @@ impl<'de> serde::Deserialize<'de> for BoundedSpans {
                 A: serde::de::SeqAccess<'de>,
             {
                 let mut spans: Vec<ZipkinSpan> = Vec::new();
+                let mut decoded_bytes: usize = 0;
                 while let Some(span) = seq.next_element::<ZipkinSpan>()? {
                     if spans.len() >= MAX_SPANS_PER_REQUEST {
                         // Charge-before-allocate: reject the over-cap span
                         // without retaining the remainder of the array.
                         return Err(serde::de::Error::custom(format!(
                             "spans exceeds the {MAX_SPANS_PER_REQUEST} per-request bound"
+                        )));
+                    }
+                    // Charge this span's bytes (issue #168) after it deserializes
+                    // (its tags/annotations are per-span-count-capped, so the
+                    // over-step is bounded to one span) but before it is
+                    // retained; reject strictly-greater. The message pins the
+                    // family-wide `"decoded bytes (estimated)"` field text, the
+                    // running total at the crossing (so a test can read the
+                    // reported estimate), and the budget value.
+                    decoded_bytes = decoded_bytes.saturating_add(decoded_span_bytes(&span));
+                    if decoded_bytes > MAX_DECODED_BYTES {
+                        return Err(serde::de::Error::custom(format!(
+                            "decoded bytes (estimated) {decoded_bytes} exceed the request decode \
+                             budget of {MAX_DECODED_BYTES}"
                         )));
                     }
                     spans.push(span);
@@ -709,14 +767,18 @@ mod tests {
         }
     }
 
-    /// Issue #75 (span count): an array of more than
+    /// Issue #75 (span count) + issue #168 (byte budget): an array of more than
     /// [`MAX_SPANS_PER_REQUEST`] spans is rejected **during** deserialization
     /// by [`BoundedSpans`] — the `Vec<ZipkinSpan>` is never grown past the cap
-    /// before the count is checked. Minimal empty-id spans (id/hex validation
-    /// happens later in `adapt_span`, not at deserialize) keep the body small
-    /// while still forcing the count cap. The bounded-seed message is the
-    /// non-vacuity proxy vs. the derived `Vec<ZipkinSpan>` (which accepted any
-    /// count).
+    /// before the check runs. Minimal empty-id spans (id/hex validation happens
+    /// later in `adapt_span`, not at deserialize) keep the body small.
+    ///
+    /// Issue #168: 1M+1 empty spans at size_of::<ZipkinSpan>() (~300 B) each
+    /// ≈ 300 MB cross the decode-time BYTE budget (256 MiB) at ~880k spans —
+    /// BEFORE the 1M span-count cap — so the reject is the byte message; the
+    /// count cap stays an enforced backstop (byte-shadowed by this shape). The
+    /// message is the non-vacuity proxy vs. the derived `Vec<ZipkinSpan>` (which
+    /// accepted any count/size).
     #[test]
     fn too_many_spans_rejected_during_deserialize() {
         let mut body = String::with_capacity(24 * MAX_SPANS_PER_REQUEST);
@@ -730,8 +792,8 @@ mod tests {
         body.push(']');
         let msg = zipkin_decode_message(body.as_bytes());
         assert!(
-            msg.contains("spans exceeds"),
-            "the reject must be the bounded-seed spans message: {msg:?}"
+            msg.contains("decoded bytes (estimated)"),
+            "the reject must be the decode-time byte-budget message: {msg:?}"
         );
     }
 
@@ -936,5 +998,190 @@ mod tests {
             }
             other => panic!("expected OversizeMessage, got {other:?}"),
         }
+    }
+
+    // -- issue #168: decode-time byte ceiling --------------------------------
+
+    /// AC 2 (weight identity, Zipkin): [`decoded_span_bytes`] is mechanically
+    /// `size_of`-weighted — a hand-built span re-sums to the inline arithmetic.
+    #[test]
+    fn decoded_span_bytes_is_size_of_weighted() {
+        let span_shell = std::mem::size_of::<ZipkinSpan>();
+        let tag_pair = std::mem::size_of::<(String, String)>();
+        let annotation = std::mem::size_of::<Annotation>();
+
+        let mut tags = BTreeMap::new();
+        tags.insert("a".to_string(), "1".to_string());
+        tags.insert("b".to_string(), "2".to_string());
+        let span = ZipkinSpan {
+            trace_id: "0000000000000001".to_string(),
+            id: "0000000000000002".to_string(),
+            parent_id: None,
+            name: None,
+            kind: None,
+            timestamp: None,
+            duration: None,
+            local_endpoint: None,
+            remote_endpoint: None,
+            tags,
+            annotations: vec![Annotation {
+                timestamp: 1,
+                value: "x".to_string(),
+            }],
+            debug: false,
+            shared: false,
+        };
+        assert_eq!(
+            decoded_span_bytes(&span),
+            span_shell + 2 * tag_pair + annotation
+        );
+    }
+
+    /// Extracts the running estimate `T` a byte-budget reject reports (the digits
+    /// after the pinned `"decoded bytes (estimated) "` marker; serde_json appends
+    /// a trailing " at line/column" the take-while ignores).
+    fn extract_estimate(msg: &str) -> usize {
+        let after = msg
+            .split("decoded bytes (estimated) ")
+            .nth(1)
+            .expect("reject message names the family field");
+        after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("the marker is followed by the running estimate")
+    }
+
+    /// AC 9 (Zipkin boundary, 2a): a payload whose per-span [`decoded_span_bytes`]
+    /// sum lands within ONE tag leaf of the budget admits through [`decode`]; one
+    /// more tag rejects as `ZipkinDecode`. Mirrors the Loki protobuf boundary
+    /// (`protobuf_byte_budget_boundary_admits_then_rejects_one_more_pair`): coarse
+    /// tag-less spans approach the budget and a final few-tag span fine-tunes to
+    /// within one leaf — an exact hit is not required (every charge is a multiple
+    /// of gcd(span shell, tag)); the boundary is asserted from `size_of`, not a
+    /// pinned span count.
+    #[test]
+    fn zipkin_byte_budget_boundary_admits_then_rejects_one_more_tag() {
+        let tag = std::mem::size_of::<(String, String)>();
+        let shell = std::mem::size_of::<ZipkinSpan>();
+
+        // N minimal (tag-less) spans + one r-tag span (r + 1 < MAX_TAGS_PER_SPAN
+        // so the +1-tag reject stays within the tag cap) with
+        // resum <= MAX < resum + tag.
+        let mut chosen: Option<(usize, usize, usize)> = None;
+        for r in 0..MAX_TAGS_PER_SPAN {
+            let base = shell + r * tag; // the final span's charge
+            if base > MAX_DECODED_BYTES {
+                continue;
+            }
+            let n = (MAX_DECODED_BYTES - base) / shell;
+            let resum = base + n * shell; // (n + 1) * shell + r * tag
+            if resum <= MAX_DECODED_BYTES && MAX_DECODED_BYTES < resum + tag {
+                chosen = Some((n, r, resum));
+                break;
+            }
+        }
+        let (n, r, resum) = chosen.expect("a within-one-tag boundary fixture must exist");
+        assert!(resum <= MAX_DECODED_BYTES && MAX_DECODED_BYTES < resum + tag);
+        assert!(
+            n + 1 < MAX_SPANS_PER_REQUEST,
+            "spans fit under the count cap"
+        );
+        assert!(
+            r + 1 < MAX_TAGS_PER_SPAN,
+            "final span stays under the tag cap"
+        );
+
+        let build = |final_tags: usize| -> String {
+            let mut tags = String::from("{");
+            for i in 0..final_tags {
+                if i > 0 {
+                    tags.push(',');
+                }
+                tags.push_str(&format!(r#""k{i}":"""#));
+            }
+            tags.push('}');
+            let final_span = format!(r#"{{"traceId":"","id":"","tags":{tags}}}"#);
+            let mut body = String::with_capacity(n * 24 + final_span.len() + 2);
+            body.push('[');
+            for _ in 0..n {
+                body.push_str(r#"{"traceId":"","id":""},"#);
+            }
+            body.push_str(&final_span);
+            body.push(']');
+            body
+        };
+
+        // Admit side: within one tag of the budget, decodes Ok and re-sums to
+        // exactly `resum`.
+        let admitted = decode(build(r).as_bytes()).expect("boundary fixture admits");
+        assert_eq!(admitted.len(), n + 1);
+        let summed: usize = admitted.iter().map(decoded_span_bytes).sum();
+        assert_eq!(summed, resum);
+
+        // Reject side: one more tag crosses the budget by a single leaf.
+        let msg = zipkin_decode_message(build(r + 1).as_bytes());
+        assert!(
+            msg.contains("decoded bytes (estimated)"),
+            "reject must name the family field: {msg}"
+        );
+        assert_eq!(extract_estimate(&msg), resum + tag);
+    }
+
+    /// AC 9 + AC 13 (Zipkin 2b + bounded overshoot): a body of uniform
+    /// tags-heavy spans (each carrying [`MAX_TAGS_PER_SPAN`] distinct tags)
+    /// crossing the budget rejects as `ZipkinDecode` naming the family field and
+    /// the budget value, and the reported estimate `T` satisfies
+    /// `MAX < T <= MAX + w` where `w` is one span's shell plus
+    /// `MAX_TAGS_PER_SPAN * size_of::<(String, String)>()` — NO `+ 1`, because
+    /// `deserialize_bounded_tags` HARD-rejects at the (cap+1)-th raw pair, so a
+    /// charged span retains exactly [`MAX_TAGS_PER_SPAN`] tags. A `>= 2`-span
+    /// overshoot would report `T > MAX + w` and fail. The fixture self-asserts
+    /// that its per-span and aggregate counts stay under every count cap.
+    #[test]
+    fn zipkin_over_budget_rejects_with_one_span_bounded_overshoot() {
+        let span_shell = std::mem::size_of::<ZipkinSpan>();
+        let tag_pair = std::mem::size_of::<(String, String)>();
+        let w = span_shell + MAX_TAGS_PER_SPAN * tag_pair;
+        let full_w = w; // each crossing span retains exactly MAX_TAGS_PER_SPAN tags
+
+        let n = MAX_DECODED_BYTES / full_w + 4; // >= 2 spans past the crossing
+        assert!(n < MAX_SPANS_PER_REQUEST, "under the span-count cap");
+
+        // One tags-heavy span with MAX_TAGS_PER_SPAN distinct keys.
+        let mut tags = String::from("{");
+        for i in 0..MAX_TAGS_PER_SPAN {
+            if i > 0 {
+                tags.push(',');
+            }
+            tags.push_str(&format!(r#""k{i}":"""#));
+        }
+        tags.push('}');
+        let one_span =
+            format!(r#"{{"traceId":"0000000000000001","id":"0000000000000002","tags":{tags}}}"#);
+
+        let mut body = String::from("[");
+        for i in 0..n {
+            if i > 0 {
+                body.push(',');
+            }
+            body.push_str(&one_span);
+        }
+        body.push(']');
+
+        let msg = zipkin_decode_message(body.as_bytes());
+        assert!(
+            msg.contains("decoded bytes (estimated)"),
+            "reject must name the family field: {msg}"
+        );
+        assert!(msg.contains(&MAX_DECODED_BYTES.to_string()), "{msg}");
+        let t = extract_estimate(&msg);
+        assert!(
+            MAX_DECODED_BYTES < t && t <= MAX_DECODED_BYTES + w,
+            "one-span bounded overshoot: {} < {t} <= {}",
+            MAX_DECODED_BYTES,
+            MAX_DECODED_BYTES + w
+        );
     }
 }

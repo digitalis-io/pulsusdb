@@ -220,9 +220,10 @@ pub const MAX_ANYVALUE_ELEMENTS: usize = 5_000_000;
 /// actual peak can exceed it by Vec growth plus ≤64 MiB of string/bytes
 /// content), like every budget in this family. A documented constant, not a
 /// config knob (the decompress.rs resolution): promote to a config variable
-/// only when a deployment actually needs a different limit. The Loki and
-/// Zipkin decode paths (budget-scale residuals) adopt this convention in the
-/// follow-up issue #168.
+/// only when a deployment actually needs a different limit. All five ingest
+/// tracks share this budget: the OTLP protobuf pre-scan, the OTLP/JSON bounded
+/// seeds, and the remote-write bounded decoder above, plus the Loki and Zipkin
+/// decode paths (budget-scale residuals) that adopt it in issue #168.
 pub const MAX_DECODED_BYTES: usize = 4 * crate::ingest::decompress::MAX_DECOMPRESSED_BYTES;
 
 /// Hard cap on the wire-walk frame stack, an explicit backstop that bounds the
