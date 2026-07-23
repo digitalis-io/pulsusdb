@@ -196,6 +196,13 @@ fn render_expr(
                 LeafEval::NestedSet { .. } => Err(PlanError::TypeMismatch(
                     "nested-set intrinsics are not supported in metrics filters".to_string(),
                 )),
+                // Trace-level intrinsics (issue #184) resolve from the
+                // search engine's per-trace co-load — no per-span SQL
+                // column exists on the metrics filter path (a clean 400,
+                // mirroring nested-set; search remains their surface).
+                LeafEval::TraceCtx(_) => Err(PlanError::TypeMismatch(
+                    "trace-level intrinsics are not supported in metrics filters".to_string(),
+                )),
                 // `compile_leaf` never yields a field-vs-field leaf (that
                 // is `compile_field_compare`, only reached via the
                 // `FieldCompare` AST arm below) — keep the match exhaustive.
@@ -232,7 +239,10 @@ fn render_expr(
 fn validate_physical_regex(p: &filter::PhysicalPredicate) -> Result<(), PlanError> {
     let (op, value) = match p {
         filter::PhysicalPredicate::Name { op, value }
-        | filter::PhysicalPredicate::Service { op, value } => (op, value),
+        | filter::PhysicalPredicate::Service { op, value }
+        | filter::PhysicalPredicate::StatusMessage { op, value }
+        | filter::PhysicalPredicate::SpanIdHex { op, value }
+        | filter::PhysicalPredicate::ParentIdHex { op, value } => (op, value),
         _ => return Ok(()),
     };
     if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {

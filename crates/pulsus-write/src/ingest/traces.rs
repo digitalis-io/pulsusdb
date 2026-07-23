@@ -27,6 +27,10 @@ pub struct SpanRecord {
     pub timestamp_ns: i64,
     pub duration_ns: i64,
     pub status_code: i8,
+    /// OTLP `Status.message` verbatim, `""` when absent (issue #184). Stored
+    /// on `trace_spans` so the `statusMessage` / `span:statusMessage`
+    /// intrinsic is queryable.
+    pub status_message: String,
     pub kind: i8,
     /// `1` iff the span carried the `zipkin.shared = "true"` attribute at
     /// parse time (issue #173): a Zipkin shared span (both RPC sides stored
@@ -120,6 +124,7 @@ mod tests {
             timestamp_ns: 1_700_000_000_000_000_000,
             duration_ns: 42,
             status_code: 2,
+            status_message: String::new(),
             kind: 3,
             shared: 0,
             payload: vec![0xDE, 0xAD],

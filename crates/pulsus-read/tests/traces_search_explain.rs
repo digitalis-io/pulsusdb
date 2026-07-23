@@ -1804,4 +1804,374 @@ async fn two_phase_search_explain_and_budget_gates() {
         ),
         "got {err:?}"
     );
+
+    // ---- Issue #184 gate T1: `trace:id =` engages the trace_id PK
+    // prefix (`ORDER BY (trace_id, timestamp_ns)`) — Tier-1 EXPLAIN
+    // evidence on the 120k corpus: a single trace selects a tiny granule
+    // subset. ------------------------------------------------------------
+    // Corpus trace ids are leftPad(hex(number), 32, '0'): number 66 = 0x42.
+    let corpus_tid = "00000000000000000000000000000042";
+    let plan = plan_for(
+        &engine,
+        &format!(r#"{{ trace:id = "{corpus_tid}" }}"#),
+        base,
+        now,
+    );
+    assert_eq!(plan.generator_sqls.len(), 1);
+    assert!(
+        plan.generator_sqls[0].contains(&format!("trace_id = unhex('{corpus_tid}')")),
+        "the PK-prefix predicate: {}",
+        plan.generator_sqls[0]
+    );
+    let raw = explain_raw(&client, &plan.generator_sqls[0]).await;
+    let (sel, total) = primary_key_granules(&raw);
+    assert!(
+        total >= 8 && sel * 4 <= total,
+        "trace:id must prune via the trace_id PK prefix to a small granule subset \
+         ({sel}/{total}):\n{raw}"
+    );
+    let output = engine.search(&plan).await.expect("trace:id search");
+    assert_eq!(output.returned, 1, "exactly the addressed trace");
+    assert_eq!(
+        output.traces[0].trace_id[15], 0x42,
+        "the addressed trace id round-trips"
+    );
+
+    // ---- Issue #184 gate T2: end-to-end trace-level intrinsics on a
+    // purpose-built fixture in a disjoint future window — the co-load's
+    // window-independence (AC-Δ1a live), the displayed-root agreement
+    // (root-less fallback + over-cap byte-capping), statusMessage
+    // filtering on the migration-35 column, and the span:id/span:parentID
+    // hex comparisons. ----------------------------------------------------
+    let g = now + 60 * 3_600_000_000_000;
+    const G1: &str = "00000000000000000000000000518401"; // rooted
+    const G2: &str = "00000000000000000000000000518402"; // root-less
+    const G3: &str = "00000000000000000000000000518403"; // over-cap root
+    const R184: &str = "00000000000184a1";
+    const C184_1: &str = "00000000000184c1";
+    const C184_2: &str = "00000000000184c2";
+    /// `(trace, span, parent, name, service, ts, duration, status_message)`.
+    async fn insert_184_span(
+        client: &ChClient,
+        spec: (&str, &str, &str, &str, &str, i64, i64, &str),
+    ) {
+        let (trace, span, parent, name, service, ts, dur, msg) = spec;
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_spans \
+                 (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                  status_code, status_message, kind, payload_type, payload) \
+                 SELECT toFixedString(unhex('{trace}'), 16), \
+                        toFixedString(unhex('{span}'), 8), \
+                        toFixedString(unhex('{parent}'), 8), \
+                        {name}, '{service}', {ts}, {dur}, 0, '{msg}', 1, 1, 'p'"
+            ),
+        )
+        .await;
+    }
+    let two_hours = 2 * 3_600_000_000_000i64;
+    for spec in [
+        // G1: root at g, two children at +2h and +2h+60s — the trace's
+        // full envelope spans ~2h1m.
+        (
+            G1,
+            R184,
+            "0000000000000000",
+            "'GET /checkout184'",
+            "gw184",
+            g,
+            5_000_000i64,
+            "",
+        ),
+        (
+            G1,
+            C184_1,
+            R184,
+            "'child-op184'",
+            "child184",
+            g + two_hours,
+            1_000,
+            "boom-184",
+        ),
+        (
+            G1,
+            C184_2,
+            R184,
+            "'child-op184b'",
+            "child184",
+            g + two_hours + 60_000_000_000,
+            1_000,
+            "",
+        ),
+        // G2: NO zero-parent span (both parents dangle/point inside) —
+        // pick_roots and the co-load must agree on the earliest-span
+        // fallback.
+        (
+            G2,
+            "00000000000184d1",
+            "00000000000000ff",
+            "'earliest-184'",
+            "svcb184",
+            g,
+            1_000,
+            "",
+        ),
+        (
+            G2,
+            "00000000000184d2",
+            "00000000000184d1",
+            "'later-184'",
+            "svcb184",
+            g + 10,
+            1_000,
+            "",
+        ),
+    ] {
+        insert_184_span(&client, spec).await;
+    }
+    // G3: a root whose name exceeds TRACE_STR_COL_CAP (9000 > 8192 bytes)
+    // — both the co-load and the displayed-root path must return the SAME
+    // 2048-code-point capped value.
+    insert_184_span(
+        &client,
+        (
+            G3,
+            "00000000000184e1",
+            "0000000000000000",
+            "repeat('x', 9000)",
+            "over184",
+            g,
+            1_000,
+            "",
+        ),
+    )
+    .await;
+    insert_184_span(
+        &client,
+        (
+            G3,
+            "00000000000184e2",
+            "00000000000184e1",
+            "'child-over184'",
+            "over184",
+            g + 10,
+            1_000,
+            "",
+        ),
+    )
+    .await;
+
+    let wide = (g - 1_000_000_000, g + 3 * 3_600_000_000_000);
+    // A narrow window holding ONLY G1's first child — the root and the
+    // trace's max-end span are both OUTSIDE it.
+    let narrow = (g + two_hours - 1_000_000_000, g + two_hours + 1_000_000_000);
+
+    // (a) AC-Δ1a live: the sole trace-level predicates resolve the
+    // FULL-trace values under the narrow window, and the displayed root
+    // is the out-of-window true root (co-load ↔ root_sql agreement).
+    for (q, expect_match) in [
+        (r#"{ rootServiceName = "gw184" }"#.to_string(), true),
+        (r#"{ rootName = "GET /checkout184" }"#.to_string(), true),
+        ("{ traceDuration > 1h }".to_string(), true),
+        ("{ traceDuration > 3h }".to_string(), false),
+        // The windowed view alone could never produce these values.
+        (r#"{ rootServiceName = "child184" }"#.to_string(), false),
+    ] {
+        let plan = plan_for(&engine, &q, narrow.0, narrow.1);
+        let output = engine.search(&plan).await.expect("narrow-window search");
+        let hit = output.traces.iter().any(|t| t.trace_id[15] == 0x01);
+        assert_eq!(hit, expect_match, "{q} (narrow window)");
+        if expect_match {
+            let t = output
+                .traces
+                .iter()
+                .find(|t| t.trace_id[15] == 0x01)
+                .expect("G1");
+            assert_eq!(
+                t.root.name, "GET /checkout184",
+                "{q}: the displayed root is the out-of-window TRUE root"
+            );
+            assert_eq!(t.root.service, "gw184", "{q}");
+        }
+    }
+
+    // (b) childCount is full-trace-exact: a window covering the root and
+    // ONE child (the second child excluded) must still evaluate the
+    // root's FULL child count of 2 — and reject the windowed count of 1.
+    let partial_window = (g - 1_000_000_000, g + two_hours + 1_000_000_000);
+    let plan = plan_for(
+        &engine,
+        "{ span:childCount = 2 }",
+        partial_window.0,
+        partial_window.1,
+    );
+    let output = engine.search(&plan).await.expect("childCount = 2");
+    assert!(
+        output.traces.iter().any(|t| t.trace_id[15] == 0x01),
+        "the root's FULL-trace child count (2) must match under the partial window"
+    );
+    let plan = plan_for(
+        &engine,
+        "{ span:childCount = 1 }",
+        partial_window.0,
+        partial_window.1,
+    );
+    let output = engine.search(&plan).await.expect("childCount = 1");
+    assert!(
+        !output.traces.iter().any(|t| t.trace_id[15] == 0x01),
+        "the WINDOWED count (1) must never be the evaluated value"
+    );
+
+    // (c) Root-less trace: co-load argMin fallback ↔ pick_roots fallback
+    // agreement — the earliest span is the root on BOTH paths.
+    let plan = plan_for(&engine, r#"{ rootName = "earliest-184" }"#, wide.0, wide.1);
+    let output = engine.search(&plan).await.expect("root-less search");
+    let t = output
+        .traces
+        .iter()
+        .find(|t| t.trace_id[15] == 0x02)
+        .expect("the root-less trace must match via the earliest-span fallback");
+    assert_eq!(t.root.name, "earliest-184", "displayed root agrees");
+    let plan = plan_for(&engine, r#"{ rootName = "later-184" }"#, wide.0, wide.1);
+    let output = engine.search(&plan).await.expect("root-less negative");
+    assert!(
+        !output.traces.iter().any(|t| t.trace_id[15] == 0x02),
+        "the later span is NOT the fallback root on either path"
+    );
+
+    // (d) Over-cap root: the co-load's evaluated value and the displayed
+    // root are BOTH the 2048-code-point capped rendering — byte-identical
+    // (AC-Δ1a over-cap fixture; the substringUTF8 fallback branch).
+    let capped = "x".repeat(2048);
+    let plan_q = format!(r#"{{ rootName = "{capped}" }}"#);
+    let plan = plan_for(&engine, &plan_q, wide.0, wide.1);
+    let output = engine.search(&plan).await.expect("over-cap search");
+    let t = output
+        .traces
+        .iter()
+        .find(|t| t.trace_id[15] == 0x03)
+        .expect("the capped root name must match the co-load value");
+    assert_eq!(
+        t.root.name, capped,
+        "the displayed root carries the IDENTICAL capped value"
+    );
+    let raw_q = format!(r#"{{ rootName = "{}" }}"#, "x".repeat(9000));
+    let plan = plan_for(&engine, &raw_q, wide.0, wide.1);
+    let output = engine.search(&plan).await.expect("raw over-cap search");
+    assert!(
+        !output.traces.iter().any(|t| t.trace_id[15] == 0x03),
+        "the RAW (uncapped) value matches on neither path"
+    );
+
+    // (e) statusMessage on the migration-35 column: equality + regex +
+    // the scoped spelling, and the matched spanset is exactly the
+    // carrying span.
+    for q in [
+        r#"{ statusMessage = "boom-184" }"#,
+        r#"{ span:statusMessage = "boom-184" }"#,
+        r#"{ statusMessage =~ "boom.*" }"#,
+    ] {
+        let plan = plan_for(&engine, q, wide.0, wide.1);
+        let output = engine.search(&plan).await.expect("statusMessage search");
+        assert_eq!(output.returned, 1, "{q}");
+        assert_eq!(output.traces[0].trace_id[15], 0x01, "{q}");
+        assert_eq!(output.traces[0].matched, 1, "{q}");
+        assert_eq!(output.traces[0].spans[0].name, "child-op184", "{q}");
+    }
+
+    // (e2) Over-cap statusMessage (issue #184 code review): Phase-1
+    // candidate selection must compare the SAME byte-capped value Phase 2
+    // hydrates and evaluates. G4's stored message exceeds
+    // TRACE_STR_COL_CAP (9004 > 8192 bytes: 9000 y's + 'TAIL'), so its
+    // capped rendering is exactly 2048 y's — a raw Phase-1 comparison
+    // never selects the candidate even though Phase 2 would match it.
+    const G4: &str = "00000000000000000000000000518404";
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, status_message, kind, payload_type, payload) \
+             SELECT toFixedString(unhex('{G4}'), 16), \
+                    toFixedString(unhex('00000000000184f1'), 8), \
+                    toFixedString(unhex('0000000000000000'), 8), \
+                    'overmsg-op184', 'overmsg184', {g}, 1000, 2, \
+                    concat(repeat('y', 9000), 'TAIL'), 1, 1, 'p'"
+        ),
+    )
+    .await;
+    // Equality on the capped literal: Phase 1 selects the candidate AND
+    // Phase 2 matches it — the two phases agree on the capped value.
+    let capped_msg = "y".repeat(2048);
+    let q = format!(r#"{{ statusMessage = "{capped_msg}" }}"#);
+    let plan = plan_for(&engine, &q, wide.0, wide.1);
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("over-cap statusMessage equality search");
+    let t = output
+        .traces
+        .iter()
+        .find(|t| t.trace_id[15] == 0x04)
+        .expect("Phase 1 must select the over-cap trace on the CAPPED value");
+    assert_eq!(t.matched, 1, "Phase 2 matches the same capped value");
+    assert_eq!(t.spans[0].name, "overmsg-op184");
+    assert!(
+        plan.generator_sqls[0].contains("substringUTF8(status_message, 1, 2048)"),
+        "the Phase-1 predicate compares the capped column:\n{}",
+        plan.generator_sqls[0]
+    );
+    // The regex form runs on the capped value in BOTH phases too: the
+    // anchored `y+` matches the all-y capped rendering but NOT the raw
+    // stored value (which ends in 'TAIL').
+    let plan = plan_for(&engine, r#"{ statusMessage =~ "y+" }"#, wide.0, wide.1);
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("over-cap statusMessage regex search");
+    assert!(
+        output.traces.iter().any(|t| t.trace_id[15] == 0x04),
+        "the anchored regex matches the capped rendering on both phases"
+    );
+    // The RAW (uncapped) value matches in neither phase.
+    let raw_msg = format!("{}TAIL", "y".repeat(9000));
+    let plan = plan_for(
+        &engine,
+        &format!(r#"{{ statusMessage = "{raw_msg}" }}"#),
+        wide.0,
+        wide.1,
+    );
+    let output = engine
+        .search(&plan)
+        .await
+        .expect("raw over-cap statusMessage search");
+    assert!(
+        !output.traces.iter().any(|t| t.trace_id[15] == 0x04),
+        "the RAW (uncapped) value matches in neither phase"
+    );
+
+    // (f) span:id / span:parentID hex comparisons (case-insensitive Eq).
+    let plan = plan_for(
+        &engine,
+        r#"{ span:id = "00000000000184C1" }"#, // uppercase query hex
+        wide.0,
+        wide.1,
+    );
+    let output = engine.search(&plan).await.expect("span:id search");
+    assert_eq!(output.returned, 1);
+    assert_eq!(output.traces[0].matched, 1);
+    assert_eq!(output.traces[0].spans[0].name, "child-op184");
+    let plan = plan_for(
+        &engine,
+        r#"{ span:parentID = "00000000000184a1" }"#,
+        wide.0,
+        wide.1,
+    );
+    let output = engine.search(&plan).await.expect("span:parentID search");
+    assert_eq!(output.returned, 1);
+    assert_eq!(
+        output.traces[0].matched, 2,
+        "both direct children of the G1 root match"
+    );
 }

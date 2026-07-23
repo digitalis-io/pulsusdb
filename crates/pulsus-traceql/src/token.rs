@@ -42,6 +42,12 @@ pub enum TokenKind {
     /// followed by a digit is instead lexed as part of a fractional
     /// number/duration literal (`.5s`).
     Dot,
+    /// `:` — the intrinsic scope separator (`span:`, `trace:` — the
+    /// colon-scoped intrinsic namespace, issue #184). Disambiguated from
+    /// the dotted attribute scope purely by parser position; an unknown
+    /// colon scope (`event:`, `link:`, `instrumentation:`) is a generic
+    /// parse error, not a named boundary.
+    Colon,
 
     /// `=` — comparison equality.
     Eq,

@@ -1,0 +1,20 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        TraceDuration,
+                    ),
+                    op: Gt,
+                    value: Duration(
+                        Duration(
+                            1000000000,
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+}

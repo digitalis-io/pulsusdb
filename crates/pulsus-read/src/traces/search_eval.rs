@@ -66,7 +66,7 @@ use super::exec::ByteBudget;
 use super::filter::NestedSetField;
 use super::search_plan::{
     AggSource, PhysicalEval, PhysicalSelect, PlannedFilter, PlannedLeafEval, PlannedOperand,
-    SearchPlan, SelectField,
+    SearchPlan, SelectField, TraceCtxEval,
 };
 use crate::logql::error::ReadError;
 
@@ -80,6 +80,9 @@ pub struct HydratedSpan {
     pub timestamp_ns: i64,
     pub duration_ns: i64,
     pub status_code: i8,
+    /// The span's OTLP `Status.message` (issue #184's `statusMessage`
+    /// intrinsic), byte-capped like `service`/`name`; `""` when absent.
+    pub status_message: String,
     pub kind: i8,
 }
 
@@ -95,12 +98,61 @@ pub struct TraceSpans {
 pub type SpanKey = ([u8; 16], [u8; 8]);
 
 /// The batch's attribute reads, index-aligned with the plan's
-/// `probes` / `agg_fields` / `select_attrs`.
+/// `probes` / `agg_fields` / `select_attrs` — plus the issue #184
+/// trace-wide co-load results (populated only when the plan's
+/// `needs_trace_ctx()`/`needs_child_counts()` flags demand them; empty
+/// maps otherwise, so other queries pay nothing).
 #[derive(Debug, Default)]
 pub struct BatchAttrs {
     pub membership: Vec<HashSet<SpanKey>>,
     pub agg_values: Vec<HashMap<SpanKey, f64>>,
     pub select_values: Vec<HashMap<SpanKey, String>>,
+    /// Per-trace context (`search_sql::trace_ctx_sql`): the trace-wide
+    /// time envelope + the `pick_roots`-equivalent root name/service,
+    /// keyed by `trace_id`. Window- and cap-independent (full-trace
+    /// exact).
+    pub trace_ctx: HashMap<[u8; 16], TraceCtxInfo>,
+    /// Direct-child counts (`search_sql::child_count_sql`), keyed by
+    /// `(trace_id, parent span_id)`; an absent key means 0 children.
+    pub child_counts: HashMap<SpanKey, u64>,
+}
+
+/// One trace's context co-load values (issue #184).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceCtxInfo {
+    /// `min(timestamp_ns)` over the WHOLE trace.
+    pub trace_start_ns: i64,
+    /// `max(timestamp_ns + duration_ns)` over the whole trace —
+    /// `traceDuration = trace_end_ns - trace_start_ns`.
+    pub trace_end_ns: i64,
+    /// The root span's byte-capped name (`pick_roots` selection order —
+    /// a zero-parent root, else the earliest span).
+    pub root_name: String,
+    /// The root span's byte-capped service.
+    pub root_service: String,
+}
+
+/// The per-trace evaluation context for the issue #184 trace-level
+/// intrinsics — built once per candidate trace in [`evaluate_batch`]
+/// (borrowing straight from [`BatchAttrs`]; no per-trace allocation in
+/// the hot loop). `info` is `None` when the plan issued no trace-context
+/// co-load (or — defensively — the trace vanished between phases): the
+/// dependent leaves then match nothing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TraceEvalCtx<'a> {
+    pub(crate) trace_id: [u8; 16],
+    pub(crate) info: Option<&'a TraceCtxInfo>,
+    pub(crate) child_counts: &'a HashMap<SpanKey, u64>,
+}
+
+/// One trace's complete read-only evaluation environment — the batch
+/// attribute reads plus the per-trace #181 nested-set numbering and the
+/// #184 trace-level context, bundled so the recursive evaluators carry
+/// one context parameter.
+struct EvalEnv<'a> {
+    attrs: &'a BatchAttrs,
+    nested_set: Option<&'a NestedSetIndex>,
+    ctx: TraceEvalCtx<'a>,
 }
 
 /// One matched span's response summary (docs/api.md §4.2 `spanSets`
@@ -191,6 +243,21 @@ fn cmp_f64(op: ComparisonOp, lhs: f64, rhs: f64) -> bool {
     }
 }
 
+const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+/// Renders `bytes` as lowercase hex into the caller's STACK buffer (no
+/// heap allocation in the per-span hot loop — query-perf mandate). `buf`
+/// must be exactly `2 × bytes.len()`.
+fn hex_into<'a>(bytes: &[u8], buf: &'a mut [u8]) -> &'a str {
+    debug_assert_eq!(buf.len(), bytes.len() * 2);
+    for (i, b) in bytes.iter().enumerate() {
+        buf[2 * i] = HEX_DIGITS[(b >> 4) as usize];
+        buf[2 * i + 1] = HEX_DIGITS[(b & 0x0f) as usize];
+    }
+    // Invariant: the buffer holds only ASCII hex digits by construction.
+    std::str::from_utf8(buf).expect("hex digits are ASCII")
+}
+
 fn eval_physical(p: &PhysicalEval, span: &HydratedSpan) -> bool {
     match p {
         PhysicalEval::Name { op, value } => op.matches(value, &span.name),
@@ -198,6 +265,53 @@ fn eval_physical(p: &PhysicalEval, span: &HydratedSpan) -> bool {
         PhysicalEval::Duration { op, nanos } => cmp_i64(*op, span.duration_ns, *nanos),
         PhysicalEval::Status { op, code } => cmp_i64(*op, span.status_code as i64, *code as i64),
         PhysicalEval::Kind { op, code } => cmp_i64(*op, span.kind as i64, *code as i64),
+        PhysicalEval::StatusMessage { op, value } => op.matches(value, &span.status_message),
+        // The hex comparisons mirror the SQL predicate exactly
+        // (`lower(hex(col)) <op> value`): Eq/Neq values arrive
+        // pre-lowercased from leaf compilation, regexes run against the
+        // lowercase rendering.
+        PhysicalEval::SpanIdHex { op, value } => {
+            let mut buf = [0u8; 16];
+            op.matches(value, hex_into(&span.span_id, &mut buf))
+        }
+        PhysicalEval::ParentIdHex { op, value } => {
+            let mut buf = [0u8; 16];
+            op.matches(value, hex_into(&span.parent_id, &mut buf))
+        }
+    }
+}
+
+/// Evaluates one trace-level intrinsic leaf (issue #184) for one span,
+/// against the trace-wide co-load context. `traceDuration`/`rootName`/
+/// `rootServiceName`/`trace:id` are trace-constant (every span of a
+/// matching trace matches); `span:childCount` is per span (its
+/// direct-child count, 0 when it parents nothing).
+fn eval_trace_ctx(tc: &TraceCtxEval, ctx: &TraceEvalCtx<'_>, span: &HydratedSpan) -> bool {
+    match tc {
+        TraceCtxEval::ChildCount { op, value } => {
+            let n = ctx
+                .child_counts
+                .get(&(ctx.trace_id, span.span_id))
+                .copied()
+                .unwrap_or(0);
+            cmp_f64(*op, n as f64, *value)
+        }
+        TraceCtxEval::TraceDurationNs { op, nanos } => ctx
+            .info
+            .map(|i| cmp_i64(*op, i.trace_end_ns.saturating_sub(i.trace_start_ns), *nanos))
+            .unwrap_or(false),
+        TraceCtxEval::RootName { op, value } => ctx
+            .info
+            .map(|i| op.matches(value, &i.root_name))
+            .unwrap_or(false),
+        TraceCtxEval::RootServiceName { op, value } => ctx
+            .info
+            .map(|i| op.matches(value, &i.root_service))
+            .unwrap_or(false),
+        TraceCtxEval::TraceId { op, value } => {
+            let mut buf = [0u8; 32];
+            op.matches(value, hex_into(&ctx.trace_id, &mut buf))
+        }
     }
 }
 
@@ -322,10 +436,8 @@ fn eval_expr(
     expr: &FieldExpr,
     filter: &PlannedFilter,
     leaf_idx: &mut usize,
-    trace_id: [u8; 16],
     span: &HydratedSpan,
-    attrs: &BatchAttrs,
-    nested_set: Option<&NestedSetIndex>,
+    env: &EvalEnv<'_>,
 ) -> bool {
     match expr {
         FieldExpr::Comparison { .. } | FieldExpr::FieldCompare { .. } => {
@@ -334,31 +446,34 @@ fn eval_expr(
             match leaf {
                 PlannedLeafEval::Physical(p) => eval_physical(p, span),
                 PlannedLeafEval::Attr { probe_idx, negated } => {
-                    let member = attrs.membership[*probe_idx].contains(&(trace_id, span.span_id));
+                    let member = env.attrs.membership[*probe_idx]
+                        .contains(&(env.ctx.trace_id, span.span_id));
                     member != *negated
                 }
                 // The numbering covers every hydrated span, so the lookup
                 // succeeds whenever the plan flagged nested-set (index is
                 // `Some`); an absent index/entry is a non-match.
-                PlannedLeafEval::NestedSet { field, op, value } => nested_set
+                PlannedLeafEval::NestedSet { field, op, value } => env
+                    .nested_set
                     .and_then(|idx| idx.get(&span.span_id))
                     .map(|v| cmp_f64(*op, v.value(*field) as f64, *value))
                     .unwrap_or(false),
                 PlannedLeafEval::FieldCompare { lhs, rhs, op } => {
-                    eval_field_compare(lhs, rhs, *op, trace_id, span, attrs)
+                    eval_field_compare(lhs, rhs, *op, env.ctx.trace_id, span, env.attrs)
                 }
+                // Trace-level intrinsics (issue #184): evaluated against
+                // the trace-wide co-load context.
+                PlannedLeafEval::TraceCtx(tc) => eval_trace_ctx(tc, &env.ctx, span),
             }
         }
         // A bare boolean static (issue #183) consumes no leaf.
         FieldExpr::BoolStatic(b) => *b,
         // Unary field negation (issue #183): the inner walk advances
         // `leaf_idx` through the inner subtree, then the result is negated.
-        FieldExpr::Not(inner) => {
-            !eval_expr(inner, filter, leaf_idx, trace_id, span, attrs, nested_set)
-        }
+        FieldExpr::Not(inner) => !eval_expr(inner, filter, leaf_idx, span, env),
         FieldExpr::Binary { op, lhs, rhs } => {
-            let l = eval_expr(lhs, filter, leaf_idx, trace_id, span, attrs, nested_set);
-            let r = eval_expr(rhs, filter, leaf_idx, trace_id, span, attrs, nested_set);
+            let l = eval_expr(lhs, filter, leaf_idx, span, env);
+            let r = eval_expr(rhs, filter, leaf_idx, span, env);
             match op {
                 pulsus_traceql::BoolOp::And => l && r,
                 pulsus_traceql::BoolOp::Or => l || r,
@@ -408,8 +523,7 @@ fn eval_filter(
     body: Option<&FieldExpr>,
     filter: &PlannedFilter,
     trace: &TraceSpans,
-    attrs: &BatchAttrs,
-    nested_set: Option<&NestedSetIndex>,
+    env: &EvalEnv<'_>,
     budget: &mut ByteBudget,
 ) -> Result<Option<ChargedSet>, ReadError> {
     let mut matched = charged_set(trace.spans.len(), budget)?;
@@ -418,15 +532,7 @@ fn eval_filter(
             None => true,
             Some(expr) => {
                 let mut leaf_idx = 0;
-                eval_expr(
-                    expr,
-                    filter,
-                    &mut leaf_idx,
-                    trace.trace_id,
-                    span,
-                    attrs,
-                    nested_set,
-                )
+                eval_expr(expr, filter, &mut leaf_idx, span, env)
             }
         };
         if is_match {
@@ -453,19 +559,18 @@ fn eval_spanset(
     plan: &SearchPlan,
     filter_idx: &mut usize,
     trace: &TraceSpans,
-    attrs: &BatchAttrs,
-    nested_set: Option<&NestedSetIndex>,
+    env: &EvalEnv<'_>,
     budget: &mut ByteBudget,
 ) -> Result<Option<ChargedSet>, ReadError> {
     match expr {
         SpansetExpr::Filter(f) => {
             let filter = &plan.filters[*filter_idx];
             *filter_idx += 1;
-            eval_filter(f.body.as_ref(), filter, trace, attrs, nested_set, budget)
+            eval_filter(f.body.as_ref(), filter, trace, env, budget)
         }
         SpansetExpr::Binary { op, lhs, rhs } => {
-            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
-            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
+            let l = eval_spanset(lhs, plan, filter_idx, trace, env, budget)?;
+            let r = eval_spanset(rhs, plan, filter_idx, trace, env, budget)?;
             match op {
                 // Trace-level intersection: the trace qualifies iff both
                 // operands matched within it; its spanset is the union of
@@ -500,8 +605,8 @@ fn eval_spanset(
             lhs,
             rhs,
         } => {
-            let l = eval_spanset(lhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
-            let r = eval_spanset(rhs, plan, filter_idx, trace, attrs, nested_set, budget)?;
+            let l = eval_spanset(lhs, plan, filter_idx, trace, env, budget)?;
+            let r = eval_spanset(rhs, plan, filter_idx, trace, env, budget)?;
             eval_structural(*op, *modifier, l, r, trace, budget)
         }
     }
@@ -1287,16 +1392,20 @@ pub(crate) fn evaluate_batch(
         } else {
             None
         };
-        let mut filter_idx = 0;
-        let spanset = eval_spanset(
-            &plan.spanset,
-            plan,
-            &mut filter_idx,
-            trace,
+        // The per-trace read-only environment — the issue #184 context is
+        // borrowed straight from the batch's co-load maps (no per-trace
+        // allocation).
+        let env = EvalEnv {
             attrs,
-            nested_set.as_ref().map(|c| &c.index),
-            budget,
-        )?;
+            nested_set: nested_set.as_ref().map(|c| &c.index),
+            ctx: TraceEvalCtx {
+                trace_id: trace.trace_id,
+                info: attrs.trace_ctx.get(&trace.trace_id),
+                child_counts: &attrs.child_counts,
+            },
+        };
+        let mut filter_idx = 0;
+        let spanset = eval_spanset(&plan.spanset, plan, &mut filter_idx, trace, &env, budget)?;
         if let Some(charged) = nested_set {
             release_nested_set(charged, budget);
         }
@@ -1416,6 +1525,7 @@ mod tests {
             timestamp_ns: ts,
             duration_ns: dur,
             status_code: 0,
+            status_message: String::new(),
             kind: 1,
         }
     }
@@ -1433,6 +1543,7 @@ mod tests {
             membership: vec![HashSet::new(); plan.probes.len()],
             agg_values: vec![HashMap::new(); plan.agg_fields.len()],
             select_values: vec![HashMap::new(); plan.select_attrs.len()],
+            ..BatchAttrs::default()
         };
         for (probe_idx, trace_id, span_id) in entries {
             attrs.membership[*probe_idx].insert((*trace_id, *span_id));
@@ -2052,6 +2163,7 @@ mod tests {
             membership: vec![HashSet::new(); p.probes_len()],
             agg_values: vec![HashMap::new(); p.agg_fields_len()],
             select_values: vec![HashMap::new(); p.select_attrs_len()],
+            ..BatchAttrs::default()
         };
         for (i, probe) in p.probes.iter().enumerate() {
             if let ValuePred::StringEq(val) = &probe.pred {
@@ -2616,6 +2728,7 @@ mod tests {
                 timestamp_ns: i as i64,
                 duration_ns: 1,
                 status_code: 0,
+                status_message: String::new(),
                 kind: 1,
             });
         }
@@ -2836,6 +2949,255 @@ mod tests {
             retained,
             "index + numbering transients all released"
         );
+    }
+
+    // -- issue #184: trace-level / colon-scoped intrinsic evaluation ------
+
+    /// A span with an explicit parent + status message (the #184 fixture
+    /// shape).
+    fn span_with(
+        n: u8,
+        parent: u8,
+        service: &str,
+        name: &str,
+        ts: i64,
+        dur: i64,
+        status_message: &str,
+    ) -> HydratedSpan {
+        let parent_id = if parent == 0 { [0u8; 8] } else { sid(parent) };
+        HydratedSpan {
+            span_id: sid(n),
+            parent_id,
+            service: service.to_string(),
+            name: name.to_string(),
+            timestamp_ns: ts,
+            duration_ns: dur,
+            status_code: 0,
+            status_message: status_message.to_string(),
+            kind: 1,
+        }
+    }
+
+    /// Installs a trace-context co-load result for `trace_id`.
+    fn with_trace_ctx(
+        attrs: &mut BatchAttrs,
+        trace_id: [u8; 16],
+        start_ns: i64,
+        end_ns: i64,
+        root_name: &str,
+        root_service: &str,
+    ) {
+        attrs.trace_ctx.insert(
+            trace_id,
+            TraceCtxInfo {
+                trace_start_ns: start_ns,
+                trace_end_ns: end_ns,
+                root_name: root_name.to_string(),
+                root_service: root_service.to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn status_message_matches_equality_regex_and_the_empty_message() {
+        let p = plan(r#"{ statusMessage = "deadline exceeded" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span_with(1, 0, "s", "a", 10, 1, "deadline exceeded"),
+                span_with(2, 0, "s", "b", 20, 1, "other"),
+                span_with(3, 0, "s", "c", 30, 1, ""),
+            ],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1)]);
+
+        // Regex over the message; the empty-message span never matches a
+        // non-empty pattern but DOES match `statusMessage = ""`.
+        let p = plan(r#"{ statusMessage =~ "deadline.*" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        assert_eq!(matches[0].spans[0].span_id, sid(1));
+        let p = plan(r#"{ statusMessage = "" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(3)], "the empty message is matchable");
+    }
+
+    #[test]
+    fn span_id_and_parent_id_match_their_lowercase_hex_case_insensitively() {
+        // sid(0xAB) renders as "00000000000000ab".
+        let p = plan(r#"{ span:id = "00000000000000AB" }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span_with(0xAB, 0, "s", "a", 10, 1, ""),
+                span_with(2, 0xAB, "s", "b", 20, 1, ""),
+            ],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(
+            ids,
+            vec![sid(0xAB)],
+            "uppercase query hex matches (case-insensitive Eq)"
+        );
+
+        let p = plan(r#"{ span:parentID = "00000000000000ab" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(2)], "only the child of 0xAB matches");
+
+        // A zero parent renders as all-zero hex — the root is addressable.
+        let p = plan(r#"{ span:parentID = "0000000000000000" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(0xAB)]);
+    }
+
+    #[test]
+    fn trace_id_matches_every_span_of_the_matching_trace_only() {
+        // tid(1) renders as 30 zeros + "01".
+        let p = plan(r#"{ trace:id = "00000000000000000000000000000001" }"#);
+        let matching = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span_with(1, 0, "s", "a", 10, 1, ""),
+                span_with(2, 1, "s", "b", 20, 1, ""),
+            ],
+        };
+        let other = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span_with(1, 0, "s", "a", 10, 1, "")],
+        };
+        let attrs = membership(&p, &[]);
+        let matches = eval(&p, &[matching, other], &attrs);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trace_id, tid(1));
+        assert_eq!(matches[0].matched, 2, "trace-constant: every span matches");
+    }
+
+    /// AC-Δ1a (window-independence): the trace-level values come from the
+    /// CO-LOAD (full-trace), not the window-bounded hydrated spans — a
+    /// trace whose root span and max-end span were NEVER hydrated still
+    /// resolves rootName/rootServiceName/traceDuration to the full-trace
+    /// values.
+    #[test]
+    fn trace_level_intrinsics_resolve_from_the_coload_not_the_hydrated_window() {
+        // Hydrated view: ONLY the in-window child (ts 500..501). The
+        // trace's true envelope (from the co-load) is [10, 2000] with a
+        // root outside the window.
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span_with(7, 9, "child-svc", "child-op", 500, 1, "")],
+        };
+        for (q, should_match) in [
+            (r#"{ rootServiceName = "gw" }"#, true),
+            (r#"{ rootName = "GET /checkout" }"#, true),
+            ("{ traceDuration > 1500ns }", true),
+            ("{ traceDuration >= 1990ns }", true),
+            ("{ traceDuration > 3000ns }", false),
+            // The window view alone (duration 1 ns) could never satisfy
+            // these — passing proves the co-load values are used.
+            (r#"{ rootServiceName = "child-svc" }"#, false),
+            (r#"{ rootName = "child-op" }"#, false),
+        ] {
+            let p = plan(q);
+            assert!(p.needs_trace_ctx(), "{q} must demand the co-load");
+            let mut attrs = membership(&p, &[]);
+            with_trace_ctx(&mut attrs, tid(1), 10, 2000, "GET /checkout", "gw");
+            let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+            assert_eq!(matches.len(), usize::from(should_match), "{q}");
+        }
+    }
+
+    /// AC-Δ1a (root-less / missing-context defensiveness): with NO
+    /// trace-context entry for the trace (the plan demanded none, or the
+    /// trace vanished between phases), the dependent leaves match nothing
+    /// — never a panic, never a spurious match.
+    #[test]
+    fn missing_trace_context_matches_nothing_for_dependent_leaves() {
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span_with(1, 0, "s", "a", 10, 1, "")],
+        };
+        for q in [
+            r#"{ rootServiceName = "s" }"#,
+            r#"{ rootName != "anything" }"#,
+            "{ traceDuration >= 0ns }",
+        ] {
+            let p = plan(q);
+            let attrs = membership(&p, &[]); // no trace_ctx entry
+            assert!(
+                eval(&p, std::slice::from_ref(&trace), &attrs).is_empty(),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn child_count_reads_the_full_trace_coload_and_defaults_to_zero() {
+        // Hydrated: parent (1) + one child (2). The co-load knows the
+        // FULL trace: span 1 actually has 3 direct children (two outside
+        // the window).
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span_with(1, 0, "s", "parent", 10, 1, ""),
+                span_with(2, 1, "s", "child", 20, 1, ""),
+            ],
+        };
+        let p = plan("{ span:childCount = 3 }");
+        assert!(p.needs_child_counts());
+        let mut attrs = membership(&p, &[]);
+        attrs.child_counts.insert((tid(1), sid(1)), 3);
+        let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(
+            ids,
+            vec![sid(1)],
+            "the parent's FULL-trace child count (3) matches, not the windowed 1"
+        );
+
+        // Absent key ⇒ 0 children: leaf spans satisfy `childCount = 0`.
+        let p = plan("{ span:childCount = 0 }");
+        let mut attrs = membership(&p, &[]);
+        attrs.child_counts.insert((tid(1), sid(1)), 3);
+        let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(2)], "the leaf span has zero children");
+    }
+
+    #[test]
+    fn trace_level_leaves_compose_with_span_leaves_in_one_filter() {
+        // `{ name = "child" && traceDuration > 100ns }`: the span leaf
+        // narrows within the trace, the trace leaf gates the whole trace.
+        let p = plan(r#"{ name = "child" && traceDuration > 100ns }"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span_with(1, 0, "s", "parent", 10, 1, ""),
+                span_with(2, 1, "s", "child", 20, 1, ""),
+            ],
+        };
+        let mut attrs = membership(&p, &[]);
+        with_trace_ctx(&mut attrs, tid(1), 10, 2000, "parent", "s");
+        let matches = eval(&p, std::slice::from_ref(&trace), &attrs);
+        assert_eq!(matches.len(), 1);
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(
+            ids,
+            vec![sid(2)],
+            "only the name-matching span is in the spanset"
+        );
+
+        // The same trace fails when the trace-level side fails.
+        let p = plan(r#"{ name = "child" && traceDuration > 5000ns }"#);
+        let mut attrs = membership(&p, &[]);
+        with_trace_ctx(&mut attrs, tid(1), 10, 2000, "parent", "s");
+        assert!(eval(&p, std::slice::from_ref(&trace), &attrs).is_empty());
     }
 
     #[test]

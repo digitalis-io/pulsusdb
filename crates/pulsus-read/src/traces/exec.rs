@@ -58,6 +58,7 @@
 //! | hydration row Vec | per row during streaming (`size_of::<HydrationRow>` + overhead + strings) |
 //! | grouped `HydratedSpan` slots + `span_id` dedup-set entries | [`group_hydrated_rows`] (pure, unit-tested exact accounting): first-push initial reservations (`VEC_INITIAL_RESERVATION_SLOTS`) + per-group 2× outer slot + overhead + inner initial reservation + per-UNIQUE-span 2× inner slot + set entry at the standard hash cost (`[u8;8]` + overhead); replays are contains-checked first and charge nothing (round 5) |
 //! | membership sets / numeric maps / select-value maps | per row during streaming (entry costs incl. overhead; string values by length) |
+//! | trace-context / child-count co-load maps (issue #184) | per row during streaming (`size_of::<TraceCtxRow>` + overhead + root strings; `CHILD_COUNT_ENTRY_BYTES`) — issued only when the plan's `needs_trace_ctx()`/`needs_child_counts()` flags demand them, released with the batch |
 //! | root row Vec | per row during streaming; charge transferred to the retained `roots` map ([`roots_retained_bytes`]) before the row charge is released |
 //! | winner id list | charged before the collect; released when the list dies after the root read (round 4) |
 //! | result heap entries | charged inside `evaluate_batch` (see `search_eval`'s audit); evict releases `retained_bytes` (the identical cost model) |
@@ -79,14 +80,16 @@ use super::graph_sql::{self, GraphWindow};
 use super::metrics_plan::{MetricsCtx, PlanKind, TraceMetricsPlan};
 use super::metrics_result::{MetricExemplar, MetricLabel, TraceMetricSeries, TraceMetricsResult};
 use super::rows::{
-    CandidateRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow, MembershipRow,
-    MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
+    CandidateRow, ChildCountRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow,
+    MembershipRow, MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
     MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
     MetricGroupCountRow, MetricHistogramInstantRow, MetricHistogramRow, MetricQuantileInstantRow,
     MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
-    TagValueRow,
+    TagValueRow, TraceCtxRow,
 };
-use super::search_eval::{self, BatchAttrs, HydratedSpan, SpanSummary, TraceMatch, TraceSpans};
+use super::search_eval::{
+    self, BatchAttrs, HydratedSpan, SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
+};
 use super::search_plan::{SearchCtx, SearchPlan};
 use crate::logql::error::{ReadError, TooBroadReason};
 use crate::logql::exec::escape_query_placeholders;
@@ -212,6 +215,10 @@ const MEMBERSHIP_ENTRY_BYTES: usize =
 /// Retention charge for one numeric attribute value entry.
 const NUM_VALUE_ENTRY_BYTES: usize =
     std::mem::size_of::<(([u8; 16], [u8; 8]), f64)>() + RETAINED_ENTRY_OVERHEAD;
+/// Retention charge for one direct-child-count co-load entry (issue
+/// #184): the `(trace_id, parent span_id) → count` map entry.
+const CHILD_COUNT_ENTRY_BYTES: usize =
+    std::mem::size_of::<(([u8; 16], [u8; 8]), u64)>() + RETAINED_ENTRY_OVERHEAD;
 
 /// Owned table/budget configuration a [`TraceEngine`] reads against —
 /// mirrors [`crate::logql::EngineConfig`]'s "owned `String`, no borrowed
@@ -1711,6 +1718,62 @@ impl TraceEngine {
             }
             attrs.select_values.push(map);
         }
+        // Issue #184: the trace-wide co-loads — deliberately WINDOW-FREE
+        // `trace_id IN` PK reads (the `root_sql` precedent generalized to
+        // the filter phase), so the trace-level intrinsics evaluate
+        // full-trace-exact regardless of the search window or the
+        // per-trace hydration cap. Issued only when the plan uses the
+        // corresponding intrinsics — every other query pays nothing.
+        if plan.needs_trace_ctx() {
+            let sql = plan.trace_ctx_sql_for(batch_ids);
+            charge_explain(explain, budget, "phase2_trace_context", &sql, None)?;
+            let rows: Vec<TraceCtxRow> = self
+                .collect_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    |row: &TraceCtxRow| {
+                        std::mem::size_of::<TraceCtxRow>()
+                            + RETAINED_ENTRY_OVERHEAD
+                            + row.root_name.len()
+                            + row.root_service.len()
+                    },
+                )
+                .await?;
+            let mut map = HashMap::with_capacity(rows.len());
+            for row in rows {
+                map.insert(
+                    row.trace_id,
+                    TraceCtxInfo {
+                        trace_start_ns: row.trace_start_ns,
+                        trace_end_ns: row.trace_end_ns,
+                        root_name: row.root_name,
+                        root_service: row.root_service,
+                    },
+                );
+            }
+            attrs.trace_ctx = map;
+        }
+        if plan.needs_child_counts() {
+            let sql = plan.child_count_sql_for(batch_ids);
+            charge_explain(explain, budget, "phase2_child_counts", &sql, None)?;
+            let rows: Vec<ChildCountRow> = self
+                .collect_rows_charged(
+                    &sql,
+                    settings,
+                    budget,
+                    batch_charged,
+                    map_trace_read_error,
+                    |_| CHILD_COUNT_ENTRY_BYTES,
+                )
+                .await?;
+            attrs.child_counts = rows
+                .into_iter()
+                .map(|r| ((r.trace_id, r.parent_id), r.child_count))
+                .collect();
+        }
         Ok(attrs)
     }
 }
@@ -2038,6 +2101,7 @@ fn group_hydrated_rows(
                 timestamp_ns: row.timestamp_ns,
                 duration_ns: row.duration_ns,
                 status_code: row.status_code,
+                status_message: row.status_message,
                 kind: row.kind,
             });
     }
@@ -2733,6 +2797,7 @@ mod tests {
             timestamp_ns: span as i64,
             duration_ns: 1,
             status_code: 0,
+            status_message: String::new(),
             kind: 1,
         }
     }

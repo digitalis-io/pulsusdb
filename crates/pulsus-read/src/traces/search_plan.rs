@@ -18,7 +18,7 @@ use crate::logql::sql::TimeWindow;
 
 use super::filter::{
     self, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate, PlanError,
-    SpanFilterCtx, ValuePred,
+    SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_sql;
 
@@ -71,11 +71,65 @@ impl StrOp {
 /// One physical leaf, ready for Phase-2 evaluation on hydrated spans.
 #[derive(Debug, Clone)]
 pub(crate) enum PhysicalEval {
-    Name { op: StrOp, value: String },
-    Service { op: StrOp, value: String },
-    Duration { op: ComparisonOp, nanos: i64 },
-    Status { op: ComparisonOp, code: i8 },
-    Kind { op: ComparisonOp, code: i8 },
+    Name {
+        op: StrOp,
+        value: String,
+    },
+    Service {
+        op: StrOp,
+        value: String,
+    },
+    Duration {
+        op: ComparisonOp,
+        nanos: i64,
+    },
+    Status {
+        op: ComparisonOp,
+        code: i8,
+    },
+    Kind {
+        op: ComparisonOp,
+        code: i8,
+    },
+    /// `statusMessage` (issue #184) — on the hydrated `status_message`.
+    StatusMessage {
+        op: StrOp,
+        value: String,
+    },
+    /// `span:id` (issue #184) — against the span id's lowercase-hex
+    /// rendering (Eq/Neq values pre-lowercased at leaf compilation).
+    SpanIdHex {
+        op: StrOp,
+        value: String,
+    },
+    /// `span:parentID` (issue #184) — as [`PhysicalEval::SpanIdHex`] over
+    /// `parent_id`.
+    ParentIdHex {
+        op: StrOp,
+        value: String,
+    },
+}
+
+/// One trace-level intrinsic leaf (issue #184), ready for Phase-2
+/// evaluation against the per-trace [`super::search_eval::TraceEvalCtx`]
+/// (populated from the trace-wide co-loads — window-independent,
+/// full-trace-exact).
+#[derive(Debug, Clone)]
+pub(crate) enum TraceCtxEval {
+    /// `span:childCount` — the span's direct-child count from the
+    /// child-count co-load (absent parent key ⇒ 0 children).
+    ChildCount { op: ComparisonOp, value: f64 },
+    /// `traceDuration`/`trace:duration` — `trace_end_ns - trace_start_ns`
+    /// from the trace-context co-load.
+    TraceDurationNs { op: ComparisonOp, nanos: i64 },
+    /// `rootName`/`trace:rootName` — the co-load's byte-capped root name.
+    RootName { op: StrOp, value: String },
+    /// `rootServiceName`/`trace:rootService` — the co-load's byte-capped
+    /// root service.
+    RootServiceName { op: StrOp, value: String },
+    /// `trace:id` — against the candidate trace id's lowercase-hex
+    /// rendering (no co-load needed).
+    TraceId { op: StrOp, value: String },
 }
 
 /// One resolved operand of a field-vs-field comparison (issue #183). An
@@ -117,6 +171,9 @@ pub(crate) enum PlannedLeafEval {
         rhs: PlannedOperand,
         op: ComparisonOp,
     },
+    /// A trace-level intrinsic comparison (issue #184), evaluated against
+    /// the per-trace context co-load.
+    TraceCtx(TraceCtxEval),
 }
 
 /// One planned `{...}` spanset filter (pre-order over the spanset
@@ -198,6 +255,15 @@ pub struct SearchPlan {
     /// (issue #181) — gates the per-trace query-time numbering in Phase 2
     /// so non-nested-set queries pay nothing.
     pub(crate) nested_set: bool,
+    /// Whether any planned leaf reads the trace-level context co-load
+    /// (`traceDuration`/`rootName`/`rootServiceName`, issue #184) — gates
+    /// the per-batch trace-wide `trace_ctx_sql` read so other queries pay
+    /// nothing.
+    pub(crate) trace_ctx: bool,
+    /// Whether any planned leaf reads the direct-child-count co-load
+    /// (`span:childCount`, issue #184) — gates the per-batch trace-wide
+    /// `child_count_sql` read.
+    pub(crate) child_count: bool,
     /// Distinct attribute membership probes (batch reads).
     pub(crate) probes: Vec<AttrProbe>,
     /// Distinct attribute aggregate `val_num` reads.
@@ -272,6 +338,31 @@ impl SearchPlan {
     /// trace-wide, no time predicate, no row cap.
     pub fn root_sql_for(&self, trace_ids: &[[u8; 16]]) -> String {
         search_sql::root_sql(&self.spans_table, trace_ids)
+    }
+
+    /// Whether the plan issues the per-batch trace-level context co-load
+    /// (issue #184 — `traceDuration`/`rootName`/`rootServiceName` leaves).
+    pub fn needs_trace_ctx(&self) -> bool {
+        self.trace_ctx
+    }
+
+    /// Whether the plan issues the per-batch direct-child-count co-load
+    /// (issue #184 — `span:childCount` leaves).
+    pub fn needs_child_counts(&self) -> bool {
+        self.child_count
+    }
+
+    /// One batch's trace-level context co-load SQL (exposed for the
+    /// golden suite; `exec` drives the same builder) — trace-wide, no
+    /// time predicate, no row cap (issue #184).
+    pub fn trace_ctx_sql_for(&self, trace_ids: &[[u8; 16]]) -> String {
+        search_sql::trace_ctx_sql(&self.spans_table, trace_ids)
+    }
+
+    /// One batch's direct-child-count co-load SQL (exposed for the golden
+    /// suite; `exec` drives the same builder) — trace-wide (issue #184).
+    pub fn child_count_sql_for(&self, trace_ids: &[[u8; 16]]) -> String {
+        search_sql::child_count_sql(&self.spans_table, trace_ids)
     }
 
     /// One aggregate field's `val_num` batch read (exposed for the
@@ -358,6 +449,64 @@ fn plan_physical(p: &PhysicalPredicate) -> Result<PhysicalEval, PlanError> {
         PhysicalPredicate::Kind { op, code } => PhysicalEval::Kind {
             op: *op,
             code: *code,
+        },
+        PhysicalPredicate::StatusMessage { op, value } => PhysicalEval::StatusMessage {
+            op: planned_str_op(*op, value)?,
+            value: value.clone(),
+        },
+        PhysicalPredicate::SpanIdHex { op, value } => PhysicalEval::SpanIdHex {
+            op: planned_str_op(*op, value)?,
+            value: value.clone(),
+        },
+        PhysicalPredicate::ParentIdHex { op, value } => PhysicalEval::ParentIdHex {
+            op: planned_str_op(*op, value)?,
+            value: value.clone(),
+        },
+    })
+}
+
+/// Plans one trace-level intrinsic leaf (issue #184): string operators
+/// compile their anchored regexes here (a bad pattern is a `400` at plan
+/// time, never a mid-execution error) and flag which co-load the plan
+/// must issue.
+fn plan_trace_ctx(
+    pred: &TraceCtxPred,
+    trace_ctx: &mut bool,
+    child_count: &mut bool,
+) -> Result<TraceCtxEval, PlanError> {
+    Ok(match pred {
+        TraceCtxPred::ChildCount { op, value } => {
+            *child_count = true;
+            TraceCtxEval::ChildCount {
+                op: *op,
+                value: *value,
+            }
+        }
+        TraceCtxPred::TraceDurationNs { op, nanos } => {
+            *trace_ctx = true;
+            TraceCtxEval::TraceDurationNs {
+                op: *op,
+                nanos: *nanos,
+            }
+        }
+        TraceCtxPred::RootName { op, value } => {
+            *trace_ctx = true;
+            TraceCtxEval::RootName {
+                op: planned_str_op(*op, value)?,
+                value: value.clone(),
+            }
+        }
+        TraceCtxPred::RootServiceName { op, value } => {
+            *trace_ctx = true;
+            TraceCtxEval::RootServiceName {
+                op: planned_str_op(*op, value)?,
+                value: value.clone(),
+            }
+        }
+        // `trace:id` needs no co-load — the candidate's id is in hand.
+        TraceCtxPred::TraceId { op, value } => TraceCtxEval::TraceId {
+            op: planned_str_op(*op, value)?,
+            value: value.clone(),
         },
     })
 }
@@ -581,6 +730,24 @@ fn plan_pipeline(
                                 "select() of a nested-set intrinsic is not supported".to_string(),
                             ));
                         }
+                        // Issue #184: `select()` projection of the
+                        // trace-level/scoped intrinsics is out of scope
+                        // (filtering only) — a clean 400, mirroring
+                        // nested-set.
+                        Field::Intrinsic(
+                            Intrinsic::StatusMessage
+                            | Intrinsic::ChildCount
+                            | Intrinsic::SpanId
+                            | Intrinsic::ParentId
+                            | Intrinsic::TraceId
+                            | Intrinsic::TraceDuration
+                            | Intrinsic::RootName
+                            | Intrinsic::RootServiceName,
+                        ) => {
+                            return Err(PlanError::TypeMismatch(
+                                "select() of this intrinsic is not supported".to_string(),
+                            ));
+                        }
                         Field::Attribute { scope, key }
                             if *scope == pulsus_traceql::AttrScope::Resource
                                 && key == "service.name" =>
@@ -626,6 +793,8 @@ pub fn plan_search(
     let mut filters = Vec::new();
     let mut generator_sqls: Vec<String> = Vec::new();
     let mut nested_set = false;
+    let mut trace_ctx = false;
+    let mut child_count = false;
     // Attribute value reads (`val_num` / `val`): declared before the
     // filter loop because a field-vs-field comparison leaf interns its
     // attribute operands here (issue #183), then `plan_pipeline` appends
@@ -659,6 +828,11 @@ pub fn plan_search(
                     rhs: plan_operand(rhs, &mut agg_fields, &mut select_attrs),
                     op: *op,
                 },
+                LeafEval::TraceCtx(pred) => PlannedLeafEval::TraceCtx(plan_trace_ctx(
+                    pred,
+                    &mut trace_ctx,
+                    &mut child_count,
+                )?),
             };
             leaves.push(planned);
         }
@@ -694,6 +868,8 @@ pub fn plan_search(
         spanset: query.spanset.clone(),
         filters,
         nested_set,
+        trace_ctx,
+        child_count,
         probes,
         agg_fields,
         select_attrs,
@@ -942,6 +1118,68 @@ mod tests {
         match plan_search(&query, &PARAMS, &ctx()) {
             Err(PlanError::TypeMismatch(msg)) => assert!(msg.contains("nested-set"), "{msg}"),
             other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    // -- issue #184: trace-level intrinsic planning ----------------------
+
+    #[test]
+    fn trace_level_leaves_set_exactly_their_coload_flags() {
+        let p = plan("{ traceDuration > 1s }");
+        assert!(p.needs_trace_ctx() && !p.needs_child_counts());
+        let p = plan(r#"{ rootName = "GET /" }"#);
+        assert!(p.needs_trace_ctx() && !p.needs_child_counts());
+        let p = plan(r#"{ rootServiceName =~ "gw.*" }"#);
+        assert!(p.needs_trace_ctx() && !p.needs_child_counts());
+        let p = plan("{ span:childCount > 2 }");
+        assert!(!p.needs_trace_ctx() && p.needs_child_counts());
+        // `trace:id` needs NO co-load (the candidate's id is in hand), and
+        // unrelated queries pay nothing.
+        let p = plan(r#"{ trace:id = "00000000000000000000000000000001" }"#);
+        assert!(!p.needs_trace_ctx() && !p.needs_child_counts());
+        let p = plan(r#"{ resource.service.name = "checkout" }"#);
+        assert!(!p.needs_trace_ctx() && !p.needs_child_counts());
+    }
+
+    #[test]
+    fn coload_sql_builders_render_the_trace_wide_reads() {
+        let p = plan(r#"{ rootServiceName = "gw" && span:childCount > 1 }"#);
+        assert!(p.needs_trace_ctx() && p.needs_child_counts());
+        let ids = [[7u8; 16]];
+        let ctx_sql = p.trace_ctx_sql_for(&ids);
+        assert!(ctx_sql.contains("FROM trace_spans\n"), "{ctx_sql}");
+        assert!(!ctx_sql.contains("timestamp_ns >"), "trace-wide: {ctx_sql}");
+        let cc_sql = p.child_count_sql_for(&ids);
+        assert!(cc_sql.contains("GROUP BY trace_id, parent_id"), "{cc_sql}");
+    }
+
+    #[test]
+    fn an_invalid_root_name_regex_fails_at_plan_time() {
+        let query = parse(r#"{ rootName =~ "(" }"#).expect("parse");
+        assert!(matches!(
+            plan_search(&query, &PARAMS, &ctx()),
+            Err(PlanError::TypeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn select_of_a_trace_level_or_scoped_intrinsic_is_a_type_mismatch() {
+        for q in [
+            r#"{ .k = "v" } | select(statusMessage)"#,
+            r#"{ .k = "v" } | select(traceDuration)"#,
+            r#"{ .k = "v" } | select(rootName)"#,
+            r#"{ .k = "v" } | select(rootServiceName)"#,
+            r#"{ .k = "v" } | select(span:childCount)"#,
+            r#"{ .k = "v" } | select(trace:id)"#,
+        ] {
+            let query = parse(q).expect("parse");
+            assert!(
+                matches!(
+                    plan_search(&query, &PARAMS, &ctx()),
+                    Err(PlanError::TypeMismatch(_))
+                ),
+                "{q}"
+            );
         }
     }
 

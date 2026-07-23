@@ -199,6 +199,7 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             timestamp_ns: ts_ns,
             duration_ns: 1_000_000_000,
             status_code: 2,
+            status_message: String::new(),
             kind: 3,
             shared: 0,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],

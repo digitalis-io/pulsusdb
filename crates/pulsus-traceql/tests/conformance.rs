@@ -37,7 +37,10 @@ use sha2::{Digest, Sha256};
 
 use pulsus_traceql::{TraceQlError, parse};
 
-const VALID_ISSUES: [u64; 4] = [181, 182, 183, 184];
+// #179 is the epic that provisionally owns the 15 event/link/instrumentation/
+// parent/existence constructs re-homed off #184 (issue #184, Plan v7 Δ2)
+// pending the owner's dedicated split-issue ruling.
+const VALID_ISSUES: [u64; 5] = [179, 181, 182, 183, 184];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/tempo/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 
@@ -497,9 +500,9 @@ fn differential_categories_are_pinned() {
     );
     // Exact pins — every T2–T5 landing flips a tracked gap to `supported`
     // and must re-pin these deliberately.
-    assert_eq!(supported, 72, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 88, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 40,
+        tracked_interim, 24,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(

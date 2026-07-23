@@ -294,6 +294,7 @@ mod tests {
                 timestamp_ns: 1,
                 duration_ns: 1,
                 status_code: 0,
+                status_message: String::new(),
                 kind: 0,
                 shared: 0,
                 payload: vec![1],

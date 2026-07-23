@@ -134,6 +134,7 @@ fn span_record(trace_seed: u8) -> SpanRecord {
         timestamp_ns: TS_NS,
         duration_ns: 1_000_000_000,
         status_code: 2,
+        status_message: String::new(),
         kind: 3,
         shared: 0,
         payload: vec![0xDE, 0xAD],

@@ -351,6 +351,13 @@ fn parse_span(
     // is stored as its truncated discriminant rather than rejected — the
     // columns are plain Int8, not enums (docs/schemas.md §4.1).
     let status_code = span.status.as_ref().map(|s| s.code).unwrap_or(0) as i8;
+    // OTLP `Status.message` verbatim (issue #184), `""` when absent — the
+    // parser previously dropped it. Bytes charged in `span_expansion_charge`.
+    let status_message = span
+        .status
+        .as_ref()
+        .map(|s| s.message.clone())
+        .unwrap_or_default();
     let kind = span.kind as i8;
     let shared = shared_flag(span);
 
@@ -423,6 +430,7 @@ fn parse_span(
         timestamp_ns,
         duration_ns,
         status_code,
+        status_message,
         kind,
         shared,
         payload: build_payload(span, ctx.resource, ctx.resource_spans, ctx.scope_spans),
@@ -540,8 +548,15 @@ fn span_expansion_charge(
     payload_base: usize,
 ) -> usize {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
-    let mut charge =
-        SPAN_ROW_OVERHEAD + span.name.len() + service_len + payload_base + span.encoded_len();
+    // The promoted `status_message` (issue #184) is an extra materialized
+    // copy beyond the wire `span.encoded_len()`, like `name`/`service`.
+    let status_message_len = span.status.as_ref().map(|s| s.message.len()).unwrap_or(0);
+    let mut charge = SPAN_ROW_OVERHEAD
+        + span.name.len()
+        + service_len
+        + payload_base
+        + span.encoded_len()
+        + status_message_len;
     for kv in resource_attrs.iter().chain(&span.attributes) {
         charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
     }
@@ -865,7 +880,7 @@ mod tests {
         let mut s = valid_span();
         s.parent_span_id = vec![3; 8];
         s.status = Some(Status {
-            message: String::new(),
+            message: "deadline exceeded".to_string(),
             code: StatusCode::Error as i32,
         });
         let out =
@@ -878,6 +893,10 @@ mod tests {
         assert_eq!(span.timestamp_ns, 1_700_000_000_000_000_000);
         assert_eq!(span.duration_ns, 1_000_000_000);
         assert_eq!(span.status_code, StatusCode::Error as i8);
+        assert_eq!(
+            span.status_message, "deadline exceeded",
+            "issue #184: Status.message is stored verbatim, no longer dropped"
+        );
         assert_eq!(span.kind, SpanKind::Server as i8);
     }
 
@@ -928,6 +947,10 @@ mod tests {
         let out = parse(&request_with(None, None, vec![valid_span()]), 0)
             .expect("within the expansion budget");
         assert_eq!(out.spans[0].status_code, 0);
+        assert_eq!(
+            out.spans[0].status_message, "",
+            "no Status ⇒ the empty message (issue #184)"
+        );
     }
 
     #[test]

@@ -281,3 +281,74 @@ async fn sync_post_round_trips_exact_counts_on_both_trace_tables() {
         "the same verbatim (key, val) at both scopes must land as two scoped rows"
     );
 }
+
+/// Issue #184 AC5 (ingest side): a non-empty OTLP `Status.message`
+/// round-trips through the REAL wire path (`POST /v1/traces` →
+/// `otlp_traces::parse` → `TraceWriter`) into the migration-35
+/// `trace_spans.status_message` column, verbatim; spans without a Status
+/// land `''`. The committed fixture is untouched — the decoded request is
+/// mutated in memory.
+#[tokio::test]
+async fn status_message_round_trips_through_the_product_ingest_path() {
+    skip_unless_live!();
+    use opentelemetry_proto::tonic::trace::v1::Status;
+    let db = "pulsus_write_it_trace_status_msg";
+    let client = fresh_db(db).await;
+
+    let (mut req, span_count, _) = fixture_request_rebased_to_now();
+    assert_eq!(span_count, 2);
+    // First span carries a message; the second carries NO Status at all
+    // (fixture-layout-independent: walk every scope_spans list in order).
+    let mut idx = 0usize;
+    for rs in &mut req.resource_spans {
+        for ss in &mut rs.scope_spans {
+            for span in &mut ss.spans {
+                span.status = if idx == 0 {
+                    Some(Status {
+                        message: "deadline exceeded: ingest-184".to_string(),
+                        code: 2,
+                    })
+                } else {
+                    None
+                };
+                idx += 1;
+            }
+        }
+    }
+    assert_eq!(idx, 2);
+
+    let writer = Arc::new(TraceWriter::new_with_tables(
+        Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),
+        &WriterConfig::default(),
+        TraceWriterTables::traces_default(),
+    ));
+    let router: Router = Router::new()
+        .route("/v1/traces", post(traces::<TraceWriter>))
+        .with_state(writer);
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/traces")
+        .body(Body::from(req.encode_to_vec()))
+        .expect("build request");
+    let response = router.oneshot(request).await.expect("router call");
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let with_message = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.trace_spans \
+             WHERE status_message = 'deadline exceeded: ingest-184'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        with_message, 1,
+        "the message lands verbatim on exactly its span"
+    );
+    let empty = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.trace_spans WHERE status_message = ''"),
+    )
+    .await;
+    assert_eq!(empty, 1, "a span without a Status stores the '' default");
+}

@@ -205,6 +205,54 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // `trace:id =` (issue #184): the generator predicate is the
+        // `trace_id = unhex('…')` PK-prefix restriction — the
+        // `ORDER BY (trace_id, timestamp_ns)` prune (AC6 / AC8's Tier-1
+        // EXPLAIN evidence lives in traces_search_explain.rs).
+        name: "trace_id_eq",
+        q: r#"{ trace:id = "000102030405060708090a0b0c0d0e0f" }"#,
+        distributed: false,
+    },
+    Case {
+        // `rootServiceName =` (issue #184, plan v2 §Performance): the
+        // TIME-RANGE superset generator (a windowed root scan would miss
+        // out-of-window roots) plus the trace-wide context co-load
+        // (AC-Δ1b: no time clause) which evaluates it full-trace-exact.
+        name: "root_service_eq",
+        q: r#"{ rootServiceName = "gw" }"#,
+        distributed: false,
+    },
+    Case {
+        // `traceDuration` (issue #184): no cheap exact pushdown — the
+        // time-range superset generator + the trace-wide context co-load
+        // resolve it full-trace-exact in Phase 2.
+        name: "trace_duration",
+        q: "{ traceDuration > 2s }",
+        distributed: false,
+    },
+    Case {
+        // `span:childCount` (issue #184): time-range superset generator +
+        // the trace-wide child-count co-load.
+        name: "child_count",
+        q: "{ span:childCount > 2 }",
+        distributed: false,
+    },
+    Case {
+        // `statusMessage` (issue #184): a bounded-window span scan on the
+        // migration-35 `status_message` column; hydration now carries the
+        // byte-capped column for Phase-2 evaluation.
+        name: "status_message_eq",
+        q: r#"{ statusMessage = "deadline exceeded" }"#,
+        distributed: false,
+    },
+    Case {
+        // `span:id` (issue #184): the lowercase-hex id comparison — a
+        // bounded-window span scan; Phase 2 compares the same rendering.
+        name: "span_id_eq",
+        q: r#"{ span:id = "0a1b2c3d4e5f6071" }"#,
+        distributed: false,
+    },
+    Case {
         // The clustered form of the worked example: `_dist` tables; the
         // §7 clustered-reader + budget settings ride as HTTP settings,
         // never SQL text (pinned separately in `traces::exec` tests).
@@ -264,6 +312,20 @@ fn composite(case: &Case) -> String {
         out.push_str(&format!(
             "\n== phase2 select values[{field_idx}] ==\n{}\n",
             plan.select_values_sql_for(field_idx, &BATCH)
+        ));
+    }
+    // Issue #184: the trace-wide co-loads (window-free by design), only
+    // when the plan's intrinsics demand them.
+    if plan.needs_trace_ctx() {
+        out.push_str(&format!(
+            "\n== phase2 trace context (sample batch) ==\n{}\n",
+            plan.trace_ctx_sql_for(&BATCH)
+        ));
+    }
+    if plan.needs_child_counts() {
+        out.push_str(&format!(
+            "\n== phase2 child counts (sample batch) ==\n{}\n",
+            plan.child_count_sql_for(&BATCH)
         ));
     }
     out.push_str(&format!(
@@ -492,6 +554,87 @@ fn rhs_attr_generator_is_the_key_only_scan_not_a_fallback() {
         !sql.contains("val ="),
         "a key-existence scan carries no value predicate: {sql}"
     );
+}
+
+/// Issue #184 AC6: `{ trace:id = "…" }` renders the `trace_id` PK-prefix
+/// generator; `{ rootServiceName = "gw" }` renders the time-range
+/// superset (plan v2 §Performance — a windowed root scan would miss
+/// out-of-window roots) plus the trace-context co-load.
+#[test]
+fn trace_id_and_root_service_generators_pin_their_documented_shapes() {
+    let plan = plan_for(
+        CASES
+            .iter()
+            .find(|c| c.name == "trace_id_eq")
+            .expect("trace_id_eq case"),
+    );
+    assert_eq!(plan.generator_sqls.len(), 1);
+    assert!(
+        plan.generator_sqls[0].contains("(trace_id = unhex('000102030405060708090a0b0c0d0e0f'))"),
+        "the PK-prefix restriction: {}",
+        plan.generator_sqls[0]
+    );
+    assert!(!plan.needs_trace_ctx(), "trace:id needs no co-load");
+
+    let plan = plan_for(
+        CASES
+            .iter()
+            .find(|c| c.name == "root_service_eq")
+            .expect("root_service_eq case"),
+    );
+    let match_all = plan_for(&Case {
+        name: "match_all",
+        q: "{}",
+        distributed: false,
+    });
+    assert_eq!(
+        plan.generator_sqls, match_all.generator_sqls,
+        "the root leaf's generator is the complete time-range superset ({{}}-identical)"
+    );
+    assert!(plan.needs_trace_ctx());
+}
+
+/// Issue #184 AC-Δ1b: the committed co-load goldens carry NO time clause
+/// and a `trace_id IN (…)` restriction — trace-wide by construction.
+#[test]
+fn committed_coload_golden_sections_are_trace_wide() {
+    let dir = golden_dir();
+    for (file, header) in [
+        (
+            "root_service_eq.sql",
+            "== phase2 trace context (sample batch) ==",
+        ),
+        (
+            "trace_duration.sql",
+            "== phase2 trace context (sample batch) ==",
+        ),
+        (
+            "child_count.sql",
+            "== phase2 child counts (sample batch) ==",
+        ),
+    ] {
+        let golden = std::fs::read_to_string(dir.join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e} (regenerate goldens)"));
+        let section = golden
+            .split(header)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{file} must contain {header}"))
+            .split("\n==")
+            .next()
+            .expect("section body");
+        assert!(
+            !section.contains("timestamp_ns >") && !section.contains("timestamp_ns <="),
+            "{file}: the co-load must carry no time clause:\n{section}"
+        );
+        assert!(
+            section.contains("trace_id IN (unhex("),
+            "{file}: the co-load must restrict on the candidate trace_ids:\n{section}"
+        );
+        assert!(
+            !section.contains("LIMIT"),
+            "{file}: the co-load must carry no row cap:\n{section}"
+        );
+    }
 }
 
 /// Regenerates every committed golden. `#[ignore]`d: run explicitly

@@ -109,6 +109,10 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, TraceQlError> {
                 sc.advance();
                 push(&mut tokens, TokenKind::Comma, start, sc.current_byte());
             }
+            ':' => {
+                sc.advance();
+                push(&mut tokens, TokenKind::Colon, start, sc.current_byte());
+            }
             '~' => {
                 sc.advance();
                 push(&mut tokens, TokenKind::Tilde, start, sc.current_byte());
@@ -647,6 +651,19 @@ mod tests {
                 TokenKind::Ident("http".to_string()),
                 TokenKind::Dot,
                 TokenKind::Ident("status_code".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_colon_scoped_intrinsic_lexes_as_ident_colon_ident() {
+        assert_eq!(
+            kinds("span:childCount"),
+            vec![
+                TokenKind::Ident("span".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("childCount".to_string()),
                 TokenKind::Eof,
             ]
         );

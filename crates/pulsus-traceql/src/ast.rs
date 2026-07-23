@@ -254,9 +254,37 @@ pub enum Intrinsic {
     NestedSetLeft,
     /// `nestedSetRight` — a span's modified-preorder `right` boundary.
     NestedSetRight,
+    // -- issue #184: the colon-scoped intrinsic namespace. The bare and
+    // `span:`/`trace:` scoped spellings normalize onto one variant each
+    // (`span:name` ≡ `name`); the canonical `Display` reparses to the same
+    // variant (the round-trip oracle).
+    /// `statusMessage` | `span:statusMessage` — the span status message
+    /// (string).
+    StatusMessage,
+    /// `span:childCount` — the number of direct children of a span
+    /// (integer; no bare spelling).
+    ChildCount,
+    /// `span:id` — the span id (hex string; no bare spelling).
+    SpanId,
+    /// `span:parentID` — the parent span id (hex string; no bare spelling).
+    ParentId,
+    /// `trace:id` — the trace id (hex string; no bare spelling).
+    TraceId,
+    /// `traceDuration` | `trace:duration` — the whole trace's duration.
+    TraceDuration,
+    /// `rootName` | `trace:rootName` — the trace root span's name (string).
+    RootName,
+    /// `rootServiceName` | `trace:rootService` — the trace root span's
+    /// service name (string).
+    RootServiceName,
 }
 
 impl Intrinsic {
+    /// Resolves a bare intrinsic keyword (`name`, `duration`, the legacy
+    /// trace-level spellings `statusMessage`/`traceDuration`/`rootName`/
+    /// `rootServiceName`, …). Colon-scoped spellings resolve via
+    /// [`Intrinsic::from_scoped`]; the intrinsics with only a scoped form
+    /// (`childCount`/`id`/`parentID`) are deliberately absent here.
     pub(crate) fn from_ident(name: &str) -> Option<Self> {
         match name {
             "name" => Some(Self::Name),
@@ -266,6 +294,33 @@ impl Intrinsic {
             "nestedSetParent" => Some(Self::NestedSetParent),
             "nestedSetLeft" => Some(Self::NestedSetLeft),
             "nestedSetRight" => Some(Self::NestedSetRight),
+            "statusMessage" => Some(Self::StatusMessage),
+            "traceDuration" => Some(Self::TraceDuration),
+            "rootName" => Some(Self::RootName),
+            "rootServiceName" => Some(Self::RootServiceName),
+            _ => None,
+        }
+    }
+
+    /// Resolves a colon-scoped intrinsic (`span:childCount`, `trace:id`,
+    /// …). An unknown scope keyword (`event:`/`link:`/`instrumentation:`)
+    /// or an unknown field yields `None`, which the parser surfaces as a
+    /// generic error — keeping those constructs' interim-generic
+    /// disposition intact (issue #184).
+    pub(crate) fn from_scoped(scope: &str, ident: &str) -> Option<Self> {
+        match (scope, ident) {
+            ("span", "name") => Some(Self::Name),
+            ("span", "duration") => Some(Self::Duration),
+            ("span", "status") => Some(Self::Status),
+            ("span", "kind") => Some(Self::Kind),
+            ("span", "statusMessage") => Some(Self::StatusMessage),
+            ("span", "childCount") => Some(Self::ChildCount),
+            ("span", "id") => Some(Self::SpanId),
+            ("span", "parentID") => Some(Self::ParentId),
+            ("trace", "id") => Some(Self::TraceId),
+            ("trace", "duration") => Some(Self::TraceDuration),
+            ("trace", "rootName") => Some(Self::RootName),
+            ("trace", "rootService") => Some(Self::RootServiceName),
             _ => None,
         }
     }
@@ -279,6 +334,16 @@ impl Intrinsic {
             Intrinsic::NestedSetParent => "nestedSetParent",
             Intrinsic::NestedSetLeft => "nestedSetLeft",
             Intrinsic::NestedSetRight => "nestedSetRight",
+            // Canonical spelling: the bare form where one exists, else the
+            // sole scoped form — each reparses to this same variant.
+            Intrinsic::StatusMessage => "statusMessage",
+            Intrinsic::ChildCount => "span:childCount",
+            Intrinsic::SpanId => "span:id",
+            Intrinsic::ParentId => "span:parentID",
+            Intrinsic::TraceId => "trace:id",
+            Intrinsic::TraceDuration => "traceDuration",
+            Intrinsic::RootName => "rootName",
+            Intrinsic::RootServiceName => "rootServiceName",
         }
     }
 }
@@ -839,6 +904,8 @@ mod tests {
 
     #[test]
     fn intrinsics_round_trip_through_from_ident_and_display() {
+        // Bare-spelled intrinsics: `from_ident` resolves them and their
+        // canonical `Display` is that same bare word.
         for (name, intrinsic) in [
             ("name", Intrinsic::Name),
             ("duration", Intrinsic::Duration),
@@ -847,12 +914,70 @@ mod tests {
             ("nestedSetParent", Intrinsic::NestedSetParent),
             ("nestedSetLeft", Intrinsic::NestedSetLeft),
             ("nestedSetRight", Intrinsic::NestedSetRight),
+            ("statusMessage", Intrinsic::StatusMessage),
+            ("traceDuration", Intrinsic::TraceDuration),
+            ("rootName", Intrinsic::RootName),
+            ("rootServiceName", Intrinsic::RootServiceName),
         ] {
             assert_eq!(Intrinsic::from_ident(name), Some(intrinsic));
             assert_eq!(intrinsic.to_string(), name);
         }
         assert_eq!(Intrinsic::from_ident("service"), None);
         assert_eq!(Intrinsic::from_ident("nestedSet"), None);
+        // The scope-only intrinsics have NO bare spelling.
+        assert_eq!(Intrinsic::from_ident("childCount"), None);
+        assert_eq!(Intrinsic::from_ident("id"), None);
+        assert_eq!(Intrinsic::from_ident("parentID"), None);
+    }
+
+    #[test]
+    fn colon_scoped_intrinsics_resolve_and_display_canonically() {
+        for (scope, ident, intrinsic, canonical) in [
+            ("span", "name", Intrinsic::Name, "name"),
+            ("span", "duration", Intrinsic::Duration, "duration"),
+            ("span", "status", Intrinsic::Status, "status"),
+            ("span", "kind", Intrinsic::Kind, "kind"),
+            (
+                "span",
+                "statusMessage",
+                Intrinsic::StatusMessage,
+                "statusMessage",
+            ),
+            (
+                "span",
+                "childCount",
+                Intrinsic::ChildCount,
+                "span:childCount",
+            ),
+            ("span", "id", Intrinsic::SpanId, "span:id"),
+            ("span", "parentID", Intrinsic::ParentId, "span:parentID"),
+            ("trace", "id", Intrinsic::TraceId, "trace:id"),
+            (
+                "trace",
+                "duration",
+                Intrinsic::TraceDuration,
+                "traceDuration",
+            ),
+            ("trace", "rootName", Intrinsic::RootName, "rootName"),
+            (
+                "trace",
+                "rootService",
+                Intrinsic::RootServiceName,
+                "rootServiceName",
+            ),
+        ] {
+            assert_eq!(Intrinsic::from_scoped(scope, ident), Some(intrinsic));
+            assert_eq!(intrinsic.to_string(), canonical);
+        }
+        // Unknown colon scopes stay unresolved (generic error at parse).
+        assert_eq!(Intrinsic::from_scoped("event", "name"), None);
+        assert_eq!(Intrinsic::from_scoped("link", "spanID"), None);
+        assert_eq!(Intrinsic::from_scoped("instrumentation", "name"), None);
+        assert_eq!(Intrinsic::from_scoped("span", "bogus"), None);
+        assert_eq!(
+            Intrinsic::from_scoped("trace", "rootName"),
+            Some(Intrinsic::RootName)
+        );
     }
 
     #[test]

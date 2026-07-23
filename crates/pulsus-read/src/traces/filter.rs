@@ -41,6 +41,8 @@ use pulsus_traceql::{
 
 use crate::logql::escape;
 
+use super::search_sql::byte_cap_expr;
+
 /// Table-name context for one compilation — `trace_spans{_dist}` /
 /// `trace_attrs_idx{_dist}` exactly as `chconfig` derives them.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +161,18 @@ pub enum PhysicalPredicate {
     Status { op: ComparisonOp, code: i8 },
     /// `kind` — Eq/Neq against the OTEL wire code.
     Kind { op: ComparisonOp, code: i8 },
+    /// `statusMessage` / `span:statusMessage` (issue #184) — Eq/Neq/Re/Nre
+    /// on the `status_message` String column. Phase-1 SQL compares the
+    /// byte-capped rendering (the shared `search_sql` cap helper), matching
+    /// the capped value Phase 2 hydrates and evaluates.
+    StatusMessage { op: ComparisonOp, value: String },
+    /// `span:id` (issue #184) — Eq/Neq/Re/Nre against the lowercase hex
+    /// rendering of the 8-byte `span_id`. `value` is stored lowercased for
+    /// Eq/Neq (hex is case-insensitive); Re/Nre keep the raw pattern.
+    SpanIdHex { op: ComparisonOp, value: String },
+    /// `span:parentID` (issue #184) — as [`PhysicalPredicate::SpanIdHex`]
+    /// but over the `parent_id` column.
+    ParentIdHex { op: ComparisonOp, value: String },
 }
 
 /// Which nested-set structural intrinsic a leaf compares (issue #181).
@@ -193,10 +207,38 @@ pub enum CompareOperand {
     },
 }
 
+/// A trace-level intrinsic comparison (issue #184), evaluated engine-side
+/// against the per-trace context co-load (`traces::search_eval`'s
+/// `TraceEvalCtx`) — window-independent, full-trace-exact. No hydrated span
+/// column carries these values, so each leaf pairs with whatever Phase-1
+/// generator its compile helper selects ([`compile_root_leaf`] /
+/// [`compile_trace_num_leaf`] / [`compile_trace_id_leaf`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraceCtxPred {
+    /// `span:childCount` — the number of direct children of the span
+    /// (from the child-count co-load, keyed by the parent's span id).
+    ChildCount { op: ComparisonOp, value: f64 },
+    /// `traceDuration` / `trace:duration` — the whole trace's span (end −
+    /// start), in nanoseconds.
+    TraceDurationNs { op: ComparisonOp, nanos: i64 },
+    /// `rootName` / `trace:rootName` — Eq/Neq/Re/Nre on the trace root
+    /// span's (byte-capped) name from the trace-context co-load.
+    RootName { op: ComparisonOp, value: String },
+    /// `rootServiceName` / `trace:rootService` — as
+    /// [`TraceCtxPred::RootName`] over the root span's service.
+    RootServiceName { op: ComparisonOp, value: String },
+    /// `trace:id` — Eq/Neq/Re/Nre against the lowercase hex rendering of the
+    /// 16-byte `trace_id`. `value` is lowercased for Eq/Neq.
+    TraceId { op: ComparisonOp, value: String },
+}
+
 /// How Phase 2 evaluates one leaf.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LeafEval {
     Physical(PhysicalPredicate),
+    /// A trace-level intrinsic comparison (issue #184), evaluated against
+    /// the per-trace context co-load.
+    TraceCtx(TraceCtxPred),
     /// Membership in `probe`'s result set; `negated` inverts it (the
     /// ratified `!=`/`!~` absent-key rule).
     Attr {
@@ -316,6 +358,45 @@ pub(crate) fn physical_sql(p: &PhysicalPredicate) -> String {
             let sym = sql_op(*op).expect("kind ops are Eq/Neq by construction");
             format!("kind {sym} {code}")
         }
+        PhysicalPredicate::StatusMessage { op, value } => {
+            // Issue #184 code review: compare the CAPPED column — the
+            // shared `byte_cap_expr` helper, the single source of the cap
+            // — so Phase-1 candidate selection agrees byte-for-byte with
+            // the capped `status_message` Phase 2 hydrates and evaluates
+            // (a raw comparison silently dropped any over-cap message
+            // whose capped rendering equals the literal). No index is
+            // lost: `status_message` has none (SpanScan class — the
+            // bounded time-window scan prunes on `timestamp_ns` alone).
+            string_column_sql(&byte_cap_expr("status_message"), *op, value)
+        }
+        PhysicalPredicate::SpanIdHex { op, value } => hex_column_sql("span_id", *op, value),
+        PhysicalPredicate::ParentIdHex { op, value } => hex_column_sql("parent_id", *op, value),
+    }
+}
+
+/// The all-zero `parent_id`/`trace_id` sentinel rendering the codebase uses
+/// for root detection (`trace_edges_mv`, `catalog.rs`) — an 8-byte fixed
+/// string of zeros. Keeping the exact spelling means a root leaf reads the
+/// same "no parent" convention the writer/graph MV emit.
+pub(crate) const ZERO_PARENT_SQL: &str = "toFixedString(unhex('0000000000000000'), 8)";
+
+/// Renders a hex-string comparison against a raw `FixedString` id column
+/// (`span_id`/`parent_id`) — `lower(hex(col))` vs the (Eq/Neq: lowercased,
+/// Re/Nre: raw) value, so the SQL predicate matches the engine-side hex
+/// comparison in [`crate::traces::search_eval`].
+fn hex_column_sql(column: &str, op: ComparisonOp, value: &str) -> String {
+    match op {
+        ComparisonOp::Eq => format!("lower(hex({column})) = {}", escape::ch_string(value)),
+        ComparisonOp::Neq => format!("lower(hex({column})) != {}", escape::ch_string(value)),
+        ComparisonOp::Re => format!(
+            "match(lower(hex({column})), {})",
+            escape::ch_regex_anchored(value)
+        ),
+        ComparisonOp::Nre => format!(
+            "NOT match(lower(hex({column})), {})",
+            escape::ch_regex_anchored(value)
+        ),
+        _ => unreachable!("hex id columns accept only = != =~ !~ (checked at compile_leaf)"),
     }
 }
 
@@ -497,6 +578,187 @@ fn compile_service_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf,
     })
 }
 
+/// Lowercases a hex string value for the case-insensitive Eq/Neq id
+/// comparisons; regex operators keep the raw pattern.
+fn hex_value(op: ComparisonOp, s: &str) -> String {
+    match op {
+        ComparisonOp::Eq | ComparisonOp::Neq => s.to_lowercase(),
+        _ => s.to_string(),
+    }
+}
+
+/// Compiles a `span:id` / `span:parentID` leaf (issue #184): a hex-string
+/// comparison (only `= != =~ !~`) over the raw id column, exact in Phase 2
+/// and paired with a bounded-window `SpanScan` generator.
+fn compile_span_hex_leaf(
+    column_kind: SpanHexColumn,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<CompiledLeaf, PlanError> {
+    let field_name = column_kind.field_name();
+    let (op, s) = string_op_leaf(field_name, op, value)?;
+    let stored = hex_value(op, &s);
+    let physical = match column_kind {
+        SpanHexColumn::SpanId => PhysicalPredicate::SpanIdHex { op, value: stored },
+        SpanHexColumn::ParentId => PhysicalPredicate::ParentIdHex { op, value: stored },
+    };
+    Ok(CompiledLeaf {
+        generator: spans_generator_for(&physical),
+        eval: LeafEval::Physical(physical),
+    })
+}
+
+/// Which raw id column a `span:id` / `span:parentID` leaf reads.
+#[derive(Debug, Clone, Copy)]
+enum SpanHexColumn {
+    SpanId,
+    ParentId,
+}
+
+impl SpanHexColumn {
+    fn field_name(self) -> &'static str {
+        match self {
+            SpanHexColumn::SpanId => "span:id",
+            SpanHexColumn::ParentId => "span:parentID",
+        }
+    }
+}
+
+/// Compiles a numeric trace-level leaf (`span:childCount`,
+/// `traceDuration`/`trace:duration`) — the six ordering/equality operators,
+/// evaluated engine-side against the per-trace co-load. No column pushdown,
+/// so it pairs with the trace-wide time-range generator.
+fn compile_trace_num_leaf(
+    which: TraceNumField,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<CompiledLeaf, PlanError> {
+    if sql_op(op).is_none() {
+        return Err(PlanError::TypeMismatch(format!(
+            "{} does not support regex operators",
+            which.field_name()
+        )));
+    }
+    let pred = match which {
+        TraceNumField::ChildCount => {
+            let Value::Number(raw) = value else {
+                return Err(PlanError::TypeMismatch(
+                    "span:childCount requires a numeric value".to_string(),
+                ));
+            };
+            TraceCtxPred::ChildCount {
+                op,
+                value: parse_num(raw)?,
+            }
+        }
+        TraceNumField::TraceDuration => {
+            let Value::Duration(d) = value else {
+                return Err(PlanError::TypeMismatch(
+                    "traceDuration requires a duration literal".to_string(),
+                ));
+            };
+            let nanos = i64::try_from(d.as_nanos()).map_err(|_| {
+                PlanError::TypeMismatch("duration literal exceeds the i64 range".to_string())
+            })?;
+            TraceCtxPred::TraceDurationNs { op, nanos }
+        }
+    };
+    Ok(CompiledLeaf {
+        generator: LeafGenerator::time_range(),
+        eval: LeafEval::TraceCtx(pred),
+    })
+}
+
+/// Which numeric trace-level intrinsic a leaf compares.
+#[derive(Debug, Clone, Copy)]
+enum TraceNumField {
+    ChildCount,
+    TraceDuration,
+}
+
+impl TraceNumField {
+    fn field_name(self) -> &'static str {
+        match self {
+            TraceNumField::ChildCount => "span:childCount",
+            TraceNumField::TraceDuration => "traceDuration",
+        }
+    }
+}
+
+/// Compiles a `rootName` / `rootServiceName` leaf (issue #184): a string
+/// comparison against the trace root span's value, exact in Phase 2 via
+/// the trace-wide context co-load. **`TimeRange`-class for every
+/// operator** (plan v2 §Performance — trace-level leaves generate no
+/// candidates themselves): a windowed root-span scan
+/// (`parent_id = <zero> AND <pred>`) would silently MISS any trace whose
+/// true root predates the search window — exactly the window-spanning
+/// traces the co-load exists to evaluate correctly — so the complete
+/// window superset is the only sound generator. Sole-predicate scale
+/// characterization is #25-routed (same class as `{}` today).
+fn compile_root_leaf(
+    which: RootField,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<CompiledLeaf, PlanError> {
+    let (op, s) = string_op_leaf(which.field_name(), op, value)?;
+    let pred = match which {
+        RootField::Name => TraceCtxPred::RootName { op, value: s },
+        RootField::ServiceName => TraceCtxPred::RootServiceName { op, value: s },
+    };
+    Ok(CompiledLeaf {
+        generator: LeafGenerator::time_range(),
+        eval: LeafEval::TraceCtx(pred),
+    })
+}
+
+/// Which trace root string a `rootName` / `rootServiceName` leaf compares.
+#[derive(Debug, Clone, Copy)]
+enum RootField {
+    Name,
+    ServiceName,
+}
+
+impl RootField {
+    fn field_name(self) -> &'static str {
+        match self {
+            RootField::Name => "rootName",
+            RootField::ServiceName => "rootServiceName",
+        }
+    }
+}
+
+/// Compiles a `trace:id` leaf (issue #184): a hex comparison over the
+/// `trace_id` column. `=` renders `trace_id = unhex('…')` — the
+/// `ORDER BY (trace_id, timestamp_ns)` PK-prefix prune (Tier-1
+/// EXPLAIN-provable); the other operators stay bounded-window `SpanScan`s.
+/// Evaluated exactly in Phase 2 against the candidate trace's id.
+fn compile_trace_id_leaf(op: ComparisonOp, value: &Value) -> Result<CompiledLeaf, PlanError> {
+    let (op, s) = string_op_leaf("trace:id", op, value)?;
+    let stored = hex_value(op, &s);
+    let predicate = match op {
+        ComparisonOp::Eq => format!("trace_id = unhex({})", escape::ch_string(&stored)),
+        ComparisonOp::Neq => format!("trace_id != unhex({})", escape::ch_string(&stored)),
+        ComparisonOp::Re => format!(
+            "match(lower(hex(trace_id)), {})",
+            escape::ch_regex_anchored(&stored)
+        ),
+        ComparisonOp::Nre => format!(
+            "NOT match(lower(hex(trace_id)), {})",
+            escape::ch_regex_anchored(&stored)
+        ),
+        _ => unreachable!("trace:id accepts only = != =~ !~"),
+    };
+    Ok(CompiledLeaf {
+        generator: LeafGenerator {
+            class: GenClass::SpanScan,
+            table: GenTable::Spans,
+            predicate,
+            prewhere: None,
+        },
+        eval: LeafEval::TraceCtx(TraceCtxPred::TraceId { op, value: stored }),
+    })
+}
+
 /// Classifies one leaf comparison — the shared compiler entry point (T5
 /// search and T7 metrics both consume it).
 pub fn compile_leaf(
@@ -587,6 +849,32 @@ pub fn compile_leaf(
         Field::Intrinsic(Intrinsic::NestedSetRight) => {
             compile_nested_set_leaf(NestedSetField::Right, op, value)
         }
+        // -- issue #184: the colon-scope intrinsic namespace -------------
+        Field::Intrinsic(Intrinsic::StatusMessage) => {
+            let (op, s) = string_op_leaf("statusMessage", op, value)?;
+            let physical = PhysicalPredicate::StatusMessage { op, value: s };
+            Ok(CompiledLeaf {
+                generator: spans_generator_for(&physical),
+                eval: LeafEval::Physical(physical),
+            })
+        }
+        Field::Intrinsic(Intrinsic::SpanId) => {
+            compile_span_hex_leaf(SpanHexColumn::SpanId, op, value)
+        }
+        Field::Intrinsic(Intrinsic::ParentId) => {
+            compile_span_hex_leaf(SpanHexColumn::ParentId, op, value)
+        }
+        Field::Intrinsic(Intrinsic::TraceId) => compile_trace_id_leaf(op, value),
+        Field::Intrinsic(Intrinsic::TraceDuration) => {
+            compile_trace_num_leaf(TraceNumField::TraceDuration, op, value)
+        }
+        Field::Intrinsic(Intrinsic::ChildCount) => {
+            compile_trace_num_leaf(TraceNumField::ChildCount, op, value)
+        }
+        Field::Intrinsic(Intrinsic::RootName) => compile_root_leaf(RootField::Name, op, value),
+        Field::Intrinsic(Intrinsic::RootServiceName) => {
+            compile_root_leaf(RootField::ServiceName, op, value)
+        }
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {
                 compile_service_leaf(op, value)
@@ -639,6 +927,22 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
             Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
         ) => Err(PlanError::TypeMismatch(
             "nested-set intrinsics are not supported in a field-vs-field comparison".to_string(),
+        )),
+        // Issue #184: the trace-level/scoped intrinsics resolve from the
+        // per-trace co-load (or an id rendering), not a per-span column
+        // value — out of scope on the field-vs-field path (a clean 400,
+        // mirroring nested-set).
+        Field::Intrinsic(
+            Intrinsic::StatusMessage
+            | Intrinsic::ChildCount
+            | Intrinsic::SpanId
+            | Intrinsic::ParentId
+            | Intrinsic::TraceId
+            | Intrinsic::TraceDuration
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName,
+        ) => Err(PlanError::TypeMismatch(
+            "this intrinsic is not supported in a field-vs-field comparison".to_string(),
         )),
         Field::Attribute { scope, key }
             if *scope == AttrScope::Resource && key == "service.name" =>
@@ -1045,6 +1349,207 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PlanError::TypeMismatch(_)));
+    }
+
+    // -- issue #184: trace-level / colon-scoped intrinsic leaves ---------
+
+    #[test]
+    fn status_message_compiles_to_a_span_scan_on_the_capped_status_message_column() {
+        // Issue #184 code review: the Phase-1 predicate compares the
+        // CAPPED column (via the shared `search_sql::byte_cap_expr`
+        // helper, its single source of truth), so candidate selection
+        // agrees with the capped value Phase 2 hydrates and evaluates —
+        // a raw comparison would silently drop an over-cap message whose
+        // capped rendering equals the literal.
+        let f = first_filter(r#"{ statusMessage = "boom" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        let generator = &compiled.generators[0];
+        assert_eq!(generator.class, GenClass::SpanScan);
+        assert_eq!(
+            generator.predicate,
+            "if(length(status_message) <= 8192, status_message, \
+             substringUTF8(status_message, 1, 2048)) = 'boom'"
+        );
+        assert_eq!(
+            generator.predicate,
+            format!("{} = 'boom'", byte_cap_expr("status_message")),
+            "the predicate is built from the shared cap helper"
+        );
+        // The regex form wraps the SAME capped expression.
+        let re = compile_span_filter(&first_filter(r#"{ statusMessage =~ "bo.*" }"#)).unwrap();
+        assert_eq!(
+            re.generators[0].predicate,
+            format!("match({}, '^(?:bo.*)$')", byte_cap_expr("status_message"))
+        );
+        assert!(matches!(
+            &compiled.leaves[0].eval,
+            LeafEval::Physical(PhysicalPredicate::StatusMessage { .. })
+        ));
+        // The scoped spelling compiles identically.
+        let scoped = compile_span_filter(&first_filter(r#"{ span:statusMessage = "boom" }"#));
+        assert_eq!(scoped.unwrap().generators[0].predicate, generator.predicate);
+    }
+
+    #[test]
+    fn span_id_leaf_lowercases_hex_for_equality_and_keeps_regex_raw() {
+        let f = first_filter(r#"{ span:id = "0A1B2C3D4E5F6071" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "lower(hex(span_id)) = '0a1b2c3d4e5f6071'"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Physical(PhysicalPredicate::SpanIdHex { op, value }) => {
+                assert_eq!(*op, ComparisonOp::Eq);
+                assert_eq!(value, "0a1b2c3d4e5f6071", "Eq value stored lowercased");
+            }
+            other => panic!("expected a span-id hex eval, got {other:?}"),
+        }
+        let f = first_filter(r#"{ span:parentID =~ "0a.*" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "match(lower(hex(parent_id)), '^(?:0a.*)$')"
+        );
+    }
+
+    #[test]
+    fn trace_id_equality_renders_the_pk_prefix_unhex_predicate() {
+        let f = first_filter(r#"{ trace:id = "000102030405060708090A0B0C0D0E0F" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "trace_id = unhex('000102030405060708090a0b0c0d0e0f')"
+        );
+        assert!(matches!(
+            &compiled.leaves[0].eval,
+            LeafEval::TraceCtx(TraceCtxPred::TraceId { .. })
+        ));
+    }
+
+    #[test]
+    fn root_leaves_pair_with_the_time_range_superset_for_every_operator() {
+        // Plan v2 §Performance: a WINDOWED root-span scan would miss any
+        // trace whose true root predates the search window (the exact
+        // window-spanning case the co-load exists for), so every operator
+        // takes the complete time-range superset; exactness lives in the
+        // Phase-2 co-load evaluation.
+        for q in [
+            r#"{ rootServiceName = "gw" }"#,
+            r#"{ rootServiceName =~ "gw.*" }"#,
+            r#"{ rootName = "GET /" }"#,
+            r#"{ rootName != "GET /" }"#,
+            r#"{ rootName !~ "GET.*" }"#,
+        ] {
+            let f = first_filter(q);
+            let compiled = compile_span_filter(&f).unwrap();
+            assert_eq!(
+                compiled.generators,
+                vec![LeafGenerator::time_range()],
+                "{q}"
+            );
+            assert!(
+                matches!(
+                    &compiled.leaves[0].eval,
+                    LeafEval::TraceCtx(
+                        TraceCtxPred::RootName { .. } | TraceCtxPred::RootServiceName { .. }
+                    )
+                ),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_duration_and_child_count_pair_with_the_time_range_generator() {
+        let f = first_filter("{ traceDuration > 2s }");
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(compiled.generators, vec![LeafGenerator::time_range()]);
+        match &compiled.leaves[0].eval {
+            LeafEval::TraceCtx(TraceCtxPred::TraceDurationNs { op, nanos }) => {
+                assert_eq!(*op, ComparisonOp::Gt);
+                assert_eq!(*nanos, 2_000_000_000);
+            }
+            other => panic!("expected a trace-duration eval, got {other:?}"),
+        }
+        let f = first_filter("{ span:childCount >= 3 }");
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(compiled.generators, vec![LeafGenerator::time_range()]);
+        assert!(matches!(
+            &compiled.leaves[0].eval,
+            LeafEval::TraceCtx(TraceCtxPred::ChildCount { .. })
+        ));
+    }
+
+    #[test]
+    fn regex_or_wrong_value_types_on_the_new_intrinsics_are_type_mismatches() {
+        // The parser rejects these spellings itself; `compile_leaf` is a
+        // public API over any AST, so the guards are exercised directly.
+        for (field, op, value) in [
+            (
+                Field::Intrinsic(Intrinsic::TraceDuration),
+                ComparisonOp::Re,
+                Value::String("x".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::ChildCount),
+                ComparisonOp::Re,
+                Value::Number("5".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::ChildCount),
+                ComparisonOp::Gt,
+                Value::String("5".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::TraceDuration),
+                ComparisonOp::Gt,
+                Value::Number("5".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::StatusMessage),
+                ComparisonOp::Gt,
+                Value::String("boom".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::SpanId),
+                ComparisonOp::Lt,
+                Value::String("0a".to_string()),
+            ),
+            (
+                Field::Intrinsic(Intrinsic::RootName),
+                ComparisonOp::Gte,
+                Value::String("x".to_string()),
+            ),
+        ] {
+            let err = compile_leaf(&field, op, &value).unwrap_err();
+            assert!(
+                matches!(err, PlanError::TypeMismatch(_)),
+                "{field:?} {op:?} must be a type mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn new_intrinsics_are_rejected_in_field_vs_field_comparisons() {
+        for intrinsic in [
+            Intrinsic::StatusMessage,
+            Intrinsic::ChildCount,
+            Intrinsic::SpanId,
+            Intrinsic::ParentId,
+            Intrinsic::TraceId,
+            Intrinsic::TraceDuration,
+            Intrinsic::RootName,
+            Intrinsic::RootServiceName,
+        ] {
+            let err = compile_field_compare(
+                &Field::Intrinsic(intrinsic),
+                ComparisonOp::Eq,
+                &Field::Intrinsic(Intrinsic::Name),
+            )
+            .unwrap_err();
+            assert!(matches!(err, PlanError::TypeMismatch(_)), "{intrinsic:?}");
+        }
     }
 
     #[test]

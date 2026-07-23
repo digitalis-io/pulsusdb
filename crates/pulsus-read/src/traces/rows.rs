@@ -59,6 +59,11 @@ pub struct HydrationRow {
     pub timestamp_ns: i64,
     pub duration_ns: i64,
     pub status_code: i8,
+    /// The OTLP `Status.message` (issue #184's `statusMessage` intrinsic),
+    /// byte-capped like `service`/`name`. Positioned between `status_code`
+    /// and `kind` — in lockstep with `search_sql::hydration_sql`'s SELECT
+    /// list (RowBinary is positional).
+    pub status_message: String,
     pub kind: i8,
 }
 
@@ -98,6 +103,30 @@ pub struct RootRow {
     pub name: String,
     pub timestamp_ns: i64,
     pub duration_ns: i64,
+}
+
+/// One trace-level context co-load row (`search_sql::trace_ctx_sql`,
+/// issue #184): the trace-wide time envelope plus the root span's
+/// byte-capped name/service, selected by the `pick_roots`-equivalent
+/// `argMin` ordering. Field order matches the SELECT list (RowBinary is
+/// positional).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct TraceCtxRow {
+    pub trace_id: [u8; 16],
+    pub trace_start_ns: i64,
+    pub trace_end_ns: i64,
+    pub root_name: String,
+    pub root_service: String,
+}
+
+/// One direct-child-count co-load row (`search_sql::child_count_sql`,
+/// issue #184): the number of distinct direct children of `parent_id`
+/// within its trace (trace-wide, replay-deduped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct ChildCountRow {
+    pub trace_id: [u8; 16],
+    pub parent_id: [u8; 8],
+    pub child_count: u64,
 }
 
 /// One metrics range-query bucket row (`metrics_sql::metrics_range_sql`,

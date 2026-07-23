@@ -16,7 +16,7 @@
 
 use crate::logql::sql::TimeWindow;
 
-use super::filter::{GenTable, LeafGenerator};
+use super::filter::{GenTable, LeafGenerator, ZERO_PARENT_SQL};
 
 /// Hard **byte** ceiling on every string value the search response
 /// returns (`name`/`service`/`select()`-projected attribute values) —
@@ -36,15 +36,30 @@ pub const TRACE_STR_COL_CAP: u64 = 8192;
 /// `TRACE_STR_COL_CAP` bytes even at the worst-case 4-byte width.
 const TRACE_STR_COL_CP_FALLBACK: u64 = TRACE_STR_COL_CAP / 4;
 
-/// Renders the byte-bound truncation expression for a plain (non-
-/// aggregated) string column read, aliased back to its own name:
-/// `if(length(col) <= 8192, col, substringUTF8(col, 1, 2048)) AS col`.
-/// Used by [`hydration_sql`]/[`root_sql`] on `service`/`name`.
-fn byte_capped(col: &str) -> String {
+/// The unaliased, unwrapped byte-bound truncation expression — the ONE
+/// definition of the cap (issue #184 plan v4: `byte_capped`,
+/// `byte_capped_agg`, and the [`trace_ctx_sql`] co-load's `argMin` value
+/// projections all build on this single helper, so the cap length and
+/// fallback can never diverge between the displayed-root path and the
+/// trace-context co-load; the in-module AC-Δ1c/Δ1d/Δ1e tests pin the
+/// construction). `pub(crate)` for exactly one out-of-module consumer
+/// (issue #184 code review): the Phase-1 `statusMessage` generator
+/// predicate (`super::filter::physical_sql`) compares this same capped
+/// expression, so candidate selection agrees byte-for-byte with the
+/// capped `status_message` Phase 2 hydrates and evaluates.
+pub(crate) fn byte_cap_expr(col: &str) -> String {
     format!(
         "if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
-         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK})) AS {col}"
+         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK}))"
     )
+}
+
+/// Renders the byte-bound truncation expression for a plain (non-
+/// aggregated) string column read, aliased back to its own name — the
+/// [`byte_cap_expr`] render plus `AS col`. Used by
+/// [`hydration_sql`]/[`root_sql`] on `service`/`name`/`status_message`.
+fn byte_capped(col: &str) -> String {
+    format!("{} AS {col}", byte_cap_expr(col))
 }
 
 /// The same byte-bound expression wrapped in `any(...)` for the
@@ -52,10 +67,7 @@ fn byte_capped(col: &str) -> String {
 /// `GROUP BY (trace_id, span_id)`), unaliased — the caller appends
 /// `AS v`.
 fn byte_capped_agg(col: &str) -> String {
-    format!(
-        "any(if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
-         substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK})))"
-    )
+    format!("any({})", byte_cap_expr(col))
 }
 
 /// Renders `days`-since-epoch as a `toDate('YYYY-MM-DD')` literal —
@@ -186,13 +198,14 @@ pub fn hydration_sql(
 ) -> String {
     format!(
         "SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns, \
-         status_code, kind\n\
+         status_code, {}, kind\n\
          FROM {spans_table}\n\
          WHERE {}\n  AND {}\n\
          ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
          LIMIT {} BY trace_id",
         byte_capped("service"),
         byte_capped("name"),
+        byte_capped("status_message"),
         trace_id_in(trace_ids),
         time_clause(window),
         max_spans_per_trace + 1
@@ -271,6 +284,63 @@ pub fn root_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
          WHERE {}",
         byte_capped("service"),
         byte_capped("name"),
+        trace_id_in(trace_ids)
+    )
+}
+
+/// The `pick_roots` ordering tuple rendered in SQL (issue #184 plan v3):
+/// `argMin` over `(toUInt8(parent_id != <zero>), timestamp_ns, span_id)`
+/// minimizes the exact lexicographic key `exec::pick_roots` minimizes —
+/// a true zero-parent root (`0`) beats every non-root (`1`), and within a
+/// class the earliest `(timestamp_ns, span_id)` wins — so the co-load's
+/// winning span is term-for-term the span `pick_roots` would pick from
+/// the same (trace-wide) rows.
+fn root_ordering_tuple() -> String {
+    format!("(toUInt8(parent_id != {ZERO_PARENT_SQL}), timestamp_ns, span_id)")
+}
+
+/// Phase 2 — the per-batch **trace-level context co-load** (issue #184
+/// plan v2 Δ1): `traceDuration`/`rootName`/`rootServiceName` are
+/// trace-level values, so this read is deliberately **trace-wide** — a
+/// `trace_id IN` PK-prefix read with **no time predicate and no row
+/// cap** (the `root_sql` precedent) — making the evaluated values
+/// full-trace-exact regardless of the search window or the per-trace
+/// hydration cap. Both `argMin`s share one ordering tuple (same winning
+/// span for name and service), and both VALUE projections go through the
+/// shared [`byte_cap_expr`] so they are byte-identical to what the
+/// displayed-root path (`root_sql` + `pick_roots`) returns; the ordering
+/// tuple itself stays on the RAW columns (the cap must never perturb
+/// root selection).
+pub fn trace_ctx_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
+    let ordering = root_ordering_tuple();
+    format!(
+        "SELECT trace_id, min(timestamp_ns) AS trace_start_ns, \
+         max(timestamp_ns + duration_ns) AS trace_end_ns, \
+         argMin({}, {ordering}) AS root_name, \
+         argMin({}, {ordering}) AS root_service\n\
+         FROM {spans_table}\n\
+         WHERE {}\n\
+         GROUP BY trace_id",
+        byte_cap_expr("name"),
+        byte_cap_expr("service"),
+        trace_id_in(trace_ids)
+    )
+}
+
+/// Phase 2 — the per-batch **direct-child-count co-load** (issue #184
+/// plan v2 Δ1): one row per `(trace_id, parent span_id)` with its number
+/// of distinct direct children. Trace-wide like [`trace_ctx_sql`] (no
+/// time predicate, no row cap), so `span:childCount` is full-trace-exact.
+/// `count(DISTINCT span_id)` — not a bare `count()` — dedups
+/// at-least-once ingest replays, mirroring the read-time dedup every
+/// other Phase-2 read performs (`SELECT DISTINCT` membership,
+/// `any() GROUP BY` values, the hydration span-id dedup).
+pub fn child_count_sql(spans_table: &str, trace_ids: &[[u8; 16]]) -> String {
+    format!(
+        "SELECT trace_id, parent_id, count(DISTINCT span_id) AS child_count\n\
+         FROM {spans_table}\n\
+         WHERE {}\n  AND parent_id != {ZERO_PARENT_SQL}\n\
+         GROUP BY trace_id, parent_id",
         trace_id_in(trace_ids)
     )
 }
@@ -373,19 +443,29 @@ mod tests {
         assert_eq!(TRACE_STR_COL_CP_FALLBACK, 2048);
     }
 
-    /// Issue #57 re-audit AC-A1: the byte-bound truncation expression
-    /// appears in every string-returning Phase-2 builder (hydration/root
-    /// plain columns, the `attr_values_sql` string arm) and NOWHERE in
-    /// the generator/membership/numeric-value SQL — the cap is a
-    /// response-projection concern only, never a predicate.
+    /// Issue #57 re-audit AC-A1 (+ issue #184): the byte-bound truncation
+    /// expression appears in every string-returning Phase-2 builder
+    /// (hydration/root plain columns — `status_message` included since
+    /// issue #184 — the `attr_values_sql` string arm, and the trace-context
+    /// co-load's root projections) and NOWHERE in the generator/membership/
+    /// numeric-value SQL rendered HERE — the cap is a response/evaluation
+    /// concern, with exactly one predicate exception living in
+    /// `filter::physical_sql` (issue #184 code review): the `statusMessage`
+    /// Phase-1 predicate compares the capped column via the shared helper
+    /// so candidate selection agrees with the capped Phase-2 evaluation.
     #[test]
-    fn the_byte_cap_expression_appears_only_in_the_three_string_returning_builders() {
+    fn the_byte_cap_expression_appears_only_in_the_string_returning_builders() {
         let needle = format!(
             "if(length(service) <= {TRACE_STR_COL_CAP}, service, \
              substringUTF8(service, 1, {TRACE_STR_COL_CP_FALLBACK})) AS service"
         );
         let hydration = hydration_sql("trace_spans", &[[7u8; 16]], W, 10_000);
         assert!(hydration.contains(&needle), "{hydration}");
+        let status_needle = format!(
+            "if(length(status_message) <= {TRACE_STR_COL_CAP}, status_message, \
+             substringUTF8(status_message, 1, {TRACE_STR_COL_CP_FALLBACK})) AS status_message"
+        );
+        assert!(hydration.contains(&status_needle), "{hydration}");
         let root = root_sql("trace_spans", &[[7u8; 16]]);
         assert!(root.contains(&needle), "{root}");
 
@@ -414,5 +494,149 @@ mod tests {
         assert!(!generator.contains("substringUTF8"), "{generator}");
         let membership = membership_sql("trace_attrs_idx", "key = 'foo'", &[[7u8; 16]], W);
         assert!(!membership.contains("substringUTF8"), "{membership}");
+        // The child-count co-load returns no strings — no cap expression.
+        let child_counts = child_count_sql("trace_spans", &[[7u8; 16]]);
+        assert!(!child_counts.contains("substringUTF8"), "{child_counts}");
+    }
+
+    /// Issue #184 plan v4: `byte_capped`/`byte_capped_agg` are built ON
+    /// `byte_cap_expr` (its render is a substring of both), and the cap
+    /// literals are unchanged — the coder verification gate half covering
+    /// the displayed-root path.
+    #[test]
+    fn byte_capped_wrappers_derive_from_the_shared_cap_expression() {
+        assert!(byte_capped("name").contains(&byte_cap_expr("name")));
+        assert!(byte_capped_agg("val").contains(&byte_cap_expr("val")));
+        assert_eq!(
+            byte_capped("name"),
+            format!("{} AS name", byte_cap_expr("name"))
+        );
+        assert_eq!(
+            byte_capped_agg("val"),
+            format!("any({})", byte_cap_expr("val"))
+        );
+    }
+
+    /// Issue #184 AC-Δ1b: the two trace-wide co-loads carry NO time
+    /// predicate and no row cap — a `trace_id IN (…)` PK restriction only
+    /// — so their values are window- and cap-independent (full-trace
+    /// exact, the `root_sql` contract generalized).
+    #[test]
+    fn trace_wide_coloads_have_no_time_predicate_and_no_row_cap() {
+        for sql in [
+            trace_ctx_sql("trace_spans", &[[7u8; 16]]),
+            child_count_sql("trace_spans", &[[7u8; 16]]),
+        ] {
+            assert!(!sql.contains("timestamp_ns >"), "trace-wide read: {sql}");
+            assert!(!sql.contains("timestamp_ns <="), "trace-wide read: {sql}");
+            assert!(!sql.contains("LIMIT"), "no row cap: {sql}");
+            assert!(sql.contains("trace_id IN (unhex("), "PK restriction: {sql}");
+            assert!(sql.contains("GROUP BY trace_id"), "per-trace groups: {sql}");
+        }
+    }
+
+    /// Issue #184 AC-Δ1c: the trace-context co-load's `root_name`/
+    /// `root_service` VALUE projections are exactly the shared-helper
+    /// render inside `argMin` over the `pick_roots` ordering tuple, and
+    /// every cap token in the rendered SQL is accounted for by exactly
+    /// the two shared-helper renders — a third inline copy of the cap
+    /// logic pushes any count to 3 and fails.
+    #[test]
+    fn trace_ctx_coload_caps_root_strings_via_the_shared_helper_only() {
+        let sql = trace_ctx_sql("trace_spans", &[[0u8; 16]]);
+        let name_cap = byte_cap_expr("name");
+        let svc_cap = byte_cap_expr("service");
+
+        assert!(
+            sql.contains(&format!("argMin({name_cap}, (toUInt8(parent_id != ")),
+            "root_name argMin must wrap byte_cap_expr(name): {sql}"
+        );
+        assert!(
+            sql.contains(&format!("argMin({svc_cap}, (toUInt8(parent_id != ")),
+            "root_service argMin must wrap byte_cap_expr(service): {sql}"
+        );
+
+        assert_eq!(
+            sql.matches("substringUTF8").count(),
+            2,
+            "exactly two capped strings: {sql}"
+        );
+        assert_eq!(
+            sql.matches("8192").count(),
+            2,
+            "cap literal only from the shared helper: {sql}"
+        );
+        assert_eq!(
+            sql.matches("2048").count(),
+            2,
+            "fallback literal only from the shared helper: {sql}"
+        );
+    }
+
+    /// Issue #184 AC-Δ1c (ordering): both `argMin`s share ONE ordering
+    /// tuple — the `pick_roots` key on the RAW columns (the cap never
+    /// perturbs root selection) — so `root_name` and `root_service`
+    /// always come from the same winning span.
+    #[test]
+    fn trace_ctx_coload_orders_both_argmins_by_the_raw_pick_roots_tuple() {
+        let sql = trace_ctx_sql("trace_spans", &[[0u8; 16]]);
+        let tuple = root_ordering_tuple();
+        assert_eq!(
+            sql.matches(&tuple).count(),
+            2,
+            "both argMins share the pick_roots ordering tuple: {sql}"
+        );
+        assert!(
+            tuple.contains("toFixedString(unhex('0000000000000000'), 8)"),
+            "the zero-parent sentinel spelling matches the codebase convention: {tuple}"
+        );
+        assert!(
+            !tuple.contains("substringUTF8") && !tuple.contains("8192"),
+            "the ordering tuple stays on raw columns: {tuple}"
+        );
+    }
+
+    /// Issue #184 AC-Δ1d: the cap expression has a SINGLE source of
+    /// truth — `substringUTF8` (the truncation call, the cap's
+    /// unmistakable signature) appears in this module's production,
+    /// non-comment code exactly once: inside `byte_cap_expr`'s `format!`
+    /// body. Any inline duplicate — placeholder template or hand-typed
+    /// rendered literal — contains `substringUTF8` and pushes this to 2.
+    #[test]
+    fn the_cap_expression_has_a_single_source_of_truth() {
+        let src = include_str!("search_sql.rs");
+        // (a) everything before the test module — excludes this test's
+        //     own needles.
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        // (b) drop comment lines so doc prose never counts.
+        let code_only: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            code_only.matches("substringUTF8").count(),
+            1,
+            "cap logic must have one definition (byte_cap_expr) — found an inline duplicate"
+        );
+    }
+
+    /// Issue #184 AC-Δ1e: the trace-context co-load INVOKES the shared
+    /// helper by name for both root projections —
+    /// `byte_cap_expr("name")`/`byte_cap_expr("service")` as literal call
+    /// tokens exist in production only at the co-load builder (every
+    /// other site calls `byte_capped`, not `byte_cap_expr`).
+    #[test]
+    fn the_trace_ctx_coload_invokes_the_shared_cap_helper_by_name() {
+        let src = include_str!("search_sql.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            prod.contains(r#"byte_cap_expr("name")"#),
+            "the trace-level co-load must call byte_cap_expr(\"name\") for root_name"
+        );
+        assert!(
+            prod.contains(r#"byte_cap_expr("service")"#),
+            "the trace-level co-load must call byte_cap_expr(\"service\") for root_service"
+        );
     }
 }

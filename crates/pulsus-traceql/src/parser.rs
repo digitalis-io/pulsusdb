@@ -176,6 +176,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::RBracket => "']'".to_string(),
         TokenKind::Comma => "','".to_string(),
         TokenKind::Dot => "'.'".to_string(),
+        TokenKind::Colon => "':'".to_string(),
         TokenKind::Eq => "'='".to_string(),
         TokenKind::Neq => "'!='".to_string(),
         TokenKind::Re => "'=~'".to_string(),
@@ -595,6 +596,34 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
             span: tok.span,
         }),
         TokenKind::Ident(name) => {
+            // Colon-scoped intrinsic (`span:childCount`, `trace:id`, …,
+            // issue #184): `<scope> : <ident>`. A known scope+field pair
+            // resolves to the normalized intrinsic; any unknown scope
+            // (`event:`/`link:`/`instrumentation:`) or unknown field is a
+            // GENERIC error — never a named boundary — so those constructs
+            // keep their interim-generic disposition.
+            if matches!(cursor.peek2().kind, TokenKind::Colon) {
+                if let TokenKind::Ident(field) = &cursor.peek_at(2).kind
+                    && let Some(intrinsic) = Intrinsic::from_scoped(name, field)
+                {
+                    let start = tok.span.start;
+                    cursor.advance(); // scope ident
+                    cursor.advance(); // ':'
+                    let field_tok = cursor.advance(); // field ident
+                    return Ok((
+                        Field::Intrinsic(intrinsic),
+                        Span {
+                            start,
+                            end: field_tok.span.end,
+                        },
+                    ));
+                }
+                return Err(TraceQlError::UnexpectedToken {
+                    found: describe(&tok.kind),
+                    expected: "a known scoped intrinsic (span:… or trace:…)".to_string(),
+                    span: tok.span,
+                });
+            }
             let followed_by_dot = matches!(cursor.peek2().kind, TokenKind::Dot);
             // Only the `parent.` scope *syntax* is the recognized M7
             // construct; a bare `parent` is an ordinary unknown word and
@@ -733,7 +762,10 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
                 }),
             }
         }
-        Field::Intrinsic(Intrinsic::Duration) => {
+        // `duration` and `traceDuration`/`trace:duration` require a
+        // duration literal (issue #184: the trace-wide duration is the
+        // same value type as the span duration).
+        Field::Intrinsic(Intrinsic::Duration | Intrinsic::TraceDuration) => {
             let tok = cursor.peek().clone();
             match &tok.kind {
                 TokenKind::Duration(raw) => {
@@ -756,7 +788,20 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
                 }),
             }
         }
-        Field::Intrinsic(Intrinsic::Name) => {
+        // String-valued intrinsics: `name` plus the issue #184 additions
+        // `statusMessage`, `span:id`, `span:parentID`, `trace:id`,
+        // `rootName`, `rootServiceName`. The operator (`=`/`!=`/`=~`/`!~`)
+        // is validated downstream at leaf compilation; here the value must
+        // be a string literal.
+        Field::Intrinsic(
+            Intrinsic::Name
+            | Intrinsic::StatusMessage
+            | Intrinsic::SpanId
+            | Intrinsic::ParentId
+            | Intrinsic::TraceId
+            | Intrinsic::RootName
+            | Intrinsic::RootServiceName,
+        ) => {
             let tok = cursor.peek().clone();
             match tok.kind {
                 TokenKind::String(value) => {
@@ -774,13 +819,15 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
                 }),
             }
         }
-        // The nested-set intrinsics (issue #181) are numeric span
-        // properties: `nestedSetParent`/`nestedSetLeft`/`nestedSetRight`
-        // compare against a bare number (`< 0`, `> 0`, `>= 1`). A regex
-        // string (`=~ "x"`) is a positioned `UnexpectedToken` here — the
-        // value must be a number.
+        // Numeric span/trace properties: the nested-set intrinsics (issue
+        // #181) and `span:childCount` (issue #184) compare against a bare
+        // number (`< 0`, `> 2`). A regex string (`=~ "x"`) is a positioned
+        // `UnexpectedToken` here — the value must be a number.
         Field::Intrinsic(
-            Intrinsic::NestedSetParent | Intrinsic::NestedSetLeft | Intrinsic::NestedSetRight,
+            Intrinsic::NestedSetParent
+            | Intrinsic::NestedSetLeft
+            | Intrinsic::NestedSetRight
+            | Intrinsic::ChildCount,
         ) => {
             let tok = cursor.peek().clone();
             match &tok.kind {
@@ -956,11 +1003,26 @@ fn parse_aggregate(
                 });
             }
             let (field, field_span) = parse_field(cursor)?;
+            // Non-numerically-aggregatable intrinsics: the string/enum
+            // fields plus every issue #184 trace-level/scoped intrinsic
+            // (`avg(rootName)`, `sum(statusMessage)`, `max(span:childCount)`
+            // — numeric aggregation of childCount/traceDuration is out of
+            // scope). `duration`/`nestedSet*` stay aggregatable.
             if matches!(
                 field,
-                Field::Intrinsic(Intrinsic::Name)
-                    | Field::Intrinsic(Intrinsic::Status)
-                    | Field::Intrinsic(Intrinsic::Kind)
+                Field::Intrinsic(
+                    Intrinsic::Name
+                        | Intrinsic::Status
+                        | Intrinsic::Kind
+                        | Intrinsic::StatusMessage
+                        | Intrinsic::ChildCount
+                        | Intrinsic::SpanId
+                        | Intrinsic::ParentId
+                        | Intrinsic::TraceId
+                        | Intrinsic::TraceDuration
+                        | Intrinsic::RootName
+                        | Intrinsic::RootServiceName
+                )
             ) {
                 return Err(TraceQlError::UnexpectedToken {
                     found: format!("identifier {:?}", field.to_string()),
@@ -1349,6 +1411,86 @@ fn parse_select(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The comparison field of a single-comparison spanset filter.
+    fn only_field(q: &str) -> Field {
+        match parse(q).expect("parse").spanset {
+            SpansetExpr::Filter(SpansetFilter {
+                body: Some(FieldExpr::Comparison { field, .. }),
+            }) => field,
+            other => panic!("{q}: expected a single comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn colon_scoped_and_legacy_intrinsics_parse_to_normalized_variants() {
+        // Every issue #184 construct (bare + scoped spellings) parses, and
+        // the scoped/bare spellings that name the same field normalize onto
+        // one variant.
+        for (q, intrinsic) in [
+            (r#"{ statusMessage = "boom" }"#, Intrinsic::StatusMessage),
+            (
+                r#"{ span:statusMessage = "boom" }"#,
+                Intrinsic::StatusMessage,
+            ),
+            (r#"{ span:name = "checkout" }"#, Intrinsic::Name),
+            ("{ span:duration > 100ms }", Intrinsic::Duration),
+            ("{ span:status = error }", Intrinsic::Status),
+            ("{ span:kind = server }", Intrinsic::Kind),
+            (r#"{ span:id = "0a1b" }"#, Intrinsic::SpanId),
+            (r#"{ span:parentID = "0a1b" }"#, Intrinsic::ParentId),
+            ("{ span:childCount > 2 }", Intrinsic::ChildCount),
+            ("{ trace:duration > 1s }", Intrinsic::TraceDuration),
+            ("{ traceDuration > 1s }", Intrinsic::TraceDuration),
+            (r#"{ trace:id = "0a1b" }"#, Intrinsic::TraceId),
+            (r#"{ trace:rootName = "GET /" }"#, Intrinsic::RootName),
+            (r#"{ rootName = "GET /" }"#, Intrinsic::RootName),
+            (
+                r#"{ trace:rootService = "gw" }"#,
+                Intrinsic::RootServiceName,
+            ),
+            (r#"{ rootServiceName = "gw" }"#, Intrinsic::RootServiceName),
+        ] {
+            assert_eq!(only_field(q), Field::Intrinsic(intrinsic), "{q}");
+        }
+    }
+
+    #[test]
+    fn unknown_colon_scopes_are_generic_errors_not_named_boundaries() {
+        // event:/link:/instrumentation: must stay GENERIC (interim-generic
+        // disposition), never a NotYetSupported named boundary.
+        for q in [
+            r#"{ event:name = "exception" }"#,
+            r#"{ link:spanID = "0a1b" }"#,
+            r#"{ instrumentation:name = "otel" }"#,
+            "{ span:bogus > 1 }",
+        ] {
+            match parse(q) {
+                Err(TraceQlError::NotYetSupported { .. }) => {
+                    panic!("{q}: must be a generic error, not a named boundary")
+                }
+                Err(_) => {}
+                Ok(ast) => panic!("{q}: must not parse, got {ast:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn aggregating_a_trace_level_or_scoped_intrinsic_is_a_positioned_error() {
+        // AC9: numeric aggregation of these intrinsics is rejected at parse.
+        for q in [
+            r#"{} | avg(rootName)"#,
+            r#"{} | sum(statusMessage)"#,
+            r#"{} | max(span:childCount)"#,
+            r#"{} | min(traceDuration)"#,
+            r#"{} | avg(rootServiceName)"#,
+        ] {
+            assert!(
+                matches!(parse(q), Err(TraceQlError::UnexpectedToken { .. })),
+                "{q}: must be a positioned aggregation error"
+            );
+        }
+    }
 
     /// `{ .a = 1 && .a = 1 && ... }` with `ops` field-level `&&`
     /// operators.

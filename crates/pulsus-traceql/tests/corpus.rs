@@ -194,9 +194,9 @@ fn accept_cases_round_trip_through_display() {
 /// (`+`, `-`, `*`, `/`, `[`, `]`) are deliberately absent: they never
 /// appear in an accept case.
 const EXPECTED_ACCEPT_TOKENS: &[&str] = &[
-    "LBrace", "RBrace", "LParen", "RParen", "Comma", "Dot", "Eq", "Neq", "Re", "Nre", "Gt", "Gte",
-    "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Shl", "Tilde", "Bang", "Amp", "Ident", "String",
-    "Duration", "Number", "Eof",
+    "LBrace", "RBrace", "LParen", "RParen", "Comma", "Dot", "Colon", "Eq", "Neq", "Re", "Nre",
+    "Gt", "Gte", "Lt", "Lte", "AndAnd", "OrOr", "Pipe", "Shr", "Shl", "Tilde", "Bang", "Amp",
+    "Ident", "String", "Duration", "Number", "Eof",
 ];
 
 /// Exhaustive by construction: adding a `TokenKind` variant fails to
@@ -212,6 +212,7 @@ fn kind_name(kind: &TokenKind) -> &'static str {
         TokenKind::RBracket => "RBracket",
         TokenKind::Comma => "Comma",
         TokenKind::Dot => "Dot",
+        TokenKind::Colon => "Colon",
         TokenKind::Eq => "Eq",
         TokenKind::Neq => "Neq",
         TokenKind::Re => "Re",

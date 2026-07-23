@@ -654,6 +654,11 @@ pub struct TraceSpanRow {
     pub timestamp_ns: i64,
     pub duration_ns: i64,
     pub status_code: i8,
+    /// OTLP `Status.message` (issue #184), `""` when absent. Inserted by
+    /// column name (`Row` derive), so the additive migration-35
+    /// `status_message String DEFAULT ''` column absorbs it regardless of
+    /// physical column order.
+    pub status_message: String,
     pub kind: i8,
     /// Always `1` (= OTLP protobuf, docs/schemas.md §4.1's `payload_type`
     /// legend) for rows produced by the OTLP receiver; `2` (Zipkin JSON) is
@@ -681,6 +686,7 @@ impl From<&SpanRecord> for TraceSpanRow {
             timestamp_ns: record.timestamp_ns,
             duration_ns: record.duration_ns,
             status_code: record.status_code,
+            status_message: record.status_message.clone(),
             kind: record.kind,
             payload_type: 1,
             shared: record.shared,
@@ -693,7 +699,12 @@ impl TraceSpanRow {
     /// See [`LogSampleRow::est_bytes`]'s doc comment for the estimate's
     /// intent and limits.
     pub fn est_bytes(&self) -> u64 {
-        Self::estimate(&self.name, &self.service, self.payload.len())
+        Self::estimate(
+            &self.name,
+            &self.service,
+            self.status_message.len(),
+            self.payload.len(),
+        )
     }
 
     /// Estimates a `SpanRecord`'s footprint *before* it is materialized
@@ -701,11 +712,16 @@ impl TraceSpanRow {
     /// `est_source_bytes` pattern) — identical accounting to
     /// [`Self::est_bytes`], read straight off the source record.
     pub fn est_source_bytes(record: &SpanRecord) -> u64 {
-        Self::estimate(&record.name, &record.service, record.payload.len())
+        Self::estimate(
+            &record.name,
+            &record.service,
+            record.status_message.len(),
+            record.payload.len(),
+        )
     }
 
-    fn estimate(name: &str, service: &str, payload_len: usize) -> u64 {
-        (name.len() + service.len() + payload_len
+    fn estimate(name: &str, service: &str, status_message_len: usize, payload_len: usize) -> u64 {
+        (name.len() + service.len() + status_message_len + payload_len
             + 16 /* trace_id */ + 8 /* span_id */ + 8 /* parent_id */
             + 8 /* timestamp_ns */ + 8 /* duration_ns */
             + 1 /* status_code */ + 1 /* kind */ + 1 /* payload_type */
@@ -729,6 +745,7 @@ impl SpoolEncode for TraceSpanRow {
             "timestamp_ns": self.timestamp_ns,
             "duration_ns": self.duration_ns,
             "status_code": self.status_code,
+            "status_message": self.status_message,
             "kind": self.kind,
             "payload_type": self.payload_type,
             "shared": self.shared,
@@ -1298,6 +1315,7 @@ mod tests {
             timestamp_ns: 1_700_000_000_000_000_000,
             duration_ns: 1_000_000_000,
             status_code: 2,
+            status_message: String::new(),
             kind: 3,
             shared: 1,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
@@ -1329,6 +1347,7 @@ mod tests {
         assert_eq!(mapped.timestamp_ns, 1_700_000_000_000_000_000);
         assert_eq!(mapped.duration_ns, 1_000_000_000);
         assert_eq!(mapped.status_code, 2);
+        assert_eq!(mapped.status_message, "", "empty when the record has none");
         assert_eq!(mapped.kind, 3);
         assert_eq!(mapped.payload_type, 1, "OTLP protobuf payload type");
         assert_eq!(mapped.shared, 1, "the Zipkin shared flag is copied through");
@@ -1359,6 +1378,7 @@ mod tests {
                 "timestamp_ns": 1_700_000_000_000_000_000i64,
                 "duration_ns": 1_000_000_000,
                 "status_code": 2,
+                "status_message": "",
                 "kind": 3,
                 "payload_type": 1,
                 "shared": 1,

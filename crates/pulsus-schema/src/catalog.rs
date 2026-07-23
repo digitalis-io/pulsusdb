@@ -727,6 +727,39 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- span status message (M7-TQ5, issue #184) ---
+    // The OTLP `Status.message` promoted onto `trace_spans` so the
+    // `statusMessage` / `span:statusMessage` intrinsic is queryable — an
+    // additive `ADD COLUMN IF NOT EXISTS` (the id 21/22 & 25/26 & 31/32
+    // precedent), never a mutation of id 16's frozen CREATE. Pre-#184 rows
+    // read back `''` — no data migration. Like id 31, the `ADD COLUMN` on
+    // `trace_spans` rebuilds its `service_time` `SELECT *` projection in
+    // place (live-gated in `live_traces.rs`).
+    Migration {
+        id: 35,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS status_message String DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 35 — cluster-gated (`StaticClusterOnly`),
+    // skipped and unrecorded on a single node, applied the first time
+    // clustering is enabled. Mirrors id 22/26/32.
+    Migration {
+        id: 36,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS status_message String DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1417,12 +1450,62 @@ mod tests {
     /// global.
     #[test]
     fn service_graph_migrations_are_checksum_scoped_per_shard_traces() {
-        for id in [31, 32, 33, 34] {
+        // Issue #184 extends the trace-family set with the `status_message`
+        // ALTER pair (ids 35/36).
+        for id in [31, 32, 33, 34, 35, 36] {
             let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
             assert_eq!(m.scope, MigrationScope::Checksum);
             assert_eq!(m.replication, Replication::PerShard);
             assert_eq!(m.family, Some(Family::Traces));
         }
+    }
+
+    /// Issue #184 (M7-TQ5): OTLP `Status.message` is added to `trace_spans`
+    /// via an additive `ADD COLUMN IF NOT EXISTS` (id 35) — never a mutation
+    /// of id 16's frozen CREATE — as `String DEFAULT ''` (pre-#184 rows read
+    /// back `''`, no data migration). Mirrors the id 31 `shared` shape.
+    #[test]
+    fn trace_spans_status_message_base_alter_is_additive_string_default_empty() {
+        let ddl = rendered_static(35);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans\n\
+             ADD COLUMN IF NOT EXISTS status_message String DEFAULT '';",
+        );
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered = render::render(static_tmpl(35), "trace_spans", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+        // The frozen id-16 CREATE never gains the column (its checksum stays
+        // byte-frozen).
+        assert!(
+            !static_tmpl(16).contains("status_message"),
+            "status_message must arrive via the additive ALTER (id 35), not id 16's CREATE"
+        );
+    }
+
+    /// Issue #184: the `status_message` `_dist` ALTER (id 36) is
+    /// `StaticClusterOnly` — it targets `trace_spans_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Mirrors id 32.
+    #[test]
+    fn trace_spans_status_message_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 36).expect("id 36");
+        assert_eq!(m.name, "trace_spans");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 36 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "trace_spans", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS status_message String DEFAULT '';",
+        );
     }
 
     /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping
