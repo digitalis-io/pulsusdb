@@ -1341,6 +1341,9 @@ fn every_mounted_route_spec_has_a_surface_consistent_gate() {
             // Only the native tag-discovery routes use TracesTags — the
             // aliases are reshaping surfaces, compat-gated by definition.
             Surface::TracesTags => spec.gate == Gate::ReaderMode,
+            // Issue #173: the service graph is a PulsusDB-native surface with
+            // no Tempo-compat alias — ReaderMode only.
+            Surface::TracesGraph => spec.gate == Gate::ReaderMode,
             Surface::TracesTagsV1 | Surface::TracesTagsV2 | Surface::Echo => {
                 spec.gate == Gate::CompatAndReader
             }

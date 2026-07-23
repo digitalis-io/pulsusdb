@@ -396,6 +396,7 @@ fn tight_budget_config() -> TraceReadConfig {
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
         catalog_table: "trace_tag_catalog".to_string(),
+        edges_table: "trace_edges".to_string(),
         max_candidates: 100,
         scan_budget_rows: TIGHT_BUDGET_ROWS,
         generator_max_memory_bytes: 536_870_912,

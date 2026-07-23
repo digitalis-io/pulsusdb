@@ -123,6 +123,23 @@ pub struct MetricCountRow {
     pub n: u64,
 }
 
+/// One service-graph edge row (`graph_sql::service_graph_sql`, issue #173):
+/// the aggregated `(client, server, conn_type)` edge with its replay-deduped
+/// call `count`, failed-instance count, and TDigest latency quantiles.
+/// `quantiles_ns` is the SQL-pinned `Array(Float64)` (`CAST(quantilesTDigest
+/// (...) AS Array(Float64))`, issue #173 Fix 2 — no f32 on the decode path),
+/// ordered `[p50, p95, p99]`. Field order matches the SELECT list exactly
+/// (RowBinary is positional).
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct GraphEdgeRow {
+    pub client: String,
+    pub server: String,
+    pub conn_type: String,
+    pub calls: u64,
+    pub failed: u64,
+    pub quantiles_ns: Vec<f64>,
+}
+
 /// One `trace_tag_catalog` row of the §4.3 tag-names read
 /// (`tags_sql::tag_names_sql` — `SELECT DISTINCT scope, key`, issue #58).
 #[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]

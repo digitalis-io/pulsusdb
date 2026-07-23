@@ -295,6 +295,7 @@ mod tests {
                 duration_ns: 1,
                 status_code: 0,
                 kind: 0,
+                shared: 0,
                 payload: vec![1],
             }],
             ..Default::default()

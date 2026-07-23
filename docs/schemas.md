@@ -502,6 +502,57 @@ ORDER BY (scope, key, val);
 - **`timestamp_ns` after the `(key, val, scope)` prefix**: TraceQL searches are always time-bounded, so within each `(key, val)` (or `(key, val, scope)`) prefix the time predicate prunes granules — a 3h search over a busy attribute reads 3h of index, not 7 days (compare finding #5's index, which ordered trace/span IDs before time).
 - **`val_num`** gives numeric comparisons (`span.http.status_code >= 500`) a typed column. Scope this honestly: `val_num` is not in the primary key, so a range predicate scans *all values of that key* in the time range and filters — acceptable for low-cardinality numeric attributes (status codes, retry counts), **not** a general strategy for high-cardinality numerics (sizes, user-defined measurements). Duration, status, kind, name, and service are physical span columns precisely so the common numeric intrinsics never rely on this index. If benchmarks show real workloads need fast range predicates on high-cardinality numeric attributes, the design adds a dedicated numeric index ordered `(key, timestamp_ns, val_num, ...)` — benchmark-gated, not speculative.
 - Tag APIs read only `trace_tag_catalog` — discovery never scans span payloads.
+- **`trace_spans.shared` (issue #173, additive migration).** A `shared UInt8 DEFAULT 0` column is added to `trace_spans` by an additive `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (never a mutation of the frozen CREATE above; pre-#173 rows read back `0`). It is `1` iff the span carried the `zipkin.shared = "true"` attribute at OTLP parse time — the exact wire contract the Zipkin receiver emits (`str_kv("zipkin.shared", "true")`), documented so an OTLP-native sender may set it too. The attribute itself still flows to `trace_attrs_idx` unchanged; the column exists only so the service-graph edge MV below can identify a Zipkin shared span (whose SERVER side is stored under the *client's* `span_id`) and key it by its own id rather than its inherited `parent_id`.
+
+**Service-graph edge ledger (issue #173, M7-E1).** `trace_edges` is a **ReplacingMergeTree half-row ledger**: one narrow row per edge-relevant span (a CLIENT/PRODUCER or a SERVER/CONSUMER span), with its own plain `timestamp_ns` — no `SimpleAggregateFunction` anywhere. The directed `client → server` edge is assembled at **query time** (§4.2), so pair completion is a pure function of the stored half-row multiset, never of background-merge progress.
+
+```sql
+CREATE TABLE trace_edges (
+    date          Date,
+    side          UInt8,                         -- 0 = client half (kind 3|4), 1 = server half (kind 2|5)
+    trace_id      FixedString(16),
+    span_id       FixedString(8),
+    pair_id       FixedString(8),                -- the edge's CLIENT-side span id (the join key)
+    conn_type     LowCardinality(String),        -- 'rpc' | 'messaging', from the emitting span's own kind
+    timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),
+    service       LowCardinality(String),
+    duration_ns   Int64  CODEC(T64, ZSTD(1)),
+    failed        UInt8
+) ENGINE = ReplacingMergeTree
+PARTITION BY date
+ORDER BY (side, trace_id, span_id)
+TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE
+SETTINGS ttl_only_drop_parts = 1;
+-- populated by trace_edges_mv over trace_spans (a pure per-row projection, kind-filtered); no MV-side
+-- GROUP BY/join/state. The CREATE-time TTL is superseded at runtime by apply_ttl's saturating form
+-- (the trace-table pattern above): toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days*86400, 4294967295)) DELETE
+```
+
+```sql
+CREATE MATERIALIZED VIEW trace_edges_mv TO trace_edges AS
+SELECT
+    toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,
+    toUInt8(kind IN (2, 5)) AS side,
+    trace_id,
+    span_id,
+    if(kind IN (3, 4) OR shared = 1, span_id, parent_id) AS pair_id,
+    if(kind IN (2, 3), 'rpc', 'messaging') AS conn_type,
+    timestamp_ns,
+    service,
+    duration_ns,
+    toUInt8(status_code = 2) AS failed
+FROM trace_spans
+WHERE kind IN (3, 4)
+   OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)));
+```
+
+- **`side` leads the ORDER BY** so each per-half read subquery (§4.2) prunes on the PrimaryKey `side` prefix — a second, independently-gateable prune besides the daily-partition MinMax prune. Because `side` is in the `ReplacingMergeTree` dedup key, a Zipkin shared span (issue #75: SERVER side stored under the client's `span_id`) never collapses its two halves.
+- **`pair_id` is the edge's CLIENT-side span id** — the single-valued join key. A client/producer half and a *shared* server half key by their own `span_id` (Zipkin's shared model: both RPC sides carry the same id); a non-shared server half keys by `parent_id`. Edge identity is thus the SERVER-side span (`(trace_id, span_id)`, one row per edge), which preserves client fan-out: a client parenting N servers yields N edges, none `max()`-collapsed across siblings.
+- **`conn_type` is derived from the emitting span's own kind** (`kind ∈ {2,3}` → `'rpc'`, `{4,5}` → `'messaging'`), and the read join (§4.2) requires `c.conn_type = s.conn_type` — so only CLIENT(3)→SERVER(2) and PRODUCER(4)→CONSUMER(5) can pair; the four cross-kind combinations are structurally rejected.
+- **Root non-shared server halves are excluded** (`parent_id` all-zero → no client twin possible); a shared server half is admitted even with a zero parent, since its pair key is its own id.
+- **Replay idempotence is read-time dedup, not ledger-exact.** Byte-identical at-least-once redelivery (the ingest contract) is fully absorbed — the read's per-side `GROUP BY` computes identical `any(...)`/`max(...)` whether zero, some, or all duplicates were physically merged. A *mutated* re-send of the same `(side, trace_id, span_id)` makes `any()` merge-order-sensitive (documented residual, unchanged in kind from the metrics path).
+- **Zipkin shared-span limitation.** The correct handling above (key a shared server half by its own id) depends on the `shared` column; a shared server half whose `zipkin.shared` marker was lost cannot be distinguished from an ordinary server half and would key by its inherited `parent_id`. No historical backfill: the edge MV sees only post-deploy inserts (a one-shot operator `INSERT ... SELECT trace_edges_mv-body FROM trace_spans` recipe reconstructs history from retained spans if needed).
+
 - **Admitted trace timestamp domain and runtime TTL (issue #131).** Ingest admits a span only if its UTC day lies in `[1970-01-01, 2106-02-06]` (days `0..=49_709`, `pulsus_model::Date::start_of_day_utc_datetime_safe`); a span outside that domain is rejected (OTLP partial success; Zipkin whole-request 400). Two wrap mechanisms motivate the gate: `PARTITION BY toDate(...)` evaluates in the 16-bit `Date` domain and wraps for days past 2149-06-06, and the delete-TTL evaluates the row timestamp in the 32-bit `DateTime` domain and wraps for instants past 2106-02-07T06:28:15Z (u32-seconds maximum, `4294967295`); day `49_710` (2106-02-07) is excluded because only part of it is u32-representable. The CREATE-time TTL shown above is superseded at runtime: `apply_ttl` re-issues `ALTER TABLE ... MODIFY TTL toDateTime(least(intDiv(timestamp_ns, 1000000000) + retention_days * 86400, 4294967295)) DELETE` on both trace tables at init and on every rotation tick, so for a stored row with epoch-seconds `s = floor(timestamp_ns / 1e9)` the operative expiry is `expiry(s) = min(s + retention_days * 86400, 4294967295)` — i.e. `min(configured_expiry, 2106-02-07T06:28:15Z)`. If `s + retention_days * 86400 <= 4294967295`, the expiry equals the configured instant, bit-identical to the pre-#131 expression; otherwise the expiry is `4294967295`, the actual retention is `4294967295 - s`, and the shortfall vs the configured value is `s + retention_days * 86400 - 4294967295`, which grows without bound as `retention_days` grows. For the enforced range `retention_days >= 1` (config validation rejects `< 1`, `crates/pulsus-config/src/validate.rs:285-287`), a row at the last admitted day (`49_709`, `s = 4_294_943_999`) has actual retention capped at `4_294_967_295 - 4_294_943_999 = 23_296 s ≈ 0.27 days (~6.5 hours)`. For every enforced `retention_days >= 1`, the saturating form strictly dominates the pre-#131 expression: pre-#131, a row with `s + retention_days * 86400 > 4294967295` wrapped to a ~1970-epoch expiry and its part became drop-eligible immediately or near-immediately after insert (`ttl_only_drop_parts = 1`); under the saturating form the same row becomes drop-eligible no earlier than 2106-02-07T06:28:15Z. The admission cutoff is deliberately not coupled to `retention_days`: retention is runtime-ALTERed after rows are stored (a changed `PULSUS_RETENTION_DAYS` re-ALTERs existing tables on the next rotation tick) and has no upper bound, so no admission-time gate can honor a retention value that did not exist when the row was admitted.
 
 ### 4.2 Read paths (generated SQL)
@@ -575,6 +626,46 @@ ORDER BY t ASC
 - **Access paths:** a root-AND-spine `resource.service.name =` conjunct (never one inside/under an `||`) hoists to `PREWHERE` and selects the `service_time` projection; every attribute leaf is an index-served `(trace_id, span_id) [NOT] IN` semi-join confined to its `(key[, val][, scope])` prefix plus daily-partition/time pruning (`NOT IN` implements the ratified absent-key negation rule); physical leaves render inline on `trace_spans` columns.
 - **Bounded state:** every metrics query carries the trace read budgets (scan rows/bytes, result bytes, throw) **plus** the semi-join IN-set limits — `max_rows_in_set` (1,000,000) / `max_bytes_in_set` (64 MiB) with `set_overflow_mode = 'throw'` → `422 query_too_broad` via its own dedicated reason, never an unbounded in-memory set. The bucket count itself is capped statically at plan time (docs/api.md §4.4).
 - **Clustered honesty:** the reader additionally injects `distributed_product_mode = 'local'`, rewriting the semi-join subquery to the **local** shard's `trace_attrs_idx` (exact under the `cityHash64(trace_id)` co-sharding, and it kills the `_dist`-inside-`_dist` double-distributed path). The time-bucket `GROUP BY` is **not** shard-local — buckets exist on every shard and the coordinator merges per-bucket partial states, bounded by the point cap × shard count (scale evidence routes to #25).
+
+**Service graph** (`GET /api/traces/v1/service_graph`, issue #173) — one fully-pushed-down two-level aggregation over the `trace_edges` half-row ledger (§4.1), both aggregation levels in ClickHouse:
+
+```sql
+SELECT
+    c.service AS client,
+    s.service AS server,
+    s.conn_type AS conn_type,
+    count() AS calls,
+    countIf(greatest(s.failed, c.failed) = 1) AS failed,
+    CAST(quantilesTDigest(0.5, 0.95, 0.99)(s.duration_ns) AS Array(Float64)) AS quantiles_ns
+FROM
+(
+    SELECT trace_id, span_id, any(pair_id) AS pair_id, any(conn_type) AS conn_type,
+           any(service) AS service, max(duration_ns) AS duration_ns, max(failed) AS failed
+    FROM trace_edges
+    WHERE side = 1 AND date >= toDate({S}) AND date <= toDate({E - 1ns})
+      AND timestamp_ns >= {S} AND timestamp_ns < {E}
+    GROUP BY trace_id, span_id
+) AS s
+INNER JOIN
+(
+    SELECT trace_id, pair_id, any(conn_type) AS conn_type,
+           any(service) AS service, max(failed) AS failed
+    FROM trace_edges
+    WHERE side = 0 AND date >= toDate({S}) AND date <= toDate({E - 1ns})
+      AND timestamp_ns >= {S} AND timestamp_ns < {E}
+    GROUP BY trace_id, pair_id
+) AS c
+ON c.trace_id = s.trace_id AND c.pair_id = s.pair_id AND c.conn_type = s.conn_type
+GROUP BY client, server, conn_type
+ORDER BY calls DESC, client ASC, server ASC
+LIMIT {SERVICE_GRAPH_MAX_EDGES + 1}
+```
+
+- **Determinism (merge-invariant).** Every half-row carries its own plain `timestamp_ns`, evaluated per stored row, so window membership of each half is merge-invariant; the per-side `GROUP BY` performs exactly the `ReplacingMergeTree` collapse at read time, so the *edge set* and its replay-deduped `calls`/`failed` counts are a pure function of the deduped in-window half-rows — **byte-identical before and after `OPTIMIZE TABLE trace_edges FINAL`**. The `quantilesTDigest` latency quantiles are the one exception: TDigest is an approximate, merge-order-sensitive estimator, so a merge can shift a quantile slightly — they are stable only within a tolerance band (the live gate bounds the drift at ±5% + 1ns), never asserted byte-equal. An edge is reported iff BOTH halves' own timestamps fall in `[S, E)` (the normative window rule, docs/api.md §4.5); a window edge with one half only is dropped by the `INNER JOIN`.
+- **Pruning (perf mandate).** Each half-scan prunes on the daily-partition `date` MinMax (the Tier-1 EXPLAIN gate) **and** the leading-`side` PrimaryKey prefix. The scan is over the payload-free ledger (~2 narrow rows per RPC edge instance vs full spans). Counting is `count()` over the deduped, `pair_id`-joined edge instances — never a bare count on the raw ledger.
+- **Quantiles wire type.** `quantilesTDigest` over `Int64` is `CAST` to `Array(Float64)` so the wire type is pinned independent of the server's internal default (which is `Array(Float32)` on 24.8) — the whole edge-row decode path carries no f32 (`GraphEdgeRow.quantiles_ns: Vec<f64>`, `[p50, p95, p99]`).
+- **Bounded response, bounded state.** `max_rows_to_read = reader.traceql_scan_budget_rows` (throw) bounds the join's scan + hash-table cost → `422 query_too_broad`; `LIMIT SERVICE_GRAPH_MAX_EDGES + 1` bounds the returned edge set (the extra row flips a non-silent `truncated` flag). The join hash table is bounded by the in-window deduped client halves.
+- **Clustered.** The SQL names the `_dist` ledger on both sides and the reader injects `distributed_product_mode = 'local'` (the ratified §4.2/§4.4 semi-join pattern): halves co-shard on `cityHash64(trace_id)`, so every joinable pair is shard-local, the join executes per shard, and the initiator merges only per-`(client, server, conn_type)` partial states (TDigest states merge), bounded by distinct service-pair labels, not by edge instances (scale evidence routes to #25).
 
 ---
 
@@ -676,7 +767,7 @@ Enabled by `PULSUS_CLUSTER`. Every table becomes `ReplicatedMergeTree`-family wi
 |-------|--------------|-----|
 | `metric_samples`, `metric_samples_5m/_1h`, `metric_series` | `cityHash64(metric_name, fingerprint)` | the metric fingerprint **excludes `__name__`**, so every metric sharing a target's label set shares one fingerprint — sharding by fingerprint alone would pile all of a target's metrics onto one shard (skew). The true series identity is `(metric_name, fingerprint)`, and the shard key matches it: a series still lives whole on one shard, per-series evaluation and tier `GROUP BY` stay shard-local, and same-labelset metrics spread across the cluster |
 | `log_samples`, `log_streams`, `log_streams_idx`, `log_metrics_5s`, `log_patterns` | `fingerprint` | index and data **co-shard**: the stream-resolution `GROUP BY fingerprint HAVING ...` runs per shard on complete groups, hydration joins locally, each shard's stage-3 read is against its own streams, and the `/patterns` read's per-shard `GROUP BY pattern, ts_ns` produces partials over the fingerprint-pruned shard subset (no `IN (subquery)` cross-shard fan-in) |
-| `trace_spans`, `trace_attrs_idx` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections and trace assembly are shard-local |
+| `trace_spans`, `trace_attrs_idx`, `trace_edges` | `cityHash64(trace_id)` | a trace is whole on one shard; span-level intersections, trace assembly, and the service-graph half-row pairing (both edge halves share `trace_id`, so the query-time join is shard-local) are all shard-local |
 | `profile_samples`, `profile_series`, `profile_series_idx` | `fingerprint` | same co-sharding argument as logs |
 | `rules`, catalogs, bookkeeping | (replicated to all shards via a shard-less replication path — one cluster-wide replica set, no Distributed writes) | tiny, read-everywhere; **prerequisite: `{replica}` macros must be unique across the whole cluster**, not merely within a shard |
 

@@ -431,7 +431,7 @@ async fn table_exists(client: &ChClient, ctx: &RenderCtx, name: &str) -> Result<
 /// deliberately appended LAST so an operator-managed schema lacking the
 /// table cannot block the eight pre-existing statements (rotation
 /// warns-and-continues).
-const TTL_STMTS: [&str; 10] = [
+const TTL_STMTS: [&str; 12] = [
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(unix_milli, 1000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.metric_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
@@ -447,6 +447,15 @@ const TTL_STMTS: [&str; 10] = [
     "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY TTL \
      toDateTime(least(intDiv(unix_milli, 1000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
     "ALTER TABLE {{db}}.metric_hist_samples{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
+    // `trace_edges` (M7-E1, issue #173) — the service-graph half-row ledger's
+    // `timestamp_ns` is a plain nanosecond column, so it carries the same
+    // saturating row-granular delete-TTL as `trace_spans`/`trace_attrs_idx`.
+    // Appended LAST so an operator-managed schema lacking the table cannot
+    // block the pre-existing statements (rotation warns-and-continues), the
+    // #137 `metric_hist_samples` precedent.
+    "ALTER TABLE {{db}}.trace_edges{{on_cluster}} MODIFY TTL \
+     toDateTime(least(intDiv(timestamp_ns, 1000000000) + {{retention_days}} * 86400, 4294967295)) DELETE;",
+    "ALTER TABLE {{db}}.trace_edges{{on_cluster}} MODIFY SETTING ttl_only_drop_parts = 1;",
 ];
 
 /// Applies the current `{{retention_days}}`-derived TTL ([`TTL_STMTS`]) to
@@ -504,8 +513,8 @@ mod tests {
             .collect();
         assert_eq!(
             trace_ttl_stmts.len(),
-            2,
-            "exactly trace_spans + trace_attrs_idx carry a trace MODIFY TTL"
+            3,
+            "exactly trace_spans + trace_attrs_idx + trace_edges carry a trace MODIFY TTL"
         );
         for stmt in &trace_ttl_stmts {
             assert!(
@@ -554,7 +563,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY TTL"))
             .collect();
-        assert_eq!(ttl_stmts.len(), 5, "five retained tables carry a TTL");
+        assert_eq!(ttl_stmts.len(), 6, "six retained tables carry a TTL");
         for stmt in &ttl_stmts {
             assert!(
                 stmt.contains("least(intDiv("),
@@ -587,7 +596,12 @@ mod tests {
                 "{table} is millisecond-scale: {stmt}"
             );
         }
-        for table in ["log_samples", "trace_spans", "trace_attrs_idx"] {
+        for table in [
+            "log_samples",
+            "trace_spans",
+            "trace_attrs_idx",
+            "trace_edges",
+        ] {
             let stmt = ttl_stmts
                 .iter()
                 .find(|s| s.contains(&format!(".{table} ")))
@@ -602,7 +616,7 @@ mod tests {
             .iter()
             .filter(|s| s.contains("MODIFY SETTING ttl_only_drop_parts = 1"))
             .collect();
-        assert_eq!(setting_stmts.len(), 5, "one MODIFY SETTING per table");
+        assert_eq!(setting_stmts.len(), 6, "one MODIFY SETTING per table");
         assert_eq!(
             ttl_stmts
                 .iter()

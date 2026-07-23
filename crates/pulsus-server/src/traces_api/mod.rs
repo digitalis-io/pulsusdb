@@ -24,6 +24,11 @@
 //! through the shared `prom_api::encode` Prometheus matrix/vector
 //! envelope.
 //!
+//! The §4.5 service-graph route (issue #173, M7-E1) lives in `graph.rs`: a
+//! thin handler over `pulsus-read`'s `service_graph` two-level aggregation
+//! against the `trace_edges` half-row ledger, shaping the native
+//! `{"edges":[...],"truncated":...}` JSON envelope. No Tempo-compat alias.
+//!
 //! The §8.1 Tempo compat aliases (issue #61, T9) ship here too:
 //! [`compat_router`] binds the eight pure aliases onto these same
 //! handlers and the reshaping/constant ones onto `compat.rs`;
@@ -34,6 +39,7 @@
 mod assemble;
 mod compat;
 mod error;
+mod graph;
 mod handlers;
 mod legacy;
 mod metrics;
@@ -68,6 +74,10 @@ pub(crate) fn router() -> Router<AppState> {
             get(metrics::metrics_query_range),
         )
         .route("/api/traces/v1/metrics/query", get(metrics::metrics_query))
+        // Service graph (M7-E1, issue #173): a PulsusDB-native surface with
+        // NO Tempo-compat alias (the interop reference has no service-graph
+        // HTTP endpoint), so it joins `router()` only, never `compat_router`.
+        .route("/api/traces/v1/service_graph", get(graph::service_graph))
 }
 
 /// The Tempo-compat alias surface (docs/api.md §8.1, issue #61) — 13

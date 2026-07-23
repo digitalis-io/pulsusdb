@@ -22,7 +22,8 @@ use pulsus_traceql::TraceQlError;
 use super::assemble::AssembleError;
 use super::legacy::LegacyError;
 use super::params::{
-    MetricsParamError, SearchParamError, TagPathError, TagsParamError, TraceIdError,
+    GraphParamError, MetricsParamError, SearchParamError, TagPathError, TagsParamError,
+    TraceIdError,
 };
 
 /// Every failure mode a `/api/traces/v1` handler can return, converted
@@ -30,7 +31,7 @@ use super::params::{
 ///
 /// | variant | HTTP | `errorType` |
 /// |---|---|---|
-/// | `Param` / `SearchParam` / `MetricsParam` / `TagsParam` / `TagPath` | 400 | `bad_data` |
+/// | `Param` / `SearchParam` / `MetricsParam` / `GraphParam` / `TagsParam` / `TagPath` | 400 | `bad_data` |
 /// | `Plan` (except the point cap) | 400 | `bad_data` |
 /// | `Query` (TraceQL parse, carries `position`) | 400 | `bad_data` |
 /// | `Legacy` (strict logfmt, carries `position` into `tags`) | 400 | `bad_data` |
@@ -48,6 +49,8 @@ pub(crate) enum ApiError {
     SearchParam(SearchParamError),
     /// Metrics request-parameter failures (issue #59, no `position`).
     MetricsParam(MetricsParamError),
+    /// Service-graph request-parameter failures (issue #173, no `position`).
+    GraphParam(GraphParamError),
     /// `/tags` request-parameter failures (issue #58, no `position`).
     TagsParam(TagsParamError),
     /// `{tag}` path-parameter failures (issue #58, no `position`).
@@ -87,6 +90,12 @@ impl From<SearchParamError> for ApiError {
 impl From<MetricsParamError> for ApiError {
     fn from(e: MetricsParamError) -> Self {
         ApiError::MetricsParam(e)
+    }
+}
+
+impl From<GraphParamError> for ApiError {
+    fn from(e: GraphParamError) -> Self {
+        ApiError::GraphParam(e)
     }
 }
 
@@ -136,6 +145,7 @@ impl IntoResponse for ApiError {
             ApiError::Param(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::SearchParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::MetricsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
+            ApiError::GraphParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::TagsParam(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             ApiError::TagPath(e) => (StatusCode::BAD_REQUEST, "bad_data", e.to_string(), None),
             // Strict logfmt errors carry a byte offset into the decoded

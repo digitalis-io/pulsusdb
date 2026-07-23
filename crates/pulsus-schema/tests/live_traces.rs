@@ -626,7 +626,9 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
     run_init(&client, &ctx)
         .await
         .expect("run_init (retention_days=7)");
-    for table in ["trace_spans", "trace_attrs_idx"] {
+    // `trace_edges` (issue #173) joins the retained-trace-table TTL set
+    // (`apply_ttl`, appended last) with the same saturating nano-scale form.
+    for table in ["trace_spans", "trace_attrs_idx", "trace_edges"] {
         let ddl = create_table_query(&client, db, table).await;
         // `apply_ttl` (issue #131) supersedes the CREATE-time TTL with the
         // saturating expression; ClickHouse normalizes the rendered
@@ -642,7 +644,7 @@ async fn run_init_after_retention_days_change_updates_ttl_on_both_trace_tables()
         .await
         .expect("re-init after a PULSUS_RETENTION_DAYS change must succeed, not MigrationDrift");
 
-    for table in ["trace_spans", "trace_attrs_idx"] {
+    for table in ["trace_spans", "trace_attrs_idx", "trace_edges"] {
         let ddl = create_table_query(&client, db, table).await;
         assert!(
             ddl.contains("(30 * 86400)"),
@@ -855,6 +857,400 @@ async fn boundary_span_survives_saturating_ttl_and_drops_under_the_wrapping_ttl(
         dropped, 0,
         "the same row must drop under the pre-#131 wrapping expression — this pins \
          the defect the saturating expression closes"
+    );
+
+    drop_database(&client, db).await;
+}
+
+// -- service-graph edge ledger (M7-E1, issue #173) ----------------------
+
+#[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct EdgeRow {
+    client: String,
+    server: String,
+    conn_type: String,
+    calls: u64,
+    failed: u64,
+}
+
+/// Runs the docs/schemas.md §4.2 service-graph read (calls/failed only; the
+/// quantiles arm is covered by `traces_graph_explain.rs`) over `[s, e)` and
+/// returns the aggregated edges in the query's own order.
+async fn read_edges(client: &ChClient, db: &str, s: i64, e: i64) -> Vec<EdgeRow> {
+    let half = |side: u8, group: &str, extra: &str| {
+        format!(
+            "SELECT trace_id, {group} any(conn_type) AS conn_type, any(service) AS service, \
+             max(failed) AS failed{extra}\n\
+             FROM {db}.trace_edges\n\
+             WHERE side = {side} \
+               AND date >= toDate(fromUnixTimestamp64Nano({s})) \
+               AND date <= toDate(fromUnixTimestamp64Nano({e})) \
+               AND timestamp_ns >= {s} AND timestamp_ns < {e}\n\
+             GROUP BY {group_by}",
+            group_by = if side == 1 {
+                "trace_id, span_id"
+            } else {
+                "trace_id, pair_id"
+            },
+        )
+    };
+    let server = half(
+        1,
+        "span_id, any(pair_id) AS pair_id,",
+        ", max(duration_ns) AS duration_ns",
+    );
+    let client_half = half(0, "pair_id,", "");
+    let sql = format!(
+        "SELECT c.service AS client, s.service AS server, s.conn_type AS conn_type, \
+         count() AS calls, countIf(greatest(s.failed, c.failed) = 1) AS failed\n\
+         FROM ({server}) AS s\n\
+         INNER JOIN ({client_half}) AS c\n\
+         ON c.trace_id = s.trace_id AND c.pair_id = s.pair_id AND c.conn_type = s.conn_type\n\
+         GROUP BY client, server, conn_type\n\
+         ORDER BY calls DESC, client ASC, server ASC"
+    );
+    let mut stream = client
+        .query_stream::<EdgeRow>(&sql, &QuerySettings::new())
+        .await
+        .unwrap_or_else(|e| panic!("read edges failed: {e}\nSQL:\n{sql}"));
+    let mut out = Vec::new();
+    while let Some(row) = stream.next().await {
+        out.push(row.expect("decode EdgeRow"));
+    }
+    out
+}
+
+/// Inserts one span into `trace_spans` (the MV fires, emitting a half-row).
+/// `shared` defaults to 0 (the additive migration-31 column).
+#[allow(clippy::too_many_arguments)] // a test span builder (the sibling suites' idiom)
+async fn insert_span(
+    client: &ChClient,
+    db: &str,
+    trace: &str,
+    span: &str,
+    parent: &str,
+    service: &str,
+    kind: i8,
+    status: i8,
+    ts: i64,
+) {
+    let sql = format!(
+        "INSERT INTO {db}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+         VALUES ('{trace}', '{span}', '{parent}', 'op', '{service}', {ts}, 5000000, \
+                 {status}, {kind}, 1, 'p')"
+    );
+    client
+        .execute(&sql, &QuerySettings::new(), Idempotency::NonIdempotent)
+        .await
+        .unwrap_or_else(|e| panic!("insert span failed: {e}\nSQL:\n{sql}"));
+}
+
+/// Issue #173 AC1/AC2/AC5/AC6: `run_init` creates `trace_edges` +
+/// `trace_edges_mv` idempotently (reconcile twice, no `MigrationDrift`),
+/// `mv_checksums` records the MV, SQL-inserted client/server pairs
+/// materialize completed edges through the MV, within-type pairing rejects a
+/// cross-kind decoy, and a byte-identical re-insert leaves the read's
+/// `calls` unchanged (replay idempotence via read-time dedup).
+#[tokio::test]
+async fn run_init_creates_the_edge_ledger_and_mv_and_pairs_client_server_edges() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_edges";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+
+    run_init(&client, &ctx).await.expect("run_init (first run)");
+    run_init(&client, &ctx)
+        .await
+        .expect("run_init (second run must be a no-op, never MigrationDrift)");
+
+    let names = table_names(&client, db).await;
+    for t in ["trace_edges", "trace_edges_mv"] {
+        assert!(names.contains(&t.to_string()), "missing {t} in {names:?}");
+    }
+    assert!(
+        !names.iter().any(|n| n == "trace_edges_dist"),
+        "single-node mode has no _dist wrapper: {names:?}"
+    );
+
+    // `trace_spans.shared` landed via the additive migration.
+    let has_shared = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.columns \
+             WHERE database = '{db}' AND table = 'trace_spans' AND name = 'shared'"
+        ),
+    )
+    .await;
+    assert_eq!(has_shared, 1, "migration 31 must add trace_spans.shared");
+
+    // `mv_checksums` records the edge MV.
+    let mv_present = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.mv_checksums WHERE mv_name = 'trace_edges_mv'"),
+    )
+    .await;
+    assert_eq!(mv_present, 1, "mv_checksums must record trace_edges_mv");
+
+    let base = now_ns();
+    // RPC pair: checkout(client, kind 3) -> payments(server, kind 2).
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0001",
+        "clientAA",
+        "00000000",
+        "checkout",
+        3,
+        0,
+        base,
+    )
+    .await;
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0001",
+        "serverAA",
+        "clientAA",
+        "payments",
+        2,
+        0,
+        base,
+    )
+    .await;
+    // Messaging pair: orders(producer, kind 4) -> shipping(consumer, kind 5).
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0002",
+        "prodBB01",
+        "00000000",
+        "orders",
+        4,
+        0,
+        base,
+    )
+    .await;
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0002",
+        "consBB01",
+        "prodBB01",
+        "shipping",
+        5,
+        0,
+        base,
+    )
+    .await;
+    // Cross-kind decoy: client(kind 3) -> consumer(kind 5): conn_type
+    // mismatch (rpc vs messaging), so it must NOT pair.
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0003",
+        "clientCC",
+        "00000000",
+        "xsvc",
+        3,
+        0,
+        base,
+    )
+    .await;
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0003",
+        "consCC01",
+        "clientCC",
+        "ysvc",
+        5,
+        0,
+        base,
+    )
+    .await;
+
+    let s = base - 3_600_000_000_000;
+    let e = base + 3_600_000_000_000;
+    let edges = read_edges(&client, db, s, e).await;
+    assert_eq!(
+        edges,
+        vec![
+            EdgeRow {
+                client: "checkout".into(),
+                server: "payments".into(),
+                conn_type: "rpc".into(),
+                calls: 1,
+                failed: 0,
+            },
+            EdgeRow {
+                client: "orders".into(),
+                server: "shipping".into(),
+                conn_type: "messaging".into(),
+                calls: 1,
+                failed: 0,
+            },
+        ],
+        "exactly the RPC and messaging edges pair; the cross-kind decoy yields none"
+    );
+
+    // Replay idempotence: a byte-identical re-insert of the RPC pair leaves
+    // the deduped `calls` at 1 (read-time GROUP BY collapses the replay).
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0001",
+        "clientAA",
+        "00000000",
+        "checkout",
+        3,
+        0,
+        base,
+    )
+    .await;
+    insert_span(
+        &client,
+        db,
+        "trace-graph-0001",
+        "serverAA",
+        "clientAA",
+        "payments",
+        2,
+        0,
+        base,
+    )
+    .await;
+    let after = read_edges(&client, db, s, e).await;
+    assert_eq!(
+        after
+            .iter()
+            .find(|r| r.client == "checkout")
+            .map(|r| r.calls),
+        Some(1),
+        "a byte-identical replay must not inflate calls"
+    );
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #173 AC-new (projection ALTER): the migration-31 `ADD COLUMN
+/// shared` runs on a POPULATED `trace_spans` carrying a `SELECT *`
+/// (`service_time`) projection with existing parts — the prior ALTER
+/// precedents (log_samples/metric_series) had no projection. Gate: 24.8
+/// accepts the ALTER, pre-existing rows read back the `0` default, and the
+/// projection is still selectable afterward. Reproduces the exact structural
+/// risk on a throwaway table so it is independent of migration internals.
+#[tokio::test]
+async fn migration_shared_add_column_survives_a_populated_projection_table() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_shared_alter";
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create db");
+
+    // The pre-#173 trace_spans shape (id-16), projection and all, WITHOUT the
+    // shared column — the state migration 31 alters.
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.trace_spans (\
+                     trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8), \
+                     name LowCardinality(String), service LowCardinality(String), \
+                     timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), \
+                     duration_ns Int64 CODEC(T64, ZSTD(1)), status_code Int8, kind Int8, \
+                     payload_type Int8, payload String CODEC(ZSTD(3)), \
+                     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4, \
+                     PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)) \
+                 ) ENGINE = MergeTree \
+                 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns)) \
+                 ORDER BY (trace_id, timestamp_ns)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create pre-#173 trace_spans");
+
+    // Populate so the ALTER runs over materialized projection parts.
+    let base = now_ns();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_spans \
+                     (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                      status_code, kind, payload_type, payload) \
+                 SELECT toFixedString(hex(cityHash64(number)), 16), \
+                        toFixedString(substring(hex(cityHash64(number, 1)), 1, 8), 8), \
+                        toFixedString('00000000', 8), 'op', concat('svc-', toString(number % 8)), \
+                        {base} + number * 1000000, 5000000, 0, 2, 1, 'p' \
+                 FROM numbers(5000)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("seed populated trace_spans");
+
+    // The migration-31 ALTER over the populated projection-carrying table.
+    client
+        .execute(
+            &format!(
+                "ALTER TABLE {db}.trace_spans ADD COLUMN IF NOT EXISTS shared UInt8 DEFAULT 0"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("ADD COLUMN shared must be accepted on a projection-carrying table (24.8)");
+
+    // Pre-existing rows read back the 0 default.
+    let nonzero_shared = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.trace_spans WHERE shared != 0"),
+    )
+    .await;
+    assert_eq!(nonzero_shared, 0, "pre-existing rows read back shared = 0");
+
+    // The `service_time` projection survives the ALTER — its definition is
+    // still on the table and it retains materialized parts (the optimizer's
+    // *selection* is data-dependent and not asserted on this tiny fixture, per
+    // the module's ≥100k-row note; survival + queryability is the ALTER gate).
+    let ddl = create_table_query(&client, db, "trace_spans").await;
+    assert!(
+        ddl.contains("PROJECTION service_time"),
+        "the projection definition must survive ADD COLUMN: {ddl}"
+    );
+    let projection_parts = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.projection_parts \
+             WHERE database = '{db}' AND table = 'trace_spans' \
+               AND name = 'service_time' AND active"
+        ),
+    )
+    .await;
+    assert!(
+        projection_parts > 0,
+        "the service_time projection must retain materialized parts after ADD COLUMN"
+    );
+    // The base and projection paths still return correct results post-ALTER.
+    let svc3 = count(
+        &client,
+        &format!("SELECT count() AS n FROM {db}.trace_spans WHERE service = 'svc-3'"),
+    )
+    .await;
+    assert_eq!(
+        svc3, 625,
+        "5000 rows spread over 8 services => 625 per service"
     );
 
     drop_database(&client, db).await;

@@ -19,6 +19,7 @@
 
 pub mod exec;
 pub mod filter;
+pub mod graph_sql;
 pub mod metrics_plan;
 pub mod metrics_sql;
 pub mod rows;
@@ -30,15 +31,17 @@ pub mod tags_sql;
 
 pub use exec::{
     BATCH_TRACES, CANDIDATE_TUPLE_BYTES, HYDRATION_BYTE_BUDGET, MAX_SPANS_PER_TRACE,
-    RETAINED_ENTRY_OVERHEAD, RootSummary, SearchOutput, TAG_NAMES_MAX, TAG_VALUES_MAX,
-    TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames,
-    TagValues, TraceEngine, TraceReadConfig, TraceSearchResult,
+    RETAINED_ENTRY_OVERHEAD, RootSummary, SearchOutput, ServiceGraph, TAG_NAMES_MAX,
+    TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
+    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceEngine, TraceReadConfig,
+    TraceSearchResult,
 };
 pub use filter::{CompiledLeaf, CompiledSpanFilter, PlanError, SpanFilterCtx, compile_span_filter};
+pub use graph_sql::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
 pub use metrics_plan::{
     DEFAULT_METRICS_POINTS, MAX_METRICS_POINTS, MetricFunc, MetricsCtx, MetricsParams,
     TraceMetricsPlan, plan_trace_metrics,
 };
-pub use rows::{StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
+pub use rows::{GraphEdgeRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
 pub use search_eval::SpanSummary;
 pub use search_plan::{SearchCtx, SearchParams, SearchPlan, plan_search};

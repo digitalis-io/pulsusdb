@@ -843,6 +843,23 @@ fn assert_success_envelope(spec: &RouteSpec, res: &RawResponse, ctx: &str) {
                 );
             }
         }
+        (Surface::TracesGraph, _) => {
+            // Issue #173: success is the documented docs/api.md §4.5 native
+            // envelope, not the Prometheus query envelope. Against this
+            // suite's empty databases a well-formed request returns exactly
+            // `{"edges":[],"truncated":false}` — the mounting oracle (an
+            // unmounted path would 404 instead of 200).
+            assert!(
+                res.content_type()
+                    .is_some_and(|ct| ct.starts_with("application/json")),
+                "{ctx}: service-graph envelope content-type"
+            );
+            assert_eq!(
+                res.json(ctx),
+                serde_json::json!({ "edges": [], "truncated": false }),
+                "{ctx}: exact empty-DB service-graph body"
+            );
+        }
         (Surface::TracesTags, path) => {
             // Issue #58: success is the documented docs/api.md §4.3
             // native envelope. Against this suite's empty databases both

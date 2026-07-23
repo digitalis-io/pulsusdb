@@ -397,6 +397,37 @@ The committed M4 function set is **`rate()` and `count_over_time()`** (zero-arit
 
 **Step derivation and the point cap (committed contract):** when `step` is omitted, `step_s = max(1, ⌊(end_s − start_s) / DEFAULT_METRICS_POINTS⌋)` with `DEFAULT_METRICS_POINTS` = 100. The snapped bucket count `(E − S) / step_s` is capped at `MAX_METRICS_POINTS` = 11000: a range resolving more buckets is rejected **statically before execution** with `422 query_too_broad` — deliberately 422 (the bounded-response family), not Prometheus's 400, and never a silent truncation. Attribute-filter semi-joins carry throwing IN-set limits with the same 422 semantics (docs/schemas.md §4.2).
 
+### 4.5 Service graph
+
+```
+GET /api/traces/v1/service_graph
+```
+
+Derives the service-graph edges (directed `client → server` call counts, error counts, and latency quantiles per connection type) over a time window, from the `trace_edges` half-row ledger populated at ingest (docs/schemas.md §4.1/§4.2). PulsusDB-native — there is **no** Tempo-compat alias (the interop reference has no service-graph HTTP endpoint; its panels read edge metrics as Prometheus series).
+
+| Param | Notes |
+|-------|-------|
+| `start`, `end` | unix s / ns / RFC3339 (§1's trace-API forms, the same parser as §4.2/§4.4) |
+| `since` | relative alternative to start/end (`1h`, `30m`) — mutually exclusive with them |
+
+There is no `q` expression and no `step`: the read is a fixed `(client, server, connectionType)` aggregation over `[start, end)`.
+
+**Response** (a bare object, not the `{status,data}` query envelope):
+
+```json
+{"edges":[{"client":"checkout","server":"payments","connectionType":"rpc",
+           "calls":123,"failed":4,"p50Ns":1200000.0,"p95Ns":8400000.0,"p99Ns":21000000.0}],
+ "truncated":false}
+```
+
+- `connectionType` is `"rpc"` (CLIENT→SERVER) or `"messaging"` (PRODUCER→CONSUMER) — the pairing is within-type, so cross-kind combinations never form an edge (docs/schemas.md §4.1).
+- `calls`/`failed` are replay-deduped exact counts; `p50Ns`/`p95Ns`/`p99Ns` are TDigest latency quantiles in nanoseconds (`f64` — the SQL pins `CAST(... AS Array(Float64))`, no f32 on the wire), computed over the SERVER-side span durations.
+- `edges` are ordered `calls` descending, then `client`/`server` ascending, and capped at `SERVICE_GRAPH_MAX_EDGES` = 1000 distinct edges; `truncated` is `true` iff more edges existed (never a silent subset).
+
+**Window boundary (normative):** an edge is reported iff **both** its halves' own timestamps fall in `[start, end)` — a call whose client and server spans straddle the window edge (or a daily partition boundary) is attributed only when both contributing rows are in-window. Results are **merge-invariant**: identical before and after a background merge or `OPTIMIZE ... FINAL` (docs/schemas.md §4.2), and unchanged under byte-identical re-ingest.
+
+**Errors:** a missing/invalid/inverted window, or `since` supplied together with `start`/`end`, is `400 bad_data`. A window too broad to bound within the reader scan budget is `422 query_too_broad` (the same bounded-response family as §4.2/§4.4). Errors are always the JSON envelope, never with `position`.
+
 ---
 
 ## 5. Profiles query API

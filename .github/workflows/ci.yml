@@ -607,6 +607,30 @@ jobs:
           PULSUS_TEST_CH_HTTP_PORT: "19123"
         run: ci/test-summary.sh run traces_metrics_live -p pulsus-read --test traces_metrics_live
 
+      # Issue #173 AC7 (Tier 1, scale-invariant): EXPLAIN/query_log gates on
+      # the service-graph read over the trace_edges ledger — daily-partition
+      # MinMax prune (narrow < full parts + read_rows ratio), leading-side
+      # PrimaryKey prune, the Array(Float64) quantile wire-type pin, merge
+      # invariance (OPTIMIZE ... FINAL), and the scan-budget 422 trip.
+      # Reuses this job's ClickHouse 24.8 container.
+      - name: Service graph EXPLAIN + budget gates (Tier 1)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: cargo test -p pulsus-read --test traces_graph_explain
+
+      # Issue #173 AC9: spawns the real `pulsusdb` binary and drives the §4.5
+      # service-graph surface end-to-end — OTLP ingest -> the edge MV ->
+      # GET /api/traces/v1/service_graph exact JSON edges (client fan-out,
+      # messaging vs cross-kind decoy, error failed count, replay + FINAL
+      # invariance, Zipkin shared-span correctness). Port 31140. Reuses this
+      # job's ClickHouse 24.8 container.
+      - name: Live service graph suite
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+        run: ci/test-summary.sh run traces_graph_live -p pulsus-server --test traces_graph_live
+
       # Issue #36: the live exhaustive API conformance matrix — every
       # mounted route x case-class over loopback HTTP against five
       # `pulsusdb` spawns (mode/auth/compat permutations), reusing this

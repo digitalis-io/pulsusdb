@@ -344,6 +344,11 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         // discovery reads the local replica without fan-out — the
         // `metric_metadata` carve-out pattern.
         catalog_table: "trace_tag_catalog".to_string(),
+        // `trace_edges` (M7-E1, issue #173) co-shards with `trace_spans` on
+        // `cityHash64(trace_id)`, so it is `_dist`-aware exactly like
+        // `spans_table`/`attrs_table` (the dist-suffix rule, not the catalog
+        // carve-out) — the query-time edge join stays shard-local.
+        edges_table: format!("trace_edges{dist}"),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
         generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
@@ -770,6 +775,7 @@ mod tests {
         assert_eq!(cfg.spans_table, "trace_spans");
         assert_eq!(cfg.attrs_table, "trace_attrs_idx");
         assert_eq!(cfg.catalog_table, "trace_tag_catalog");
+        assert_eq!(cfg.edges_table, "trace_edges");
         assert!(!cfg.distributed);
     }
 
@@ -782,6 +788,7 @@ mod tests {
         let cfg = trace_read_config_from(&config);
         assert_eq!(cfg.spans_table, "trace_spans_dist");
         assert_eq!(cfg.attrs_table, "trace_attrs_idx_dist");
+        assert_eq!(cfg.edges_table, "trace_edges_dist");
         assert!(cfg.distributed);
     }
 

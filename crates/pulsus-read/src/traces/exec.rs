@@ -75,10 +75,11 @@ use std::collections::{HashMap, HashSet};
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
+use super::graph_sql::{self, GraphWindow};
 use super::metrics_plan::{MetricFunc, MetricsCtx, TraceMetricsPlan};
 use super::rows::{
-    CandidateRow, HydrationRow, MembershipRow, MetricBucketRow, MetricCountRow, NumValueRow,
-    RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow,
+    CandidateRow, GraphEdgeRow, HydrationRow, MembershipRow, MetricBucketRow, MetricCountRow,
+    NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow,
 };
 use super::search_eval::{self, BatchAttrs, HydratedSpan, SpanSummary, TraceMatch, TraceSpans};
 use super::search_plan::{SearchCtx, SearchPlan};
@@ -227,6 +228,11 @@ pub struct TraceReadConfig {
     /// `chconfig::trace_read_config_from` sets it unconditionally, the
     /// `metric_metadata` carve-out pattern).
     pub catalog_table: String,
+    /// `trace_edges{_dist}` — the service-graph half-row ledger the
+    /// `service_graph` read targets (issue #173). `_dist`-suffixed when
+    /// clustered exactly like `spans_table`/`attrs_table` (halves co-shard
+    /// on `cityHash64(trace_id)`, so the query-time join is shard-local).
+    pub edges_table: String,
     /// `reader.traceql_max_candidates` — per-generator top-K depth and
     /// the merged consumption ceiling.
     pub max_candidates: u64,
@@ -280,6 +286,17 @@ pub struct SearchOutput {
     pub partial: bool,
     pub returned: u32,
     pub limit: u32,
+}
+
+/// [`TraceEngine::service_graph`]'s output (issue #173): the aggregated
+/// service-graph edges, ordered `calls DESC, client ASC, server ASC`, at
+/// most [`graph_sql::SERVICE_GRAPH_MAX_EDGES`] of them; `truncated` is the
+/// non-silent cap indicator — `true` iff the `LIMIT cap + 1` probe row
+/// appeared (the search path's convention).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceGraph {
+    pub edges: Vec<GraphEdgeRow>,
+    pub truncated: bool,
 }
 
 /// [`TraceEngine::list_tag_names`]'s output (issue #58): distinct
@@ -576,6 +593,43 @@ impl TraceEngine {
             labels: vec![],
             value: metric_value(plan.func(), n, plan.window_s()),
         }]))
+    }
+
+    /// Executes the §4.5 service-graph read (issue #173): one fully-pushed-
+    /// down two-level aggregation over the `trace_edges` half-row ledger —
+    /// per-side dedup, the within-`conn_type` `pair_id` equi-join, and the
+    /// per-`(client, server, conn_type)` rollup all happen in ClickHouse; the
+    /// engine only frames at most [`graph_sql::SERVICE_GRAPH_MAX_EDGES`]
+    /// edges. The `LIMIT cap + 1` probe row (never returned) flips
+    /// `truncated` rather than shipping a silent subset. `max_rows_to_read =
+    /// scan_budget_rows` (throw) bounds the join's scan/hash-table cost — a
+    /// breach maps through [`map_trace_read_error`] (code 158) to `422
+    /// query_too_broad`; clustered mode injects the §7 clustered-reader
+    /// settings + `distributed_product_mode='local'` so the join runs
+    /// shard-local. Merge-invariant by construction (per-side read-time
+    /// dedup), so the result is byte-identical before and after
+    /// `OPTIMIZE ... FINAL`.
+    pub async fn service_graph(&self, window: GraphWindow) -> Result<ServiceGraph, ReadError> {
+        let cap = graph_sql::SERVICE_GRAPH_MAX_EDGES;
+        let raw_sql = graph_sql::service_graph_sql(window, &self.config.edges_table, cap);
+        let sql = escape_query_placeholders(&raw_sql);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let settings = graph_settings(&self.config);
+        let mut edges: Vec<GraphEdgeRow> = Vec::new();
+        // Scoped stream (module convention): the pooled-connection lease
+        // drops at return, after full consumption (≤ cap + 1 rows by the SQL
+        // LIMIT).
+        let mut stream = self
+            .client
+            .query_stream::<GraphEdgeRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            edges.push(row.map_err(|e| map_trace_read_error(e, &self.config))?);
+        }
+        let truncated = edges.len() as u64 > cap;
+        edges.truncate(cap as usize);
+        Ok(ServiceGraph { edges, truncated })
     }
 
     /// Streams the §4.2 point read for one trace. `hex32` must already be
@@ -1224,6 +1278,25 @@ fn metrics_settings(config: &TraceReadConfig) -> QuerySettings {
     }
 }
 
+/// The Layer-1 settings the §4.5 service-graph query carries (issue #173):
+/// the full search budget set ([`search_settings`] — `max_rows_to_read =
+/// scan_budget_rows` throw bounds the join's scan + hash-table cost, plus
+/// the read/result byte ceilings and `max_block_size`), with
+/// `distributed_product_mode='local'` added in clustered mode so the
+/// within-`conn_type` `pair_id` join executes per shard (halves co-shard on
+/// `cityHash64(trace_id)`, so each shard's local join is complete and the
+/// initiator merges only per-`(client, server, conn_type)` partial states).
+/// The graph query carries no `IN`-set, so the metrics set-limits are
+/// deliberately omitted.
+fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
+    let base = search_settings(config);
+    if config.distributed {
+        base.set("distributed_product_mode", "local")
+    } else {
+        base
+    }
+}
+
 /// The explicit encode-boundary value conversion (issue #59 plan v2
 /// delta 5): the SQL side always ships the deduped `UInt64` count;
 /// `rate` divides by its denominator (`step_s` per range bucket, the
@@ -1410,6 +1483,7 @@ mod tests {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
             catalog_table: "trace_tag_catalog".to_string(),
+            edges_table: "trace_edges".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
             generator_max_memory_bytes: 536_870_912,
@@ -1427,6 +1501,7 @@ mod tests {
             spans_table: "trace_spans".to_string(),
             attrs_table: "trace_attrs_idx".to_string(),
             catalog_table: "trace_tag_catalog".to_string(),
+            edges_table: "trace_edges".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
             generator_max_memory_bytes: 536_870_912,
@@ -1537,6 +1612,32 @@ mod tests {
         let clustered = format!("{:?}", metrics_settings(&clustered_cfg));
         assert!(clustered.contains("distributed_product_mode"));
         assert!(clustered.contains("local"));
+    }
+
+    /// Issue #173: `graph_settings` carries the search row/byte budget and
+    /// gates `distributed_product_mode='local'` on clustered mode only (so
+    /// the `pair_id` join runs shard-local), and never carries the metrics
+    /// set-limits (the graph query has no `IN`-set).
+    #[test]
+    fn graph_settings_carry_the_scan_budget_and_gate_the_local_product_mode() {
+        let local = format!("{:?}", graph_settings(&cfg()));
+        for needle in ["max_rows_to_read", "max_bytes_to_read", "max_result_bytes"] {
+            assert!(local.contains(needle), "missing {needle} in {local}");
+        }
+        assert!(
+            !local.contains("distributed_product_mode"),
+            "the local-product rewrite is clustered-only: {local}"
+        );
+        assert!(
+            !local.contains("max_rows_in_set"),
+            "the graph query has no IN-set: {local}"
+        );
+        let mut clustered = cfg();
+        clustered.distributed = true;
+        let clustered = format!("{:?}", graph_settings(&clustered));
+        assert!(clustered.contains("distributed_product_mode"));
+        assert!(clustered.contains("local"));
+        assert!(clustered.contains("optimize_skip_unused_shards"));
     }
 
     /// Issue #133 AC5: `search_settings` and `catalog_settings` carry

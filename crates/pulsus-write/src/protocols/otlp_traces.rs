@@ -352,6 +352,7 @@ fn parse_span(
     // columns are plain Int8, not enums (docs/schemas.md §4.1).
     let status_code = span.status.as_ref().map(|s| s.code).unwrap_or(0) as i8;
     let kind = span.kind as i8;
+    let shared = shared_flag(span);
 
     let resource_attrs = ctx.resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
 
@@ -423,9 +424,28 @@ fn parse_span(
         duration_ns,
         status_code,
         kind,
+        shared,
         payload: build_payload(span, ctx.resource, ctx.resource_spans, ctx.scope_spans),
     });
     Ok(())
+}
+
+/// `1` iff `span` carries the `zipkin.shared` attribute with the exact
+/// string value `"true"` — the wire contract `zipkin::to_otlp` emits for a
+/// Zipkin shared span (issue #173, `str_kv("zipkin.shared", "true")`),
+/// documented so an OTLP-native sender can set it too. Matched on a literal
+/// `StringValue` (not the rendered form) so only that precise pair flips the
+/// bit; anything else (a bool value, a different string, absence) is `0`.
+/// The attribute itself still flows to `trace_attrs_idx` unchanged.
+fn shared_flag(span: &Span) -> u8 {
+    let is_true = span.attributes.iter().any(|kv| {
+        kv.key == "zipkin.shared"
+            && matches!(
+                kv.value.as_ref().and_then(|v| v.value.as_ref()),
+                Some(Value::StringValue(s)) if s == "true"
+            )
+    });
+    u8::from(is_true)
 }
 
 /// Rejects a single span into partial success.
@@ -859,6 +879,48 @@ mod tests {
         assert_eq!(span.duration_ns, 1_000_000_000);
         assert_eq!(span.status_code, StatusCode::Error as i8);
         assert_eq!(span.kind, SpanKind::Server as i8);
+    }
+
+    /// Issue #173 (M7-E1) AC7(e): an OTLP-native span with no `zipkin.shared`
+    /// attribute stores `shared = 0`; a span carrying `zipkin.shared = "true"`
+    /// (the wire contract `zipkin::to_otlp` emits) stores `shared = 1`. The
+    /// attribute still flows to `trace_attrs_idx` as an ordinary span attr.
+    #[test]
+    fn parse_promotes_the_zipkin_shared_attribute_to_the_shared_column() {
+        // Native span, no marker → shared = 0.
+        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+            .expect("within the expansion budget");
+        assert_eq!(out.spans[0].shared, 0);
+
+        // A shared-flagged span → shared = 1, and the attr is still indexed.
+        let mut s = valid_span();
+        s.attributes = vec![kv("zipkin.shared", Value::StringValue("true".to_string()))];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        assert_eq!(out.spans[0].shared, 1);
+        assert!(
+            out.attrs
+                .iter()
+                .any(|a| a.key == "zipkin.shared" && a.val == "true"),
+            "the shared attribute still flows to trace_attrs_idx"
+        );
+
+        // Only the exact string "true" flips the bit — a bool value or a
+        // different string does not (the literal wire contract).
+        let mut s = valid_span();
+        s.attributes = vec![kv("zipkin.shared", Value::BoolValue(true))];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        assert_eq!(
+            out.spans[0].shared, 0,
+            "a bool value is not the string contract"
+        );
+
+        let mut s = valid_span();
+        s.attributes = vec![kv("zipkin.shared", Value::StringValue("false".to_string()))];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        assert_eq!(out.spans[0].shared, 0);
     }
 
     #[test]

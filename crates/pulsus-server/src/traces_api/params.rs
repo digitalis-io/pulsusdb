@@ -320,6 +320,83 @@ fn parse_whole_seconds(raw: &str) -> Option<i64> {
     Some(ms / 1_000)
 }
 
+/// Errors from parsing `/api/traces/v1/service_graph` request parameters
+/// (issue #173, docs/api.md §4.5) — mapped to `400 bad_data` by
+/// `error::ApiError`. Same window grammar as the metrics surface (`start`/
+/// `end`/`since`), minus `q`/`step` — the service graph is a fixed
+/// aggregation over a window, with no expression and no bucketing.
+#[derive(Debug, Error)]
+pub(crate) enum GraphParamError {
+    #[error(
+        "'since' and 'start'/'end' are mutually exclusive: supply a relative window or an \
+         absolute one, never both"
+    )]
+    ConflictingRange,
+    #[error("missing required parameters: supply start and end (unix seconds), or since")]
+    MissingRange,
+    #[error("invalid timestamp {0:?}: expected unix seconds, unix nanoseconds, or RFC3339")]
+    InvalidTimestamp(String),
+    #[error("invalid range: end ({end}) must be greater than start ({start})")]
+    InvalidRange { start: i64, end: i64 },
+    #[error("invalid 'since' {0:?}: expected a whole-second duration (e.g. 1h, 30m, 90s)")]
+    InvalidSince(String),
+}
+
+/// The parsed service-graph request: just the validated window (issue
+/// #173). No expression, no step — the read is a fixed
+/// `(client, server, conn_type)` aggregation over `[start_ns, end_ns)`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RawGraphParams {
+    pub start_ns: i64,
+    pub end_ns: i64,
+}
+
+/// Parses the service-graph query string (docs/api.md §4.5). Reuses the
+/// metrics surface's window grammar exactly: `start`/`end` (unix s/ns/
+/// RFC3339) XOR a relative `since` (whole-second duration), `now_s` feeding
+/// the `since` window (injected for testability). Any missing/invalid/
+/// conflicting window is an explicit `400 bad_data`.
+pub(crate) fn parse_graph_params(raw: &str, now_s: i64) -> Result<RawGraphParams, GraphParamError> {
+    let pairs = parse_pairs(raw);
+    let parse_ts = |name: &str| -> Result<Option<i64>, GraphParamError> {
+        let Some(raw) = get(&pairs, name).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        parse_timestamp_ns(raw)
+            .map(Some)
+            .ok_or_else(|| GraphParamError::InvalidTimestamp(raw.to_string()))
+    };
+    let start = parse_ts("start")?;
+    let end = parse_ts("end")?;
+    let since = get(&pairs, "since").filter(|s| !s.is_empty());
+    let (start_ns, end_ns) = match (since, start, end) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+            return Err(GraphParamError::ConflictingRange);
+        }
+        (Some(raw_since), None, None) => {
+            let since_s = parse_whole_seconds(raw_since)
+                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
+            let end_ns = now_s
+                .checked_mul(1_000_000_000)
+                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
+            let start_ns = now_s
+                .checked_sub(since_s)
+                .and_then(|s| s.checked_mul(1_000_000_000))
+                .ok_or_else(|| GraphParamError::InvalidSince(raw_since.to_string()))?;
+            (start_ns, end_ns)
+        }
+        (None, Some(start_ns), Some(end_ns)) => (start_ns, end_ns),
+        (None, _, _) => return Err(GraphParamError::MissingRange),
+    };
+    if end_ns <= start_ns {
+        return Err(GraphParamError::InvalidRange {
+            start: start_ns / 1_000_000_000,
+            end: end_ns / 1_000_000_000,
+        });
+    }
+    Ok(RawGraphParams { start_ns, end_ns })
+}
+
 /// Errors from parsing the `/api/traces/v1/tags` query parameters —
 /// mapped to `400 bad_data` by `error::ApiError` (issue #58).
 #[derive(Debug, Error)]
@@ -816,6 +893,76 @@ mod tests {
             parse_metrics_params("q=%7B%7D&start=100&end=100", NOW_S),
             Err(MetricsParamError::InvalidRange { .. })
         ));
+    }
+
+    // -- service-graph params (issue #173) ---------------------------------
+
+    #[test]
+    fn a_minimal_graph_request_parses_an_absolute_window() {
+        let p = parse_graph_params("start=1700000000&end=1700003600", NOW_S).unwrap();
+        assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
+        assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
+    }
+
+    #[test]
+    fn graph_since_derives_the_window_and_conflicts_with_absolute_bounds() {
+        let p = parse_graph_params("since=1h", NOW_S).unwrap();
+        assert_eq!(p.start_ns, (NOW_S - 3_600) * 1_000_000_000);
+        assert_eq!(p.end_ns, NOW_S * 1_000_000_000);
+        for raw in [
+            "since=1h&start=1",
+            "since=1h&end=2",
+            "since=1h&start=1&end=2",
+        ] {
+            assert!(
+                matches!(
+                    parse_graph_params(raw, NOW_S),
+                    Err(GraphParamError::ConflictingRange)
+                ),
+                "{raw} must conflict"
+            );
+        }
+        assert!(matches!(
+            parse_graph_params("since=soon", NOW_S),
+            Err(GraphParamError::InvalidSince(_))
+        ));
+    }
+
+    #[test]
+    fn graph_missing_or_partial_range_is_rejected() {
+        for raw in ["", "start=1", "end=2"] {
+            assert!(
+                matches!(
+                    parse_graph_params(raw, NOW_S),
+                    Err(GraphParamError::MissingRange)
+                ),
+                "{raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_bad_timestamps_and_inverted_ranges_are_rejected() {
+        assert!(matches!(
+            parse_graph_params("start=abc&end=2", NOW_S),
+            Err(GraphParamError::InvalidTimestamp(_))
+        ));
+        assert!(matches!(
+            parse_graph_params("start=200&end=100", NOW_S),
+            Err(GraphParamError::InvalidRange { .. })
+        ));
+        assert!(matches!(
+            parse_graph_params("start=100&end=100", NOW_S),
+            Err(GraphParamError::InvalidRange { .. })
+        ));
+    }
+
+    #[test]
+    fn graph_accepts_nanosecond_and_rfc3339_bounds() {
+        let p = parse_graph_params("start=1700000000000000000&end=2023-11-14T23:13:20Z", NOW_S)
+            .unwrap();
+        assert_eq!(p.start_ns, 1_700_000_000_000_000_000);
+        assert_eq!(p.end_ns, 1_700_003_600_000_000_000);
     }
 
     // -- tags params (issue #58) -------------------------------------------

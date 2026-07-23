@@ -50,6 +50,8 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "the empty-winners roots arm: HashMap::new() with zero entries - nothing to charge"),
     ("exec.rs", "metrics_range", "Vec::new", 1,
      "metrics matrix points (issue #59) - outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by the plan's static MAX_METRICS_POINTS bucket cap (11k x 16-byte points)"),
+    ("exec.rs", "service_graph", "Vec::new", 1,
+     "service-graph edges (issue #173) - same class as list_tag_names/metrics_range: outside the search ByteBudget by design (no SearchPlan on this path); hard-bounded by the SQL LIMIT to SERVICE_GRAPH_MAX_EDGES + 1 rows"),
     ("exec.rs", "pick_roots", "HashMap::", 1,
      "root rows charged per row during streaming; map retained via roots_retained_bytes charge before row release"),
     ("exec.rs", "pick_roots", ".collect", 1,

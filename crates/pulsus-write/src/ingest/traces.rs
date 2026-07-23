@@ -28,6 +28,13 @@ pub struct SpanRecord {
     pub duration_ns: i64,
     pub status_code: i8,
     pub kind: i8,
+    /// `1` iff the span carried the `zipkin.shared = "true"` attribute at
+    /// parse time (issue #173): a Zipkin shared span (both RPC sides stored
+    /// under the same `span_id`), else `0`. Promoted onto `trace_spans` so
+    /// the service-graph edge MV can key a shared server half by its own
+    /// `span_id` rather than its inherited `parent_id` — the exact wire
+    /// contract `zipkin.rs` emits, which an OTLP-native sender may also set.
+    pub shared: u8,
     /// Encoded single-`ResourceSpans` `TracesData` (see above).
     pub payload: Vec<u8>,
 }
@@ -114,6 +121,7 @@ mod tests {
             duration_ns: 42,
             status_code: 2,
             kind: 3,
+            shared: 0,
             payload: vec![0xDE, 0xAD],
         };
         assert_eq!(span.trace_id, [1; 16]);
@@ -125,6 +133,7 @@ mod tests {
         assert_eq!(span.duration_ns, 42);
         assert_eq!(span.status_code, 2);
         assert_eq!(span.kind, 3);
+        assert_eq!(span.shared, 0);
         assert_eq!(span.payload, vec![0xDE, 0xAD]);
     }
 

@@ -659,6 +659,13 @@ pub struct TraceSpanRow {
     /// legend) for rows produced by the OTLP receiver; `2` (Zipkin JSON) is
     /// a compat-receiver value (M6+).
     pub payload_type: i8,
+    /// `1` iff this span is a Zipkin shared span (issue #173) — the
+    /// `zipkin.shared = "true"` signal promoted from the OTLP attribute
+    /// (`SpanRecord::shared`) so the service-graph edge MV can pair a shared
+    /// server half correctly. Inserted by column name (`Row` derive), so the
+    /// additive migration-31 `shared UInt8 DEFAULT 0` column absorbs it
+    /// regardless of physical column order.
+    pub shared: u8,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
@@ -676,6 +683,7 @@ impl From<&SpanRecord> for TraceSpanRow {
             status_code: record.status_code,
             kind: record.kind,
             payload_type: 1,
+            shared: record.shared,
             payload: record.payload.clone(),
         }
     }
@@ -700,7 +708,8 @@ impl TraceSpanRow {
         (name.len() + service.len() + payload_len
             + 16 /* trace_id */ + 8 /* span_id */ + 8 /* parent_id */
             + 8 /* timestamp_ns */ + 8 /* duration_ns */
-            + 1 /* status_code */ + 1 /* kind */ + 1/* payload_type */) as u64
+            + 1 /* status_code */ + 1 /* kind */ + 1 /* payload_type */
+            + 1/* shared */) as u64
     }
 }
 
@@ -722,6 +731,7 @@ impl SpoolEncode for TraceSpanRow {
             "status_code": self.status_code,
             "kind": self.kind,
             "payload_type": self.payload_type,
+            "shared": self.shared,
             "payload_len": self.payload.len(),
         })
     }
@@ -1289,6 +1299,7 @@ mod tests {
             duration_ns: 1_000_000_000,
             status_code: 2,
             kind: 3,
+            shared: 1,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }
     }
@@ -1320,6 +1331,7 @@ mod tests {
         assert_eq!(mapped.status_code, 2);
         assert_eq!(mapped.kind, 3);
         assert_eq!(mapped.payload_type, 1, "OTLP protobuf payload type");
+        assert_eq!(mapped.shared, 1, "the Zipkin shared flag is copied through");
         assert_eq!(mapped.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -1349,6 +1361,7 @@ mod tests {
                 "status_code": 2,
                 "kind": 3,
                 "payload_type": 1,
+                "shared": 1,
                 "payload_len": 4,
             })
         );

@@ -24,13 +24,14 @@ pub use metrics::{
 };
 pub use querytext::{MAX_QUERY_TEXT_BYTES, ensure_query_text_fits};
 pub use traces::{
-    BATCH_TRACES, CANDIDATE_TUPLE_BYTES, DEFAULT_METRICS_POINTS, HYDRATION_BYTE_BUDGET,
-    MAX_METRICS_POINTS, MAX_SPANS_PER_TRACE, MetricFunc, MetricsCtx, MetricsParams,
-    PlanError as TracePlanError, RETAINED_ENTRY_OVERHEAD, RootSummary, SearchCtx, SearchOutput,
-    SearchParams, SearchPlan, SpanFilterCtx, SpanSummary, StoredSpan, TAG_NAMES_MAX,
-    TAG_VALUES_MAX, TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS,
-    TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames, TagValues, TraceEngine, TraceMetricsPlan,
-    TraceReadConfig, TraceSearchResult, compile_span_filter, plan_search, plan_trace_metrics,
+    BATCH_TRACES, CANDIDATE_TUPLE_BYTES, DEFAULT_METRICS_POINTS, GraphEdgeRow, GraphWindow,
+    HYDRATION_BYTE_BUDGET, MAX_METRICS_POINTS, MAX_SPANS_PER_TRACE, MetricFunc, MetricsCtx,
+    MetricsParams, PlanError as TracePlanError, RETAINED_ENTRY_OVERHEAD, RootSummary,
+    SERVICE_GRAPH_MAX_EDGES, SearchCtx, SearchOutput, SearchParams, SearchPlan, ServiceGraph,
+    SpanFilterCtx, SpanSummary, StoredSpan, TAG_NAMES_MAX, TAG_VALUES_MAX,
+    TRACE_METRICS_MAX_SET_BYTES, TRACE_METRICS_MAX_SET_ROWS, TRACE_SEARCH_MAX_BLOCK_ROWS, TagNames,
+    TagValues, TraceEngine, TraceMetricsPlan, TraceReadConfig, TraceSearchResult,
+    compile_span_filter, plan_search, plan_trace_metrics, service_graph_sql,
 };
 
 #[cfg(test)]

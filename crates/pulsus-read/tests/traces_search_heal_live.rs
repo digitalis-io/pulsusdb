@@ -200,6 +200,7 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             duration_ns: 1_000_000_000,
             status_code: 2,
             kind: 3,
+            shared: 0,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }],
         attrs: vec![AttrRecord {
@@ -222,6 +223,7 @@ fn engine_config() -> TraceReadConfig {
         spans_table: "trace_spans".to_string(),
         attrs_table: "trace_attrs_idx".to_string(),
         catalog_table: "trace_tag_catalog".to_string(),
+        edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
         generator_max_memory_bytes: 536_870_912,

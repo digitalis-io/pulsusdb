@@ -215,6 +215,9 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         ("log_metrics_5s_dist", Family::Logs),
         ("trace_spans_dist", Family::Traces),
         ("trace_attrs_idx_dist", Family::Traces),
+        // Service-graph edge ledger (M7-E1, issue #173): co-shards with the
+        // rest of the Traces family on `cityHash64(trace_id)`.
+        ("trace_edges_dist", Family::Traces),
     ];
     for (table, family) in dist_tables {
         assert!(
@@ -260,7 +263,11 @@ async fn run_init_clustered_creates_dist_wrappers_on_every_shard_with_identical_
         assert!(ddl.contains(Family::Logs.sharding_expr()));
     }
 
-    let traces_dist = ["trace_spans_dist", "trace_attrs_idx_dist"];
+    let traces_dist = [
+        "trace_spans_dist",
+        "trace_attrs_idx_dist",
+        "trace_edges_dist",
+    ];
     for t in traces_dist {
         let ddl = create_table_query(&shard1, TEST_DB_DIST, t).await;
         assert!(ddl.contains(Family::Traces.sharding_expr()));

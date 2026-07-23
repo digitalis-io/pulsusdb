@@ -160,6 +160,17 @@ pub enum Surface {
     /// static point-cap rejection is a 422 `query_too_broad` (the
     /// adjudicated bounded-response contract).
     TracesMetrics,
+    /// `GET /api/traces/v1/service_graph` (issue #173, M7-E1, docs/api.md
+    /// §4.5) — success is the documented native envelope
+    /// `{"edges":[...],"truncated":<bool>}` (NOT the Prometheus query
+    /// envelope: `Surface::TracesMetrics` is not reused). Against this
+    /// suite's empty databases a well-formed request returns exactly
+    /// `{"edges":[],"truncated":false}` with 200 — the mounting oracle (an
+    /// unmounted path would 404 instead). Errors are the JSON envelope
+    /// (`{"status","errorType","error"}`), never with `position`. This is a
+    /// PulsusDB-native surface with no Tempo-compat alias (the interop
+    /// reference has no service-graph HTTP endpoint).
+    TracesGraph,
     /// `GET /api/traces/v1/tags` and `/api/traces/v1/tag/{tag}/values`
     /// (issue #58, docs/api.md §4.3) — success is the documented native
     /// envelope (`{"scopes":[...],"truncated":...}` /
@@ -1281,6 +1292,57 @@ const TRACES_METRICS_CASES: &[CaseClass] = &[
     },
 ];
 
+// -- traces service graph (issue #173, docs/api.md §4.5) ----------------
+
+/// The base query the service-graph success cell mutates from: a fixed
+/// absolute 1h window (both required bounds present, no `q`, no `step`).
+pub const TRACES_GRAPH_BASE_QUERY: &str = "start=1700000000&end=1700003600";
+
+fn traces_graph_missing_window(req: &mut Req) {
+    req.query.clear();
+}
+
+fn traces_graph_inverted_range(req: &mut Req) {
+    // `end <= start` — explicit 400, never a silently empty window.
+    req.query = "start=1700003600&end=1700000000".to_string();
+}
+
+fn traces_graph_since_plus_absolute(req: &mut Req) {
+    // `since` conflicts with `start`/`end` (the §4.4 mutual-exclusion rule,
+    // shared window grammar) — explicit 400, never silent precedence.
+    req.query = format!("{TRACES_GRAPH_BASE_QUERY}&since=1h");
+}
+
+const TRACES_GRAPH_CASES: &[CaseClass] = &[
+    CaseClass {
+        name: "missing_window",
+        build: traces_graph_missing_window,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "inverted_range",
+        build: traces_graph_inverted_range,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+    CaseClass {
+        name: "since_plus_absolute_conflict",
+        build: traces_graph_since_plus_absolute,
+        expect_status: 400,
+        expect: ExpectedError::Json {
+            error_type: "bad_data",
+            has_position: false,
+        },
+    },
+];
+
 // -- traces tags (issue #58, docs/api.md §4.3) --------------------------
 
 /// The non-trivial `q=` the values route's `base_query` carries —
@@ -2118,6 +2180,23 @@ static MANIFEST: &[RouteSpec] = &[
         success_status: 200,
         base_query: TRACES_METRICS_BASE_QUERY,
         cases: TRACES_METRICS_CASES,
+    },
+    // -- Traces service graph (ReaderMode, issue #173, M7-E1) -------------
+    // `success_status` is 200: against this suite's empty databases a
+    // well-formed request returns the documented empty envelope
+    // `{"edges":[],"truncated":false}` — the mounting oracle
+    // (`Surface::TracesGraph`'s doc comment). PulsusDB-native, no Tempo
+    // alias, so there is no `CompatAndReader` twin row for it.
+    RouteSpec {
+        path: "/api/traces/v1/service_graph",
+        methods: &[Method::Get],
+        surface: Surface::TracesGraph,
+        gate: Gate::ReaderMode,
+        status: RouteStatus::Mounted,
+        doc_ref: DocRef::Verbatim,
+        success_status: 200,
+        base_query: TRACES_GRAPH_BASE_QUERY,
+        cases: TRACES_GRAPH_CASES,
     },
     // -- Tempo compat aliases (CompatAndReader, issue #61) ----------------
     // 13 routes, all GET, all mounted iff `PULSUS_COMPAT_ENDPOINTS=true`

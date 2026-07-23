@@ -195,6 +195,7 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             duration_ns: 1_000_000_000,
             status_code: 2,
             kind: 3,
+            shared: 0,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }],
         attrs: vec![AttrRecord {

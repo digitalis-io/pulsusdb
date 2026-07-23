@@ -632,6 +632,101 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- service-graph edge ledger (M7-E1, issue #173) ---
+    // The Zipkin shared-span signal promoted onto `trace_spans` (issue #173
+    // Fix 1): an additive `ADD COLUMN IF NOT EXISTS` (the id 21/22 & 25/26
+    // precedent), never a mutation of id 16's frozen CREATE. `shared` = 1
+    // iff the span carried the `zipkin.shared = "true"` attribute at OTLP
+    // parse time (documented wire contract); pre-#173 rows read back 0 — no
+    // data migration. The edge MV (`trace_edges_mv`) keys a shared server
+    // half by its OWN `span_id` (Zipkin's shared model: both RPC sides carry
+    // the same id) so it pairs with — and only with — its same-id client
+    // twin, never fabricating an edge from a coincidental `parent_id`
+    // collision. `ADD COLUMN` on `trace_spans` rebuilds its `service_time`
+    // `SELECT *` projection in place (live-gated in `live_traces.rs`, the
+    // first ALTER precedent over a projection-carrying table).
+    Migration {
+        id: 31,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS shared UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper is a `CREATE ... AS trace_spans` that copies columns
+    // at creation and does NOT inherit id 31's base ALTER; in cluster mode all
+    // reads/writes go through `trace_spans_dist`, so it must gain the column
+    // too. Cluster-gated (`StaticClusterOnly`) — skipped and unrecorded on a
+    // single node, applied the first time clustering is enabled. Mirrors
+    // id 22/26.
+    Migration {
+        id: 32,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS shared UInt8 DEFAULT 0;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // `trace_edges` is a ReplacingMergeTree half-row LEDGER (issue #173, plan
+    // v2 core redesign): one narrow row per edge-relevant span (its own plain
+    // `timestamp_ns`, no `SimpleAggregateFunction`), and the directed
+    // `client -> server` edge is assembled at QUERY time by a within-type
+    // equi-join of the deduped server halves to the deduped client halves —
+    // so pair completion is a pure function of the stored half-row multiset,
+    // never of background-merge progress. `side` leads the ORDER BY so each
+    // read subquery PK-prunes to its own half (a second prune besides the
+    // daily-partition MinMax prune); Zipkin shared spans (SERVER stored under
+    // the client's `span_id`) never collapse because `side` is in the dedup
+    // key. `pair_id` is the edge's CLIENT-side span id (`span_id` for a
+    // client/shared-server half, else `parent_id`), the single-valued join
+    // key. `conn_type` (`'rpc'`|`'messaging'`) is derived from the emitting
+    // span's OWN kind, so only CLIENT(3)->SERVER(2) and PRODUCER(4)->
+    // CONSUMER(5) can pair. Same tokenized delete-TTL / part-level drops as
+    // `trace_spans` (superseded at runtime by `apply_ttl`'s saturating form).
+    Migration {
+        id: 33,
+        name: "trace_edges",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "CREATE TABLE IF NOT EXISTS {{db}}.trace_edges{{on_cluster}} (\n\
+                 date          Date,\n\
+                 side          UInt8,\n\
+                 trace_id      FixedString(16),\n\
+                 span_id       FixedString(8),\n\
+                 pair_id       FixedString(8),\n\
+                 conn_type     LowCardinality(String),\n\
+                 timestamp_ns  Int64  CODEC(DoubleDelta, ZSTD(1)),\n\
+                 service       LowCardinality(String),\n\
+                 duration_ns   Int64  CODEC(T64, ZSTD(1)),\n\
+                 failed        UInt8\n\
+             ) ENGINE = ReplacingMergeTree\n\
+             PARTITION BY date\n\
+             ORDER BY (side, trace_id, span_id)\n\
+             TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL {{retention_days}} DAY DELETE\n\
+             SETTINGS ttl_only_drop_parts = 1;",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `trace_edges` `_dist` wrapper co-shards with
+    // `trace_spans`/`trace_attrs_idx` on the same `cityHash64(trace_id)`
+    // Traces-family expression (render.rs), so every joinable client/server
+    // pair is shard-local (both halves share `trace_id`) and the read join
+    // executes per shard.
+    Migration {
+        id: 34,
+        name: "trace_edges",
+        family: Some(Family::Traces),
+        ddl: Ddl::Dist,
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -668,6 +763,38 @@ pub const MVS: &[MvDef] = &[
         tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_tag_catalog_mv{{on_cluster}} TO {{db}}.trace_tag_catalog AS\n\
                SELECT scope, key, val\n\
                FROM {{db}}.trace_attrs_idx;",
+    },
+    // The service-graph edge ledger MV (M7-E1, issue #173): a pure per-row
+    // projection over `trace_spans` — no MV-side GROUP BY/join/state, so
+    // ingest-time precompute is just the kind-filter plus a payload-free
+    // narrowing. Emits one half-row per edge-relevant span: `side` 0 for a
+    // client half (kind 3|4), 1 for a server half (kind 2|5). `pair_id` is
+    // the CLIENT-side span id — a client/producer half and a *shared* server
+    // half key by their own `span_id` (Zipkin's shared model), a non-shared
+    // server half by `parent_id`. `conn_type` is `'rpc'` (kind 2|3) or
+    // `'messaging'` (kind 4|5), from the emitting span's own kind, so the
+    // query-time join admits only CLIENT->SERVER and PRODUCER->CONSUMER.
+    // Root server halves (zero parent) are excluded — but a shared server
+    // half is admitted even with a zero parent (its pair key is its own id).
+    // Fires per shard on distributed-forwarded inserts; halves co-shard via
+    // `cityHash64(trace_id)`, so pairing is shard-local complete (§7).
+    MvDef {
+        name: "trace_edges_mv",
+        tmpl: "CREATE MATERIALIZED VIEW {{db}}.trace_edges_mv{{on_cluster}} TO {{db}}.trace_edges AS\n\
+               SELECT\n\
+                   toDate(fromUnixTimestamp64Nano(timestamp_ns)) AS date,\n\
+                   toUInt8(kind IN (2, 5)) AS side,\n\
+                   trace_id,\n\
+                   span_id,\n\
+                   if(kind IN (3, 4) OR shared = 1, span_id, parent_id) AS pair_id,\n\
+                   if(kind IN (2, 3), 'rpc', 'messaging') AS conn_type,\n\
+                   timestamp_ns,\n\
+                   service,\n\
+                   duration_ns,\n\
+                   toUInt8(status_code = 2) AS failed\n\
+               FROM {{db}}.trace_spans\n\
+               WHERE kind IN (3, 4)\n\
+                  OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)));",
     },
 ];
 
@@ -754,6 +881,7 @@ mod tests {
                 "log_streams_idx_mv",
                 "log_metrics_{{log_rollup_suffix}}_mv",
                 "trace_tag_catalog_mv",
+                "trace_edges_mv",
             ],
             "MVS must contain exactly the catalog's materialized views"
         );
@@ -1161,6 +1289,140 @@ mod tests {
         let out = render::render(&tmpl, "log_patterns", &ctx(), false);
         assert!(out.contains("pulsus.log_patterns_dist"));
         assert!(out.contains("Distributed('', pulsus, log_patterns, fingerprint)"));
+    }
+
+    /// Issue #173 (M7-E1) Fix 1: the Zipkin `shared` signal is added to
+    /// `trace_spans` via an additive `ADD COLUMN IF NOT EXISTS` (id 31) —
+    /// never a mutation of id 16's frozen CREATE — as `UInt8 DEFAULT 0`
+    /// (pre-#173 rows read back 0, no data migration). Mirrors the id 25/26
+    /// `value_type` shape. An ALTER carries no `ENGINE =` clause, so it passes
+    /// through `render` unchanged even in cluster mode.
+    #[test]
+    fn trace_spans_shared_base_alter_is_additive_uint8_default_zero() {
+        let ddl = rendered_static(31);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans\n\
+             ADD COLUMN IF NOT EXISTS shared UInt8 DEFAULT 0;",
+        );
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered = render::render(static_tmpl(31), "trace_spans", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+        // The frozen id-16 CREATE never gains the column (its checksum stays
+        // byte-frozen).
+        assert!(
+            !static_tmpl(16).contains("shared"),
+            "shared must arrive via the additive ALTER (id 31), not id 16's CREATE"
+        );
+    }
+
+    /// Issue #173 Fix 1: the `shared` `_dist` ALTER (id 32) is
+    /// `StaticClusterOnly` — it targets `trace_spans_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Mirrors id 22/26.
+    #[test]
+    fn trace_spans_shared_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 32).expect("id 32");
+        assert_eq!(m.name, "trace_spans");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 32 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "trace_spans", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS shared UInt8 DEFAULT 0;",
+        );
+    }
+
+    /// Issue #173 (M7-E1): `trace_edges` (id 33) is a ReplacingMergeTree
+    /// half-row ledger keyed `(side, trace_id, span_id)` — `side` leads so
+    /// each per-half read subquery PK-prunes. Partitioned by the plain `date`
+    /// column, tokenized delete-TTL / part-level drops like `trace_spans`.
+    #[test]
+    fn trace_edges_ddl_is_a_side_keyed_replacing_ledger_with_tokenized_ttl() {
+        let ddl = rendered_static(33);
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS pulsus.trace_edges"));
+        assert!(ddl.contains("side          UInt8,"));
+        assert!(ddl.contains("pair_id       FixedString(8),"));
+        assert!(ddl.contains("conn_type     LowCardinality(String),"));
+        assert!(ddl.contains("failed        UInt8"));
+        assert!(ddl.contains("ENGINE = ReplacingMergeTree"));
+        assert!(ddl.contains("PARTITION BY date"));
+        assert!(ddl.contains("ORDER BY (side, trace_id, span_id)"));
+        assert!(ddl.contains(
+            "TTL toDateTime(fromUnixTimestamp64Nano(timestamp_ns)) + INTERVAL 7 DAY DELETE"
+        ));
+        assert!(ddl.contains("SETTINGS ttl_only_drop_parts = 1;"));
+        // Retention stays mutable operational config, excluded from identity.
+        assert!(static_tmpl(33).contains("INTERVAL {{retention_days}} DAY DELETE"));
+    }
+
+    /// Issue #173: the `trace_edges` `_dist` wrapper (id 34) carries the
+    /// Traces family, so `dist_ddl_template` renders the byte-identical
+    /// `cityHash64(trace_id)` co-shard expression it shares with
+    /// `trace_spans`/`trace_attrs_idx` — pairing is shard-local.
+    #[test]
+    fn trace_edges_dist_wrapper_reuses_the_traces_family_co_shard() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 34).expect("id 34");
+        assert_eq!(m.name, "trace_edges");
+        assert!(matches!(m.ddl, Ddl::Dist));
+        assert_eq!(m.family, Some(Family::Traces));
+        assert_eq!(m.scope, MigrationScope::Checksum);
+        assert_eq!(m.replication, Replication::PerShard);
+        let tmpl = render::dist_ddl_template("trace_edges", Family::Traces);
+        let out = render::render(&tmpl, "trace_edges", &ctx(), false);
+        assert!(out.contains("pulsus.trace_edges_dist"));
+        assert!(out.contains("Distributed('', pulsus, trace_edges, cityHash64(trace_id))"));
+    }
+
+    /// Issue #173: the edge MV is a pure per-row projection over
+    /// `trace_spans` — the `side` discriminator, the `pair_id` expression
+    /// (shared server halves key by their own `span_id`), the per-kind
+    /// `conn_type` map, and the kind filter with the shared-OR-zero-parent
+    /// admission clause (root non-shared server halves excluded).
+    #[test]
+    fn trace_edges_mv_projects_side_pair_id_conn_type_and_the_shared_admission() {
+        let mv = MVS
+            .iter()
+            .find(|mv| mv.name == "trace_edges_mv")
+            .expect("trace_edges_mv present");
+        assert!(mv.tmpl.contains("TO {{db}}.trace_edges AS"));
+        assert!(mv.tmpl.contains("toUInt8(kind IN (2, 5)) AS side"));
+        assert!(
+            mv.tmpl
+                .contains("if(kind IN (3, 4) OR shared = 1, span_id, parent_id) AS pair_id")
+        );
+        assert!(
+            mv.tmpl
+                .contains("if(kind IN (2, 3), 'rpc', 'messaging') AS conn_type")
+        );
+        assert!(mv.tmpl.contains("toUInt8(status_code = 2) AS failed"));
+        assert!(mv.tmpl.contains("FROM {{db}}.trace_spans"));
+        assert!(mv.tmpl.contains(
+            "WHERE kind IN (3, 4)\n\
+                  OR (kind IN (2, 5) AND (shared = 1 OR parent_id != toFixedString(unhex('0000000000000000'), 8)));"
+        ));
+    }
+
+    /// Issue #173: the two new trace-family migrations (the `shared` ALTERs)
+    /// and the `trace_edges` table + `_dist` are checksum-gated, per-shard
+    /// replicated, and carry the Traces family — never config-named, never
+    /// global.
+    #[test]
+    fn service_graph_migrations_are_checksum_scoped_per_shard_traces() {
+        for id in [31, 32, 33, 34] {
+            let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
+            assert_eq!(m.scope, MigrationScope::Checksum);
+            assert_eq!(m.replication, Replication::PerShard);
+            assert_eq!(m.family, Some(Family::Traces));
+        }
     }
 
     /// Issue #5 fix plan F2 (+ issue #53): only the catalog/bookkeeping
