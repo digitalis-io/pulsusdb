@@ -798,17 +798,20 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // resolved WINDOW-FREE (trace-wide) so they never disagree with the
     // #184 search path's roots, then LEFT JOINed on trace_id into the
     // intrinsics branch only. `statusMessage` sources the per-span
-    // `status_message` column already carried in `base`; the `arrayFilter`
-    // drops it when empty so an absent status message falls to the nil
-    // complement (matching TraceQL's absent→nil), leaving `name`/`kind`/
-    // `status`/`resource.service.name` semantics byte-unchanged.
+    // `status_message` PHYSICAL column already carried in `base`: every span
+    // has a `""`-or-value (there is no absent case), and Tempo v3.0.2's
+    // compare() emits an empty `statusMessage` as a DISTINCT `""` value (not
+    // folded into the `key=nil` complement — verified against the pinned
+    // reference, #185). So it is emitted verbatim like every other
+    // intrinsic; `name`/`kind`/`status`/`resource.service.name` and the
+    // window-free roots are byte-unchanged.
     let roots_cte = compare_roots_cte(spans_table, &base);
     let intrinsics = format!(
         "SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (\n    \
-         SELECT t, is_sel, arrayJoin(arrayFilter(x -> NOT (x.1 = 'statusMessage' AND x.2 = ''), [\
+         SELECT t, is_sel, arrayJoin([\
          ('name', i_name), ('kind', {KIND_MAP}), ('status', {STATUS_MAP}), \
          ('resource.service.name', i_service), ('statusMessage', i_status_message), \
-         ('rootName', r.root_name), ('rootServiceName', r.root_service)])) AS kv\n    \
+         ('rootName', r.root_name), ('rootServiceName', r.root_service)]) AS kv\n    \
          FROM (\n  {base}\n    ) b\n    LEFT JOIN (\n  {roots_cte}\n    ) r ON b.trace_id = r.trace_id\n  )"
     );
     let index_attrs = format!(

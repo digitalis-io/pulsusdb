@@ -829,8 +829,10 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
     // per-value series (no longer well-known-`nil`). All 600 spans are
     // single-span roots named `op`, so `rootName=op` == the whole
     // population; `rootServiceName` follows the `checkout`/`svc-x` split;
-    // `statusMessage='deadline exceeded'` is every 6th span (empty → the
-    // nil complement, matching TraceQL's absent→nil).
+    // `statusMessage='deadline exceeded'` is every 6th span, and every other
+    // span's EMPTY `statusMessage` emits as a DISTINCT `""` value (issue
+    // #185: `status_message` is a physical column — no absent case — and
+    // Tempo v3.0.2 emits empty as `""`, not folded to the nil complement).
     assert_eq!(value("selection", "rootName", "op"), Some(150.0));
     assert_eq!(value("baseline", "rootName", "op"), Some(450.0));
     assert_eq!(
@@ -848,11 +850,15 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
         value("baseline", "statusMessage", "deadline exceeded"),
         Some(50.0)
     );
-    // Empty status messages fold into the nil complement.
-    assert_eq!(value("baseline", "statusMessage", "nil"), Some(400.0));
-    assert_eq!(value("selection", "statusMessage", "nil"), Some(100.0));
-    // Every in-window span has a root, so rootName/rootServiceName have NO
-    // nil complement (dropped by the all-zero `retain`).
+    // Empty status messages emit as the distinct `""` value (the empty
+    // spans: 400 baseline / 100 selection).
+    assert_eq!(value("baseline", "statusMessage", ""), Some(400.0));
+    assert_eq!(value("selection", "statusMessage", ""), Some(100.0));
+    // Every span carries a `status_message` (`""`-or-value), so
+    // statusMessage — like rootName/rootServiceName — has NO nil complement
+    // (its all-zero `key=nil` series is dropped by the all-zero `retain`).
+    assert_eq!(value("baseline", "statusMessage", "nil"), None);
+    assert_eq!(value("selection", "statusMessage", "nil"), None);
     assert_eq!(value("baseline", "rootName", "nil"), None);
     assert_eq!(value("selection", "rootName", "nil"), None);
     assert_eq!(value("baseline", "rootServiceName", "nil"), None);

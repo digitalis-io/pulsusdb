@@ -1,4 +1,4 @@
-# Single-binary Tempo config used as the black-box oracle for BOTH
+# Single-binary Tempo v3.0.2 config used as the black-box oracle for BOTH
 # TraceQL differential legs (issue #185, M7-TQ6):
 #
 #   1. the syntax differential (tempo_differential.rs) — sends TraceQL query
@@ -11,11 +11,34 @@
 # It stores nothing meaningful and serves no production role — pure runtime
 # use of the unmodified upstream image. No Tempo source is copied.
 #
-# Ingest is tuned aggressively so freshly-pushed OTLP spans become
-# compare()-queryable within a few seconds (well inside the test's bounded
-# 120 s poll): trace_idle_period 1s + max_block_duration 2s ⇒ ~3–6 s
-# steady-state visibility; complete_block_timeout 30m keeps completed
-# blocks queryable for the whole test window.
+# --- Tempo v3.0.2 architecture note ---------------------------------------
+# v3.0 reworked the write path. There is NO top-level `ingester` block and NO
+# `local_blocks` metrics-generator processor (both were rejected by 3.0.2's
+# strict parser). Recent-trace buffering AND TraceQL-metrics/compare() over
+# recent spans are now both served by the new `live_store` component — it
+# holds live traces, cuts local WAL/blocks, and answers metrics queries over
+# those recent blocks directly (query_block_concurrency / live_store.metrics).
+# So the old `metrics_generator.processor.local_blocks` + per-tenant
+# `processors: [local-blocks]` override is gone; nothing replaces it — metrics
+# queries over local data are automatic via live_store.
+#
+# Ingest is tuned aggressively (max_trace_idle 1s + max_block_duration 2s +
+# flush_check_period 1s) so a freshly-pushed span is cut into a queryable
+# live-store block within a few seconds; complete_block_timeout 30m then keeps
+# that completed block queryable for the whole test window.
+#
+# NOTE on visibility latency: the compare() leg queries a metrics window that
+# extends ~120 s INTO THE FUTURE (base-60s .. base+120s, one 180 s bucket), so
+# the value-bearing bucket is only finalised as wall-clock advances — observed
+# ~70-90 s from push to non-empty compare() output locally. That is well
+# inside the test's 60x2s = 120 s poll budget, but it is NOT the "few seconds"
+# an instant query would give; the latency is a property of the forward window,
+# not of these flush knobs.
+# --------------------------------------------------------------------------
+
+# Required for TraceQL streaming/metrics responses over plain HTTP.
+stream_over_http_enabled: true
+
 server:
   http_listen_port: 3200
   log_level: warn
@@ -28,30 +51,18 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 
-ingester:
-  trace_idle_period: 1s
+# v3.0.2 replacement for the old top-level `ingester` fast-flush knobs. The
+# live-store buffers recent traces, cuts local blocks, and serves TraceQL
+# metrics/compare() over them.
+live_store:
+  max_trace_idle: 1s
   max_block_duration: 2s
   flush_check_period: 1s
   complete_block_timeout: 30m
-
-# The local-blocks metrics processor answers TraceQL metrics/compare() over
-# recent spans. `filter_server_spans: false` is REQUIRED: the reference's
-# local-blocks default restricts metrics aggregation to SERVER-kind spans,
-# but the compare() fixture pushes INTERNAL (kind=1) spans (OTLP SpanKind
-# internal=1, matching PulsusDB's own mapping) — with the default they would
-# be excluded and silently zero the baseline/selection counts. Harmless
-# no-op if the default is already permissive; pinned unconditionally.
-metrics_generator:
-  processor:
-    local_blocks:
-      flush_check_period: 1s
-      max_block_duration: 2s
-      complete_block_timeout: 30m
-      filter_server_spans: false
-  storage:
-    path: /var/tempo/generator/wal
-  traces_storage:
-    path: /var/tempo/generator/traces
+  # Single-binary, no Kafka: there is no consumer lag to catch up on, so don't
+  # gate /ready on a lag target and don't fail queries on lag.
+  readiness_target_lag: 0s
+  fail_on_high_lag: false
 
 storage:
   trace:
@@ -61,16 +72,15 @@ storage:
     wal:
       path: /var/tempo/wal
 
-# Per-tenant default: enable the local-blocks metrics processor so the
-# metrics API answers compare() over locally-ingested spans.
-overrides:
-  defaults:
-    metrics_generator:
-      processors:
-        - local-blocks
-
 # Allow unbounded TraceQL-metrics query windows so the wide compare() test
-# window is not range-rejected.
+# window is not range-rejected. The default `query_backend_after` (15m) is
+# left in place on purpose: in v3.0.2 metrics ranges newer than that boundary
+# are served from the live-store (where our freshly-pushed spans live), while
+# older ranges hit the object-storage backend. The compare() corpus is always
+# within a few minutes of "now", so it is served entirely by the live-store.
 query_frontend:
   metrics:
     max_duration: 0s
+
+usage_report:
+  reporting_enabled: false
