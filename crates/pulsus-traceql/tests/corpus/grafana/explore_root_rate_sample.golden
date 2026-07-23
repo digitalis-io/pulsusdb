@@ -1,6 +1,40 @@
-TrailingInput {
-    span: Span {
-        start: 37,
-        end: 41,
-    },
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Binary {
+                    op: And,
+                    lhs: Comparison {
+                        field: Intrinsic(
+                            NestedSetParent,
+                        ),
+                        op: Lt,
+                        value: Number(
+                            "0",
+                        ),
+                    },
+                    rhs: BoolStatic(
+                        true,
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Metric(
+            MetricStage {
+                func: Rate,
+                by: [],
+                hints: [
+                    MetricHint {
+                        key: "sample",
+                        value: Bool(
+                            true,
+                        ),
+                    },
+                ],
+                result_filter: None,
+            },
+        ),
+    ],
 }

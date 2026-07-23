@@ -497,9 +497,9 @@ fn differential_categories_are_pinned() {
     );
     // Exact pins — every T2–T5 landing flips a tracked gap to `supported`
     // and must re-pin these deliberately.
-    assert_eq!(supported, 58, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 72, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 54,
+        tracked_interim, 40,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(

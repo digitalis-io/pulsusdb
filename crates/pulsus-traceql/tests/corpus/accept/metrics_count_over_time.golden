@@ -6,7 +6,12 @@ Query {
     ),
     pipeline: [
         Metric(
-            CountOverTime,
+            MetricStage {
+                func: CountOverTime,
+                by: [],
+                hints: [],
+                result_filter: None,
+            },
         ),
     ],
 }

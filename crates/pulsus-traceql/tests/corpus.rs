@@ -24,8 +24,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use pulsus_traceql::{
-    AggregateOp, BOUNDARY_CONSTRUCTS, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
-    PipelineStage, Query, SpansetExpr, StructuralOp, TokenKind, TraceQlError, parse,
+    BOUNDARY_CONSTRUCTS, ComparisonOp, Field, FieldExpr, Intrinsic, Query, SpansetExpr,
+    StructuralOp, TokenKind, TraceQlError, parse,
 };
 
 const SUBDIRS: [&str; 4] = ["accept", "reject", "unsupported", "grafana"];
@@ -302,14 +302,6 @@ enum AcceptRole {
     /// The AST contains a comparison on the `name` intrinsic (the same
     /// `Ident` token that spells `parent` in the boundary case).
     IntrinsicNameField,
-    /// The pipeline contains a zero-arity `count()` aggregate (the same
-    /// `Ident` position where the M7 `*_over_time` functions are
-    /// boundaries).
-    CountAggregate,
-    /// The pipeline contains the zero-arity `rate()` metric stage (issue
-    /// #59 — the same `Ident` position where `quantile_over_time` stays
-    /// an M7 boundary).
-    RateMetric,
 }
 
 /// F6c: context-dependent tokens pinned in BOTH roles — `>=`/`<`/`<=`
@@ -341,20 +333,6 @@ const DUAL_ROLE_CASES: &[(&str, &str, AcceptRole, &str, &str)] = &[
         AcceptRole::IntrinsicNameField,
         "unsupported/parent_scope",
         "parent scope",
-    ),
-    (
-        "Ident (search aggregate vs M7 metrics function)",
-        "accept/pipeline_count",
-        AcceptRole::CountAggregate,
-        "unsupported/metrics_quantile_over_time",
-        "metrics function 'quantile_over_time'",
-    ),
-    (
-        "Ident (M4 metrics function vs M7 metrics function)",
-        "accept/metrics_rate",
-        AcceptRole::RateMetric,
-        "unsupported/metrics_histogram_over_time",
-        "metrics function 'histogram_over_time'",
     ),
 ];
 
@@ -420,32 +398,6 @@ fn assert_accept_role(token: &str, case: &str, role: AcceptRole, query: &Query) 
                     .any(|(field, _)| matches!(field, Field::Intrinsic(Intrinsic::Name))),
                 "dual-role token {token}: {case} must compare the `name` intrinsic, \
                  got {comparisons:?}"
-            );
-        }
-        AcceptRole::CountAggregate => {
-            assert!(
-                query.pipeline.iter().any(|stage| matches!(
-                    stage,
-                    PipelineStage::Aggregate {
-                        op: AggregateOp::Count,
-                        field: None,
-                        ..
-                    }
-                )),
-                "dual-role token {token}: {case} must contain a zero-arity count() \
-                 aggregate, got {:?}",
-                query.pipeline
-            );
-        }
-        AcceptRole::RateMetric => {
-            assert!(
-                query
-                    .pipeline
-                    .iter()
-                    .any(|stage| matches!(stage, PipelineStage::Metric(MetricFn::Rate))),
-                "dual-role token {token}: {case} must contain the zero-arity rate() \
-                 metric stage, got {:?}",
-                query.pipeline
             );
         }
     }

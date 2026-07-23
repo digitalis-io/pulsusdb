@@ -345,6 +345,15 @@ pub struct ReaderConfig {
     pub logql_pipeline_scan_factor: u32,
     pub traceql_max_candidates: u64,
     pub traceql_scan_budget_rows: u64,
+    /// Issue #182: the safety cap on the number of distinct output series
+    /// a TraceQL metrics `by(...)` query may resolve. Enforced with a
+    /// `GROUP BY <by-keys> LIMIT cap+1` distinct-by-key probe issued
+    /// before the main range/instant query — a breach is a static `422
+    /// query_too_broad` (`TooBroadReason::TraceMetricsSeriesCap`), never a
+    /// silent subset. Mirrors the service-graph `SERVICE_GRAPH_MAX_EDGES`
+    /// bound; ungrouped queries skip the probe. Default 1000; operator
+    /// scale-tuning routes to issue #25.
+    pub traceql_max_series: u64,
     /// Issue #57 re-audit (sub-problem B): the trace-search phase-1
     /// candidate-generator query's `max_memory_usage` ceiling (throw) —
     /// bounds a dense common-value prefix's `GROUP BY trace_id`
@@ -422,6 +431,7 @@ impl Default for ReaderConfig {
             logql_pipeline_scan_factor: 10,
             traceql_max_candidates: 100_000,
             traceql_scan_budget_rows: 50_000_000,
+            traceql_max_series: 1_000,
             traceql_generator_max_memory_bytes: 536_870_912,
             query_eval_concurrency: 256,
             tail_poll_interval: HumanDuration(Duration::from_secs(1)),

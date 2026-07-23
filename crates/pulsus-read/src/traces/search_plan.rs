@@ -528,11 +528,25 @@ fn plan_pipeline(
             // Metrics functions are `/api/traces/v1/metrics/*`-only (issue
             // #59): on the search surface a parsed `| rate()` is a caller
             // error (400 bad_data), never silently ignored.
-            PipelineStage::Metric(func) => {
+            PipelineStage::Metric(stage) => {
                 return Err(PlanError::TypeMismatch(format!(
-                    "{func}() is a metrics function: use /api/traces/v1/metrics/query_range or \
-                     /query, not search"
+                    "{} is a metrics function: use /api/traces/v1/metrics/query_range or \
+                     /query, not search",
+                    stage.func
                 )));
+            }
+            PipelineStage::MetricSecondStage(stage) => {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{stage} is a metrics second-stage operator: use \
+                     /api/traces/v1/metrics/query_range or /query, not search"
+                )));
+            }
+            PipelineStage::Compare { .. } => {
+                return Err(PlanError::TypeMismatch(
+                    "compare() is a metrics function: use /api/traces/v1/metrics/query_range or \
+                     /query, not search"
+                        .to_string(),
+                ));
             }
             PipelineStage::Select { fields } => {
                 for field in fields {

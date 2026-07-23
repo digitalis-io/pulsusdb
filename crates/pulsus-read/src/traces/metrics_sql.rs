@@ -152,6 +152,22 @@ fn recombine(lhs: Option<FieldExpr>, rhs: Option<FieldExpr>) -> Option<FieldExpr
     }
 }
 
+/// Compiles a filter body into a single boolean SQL expression (issue
+/// #182, compare's `selection`): no `PREWHERE` hoisting — the whole filter
+/// renders as one per-span predicate (`service = '…'` inline, attribute
+/// leaves as `[NOT] IN` semi-joins). `None` (the `{}` match-all) is `1`.
+/// Regexes are validated at plan time.
+pub fn compile_filter_bool(
+    body: Option<&FieldExpr>,
+    attrs_table: &str,
+    window: SnappedWindow,
+) -> Result<String, PlanError> {
+    match body {
+        None => Ok("1".to_string()),
+        Some(expr) => render_expr(expr, attrs_table, window),
+    }
+}
+
 /// Renders one filter subtree as a boolean SQL expression: binary nodes
 /// are always parenthesized (`(lhs AND rhs)`), physical leaves render via
 /// the shared compiler's pre-escaped fragments, attribute leaves become
@@ -312,6 +328,477 @@ pub fn metrics_instant_sql(spans_table: &str, filter: &FilterSql, window: Snappe
         sql.push_str(&format!("\n  AND {where_expr}"));
     }
     sql
+}
+
+// ---------------------------------------------------------------------------
+// Issue #182: grouped (`by(...)`) counting + first-stage value aggregation
+// (`sum/min/max/avg_over_time`). All aggregations nest a per-`(trace_id,
+// span_id)` dedup inner query so at-least-once replays never inflate `sum`/
+// `avg` (the replay-dedup invariant); `min`/`max`/`count(uniqExact)` are
+// replay-idempotent by construction. Counting stays `uniqExact(trace_id,
+// span_id)`. This pass lowers the `by(resource.service.name)` grouping to
+// the physical `service` column (always present); attribute by-keys and
+// attribute value targets route to a follow-up.
+// ---------------------------------------------------------------------------
+
+/// One resolved `by(...)` grouping key. `col_expr` is the SQL scalar the
+/// query groups on; `label_key` is the Tempo series-label key it becomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupKeySql {
+    pub col_expr: String,
+    pub label_key: String,
+}
+
+/// The first-stage value-aggregation functions (`*_over_time`), issue
+/// #182. `count`/`rate` are not here — they are the `uniqExact` count
+/// path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFn {
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+impl AggFn {
+    fn sql(self) -> &'static str {
+        match self {
+            AggFn::Sum => "sum",
+            AggFn::Min => "min",
+            AggFn::Max => "max",
+            AggFn::Avg => "avg",
+        }
+    }
+}
+
+/// Renders the `SELECT`-list group columns (`, <expr> AS g0, …`) and the
+/// trailing `GROUP BY`/`ORDER BY` group tails for a set of by-keys. Group
+/// columns are aliased `g0..gN` so the outer query and the decode-row
+/// order are positional and deterministic.
+fn group_fragments(keys: &[GroupKeySql]) -> (String, String, String) {
+    let mut select = String::new();
+    let mut group_by = String::new();
+    let mut order_by = String::new();
+    for (i, k) in keys.iter().enumerate() {
+        select.push_str(&format!(", {} AS g{i}", k.col_expr));
+        group_by.push_str(&format!(", g{i}"));
+        order_by.push_str(&format!(", g{i}"));
+    }
+    (select, group_by, order_by)
+}
+
+/// The grouped/ungrouped replay-deduped **count** range query (rate and
+/// count_over_time). With no by-keys this is the ungrouped
+/// [`metrics_range_sql`] shape plus the group columns; `uniqExact` is
+/// replay-safe so no inner dedup subquery is needed.
+pub fn metrics_count_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_s: i64,
+    keys: &[GroupKeySql],
+) -> String {
+    let step_ms = step_s * 1000;
+    let (gsel, ggroup, gorder) = group_fragments(keys);
+    let mut sql = format!(
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t{gsel},\n       uniqExact(trace_id, span_id) AS n\n\
+         FROM {spans_table}\n"
+    );
+    push_prewhere_where(&mut sql, filter, window);
+    sql.push_str(&format!("\nGROUP BY t{ggroup}\nORDER BY t ASC{gorder}"));
+    sql
+}
+
+/// The grouped/ungrouped **count** instant query (whole snapped window,
+/// no time bucket). With by-keys this yields one row per label-set.
+pub fn metrics_count_instant_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    keys: &[GroupKeySql],
+) -> String {
+    let (gsel, ggroup, gorder) = group_fragments(keys);
+    if keys.is_empty() {
+        return metrics_instant_sql(spans_table, filter, window);
+    }
+    let cols = gsel.trim_start_matches(", ");
+    let mut sql = format!("SELECT {cols}, uniqExact(trace_id, span_id) AS n\nFROM {spans_table}\n");
+    push_prewhere_where(&mut sql, filter, window);
+    sql.push_str(&format!(
+        "\nGROUP BY {}\nORDER BY {}",
+        ggroup.trim_start_matches(", "),
+        gorder.trim_start_matches(", ")
+    ));
+    sql
+}
+
+/// The grouped/ungrouped value-aggregation range query
+/// (`sum/min/max/avg_over_time`). The inner subquery deduplicates to one
+/// value per `(t, group…, trace_id, span_id)` (`any(duration_ns)`); the
+/// outer aggregates per `(t, group…)`. Duration is the physical
+/// `duration_ns`; the engine scales ns→seconds at the encode boundary.
+pub fn metrics_agg_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_s: i64,
+    agg: AggFn,
+    keys: &[GroupKeySql],
+) -> String {
+    let step_ms = step_s * 1000;
+    let (gsel, ggroup, gorder) = group_fragments(keys);
+    let mut inner = format!(
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t{gsel}, trace_id, span_id,\n         \
+         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str(&format!("\n  GROUP BY t{ggroup}, trace_id, span_id"));
+    format!(
+        "SELECT t{ggroup}, toFloat64({}(val)) AS v\nFROM (\n  {inner}\n)\nGROUP BY t{ggroup}\nORDER BY t ASC{gorder}",
+        agg.sql()
+    )
+}
+
+/// The grouped/ungrouped value-aggregation instant query — the same
+/// dedup-then-aggregate over the whole snapped window, no time bucket.
+pub fn metrics_agg_instant_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    agg: AggFn,
+    keys: &[GroupKeySql],
+) -> String {
+    let (gsel, ggroup, gorder) = group_fragments(keys);
+    if keys.is_empty() {
+        let mut inner =
+            format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+        push_prewhere_where_indented(&mut inner, filter, window);
+        inner.push_str("\n  GROUP BY trace_id, span_id");
+        return format!(
+            "SELECT toFloat64({}(val)) AS v\nFROM (\n  {inner}\n)",
+            agg.sql()
+        );
+    }
+    let cols = gsel.trim_start_matches(", ");
+    let group = ggroup.trim_start_matches(", ");
+    let order = gorder.trim_start_matches(", ");
+    let mut inner = format!(
+        "SELECT {cols}, trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  "
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str(&format!("\n  GROUP BY {group}, trace_id, span_id"));
+    format!(
+        "SELECT {group}, toFloat64({}(val)) AS v\nFROM (\n  {inner}\n)\nGROUP BY {group}\nORDER BY {order}",
+        agg.sql()
+    )
+}
+
+/// Renders the `quantilesTDigest(q, …)` argument list from quantile
+/// literals (already validated to `[0, 1]` at plan time), each formatted
+/// with `ryu`-style shortest round-trip via `f64` `Display`.
+fn quantile_args(quantiles: &[f64]) -> String {
+    quantiles
+        .iter()
+        .map(|q| format!("{q}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The ungrouped `quantile_over_time` range query (issue #182, OQ4):
+/// `quantilesTDigest(q…)` over the per-`(t, trace_id, span_id)`-deduped
+/// physical `duration_ns`, yielding one `Array(Float64)` per bucket
+/// (`[q0, q1, …]`, ordered as requested). The engine scales ns→seconds and
+/// emits one series per quantile (`p=<q>` label). Grouped quantiles route
+/// to a follow-up.
+pub fn metrics_quantile_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_s: i64,
+    quantiles: &[f64],
+) -> String {
+    let step_ms = step_s * 1000;
+    let mut inner = format!(
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t, trace_id, span_id,\n         \
+         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY t, trace_id, span_id");
+    format!(
+        "SELECT t, CAST(quantilesTDigest({})(val) AS Array(Float64)) AS qs\nFROM (\n  {inner}\n)\nGROUP BY t\nORDER BY t ASC",
+        quantile_args(quantiles)
+    )
+}
+
+/// The ungrouped `quantile_over_time` instant query — the same
+/// dedup-then-TDigest over the whole snapped window, no time bucket.
+pub fn metrics_quantile_instant_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    quantiles: &[f64],
+) -> String {
+    let mut inner =
+        format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY trace_id, span_id");
+    format!(
+        "SELECT CAST(quantilesTDigest({})(val) AS Array(Float64)) AS qs\nFROM (\n  {inner}\n)",
+        quantile_args(quantiles)
+    )
+}
+
+/// The ungrouped `histogram_over_time` range query (issue #182, OQ4):
+/// pushed-down conditional cumulative counts over fixed exponential
+/// power-of-two nanosecond `le` boundaries, one column per bucket. The
+/// engine emits one cumulative-count series per bucket (`__bucket=<le
+/// seconds>` label). Exact bucket-boundary/value parity vs Tempo is
+/// Tier-2 (issue #25); this pins the exp-`le` shape.
+pub fn metrics_histogram_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_s: i64,
+    le_bounds_ns: &[i64],
+) -> String {
+    let step_ms = step_s * 1000;
+    let cols = histogram_bucket_cols(le_bounds_ns);
+    let mut inner = format!(
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t, trace_id, span_id,\n         \
+         any(duration_ns) AS val\n  FROM {spans_table}\n  "
+    );
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY t, trace_id, span_id");
+    format!("SELECT t, {cols} AS bkts\nFROM (\n  {inner}\n)\nGROUP BY t\nORDER BY t ASC")
+}
+
+/// The ungrouped `histogram_over_time` instant query.
+pub fn metrics_histogram_instant_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    le_bounds_ns: &[i64],
+) -> String {
+    let cols = histogram_bucket_cols(le_bounds_ns);
+    let mut inner =
+        format!("SELECT trace_id, span_id, any(duration_ns) AS val\n  FROM {spans_table}\n  ");
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str("\n  GROUP BY trace_id, span_id");
+    format!("SELECT {cols} AS bkts\nFROM (\n  {inner}\n)")
+}
+
+/// Renders the cumulative per-bucket count array
+/// `[countIf(val <= le0), …]` for the histogram's `le` boundaries — one
+/// `Array(UInt64)` column, decoded positionally against the boundary
+/// list.
+fn histogram_bucket_cols(le_bounds_ns: &[i64]) -> String {
+    let items = le_bounds_ns
+        .iter()
+        .map(|le| format!("countIf(val <= {le})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+/// The per-bucket exemplar collection query (issue #182 P5): a bounded
+/// `groupArraySample(K, seed)` of `(trace_id, timestamp_ns)` per time
+/// bucket, pushed down alongside the count aggregation. Rendered only for
+/// an ungrouped rate/count query under `with(exemplars=…)`. The fixed
+/// seed keeps the sample deterministic (test-stable); exact
+/// exemplar-count/selection parity vs Tempo is Tier-2 (issue #25).
+pub fn metrics_exemplar_range_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    step_s: i64,
+    k: u32,
+) -> String {
+    let step_ms = step_s * 1000;
+    let mut sql = format!(
+        "SELECT toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND)) AS t,\n       \
+         groupArraySample({k}, 1)(tuple(trace_id, timestamp_ns)) AS ex\nFROM {spans_table}\n"
+    );
+    push_prewhere_where(&mut sql, filter, window);
+    sql.push_str("\nGROUP BY t\nORDER BY t ASC");
+    sql
+}
+
+/// The distinct-by-key series-cardinality probe (issue #182, review Fix
+/// 2): counts DISTINCT label-sets (never bucket rows) under the same
+/// predicate, bounded by `LIMIT cap+1`. The engine issues it before the
+/// main query; a result of `cap+1` is a static `422 query_too_broad`.
+/// Only rendered when there is at least one by-key.
+pub fn metrics_series_probe_sql(
+    spans_table: &str,
+    filter: &FilterSql,
+    window: SnappedWindow,
+    keys: &[GroupKeySql],
+    cap: u64,
+) -> String {
+    let cols: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| format!("{} AS g{i}", k.col_expr))
+        .collect();
+    let group: Vec<String> = (0..keys.len()).map(|i| format!("g{i}")).collect();
+    let mut inner = format!("SELECT {}\n  FROM {spans_table}\n  ", cols.join(", "));
+    push_prewhere_where_indented(&mut inner, filter, window);
+    inner.push_str(&format!(
+        "\n  GROUP BY {}\n  LIMIT {}",
+        group.join(", "),
+        cap + 1
+    ));
+    format!("SELECT count() AS n FROM (\n  {inner}\n)")
+}
+
+/// The three SQL forms `compare()` needs (issue #182 P6b): the
+/// per-`(bucket, attr_key, attr_value)` baseline/selection cross-tab, the
+/// per-bucket totals (the `*_total` denominators + the `key=nil`
+/// complement), and the distinct-`(key, value)` cardinality probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompareSql {
+    pub cross_tab: String,
+    pub totals: String,
+    pub probe: String,
+}
+
+/// Maps the physical `kind`/`status_code` `Int8` columns to the TraceQL
+/// intrinsic string values (Tempo's `kind`/`status` intrinsic rendering).
+const KIND_MAP: &str = "transform(i_kind, [0, 1, 2, 3, 4, 5], ['unspecified', 'internal', 'server', 'client', \
+     'producer', 'consumer'], 'unspecified')";
+const STATUS_MAP: &str = "transform(i_status, [0, 1, 2], ['unset', 'ok', 'error'], 'unset')";
+
+/// The inputs to [`metrics_compare_sql`] — bundled to keep the builder's
+/// signature within the argument limit.
+#[derive(Debug, Clone, Copy)]
+pub struct CompareSqlInput<'a> {
+    pub spans_table: &'a str,
+    pub attrs_table: &'a str,
+    pub outer: &'a FilterSql,
+    /// The pre-compiled selection predicate (`compile_filter_bool`).
+    pub inner_bool: &'a str,
+    pub window: SnappedWindow,
+    /// The bucket-start expression aliased `t` (the `toStartOfInterval`
+    /// form for range, a literal ms for instant).
+    pub bucket_expr: &'a str,
+    /// The distinct-series cap (`reader.traceql_max_series`).
+    pub cap: u64,
+    /// The fixed well-known-attribute series count folded into the cap.
+    pub fixed_series: u64,
+}
+
+/// Builds the compare() SQL trio. The cross-tab enumerates the present
+/// attributes — the `name`/`kind`/`status`/`resource.service.name`
+/// intrinsics plus every scoped `trace_attrs_idx` `(scope.key, val)` — and
+/// counts them in the baseline complement (`countIf(is_sel = 0)`) and the
+/// selection (`countIf(is_sel)`). The well-known-absent universe is folded
+/// in engine-side (`frame_compare`); the cap probe bounds the true output
+/// series count.
+pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
+    let CompareSqlInput {
+        spans_table,
+        attrs_table,
+        outer,
+        inner_bool,
+        window,
+        bucket_expr,
+        cap,
+        fixed_series,
+    } = *input;
+    let mut raw = format!(
+        "SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
+         status_code AS i_status, service AS i_service, ({inner_bool}) AS is_sel\n    FROM {spans_table}\n    "
+    );
+    push_prewhere_where_indented(&mut raw, outer, window);
+    // Replay-dedup: one row per (t, trace_id, span_id) so at-least-once
+    // replays never inflate the baseline/selection counts (mirrors the
+    // `uniqExact` rule on the count path).
+    let base = format!(
+        "SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, \
+         any(i_status) AS i_status, any(i_service) AS i_service, max(is_sel) AS is_sel\n  FROM (\n  {raw}\n  )\n  GROUP BY t, trace_id, span_id"
+    );
+    let intrinsics = format!(
+        "SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (\n    SELECT t, is_sel, arrayJoin([\
+         ('name', i_name), ('kind', {KIND_MAP}), ('status', {STATUS_MAP}), \
+         ('resource.service.name', i_service)]) AS kv\n    FROM (\n  {base}\n    )\n  )"
+    );
+    let index_attrs = format!(
+        "SELECT b.t AS t, b.is_sel AS is_sel, concat(a.scope, '.', a.key) AS akey, a.val AS aval\n  \
+         FROM (\n  {base}\n  ) b\n  INNER JOIN (\n    SELECT DISTINCT trace_id, span_id, scope, key, val \
+         FROM {attrs_table} WHERE {} AND {}\n  ) a ON b.trace_id = a.trace_id AND b.span_id = a.span_id",
+        date_clause(window),
+        time_clause(window)
+    );
+    let union = format!("{intrinsics}\n  UNION ALL\n  {index_attrs}");
+    // `baseline` is the COMPLEMENT of the selection (spans NOT matching the
+    // inner filter), `selection` the matching spans — the captured Tempo
+    // convention (a selection value never appears under `baseline`). The
+    // `_total` denominators count each population.
+    let cross_tab = format!(
+        "SELECT t, akey, aval, countIf(is_sel = 0) AS base_n, countIf(is_sel) AS sel_n\nFROM (\n  {union}\n)\n\
+         GROUP BY t, akey, aval\nORDER BY t ASC, akey, aval"
+    );
+    let totals = format!(
+        "SELECT t, countIf(is_sel = 0) AS base_total, countIf(is_sel) AS sel_total\nFROM (\n  {base}\n)\n\
+         GROUP BY t\nORDER BY t ASC"
+    );
+    // The cap must bound the ACTUAL materialized output-series count, not
+    // just distinct (key,value) pairs (issue #182 review Fix 2): framing
+    // emits 2 series/pair (baseline + selection) + 4 series/key
+    // (baseline/selection `key=nil` + `*_total`). The probe computes
+    // `2·pairs + 4·keys`, bounding the scan by `LIMIT cap+1` on the
+    // distinct pairs so `pairs > cap` short-circuits to a reject. (The
+    // fixed well-known-absent-attribute set adds a bounded ≤ 4·25 series
+    // on top — a small constant, not attacker-controlled.)
+    let probe = format!(
+        "SELECT toUInt64(pairs * 2 + keys * 4 + {fixed_series}) AS n FROM (\n  SELECT count() AS pairs, \
+         uniqExact(akey) AS keys FROM (\n  SELECT akey, aval FROM (\n  {union}\n) GROUP BY akey, aval \
+         LIMIT {}\n)\n)",
+        cap + 1
+    );
+    CompareSql {
+        cross_tab,
+        totals,
+        probe,
+    }
+}
+
+/// The range-form bucket-start expression (`toStartOfInterval` → ms) for
+/// compare().
+pub fn compare_range_bucket_expr(step_s: i64) -> String {
+    let step_ms = step_s * 1000;
+    format!(
+        "toUnixTimestamp64Milli(toStartOfInterval(fromUnixTimestamp64Nano(timestamp_ns), \
+         INTERVAL {step_ms} MILLISECOND))"
+    )
+}
+
+/// Appends the `PREWHERE`/`WHERE` fragments at the top-level indentation.
+fn push_prewhere_where(sql: &mut String, filter: &FilterSql, window: SnappedWindow) {
+    if let Some(prewhere) = &filter.prewhere {
+        sql.push_str(&format!("PREWHERE {prewhere}\n"));
+    }
+    sql.push_str(&format!("WHERE {}", time_clause(window)));
+    if let Some(where_expr) = &filter.where_expr {
+        sql.push_str(&format!("\n  AND {where_expr}"));
+    }
+}
+
+/// Appends the `PREWHERE`/`WHERE` fragments at the nested (2-space)
+/// indentation used inside the dedup/probe subqueries.
+fn push_prewhere_where_indented(sql: &mut String, filter: &FilterSql, window: SnappedWindow) {
+    if let Some(prewhere) = &filter.prewhere {
+        sql.push_str(&format!("PREWHERE {prewhere}\n  "));
+    }
+    sql.push_str(&format!("WHERE {}", time_clause(window)));
+    if let Some(where_expr) = &filter.where_expr {
+        sql.push_str(&format!("\n    AND {where_expr}"));
+    }
 }
 
 #[cfg(test)]

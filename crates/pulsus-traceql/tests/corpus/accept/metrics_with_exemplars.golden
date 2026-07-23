@@ -1,0 +1,35 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Unscoped,
+                        key: "a",
+                    },
+                    op: Eq,
+                    value: Number(
+                        "1",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Metric(
+            MetricStage {
+                func: Rate,
+                by: [],
+                hints: [
+                    MetricHint {
+                        key: "exemplars",
+                        value: Bool(
+                            true,
+                        ),
+                    },
+                ],
+                result_filter: None,
+            },
+        ),
+    ],
+}

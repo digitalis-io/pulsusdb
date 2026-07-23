@@ -1,7 +1,0 @@
-NotYetSupported {
-    construct: "metrics function 'min_over_time'",
-    span: Span {
-        start: 5,
-        end: 18,
-    },
-}

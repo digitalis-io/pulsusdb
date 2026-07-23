@@ -225,6 +225,7 @@ fn engine_config(scan_budget_rows: u64) -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows,
+        max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,

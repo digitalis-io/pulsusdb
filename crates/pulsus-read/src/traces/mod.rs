@@ -21,6 +21,7 @@ pub mod exec;
 pub mod filter;
 pub mod graph_sql;
 pub mod metrics_plan;
+pub mod metrics_result;
 pub mod metrics_sql;
 pub mod rows;
 pub mod search_eval;
@@ -41,6 +42,9 @@ pub use graph_sql::{GraphWindow, SERVICE_GRAPH_MAX_EDGES, service_graph_sql};
 pub use metrics_plan::{
     DEFAULT_METRICS_POINTS, MAX_METRICS_POINTS, MetricFunc, MetricsCtx, MetricsParams,
     TraceMetricsPlan, plan_trace_metrics,
+};
+pub use metrics_result::{
+    MetricExemplar, MetricLabel, MetricLabelValue, TraceMetricSeries, TraceMetricsResult,
 };
 pub use rows::{GraphEdgeRow, StoredSpan, StoredSpanRow, TagNameRow, TagValueRow};
 pub use search_eval::SpanSummary;

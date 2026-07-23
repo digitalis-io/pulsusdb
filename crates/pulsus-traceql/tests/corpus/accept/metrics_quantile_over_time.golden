@@ -1,0 +1,37 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Unscoped,
+                        key: "a",
+                    },
+                    op: Eq,
+                    value: Number(
+                        "1",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [
+        Metric(
+            MetricStage {
+                func: QuantileOverTime {
+                    field: Intrinsic(
+                        Duration,
+                    ),
+                    quantiles: [
+                        Number(
+                            "0.9",
+                        ),
+                    ],
+                },
+                by: [],
+                hints: [],
+                result_filter: None,
+            },
+        ),
+    ],
+}

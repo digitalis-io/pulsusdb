@@ -232,7 +232,7 @@ fn quoted_value(v: f64) -> String {
     json_string(&prom_float(v))
 }
 
-/// The error envelope [`query_response`]'s unreachable `QueryResult::Streams`
+/// The error envelope `query_response`'s unreachable `QueryResult::Streams`
 /// arm builds — mirrors `error::ApiError`'s 3-field shape, kept local to
 /// this module since it never flows through `ApiError` itself.
 #[derive(Serialize)]
@@ -492,6 +492,11 @@ fn annotations_suffix(query: &str, annotations: &pulsus_promql::Annotations) -> 
 /// which has no upstream ordering contract here) keeps the label-sorted
 /// output the M2 determinism discipline pinned. Without this, `sort()`/
 /// `sort_desc()` would be inert at the API.
+// Test-only since issue #182: the traces metrics endpoints (its last
+// production caller) now emit the Tempo-native body
+// (`traces_api::metrics_response`); the Prometheus endpoints call
+// `query_response_annotated` directly. Kept as a thin test convenience.
+#[cfg(test)]
 pub(crate) fn query_response(
     result: QueryResult,
     explain: Option<PlanExplain>,
@@ -504,7 +509,7 @@ pub(crate) fn query_response(
     query_response_annotated(result, explain, at_ms, ordered, "", &empty)
 }
 
-/// [`query_response`] plus the `warnings`/`infos` envelope arrays (M7-A5b-i)
+/// `query_response` plus the `warnings`/`infos` envelope arrays (M7-A5b-i)
 /// and the two histogram-carrying `QueryResult` variants
 /// ([`QueryResult::VectorHist`]/[`QueryResult::MatrixHist`], replacing the
 /// A5a `HistogramResultUnsupported` reject). Split from `query_response` so

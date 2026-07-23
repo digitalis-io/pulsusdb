@@ -44,9 +44,9 @@
 //! precedent.
 
 use crate::ast::{
-    self, AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, Intrinsic, MetricFn,
-    PipelineStage, Query, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue,
-    StructuralModifier, StructuralOp, Value,
+    AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic, MetricFn,
+    MetricHint, MetricStage, PipelineStage, Query, SecondStage, SpanKindValue, SpansetExpr,
+    SpansetFilter, StatusValue, StructuralModifier, StructuralOp, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -880,21 +880,57 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
         cursor.advance();
         return parse_aggregate(cursor, op);
     }
-    if let Some(func) = MetricFn::from_ident(&name) {
+    if is_metric_fn_name(&name) {
         cursor.advance();
-        return parse_metric(cursor, func);
+        return parse_metric(cursor, &name);
     }
-    if ast::UNSUPPORTED_METRIC_FNS.contains(&name.as_str()) {
-        return Err(TraceQlError::NotYetSupported {
-            construct: format!("metrics function '{name}'"),
-            span: tok.span,
-        });
+    if name == "topk" || name == "bottomk" {
+        cursor.advance();
+        return parse_second_stage(cursor, &name);
+    }
+    if name == "compare" {
+        cursor.advance();
+        return parse_compare(cursor);
     }
     Err(TraceQlError::UnexpectedToken {
         found: describe(&tok.kind),
         expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
         span: tok.span,
     })
+}
+
+/// `Compare := "compare" "(" SpansetFilter ")"` (issue #182): the
+/// `metrics.compare` construct. Its argument is a `{ … }` spanset filter
+/// (the selection), not a field. The inner filter carries its own
+/// (fresh, bounded) recursion budget.
+fn parse_compare(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let mut inner_nodes = 0usize;
+    let selection = parse_spanset_filter(cursor, 0, &mut inner_nodes)?;
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    let hints = parse_optional_with(cursor)?;
+    Ok(PipelineStage::Compare {
+        selection: Box::new(selection),
+        hints,
+    })
+}
+
+/// Whether `name` is a first-stage TraceQL metrics function (issue
+/// #59/#182). `rate`/`count_over_time` are zero-arity; the `*_over_time`
+/// family takes a numeric aggregation target (and `quantile_over_time`
+/// trailing quantile literals).
+fn is_metric_fn_name(name: &str) -> bool {
+    matches!(
+        name,
+        "rate"
+            | "count_over_time"
+            | "sum_over_time"
+            | "min_over_time"
+            | "max_over_time"
+            | "avg_over_time"
+            | "quantile_over_time"
+            | "histogram_over_time"
+    )
 }
 
 /// `count() Cmp Value` (zero-arity) or `avg|sum|min|max(AggField) Cmp
@@ -946,36 +982,286 @@ fn parse_aggregate(
     })
 }
 
-/// `Metric := ("rate"|"count_over_time") "(" ")"` — strictly zero-arity
-/// (a stray argument is a positioned error). A trailing `by` is the
-/// recognized-but-M7 metrics-grouping construct (issue #59 plan v2
-/// delta 7), named rather than left to fail as generic trailing input.
-fn parse_metric(cursor: &mut Cursor<'_>, func: MetricFn) -> Result<PipelineStage, TraceQlError> {
+/// `Metric := MetricFn [ "by" "(" Field { "," Field } ")" ]
+///                     [ "with" "(" Hint { "," Hint } ")" ]` (issue
+/// #59/#182). `rate()`/`count_over_time()` are strictly zero-arity; the
+/// `*_over_time` family takes a numeric target field, and
+/// `quantile_over_time` trailing quantile literals. Every malformed arity
+/// is a positioned error.
+fn parse_metric(cursor: &mut Cursor<'_>, name: &str) -> Result<PipelineStage, TraceQlError> {
     cursor.expect(&TokenKind::LParen, "'('")?;
-    if !matches!(cursor.peek().kind, TokenKind::RParen) {
-        let tok = cursor.peek().clone();
-        if matches!(tok.kind, TokenKind::Eof) {
-            return Err(TraceQlError::UnexpectedEof {
-                expected: format!("')' ({func}() takes no argument)"),
-                span: tok.span,
-            });
+    let func = match name {
+        "rate" => {
+            expect_no_metric_arg(cursor, name)?;
+            MetricFn::Rate
         }
-        return Err(TraceQlError::UnexpectedToken {
-            found: describe(&tok.kind),
-            expected: format!("')' ({func}() takes no argument)"),
+        "count_over_time" => {
+            expect_no_metric_arg(cursor, name)?;
+            MetricFn::CountOverTime
+        }
+        "sum_over_time" => MetricFn::SumOverTime(parse_metric_target(cursor)?),
+        "min_over_time" => MetricFn::MinOverTime(parse_metric_target(cursor)?),
+        "max_over_time" => MetricFn::MaxOverTime(parse_metric_target(cursor)?),
+        "avg_over_time" => MetricFn::AvgOverTime(parse_metric_target(cursor)?),
+        "histogram_over_time" => MetricFn::HistogramOverTime(parse_metric_target(cursor)?),
+        "quantile_over_time" => {
+            let field = parse_metric_target_keep_open(cursor)?;
+            let quantiles = parse_quantile_list(cursor)?;
+            MetricFn::QuantileOverTime { field, quantiles }
+        }
+        other => unreachable!("parse_metric dispatched on a non-metric name {other:?}"),
+    };
+    let by = parse_optional_by(cursor)?;
+    let hints = parse_optional_with(cursor)?;
+    let result_filter = parse_optional_result_filter(cursor)?;
+    Ok(PipelineStage::Metric(MetricStage {
+        func,
+        by,
+        hints,
+        result_filter,
+    }))
+}
+
+/// Parses an optional trailing metrics-result comparison (`… > 5`, issue
+/// #182 — `metrics.result_comparison`): a comparison operator followed by
+/// a number/duration, attached to the metric with no `|`. Regex operators
+/// are not valid here. Returns `None` when no comparison follows.
+fn parse_optional_result_filter(
+    cursor: &mut Cursor<'_>,
+) -> Result<Option<(ComparisonOp, Value)>, TraceQlError> {
+    let op = match cursor.peek().kind {
+        TokenKind::Eq => ComparisonOp::Eq,
+        TokenKind::Neq => ComparisonOp::Neq,
+        TokenKind::Gt => ComparisonOp::Gt,
+        TokenKind::Gte => ComparisonOp::Gte,
+        TokenKind::Lt => ComparisonOp::Lt,
+        TokenKind::Lte => ComparisonOp::Lte,
+        _ => return Ok(None),
+    };
+    cursor.advance();
+    let value = parse_aggregate_value(cursor)?;
+    Ok(Some((op, value)))
+}
+
+/// Consumes the closing `)` of a zero-arity metric function; a stray
+/// argument (or EOF) is a positioned error.
+fn expect_no_metric_arg(cursor: &mut Cursor<'_>, name: &str) -> Result<(), TraceQlError> {
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        cursor.advance();
+        return Ok(());
+    }
+    let tok = cursor.peek().clone();
+    if matches!(tok.kind, TokenKind::Eof) {
+        return Err(TraceQlError::UnexpectedEof {
+            expected: format!("')' ({name}() takes no argument)"),
             span: tok.span,
         });
     }
-    cursor.advance(); // ')'
-    if let TokenKind::Ident(next) = &cursor.peek().kind
-        && next == "by"
-    {
-        return Err(TraceQlError::NotYetSupported {
-            construct: "metrics grouping 'by'".to_string(),
-            span: cursor.peek().span,
+    Err(TraceQlError::UnexpectedToken {
+        found: describe(&tok.kind),
+        expected: format!("')' ({name}() takes no argument)"),
+        span: tok.span,
+    })
+}
+
+/// Parses `Field ")"` — the single aggregation target of a `*_over_time`
+/// function. An empty argument list is a positioned error.
+fn parse_metric_target(cursor: &mut Cursor<'_>) -> Result<Field, TraceQlError> {
+    let field = parse_metric_target_keep_open(cursor)?;
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(field)
+}
+
+/// Parses the aggregation-target `Field` but leaves the cursor before the
+/// closing `)` / next `,` — used by `quantile_over_time`, which follows
+/// the field with a quantile list.
+fn parse_metric_target_keep_open(cursor: &mut Cursor<'_>) -> Result<Field, TraceQlError> {
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        let span = cursor.peek().span;
+        return Err(TraceQlError::UnexpectedToken {
+            found: "')'".to_string(),
+            expected: "an aggregation target (duration or an attribute)".to_string(),
+            span,
         });
     }
-    Ok(PipelineStage::Metric(func))
+    let (field, _) = parse_field(cursor)?;
+    Ok(field)
+}
+
+/// Parses `"," Number { "," Number } ")"` — one or more quantile literals
+/// after a `quantile_over_time` target. At least one quantile is required.
+fn parse_quantile_list(cursor: &mut Cursor<'_>) -> Result<Vec<Value>, TraceQlError> {
+    let mut quantiles = Vec::new();
+    cursor.expect(
+        &TokenKind::Comma,
+        "',' (quantile_over_time requires at least one quantile)",
+    )?;
+    loop {
+        let tok = cursor.peek().clone();
+        match &tok.kind {
+            TokenKind::Number(raw) => {
+                quantiles.push(Value::Number(raw.clone()));
+                cursor.advance();
+            }
+            TokenKind::Eof => {
+                return Err(TraceQlError::UnexpectedEof {
+                    expected: "a quantile in [0, 1]".to_string(),
+                    span: tok.span,
+                });
+            }
+            _ => {
+                return Err(TraceQlError::UnexpectedToken {
+                    found: describe(&tok.kind),
+                    expected: "a quantile in [0, 1]".to_string(),
+                    span: tok.span,
+                });
+            }
+        }
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(quantiles)
+}
+
+/// Parses an optional trailing `by (field, ...)` grouping clause. Returns
+/// the empty vector when no `by` follows (ungrouped).
+fn parse_optional_by(cursor: &mut Cursor<'_>) -> Result<Vec<Field>, TraceQlError> {
+    if !matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "by") {
+        return Ok(Vec::new());
+    }
+    cursor.advance(); // 'by'
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        let span = cursor.peek().span;
+        return Err(TraceQlError::UnexpectedToken {
+            found: "')'".to_string(),
+            expected: "a grouping field (by() requires at least one field)".to_string(),
+            span,
+        });
+    }
+    let mut fields = Vec::new();
+    loop {
+        let (field, _) = parse_field(cursor)?;
+        fields.push(field);
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(fields)
+}
+
+/// Parses an optional trailing `with (key=value, ...)` hint clause.
+/// Returns the empty vector when no `with` follows.
+fn parse_optional_with(cursor: &mut Cursor<'_>) -> Result<Vec<MetricHint>, TraceQlError> {
+    if !matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "with") {
+        return Ok(Vec::new());
+    }
+    cursor.advance(); // 'with'
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        let span = cursor.peek().span;
+        return Err(TraceQlError::UnexpectedToken {
+            found: "')'".to_string(),
+            expected: "a hint (with() requires at least one key=value pair)".to_string(),
+            span,
+        });
+    }
+    let mut hints = Vec::new();
+    loop {
+        hints.push(parse_hint(cursor)?);
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(hints)
+}
+
+/// `Hint := Ident "=" (Bool | Number | Duration | String)`.
+fn parse_hint(cursor: &mut Cursor<'_>) -> Result<MetricHint, TraceQlError> {
+    let (key, _) = cursor.expect_ident("a hint name (e.g. sample, exemplars)")?;
+    cursor.expect(&TokenKind::Eq, "'=' (hints are key=value pairs)")?;
+    let tok = cursor.peek().clone();
+    let value = match &tok.kind {
+        TokenKind::Ident(word) if word == "true" => HintValue::Bool(true),
+        TokenKind::Ident(word) if word == "false" => HintValue::Bool(false),
+        TokenKind::Number(raw) => HintValue::Number(raw.clone()),
+        TokenKind::Duration(raw) => {
+            let parsed = duration::parse_duration(raw, tok.span)?;
+            cursor.advance();
+            return Ok(MetricHint {
+                key,
+                value: HintValue::Duration(parsed),
+            });
+        }
+        TokenKind::String(s) => HintValue::String(s.clone()),
+        TokenKind::Eof => {
+            return Err(TraceQlError::UnexpectedEof {
+                expected: "a hint value (true, false, a number, a duration, or a string)"
+                    .to_string(),
+                span: tok.span,
+            });
+        }
+        _ => {
+            return Err(TraceQlError::UnexpectedToken {
+                found: describe(&tok.kind),
+                expected: "a hint value (true, false, a number, a duration, or a string)"
+                    .to_string(),
+                span: tok.span,
+            });
+        }
+    };
+    cursor.advance();
+    Ok(MetricHint { key, value })
+}
+
+/// `SecondStage := ("topk"|"bottomk") "(" Number ")"` (issue #182): a
+/// series-reduction operator over a first-stage metric's output.
+fn parse_second_stage(cursor: &mut Cursor<'_>, name: &str) -> Result<PipelineStage, TraceQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    let tok = cursor.peek().clone();
+    let n = match &tok.kind {
+        TokenKind::Number(raw) => {
+            let n = raw
+                .parse::<u64>()
+                .map_err(|_| TraceQlError::UnexpectedToken {
+                    found: format!("number {raw:?}"),
+                    expected: format!("a whole number of series ({name}(n))"),
+                    span: tok.span,
+                })?;
+            cursor.advance();
+            n
+        }
+        TokenKind::Eof => {
+            return Err(TraceQlError::UnexpectedEof {
+                expected: format!("a whole number of series ({name}(n))"),
+                span: tok.span,
+            });
+        }
+        _ => {
+            return Err(TraceQlError::UnexpectedToken {
+                found: describe(&tok.kind),
+                expected: format!("a whole number of series ({name}(n))"),
+                span: tok.span,
+            });
+        }
+    };
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    let stage = match name {
+        "topk" => SecondStage::TopK(n),
+        "bottomk" => SecondStage::BottomK(n),
+        other => unreachable!("parse_second_stage dispatched on {other:?}"),
+    };
+    Ok(PipelineStage::MetricSecondStage(stage))
 }
 
 fn parse_comparison_op(cursor: &mut Cursor<'_>) -> Result<ComparisonOp, TraceQlError> {
@@ -1529,12 +1815,20 @@ mod tests {
             ("{} | count_over_time()", MetricFn::CountOverTime),
         ] {
             let parsed = parse(query).unwrap();
-            assert_eq!(parsed.pipeline, vec![PipelineStage::Metric(func)]);
+            assert_eq!(
+                parsed.pipeline,
+                vec![PipelineStage::Metric(MetricStage {
+                    func,
+                    by: vec![],
+                    hints: vec![],
+                    result_filter: None,
+                })]
+            );
         }
     }
 
     #[test]
-    fn a_metric_fn_with_an_argument_is_a_positioned_arity_error() {
+    fn a_zero_arity_metric_fn_with_an_argument_is_a_positioned_arity_error() {
         let err = parse("{} | rate(5)").unwrap_err();
         match err {
             TraceQlError::UnexpectedToken { expected, span, .. } => {
@@ -1552,36 +1846,206 @@ mod tests {
     }
 
     #[test]
-    fn metrics_grouping_by_is_the_recognized_m7_boundary() {
-        let query = "{} | rate() by (resource.service.name)";
-        let err = parse(query).unwrap_err();
-        match err {
-            TraceQlError::NotYetSupported { construct, span } => {
-                assert_eq!(construct, "metrics grouping 'by'");
-                assert_eq!(&query[span.start..span.end], "by");
-            }
-            other => panic!("unexpected {other}"),
+    fn over_time_functions_parse_with_their_aggregation_target() {
+        for (query, want) in [
+            (
+                "{} | sum_over_time(duration)",
+                MetricFn::SumOverTime(Field::Intrinsic(Intrinsic::Duration)),
+            ),
+            (
+                "{} | min_over_time(duration)",
+                MetricFn::MinOverTime(Field::Intrinsic(Intrinsic::Duration)),
+            ),
+            (
+                "{} | max_over_time(duration)",
+                MetricFn::MaxOverTime(Field::Intrinsic(Intrinsic::Duration)),
+            ),
+            (
+                "{} | avg_over_time(duration)",
+                MetricFn::AvgOverTime(Field::Intrinsic(Intrinsic::Duration)),
+            ),
+            (
+                "{} | histogram_over_time(duration)",
+                MetricFn::HistogramOverTime(Field::Intrinsic(Intrinsic::Duration)),
+            ),
+        ] {
+            let parsed = parse(query).unwrap();
+            assert_eq!(
+                parsed.pipeline,
+                vec![PipelineStage::Metric(MetricStage {
+                    func: want,
+                    by: vec![],
+                    hints: vec![],
+                    result_filter: None,
+                })],
+                "{query}"
+            );
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
         }
     }
 
     #[test]
-    fn deferred_over_time_functions_stay_positioned_not_yet_supported() {
-        for name in [
-            "avg_over_time",
-            "min_over_time",
-            "max_over_time",
-            "quantile_over_time",
-            "histogram_over_time",
+    fn an_over_time_function_without_a_target_is_a_positioned_error() {
+        let err = parse("{} | sum_over_time()").unwrap_err();
+        assert!(matches!(err, TraceQlError::UnexpectedToken { .. }), "{err}");
+    }
+
+    #[test]
+    fn quantile_over_time_parses_single_and_multiple_quantiles() {
+        let parsed = parse("{} | quantile_over_time(duration, 0.5, 0.9, 0.99)").unwrap();
+        assert_eq!(
+            parsed.pipeline,
+            vec![PipelineStage::Metric(MetricStage {
+                func: MetricFn::QuantileOverTime {
+                    field: Field::Intrinsic(Intrinsic::Duration),
+                    quantiles: vec![
+                        Value::Number("0.5".to_string()),
+                        Value::Number("0.9".to_string()),
+                        Value::Number("0.99".to_string()),
+                    ],
+                },
+                by: vec![],
+                hints: vec![],
+                result_filter: None,
+            })]
+        );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn quantile_over_time_without_a_quantile_is_a_positioned_error() {
+        let err = parse("{} | quantile_over_time(duration)").unwrap_err();
+        assert!(matches!(err, TraceQlError::UnexpectedToken { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_metric_by_grouping_parses_to_the_stage_grouping_keys() {
+        let parsed = parse("{} | rate() by(resource.service.name)").unwrap();
+        let PipelineStage::Metric(stage) = &parsed.pipeline[0] else {
+            panic!("expected a metric stage, got {:?}", parsed.pipeline);
+        };
+        assert_eq!(
+            stage.by,
+            vec![Field::Attribute {
+                scope: AttrScope::Resource,
+                key: "service.name".to_string(),
+            }]
+        );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn a_metric_by_with_no_field_is_a_positioned_error() {
+        let err = parse("{} | rate() by()").unwrap_err();
+        assert!(matches!(err, TraceQlError::UnexpectedToken { .. }), "{err}");
+    }
+
+    #[test]
+    fn metric_with_hints_parse_bool_and_numeric_values() {
+        let parsed = parse("{} | rate() with(sample=true, exemplars=100)").unwrap();
+        let PipelineStage::Metric(stage) = &parsed.pipeline[0] else {
+            panic!("expected a metric stage");
+        };
+        assert_eq!(
+            stage.hints,
+            vec![
+                MetricHint {
+                    key: "sample".to_string(),
+                    value: HintValue::Bool(true),
+                },
+                MetricHint {
+                    key: "exemplars".to_string(),
+                    value: HintValue::Number("100".to_string()),
+                },
+            ]
+        );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn a_by_and_with_can_both_trail_a_metric() {
+        let parsed =
+            parse("{} | quantile_over_time(duration, 0.9) by(name) with(exemplars=true)").unwrap();
+        let PipelineStage::Metric(stage) = &parsed.pipeline[0] else {
+            panic!("expected a metric stage");
+        };
+        assert_eq!(stage.by, vec![Field::Intrinsic(Intrinsic::Name)]);
+        assert_eq!(stage.hints.len(), 1);
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn topk_and_bottomk_parse_as_second_stages() {
+        for (query, want) in [
+            ("{} | rate() | topk(10)", SecondStage::TopK(10)),
+            ("{} | rate() | bottomk(3)", SecondStage::BottomK(3)),
         ] {
-            let query = format!("{{}} | {name}()");
-            let err = parse(&query).unwrap_err();
-            match err {
-                TraceQlError::NotYetSupported { construct, span } => {
-                    assert_eq!(construct, format!("metrics function '{name}'"));
-                    assert_eq!(span.start, 5, "{query}");
-                }
-                other => panic!("{query} -> unexpected {other}"),
-            }
+            let parsed = parse(query).unwrap();
+            assert_eq!(
+                parsed.pipeline[1],
+                PipelineStage::MetricSecondStage(want),
+                "{query}"
+            );
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
         }
+    }
+
+    #[test]
+    fn a_standalone_by_pipeline_stage_is_a_generic_error() {
+        // `pipeline.by` (a top-level `| by(...)`, not a metric grouping)
+        // stays a generic error, distinct from the metric `by(...)` clause.
+        let err = parse("{} | by(resource.service.name)").unwrap_err();
+        assert!(
+            !matches!(err, TraceQlError::NotYetSupported { .. }),
+            "standalone by() must be a generic error, got {err}"
+        );
+    }
+
+    #[test]
+    fn compare_parses_to_a_compare_stage_with_its_selection() {
+        let parsed = parse(r#"{} | compare({ span.http.status_code = "500" })"#).unwrap();
+        match &parsed.pipeline[..] {
+            [PipelineStage::Compare { selection, hints }] => {
+                assert!(selection.body.is_some(), "the selection filter is captured");
+                assert!(hints.is_empty());
+            }
+            other => panic!("expected a compare stage, got {other:?}"),
+        }
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "round-trips");
+        // compare accepts trailing with() hints (e.g. exemplars).
+        let with_ex = parse(r#"{} | compare({ .a = 1 }) with(exemplars=2)"#).unwrap();
+        match &with_ex.pipeline[..] {
+            [PipelineStage::Compare { hints, .. }] => assert_eq!(hints.len(), 1),
+            other => panic!("expected compare with hints, got {other:?}"),
+        }
+        assert_eq!(parse(&with_ex.to_string()).unwrap(), with_ex, "round-trips");
+    }
+
+    #[test]
+    fn a_metrics_result_comparison_attaches_to_the_metric_stage() {
+        let parsed = parse("{} | rate() > 5").unwrap();
+        match &parsed.pipeline[..] {
+            [PipelineStage::Metric(stage)] => {
+                assert_eq!(
+                    stage.result_filter,
+                    Some((ComparisonOp::Gt, Value::Number("5".to_string())))
+                );
+            }
+            other => panic!("expected a metric stage with a result filter, got {other:?}"),
+        }
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "round-trips");
+        // A regex result comparison is not valid.
+        assert!(parse(r#"{} | rate() =~ "5""#).is_err());
+    }
+
+    #[test]
+    fn a_bare_with_after_a_spanset_is_a_generic_error() {
+        // `hints.most_recent` probe: `with(...)` directly on a spanset
+        // (no metric) stays a generic trailing-input error.
+        let err = parse("{ .a = 1 } with(most_recent=true)").unwrap_err();
+        assert!(
+            !matches!(err, TraceQlError::NotYetSupported { .. }),
+            "bare with() must be a generic error, got {err}"
+        );
     }
 }

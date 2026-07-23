@@ -95,6 +95,65 @@ const CASES: &[Case] = &[
         q: r#"{ resource.service.name = "checkout" && span.http.status_code >= 500 && duration > 2s } | rate()"#,
         distributed: true,
     },
+    Case {
+        // Issue #182: `sum_over_time(duration)` — the replay-dedup inner
+        // query (`any(duration_ns)` per (t, trace_id, span_id)) then the
+        // outer `toFloat64(sum(val))`.
+        name: "sum_over_time_duration",
+        q: r#"{ span.http.status_code >= 500 } | sum_over_time(duration)"#,
+        distributed: false,
+    },
+    Case {
+        // `avg_over_time(duration)` — same dedup shape, avg aggregate.
+        name: "avg_over_time_duration",
+        q: "{} | avg_over_time(duration)",
+        distributed: false,
+    },
+    Case {
+        // `rate() by(resource.service.name)` — grouped count with the
+        // physical `service` group column and the distinct-by-key series
+        // cap probe (rendered separately, pinned below).
+        name: "rate_by_service",
+        q: r#"{ duration > 1s } | rate() by(resource.service.name)"#,
+        distributed: false,
+    },
+    Case {
+        // `sum_over_time(duration) by(resource.service.name)` — grouped
+        // value aggregation: dedup inner, grouped outer sum.
+        name: "sum_over_time_by_service",
+        q: r#"{ span.env = "prod" } | sum_over_time(duration) by(resource.service.name)"#,
+        distributed: false,
+    },
+    Case {
+        // `quantile_over_time(duration, ...)` — TDigest over the deduped
+        // duration, one Array(Float64) per bucket (issue #182 OQ4).
+        name: "quantile_over_time_multi",
+        q: "{} | quantile_over_time(duration, 0.5, 0.9, 0.99)",
+        distributed: false,
+    },
+    Case {
+        // `histogram_over_time(duration)` — cumulative countIf over the
+        // fixed exponential le boundaries, one Array(UInt64) per bucket.
+        name: "histogram_over_time_duration",
+        q: r#"{ span.http.status_code >= 500 } | histogram_over_time(duration)"#,
+        distributed: false,
+    },
+    Case {
+        // `with(exemplars=N)` — the bounded per-bucket groupArraySample
+        // collection SQL (issue #182 P5), rendered alongside the count
+        // range query.
+        name: "rate_with_exemplars",
+        q: "{} | rate() with(exemplars=3)",
+        distributed: false,
+    },
+    Case {
+        // `compare({selection})` — the attribute cross-tab (intrinsic
+        // arrayJoin + index-attr join), the baseline/selection totals, and
+        // the distinct-(key,value) cap probe (issue #182 P6b).
+        name: "compare_status",
+        q: r#"{ resource.service.name = "checkout" } | compare({ span.http.status_code = "500" })"#,
+        distributed: false,
+    },
 ];
 
 fn plan_for(case: &Case) -> TraceMetricsPlan {
@@ -113,6 +172,7 @@ fn plan_for(case: &Case) -> TraceMetricsPlan {
                 attrs_table: attrs,
             },
             scan_budget_rows: 50_000_000,
+            max_series: 1_000,
             distributed: case.distributed,
             skip_unavailable_shards: false,
         },
@@ -124,13 +184,35 @@ fn plan_for(case: &Case) -> TraceMetricsPlan {
 /// SQL forms of the plan (range → matrix, instant → vector).
 fn composite(case: &Case) -> String {
     let plan = plan_for(case);
-    format!(
+    // compare() has no range_sql/instant_sql — it serves from its
+    // cross-tab/totals SQL, frozen here.
+    if let Some((cross, totals)) = plan.compare_range() {
+        let mut out = format!(
+            "-- case: {}\n-- q: {}\n\n== compare cross-tab (query_range) ==\n{cross}\n\n\
+             == compare totals (query_range) ==\n{totals}\n",
+            case.name, case.q,
+        );
+        if let Some(probe) = plan.probe_sql() {
+            out.push_str(&format!("\n== compare series probe ==\n{probe}\n"));
+        }
+        return out;
+    }
+    let mut out = format!(
         "-- case: {}\n-- q: {}\n\n== range (query_range) ==\n{}\n\n== instant (query) ==\n{}\n",
         case.name,
         case.q,
         plan.range_sql(),
         plan.instant_sql()
-    )
+    );
+    // Grouped queries also freeze the distinct-by-key series cap probe.
+    if let Some(probe) = plan.probe_sql() {
+        out.push_str(&format!("\n== series probe ==\n{probe}\n"));
+    }
+    // with(exemplars=…) queries freeze the exemplar-collection SQL.
+    if let Some(ex) = plan.exemplar_sql() {
+        out.push_str(&format!("\n== exemplars ==\n{ex}\n"));
+    }
+    out
 }
 
 fn golden_dir() -> std::path::PathBuf {

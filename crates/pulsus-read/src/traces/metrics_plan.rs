@@ -8,10 +8,10 @@
 //! bad_data` server-side, except [`PlanError::MetricsPointCap`] — the
 //! adjudicated static pre-execution `422 query_too_broad`.
 
-use pulsus_traceql::{MetricFn, PipelineStage, Query, SpansetExpr};
+use pulsus_traceql::{AttrScope, Field, Intrinsic, MetricFn, PipelineStage, Query, SpansetExpr};
 
 use super::filter::{PlanError, SpanFilterCtx};
-use super::metrics_sql::{self, SnappedWindow};
+use super::metrics_sql::{self, AggFn, GroupKeySql, SnappedWindow};
 
 /// The auto-derivation target when `step` is omitted (docs/api.md §4.4,
 /// task-manager adjudication 3): `step_s = max(1, ⌊(end_s − start_s) /
@@ -45,6 +45,10 @@ pub struct MetricsCtx<'a> {
     /// `reader.traceql_scan_budget_rows` — carried for parity with the
     /// engine's Layer-1 settings (the engine injects it at execution).
     pub scan_budget_rows: u64,
+    /// `reader.traceql_max_series` (issue #182) — the `by(...)`
+    /// distinct-series cap; the plan renders the `LIMIT cap+1` probe with
+    /// it, and the engine flips a breach to a static 422.
+    pub max_series: u64,
     /// Clustered mode: the engine injects the §7 clustered-reader
     /// settings plus `distributed_product_mode='local'` (the attr
     /// semi-join reads the co-sharded local `trace_attrs_idx` — plan v2
@@ -64,11 +68,95 @@ pub enum MetricFunc {
     CountOverTime,
 }
 
+impl MetricFunc {
+    /// The Tempo `__name__` label value for an ungrouped series of this
+    /// function (issue #182): the bare function name.
+    pub fn name(self) -> &'static str {
+        match self {
+            MetricFunc::Rate => "rate",
+            MetricFunc::CountOverTime => "count_over_time",
+        }
+    }
+}
+
+/// The read-side metric kind (issue #182): the `uniqExact` count path
+/// (rate/count_over_time) or a first-stage value aggregation
+/// (sum/min/max/avg over the physical `duration_ns`, scaled ns→seconds at
+/// the encode boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanKind {
+    /// `rate()` (divides the deduped count by the window width) or
+    /// `count_over_time()` (the count itself).
+    Count { is_rate: bool },
+    /// `sum/min/max/avg_over_time(duration)`.
+    Agg(AggFn),
+    /// `quantile_over_time(duration, q…)` — one series per quantile
+    /// (`p=<q>` label); the quantile list is carried on the plan.
+    Quantile,
+    /// `histogram_over_time(duration)` — one cumulative-count series per
+    /// exponential `le` bucket (`__bucket=<le seconds>` label).
+    Histogram,
+    /// `compare({selection})` — baseline/selection attribute meta-series
+    /// (`__meta_type` + one attribute label). The cross-tab/totals SQL is
+    /// carried on the plan.
+    Compare,
+}
+
+/// The fixed exponential power-of-two nanosecond `le` boundaries for
+/// `histogram_over_time` (issue #182, OQ4). Captured to match the Tempo
+/// v3.0.2 `__bucket` convention (power-of-two nanoseconds rendered as
+/// float seconds — e.g. `2^30 ns = 1.073741824`); exact
+/// boundary/membership value parity vs Tempo is Tier-2 (issue #25). The
+/// series count is fixed (bounded), so no cardinality probe applies.
+pub const HISTOGRAM_LE_BOUNDS_NS: &[i64] = &[
+    1 << 10, // ~1.02µs
+    1 << 13,
+    1 << 16,
+    1 << 19,
+    1 << 22, // ~4.19ms
+    1 << 25,
+    1 << 28,
+    1 << 30, // ~1.07s
+    1 << 31,
+    1 << 32,
+    1 << 34,
+    1 << 36,
+    1 << 38,
+    1 << 40, // ~1099s
+];
+
 /// The complete, deterministic metrics plan — both SQL forms are
 /// byte-frozen (`tests/traces_metrics_sql.rs`).
 #[derive(Debug, Clone)]
 pub struct TraceMetricsPlan {
-    func: MetricFunc,
+    kind: PlanKind,
+    /// The Tempo `__name__` label for an ungrouped series.
+    metric_name: &'static str,
+    /// The single resolved `by(...)` grouping key, if any (this pass
+    /// supports one key: `resource.service.name` → the physical `service`
+    /// column). `None` is ungrouped.
+    group_label: Option<String>,
+    /// The distinct-by-key series-cardinality probe SQL, rendered only for
+    /// a grouped query; the engine runs it before the main query.
+    probe_sql: Option<String>,
+    /// The requested quantiles (`PlanKind::Quantile` only), in request
+    /// order — one output series per entry (`p=<q>` label).
+    quantiles: Vec<f64>,
+    /// The optional second-stage `topk`/`bottomk` reduction, applied
+    /// client-side per timestamp after the series are framed.
+    reduce: Option<SeriesReduce>,
+    /// The per-bucket exemplar collection SQL (issue #182 P5), rendered
+    /// when `with(exemplars=…)` is present on an ungrouped rate/count
+    /// query; the engine runs it and attaches `trace:id` exemplars.
+    exemplar_sql: Option<String>,
+    /// A trailing `metrics-result comparison` post-filter (`… > 5`, issue
+    /// #182 P6b): keeps only samples satisfying `<op> <value>`. Applied
+    /// client-side after the series are framed.
+    result_filter: Option<(pulsus_traceql::ComparisonOp, f64)>,
+    /// `compare()` cross-tab + totals SQL, `(cross_tab, totals)` for the
+    /// range and instant forms (`PlanKind::Compare` only).
+    compare_range: Option<(String, String)>,
+    compare_instant: Option<(String, String)>,
     step_s: i64,
     window: SnappedWindow,
     distributed: bool,
@@ -85,8 +173,67 @@ impl TraceMetricsPlan {
         &self.instant_sql
     }
 
-    pub fn func(&self) -> MetricFunc {
-        self.func
+    pub fn kind(&self) -> PlanKind {
+        self.kind
+    }
+
+    /// The `__name__` label value for an ungrouped series.
+    pub fn metric_name(&self) -> &str {
+        self.metric_name
+    }
+
+    /// The grouping label key, if the query is grouped.
+    pub fn group_label(&self) -> Option<&str> {
+        self.group_label.as_deref()
+    }
+
+    /// The requested quantiles (`PlanKind::Quantile`), in request order.
+    pub fn quantiles(&self) -> &[f64] {
+        &self.quantiles
+    }
+
+    /// The histogram `le` boundaries in nanoseconds (`PlanKind::Histogram`).
+    pub fn histogram_le_bounds_ns(&self) -> &[i64] {
+        HISTOGRAM_LE_BOUNDS_NS
+    }
+
+    /// The second-stage `topk`/`bottomk` reduction, if any.
+    pub fn reduce(&self) -> Option<SeriesReduce> {
+        self.reduce
+    }
+
+    /// The per-bucket exemplar collection SQL, if `with(exemplars=…)` was
+    /// requested on a supported (ungrouped rate/count) query.
+    pub fn exemplar_sql(&self) -> Option<&str> {
+        self.exemplar_sql.as_deref()
+    }
+
+    /// The trailing metrics-result comparison post-filter, if present.
+    pub fn result_filter(&self) -> Option<(pulsus_traceql::ComparisonOp, f64)> {
+        self.result_filter
+    }
+
+    /// The compare() range `(cross_tab, totals)` SQL, if this is a compare
+    /// plan.
+    pub fn compare_range(&self) -> Option<(&str, &str)> {
+        self.compare_range
+            .as_ref()
+            .map(|(c, t)| (c.as_str(), t.as_str()))
+    }
+
+    /// The compare() instant `(cross_tab, totals)` SQL, if this is a
+    /// compare plan.
+    pub fn compare_instant(&self) -> Option<(&str, &str)> {
+        self.compare_instant
+            .as_ref()
+            .map(|(c, t)| (c.as_str(), t.as_str()))
+    }
+
+    /// The distinct-by-key series-cardinality probe SQL (grouped queries
+    /// only); the engine runs it before the main query and 422s on a
+    /// `cap+1` result.
+    pub fn probe_sql(&self) -> Option<&str> {
+        self.probe_sql.as_deref()
     }
 
     pub fn step_s(&self) -> i64 {
@@ -140,7 +287,7 @@ pub fn plan_trace_metrics(
         ));
     }
 
-    let func = single_metric_stage(query)?;
+    let analysis = analyze_pipeline(query)?;
 
     // Cross-spanset and structural metrics are out of scope (plan v1
     // edge 4: the compiler is per-SpansetFilter; issue #172's structural
@@ -205,12 +352,132 @@ pub fn plan_trace_metrics(
         ctx.filter.attrs_table,
         window,
     )?;
-    let range_sql =
-        metrics_sql::metrics_range_sql(ctx.filter.spans_table, &filter_sql, window, params.step_s);
-    let instant_sql = metrics_sql::metrics_instant_sql(ctx.filter.spans_table, &filter_sql, window);
+    let spans = ctx.filter.spans_table;
+    let keys = analysis.keys;
+    let (range_sql, instant_sql) = match analysis.kind {
+        PlanKind::Count { .. } => (
+            metrics_sql::metrics_count_range_sql(spans, &filter_sql, window, params.step_s, &keys),
+            metrics_sql::metrics_count_instant_sql(spans, &filter_sql, window, &keys),
+        ),
+        PlanKind::Agg(agg) => (
+            metrics_sql::metrics_agg_range_sql(
+                spans,
+                &filter_sql,
+                window,
+                params.step_s,
+                agg,
+                &keys,
+            ),
+            metrics_sql::metrics_agg_instant_sql(spans, &filter_sql, window, agg, &keys),
+        ),
+        PlanKind::Quantile => (
+            metrics_sql::metrics_quantile_range_sql(
+                spans,
+                &filter_sql,
+                window,
+                params.step_s,
+                &analysis.quantiles,
+            ),
+            metrics_sql::metrics_quantile_instant_sql(
+                spans,
+                &filter_sql,
+                window,
+                &analysis.quantiles,
+            ),
+        ),
+        PlanKind::Histogram => (
+            metrics_sql::metrics_histogram_range_sql(
+                spans,
+                &filter_sql,
+                window,
+                params.step_s,
+                HISTOGRAM_LE_BOUNDS_NS,
+            ),
+            metrics_sql::metrics_histogram_instant_sql(
+                spans,
+                &filter_sql,
+                window,
+                HISTOGRAM_LE_BOUNDS_NS,
+            ),
+        ),
+        // compare() serves from its own cross-tab/totals SQL below.
+        PlanKind::Compare => (String::new(), String::new()),
+    };
+
+    // compare(): build the cross-tab/totals for the range and instant
+    // forms, plus the distinct-(key,value) cap probe (reused by
+    // `enforce_series_cap`).
+    let (compare_range, compare_instant, compare_probe) = if analysis.kind == PlanKind::Compare {
+        let inner_bool = metrics_sql::compile_filter_bool(
+            analysis
+                .compare_selection
+                .as_ref()
+                .and_then(|f| f.body.as_ref()),
+            ctx.filter.attrs_table,
+            window,
+        )?;
+        // The fixed well-known-absent-attribute set contributes 4 series
+        // per key on top of the data-driven cross-tab; fold it into the
+        // cap so the probe bounds the true materialized output count.
+        let fixed_series = 4 * WELL_KNOWN_COMPARE_KEYS.len() as u64;
+        let range_bucket = metrics_sql::compare_range_bucket_expr(params.step_s);
+        let r = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
+            spans_table: spans,
+            attrs_table: ctx.filter.attrs_table,
+            outer: &filter_sql,
+            inner_bool: &inner_bool,
+            window,
+            bucket_expr: &range_bucket,
+            cap: ctx.max_series,
+            fixed_series,
+        });
+        let instant_bucket = (window.end_ns / 1_000_000).to_string();
+        let i = metrics_sql::metrics_compare_sql(&metrics_sql::CompareSqlInput {
+            spans_table: spans,
+            attrs_table: ctx.filter.attrs_table,
+            outer: &filter_sql,
+            inner_bool: &inner_bool,
+            window,
+            bucket_expr: &instant_bucket,
+            cap: ctx.max_series,
+            fixed_series,
+        });
+        (
+            Some((r.cross_tab, r.totals)),
+            Some((i.cross_tab, i.totals)),
+            Some(r.probe),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let probe_sql = compare_probe.or_else(|| {
+        keys.first().map(|_| {
+            metrics_sql::metrics_series_probe_sql(spans, &filter_sql, window, &keys, ctx.max_series)
+        })
+    });
+
+    // Exemplars are collected for EVERY range shape (issue #182 review
+    // Fix 1 — Tempo emits exemplars for range rate/count/agg/quantile/
+    // histogram/compare, and none for instant): the per-bucket sample is
+    // taken over the outer filter and attached to the first series (Tempo
+    // concentrates a range's exemplars on one series). The instant path
+    // never attaches (matching Tempo — verified black-box).
+    let exemplar_sql = analysis.exemplar_k.map(|k| {
+        metrics_sql::metrics_exemplar_range_sql(spans, &filter_sql, window, params.step_s, k)
+    });
 
     Ok(TraceMetricsPlan {
-        func,
+        kind: analysis.kind,
+        metric_name: analysis.metric_name,
+        group_label: keys.first().map(|k| k.label_key.clone()),
+        probe_sql,
+        quantiles: analysis.quantiles,
+        reduce: analysis.reduce,
+        exemplar_sql,
+        result_filter: analysis.result_filter,
+        compare_range,
+        compare_instant,
         step_s: params.step_s,
         window,
         distributed: ctx.distributed,
@@ -219,23 +486,304 @@ pub fn plan_trace_metrics(
     })
 }
 
-/// The M4 metrics pipeline shape: exactly one stage, and it is the
-/// metric function.
-fn single_metric_stage(query: &Query) -> Result<MetricFunc, PlanError> {
-    match query.pipeline.as_slice() {
-        [PipelineStage::Metric(func)] => Ok(match func {
-            MetricFn::Rate => MetricFunc::Rate,
-            MetricFn::CountOverTime => MetricFunc::CountOverTime,
-        }),
-        [] => Err(PlanError::TypeMismatch(
-            "a metrics query requires a metrics function stage: rate() or count_over_time()"
+/// A second-stage series reduction (issue #182 P5): `topk(n)`/`bottomk(n)`
+/// applied client-side per timestamp over the (capped) series set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesReduce {
+    TopK(u64),
+    BottomK(u64),
+}
+
+/// The well-known attribute keys Tempo v3.0.2 always enumerates in a
+/// `compare()` result — appearing as `key=nil` when no span carries them
+/// (issue #182 review Fix 3). Captured black-box from the pinned container
+/// (query `compare()` over a representative corpus, collect every `key=nil`
+/// key) and cross-referenced to the published OTLP semantic conventions
+/// (Apache-2.0, freely referenceable) — the same clean-room method used
+/// for the response envelope; **no Tempo source list is copied**. Grouped:
+/// span intrinsics, instrumentation scope, well-known resource attributes,
+/// and the common OTLP HTTP/URL span attributes.
+pub const WELL_KNOWN_COMPARE_KEYS: &[&str] = &[
+    // Span/trace intrinsics.
+    "name",
+    "kind",
+    "status",
+    "statusMessage",
+    "rootName",
+    "rootServiceName",
+    // Instrumentation scope.
+    "instrumentation:name",
+    "instrumentation:version",
+    // Well-known resource attributes (OTLP resource semconv).
+    "resource.service.name",
+    "resource.cluster",
+    "resource.container",
+    "resource.namespace",
+    "resource.pod",
+    "resource.k8s.cluster.name",
+    "resource.k8s.container.name",
+    "resource.k8s.namespace.name",
+    "resource.k8s.pod.name",
+    // Common OTLP HTTP/URL span attributes (span semconv).
+    "span.http.method",
+    "span.http.request.method",
+    "span.http.route",
+    "span.http.status_code",
+    "span.http.url",
+    "span.server.address",
+    "span.url.path",
+    "span.url.route",
+];
+
+/// The default per-bucket exemplar sample size when `with(exemplars=true)`
+/// carries no explicit count. Bounded (see [`MAX_EXEMPLARS_PER_BUCKET`]).
+pub const DEFAULT_EXEMPLARS_PER_BUCKET: u32 = 1;
+
+/// The hard per-bucket exemplar cap — a `with(exemplars=N)` is clamped to
+/// it so exemplar collection can never blow the scan/response budget.
+pub const MAX_EXEMPLARS_PER_BUCKET: u32 = 100;
+
+/// The resolved metrics pipeline: its kind, the `__name__` label for
+/// ungrouped output, the resolved `by(...)` grouping keys, the optional
+/// second-stage reduction, and the optional exemplar sample size.
+struct PipelineAnalysis {
+    kind: PlanKind,
+    metric_name: &'static str,
+    keys: Vec<GroupKeySql>,
+    quantiles: Vec<f64>,
+    reduce: Option<SeriesReduce>,
+    exemplar_k: Option<u32>,
+    /// The trailing metrics-result comparison (`… > 5`), parsed to `f64`.
+    result_filter: Option<(pulsus_traceql::ComparisonOp, f64)>,
+    /// The `compare({selection})` inner filter (cloned), if the pipeline is
+    /// a compare stage.
+    compare_selection: Option<pulsus_traceql::SpansetFilter>,
+}
+
+/// Analyzes the metrics pipeline: a first-stage metric function (with
+/// optional `by(...)`, `with()`, trailing `> value`, and a `topk`/`bottomk`
+/// second stage), or a standalone `compare({selection})` stage.
+fn analyze_pipeline(query: &Query) -> Result<PipelineAnalysis, PlanError> {
+    // compare() is a standalone metrics stage with its own shape; it
+    // accepts `with(...)` hints (e.g. exemplars).
+    if let [PipelineStage::Compare { selection, hints }] = query.pipeline.as_slice() {
+        return Ok(PipelineAnalysis {
+            kind: PlanKind::Compare,
+            metric_name: "compare",
+            keys: Vec::new(),
+            quantiles: Vec::new(),
+            reduce: None,
+            exemplar_k: resolve_hints(hints)?,
+            result_filter: None,
+            compare_selection: Some((**selection).clone()),
+        });
+    }
+    let (stage, reduce) = match query.pipeline.as_slice() {
+        [PipelineStage::Metric(stage)] => (stage, None),
+        [
+            PipelineStage::Metric(stage),
+            PipelineStage::MetricSecondStage(second),
+        ] => (stage, Some(resolve_second_stage(second))),
+        [] => {
+            return Err(PlanError::TypeMismatch(
+                "a metrics query requires a metrics function stage (rate, count_over_time, a \
+                 *_over_time aggregation, or compare())"
+                    .to_string(),
+            ));
+        }
+        _ => {
+            return Err(PlanError::TypeMismatch(
+                "a metrics query takes one metrics function stage and at most one topk()/bottomk() \
+                 second stage; aggregate filters and select() are search-only"
+                    .to_string(),
+            ));
+        }
+    };
+    let exemplar_k = resolve_hints(&stage.hints)?;
+    let keys = resolve_by_keys(&stage.by)?;
+    let (kind, metric_name, quantiles) = resolve_func(&stage.func)?;
+    // Quantile/histogram grouping is a follow-up; keep them ungrouped.
+    if matches!(kind, PlanKind::Quantile | PlanKind::Histogram) && !keys.is_empty() {
+        return Err(PlanError::TypeMismatch(
+            "quantile_over_time/histogram_over_time do not yet support by() grouping (issue #182)"
+                .to_string(),
+        ));
+    }
+    let result_filter = resolve_result_filter(&stage.result_filter)?;
+    Ok(PipelineAnalysis {
+        kind,
+        metric_name,
+        keys,
+        quantiles,
+        reduce,
+        exemplar_k,
+        result_filter,
+        compare_selection: None,
+    })
+}
+
+/// Parses a trailing metrics-result comparison value to `f64` (a duration
+/// literal is compared in seconds, matching the value aggregations'
+/// ns→seconds encode scaling).
+fn resolve_result_filter(
+    filter: &Option<(pulsus_traceql::ComparisonOp, pulsus_traceql::Value)>,
+) -> Result<Option<(pulsus_traceql::ComparisonOp, f64)>, PlanError> {
+    let Some((op, value)) = filter else {
+        return Ok(None);
+    };
+    let v = match value {
+        pulsus_traceql::Value::Number(raw) => raw
+            .parse::<f64>()
+            .map_err(|_| PlanError::TypeMismatch(format!("invalid comparison value {raw:?}")))?,
+        pulsus_traceql::Value::Duration(d) => d.as_nanos() as f64 / 1e9,
+        other => {
+            return Err(PlanError::TypeMismatch(format!(
+                "a metrics-result comparison takes a number or duration, got {other}"
+            )));
+        }
+    };
+    Ok(Some((*op, v)))
+}
+
+/// Maps a parsed second stage to its read-side reduction.
+fn resolve_second_stage(second: &pulsus_traceql::SecondStage) -> SeriesReduce {
+    match second {
+        pulsus_traceql::SecondStage::TopK(n) => SeriesReduce::TopK(*n),
+        pulsus_traceql::SecondStage::BottomK(n) => SeriesReduce::BottomK(*n),
+    }
+}
+
+/// Resolves `with(...)` hints (issue #182 P5). `sample` is accepted and
+/// returns the exact (superset) result — value-exact sampling parity
+/// routes to #25. `exemplars=<true|N>` requests per-bucket exemplar
+/// collection, clamped to [`MAX_EXEMPLARS_PER_BUCKET`]. Other hints
+/// (e.g. `most_recent`) are accepted and ignored (a valid superset), never
+/// a `400`.
+fn resolve_hints(hints: &[pulsus_traceql::MetricHint]) -> Result<Option<u32>, PlanError> {
+    use pulsus_traceql::HintValue;
+    let mut exemplar_k: Option<u32> = None;
+    for hint in hints {
+        if hint.key == "exemplars" {
+            let k = match &hint.value {
+                HintValue::Bool(true) => DEFAULT_EXEMPLARS_PER_BUCKET,
+                HintValue::Bool(false) => continue,
+                HintValue::Number(raw) => raw
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|n| *n >= 0.0)
+                    .map(|n| (n as u32).clamp(1, MAX_EXEMPLARS_PER_BUCKET))
+                    .ok_or_else(|| {
+                        PlanError::TypeMismatch(format!("invalid exemplars count {raw:?}"))
+                    })?,
+                _ => {
+                    return Err(PlanError::TypeMismatch(
+                        "exemplars must be a boolean or a number".to_string(),
+                    ));
+                }
+            };
+            exemplar_k = Some(k.min(MAX_EXEMPLARS_PER_BUCKET));
+        }
+        // `sample` and any other hint: accepted, exact superset returned.
+    }
+    Ok(exemplar_k)
+}
+
+/// Resolves the `by(...)` fields to grouping keys. This pass supports
+/// exactly one key, `resource.service.name` (the physical `service`
+/// column); attribute by-keys and multi-key grouping route to a
+/// follow-up (a clean `400`).
+fn resolve_by_keys(by: &[Field]) -> Result<Vec<GroupKeySql>, PlanError> {
+    match by {
+        [] => Ok(Vec::new()),
+        [Field::Attribute { scope, key }]
+            if *scope == AttrScope::Resource && key == "service.name" =>
+        {
+            Ok(vec![GroupKeySql {
+                col_expr: "service".to_string(),
+                label_key: "resource.service.name".to_string(),
+            }])
+        }
+        [_] => Err(PlanError::TypeMismatch(
+            "by() currently supports grouping by resource.service.name only (issue #182); \
+             attribute grouping keys route to a follow-up"
                 .to_string(),
         )),
         _ => Err(PlanError::TypeMismatch(
-            "a metrics query takes exactly one pipeline stage (rate() or count_over_time()); \
-             aggregate filters and select() are search-only"
-                .to_string(),
+            "by() currently supports a single grouping key (issue #182)".to_string(),
         )),
+    }
+}
+
+/// Resolves a metric function to its read-side kind, `__name__`, and (for
+/// `quantile_over_time`) the parsed quantile list. Non-duration
+/// aggregation targets route to a follow-up with a precise `400`.
+fn resolve_func(func: &MetricFn) -> Result<(PlanKind, &'static str, Vec<f64>), PlanError> {
+    let no_q = Vec::new();
+    match func {
+        MetricFn::Rate => Ok((PlanKind::Count { is_rate: true }, "rate", no_q)),
+        MetricFn::CountOverTime => {
+            Ok((PlanKind::Count { is_rate: false }, "count_over_time", no_q))
+        }
+        MetricFn::SumOverTime(f) => {
+            require_duration_target(f, "sum_over_time")?;
+            Ok((PlanKind::Agg(AggFn::Sum), "sum_over_time", no_q))
+        }
+        MetricFn::MinOverTime(f) => {
+            require_duration_target(f, "min_over_time")?;
+            Ok((PlanKind::Agg(AggFn::Min), "min_over_time", no_q))
+        }
+        MetricFn::MaxOverTime(f) => {
+            require_duration_target(f, "max_over_time")?;
+            Ok((PlanKind::Agg(AggFn::Max), "max_over_time", no_q))
+        }
+        MetricFn::AvgOverTime(f) => {
+            require_duration_target(f, "avg_over_time")?;
+            Ok((PlanKind::Agg(AggFn::Avg), "avg_over_time", no_q))
+        }
+        MetricFn::QuantileOverTime { field, quantiles } => {
+            require_duration_target(field, "quantile_over_time")?;
+            let qs = parse_quantiles(quantiles)?;
+            Ok((PlanKind::Quantile, "quantile_over_time", qs))
+        }
+        MetricFn::HistogramOverTime(f) => {
+            require_duration_target(f, "histogram_over_time")?;
+            Ok((PlanKind::Histogram, "histogram_over_time", no_q))
+        }
+    }
+}
+
+/// Parses the quantile literals to `f64`, validating each is in `[0, 1]`.
+fn parse_quantiles(quantiles: &[pulsus_traceql::Value]) -> Result<Vec<f64>, PlanError> {
+    let mut out = Vec::with_capacity(quantiles.len());
+    for q in quantiles {
+        let pulsus_traceql::Value::Number(raw) = q else {
+            return Err(PlanError::TypeMismatch(
+                "quantile_over_time quantiles must be numbers".to_string(),
+            ));
+        };
+        let v: f64 = raw
+            .parse()
+            .map_err(|_| PlanError::TypeMismatch(format!("invalid quantile {raw:?}")))?;
+        if !(0.0..=1.0).contains(&v) {
+            return Err(PlanError::TypeMismatch(format!(
+                "quantile {v} is out of range [0, 1]"
+            )));
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// The `*_over_time` value target this pass supports is the physical
+/// `duration` intrinsic; attribute numeric targets route to a follow-up.
+fn require_duration_target(field: &Field, func: &str) -> Result<(), PlanError> {
+    if matches!(field, Field::Intrinsic(Intrinsic::Duration)) {
+        Ok(())
+    } else {
+        Err(PlanError::TypeMismatch(format!(
+            "{func}() currently supports the duration target only (issue #182); attribute value \
+             targets route to a follow-up"
+        )))
     }
 }
 
@@ -252,6 +800,7 @@ mod tests {
                 attrs_table: "trace_attrs_idx",
             },
             scan_budget_rows: 50_000_000,
+            max_series: 1_000,
             distributed: false,
             skip_unavailable_shards: false,
         }
@@ -296,12 +845,172 @@ mod tests {
     }
 
     #[test]
-    fn rate_and_count_over_time_map_to_their_funcs() {
-        assert_eq!(plan("{} | rate()").func(), MetricFunc::Rate);
-        assert_eq!(
-            plan("{} | count_over_time()").func(),
-            MetricFunc::CountOverTime
+    fn rate_and_count_over_time_map_to_their_kinds() {
+        let rate = plan("{} | rate()");
+        assert_eq!(rate.kind(), PlanKind::Count { is_rate: true });
+        assert_eq!(rate.metric_name(), "rate");
+        let count = plan("{} | count_over_time()");
+        assert_eq!(count.kind(), PlanKind::Count { is_rate: false });
+        assert_eq!(count.metric_name(), "count_over_time");
+    }
+
+    #[test]
+    fn over_time_aggregations_map_to_agg_kinds() {
+        for (q, agg, name) in [
+            ("{} | sum_over_time(duration)", AggFn::Sum, "sum_over_time"),
+            ("{} | min_over_time(duration)", AggFn::Min, "min_over_time"),
+            ("{} | max_over_time(duration)", AggFn::Max, "max_over_time"),
+            ("{} | avg_over_time(duration)", AggFn::Avg, "avg_over_time"),
+        ] {
+            let p = plan(q);
+            assert_eq!(p.kind(), PlanKind::Agg(agg), "{q}");
+            assert_eq!(p.metric_name(), name, "{q}");
+        }
+    }
+
+    #[test]
+    fn by_resource_service_name_sets_the_group_label_and_probe() {
+        let p = plan("{} | rate() by(resource.service.name)");
+        assert_eq!(p.group_label(), Some("resource.service.name"));
+        let probe = p.probe_sql().expect("grouped query renders a probe");
+        assert!(probe.contains("GROUP BY g0"), "{probe}");
+        assert!(probe.contains("LIMIT 1001"), "cap+1 sentinel: {probe}");
+        assert!(p.range_sql().contains("service AS g0"), "{}", p.range_sql());
+    }
+
+    #[test]
+    fn an_attribute_by_key_is_a_clean_plan_error_for_now() {
+        let err = plan_trace_metrics(
+            &parse("{} | rate() by(span.route)").unwrap(),
+            &PARAMS,
+            &ctx(),
+        )
+        .expect_err("attribute by-keys route to a follow-up");
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "{err}");
+    }
+
+    #[test]
+    fn quantile_and_histogram_plan_to_their_kinds() {
+        let quant = plan("{} | quantile_over_time(duration, 0.5, 0.9)");
+        assert_eq!(quant.kind(), PlanKind::Quantile);
+        assert_eq!(quant.quantiles(), &[0.5, 0.9]);
+        assert!(
+            quant
+                .range_sql()
+                .contains("quantilesTDigest(0.5, 0.9)(val)")
         );
+
+        let hist = plan("{} | histogram_over_time(duration)");
+        assert_eq!(hist.kind(), PlanKind::Histogram);
+        assert!(
+            hist.range_sql().contains("countIf(val <= "),
+            "{}",
+            hist.range_sql()
+        );
+        assert_eq!(
+            hist.histogram_le_bounds_ns().len(),
+            HISTOGRAM_LE_BOUNDS_NS.len()
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_quantile_is_a_plan_error() {
+        let err = plan_trace_metrics(
+            &parse("{} | quantile_over_time(duration, 1.5)").unwrap(),
+            &PARAMS,
+            &ctx(),
+        )
+        .expect_err("quantile out of [0,1]");
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "{err}");
+    }
+
+    #[test]
+    fn with_sample_is_accepted_and_returns_the_exact_query() {
+        // sample is accepted (exact superset) and does not alter the SQL.
+        let plain = plan("{} | rate()");
+        let sampled = plan("{} | rate() with(sample=0.1)");
+        assert_eq!(plain.range_sql(), sampled.range_sql());
+        assert!(sampled.exemplar_sql().is_none());
+    }
+
+    #[test]
+    fn with_exemplars_renders_the_groupsample_collection_sql() {
+        let p = plan("{} | rate() with(exemplars=5)");
+        let ex = p
+            .exemplar_sql()
+            .expect("exemplars requested → collection SQL");
+        assert!(
+            ex.contains("groupArraySample(5, 1)(tuple(trace_id, timestamp_ns))"),
+            "{ex}"
+        );
+    }
+
+    #[test]
+    fn exemplars_are_collected_for_every_range_shape() {
+        // Review Fix 1: not just ungrouped rate/count — grouped,
+        // aggregation, quantile, histogram all collect exemplars for range.
+        for q in [
+            "{} | rate() by(resource.service.name) with(exemplars=2)",
+            "{} | sum_over_time(duration) with(exemplars=2)",
+            "{} | quantile_over_time(duration, 0.9) with(exemplars=2)",
+            "{} | histogram_over_time(duration) with(exemplars=2)",
+        ] {
+            assert!(
+                plan(q).exemplar_sql().is_some(),
+                "{q}: exemplars must be collected for range shapes"
+            );
+        }
+    }
+
+    #[test]
+    fn topk_and_bottomk_second_stages_set_the_reduction() {
+        assert_eq!(
+            plan("{} | rate() | topk(3)").reduce(),
+            Some(SeriesReduce::TopK(3))
+        );
+        assert_eq!(
+            plan("{} | rate() | bottomk(2)").reduce(),
+            Some(SeriesReduce::BottomK(2))
+        );
+        assert_eq!(plan("{} | rate()").reduce(), None);
+    }
+
+    #[test]
+    fn compare_plans_to_a_cross_tab_with_a_selection_predicate_and_probe() {
+        let p = plan(r#"{} | compare({ span.http.status_code = "500" })"#);
+        assert_eq!(p.kind(), PlanKind::Compare);
+        let (cross, totals) = p.compare_range().expect("compare range SQL");
+        // The cross-tab enumerates intrinsics + index attrs and counts
+        // baseline (count()) and selection (countIf(is_sel)).
+        assert!(cross.contains("countIf(is_sel) AS sel_n"), "{cross}");
+        assert!(cross.contains("arrayJoin(["), "intrinsic pivot: {cross}");
+        assert!(
+            cross.contains("concat(a.scope, '.', a.key)"),
+            "attr pivot: {cross}"
+        );
+        // The selection predicate is the inner filter compiled to a bool.
+        assert!(cross.contains("key = 'http.status_code'"), "{cross}");
+        assert!(totals.contains("countIf(is_sel) AS sel_total"), "{totals}");
+        // The distinct-(key,value) cap probe is reused by the engine.
+        let probe = p.probe_sql().expect("compare renders a cap probe");
+        assert!(probe.contains("GROUP BY akey, aval"), "{probe}");
+        assert!(probe.contains("LIMIT 1001"), "cap+1: {probe}");
+    }
+
+    #[test]
+    fn a_metrics_result_comparison_sets_the_post_filter() {
+        let p = plan("{} | rate() > 5");
+        assert_eq!(
+            p.result_filter(),
+            Some((pulsus_traceql::ComparisonOp::Gt, 5.0))
+        );
+        // A duration comparison is normalized to seconds.
+        let d = plan("{} | avg_over_time(duration) > 5ms");
+        assert_eq!(
+            d.result_filter(),
+            Some((pulsus_traceql::ComparisonOp::Gt, 0.005))
+        );
+        assert_eq!(plan("{} | rate()").result_filter(), None);
     }
 
     #[test]
@@ -529,6 +1238,7 @@ mod tests {
                 attrs_table: "trace_attrs_idx_dist",
             },
             scan_budget_rows: 50_000_000,
+            max_series: 1_000,
             distributed: true,
             skip_unavailable_shards: false,
         };

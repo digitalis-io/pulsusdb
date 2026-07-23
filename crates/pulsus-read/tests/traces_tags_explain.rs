@@ -399,6 +399,7 @@ fn tight_budget_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100,
         scan_budget_rows: TIGHT_BUDGET_ROWS,
+        max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,

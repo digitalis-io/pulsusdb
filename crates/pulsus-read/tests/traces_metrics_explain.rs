@@ -34,9 +34,7 @@ use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings, Row};
 use pulsus_read::logql::{ReadError, TooBroadReason};
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
-use pulsus_read::{
-    QueryResult, TRACE_METRICS_MAX_SET_ROWS, TraceEngine, TraceMetricsPlan, TraceReadConfig,
-};
+use pulsus_read::{TRACE_METRICS_MAX_SET_ROWS, TraceEngine, TraceMetricsPlan, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
 fn should_run() -> bool {
@@ -260,6 +258,7 @@ fn engine_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
@@ -355,10 +354,7 @@ async fn metrics_explain_and_budget_gates() {
     );
     // Execute the REAL query, then corroborate via query_log.
     let result = engine.metrics_range(&plan).await.expect("range executes");
-    match &result {
-        QueryResult::Matrix(series) => assert_eq!(series.len(), 1, "matching spans exist"),
-        other => panic!("expected a matrix, got {other:?}"),
-    }
+    assert_eq!(result.series.len(), 1, "matching spans exist");
     exec(&client, "SYSTEM FLUSH LOGS").await;
     let row = query_log_like(
         &client,
@@ -503,4 +499,94 @@ async fn metrics_explain_and_budget_gates() {
         err,
         ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSetRows { .. })
     ));
+
+    // ---- Issue #182 gate: by(resource.service.name) grouping pushes the
+    // GROUP BY down to ClickHouse (Aggregating step), keeps the service
+    // PREWHERE hoist, and does not regress granule pruning. -------------
+    let by_plan = plan_for(
+        &engine,
+        r#"{ resource.service.name = "checkout" } | rate() by(resource.service.name)"#,
+        base,
+        now,
+    );
+    assert!(
+        by_plan.range_sql().contains("service AS g0"),
+        "the by-key lowers to the physical service column:\n{}",
+        by_plan.range_sql()
+    );
+    assert!(
+        by_plan
+            .range_sql()
+            .contains("PREWHERE service = 'checkout'"),
+        "the service PREWHERE hoist survives grouping:\n{}",
+        by_plan.range_sql()
+    );
+    let by_raw = explain_raw(&client, by_plan.range_sql()).await;
+    assert!(
+        by_raw.contains("Aggregating"),
+        "the GROUP BY must push down as an Aggregating step:\n{by_raw}"
+    );
+    // The real grouped query executes and returns one series (only
+    // `checkout` matches the filter).
+    let by_result = engine
+        .metrics_range(&by_plan)
+        .await
+        .expect("grouped range executes");
+    assert_eq!(by_result.series.len(), 1, "one matching service");
+
+    // The distinct-by-key probe SQL exists for the grouped plan and
+    // carries the LIMIT cap+1 sentinel (bucket-count-independent).
+    let probe = by_plan.probe_sql().expect("grouped plans render a probe");
+    assert!(
+        probe.contains("GROUP BY g0") && probe.contains("LIMIT 1001"),
+        "the probe counts distinct label-sets under a cap+1 limit:\n{probe}"
+    );
+
+    // ---- Issue #182 P6b: compare() cross-tab pushes down (Aggregating +
+    // the intrinsic/attr union), executes, and its distinct-(key,value)
+    // cap probe trips a static 422 under a tight max_series. -------------
+    let cmp_plan = plan_for(
+        &engine,
+        r#"{} | compare({ span.http.status_code = "500" })"#,
+        base,
+        now,
+    );
+    let (cross, _totals) = cmp_plan.compare_range().expect("compare range SQL");
+    let cmp_raw = explain_raw(&client, cross).await;
+    assert!(
+        cmp_raw.contains("Aggregating"),
+        "compare cross-tab GROUP BY must push down:\n{cmp_raw}"
+    );
+    let cmp_res = engine
+        .metrics_range(&cmp_plan)
+        .await
+        .expect("compare executes");
+    assert!(
+        cmp_res
+            .series
+            .iter()
+            .any(|s| s.labels.iter().any(|l| l.key == "__meta_type")),
+        "compare emits __meta_type meta-series"
+    );
+    // A tight max_series makes the distinct-(key,value) probe reject.
+    let mut capped_cfg = engine_config();
+    capped_cfg.max_series = 1;
+    let capped = TraceEngine::new(data_client().await, capped_cfg);
+    let capped_plan = plan_for(
+        &capped,
+        r#"{} | compare({ span.http.status_code = "500" })"#,
+        base,
+        now,
+    );
+    let err = capped
+        .metrics_range(&capped_plan)
+        .await
+        .expect_err("many distinct (key,value) pairs > cap 1 must reject");
+    assert!(
+        matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSeriesCap { .. })
+        ),
+        "compare cap breach is a 422 query_too_broad, got {err:?}"
+    );
 }

@@ -6,7 +6,12 @@ Query {
     ),
     pipeline: [
         Metric(
-            Rate,
+            MetricStage {
+                func: Rate,
+                by: [],
+                hints: [],
+                result_filter: None,
+            },
         ),
     ],
 }

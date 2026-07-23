@@ -117,10 +117,135 @@ pub struct MetricBucketRow {
 
 /// One metrics instant-query row (`metrics_sql::metrics_instant_sql`):
 /// the whole snapped window's deduped count — always exactly one row
-/// (aggregate with no `GROUP BY`).
+/// (aggregate with no `GROUP BY`). Also the shape of the by()-series
+/// distinct-by-key probe (`metrics_series_probe_sql`, issue #182): the
+/// probe's `count()` of distinct label-sets, capped at `cap+1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
 pub struct MetricCountRow {
     pub n: u64,
+}
+
+/// One grouped metrics count range-query row (`metrics_count_range_sql`
+/// with one by-key, issue #182): the bucket start `t`, the single group
+/// label value `g0`, and the replay-deduped `uniqExact` count. Field order
+/// matches the SELECT list (RowBinary is positional).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricGroupCountRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub g0: String,
+    pub n: u64,
+}
+
+/// One grouped metrics count instant-query row
+/// (`metrics_count_instant_sql` with one by-key): the group label value
+/// and its deduped count, one row per label-set.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricGroupCountInstantRow {
+    pub g0: String,
+    pub n: u64,
+}
+
+/// One ungrouped value-aggregation range-query row (`metrics_agg_range_sql`
+/// with no by-keys, issue #182): the bucket start `t` and the
+/// `toFloat64`-cast aggregate value `v`.
+#[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricAggRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub v: f64,
+}
+
+/// One ungrouped value-aggregation instant-query row.
+#[derive(Debug, Clone, Copy, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricAggInstantRow {
+    pub v: f64,
+}
+
+/// One grouped value-aggregation range-query row (one by-key): bucket
+/// start, group label value, aggregate value.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricAggGroupRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub g0: String,
+    pub v: f64,
+}
+
+/// One grouped value-aggregation instant-query row (one by-key).
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricAggGroupInstantRow {
+    pub g0: String,
+    pub v: f64,
+}
+
+/// One `quantile_over_time` range-query row (`metrics_quantile_range_sql`,
+/// issue #182): the bucket start and the `quantilesTDigest` result array
+/// (`[q0, q1, …]`, one per requested quantile, in ns — scaled ns→seconds
+/// at the encode boundary). `qs` is the SQL-pinned `Array(Float64)`.
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricQuantileRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub qs: Vec<f64>,
+}
+
+/// One `quantile_over_time` instant-query row — the whole-window TDigest
+/// array (no time bucket).
+#[derive(Debug, Clone, PartialEq, Row, Serialize, Deserialize)]
+pub struct MetricQuantileInstantRow {
+    pub qs: Vec<f64>,
+}
+
+/// One `histogram_over_time` range-query row (`metrics_histogram_range_sql`,
+/// issue #182): the bucket start and the cumulative per-`le`-bucket count
+/// array (`Array(UInt64)`, one entry per exponential boundary).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricHistogramRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub bkts: Vec<u64>,
+}
+
+/// One `histogram_over_time` instant-query row — the whole-window
+/// cumulative bucket-count array.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricHistogramInstantRow {
+    pub bkts: Vec<u64>,
+}
+
+/// One per-bucket exemplar-collection row (`metrics_exemplar_range_sql`,
+/// issue #182 P5): the bucket start and a bounded `groupArraySample` of
+/// `(trace_id, timestamp_ns)` tuples (`Array(Tuple(FixedString(16),
+/// Int64))`).
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct MetricExemplarRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub ex: Vec<([u8; 16], i64)>,
+}
+
+/// One `compare()` cross-tab row (`metrics_compare_sql`, issue #182 P6b):
+/// the bucket start, an attribute `(key, value)`, and its baseline (all
+/// outer spans) and selection (`countIf(is_sel)`) counts.
+#[derive(Debug, Clone, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct CompareCrossTabRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub akey: String,
+    pub aval: String,
+    pub base_n: u64,
+    pub sel_n: u64,
+}
+
+/// One `compare()` per-bucket totals row: the baseline/selection span
+/// totals (the `*_total` denominators and the `key=nil` complement base).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Row, Serialize, Deserialize)]
+pub struct CompareTotalsRow {
+    #[serde(rename = "t")]
+    pub t_ms: i64,
+    pub base_total: u64,
+    pub sel_total: u64,
 }
 
 /// One service-graph edge row (`graph_sql::service_graph_sql`, issue #173):

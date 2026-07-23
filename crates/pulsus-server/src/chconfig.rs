@@ -351,6 +351,7 @@ pub(crate) fn trace_read_config_from(config: &Config) -> TraceReadConfig {
         edges_table: format!("trace_edges{dist}"),
         max_candidates: config.reader.traceql_max_candidates,
         scan_budget_rows: config.reader.traceql_scan_budget_rows,
+        max_series: config.reader.traceql_max_series,
         generator_max_memory_bytes: config.reader.traceql_generator_max_memory_bytes,
         distributed: config.cluster.is_some(),
         skip_unavailable_shards: config.skip_unavailable_shards,

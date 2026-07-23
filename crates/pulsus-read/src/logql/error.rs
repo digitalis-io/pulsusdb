@@ -87,6 +87,15 @@ pub enum TooBroadReason {
     /// mapper (`traces::exec::map_trace_metrics_error`); never conflated
     /// with the byte scan budget or the trace row budget.
     TraceMetricsSetRows { max_set_rows: u64 },
+    /// Issue #182: a TraceQL metrics `by(...)` query resolved more distinct
+    /// output series than `reader.traceql_max_series`. A Rust-side
+    /// structural limit — the distinct-by-key `GROUP BY <by-keys> LIMIT
+    /// cap+1` probe returned `cap+1` before the main query ran — never
+    /// from a ClickHouse error code. `Trace…`-prefixed to sit unconflated
+    /// beside the LogQL `MetricSeries` cap (a different construct).
+    /// Complete-or-error: a breach is a static reject, never a silent
+    /// subset. Operator scale tuning routes to issue #25.
+    TraceMetricsSeriesCap { count: u64, cap: u64 },
     /// Issue #57 re-audit (sub-problem B): the traces phase-1 candidate-
     /// generator read's memory ceiling (`max_memory_usage` +
     /// `max_bytes_before_external_group_by = 0`, throw — server code 241
@@ -197,6 +206,13 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "trace metrics attribute-set budget of {max_set_rows} rows exceeded"
+                )
+            }
+            TooBroadReason::TraceMetricsSeriesCap { count, cap } => {
+                write!(
+                    f,
+                    "trace metrics by() resolved at least {count} series, exceeding the \
+                     {cap}-series cap"
                 )
             }
             TooBroadReason::TraceGeneratorMemory { budget_bytes } => {

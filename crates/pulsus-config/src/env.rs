@@ -68,6 +68,7 @@ pub const ALL_ENV_VARS: &[&str] = &[
     "PULSUS_LOGQL_PIPELINE_SCAN_FACTOR",
     "PULSUS_TRACEQL_MAX_CANDIDATES",
     "PULSUS_TRACEQL_SCAN_BUDGET_ROWS",
+    "PULSUS_TRACEQL_MAX_SERIES",
     "PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES",
     "PULSUS_QUERY_EVAL_CONCURRENCY",
     "PULSUS_TAIL_POLL_INTERVAL",
@@ -327,6 +328,9 @@ pub fn apply_env(cfg: &mut Config) -> Result<(), ConfigError> {
     if let Some(v) = read("PULSUS_TRACEQL_SCAN_BUDGET_ROWS") {
         cfg.reader.traceql_scan_budget_rows = parse_int("PULSUS_TRACEQL_SCAN_BUDGET_ROWS", &v)?;
     }
+    if let Some(v) = read("PULSUS_TRACEQL_MAX_SERIES") {
+        cfg.reader.traceql_max_series = parse_int("PULSUS_TRACEQL_MAX_SERIES", &v)?;
+    }
     if let Some(v) = read("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES") {
         cfg.reader.traceql_generator_max_memory_bytes =
             parse_int("PULSUS_TRACEQL_GENERATOR_MAX_MEMORY_BYTES", &v)?;
@@ -387,8 +391,8 @@ mod tests {
         assert_eq!(sorted, deduped, "ALL_ENV_VARS must not contain duplicates");
         assert_eq!(
             ALL_ENV_VARS.len(),
-            68,
-            "docs/configuration.md §§1-8 document exactly 68 variables"
+            69,
+            "docs/configuration.md §§1-8 document exactly 69 variables"
         );
     }
 

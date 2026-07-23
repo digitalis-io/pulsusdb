@@ -28,8 +28,9 @@
 use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChProto, Idempotency, QuerySettings};
+use pulsus_read::logql::error::TooBroadReason;
 use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
-use pulsus_read::{QueryResult, TraceEngine, TraceMetricsPlan, TraceReadConfig};
+use pulsus_read::{ReadError, TraceEngine, TraceMetricsPlan, TraceMetricsResult, TraceReadConfig};
 use pulsus_schema::{RenderCtx, SchemaParams, run_init};
 
 fn should_run() -> bool {
@@ -230,6 +231,7 @@ fn engine_config() -> TraceReadConfig {
         edges_table: "trace_edges".to_string(),
         max_candidates: 100_000,
         scan_budget_rows: 50_000_000,
+        max_series: 1_000,
         generator_max_memory_bytes: 536_870_912,
         distributed: false,
         skip_unavailable_shards: false,
@@ -262,25 +264,29 @@ fn plan_for(
     .expect("query plans")
 }
 
-fn matrix_points(result: &QueryResult) -> Vec<(i64, f64)> {
-    match result {
-        QueryResult::Matrix(series) => {
-            assert!(series.len() <= 1, "single-series M4 output: {series:?}");
-            series.first().map(|s| s.points.clone()).unwrap_or_default()
-        }
-        other => panic!("expected a matrix, got {other:?}"),
-    }
+/// The samples of an ungrouped result (0 or 1 series).
+fn matrix_points(result: &TraceMetricsResult) -> Vec<(i64, f64)> {
+    assert!(
+        result.series.len() <= 1,
+        "single-series ungrouped output: {:?}",
+        result.series
+    );
+    result
+        .series
+        .first()
+        .map(|s| s.samples.clone())
+        .unwrap_or_default()
 }
 
-fn vector_value(result: &QueryResult) -> f64 {
-    match result {
-        QueryResult::Vector(samples) => {
-            assert_eq!(samples.len(), 1, "one instant sample: {samples:?}");
-            assert!(samples[0].labels.is_empty(), "label-less M4 output");
-            samples[0].value
-        }
-        other => panic!("expected a vector, got {other:?}"),
-    }
+/// The one instant sample value of an ungrouped result.
+fn vector_value(result: &TraceMetricsResult) -> f64 {
+    assert_eq!(result.series.len(), 1, "one instant series: {result:?}");
+    assert_eq!(
+        result.series[0].samples.len(),
+        1,
+        "one instant sample: {result:?}"
+    );
+    result.series[0].samples[0].1
 }
 
 /// Asserts the full AC4 identity set for one filter over the aligned
@@ -374,6 +380,487 @@ async fn assert_identities(engine: &TraceEngine, filter: &str, expected: i64) {
             "{filter}: instant ({instant_rate}) == the single whole-window bucket ({})",
             whole_points[0].1
         );
+    }
+}
+
+/// P3 (issue #182): the `*_over_time(duration)` value-aggregation
+/// identities over the aligned primary window. Every corpus span has
+/// `duration_ns = 1_000_000` (0.001 s), so `min == max == avg == 0.001`
+/// and `sum == count · 0.001`. Proves the replay-dedup inner query and
+/// the ns→seconds encode-boundary scaling.
+async fn assert_aggregation_identities(engine: &TraceEngine) {
+    let end_s = base_s() + CORPUS_SPANS;
+    let one_ms_s = 0.001_f64;
+
+    // sum_over_time(duration): Σ buckets == CORPUS_SPANS · 0.001.
+    let sum_plan = plan_for(engine, "{} | sum_over_time(duration)", base_s(), end_s, 60);
+    let sum_points = matrix_points(&engine.metrics_range(&sum_plan).await.expect("sum range"));
+    let sum_total: f64 = sum_points.iter().map(|(_, v)| v).sum();
+    assert!(
+        (sum_total - CORPUS_SPANS as f64 * one_ms_s).abs() < 1e-9,
+        "sum_over_time total {sum_total} != {}",
+        CORPUS_SPANS as f64 * one_ms_s
+    );
+
+    // Instant min/max/avg over the whole window == 0.001 (all equal).
+    for (func, label) in [
+        ("min_over_time", "min"),
+        ("max_over_time", "avg"),
+        ("avg_over_time", "avg"),
+    ] {
+        let _ = label;
+        let plan = plan_for(
+            engine,
+            &format!("{{}} | {func}(duration)"),
+            base_s(),
+            end_s,
+            60,
+        );
+        let v = vector_value(&engine.metrics_instant(&plan).await.expect("agg instant"));
+        assert!(
+            (v - one_ms_s).abs() < 1e-9,
+            "{func} instant {v} != {one_ms_s}"
+        );
+    }
+
+    // Replay-dedup: sum is invariant under duplicate inserts (the inner
+    // any(duration_ns) per (t, trace_id, span_id) collapses replays).
+    let before = engine.metrics_range(&sum_plan).await.expect("sum before");
+    // (the corpus was already duplicated earlier in the test run)
+    let after = engine.metrics_range(&sum_plan).await.expect("sum after");
+    assert_eq!(before, after, "sum_over_time is replay-invariant");
+}
+
+/// P3 (issue #182): `by(resource.service.name)` grouping. The corpus has
+/// two services — `checkout` (every 5th span → 120) and `svc-x` (480).
+/// Grouped `rate()` returns one series per service; the partition counts
+/// sum to the ungrouped total, and the series carry the
+/// `resource.service.name` label.
+async fn assert_by_service_grouping(engine: &TraceEngine) {
+    let end_s = base_s() + CORPUS_SPANS;
+    let plan = plan_for(
+        engine,
+        "{} | count_over_time() by(resource.service.name)",
+        base_s(),
+        end_s,
+        CORPUS_SPANS, // one whole-window bucket
+    );
+    let result = engine
+        .metrics_range(&plan)
+        .await
+        .expect("grouped range executes");
+    assert_eq!(result.series.len(), 2, "two services: {result:?}");
+
+    let mut totals: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for series in &result.series {
+        let label = series
+            .labels
+            .iter()
+            .find(|l| l.key == "resource.service.name")
+            .unwrap_or_else(|| panic!("series must carry the service label: {series:?}"));
+        let value = match &label.value {
+            pulsus_read::MetricLabelValue::Str(s) => s.clone(),
+            other => panic!("service label must be a string, got {other:?}"),
+        };
+        totals.insert(value, series.samples.iter().map(|(_, v)| v).sum());
+    }
+    assert_eq!(totals.get("checkout").copied(), Some(120.0));
+    assert_eq!(totals.get("svc-x").copied(), Some(480.0));
+    let grand: f64 = totals.values().sum();
+    assert_eq!(
+        grand, CORPUS_SPANS as f64,
+        "Σ by-partition == ungrouped total"
+    );
+}
+
+/// P3 (issue #182): the `by()` distinct-series cap. With `max_series = 1`
+/// a two-service grouped query trips the distinct-by-key probe → `422
+/// query_too_broad` (`TraceMetricsSeriesCap`), a static reject before the
+/// main query.
+async fn assert_series_cap_rejects() {
+    let mut cfg = engine_config();
+    cfg.max_series = 1;
+    let capped = TraceEngine::new(data_client().await, cfg);
+    let end_s = base_s() + CORPUS_SPANS;
+    let plan = plan_for(
+        &capped,
+        "{} | count_over_time() by(resource.service.name)",
+        base_s(),
+        end_s,
+        60,
+    );
+    let err = capped
+        .metrics_range(&plan)
+        .await
+        .expect_err("2 distinct services > cap 1 must reject");
+    match err {
+        ReadError::QueryTooBroad(TooBroadReason::TraceMetricsSeriesCap { count, cap }) => {
+            assert!(count > cap, "count {count} must exceed cap {cap}");
+            assert_eq!(cap, 1);
+        }
+        other => panic!("expected TraceMetricsSeriesCap, got {other:?}"),
+    }
+    // Under the cap the same query succeeds (control).
+    let ok = TraceEngine::new(data_client().await, engine_config());
+    assert_eq!(
+        ok.metrics_range(&plan)
+            .await
+            .expect("under cap")
+            .series
+            .len(),
+        2
+    );
+}
+
+/// P4 (issue #182): `quantile_over_time` (TDigest) and
+/// `histogram_over_time` (exp-`le`). Every corpus span has
+/// `duration_ns = 1_000_000` (0.001 s), so every quantile is 0.001 s, and
+/// the cumulative histogram is 0 below the `1_000_000`-ns value and
+/// `CORPUS_SPANS` at and above it.
+async fn assert_quantile_and_histogram(engine: &TraceEngine) {
+    let end_s = base_s() + CORPUS_SPANS;
+
+    // quantile_over_time instant: one series per quantile (`p` label),
+    // each == 0.001 s (all durations equal).
+    let q_plan = plan_for(
+        engine,
+        "{} | quantile_over_time(duration, 0.5, 0.9)",
+        base_s(),
+        end_s,
+        CORPUS_SPANS,
+    );
+    let q_res = engine
+        .metrics_instant(&q_plan)
+        .await
+        .expect("quantile instant");
+    assert_eq!(q_res.series.len(), 2, "one series per quantile: {q_res:?}");
+    for (series, want_p) in q_res.series.iter().zip([0.5_f64, 0.9]) {
+        let p = series
+            .labels
+            .iter()
+            .find(|l| l.key == "p")
+            .unwrap_or_else(|| panic!("quantile series carries a `p` label: {series:?}"));
+        assert_eq!(p.value, pulsus_read::MetricLabelValue::Double(want_p));
+        assert!(
+            (series.samples[0].1 - 0.001).abs() < 1e-9,
+            "quantile p={want_p} == 0.001s, got {}",
+            series.samples[0].1
+        );
+    }
+
+    // histogram_over_time instant: one cumulative series per `le` bucket
+    // (`__bucket` label). 1_000_000 ns falls at/below le=4194304 (2^22)
+    // and above le=524288 (2^19), so those two adjacent buckets bracket
+    // the whole population.
+    let h_plan = plan_for(
+        engine,
+        "{} | histogram_over_time(duration)",
+        base_s(),
+        end_s,
+        CORPUS_SPANS,
+    );
+    let h_res = engine
+        .metrics_instant(&h_plan)
+        .await
+        .expect("histogram instant");
+    assert_eq!(
+        h_res.series.len(),
+        14,
+        "one series per exp-le bucket: {h_res:?}"
+    );
+    let bucket = |le_ns: i64| -> f64 {
+        let target = pulsus_read::MetricLabelValue::Double(le_ns as f64 / 1e9);
+        h_res
+            .series
+            .iter()
+            .find(|s| {
+                s.labels
+                    .iter()
+                    .any(|l| l.key == "__bucket" && l.value == target)
+            })
+            .unwrap_or_else(|| panic!("no __bucket series for le={le_ns}"))
+            .samples[0]
+            .1
+    };
+    assert_eq!(bucket(524_288), 0.0, "no span <= 524288 ns");
+    assert_eq!(
+        bucket(4_194_304),
+        CORPUS_SPANS as f64,
+        "all spans <= 4194304 ns (cumulative)"
+    );
+    assert_eq!(
+        bucket(1 << 40),
+        CORPUS_SPANS as f64,
+        "the top bucket holds all"
+    );
+}
+
+/// P5 (issue #182): `with(exemplars=…)` collects ≥1 `trace:id` exemplar,
+/// `with(sample=…)` is accepted (exact superset), and `topk`/`bottomk`
+/// reduce the grouped series set per step.
+async fn assert_exemplars_and_reduction(engine: &TraceEngine) {
+    let end_s = base_s() + CORPUS_SPANS;
+
+    // with(exemplars): review Fix 1 — EVERY range shape carries exemplars
+    // (Tempo emits them for range rate/count/agg/quantile/histogram/
+    // compare; none for instant). Each shape returns ≥1 exemplar with a
+    // real 32-hex trace:id.
+    for q in [
+        "{} | rate() with(exemplars=2)",
+        "{} | count_over_time() with(exemplars=2)",
+        "{} | rate() by(resource.service.name) with(exemplars=2)",
+        "{} | sum_over_time(duration) with(exemplars=2)",
+        "{} | quantile_over_time(duration, 0.9) with(exemplars=2)",
+        "{} | histogram_over_time(duration) with(exemplars=2)",
+        r#"{} | compare({ span.http.status_code = "500" }) with(exemplars=2)"#,
+    ] {
+        let res = engine
+            .metrics_range(&plan_for(engine, q, base_s(), end_s, 60))
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let exs: Vec<&pulsus_read::MetricExemplar> =
+            res.series.iter().flat_map(|s| &s.exemplars).collect();
+        assert!(
+            !exs.is_empty(),
+            "{q}: every range shape must carry exemplars"
+        );
+        let trace = exs[0]
+            .labels
+            .iter()
+            .find(|l| l.key == "trace:id")
+            .unwrap_or_else(|| panic!("{q}: exemplar carries a trace:id label"));
+        match &trace.value {
+            pulsus_read::MetricLabelValue::Str(hex) => {
+                assert_eq!(hex.len(), 32, "{q}: 16-byte hex trace id: {hex:?}");
+                assert!(hex.chars().all(|c| c.is_ascii_hexdigit()), "{q}");
+            }
+            other => panic!("{q}: trace:id must be a string, got {other:?}"),
+        }
+    }
+    // Instant carries no exemplars (matches Tempo — verified black-box).
+    let instant_ex = engine
+        .metrics_instant(&plan_for(
+            engine,
+            "{} | rate() with(exemplars=2)",
+            base_s(),
+            end_s,
+            60,
+        ))
+        .await
+        .expect("instant exemplars");
+    assert_eq!(
+        instant_ex
+            .series
+            .iter()
+            .map(|s| s.exemplars.len())
+            .sum::<usize>(),
+        0,
+        "instant emits no exemplars, matching Tempo"
+    );
+
+    // with(sample): accepted, exact superset — identical to no sample.
+    let plain = engine
+        .metrics_range(&plan_for(engine, "{} | rate()", base_s(), end_s, 60))
+        .await
+        .expect("plain");
+    let sampled = engine
+        .metrics_range(&plan_for(
+            engine,
+            "{} | rate() with(sample=0.1)",
+            base_s(),
+            end_s,
+            60,
+        ))
+        .await
+        .expect("sampled");
+    // Samples equal; sampled has no exemplars, plain has none either.
+    assert_eq!(
+        plain.series[0].samples, sampled.series[0].samples,
+        "with(sample) returns the exact (superset) result"
+    );
+
+    // topk(1) over the two-service grouping keeps only the larger series
+    // per step (svc-x = 480 > checkout = 120); bottomk(1) keeps checkout.
+    let topk = engine
+        .metrics_range(&plan_for(
+            engine,
+            "{} | count_over_time() by(resource.service.name) | topk(1)",
+            base_s(),
+            end_s,
+            CORPUS_SPANS,
+        ))
+        .await
+        .expect("topk");
+    assert_eq!(topk.series.len(), 1, "topk(1) keeps one series");
+    assert_eq!(service_label(&topk.series[0]), "svc-x");
+
+    let bottomk = engine
+        .metrics_range(&plan_for(
+            engine,
+            "{} | count_over_time() by(resource.service.name) | bottomk(1)",
+            base_s(),
+            end_s,
+            CORPUS_SPANS,
+        ))
+        .await
+        .expect("bottomk");
+    assert_eq!(bottomk.series.len(), 1, "bottomk(1) keeps one series");
+    assert_eq!(service_label(&bottomk.series[0]), "checkout");
+}
+
+/// P6b (issue #182): `compare({selection})` cross-tab meta-series and the
+/// `rate() > 5` metrics-result comparison. The corpus has
+/// `span.http.status_code = 500` on every 4th span (150 of 600) and 200 on
+/// the rest (450); the selection is `status_code = 500`.
+async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
+    let end_s = base_s() + CORPUS_SPANS;
+    let plan = plan_for(
+        engine,
+        r#"{} | compare({ span.http.status_code = "500" })"#,
+        base_s(),
+        end_s,
+        CORPUS_SPANS, // one whole-window bucket for exact counts
+    );
+    let res = engine.metrics_range(&plan).await.expect("compare executes");
+
+    // Every series carries a __meta_type in the captured set.
+    let meta_of = |s: &pulsus_read::TraceMetricSeries| -> String {
+        match &s
+            .labels
+            .iter()
+            .find(|l| l.key == "__meta_type")
+            .unwrap()
+            .value
+        {
+            pulsus_read::MetricLabelValue::Str(v) => v.clone(),
+            other => panic!("__meta_type must be a string: {other:?}"),
+        }
+    };
+    let metas: std::collections::BTreeSet<String> = res.series.iter().map(&meta_of).collect();
+    assert!(
+        metas.is_superset(
+            &["baseline", "selection", "baseline_total", "selection_total"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        ),
+        "compare emits the four __meta_type kinds, got {metas:?}"
+    );
+
+    // Look up a series' single-bucket value by (meta_type, attr_key, attr_val).
+    let value = |meta: &str, key: &str, val: &str| -> Option<f64> {
+        res.series
+            .iter()
+            .find(|s| {
+                meta_of(s) == meta
+                    && s.labels.iter().any(|l| {
+                        l.key == key
+                            && matches!(&l.value, pulsus_read::MetricLabelValue::Str(v) if v == val)
+                    })
+            })
+            .map(|s| s.samples.iter().map(|(_, v)| v).sum())
+    };
+    let k = "span.http.status_code";
+    // baseline = the COMPLEMENT (non-selection spans, all status=200 → 450);
+    // a selection value (500) never appears under baseline (the captured
+    // Tempo convention). selection = the 150 status=500 spans.
+    assert_eq!(
+        value("baseline", k, "500"),
+        None,
+        "no baseline 500 (it is the selection)"
+    );
+    assert_eq!(
+        value("baseline", k, "200"),
+        Some(450.0),
+        "baseline 200 = complement"
+    );
+    assert_eq!(value("selection", k, "500"), Some(150.0), "selection 500");
+    assert_eq!(
+        value("selection", k, "200"),
+        None,
+        "no 200 span in the selection"
+    );
+    // Totals: the complement / selection populations.
+    assert_eq!(
+        value("baseline_total", k, "nil"),
+        Some(450.0),
+        "baseline_total = complement"
+    );
+    assert_eq!(
+        value("selection_total", k, "nil"),
+        Some(150.0),
+        "selection_total"
+    );
+
+    // Review Fix 3: the well-known-absent-attribute universe — every
+    // well-known key Tempo enumerates appears as `key=nil` even when no
+    // span carries it; a fully-absent key's baseline/selection nil counts
+    // equal the totals.
+    for wk in [
+        "resource.cluster",
+        "resource.k8s.pod.name",
+        "span.http.method",
+        "span.url.path",
+        "rootServiceName",
+    ] {
+        assert_eq!(
+            value("baseline", wk, "nil"),
+            Some(450.0),
+            "{wk}: well-known-absent baseline nil == complement total"
+        );
+        assert_eq!(
+            value("selection", wk, "nil"),
+            Some(150.0),
+            "{wk}: well-known-absent selection nil == selection total"
+        );
+        assert!(
+            value("baseline_total", wk, "nil").is_some(),
+            "{wk}: well-known key carries a baseline_total series"
+        );
+    }
+
+    // ---- result comparison (`> N`): a client-side sample post-filter. ---
+    // count_over_time per 60s bucket == 60 (one span/second).
+    let kept = engine
+        .metrics_range(&plan_for(
+            engine,
+            "{} | count_over_time() > 50",
+            base_s(),
+            end_s,
+            60,
+        ))
+        .await
+        .expect("result-comparison kept");
+    assert_eq!(kept.series.len(), 1, "60 > 50 keeps the series");
+    assert!(kept.series[0].samples.iter().all(|(_, v)| *v > 50.0));
+
+    let dropped = engine
+        .metrics_range(&plan_for(
+            engine,
+            "{} | count_over_time() > 100",
+            base_s(),
+            end_s,
+            60,
+        ))
+        .await
+        .expect("result-comparison dropped");
+    assert!(
+        dropped.series.is_empty(),
+        "60 > 100 drops every sample → no series"
+    );
+}
+
+/// The `resource.service.name` string label value of a series.
+fn service_label(series: &pulsus_read::TraceMetricSeries) -> String {
+    match &series
+        .labels
+        .iter()
+        .find(|l| l.key == "resource.service.name")
+        .expect("service label")
+        .value
+    {
+        pulsus_read::MetricLabelValue::Str(s) => s.clone(),
+        other => panic!("service label must be a string, got {other:?}"),
     }
 }
 
@@ -500,12 +987,28 @@ async fn metrics_internal_consistency_identities() {
     // (the documented empty-DB oracles). ---------------------------------
     let empty_start = base_s() - 86_400;
     let plan = plan_for(&engine, "{} | rate()", empty_start, empty_start + 600, 60);
-    assert_eq!(
-        engine.metrics_range(&plan).await.expect("empty range"),
-        QueryResult::Matrix(vec![])
+    assert!(
+        engine
+            .metrics_range(&plan)
+            .await
+            .expect("empty range")
+            .series
+            .is_empty(),
+        "an empty range is no series"
     );
     let instant = engine.metrics_instant(&plan).await.expect("empty instant");
     assert_eq!(vector_value(&instant), 0.0);
+
+    // ---- P3 (issue #182): value aggregations, by() grouping, series cap.
+    assert_aggregation_identities(&engine).await;
+    assert_by_service_grouping(&engine).await;
+    assert_series_cap_rejects().await;
+    // ---- P4 (issue #182): quantile (TDigest) + histogram (exp-le).
+    assert_quantile_and_histogram(&engine).await;
+    // ---- P5 (issue #182): exemplars, with(sample), topk/bottomk.
+    assert_exemplars_and_reduction(&engine).await;
+    // ---- P6b (issue #182): compare() cross-tab + result comparison.
+    assert_compare_and_result_comparison(&engine).await;
 
     // ---- Extreme-epoch bucket labels (issue #59 re-audit): pre-1970 and
     // post-2106 buckets must produce the correct Int64 millisecond label,

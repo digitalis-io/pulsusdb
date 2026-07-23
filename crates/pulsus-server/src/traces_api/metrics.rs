@@ -1,11 +1,13 @@
-//! `GET /api/traces/v1/metrics/{query_range,query}` (issue #59;
+//! `GET /api/traces/v1/metrics/{query_range,query}` (issue #59/#182;
 //! docs/api.md §4.4): parse params (`params.rs`) → `pulsus_traceql::parse`
 //! → `pulsus_read::plan_trace_metrics` — all **before** the pool, same
 //! discipline as `search.rs`, so every 400/422-class failure resolves
 //! without ClickHouse — → `TraceEngine::metrics_range`/`metrics_instant`
-//! → the shared Prometheus matrix/vector encoder
-//! (`prom_api::encode::query_response`). Thin by design: SQL/execution
-//! stays in `pulsus-read`.
+//! → the Tempo-native metrics encoder (`metrics_response::encode_metrics`).
+//! Thin by design: SQL/execution stays in `pulsus-read`. Issue #182
+//! replaced the Prometheus matrix/vector envelope with the Tempo-native
+//! `{series, metrics}` body (a documented breaking change — these
+//! endpoints are Tempo-datasource-only).
 
 use axum::extract::{RawQuery, State};
 use axum::response::{IntoResponse, Response};
@@ -70,6 +72,7 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
             attrs_table: &read_config.attrs_table,
         },
         scan_budget_rows: read_config.scan_budget_rows,
+        max_series: read_config.max_series,
         distributed: read_config.distributed,
         skip_unavailable_shards: read_config.skip_unavailable_shards,
     };
@@ -82,17 +85,11 @@ async fn metrics_impl(state: AppState, raw: &str, form: MetricsForm) -> Result<R
         pulsus_read::plan_trace_metrics(&query, &metrics_params, &ctx).map_err(ApiError::Plan)?;
 
     let engine = engine_for(&state).await?;
-    let (result, at_ms) = match form {
-        // `at_ms` is only read for vector/scalar results — the matrix's
-        // points carry their own bucket timestamps.
-        MetricsForm::Range => (engine.metrics_range(&plan).await?, 0),
-        MetricsForm::Instant => (engine.metrics_instant(&plan).await?, plan.snapped_end_ms()),
+    let result = match form {
+        MetricsForm::Range => engine.metrics_range(&plan).await?,
+        MetricsForm::Instant => engine.metrics_instant(&plan).await?,
     };
-    // `ordered: false` — TraceQL metrics have no sort-rooted form; the
-    // encoder's deterministic label sort stays in force (issue #68).
-    Ok(crate::prom_api::encode::query_response(
-        result, None, at_ms, false,
-    ))
+    Ok(super::metrics_response::encode_metrics(&result))
 }
 
 #[cfg(test)]

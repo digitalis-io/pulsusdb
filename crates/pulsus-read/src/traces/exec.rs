@@ -70,21 +70,26 @@
 //! token in these two files fails that guard until it is allowlisted with
 //! its charge site documented.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use futures::StreamExt;
 use pulsus_clickhouse::{ChClient, ChError, ChRow, QuerySettings};
 
 use super::graph_sql::{self, GraphWindow};
-use super::metrics_plan::{MetricFunc, MetricsCtx, TraceMetricsPlan};
+use super::metrics_plan::{MetricsCtx, PlanKind, TraceMetricsPlan};
+use super::metrics_result::{MetricExemplar, MetricLabel, TraceMetricSeries, TraceMetricsResult};
 use super::rows::{
-    CandidateRow, GraphEdgeRow, HydrationRow, MembershipRow, MetricBucketRow, MetricCountRow,
-    NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow, TagValueRow,
+    CandidateRow, CompareCrossTabRow, CompareTotalsRow, GraphEdgeRow, HydrationRow, MembershipRow,
+    MetricAggGroupInstantRow, MetricAggGroupRow, MetricAggInstantRow, MetricAggRow,
+    MetricBucketRow, MetricCountRow, MetricExemplarRow, MetricGroupCountInstantRow,
+    MetricGroupCountRow, MetricHistogramInstantRow, MetricHistogramRow, MetricQuantileInstantRow,
+    MetricQuantileRow, NumValueRow, RootRow, StoredSpan, StoredSpanRow, StrValueRow, TagNameRow,
+    TagValueRow,
 };
 use super::search_eval::{self, BatchAttrs, HydratedSpan, SpanSummary, TraceMatch, TraceSpans};
 use super::search_plan::{SearchCtx, SearchPlan};
 use crate::logql::error::{ReadError, TooBroadReason};
-use crate::logql::exec::{MatrixSeries, QueryResult, VectorSample, escape_query_placeholders};
+use crate::logql::exec::escape_query_placeholders;
 use crate::logql::explain::PlanExplain;
 
 /// Phase-2 batch width: candidates hydrated/evaluated per round trip.
@@ -240,6 +245,10 @@ pub struct TraceReadConfig {
     /// every search query; breach → 422 (code 158 →
     /// [`TooBroadReason::TraceScanBudgetRows`]).
     pub scan_budget_rows: u64,
+    /// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
+    /// distinct-series cap; the `LIMIT cap+1` probe breach → 422
+    /// ([`TooBroadReason::TraceMetricsSeriesCap`]).
+    pub max_series: u64,
     /// `reader.traceql_generator_max_memory_bytes` — the phase-1
     /// candidate-generator query's `max_memory_usage` ceiling (issue #57
     /// re-audit, sub-problem B): bounds a dense common-value prefix's
@@ -526,6 +535,7 @@ impl TraceEngine {
                 attrs_table: &self.config.attrs_table,
             },
             scan_budget_rows: self.config.scan_budget_rows,
+            max_series: self.config.max_series,
             distributed: self.config.distributed,
             skip_unavailable_shards: self.config.skip_unavailable_shards,
         }
@@ -541,29 +551,409 @@ impl TraceEngine {
     /// issue #59 re-audit, `Int64` epoch-milliseconds). Empty result
     /// → `Matrix(vec![])` (the documented empty-DB oracle); otherwise one
     /// label-less series (single-series M4 output — `by()` is M7).
-    pub async fn metrics_range(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
+    pub async fn metrics_range(
+        &self,
+        plan: &TraceMetricsPlan,
+    ) -> Result<TraceMetricsResult, ReadError> {
+        let mut result = self.frame_range(plan).await?;
+        // P5: attach per-bucket exemplars (ungrouped rate/count) and apply
+        // the topk/bottomk second-stage reduction (issue #182).
+        if plan.exemplar_sql().is_some() {
+            self.attach_range_exemplars(plan, &mut result).await?;
+        }
+        // P6b: the metrics-result comparison post-filter (`… > 5`).
+        if let Some(rf) = plan.result_filter() {
+            apply_result_filter(rf, &mut result);
+        }
+        if let Some(reduce) = plan.reduce() {
+            apply_series_reduce(reduce, &mut result);
+        }
+        Ok(result)
+    }
+
+    /// Frames the first-stage range result (before P5 exemplars/reduce).
+    async fn frame_range(&self, plan: &TraceMetricsPlan) -> Result<TraceMetricsResult, ReadError> {
+        self.enforce_series_cap(plan).await?;
+        if plan.kind() == PlanKind::Compare {
+            let (cross_tab, totals) = plan
+                .compare_range()
+                .expect("compare plan carries range SQL");
+            return self.frame_compare(cross_tab, totals).await;
+        }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.range_sql());
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
-        let mut points: Vec<(i64, f64)> = Vec::new();
-        // Scoped stream (module convention): the pooled-connection lease
-        // drops at return, after full consumption (≤ cap buckets).
+        match (plan.kind(), plan.group_label()) {
+            (PlanKind::Quantile, _) => {
+                // One series per requested quantile (`p=<q>`); the TDigest
+                // result array is ordered as requested. ns→seconds scale.
+                let quantiles = plan.quantiles();
+                let mut series: Vec<TraceMetricSeries> = quantiles
+                    .iter()
+                    .map(|q| TraceMetricSeries {
+                        labels: vec![MetricLabel::double("p", *q)],
+                        samples: Vec::new(),
+                        exemplars: Vec::new(),
+                    })
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricQuantileRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    for (i, s) in series.iter_mut().enumerate() {
+                        let v = row.qs.get(i).copied().unwrap_or(0.0);
+                        s.samples.push((row.t_ms, agg_value(finite_or_zero(v))));
+                    }
+                }
+                if series.iter().all(|s| s.samples.is_empty()) {
+                    return Ok(TraceMetricsResult { series: vec![] });
+                }
+                Ok(TraceMetricsResult { series })
+            }
+            (PlanKind::Histogram, _) => {
+                // One cumulative-count series per exponential `le` bucket
+                // (`__bucket=<le seconds>`).
+                let bounds = plan.histogram_le_bounds_ns();
+                let mut series: Vec<TraceMetricSeries> = bounds
+                    .iter()
+                    .map(|le| TraceMetricSeries {
+                        labels: vec![MetricLabel::double("__bucket", *le as f64 / 1e9)],
+                        samples: Vec::new(),
+                        exemplars: Vec::new(),
+                    })
+                    .collect();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricHistogramRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                    for (i, s) in series.iter_mut().enumerate() {
+                        let v = row.bkts.get(i).copied().unwrap_or(0);
+                        s.samples.push((row.t_ms, v as f64));
+                    }
+                }
+                if series.iter().all(|s| s.samples.is_empty()) {
+                    return Ok(TraceMetricsResult { series: vec![] });
+                }
+                Ok(TraceMetricsResult { series })
+            }
+            (kind, None) => {
+                let mut samples: Vec<(i64, f64)> = Vec::new();
+                match kind {
+                    PlanKind::Count { is_rate } => {
+                        let denom = plan.step_s();
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricBucketRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            samples.push((row.t_ms, count_value(is_rate, row.n, denom)));
+                        }
+                    }
+                    PlanKind::Agg(_) => {
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricAggRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            samples.push((row.t_ms, agg_value(row.v)));
+                        }
+                    }
+                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+                        unreachable!("quantile/histogram are framed above")
+                    }
+                }
+                if samples.is_empty() {
+                    return Ok(TraceMetricsResult { series: vec![] });
+                }
+                Ok(TraceMetricsResult {
+                    series: vec![TraceMetricSeries {
+                        labels: vec![MetricLabel::str("__name__", plan.metric_name())],
+                        samples,
+                        exemplars: vec![],
+                    }],
+                })
+            }
+            (kind, Some(label)) => {
+                // Grouped: collect samples per group value into a
+                // deterministic (BTreeMap-ordered) set of labelled series.
+                let mut by_group: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+                match kind {
+                    PlanKind::Count { is_rate } => {
+                        let denom = plan.step_s();
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricGroupCountRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            by_group
+                                .entry(row.g0)
+                                .or_default()
+                                .push((row.t_ms, count_value(is_rate, row.n, denom)));
+                        }
+                    }
+                    PlanKind::Agg(_) => {
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricAggGroupRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            by_group
+                                .entry(row.g0)
+                                .or_default()
+                                .push((row.t_ms, agg_value(row.v)));
+                        }
+                    }
+                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+                        unreachable!("quantile/histogram are framed above")
+                    }
+                }
+                Ok(TraceMetricsResult {
+                    series: by_group
+                        .into_iter()
+                        .map(|(g, samples)| TraceMetricSeries {
+                            labels: vec![MetricLabel::str(label, g)],
+                            samples,
+                            exemplars: vec![],
+                        })
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    /// Runs the grouped-query distinct-by-key series probe (issue #182):
+    /// a `cap+1` result is a static `422 query_too_broad`
+    /// ([`TooBroadReason::TraceMetricsSeriesCap`]). Ungrouped plans have
+    /// no probe and return immediately.
+    async fn enforce_series_cap(&self, plan: &TraceMetricsPlan) -> Result<(), ReadError> {
+        let Some(probe) = plan.probe_sql() else {
+            return Ok(());
+        };
+        let cap = self.config.max_series;
+        let settings = metrics_settings(&self.config);
+        let sql = escape_query_placeholders(probe);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let mut count: u64 = 0;
+        // Scoped stream: the probe returns exactly one `count()` row.
         let mut stream = self
             .client
-            .query_stream::<MetricBucketRow>(&sql, &settings)
+            .query_stream::<MetricCountRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            count = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
+        }
+        if count > cap {
+            return Err(ReadError::QueryTooBroad(
+                TooBroadReason::TraceMetricsSeriesCap { count, cap },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Frames a `compare()` result (issue #182 P6b) from its cross-tab and
+    /// totals queries into the captured Tempo meta-series shape: per
+    /// attribute `(key, value)` a `baseline` (all outer spans) and a
+    /// `selection` (`is_sel`) series; per key a `key=nil` complement
+    /// (`total − Σ present`) and the `baseline_total`/`selection_total`
+    /// denominators (`__meta_type` label + one attribute label).
+    async fn frame_compare(
+        &self,
+        cross_tab_sql: &str,
+        totals_sql: &str,
+    ) -> Result<TraceMetricsResult, ReadError> {
+        let settings = metrics_settings(&self.config);
+        // (key, value) -> [(t, base_n, sel_n)]; (key, t) -> Σ present.
+        let mut per_kv: BTreeMap<(String, String), CompareValueBuckets> = BTreeMap::new();
+        let mut key_bucket_sum: BTreeMap<(String, i64), (u64, u64)> = BTreeMap::new();
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        {
+            let sql = escape_query_placeholders(cross_tab_sql);
+            crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+            let mut stream = self
+                .client
+                .query_stream::<CompareCrossTabRow>(&sql, &settings)
+                .await
+                .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                keys.insert(row.akey.clone());
+                per_kv
+                    .entry((row.akey.clone(), row.aval))
+                    .or_default()
+                    .push((row.t_ms, row.base_n, row.sel_n));
+                let e = key_bucket_sum.entry((row.akey, row.t_ms)).or_default();
+                e.0 += row.base_n;
+                e.1 += row.sel_n;
+            }
+        }
+        // Per-bucket baseline/selection totals (the denominators).
+        let mut totals: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+        {
+            let sql = escape_query_placeholders(totals_sql);
+            crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+            let mut stream = self
+                .client
+                .query_stream::<CompareTotalsRow>(&sql, &settings)
+                .await
+                .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+            while let Some(row) = stream.next().await {
+                let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                totals.insert(row.t_ms, (row.base_total, row.sel_total));
+            }
+        }
+
+        let mut series: Vec<TraceMetricSeries> = Vec::new();
+        let meta = |kind: &str, key: &str, val: &str| -> Vec<MetricLabel> {
+            vec![
+                MetricLabel::str("__meta_type", kind),
+                MetricLabel::str(key, val),
+            ]
+        };
+        for key in &keys {
+            // Present values: one baseline + one selection series each.
+            for ((k, val), rows) in per_kv.range((key.clone(), String::new())..) {
+                if k != key {
+                    break;
+                }
+                let base: Vec<(i64, f64)> = rows.iter().map(|(t, b, _)| (*t, *b as f64)).collect();
+                let sel: Vec<(i64, f64)> = rows.iter().map(|(t, _, s)| (*t, *s as f64)).collect();
+                series.push(TraceMetricSeries {
+                    labels: meta("baseline", key, val),
+                    samples: base,
+                    exemplars: vec![],
+                });
+                series.push(TraceMetricSeries {
+                    labels: meta("selection", key, val),
+                    samples: sel,
+                    exemplars: vec![],
+                });
+            }
+            // `key=nil` complement + the `*_total` denominators, per bucket.
+            let mut base_nil = Vec::new();
+            let mut sel_nil = Vec::new();
+            let mut base_total = Vec::new();
+            let mut sel_total = Vec::new();
+            for (&t, &(bt, st)) in &totals {
+                let (bp, sp) = key_bucket_sum
+                    .get(&(key.clone(), t))
+                    .copied()
+                    .unwrap_or((0, 0));
+                base_nil.push((t, bt.saturating_sub(bp) as f64));
+                sel_nil.push((t, st.saturating_sub(sp) as f64));
+                base_total.push((t, bt as f64));
+                sel_total.push((t, st as f64));
+            }
+            series.push(TraceMetricSeries {
+                labels: meta("baseline", key, "nil"),
+                samples: base_nil,
+                exemplars: vec![],
+            });
+            series.push(TraceMetricSeries {
+                labels: meta("selection", key, "nil"),
+                samples: sel_nil,
+                exemplars: vec![],
+            });
+            series.push(TraceMetricSeries {
+                labels: meta("baseline_total", key, "nil"),
+                samples: base_total,
+                exemplars: vec![],
+            });
+            series.push(TraceMetricSeries {
+                labels: meta("selection_total", key, "nil"),
+                samples: sel_total,
+                exemplars: vec![],
+            });
+        }
+        // The well-known-absent-attribute universe (issue #182 review Fix
+        // 3): Tempo enumerates a fixed set of intrinsic/resource/OTLP-
+        // semconv keys even when no span carries them, as `key=nil`. For a
+        // fully-absent key every span lacks it, so `baseline`/`selection`
+        // `key=nil` equal the totals. Captured black-box + OTLP semconv
+        // (see [`WELL_KNOWN_COMPARE_KEYS`]).
+        for &wk in super::metrics_plan::WELL_KNOWN_COMPARE_KEYS {
+            if keys.contains(wk) {
+                continue; // already enumerated from present data
+            }
+            let base_total: Vec<(i64, f64)> =
+                totals.iter().map(|(&t, &(b, _))| (t, b as f64)).collect();
+            let sel_total: Vec<(i64, f64)> =
+                totals.iter().map(|(&t, &(_, s))| (t, s as f64)).collect();
+            for kind in ["baseline", "baseline_total"] {
+                series.push(TraceMetricSeries {
+                    labels: meta(kind, wk, "nil"),
+                    samples: base_total.clone(),
+                    exemplars: vec![],
+                });
+            }
+            for kind in ["selection", "selection_total"] {
+                series.push(TraceMetricSeries {
+                    labels: meta(kind, wk, "nil"),
+                    samples: sel_total.clone(),
+                    exemplars: vec![],
+                });
+            }
+        }
+        // Drop all-zero meta-series (e.g. a selection value never appears
+        // under `baseline`) — matches Tempo's omission of empty series.
+        series.retain(|s| s.samples.iter().any(|(_, v)| *v != 0.0));
+        Ok(TraceMetricsResult { series })
+    }
+
+    /// Runs the exemplar-collection query (issue #182 P5) and attaches a
+    /// bounded `trace:id` exemplar per sampled span to the (single,
+    /// ungrouped rate/count) series. Each exemplar carries the bucket's
+    /// metric value and the span's own timestamp (Tempo emits only the
+    /// trace reference; the sampled span_id is not a wire field).
+    async fn attach_range_exemplars(
+        &self,
+        plan: &TraceMetricsPlan,
+        result: &mut TraceMetricsResult,
+    ) -> Result<(), ReadError> {
+        let Some(exemplar_sql) = plan.exemplar_sql() else {
+            return Ok(());
+        };
+        let Some(series) = result.series.first_mut() else {
+            return Ok(());
+        };
+        // Bucket start (ms) → the series value at that bucket.
+        let value_at: BTreeMap<i64, f64> = series.samples.iter().copied().collect();
+        let settings = metrics_settings(&self.config);
+        let sql = escape_query_placeholders(exemplar_sql);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let mut exemplars: Vec<MetricExemplar> = Vec::new();
+        let mut stream = self
+            .client
+            .query_stream::<MetricExemplarRow>(&sql, &settings)
             .await
             .map_err(|e| map_trace_metrics_error(e, &self.config))?;
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-            points.push((row.t_ms, metric_value(plan.func(), row.n, plan.step_s())));
+            let value = value_at.get(&row.t_ms).copied().unwrap_or(0.0);
+            for (trace_id, ts_ns) in row.ex {
+                exemplars.push(MetricExemplar {
+                    labels: vec![MetricLabel::str("trace:id", hex16(&trace_id))],
+                    value,
+                    timestamp_ms: ts_ns / 1_000_000,
+                });
+            }
         }
-        if points.is_empty() {
-            return Ok(QueryResult::Matrix(vec![]));
-        }
-        Ok(QueryResult::Matrix(vec![MatrixSeries {
-            labels: vec![],
-            points,
-        }]))
+        series.exemplars = exemplars;
+        Ok(())
     }
 
     /// Executes a metrics instant plan (issue #59): the same pushed-down
@@ -572,27 +962,174 @@ impl TraceEngine {
     /// one-sample label-less vector; the instant `rate` denominator is
     /// the snapped window width (plan v2 delta 2). The caller stamps the
     /// sample at [`TraceMetricsPlan::snapped_end_ms`].
-    pub async fn metrics_instant(&self, plan: &TraceMetricsPlan) -> Result<QueryResult, ReadError> {
+    pub async fn metrics_instant(
+        &self,
+        plan: &TraceMetricsPlan,
+    ) -> Result<TraceMetricsResult, ReadError> {
+        let mut result = self.frame_instant(plan).await?;
+        if let Some(rf) = plan.result_filter() {
+            apply_result_filter(rf, &mut result);
+        }
+        if let Some(reduce) = plan.reduce() {
+            apply_series_reduce(reduce, &mut result);
+        }
+        Ok(result)
+    }
+
+    /// Frames the first-stage instant result (before the P5 reduction).
+    async fn frame_instant(
+        &self,
+        plan: &TraceMetricsPlan,
+    ) -> Result<TraceMetricsResult, ReadError> {
+        self.enforce_series_cap(plan).await?;
+        if plan.kind() == PlanKind::Compare {
+            let (cross_tab, totals) = plan
+                .compare_instant()
+                .expect("compare plan carries instant SQL");
+            return self.frame_compare(cross_tab, totals).await;
+        }
         let settings = metrics_settings(&self.config);
         let sql = escape_query_placeholders(plan.instant_sql());
         crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
-        let mut count: Option<u64> = None;
-        // Scoped stream: same lease/drain contract as metrics_range
-        // (exactly one row by the SQL shape).
-        let mut stream = self
-            .client
-            .query_stream::<MetricCountRow>(&sql, &settings)
-            .await
-            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
-            count = Some(row.n);
+        let at_ms = plan.snapped_end_ms();
+        match (plan.kind(), plan.group_label()) {
+            (PlanKind::Quantile, _) => {
+                let quantiles = plan.quantiles();
+                let mut qs: Vec<f64> = Vec::new();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricQuantileInstantRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    qs = row
+                        .map_err(|e| map_trace_metrics_error(e, &self.config))?
+                        .qs;
+                }
+                Ok(TraceMetricsResult {
+                    series: quantiles
+                        .iter()
+                        .enumerate()
+                        .map(|(i, q)| {
+                            let v = agg_value(finite_or_zero(qs.get(i).copied().unwrap_or(0.0)));
+                            TraceMetricSeries {
+                                labels: vec![MetricLabel::double("p", *q)],
+                                samples: vec![(at_ms, v)],
+                                exemplars: vec![],
+                            }
+                        })
+                        .collect(),
+                })
+            }
+            (PlanKind::Histogram, _) => {
+                let bounds = plan.histogram_le_bounds_ns();
+                let mut bkts: Vec<u64> = Vec::new();
+                let mut stream = self
+                    .client
+                    .query_stream::<MetricHistogramInstantRow>(&sql, &settings)
+                    .await
+                    .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                while let Some(row) = stream.next().await {
+                    bkts = row
+                        .map_err(|e| map_trace_metrics_error(e, &self.config))?
+                        .bkts;
+                }
+                Ok(TraceMetricsResult {
+                    series: bounds
+                        .iter()
+                        .enumerate()
+                        .map(|(i, le)| TraceMetricSeries {
+                            labels: vec![MetricLabel::double("__bucket", *le as f64 / 1e9)],
+                            samples: vec![(at_ms, bkts.get(i).copied().unwrap_or(0) as f64)],
+                            exemplars: vec![],
+                        })
+                        .collect(),
+                })
+            }
+            (kind, None) => {
+                // Ungrouped: exactly one row (aggregate with no GROUP BY).
+                let value = match kind {
+                    PlanKind::Count { is_rate } => {
+                        let denom = plan.window_s();
+                        let mut n: u64 = 0;
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricCountRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            n = row.map_err(|e| map_trace_metrics_error(e, &self.config))?.n;
+                        }
+                        count_value(is_rate, n, denom)
+                    }
+                    PlanKind::Agg(_) => {
+                        // `any(...)` over an empty set yields no row; an
+                        // empty aggregate window is a 0-valued sample.
+                        let mut v: Option<f64> = None;
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricAggInstantRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            v = Some(row.map_err(|e| map_trace_metrics_error(e, &self.config))?.v);
+                        }
+                        v.map(agg_value).unwrap_or(0.0)
+                    }
+                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+                        unreachable!("quantile/histogram are framed above")
+                    }
+                };
+                Ok(TraceMetricsResult {
+                    series: vec![TraceMetricSeries {
+                        labels: vec![MetricLabel::str("__name__", plan.metric_name())],
+                        samples: vec![(at_ms, value)],
+                        exemplars: vec![],
+                    }],
+                })
+            }
+            (kind, Some(label)) => {
+                let mut by_group: BTreeMap<String, f64> = BTreeMap::new();
+                match kind {
+                    PlanKind::Count { is_rate } => {
+                        let denom = plan.window_s();
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricGroupCountInstantRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            by_group.insert(row.g0, count_value(is_rate, row.n, denom));
+                        }
+                    }
+                    PlanKind::Agg(_) => {
+                        let mut stream = self
+                            .client
+                            .query_stream::<MetricAggGroupInstantRow>(&sql, &settings)
+                            .await
+                            .map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                        while let Some(row) = stream.next().await {
+                            let row = row.map_err(|e| map_trace_metrics_error(e, &self.config))?;
+                            by_group.insert(row.g0, agg_value(row.v));
+                        }
+                    }
+                    PlanKind::Quantile | PlanKind::Histogram | PlanKind::Compare => {
+                        unreachable!("quantile/histogram are framed above")
+                    }
+                }
+                Ok(TraceMetricsResult {
+                    series: by_group
+                        .into_iter()
+                        .map(|(g, value)| TraceMetricSeries {
+                            labels: vec![MetricLabel::str(label, g)],
+                            samples: vec![(at_ms, value)],
+                            exemplars: vec![],
+                        })
+                        .collect(),
+                })
+            }
         }
-        let n = count.unwrap_or(0);
-        Ok(QueryResult::Vector(vec![VectorSample {
-            labels: vec![],
-            value: metric_value(plan.func(), n, plan.window_s()),
-        }]))
     }
 
     /// Executes the §4.5 service-graph read (issue #173): one fully-pushed-
@@ -1299,13 +1836,125 @@ fn graph_settings(config: &TraceReadConfig) -> QuerySettings {
 
 /// The explicit encode-boundary value conversion (issue #59 plan v2
 /// delta 5): the SQL side always ships the deduped `UInt64` count;
+/// The count-path (`rate`/`count_over_time`) encode-boundary value:
 /// `rate` divides by its denominator (`step_s` per range bucket, the
-/// snapped window width for an instant) in `f64` here — never in SQL.
-fn metric_value(func: MetricFunc, n: u64, rate_denominator_s: i64) -> f64 {
-    match func {
-        MetricFunc::Rate => n as f64 / rate_denominator_s as f64,
-        MetricFunc::CountOverTime => n as f64,
+/// snapped window width for an instant) in `f64` here — never in SQL;
+/// `count_over_time` is the deduped count itself.
+fn count_value(is_rate: bool, n: u64, rate_denominator_s: i64) -> f64 {
+    if is_rate {
+        n as f64 / rate_denominator_s as f64
+    } else {
+        n as f64
     }
+}
+
+/// The value-aggregation (`*_over_time`) encode-boundary value: the
+/// `toFloat64`-cast aggregate over the physical `duration_ns` scaled
+/// nanoseconds→seconds (Tempo's duration-metric unit). Attribute value
+/// targets — when wired — will carry a unit scale of 1.
+fn agg_value(v: f64) -> f64 {
+    v / 1_000_000_000.0
+}
+
+/// Sanitizes a non-finite aggregate (e.g. `quantilesTDigest` over an empty
+/// bucket yields NaN) to `0.0` so the JSON encoder never emits `NaN`.
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() { v } else { 0.0 }
+}
+
+/// Per-bucket `(t_ms, baseline_n, selection_n)` counts for one compare()
+/// attribute `(key, value)` (issue #182 P6b).
+type CompareValueBuckets = Vec<(i64, u64, u64)>;
+
+/// Lowercase hex of a 16-byte trace id (the `trace:id` exemplar label).
+fn hex16(bytes: &[u8; 16]) -> String {
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Applies a metrics-result comparison post-filter (`… > 5`, issue #182
+/// P6b): keeps only samples whose value satisfies `value <op> threshold`;
+/// series left empty are dropped.
+fn apply_result_filter(
+    filter: (pulsus_traceql::ComparisonOp, f64),
+    result: &mut TraceMetricsResult,
+) {
+    use pulsus_traceql::ComparisonOp;
+    let (op, threshold) = filter;
+    let keep = |v: f64| -> bool {
+        match op {
+            ComparisonOp::Eq => v == threshold,
+            ComparisonOp::Neq => v != threshold,
+            ComparisonOp::Gt => v > threshold,
+            ComparisonOp::Gte => v >= threshold,
+            ComparisonOp::Lt => v < threshold,
+            ComparisonOp::Lte => v <= threshold,
+            // Regex operators are rejected at parse time for result
+            // comparisons; treat defensively as no-match.
+            ComparisonOp::Re | ComparisonOp::Nre => false,
+        }
+    };
+    for s in &mut result.series {
+        s.samples.retain(|(_, v)| keep(*v));
+    }
+    result.series.retain(|s| !s.samples.is_empty());
+}
+
+/// Applies a `topk(n)`/`bottomk(n)` second-stage reduction (issue #182 P5)
+/// per timestamp over the series set: at each timestamp the `n` series
+/// with the largest (topk) / smallest (bottomk) value keep their sample;
+/// the rest drop it. Series left with no samples are removed. Ties break
+/// deterministically by series index.
+fn apply_series_reduce(reduce: super::metrics_plan::SeriesReduce, result: &mut TraceMetricsResult) {
+    use super::metrics_plan::SeriesReduce;
+    let (k, top) = match reduce {
+        SeriesReduce::TopK(n) => (n as usize, true),
+        SeriesReduce::BottomK(n) => (n as usize, false),
+    };
+    if k == 0 {
+        result.series.clear();
+        return;
+    }
+    // Every distinct timestamp across all series.
+    let mut timestamps: BTreeSet<i64> = BTreeSet::new();
+    for s in &result.series {
+        for (t, _) in &s.samples {
+            timestamps.insert(*t);
+        }
+    }
+    for t in timestamps {
+        // (series_idx, value) for series present at this timestamp.
+        let mut present: Vec<(usize, f64)> = result
+            .series
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                s.samples
+                    .iter()
+                    .find(|(ts, _)| *ts == t)
+                    .map(|(_, v)| (i, *v))
+            })
+            .collect();
+        if present.len() <= k {
+            continue;
+        }
+        // Rank: topk keeps largest values; bottomk keeps smallest. Ties
+        // break by series index (ascending) deterministically.
+        present.sort_by(|a, b| {
+            let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+            if top { ord.reverse() } else { ord }.then(a.0.cmp(&b.0))
+        });
+        let keep: HashSet<usize> = present.iter().take(k).map(|(i, _)| *i).collect();
+        for (i, s) in result.series.iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                s.samples.retain(|(ts, _)| *ts != t);
+            }
+        }
+    }
+    result.series.retain(|s| !s.samples.is_empty());
 }
 
 /// A fresh `Vec`'s initial reservation, in element slots: `std`'s
@@ -1486,6 +2135,7 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             max_candidates: 100_000,
             scan_budget_rows: 50_000_000,
+            max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             distributed: false,
             skip_unavailable_shards: false,
@@ -1504,6 +2154,7 @@ mod tests {
             edges_table: "trace_edges".to_string(),
             max_candidates: 100,
             scan_budget_rows: 1_000,
+            max_series: 1_000,
             generator_max_memory_bytes: 536_870_912,
             distributed: false,
             skip_unavailable_shards: false,
@@ -1726,9 +2377,12 @@ mod tests {
 
     #[test]
     fn metric_values_convert_at_the_encode_boundary() {
-        assert_eq!(metric_value(MetricFunc::Rate, 120, 60), 2.0);
-        assert_eq!(metric_value(MetricFunc::CountOverTime, 120, 60), 120.0);
-        assert_eq!(metric_value(MetricFunc::Rate, 0, 3_600), 0.0);
+        assert_eq!(count_value(true, 120, 60), 2.0);
+        assert_eq!(count_value(false, 120, 60), 120.0);
+        assert_eq!(count_value(true, 0, 3_600), 0.0);
+        // Value aggregations scale duration ns → seconds.
+        assert_eq!(agg_value(2_000_000_000.0), 2.0);
+        assert_eq!(agg_value(0.0), 0.0);
     }
 
     #[test]

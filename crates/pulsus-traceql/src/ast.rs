@@ -4,13 +4,14 @@
 //! plan cache; also load-bearing for the `Display` round-trip oracle:
 //! `parse(ast.to_string()) == ast`).
 //!
-//! [`PipelineStage`] is the designated additive growth point: T7's
-//! metrics pipeline functions landed as the additive
-//! [`PipelineStage::Metric`] variant (`rate()`, `count_over_time()` —
-//! the committed M4 set), never a reshape of the existing types or
-//! fields. The deferred `*_over_time` functions and metrics grouping
-//! `by` are recognized and reported as `NotYetSupported` (M7 — see
-//! [`UNSUPPORTED_METRIC_FNS`] / [`BOUNDARY_CONSTRUCTS`]).
+//! [`PipelineStage`] is the metrics/aggregate growth point. Issue #59
+//! shipped the zero-arity [`PipelineStage::Metric`] set (`rate()`,
+//! `count_over_time()`); issue #182 completes the first-stage
+//! `*_over_time` family (carried by [`MetricFn`] with its aggregation
+//! target), the `by(...)`/`with(...)` clauses ([`MetricStage`]), and the
+//! `topk`/`bottomk` [`SecondStage`] operators. The remaining
+//! recognized-but-unsupported constructs are reported as `NotYetSupported`
+//! (see [`BOUNDARY_CONSTRUCTS`]).
 
 use std::fmt;
 
@@ -445,9 +446,11 @@ impl fmt::Display for SpanKindValue {
 }
 
 /// A pipeline stage after `|`. M4 implements the search aggregate
-/// filters, `select`, and (issue #59, T7) the zero-arity metrics
-/// functions — [`PipelineStage::Metric`] is the additive fill of the
-/// designated growth point, never a reshape.
+/// filters, `select`, and (issue #59, T7) the metrics functions.
+/// [`PipelineStage::Metric`] carries the first-stage metrics function with
+/// its optional `by(...)` grouping and `with(...)` hints (issue #182);
+/// [`PipelineStage::MetricSecondStage`] carries `topk(n)`/`bottomk(n)`
+/// applied after a `|` to a first-stage metric's series.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PipelineStage {
     /// `count() cmp value` (zero-arity — `field: None`) or
@@ -462,11 +465,25 @@ pub enum PipelineStage {
     /// `select(field, ...)` — one or more fields; `select()` is a
     /// positioned parse error.
     Select { fields: Vec<Field> },
-    /// `rate()` / `count_over_time()` (zero-arity — a stray argument is a
-    /// positioned parse error). Served exclusively by the
+    /// A first-stage metrics function (`rate()`, `count_over_time()`, the
+    /// `*_over_time` family) with its optional `by(...)` grouping and
+    /// trailing `with(...)` hints. Served exclusively by the
     /// `/api/traces/v1/metrics/*` endpoints; the search planner rejects
-    /// this stage (issue #59).
-    Metric(MetricFn),
+    /// this stage (issue #59/#182).
+    Metric(MetricStage),
+    /// A second-stage metrics operator (`topk(n)` / `bottomk(n)`, issue
+    /// #182): reduces the series set a first-stage metric produced. Only
+    /// valid after a metrics stage; the metrics planner enforces that.
+    MetricSecondStage(SecondStage),
+    /// `compare({ selection })` (issue #182): a standalone metrics
+    /// function that partitions the outer spanset into a `selection` (the
+    /// inner filter) and a `baseline` (everything) and emits per-attribute
+    /// meta-series. Its argument is a spanset filter, not a field; it
+    /// accepts trailing `with(...)` hints (e.g. `with(exemplars=…)`).
+    Compare {
+        selection: Box<SpansetFilter>,
+        hints: Vec<MetricHint>,
+    },
 }
 
 impl fmt::Display for PipelineStage {
@@ -491,41 +508,186 @@ impl fmt::Display for PipelineStage {
                 }
                 write!(f, ")")
             }
-            PipelineStage::Metric(func) => write!(f, "{func}()"),
+            PipelineStage::Metric(stage) => write!(f, "{stage}"),
+            PipelineStage::MetricSecondStage(stage) => write!(f, "{stage}"),
+            PipelineStage::Compare { selection, hints } => {
+                write!(f, "compare({selection})")?;
+                if !hints.is_empty() {
+                    write!(f, " with(")?;
+                    for (i, hint) in hints.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{hint}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
-/// The committed M4 TraceQL metrics functions (issue #59, task-manager
-/// adjudication 1): `rate()` and `count_over_time()` only. The five
-/// deferred `*_over_time` functions stay in [`UNSUPPORTED_METRIC_FNS`]
-/// (M7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// A first-stage metrics-function call with its optional `by(...)`
+/// grouping and trailing `with(...)` hints (issue #182). Ungrouped,
+/// hint-less calls carry empty `by`/`hints` vectors — the `rate()` /
+/// `count_over_time()` M4 shape.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MetricStage {
+    pub func: MetricFn,
+    /// `by (fields)` grouping keys; empty means ungrouped.
+    pub by: Vec<Field>,
+    /// `with (k=v, ...)` hints; empty means none.
+    pub hints: Vec<MetricHint>,
+    /// A trailing metrics-result comparison filter (`… > 5`, issue #182 —
+    /// the `metrics.result_comparison` construct): keeps only the series
+    /// samples satisfying `<op> <value>`. `None` when absent. Rendered
+    /// attached to the metric (no `|`) so the round-trip oracle holds.
+    pub result_filter: Option<(ComparisonOp, Value)>,
+}
+
+impl fmt::Display for MetricStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.func)?;
+        if !self.by.is_empty() {
+            write!(f, " by(")?;
+            for (i, field) in self.by.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{field}")?;
+            }
+            write!(f, ")")?;
+        }
+        if !self.hints.is_empty() {
+            write!(f, " with(")?;
+            for (i, hint) in self.hints.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{hint}")?;
+            }
+            write!(f, ")")?;
+        }
+        if let Some((op, value)) = &self.result_filter {
+            write!(f, " {op} {value}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The TraceQL first-stage metrics functions (issue #59 shipped the
+/// zero-arity `rate`/`count_over_time`; issue #182 completes the
+/// `*_over_time` family to Tempo v3.0.2 parity). Each `*_over_time`
+/// function carries a numeric aggregation target field; `quantile_over_time`
+/// additionally carries one or more quantile literals (kept raw as
+/// [`Value::Number`] so the AST stays `Eq`/`Hash`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetricFn {
     Rate,
     CountOverTime,
+    SumOverTime(Field),
+    MinOverTime(Field),
+    MaxOverTime(Field),
+    AvgOverTime(Field),
+    QuantileOverTime { field: Field, quantiles: Vec<Value> },
+    HistogramOverTime(Field),
 }
 
 impl MetricFn {
-    pub(crate) fn from_ident(name: &str) -> Option<Self> {
-        match name {
-            "rate" => Some(Self::Rate),
-            "count_over_time" => Some(Self::CountOverTime),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
+    /// The bare function name (no arguments) — the `Display` head and the
+    /// disposition/registry probe key.
+    pub fn name(&self) -> &'static str {
         match self {
             MetricFn::Rate => "rate",
             MetricFn::CountOverTime => "count_over_time",
+            MetricFn::SumOverTime(_) => "sum_over_time",
+            MetricFn::MinOverTime(_) => "min_over_time",
+            MetricFn::MaxOverTime(_) => "max_over_time",
+            MetricFn::AvgOverTime(_) => "avg_over_time",
+            MetricFn::QuantileOverTime { .. } => "quantile_over_time",
+            MetricFn::HistogramOverTime(_) => "histogram_over_time",
         }
     }
 }
 
 impl fmt::Display for MetricFn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        write!(f, "{}(", self.name())?;
+        match self {
+            MetricFn::Rate | MetricFn::CountOverTime => {}
+            MetricFn::SumOverTime(field)
+            | MetricFn::MinOverTime(field)
+            | MetricFn::MaxOverTime(field)
+            | MetricFn::AvgOverTime(field)
+            | MetricFn::HistogramOverTime(field) => write!(f, "{field}")?,
+            MetricFn::QuantileOverTime { field, quantiles } => {
+                write!(f, "{field}")?;
+                for q in quantiles {
+                    write!(f, ", {q}")?;
+                }
+            }
+        }
+        write!(f, ")")
+    }
+}
+
+/// A `with(...)` hint on a metrics stage (issue #182) — one `key=value`
+/// pair. Values keep their raw lexical form (numbers stay `String`, like
+/// [`Value`]) so the whole AST stays `Eq`/`Hash` for the plan cache and
+/// the `Display` round-trip oracle.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MetricHint {
+    pub key: String,
+    pub value: HintValue,
+}
+
+impl fmt::Display for MetricHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}={}", self.key, self.value)
+    }
+}
+
+/// A `with(...)` hint value (issue #182). Numbers stay raw `String` to
+/// preserve `Eq`/`Hash` on the AST (the [`Value`] convention); the
+/// planner parses them where it needs an `f64`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum HintValue {
+    Bool(bool),
+    Number(String),
+    String(String),
+    Duration(Duration),
+}
+
+impl fmt::Display for HintValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HintValue::Bool(b) => write!(f, "{b}"),
+            HintValue::Number(n) => write!(f, "{n}"),
+            HintValue::String(s) => write!(f, "{}", quote(s)),
+            HintValue::Duration(d) => write!(f, "{d}"),
+        }
+    }
+}
+
+/// A second-stage metrics operator (issue #182): applied after a `|` to
+/// the series a first-stage metric produced. `compare()` and the
+/// metrics-result comparison filter route through the review-gated design
+/// spike (P6) and are not yet parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecondStage {
+    /// `topk(n)` — the `n` series with the largest value per step.
+    TopK(u64),
+    /// `bottomk(n)` — the `n` series with the smallest value per step.
+    BottomK(u64),
+}
+
+impl fmt::Display for SecondStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SecondStage::TopK(n) => write!(f, "topk({n})"),
+            SecondStage::BottomK(n) => write!(f, "bottomk({n})"),
+        }
     }
 }
 
@@ -631,19 +793,6 @@ fn quote(value: &str) -> String {
     out
 }
 
-/// The deferred metrics pipeline functions (issue #59, task-manager
-/// adjudication 1: re-owned to **M7**): recognized at pipeline position,
-/// rejected as `NotYetSupported` with a position. `rate` and
-/// `count_over_time` left this registry when T7 implemented them via
-/// [`PipelineStage::Metric`].
-pub(crate) const UNSUPPORTED_METRIC_FNS: &[&str] = &[
-    "avg_over_time",
-    "min_over_time",
-    "max_over_time",
-    "quantile_over_time",
-    "histogram_over_time",
-];
-
 /// The frozen scope-boundary registry: every recognized-but-unsupported
 /// construct, paired with the milestone/task that owns it. Each entry's
 /// first element is the exact `construct` string carried by the
@@ -661,12 +810,6 @@ pub const BOUNDARY_CONSTRUCTS: &[(&str, &str)] = &[
     ("parent scope", "M7"),
     ("bracketed attribute", "M7"),
     ("bare attribute expression", "M7"),
-    ("metrics function 'avg_over_time'", "M7"),
-    ("metrics function 'min_over_time'", "M7"),
-    ("metrics function 'max_over_time'", "M7"),
-    ("metrics function 'quantile_over_time'", "M7"),
-    ("metrics function 'histogram_over_time'", "M7"),
-    ("metrics grouping 'by'", "M7"),
 ];
 
 #[cfg(test)]
@@ -756,33 +899,92 @@ mod tests {
     }
 
     #[test]
-    fn metric_fns_are_not_recognized_as_implemented_aggregates() {
-        for name in UNSUPPORTED_METRIC_FNS {
-            assert_eq!(AggregateOp::from_ident(name), None);
-            assert_eq!(MetricFn::from_ident(name), None);
-        }
-    }
-
-    #[test]
-    fn metric_fns_round_trip_through_from_ident_and_display() {
-        for (name, func) in [
-            ("rate", MetricFn::Rate),
-            ("count_over_time", MetricFn::CountOverTime),
+    fn metric_fn_names_are_not_search_aggregates() {
+        for name in [
+            "rate",
+            "count_over_time",
+            "sum_over_time",
+            "min_over_time",
+            "max_over_time",
+            "avg_over_time",
+            "quantile_over_time",
+            "histogram_over_time",
         ] {
-            assert_eq!(MetricFn::from_ident(name), Some(func));
-            assert_eq!(func.to_string(), name);
             assert_eq!(AggregateOp::from_ident(name), None);
         }
-        assert_eq!(MetricFn::from_ident("quantile_over_time"), None);
     }
 
     #[test]
-    fn metric_stage_display_renders_the_zero_arity_call() {
-        assert_eq!(PipelineStage::Metric(MetricFn::Rate).to_string(), "rate()");
+    fn metric_fn_display_renders_the_call_with_its_arguments() {
+        assert_eq!(MetricFn::Rate.to_string(), "rate()");
+        assert_eq!(MetricFn::CountOverTime.to_string(), "count_over_time()");
         assert_eq!(
-            PipelineStage::Metric(MetricFn::CountOverTime).to_string(),
-            "count_over_time()"
+            MetricFn::SumOverTime(Field::Intrinsic(Intrinsic::Duration)).to_string(),
+            "sum_over_time(duration)"
         );
+        assert_eq!(
+            MetricFn::QuantileOverTime {
+                field: Field::Intrinsic(Intrinsic::Duration),
+                quantiles: vec![
+                    Value::Number("0.5".to_string()),
+                    Value::Number("0.9".to_string())
+                ],
+            }
+            .to_string(),
+            "quantile_over_time(duration, 0.5, 0.9)"
+        );
+    }
+
+    #[test]
+    fn metric_stage_display_renders_by_and_with_clauses() {
+        let stage = MetricStage {
+            func: MetricFn::Rate,
+            by: vec![Field::Attribute {
+                scope: AttrScope::Resource,
+                key: "service.name".to_string(),
+            }],
+            hints: vec![MetricHint {
+                key: "exemplars".to_string(),
+                value: HintValue::Number("100".to_string()),
+            }],
+            result_filter: None,
+        };
+        assert_eq!(
+            PipelineStage::Metric(stage).to_string(),
+            "rate() by(resource.service.name) with(exemplars=100)"
+        );
+        assert_eq!(
+            PipelineStage::MetricSecondStage(SecondStage::TopK(10)).to_string(),
+            "topk(10)"
+        );
+        // Compare stage + result-comparison filter round-trip.
+        let compare = Query {
+            spanset: SpansetExpr::Filter(SpansetFilter { body: None }),
+            pipeline: vec![PipelineStage::Compare {
+                selection: Box::new(SpansetFilter {
+                    body: Some(FieldExpr::Comparison {
+                        field: Field::Attribute {
+                            scope: AttrScope::Span,
+                            key: "http.status_code".to_string(),
+                        },
+                        op: ComparisonOp::Eq,
+                        value: Value::Number("500".to_string()),
+                    }),
+                }),
+                hints: vec![],
+            }],
+        };
+        assert_eq!(
+            compare.to_string(),
+            "{} | compare({ span.http.status_code = 500 })"
+        );
+        let rc = MetricStage {
+            func: MetricFn::Rate,
+            by: vec![],
+            hints: vec![],
+            result_filter: Some((ComparisonOp::Gt, Value::Number("5".to_string()))),
+        };
+        assert_eq!(PipelineStage::Metric(rc).to_string(), "rate() > 5");
     }
 
     #[test]

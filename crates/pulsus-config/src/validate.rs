@@ -160,6 +160,11 @@ pub const TRACEQL_SCAN_BUDGET_ROWS_CEILING: u64 = 50_000_000_000;
 /// 512 MiB default (512 GiB, the power-of-two byte analogue).
 pub const TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING: u64 = 512 * 1024 * 1024 * 1024;
 
+/// `reader.traceql_max_series` (issue #182) — the metrics `by(...)`
+/// distinct-series cap. Rendered into a `LIMIT {cap + 1}` probe, so the
+/// ceiling keeps `cap + 1` overflow-free; 1000x the 1000 default.
+pub const TRACEQL_MAX_SERIES_CEILING: u64 = 1_000_000;
+
 /// `reader.query_eval_concurrency` — feeds `Semaphore::new` directly
 /// (`pulsus-read`'s `EvalGate`); `usize::MAX` exceeds tokio's
 /// `MAX_PERMITS` (`usize::MAX >> 3`) and panics at startup, and any huge
@@ -500,6 +505,18 @@ pub fn validate(cfg: &Config) -> Result<(), ConfigError> {
             TRACEQL_GENERATOR_MAX_MEMORY_BYTES_CEILING,
             1,
             "the generator memory guard",
+        ));
+    }
+    // Issue #182: the metrics by()-series cap is rendered into a
+    // `LIMIT {cap + 1}` probe; zero would reject every grouped query and
+    // the ceiling keeps `cap + 1` overflow-free.
+    positive_u64("reader.traceql_max_series", cfg.reader.traceql_max_series)?;
+    if cfg.reader.traceql_max_series > TRACEQL_MAX_SERIES_CEILING {
+        return Err(ceiling_err(
+            "reader.traceql_max_series",
+            TRACEQL_MAX_SERIES_CEILING,
+            1,
+            "the metrics series cap",
         ));
     }
     // Issue #101: a zero eval-concurrency bound would admit no eval at all

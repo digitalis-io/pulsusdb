@@ -43,6 +43,7 @@ mod graph;
 mod handlers;
 mod legacy;
 mod metrics;
+mod metrics_response;
 mod negotiate;
 mod params;
 mod search;
