@@ -156,7 +156,13 @@ fn fixture_request_rebased_to_now() -> (ExportTraceServiceRequest, usize, usize)
                 span.start_time_unix_nano = now_ns + offset;
                 span.end_time_unix_nano = now_ns + offset + duration;
                 span_count += 1;
-                attr_count += resource_attrs + span.attributes.len() + scope_attrs;
+                // Issue #192 PR-B: each span event fans out into two
+                // `event:intrinsic` rows (name/timeSinceStart) plus one
+                // `event`-scoped row per event attribute. (The attr rows carry
+                // the SPAN's rebased timestamp/date, so they land in a live
+                // partition; the event's own time only feeds timeSinceStart.)
+                let event_rows: usize = span.events.iter().map(|e| 2 + e.attributes.len()).sum();
+                attr_count += resource_attrs + span.attributes.len() + scope_attrs + event_rows;
             }
         }
     }
@@ -187,11 +193,13 @@ async fn sync_post_round_trips_exact_counts_on_both_trace_tables() {
     let (req, span_count, attr_count) = fixture_request_rebased_to_now();
     // The committed fixture's known shape: 2 spans; 2 resource attrs x 2
     // spans + 3 span attrs on span A + 1 instrumentation-scope attr x 2
-    // spans (issue #192) = 9 attr rows. Recounted from the decoded fixture
+    // spans (issue #192) + span A's one event: 2 `event:intrinsic` rows
+    // (name/timeSinceStart) + 1 `event` attr row (issue #192 PR-B) = 12 attr
+    // rows. Recounted from the decoded fixture
     // above so a fixture edit fails here loudly rather than silently
     // weakening the exact-count assertion.
     assert_eq!(span_count, 2);
-    assert_eq!(attr_count, 9);
+    assert_eq!(attr_count, 12);
 
     let writer = Arc::new(TraceWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),

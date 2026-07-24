@@ -1,6 +1,6 @@
 {
-  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. #192 PR-A flips the 3 instrumentation-scope constructs (scope.instrumentation + the 2 intrinsics) to supported. The 6 residual interim constructs (event/link scope + intrinsics) remain schema-blocked, owned by #192.",
-  "interim_count_pin": 6,
+  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. #192 PR-A flips the 3 instrumentation-scope constructs (scope.instrumentation + the 2 intrinsics) to supported; PR-B flips the 3 span-event constructs (scope.event + event:name/event:timeSinceStart). The 3 residual interim constructs (link scope + intrinsics) remain schema-blocked, owned by #192 (PR-C).",
+  "interim_count_pin": 3,
   "entries": [
     {
       "construct": "intrinsic.name",
@@ -156,16 +156,18 @@
     },
     {
       "construct": "intrinsic.event.name",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_event_name"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.event.timeSinceStart",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_event_time_since_start"
+      ],
       "tempo": "accept"
     },
     {
@@ -254,9 +256,10 @@
     },
     {
       "construct": "scope.event",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/scope_event"
+      ],
       "tempo": "accept"
     },
     {

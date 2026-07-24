@@ -12,7 +12,13 @@
 //! selector resolves; the scope's `name`/`version` are promoted onto the
 //! `SpanRecord`'s `scope_name`/`scope_version` columns for the
 //! `instrumentation:name`/`instrumentation:version` intrinsics. Everything
-//! remains fully preserved in the span payload as well.
+//! remains fully preserved in the span payload as well. Span **events**
+//! (issue #192 PR-B) are indexed the same way: each event's attributes
+//! ride `scope='event'` (verbatim keys, so `event.<key>` resolves), and
+//! each event's `name`/`timeSinceStart` intrinsics ride a dedicated
+//! `scope='event:intrinsic'` (reserved keys `name`/`timeSinceStart`,
+//! `val_num` = ns for `timeSinceStart`) — a hard namespace partition so no
+//! sender-supplied event attribute can collide with an intrinsic row.
 //!
 //! **Payload contract (pinned for T2/T3, issue #54 adjudication #3):**
 //! every [`SpanRecord::payload`] is a self-contained single-`ResourceSpans`
@@ -64,6 +70,26 @@ const SCOPE_SPAN: &str = "span";
 /// row (issue #192) — `scope_spans.scope.attributes`, indexed verbatim so
 /// the `instrumentation.<key>` TraceQL selector resolves.
 const SCOPE_INSTRUMENTATION: &str = "instrumentation";
+/// The `scope` discriminator value for a span-event **attribute** row
+/// (issue #192 PR-B) — `span.events[].attributes`, indexed verbatim so the
+/// `event.<key>` TraceQL selector resolves. Multi-valued (0..N per span),
+/// exactly like resource/span attributes.
+const SCOPE_EVENT: &str = "event";
+/// The **dedicated intrinsic-scope** discriminator for span-event
+/// intrinsics (issue #192 PR-B, plan v2 Δ1): a hard namespace partition
+/// disjoint from the sender-supplied [`SCOPE_EVENT`] attribute scope. The
+/// writer emits this scope *only* from the intrinsic-emission code below,
+/// never from a sender attribute (whose keys are stored verbatim), so no
+/// OTLP event attribute — even one literally keyed `name`/`timeSinceStart`,
+/// reachable via `event."name"` — can collide with an intrinsic row.
+const SCOPE_EVENT_INTRINSIC: &str = "event:intrinsic";
+/// The reserved intrinsic key for a span event's name, under
+/// [`SCOPE_EVENT_INTRINSIC`] — resolves the `event:name` intrinsic.
+const EVENT_INTRINSIC_NAME_KEY: &str = "name";
+/// The reserved intrinsic key for a span event's time-since-span-start (ns,
+/// carried in `val_num`), under [`SCOPE_EVENT_INTRINSIC`] — resolves the
+/// `event:timeSinceStart` intrinsic.
+const EVENT_INTRINSIC_TIME_SINCE_START_KEY: &str = "timeSinceStart";
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (see the module doc's "Expansion budget" section). Derivation: the
@@ -451,6 +477,55 @@ fn parse_span(
         }
     }
 
+    // Span events (issue #192 PR-B): each event fans out into indexed rows —
+    // two intrinsic rows under the dedicated `event:intrinsic` scope (the
+    // event `name`, and its `timeSinceStart` in ns carried in `val_num`)
+    // followed by one `event`-scoped row per event attribute (verbatim key).
+    // Emitted AFTER the resource/span/instrumentation attrs, charged in
+    // `span_expansion_charge` in lockstep. Membership resolves against this
+    // owning span's rows, exactly as attributes do.
+    for event in &span.events {
+        // Intrinsic: event name (dedicated `event:intrinsic` scope,
+        // reserved key `name`).
+        out.attrs.push(AttrRecord {
+            date,
+            key: EVENT_INTRINSIC_NAME_KEY.to_string(),
+            scope: SCOPE_EVENT_INTRINSIC.to_string(),
+            val: event.name.clone(),
+            val_num: numeric_val_num(&event.name),
+            timestamp_ns,
+            trace_id,
+            span_id,
+            duration_ns,
+        });
+        // Intrinsic: timeSinceStart (ns in `val_num`, key-only `val_num`
+        // scan resolves `event:timeSinceStart <op> <duration>`).
+        let time_since_start =
+            resolve_time_since_start_ns(span.start_time_unix_nano, event.time_unix_nano);
+        out.attrs.push(AttrRecord {
+            date,
+            key: EVENT_INTRINSIC_TIME_SINCE_START_KEY.to_string(),
+            scope: SCOPE_EVENT_INTRINSIC.to_string(),
+            val: time_since_start.to_string(),
+            val_num: Some(time_since_start as f64),
+            timestamp_ns,
+            trace_id,
+            span_id,
+            duration_ns,
+        });
+        for kv in &event.attributes {
+            out.attrs.push(attr_record(
+                kv,
+                SCOPE_EVENT,
+                date,
+                timestamp_ns,
+                trace_id,
+                span_id,
+                duration_ns,
+            ));
+        }
+    }
+
     out.spans.push(SpanRecord {
         trace_id,
         span_id,
@@ -535,7 +610,7 @@ fn attr_record(
     duration_ns: i64,
 ) -> AttrRecord {
     let val = any_value_to_string(kv.value.as_ref());
-    let val_num = val.parse::<f64>().ok().filter(|n| n.is_finite());
+    let val_num = numeric_val_num(&val);
     AttrRecord {
         date,
         key: kv.key.clone(),
@@ -547,6 +622,29 @@ fn attr_record(
         span_id,
         duration_ns,
     }
+}
+
+/// The `val_num` for a stored `val` string: its `f64` parse when finite,
+/// else `None` (docs/schemas.md §4.1 — non-finite parses like `inf`/`NaN`
+/// are excluded, a `Nullable(Float64)` comparison column has no meaningful
+/// ordering for them).
+fn numeric_val_num(val: &str) -> Option<f64> {
+    val.parse::<f64>().ok().filter(|n| n.is_finite())
+}
+
+/// A span event's `timeSinceStart` in nanoseconds: `event.time_unix_nano −
+/// span.start_time_unix_nano` (issue #192 PR-B). Both operands are `u64`
+/// wire values; the difference is computed in `i128` and clamped into the
+/// `i64` range, so it preserves sign (a non-conformant sender whose event
+/// predates its span start yields a negative value, never a wrap) and
+/// saturates rather than overflowing. The RAW `start_time_unix_nano` is
+/// used (never the now-fallback resolved `timestamp_ns`), matching the
+/// reference's literal `time − start` definition — a span with an unknown
+/// (`0`) start therefore reports the event's absolute time, the degenerate
+/// case a conformant sender never produces.
+fn resolve_time_since_start_ns(start_time_unix_nano: u64, event_time_unix_nano: u64) -> i64 {
+    let delta = i128::from(event_time_unix_nano) - i128::from(start_time_unix_nano);
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// The resource attribute backing the promoted `service` column: the one
@@ -603,6 +701,19 @@ fn span_expansion_charge(
         .chain(scope_attrs)
     {
         charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+    }
+    // Every span event (issue #192 PR-B) fans out into indexed rows: two
+    // intrinsic rows (`event:intrinsic` name/timeSinceStart — the name's
+    // `val` is the event name; timeSinceStart is a small numeric string
+    // within the row-overhead floor) plus one row per event attribute —
+    // charged BEFORE materialization, in lockstep with the event emission
+    // loop above. `span.encoded_len()` already covers the events' wire
+    // bytes (they nest inside the span); this is the extra index-row cost.
+    for event in &span.events {
+        charge += ATTR_ROW_OVERHEAD + event.name.len() + ATTR_ROW_OVERHEAD;
+        for kv in &event.attributes {
+            charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+        }
     }
     charge
 }
@@ -797,6 +908,7 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::trace::v1::Status;
+    use opentelemetry_proto::tonic::trace::v1::span::Event;
     use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
     use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 
@@ -1284,6 +1396,122 @@ mod tests {
         assert_eq!(out.spans[0].scope_version, "");
     }
 
+    /// Issue #192 PR-B: a span event fans out into indexed rows — two
+    /// intrinsic rows under the dedicated `event:intrinsic` scope (`name`,
+    /// `timeSinceStart` in ns via `val_num`) followed by one `event`-scoped
+    /// row per event attribute (verbatim key), emitted after the
+    /// resource/span/instrumentation attrs.
+    #[test]
+    fn parse_indexes_span_events_intrinsics_and_attributes() {
+        let mut s = valid_span(); // start = 1_700_000_000_000_000_000
+        s.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
+        s.events = vec![Event {
+            time_unix_nano: s.start_time_unix_nano + 3_000_000, // +3ms
+            name: "exception".to_string(),
+            attributes: vec![kv(
+                "exception.type",
+                Value::StringValue("IOError".to_string()),
+            )],
+            dropped_attributes_count: 0,
+        }];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+
+        let rows: Vec<(&str, &str, &str, Option<f64>)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str(), a.val_num))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("span", "span.attr", "s", None),
+                // ...then the event: intrinsics first (dedicated scope,
+                // reserved keys), then its verbatim attribute.
+                ("event:intrinsic", "name", "exception", None),
+                (
+                    "event:intrinsic",
+                    "timeSinceStart",
+                    "3000000",
+                    Some(3_000_000.0)
+                ),
+                ("event", "exception.type", "IOError", None),
+            ]
+        );
+    }
+
+    /// The event intrinsic scope is a HARD partition: an event attribute
+    /// literally keyed `name` lands under `scope='event'`, never colliding
+    /// with the `event:intrinsic`/`name` intrinsic row.
+    #[test]
+    fn span_event_attribute_named_like_an_intrinsic_stays_in_the_event_scope() {
+        let mut s = valid_span();
+        s.events = vec![Event {
+            time_unix_nano: s.start_time_unix_nano,
+            name: "evt".to_string(),
+            attributes: vec![kv("name", Value::StringValue("shadow".to_string()))],
+            dropped_attributes_count: 0,
+        }];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        // The intrinsic `name` row (event:intrinsic) and the sender's `name`
+        // attribute (event) are two distinct rows separated by scope.
+        let name_rows: Vec<(&str, &str)> = out
+            .attrs
+            .iter()
+            .filter(|a| a.key == "name")
+            .map(|a| (a.scope.as_str(), a.val.as_str()))
+            .collect();
+        assert_eq!(
+            name_rows,
+            vec![("event:intrinsic", "evt"), ("event", "shadow")]
+        );
+    }
+
+    /// `timeSinceStart` preserves sign and saturates (issue #192 PR-B): a
+    /// conformant event (after start) is positive; a non-conformant event
+    /// before its span start is negative, never a wrap.
+    #[test]
+    fn span_event_time_since_start_is_signed_and_saturating() {
+        let mut s = valid_span();
+        s.start_time_unix_nano = 1_000;
+        s.events = vec![
+            Event {
+                time_unix_nano: 1_500, // +500ns
+                name: "after".to_string(),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            },
+            Event {
+                time_unix_nano: 400, // −600ns (before start)
+                name: "before".to_string(),
+                attributes: vec![],
+                dropped_attributes_count: 0,
+            },
+        ];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        let tss: Vec<f64> = out
+            .attrs
+            .iter()
+            .filter(|a| a.scope == "event:intrinsic" && a.key == "timeSinceStart")
+            .map(|a| a.val_num.expect("timeSinceStart carries val_num"))
+            .collect();
+        assert_eq!(tss, vec![500.0, -600.0]);
+    }
+
+    /// A span carrying no events yields no `event`/`event:intrinsic` rows.
+    #[test]
+    fn parse_absent_events_leave_no_event_rows() {
+        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+            .expect("within the expansion budget");
+        assert!(
+            out.attrs
+                .iter()
+                .all(|a| a.scope != "event" && a.scope != "event:intrinsic")
+        );
+    }
+
     #[test]
     fn parse_val_num_excludes_non_finite_and_non_numeric_parses() {
         let mut s = valid_span();
@@ -1429,6 +1657,51 @@ mod tests {
         // materialization.
         let err =
             parse(&req, 0).expect_err("escape-dense array fan-out must trip the multiplied budget");
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage { limit, actual, .. }
+                    if limit == MAX_EXPANDED_BYTES && actual > MAX_EXPANDED_BYTES
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Issue #192 PR-B: span events are multiplicative in span output
+    /// (0..N per span, each fanning out into intrinsic + attribute index
+    /// rows), so their materialization must be charged BEFORE it happens.
+    /// A single span with an over-budget event fan-out (each event carrying
+    /// an escape-dense array attribute charged at [`MAX_JSON_ESCAPE_FACTOR`]×)
+    /// trips the `OversizeMessage` guard rather than exhausting memory. Event
+    /// count derives from the budget constants, so a retune cannot silently
+    /// weaken it.
+    #[test]
+    fn expansion_budget_rejects_a_pathological_span_event_fan_out() {
+        const MIB: usize = 1024 * 1024;
+        let nul_dense = "\0".repeat(MIB); // ~6 MiB once JSON-rendered
+        let event_attr = kv(
+            "evt.bomb",
+            Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::StringValue(nul_dense)),
+                }],
+            }),
+        );
+        let attr_wire = event_attr.encoded_len();
+        let event = Event {
+            time_unix_nano: 1_700_000_000_500_000_000,
+            name: "exception".to_string(),
+            attributes: vec![event_attr],
+            dropped_attributes_count: 0,
+        };
+        // Per-event charge is dominated by the 6× attr rendering (~6 MiB);
+        // enough events on ONE span to exceed the budget with certainty.
+        let event_count = MAX_EXPANDED_BYTES / (6 * attr_wire) + 2;
+        let mut s = valid_span();
+        s.events = (0..event_count).map(|_| event.clone()).collect();
+
+        let err = parse(&request_with(None, None, vec![s]), 0)
+            .expect_err("pathological event fan-out must trip the expansion budget");
         assert!(
             matches!(
                 err,

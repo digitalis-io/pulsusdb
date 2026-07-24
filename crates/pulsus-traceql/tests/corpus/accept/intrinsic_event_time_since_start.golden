@@ -1,0 +1,21 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        EventTimeSinceStart,
+                    ),
+                    op: Gt,
+                    value: Duration(
+                        Duration(
+                            1000000,
+                        ),
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

@@ -228,6 +228,7 @@ fn render_expr(
                         AttrScope::Resource => Some("resource"),
                         AttrScope::Unscoped => None,
                         AttrScope::Instrumentation => Some("instrumentation"),
+                        AttrScope::Event => Some("event"),
                     },
                     pred: ValuePred::KeyExists,
                 },

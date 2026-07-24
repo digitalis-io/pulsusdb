@@ -567,13 +567,14 @@ fn differential_categories_are_pinned() {
     // the new reject-parity bucket (both_reject 4 → 0, reject_parity = 4),
     // and left the 9 schema-blocked Cat-C constructs as the residual tracked
     // interim (24 → 9). Issue #192 PR-A flips the 3 instrumentation-scope
-    // constructs to `supported` (103 → 106, tracked_interim 9 → 6).
+    // constructs to `supported` (103 → 106, tracked_interim 9 → 6); PR-B
+    // flips the 3 span-event constructs (106 → 109, tracked_interim 6 → 3).
     assert_eq!(
-        supported, 106,
+        supported, 109,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
-        tracked_interim, 6,
+        tracked_interim, 3,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(
