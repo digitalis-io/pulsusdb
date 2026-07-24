@@ -2,8 +2,13 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
+  # No `push: branches: [main]` trigger: per-PR CI (above) is the authoritative
+  # gate — every change lands via a PR that runs the full per-PR suite before
+  # merge — so re-running the identical suite on the post-merge `main` commit is
+  # pure redundant compute. `main` health is instead validated by the nightly
+  # `schedule` below (which also runs the full differential tiers). Keep PRs
+  # up-to-date with `main` before merge (branch protection) so the PR run
+  # reflects the true post-merge state.
   # Issue #16: lets the manual-dispatch-only `bench-cluster` job (below) be
   # triggered on demand — the scale-invariant gates already run per-PR on
   # single-node (`schema-it`); the 4-shard leg is evidence-gathering, not

@@ -1,5 +1,5 @@
 {
-  "interim_count_pin": 2,
+  "interim_count_pin": 0,
   "entries": [
     {
       "construct": "matcher.eq",
@@ -478,17 +478,15 @@
     },
     {
       "construct": "stage.distinct",
-      "status": "interim-named",
+      "status": "reject-parity",
       "oracle": "reject",
-      "error_construct": "distinct",
-      "owning_issue": 190
+      "error_construct": "distinct"
     },
     {
       "construct": "stage.ip",
-      "status": "interim-named",
+      "status": "reject-parity",
       "oracle": "reject",
-      "error_construct": "ip",
-      "owning_issue": 190
+      "error_construct": "ip"
     },
     {
       "construct": "statics.string",
