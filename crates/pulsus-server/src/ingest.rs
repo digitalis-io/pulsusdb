@@ -27,6 +27,9 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use axum::routing::post;
 
+use pulsus_write::writer::{
+    MetricWriterMetricsSnapshot, TraceWriterMetricsSnapshot, WriterMetricsSnapshot,
+};
 use pulsus_write::{
     Backpressure, FlushWait, LogSink, LogWriter, MetricSink, MetricWriter, ParsedLogs,
     ParsedMetrics, ParsedTraces, TraceSink, TraceWriter,
@@ -42,11 +45,44 @@ use crate::app::AppState;
 /// the reconnect loop's first successful pass.
 pub(crate) struct WriterSink {
     slot: Arc<OnceLock<Arc<LogWriter>>>,
+    /// Test-only snapshot seam (issue #214 AC-7): lets a hermetic test
+    /// drive the real `/metrics` bridge with a populated snapshot without a
+    /// live `ChClient` (a `LogWriter` cannot be built or moved off zero
+    /// without one). Stripped from release builds — production `metrics()`
+    /// is exactly `self.slot.get().map(|w| w.metrics())`.
+    #[cfg(test)]
+    metrics_override: Option<WriterMetricsSnapshot>,
 }
 
 impl WriterSink {
     pub(crate) fn new(slot: Arc<OnceLock<Arc<LogWriter>>>) -> Self {
-        WriterSink { slot }
+        WriterSink {
+            slot,
+            #[cfg(test)]
+            metrics_override: None,
+        }
+    }
+
+    /// Test-only constructor seeding [`WriterSink::metrics`] with a fixed
+    /// snapshot (issue #214 AC-7).
+    #[cfg(test)]
+    pub(crate) fn with_metrics_snapshot(snap: WriterMetricsSnapshot) -> Self {
+        WriterSink {
+            slot: Arc::new(OnceLock::new()),
+            metrics_override: Some(snap),
+        }
+    }
+
+    /// The writer's ingest-metrics snapshot when the slot is filled (a
+    /// writer/all process), else `None` (a reader-only process never fills
+    /// the slot). Read-only `load(Relaxed)` on already-maintained atomics —
+    /// no ingest-hot-path work (issue #214).
+    pub(crate) fn metrics(&self) -> Option<WriterMetricsSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.metrics_override {
+            return Some(snap);
+        }
+        self.slot.get().map(|w| w.metrics())
     }
 }
 
@@ -71,11 +107,38 @@ impl LogSink for WriterSink {
 /// "backpressure while empty" contract.
 pub(crate) struct MetricWriterSink {
     slot: Arc<OnceLock<Arc<MetricWriter>>>,
+    /// Test-only snapshot seam (issue #214 AC-7); see [`WriterSink`].
+    #[cfg(test)]
+    metrics_override: Option<MetricWriterMetricsSnapshot>,
 }
 
 impl MetricWriterSink {
     pub(crate) fn new(slot: Arc<OnceLock<Arc<MetricWriter>>>) -> Self {
-        MetricWriterSink { slot }
+        MetricWriterSink {
+            slot,
+            #[cfg(test)]
+            metrics_override: None,
+        }
+    }
+
+    /// Test-only constructor seeding [`MetricWriterSink::metrics`] (issue
+    /// #214 AC-7).
+    #[cfg(test)]
+    pub(crate) fn with_metrics_snapshot(snap: MetricWriterMetricsSnapshot) -> Self {
+        MetricWriterSink {
+            slot: Arc::new(OnceLock::new()),
+            metrics_override: Some(snap),
+        }
+    }
+
+    /// The metric writer's ingest-metrics snapshot, else `None` on an empty
+    /// slot (issue #214). See [`WriterSink::metrics`].
+    pub(crate) fn metrics(&self) -> Option<MetricWriterMetricsSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.metrics_override {
+            return Some(snap);
+        }
+        self.slot.get().map(|w| w.metrics())
     }
 }
 
@@ -100,11 +163,38 @@ impl MetricSink for MetricWriterSink {
 /// while empty" contract.
 pub(crate) struct TraceWriterSink {
     slot: Arc<OnceLock<Arc<TraceWriter>>>,
+    /// Test-only snapshot seam (issue #214 AC-7); see [`WriterSink`].
+    #[cfg(test)]
+    metrics_override: Option<TraceWriterMetricsSnapshot>,
 }
 
 impl TraceWriterSink {
     pub(crate) fn new(slot: Arc<OnceLock<Arc<TraceWriter>>>) -> Self {
-        TraceWriterSink { slot }
+        TraceWriterSink {
+            slot,
+            #[cfg(test)]
+            metrics_override: None,
+        }
+    }
+
+    /// Test-only constructor seeding [`TraceWriterSink::metrics`] (issue
+    /// #214 AC-7).
+    #[cfg(test)]
+    pub(crate) fn with_metrics_snapshot(snap: TraceWriterMetricsSnapshot) -> Self {
+        TraceWriterSink {
+            slot: Arc::new(OnceLock::new()),
+            metrics_override: Some(snap),
+        }
+    }
+
+    /// The trace writer's ingest-metrics snapshot, else `None` on an empty
+    /// slot (issue #214). See [`WriterSink::metrics`].
+    pub(crate) fn metrics(&self) -> Option<TraceWriterMetricsSnapshot> {
+        #[cfg(test)]
+        if let Some(snap) = self.metrics_override {
+            return Some(snap);
+        }
+        self.slot.get().map(|w| w.metrics())
     }
 }
 
