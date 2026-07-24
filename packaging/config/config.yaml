@@ -34,6 +34,7 @@
 #skip_unavailable_shards: false
 #availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches
 #az_detect: off                   # off | aws | gcp | azure | auto (detect zone from cloud metadata)
+#exp_histogram_mode: classic      # classic | native | dual (OTLP exp-histogram storage; M7-A4)
 
 clickhouse:
   server: localhost               # <-- point this at your ClickHouse host
@@ -60,6 +61,7 @@ clickhouse:
   #batch_ms: 200
   #insert_mode: sync              # sync | async
   #ingest_queue_bytes: 256MiB
+  #log_patterns: true             # ingest-time log-pattern extraction kill-switch (M7-C3)
 
 #reader:
   #cache_ttl: 60s

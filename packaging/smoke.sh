@@ -105,8 +105,9 @@ echo "== DEB leg (ubuntu:22.04) =="
     grep -Pzoq "\[ \"\\\$1\" = \"configure\" \] && \[ -n \"\\\$\{2:-\}\" \]; then\n[[:space:]]*systemctl try-restart pulsusdb\.service" DEBIAN/postinst \
         || { echo "FAIL: deb try-restart not gated by configure+upgrade"; exit 1; }
 
-    # sanity: the real binary runs
-    /usr/bin/pulsusdb --version || true
+    # sanity: the real binary actually runs (proves the payload executes on the
+    # target glibc). A failure here MUST fail the smoke test (no masking).
+    /usr/bin/pulsusdb --version
 
     # 6) clean uninstall removes binary + unit
     dpkg -r pulsusdb
@@ -163,7 +164,9 @@ echo "== RPM leg (rockylinux:9) =="
         echo "FAIL: try-restart leaked into rpm %post"; exit 1
     fi
 
-    /usr/bin/pulsusdb --version || true
+    # sanity: the real binary actually runs (proves the payload executes on the
+    # target glibc). A failure here MUST fail the smoke test (no masking).
+    /usr/bin/pulsusdb --version
 
     # 6) clean uninstall
     rpm -e pulsusdb
