@@ -416,6 +416,13 @@ pub enum Intrinsic {
     /// `event:timeSinceStart` — a span event's timestamp relative to its
     /// span's start, as a duration (`event.timeUnixNano − span.startTimeUnixNano`).
     EventTimeSinceStart,
+    // -- issue #192 (PR-C): the span-link intrinsic namespace. Only a
+    // scoped spelling exists (`link:spanID`/`link:traceID`), resolved through
+    // the `link` scope keyword.
+    /// `link:spanID` — a span link's referenced span id (lowercase-hex string).
+    LinkSpanId,
+    /// `link:traceID` — a span link's referenced trace id (lowercase-hex string).
+    LinkTraceId,
 }
 
 impl Intrinsic {
@@ -464,6 +471,8 @@ impl Intrinsic {
             ("instrumentation", "version") => Some(Self::InstrumentationVersion),
             ("event", "name") => Some(Self::EventName),
             ("event", "timeSinceStart") => Some(Self::EventTimeSinceStart),
+            ("link", "spanID") => Some(Self::LinkSpanId),
+            ("link", "traceID") => Some(Self::LinkTraceId),
             _ => None,
         }
     }
@@ -491,6 +500,8 @@ impl Intrinsic {
             Intrinsic::InstrumentationVersion => "instrumentation:version",
             Intrinsic::EventName => "event:name",
             Intrinsic::EventTimeSinceStart => "event:timeSinceStart",
+            Intrinsic::LinkSpanId => "link:spanID",
+            Intrinsic::LinkTraceId => "link:traceID",
         }
     }
 }
@@ -515,6 +526,9 @@ pub enum AttrScope {
     /// `event.` — the span-event attribute namespace (issue #192 PR-B),
     /// index-served under `scope='event'`.
     Event,
+    /// `link.` — the span-link attribute namespace (issue #192 PR-C),
+    /// index-served under `scope='link'`.
+    Link,
 }
 
 impl fmt::Display for AttrScope {
@@ -525,6 +539,7 @@ impl fmt::Display for AttrScope {
             AttrScope::Unscoped => ".",
             AttrScope::Instrumentation => "instrumentation.",
             AttrScope::Event => "event.",
+            AttrScope::Link => "link.",
         };
         write!(f, "{s}")
     }
@@ -1156,17 +1171,18 @@ mod tests {
                 Intrinsic::EventTimeSinceStart,
                 "event:timeSinceStart",
             ),
+            ("link", "spanID", Intrinsic::LinkSpanId, "link:spanID"),
+            ("link", "traceID", Intrinsic::LinkTraceId, "link:traceID"),
         ] {
             assert_eq!(Intrinsic::from_scoped(scope, ident), Some(intrinsic));
             assert_eq!(intrinsic.to_string(), canonical);
         }
-        // Unknown colon scopes stay unresolved (generic error at parse).
-        // event: now resolves (issue #192 PR-B) — see the loop above; link:
-        // stays interim (PR-C).
-        assert_eq!(Intrinsic::from_scoped("link", "spanID"), None);
-        // instrumentation:/event: resolve (issue #192) — see the loop above.
+        // instrumentation:/event:/link: all resolve (issue #192) — see the
+        // loop above; an unknown field under a known scope stays unresolved
+        // (generic error at parse).
         assert_eq!(Intrinsic::from_scoped("instrumentation", "bogus"), None);
         assert_eq!(Intrinsic::from_scoped("event", "bogus"), None);
+        assert_eq!(Intrinsic::from_scoped("link", "bogus"), None);
         assert_eq!(Intrinsic::from_scoped("span", "bogus"), None);
         assert_eq!(
             Intrinsic::from_scoped("trace", "rootName"),

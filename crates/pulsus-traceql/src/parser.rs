@@ -603,7 +603,8 @@ fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
                 || name == "resource"
                 || name == "parent"
                 || name == "instrumentation"
-                || name == "event")
+                || name == "event"
+                || name == "link")
                 && matches!(cursor.peek2().kind, TokenKind::Dot)
             {
                 true
@@ -861,14 +862,16 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
             if (name == "span"
                 || name == "resource"
                 || name == "instrumentation"
-                || name == "event")
+                || name == "event"
+                || name == "link")
                 && followed_by_dot
             {
                 let scope = match name.as_str() {
                     "span" => AttrScope::Span,
                     "resource" => AttrScope::Resource,
                     "instrumentation" => AttrScope::Instrumentation,
-                    _ => AttrScope::Event,
+                    "event" => AttrScope::Event,
+                    _ => AttrScope::Link,
                 };
                 cursor.advance(); // scope ident
                 cursor.advance(); // '.'
@@ -1050,7 +1053,8 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
         // String-valued intrinsics: `name` plus the issue #184 additions
         // `statusMessage`, `span:id`, `span:parentID`, `trace:id`,
         // `rootName`, `rootServiceName`, and the issue #192 scoped intrinsics
-        // `instrumentation:name`/`instrumentation:version`/`event:name`. The
+        // `instrumentation:name`/`instrumentation:version`/`event:name`/
+        // `link:spanID`/`link:traceID` (the last two lowercase-hex ids). The
         // operator (`=`/`!=`/`=~`/`!~`)
         // is validated downstream at leaf compilation; here the value must
         // be a string literal.
@@ -1064,7 +1068,9 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
             | Intrinsic::RootServiceName
             | Intrinsic::InstrumentationName
             | Intrinsic::InstrumentationVersion
-            | Intrinsic::EventName,
+            | Intrinsic::EventName
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId,
         ) => {
             let tok = cursor.peek().clone();
             match tok.kind {
@@ -1349,6 +1355,8 @@ fn parse_aggregate(
                         | Intrinsic::InstrumentationVersion
                         | Intrinsic::EventName
                         | Intrinsic::EventTimeSinceStart
+                        | Intrinsic::LinkSpanId
+                        | Intrinsic::LinkTraceId
                 )
             ) {
                 return Err(TraceQlError::UnexpectedToken {
@@ -1784,11 +1792,12 @@ mod tests {
 
     #[test]
     fn unknown_colon_scopes_are_generic_errors_not_named_boundaries() {
-        // link: must stay GENERIC (interim-generic disposition), never a
-        // NotYetSupported named boundary. (instrumentation: and event: now
-        // resolve — see instrumentation_scope_constructs_parse /
-        // event_scope_constructs_parse.)
-        for q in [r#"{ link:spanID = "0a1b" }"#, "{ span:bogus > 1 }"] {
+        // An unknown colon field stays GENERIC, never a NotYetSupported named
+        // boundary. (instrumentation:, event: and link: now resolve their
+        // known fields — see instrumentation_scope_constructs_parse /
+        // event_scope_constructs_parse / link_scope_constructs_parse; an
+        // unknown field under any of them, like `link:bogus`, stays generic.)
+        for q in ["{ link:bogus = \"x\" }", "{ span:bogus > 1 }"] {
             match parse(q) {
                 Err(TraceQlError::NotYetSupported { .. }) => {
                     panic!("{q}: must be a generic error, not a named boundary")
@@ -1840,6 +1849,28 @@ mod tests {
         assert_eq!(
             only_field(r#"{ event:timeSinceStart > 1ms }"#),
             Field::Intrinsic(Intrinsic::EventTimeSinceStart),
+        );
+    }
+
+    /// Issue #192 (PR-C): the three span-link constructs parse — the
+    /// `scope.link` attribute namespace plus the `link:spanID`/`link:traceID`
+    /// intrinsics (both lowercase-hex id strings).
+    #[test]
+    fn link_scope_constructs_parse() {
+        assert_eq!(
+            only_field(r#"{ link.relation = "child_of" }"#),
+            Field::Attribute {
+                scope: AttrScope::Link,
+                key: "relation".to_string(),
+            },
+        );
+        assert_eq!(
+            only_field(r#"{ link:spanID = "0a1b2c3d4e5f6071" }"#),
+            Field::Intrinsic(Intrinsic::LinkSpanId),
+        );
+        assert_eq!(
+            only_field(r#"{ link:traceID = "000102030405060708090a0b0c0d0e0f" }"#),
+            Field::Intrinsic(Intrinsic::LinkTraceId),
         );
     }
 

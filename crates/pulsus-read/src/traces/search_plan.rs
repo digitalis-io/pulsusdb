@@ -645,6 +645,7 @@ fn attr_field_ref(field: &Field) -> Option<AttrFieldRef> {
                 pulsus_traceql::AttrScope::Unscoped => None,
                 pulsus_traceql::AttrScope::Instrumentation => Some("instrumentation"),
                 pulsus_traceql::AttrScope::Event => Some("event"),
+                pulsus_traceql::AttrScope::Link => Some("link"),
             },
         }),
         Field::Intrinsic(_) => None,
@@ -885,7 +886,9 @@ fn plan_pipeline(
                             | Intrinsic::InstrumentationName
                             | Intrinsic::InstrumentationVersion
                             | Intrinsic::EventName
-                            | Intrinsic::EventTimeSinceStart,
+                            | Intrinsic::EventTimeSinceStart
+                            | Intrinsic::LinkSpanId
+                            | Intrinsic::LinkTraceId,
                         ) => {
                             return Err(PlanError::TypeMismatch(
                                 "select() of this intrinsic is not supported".to_string(),

@@ -1,6 +1,6 @@
 {
-  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. #192 PR-A flips the 3 instrumentation-scope constructs (scope.instrumentation + the 2 intrinsics) to supported; PR-B flips the 3 span-event constructs (scope.event + event:name/event:timeSinceStart). The 3 residual interim constructs (link scope + intrinsics) remain schema-blocked, owned by #192 (PR-C).",
-  "interim_count_pin": 3,
+  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. #192 flips the 9 schema-blocked event/link/instrumentation-scope constructs to supported across three PRs: PR-A the 3 instrumentation-scope constructs (scope.instrumentation + the 2 intrinsics), PR-B the 3 span-event constructs (scope.event + event:name/event:timeSinceStart), PR-C the 3 span-link constructs (scope.link + link:spanID/link:traceID). No interim constructs remain — the #185 closeout allowlist is empty and the strict gate now enforces interim == 0.",
+  "interim_count_pin": 0,
   "entries": [
     {
       "construct": "intrinsic.name",
@@ -172,16 +172,18 @@
     },
     {
       "construct": "intrinsic.link.spanID",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_link_span_id"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.link.traceID",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_link_trace_id"
+      ],
       "tempo": "accept"
     },
     {
@@ -264,9 +266,10 @@
     },
     {
       "construct": "scope.link",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/scope_link"
+      ],
       "tempo": "accept"
     },
     {

@@ -30,7 +30,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::span::{Event, SpanKind};
+use opentelemetry_proto::tonic::trace::v1::span::{Event, Link, SpanKind};
 use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData};
 use prost::Message;
@@ -61,6 +61,15 @@ const SPAN_A_END_NS: u64 = SPAN_A_START_NS + 1_000_000_000; // +1s
 /// its `event:timeSinceStart` intrinsic is therefore exactly this many ns.
 const SPAN_A_EVENT_NS: u64 = SPAN_A_START_NS + 3_000_000; // +3ms
 const SPAN_A_EVENT_TIME_SINCE_START_NS: i64 = 3_000_000;
+/// Span A's single link (issue #192 PR-C) references another span in another
+/// trace; the `link:spanID`/`link:traceID` intrinsics store these raw bytes
+/// as lowercase hex.
+const LINK_TRACE_ID: [u8; 16] = [
+    0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+];
+const LINK_SPAN_ID: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+const LINK_TRACE_ID_HEX: &str = "aabbccddeeff00112233445566778899";
+const LINK_SPAN_ID_HEX: &str = "0123456789abcdef";
 const SPAN_B_START_NS: u64 = SPAN_A_START_NS + 5_000_000; // +5ms
 const SPAN_B_END_NS: u64 = SPAN_B_START_NS + 250_000_000; // +250ms
 const GOLDEN_DAY: u16 = 19_675;
@@ -119,7 +128,9 @@ fn fixture_scope() -> InstrumentationScope {
 /// `http.method` ("GET"), and `deployment.environment` ("prod") which
 /// ALSO exists at resource scope: the dual-scope same-key golden (issue
 /// #54 plan v2 test-gap fix). It also carries one span **event** (issue
-/// #192 PR-B): `exception` at +3 ms with one attribute `exception.type`.
+/// #192 PR-B): `exception` at +3 ms with one attribute `exception.type`, and
+/// one span **link** (issue #192 PR-C) to another trace's span with one
+/// attribute `link.relation`.
 fn span_a() -> Span {
     Span {
         trace_id: TRACE_ID.to_vec(),
@@ -145,6 +156,17 @@ fn span_a() -> Span {
                 Value::StringValue("IOError".to_string()),
             )],
             dropped_attributes_count: 0,
+        }],
+        links: vec![Link {
+            trace_id: LINK_TRACE_ID.to_vec(),
+            span_id: LINK_SPAN_ID.to_vec(),
+            trace_state: String::new(),
+            attributes: vec![kv(
+                "link.relation",
+                Value::StringValue("child_of".to_string()),
+            )],
+            dropped_attributes_count: 0,
+            flags: 0,
         }],
         status: None,
         ..Default::default()
@@ -314,6 +336,25 @@ fn parse_produces_the_hand_derived_golden_rows() {
                 SPAN_A_ID
             ),
             ("event", "exception.type", "IOError", None, SPAN_A_ID),
+            // ...then span A's link rows (issue #192 PR-C): the two intrinsics
+            // under the dedicated `link:intrinsic` scope (spanID, then traceID,
+            // as lowercase hex in `val`) followed by the link's verbatim
+            // attribute under `scope='link'`.
+            (
+                "link:intrinsic",
+                "spanID",
+                LINK_SPAN_ID_HEX,
+                None,
+                SPAN_A_ID
+            ),
+            (
+                "link:intrinsic",
+                "traceID",
+                LINK_TRACE_ID_HEX,
+                None,
+                SPAN_A_ID
+            ),
+            ("link", "link.relation", "child_of", None, SPAN_A_ID),
             // span B: resource attrs (no span attrs) then the scope attr.
             ("resource", "service.name", "checkout", None, SPAN_B_ID),
             (
