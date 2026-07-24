@@ -501,6 +501,9 @@ fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
         // Issue #192 PR-B: `event.<key>` span-event attributes are
         // index-served under the writer's `scope='event'` discriminator.
         AttrScope::Event => Some(SCOPE_EVENT),
+        // Issue #192 PR-C: `link.<key>` span-link attributes are index-served
+        // under the writer's `scope='link'` discriminator.
+        AttrScope::Link => Some(SCOPE_LINK),
     }
 }
 
@@ -516,6 +519,32 @@ const EVENT_NAME_KEY: &str = "name";
 /// The reserved intrinsic key for `event:timeSinceStart` (numeric `val_num`,
 /// ns) under [`SCOPE_EVENT_INTRINSIC`].
 const EVENT_TIME_SINCE_START_KEY: &str = "timeSinceStart";
+/// The span-link attribute scope and its dedicated intrinsic-scope
+/// discriminator (issue #192 PR-C, `otlp_traces::SCOPE_LINK` /
+/// `SCOPE_LINK_INTRINSIC`) — the hard namespace partition mirroring events, so
+/// `link:spanID`/`link:traceID` resolve against intrinsic rows only, never a
+/// user `link.<key>` attribute.
+const SCOPE_LINK: &str = "link";
+const SCOPE_LINK_INTRINSIC: &str = "link:intrinsic";
+/// The reserved intrinsic key for `link:spanID` (lowercase-hex `val`) under
+/// [`SCOPE_LINK_INTRINSIC`].
+const LINK_SPAN_ID_KEY: &str = "spanID";
+/// The reserved intrinsic key for `link:traceID` (lowercase-hex `val`) under
+/// [`SCOPE_LINK_INTRINSIC`].
+const LINK_TRACE_ID_KEY: &str = "traceID";
+
+/// Lowercases a `link:spanID`/`link:traceID` hex literal for the
+/// case-insensitive Eq/Neq comparisons (matching the `span:id`/`trace:id`
+/// intrinsics' [`hex_value`]), so an uppercase-hex probe resolves against the
+/// stored lowercase-hex `val` rather than silently matching nothing. Regex
+/// operators (`=~`/`!~`) keep the raw pattern — a regex may be intentionally
+/// case-sensitive — and non-string values pass through unchanged.
+fn lowercase_hex_literal(op: ComparisonOp, value: &Value) -> Value {
+    match (op, value) {
+        (ComparisonOp::Eq | ComparisonOp::Neq, Value::String(s)) => Value::String(s.to_lowercase()),
+        _ => value.clone(),
+    }
+}
 
 /// Compiles one attribute leaf (anything but `resource.service.name`).
 fn compile_attr_leaf(
@@ -1009,6 +1038,21 @@ pub fn compile_leaf(
             op,
             value,
         ),
+        // -- issue #192 PR-C: the span-link intrinsics — reserved-key string
+        // probes (AttrEq on lowercase-hex `val`) on the dedicated
+        // `link:intrinsic` index scope, mirroring `event:name`. The user's hex
+        // literal is lowercased first (Eq/Neq only) so the match is
+        // case-insensitive, consistent with the `span:id`/`trace:id` id
+        // intrinsics — an uppercase-hex probe resolves against the stored
+        // lowercase-hex value rather than silently missing.
+        Field::Intrinsic(Intrinsic::LinkSpanId) => {
+            let value = lowercase_hex_literal(op, value);
+            compile_attr_probe_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_SPAN_ID_KEY, op, &value)
+        }
+        Field::Intrinsic(Intrinsic::LinkTraceId) => {
+            let value = lowercase_hex_literal(op, value);
+            compile_attr_probe_leaf(Some(SCOPE_LINK_INTRINSIC), LINK_TRACE_ID_KEY, op, &value)
+        }
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {
                 compile_service_leaf(op, value)
@@ -1078,7 +1122,9 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
             | Intrinsic::InstrumentationName
             | Intrinsic::InstrumentationVersion
             | Intrinsic::EventName
-            | Intrinsic::EventTimeSinceStart,
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId,
         ) => Err(PlanError::TypeMismatch(
             "this intrinsic is not supported in a field-vs-field comparison".to_string(),
         )),
@@ -1955,6 +2001,98 @@ mod tests {
             compiled.generators[0].predicate,
             "key = 'exception.type' AND val = 'IOError' AND scope = 'event'"
         );
+    }
+
+    /// Issue #192 PR-C: the span-link intrinsics lower to reserved-key probes
+    /// on the dedicated `link:intrinsic` index scope (AttrEq on lowercase-hex
+    /// `val`), and the `link.<key>` attribute to the disjoint `link` scope —
+    /// the hard namespace partition (plan v2 Δ1), mirroring events.
+    #[test]
+    fn link_intrinsics_and_attrs_lower_to_partitioned_index_scopes() {
+        // link:spanID -> AttrEq on (key='spanID', val, scope='link:intrinsic').
+        let f = first_filter(r#"{ link:spanID = "0a1b2c3d4e5f6071" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'spanID' AND val = '0a1b2c3d4e5f6071' AND scope = 'link:intrinsic'"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert!(!negated);
+                assert_eq!(probe.key, "spanID");
+                assert_eq!(probe.scope, Some("link:intrinsic"));
+                assert_eq!(
+                    probe.pred,
+                    ValuePred::StringEq("0a1b2c3d4e5f6071".to_string())
+                );
+            }
+            other => panic!("expected an attr membership eval, got {other:?}"),
+        }
+
+        // link:traceID -> AttrEq on (key='traceID', val, scope='link:intrinsic').
+        let f = first_filter(r#"{ link:traceID = "000102030405060708090a0b0c0d0e0f" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'traceID' AND val = '000102030405060708090a0b0c0d0e0f' AND scope = 'link:intrinsic'"
+        );
+
+        // link.<key> attribute -> AttrEq under the disjoint scope='link'.
+        let f = first_filter(r#"{ link.relation = "child_of" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'relation' AND val = 'child_of' AND scope = 'link'"
+        );
+    }
+
+    /// Issue #192 PR-C (review finding): `link:spanID`/`link:traceID` matching
+    /// is CASE-INSENSITIVE, consistent with `span:id`/`trace:id` — an
+    /// uppercase-hex literal is lowercased at compile time so it resolves
+    /// against the stored lowercase-hex `val` rather than silently missing.
+    #[test]
+    fn link_id_intrinsics_lowercase_the_hex_literal_for_case_insensitive_eq() {
+        // Uppercase-hex `link:spanID` literal -> lowercase `val` predicate.
+        let f = first_filter(r#"{ link:spanID = "0A1B2C3D4E5F6071" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'spanID' AND val = '0a1b2c3d4e5f6071' AND scope = 'link:intrinsic'"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, .. } => {
+                assert_eq!(
+                    probe.pred,
+                    ValuePred::StringEq("0a1b2c3d4e5f6071".to_string())
+                );
+            }
+            other => panic!("expected an attr membership eval, got {other:?}"),
+        }
+
+        // Uppercase-hex `link:traceID` with `!=` (Neq) -> the negated
+        // membership probe still carries the lowercased value.
+        let f = first_filter(r#"{ link:traceID != "AABBCCDDEEFF00112233445566778899" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert!(negated);
+                assert_eq!(
+                    probe.pred,
+                    ValuePred::StringEq("aabbccddeeff00112233445566778899".to_string())
+                );
+            }
+            other => panic!("expected an attr membership eval, got {other:?}"),
+        }
+
+        // A regex operator keeps the raw (case-sensitive) pattern — unchanged.
+        let f = first_filter(r#"{ link:spanID =~ "0A1B.*" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, .. } => {
+                assert_eq!(probe.pred, ValuePred::Regex("0A1B.*".to_string()));
+            }
+            other => panic!("expected an attr membership eval, got {other:?}"),
+        }
     }
 
     #[test]

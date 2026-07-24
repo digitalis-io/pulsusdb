@@ -297,6 +297,31 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // `link:spanID` (issue #192 PR-C): index-served via the `(key, val,
+        // scope)` prefix with the reserved key `spanID` under the dedicated
+        // `scope = 'link:intrinsic'` — an AttrEq generator on the lowercase-hex
+        // `val`, exactly like an attribute leaf. The intrinsic scope is a hard
+        // partition from the sender `link` attribute scope.
+        name: "link_span_id_eq",
+        q: r#"{ link:spanID = "0a1b2c3d4e5f6071" }"#,
+        distributed: false,
+    },
+    Case {
+        // `link:traceID` (issue #192 PR-C): the same AttrEq generator on the
+        // reserved `traceID` key under `scope = 'link:intrinsic'`.
+        name: "link_trace_id_eq",
+        q: r#"{ link:traceID = "000102030405060708090a0b0c0d0e0f" }"#,
+        distributed: false,
+    },
+    Case {
+        // `link.<key>` attribute (issue #192 PR-C): index-served via the
+        // `(key, val, scope)` prefix with `scope = 'link'`, exactly like any
+        // `span.`/`resource.` attribute leaf.
+        name: "link_attr_eq",
+        q: r#"{ link.relation = "child_of" }"#,
+        distributed: false,
+    },
+    Case {
         // Attribute existence present (issue #185, `existence.neq_nil` /
         // bare-attr): an index-served key-only `(key)` scan with the no-op
         // `1` value predicate + a key-existence membership probe.

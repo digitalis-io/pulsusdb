@@ -2369,4 +2369,172 @@ async fn two_phase_search_explain_and_budget_gates() {
             .is_empty(),
         r#"the intrinsic value A never satisfies the event."name" attribute"#
     );
+
+    // (h) Issue #192 PR-C: span-link search-value coverage + the AC8 hard
+    // namespace partition, proven as DISJOINT RESULT SETS across TWO SEPARATE
+    // spans (plan v2 Δ1 — a sender attribute keyed `spanID` can NEVER satisfy
+    // the `link:spanID` intrinsic, and vice-versa).
+    //
+    // AC8 differential scope (identical bar to PR-A/PR-B, per the accepted
+    // events precedent): the search-value parity for the new constructs is
+    // proven by THIS hermetic disjoint-partition test plus the parse-level
+    // Tempo differential (automatic via the disposition registry —
+    // `tempo_differential.rs`). A dedicated `compare()`-value differential
+    // exists ONLY where a `compare()` key exists (instrumentation had two;
+    // events and links have none — they are not `compare()` targets), so links
+    // add no new differential file, exactly as span events (PR-B) did not.
+    //
+    // The seeded spans:
+    //  - Span P: one link whose INTRINSIC `link:spanID` = "0a1b2c3d4e5f6071"
+    //    and `link:traceID` = "aabbccddeeff00112233445566778899" (lowercase
+    //    hex, under `scope='link:intrinsic'`), plus a verbatim `relation` =
+    //    "child_of" attribute (`scope='link'`). P carries NO user attribute
+    //    keyed `spanID`.
+    //  - Span Q (distinct trace): one link-scoped user attribute literally
+    //    keyed `spanID` = "shadowval" (`link."spanID"`, `scope='link'`), and
+    //    NO intrinsic.
+    const LP: &str = "000000000000000000000000000e1931"; // P: trace_id[15] = 0x31
+    const LP_SPAN: &str = "0000000000e19301";
+    const LQ: &str = "000000000000000000000000000e1932"; // Q: trace_id[15] = 0x32
+    const LQ_SPAN: &str = "0000000000e19302";
+    const LINK_SPAN_HEX: &str = "0a1b2c3d4e5f6071";
+    const LINK_TRACE_HEX: &str = "aabbccddeeff00112233445566778899";
+    // insert_event_span / insert_event_attr are generic trace_spans /
+    // trace_attrs_idx inserters (scope is a parameter) — reused verbatim for
+    // the link rows.
+    insert_event_span(&client, g, LP, LP_SPAN, "link-span-p").await;
+    insert_event_attr(
+        &client,
+        g,
+        (LP, LP_SPAN),
+        "spanID",
+        LINK_SPAN_HEX,
+        "link:intrinsic",
+        "NULL",
+    )
+    .await;
+    insert_event_attr(
+        &client,
+        g,
+        (LP, LP_SPAN),
+        "traceID",
+        LINK_TRACE_HEX,
+        "link:intrinsic",
+        "NULL",
+    )
+    .await;
+    insert_event_attr(
+        &client,
+        g,
+        (LP, LP_SPAN),
+        "relation",
+        "child_of",
+        "link",
+        "NULL",
+    )
+    .await;
+    insert_event_span(&client, g, LQ, LQ_SPAN, "link-span-q").await;
+    insert_event_attr(
+        &client,
+        g,
+        (LQ, LQ_SPAN),
+        "spanID",
+        "shadowval",
+        "link",
+        "NULL",
+    )
+    .await;
+
+    // Each construct returns EXACTLY span P (index-served), never span Q.
+    for q in [
+        format!(r#"{{ link:spanID = "{LINK_SPAN_HEX}" }}"#),
+        format!(r#"{{ link:traceID = "{LINK_TRACE_HEX}" }}"#),
+        r#"{ link.relation = "child_of" }"#.to_string(),
+    ] {
+        let plan = plan_for(&engine, &q, wide.0, wide.1);
+        let output = engine.search(&plan).await.expect("link search");
+        assert_eq!(output.returned, 1, "{q}");
+        assert_eq!(output.traces[0].trace_id[15], 0x31, "{q}");
+        assert_eq!(output.traces[0].matched, 1, "{q}");
+        assert_eq!(output.traces[0].spans[0].name, "link-span-p", "{q}");
+    }
+
+    // The AC8 hard partition, proven as DISJOINT RESULT SETS: the intrinsic
+    // namespace (`link:spanID`, `scope='link:intrinsic'`) and the user
+    // attribute namespace (`link."spanID"`, `scope='link'`) never cross.
+    // The intrinsic query resolves EXACTLY P (the intrinsic id), never Q's
+    // same-keyed user attribute.
+    assert_eq!(
+        event_hits(
+            &engine,
+            &format!(r#"{{ link:spanID = "{LINK_SPAN_HEX}" }}"#),
+            wide.0,
+            wide.1
+        )
+        .await,
+        vec![0x31],
+        "link:spanID intrinsic returns ONLY span P"
+    );
+    // The quoted user attribute resolves EXACTLY Q, never P's intrinsic.
+    assert_eq!(
+        event_hits(
+            &engine,
+            r#"{ link."spanID" = "shadowval" }"#,
+            wide.0,
+            wide.1
+        )
+        .await,
+        vec![0x32],
+        r#"link."spanID" attribute returns ONLY span Q"#
+    );
+    // Cross-namespace value lookups match NOTHING: "shadowval" is only a user
+    // attribute (never an intrinsic), the hex id is only an intrinsic (never a
+    // user attribute).
+    assert!(
+        event_hits(&engine, r#"{ link:spanID = "shadowval" }"#, wide.0, wide.1)
+            .await
+            .is_empty(),
+        "the user-attribute value shadowval never satisfies the link:spanID intrinsic"
+    );
+    assert!(
+        event_hits(
+            &engine,
+            &format!(r#"{{ link."spanID" = "{LINK_SPAN_HEX}" }}"#),
+            wide.0,
+            wide.1
+        )
+        .await
+        .is_empty(),
+        r#"the intrinsic id never satisfies the link."spanID" attribute"#
+    );
+
+    // Review finding: `link:spanID`/`link:traceID` matching is CASE-INSENSITIVE,
+    // consistent with `span:id`/`trace:id` — an UPPERCASE-hex literal is
+    // lowercased at compile time and resolves the seeded (lowercase-hex-stored)
+    // span P, rather than silently returning zero rows.
+    assert_eq!(
+        event_hits(
+            &engine,
+            &format!(r#"{{ link:spanID = "{}" }}"#, LINK_SPAN_HEX.to_uppercase()),
+            wide.0,
+            wide.1
+        )
+        .await,
+        vec![0x31],
+        "an uppercase-hex link:spanID literal must resolve the lowercase-hex-stored span P"
+    );
+    assert_eq!(
+        event_hits(
+            &engine,
+            &format!(
+                r#"{{ link:traceID = "{}" }}"#,
+                LINK_TRACE_HEX.to_uppercase()
+            ),
+            wide.0,
+            wide.1
+        )
+        .await,
+        vec![0x31],
+        "an uppercase-hex link:traceID literal must resolve the lowercase-hex-stored span P"
+    );
 }

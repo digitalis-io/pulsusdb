@@ -18,7 +18,11 @@
 //! each event's `name`/`timeSinceStart` intrinsics ride a dedicated
 //! `scope='event:intrinsic'` (reserved keys `name`/`timeSinceStart`,
 //! `val_num` = ns for `timeSinceStart`) — a hard namespace partition so no
-//! sender-supplied event attribute can collide with an intrinsic row.
+//! sender-supplied event attribute can collide with an intrinsic row. Span
+//! **links** (issue #192 PR-C) mirror events exactly: each link's attributes
+//! ride `scope='link'`, and each link's `spanID`/`traceID` intrinsics ride a
+//! dedicated `scope='link:intrinsic'` (reserved keys `spanID`/`traceID`,
+//! `val` = lowercase hex of the referenced id bytes).
 //!
 //! **Payload contract (pinned for T2/T3, issue #54 adjudication #3):**
 //! every [`SpanRecord::payload`] is a self-contained single-`ResourceSpans`
@@ -90,6 +94,27 @@ const EVENT_INTRINSIC_NAME_KEY: &str = "name";
 /// carried in `val_num`), under [`SCOPE_EVENT_INTRINSIC`] — resolves the
 /// `event:timeSinceStart` intrinsic.
 const EVENT_INTRINSIC_TIME_SINCE_START_KEY: &str = "timeSinceStart";
+/// The `scope` discriminator value for a span-link **attribute** row (issue
+/// #192 PR-C) — `span.links[].attributes`, indexed verbatim so the
+/// `link.<key>` TraceQL selector resolves. Multi-valued (0..N per span),
+/// exactly like span events.
+const SCOPE_LINK: &str = "link";
+/// The **dedicated intrinsic-scope** discriminator for span-link intrinsics
+/// (issue #192 PR-C, plan v2 Δ1): a hard namespace partition disjoint from
+/// the sender-supplied [`SCOPE_LINK`] attribute scope, mirroring
+/// [`SCOPE_EVENT_INTRINSIC`]. The writer emits this scope *only* from the
+/// intrinsic-emission code below, so no OTLP link attribute — even one
+/// literally keyed `spanID`/`traceID`, reachable via `link."spanID"` — can
+/// collide with an intrinsic row.
+const SCOPE_LINK_INTRINSIC: &str = "link:intrinsic";
+/// The reserved intrinsic key for a span link's referenced span id
+/// (lowercase hex in `val`), under [`SCOPE_LINK_INTRINSIC`] — resolves the
+/// `link:spanID` intrinsic.
+const LINK_INTRINSIC_SPAN_ID_KEY: &str = "spanID";
+/// The reserved intrinsic key for a span link's referenced trace id
+/// (lowercase hex in `val`), under [`SCOPE_LINK_INTRINSIC`] — resolves the
+/// `link:traceID` intrinsic.
+const LINK_INTRINSIC_TRACE_ID_KEY: &str = "traceID";
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (see the module doc's "Expansion budget" section). Derivation: the
@@ -526,6 +551,53 @@ fn parse_span(
         }
     }
 
+    // Span links (issue #192 PR-C): each link fans out exactly like an event —
+    // two intrinsic rows under the dedicated `link:intrinsic` scope (the
+    // referenced `spanID`/`traceID` as lowercase hex in `val`) followed by one
+    // `link`-scoped row per link attribute (verbatim key). The referenced ids
+    // are stored as `val` (not `val_num` — hex is non-numeric), so `AttrEq`
+    // resolves them. Emitted AFTER the events, charged in
+    // `span_expansion_charge` in lockstep.
+    for link in &span.links {
+        // Intrinsic: link:spanID (dedicated `link:intrinsic` scope, reserved
+        // key `spanID`, lowercase hex of the link's raw span-id bytes).
+        out.attrs.push(AttrRecord {
+            date,
+            key: LINK_INTRINSIC_SPAN_ID_KEY.to_string(),
+            scope: SCOPE_LINK_INTRINSIC.to_string(),
+            val: hex_lower(&link.span_id),
+            val_num: None,
+            timestamp_ns,
+            trace_id,
+            span_id,
+            duration_ns,
+        });
+        // Intrinsic: link:traceID (reserved key `traceID`, lowercase hex of
+        // the link's raw trace-id bytes).
+        out.attrs.push(AttrRecord {
+            date,
+            key: LINK_INTRINSIC_TRACE_ID_KEY.to_string(),
+            scope: SCOPE_LINK_INTRINSIC.to_string(),
+            val: hex_lower(&link.trace_id),
+            val_num: None,
+            timestamp_ns,
+            trace_id,
+            span_id,
+            duration_ns,
+        });
+        for kv in &link.attributes {
+            out.attrs.push(attr_record(
+                kv,
+                SCOPE_LINK,
+                date,
+                timestamp_ns,
+                trace_id,
+                span_id,
+                duration_ns,
+            ));
+        }
+    }
+
     out.spans.push(SpanRecord {
         trace_id,
         span_id,
@@ -647,6 +719,23 @@ fn resolve_time_since_start_ns(start_time_unix_nano: u64, event_time_unix_nano: 
     delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+/// Lowercase-hex rendering of a span link's referenced id bytes (issue #192
+/// PR-C). The bytes are stored verbatim (a link references some OTHER span,
+/// so — unlike this span's own 16/8-byte ids — they are never length-validated
+/// here): whatever the sender put on the wire is rendered as-is, so an
+/// off-length id round-trips honestly rather than being rejected. Matches the
+/// `link:spanID`/`link:traceID` intrinsics' `AttrEq` value classification (the
+/// TraceQL probe supplies lowercase hex).
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Infallible: writing to a String never errors.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// The resource attribute backing the promoted `service` column: the one
 /// literally keyed `service.name`, **verbatim** — traces never normalize
 /// keys (docs/architecture.md §2.3), so unlike logs/metrics a
@@ -712,6 +801,18 @@ fn span_expansion_charge(
     for event in &span.events {
         charge += ATTR_ROW_OVERHEAD + event.name.len() + ATTR_ROW_OVERHEAD;
         for kv in &event.attributes {
+            charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
+        }
+    }
+    // Every span link (issue #192 PR-C) fans out identically: two intrinsic
+    // rows (`link:intrinsic` spanID/traceID, whose `val` is lowercase hex —
+    // 2× the referenced id's byte length) plus one row per link attribute —
+    // charged BEFORE materialization, in lockstep with the link emission loop
+    // above. `span.encoded_len()` already covers the links' wire bytes.
+    for link in &span.links {
+        charge += ATTR_ROW_OVERHEAD + link.span_id.len() * 2;
+        charge += ATTR_ROW_OVERHEAD + link.trace_id.len() * 2;
+        for kv in &link.attributes {
             charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
         }
     }
@@ -909,6 +1010,7 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{ArrayValue, InstrumentationScope, KeyValueList};
     use opentelemetry_proto::tonic::trace::v1::Status;
     use opentelemetry_proto::tonic::trace::v1::span::Event;
+    use opentelemetry_proto::tonic::trace::v1::span::Link;
     use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
     use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 
@@ -1512,6 +1614,96 @@ mod tests {
         );
     }
 
+    /// Issue #192 PR-C: a span link fans out into indexed rows — two intrinsic
+    /// rows under the dedicated `link:intrinsic` scope (`spanID`/`traceID` as
+    /// lowercase hex in `val`) followed by one `link`-scoped row per link
+    /// attribute (verbatim key), emitted after the events.
+    #[test]
+    fn parse_indexes_span_links_intrinsics_and_attributes() {
+        let mut s = valid_span();
+        s.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
+        s.links = vec![Link {
+            trace_id: vec![
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f,
+            ],
+            span_id: vec![0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71],
+            trace_state: String::new(),
+            attributes: vec![kv(
+                "link.relation",
+                Value::StringValue("child_of".to_string()),
+            )],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+
+        let rows: Vec<(&str, &str, &str, Option<f64>)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str(), a.val_num))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("span", "span.attr", "s", None),
+                // ...then the link: intrinsics first (dedicated scope, reserved
+                // keys, lowercase-hex ids in `val`), then its verbatim attribute.
+                ("link:intrinsic", "spanID", "0a1b2c3d4e5f6071", None),
+                (
+                    "link:intrinsic",
+                    "traceID",
+                    "000102030405060708090a0b0c0d0e0f",
+                    None
+                ),
+                ("link", "link.relation", "child_of", None),
+            ]
+        );
+    }
+
+    /// The link intrinsic scope is a HARD partition: a link attribute literally
+    /// keyed `spanID` lands under `scope='link'`, never colliding with the
+    /// `link:intrinsic`/`spanID` intrinsic row.
+    #[test]
+    fn span_link_attribute_named_like_an_intrinsic_stays_in_the_link_scope() {
+        let mut s = valid_span();
+        s.links = vec![Link {
+            trace_id: vec![0xaa; 16],
+            span_id: vec![0xbb; 8],
+            trace_state: String::new(),
+            attributes: vec![kv("spanID", Value::StringValue("shadow".to_string()))],
+            dropped_attributes_count: 0,
+            flags: 0,
+        }];
+        let out =
+            parse(&request_with(None, None, vec![s]), 0).expect("within the expansion budget");
+        // The intrinsic `spanID` row (link:intrinsic) and the sender's `spanID`
+        // attribute (link) are two distinct rows separated by scope.
+        let span_id_rows: Vec<(&str, &str)> = out
+            .attrs
+            .iter()
+            .filter(|a| a.key == "spanID")
+            .map(|a| (a.scope.as_str(), a.val.as_str()))
+            .collect();
+        assert_eq!(
+            span_id_rows,
+            vec![("link:intrinsic", "bbbbbbbbbbbbbbbb"), ("link", "shadow")]
+        );
+    }
+
+    /// A span carrying no links yields no `link`/`link:intrinsic` rows.
+    #[test]
+    fn parse_absent_links_leave_no_link_rows() {
+        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+            .expect("within the expansion budget");
+        assert!(
+            out.attrs
+                .iter()
+                .all(|a| a.scope != "link" && a.scope != "link:intrinsic")
+        );
+    }
+
     #[test]
     fn parse_val_num_excludes_non_finite_and_non_numeric_parses() {
         let mut s = valid_span();
@@ -1702,6 +1894,53 @@ mod tests {
 
         let err = parse(&request_with(None, None, vec![s]), 0)
             .expect_err("pathological event fan-out must trip the expansion budget");
+        assert!(
+            matches!(
+                err,
+                LogsIngestError::OversizeMessage { limit, actual, .. }
+                    if limit == MAX_EXPANDED_BYTES && actual > MAX_EXPANDED_BYTES
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Issue #192 PR-C: span links are multiplicative in span output exactly
+    /// like events (0..N per span, each fanning out into intrinsic + attribute
+    /// index rows), so their materialization must be charged BEFORE it happens.
+    /// A single span with an over-budget link fan-out (each link carrying an
+    /// escape-dense array attribute charged at [`MAX_JSON_ESCAPE_FACTOR`]×)
+    /// trips the `OversizeMessage` guard rather than exhausting memory. Link
+    /// count derives from the budget constants, so a retune cannot silently
+    /// weaken it.
+    #[test]
+    fn expansion_budget_rejects_a_pathological_span_link_fan_out() {
+        const MIB: usize = 1024 * 1024;
+        let nul_dense = "\0".repeat(MIB); // ~6 MiB once JSON-rendered
+        let link_attr = kv(
+            "link.bomb",
+            Value::ArrayValue(ArrayValue {
+                values: vec![AnyValue {
+                    value: Some(Value::StringValue(nul_dense)),
+                }],
+            }),
+        );
+        let attr_wire = link_attr.encoded_len();
+        let link = Link {
+            trace_id: vec![0x11; 16],
+            span_id: vec![0x22; 8],
+            trace_state: String::new(),
+            attributes: vec![link_attr],
+            dropped_attributes_count: 0,
+            flags: 0,
+        };
+        // Per-link charge is dominated by the 6× attr rendering (~6 MiB);
+        // enough links on ONE span to exceed the budget with certainty.
+        let link_count = MAX_EXPANDED_BYTES / (6 * attr_wire) + 2;
+        let mut s = valid_span();
+        s.links = (0..link_count).map(|_| link.clone()).collect();
+
+        let err = parse(&request_with(None, None, vec![s]), 0)
+            .expect_err("pathological link fan-out must trip the expansion budget");
         assert!(
             matches!(
                 err,

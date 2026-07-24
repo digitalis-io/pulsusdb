@@ -37,17 +37,19 @@ use sha2::{Digest, Sha256};
 
 use pulsus_traceql::{TraceQlError, parse};
 
-// #192 owns the 9 schema-blocked event/link/instrumentation-scope
+// #192 owned the 9 schema-blocked event/link/instrumentation-scope
 // constructs (the residual interim set after the M7-TQ6 closeout, issue
-// #185). Every interim disposition must name it; a construct owned by a
-// now-closed sub-issue (179/181–184) is RED. The closeout gate
-// (`interim_entries_are_allowlisted`) is the forcing function that drives
-// the interim set to zero once #192 lands.
-const VALID_ISSUES: [u64; 1] = [192];
+// #185); its final PR-C flipped the last 3 to `supported`, so the interim
+// set is now EMPTY. The closeout gate (`interim_entries_are_allowlisted`)
+// therefore enforces `interim_count == 0`: any newly-added interim
+// disposition would name an issue absent from the (empty) allowlist and go
+// RED. Re-populate both lists in lockstep if a future issue reopens an
+// interim gap.
+const VALID_ISSUES: [u64; 0] = [];
 // The committed open-issue allowlist the strict closeout gate enforces:
-// every interim entry's owning_issue must be in it (auto-tightening to
-// `interim_count == 0` when #192 flips its 9 to `supported`).
-const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[192];
+// every interim entry's owning_issue must be in it. Empty now that #192
+// closed out the last interim constructs — the gate is a hard `interim == 0`.
+const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[];
 const DOCS_PREFIX: &str = "https://grafana.com/docs/tempo/";
 const REPO_PREFIX: &str = "https://github.com/digitalis-io/pulsusdb/";
 
@@ -566,15 +568,17 @@ fn differential_categories_are_pinned() {
     // to `supported` (88 → 103), moved the 4 both-reject constructs into
     // the new reject-parity bucket (both_reject 4 → 0, reject_parity = 4),
     // and left the 9 schema-blocked Cat-C constructs as the residual tracked
-    // interim (24 → 9). Issue #192 PR-A flips the 3 instrumentation-scope
-    // constructs to `supported` (103 → 106, tracked_interim 9 → 6); PR-B
-    // flips the 3 span-event constructs (106 → 109, tracked_interim 6 → 3).
+    // interim (24 → 9). Issue #192 flips all 9 to `supported` across three
+    // PRs — PR-A the 3 instrumentation-scope constructs (103 → 106,
+    // tracked_interim 9 → 6), PR-B the 3 span-event constructs (106 → 109,
+    // tracked_interim 6 → 3), PR-C the 3 span-link constructs (109 → 112,
+    // tracked_interim 3 → 0). The interim set is now empty.
     assert_eq!(
-        supported, 109,
+        supported, 112,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
-        tracked_interim, 3,
+        tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(

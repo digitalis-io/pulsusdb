@@ -40,6 +40,8 @@ accept/intrinsic_instrumentation_name
 accept/intrinsic_instrumentation_version
 accept/intrinsic_kind_eq_server
 accept/intrinsic_kind_neq_producer
+accept/intrinsic_link_span_id
+accept/intrinsic_link_trace_id
 accept/intrinsic_name_eq
 accept/intrinsic_name_regex
 accept/intrinsic_nested_set_left_gt
@@ -92,6 +94,7 @@ accept/pipeline_sum_attr
 accept/rhs_attr_eq
 accept/scope_event
 accept/scope_instrumentation
+accept/scope_link
 accept/scope_quoted
 accept/select_multi
 accept/select_single

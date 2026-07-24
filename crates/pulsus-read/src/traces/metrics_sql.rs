@@ -229,6 +229,7 @@ fn render_expr(
                         AttrScope::Unscoped => None,
                         AttrScope::Instrumentation => Some("instrumentation"),
                         AttrScope::Event => Some("event"),
+                        AttrScope::Link => Some("link"),
                     },
                     pred: ValuePred::KeyExists,
                 },
