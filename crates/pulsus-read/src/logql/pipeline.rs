@@ -47,10 +47,13 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::net::IpAddr;
 
 use pulsus_logql::{
     CompareOp, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, NumericLiteral, ParserStage, Stage,
 };
+
+use super::ip::{IpMatcher, line_has_ip_in};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
 // stdlib `time`'s internal `quote` (duration branch) — reused here so the
@@ -87,6 +90,7 @@ pub enum PipelineError {
     BadRegex(String),
     UnsupportedTemplate(String),
     BadParserExpr(String),
+    BadIpFilter(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -99,6 +103,7 @@ impl fmt::Display for PipelineError {
                  only `{{{{.label}}}}` field substitution and literal text"
             ),
             PipelineError::BadParserExpr(msg) => write!(f, "bad parser expression: {msg}"),
+            PipelineError::BadIpFilter(msg) => write!(f, "bad ip() label filter: {msg}"),
         }
     }
 }
@@ -151,10 +156,18 @@ pub enum MetricRun<'a> {
     },
 }
 
+/// One alternative of a client-side line filter (M8-LQ2 `linefilter.or`).
+/// A filter's alternatives are an `or` disjunction: the stage matches iff
+/// ANY alternative matches the current line. An `ip("…")` head/alternative
+/// compiles to [`LineMatcher::Ip`] (a range test with no token prefilter,
+/// so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
+/// down and it is evaluated here); a plain value compiles to `Literal`
+/// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
 #[derive(Debug)]
 enum LineMatcher {
     Literal(String),
     Regex(regex::Regex),
+    Ip(IpMatcher),
 }
 
 #[derive(Debug)]
@@ -172,6 +185,17 @@ enum CompiledLabelFilter {
         op: CompareOp,
         kind: UnitKind,
         threshold: f64,
+    },
+    /// IP form (M8-LQ2 `labelfilter.ip`): `name = ip("…")` /
+    /// `name != ip("…")`. The label value is parsed as an IP and tested for
+    /// membership in the compiled range. Unlike the numeric `Compare` filter,
+    /// this NEVER errors: a missing label or an unparseable value is simply a
+    /// non-match (reference v3.7.3-verified — no `__error__`/`__error_details__`
+    /// is ever set). `=` drops the non-match; `!=` keeps it.
+    Ip {
+        name: String,
+        matcher: IpMatcher,
+        negated: bool,
     },
     And(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
     Or(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
@@ -200,8 +224,10 @@ enum TmplPart {
 #[derive(Debug)]
 enum CompiledStage {
     LineFilter {
-        op: LineFilterOp,
-        matcher: LineMatcher,
+        /// `or`-disjunction alternatives; the stage matches iff ANY matches.
+        matchers: Vec<LineMatcher>,
+        /// `!=`/`!~` invert the disjunction (keep iff NONE match).
+        negated: bool,
     },
     Json {
         /// Empty = full flatten.
@@ -265,22 +291,42 @@ impl CompiledPipeline {
         for stage in stages {
             match stage {
                 Stage::LineFilter(lf) => {
-                    if !seen_line_format {
-                        // Pushed down to SQL by `plan::compile_line_filters`
-                        // — never re-evaluated here.
+                    // A line filter is pushed down to SQL (and skipped here to
+                    // avoid double evaluation) ONLY when it both precedes the
+                    // first `line_format` (it references the original `body`)
+                    // AND is pushable — i.e. no alternative is an `ip("…")`.
+                    // An `ip(…)`/mixed-`or` filter, or any filter following a
+                    // `line_format`, is served here client-side, matching
+                    // `plan::compile_line_filters`'s pushdown split exactly.
+                    if !seen_line_format && super::plan::is_pushable_line_filter(lf) {
                         continue;
                     }
-                    let matcher = match lf.op {
-                        LineFilterOp::Contains | LineFilterOp::NotContains => {
-                            LineMatcher::Literal(lf.value.clone())
-                        }
-                        LineFilterOp::Regex | LineFilterOp::NotRegex => {
-                            // Unanchored, like the SQL pushdown's
-                            // `match(body, ...)`.
-                            LineMatcher::Regex(compile_regex(&lf.value)?)
-                        }
-                    };
-                    compiled.push(CompiledStage::LineFilter { op: lf.op, matcher });
+                    let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
+                    for (value, is_ip) in lf.alternatives() {
+                        let matcher = if is_ip {
+                            // `ip("…")` compiles to a range matcher regardless
+                            // of the outer op (`ip(…)` is only ever `|=`/`!=`).
+                            LineMatcher::Ip(
+                                IpMatcher::parse(value)
+                                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
+                            )
+                        } else {
+                            match lf.op {
+                                LineFilterOp::Contains | LineFilterOp::NotContains => {
+                                    LineMatcher::Literal(value.to_string())
+                                }
+                                LineFilterOp::Regex | LineFilterOp::NotRegex => {
+                                    // Unanchored, like the SQL pushdown's
+                                    // `match(body, ...)`.
+                                    LineMatcher::Regex(compile_regex(value)?)
+                                }
+                            }
+                        };
+                        matchers.push(matcher);
+                    }
+                    let negated =
+                        matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex);
+                    compiled.push(CompiledStage::LineFilter { matchers, negated });
                 }
                 Stage::Parser(p) => {
                     mutates_labels = true;
@@ -335,11 +381,19 @@ impl CompiledPipeline {
             }
         }
 
+        // Fast path only when the pipeline is line filters AND every one
+        // pushed down (nothing compiled to run). A non-pushable `ip(…)`/
+        // mixed-`or` filter compiles a run-stage, so `compiled` is non-empty
+        // and the fast path is (correctly) declined — otherwise exec would
+        // skip its client-side evaluation entirely.
+        let line_filter_only =
+            compiled.is_empty() && stages.iter().all(|s| matches!(s, Stage::LineFilter(_)));
+
         Ok(CompiledPipeline {
             stages: compiled,
             mutates_labels,
             rewrites_line,
-            line_filter_only: stages.iter().all(|s| matches!(s, Stage::LineFilter(_))),
+            line_filter_only,
             has_unwrap,
         })
     }
@@ -446,15 +500,19 @@ impl CompiledPipeline {
 
         for stage in &self.stages {
             match stage {
-                CompiledStage::LineFilter { op, matcher } => {
-                    let hit = match matcher {
+                CompiledStage::LineFilter { matchers, negated } => {
+                    // `or` disjunction: the line hits iff ANY alternative
+                    // matches the current (possibly `line_format`-rewritten)
+                    // line bytes. `ip("…")` alternatives scan the line for an
+                    // in-range address; literal/regex alternatives use the
+                    // substring/regex test.
+                    let hit = matchers.iter().any(|m| match m {
                         LineMatcher::Literal(lit) => line.contains(lit.as_str()),
                         LineMatcher::Regex(re) => re.is_match(&line),
-                    };
-                    let keep = match op {
-                        LineFilterOp::Contains | LineFilterOp::Regex => hit,
-                        LineFilterOp::NotContains | LineFilterOp::NotRegex => !hit,
-                    };
+                        LineMatcher::Ip(matcher) => line_has_ip_in(matcher, &line),
+                    });
+                    // `!=`/`!~` keep the line iff NONE of the alternatives match.
+                    let keep = if *negated { !hit } else { hit };
                     if !keep {
                         return MetricRun::Dropped;
                     }
@@ -808,6 +866,19 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
                 threshold,
             }
         }
+        LabelFilterExpr::Ip {
+            name,
+            value,
+            negated,
+        } => {
+            let matcher =
+                IpMatcher::parse(value).map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
+            CompiledLabelFilter::Ip {
+                name: name.clone(),
+                matcher,
+                negated: *negated,
+            }
+        }
         LabelFilterExpr::And(a, b) => CompiledLabelFilter::And(
             Box::new(compile_label_filter(a)?),
             Box::new(compile_label_filter(b)?),
@@ -823,6 +894,9 @@ fn filter_contains_compare(f: &CompiledLabelFilter) -> bool {
     match f {
         CompiledLabelFilter::Match { .. } => false,
         CompiledLabelFilter::Compare { .. } => true,
+        // The IP label filter never mutates the label set (it cannot error),
+        // so it does not force the label-mutating fan-out path.
+        CompiledLabelFilter::Ip { .. } => false,
         CompiledLabelFilter::And(a, b) | CompiledLabelFilter::Or(a, b) => {
             filter_contains_compare(a) || filter_contains_compare(b)
         }
@@ -1347,6 +1421,22 @@ fn eval_label_filter<'v>(
                 CompareOp::Lte => v <= *threshold,
             })
         }
+        CompiledLabelFilter::Ip {
+            name,
+            matcher,
+            negated,
+        } => {
+            // Reference v3.7.3 semantics (differential-authoritative): parse the
+            // label value as an IP and test range membership. A missing label OR
+            // an unparseable value is `match = false` — NEVER an error, so no
+            // `__error__`/`__error_details__` is set (this is the key divergence
+            // from the numeric label filter, which DOES error on bad values).
+            // `=` returns the line iff matched; `!=` iff not matched.
+            let matched = get_label(labels, name)
+                .and_then(|raw| raw.parse::<IpAddr>().ok())
+                .is_some_and(|ip| matcher.contains(&ip));
+            Some(if *negated { !matched } else { matched })
+        }
         CompiledLabelFilter::And(a, b) => {
             match (
                 eval_label_filter(a, labels, failed),
@@ -1766,6 +1856,29 @@ mod tests {
             pulsus_logql::Expr::Log(log) => log.pipeline,
             other => panic!("unexpected expr shape: {other:?}"),
         }
+    }
+
+    /// Issue #201 regression: an `ip(…)` line filter has no token/skip-index
+    /// prefilter, so it does NOT push down — it compiles a run-stage and must
+    /// therefore decline the `is_line_filter_only` fast path. If the gate
+    /// wrongly reported `true`, exec would skip the client-side IP scan and the
+    /// filter would silently no-op. A plain literal line filter still qualifies.
+    #[test]
+    fn an_ip_only_line_filter_is_not_line_filter_only() {
+        let ip_only =
+            CompiledPipeline::compile(&stages_of(r#"{a="b"} |= ip("10.0.0.0/8")"#)).unwrap();
+        assert!(
+            !ip_only.is_line_filter_only(),
+            "an ip() line filter must not take the pushdown-only fast path"
+        );
+
+        // Positive control: a pure literal line filter DOES push down fully and
+        // keeps the fast path.
+        let literal = CompiledPipeline::compile(&stages_of(r#"{a="b"} |= "boom""#)).unwrap();
+        assert!(
+            literal.is_line_filter_only(),
+            "a pure literal line filter should remain line-filter-only"
+        );
     }
 
     /// Adjudication #2 regression: the STREAMS path is byte-identical

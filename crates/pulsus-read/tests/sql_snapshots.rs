@@ -213,6 +213,61 @@ fn line_filter_not_regex_negates_the_whole_compound_predicate() {
 }
 
 #[test]
+fn or_line_filter_of_literals_pushes_down_as_a_parenthesized_disjunction() {
+    // M8-LQ2 `linefilter.or`: each disjunct keeps its own `hasToken`
+    // prefilter, so the `tokenbf_v1` skip index still prunes per alternative.
+    let sp = streams_plan(
+        r#"{service_name="checkout"} |= "foo" or "bar""#,
+        &range_params(100, Direction::Backward),
+    );
+    assert_eq!(
+        sp.line_filters,
+        vec![
+            "((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn or_line_filter_negative_op_wraps_the_disjunction_in_not() {
+    let sp = streams_plan(
+        r#"{service_name="checkout"} != "foo" or "bar""#,
+        &range_params(100, Direction::Backward),
+    );
+    assert_eq!(
+        sp.line_filters,
+        vec![
+            "NOT ((hasToken(body, 'foo') AND position(body, 'foo') > 0) OR (hasToken(body, 'bar') AND position(body, 'bar') > 0))"
+                .to_string()
+        ]
+    );
+}
+
+#[test]
+fn ip_line_filter_is_not_pushed_down_while_a_sibling_literal_filter_is() {
+    // An `ip()` line filter has no token/skip-index prefilter, so it is served
+    // client-side and must NOT appear in `sp.line_filters`; a sibling literal
+    // filter still pushes down (and still prunes granules).
+    let sp = streams_plan(
+        r#"{service_name="checkout"} |= "boot" |= ip("10.0.0.0/8")"#,
+        &range_params(100, Direction::Backward),
+    );
+    assert_eq!(
+        sp.line_filters,
+        vec!["hasToken(body, 'boot') AND position(body, 'boot') > 0".to_string()],
+        "only the literal filter pushes down; the ip() filter is client-side"
+    );
+    assert!(
+        !sp.line_filters
+            .iter()
+            .any(|f| f.contains("10.0.0.0") || f.to_ascii_lowercase().contains("ip")),
+        "no ip() predicate may leak into the pushed-down SQL: {:?}",
+        sp.line_filters
+    );
+}
+
+#[test]
 fn stage3_renders_the_canonical_shape_with_a_single_service() {
     let sp = streams_plan(
         r#"{service_name="checkout", env="prod"} |= "connection refused""#,

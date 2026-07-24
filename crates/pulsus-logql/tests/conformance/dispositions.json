@@ -1,5 +1,5 @@
 {
-  "interim_count_pin": 13,
+  "interim_count_pin": 10,
   "entries": [
     {
       "construct": "matcher.eq",
@@ -43,15 +43,13 @@
     },
     {
       "construct": "linefilter.ip",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "linefilter.or",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "parser.json",
@@ -171,9 +169,8 @@
     },
     {
       "construct": "labelfilter.ip",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "fmt.line_format",

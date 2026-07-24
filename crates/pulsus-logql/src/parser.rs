@@ -494,8 +494,24 @@ fn parse_log_expr(cursor: &mut Cursor<'_>) -> Result<LogExpr, LogQlError> {
                 ));
             }
             cursor.advance();
-            let (value, _) = cursor.expect_string()?;
-            pipeline.push(Stage::LineFilter(LineFilter { op, value }));
+            let (value, value_is_ip) = parse_line_match(cursor, op)?;
+            // `or`-chained alternatives (M8-LQ2 `linefilter.or`): greedily
+            // consume `or <line-match>` — a line-level `or` only ever
+            // follows a line-match value, so it never collides with the
+            // metric-level `or` binary op (which appears after the range
+            // closes, outside this log expression).
+            let mut or_matches = Vec::new();
+            while matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "or") {
+                cursor.advance();
+                let (v, is_ip) = parse_line_match(cursor, op)?;
+                or_matches.push(ast::LineMatch { value: v, is_ip });
+            }
+            pipeline.push(Stage::LineFilter(LineFilter {
+                op,
+                value,
+                value_is_ip,
+                or_matches,
+            }));
             continue;
         }
         if matches!(cursor.peek().kind, TokenKind::Pipe) {
@@ -525,6 +541,36 @@ fn post_unwrap_stage_error(found: String, span: crate::token::Span) -> LogQlErro
         found,
         expected: "a label filter (only label filters may follow `unwrap`)".to_string(),
         span,
+    }
+}
+
+/// Parses one line-filter alternative: `ip("<spec>")` (M8-LQ2
+/// `linefilter.ip`) when the next tokens are `ip` `(`, else a plain quoted
+/// string. `ip(…)` is accepted only with `|=`/`!=` (matching the reference)
+/// — under `|~`/`!~` it is an `UnexpectedToken`. Returns `(value, is_ip)`.
+fn parse_line_match(
+    cursor: &mut Cursor<'_>,
+    op: LineFilterOp,
+) -> Result<(String, bool), LogQlError> {
+    if matches!(&cursor.peek().kind, TokenKind::Ident(n) if n == "ip")
+        && matches!(cursor.peek2().kind, TokenKind::LParen)
+    {
+        let ip_tok = cursor.peek().clone();
+        if !matches!(op, LineFilterOp::Contains | LineFilterOp::NotContains) {
+            return Err(LogQlError::UnexpectedToken {
+                found: describe(&ip_tok.kind),
+                expected: "a string (ip() line filters require `|=` or `!=`)".to_string(),
+                span: ip_tok.span,
+            });
+        }
+        cursor.advance(); // `ip`
+        cursor.expect(&TokenKind::LParen, "'('")?;
+        let (value, _) = cursor.expect_string()?;
+        cursor.expect(&TokenKind::RParen, "')'")?;
+        Ok((value, true))
+    } else {
+        let (value, _) = cursor.expect_string()?;
+        Ok((value, false))
     }
 }
 
@@ -807,6 +853,22 @@ fn parse_label_filter_predicate(cursor: &mut Cursor<'_>) -> Result<LabelFilterEx
             TokenKind::String(_) => {
                 let (value, _) = cursor.expect_string()?;
                 Ok(LabelFilterExpr::Match(Matcher { name, op: m, value }))
+            }
+            // `name = ip("…")` / `name != ip("…")` (M8-LQ2 `labelfilter.ip`).
+            // Only `=`/`!=` accept an `ip()` RHS; `=~`/`!~`/numeric ops keep
+            // rejecting it via their own arms below.
+            TokenKind::Ident(n)
+                if n == "ip" && matches!(cursor.peek2().kind, TokenKind::LParen) =>
+            {
+                cursor.advance(); // `ip`
+                cursor.expect(&TokenKind::LParen, "'('")?;
+                let (value, _) = cursor.expect_string()?;
+                cursor.expect(&TokenKind::RParen, "')'")?;
+                Ok(LabelFilterExpr::Ip {
+                    name,
+                    value,
+                    negated: matches!(m, MatchOp::Neq),
+                })
             }
             _ => {
                 let rhs = numeric_rhs(cursor)?;

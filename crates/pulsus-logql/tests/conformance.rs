@@ -320,6 +320,12 @@ fn walk_stage(stage: &Stage, out: &mut BTreeSet<String>) {
         Stage::LineFilter(lf) => {
             out.insert(linefilter_id(lf.op).to_string());
             out.insert("statics.string".to_string());
+            if lf.alternatives().any(|(_, is_ip)| is_ip) {
+                out.insert("linefilter.ip".to_string());
+            }
+            if !lf.or_matches.is_empty() {
+                out.insert("linefilter.or".to_string());
+            }
         }
         Stage::Parser(p) => {
             out.insert(parser_base_id(p).to_string());
@@ -391,6 +397,10 @@ fn walk_label_filter(lfe: &LabelFilterExpr, out: &mut BTreeSet<String>) {
         LabelFilterExpr::Compare { op, rhs, .. } => {
             out.insert(compare_id(*op).to_string());
             out.insert(numeric_id(rhs).to_string());
+        }
+        LabelFilterExpr::Ip { .. } => {
+            out.insert("labelfilter.ip".to_string());
+            out.insert("statics.string".to_string());
         }
         LabelFilterExpr::And(a, b) => {
             out.insert("labelfilter.and".to_string());
@@ -994,9 +1004,9 @@ fn differential_categories_are_pinned() {
         unescalated_divergence.is_empty(),
         "supported constructs the reference rejects (unescalated divergences): {unescalated_divergence:?}"
     );
-    assert_eq!(supported, 86, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 89, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 11,
+        tracked_interim, 8,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"
     );
     assert_eq!(

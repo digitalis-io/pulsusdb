@@ -197,6 +197,57 @@ fn a_label_format_with_a_numeric_rhs_is_rejected() {
     }
 }
 
+// --- IP line/label filters (M8-LQ2): rejected shapes ---
+
+#[test]
+fn an_empty_ip_line_filter_spec_is_rejected() {
+    // `ip()` with no string argument: the `(` must be followed by a string.
+    match parse(r#"{a="b"} |= ip()"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("a string"), "{expected}");
+        }
+        other => panic!("expected `ip()` with no argument to be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ip_line_filter_with_a_regex_operator_is_rejected() {
+    // `ip()` is accepted only with `|=`/`!=`; `|~ ip(...)` names the rule.
+    match parse(r#"{a="b"} |~ ip("10.0.0.0/8")"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(
+                expected.contains("|=") && expected.contains("!="),
+                "{expected}"
+            );
+        }
+        other => panic!("expected `|~ ip(...)` to be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ip_label_filter_with_a_regex_operator_is_rejected() {
+    // `=~ ip(...)` is not an IP label filter — `=~` takes a string RHS, so
+    // the `ip` identifier is an unexpected non-string.
+    match parse(r#"{a="b"} | addr =~ ip("10.0.0.0/8")"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("a string"), "{expected}");
+        }
+        other => panic!("expected `=~ ip(...)` to be rejected, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_ip_label_filter_without_parens_is_rejected() {
+    // `addr = ip` (no `(...)`) is a bare identifier RHS — neither a string
+    // matcher nor a numeric comparison.
+    match parse(r#"{a="b"} | addr = ip"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("number"), "{expected}");
+        }
+        other => panic!("expected `addr = ip` without parens to be rejected, got {other:?}"),
+    }
+}
+
 // --- `!=`/`!~` disambiguation, both directions (amendments 1-3) ---
 
 #[test]

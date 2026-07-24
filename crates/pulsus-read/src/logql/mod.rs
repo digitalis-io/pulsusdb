@@ -61,6 +61,7 @@ pub mod error;
 pub mod escape;
 pub mod exec;
 pub mod explain;
+mod ip;
 pub mod params;
 pub mod pipeline;
 pub mod plan;

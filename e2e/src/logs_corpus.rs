@@ -69,6 +69,15 @@ pub const CASE_IDS: &[&str] = &[
     // wins-resolved SM) is set-equal PulsusDB==Loki, and the `{scope_name="…"}`
     // STREAM selector returns empty on both stores (scope is not indexed).
     "scope_structured_metadata",
+    // Issue #201 `labelfilter.ip` no-error-semantics cases (append-only): the
+    // IP label filter parses the label VALUE as an IP and NEVER errors — a
+    // missing label or an unparseable value is a plain non-match (drop under
+    // `=`, keep under `!=`, no `__error__`/`__error_details__`). `ip_label_missing`
+    // proves missing⇒drop under `=` (non-empty via a sibling in-range match);
+    // `ip_label_invalid` uses `!=` so the non-IP witness RETURNS carrying its
+    // raw `addr` label and NO error labels.
+    "ip_label_missing",
+    "ip_label_invalid",
 ];
 
 /// The committed METRIC differential case ids (issue M6-10), in fixture
@@ -122,6 +131,34 @@ pub const BADJSON_BODY: &str = "not a json line";
 pub const SVC_BADNUM: &str = "svc-badnum";
 /// `| logfmt | n > 5` fails the numeric conversion (`LabelFilterErr`).
 pub const BADNUM_BODY: &str = "n=oops";
+
+/// Issue #201 `labelfilter.ip` error-semantics witness services. The
+/// `| logfmt | addr = ip("10.0.0.0/8")` probe materializes `addr` as a
+/// label via `logfmt`, then applies the IP label filter; each service
+/// isolates one arm of the missing/invalid truth table so no regular
+/// case's projection touches it.
+///
+/// [`SVC_IP_MISSING`] carries TWO witnesses: one whose `addr` is a
+/// matching in-range IP (returned, no error) and one lacking `addr`
+/// entirely (dropped, no error) — so the case both proves the missing-⇒
+/// drop rule AND keeps a NON-EMPTY expected set for the set comparison.
+pub const SVC_IP_MISSING: &str = "svc-ipmiss";
+/// The in-range witness body: `logfmt` extracts `addr=10.1.2.3`, which is
+/// inside `10.0.0.0/8` (returned).
+pub const IP_MISSING_MATCH_BODY: &str = "addr=10.1.2.3";
+/// The missing-label witness body: `logfmt` extracts `svc`, never `addr`,
+/// so `addr = ip(...)` drops the line (no `__error__`).
+pub const IP_MISSING_DROP_BODY: &str = "svc=web";
+
+/// [`SVC_IP_INVALID`] carries ONE witness whose `addr` is present but not
+/// a valid IP. The `ip_label_invalid` case probes it with `!=` so the
+/// unparseable value (a non-match) RETURNS the line carrying its raw `addr`
+/// label and NO error labels — the reference v3.7.3 IP label filter never
+/// sets `__error__`/`__error_details__` (unlike the numeric label filter).
+pub const SVC_IP_INVALID: &str = "svc-ipbad";
+/// The invalid-value witness body: `logfmt` extracts `addr=not-an-ip`,
+/// which fails IP parsing (a non-match — kept under `!=`, no error labels).
+pub const IP_INVALID_BODY: &str = "addr=not-an-ip";
 
 /// The issue #109 scope witness service: exactly ONE synthetic record
 /// carrying a collision-bearing `InstrumentationScope`, isolated under its
@@ -311,7 +348,7 @@ fn render_body(r: &GeneratedRecord) -> String {
 /// regular records; its dedicated service keeps every other case's
 /// projection untouched.
 pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
-    let mut records = Vec::with_capacity(spec.record_count + 4);
+    let mut records = Vec::with_capacity(spec.record_count + 7);
     for i in 0..spec.record_count {
         let mut r = GeneratedRecord {
             service: service_of(i),
@@ -351,7 +388,14 @@ pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
     // implied by `service == SVC_SCOPE` (see `to_otlp_export_request` /
     // `base_labels`), so it needs no extra `GeneratedRecord` fields.
     records.push(witness(2, SVC_SCOPE, SCOPE_WITNESS_BODY));
-    records.push(witness(3, SVC_BADUNIT, BADUNIT_BODY));
+    // Issue #201 `labelfilter.ip` error-semantics witnesses — appended
+    // BEFORE `svc-badunit` so the latter stays LAST and `last_ts_ns` keeps
+    // pinning to it. `svc-ipmiss` carries a matching+missing pair (returned
+    // + dropped); `svc-ipbad` carries the single invalid-value witness.
+    records.push(witness(3, SVC_IP_MISSING, IP_MISSING_MATCH_BODY));
+    records.push(witness(4, SVC_IP_MISSING, IP_MISSING_DROP_BODY));
+    records.push(witness(5, SVC_IP_INVALID, IP_INVALID_BODY));
+    records.push(witness(6, SVC_BADUNIT, BADUNIT_BODY));
     let last_ts_ns = records.last().map_or(spec.base_ns, |r| r.ts_ns);
     LogCorpus {
         run_id: spec.run_id.clone(),
@@ -919,6 +963,23 @@ pub fn case_projection(
             ]);
             (labels, r.body.clone())
         }),
+        // Issue #201: `| logfmt | addr = ip("10.0.0.0/8")` — the missing-label
+        // arm. Only the in-range match witness survives (logfmt extracts
+        // `addr=10.1.2.3`, inside 10.0.0.0/8); the sibling `svc=web` witness
+        // has no `addr` and is DROPPED (no `__error__`), so it projects None.
+        "ip_label_missing" => (r.service == SVC_IP_MISSING && r.body == IP_MISSING_MATCH_BODY)
+            .then(|| {
+                let labels = BTreeMap::from([("addr".to_string(), "10.1.2.3".to_string())]);
+                (labels, r.body.clone())
+            }),
+        // Issue #201: the invalid-value arm, probed with `!=`. `logfmt` extracts
+        // `addr=not-an-ip`, which fails IP parsing — a non-match, so `addr != ip(…)`
+        // RETURNS the line carrying only its raw `addr` label and NO error labels
+        // (the reference IP label filter never tags `__error__`/`__error_details__`).
+        "ip_label_invalid" => (r.service == SVC_IP_INVALID).then(|| {
+            let labels = BTreeMap::from([("addr".to_string(), "not-an-ip".to_string())]);
+            (labels, r.body.clone())
+        }),
         // Issue #109: `{run_id="R"} | scope_name="coll-scope"` selects the
         // scope witness by its structured-metadata `scope_name` label. The
         // pipeline extracts no NEW labels (the SM keys are already in
@@ -1096,6 +1157,28 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
                     .get("n")
                     .is_some_and(|v| v.parse::<f64>().is_err())
         }
+        // Issue #201: independent re-derivation of the IP-label survival.
+        // Missing-label arm: an `addr` that logfmt-parses to an IPv4 in
+        // 10.0.0.0/8 (first octet 10) survives; a record without `addr` drops.
+        "ip_label_missing" => {
+            r.service == SVC_IP_MISSING
+                && body_logfmt(r)
+                    .get("addr")
+                    .and_then(|v| v.parse::<std::net::IpAddr>().ok())
+                    .is_some_and(
+                        |ip| matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 10),
+                    )
+        }
+        // Invalid-value arm: `addr` present but not parseable as an IP ⇒
+        // `match=false` (no error labels, per the pinned reference). Under the
+        // `!=` filter that non-match is *returned*, carrying only the raw
+        // `addr` label, so it counts as a survivor.
+        "ip_label_invalid" => {
+            r.service == SVC_IP_INVALID
+                && body_logfmt(r)
+                    .get("addr")
+                    .is_some_and(|v| v.parse::<std::net::IpAddr>().is_err())
+        }
         // Issue #109: the scope witness carries no body signal (scope is
         // metadata), so the independent oracle re-derives survival purely from
         // the service isolation — every SVC_SCOPE record has `scope_name` =
@@ -1232,10 +1315,10 @@ mod tests {
         let resources = req["resourceLogs"].as_array().unwrap();
         assert_eq!(
             resources.len(),
-            7,
+            9,
             "one resource group per service (svc-json/logfmt/plain + the \
-             issue #99 svc-badjson/svc-badnum, the issue #109 svc-scope, and the \
-             M6-10 svc-badunit witnesses)"
+             issue #99 svc-badjson/svc-badnum, the issue #109 svc-scope, the \
+             issue #201 svc-ipmiss/svc-ipbad, and the M6-10 svc-badunit witnesses)"
         );
         for res in resources {
             let attrs = res["resource"]["attributes"].as_array().unwrap();

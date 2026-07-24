@@ -104,6 +104,8 @@ Log(
                 LineFilter {
                     op: Contains,
                     value: "err",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
         ],
@@ -135,6 +137,8 @@ Log(
                 LineFilter {
                     op: NotContains,
                     value: "err",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
         ],
@@ -165,6 +169,8 @@ Log(
                 LineFilter {
                     op: NotRegex,
                     value: "e.*r",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
         ],
@@ -195,24 +201,232 @@ Log(
                 LineFilter {
                     op: Contains,
                     value: "a",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: NotContains,
                     value: "b",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: Regex,
                     value: "c",
+                    value_is_ip: false,
+                    or_matches: [],
                 },
             ),
             LineFilter(
                 LineFilter {
                     op: NotRegex,
                     value: "d",
+                    value_is_ip: false,
+                    or_matches: [],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn an_ip_line_filter_head() {
+    assert_snapshot(
+        r#"{app="x"} |= ip("10.0.0.0/8")"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LineFilter(
+                LineFilter {
+                    op: Contains,
+                    value: "10.0.0.0/8",
+                    value_is_ip: true,
+                    or_matches: [],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_negative_ip_line_filter() {
+    assert_snapshot(
+        r#"{app="x"} != ip("10.0.0.0/8")"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LineFilter(
+                LineFilter {
+                    op: NotContains,
+                    value: "10.0.0.0/8",
+                    value_is_ip: true,
+                    or_matches: [],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn an_or_line_filter_of_two_literals() {
+    assert_snapshot(
+        r#"{app="x"} |= "a" or "b""#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LineFilter(
+                LineFilter {
+                    op: Contains,
+                    value: "a",
+                    value_is_ip: false,
+                    or_matches: [
+                        LineMatch {
+                            value: "b",
+                            is_ip: false,
+                        },
+                    ],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_mixed_or_line_filter_of_a_literal_and_an_ip() {
+    assert_snapshot(
+        r#"{app="x"} |= "a" or ip("10.0.0.0/8")"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LineFilter(
+                LineFilter {
+                    op: Contains,
+                    value: "a",
+                    value_is_ip: false,
+                    or_matches: [
+                        LineMatch {
+                            value: "10.0.0.0/8",
+                            is_ip: true,
+                        },
+                    ],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn an_ip_label_filter() {
+    assert_snapshot(
+        r#"{app="x"} | addr = ip("10.0.0.0/8")"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LabelFilter(
+                Ip {
+                    name: "addr",
+                    value: "10.0.0.0/8",
+                    negated: false,
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_negated_ip_label_filter() {
+    assert_snapshot(
+        r#"{app="x"} | addr != ip("10.0.0.0/8")"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            LabelFilter(
+                Ip {
+                    name: "addr",
+                    value: "10.0.0.0/8",
+                    negated: true,
                 },
             ),
         ],
@@ -394,12 +608,16 @@ Metric(
                         LineFilter {
                             op: Contains,
                             value: "a",
+                            value_is_ip: false,
+                            or_matches: [],
                         },
                     ),
                     LineFilter(
                         LineFilter {
                             op: NotContains,
                             value: "b",
+                            value_is_ip: false,
+                            or_matches: [],
                         },
                     ),
                 ],

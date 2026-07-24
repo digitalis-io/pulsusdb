@@ -1463,6 +1463,17 @@ pub struct TailSetup {
     resolved: Vec<u64>,
 }
 
+/// Whether a `/stats` pipeline is fully served by pushdown aggregation: a
+/// stream selector plus PUSHABLE line filters only. Any other stage — or a
+/// non-pushable `ip()`/mixed-`or` line filter (no client fallback on the
+/// stats path) — must reject rather than silently over-count. Consults
+/// [`plan::is_pushable_line_filter`], the single pushability source of truth.
+fn stats_pipeline_is_pushdown_only(pipeline: &[Stage]) -> bool {
+    pipeline
+        .iter()
+        .all(|s| matches!(s, Stage::LineFilter(lf) if plan::is_pushable_line_filter(lf)))
+}
+
 impl LogQlEngine {
     /// `/api/logs/v1/stats` (docs/api.md §2.5): stage-1 fingerprint
     /// resolution, then ONE aggregation — rollup-routed (zero body
@@ -1515,17 +1526,17 @@ impl LogQlEngine {
                 });
             }
         };
-        // Only line filters have a pushdown aggregation shape; a parser/
-        // format/label-filter stage would silently over-count if ignored
-        // (defense in depth — the API layer rejects these before parsing
-        // reaches the engine).
-        if !sp
-            .pipeline
-            .iter()
-            .all(|s| matches!(s, Stage::LineFilter(_)))
-        {
+        // Only PUSHABLE line filters have a pushdown aggregation shape; a
+        // parser/format/label-filter stage — OR a non-pushable `ip()`/mixed-
+        // `or` line filter — would silently over-count if ignored. This path
+        // is pushdown-only (no client pipeline), so a non-pushable line filter
+        // must REJECT here rather than drop (defense in depth — the API layer
+        // rejects most of these before parsing reaches the engine).
+        if !stats_pipeline_is_pushdown_only(&sp.pipeline) {
             return Err(ReadError::PipelineInvalid {
-                reason: "stats supports a stream selector plus line filters only".to_string(),
+                reason: "stats supports a stream selector plus line filters only (ip() line \
+                         filters are not supported by stats)"
+                    .to_string(),
             });
         }
 
@@ -4913,6 +4924,39 @@ mod tests {
     use pulsus_clickhouse::ChError;
 
     use super::*;
+
+    /// The `/stats` pushdown-only gate (M8-LQ2 Delta 1): a pushable literal
+    /// line filter is accepted, but a non-pushable `ip()`/mixed-`or` line
+    /// filter — and any beyond-line-filter stage — is rejected, so `stats`
+    /// never silently over-counts a filter it cannot push down.
+    #[test]
+    fn stats_gate_rejects_non_pushable_line_filters() {
+        fn pipeline(query: &str) -> Vec<Stage> {
+            let pulsus_logql::Expr::Log(le) = pulsus_logql::parse(query).expect("parse") else {
+                panic!("log expr");
+            };
+            le.pipeline
+        }
+        // Pushable: plain literal line filter(s).
+        assert!(stats_pipeline_is_pushdown_only(&pipeline(r#"{app="x"}"#)));
+        assert!(stats_pipeline_is_pushdown_only(&pipeline(
+            r#"{app="x"} |= "err""#
+        )));
+        assert!(stats_pipeline_is_pushdown_only(&pipeline(
+            r#"{app="x"} |= "a" or "b""#
+        )));
+        // Non-pushable: ip() line filter and a mixed-or with an ip alternative.
+        assert!(!stats_pipeline_is_pushdown_only(&pipeline(
+            r#"{app="x"} |= ip("10.0.0.0/8")"#
+        )));
+        assert!(!stats_pipeline_is_pushdown_only(&pipeline(
+            r#"{app="x"} |= "a" or ip("10.0.0.0/8")"#
+        )));
+        // Beyond-line-filter stages are still rejected.
+        assert!(!stats_pipeline_is_pushdown_only(&pipeline(
+            r#"{app="x"} | json"#
+        )));
+    }
 
     /// Issue #170 plan v2 test delta 3: the detected-fields matched-entry
     /// count is POST-pipeline — rows the pipeline drops never count toward

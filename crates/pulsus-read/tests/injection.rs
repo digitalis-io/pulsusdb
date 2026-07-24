@@ -186,6 +186,8 @@ fn a_line_filter_payload_stays_inside_one_literal_in_the_exact_predicate() {
     let filters = vec![pulsus_logql::Stage::LineFilter(LineFilter {
         op: LineFilterOp::Contains,
         value: PAYLOAD_PAREN.to_string(),
+        value_is_ip: false,
+        or_matches: Vec::new(),
     })];
     let clauses = compile_line_filters(&filters);
     assert_eq!(clauses.len(), 1);
@@ -236,6 +238,8 @@ fn stage3_with_an_injection_payload_in_the_line_filter_keeps_the_statement_well_
     let filters = vec![pulsus_logql::Stage::LineFilter(LineFilter {
         op: LineFilterOp::Contains,
         value: PAYLOAD_COMMENT.to_string(),
+        value_is_ip: false,
+        or_matches: Vec::new(),
     })];
     let clauses = compile_line_filters(&filters);
     let sql = sql::stage3(

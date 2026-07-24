@@ -103,6 +103,18 @@
       "query": "{run_id=\"{R}\"} | scope_name=\"coll-scope\""
     },
     {
+      "case_id": "ip_label_missing",
+      "construct": "issue #201: `| logfmt | addr = ip(\"10.0.0.0/8\")` — a missing `addr` label DROPS the line (no __error__). The svc-ipmiss scope carries one witness with a matching in-range addr (returned) and one lacking addr (dropped), so the set is NON-EMPTY and proves the drop rule",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-ipmiss\"} | logfmt | addr = ip(\"10.0.0.0/8\")"
+    },
+    {
+      "case_id": "ip_label_invalid",
+      "construct": "issue #201: `| logfmt | addr != ip(\"10.0.0.0/8\")` — a present-but-non-IP `addr` value is a plain non-match (the IP label filter NEVER errors), so `!=` RETURNS the svc-ipbad witness carrying only its raw `addr=not-an-ip` label and NO __error__/__error_details__, compared set-equal against the pinned reference v3.7.3",
+      "mode": "gated",
+      "query": "{run_id=\"{R}\", service_name=\"svc-ipbad\"} | logfmt | addr != ip(\"10.0.0.0/8\")"
+    },
+    {
       "case_id": "metric_filtered_count",
       "construct": "M6-10 client-aggregated count_over_time over a json + label-filter pipeline (instant vector; instant windows are semantically identical on both stores \u2014 no tumbling divergence)",
       "mode": "gated",

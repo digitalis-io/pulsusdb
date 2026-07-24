@@ -789,3 +789,191 @@ fn metric_path_sets_both_error_and_the_detail_label() {
         "metric path must now carry the byte-exact __error_details__: {labels:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// ip() line + label filters (M8-LQ2)
+//
+// The IpMatcher parse/contains boundary matrix (v4/v6 × single/CIDR/range,
+// off-by-one edges, malformed specs) is pinned exhaustively in the
+// `logql::ip` unit tests; these goldens pin the EXEC wiring through the
+// client pipeline — line-filter substring scan and label-filter membership,
+// negation inversion, the mixed `or` disjunction, and the missing/invalid
+// label error semantics — for at least one line + one label case per family.
+// ---------------------------------------------------------------------
+
+/// Runs a `| logfmt | <label filter>` pipeline against a logfmt body so the
+/// filtered label is a real extracted label; returns the sorted final label
+/// set, or `None` when dropped.
+fn run_label(query: &str, body: &str) -> Option<Vec<(String, String)>> {
+    run(query, body).map(|(labels, _)| labels)
+}
+
+#[test]
+fn ip_line_filter_v4_cidr_keeps_in_range_and_drops_out_of_range() {
+    // In-range IP embedded in a larger line is kept, label set + line intact.
+    let (got, line) = run(
+        r#"{a="b"} |= ip("10.0.0.0/8")"#,
+        "request from 10.1.2.3 done",
+    )
+    .unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(line, "request from 10.1.2.3 done");
+    // Out-of-range IP drops the line.
+    assert!(
+        run(
+            r#"{a="b"} |= ip("10.0.0.0/8")"#,
+            "request from 8.8.8.8 done"
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn ip_line_filter_negation_inverts_v4() {
+    assert!(run(r#"{a="b"} != ip("10.0.0.0/8")"#, "from 10.1.2.3").is_none());
+    assert!(run(r#"{a="b"} != ip("10.0.0.0/8")"#, "from 8.8.8.8").is_some());
+}
+
+#[test]
+fn ip_line_filter_v4_range_boundaries() {
+    let q = r#"{a="b"} |= ip("10.0.0.1-10.0.0.5")"#;
+    assert!(run(q, "x 10.0.0.1 y").is_some()); // first
+    assert!(run(q, "x 10.0.0.5 y").is_some()); // last
+    assert!(run(q, "x 10.0.0.6 y").is_none()); // just past
+    assert!(run(q, "x 10.0.0.0 y").is_none()); // just before
+}
+
+#[test]
+fn ip_line_filter_v4_cidr_boundaries() {
+    let q = r#"{a="b"} |= ip("10.0.0.0/24")"#;
+    assert!(run(q, "a 10.0.0.0 b").is_some()); // network
+    assert!(run(q, "a 10.0.0.255 b").is_some()); // broadcast/last
+    assert!(run(q, "a 10.0.1.0 b").is_none()); // first of next block
+    assert!(run(q, "a 9.255.255.255 b").is_none()); // last before block
+}
+
+#[test]
+fn ip_line_filter_v6_cidr_boundaries_including_predecessor() {
+    let q = r#"{a="b"} |= ip("2001:db8::/126")"#;
+    assert!(run(q, "peer [2001:db8::] up").is_some()); // network
+    assert!(run(q, "peer [2001:db8::3] up").is_some()); // last of block
+    assert!(run(q, "peer [2001:db8::4] up").is_none()); // first of next block
+    // last address of the immediately-preceding block.
+    assert!(run(q, "peer [2001:db7:ffff:ffff:ffff:ffff:ffff:ffff] up").is_none());
+}
+
+#[test]
+fn ip_line_filter_v6_range_boundaries() {
+    let q = r#"{a="b"} |= ip("2001:db8::1-2001:db8::5")"#;
+    assert!(run(q, "x 2001:db8::1 y").is_some()); // first
+    assert!(run(q, "x 2001:db8::5 y").is_some()); // last
+    assert!(run(q, "x 2001:db8::6 y").is_none()); // just past
+    assert!(run(q, "x 2001:db8:: y").is_none()); // just before
+}
+
+#[test]
+fn mixed_or_line_filter_matches_via_either_literal_or_ip() {
+    let q = r#"{a="b"} |= "boot" or ip("10.0.0.0/8")"#;
+    assert!(run(q, "system boot complete").is_some()); // literal alternative
+    assert!(run(q, "packet from 10.1.2.3").is_some()); // ip alternative
+    assert!(run(q, "nothing relevant here").is_none()); // neither
+}
+
+#[test]
+fn or_line_filter_disjunction_over_a_rewritten_line() {
+    // `| line_format` rewrites the line; the trailing `or` literal filter is
+    // non-pushable (post-`line_format`) and evaluated client-side as a
+    // disjunction over the rewritten text.
+    let q = r#"{a="b"} | logfmt | line_format "{{.level}}" |= "warn" or "error""#;
+    // rewritten line = "error" -> matches the second alternative.
+    assert!(run(q, "level=error msg=x").is_some());
+    // rewritten line = "info" -> matches neither.
+    assert!(run(q, "level=info msg=x").is_none());
+}
+
+#[test]
+fn ip_label_filter_v4_cidr_membership_and_negation() {
+    let q = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
+    // in range: kept, addr extracted.
+    assert_eq!(
+        run_label(q, "addr=10.1.2.3").unwrap(),
+        labels(&[("app", "checkout"), ("env", "prod"), ("addr", "10.1.2.3")])
+    );
+    // out of range: dropped.
+    assert!(run_label(q, "addr=8.8.8.8").is_none());
+    // negation inverts both verdicts.
+    let nq = r#"{a="b"} | logfmt | addr != ip("10.0.0.0/8")"#;
+    assert!(run_label(nq, "addr=10.1.2.3").is_none());
+    assert!(run_label(nq, "addr=8.8.8.8").is_some());
+}
+
+#[test]
+fn ip_label_filter_v4_range_boundaries() {
+    let q = r#"{a="b"} | logfmt | addr = ip("10.0.0.1-10.0.0.5")"#;
+    assert!(run_label(q, "addr=10.0.0.1").is_some()); // first
+    assert!(run_label(q, "addr=10.0.0.5").is_some()); // last
+    assert!(run_label(q, "addr=10.0.0.6").is_none()); // just past
+    assert!(run_label(q, "addr=10.0.0.0").is_none()); // just before
+}
+
+#[test]
+fn ip_label_filter_v6_cidr_boundaries_including_predecessor() {
+    let q = r#"{a="b"} | logfmt | addr = ip("2001:db8::/126")"#;
+    assert!(run_label(q, "addr=2001:db8::").is_some()); // network
+    assert!(run_label(q, "addr=2001:db8::3").is_some()); // last of block
+    assert!(run_label(q, "addr=2001:db8::4").is_none()); // first of next block
+    assert!(run_label(q, "addr=2001:db7:ffff:ffff:ffff:ffff:ffff:ffff").is_none()); // predecessor
+}
+
+#[test]
+fn ip_label_filter_v6_range_boundaries() {
+    let q = r#"{a="b"} | logfmt | addr = ip("2001:db8::1-2001:db8::5")"#;
+    assert!(run_label(q, "addr=2001:db8::1").is_some()); // first
+    assert!(run_label(q, "addr=2001:db8::5").is_some()); // last
+    assert!(run_label(q, "addr=2001:db8::6").is_none()); // just past
+    assert!(run_label(q, "addr=2001:db8::").is_none()); // just before
+}
+
+#[test]
+fn ip_label_filter_missing_label_drops_under_eq_keeps_under_neq() {
+    // Reference v3.7.3 (differential-authoritative): a missing label is a
+    // non-match — dropped under `=`, kept under `!=`, and NEVER tagged with
+    // `__error__`/`__error_details__`.
+    let eq = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
+    assert!(run_label(eq, "other=1 msg=x").is_none());
+    let neq = r#"{a="b"} | logfmt | addr != ip("10.0.0.0/8")"#;
+    let kept = run_label(neq, "other=1 msg=x").expect("missing label survives `!=`");
+    assert!(
+        !kept
+            .iter()
+            .any(|(k, _)| k == "__error__" || k == "__error_details__"),
+        "a missing IP label must not set any error label: {kept:?}"
+    );
+}
+
+#[test]
+fn ip_label_filter_invalid_value_is_a_non_match_without_error() {
+    // Reference v3.7.3 (differential-authoritative): a present-but-unparseable
+    // value is a plain non-match — NO `__error__`/`__error_details__` is ever
+    // set (this is the key divergence from the numeric label filter, which does
+    // tag `LabelFilterErr`). Dropped under `=`, kept under `!=` carrying the raw
+    // label untouched.
+    let eq = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
+    assert!(
+        run_label(eq, "addr=not-an-ip msg=x").is_none(),
+        "an invalid IP value must DROP under `=`"
+    );
+
+    let neq = r#"{a="b"} | logfmt | addr != ip("10.0.0.0/8")"#;
+    let kept = run_label(neq, "addr=not-an-ip msg=x").expect("invalid value survives `!=`");
+    assert!(
+        !kept
+            .iter()
+            .any(|(k, _)| k == "__error__" || k == "__error_details__"),
+        "an invalid IP value must NOT set any error label: {kept:?}"
+    );
+    assert!(
+        kept.contains(&("addr".to_string(), "not-an-ip".to_string())),
+        "the raw non-IP label value is carried unchanged: {kept:?}"
+    );
+}
