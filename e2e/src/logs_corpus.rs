@@ -105,6 +105,20 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     // Issue #91 matching runtime errors (both stores fail the query).
     "metric_match_multiple_err",
     "metric_match_duplicate_err",
+    // Issue M8-LQ3 `rate_counter` differential vectors (instant, `[1m]`;
+    // gated). Each rides `run_metric_instant_case` (hard-gating BOTH
+    // pulsus-vs-corpus AND oracle-vs-corpus values), so a wrong reset /
+    // boundary / dup-ts / no-extrapolation rule is RED vs the live
+    // reference. Oracle-confirmed values (v3.7.3): reset 0.5333, sparse
+    // 1.0, boundary 1.0, dup-ts 0.2833.
+    "metric_rate_counter_reset",
+    "metric_rate_counter_sparse",
+    "metric_rate_counter_boundary",
+    "metric_rate_counter_dup_ts",
+    // Issue M8-LQ3 `sort` value-order vector (instant; gated). A dedicated
+    // `metric_instant_ordered` kind whose ordered result sequence is
+    // compared store-vs-store; branch-validated order `b, a, c`.
+    "metric_sort_order",
 ];
 
 pub const SVC_JSON: &str = "svc-json";
@@ -159,6 +173,27 @@ pub const SVC_IP_INVALID: &str = "svc-ipbad";
 /// The invalid-value witness body: `logfmt` extracts `addr=not-an-ip`,
 /// which fails IP parsing (a non-match — kept under `!=`, no error labels).
 pub const IP_INVALID_BODY: &str = "addr=not-an-ip";
+
+/// Issue M8-LQ3 `rate_counter` witness services. Each isolates ONE
+/// dedicated counter series under its own `service_name` so the
+/// `rate_counter({… | logfmt | unwrap c [1m]})` probe reduces exactly the
+/// intended `c=<n>` samples and no regular case's projection ever touches
+/// them. Every witness body is `c=<n>` (logfmt extracts `c`, `unwrap c`
+/// deletes it → all samples collapse onto the base label set, one series).
+/// All samples are placed inside the `[1m]` instant lookback window (see
+/// `generate`), so the per-second value is `increase / 60`.
+pub const SVC_RC_RESET: &str = "svc-rcreset";
+pub const SVC_RC_SPARSE: &str = "svc-rcsparse";
+pub const SVC_RC_BOUNDARY: &str = "svc-rcbound";
+pub const SVC_RC_DUPTS: &str = "svc-rcdup";
+
+/// Issue M8-LQ3 `sort` witness service. Eleven `grp=<v>` records — five
+/// `grp=a`, one `grp=b`, five `grp=c` — so
+/// `sum by (grp) (count_over_time({… | logfmt [30m]}))` yields the counts
+/// `{a:5, b:1, c:5}`; `sort` then orders them ascending by value with the
+/// equal-value (`a`/`c`) tie broken by label set ascending → `b, a, c`
+/// (branch-validated against the pinned reference v3.7.3).
+pub const SVC_SORT: &str = "svc-sort";
 
 /// The issue #109 scope witness service: exactly ONE synthetic record
 /// carrying a collision-bearing `InstrumentationScope`, isolated under its
@@ -348,7 +383,7 @@ fn render_body(r: &GeneratedRecord) -> String {
 /// regular records; its dedicated service keeps every other case's
 /// projection untouched.
 pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
-    let mut records = Vec::with_capacity(spec.record_count + 7);
+    let mut records = Vec::with_capacity(spec.record_count + 30);
     for i in 0..spec.record_count {
         let mut r = GeneratedRecord {
             service: service_of(i),
@@ -395,7 +430,47 @@ pub fn generate(spec: &LogCorpusSpec) -> LogCorpus {
     records.push(witness(3, SVC_IP_MISSING, IP_MISSING_MATCH_BODY));
     records.push(witness(4, SVC_IP_MISSING, IP_MISSING_DROP_BODY));
     records.push(witness(5, SVC_IP_INVALID, IP_INVALID_BODY));
-    records.push(witness(6, SVC_BADUNIT, BADUNIT_BODY));
+    // Issue M8-LQ3 `rate_counter` / `sort` witnesses — appended BEFORE
+    // `svc-badunit` so the latter stays the last-pushed record and
+    // `last_ts_ns` keeps pinning to it. Offsets 6..=27 place every sample
+    // at `base_ns + step_ns·(record_count + offset)`; with `step_ns = 1s`
+    // and the eval instant at `last_ts_ns + 5s = index (record_count+28)+5`,
+    // the `[1m]` lookback `(eval-60s, eval]` spans indices
+    // `(record_count-27, record_count+33]`, so all these samples sit
+    // strictly INSIDE the window (both stores include them unambiguously —
+    // the half-open edge-inclusion rule itself is pinned in the hermetic
+    // reducer golden, not gambled on a literal-edge live placement).
+    //
+    // `rate_counter` reset (c=10,30,5,12 by ts): +20, reset +5, +7 = 32.
+    records.push(witness(6, SVC_RC_RESET, "c=10"));
+    records.push(witness(7, SVC_RC_RESET, "c=30"));
+    records.push(witness(8, SVC_RC_RESET, "c=5")); // reset: 5 < 30
+    records.push(witness(9, SVC_RC_RESET, "c=12"));
+    // Sparse interior (c=200,260, 10s apart): increase 60 over the FULL 60s
+    // window ⇒ 1.0 (a boundary-extrapolated reading would inflate to 6.0).
+    records.push(witness(10, SVC_RC_SPARSE, "c=200"));
+    records.push(witness(11, SVC_RC_SPARSE, "c=260"));
+    // Boundary span (c=100,160): monotone increase 60 ⇒ 1.0.
+    records.push(witness(12, SVC_RC_BOUNDARY, "c=100"));
+    records.push(witness(13, SVC_RC_BOUNDARY, "c=160"));
+    // Duplicate timestamp: `c=10` and `c=3` share offset 15 (identical ts).
+    // Delivered scan order (ts asc, then body asc — `"c=10" < "c=3"`) is
+    // 5,10,3,12 ⇒ +5, reset +3, +9 = 17 (NOT the 12 an ascending-VALUE
+    // tie-sort would give). Pushed 10-before-3 so the hermetic scan order
+    // matches the live `ORDER BY timestamp_ns, fingerprint, body`.
+    records.push(witness(14, SVC_RC_DUPTS, "c=5"));
+    records.push(witness(15, SVC_RC_DUPTS, "c=10"));
+    records.push(witness(15, SVC_RC_DUPTS, "c=3"));
+    records.push(witness(16, SVC_RC_DUPTS, "c=12"));
+    // `sort` grouping data: 5×grp=a, 1×grp=b, 5×grp=c ⇒ counts {a:5,b:1,c:5}.
+    for off in 17..=21 {
+        records.push(witness(off, SVC_SORT, "grp=a"));
+    }
+    records.push(witness(22, SVC_SORT, "grp=b"));
+    for off in 23..=27 {
+        records.push(witness(off, SVC_SORT, "grp=c"));
+    }
+    records.push(witness(28, SVC_BADUNIT, BADUNIT_BODY));
     let last_ts_ns = records.last().map_or(spec.base_ns, |r| r.ts_ns);
     LogCorpus {
         run_id: spec.run_id.clone(),
@@ -483,6 +558,14 @@ impl LogCorpus {
             labels.insert("took_ms".to_string(), r.took_ms.to_string());
             labels.insert("req_path".to_string(), r.req_path.to_string());
             labels
+        };
+        // The `rate_counter` base label set (`unwrap c` deletes the only
+        // parsed label, so every sample collapses onto `{service_name, run_id}`).
+        let rc_base = |service: &str| {
+            BTreeMap::from([
+                ("service_name".to_string(), service.to_string()),
+                (RUN_ATTR.to_string(), self.run_id.clone()),
+            ])
         };
         let mut out = MetricVector::new();
         match case_id {
@@ -581,6 +664,37 @@ impl LogCorpus {
                     &svc_json_counts(&self.records, &["method", "status"], None),
                 );
                 out.extend(joined);
+            }
+            // Issue M8-LQ3 `rate_counter`: all samples collapse onto the
+            // base label set (`logfmt` extracts `c`, `unwrap c` deletes
+            // it), one series, value = reset-aware increase / 60s. The
+            // hermetic `shipped_metric_expectations_agree_with_the_shipped_evaluator`
+            // test cross-checks each derived value against the real reducer.
+            "metric_rate_counter_reset" => {
+                out.insert(rc_base(SVC_RC_RESET), 32.0 / 60.0);
+            }
+            "metric_rate_counter_sparse" => {
+                // increase 60 (200→260) / 60s window = 1.0 (no extrapolation).
+                out.insert(rc_base(SVC_RC_SPARSE), 1.0);
+            }
+            "metric_rate_counter_boundary" => {
+                // increase 60 (100→160) / 60s window = 1.0.
+                out.insert(rc_base(SVC_RC_BOUNDARY), 1.0);
+            }
+            "metric_rate_counter_dup_ts" => {
+                out.insert(rc_base(SVC_RC_DUPTS), 17.0 / 60.0);
+            }
+            // Issue M8-LQ3 `sort`: `sum by (grp) (count_over_time(...))`
+            // reduces to `{grp}` counts {a:5, b:1, c:5}. The set is the
+            // order-neutral validity gate; the ordered sequence (b,a,c) is
+            // checked store-vs-store in `run_metric_instant_ordered_case`.
+            "metric_sort_order" => {
+                for (grp, count) in [("a", 5.0), ("b", 1.0), ("c", 5.0)] {
+                    out.insert(
+                        BTreeMap::from([("grp".to_string(), grp.to_string())]),
+                        count,
+                    );
+                }
             }
             other => panic!("expected_metric_vector: unknown case id {other:?}"),
         }
@@ -1315,10 +1429,12 @@ mod tests {
         let resources = req["resourceLogs"].as_array().unwrap();
         assert_eq!(
             resources.len(),
-            9,
+            14,
             "one resource group per service (svc-json/logfmt/plain + the \
              issue #99 svc-badjson/svc-badnum, the issue #109 svc-scope, the \
-             issue #201 svc-ipmiss/svc-ipbad, and the M6-10 svc-badunit witnesses)"
+             issue #201 svc-ipmiss/svc-ipbad, the M8-LQ3 \
+             svc-rcreset/svc-rcsparse/svc-rcbound/svc-rcdup/svc-sort, and the \
+             M6-10 svc-badunit witnesses)"
         );
         for res in resources {
             let attrs = res["resource"]["attributes"].as_array().unwrap();

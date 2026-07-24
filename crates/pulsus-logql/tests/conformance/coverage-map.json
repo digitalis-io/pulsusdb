@@ -302,6 +302,49 @@
         "agg.sum",
         "grouping.by"
       ]
+    },
+    {
+      "source": "metric_rate_counter_reset",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.rate_counter",
+        "parser.logfmt"
+      ]
+    },
+    {
+      "source": "metric_rate_counter_sparse",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.rate_counter",
+        "parser.logfmt"
+      ]
+    },
+    {
+      "source": "metric_rate_counter_boundary",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.rate_counter",
+        "parser.logfmt"
+      ]
+    },
+    {
+      "source": "metric_rate_counter_dup_ts",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.rate_counter",
+        "parser.logfmt"
+      ]
+    },
+    {
+      "source": "metric_sort_order",
+      "kind": "e2e-differential",
+      "constructs": [
+        "agg.sort",
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time",
+        "parser.logfmt"
+      ]
     }
   ]
 }

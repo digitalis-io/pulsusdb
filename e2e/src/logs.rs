@@ -940,6 +940,7 @@ async fn run_case(
         "streams" => run_streams_case(ctx, corpus, fixture, case, window).await,
         "streams_limited" => run_streams_limited_case(ctx, corpus, case, window).await,
         "metric_instant" => run_metric_instant_case(ctx, corpus, case).await,
+        "metric_instant_ordered" => run_metric_instant_ordered_case(ctx, corpus, case).await,
         "metric_range" => run_metric_range_case(ctx, corpus, case, window).await,
         "metric_error" => run_metric_error_case(ctx, corpus, case).await,
         "metric_match_error" => run_metric_match_error_case(ctx, corpus, case).await,
@@ -1277,6 +1278,155 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
             "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
             case.case_id,
             case.ledger.as_deref().unwrap_or(""),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// The ordered (received-order) `(labels, value)` sequence of an INSTANT
+/// vector response — the order-preserving analog of `vector_result_set`.
+/// A terminal `sort`/`sort_desc` survives the encoder's label re-sort
+/// (`preserve_vector_order`), so `data.result[]` arrives in value order.
+fn ordered_vector(body: &serde_json::Value) -> Result<Vec<(BTreeMap<String, String>, f64)>> {
+    let result_type = body["data"]["resultType"].as_str().unwrap_or_default();
+    if result_type != "vector" {
+        bail!("expected a vector result, got {result_type:?}: {body}");
+    }
+    let mut out = Vec::new();
+    for sample in body["data"]["result"].as_array().into_iter().flatten() {
+        out.push((labels_of(sample)?, parse_value_str(&sample["value"][1])?));
+    }
+    Ok(out)
+}
+
+/// Issue M8-LQ3 AC9: the `sort`/`sort_desc` VALUE-ORDER differential. A
+/// terminal sort establishes the wire order of the instant vector, so
+/// both stores must return the same series in the same value order. The
+/// set-equal `expected_metric_vector` comparison is the direction-neutral
+/// validity gate (dup-label hard-fail); the ordered sequence is then
+/// asserted (a) monotone in the sort direction on PulsusDB and (b)
+/// label-sequence-equal between the two stores. Kept separate from
+/// `run_metric_instant_case` because that path normalizes to a set.
+async fn run_metric_instant_ordered_case(
+    ctx: &Ctx,
+    corpus: &LogCorpus,
+    case: &CaseRaw,
+) -> Result<()> {
+    let q = case.query.replace("{R}", &corpus.run_id);
+    let expected = corpus.expected_metric_vector(&case.case_id);
+    let descending = q.contains("sort_desc");
+    let eval_ns = metric_eval_ns(corpus);
+    let query_timeout = query_request_timeout(corpus.scale);
+    println!(
+        "pulsus-e2e:     case {:?} [{}] — {}: {} expected series, {} order",
+        case.case_id,
+        case.mode,
+        case.construct,
+        expected.len(),
+        if descending {
+            "descending"
+        } else {
+            "ascending"
+        },
+    );
+
+    let pulsus_body = query_instant(
+        ctx,
+        &ctx.url("/api/logs/v1/query"),
+        &q,
+        eval_ns,
+        query_timeout,
+    )
+    .await?;
+    let oracle_body = query_instant(
+        ctx,
+        &format!("{}/loki/api/v1/query", ctx.loki_url),
+        &q,
+        eval_ns,
+        query_timeout,
+    )
+    .await?;
+
+    let pulsus_ordered = ordered_vector(&pulsus_body)?;
+    let oracle_ordered = ordered_vector(&oracle_body)?;
+    // Set-equal validity gate (dup-label hard-fail lives in vector_result_set).
+    let pulsus_set = vector_result_set(&pulsus_body)?;
+    let oracle_set = vector_result_set(&oracle_body)?;
+
+    let dump = |detail: &str| -> Result<std::path::PathBuf> {
+        let artifact = serde_json::json!({
+            "surface": "logs_metric_ordered",
+            "case_id": case.case_id,
+            "mode": case.mode,
+            "kind": "metric_instant_ordered",
+            "query": q,
+            "eval_ns": eval_ns,
+            "descending": descending,
+            "expected_set": expected.iter().map(|(l, v)| serde_json::json!({"labels": l, "value": v})).collect::<Vec<_>>(),
+            "pulsusdb_result": pulsus_body,
+            "oracle_result": oracle_body,
+            "detail": detail,
+        });
+        write_artifact(ctx, ARTIFACT_AREA, "metric-case-mismatch", &artifact)
+    };
+
+    if !vectors_match(&pulsus_set, &expected) {
+        let path = dump(&format!(
+            "pulsusdb vector diverged: got {pulsus_set:?}, expected {expected:?}"
+        ))?;
+        bail!(
+            "case {:?}: pulsusdb diverged from the corpus expectation (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    if !vectors_match(&oracle_set, &expected) {
+        let path = dump(&format!(
+            "oracle vector diverged: got {oracle_set:?}, expected {expected:?}"
+        ))?;
+        bail!(
+            "case {:?}: oracle diverged from the corpus expectation (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    // (a) PulsusDB's value sequence is monotone in the sort direction.
+    let monotone = pulsus_ordered.windows(2).all(|w| {
+        if descending {
+            w[0].1 >= w[1].1
+        } else {
+            w[0].1 <= w[1].1
+        }
+    });
+    if !monotone {
+        let path = dump(&format!(
+            "pulsusdb value sequence not monotone ({}): {pulsus_ordered:?}",
+            if descending {
+                "descending"
+            } else {
+                "ascending"
+            }
+        ))?;
+        bail!(
+            "case {:?}: pulsusdb result is not value-ordered (repro {})",
+            case.case_id,
+            path.display()
+        );
+    }
+    // (b) The ordered label-set sequences agree between the two stores
+    // (the equal-value a/c tie-break is label-ascending on both — v3.7.3).
+    let pulsus_seq: Vec<&BTreeMap<String, String>> =
+        pulsus_ordered.iter().map(|(l, _)| l).collect();
+    let oracle_seq: Vec<&BTreeMap<String, String>> =
+        oracle_ordered.iter().map(|(l, _)| l).collect();
+    if pulsus_seq != oracle_seq {
+        let path = dump(&format!(
+            "ordered label sequence diverged: pulsusdb {pulsus_seq:?} vs oracle {oracle_seq:?}"
+        ))?;
+        bail!(
+            "case {:?}: the two stores disagree on value order (repro {})",
+            case.case_id,
             path.display()
         );
     }
@@ -2309,7 +2459,10 @@ mod tests {
                 continue;
             }
             match case.kind() {
-                "metric_instant" | "metric_error" | "metric_match_error" => {
+                "metric_instant"
+                | "metric_instant_ordered"
+                | "metric_error"
+                | "metric_match_error" => {
                     assert!(case.step_s.is_none(), "{}", case.case_id)
                 }
                 "metric_range" => assert!(case.step_s.is_some(), "{}", case.case_id),
@@ -2405,7 +2558,7 @@ mod tests {
 
     fn hermetic_params(case: &CaseRaw, corpus: &LogCorpus) -> pulsus_read::logql::QueryParams {
         let spec = match case.kind() {
-            "metric_instant" | "metric_error" | "metric_match_error" => {
+            "metric_instant" | "metric_instant_ordered" | "metric_error" | "metric_match_error" => {
                 pulsus_read::logql::QuerySpec::Instant {
                     at_ns: metric_eval_ns(corpus),
                 }
@@ -2516,7 +2669,7 @@ mod tests {
             let corpus = shipped_corpus(&fixture, count);
             for case in &fixture.cases {
                 match case.kind() {
-                    "metric_instant" => {
+                    "metric_instant" | "metric_instant_ordered" => {
                         let expected = corpus.expected_metric_vector(&case.case_id);
                         assert!(
                             !expected.is_empty(),
@@ -2552,7 +2705,7 @@ mod tests {
         for case in fixture
             .cases
             .iter()
-            .filter(|c| c.kind() == "metric_instant")
+            .filter(|c| matches!(c.kind(), "metric_instant" | "metric_instant_ordered"))
         {
             let rendered = case.query.replace("{R}", &corpus.run_id);
             let expr = pulsus_logql::parse(&rendered).expect("parse");
@@ -2597,6 +2750,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Issue M8-LQ3 AC9 (hermetic half): the `metric_sort_order` case's
+    /// SHIPPED evaluator output is in the pinned value order `b, a, c`
+    /// (ascending by value, the equal-value `a`/`c` tie broken by label
+    /// ascending). The live lane then asserts both stores agree on this
+    /// order; here the ordered engine output itself is pinned so a
+    /// reducer/encoder regression fails hermetically every PR.
+    #[test]
+    fn shipped_sort_case_evaluates_in_the_pinned_value_order() {
+        let fixture = shipped_fixture();
+        let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
+        let case = fixture
+            .cases
+            .iter()
+            .find(|c| c.kind() == "metric_instant_ordered")
+            .expect("the sort-order case is committed");
+        let rendered = case.query.replace("{R}", &corpus.run_id);
+        let expr = pulsus_logql::parse(&rendered).expect("parse");
+        let service = first_selector_service(&expr);
+        let params = hermetic_params(case, &corpus);
+        let plan = pulsus_read::logql::plan(&expr, &params, &hermetic_plan_ctx()).expect("plan");
+        let pulsus_read::logql::Plan::Metric(mp) = &plan else {
+            panic!("the sort case plans as a single metric leaf");
+        };
+        let pulsus_read::logql::QueryResult::Vector(samples) =
+            evaluate_leaf_hermetically(&corpus, mp, &service)
+        else {
+            panic!("sort case did not evaluate to a vector");
+        };
+        let order: Vec<(String, f64)> = samples
+            .into_iter()
+            .map(|s| {
+                let grp = s
+                    .labels
+                    .iter()
+                    .find(|(k, _)| k == "grp")
+                    .map(|(_, v)| v.clone())
+                    .expect("grp label");
+                (grp, s.value)
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("b".to_string(), 1.0),
+                ("a".to_string(), 5.0),
+                ("c".to_string(), 5.0),
+            ],
+            "sort must order ascending by value with the a/c tie broken by label ascending"
+        );
     }
 
     /// The D1 witness, hermetic half: the SHIPPED evaluator FAILS the

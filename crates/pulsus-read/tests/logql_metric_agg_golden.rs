@@ -2094,23 +2094,36 @@ fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
     assert_eq!(rate_counter_instant(&rows), 32.0 / 60.0);
 }
 
-/// Rule 3 — duplicate-timestamp tie-break is ascending value order, so
-/// tied samples never fabricate a reset. Values 5,{10,3}@20s,12: sorted
-/// ascending within the tie → 5,3,10,12 → reset +3 (5→3), +7 (3→10),
-/// +2 (10→12) = 12. A descending tie order (5,10,3,12) would give 17, so
-/// this vector proves the tie-break rule.
+/// Rule 3 — duplicate-timestamp samples are processed in DELIVERED scan
+/// order (the reducer's stable sort by timestamp preserves the SQL
+/// `ORDER BY timestamp_ns, fingerprint, body` order), NOT re-sorted by
+/// value. Branch-validated against the pinned reference (v3.7.3): values
+/// 5,{10,3}@20s,12 delivered as 5,10,3,12 → +5 (5→10), reset +3 (10→3),
+/// +9 (3→12) = 17; divided by the 60s window = 17/60 (0.2833). An
+/// ascending-value tie-sort would instead see 5,3,10,12 → 12/60 (0.2),
+/// which the reference does NOT produce — so the delivered order is
+/// load-bearing and this vector pins it.
 #[test]
-fn rate_counter_duplicate_timestamp_uses_ascending_value_order() {
+fn rate_counter_duplicate_timestamp_preserves_delivered_scan_order() {
+    // Delivered in the SQL scan order (ts asc, then fingerprint/body): the
+    // two ts=20s samples arrive as c=10 then c=3.
     let rows = vec![
         row(1, 10 * NS, "c=5"),
         row(1, 20 * NS, "c=10"),
-        row(1, 20 * NS, "c=3"), // same ts as c=10
+        row(1, 20 * NS, "c=3"), // same ts as c=10, delivered after it
         row(1, 30 * NS, "c=12"),
     ];
-    assert_eq!(rate_counter_instant(&rows), 12.0 / 60.0);
-    // Input order must not change the answer (reducer sorts internally).
-    let reversed: Vec<MetricScanRow> = rows.iter().rev().cloned().collect();
-    assert_eq!(rate_counter_instant(&reversed), 12.0 / 60.0);
+    assert_eq!(rate_counter_instant(&rows), 17.0 / 60.0);
+    // The stable sort keys only on timestamp, so distinct-ts samples are
+    // reordered into ascending time regardless of arrival, but the tied
+    // pair keeps whatever relative order it was delivered in.
+    let shuffled_distinct = vec![
+        row(1, 30 * NS, "c=12"),
+        row(1, 10 * NS, "c=5"),
+        row(1, 20 * NS, "c=10"),
+        row(1, 20 * NS, "c=3"),
+    ];
+    assert_eq!(rate_counter_instant(&shuffled_distinct), 17.0 / 60.0);
 }
 
 /// Rule 2 — samples ON the window boundaries both contribute. Monotone

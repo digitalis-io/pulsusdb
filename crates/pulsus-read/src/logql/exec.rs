@@ -3047,15 +3047,21 @@ impl BucketAcc {
 }
 
 /// The reset-aware total counter increase over a bucket's unwrapped
-/// samples (issue M8-LQ3, AC4). Samples are ordered by timestamp with an
-/// ascending-value (`f64::total_cmp`) tie-break so duplicate-timestamp
-/// samples never fabricate a reset (Rule 3); the walk then adds
-/// `next - prev` on a monotone step and the bare `next` on a drop (a
-/// counter reset counts from zero). Total increase `= last - first +
-/// Σ(resets)`; the caller divides by the window seconds (`apply_rate`).
-/// No PromQL-style boundary extrapolation.
+/// samples (issue M8-LQ3, AC4). Samples are ordered by timestamp with a
+/// STABLE sort (no value tie-break): duplicate-timestamp samples keep
+/// their delivered scan order — the deterministic SQL scan order
+/// `ORDER BY timestamp_ns, fingerprint, body` (`metric_raw_samples`) —
+/// matching the pinned reference (v3.7.3), which processes same-timestamp
+/// unwrapped samples in storage/scan order rather than re-sorting them by
+/// value (branch-validated: the sequence `5, 10, 3, 12` with `10`/`3`
+/// tied at one timestamp yields increase 17 / 0.2833, not the 12 / 0.2 an
+/// ascending-value sort would give). The walk then adds `next - prev` on
+/// a monotone step and the bare `next` on a drop (a counter reset counts
+/// from zero). Total increase `= last - first + Σ(resets)`; the caller
+/// divides by the window seconds (`apply_rate`). No PromQL-style boundary
+/// extrapolation.
 fn counter_increase(mut pts: Vec<(i64, f64)>) -> f64 {
-    pts.sort_by(|(at, av), (bt, bv)| at.cmp(bt).then_with(|| av.total_cmp(bv)));
+    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
     let mut iter = pts.into_iter().map(|(_, v)| v);
     let Some(mut prev) = iter.next() else {
         return 0.0;
