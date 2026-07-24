@@ -69,11 +69,13 @@ pub const CASE_IDS: &[&str] = &[
     // wins-resolved SM) is set-equal PulsusDB==Loki, and the `{scope_name="…"}`
     // STREAM selector returns empty on both stores (scope is not indexed).
     "scope_structured_metadata",
-    // Issue #201 `labelfilter.ip` error-semantics cases (append-only): the
-    // `| logfmt | addr = ip("10.0.0.0/8")` probe over per-service witnesses —
-    // a missing `addr` drops the line (non-empty via a sibling in-range
-    // match), a present-but-non-IP `addr` returns the line carrying
-    // __error__=IPLabelFilterErr plus the byte-exact __error_details__.
+    // Issue #201 `labelfilter.ip` no-error-semantics cases (append-only): the
+    // IP label filter parses the label VALUE as an IP and NEVER errors — a
+    // missing label or an unparseable value is a plain non-match (drop under
+    // `=`, keep under `!=`, no `__error__`/`__error_details__`). `ip_label_missing`
+    // proves missing⇒drop under `=` (non-empty via a sibling in-range match);
+    // `ip_label_invalid` uses `!=` so the non-IP witness RETURNS carrying its
+    // raw `addr` label and NO error labels.
     "ip_label_missing",
     "ip_label_invalid",
 ];
@@ -149,17 +151,14 @@ pub const IP_MISSING_MATCH_BODY: &str = "addr=10.1.2.3";
 pub const IP_MISSING_DROP_BODY: &str = "svc=web";
 
 /// [`SVC_IP_INVALID`] carries ONE witness whose `addr` is present but not
-/// a valid IP; the filter returns the line tagged
-/// `__error__="IPLabelFilterErr"` + the byte-exact `__error_details__`.
+/// a valid IP. The `ip_label_invalid` case probes it with `!=` so the
+/// unparseable value (a non-match) RETURNS the line carrying its raw `addr`
+/// label and NO error labels — the reference v3.7.3 IP label filter never
+/// sets `__error__`/`__error_details__` (unlike the numeric label filter).
 pub const SVC_IP_INVALID: &str = "svc-ipbad";
 /// The invalid-value witness body: `logfmt` extracts `addr=not-an-ip`,
-/// which fails IP parsing (error-tagged, returned).
+/// which fails IP parsing (a non-match — kept under `!=`, no error labels).
 pub const IP_INVALID_BODY: &str = "addr=not-an-ip";
-/// The reference-derived `__error_details__` for the invalid IP-label
-/// value (issue #201): Go `netip.ParseAddr` classification for a value
-/// with no `.`/`:`/`%` separator, value wrapped by `strconv.Quote`. Kept
-/// byte-identical to `pulsus-read`'s `ip_label_filter_error_details`.
-pub const IP_INVALID_ERROR_DETAILS: &str = r#"ParseAddr("not-an-ip"): unable to parse IP"#;
 
 /// The issue #109 scope witness service: exactly ONE synthetic record
 /// carrying a collision-bearing `InstrumentationScope`, isolated under its
@@ -973,19 +972,12 @@ pub fn case_projection(
                 let labels = BTreeMap::from([("addr".to_string(), "10.1.2.3".to_string())]);
                 (labels, r.body.clone())
             }),
-        // Issue #201: the invalid-value arm. `logfmt` extracts `addr=not-an-ip`,
-        // which fails IP parsing — the line is returned carrying the extracted
-        // `addr` label plus IPLabelFilterErr and the byte-exact detail (kept
-        // identical to `pulsus-read`'s `ip_label_filter_error_details`).
+        // Issue #201: the invalid-value arm, probed with `!=`. `logfmt` extracts
+        // `addr=not-an-ip`, which fails IP parsing — a non-match, so `addr != ip(…)`
+        // RETURNS the line carrying only its raw `addr` label and NO error labels
+        // (the reference IP label filter never tags `__error__`/`__error_details__`).
         "ip_label_invalid" => (r.service == SVC_IP_INVALID).then(|| {
-            let labels = BTreeMap::from([
-                ("addr".to_string(), "not-an-ip".to_string()),
-                ("__error__".to_string(), "IPLabelFilterErr".to_string()),
-                (
-                    "__error_details__".to_string(),
-                    IP_INVALID_ERROR_DETAILS.to_string(),
-                ),
-            ]);
+            let labels = BTreeMap::from([("addr".to_string(), "not-an-ip".to_string())]);
             (labels, r.body.clone())
         }),
         // Issue #109: `{run_id="R"} | scope_name="coll-scope"` selects the

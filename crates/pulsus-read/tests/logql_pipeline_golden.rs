@@ -935,26 +935,45 @@ fn ip_label_filter_v6_range_boundaries() {
 }
 
 #[test]
-fn ip_label_filter_missing_label_drops_without_error() {
-    // OQ2 default (differential-authoritative): a missing label is a non-match
-    // (dropped), no `__error__` tag.
-    let q = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
-    assert!(run_label(q, "other=1 msg=x").is_none());
+fn ip_label_filter_missing_label_drops_under_eq_keeps_under_neq() {
+    // Reference v3.7.3 (differential-authoritative): a missing label is a
+    // non-match — dropped under `=`, kept under `!=`, and NEVER tagged with
+    // `__error__`/`__error_details__`.
+    let eq = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
+    assert!(run_label(eq, "other=1 msg=x").is_none());
+    let neq = r#"{a="b"} | logfmt | addr != ip("10.0.0.0/8")"#;
+    let kept = run_label(neq, "other=1 msg=x").expect("missing label survives `!=`");
+    assert!(
+        !kept
+            .iter()
+            .any(|(k, _)| k == "__error__" || k == "__error_details__"),
+        "a missing IP label must not set any error label: {kept:?}"
+    );
 }
 
 #[test]
-fn ip_label_filter_invalid_value_tags_the_ip_error_class() {
-    // OQ2 default: a present-but-non-IP value keeps the line tagged
-    // `__error__="IPLabelFilterErr"` (the exact `__error_details__` bytes are
-    // reference-authoritative — pinned by the e2e `ip_label_invalid` case).
-    let q = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
-    let got = run_label(q, "addr=not-an-ip msg=x").unwrap();
+fn ip_label_filter_invalid_value_is_a_non_match_without_error() {
+    // Reference v3.7.3 (differential-authoritative): a present-but-unparseable
+    // value is a plain non-match — NO `__error__`/`__error_details__` is ever
+    // set (this is the key divergence from the numeric label filter, which does
+    // tag `LabelFilterErr`). Dropped under `=`, kept under `!=` carrying the raw
+    // label untouched.
+    let eq = r#"{a="b"} | logfmt | addr = ip("10.0.0.0/8")"#;
     assert!(
-        got.contains(&("__error__".to_string(), "IPLabelFilterErr".to_string())),
-        "invalid ip label value must tag IPLabelFilterErr: {got:?}"
+        run_label(eq, "addr=not-an-ip msg=x").is_none(),
+        "an invalid IP value must DROP under `=`"
+    );
+
+    let neq = r#"{a="b"} | logfmt | addr != ip("10.0.0.0/8")"#;
+    let kept = run_label(neq, "addr=not-an-ip msg=x").expect("invalid value survives `!=`");
+    assert!(
+        !kept
+            .iter()
+            .any(|(k, _)| k == "__error__" || k == "__error_details__"),
+        "an invalid IP value must NOT set any error label: {kept:?}"
     );
     assert!(
-        got.iter().any(|(k, _)| k == "__error_details__"),
-        "invalid ip label value must carry __error_details__: {got:?}"
+        kept.contains(&("addr".to_string(), "not-an-ip".to_string())),
+        "the raw non-IP label value is carried unchanged: {kept:?}"
     );
 }

@@ -47,10 +47,13 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::net::IpAddr;
 
 use pulsus_logql::{
     CompareOp, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, NumericLiteral, ParserStage, Stage,
 };
+
+use super::ip::IpMatcher;
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
 // stdlib `time`'s internal `quote` (duration branch) — reused here so the
@@ -87,6 +90,7 @@ pub enum PipelineError {
     BadRegex(String),
     UnsupportedTemplate(String),
     BadParserExpr(String),
+    BadIpFilter(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -99,6 +103,7 @@ impl fmt::Display for PipelineError {
                  only `{{{{.label}}}}` field substitution and literal text"
             ),
             PipelineError::BadParserExpr(msg) => write!(f, "bad parser expression: {msg}"),
+            PipelineError::BadIpFilter(msg) => write!(f, "bad ip() label filter: {msg}"),
         }
     }
 }
@@ -172,6 +177,17 @@ enum CompiledLabelFilter {
         op: CompareOp,
         kind: UnitKind,
         threshold: f64,
+    },
+    /// IP form (M8-LQ2 `labelfilter.ip`): `name = ip("…")` /
+    /// `name != ip("…")`. The label value is parsed as an IP and tested for
+    /// membership in the compiled range. Unlike the numeric `Compare` filter,
+    /// this NEVER errors: a missing label or an unparseable value is simply a
+    /// non-match (reference v3.7.3-verified — no `__error__`/`__error_details__`
+    /// is ever set). `=` drops the non-match; `!=` keeps it.
+    Ip {
+        name: String,
+        matcher: IpMatcher,
+        negated: bool,
     },
     And(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
     Or(Box<CompiledLabelFilter>, Box<CompiledLabelFilter>),
@@ -808,6 +824,19 @@ fn compile_label_filter(expr: &LabelFilterExpr) -> Result<CompiledLabelFilter, P
                 threshold,
             }
         }
+        LabelFilterExpr::Ip {
+            name,
+            value,
+            negated,
+        } => {
+            let matcher =
+                IpMatcher::parse(value).map_err(|e| PipelineError::BadIpFilter(e.to_string()))?;
+            CompiledLabelFilter::Ip {
+                name: name.clone(),
+                matcher,
+                negated: *negated,
+            }
+        }
         LabelFilterExpr::And(a, b) => CompiledLabelFilter::And(
             Box::new(compile_label_filter(a)?),
             Box::new(compile_label_filter(b)?),
@@ -823,6 +852,9 @@ fn filter_contains_compare(f: &CompiledLabelFilter) -> bool {
     match f {
         CompiledLabelFilter::Match { .. } => false,
         CompiledLabelFilter::Compare { .. } => true,
+        // The IP label filter never mutates the label set (it cannot error),
+        // so it does not force the label-mutating fan-out path.
+        CompiledLabelFilter::Ip { .. } => false,
         CompiledLabelFilter::And(a, b) | CompiledLabelFilter::Or(a, b) => {
             filter_contains_compare(a) || filter_contains_compare(b)
         }
@@ -1346,6 +1378,22 @@ fn eval_label_filter<'v>(
                 CompareOp::Lt => v < *threshold,
                 CompareOp::Lte => v <= *threshold,
             })
+        }
+        CompiledLabelFilter::Ip {
+            name,
+            matcher,
+            negated,
+        } => {
+            // Reference v3.7.3 semantics (differential-authoritative): parse the
+            // label value as an IP and test range membership. A missing label OR
+            // an unparseable value is `match = false` — NEVER an error, so no
+            // `__error__`/`__error_details__` is set (this is the key divergence
+            // from the numeric label filter, which DOES error on bad values).
+            // `=` returns the line iff matched; `!=` iff not matched.
+            let matched = get_label(labels, name)
+                .and_then(|raw| raw.parse::<IpAddr>().ok())
+                .is_some_and(|ip| matcher.contains(&ip));
+            Some(if *negated { !matched } else { matched })
         }
         CompiledLabelFilter::And(a, b) => {
             match (
