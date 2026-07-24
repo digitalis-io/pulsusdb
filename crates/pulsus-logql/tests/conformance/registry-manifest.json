@@ -1,0 +1,22 @@
+{
+  "language": "LogQL",
+  "target": "v3.7.3",
+  "sha256": "d0d8174bd10b5d4e624240b006ced8efc4e8656bb0e20c4269af6049eea3a98f",
+  "construct_count": 99,
+  "category_counts": {
+    "binary-ops": 16,
+    "extraction": 4,
+    "formatters": 3,
+    "grouping": 2,
+    "label-filters": 17,
+    "line-filters": 6,
+    "metric-range-functions": 16,
+    "parsers": 7,
+    "pipeline-stages": 6,
+    "statics": 2,
+    "stream-selector-matchers": 4,
+    "template-functions": 1,
+    "vector-aggregations": 11,
+    "vector-matching": 4
+  }
+}

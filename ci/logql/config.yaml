@@ -1,0 +1,49 @@
+# Minimal single-binary LogQL reference-implementation config used ONLY as a
+# black-box LogQL syntax oracle for the env-gated differential leg
+# (crates/pulsus-logql/tests/logql_differential.rs, issue #191).
+#
+# It stores nothing meaningful and serves no production role: the leg sends
+# LogQL query strings to /loki/api/v1/query_range and observes only the HTTP
+# status (2xx accept vs 400 reject). No upstream source is copied — this is
+# pure runtime use of the unmodified, digest-pinned reference image. This
+# file is deployment config authored from the reference container's documented
+# (non-copyleft) config schema, not lifted source.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /tmp/loki
+  storage:
+    filesystem:
+      chunks_directory: /tmp/loki/chunks
+      rules_directory: /tmp/loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Generous query limits so a syntactically valid query answers (empty)
+# instead of being rejected on a range/length cap — the leg must distinguish
+# a syntax rejection (400) from an accepted-but-empty query (2xx).
+limits_config:
+  metric_aggregation_enabled: true
+
+query_range:
+  cache_results: false
+
+analytics:
+  reporting_enabled: false

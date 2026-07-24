@@ -251,6 +251,34 @@ jobs:
         if: always()
         run: docker rm -f pulsus-tempo-diff || true
 
+      # Issue #191 (M8-LQ0): the black-box LogQL differential oracle. ONE
+      # UNMODIFIED, digest-pinned v3.7.3 reference container serves the syntax
+      # leg (observes only HTTP status at /loki/api/v1/query_range). Every
+      # registry probe's live accept/reject verdict is pinned against the
+      # recorded `oracle` disposition; a supported∧reject is RED. No upstream
+      # source is copied. The hermetic `ci` job runs the same test with its
+      # gate off, skipping.
+      - name: Start LogQL v3.7.3 reference (differential oracle)
+        run: |
+          docker run -d --name pulsus-logql-diff -p 13100:3100 \
+            -v "$GITHUB_WORKSPACE"/ci/logql/config.yaml:/etc/loki/local-config.yaml:ro \
+            grafana/loki@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8 \
+            -config.file=/etc/loki/local-config.yaml
+          for _ in $(seq 1 60); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:13100/ready)" = "200" ] && break
+            sleep 1
+          done
+          curl -sf http://localhost:13100/ready
+
+      - name: LogQL differential leg (syntax)
+        env:
+          PULSUSDB_LOGQL_DIFF_URL: "http://localhost:13100"
+        run: cargo test -p pulsus-logql --test logql_differential
+
+      - name: Stop LogQL differential oracle
+        if: always()
+        run: docker rm -f pulsus-logql-diff || true
+
       # Issue #43: multi-endpoint connection spreading + transport-failure
       # failover on ONE node — both SHARD endpoints point at this job's
       # 19123 server (spreading observable via per-endpoint selection

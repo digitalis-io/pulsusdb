@@ -1,0 +1,291 @@
+{
+  "sources": [
+    {
+      "source": "json_string_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "matcher.eq",
+        "parser.json",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "json_label_filter_regex",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json",
+        "labelfilter.match.re"
+      ]
+    },
+    {
+      "source": "logfmt_string_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "regexp_extract_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.regexp",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "pattern_extract_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.pattern",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "numeric_number_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json",
+        "labelfilter.compare.gte",
+        "labelfilter.compare.number"
+      ]
+    },
+    {
+      "source": "numeric_duration_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.compare.gt",
+        "labelfilter.compare.unit"
+      ]
+    },
+    {
+      "source": "numeric_bytes_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.compare.gt",
+        "labelfilter.compare.unit"
+      ]
+    },
+    {
+      "source": "line_format_rewrite",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json",
+        "labelfilter.match.eq",
+        "fmt.line_format",
+        "template.builtin.representative"
+      ]
+    },
+    {
+      "source": "label_format_rename",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.match.eq",
+        "fmt.label_format.rename"
+      ]
+    },
+    {
+      "source": "json_error_details",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json"
+      ]
+    },
+    {
+      "source": "json_error_kept_by_error_filter",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json",
+        "labelfilter.error"
+      ]
+    },
+    {
+      "source": "labelfilter_number_error_details",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.compare.gt",
+        "labelfilter.compare.number"
+      ]
+    },
+    {
+      "source": "fetch_until_limit_paged",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.json",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "scope_structured_metadata",
+      "kind": "e2e-differential",
+      "constructs": [
+        "matcher.eq",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "metric_filtered_count",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.count_over_time",
+        "range.duration_literal",
+        "parser.json",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "metric_unwrap_sum",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.sum_over_time",
+        "parser.logfmt",
+        "parser.logfmt.expressions",
+        "unwrap.duration"
+      ]
+    },
+    {
+      "source": "metric_vector_agg",
+      "kind": "e2e-differential",
+      "constructs": [
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time",
+        "parser.logfmt"
+      ]
+    },
+    {
+      "source": "metric_binary_scalar",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.count_over_time",
+        "binop.mul",
+        "statics.number",
+        "parser.json",
+        "labelfilter.match.eq"
+      ]
+    },
+    {
+      "source": "metric_rate_tumbling",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.rate",
+        "range.duration_literal"
+      ]
+    },
+    {
+      "source": "metric_unwrap_error",
+      "kind": "e2e-differential",
+      "constructs": [
+        "range.sum_over_time",
+        "parser.logfmt",
+        "unwrap.duration"
+      ]
+    },
+    {
+      "source": "metric_match_on",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time",
+        "parser.json"
+      ]
+    },
+    {
+      "source": "metric_match_ignoring",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.ignoring",
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time"
+      ]
+    },
+    {
+      "source": "metric_match_group_left",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "match.group_left",
+        "agg.sum",
+        "grouping.by"
+      ]
+    },
+    {
+      "source": "metric_match_group_right",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.mul",
+        "match.on",
+        "match.group_right",
+        "agg.sum",
+        "grouping.by"
+      ]
+    },
+    {
+      "source": "metric_match_on_range",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "range.count_over_time"
+      ]
+    },
+    {
+      "source": "metric_match_ignoring_range",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.ignoring",
+        "range.count_over_time"
+      ]
+    },
+    {
+      "source": "metric_match_group_left_range",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "match.group_left"
+      ]
+    },
+    {
+      "source": "metric_match_group_right_range",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.mul",
+        "match.on",
+        "match.group_right"
+      ]
+    },
+    {
+      "source": "metric_match_multiple_err",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "agg.sum",
+        "grouping.by"
+      ]
+    },
+    {
+      "source": "metric_match_duplicate_err",
+      "kind": "e2e-differential",
+      "constructs": [
+        "binop.div",
+        "match.on",
+        "match.group_left",
+        "agg.sum",
+        "grouping.by"
+      ]
+    }
+  ]
+}
