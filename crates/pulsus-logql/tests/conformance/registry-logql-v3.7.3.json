@@ -1,0 +1,699 @@
+{
+  "language": "LogQL",
+  "target": "v3.7.3",
+  "constructs": [
+    {
+      "id": "matcher.eq",
+      "category": "stream-selector-matchers",
+      "syntax": "name = \"value\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#log-stream-selector",
+      "probe": "{app=\"x\"}"
+    },
+    {
+      "id": "matcher.neq",
+      "category": "stream-selector-matchers",
+      "syntax": "name != \"value\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#log-stream-selector",
+      "probe": "{app=\"x\", env!=\"prod\"}"
+    },
+    {
+      "id": "matcher.re",
+      "category": "stream-selector-matchers",
+      "syntax": "name =~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#log-stream-selector",
+      "probe": "{app=~\"x.*\"}"
+    },
+    {
+      "id": "matcher.nre",
+      "category": "stream-selector-matchers",
+      "syntax": "name !~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#log-stream-selector",
+      "probe": "{app=\"x\", host!~\"db.*\"}"
+    },
+    {
+      "id": "linefilter.contains",
+      "category": "line-filters",
+      "syntax": "|= \"text\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-filter-expression",
+      "probe": "{app=\"x\"} |= \"err\""
+    },
+    {
+      "id": "linefilter.notcontains",
+      "category": "line-filters",
+      "syntax": "!= \"text\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-filter-expression",
+      "probe": "{app=\"x\"} != \"err\""
+    },
+    {
+      "id": "linefilter.regex",
+      "category": "line-filters",
+      "syntax": "|~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-filter-expression",
+      "probe": "{app=\"x\"} |~ \"e.*r\""
+    },
+    {
+      "id": "linefilter.notregex",
+      "category": "line-filters",
+      "syntax": "!~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-filter-expression",
+      "probe": "{app=\"x\"} !~ \"e.*r\""
+    },
+    {
+      "id": "linefilter.ip",
+      "category": "line-filters",
+      "syntax": "|= ip(\"cidr\")",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#ip-line-filter-expression",
+      "probe": "{app=\"x\"} |= ip(\"10.0.0.0/8\")"
+    },
+    {
+      "id": "linefilter.or",
+      "category": "line-filters",
+      "syntax": "|= \"a\" or \"b\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-filter-expression",
+      "probe": "{app=\"x\"} |= \"a\" or \"b\""
+    },
+    {
+      "id": "parser.json",
+      "category": "parsers",
+      "syntax": "| json",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#json",
+      "probe": "{app=\"x\"} | json"
+    },
+    {
+      "id": "parser.json.expressions",
+      "category": "parsers",
+      "syntax": "| json label=\"path\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#json",
+      "probe": "{app=\"x\"} | json first=\"response.first\""
+    },
+    {
+      "id": "parser.logfmt",
+      "category": "parsers",
+      "syntax": "| logfmt",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#logfmt",
+      "probe": "{app=\"x\"} | logfmt"
+    },
+    {
+      "id": "parser.logfmt.expressions",
+      "category": "parsers",
+      "syntax": "| logfmt label=\"key\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#logfmt",
+      "probe": "{app=\"x\"} | logfmt duration=\"took\""
+    },
+    {
+      "id": "parser.logfmt.flags",
+      "category": "parsers",
+      "syntax": "| logfmt --strict",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#logfmt",
+      "probe": "{app=\"x\"} | logfmt --strict"
+    },
+    {
+      "id": "parser.regexp",
+      "category": "parsers",
+      "syntax": "| regexp \"(?P<n>re)\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#regexp",
+      "probe": "{app=\"x\"} | regexp \"(?P<method>\\\\w+)\""
+    },
+    {
+      "id": "parser.pattern",
+      "category": "parsers",
+      "syntax": "| pattern \"<name>\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#pattern",
+      "probe": "{app=\"x\"} | pattern \"<method> <_>\""
+    },
+    {
+      "id": "labelfilter.match.eq",
+      "category": "label-filters",
+      "syntax": "name = \"value\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | level = \"error\""
+    },
+    {
+      "id": "labelfilter.match.neq",
+      "category": "label-filters",
+      "syntax": "name != \"value\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | level != \"error\""
+    },
+    {
+      "id": "labelfilter.match.re",
+      "category": "label-filters",
+      "syntax": "name =~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | method =~ \"GET|POST\""
+    },
+    {
+      "id": "labelfilter.match.nre",
+      "category": "label-filters",
+      "syntax": "name !~ \"regex\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | method !~ \"GET|POST\""
+    },
+    {
+      "id": "labelfilter.compare.eq",
+      "category": "label-filters",
+      "syntax": "name == number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status == 200"
+    },
+    {
+      "id": "labelfilter.compare.neq",
+      "category": "label-filters",
+      "syntax": "name != number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status != 200"
+    },
+    {
+      "id": "labelfilter.compare.gt",
+      "category": "label-filters",
+      "syntax": "name > number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status > 400"
+    },
+    {
+      "id": "labelfilter.compare.gte",
+      "category": "label-filters",
+      "syntax": "name >= number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status >= 500"
+    },
+    {
+      "id": "labelfilter.compare.lt",
+      "category": "label-filters",
+      "syntax": "name < number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status < 300"
+    },
+    {
+      "id": "labelfilter.compare.lte",
+      "category": "label-filters",
+      "syntax": "name <= number",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status <= 299"
+    },
+    {
+      "id": "labelfilter.compare.number",
+      "category": "label-filters",
+      "syntax": "name > 500",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | status >= 500"
+    },
+    {
+      "id": "labelfilter.compare.unit",
+      "category": "label-filters",
+      "syntax": "name > 250ms | 5KB",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | took > 250ms"
+    },
+    {
+      "id": "labelfilter.and",
+      "category": "label-filters",
+      "syntax": "expr and expr (, )",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | a = \"1\" and b = \"2\""
+    },
+    {
+      "id": "labelfilter.or",
+      "category": "label-filters",
+      "syntax": "expr or expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#label-filter-expression",
+      "probe": "{app=\"x\"} | a = \"1\" or b = \"2\""
+    },
+    {
+      "id": "labelfilter.error",
+      "category": "label-filters",
+      "syntax": "__error__ = \"\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#filtering-for-errors",
+      "probe": "{app=\"x\"} | __error__ = \"\""
+    },
+    {
+      "id": "labelfilter.error_details",
+      "category": "label-filters",
+      "syntax": "__error_details__ != \"\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#filtering-for-errors",
+      "probe": "{app=\"x\"} | __error_details__ != \"\""
+    },
+    {
+      "id": "labelfilter.ip",
+      "category": "label-filters",
+      "syntax": "name = ip(\"cidr\")",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#ip-label-filter-expression",
+      "probe": "{app=\"x\"} | addr = ip(\"10.0.0.0/8\")"
+    },
+    {
+      "id": "fmt.line_format",
+      "category": "formatters",
+      "syntax": "| line_format \"tmpl\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#line-format-expression",
+      "probe": "{app=\"x\"} | line_format \"{{.method}} {{.status}}\""
+    },
+    {
+      "id": "fmt.label_format.rename",
+      "category": "formatters",
+      "syntax": "| label_format dst=src",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#labels-format-expression",
+      "probe": "{app=\"x\"} | label_format lvl=level"
+    },
+    {
+      "id": "fmt.label_format.template",
+      "category": "formatters",
+      "syntax": "| label_format dst=\"tmpl\"",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#labels-format-expression",
+      "probe": "{app=\"x\"} | label_format status=\"{{.code}}\""
+    },
+    {
+      "id": "template.builtin.representative",
+      "category": "template-functions",
+      "syntax": "{{ ... }} action",
+      "doc": "https://grafana.com/docs/loki/latest/query/template_functions/#template-functions",
+      "probe": "{app=\"x\"} | line_format \"{{ .path | printf \\\"%s\\\" }}\""
+    },
+    {
+      "id": "unwrap.bare",
+      "category": "extraction",
+      "syntax": "| unwrap label",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "sum_over_time({app=\"x\"} | unwrap latency [5m])"
+    },
+    {
+      "id": "unwrap.duration",
+      "category": "extraction",
+      "syntax": "| unwrap duration(label)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "sum_over_time({app=\"x\"} | unwrap duration(took) [5m])"
+    },
+    {
+      "id": "unwrap.duration_seconds",
+      "category": "extraction",
+      "syntax": "| unwrap duration_seconds(label)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "sum_over_time({app=\"x\"} | unwrap duration_seconds(took) [5m])"
+    },
+    {
+      "id": "unwrap.bytes",
+      "category": "extraction",
+      "syntax": "| unwrap bytes(label)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#unwrapped-range-aggregations",
+      "probe": "sum_over_time({app=\"x\"} | unwrap bytes(size) [5m])"
+    },
+    {
+      "id": "range.rate",
+      "category": "metric-range-functions",
+      "syntax": "rate(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "rate({app=\"x\"}[5m])"
+    },
+    {
+      "id": "range.count_over_time",
+      "category": "metric-range-functions",
+      "syntax": "count_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "count_over_time({app=\"x\"}[5m])"
+    },
+    {
+      "id": "range.bytes_rate",
+      "category": "metric-range-functions",
+      "syntax": "bytes_rate(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "bytes_rate({app=\"x\"}[5m])"
+    },
+    {
+      "id": "range.bytes_over_time",
+      "category": "metric-range-functions",
+      "syntax": "bytes_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "bytes_over_time({app=\"x\"}[5m])"
+    },
+    {
+      "id": "range.sum_over_time",
+      "category": "metric-range-functions",
+      "syntax": "sum_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "sum_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.avg_over_time",
+      "category": "metric-range-functions",
+      "syntax": "avg_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "avg_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.min_over_time",
+      "category": "metric-range-functions",
+      "syntax": "min_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "min_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.max_over_time",
+      "category": "metric-range-functions",
+      "syntax": "max_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "max_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.stddev_over_time",
+      "category": "metric-range-functions",
+      "syntax": "stddev_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "stddev_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.stdvar_over_time",
+      "category": "metric-range-functions",
+      "syntax": "stdvar_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "stdvar_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.quantile_over_time",
+      "category": "metric-range-functions",
+      "syntax": "quantile_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "quantile_over_time(0.95, {app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.first_over_time",
+      "category": "metric-range-functions",
+      "syntax": "first_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "first_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.last_over_time",
+      "category": "metric-range-functions",
+      "syntax": "last_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "last_over_time({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.absent_over_time",
+      "category": "metric-range-functions",
+      "syntax": "absent_over_time(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "absent_over_time({app=\"x\"}[5m])"
+    },
+    {
+      "id": "range.rate_counter",
+      "category": "metric-range-functions",
+      "syntax": "rate_counter(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-range-aggregation",
+      "probe": "rate_counter({app=\"x\"} | unwrap v [5m])"
+    },
+    {
+      "id": "range.duration_literal",
+      "category": "metric-range-functions",
+      "syntax": "[<duration>]",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#range-vector-aggregation",
+      "probe": "count_over_time({app=\"x\"}[10m])"
+    },
+    {
+      "id": "agg.sum",
+      "category": "vector-aggregations",
+      "syntax": "sum(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "sum(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.avg",
+      "category": "vector-aggregations",
+      "syntax": "avg(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "avg(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.min",
+      "category": "vector-aggregations",
+      "syntax": "min(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "min(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.max",
+      "category": "vector-aggregations",
+      "syntax": "max(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "max(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.count",
+      "category": "vector-aggregations",
+      "syntax": "count(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "count(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.stddev",
+      "category": "vector-aggregations",
+      "syntax": "stddev(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "stddev(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.stdvar",
+      "category": "vector-aggregations",
+      "syntax": "stdvar(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "stdvar(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.topk",
+      "category": "vector-aggregations",
+      "syntax": "topk(k, ...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "topk(5, rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.bottomk",
+      "category": "vector-aggregations",
+      "syntax": "bottomk(k, ...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "bottomk(5, rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.sort",
+      "category": "vector-aggregations",
+      "syntax": "sort(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "sort(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "agg.sort_desc",
+      "category": "vector-aggregations",
+      "syntax": "sort_desc(...)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "sort_desc(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "grouping.by",
+      "category": "grouping",
+      "syntax": "by(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "sum by(app)(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "grouping.without",
+      "category": "grouping",
+      "syntax": "without(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#built-in-aggregation-operators",
+      "probe": "sum without(app)(rate({app=\"x\"}[5m]))"
+    },
+    {
+      "id": "binop.add",
+      "category": "binary-ops",
+      "syntax": "expr + expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) + rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "binop.sub",
+      "category": "binary-ops",
+      "syntax": "expr - expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) - rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "binop.mul",
+      "category": "binary-ops",
+      "syntax": "expr * expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) * 2"
+    },
+    {
+      "id": "binop.div",
+      "category": "binary-ops",
+      "syntax": "expr / expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) / 2"
+    },
+    {
+      "id": "binop.mod",
+      "category": "binary-ops",
+      "syntax": "expr % expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) % 2"
+    },
+    {
+      "id": "binop.pow",
+      "category": "binary-ops",
+      "syntax": "expr ^ expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) ^ 2"
+    },
+    {
+      "id": "binop.eq",
+      "category": "binary-ops",
+      "syntax": "expr == expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) == 2"
+    },
+    {
+      "id": "binop.neq",
+      "category": "binary-ops",
+      "syntax": "expr != expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) != 2"
+    },
+    {
+      "id": "binop.gt",
+      "category": "binary-ops",
+      "syntax": "expr > expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) > 2"
+    },
+    {
+      "id": "binop.gte",
+      "category": "binary-ops",
+      "syntax": "expr >= expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) >= 2"
+    },
+    {
+      "id": "binop.lt",
+      "category": "binary-ops",
+      "syntax": "expr < expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) < 2"
+    },
+    {
+      "id": "binop.lte",
+      "category": "binary-ops",
+      "syntax": "expr <= expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) <= 2"
+    },
+    {
+      "id": "binop.and",
+      "category": "binary-ops",
+      "syntax": "expr and expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) and rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "binop.or",
+      "category": "binary-ops",
+      "syntax": "expr or expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) or rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "binop.unless",
+      "category": "binary-ops",
+      "syntax": "expr unless expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "rate({app=\"x\"}[5m]) unless rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "binop.bool",
+      "category": "binary-ops",
+      "syntax": "expr > bool expr",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#comparison-operators",
+      "probe": "rate({app=\"x\"}[5m]) > bool 2"
+    },
+    {
+      "id": "match.on",
+      "category": "vector-matching",
+      "syntax": "on(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#many-to-one-and-one-to-many-vector-matches",
+      "probe": "rate({app=\"x\"}[5m]) / on(path) rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "match.ignoring",
+      "category": "vector-matching",
+      "syntax": "ignoring(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#many-to-one-and-one-to-many-vector-matches",
+      "probe": "rate({app=\"x\"}[5m]) / ignoring(path) rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "match.group_left",
+      "category": "vector-matching",
+      "syntax": "group_left(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#many-to-one-and-one-to-many-vector-matches",
+      "probe": "rate({app=\"x\"}[5m]) / on(path) group_left rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "match.group_right",
+      "category": "vector-matching",
+      "syntax": "group_right(labels)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#many-to-one-and-one-to-many-vector-matches",
+      "probe": "rate({app=\"x\"}[5m]) / on(path) group_right rate({app=\"y\"}[5m])"
+    },
+    {
+      "id": "stage.unpack",
+      "category": "pipeline-stages",
+      "syntax": "| unpack",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#unpack",
+      "probe": "{app=\"x\"} | unpack"
+    },
+    {
+      "id": "stage.drop",
+      "category": "pipeline-stages",
+      "syntax": "| drop",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#drop-labels-expression",
+      "probe": "{app=\"x\"} | drop level"
+    },
+    {
+      "id": "stage.keep",
+      "category": "pipeline-stages",
+      "syntax": "| keep",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#keep-labels-expression",
+      "probe": "{app=\"x\"} | keep app"
+    },
+    {
+      "id": "stage.decolorize",
+      "category": "pipeline-stages",
+      "syntax": "| decolorize",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#decolorize",
+      "probe": "{app=\"x\"} | decolorize"
+    },
+    {
+      "id": "stage.distinct",
+      "category": "pipeline-stages",
+      "syntax": "| distinct",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#distinct",
+      "probe": "{app=\"x\"} | distinct"
+    },
+    {
+      "id": "stage.ip",
+      "category": "pipeline-stages",
+      "syntax": "| ip",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#ip-line-filter-expression",
+      "probe": "{app=\"x\"} | ip"
+    },
+    {
+      "id": "statics.string",
+      "category": "statics",
+      "syntax": "\"...\" | `...`",
+      "doc": "https://grafana.com/docs/loki/latest/query/log_queries/#log-stream-selector",
+      "probe": "{app=\"x\"}"
+    },
+    {
+      "id": "statics.number",
+      "category": "statics",
+      "syntax": "bare scalar number",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
+      "probe": "count_over_time({app=\"x\"}[5m]) * 2"
+    }
+  ]
+}

@@ -1,0 +1,519 @@
+{
+  "interim_count_pin": 13,
+  "entries": [
+    {
+      "construct": "matcher.eq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "matcher.neq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "matcher.re",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "matcher.nre",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "linefilter.contains",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "linefilter.notcontains",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "linefilter.regex",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "linefilter.notregex",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "linefilter.ip",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "linefilter.or",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "parser.json",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "parser.json.expressions",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "parser.logfmt",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "parser.logfmt.expressions",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "parser.logfmt.flags",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "parser.regexp",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "parser.pattern",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.match.eq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.match.neq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.match.re",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.match.nre",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.eq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.neq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.gt",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.gte",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.lt",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.lte",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.number",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.compare.unit",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.and",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.or",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.error",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.error_details",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "labelfilter.ip",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "fmt.line_format",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "fmt.label_format.rename",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "fmt.label_format.template",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "template.builtin.representative",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "unwrap.bare",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "unwrap.duration",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "unwrap.duration_seconds",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "unwrap.bytes",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.rate",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.count_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.bytes_rate",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.bytes_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.sum_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.avg_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.min_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.max_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.stddev_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.stdvar_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.quantile_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.first_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.last_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.absent_over_time",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "range.rate_counter",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "range.duration_literal",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.sum",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.avg",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.min",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.max",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.count",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.stddev",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.stdvar",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.topk",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.bottomk",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "agg.sort",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "agg.sort_desc",
+      "status": "interim-generic",
+      "oracle": "accept",
+      "owning_issue": 190
+    },
+    {
+      "construct": "grouping.by",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "grouping.without",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.add",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.sub",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.mul",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.div",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.mod",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.pow",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.eq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.neq",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.gt",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.gte",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.lt",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.lte",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.and",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.or",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.unless",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "binop.bool",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "match.on",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "match.ignoring",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "match.group_left",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "match.group_right",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "stage.unpack",
+      "status": "interim-named",
+      "oracle": "accept",
+      "error_construct": "unpack",
+      "owning_issue": 190
+    },
+    {
+      "construct": "stage.drop",
+      "status": "interim-named",
+      "oracle": "accept",
+      "error_construct": "drop",
+      "owning_issue": 190
+    },
+    {
+      "construct": "stage.keep",
+      "status": "interim-named",
+      "oracle": "accept",
+      "error_construct": "keep",
+      "owning_issue": 190
+    },
+    {
+      "construct": "stage.decolorize",
+      "status": "interim-named",
+      "oracle": "accept",
+      "error_construct": "decolorize",
+      "owning_issue": 190
+    },
+    {
+      "construct": "stage.distinct",
+      "status": "interim-named",
+      "oracle": "reject",
+      "error_construct": "distinct",
+      "owning_issue": 190
+    },
+    {
+      "construct": "stage.ip",
+      "status": "interim-named",
+      "oracle": "reject",
+      "error_construct": "ip",
+      "owning_issue": 190
+    },
+    {
+      "construct": "statics.string",
+      "status": "supported",
+      "oracle": "accept"
+    },
+    {
+      "construct": "statics.number",
+      "status": "supported",
+      "oracle": "accept"
+    }
+  ]
+}

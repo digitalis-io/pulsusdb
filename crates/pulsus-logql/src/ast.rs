@@ -865,23 +865,32 @@ fn quote(value: &str) -> String {
 // (docs/features.md §2 "LogQL — parity (M6)"; architect plan amendment 1
 // §3). `offset` is deliberately absent — it is a PromQL-ism with no LogQL
 // grammar (amendment 1 §3 note).
+//
+// These three tables are `pub` (re-exported from `lib.rs`) SOLELY so the
+// LogQL conformance harness (issue #191, `tests/conformance.rs`) can couple
+// its construct-registry completeness check to the *canonical* accepted-syntax
+// surface rather than hand-copying the entries. Visibility-only: no behaviour
+// change, and `pulsus-logql` is an internal workspace crate so `pub` is
+// workspace-visible. Hand-copying these tables into the test was a proven
+// silent-gap source (adding an entry here made the parser accept new syntax
+// with the test suite still green), so the coupling is the correct root fix.
 
 /// Pipeline stage keywords still outside the implemented set after
 /// M6-09 (which emptied the former `FUTURE_PARSERS`/
 /// `FUTURE_STAGE_KEYWORDS` tables): recognized after a bare `|` and named
 /// in `NotYetSupported`.
-pub(crate) const REMAINING_UNSUPPORTED_STAGES: &[&str] =
+pub const REMAINING_UNSUPPORTED_STAGES: &[&str] =
     &["unpack", "drop", "keep", "decolorize", "distinct", "ip"];
 
 /// The conversion functions `unwrap` accepts in its wrapped form.
-pub(crate) const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];
+pub const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];
 
 /// The identifier-shaped binary operators (`and`/`or`/`unless`) — since
 /// M6-10 consumed by the precedence-climbing binary-op parser (the
 /// symbolic operators `+ - * / % ^ == != > < >= <=` are their own token
 /// kinds). `!~`/`|=`/`|~` are deliberately excluded — they are never
 /// binary operators in any LogQL milestone.
-pub(crate) const BINARY_OP_KEYWORDS: &[&str] = &["and", "or", "unless"];
+pub const BINARY_OP_KEYWORDS: &[&str] = &["and", "or", "unless"];
 
 // The vector-matching modifier keywords (`on`/`ignoring`/`group_left`/
 // `group_right`) are recognized directly by the parser

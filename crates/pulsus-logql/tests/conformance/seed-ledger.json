@@ -1,0 +1,4 @@
+{
+  "comment": "Generic-failure ledger for the observed e2e differential seed (test/fixtures/logs/differential.json). Empty at LQ0: every one of the 31 cases parses Ok. Monotone shrink only \u2014 an entry whose case starts parsing Ok or reaching a NotYetSupported boundary is stale and fails the harness (conformance.rs::seed_cases_are_ok_named_or_ledgered).",
+  "entries": []
+}
