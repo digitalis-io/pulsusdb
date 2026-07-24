@@ -25,11 +25,11 @@ mod parser;
 mod token;
 
 pub use ast::{
-    BINARY_OP_KEYWORDS, BinModifier, BinOp, CompareOp, Duration, Expr, Grouping, GroupingKind,
-    LabelExtraction, LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LineMatch, LogExpr,
-    LogRange, MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral, ParserStage,
-    REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector, UNWRAP_CONVERSIONS, Unwrap,
-    VectorAggOp, VectorMatching,
+    BINARY_OP_KEYWORDS, BinModifier, BinOp, CompareOp, DropKeepElem, Duration, Expr, Grouping,
+    GroupingKind, LabelExtraction, LabelFilterExpr, LabelFmt, LabelMatch, LineFilter, LineFilterOp,
+    LineMatch, LogExpr, LogRange, MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral,
+    ParserStage, REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector,
+    UNWRAP_CONVERSIONS, Unwrap, VectorAggOp, VectorMatching,
 };
 pub use error::LogQlError;
 pub use parser::{parse, parse_selector};

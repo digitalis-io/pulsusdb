@@ -458,6 +458,10 @@ fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
     for stage in pipeline {
         match stage {
             Stage::LineFormat(_) => seen_line_format = true,
+            // `decolorize`/`unpack` rewrite the line, so a following line
+            // filter references the rewritten line and cannot push down (it
+            // becomes an in-engine dropping stage — issue #200).
+            Stage::Decolorize | Stage::Unpack => seen_line_format = true,
             Stage::LabelFilter(_) => return true,
             Stage::LineFilter(_) if seen_line_format => return true,
             // A non-pushable line filter (`ip(…)`/mixed-`or`) drops lines
@@ -490,6 +494,10 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
         Stage::LineFormat(_) => Some("line_format"),
         Stage::LabelFormat(_) => Some("label_format"),
         Stage::Unwrap(_) => Some("unwrap"),
+        Stage::Unpack => Some("unpack"),
+        Stage::Decolorize => Some("decolorize"),
+        Stage::Drop(_) => Some("drop"),
+        Stage::Keep(_) => Some("keep"),
     })
 }
 
@@ -923,7 +931,10 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
                 out.push(compile_line_filter(lf))
             }
             Stage::LineFilter(_) => {}
-            Stage::LineFormat(_) => break,
+            // `line_format`/`decolorize`/`unpack` rewrite the line — a line
+            // filter after any of them references the rewritten text and must
+            // NOT push down (issue #200).
+            Stage::LineFormat(_) | Stage::Decolorize | Stage::Unpack => break,
             _ => {}
         }
     }

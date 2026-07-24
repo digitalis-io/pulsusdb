@@ -109,8 +109,31 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, LogQlError> {
                 push(&mut tokens, TokenKind::Plus, start, sc.current_byte());
             }
             '-' => {
-                sc.advance();
-                push(&mut tokens, TokenKind::Minus, start, sc.current_byte());
+                // `--<letter>...` is a stage flag (`--strict`, `--keep-empty`);
+                // a lone `-`, or `--` not followed by a letter, stays `Minus`
+                // (issue #200). Space-separated `x - -1` / `5 - -y` are
+                // unaffected — they are not adjacent `--`.
+                if sc.peek_at(1) == Some('-')
+                    && matches!(sc.peek_at(2), Some(c) if c.is_ascii_alphabetic())
+                {
+                    sc.advance(); // first '-'
+                    sc.advance(); // second '-'
+                    let body_start = sc.current_byte();
+                    while matches!(sc.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    {
+                        sc.advance();
+                    }
+                    let end = sc.current_byte();
+                    push(
+                        &mut tokens,
+                        TokenKind::Flag(input[body_start..end].to_string()),
+                        start,
+                        end,
+                    );
+                } else {
+                    sc.advance();
+                    push(&mut tokens, TokenKind::Minus, start, sc.current_byte());
+                }
             }
             '*' => {
                 sc.advance();
@@ -450,6 +473,45 @@ mod tests {
                 TokenKind::EqEq,
                 TokenKind::Gte,
                 TokenKind::Lte,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_double_dash_flag_lexes_as_a_flag_token() {
+        assert_eq!(
+            kinds("--strict"),
+            vec![TokenKind::Flag("strict".to_string()), TokenKind::Eof]
+        );
+        assert_eq!(
+            kinds("--keep-empty"),
+            vec![TokenKind::Flag("keep-empty".to_string()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn space_separated_minus_signs_do_not_lex_as_a_flag() {
+        // `a - -2` / `5 - -1`: the `-`s are not adjacent `--`, so each stays
+        // a `Minus` (issue #200 — the flag token must not steal binary/unary
+        // minus).
+        assert_eq!(
+            kinds("a - -2"),
+            vec![
+                TokenKind::Ident("a".to_string()),
+                TokenKind::Minus,
+                TokenKind::Minus,
+                TokenKind::Number("2".to_string()),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("5 - -1"),
+            vec![
+                TokenKind::Number("5".to_string()),
+                TokenKind::Minus,
+                TokenKind::Minus,
+                TokenKind::Number("1".to_string()),
                 TokenKind::Eof,
             ]
         );

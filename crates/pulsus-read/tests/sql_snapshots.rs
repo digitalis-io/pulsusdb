@@ -441,6 +441,71 @@ fn a_line_filter_after_line_format_is_absent_from_stage3_sql() {
 }
 
 // ---------------------------------------------------------------------
+// Issue #200 (M8-LQ1): pushdown identity around the new stages. A leading
+// line filter before `decolorize`/`drop`/`keep`/`unpack`/`logfmt --strict`
+// keeps its byte-identical pushdown (they are pure post-fetch transforms
+// that add no SQL predicate); a line filter AFTER `decolorize`/`unpack`
+// references the rewritten line and must be ABSENT from stage-3 SQL, while
+// one after `drop`/`keep` (which do NOT rewrite the line) still pushes down.
+// ---------------------------------------------------------------------
+
+#[test]
+fn a_leading_line_filter_before_the_new_stages_pushes_down_byte_identically() {
+    let plain = streams_plan(
+        r#"{service_name="checkout"} |= "connection refused""#,
+        &range_params(100, Direction::Backward),
+    );
+    for query in [
+        r#"{service_name="checkout"} |= "connection refused" | decolorize"#,
+        r#"{service_name="checkout"} |= "connection refused" | drop level"#,
+        r#"{service_name="checkout"} |= "connection refused" | keep app"#,
+        r#"{service_name="checkout"} |= "connection refused" | unpack"#,
+        r#"{service_name="checkout"} |= "connection refused" | logfmt --strict"#,
+    ] {
+        let sp = streams_plan(query, &range_params(100, Direction::Backward));
+        assert_eq!(
+            sp.line_filters, plain.line_filters,
+            "the new stage must not disturb the leading pushdown predicate: {query}"
+        );
+    }
+}
+
+#[test]
+fn a_line_filter_after_decolorize_or_unpack_is_absent_from_pushdown() {
+    // `decolorize`/`unpack` rewrite the line, so a following line filter
+    // evaluates in-engine and must not appear in `line_filters`.
+    for query in [
+        r#"{service_name="checkout"} | decolorize |= "err""#,
+        r#"{service_name="checkout"} | unpack |= "err""#,
+    ] {
+        let sp = streams_plan(query, &range_params(100, Direction::Backward));
+        assert!(
+            sp.line_filters.is_empty(),
+            "a post-rewrite line filter must not push down: {query} => {:?}",
+            sp.line_filters
+        );
+    }
+}
+
+#[test]
+fn a_line_filter_after_drop_or_keep_still_pushes_down() {
+    // `drop`/`keep` mutate labels but do NOT rewrite the line, so a
+    // following line filter still references the original body and pushes
+    // down byte-identically.
+    for query in [
+        r#"{service_name="checkout"} | drop level |= "err""#,
+        r#"{service_name="checkout"} | keep app |= "err""#,
+    ] {
+        let sp = streams_plan(query, &range_params(100, Direction::Backward));
+        assert_eq!(
+            sp.line_filters,
+            vec!["hasToken(body, 'err') AND position(body, 'err') > 0".to_string()],
+            "a line filter after drop/keep must still push down: {query}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
 // Stage 2 — hydration.
 // ---------------------------------------------------------------------
 

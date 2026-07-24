@@ -181,3 +181,91 @@ matching Loki 3.4.2 — RESOLVING the OQ2 deferral above. Only
 logql_metric_agg_golden.rs gates the metric detail bytes; the server
 goldens (logs_api/error.rs, prom_api/error.rs) are synthetic prefix-only
 asserts and stay byte-identical.
+
+
+========================================================================
+M8-LQ1 (issue #200) — logfmt flags + unpack/decolorize/drop/keep
+========================================================================
+
+Reference target: grafana/loki v3.7.3 (the pinned M8-LQ conformance
+target). NOT YET container-captured in this sandbox (the pinned image
+cannot run here); the (__error__, __error_details__) values and
+accept/reject verdicts below are the coder's reasoned, reference-correct
+expectations, pinned by the hermetic goldens in
+`logql_pipeline_golden.rs`. FLAGGED for branch-validation against the
+pinned v3.7.3 container — see "capture probes" at the end.
+
+------------------------------------------------------------------------
+[A] Default `| logfmt` is LENIENT (best-effort, NEVER sets __error__)
+------------------------------------------------------------------------
+
+The reference's default `| logfmt` (no --strict) does not error on a
+malformed line; it emits the pairs decoded before the first malformed
+token and drops empty-value pairs. This corrects the pre-existing #72
+over-eager default (which set LogfmtParserErr on an unterminated quote).
+
+  INPUT `foo="bar" baz="qux`  (unterminated quote after a valid pair)
+    default => foo="bar"   (no __error__)
+  INPUT `level="unterminated`
+    default => (no extracted label, no __error__)
+  INPUT `level=error msg="conn \"lost\"" retry took=250ms`
+    default => level=error, msg=`conn "lost"`, took=250ms
+              (bare key `retry` => empty value => DROPPED by default)
+
+------------------------------------------------------------------------
+[B] `| logfmt --keep-empty` RETAINS empty-value pairs
+------------------------------------------------------------------------
+
+  INPUT `level=error retry took=250ms`, query `| logfmt --keep-empty`
+    => level=error, retry="", took=250ms
+  INPUT `level=warn other=x`, query `| logfmt --keep-empty lvl="level", missing="nope"`
+    => lvl=warn, missing=""    (targeted miss retained as "")
+
+------------------------------------------------------------------------
+[C] `| logfmt --strict` sets LogfmtParserErr for EVERY malformed class
+------------------------------------------------------------------------
+
+The LABEL __error__="LogfmtParserErr" is set for all three malformed
+classes; the detail STRING is byte-exact for the unterminated quote and
+faithful-format (same structure, ledgered position) for the others.
+
+  INPUT `level="unterminated`  (19 runes)  =>
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 20 : unterminated quoted value  [byte-exact]
+  INPUT `a=1=2`  =>
+    a="1"  kept (pair completed before the error), then:
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 4 : unexpected '='             [faithful-format]
+  INPUT `"quoted=1`  (a `"` opens the key)  =>
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 1 : invalid key                [faithful-format]
+
+------------------------------------------------------------------------
+[D] unpack / decolorize / drop / keep
+------------------------------------------------------------------------
+
+  unpack: parse the line as a JSON object; a string `_entry` field
+    replaces the line, other STRING fields become labels (collision =>
+    `<key>_extracted`), non-string fields skipped; a non-object/parse
+    failure keeps the line with __error__="JSONParserErr" +
+    "Value looks like object, but can't find closing '}' symbol".
+  decolorize: strip ANSI SGR escapes matching \x1b\[[0-9;]*m; zero-alloc
+    (line unchanged) when nothing matches.
+  drop <elems>: remove each listed label (a value matcher gates on the
+    current value); dropping `__error__` also clears `__error_details__`.
+  keep <elems>: retain only labels matched by the list (a matcher-qualified
+    element retains only on a value match); all others (including stream
+    labels) drop.
+
+------------------------------------------------------------------------
+capture probes (for branch-validation against the pinned v3.7.3 image)
+------------------------------------------------------------------------
+
+  # push each INPUT under {probe="<name>"}; GET query_range with:
+  {probe="p"} | logfmt                         # [A] lenient default
+  {probe="p"} | logfmt --keep-empty            # [B]
+  {probe="p"} | logfmt --strict                # [C] all three classes
+  {probe="p"} | unpack                         # [D]
+  {probe="p"} | decolorize
+  {probe="p"} | logfmt | drop level
+  {probe="p"} | logfmt | keep app

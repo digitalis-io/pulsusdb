@@ -136,6 +136,47 @@ pub enum Stage {
     LineFormat(String),
     LabelFormat(Vec<LabelFmt>),
     Unwrap(Unwrap),
+    /// `| unpack` — parse the line as a packed JSON object, promoting the
+    /// `_entry` field back to the line and other string fields to labels
+    /// (issue #200). No arguments.
+    Unpack,
+    /// `| decolorize` — strip ANSI SGR color escape sequences from the line
+    /// (issue #200). No arguments.
+    Decolorize,
+    /// `| drop <elem> (, <elem>)*` — remove the listed labels (issue #200).
+    Drop(Vec<DropKeepElem>),
+    /// `| keep <elem> (, <elem>)*` — retain only the listed labels (issue
+    /// #200).
+    Keep(Vec<DropKeepElem>),
+}
+
+/// One element of a `drop`/`keep` label list: a bare label name, or a
+/// label qualified by a value matcher (`level="info"`, `status=~"5.."`).
+/// The matcher, when present, gates the drop/keep on the label's current
+/// value (`pulsus-read` evaluates it — this crate stays purely syntactic).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DropKeepElem {
+    pub label: String,
+    pub matcher: Option<LabelMatch>,
+}
+
+impl fmt::Display for DropKeepElem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.label)?;
+        if let Some(m) = &self.matcher {
+            write!(f, "{}{}", m.op, quote(&m.value))?;
+        }
+        Ok(())
+    }
+}
+
+/// A `<op> "value"` matcher qualifying a `drop`/`keep` element. `op` is a
+/// stream-selector [`MatchOp`] (`=`/`!=`/`=~`/`!~`); `value` is the raw
+/// pattern (regex bodies are never compiled here — the `Matcher` contract).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LabelMatch {
+    pub op: MatchOp,
+    pub value: String,
 }
 
 impl fmt::Display for Stage {
@@ -159,8 +200,27 @@ impl fmt::Display for Stage {
                 Some(conv) => write!(f, "| unwrap {conv}({})", u.label),
                 None => write!(f, "| unwrap {}", u.label),
             },
+            Stage::Unpack => write!(f, "| unpack"),
+            Stage::Decolorize => write!(f, "| decolorize"),
+            Stage::Drop(elems) => write_drop_keep(f, "drop", elems),
+            Stage::Keep(elems) => write_drop_keep(f, "keep", elems),
         }
     }
+}
+
+fn write_drop_keep(
+    f: &mut fmt::Formatter<'_>,
+    keyword: &str,
+    elems: &[DropKeepElem],
+) -> fmt::Result {
+    write!(f, "| {keyword} ")?;
+    for (i, e) in elems.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{e}")?;
+    }
+    Ok(())
 }
 
 /// A parser stage: extracts labels from the (unmodified) log line. Regex
@@ -171,8 +231,15 @@ pub enum ParserStage {
     /// `| json` (full flatten) or `| json foo="a.b", bar` (targeted
     /// extractions; a bare identifier is shorthand for `foo="foo"`).
     Json { extractions: Vec<LabelExtraction> },
-    /// `| logfmt` or `| logfmt foo="source_key", bar`.
-    Logfmt { extractions: Vec<LabelExtraction> },
+    /// `| logfmt`, optionally with the `--strict`/`--keep-empty` flags
+    /// (issue #200) and/or `foo="source_key", bar` extractions. `strict`
+    /// errors on a malformed line; `keep_empty` retains empty-value pairs
+    /// (both are `pulsus-read` semantics — this crate only records them).
+    Logfmt {
+        strict: bool,
+        keep_empty: bool,
+        extractions: Vec<LabelExtraction>,
+    },
     /// `| regexp "<re>"` — named capture groups become labels.
     Regexp(String),
     /// `| pattern "<p>"` — `<name>` captures between literal delimiters,
@@ -199,8 +266,20 @@ impl fmt::Display for ParserStage {
                 write!(f, "json")?;
                 extraction_list(f, extractions)
             }
-            ParserStage::Logfmt { extractions } => {
+            ParserStage::Logfmt {
+                strict,
+                keep_empty,
+                extractions,
+            } => {
                 write!(f, "logfmt")?;
+                // Flags render before the extraction list so the round-trip
+                // oracle holds (`parse(ast.to_string()) == ast`).
+                if *strict {
+                    write!(f, " --strict")?;
+                }
+                if *keep_empty {
+                    write!(f, " --keep-empty")?;
+                }
                 extraction_list(f, extractions)
             }
             ParserStage::Regexp(re) => write!(f, "regexp {}", quote(re)),
@@ -934,12 +1013,10 @@ fn quote(value: &str) -> String {
 // silent-gap source (adding an entry here made the parser accept new syntax
 // with the test suite still green), so the coupling is the correct root fix.
 
-/// Pipeline stage keywords still outside the implemented set after
-/// M6-09 (which emptied the former `FUTURE_PARSERS`/
-/// `FUTURE_STAGE_KEYWORDS` tables): recognized after a bare `|` and named
-/// in `NotYetSupported`.
-pub const REMAINING_UNSUPPORTED_STAGES: &[&str] =
-    &["unpack", "drop", "keep", "decolorize", "distinct", "ip"];
+/// Pipeline stage keywords still outside the implemented set (issue #200
+/// flipped `unpack`/`drop`/`keep`/`decolorize` to first-class stages):
+/// recognized after a bare `|` and named in `NotYetSupported`.
+pub const REMAINING_UNSUPPORTED_STAGES: &[&str] = &["distinct", "ip"];
 
 /// The conversion functions `unwrap` accepts in its wrapped form.
 pub const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];

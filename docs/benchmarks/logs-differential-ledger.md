@@ -76,9 +76,13 @@ Out of this ledger's scope by design:
     extracts; our engine reports the one representative message and does
     not partially extract.
   - `LogfmtParserErr` classes **other than** the unterminated quote
-    (`unexpected '='`, invalid key, …): not error sites in our parser, and
-    Loki only raises `LogfmtParserErr` under `| logfmt --strict` (which
-    our grammar does not carry — a pre-existing #72 trigger delta).
+    (`unexpected '='`, invalid key): since M8-LQ1 (#200) these ARE error
+    sites under `| logfmt --strict` and set the correct `__error__`
+    LABEL. Only the `__error_details__` position STRING for these two
+    classes stays faithful-format (same structure, ledgered position) —
+    the #99 detail-only precedent, LABEL always correct. The default
+    (non-strict) `| logfmt` is now reference-lenient (best-effort, never
+    sets `__error__`), resolving the former #72 default-trigger delta.
   - `LabelFilterErr` **bytes** family (`humanize.ParseBytes` interpolates
     an internal numeric split) and the duration **`unknown unit`** branch
     (Go consumes valid leading components first for compound values, so

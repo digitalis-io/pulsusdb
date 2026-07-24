@@ -99,10 +99,9 @@ fn a_parameter_on_a_parameterless_vector_aggregation_is_rejected() {
 
 #[test]
 fn every_remaining_unsupported_stage_keyword_is_named() {
-    for keyword in ["unpack", "drop", "keep", "decolorize", "distinct", "ip"] {
-        // `drop`/`keep` take label arguments upstream, but the keyword is
-        // rejected before any argument is consumed, so the bare form is
-        // representative for all six.
+    // Issue #200 flipped `unpack`/`drop`/`keep`/`decolorize` to first-class
+    // stages; only `distinct`/`ip` remain out-of-subset.
+    for keyword in ["distinct", "ip"] {
         let query = format!(r#"{{a="b"}} | {keyword}"#);
         assert_not_yet_supported(&query, keyword);
     }

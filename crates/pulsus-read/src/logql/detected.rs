@@ -211,6 +211,11 @@ static JSON_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
 
 static LOGFMT_PARSER: LazyLock<CompiledPipeline> = LazyLock::new(|| {
     CompiledPipeline::compile(&[Stage::Parser(ParserStage::Logfmt {
+        // Lenient default (issue #200): auto-detection mirrors the
+        // reference's default `| logfmt` — a malformed line best-effort
+        // extracts and never sets `__error__`.
+        strict: false,
+        keep_empty: false,
         extractions: Vec::new(),
     })])
     .expect("a bare logfmt parser stage always compiles")
@@ -306,10 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_parse_returns_none_when_both_parsers_error() {
-        // json: not an object; logfmt: unterminated quoted value — the
-        // only malformed logfmt class.
-        assert!(auto_parse(r#"plain x="unterminated"#).is_none());
+    fn auto_parse_treats_a_lenient_logfmt_line_as_logfmt_even_when_it_extracts_nothing() {
+        // Issue #200: the default `| logfmt` is lenient — an unterminated
+        // quote no longer sets `__error__`, so a non-JSON line best-effort
+        // parses as logfmt (contributing no clean fields here: `plain` is a
+        // dropped empty bare key, and the unterminated `x=` yields nothing).
+        // This matches the reference's lenient default; the old "both error
+        // => None" state is no longer reachable via a malformed logfmt line.
+        let (parser, pairs) = auto_parse(r#"plain x="unterminated"#).expect("lenient logfmt");
+        assert_eq!(parser, "logfmt");
+        assert!(pairs.is_empty(), "no clean fields, got {pairs:?}");
     }
 
     // -- FieldAccumulator --------------------------------------------------
