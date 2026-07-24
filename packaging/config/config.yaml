@@ -1,0 +1,108 @@
+# PulsusDB configuration — /etc/pulsusdb/config.yaml
+#
+# This is the COMPLETE document schema (docs/configuration.md §9). Every key is
+# shown commented at its default; uncomment and edit only what you need. Unknown
+# keys are rejected at startup.
+#
+# Precedence: CLI flags (--config, --mode) > environment variables > this YAML >
+# defaults. An environment variable set to the empty string counts as unset.
+# Secrets (clickhouse.auth password, auth_password) are better placed in the env
+# file /etc/pulsusdb/pulsusdb.env so they stay out of this world-readable schema.
+#
+# Durations accept ms|s|m|h|d|w; byte sizes accept binary (KiB/MiB/GiB/TiB),
+# decimal (KB/MB/GB/TB), or a bare integer of bytes.
+
+# --- root scalars ---
+#mode: all                        # all | writer | reader | init
+#host: 0.0.0.0
+#port: 3100
+#log_level: info                  # error | warn | info | debug | trace
+#auth_user: null                  # both set => basic auth; one-sided => startup error
+#auth_password: null              # secret: prefer the env file
+#compat_endpoints: false
+#cors_origin: "*"
+#query_timeout: 2m
+#tls_cert: null                   # PEM cert chain path; with tls_key set, the one listener is TLS-only
+#tls_key: null                    # PEM private key path; one-sided => startup error
+#skip_ddl: false
+#retention_days: 7
+#storage_policy: null
+#rotation_interval: 1h
+#log_rollup_resolution: 5s
+#cluster: null                    # ClickHouse cluster name; enables distributed DDL
+#dist_suffix: _dist
+#skip_unavailable_shards: false
+#availability_zone: null          # this node's AZ; pool prefers clickhouse.servers whose zone matches
+#az_detect: off                   # off | aws | gcp | azure | auto (detect zone from cloud metadata)
+#exp_histogram_mode: classic      # classic | native | dual (OTLP exp-histogram storage; M7-A4)
+
+clickhouse:
+  server: localhost               # <-- point this at your ClickHouse host
+  #port: 9000
+  #http_port: 8123
+  #database: pulsus
+  #auth: "default:"               # user:password (prefer CLICKHOUSE_AUTH in the env file)
+  #proto: http                    # http | https  (native rejected at startup — ADR 0001)
+  #tls_skip_verify: false
+  #pool_size: 8
+  #insert_quorum: 0               # replicas that must confirm a block (0 = off; Replicated* only)
+  #insert_quorum_parallel: true   # only applied when insert_quorum > 0
+  #insert_quorum_timeout: 120s    # 0 < timeout <= query_timeout when insert_quorum > 0
+  #select_sequential_consistency: false  # read-your-writes; adds latency, off by default
+  #servers: []                    # multi-endpoint spreading (overrides `server` when non-empty).
+                                   # Each entry: {host, http_port?, zone?}; http_port falls back to
+                                   # clickhouse.http_port. IPv6 literal hosts must use this object form. e.g.:
+                                   #   servers:
+                                   #     - {host: ch1, zone: az-a}
+                                   #     - {host: ch2, http_port: 8123, zone: az-b}
+
+#writer:
+  #batch_bytes: 16MiB
+  #batch_ms: 200
+  #insert_mode: sync              # sync | async
+  #ingest_queue_bytes: 256MiB
+  #log_patterns: true             # ingest-time log-pattern extraction kill-switch (M7-C3)
+
+#reader:
+  #cache_ttl: 60s
+  #cache_max_series: 50000
+  #series_activity_bucket: 1h
+  #cache_window: 24h
+  #promql_max_samples: 50000000
+  #promql_lookback: 5m
+  #promql_experimental_functions: false
+  #promql_max_metric_fanout: 1000
+  #promql_max_cache_scan: 200000
+  #promql_max_info_series: 100000
+  #logql_scan_budget_bytes: 50GiB
+  #logql_pipeline_scan_factor: 10
+  #traceql_max_candidates: 100000
+  #traceql_scan_budget_rows: 50000000
+  #traceql_max_series: 1000
+  #traceql_generator_max_memory_bytes: 536870912
+  #query_eval_concurrency: 256
+  #tail_poll_interval: 1s
+  #tail_max_delay: 5s
+  #tail_max_connections: 100
+  #tail_max_entries_per_frame: 1000
+  #tail_channel_depth: 4
+  #tail_send_timeout: 30s
+  #tail_max_fetch_limit: 5000
+  #tail_catchup_slice: 60s
+
+#downsampling:
+  #enabled: false
+  #raw_retention: null            # overrides retention_days for metric_samples when set
+  #tier_policy: exact             # exact | fast
+  #tiers: []                      # per-tier rollup layout (docs §7). Each entry: {name,
+                                  # resolution, table, retention, min_step}. name/table unique;
+                                  # resolution/min_step/retention strictly increasing across tiers;
+                                  # min_step >= resolution per tier. e.g.:
+                                  #   tiers:
+                                  #     - {name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}
+                                  #     - {name: r1h, resolution: 1h, table: metric_samples_1h, retention: 365d, min_step: 1h}
+
+#ruler:
+  #enabled: false
+  #poll_interval: 30s
+  #max_result_bytes: 10MiB

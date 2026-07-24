@@ -1,0 +1,86 @@
+# nfpm config — one declarative source for both .deb and .rpm (issue #213).
+# Invoked per format:  nfpm package --config packaging/nfpm.yaml --packager <deb|rpm> --target out/
+#
+# Env-expanded at load. nfpm expands ${VAR} in the top-level scalar fields
+# (arch, version, ...) but NOT in contents[].src (verified empirically on nfpm
+# v2.43.1: a src glob is matched against the literal, unexpanded string). So the
+# binary is staged to a FIXED path, dist/pulsusdb, by the caller before each run
+# — each release runner is single-arch, so no ${arch} is needed in the path; the
+# arch is carried by the `arch:` field alone. Exported by every invocation:
+#   PKG_VERSION  release version, rpm-legal (`-` rewritten to `~`), e.g. 1.2.3 / 1.2.3~rc.1
+#   PKG_ARCH     amd64 | arm64  (nfpm maps to x86_64/aarch64 for rpm)
+# The synthetic smoke-test base package reuses this same config; the caller
+# swaps a distinct payload into dist/pulsusdb and passes PKG_VERSION=0.0.0~smoketest.
+name: pulsusdb
+arch: ${PKG_ARCH}
+version: ${PKG_VERSION}
+version_schema: none
+maintainer: Digitalis <info@digitalis.io>
+vendor: Digitalis
+homepage: https://github.com/digitalis-io/pulsusdb
+license: AGPL-3.0-only
+section: database
+priority: optional
+description: |
+  PulsusDB is a lightweight, all-in-one observability database for logs,
+  metrics, traces, and profiles, written in Rust and backed by ClickHouse.
+depends: []
+
+contents:
+  - src: dist/pulsusdb
+    dst: /usr/bin/pulsusdb
+    file_info:
+      mode: 0755
+
+  - src: packaging/systemd/pulsusdb.service
+    dst: /usr/lib/systemd/system/pulsusdb.service
+    file_info:
+      mode: 0644
+
+  - src: packaging/config/config.yaml
+    dst: /etc/pulsusdb/config.yaml
+    type: "config|noreplace"
+    file_info:
+      mode: 0640
+      owner: root
+      group: pulsusdb
+
+  - src: packaging/config/pulsusdb.env
+    dst: /etc/pulsusdb/pulsusdb.env
+    type: "config|noreplace"
+    file_info:
+      mode: 0640
+      owner: root
+      group: pulsusdb
+
+  - dst: /etc/pulsusdb
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /var/lib/pulsusdb
+    type: dir
+    file_info:
+      mode: 0750
+      owner: pulsusdb
+      group: pulsusdb
+
+# Shared scriptlets → deb maintainer scripts + rpm scriptlets. rpm overrides the
+# postinstall below so its %post carries no restart branch.
+scripts:
+  preinstall: packaging/scripts/preinstall.sh
+  postinstall: packaging/scripts/postinstall.sh
+  preremove: packaging/scripts/preremove.sh
+  postremove: packaging/scripts/postremove.sh
+
+rpm:
+  scripts:
+    # rpm-only %posttrans — the only safe place to restart on an rpm upgrade
+    # (%post runs before the old package's %postun).
+    posttrans: packaging/scripts/posttrans.sh
+
+overrides:
+  rpm:
+    scripts:
+      # rpm %post without the deb upgrade-gated try-restart branch.
+      postinstall: packaging/scripts/postinstall.rpm.sh

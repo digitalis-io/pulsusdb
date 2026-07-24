@@ -279,3 +279,85 @@ tagged commit is an ancestor of `origin/main` (`git merge-base
 of publishing. Ancestry no longer rests on convention; branch protection
 is still required for the *behavioural test* gate (`chart-test-kind`),
 which no workflow step re-runs.
+
+## 7. OS packages (.deb + .rpm)
+
+The same `v*` tag that publishes the GHCR image also builds native OS packages
+(issue #213) and **attaches them to the GitHub Release** (owner decision:
+Releases-only — no hosted apt/yum repo). This is the `packages` /
+`packages-release` job pair in `.github/workflows/release.yml`, mirroring the
+Docker `build`/`merge` split: per-arch native runners (`amd64 -> ubuntu-latest`,
+`arm64 -> ubuntu-24.04-arm`, no QEMU), a fan-in that checksums and uploads. It
+carries the same byte-identical tag-ancestry gate and never touches
+GHCR/cosign; only the fan-in job elevates to `contents: write`.
+
+**What is produced**, from one `packaging/nfpm.yaml` (nfpm emits both formats):
+
+| Asset | |
+|-------|---|
+| `pulsusdb_<ver>_amd64.deb`, `pulsusdb_<ver>_arm64.deb` | Debian/Ubuntu |
+| `pulsusdb-<ver>-1.x86_64.rpm`, `pulsusdb-<ver>-1.aarch64.rpm` | RHEL/Rocky/Alma/Fedora |
+| `SHA256SUMS` | checksums for all four (no GPG signing for v1) |
+
+A prerelease tag's `-` is rewritten to `~` in the package version
+(`v1.2.3-rc.1` → `1.2.3~rc.1`), legal and correctly-ordered in both formats.
+
+**glibc floor / supported distros.** The binary is built dynamically against a
+conservative glibc floor — Debian **bullseye, glibc 2.31** (not the runtime
+image's bookworm), so it is **not** musl-static (a static musl build would
+penalise the query engine's allocator). rustls means glibc + libgcc are
+effectively the only runtime deps. The floor supports **Debian 11+, Ubuntu
+20.04+, RHEL/Rocky/AlmaLinux 9+, and Fedora**. The CI smoke test installs the
+`.deb` on `ubuntu:22.04` (glibc 2.35) and the `.rpm` on `rockylinux:9` (glibc
+2.34); the Rocky leg is the mechanical proof the floor is low enough. EL8
+(glibc 2.28) is a possible follow-up (it would require dropping the build base
+to EL8/AlmaLinux 8).
+
+**What a package installs:**
+
+- `/usr/bin/pulsusdb` — the server binary.
+- `/usr/lib/systemd/system/pulsusdb.service` — the systemd unit:
+  `ExecStart=/usr/bin/pulsusdb --config /etc/pulsusdb/config.yaml`, runs as the
+  dedicated non-root `pulsusdb` user, `WorkingDirectory=/var/lib/pulsusdb`
+  (where the writer's `./spool` resolves), plus a systemd hardening block
+  (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths=/var/lib/pulsusdb`,
+  …). Mode is left implicit (`all`); edit `mode:` in `config.yaml` or drop in a
+  unit override for a writer/reader split.
+- `/etc/pulsusdb/config.yaml` — the complete commented config schema
+  (docs/configuration.md §9), a **noreplace conffile** so operator edits survive
+  upgrades.
+- `/etc/pulsusdb/pulsusdb.env` — an optional env-override file (0640
+  root:pulsusdb) the unit loads via `EnvironmentFile=-`, for secrets like
+  `CLICKHOUSE_AUTH` (env wins over YAML). Also a noreplace conffile.
+- `/var/lib/pulsusdb` — data/spool dir, owned by the `pulsusdb` system
+  user/group (created by the package's preinstall scriptlet).
+
+**Not auto-started.** Installing a package creates the user, lays down the
+files, and reloads systemd — it does **not** enable or start the service.
+Bring it up yourself once `config.yaml` points at your ClickHouse:
+
+```sh
+sudo systemctl enable --now pulsusdb
+```
+
+**Upgrades** restart the unit **only if it was already running** (deb
+`postinst` gated on `configure` + a non-empty old-version arg; rpm via
+`%posttrans`, both using `systemctl try-restart`, a no-op on an inactive unit)
+— so a fresh install stays stopped and a running instance rolls onto the new
+binary. Removal stops/disables the unit and reloads systemd but leaves the
+`pulsusdb` user and `/var/lib/pulsusdb` data in place.
+
+### Installing
+
+```sh
+# Debian / Ubuntu
+sudo apt install ./pulsusdb_<ver>_amd64.deb
+
+# RHEL / Rocky / AlmaLinux / Fedora
+sudo dnf install ./pulsusdb-<ver>-1.x86_64.rpm
+
+# then, after editing /etc/pulsusdb/config.yaml:
+sudo systemctl enable --now pulsusdb
+```
+
+Verify a download against the Release's `SHA256SUMS` with `sha256sum -c`.
