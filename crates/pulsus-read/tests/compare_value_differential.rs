@@ -18,15 +18,15 @@
 //!     `/api/metrics/query_range` metrics API (the Tempo-native
 //!     `{series:[{labels, samples}]}` body PulsusDB mirrors byte-for-byte).
 //!
-//! **Honest by construction.** The corpus deliberately exercises both
-//! branches of the empty-`statusMessage` hypothesis (`arrayFilter` folds
-//! an empty status message into the `key=nil` complement) — spans WITH a
-//! non-empty status message and spans WITHOUT — and a multi-span trace
-//! (root + child, both in-window) so `rootName`/`rootServiceName` must
-//! propagate the ROOT's value across a child of a different name/service.
-//! If Tempo v3.0.2 instead emits `statusMessage=""` as a distinct value,
-//! this gate FAILS loudly and the fix is the one-line removal of the
-//! `arrayFilter` predicate (see the metrics_sql builder). Because it is
+//! **Honest by construction.** The corpus deliberately exercises the
+//! empty-`statusMessage` case — spans WITH a non-empty status message and
+//! spans WITHOUT (which emit as the distinct `""` value) — and a multi-span
+//! trace (root + child, both in-window) so `rootName`/`rootServiceName`
+//! must propagate the ROOT's value across a child of a different
+//! name/service.
+//! Tempo v3.0.2 emits `statusMessage=""` as a DISTINCT value (verified
+//! against the pinned reference, #185), so the metrics_sql builder emits it
+//! verbatim (no `arrayFilter` fold to nil) to match. Because it is
 //! env-gated, fast CI never runs it.
 //!
 //! Gate: skips unless `PULSUS_TEST_CLICKHOUSE=1` AND
@@ -516,9 +516,9 @@ async fn compare_value_differential() {
     assert!(
         mism.is_empty(),
         "compare() value-parity divergence for statusMessage/rootName/rootServiceName \
-         (REAL PulsusDB + Tempo output):\n  {}\n\nIf the divergence is an empty statusMessage \
-         emitted as \"\" by Tempo rather than folded into the nil complement, the fix is the \
-         one-line removal of the metrics_sql `arrayFilter` predicate.",
+         (REAL PulsusDB + Tempo output):\n  {}\n\nPulsusDB emits an empty statusMessage as a \
+         distinct \"\" value (the `arrayFilter` fold-to-nil was removed, #185) to match Tempo \
+         v3.0.2 — a residual divergence here is a NEW mismatch, not the known empty-message case.",
         mism.join("\n  ")
     );
 }

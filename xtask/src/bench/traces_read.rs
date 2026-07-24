@@ -593,6 +593,9 @@ pub async fn run(args: BenchArgs) -> anyhow::Result<()> {
             attrs_table: "trace_attrs_idx_dist",
         },
         max_candidates: 100_000,
+        // The `reader.traceql_max_series` default (issue #185): the shared
+        // `by()` cardinality cap, matching the production sites.
+        max_series: 1_000,
         distributed: true,
     };
     let params = SearchParams {

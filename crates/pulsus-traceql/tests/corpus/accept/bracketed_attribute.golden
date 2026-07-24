@@ -1,0 +1,20 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Attribute {
+                        scope: Span,
+                        key: "foo bar",
+                    },
+                    op: Eq,
+                    value: String(
+                        "x",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

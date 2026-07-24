@@ -562,6 +562,45 @@ async fn two_phase_search_explain_and_budget_gates() {
         "the key-only regex generator must prune on the (key) prefix ({sel}/{total}):\n{raw}"
     );
 
+    // ---- AC2 gate 4b (issue #185): attribute EXISTENCE is index-served --
+    // `{ span.http.status_code != nil }` compiles to a key-only `(key)`
+    // prefix scan (the no-op `1` value predicate); it must prune on the
+    // key prefix, never a full attr-table scan.
+    let plan = plan_for(&engine, r#"{ span.http.status_code != nil }"#, base, now);
+    let generator = &plan.generator_sqls[0];
+    assert!(
+        generator.contains("key = 'http.status_code' AND 1"),
+        "existence compiles to the key-only predicate:\n{generator}"
+    );
+    let raw = explain_raw(&client, generator).await;
+    let (sel, total) = primary_key_granules(&raw);
+    assert!(
+        sel < total,
+        "attribute existence must prune on the (key) prefix ({sel}/{total}):\n{raw}"
+    );
+
+    // ---- AC2 gate 4c (issue #185): single-attribute ARITHMETIC pushes to
+    // a column-side `val_num` predicate that still prunes on the (key)
+    // prefix — NOT a post-hydration Rust scan. The query-performance
+    // mandate: general arithmetic renders column-side, index-served.
+    let plan = plan_for(
+        &engine,
+        r#"{ span.http.status_code * 1 >= 500 }"#,
+        base,
+        now,
+    );
+    let generator = &plan.generator_sqls[0];
+    assert!(
+        generator.contains("key = 'http.status_code' AND (val_num * 1) >= 500"),
+        "single-attr arithmetic renders a column-side val_num predicate:\n{generator}"
+    );
+    let raw = explain_raw(&client, generator).await;
+    let (sel, total) = primary_key_granules(&raw);
+    assert!(
+        sel < total,
+        "arithmetic val_num pushdown must prune on the (key) prefix ({sel}/{total}):\n{raw}"
+    );
+
     // ---- AC2 gate 5: indexed resource.service.name =~ ------------------
     let plan = plan_for(
         &engine,

@@ -1,7 +1,0 @@
-NotYetSupported {
-    construct: "bracketed attribute",
-    span: Span {
-        start: 7,
-        end: 8,
-    },
-}

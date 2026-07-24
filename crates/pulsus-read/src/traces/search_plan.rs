@@ -8,8 +8,8 @@
 //! rejection here is a caller error ([`PlanError`] → `400 bad_data`).
 
 use pulsus_traceql::{
-    AggregateOp, ComparisonOp, Field, Intrinsic, PipelineStage, Query, SpansetExpr, SpansetFilter,
-    Value,
+    AggregateOp, ComparisonOp, Field, HintValue, Intrinsic, PipelineStage, Query, SpansetExpr,
+    SpansetFilter, Value,
 };
 use regex::Regex;
 
@@ -17,8 +17,8 @@ use crate::logql::escape;
 use crate::logql::sql::TimeWindow;
 
 use super::filter::{
-    self, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate, PlanError,
-    SpanFilterCtx, TraceCtxPred, ValuePred,
+    self, ArithNode, AttrProbe, CompareOperand, LeafEval, NestedSetField, PhysicalPredicate,
+    PlanError, SpanFilterCtx, TraceCtxPred, ValuePred,
 };
 use super::search_sql;
 
@@ -40,6 +40,11 @@ pub struct SearchCtx<'a> {
     /// `reader.traceql_max_candidates` — the per-generator top-K depth
     /// (`gen_cap`) *and* the merged-stream consumption ceiling.
     pub max_candidates: u64,
+    /// `reader.traceql_max_series` (default 1000) — the shared `by(...)`
+    /// cardinality cap (issue #185). A spanset `| by(...)` grouping more
+    /// than this many distinct groups is a `422 query_too_broad`, the same
+    /// cap and mechanism the metric `by(...)` clause uses.
+    pub max_series: u64,
     /// Clustered mode: the engine injects the §7 clustered-reader
     /// settings on every query (co-sharding on `cityHash64(trace_id)`
     /// keeps both phases shard-local — docs/schemas.md §7).
@@ -174,6 +179,28 @@ pub(crate) enum PlannedLeafEval {
     /// A trace-level intrinsic comparison (issue #184), evaluated against
     /// the per-trace context co-load.
     TraceCtx(TraceCtxEval),
+    /// An arithmetic comparison (issue #185 `arith.*`), evaluated per
+    /// candidate span from both resolved operand trees.
+    Arith {
+        lhs: PlannedArith,
+        op: ComparisonOp,
+        rhs: PlannedArith,
+    },
+}
+
+/// A planned arithmetic operand tree (issue #185): literals are folded;
+/// attribute operands are interned into the `val_num` reads Phase 2
+/// resolves them from.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedArith {
+    Value(f64),
+    Operand(PlannedOperand),
+    Neg(Box<PlannedArith>),
+    Bin {
+        op: pulsus_traceql::ArithOp,
+        lhs: Box<PlannedArith>,
+        rhs: Box<PlannedArith>,
+    },
 }
 
 /// One planned `{...}` spanset filter (pre-order over the spanset
@@ -272,6 +299,22 @@ pub struct SearchPlan {
     pub(crate) select_attrs: Vec<AttrFieldRef>,
     pub(crate) aggregates: Vec<PlannedAggregate>,
     pub(crate) select_fields: Vec<SelectField>,
+    /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
+    /// absent. The executor enforces `reader.traceql_max_series` over the
+    /// distinct group cardinality (`422 query_too_broad`).
+    pub(crate) group_by: Vec<Field>,
+    /// Whether a `| coalesce()` stage is present (issue #185).
+    pub(crate) coalesce: bool,
+    /// The `with(most_recent=true)` search hint (issue #185): the response
+    /// keeps its recency ordering (the default), most-recent first.
+    pub(crate) most_recent: bool,
+    /// The spanset `| by(...)` cardinality pre-flight probe SQL (issue
+    /// #185): `Some` when the `by()` keys and spanset shape admit the
+    /// distinct-by-key `GROUP BY <keys> LIMIT cap+1` probe (a single
+    /// `{...}` filter grouped by `resource.service.name`). The executor
+    /// runs it before the main search and flips a `cap+1` result to a
+    /// static `422 query_too_broad`.
+    pub(crate) by_probe_sql: Option<String>,
 }
 
 impl SearchPlan {
@@ -288,6 +331,31 @@ impl SearchPlan {
 
     pub fn max_candidates(&self) -> u64 {
         self.max_candidates
+    }
+
+    /// The spanset-level `| by(fields)` grouping keys (issue #185); empty
+    /// when the query has no `by()` stage. The executor enforces the shared
+    /// `reader.traceql_max_series` cardinality cap over these keys.
+    pub fn group_by(&self) -> &[Field] {
+        &self.group_by
+    }
+
+    /// Whether the query carries a `| coalesce()` stage (issue #185).
+    pub fn coalesce(&self) -> bool {
+        self.coalesce
+    }
+
+    /// Whether the query carries a `with(most_recent=true)` hint (issue
+    /// #185); the response keeps its default recency ordering.
+    pub fn most_recent(&self) -> bool {
+        self.most_recent
+    }
+
+    /// The spanset `| by(...)` cardinality pre-flight probe SQL (issue
+    /// #185), when one applies — exposed for the executor's cap
+    /// enforcement and the golden suite.
+    pub fn by_probe_sql(&self) -> Option<&str> {
+        self.by_probe_sql.as_deref()
     }
 
     /// Whether the plan was built against `_dist` tables — the engine's
@@ -588,6 +656,31 @@ fn plan_operand(
     }
 }
 
+/// Plans one arithmetic operand tree (issue #185): folded literals stay
+/// scalars; attribute operands intern their `val_num` read (via
+/// [`plan_operand`]) so Phase 2 resolves a typed numeric value with no new
+/// hydration builder.
+fn plan_arith(
+    node: &ArithNode,
+    agg_fields: &mut Vec<AttrFieldRef>,
+    select_attrs: &mut Vec<AttrFieldRef>,
+) -> PlannedArith {
+    match node {
+        ArithNode::Value(v) => PlannedArith::Value(*v),
+        ArithNode::Operand(operand) => {
+            PlannedArith::Operand(plan_operand(operand, agg_fields, select_attrs))
+        }
+        ArithNode::Neg(inner) => {
+            PlannedArith::Neg(Box::new(plan_arith(inner, agg_fields, select_attrs)))
+        }
+        ArithNode::Bin { op, lhs, rhs } => PlannedArith::Bin {
+            op: *op,
+            lhs: Box::new(plan_arith(lhs, agg_fields, select_attrs)),
+            rhs: Box::new(plan_arith(rhs, agg_fields, select_attrs)),
+        },
+    }
+}
+
 fn aggregate_threshold(
     op: AggregateOp,
     field: &Option<Field>,
@@ -615,15 +708,38 @@ fn aggregate_threshold(
     }
 }
 
+/// The result of planning a search pipeline: engine-side aggregates,
+/// `select()` projections, and the spanset-level `by(...)`/`coalesce()`
+/// stages (issue #185).
+struct PlannedPipeline {
+    aggregates: Vec<PlannedAggregate>,
+    select_fields: Vec<SelectField>,
+    /// Spanset-level `| by(fields)` grouping keys (issue #185); empty when
+    /// absent. Bounded at execution by `reader.traceql_max_series`
+    /// (`422 query_too_broad`), the same cap the metric `by(...)` clause
+    /// uses.
+    group_by: Vec<Field>,
+    /// Whether a `| coalesce()` stage is present (issue #185).
+    coalesce: bool,
+}
+
 fn plan_pipeline(
     query: &Query,
     agg_fields: &mut Vec<AttrFieldRef>,
     select_attrs: &mut Vec<AttrFieldRef>,
-) -> Result<(Vec<PlannedAggregate>, Vec<SelectField>), PlanError> {
+) -> Result<PlannedPipeline, PlanError> {
     let mut aggregates = Vec::new();
     let mut select_fields = Vec::new();
+    let mut group_by = Vec::new();
+    let mut coalesce = false;
     for stage in &query.pipeline {
         match stage {
+            // Spanset-level grouping / coalesce (issue #185): recognized
+            // search stages. `by(...)` grouping keys are carried to the
+            // executor, which enforces the shared `reader.traceql_max_series`
+            // cardinality cap (`422 query_too_broad`).
+            PipelineStage::By { fields } => group_by.extend(fields.iter().cloned()),
+            PipelineStage::Coalesce => coalesce = true,
             PipelineStage::Aggregate {
                 op,
                 field,
@@ -771,7 +887,12 @@ fn plan_pipeline(
             }
         }
     }
-    Ok((aggregates, select_fields))
+    Ok(PlannedPipeline {
+        aggregates,
+        select_fields,
+        group_by,
+        coalesce,
+    })
 }
 
 /// Plans one search request. Pure and deterministic — the same inputs
@@ -833,6 +954,11 @@ pub fn plan_search(
                     &mut trace_ctx,
                     &mut child_count,
                 )?),
+                LeafEval::Arith { lhs, op, rhs } => PlannedLeafEval::Arith {
+                    lhs: plan_arith(lhs, &mut agg_fields, &mut select_attrs),
+                    op: *op,
+                    rhs: plan_arith(rhs, &mut agg_fields, &mut select_attrs),
+                },
             };
             leaves.push(planned);
         }
@@ -854,7 +980,38 @@ pub fn plan_search(
         }
     }
 
-    let (aggregates, select_fields) = plan_pipeline(query, &mut agg_fields, &mut select_attrs)?;
+    let pipeline = plan_pipeline(query, &mut agg_fields, &mut select_attrs)?;
+    // A trailing `with(most_recent=true)` search hint (issue #185): keeps
+    // the response's default recency ordering (most-recent first).
+    let most_recent = query
+        .hints
+        .iter()
+        .any(|h| h.key == "most_recent" && matches!(h.value, HintValue::Bool(true)));
+
+    // The spanset `| by(...)` cardinality cap (issue #185): the SAME
+    // `reader.traceql_max_series` cap + distinct-by-key pre-flight probe as
+    // the metric `by()` cap. The probe is buildable when the `by()` key is
+    // `resource.service.name` (the `service` column) and the spanset is a
+    // single `{...}` filter (so the "same predicate" is well-defined);
+    // other by-key / composite-spanset forms still return 200 (parse-
+    // supported, bounded by the search limit / scan budget — the full
+    // value/response reshaping is #193).
+    let by_probe_sql = by_probe_column(&pipeline.group_by)
+        .and_then(|col| single_filter_body(&query.spanset).map(|body| (col, body)))
+        .map(|(col, body)| {
+            super::metrics_sql::search_by_probe_sql(
+                ctx.filter.spans_table,
+                ctx.filter.attrs_table,
+                body,
+                super::metrics_sql::SnappedWindow {
+                    start_ns: window.start_ns,
+                    end_ns: window.end_ns,
+                },
+                col,
+                ctx.max_series,
+            )
+        })
+        .transpose()?;
 
     Ok(SearchPlan {
         window,
@@ -873,9 +1030,39 @@ pub fn plan_search(
         probes,
         agg_fields,
         select_attrs,
-        aggregates,
-        select_fields,
+        aggregates: pipeline.aggregates,
+        select_fields: pipeline.select_fields,
+        group_by: pipeline.group_by,
+        coalesce: pipeline.coalesce,
+        most_recent,
+        by_probe_sql,
     })
+}
+
+/// The grouping column for a spanset `| by(...)` cap probe, when the keys
+/// admit one (issue #185). Currently only `resource.service.name` (the
+/// physical `service` column), mirroring the metric `by()` cap; other keys
+/// return `None` (no probe — the query still runs, bounded by the search
+/// limit / scan budget).
+fn by_probe_column(group_by: &[Field]) -> Option<&'static str> {
+    match group_by {
+        [Field::Attribute { scope, key }]
+            if *scope == pulsus_traceql::AttrScope::Resource && key == "service.name" =>
+        {
+            Some("service")
+        }
+        _ => None,
+    }
+}
+
+/// The `{...}` filter body of a single-filter spanset (issue #185): the
+/// `by()` cap probe's "same predicate" is only well-defined over a single
+/// filter, so composite spansets (`&&`/`||`/structural) yield `None`.
+fn single_filter_body(spanset: &SpansetExpr) -> Option<Option<&pulsus_traceql::FieldExpr>> {
+    match spanset {
+        SpansetExpr::Filter(f) => Some(f.body.as_ref()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -891,6 +1078,7 @@ mod tests {
                 attrs_table: "trace_attrs_idx",
             },
             max_candidates: 100,
+            max_series: 1_000,
             distributed: false,
         }
     }
@@ -1184,6 +1372,44 @@ mod tests {
     }
 
     #[test]
+    fn spanset_by_service_builds_the_distinct_by_key_cap_probe() {
+        // `{ .a = "1" } | by(resource.service.name)` (issue #185): the plan
+        // carries the `GROUP BY g0 LIMIT max_series+1` distinct-by-key
+        // probe over the `service` column and the filter predicate.
+        let p = plan(r#"{ .a = "1" } | by(resource.service.name)"#);
+        let probe = p.by_probe_sql().expect("service by() builds a cap probe");
+        assert!(probe.contains("service AS g0"), "{probe}");
+        assert!(probe.contains("GROUP BY g0"), "{probe}");
+        assert!(
+            probe.contains("LIMIT 1001"),
+            "cap+1 (max_series=1000): {probe}"
+        );
+        assert!(probe.contains("count() AS n"), "{probe}");
+        assert!(
+            probe.contains("key = 'a'"),
+            "carries the filter predicate: {probe}"
+        );
+    }
+
+    #[test]
+    fn spanset_by_without_the_service_key_or_over_a_composite_builds_no_probe() {
+        // A non-service by-key has no probe column; a composite spanset has
+        // no single-filter predicate — both still plan (200), uncapped.
+        assert!(
+            plan(r#"{ .a = "1" } | by(span.foo)"#)
+                .by_probe_sql()
+                .is_none()
+        );
+        assert!(
+            plan(r#"{ .a = "1" } && { .b = "2" } | by(resource.service.name)"#)
+                .by_probe_sql()
+                .is_none()
+        );
+        // No by() ⇒ no probe.
+        assert!(plan(r#"{ .a = "1" }"#).by_probe_sql().is_none());
+    }
+
+    #[test]
     fn clustered_ctx_switches_the_table_names_only_via_ctx() {
         let query = parse(r#"{ resource.service.name = "checkout" }"#).expect("parse");
         let clustered = SearchCtx {
@@ -1192,6 +1418,7 @@ mod tests {
                 attrs_table: "trace_attrs_idx_dist",
             },
             max_candidates: 100,
+            max_series: 1_000,
             distributed: true,
         };
         let p = plan_search(&query, &PARAMS, &clustered).expect("plan");

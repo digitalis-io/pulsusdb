@@ -5,7 +5,7 @@
 SELECT t, akey, aval, countIf(is_sel = 0) AS base_n, countIf(is_sel) AS sel_n
 FROM (
   SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (
-    SELECT t, is_sel, arrayJoin(arrayFilter(x -> NOT (x.1 = 'statusMessage' AND x.2 = ''), [('name', i_name), ('kind', transform(i_kind, [0, 1, 2, 3, 4, 5], ['unspecified', 'internal', 'server', 'client', 'producer', 'consumer'], 'unspecified')), ('status', transform(i_status, [0, 1, 2], ['unset', 'ok', 'error'], 'unset')), ('resource.service.name', i_service), ('statusMessage', i_status_message), ('rootName', r.root_name), ('rootServiceName', r.root_service)])) AS kv
+    SELECT t, is_sel, arrayJoin([('name', i_name), ('kind', transform(i_kind, [0, 1, 2, 3, 4, 5], ['unspecified', 'internal', 'server', 'client', 'producer', 'consumer'], 'unspecified')), ('status', transform(i_status, [0, 1, 2], ['unset', 'ok', 'error'], 'unset')), ('resource.service.name', i_service), ('statusMessage', i_status_message), ('rootName', r.root_name), ('rootServiceName', r.root_service)]) AS kv
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, max(is_sel) AS is_sel
   FROM (
@@ -71,7 +71,7 @@ SELECT toUInt64(pairs * 2 + keys * 4 + 100) AS n FROM (
   SELECT count() AS pairs, uniqExact(akey) AS keys FROM (
   SELECT akey, aval FROM (
   SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (
-    SELECT t, is_sel, arrayJoin(arrayFilter(x -> NOT (x.1 = 'statusMessage' AND x.2 = ''), [('name', i_name), ('kind', transform(i_kind, [0, 1, 2, 3, 4, 5], ['unspecified', 'internal', 'server', 'client', 'producer', 'consumer'], 'unspecified')), ('status', transform(i_status, [0, 1, 2], ['unset', 'ok', 'error'], 'unset')), ('resource.service.name', i_service), ('statusMessage', i_status_message), ('rootName', r.root_name), ('rootServiceName', r.root_service)])) AS kv
+    SELECT t, is_sel, arrayJoin([('name', i_name), ('kind', transform(i_kind, [0, 1, 2, 3, 4, 5], ['unspecified', 'internal', 'server', 'client', 'producer', 'consumer'], 'unspecified')), ('status', transform(i_status, [0, 1, 2], ['unset', 'ok', 'error'], 'unset')), ('resource.service.name', i_service), ('statusMessage', i_status_message), ('rootName', r.root_name), ('rootServiceName', r.root_service)]) AS kv
     FROM (
   SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, any(i_status) AS i_status, any(i_service) AS i_service, any(i_status_message) AS i_status_message, max(is_sel) AS is_sel
   FROM (

@@ -42,10 +42,10 @@ mod parser;
 mod token;
 
 pub use ast::{
-    AggregateOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field, FieldExpr,
-    HintValue, Intrinsic, MetricFn, MetricHint, MetricStage, PipelineStage, Query, SecondStage,
-    SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp,
-    Value,
+    AggregateOp, ArithOp, AttrScope, BOUNDARY_CONSTRUCTS, BoolOp, ComparisonOp, Duration, Field,
+    FieldExpr, HintValue, Intrinsic, MetricFn, MetricHint, MetricStage, Operand, PipelineStage,
+    Query, SecondStage, SpanKindValue, SpansetExpr, SpansetFilter, StatusValue, StructuralModifier,
+    StructuralOp, Value,
 };
 pub use error::TraceQlError;
 pub use parser::parse;

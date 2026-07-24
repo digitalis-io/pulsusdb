@@ -32,16 +32,12 @@ pub enum TraceQlError {
     #[error("unexpected end of query at byte {}: expected {expected}", .span.start)]
     UnexpectedEof { expected: String, span: Span },
 
-    /// A recognized-but-unimplemented construct outside the committed M4
-    /// search subset (structural operators, negation, arithmetic,
-    /// `parent.`, bracketed attributes, bare-attribute existence — M7;
-    /// metrics pipeline functions — T7). Names the construct so the
+    /// A recognized-but-unimplemented construct (the remaining structural
+    /// `>=`/`<=` operators and the schema-blocked `parent.` scope — see
+    /// [`crate::ast::BOUNDARY_CONSTRUCTS`]). Names the construct so the
     /// caller can distinguish "not yet supported" from a genuine syntax
-    /// error. The full registry is [`crate::ast::BOUNDARY_CONSTRUCTS`].
-    #[error(
-        "`{construct}` at byte {} is not yet supported (M4 TraceQL search subset — features.md §4)",
-        .span.start
-    )]
+    /// error.
+    #[error("`{construct}` at byte {} is not yet supported", .span.start)]
     NotYetSupported { construct: String, span: Span },
 
     /// A duration literal (`2s`, `1.5s`, ...) that is malformed (unknown

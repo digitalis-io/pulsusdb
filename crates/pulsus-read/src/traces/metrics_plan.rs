@@ -989,18 +989,16 @@ mod tests {
         // The cross-tab enumerates intrinsics + index attrs and counts
         // baseline (count()) and selection (countIf(is_sel)).
         assert!(cross.contains("countIf(is_sel) AS sel_n"), "{cross}");
-        assert!(
-            cross.contains("arrayJoin(arrayFilter("),
-            "intrinsic pivot: {cross}"
-        );
+        assert!(cross.contains("arrayJoin(["), "intrinsic pivot: {cross}");
         assert!(
             cross.contains("concat(a.scope, '.', a.key)"),
             "attr pivot: {cross}"
         );
-        // Issue #189: the 3 data-driven well-known keys are emitted, with an
-        // empty statusMessage folded to the nil complement, and the roots
-        // resolved by a WINDOW-FREE per-trace argMin LEFT JOIN (no time
-        // predicate inside the roots subquery — trace-wide exactness).
+        // Issue #189/#185: the 3 data-driven well-known keys are emitted;
+        // an empty statusMessage is emitted as the DISTINCT `""` value (not
+        // folded to nil — Tempo v3.0.2 parity), and the roots are resolved
+        // by a WINDOW-FREE per-trace argMin LEFT JOIN (no time predicate
+        // inside the roots subquery — trace-wide exactness).
         for tuple in [
             "('statusMessage', i_status_message)",
             "('rootName', r.root_name)",
@@ -1009,8 +1007,8 @@ mod tests {
             assert!(cross.contains(tuple), "missing {tuple}: {cross}");
         }
         assert!(
-            cross.contains("NOT (x.1 = 'statusMessage' AND x.2 = '')"),
-            "empty statusMessage → nil complement: {cross}"
+            !cross.contains("arrayFilter"),
+            "empty statusMessage is a distinct value, not filtered to nil: {cross}"
         );
         // The roots read scans `trace_spans` keyed ONLY on the DISTINCT
         // in-window trace_id IN-set (no time predicate on its own scan —

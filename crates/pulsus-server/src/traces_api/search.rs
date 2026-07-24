@@ -50,6 +50,7 @@ async fn search_impl(state: AppState, raw: &str) -> Result<Response, ApiError> {
             attrs_table: &read_config.attrs_table,
         },
         max_candidates: read_config.max_candidates,
+        max_series: read_config.max_series,
         distributed: read_config.distributed,
     };
     let search_params = pulsus_read::SearchParams {

@@ -99,6 +99,10 @@ pub enum TokenKind {
     Star,
     /// `/` — arithmetic (M7 boundary, recognition only).
     Slash,
+    /// `%` — arithmetic modulo (field-expression arithmetic).
+    Percent,
+    /// `^` — arithmetic exponentiation (field-expression arithmetic).
+    Caret,
 
     Ident(String),
     /// An unescaped string value (double-quoted Go-style escapes or a

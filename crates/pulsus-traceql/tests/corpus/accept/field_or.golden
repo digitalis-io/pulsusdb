@@ -29,4 +29,5 @@ Query {
         },
     ),
     pipeline: [],
+    hints: [],
 }

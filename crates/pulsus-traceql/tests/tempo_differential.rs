@@ -181,6 +181,14 @@ fn registry_probes_match_the_recorded_tempo_verdict() {
                 "{}: supported but Tempo rejects — an unescalated divergence",
                 c.id
             )),
+            // Reject-parity (issue #185): we reject AND the reference must
+            // reject. A live Accept is an unescalated divergence in the
+            // other direction (we reject, the reference does not).
+            ("reject-parity", Verdict::Reject) => agreements += 1,
+            ("reject-parity", Verdict::Accept) => mismatches.push(format!(
+                "{}: reject-parity but Tempo now accepts — an unescalated divergence",
+                c.id
+            )),
             (_, Verdict::Reject) => agreements += 1, // interim ∧ both reject
             (_, Verdict::Accept) => tracked_interim += 1, // interim ∧ Tempo accepts
         }

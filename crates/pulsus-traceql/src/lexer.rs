@@ -133,6 +133,14 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, TraceQlError> {
                 sc.advance();
                 push(&mut tokens, TokenKind::Slash, start, sc.current_byte());
             }
+            '%' => {
+                sc.advance();
+                push(&mut tokens, TokenKind::Percent, start, sc.current_byte());
+            }
+            '^' => {
+                sc.advance();
+                push(&mut tokens, TokenKind::Caret, start, sc.current_byte());
+            }
             '.' => {
                 // `.5s` / `.5` — a leading-dot fraction is a literal, not
                 // the unscoped-attribute `.attr` form.
@@ -636,6 +644,21 @@ mod tests {
                 TokenKind::Eq,
                 TokenKind::Tilde,
                 TokenKind::Bang,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn arithmetic_modulo_and_power_lex_as_their_own_tokens() {
+        assert_eq!(
+            kinds("5 % 2 ^ 3"),
+            vec![
+                TokenKind::Number("5".to_string()),
+                TokenKind::Percent,
+                TokenKind::Number("2".to_string()),
+                TokenKind::Caret,
+                TokenKind::Number("3".to_string()),
                 TokenKind::Eof,
             ]
         );

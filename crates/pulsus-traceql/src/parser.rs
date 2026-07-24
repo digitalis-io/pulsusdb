@@ -44,9 +44,9 @@
 //! precedent.
 
 use crate::ast::{
-    AggregateOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic, MetricFn,
-    MetricHint, MetricStage, PipelineStage, Query, SecondStage, SpanKindValue, SpansetExpr,
-    SpansetFilter, StatusValue, StructuralModifier, StructuralOp, Value,
+    AggregateOp, ArithOp, AttrScope, BoolOp, ComparisonOp, Field, FieldExpr, HintValue, Intrinsic,
+    MetricFn, MetricHint, MetricStage, Operand, PipelineStage, Query, SecondStage, SpanKindValue,
+    SpansetExpr, SpansetFilter, StatusValue, StructuralModifier, StructuralOp, Value,
 };
 use crate::duration;
 use crate::error::{MAX_DEPTH, TraceQlError};
@@ -65,8 +65,15 @@ pub fn parse(input: &str) -> Result<Query, TraceQlError> {
         cursor.advance();
         pipeline.push(parse_pipeline_stage(&mut cursor)?);
     }
+    // A trailing `with(...)` on a non-metric query carries search hints
+    // (issue #185, `hints.most_recent`): `{ … } with(most_recent=true)`.
+    let hints = parse_optional_with(&mut cursor)?;
     expect_eof(&cursor)?;
-    Ok(Query { spanset, pipeline })
+    Ok(Query {
+        spanset,
+        pipeline,
+        hints,
+    })
 }
 
 /// Charges one `&&`/`||` node against the query-wide binary-node budget
@@ -197,6 +204,8 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::Minus => "'-'".to_string(),
         TokenKind::Star => "'*'".to_string(),
         TokenKind::Slash => "'/'".to_string(),
+        TokenKind::Percent => "'%'".to_string(),
+        TokenKind::Caret => "'^'".to_string(),
         TokenKind::Ident(s) => format!("identifier {s:?}"),
         TokenKind::String(s) => format!("string {s:?}"),
         TokenKind::Duration(s) => format!("duration {s:?}"),
@@ -408,7 +417,6 @@ fn parse_field_and(
 ) -> Result<FieldExpr, TraceQlError> {
     let mut lhs = parse_field_primary(cursor, depth, binary_nodes)?;
     loop {
-        check_no_arithmetic_op(cursor)?;
         if matches!(cursor.peek().kind, TokenKind::AndAnd) {
             charge_binary_node(binary_nodes, cursor.peek().span)?;
             cursor.advance();
@@ -424,32 +432,27 @@ fn parse_field_and(
     }
 }
 
-/// After a complete field-expression operand, checks whether the next
-/// token starts an arithmetic expression — valid Tempo, out of M4 — and
-/// names the operator.
-fn check_no_arithmetic_op(cursor: &Cursor<'_>) -> Result<(), TraceQlError> {
-    let tok = cursor.peek();
-    let construct = match &tok.kind {
-        TokenKind::Plus => "arithmetic operator '+'",
-        TokenKind::Minus => "arithmetic operator '-'",
-        TokenKind::Star => "arithmetic operator '*'",
-        TokenKind::Slash => "arithmetic operator '/'",
-        _ => return Ok(()),
-    };
-    Err(TraceQlError::NotYetSupported {
-        construct: construct.to_string(),
-        span: tok.span,
-    })
+/// Whether `kind` starts (or continues) a field-expression arithmetic
+/// expression (issue #185, `arith.*`): `+ - * / % ^`.
+fn arith_op_of(kind: &TokenKind) -> Option<ArithOp> {
+    match kind {
+        TokenKind::Plus => Some(ArithOp::Add),
+        TokenKind::Minus => Some(ArithOp::Sub),
+        TokenKind::Star => Some(ArithOp::Mul),
+        TokenKind::Slash => Some(ArithOp::Div),
+        TokenKind::Percent => Some(ArithOp::Mod),
+        TokenKind::Caret => Some(ArithOp::Pow),
+        _ => None,
+    }
 }
 
-/// `FieldPrimary := "(" FieldExpr ")" | Field CmpOp Value`. An
-/// *attribute* with no comparison (`{ .foo }`) is valid Tempo (attribute
-/// existence) but out of the M4 comparison-only surface →
-/// `NotYetSupported` at the field's span (task-manager adjudication 3).
-/// A bare *intrinsic* (`{ name }`) is not a future construct — it is
-/// malformed grammar in every milestone, so it gets a plain positioned
-/// missing-comparison error (round-2 adjudication 1, same rationale as
-/// bare `parent`).
+/// `FieldPrimary := "(" FieldExpr ")" | Field CmpOp Value | Exists |
+/// ArithCompare`. An *attribute* with no comparison (`{ .foo }`) is
+/// attribute existence (`FieldExpr::Exists`, issue #185); a bare
+/// *intrinsic* (`{ name }`) is malformed grammar in every milestone, so
+/// it gets a plain positioned missing-comparison error (same rationale as
+/// bare `parent`). A comparison with an arithmetic operand on either side
+/// routes to `ArithCompare`.
 const COMPARISON_EXPECTED: &str =
     "a comparison operator ('=', '!=', '>', '>=', '<', '<=', '=~', '!~')";
 
@@ -489,7 +492,16 @@ fn parse_field_primary(
             Ok(FieldExpr::BoolStatic(b))
         }
         _ => {
-            let (field, field_span) = parse_field(cursor)?;
+            let (field, _) = parse_field(cursor)?;
+            // LHS arithmetic (issue #185, `arith.*`): a field immediately
+            // followed by an arithmetic operator makes the whole comparison
+            // an `ArithCompare`, not a `Comparison`.
+            if arith_op_of(&cursor.peek().kind).is_some() {
+                let lhs = parse_operand_from(cursor, Operand::Field(field), depth)?;
+                let op = parse_arith_comparison_op(cursor)?;
+                let rhs = parse_operand(cursor, depth)?;
+                return Ok(FieldExpr::ArithCompare { lhs, op, rhs });
+            }
             let op = match &cursor.peek().kind {
                 TokenKind::Eq => ComparisonOp::Eq,
                 TokenKind::Neq => ComparisonOp::Neq,
@@ -506,10 +518,9 @@ fn parse_field_primary(
                 | TokenKind::Eof
                     if matches!(field, Field::Attribute { .. }) =>
                 {
-                    return Err(TraceQlError::NotYetSupported {
-                        construct: "bare attribute expression".to_string(),
-                        span: field_span,
-                    });
+                    // `existence.bare_attr` (issue #185): a bare attribute
+                    // with no comparison is an existence check.
+                    return Ok(FieldExpr::Exists(field));
                 }
                 TokenKind::Eof => {
                     return Err(TraceQlError::UnexpectedEof {
@@ -527,6 +538,17 @@ fn parse_field_primary(
                 }
             };
             cursor.advance();
+            // `= nil` / `!= nil` existence (issue #185): recognized only in
+            // value position (a bare `Ident("nil")`), never a `Value`
+            // variant. `= nil` ⇒ absence (`Not(Exists)`), `!= nil` ⇒
+            // presence (`Exists`).
+            if matches!(op, ComparisonOp::Eq | ComparisonOp::Neq) && is_nil(cursor.peek()) {
+                cursor.advance();
+                return Ok(match op {
+                    ComparisonOp::Eq => FieldExpr::Not(Box::new(FieldExpr::Exists(field))),
+                    _ => FieldExpr::Exists(field),
+                });
+            }
             // `comparison.rhs_attribute` (issue #183): when the value
             // position begins a field (attribute or intrinsic) the RHS is
             // a `Field`, not a literal. Regex operators (`=~`/`!~`) never
@@ -534,8 +556,30 @@ fn parse_field_primary(
             // which rejects the field-start (Tempo rejects `{ .a =~ .b }`).
             if !matches!(op, ComparisonOp::Re | ComparisonOp::Nre) && rhs_begins_field(cursor) {
                 let (rhs, _) = parse_field(cursor)?;
+                // RHS arithmetic (issue #185): a field operand followed by
+                // an arithmetic operator makes this an `ArithCompare`.
+                if arith_op_of(&cursor.peek().kind).is_some() {
+                    let rhs = parse_operand_from(cursor, Operand::Field(rhs), depth)?;
+                    return Ok(FieldExpr::ArithCompare {
+                        lhs: Operand::Field(field),
+                        op,
+                        rhs,
+                    });
+                }
                 return Ok(FieldExpr::FieldCompare {
                     lhs: field,
+                    op,
+                    rhs,
+                });
+            }
+            // RHS arithmetic value (issue #185): a unary `-`, a
+            // parenthesized operand, or a numeric literal followed by an
+            // arithmetic operator (a lone number/duration stays a plain
+            // typed `Value` so the frozen goldens do not churn).
+            if !matches!(op, ComparisonOp::Re | ComparisonOp::Nre) && rhs_begins_arith(cursor) {
+                let rhs = parse_operand(cursor, depth)?;
+                return Ok(FieldExpr::ArithCompare {
+                    lhs: Operand::Field(field),
                     op,
                     rhs,
                 });
@@ -568,6 +612,186 @@ fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
     }
 }
 
+/// Whether the token is the value-position `nil` keyword (issue #185
+/// existence): a bare `Ident("nil")`, recognized only here — never a
+/// `Value` variant.
+fn is_nil(tok: &Token) -> bool {
+    matches!(&tok.kind, TokenKind::Ident(n) if n == "nil")
+}
+
+/// Whether the token at the value position begins an arithmetic operand
+/// (issue #185): a unary `-`, a parenthesized operand, or a numeric
+/// literal immediately followed by an arithmetic operator. A lone
+/// number/duration is NOT arithmetic (it stays a plain typed `Value`).
+fn rhs_begins_arith(cursor: &Cursor<'_>) -> bool {
+    match &cursor.peek().kind {
+        TokenKind::Minus | TokenKind::LParen => true,
+        TokenKind::Number(_) | TokenKind::Duration(_) => {
+            arith_op_of(&cursor.peek2().kind).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// The binding power of an arithmetic operator (issue #185): `+ -` bind
+/// loosest, then `* / %`, then `^` (which is right-associative).
+fn arith_prec(op: ArithOp) -> u8 {
+    match op {
+        ArithOp::Add | ArithOp::Sub => 1,
+        ArithOp::Mul | ArithOp::Div | ArithOp::Mod => 2,
+        ArithOp::Pow => 3,
+    }
+}
+
+/// A comparison operator introducing the RHS of an arithmetic comparison
+/// (issue #185). Arithmetic expressions never compare with a regex, so
+/// `=~`/`!~` are positioned errors here.
+fn parse_arith_comparison_op(cursor: &mut Cursor<'_>) -> Result<ComparisonOp, TraceQlError> {
+    let tok = cursor.peek().clone();
+    let op = match tok.kind {
+        TokenKind::Eq => ComparisonOp::Eq,
+        TokenKind::Neq => ComparisonOp::Neq,
+        TokenKind::Gt => ComparisonOp::Gt,
+        TokenKind::Gte => ComparisonOp::Gte,
+        TokenKind::Lt => ComparisonOp::Lt,
+        TokenKind::Lte => ComparisonOp::Lte,
+        TokenKind::Eof => {
+            return Err(TraceQlError::UnexpectedEof {
+                expected: "a comparison operator".to_string(),
+                span: tok.span,
+            });
+        }
+        _ => {
+            return Err(TraceQlError::UnexpectedToken {
+                found: describe(&tok.kind),
+                expected: "a comparison operator (arithmetic expressions do not support regex)"
+                    .to_string(),
+                span: tok.span,
+            });
+        }
+    };
+    cursor.advance();
+    Ok(op)
+}
+
+/// `Operand := Add`, a precedence-climbing arithmetic expression (issue
+/// #185, `arith.*`). Operands are fields, numeric literals, unary
+/// negations, and parenthesized sub-expressions. `depth` bounds paren /
+/// unary nesting to [`MAX_DEPTH`].
+fn parse_operand(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
+    if depth >= MAX_DEPTH {
+        return Err(TraceQlError::RecursionLimitExceeded {
+            span: cursor.peek().span,
+        });
+    }
+    let first = parse_operand_unary(cursor, depth)?;
+    parse_operand_bin(cursor, first, 0, depth)
+}
+
+/// Continues precedence-climbing from an already-parsed leading operand
+/// (used when the parser has consumed a field before discovering the
+/// arithmetic operator).
+fn parse_operand_from(
+    cursor: &mut Cursor<'_>,
+    first: Operand,
+    depth: usize,
+) -> Result<Operand, TraceQlError> {
+    if depth >= MAX_DEPTH {
+        return Err(TraceQlError::RecursionLimitExceeded {
+            span: cursor.peek().span,
+        });
+    }
+    parse_operand_bin(cursor, first, 0, depth)
+}
+
+/// The precedence-climbing loop: folds `lhs (op rhs)*` while the operator
+/// binds at least as tightly as `min_prec`.
+fn parse_operand_bin(
+    cursor: &mut Cursor<'_>,
+    mut lhs: Operand,
+    min_prec: u8,
+    depth: usize,
+) -> Result<Operand, TraceQlError> {
+    while let Some(op) = arith_op_of(&cursor.peek().kind) {
+        let prec = arith_prec(op);
+        if prec < min_prec {
+            break;
+        }
+        cursor.advance();
+        let mut rhs = parse_operand_unary(cursor, depth)?;
+        while let Some(next) = arith_op_of(&cursor.peek().kind) {
+            let next_prec = arith_prec(next);
+            // `^` is right-associative (equal precedence recurses); the
+            // left-associative operators only recurse on a tighter level.
+            let recurse = next_prec > prec || (next_prec == prec && next == ArithOp::Pow);
+            if !recurse {
+                break;
+            }
+            let next_min = if next_prec > prec { prec + 1 } else { prec };
+            rhs = parse_operand_bin(cursor, rhs, next_min, depth)?;
+        }
+        lhs = Operand::Arith {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        };
+    }
+    Ok(lhs)
+}
+
+/// A unary-negation-prefixed operand (`-x`) or an atom.
+fn parse_operand_unary(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
+    if matches!(cursor.peek().kind, TokenKind::Minus) {
+        if depth >= MAX_DEPTH {
+            return Err(TraceQlError::RecursionLimitExceeded {
+                span: cursor.peek().span,
+            });
+        }
+        let minus = cursor.advance();
+        // A bare signed duration literal (`-2s`) stays a positioned parse
+        // error: the normative duration grammar admits no sign (docs/api.md
+        // §4.2). Arithmetic negation applies to numbers, fields, and
+        // parenthesized operands only.
+        if matches!(cursor.peek().kind, TokenKind::Duration(_)) {
+            return Err(TraceQlError::UnexpectedToken {
+                found: "'-'".to_string(),
+                expected: "a duration literal (durations carry no sign)".to_string(),
+                span: minus.span,
+            });
+        }
+        let inner = parse_operand_unary(cursor, depth + 1)?;
+        return Ok(Operand::Neg(Box::new(inner)));
+    }
+    parse_operand_atom(cursor, depth)
+}
+
+/// `Atom := "(" Operand ")" | Number | Duration | Field`.
+fn parse_operand_atom(cursor: &mut Cursor<'_>, depth: usize) -> Result<Operand, TraceQlError> {
+    let tok = cursor.peek().clone();
+    match &tok.kind {
+        TokenKind::LParen => {
+            cursor.advance();
+            let inner = parse_operand(cursor, depth + 1)?;
+            cursor.expect(&TokenKind::RParen, "')'")?;
+            Ok(inner)
+        }
+        TokenKind::Number(raw) => {
+            let raw = raw.clone();
+            cursor.advance();
+            Ok(Operand::Literal(Value::Number(raw)))
+        }
+        TokenKind::Duration(raw) => {
+            let parsed = duration::parse_duration(raw, tok.span)?;
+            cursor.advance();
+            Ok(Operand::Literal(Value::Duration(parsed)))
+        }
+        _ => {
+            let (field, _) = parse_field(cursor)?;
+            Ok(Operand::Field(field))
+        }
+    }
+}
+
 /// `Field := Intrinsic | ("span"|"resource") "." DottedKey | "." DottedKey`.
 /// A bare intrinsic keyword not followed by `.` resolves to the
 /// intrinsic; `parent.` and bracketed attributes are recognized-but-M7;
@@ -591,10 +815,6 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
                 },
             ))
         }
-        TokenKind::LBracket => Err(TraceQlError::NotYetSupported {
-            construct: "bracketed attribute".to_string(),
-            span: tok.span,
-        }),
         TokenKind::Ident(name) => {
             // Colon-scoped intrinsic (`span:childCount`, `trace:id`, …,
             // issue #184): `<scope> : <ident>`. A known scope+field pair
@@ -678,19 +898,46 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
 }
 
 /// Parses the dotted key after a scope prefix: `Ident ("." Ident)*`,
-/// e.g. `http.status_code`. Returns the joined key and the byte offset
-/// just past its last segment. A `[` here is the bracketed-attribute
-/// form — recognized, M7.
+/// e.g. `http.status_code`. The leading segment may instead be a quoted
+/// string (`span."attr with spaces"` — `scope.quoted`, issue #185) or a
+/// bracketed string (`span.["foo bar"]` — `scope.bracketed`), both of
+/// which carry an arbitrary key with spaces/punctuation. Returns the
+/// joined key and the byte offset just past its last segment.
 fn parse_dotted_key(cursor: &mut Cursor<'_>) -> Result<(String, usize), TraceQlError> {
-    if matches!(cursor.peek().kind, TokenKind::LBracket) {
-        return Err(TraceQlError::NotYetSupported {
-            construct: "bracketed attribute".to_string(),
-            span: cursor.peek().span,
-        });
-    }
-    let (first, first_span) = cursor.expect_ident("an attribute name")?;
-    let mut key = first;
-    let mut end = first_span.end;
+    let (mut key, mut end) = match &cursor.peek().kind {
+        // `span.["foo bar"]` — a bracketed key segment.
+        TokenKind::LBracket => {
+            cursor.advance(); // '['
+            let tok = cursor.peek().clone();
+            let TokenKind::String(s) = tok.kind else {
+                return Err(match tok.kind {
+                    TokenKind::Eof => TraceQlError::UnexpectedEof {
+                        expected: "a quoted attribute name inside '[...]'".to_string(),
+                        span: tok.span,
+                    },
+                    other => TraceQlError::UnexpectedToken {
+                        found: describe(&other),
+                        expected: "a quoted attribute name inside '[...]'".to_string(),
+                        span: tok.span,
+                    },
+                });
+            };
+            cursor.advance(); // string
+            let close = cursor.expect(&TokenKind::RBracket, "']'")?;
+            (s, close.span.end)
+        }
+        // `span."attr with spaces"` — a quoted key segment.
+        TokenKind::String(s) => {
+            let s = s.clone();
+            let span = cursor.peek().span;
+            cursor.advance();
+            (s, span.end)
+        }
+        _ => {
+            let (first, first_span) = cursor.expect_ident("an attribute name")?;
+            (first, first_span.end)
+        }
+    };
     while matches!(cursor.peek().kind, TokenKind::Dot)
         && matches!(cursor.peek2().kind, TokenKind::Ident(_))
     {
@@ -939,9 +1186,68 @@ fn parse_pipeline_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQ
         cursor.advance();
         return parse_compare(cursor);
     }
+    // Spanset-level `by(...)` / `coalesce()` stages (issue #185): a
+    // top-level `| by(...)` regroups the matched spans (distinct from the
+    // metric `by(...)` clause); `| coalesce()` merges the spanset arrays.
+    if name == "by" {
+        cursor.advance();
+        return parse_by_stage(cursor);
+    }
+    if name == "coalesce" {
+        cursor.advance();
+        return parse_coalesce_stage(cursor);
+    }
     Err(TraceQlError::UnexpectedToken {
         found: describe(&tok.kind),
         expected: "a pipeline stage (count, sum, avg, min, max, or select)".to_string(),
+        span: tok.span,
+    })
+}
+
+/// `By := "by" "(" Field { "," Field } ")"` (issue #185, `pipeline.by`):
+/// a spanset-level grouping stage. Empty `by()` is a positioned error.
+fn parse_by_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        let span = cursor.peek().span;
+        return Err(TraceQlError::UnexpectedToken {
+            found: "')'".to_string(),
+            expected: "a grouping field (by() requires at least one field)".to_string(),
+            span,
+        });
+    }
+    let mut fields = Vec::new();
+    loop {
+        let (field, _) = parse_field(cursor)?;
+        fields.push(field);
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    cursor.expect(&TokenKind::RParen, "')'")?;
+    Ok(PipelineStage::By { fields })
+}
+
+/// `Coalesce := "coalesce" "(" ")"` (issue #185, `pipeline.coalesce`):
+/// zero-arity spanset-array merge. A stray argument is a positioned error.
+fn parse_coalesce_stage(cursor: &mut Cursor<'_>) -> Result<PipelineStage, TraceQlError> {
+    cursor.expect(&TokenKind::LParen, "'('")?;
+    if matches!(cursor.peek().kind, TokenKind::RParen) {
+        cursor.advance();
+        return Ok(PipelineStage::Coalesce);
+    }
+    let tok = cursor.peek().clone();
+    if matches!(tok.kind, TokenKind::Eof) {
+        return Err(TraceQlError::UnexpectedEof {
+            expected: "')' (coalesce() takes no argument)".to_string(),
+            span: tok.span,
+        });
+    }
+    Err(TraceQlError::UnexpectedToken {
+        found: describe(&tok.kind),
+        expected: "')' (coalesce() takes no argument)".to_string(),
         span: tok.span,
     })
 }
@@ -1875,14 +2181,113 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_attribute_is_the_recognized_existence_boundary() {
-        let err = parse("{ .foo }").unwrap_err();
-        match err {
-            TraceQlError::NotYetSupported { construct, .. } => {
-                assert_eq!(construct, "bare attribute expression");
+    fn a_bare_attribute_parses_to_an_existence_check() {
+        // `existence.bare_attr` (issue #185): a bare attribute is now an
+        // existence check, not a named boundary.
+        let parsed = parse("{ .foo }").unwrap();
+        assert_eq!(
+            parsed.spanset,
+            SpansetExpr::Filter(SpansetFilter {
+                body: Some(FieldExpr::Exists(Field::Attribute {
+                    scope: AttrScope::Unscoped,
+                    key: "foo".to_string(),
+                })),
+            })
+        );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
+    }
+
+    #[test]
+    fn nil_comparisons_parse_to_existence_and_absence() {
+        // `!= nil` ⇒ presence (Exists); `= nil` ⇒ absence (Not(Exists)).
+        let present = parse("{ .a != nil }").unwrap();
+        assert_eq!(
+            present.spanset,
+            SpansetExpr::Filter(SpansetFilter {
+                body: Some(FieldExpr::Exists(Field::Attribute {
+                    scope: AttrScope::Unscoped,
+                    key: "a".to_string(),
+                })),
+            })
+        );
+        assert_eq!(parse(&present.to_string()).unwrap(), present);
+        let absent = parse("{ .a = nil }").unwrap();
+        assert!(matches!(
+            absent.spanset,
+            SpansetExpr::Filter(SpansetFilter {
+                body: Some(FieldExpr::Not(_)),
+            })
+        ));
+        assert_eq!(parse(&absent.to_string()).unwrap(), absent);
+    }
+
+    #[test]
+    fn arithmetic_comparisons_parse_and_round_trip() {
+        for query in [
+            "{ .a = 1 + 2 }",
+            "{ .a = 2 - 1 }",
+            "{ .a = 2 * 3 }",
+            "{ .a = 4 / 2 }",
+            "{ .a = 5 % 2 }",
+            "{ .a = 2 ^ 3 }",
+            "{ .a = -1 }",
+            "{ duration * 2 > 1s }",
+        ] {
+            let parsed = parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+            match &parsed.spanset {
+                SpansetExpr::Filter(SpansetFilter {
+                    body: Some(FieldExpr::ArithCompare { .. }),
+                }) => {}
+                other => panic!("{query}: expected ArithCompare, got {other:?}"),
             }
-            other => panic!("unexpected {other}"),
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
         }
+    }
+
+    #[test]
+    fn quoted_and_bracketed_attribute_keys_parse_and_round_trip() {
+        for (query, key) in [
+            (r#"{ span."attr with spaces" = 1 }"#, "attr with spaces"),
+            (r#"{ span.["foo bar"] = "x" }"#, "foo bar"),
+            (r#"{ .["a b"] = "x" }"#, "a b"),
+        ] {
+            let field = only_field(query);
+            match field {
+                Field::Attribute { key: got, .. } => assert_eq!(got, key, "{query}"),
+                other => panic!("{query}: expected an attribute, got {other:?}"),
+            }
+            let parsed = parse(query).unwrap();
+            assert_eq!(parse(&parsed.to_string()).unwrap(), parsed, "{query}");
+        }
+    }
+
+    #[test]
+    fn spanset_by_and_coalesce_pipeline_stages_parse() {
+        let by = parse("{ .a = 1 } | by(resource.service.name)").unwrap();
+        assert!(matches!(by.pipeline[..], [PipelineStage::By { .. }]));
+        assert_eq!(parse(&by.to_string()).unwrap(), by);
+        let coalesce = parse("{ .a = 1 } | coalesce()").unwrap();
+        assert_eq!(coalesce.pipeline, vec![PipelineStage::Coalesce]);
+        assert_eq!(parse(&coalesce.to_string()).unwrap(), coalesce);
+        // Empty by() stays a positioned error.
+        assert!(matches!(
+            parse("{ .a = 1 } | by()"),
+            Err(TraceQlError::UnexpectedToken { .. })
+        ));
+    }
+
+    #[test]
+    fn a_trailing_with_on_a_spanset_carries_query_hints() {
+        // `hints.most_recent` (issue #185): `{ … } with(most_recent=true)`.
+        let parsed = parse("{ .a = 1 } with(most_recent=true)").unwrap();
+        assert_eq!(
+            parsed.hints,
+            vec![MetricHint {
+                key: "most_recent".to_string(),
+                value: HintValue::Bool(true),
+            }]
+        );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
     }
 
     #[test]
@@ -2133,14 +2538,20 @@ mod tests {
     }
 
     #[test]
-    fn a_standalone_by_pipeline_stage_is_a_generic_error() {
-        // `pipeline.by` (a top-level `| by(...)`, not a metric grouping)
-        // stays a generic error, distinct from the metric `by(...)` clause.
-        let err = parse("{} | by(resource.service.name)").unwrap_err();
-        assert!(
-            !matches!(err, TraceQlError::NotYetSupported { .. }),
-            "standalone by() must be a generic error, got {err}"
+    fn a_standalone_by_pipeline_stage_parses_to_the_by_stage() {
+        // `pipeline.by` (issue #185): a top-level `| by(...)` is a spanset
+        // grouping stage, distinct from the metric `by(...)` clause.
+        let parsed = parse("{} | by(resource.service.name)").unwrap();
+        assert_eq!(
+            parsed.pipeline,
+            vec![PipelineStage::By {
+                fields: vec![Field::Attribute {
+                    scope: AttrScope::Resource,
+                    key: "service.name".to_string(),
+                }],
+            }]
         );
+        assert_eq!(parse(&parsed.to_string()).unwrap(), parsed);
     }
 
     #[test]
@@ -2181,13 +2592,16 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_with_after_a_spanset_is_a_generic_error() {
-        // `hints.most_recent` probe: `with(...)` directly on a spanset
-        // (no metric) stays a generic trailing-input error.
-        let err = parse("{ .a = 1 } with(most_recent=true)").unwrap_err();
-        assert!(
-            !matches!(err, TraceQlError::NotYetSupported { .. }),
-            "bare with() must be a generic error, got {err}"
-        );
+    fn most_recent_is_the_only_recognized_but_arbitrary_hint_key() {
+        // `hints.most_recent` (issue #185): the trailing `with(...)` accepts
+        // any key=value pair; `most_recent=true` is the recognized use.
+        let parsed = parse("{ .a = 1 } with(most_recent=true)").unwrap();
+        assert_eq!(parsed.hints.len(), 1);
+        assert_eq!(parsed.hints[0].key, "most_recent");
+        // An empty with() is still a positioned error.
+        assert!(matches!(
+            parse("{ .a = 1 } with()"),
+            Err(TraceQlError::UnexpectedToken { .. })
+        ));
     }
 }

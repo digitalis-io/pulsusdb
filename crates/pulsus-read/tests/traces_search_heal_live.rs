@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use pulsus_clickhouse::{ChClient, ChConnConfig, ChError, ChProto, Idempotency, QuerySettings};
 use pulsus_config::WriterConfig;
+use pulsus_read::logql::error::{ReadError, TooBroadReason};
 use pulsus_read::traces::search_plan::{SearchParams, plan_search};
 use pulsus_read::{SearchPlan, TraceEngine, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
@@ -399,6 +400,131 @@ async fn healed_attr_registration_is_found_by_attribute_scoped_traceql_search() 
     assert_eq!(trace.matched, 1, "exactly the one matched span");
     assert_eq!(trace.spans.len(), 1);
     assert_eq!(trace.spans[0].name, "op-a");
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_database(&bootstrap, db).await;
+}
+
+/// A two-span batch with DISTINCT services — the fixture for the spanset
+/// `by(resource.service.name)` cardinality-cap test (issue #185).
+fn two_service_batch(ts_ns: i64) -> ParsedTraces {
+    let span = |tid: u8, sid: u8, service: &str| SpanRecord {
+        trace_id: [tid; 16],
+        span_id: [sid; 8],
+        parent_id: [0; 8],
+        name: "op".to_string(),
+        service: service.to_string(),
+        timestamp_ns: ts_ns,
+        duration_ns: 1_000_000_000,
+        status_code: 1,
+        status_message: String::new(),
+        kind: 3,
+        shared: 0,
+        payload: vec![0x01],
+    };
+    ParsedTraces {
+        spans: vec![span(0xA1, 0x01, "svc-a"), span(0xB2, 0x02, "svc-b")],
+        attrs: vec![],
+        ..Default::default()
+    }
+}
+
+/// AC5 (issue #185): a spanset `| by(resource.service.name)` grouping more
+/// distinct services than `reader.traceql_max_series` trips the
+/// distinct-by-key pre-flight probe → `422 query_too_broad`
+/// (`TraceSearchSeriesCap`) — the SAME cap and mechanism as the metric
+/// `by()` cap, a static reject before the main search. Under the cap the
+/// same query succeeds (control).
+#[tokio::test]
+async fn spanset_by_service_cardinality_cap_rejects_over_max_series() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_trace_search_by_cap";
+    init_db(&bootstrap, db).await;
+
+    let client = Arc::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (writer db)"),
+    );
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+    let writer = TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(client.clone())),
+        Arc::new(ChBlockInserter::new(client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    );
+
+    let ts_ns = now_ns();
+    let wait = writer
+        .admit_flush(two_service_batch(ts_ns))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("flush settles")
+        .expect("both services commit");
+
+    let params = SearchParams {
+        start_ns: ts_ns - 3_600_000_000_000,
+        end_ns: ts_ns + 3_600_000_000_000,
+        limit: 20,
+        spss: 10,
+    };
+
+    // Poll until both spans are queryable, then assert the cap.
+    let control_engine = TraceEngine::new(
+        ChClient::new(test_config(db)).await.expect("connect"),
+        engine_config(),
+    );
+    let control_query = pulsus_traceql::parse(r#"{} | by(resource.service.name)"#).expect("parses");
+    let mut both_searchable = false;
+    for _ in 0..150 {
+        let plan =
+            plan_search(&control_query, &params, &control_engine.search_ctx()).expect("plans");
+        if control_engine
+            .search(&plan)
+            .await
+            .map(|o| o.returned >= 2)
+            .unwrap_or(false)
+        {
+            both_searchable = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        both_searchable,
+        "both services became searchable within the poll budget"
+    );
+
+    // With max_series = 1, two distinct services trip the cap.
+    let mut capped_cfg = engine_config();
+    capped_cfg.max_series = 1;
+    let capped = TraceEngine::new(
+        ChClient::new(test_config(db)).await.expect("connect"),
+        capped_cfg,
+    );
+    let capped_plan = plan_search(&control_query, &params, &capped.search_ctx()).expect("plans");
+    match capped.search(&capped_plan).await {
+        Err(ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count, cap })) => {
+            assert!(count > cap, "count {count} must exceed cap {cap}");
+            assert_eq!(cap, 1);
+        }
+        other => panic!("expected TraceSearchSeriesCap 422, got {other:?}"),
+    }
+
+    // Control: under the default cap the same query succeeds.
+    let control_plan =
+        plan_search(&control_query, &params, &control_engine.search_ctx()).expect("plans");
+    let ok = control_engine
+        .search(&control_plan)
+        .await
+        .expect("under cap the by() query succeeds");
+    assert!(ok.returned >= 2, "both services returned under the cap");
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, db).await;

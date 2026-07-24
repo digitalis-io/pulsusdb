@@ -528,6 +528,7 @@ impl TraceEngine {
                 attrs_table: &self.config.attrs_table,
             },
             max_candidates: self.config.max_candidates,
+            max_series: self.config.max_series,
             distributed: self.config.distributed,
         }
     }
@@ -1369,6 +1370,39 @@ impl TraceEngine {
         Ok(rows)
     }
 
+    /// Runs the spanset `| by(...)` distinct-by-key cardinality probe
+    /// (issue #185) before the main search: a `cap+1` result is a static
+    /// `422 query_too_broad` ([`TooBroadReason::TraceSearchSeriesCap`]) —
+    /// the SAME `reader.traceql_max_series` cap and mechanism as the metric
+    /// `by()` cap ([`Self::enforce_series_cap`]). Plans with no probe (no
+    /// `by()`, an unsupported by-key, or a composite spanset) return
+    /// immediately.
+    async fn enforce_search_series_cap(&self, plan: &SearchPlan) -> Result<(), ReadError> {
+        let Some(probe) = plan.by_probe_sql() else {
+            return Ok(());
+        };
+        let cap = self.config.max_series;
+        let settings = self.search_settings();
+        let sql = escape_query_placeholders(probe);
+        crate::querytext::ensure_query_text_fits(&sql).map_err(ReadError::QueryTooBroad)?;
+        let mut count: u64 = 0;
+        // Scoped stream: the probe returns exactly one `count()` row.
+        let mut stream = self
+            .client
+            .query_stream::<MetricCountRow>(&sql, &settings)
+            .await
+            .map_err(|e| map_trace_read_error(e, &self.config))?;
+        while let Some(row) = stream.next().await {
+            count = row.map_err(|e| map_trace_read_error(e, &self.config))?.n;
+        }
+        if count > cap {
+            return Err(ReadError::QueryTooBroad(
+                TooBroadReason::TraceSearchSeriesCap { count, cap },
+            ));
+        }
+        Ok(())
+    }
+
     async fn search_inner(
         &self,
         plan: &SearchPlan,
@@ -1377,6 +1411,10 @@ impl TraceEngine {
         let settings = self.search_settings();
         let gen_settings = generator_settings(&self.config);
         let mut budget = ByteBudget::new(HYDRATION_BYTE_BUDGET);
+
+        // The spanset `by()` cardinality cap runs before any main-query
+        // work (issue #185) — a static `422 query_too_broad` on breach.
+        self.enforce_search_series_cap(plan).await?;
 
         // ---- Phase 1: per-generator bounded ranked queries + merge ----
         // Every pre-hydration Layer-2 charge in this phase is enumerated
