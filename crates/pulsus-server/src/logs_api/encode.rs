@@ -521,10 +521,20 @@ fn explain_suffix(mut suffix: String, explain: Option<&PlanExplain>) -> String {
 /// evaluation time (`/query`'s `time` param) — only read when `result` is
 /// [`QueryResult::Vector`] (never produced by a `Range` spec, so
 /// `query_range` callers may pass any placeholder).
+///
+/// `preserve_vector_order` (issue M8-LQ3, mirrors the PromQL `ordered`
+/// gate at `prom_api::encode::query_response`): `true` for a terminal
+/// `sort`/`sort_desc` **instant** query, so the engine's value order
+/// survives on the wire instead of being clobbered by the default label
+/// re-sort. It applies to the Vector arm ONLY — the Matrix/Streams arms
+/// keep their deterministic label-sort (a range `sort(...)` yields a
+/// matrix with no per-series value order, so no HashMap nondeterminism
+/// reaches the wire).
 pub(crate) fn query_response(
     result: QueryResult,
     explain: Option<PlanExplain>,
     at_ns: i64,
+    preserve_vector_order: bool,
 ) -> Response {
     match result {
         QueryResult::Streams { mut items, partial } => {
@@ -563,7 +573,11 @@ pub(crate) fn query_response(
             json_response(stream_array(prefix, items, render_matrix_item, suffix))
         }
         QueryResult::Vector(mut items) => {
-            items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            // Skip the label re-sort for a terminal sort/sort_desc instant
+            // query so the engine's value order reaches the client.
+            if !preserve_vector_order {
+                items.sort_by(|a, b| a.labels.cmp(&b.labels));
+            }
             let stats = SeriesStats {
                 series: items.len(),
             };
@@ -704,7 +718,7 @@ mod tests {
             )],
             partial: false,
         };
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -720,7 +734,7 @@ mod tests {
             items: vec![stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")])],
             partial: false,
         };
-        let body = body_string(query_response(result, None, 0)).await;
+        let body = body_string(query_response(result, None, 0, false)).await;
         assert!(
             !body.contains("pulsus_partial"),
             "complete result must not carry the partial signal: {body}"
@@ -736,7 +750,7 @@ mod tests {
             items: vec![stream(1, r#"{"service_name":"a"}"#, vec![(1, "x")])],
             partial: true,
         };
-        let body = body_string(query_response(result, None, 0)).await;
+        let body = body_string(query_response(result, None, 0, false)).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["stats"]["pulsus_partial"], true);
     }
@@ -750,7 +764,7 @@ mod tests {
             ],
             partial: false,
         };
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let body = body_string(res).await;
         // "alpha" sorts before "zeta" lexicographically.
         let alpha_pos = body.find("alpha").expect("alpha present");
@@ -772,7 +786,7 @@ mod tests {
             ],
             partial: false,
         };
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["stats"]["entries"], 2);
@@ -787,7 +801,7 @@ mod tests {
             items: vec![],
             partial: false,
         };
-        let res = query_response(result, Some(explain), 0);
+        let res = query_response(result, Some(explain), 0, false);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["explain"]["result_type"], "streams");
@@ -809,7 +823,7 @@ mod tests {
             chosen: RouteChoice::Rollup,
             reason: "rollup: step divisible by resolution".to_string(),
         });
-        let res = query_response(QueryResult::Matrix(vec![series]), Some(explain), 0);
+        let res = query_response(QueryResult::Matrix(vec![series]), Some(explain), 0, false);
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["resultType"], "matrix");
@@ -829,7 +843,12 @@ mod tests {
             labels: vec![("service_name".to_string(), "checkout".to_string())],
             value: 42.0,
         };
-        let res = query_response(QueryResult::Vector(vec![sample]), None, 5_500_000_000);
+        let res = query_response(
+            QueryResult::Vector(vec![sample]),
+            None,
+            5_500_000_000,
+            false,
+        );
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["data"]["resultType"], "vector");
@@ -850,7 +869,7 @@ mod tests {
             labels: vec![("service_name".to_string(), "checkout".to_string())],
             points: vec![(0, 1.0), (1_000_000_000, 2.5)],
         };
-        let res = query_response(QueryResult::Matrix(vec![series]), None, 0);
+        let res = query_response(QueryResult::Matrix(vec![series]), None, 0, false);
         let body = body_string(res).await;
         assert_eq!(
             body,
@@ -867,12 +886,63 @@ mod tests {
             labels: vec![("service_name".to_string(), "checkout".to_string())],
             value: 42.0,
         };
-        let res = query_response(QueryResult::Vector(vec![sample]), None, 5_500_000_000);
+        let res = query_response(
+            QueryResult::Vector(vec![sample]),
+            None,
+            5_500_000_000,
+            false,
+        );
         let body = body_string(res).await;
         assert_eq!(
             body,
             r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"service_name":"checkout"},"value":[5.500,"42"]}],"stats":{"series":1}}}"#
         );
+    }
+
+    /// Issue M8-LQ3, direction 1: `preserve_vector_order = true` (a
+    /// terminal `sort`/`sort_desc` instant query) keeps the engine's value
+    /// order on the wire. The input Vec is deliberately in the OPPOSITE of
+    /// label-sorted order (`z` before `a`); with the flag set it must
+    /// serialise in that engine order, never re-sorted by label.
+    #[tokio::test]
+    async fn preserve_vector_order_keeps_the_engine_value_order_on_the_wire() {
+        let items = vec![
+            VectorSample {
+                labels: vec![("app".to_string(), "z".to_string())],
+                value: 9.0,
+            },
+            VectorSample {
+                labels: vec![("app".to_string(), "a".to_string())],
+                value: 1.0,
+            },
+        ];
+        let res = query_response(QueryResult::Vector(items), None, 0, true);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["data"]["result"][0]["metric"]["app"], "z");
+        assert_eq!(json["data"]["result"][1]["metric"]["app"], "a");
+    }
+
+    /// Issue M8-LQ3, direction 2 (the regression pin proving the flag is
+    /// load-bearing): with `preserve_vector_order = false` the SAME input
+    /// label-sorts (`a` before `z`).
+    #[tokio::test]
+    async fn without_preserve_vector_order_the_vector_label_sorts() {
+        let items = vec![
+            VectorSample {
+                labels: vec![("app".to_string(), "z".to_string())],
+                value: 9.0,
+            },
+            VectorSample {
+                labels: vec![("app".to_string(), "a".to_string())],
+                value: 1.0,
+            },
+        ];
+        let res = query_response(QueryResult::Vector(items), None, 0, false);
+        let body = body_string(res).await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["data"]["result"][0]["metric"]["app"], "a");
+        assert_eq!(json["data"]["result"][1]["metric"]["app"], "z");
     }
 
     /// Issue #169 byte-exact volume golden: the vector envelope at
@@ -1089,6 +1159,7 @@ mod tests {
             },
             None,
             0,
+            false,
         );
         let body = body_string(res).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -1193,6 +1264,7 @@ mod tests {
             },
             None,
             0,
+            false,
         );
         let mut stream = res.into_body().into_data_stream();
 
@@ -1241,7 +1313,7 @@ mod tests {
             )],
             partial: false,
         };
-        let res = query_response(result, None, 0);
+        let res = query_response(result, None, 0, false);
         let mut body_stream = res.into_body().into_data_stream();
 
         while body_stream.next().await.is_some() {}
@@ -1325,7 +1397,7 @@ mod tests {
                 ],
                 partial: false,
             };
-            query_response(result, None, 0)
+            query_response(result, None, 0, false)
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
@@ -1340,6 +1412,7 @@ mod tests {
                 },
                 None,
                 0,
+                false,
             )
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
@@ -1352,7 +1425,7 @@ mod tests {
                 labels: vec![("service_name".to_string(), "checkout".to_string())],
                 points: vec![(0, 1.0), (1_000_000_000, 2.5)],
             };
-            query_response(QueryResult::Matrix(vec![series]), None, 0)
+            query_response(QueryResult::Matrix(vec![series]), None, 0, false)
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }
@@ -1364,7 +1437,12 @@ mod tests {
                 labels: vec![("service_name".to_string(), "checkout".to_string())],
                 value: 42.0,
             };
-            query_response(QueryResult::Vector(vec![sample]), None, 5_500_000_000)
+            query_response(
+                QueryResult::Vector(vec![sample]),
+                None,
+                5_500_000_000,
+                false,
+            )
         }
         assert_gzip_response_is_byte_identical_to_identity(build).await;
     }

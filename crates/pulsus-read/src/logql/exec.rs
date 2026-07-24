@@ -2985,20 +2985,23 @@ impl SimpleAcc {
     }
 }
 
-/// One bucket's state: streaming stats, or the full value set for
-/// `quantile_over_time`.
+/// One bucket's state: streaming stats, the full value set for
+/// `quantile_over_time`, or the timestamped counter samples for
+/// `rate_counter` (reset detection is order-dependent, so the raw
+/// `(ts, value)` points are retained and walked at `finish`).
 #[derive(Debug, Clone)]
 enum BucketAcc {
     Simple(SimpleAcc),
     Values(Vec<f64>),
+    Counter(Vec<(i64, f64)>),
 }
 
 impl BucketAcc {
     fn new(op: RangeAggOp, ts_ns: i64, v: f64) -> Self {
-        if matches!(op, RangeAggOp::QuantileOverTime) {
-            BucketAcc::Values(vec![v])
-        } else {
-            BucketAcc::Simple(SimpleAcc::new(ts_ns, v))
+        match op {
+            RangeAggOp::QuantileOverTime => BucketAcc::Values(vec![v]),
+            RangeAggOp::RateCounter => BucketAcc::Counter(vec![(ts_ns, v)]),
+            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, v)),
         }
     }
 
@@ -3006,6 +3009,7 @@ impl BucketAcc {
         match self {
             BucketAcc::Simple(acc) => acc.add(ts_ns, v),
             BucketAcc::Values(vals) => vals.push(v),
+            BucketAcc::Counter(pts) => pts.push((ts_ns, v)),
         }
     }
 
@@ -3013,6 +3017,7 @@ impl BucketAcc {
     fn finish(self, op: RangeAggOp, rate_window_ns: Option<u64>, quantile: Option<f64>) -> f64 {
         match self {
             BucketAcc::Values(mut vals) => quantile_of(&mut vals, quantile.unwrap_or(f64::NAN)),
+            BucketAcc::Counter(pts) => apply_rate(counter_increase(pts), rate_window_ns),
             BucketAcc::Simple(acc) => match op {
                 // Oracle-probed: `rate` over an unwrapped range is the
                 // per-second SUM of values (count-shaped inputs
@@ -3033,9 +3038,38 @@ impl BucketAcc {
                 RangeAggOp::QuantileOverTime | RangeAggOp::AbsentOverTime => {
                     unreachable!("dispatched before BucketAcc::finish")
                 }
+                // `rate_counter` is `Counter`-backed (reset detection is
+                // order-dependent), never `Simple`.
+                RangeAggOp::RateCounter => unreachable!("Counter-backed"),
             },
         }
     }
+}
+
+/// The reset-aware total counter increase over a bucket's unwrapped
+/// samples (issue M8-LQ3, AC4). Samples are ordered by timestamp with an
+/// ascending-value (`f64::total_cmp`) tie-break so duplicate-timestamp
+/// samples never fabricate a reset (Rule 3); the walk then adds
+/// `next - prev` on a monotone step and the bare `next` on a drop (a
+/// counter reset counts from zero). Total increase `= last - first +
+/// Σ(resets)`; the caller divides by the window seconds (`apply_rate`).
+/// No PromQL-style boundary extrapolation.
+fn counter_increase(mut pts: Vec<(i64, f64)>) -> f64 {
+    pts.sort_by(|(at, av), (bt, bv)| at.cmp(bt).then_with(|| av.total_cmp(bv)));
+    let mut iter = pts.into_iter().map(|(_, v)| v);
+    let Some(mut prev) = iter.next() else {
+        return 0.0;
+    };
+    let mut increase = 0.0;
+    for v in iter {
+        if v < prev {
+            increase += v;
+        } else {
+            increase += v - prev;
+        }
+        prev = v;
+    }
+    increase
 }
 
 /// The reference oracle's quantile semantics (live-probed: `q=0.9` over
@@ -4673,7 +4707,37 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
         VectorAggOp::Topk | VectorAggOp::Bottomk => {
             unreachable!("topk/bottomk are selections, dispatched before reduce")
         }
+        // sort/sort_desc reorder the result vector — `group_instant`
+        // (reorder) / `group_range` (passthrough) branch before `reduce`.
+        VectorAggOp::Sort | VectorAggOp::SortDesc => {
+            unreachable!("sort/sort_desc reorder, dispatched before reduce")
+        }
     }
+}
+
+/// `sort`/`sort_desc` order an instant result vector by value: ascending
+/// (`Sort`) / descending (`SortDesc`). A NaN value ranks LAST in BOTH
+/// directions (compared via `is_nan()`, so a NaN's sign never leaks into
+/// the order the way `f64::total_cmp` alone would); equal values break by
+/// label set ascending — deterministic and hermetically golden-able.
+fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantSeries> {
+    let desc = matches!(op, VectorAggOp::SortDesc);
+    series.sort_by(|a, b| {
+        a.value
+            .is_nan()
+            .cmp(&b.value.is_nan())
+            .then_with(|| {
+                if a.value.is_nan() {
+                    std::cmp::Ordering::Equal
+                } else if desc {
+                    b.value.total_cmp(&a.value)
+                } else {
+                    a.value.total_cmp(&b.value)
+                }
+            })
+            .then_with(|| a.labels.cmp(&b.labels))
+    });
+    series
 }
 
 /// The `topk`/`bottomk` `k`: the parameter floored to a count; a missing
@@ -4809,6 +4873,12 @@ fn group_range(
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         return select_k_range(series, op, grouping, param);
     }
+    // A range result (matrix) has no single sortable value per series;
+    // `sort`/`sort_desc` are passthrough here (the reference likewise does
+    // not value-order matrices — the wire stays label-canonical).
+    if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
+        return series;
+    }
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -4847,6 +4917,11 @@ fn group_instant(
 ) -> Vec<InstantSeries> {
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         return select_k_instant(series, op, grouping, param);
+    }
+    // `sort`/`sort_desc` reorder the vector by value (no grouping —
+    // rejected at plan time), preserving each series unchanged.
+    if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
+        return sort_instant(series, op);
     }
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {

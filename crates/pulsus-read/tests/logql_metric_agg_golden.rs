@@ -2050,3 +2050,201 @@ fn a_matching_modifier_on_a_scalar_operand_is_ignored_matching_the_loki_oracle()
     assert_eq!(out[0].value, 110.0);
     assert_eq!(out[1].value, 103.0);
 }
+
+// ---------------------------------------------------------------------
+// Issue M8-LQ3 (AC4/AC5): `rate_counter` reset-aware per-second increase
+// and `sort`/`sort_desc` value ordering.
+//
+// ORACLE NOTE: the exact `rate_counter` per-window VALUES (reset/dup-ts
+// tie-break/boundary/sparse) and the `sort`/`sort_desc` NaN+tie ORDER are
+// reference-dependent (pinned Loki v3.7.3). The expectations below are the
+// hand-derived values under plan v4's stated Rules 1-3; they are pinned
+// here for the reducer SHAPE every PR and cross-checked against the live
+// reference by the gated e2e vectors (`metric_rate_counter_*`). If the
+// reference diverges the e2e gate goes RED and these are corrected in place.
+// ---------------------------------------------------------------------
+
+/// Runs an instant `rate_counter` query over a single-series counter body
+/// (`c=<n>`, `logfmt | unwrap c`), returning the one per-second value. The
+/// `[1m]` window makes the divisor exactly 60s.
+fn rate_counter_instant(rows: &[MetricScanRow]) -> f64 {
+    let params = instant_params(60 * NS);
+    single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            rows,
+            &meta_one(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Rule 1 — a counter that RESETS mid-window. Values 10,30,5,12 by ts:
+/// +20 (10→30), reset +5 (drop to 5, counts from zero), +7 (5→12) = 32;
+/// divided by the 60s window = 32/60.
+#[test]
+fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
+    let rows = vec![
+        row(1, 10 * NS, "c=10"),
+        row(1, 20 * NS, "c=30"),
+        row(1, 30 * NS, "c=5"), // reset: 5 < 30
+        row(1, 40 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 32.0 / 60.0);
+}
+
+/// Rule 3 — duplicate-timestamp tie-break is ascending value order, so
+/// tied samples never fabricate a reset. Values 5,{10,3}@20s,12: sorted
+/// ascending within the tie → 5,3,10,12 → reset +3 (5→3), +7 (3→10),
+/// +2 (10→12) = 12. A descending tie order (5,10,3,12) would give 17, so
+/// this vector proves the tie-break rule.
+#[test]
+fn rate_counter_duplicate_timestamp_uses_ascending_value_order() {
+    let rows = vec![
+        row(1, 10 * NS, "c=5"),
+        row(1, 20 * NS, "c=10"),
+        row(1, 20 * NS, "c=3"), // same ts as c=10
+        row(1, 30 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 12.0 / 60.0);
+    // Input order must not change the answer (reducer sorts internally).
+    let reversed: Vec<MetricScanRow> = rows.iter().rev().cloned().collect();
+    assert_eq!(rate_counter_instant(&reversed), 12.0 / 60.0);
+}
+
+/// Rule 2 — samples ON the window boundaries both contribute. Monotone
+/// 100→160 with no reset ⇒ increase 60, divided by the 60s window = 1.0.
+/// (The SQL half-open `(t-range, t]` window inclusion itself is validated
+/// by the gated e2e `metric_rate_counter_boundary` vector; the hermetic
+/// reducer sees whatever rows it is handed.)
+#[test]
+fn rate_counter_boundary_samples_contribute() {
+    let rows = vec![row(1, 1, "c=100"), row(1, 60 * NS, "c=160")];
+    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+}
+
+/// Rule 1 divisor / no-extrapolation — sparse interior samples 200→260
+/// (span 10s) still divide by the FULL 60s window, not the sample span:
+/// increase 60 / 60s = 1.0 (a boundary-extrapolated reading would inflate
+/// to 6.0).
+#[test]
+fn rate_counter_sparse_window_divides_by_the_full_interval() {
+    let rows = vec![row(1, 25 * NS, "c=200"), row(1, 35 * NS, "c=260")];
+    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+}
+
+/// `rate_counter` requires `unwrap` (it reduces unwrapped counter values);
+/// without it the planner rejects with the oracle-shaped arity message.
+#[test]
+fn rate_counter_without_unwrap_is_rejected() {
+    let params = instant_params(60 * NS);
+    let expr = parse(r#"rate_counter({env="prod"}[1m])"#).expect("parse");
+    match plan(&expr, &params, &ctx()) {
+        Err(ReadError::PipelineInvalid { reason }) => {
+            assert_eq!(reason, "invalid aggregation rate_counter without unwrap");
+        }
+        other => panic!("expected PipelineInvalid, got {other:?}"),
+    }
+}
+
+// --- sort / sort_desc value ordering ---------------------------------
+
+fn sort_vector_fixture() -> QueryResult {
+    QueryResult::Vector(vec![
+        VectorSample {
+            labels: vec![("app".to_string(), "a".to_string())],
+            value: 5.0,
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "b".to_string())],
+            value: 1.0,
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "c".to_string())],
+            value: 5.0, // ties app=a
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "d".to_string())],
+            value: f64::NAN,
+        },
+    ])
+}
+
+fn ordered_apps(result: QueryResult) -> Vec<String> {
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    items.into_iter().map(|s| s.labels[0].1.clone()).collect()
+}
+
+/// `sort` orders the returned vector ascending by value; equal values
+/// break by label set ascending (a before c); NaN ranks LAST.
+#[test]
+fn sort_orders_the_vector_ascending_with_nan_last() {
+    let aggs = vec![(pulsus_logql::VectorAggOp::Sort, None, None)];
+    assert_eq!(
+        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        vec!["b", "a", "c", "d"]
+    );
+}
+
+/// `sort_desc` orders descending; the 5.0 tie still breaks by label set
+/// ascending (a before c); NaN ranks LAST in BOTH directions.
+#[test]
+fn sort_desc_orders_the_vector_descending_with_nan_last() {
+    let aggs = vec![(pulsus_logql::VectorAggOp::SortDesc, None, None)];
+    assert_eq!(
+        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        vec!["a", "c", "b", "d"]
+    );
+}
+
+/// A range `sort(...)` yields a matrix with no single sortable value per
+/// series, so it is a passthrough — the series set is unchanged.
+#[test]
+fn range_sort_is_a_passthrough_over_the_matrix() {
+    let matrix = QueryResult::Matrix(vec![
+        MatrixSeries {
+            labels: vec![("app".to_string(), "a".to_string())],
+            points: vec![(0, 5.0), (STEP, 1.0)],
+        },
+        MatrixSeries {
+            labels: vec![("app".to_string(), "b".to_string())],
+            points: vec![(0, 3.0)],
+        },
+    ]);
+    for op in [
+        pulsus_logql::VectorAggOp::Sort,
+        pulsus_logql::VectorAggOp::SortDesc,
+    ] {
+        let out = apply_vector_aggs(matrix.clone(), &[(op, None, None)]);
+        let QueryResult::Matrix(items) = out else {
+            panic!("expected a matrix");
+        };
+        let by_app: HashMap<String, Vec<(i64, f64)>> = items
+            .into_iter()
+            .map(|s| (s.labels[0].1.clone(), s.points))
+            .collect();
+        assert_eq!(by_app["a"], vec![(0, 5.0), (STEP, 1.0)]);
+        assert_eq!(by_app["b"], vec![(0, 3.0)]);
+    }
+}
+
+/// `sort`/`sort_desc` reject a grouping clause — the reference has no
+/// `sort by(x)(...)` form, so the planner 400s rather than silently
+/// ignoring it.
+#[test]
+fn sort_with_a_grouping_is_rejected() {
+    let params = instant_params(60 * NS);
+    for query in [
+        r#"sort by(app) (rate({env="prod"}[1m]))"#,
+        r#"sort_desc by(app) (rate({env="prod"}[1m]))"#,
+    ] {
+        let expr = parse(query).expect("parse");
+        match plan(&expr, &params, &ctx()) {
+            Err(ReadError::PipelineInvalid { .. }) => {}
+            other => panic!("expected {query:?} to be PipelineInvalid, got {other:?}"),
+        }
+    }
+}

@@ -1,5 +1,5 @@
 {
-  "interim_count_pin": 5,
+  "interim_count_pin": 2,
   "entries": [
     {
       "construct": "matcher.eq",
@@ -283,9 +283,8 @@
     },
     {
       "construct": "range.rate_counter",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "range.duration_literal",
@@ -339,15 +338,13 @@
     },
     {
       "construct": "agg.sort",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "agg.sort_desc",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "grouping.by",

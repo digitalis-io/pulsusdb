@@ -372,6 +372,14 @@ fn parse_plan_number(raw: &str, what: &str) -> Result<f64, ReadError> {
 fn parse_vector_agg_params(raw: &[RawVectorAggSpec]) -> Result<Vec<VectorAggSpec>, ReadError> {
     raw.iter()
         .map(|(op, grouping, param)| {
+            // `sort`/`sort_desc` order the result vector by value; the
+            // reference has no grouping form (`sort by(x)(...)` is a 400),
+            // so reject a grouping rather than silently ignore it.
+            if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) && grouping.is_some() {
+                return Err(ReadError::PipelineInvalid {
+                    reason: format!("`{op}` does not accept a grouping clause"),
+                });
+            }
             let parsed = match (op.takes_param(), param) {
                 (true, Some(raw)) => Some(parse_plan_number(raw, &format!("{op} parameter"))?),
                 (true, None) => {
@@ -554,6 +562,7 @@ fn metric_plan(
             | RangeAggOp::QuantileOverTime
             | RangeAggOp::FirstOverTime
             | RangeAggOp::LastOverTime
+            | RangeAggOp::RateCounter
     );
     let forbids_unwrap = matches!(
         op,
@@ -706,7 +715,12 @@ fn metric_plan(
     let rollup_eligible = matches!(routing.chosen, RouteChoice::Rollup);
 
     let is_bytes = matches!(op, RangeAggOp::BytesRate | RangeAggOp::BytesOverTime);
-    let is_rate = matches!(op, RangeAggOp::Rate | RangeAggOp::BytesRate);
+    // `rate_counter` divides its reset-aware increase by the window
+    // seconds via the same `rate_window_ns` divisor as `rate`/`bytes_rate`.
+    let is_rate = matches!(
+        op,
+        RangeAggOp::Rate | RangeAggOp::BytesRate | RangeAggOp::RateCounter
+    );
 
     let (table, bucket_col, agg_expr) = if rollup_eligible {
         (

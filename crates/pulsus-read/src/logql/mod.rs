@@ -56,6 +56,8 @@
 //! [`plan::ProbePlan`]'s doc comment for the deferral rationale
 //! (code-review fix-plan amendment §2).
 
+use pulsus_logql::{Expr, MetricExpr, VectorAggOp};
+
 pub mod detected;
 pub mod error;
 pub mod escape;
@@ -67,6 +69,24 @@ pub mod pipeline;
 pub mod plan;
 pub mod rows;
 pub mod sql;
+
+/// True iff the OUTERMOST node of `expr` is a terminal `sort`/`sort_desc`
+/// vector aggregation (issue M8-LQ3). Mirrors PromQL's
+/// `pulsus_promql::expr_is_sort_root` (root-only): only a terminal sort's
+/// value order survives to the wire, so the server encoder skips its
+/// deterministic label re-sort for a sort-rooted **instant** query. A sort
+/// nested under a binary op or an inner aggregation has its order destroyed
+/// upstream (matches the reference), so this returns false there. LogQL's
+/// `MetricExpr` has no `Paren` variant, so no paren-stripping is needed.
+pub fn terminal_sort(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Metric(MetricExpr::Vector {
+            op: VectorAggOp::Sort | VectorAggOp::SortDesc,
+            ..
+        })
+    )
+}
 
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
 pub use error::{ReadError, TooBroadReason};
@@ -86,6 +106,33 @@ pub use plan::{
 
 #[cfg(test)]
 mod tests {
+    use super::terminal_sort;
+    use pulsus_logql::parse;
+
+    /// `terminal_sort` is true only when the OUTERMOST node is a
+    /// `sort`/`sort_desc` (mirrors PromQL's root-only `expr_is_sort_root`).
     #[test]
-    fn crate_compiles() {}
+    fn terminal_sort_matches_only_a_root_sort() {
+        for query in [
+            r#"sort(rate({app="x"}[5m]))"#,
+            r#"sort_desc(rate({app="x"}[5m]))"#,
+        ] {
+            assert!(terminal_sort(&parse(query).unwrap()), "{query}");
+        }
+    }
+
+    /// A sort nested under a binary op / an inner aggregation, a non-sort
+    /// aggregation, and a bare log query are all false — their order is
+    /// destroyed upstream (or there is none).
+    #[test]
+    fn terminal_sort_is_false_when_not_at_the_root() {
+        for query in [
+            r#"sum(sort(rate({app="x"}[5m])))"#,
+            r#"sort(rate({app="x"}[5m])) + 1"#,
+            r#"topk(3, rate({app="x"}[5m]))"#,
+            r#"{app="x"}"#,
+        ] {
+            assert!(!terminal_sort(&parse(query).unwrap()), "{query}");
+        }
+    }
 }
