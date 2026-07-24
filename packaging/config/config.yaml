@@ -94,8 +94,13 @@ clickhouse:
   #enabled: false
   #raw_retention: null            # overrides retention_days for metric_samples when set
   #tier_policy: exact             # exact | fast
-  #tiers: []                      # name/table unique, resolution/min_step/retention strictly
-                                  # increasing, min_step >= resolution per tier (docs §7)
+  #tiers: []                      # per-tier rollup layout (docs §7). Each entry: {name,
+                                  # resolution, table, retention, min_step}. name/table unique;
+                                  # resolution/min_step/retention strictly increasing across tiers;
+                                  # min_step >= resolution per tier. e.g.:
+                                  #   tiers:
+                                  #     - {name: r5m, resolution: 5m, table: metric_samples_5m, retention: 30d, min_step: 5m}
+                                  #     - {name: r1h, resolution: 1h, table: metric_samples_1h, retention: 365d, min_step: 1h}
 
 #ruler:
   #enabled: false
