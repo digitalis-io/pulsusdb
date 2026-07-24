@@ -760,6 +760,45 @@ pub const MIGRATIONS: &[Migration] = &[
         scope: MigrationScope::Checksum,
         replication: Replication::PerShard,
     },
+    // --- instrumentation scope name/version (M7-TQ, issue #192) ---
+    // The OTLP `InstrumentationScope` `name`/`version` promoted onto
+    // `trace_spans` so the `instrumentation.name`/`instrumentation.version`
+    // intrinsics are queryable and `compare()` has a per-span source — the
+    // additive `ADD COLUMN IF NOT EXISTS` pattern (id 21/22 & 25/26 & 31/32 &
+    // 35/36 precedent), never a mutation of id 16's frozen CREATE. Pre-#192
+    // rows read back `''` — no data migration. Unlike id 35's free-text
+    // `status_message`, instrumentation library name/version are genuinely
+    // low-cardinality (a handful per deployment) and match the sibling
+    // `trace_spans.name`/`service` `LowCardinality(String)` columns. Like id
+    // 31/35, the `ADD COLUMN` rebuilds the `service_time` `SELECT *`
+    // projection in place (live-gated in `live_traces.rs`).
+    Migration {
+        id: 37,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::Static(
+            "ALTER TABLE {{db}}.trace_spans{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '',\n\
+             ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
+    // The `_dist` wrapper copy of id 37 — cluster-gated (`StaticClusterOnly`),
+    // skipped and unrecorded on a single node, applied the first time
+    // clustering is enabled. Mirrors id 22/26/32/36.
+    Migration {
+        id: 38,
+        name: "trace_spans",
+        family: Some(Family::Traces),
+        ddl: Ddl::StaticClusterOnly(
+            "ALTER TABLE {{db}}.trace_spans{{dist_suffix}}{{on_cluster}}\n\
+             ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '',\n\
+             ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT '';",
+        ),
+        scope: MigrationScope::Checksum,
+        replication: Replication::PerShard,
+    },
 ];
 
 /// Materialized views (docs/schemas.md §3.1), reconciled separately from
@@ -1451,8 +1490,9 @@ mod tests {
     #[test]
     fn service_graph_migrations_are_checksum_scoped_per_shard_traces() {
         // Issue #184 extends the trace-family set with the `status_message`
-        // ALTER pair (ids 35/36).
-        for id in [31, 32, 33, 34, 35, 36] {
+        // ALTER pair (ids 35/36); issue #192 with the instrumentation
+        // `scope_name`/`scope_version` ALTER pair (ids 37/38).
+        for id in [31, 32, 33, 34, 35, 36, 37, 38] {
             let m = MIGRATIONS.iter().find(|m| m.id == id).expect("present");
             assert_eq!(m.scope, MigrationScope::Checksum);
             assert_eq!(m.replication, Replication::PerShard);
@@ -1505,6 +1545,58 @@ mod tests {
             ddl,
             "ALTER TABLE pulsus.trace_spans_dist ON CLUSTER 'prod'\n\
              ADD COLUMN IF NOT EXISTS status_message String DEFAULT '';",
+        );
+    }
+
+    /// Issue #192: OTLP `InstrumentationScope` `name`/`version` are added to
+    /// `trace_spans` via an additive `ADD COLUMN IF NOT EXISTS` (id 37) —
+    /// never a mutation of id 16's frozen CREATE — as
+    /// `LowCardinality(String) DEFAULT ''` (pre-#192 rows read back `''`, no
+    /// data migration). Matches the sibling `trace_spans.name`/`service`
+    /// low-cardinality columns; deliberately not id 35's free-text `String`.
+    #[test]
+    fn trace_spans_scope_name_version_base_alter_is_additive_lowcard_default_empty() {
+        let ddl = rendered_static(37);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans\n\
+             ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '',\n\
+             ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT '';",
+        );
+        // Cluster mode: still a plain ALTER (no engine swap, no Replicated).
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        clustered.storage_policy = Some("hot_cold".to_string());
+        let ddl_clustered = render::render(static_tmpl(37), "trace_spans", &clustered, false);
+        assert!(ddl_clustered.contains("ON CLUSTER 'prod'"));
+        assert!(!ddl_clustered.contains("Replicated"));
+        assert!(!ddl_clustered.contains("storage_policy"));
+        // The frozen id-16 CREATE never gains the columns (its checksum stays
+        // byte-frozen).
+        assert!(
+            !static_tmpl(16).contains("scope_name"),
+            "scope_name must arrive via the additive ALTER (id 37), not id 16's CREATE"
+        );
+    }
+
+    /// Issue #192: the `scope_name`/`scope_version` `_dist` ALTER (id 38) is
+    /// `StaticClusterOnly` — it targets `trace_spans_dist` (via
+    /// `{{dist_suffix}}`) and is cluster-gated. Mirrors id 36.
+    #[test]
+    fn trace_spans_scope_name_version_dist_alter_targets_the_dist_object() {
+        let m = MIGRATIONS.iter().find(|m| m.id == 38).expect("id 38");
+        assert_eq!(m.name, "trace_spans");
+        let Ddl::StaticClusterOnly(tmpl) = m.ddl else {
+            panic!("migration 38 must be Ddl::StaticClusterOnly");
+        };
+        let mut clustered = ctx();
+        clustered.cluster = Some("prod".to_string());
+        let ddl = render::render(tmpl, "trace_spans", &clustered, false);
+        assert_eq!(
+            ddl,
+            "ALTER TABLE pulsus.trace_spans_dist ON CLUSTER 'prod'\n\
+             ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '',\n\
+             ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT '';",
         );
     }
 

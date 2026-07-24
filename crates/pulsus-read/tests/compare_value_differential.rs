@@ -55,9 +55,16 @@ use pulsus_read::traces::metrics_plan::{MetricsParams, plan_trace_metrics};
 use pulsus_read::{MetricLabelValue, TraceEngine, TraceMetricsResult, TraceReadConfig};
 use pulsus_schema::{RenderCtx, run_init};
 
-/// The three keys #189 makes data-driven; the differential is scoped to
-/// exactly these.
-const KEYS: &[&str] = &["statusMessage", "rootName", "rootServiceName"];
+/// The keys the value differential is scoped to: the three #189 keys plus
+/// the two #192 instrumentation-scope intrinsics (both data-driven from the
+/// per-span `scope_name`/`scope_version` columns).
+const KEYS: &[&str] = &[
+    "statusMessage",
+    "rootName",
+    "rootServiceName",
+    "instrumentation:name",
+    "instrumentation:version",
+];
 
 // ---------------------------------------------------------------------------
 // Gating + ClickHouse setup
@@ -128,6 +135,11 @@ struct SpanDef {
     service: &'static str,
     status: u8,
     msg: &'static str,
+    /// OTLP `InstrumentationScope.name`/`version` (issue #192) — each span
+    /// carries a distinct populated scope so `compare()` value parity is
+    /// exercised per span.
+    scope_name: &'static str,
+    scope_version: &'static str,
     ts_ns: i64,
 }
 
@@ -149,6 +161,8 @@ fn corpus(base: i64) -> Vec<SpanDef> {
             service: "gateway",
             status: 1,
             msg: "",
+            scope_name: "otel-frontend",
+            scope_version: "1.0.0",
             ts_ns: base,
         },
         SpanDef {
@@ -159,6 +173,8 @@ fn corpus(base: i64) -> Vec<SpanDef> {
             service: "cart",
             status: 2,
             msg: "boom",
+            scope_name: "otel-checkout",
+            scope_version: "1.1.0",
             ts_ns: base + sec,
         },
         SpanDef {
@@ -169,6 +185,8 @@ fn corpus(base: i64) -> Vec<SpanDef> {
             service: "batch",
             status: 2,
             msg: "timeout",
+            scope_name: "otel-worker",
+            scope_version: "2.0.0",
             ts_ns: base + 2 * sec,
         },
         SpanDef {
@@ -179,6 +197,8 @@ fn corpus(base: i64) -> Vec<SpanDef> {
             service: "batch",
             status: 1,
             msg: "",
+            scope_name: "otel-idle",
+            scope_version: "2.1.0",
             ts_ns: base + 3 * sec,
         },
     ]
@@ -279,13 +299,16 @@ async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[S
         };
         rows.push(format!(
             "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-             toFixedString(unhex('{pid}'),8), '{name}', '{service}', '{msg}', {ts}, 1000, \
+             toFixedString(unhex('{pid}'),8), '{name}', '{service}', '{msg}', \
+             '{scope_name}', '{scope_version}', {ts}, 1000, \
              {status}, 1, 1, 'x')",
             tid = hex(&tid_bytes(nonce, s.trace)),
             sid = hex(&sid_bytes(s.id)),
             name = s.name,
             service = s.service,
             msg = s.msg,
+            scope_name = s.scope_name,
+            scope_version = s.scope_version,
             ts = s.ts_ns,
             status = s.status,
         ));
@@ -294,7 +317,8 @@ async fn pulsus_insert(client: &ChClient, db: &str, nonce: &[u8; 16], spans: &[S
         client,
         &format!(
             "INSERT INTO {db}.trace_spans \
-             (trace_id, span_id, parent_id, name, service, status_message, timestamp_ns, \
+             (trace_id, span_id, parent_id, name, service, status_message, \
+              scope_name, scope_version, timestamp_ns, \
               duration_ns, status_code, kind, payload_type, payload) VALUES {}",
             rows.join(", ")
         ),
@@ -332,7 +356,10 @@ fn otlp_push(otlp_base: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
                 "resource": {"attributes": [
                     {"key": "service.name", "value": {"stringValue": s.service}}
                 ]},
-                "scopeSpans": [{"spans": [span]}],
+                "scopeSpans": [{
+                    "scope": {"name": s.scope_name, "version": s.scope_version},
+                    "spans": [span],
+                }],
             })
         })
         .collect();
@@ -536,7 +563,7 @@ async fn compare_value_differential() {
 
     exec(&bootstrap, &format!("DROP DATABASE IF EXISTS {db}")).await;
 
-    // Span-by-span byte-match on the three keys' baseline/selection counts.
+    // Span-by-span byte-match on the five keys' baseline/selection counts.
     let mut mism: Vec<String> = Vec::new();
     let all_keys: std::collections::BTreeSet<_> = pulsus.keys().chain(tempo.keys()).collect();
     for k in all_keys {
@@ -547,10 +574,12 @@ async fn compare_value_differential() {
     }
     assert!(
         mism.is_empty(),
-        "compare() value-parity divergence for statusMessage/rootName/rootServiceName \
-         (REAL PulsusDB + Tempo output):\n  {}\n\nPulsusDB emits an empty statusMessage as a \
-         distinct \"\" value (the `arrayFilter` fold-to-nil was removed, #185) to match Tempo \
-         v3.0.2 — a residual divergence here is a NEW mismatch, not the known empty-message case.",
+        "compare() value-parity divergence for statusMessage/rootName/rootServiceName/\
+         instrumentation:name/instrumentation:version (REAL PulsusDB + Tempo output):\n  {}\n\n\
+         PulsusDB emits an empty statusMessage as a distinct \"\" value (the `arrayFilter` \
+         fold-to-nil was removed, #185) to match Tempo v3.0.2, and emits instrumentation \
+         name/version verbatim from the per-span scope columns (#192) — a residual divergence \
+         here is a NEW mismatch, not the known empty-message case.",
         mism.join("\n  ")
     );
 }

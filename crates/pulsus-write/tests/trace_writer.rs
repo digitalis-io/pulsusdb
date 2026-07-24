@@ -137,6 +137,8 @@ fn span_record(trace_seed: u8) -> SpanRecord {
         status_message: String::new(),
         kind: 3,
         shared: 0,
+        scope_name: String::new(),
+        scope_version: String::new(),
         payload: vec![0xDE, 0xAD],
     }
 }

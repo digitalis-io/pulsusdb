@@ -562,17 +562,18 @@ fn differential_categories_are_pinned() {
         "reject-parity constructs the reference now accepts (unescalated divergences): \
          {oracle_flipped_reject_parity:?}"
     );
-    // Exact pins — the M7-TQ6 closeout (issue #185) flips 15 tracked gaps
-    // to `supported` (88 → 103), moves the 4 both-reject constructs into
+    // Exact pins — the M7-TQ6 closeout (issue #185) flipped 15 tracked gaps
+    // to `supported` (88 → 103), moved the 4 both-reject constructs into
     // the new reject-parity bucket (both_reject 4 → 0, reject_parity = 4),
-    // and leaves the 9 schema-blocked Cat-C constructs as the residual
-    // tracked interim (24 → 9).
+    // and left the 9 schema-blocked Cat-C constructs as the residual tracked
+    // interim (24 → 9). Issue #192 PR-A flips the 3 instrumentation-scope
+    // constructs to `supported` (103 → 106, tracked_interim 9 → 6).
     assert_eq!(
-        supported, 103,
+        supported, 106,
         "supported (both-accept agreement) count pin"
     );
     assert_eq!(
-        tracked_interim, 9,
+        tracked_interim, 6,
         "tracked interim gap count pin (interim ∧ Tempo accepts, each with an owning issue)"
     );
     assert_eq!(

@@ -599,7 +599,10 @@ fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
     match &cursor.peek().kind {
         TokenKind::Dot => true,
         TokenKind::Ident(name) => {
-            if (name == "span" || name == "resource" || name == "parent")
+            if (name == "span"
+                || name == "resource"
+                || name == "parent"
+                || name == "instrumentation")
                 && matches!(cursor.peek2().kind, TokenKind::Dot)
             {
                 true
@@ -854,11 +857,13 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
                     span: tok.span,
                 });
             }
-            if (name == "span" || name == "resource") && followed_by_dot {
-                let scope = if name == "span" {
-                    AttrScope::Span
-                } else {
-                    AttrScope::Resource
+            if (name == "span" || name == "resource" || name == "instrumentation")
+                && followed_by_dot
+            {
+                let scope = match name.as_str() {
+                    "span" => AttrScope::Span,
+                    "resource" => AttrScope::Resource,
+                    _ => AttrScope::Instrumentation,
                 };
                 cursor.advance(); // scope ident
                 cursor.advance(); // '.'
@@ -1047,7 +1052,9 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
             | Intrinsic::ParentId
             | Intrinsic::TraceId
             | Intrinsic::RootName
-            | Intrinsic::RootServiceName,
+            | Intrinsic::RootServiceName
+            | Intrinsic::InstrumentationName
+            | Intrinsic::InstrumentationVersion,
         ) => {
             let tok = cursor.peek().clone();
             match tok.kind {
@@ -1328,6 +1335,8 @@ fn parse_aggregate(
                         | Intrinsic::TraceDuration
                         | Intrinsic::RootName
                         | Intrinsic::RootServiceName
+                        | Intrinsic::InstrumentationName
+                        | Intrinsic::InstrumentationVersion
                 )
             ) {
                 return Err(TraceQlError::UnexpectedToken {
@@ -1763,12 +1772,12 @@ mod tests {
 
     #[test]
     fn unknown_colon_scopes_are_generic_errors_not_named_boundaries() {
-        // event:/link:/instrumentation: must stay GENERIC (interim-generic
-        // disposition), never a NotYetSupported named boundary.
+        // event:/link: must stay GENERIC (interim-generic disposition),
+        // never a NotYetSupported named boundary. (instrumentation: now
+        // resolves — see instrumentation_scope_constructs_parse.)
         for q in [
             r#"{ event:name = "exception" }"#,
             r#"{ link:spanID = "0a1b" }"#,
-            r#"{ instrumentation:name = "otel" }"#,
             "{ span:bogus > 1 }",
         ] {
             match parse(q) {
@@ -1779,6 +1788,28 @@ mod tests {
                 Ok(ast) => panic!("{q}: must not parse, got {ast:?}"),
             }
         }
+    }
+
+    /// Issue #192 (PR-A): the three instrumentation-scope constructs parse —
+    /// the `scope.instrumentation` attribute namespace plus the
+    /// `instrumentation:name`/`instrumentation:version` intrinsics.
+    #[test]
+    fn instrumentation_scope_constructs_parse() {
+        assert_eq!(
+            only_field(r#"{ instrumentation.name = "otel" }"#),
+            Field::Attribute {
+                scope: AttrScope::Instrumentation,
+                key: "name".to_string(),
+            },
+        );
+        assert_eq!(
+            only_field(r#"{ instrumentation:name = "otel" }"#),
+            Field::Intrinsic(Intrinsic::InstrumentationName),
+        );
+        assert_eq!(
+            only_field(r#"{ instrumentation:version = "1.4.2" }"#),
+            Field::Intrinsic(Intrinsic::InstrumentationVersion),
+        );
     }
 
     #[test]

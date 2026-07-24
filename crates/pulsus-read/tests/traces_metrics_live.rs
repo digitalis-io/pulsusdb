@@ -800,14 +800,13 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
     // span carries it; a fully-absent key's baseline/selection nil counts
     // equal the totals. `rootServiceName` is NO LONGER here (issue #189:
     // now data-driven, asserted below); `instrumentation:name`/
-    // `instrumentation:version` stay absent (value deferred to #179).
+    // `instrumentation:version` are NO LONGER here either (issue #192: now
+    // data-driven physical columns, asserted below).
     for wk in [
         "resource.cluster",
         "resource.k8s.pod.name",
         "span.http.method",
         "span.url.path",
-        "instrumentation:name",
-        "instrumentation:version",
     ] {
         assert_eq!(
             value("baseline", wk, "nil"),
@@ -863,6 +862,26 @@ async fn assert_compare_and_result_comparison(engine: &TraceEngine) {
     assert_eq!(value("selection", "rootName", "nil"), None);
     assert_eq!(value("baseline", "rootServiceName", "nil"), None);
     assert_eq!(value("selection", "rootServiceName", "nil"), None);
+
+    // Issue #192: `instrumentation:name`/`instrumentation:version` are now
+    // data-driven physical columns (`scope_name`/`scope_version`). The seed
+    // spans carry no scope, so every span emits the DISTINCT `""` value (the
+    // `statusMessage` empty-value precedent) — baseline 450 / selection 150 —
+    // and, like `statusMessage`, there is NO nil complement.
+    assert_eq!(value("baseline", "instrumentation:name", ""), Some(450.0));
+    assert_eq!(value("selection", "instrumentation:name", ""), Some(150.0));
+    assert_eq!(
+        value("baseline", "instrumentation:version", ""),
+        Some(450.0)
+    );
+    assert_eq!(
+        value("selection", "instrumentation:version", ""),
+        Some(150.0)
+    );
+    assert_eq!(value("baseline", "instrumentation:name", "nil"), None);
+    assert_eq!(value("selection", "instrumentation:name", "nil"), None);
+    assert_eq!(value("baseline", "instrumentation:version", "nil"), None);
+    assert_eq!(value("selection", "instrumentation:version", "nil"), None);
 
     // ---- result comparison (`> N`): a client-side sample post-filter. ---
     // count_over_time per 60s bucket == 60 (one span/second).

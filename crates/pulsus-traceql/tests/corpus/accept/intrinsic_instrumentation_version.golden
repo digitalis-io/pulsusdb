@@ -1,0 +1,19 @@
+Query {
+    spanset: Filter(
+        SpansetFilter {
+            body: Some(
+                Comparison {
+                    field: Intrinsic(
+                        InstrumentationVersion,
+                    ),
+                    op: Eq,
+                    value: String(
+                        "1.0",
+                    ),
+                },
+            ),
+        },
+    ),
+    pipeline: [],
+    hints: [],
+}

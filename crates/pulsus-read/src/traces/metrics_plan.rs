@@ -1001,6 +1001,8 @@ mod tests {
         // inside the roots subquery — trace-wide exactness).
         for tuple in [
             "('statusMessage', i_status_message)",
+            "('instrumentation:name', i_scope_name)",
+            "('instrumentation:version', i_scope_version)",
             "('rootName', r.root_name)",
             "('rootServiceName', r.root_service)",
         ] {

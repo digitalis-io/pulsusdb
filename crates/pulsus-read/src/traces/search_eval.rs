@@ -84,6 +84,11 @@ pub struct HydratedSpan {
     /// intrinsic), byte-capped like `service`/`name`; `""` when absent.
     pub status_message: String,
     pub kind: i8,
+    /// The span's OTLP `InstrumentationScope.name`/`version` (issue #192's
+    /// `instrumentation:name`/`instrumentation:version` intrinsics),
+    /// byte-capped like `service`/`name`; `""` when absent.
+    pub scope_name: String,
+    pub scope_version: String,
 }
 
 /// One candidate trace's hydrated batch slice.
@@ -277,6 +282,10 @@ fn eval_physical(p: &PhysicalEval, span: &HydratedSpan) -> bool {
         PhysicalEval::ParentIdHex { op, value } => {
             let mut buf = [0u8; 16];
             op.matches(value, hex_into(&span.parent_id, &mut buf))
+        }
+        PhysicalEval::InstrumentationName { op, value } => op.matches(value, &span.scope_name),
+        PhysicalEval::InstrumentationVersion { op, value } => {
+            op.matches(value, &span.scope_version)
         }
     }
 }
@@ -1584,6 +1593,8 @@ mod tests {
             status_code: 0,
             status_message: String::new(),
             kind: 1,
+            scope_name: String::new(),
+            scope_version: String::new(),
         }
     }
 
@@ -2825,6 +2836,8 @@ mod tests {
                 status_code: 0,
                 status_message: String::new(),
                 kind: 1,
+                scope_name: String::new(),
+                scope_version: String::new(),
             });
         }
         TraceSpans {
@@ -3070,6 +3083,8 @@ mod tests {
             status_code: 0,
             status_message: status_message.to_string(),
             kind: 1,
+            scope_name: String::new(),
+            scope_version: String::new(),
         }
     }
 
@@ -3118,6 +3133,46 @@ mod tests {
         let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
         let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
         assert_eq!(ids, vec![sid(3)], "the empty message is matchable");
+    }
+
+    #[test]
+    fn instrumentation_name_and_version_match_equality_regex_and_the_empty_value() {
+        // Issue #192: the instrumentation intrinsics evaluate on the hydrated
+        // `scope_name`/`scope_version` columns, the `statusMessage` shape.
+        let with_scope = |n: u8, name: &str, version: &str| HydratedSpan {
+            scope_name: name.to_string(),
+            scope_version: version.to_string(),
+            ..span_with(n, 0, "s", "op", n as i64 * 10, 1, "")
+        };
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                with_scope(1, "io.otel.http", "1.4.2"),
+                with_scope(2, "io.otel.grpc", "2.0.0"),
+                with_scope(3, "", ""),
+            ],
+        };
+
+        let p = plan(r#"{ instrumentation:name = "io.otel.http" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1)]);
+
+        let p = plan(r#"{ instrumentation:name =~ "io.otel.*" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(1), sid(2)]);
+
+        let p = plan(r#"{ instrumentation:version = "2.0.0" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(2)]);
+
+        // The empty scope span matches only the empty-value equality.
+        let p = plan(r#"{ instrumentation:version = "" }"#);
+        let matches = eval(&p, std::slice::from_ref(&trace), &membership(&p, &[]));
+        let ids: Vec<[u8; 8]> = matches[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(ids, vec![sid(3)], "the empty scope version is matchable");
     }
 
     #[test]

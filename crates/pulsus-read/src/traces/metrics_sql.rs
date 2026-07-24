@@ -227,6 +227,7 @@ fn render_expr(
                         AttrScope::Span => Some("span"),
                         AttrScope::Resource => Some("resource"),
                         AttrScope::Unscoped => None,
+                        AttrScope::Instrumentation => Some("instrumentation"),
                     },
                     pred: ValuePred::KeyExists,
                 },
@@ -275,7 +276,9 @@ fn validate_physical_regex(p: &filter::PhysicalPredicate) -> Result<(), PlanErro
         | filter::PhysicalPredicate::Service { op, value }
         | filter::PhysicalPredicate::StatusMessage { op, value }
         | filter::PhysicalPredicate::SpanIdHex { op, value }
-        | filter::PhysicalPredicate::ParentIdHex { op, value } => (op, value),
+        | filter::PhysicalPredicate::ParentIdHex { op, value }
+        | filter::PhysicalPredicate::InstrumentationName { op, value }
+        | filter::PhysicalPredicate::InstrumentationVersion { op, value } => (op, value),
         _ => return Ok(()),
     };
     if matches!(op, ComparisonOp::Re | ComparisonOp::Nre) {
@@ -783,6 +786,7 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     let mut raw = format!(
         "SELECT {bucket_expr} AS t, trace_id, span_id, name AS i_name, kind AS i_kind, \
          status_code AS i_status, service AS i_service, status_message AS i_status_message, \
+         scope_name AS i_scope_name, scope_version AS i_scope_version, \
          ({inner_bool}) AS is_sel\n    FROM {spans_table}\n    "
     );
     push_prewhere_where_indented(&mut raw, outer, window);
@@ -792,7 +796,8 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     let base = format!(
         "SELECT t, trace_id, span_id, any(i_name) AS i_name, any(i_kind) AS i_kind, \
          any(i_status) AS i_status, any(i_service) AS i_service, \
-         any(i_status_message) AS i_status_message, max(is_sel) AS is_sel\n  FROM (\n  {raw}\n  )\n  GROUP BY t, trace_id, span_id"
+         any(i_status_message) AS i_status_message, any(i_scope_name) AS i_scope_name, \
+         any(i_scope_version) AS i_scope_version, max(is_sel) AS is_sel\n  FROM (\n  {raw}\n  )\n  GROUP BY t, trace_id, span_id"
     );
     // Issue #189: `rootName`/`rootServiceName` are trace-level intrinsics —
     // resolved WINDOW-FREE (trace-wide) so they never disagree with the
@@ -804,13 +809,18 @@ pub fn metrics_compare_sql(input: &CompareSqlInput<'_>) -> CompareSql {
     // folded into the `key=nil` complement — verified against the pinned
     // reference, #185). So it is emitted verbatim like every other
     // intrinsic; `name`/`kind`/`status`/`resource.service.name` and the
-    // window-free roots are byte-unchanged.
+    // window-free roots are byte-unchanged. Issue #192: the
+    // `instrumentation:name`/`instrumentation:version` intrinsics source the
+    // per-span `scope_name`/`scope_version` PHYSICAL columns the same way —
+    // every span has a `""`-or-value, emitted verbatim (the `statusMessage`
+    // precedent), so a scopeless span contributes a DISTINCT `""` value.
     let roots_cte = compare_roots_cte(spans_table, &base);
     let intrinsics = format!(
         "SELECT t, is_sel, kv.1 AS akey, kv.2 AS aval FROM (\n    \
          SELECT t, is_sel, arrayJoin([\
          ('name', i_name), ('kind', {KIND_MAP}), ('status', {STATUS_MAP}), \
          ('resource.service.name', i_service), ('statusMessage', i_status_message), \
+         ('instrumentation:name', i_scope_name), ('instrumentation:version', i_scope_version), \
          ('rootName', r.root_name), ('rootServiceName', r.root_service)]) AS kv\n    \
          FROM (\n  {base}\n    ) b\n    LEFT JOIN (\n  {roots_cte}\n    ) r ON b.trace_id = r.trace_id\n  )"
     );
