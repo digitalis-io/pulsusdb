@@ -210,7 +210,7 @@ mod tests {
         output.traces[0].groups = Some(vec![
             SpanSetGroup {
                 attributes: vec![(
-                    "resource.service.name".to_string(),
+                    "by(resource.service.name)".to_string(),
                     GroupValue::Str("checkout".to_string()),
                 )],
                 matched: 2,
@@ -218,7 +218,7 @@ mod tests {
             },
             SpanSetGroup {
                 attributes: vec![(
-                    "resource.service.name".to_string(),
+                    "by(resource.service.name)".to_string(),
                     GroupValue::Str("billing".to_string()),
                 )],
                 matched: 3,
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(
             sets[0]["attributes"][0],
             serde_json::json!({
-                "key": "resource.service.name",
+                "key": "by(resource.service.name)",
                 "value": {"stringValue": "checkout"}
             })
         );

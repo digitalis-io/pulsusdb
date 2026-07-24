@@ -2593,7 +2593,7 @@ async fn two_phase_search_explain_and_budget_gates() {
                 .all(|t| t.groups.as_ref().is_some_and(|gs| gs.iter().all(|g| g
                     .attributes
                     .first()
-                    .is_some_and(|(k, _)| k == "resource.service.name")))),
+                    .is_some_and(|(k, _)| k == "by(resource.service.name)")))),
         "every by(resource.service.name) trace carries per-group spanSets keyed on the by-key"
     );
 
@@ -2654,7 +2654,7 @@ async fn two_phase_search_explain_and_budget_gates() {
             .expect("by(name) produces grouped spanSets");
         assert_eq!(groups.len(), 1, "each single-span trace has one name group");
         let (key, value) = &groups[0].attributes[0];
-        assert_eq!(key, "name");
+        assert_eq!(key, "by(name)");
         match value {
             pulsus_read::GroupValue::Str(v) => assert!(
                 v.starts_with("ac9-") && v.len() as u64 >= AC9_NAME_BYTES,

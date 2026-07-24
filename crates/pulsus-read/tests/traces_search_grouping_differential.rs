@@ -15,17 +15,23 @@
 //!     read back from its live `/api/search` with the identical `q=`.
 //!
 //! The gate compares, per trace: the SET of group key-tuples, the per-group
-//! span-id membership, and the group `attributes` typing (here the physical
-//! `name` key → `stringValue`). A `coalesce()` fixture asserts the groups
-//! collapse to a single flat spanSet on BOTH sides.
+//! span-id membership, and the group `attributes` TYPING — the value is a
+//! TYPE-TAGGED token (`stringValue=…`/`intValue=…`/`doubleValue=…`/
+//! `boolValue=…`), so a wire-type mismatch (e.g. Tempo `stringValue "error"`
+//! vs an `intValue 2`) fails the gate, not just a value mismatch. A
+//! `coalesce()` fixture asserts the groups collapse to a single flat
+//! spanSet on BOTH sides.
 //!
-//! **Scope.** This live leg pins the string (physical-key) grouping and
-//! `coalesce()` collapse — the close-condition core. Numeric / `-0.0` /
-//! NaN float grouping (`canonical_double_bits`) is pinned by the HERMETIC
+//! **Type coverage (flag-5).** One representative case of EACH by-key type
+//! so a single CI pass reveals any remaining wire-type divergence: `name`
+//! (string), `status`/`kind` (lowercase keyword `stringValue`), `duration`
+//! (Go `time.Duration.String()` `stringValue`), and `nestedSetParent`
+//! (`intValue`). Numeric-attribute `doubleValue` and the `-0.0`/NaN
+//! `canonical_double_bits` folding are pinned by the HERMETIC
 //! `search_eval::tests::float_by_key_collapses_signed_zero_and_all_nan`
 //! and `..::grouped_charges_equal_retained_plus_counter_exactly` units
-//! (OTLP/JSON cannot even carry a NaN attribute), so those semantics need
-//! no live oracle.
+//! (OTLP/JSON cannot even carry a NaN attribute), so those need no live
+//! oracle.
 //!
 //! Gate: skips unless `PULSUS_TEST_CLICKHOUSE=1` AND
 //! `PULSUSDB_GROUPING_DIFF_URL` (Tempo search API base, e.g.
@@ -111,38 +117,55 @@ async fn init_db(bootstrap: &ChClient, db: &str) {
 // Fixtures
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SpanDef {
     id: u8,
+    /// 0 = root (no `parentSpanId`).
+    parent: u8,
     name: &'static str,
     ts_ns: i64,
-    /// OTLP StatusCode (0 unset / 1 ok / 2 error) — the `by(status)`
-    /// int-typed group key.
+    duration_ns: i64,
+    /// OTLP StatusCode (0 unset / 1 ok / 2 error).
     status: i32,
+    /// OTLP SpanKind (1 internal / 2 server / 3 client / 4 producer /
+    /// 5 consumer).
+    kind: i32,
 }
 
 impl SpanDef {
-    const fn new(id: u8, name: &'static str, ts_ns: i64) -> Self {
+    fn new(id: u8, name: &'static str, ts_ns: i64) -> Self {
         SpanDef {
             id,
+            parent: 0,
             name,
             ts_ns,
+            duration_ns: 1_000,
             status: 0,
+            kind: 1,
         }
     }
-    const fn with_status(id: u8, ts_ns: i64, status: i32) -> Self {
-        SpanDef {
-            id,
-            name: "s",
-            ts_ns,
-            status,
-        }
+    fn status(mut self, status: i32) -> Self {
+        self.status = status;
+        self
+    }
+    fn kind(mut self, kind: i32) -> Self {
+        self.kind = kind;
+        self
+    }
+    fn duration(mut self, duration_ns: i64) -> Self {
+        self.duration_ns = duration_ns;
+        self
+    }
+    fn parent(mut self, parent: u8) -> Self {
+        self.parent = parent;
+        self
     }
 }
 
 struct Fixture {
     /// The differential name.
     name: &'static str,
-    /// The TraceQL query (`by(name)` / `by(name)|coalesce()`).
+    /// The TraceQL query.
     q: &'static str,
     /// `true` when the query coalesces back to a single flat spanSet.
     coalesced: bool,
@@ -171,17 +194,52 @@ fn fixtures(base: i64) -> Vec<Fixture> {
                 SpanDef::new(2, "silver", base + sec),
             ],
         },
-        // Finding #4: an INT-typed by-key (`by(status)`). PulsusDB renders
-        // `status` as an integer group value; the differential pins the
-        // exact wire typing (intValue vs keyword) against the reference.
+        // Flag-5 coverage: one representative case of EACH by-key TYPE so a
+        // single CI pass reveals any remaining wire-type divergence.
+        // `status` renders its lowercase keyword as `stringValue`.
         Fixture {
-            name: "by_status_int_groups",
+            name: "by_status_keyword_string",
             q: "{} | by(status)",
             coalesced: false,
             spans: vec![
-                SpanDef::with_status(1, base, 2),           // error
-                SpanDef::with_status(2, base + sec, 2),     // error
-                SpanDef::with_status(3, base + 2 * sec, 1), // ok
+                SpanDef::new(1, "s", base).status(2),           // error
+                SpanDef::new(2, "s", base + sec).status(2),     // error
+                SpanDef::new(3, "s", base + 2 * sec).status(1), // ok
+            ],
+        },
+        // `kind` renders its lowercase keyword as `stringValue`.
+        Fixture {
+            name: "by_kind_keyword_string",
+            q: "{} | by(kind)",
+            coalesced: false,
+            spans: vec![
+                SpanDef::new(1, "s", base).kind(2),           // server
+                SpanDef::new(2, "s", base + sec).kind(2),     // server
+                SpanDef::new(3, "s", base + 2 * sec).kind(3), // client
+            ],
+        },
+        // `duration` renders Go's `time.Duration.String()` as `stringValue`.
+        Fixture {
+            name: "by_duration_go_string",
+            q: "{} | by(duration)",
+            coalesced: false,
+            spans: vec![
+                SpanDef::new(1, "s", base).duration(1_500_000_000), // 1.5s
+                SpanDef::new(2, "s", base + sec).duration(1_500_000_000),
+                SpanDef::new(3, "s", base + 2 * sec).duration(2_000_000_000), // 2s
+            ],
+        },
+        // A nested-set (COUNT/numbering) intrinsic renders as `intValue`.
+        // A simple root -> single-child tree (no siblings, in-window) has
+        // an unambiguous numbering both systems agree on: root
+        // nestedSetParent = -1, child nestedSetParent = root's left (1).
+        Fixture {
+            name: "by_nested_set_parent_int",
+            q: "{} | by(nestedSetParent)",
+            coalesced: false,
+            spans: vec![
+                SpanDef::new(1, "root", base),
+                SpanDef::new(2, "child", base + sec).parent(1),
             ],
         },
     ]
@@ -208,14 +266,21 @@ fn sid_bytes(id: u8) -> [u8; 8] {
 async fn pulsus_insert(client: &ChClient, db: &str, trace: &[u8; 16], spans: &[SpanDef]) {
     let mut rows = Vec::new();
     for s in spans {
+        let parent = if s.parent == 0 {
+            "0000000000000000".to_string()
+        } else {
+            hex(&sid_bytes(s.parent))
+        };
         rows.push(format!(
             "(toFixedString(unhex('{tid}'),16), toFixedString(unhex('{sid}'),8), \
-             toFixedString(unhex('0000000000000000'),8), '{name}', 'svc', {ts}, 1000, {status}, 1, 1, 'x')",
+             toFixedString(unhex('{parent}'),8), '{name}', 'svc', {ts}, {dur}, {status}, {kind}, 1, 'x')",
             tid = hex(trace),
             sid = hex(&sid_bytes(s.id)),
             name = s.name,
             ts = s.ts_ns,
+            dur = s.duration_ns,
             status = s.status,
+            kind = s.kind,
         ));
     }
     exec(
@@ -296,15 +361,19 @@ fn otlp_push(otlp_base: &str, trace: &[u8; 16], spans: &[SpanDef]) {
     let otlp_spans: Vec<serde_json::Value> = spans
         .iter()
         .map(|s| {
-            serde_json::json!({
+            let mut span = serde_json::json!({
                 "traceId": hex(trace),
                 "spanId": hex(&sid_bytes(s.id)),
                 "name": s.name,
                 "startTimeUnixNano": s.ts_ns.to_string(),
-                "endTimeUnixNano": (s.ts_ns + 1_000_000_000).to_string(),
-                "kind": 1,
+                "endTimeUnixNano": (s.ts_ns + s.duration_ns).to_string(),
+                "kind": s.kind,
                 "status": {"code": s.status},
-            })
+            });
+            if s.parent != 0 {
+                span["parentSpanId"] = serde_json::Value::String(hex(&sid_bytes(s.parent)));
+            }
+            span
         })
         .collect();
     let body = serde_json::json!({

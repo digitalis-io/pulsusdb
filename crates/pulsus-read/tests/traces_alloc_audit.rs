@@ -114,6 +114,10 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "the tuple->bucket index map: covered by the same PER_SPAN_GROUP_TRANSIENT_BYTES envelope (per-entry key header + value + overhead) + the map key's string payload charged before insert; released with the transient partition"),
     ("search_eval.rs", "build_span_set_groups", "Vec::with_capacity", 3,
      "retained groups vec (overhead + n x size_of<SpanSetGroup> charged before) + per-group attributes vec (overhead + keys.len slots charged before) + per-group spans vec (take x size_of<SpanSummary> charged before); together == groups_retained_bytes"),
+    ("search_eval.rs", "go_duration_frac", "Vec::new", 1,
+     "the fractional-digit scratch buffer (<= 9 ASCII bytes) for a by(duration) group value's Go-duration render - a bounded scalar render whose result .len() is charged by charged_str at the group-value site before retention (the same residual class as build_summary's duration/status/kind scalar renders)"),
+    ("search_eval.rs", "go_duration_string", "format!", 5,
+     "bounded duration-string assembly (<= ~32 bytes, e.g. '2540400h10m10.000000000s') for a by(duration)/by(traceDuration) group value; charged_str charges its .len() before it is cloned into the retained tuple/attributes - a scalar-render residual"),
     // ---- issue #172 + #183: structural relation intermediates -----------
     ("search_eval.rs", "rel_descendants", "HashMap::", 1,
      "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),

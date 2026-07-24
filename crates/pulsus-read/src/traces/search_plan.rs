@@ -1051,7 +1051,12 @@ fn plan_group_key(
     trace_ctx: &mut bool,
     child_count: &mut bool,
 ) -> Result<PlannedGroupKey, PlanError> {
-    let display = field.to_string();
+    // Tempo v3.0.2 names the per-group group-key attribute with the `by()`
+    // EXPRESSION, not the bare field (verified live via the e2e grouped
+    // signature: PulsusDB `name` vs Tempo `by(name)`). So the response
+    // attribute key is `by(<field-spelling>)` — `by(name)`,
+    // `by(resource.service.name)`, `by(.foo)`, …
+    let display = format!("by({field})");
     let resolver = match field {
         Field::Intrinsic(Intrinsic::Name) => GroupKeyResolver::Physical(PhysicalSelect::Name),
         Field::Intrinsic(Intrinsic::Duration) => {

@@ -1655,6 +1655,71 @@ fn charged_str(
     Ok(GroupValue::Str(s.to_string()))
 }
 
+/// Go's `time.Duration.String()` fractional-part formatter: emits up to
+/// `prec` fractional digits (trailing zeros trimmed) as `".xxx"` (empty if
+/// all zero) and returns the integer part `u / 10^prec`.
+fn go_duration_frac(mut u: u128, prec: u32) -> (String, u128) {
+    let mut digits: Vec<u8> = Vec::new();
+    let mut printing = false;
+    for _ in 0..prec {
+        let digit = (u % 10) as u8;
+        printing = printing || digit != 0;
+        if printing {
+            digits.push(b'0' + digit);
+        }
+        u /= 10;
+    }
+    let frac = if digits.is_empty() {
+        String::new()
+    } else {
+        digits.reverse();
+        let mut s = String::from(".");
+        // Safety: `digits` holds only ASCII '0'..='9' by construction.
+        s.push_str(std::str::from_utf8(&digits).expect("ascii digits"));
+        s
+    };
+    (frac, u)
+}
+
+/// Renders a nanosecond duration as Go's `time.Duration.String()` — the
+/// form Tempo v3.0.2 uses for a TraceQL `duration`/`traceDuration` group
+/// value's `stringValue` (verified live via the grouping differential):
+/// sub-second uses `ns`/`µs`/`ms` with a trimmed fraction, `>= 1s` uses
+/// `[h][m]s` with a trimmed fractional-seconds part (`1.5s`, `1m30s`,
+/// `1h1m1s`, `500µs`, `0s`).
+fn go_duration_string(nanos: i64) -> String {
+    if nanos == 0 {
+        return "0s".to_string();
+    }
+    let neg = nanos < 0;
+    let u0: u128 = (nanos as i128).unsigned_abs();
+    const SECOND: u128 = 1_000_000_000;
+    let s = if u0 < SECOND {
+        let (unit, prec): (&str, u32) = if u0 < 1_000 {
+            ("ns", 0)
+        } else if u0 < 1_000_000 {
+            ("µs", 3)
+        } else {
+            ("ms", 6)
+        };
+        let (frac, int_part) = go_duration_frac(u0, prec);
+        format!("{int_part}{frac}{unit}")
+    } else {
+        let (frac, secs) = go_duration_frac(u0, 9);
+        let mut out = format!("{}{frac}s", secs % 60);
+        let mins = secs / 60;
+        if mins > 0 {
+            out = format!("{}m{out}", mins % 60);
+            let hours = mins / 60;
+            if hours > 0 {
+                out = format!("{hours}h{out}");
+            }
+        }
+        out
+    };
+    if neg { format!("-{s}") } else { s }
+}
+
 /// Resolves one `by()` key's typed value for a hydrated span (issue #193),
 /// covering EVERY resolvable key form — physical columns, the #181
 /// nested-set / #184 trace-level / #192 instrumentation intrinsics, and
@@ -1677,11 +1742,20 @@ fn resolve_group_value(
         GroupKeyResolver::Physical(PhysicalSelect::Name) => {
             charged_str(&span.name, budget, transient)?
         }
-        GroupKeyResolver::Physical(PhysicalSelect::DurationNs) => GroupValue::Int(span.duration_ns),
-        GroupKeyResolver::Physical(PhysicalSelect::Status) => {
-            GroupValue::Int(span.status_code as i64)
+        // `duration`/`status`/`kind` render by their TraceQL TYPE, matching
+        // Tempo v3.0.2 (verified live via the grouping differential): a
+        // `duration` value is Go's `time.Duration.String()` form, and
+        // `status`/`kind` are their lowercase keyword enums — all
+        // `stringValue`, NOT numeric.
+        GroupKeyResolver::Physical(PhysicalSelect::DurationNs) => {
+            charged_str(&go_duration_string(span.duration_ns), budget, transient)?
         }
-        GroupKeyResolver::Physical(PhysicalSelect::Kind) => GroupValue::Int(span.kind as i64),
+        GroupKeyResolver::Physical(PhysicalSelect::Status) => {
+            charged_str(status_keyword(span.status_code), budget, transient)?
+        }
+        GroupKeyResolver::Physical(PhysicalSelect::Kind) => {
+            charged_str(kind_keyword(span.kind), budget, transient)?
+        }
         GroupKeyResolver::StatusMessage => charged_str(&span.status_message, budget, transient)?,
         GroupKeyResolver::InstrumentationName => charged_str(&span.scope_name, budget, transient)?,
         GroupKeyResolver::InstrumentationVersion => {
@@ -1707,11 +1781,16 @@ fn resolve_group_value(
             .and_then(|idx| idx.get(&span.span_id))
             .map(|v| GroupValue::Int(v.value(*field)))
             .unwrap_or(GroupValue::Nil),
-        GroupKeyResolver::TraceDuration => env
-            .ctx
-            .info
-            .map(|i| GroupValue::Int(i.trace_end_ns.saturating_sub(i.trace_start_ns)))
-            .unwrap_or(GroupValue::Nil),
+        // `traceDuration` is a duration type too → the same Go-duration
+        // `stringValue` form as `duration`.
+        GroupKeyResolver::TraceDuration => match env.ctx.info {
+            Some(i) => charged_str(
+                &go_duration_string(i.trace_end_ns.saturating_sub(i.trace_start_ns)),
+                budget,
+                transient,
+            )?,
+            None => GroupValue::Nil,
+        },
         GroupKeyResolver::RootName => match env.ctx.info {
             Some(i) => charged_str(&i.root_name, budget, transient)?,
             None => GroupValue::Nil,
@@ -3144,7 +3223,7 @@ mod tests {
         assert_eq!(
             groups[0].attributes,
             vec![(
-                "resource.service.name".to_string(),
+                "by(resource.service.name)".to_string(),
                 GroupValue::Str("checkout".to_string())
             )]
         );
@@ -3313,11 +3392,28 @@ mod tests {
         assert_eq!(nan_group.matched, 2);
     }
 
-    /// Finding #4 (int-typed by-key wire rendering): a physical `by(kind)`
-    /// groups on the integer column and yields `GroupValue::Int` (→
-    /// `intValue`), distinct from an attribute's `doubleValue` path.
+    /// Go `time.Duration.String()` parity (Tempo renders a `duration`
+    /// group value via this exact format).
     #[test]
-    fn int_typed_by_key_groups_as_int_value() {
+    fn go_duration_string_matches_the_go_runtime_format() {
+        assert_eq!(go_duration_string(0), "0s");
+        assert_eq!(go_duration_string(500), "500ns");
+        assert_eq!(go_duration_string(1_500), "1.5µs");
+        assert_eq!(go_duration_string(1_000_000), "1ms");
+        assert_eq!(go_duration_string(1_500_000), "1.5ms");
+        assert_eq!(go_duration_string(1_000_000_000), "1s");
+        assert_eq!(go_duration_string(1_500_000_000), "1.5s");
+        assert_eq!(go_duration_string(90_000_000_000), "1m30s");
+        assert_eq!(go_duration_string(3_661_000_000_000), "1h1m1s");
+        assert_eq!(go_duration_string(-1_500_000_000), "-1.5s");
+    }
+
+    /// Finding (flag-5 answer): `by(status)`/`by(kind)`/`by(duration)`
+    /// render by their TraceQL TYPE as `stringValue` keyword / duration
+    /// forms — matching Tempo v3.0.2 (NOT numeric enums), under the
+    /// `by(<expr>)` group-key attribute NAME.
+    #[test]
+    fn enum_and_duration_by_keys_render_as_typed_keyword_strings() {
         let p = plan("{} | by(kind)");
         let mut s1 = span(1, "s", "a", 10, 1);
         s1.kind = 2; // server
@@ -3325,19 +3421,68 @@ mod tests {
         s2.kind = 2;
         let mut s3 = span(3, "s", "c", 30, 1);
         s3.kind = 5; // consumer
-        let trace = TraceSpans {
-            trace_id: tid(1),
-            spans: vec![s1, s2, s3],
-        };
-        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        let matches = eval(
+            &p,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![s1, s2, s3],
+            }],
+            &membership(&p, &[]),
+        );
         let groups = matches[0].groups.as_ref().expect("by() active");
         assert_eq!(groups.len(), 2);
         assert_eq!(
             groups[0].attributes[0],
-            ("kind".to_string(), GroupValue::Int(2))
+            (
+                "by(kind)".to_string(),
+                GroupValue::Str("server".to_string())
+            )
         );
         assert_eq!(groups[0].matched, 2);
-        assert_eq!(groups[1].attributes[0].1, GroupValue::Int(5));
+        assert_eq!(
+            groups[1].attributes[0].1,
+            GroupValue::Str("consumer".to_string())
+        );
+
+        let ps = plan("{} | by(status)");
+        let mut e1 = span(1, "s", "a", 10, 1);
+        e1.status_code = 2; // error
+        let mut e2 = span(2, "s", "b", 20, 1);
+        e2.status_code = 1; // ok
+        let ms = eval(
+            &ps,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![e1, e2],
+            }],
+            &membership(&ps, &[]),
+        );
+        let gs = ms[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            gs[0].attributes[0],
+            (
+                "by(status)".to_string(),
+                GroupValue::Str("error".to_string())
+            )
+        );
+        assert_eq!(gs[1].attributes[0].1, GroupValue::Str("ok".to_string()));
+
+        let pd = plan("{} | by(duration)");
+        let md = eval(
+            &pd,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "a", 10, 1_500_000_000)],
+            }],
+            &membership(&pd, &[]),
+        );
+        assert_eq!(
+            md[0].groups.as_ref().expect("by() active")[0].attributes[0],
+            (
+                "by(duration)".to_string(),
+                GroupValue::Str("1.5s".to_string())
+            )
+        );
     }
 
     /// Issue #193 (no silent subset): the nested-set intrinsics are
@@ -3403,7 +3548,7 @@ mod tests {
         assert_eq!(
             groups[0].attributes[0],
             (
-                "rootServiceName".to_string(),
+                "by(rootServiceName)".to_string(),
                 GroupValue::Str("gateway".to_string())
             )
         );

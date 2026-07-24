@@ -950,8 +950,8 @@ async fn search_semantics_against_real_clickhouse() {
     assert_eq!(group_values, vec![1.0, 3.0], "the two group key values");
     for set in sets {
         assert_eq!(
-            set["attributes"][0]["key"], "span.retries",
-            "group attribute carries the by() key spelling"
+            set["attributes"][0]["key"], "by(span.retries)",
+            "group attribute carries Tempo's by(<expr>) key spelling"
         );
     }
 
