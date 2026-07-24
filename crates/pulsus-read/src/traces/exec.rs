@@ -88,7 +88,8 @@ use super::rows::{
     TagValueRow, TraceCtxRow,
 };
 use super::search_eval::{
-    self, BatchAttrs, HydratedSpan, SpanSummary, TraceCtxInfo, TraceMatch, TraceSpans,
+    self, BatchAttrs, GroupCardinalityCounter, HydratedSpan, SpanSetGroup, SpanSummary,
+    TraceCtxInfo, TraceMatch, TraceSpans,
 };
 use super::search_plan::{SearchCtx, SearchPlan};
 use crate::logql::error::{ReadError, TooBroadReason};
@@ -292,6 +293,13 @@ pub struct TraceSearchResult {
     pub matched: u32,
     /// `spss`-capped matched-span summaries, ascending `(start_ns, span_id)`.
     pub spans: Vec<SpanSummary>,
+    /// The `by()`-regrouped spanSets (issue #193): `Some` iff a `by()`
+    /// grouping stage is active and not collapsed by a trailing
+    /// `coalesce()`. `None` keeps the flat single-spanSet response
+    /// byte-identical (the default path). When `Some`, the encoder emits
+    /// one spanSet per group (carrying typed `attributes`) and the flat
+    /// `matched`/`spans` are not serialized.
+    pub groups: Option<Vec<SpanSetGroup>>,
 }
 
 /// The search result: `traces` ordered by the public contract (max
@@ -1470,6 +1478,13 @@ impl TraceEngine {
 
         // ---- Phase 2: streaming batched exact evaluation --------------
         let limit = plan.limit() as usize;
+        // The issue #193 distinct-group cardinality cap: a cross-batch
+        // running accumulator enforced INSIDE `by()` grouping at
+        // production time (before any `coalesce()` collapse and before
+        // winner eviction), so every regrouped form is bounded by the
+        // SAME static `422 TraceSearchSeriesCap` as the #185 pre-flight.
+        // Inert (no charge, no work) for non-`by()` queries.
+        let mut group_counter = GroupCardinalityCounter::new(self.config.max_series);
         let mut heap: std::collections::BinaryHeap<HeapEntry> = std::collections::BinaryHeap::new();
         let mut consumed: u64 = 0;
         let mut ceiling_hit = false;
@@ -1536,7 +1551,9 @@ impl TraceEngine {
             // charge must never trail materialization); the heap-evict
             // release below returns exactly what was charged
             // (`retained_bytes` is the same capacity-based cost model).
-            for m in search_eval::evaluate_batch(plan, &traces, &attrs, &mut budget)? {
+            for m in
+                search_eval::evaluate_batch(plan, &traces, &attrs, &mut group_counter, &mut budget)?
+            {
                 heap.push(HeapEntry(m));
                 if heap.len() > limit
                     && let Some(worst) = heap.pop()
@@ -1555,6 +1572,13 @@ impl TraceEngine {
         }
 
         let partial = generator_truncated || ceiling_hit || overflow_partial;
+
+        // The group-cardinality accumulator has done its enforcement job;
+        // release its retained charge (its bytes live in the winners'
+        // `retained_bytes` via each `TraceMatch.groups`, released on the
+        // usual heap-evict / return path). Success-path only — an error
+        // above dropped the whole budget with the request.
+        group_counter.release(&mut budget);
 
         // ---- Winners: rank + trace-wide root hydration -----------------
         let mut winners: Vec<TraceMatch> = heap.into_iter().map(|e| e.0).collect();
@@ -1638,6 +1662,7 @@ impl TraceEngine {
                 root,
                 matched: w.matched,
                 spans: w.spans,
+                groups: w.groups,
             });
         }
 
@@ -2689,6 +2714,7 @@ mod tests {
                 duration_ns: 1,
                 attributes: vec![("k".to_string(), "v".to_string())],
             }],
+            groups: None,
         };
         assert!(
             m.retained_bytes()
@@ -2782,6 +2808,7 @@ mod tests {
                 sort_key: ts,
                 matched: 1,
                 spans: Vec::new(),
+                groups: None,
             })
         };
         let mut heap = std::collections::BinaryHeap::new();

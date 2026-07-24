@@ -270,6 +270,72 @@ pub(crate) enum PhysicalSelect {
     Kind,
 }
 
+/// One `| by(<keys>)` grouping key (issue #193): the display spelling for
+/// the response spanSet `attributes` entry plus the per-span value
+/// resolver Phase 2 partitions on. The resolver reuses the SAME interned
+/// physical-column / attribute value reads as `select()` and the field
+/// operands, so grouping adds no new scan shape (the query-perf mandate).
+#[derive(Debug, Clone)]
+pub(crate) struct PlannedGroupKey {
+    pub(crate) display: String,
+    pub(crate) resolver: GroupKeyResolver,
+}
+
+/// How one `by()` key's value is resolved for a hydrated span (issue
+/// #193). Every by-key form the read-path can resolve to a per-span scalar
+/// is covered — physical columns, the trace-level / nested-set / scoped
+/// intrinsics #184/#185/#192 already hydrate, and attributes — so no
+/// resolvable key silently falls back to the flat response. The only
+/// excluded class (multi-valued span-EVENT / span-LINK intrinsics) is a
+/// clean `400`, never a flat 200 (see [`plan_group_key`]).
+#[derive(Debug, Clone)]
+pub(crate) enum GroupKeyResolver {
+    /// A physical span column (service/name/duration/status/kind).
+    Physical(PhysicalSelect),
+    /// `statusMessage` (issue #184) — the hydrated `status_message` string.
+    StatusMessage,
+    /// `span:id` / `span:parentID` / `trace:id` (issue #184) — the id's
+    /// lowercase-hex rendering (`trace:id` is trace-constant).
+    SpanIdHex,
+    ParentIdHex,
+    TraceIdHex,
+    /// `instrumentation:name` / `instrumentation:version` (issue #192) —
+    /// the hydrated `scope_name` / `scope_version` string.
+    InstrumentationName,
+    InstrumentationVersion,
+    /// `nestedSetParent`/`Left`/`Right` (issue #181) — the per-trace
+    /// query-time nested-set numbering (an integer).
+    NestedSet(NestedSetField),
+    /// `traceDuration` (issue #184) — `trace_end_ns - trace_start_ns` from
+    /// the trace-wide context co-load (an integer, nanoseconds).
+    TraceDuration,
+    /// `rootName` / `rootServiceName` (issue #184) — the co-load's
+    /// byte-capped root name / service (a string).
+    RootName,
+    RootServiceName,
+    /// `span:childCount` (issue #184) — the span's direct-child count from
+    /// the child-count co-load (an integer).
+    ChildCount,
+    /// An attribute value: interned into BOTH the numeric (`agg_fields`)
+    /// and string (`select_attrs`) reads so the group value is typed —
+    /// a `val_num` reading renders `doubleValue`, else the `val` string
+    /// renders `stringValue` (the differential pins the exact typing).
+    Attr {
+        str_idx: usize,
+        num_idx: usize,
+    },
+}
+
+/// One ordered post-filter spanset stage (issue #193): `by()` regroups the
+/// matched spans into one spanSet per distinct key-tuple, `coalesce()`
+/// merges the current spanSets back into one. Ordered (not flattened
+/// flags) so `by()|coalesce()` and `coalesce()|by()` stay distinguishable.
+#[derive(Debug, Clone)]
+pub(crate) enum SpansetStage {
+    By(Vec<PlannedGroupKey>),
+    Coalesce,
+}
+
 /// The complete, deterministic search plan — everything
 /// [`super::exec::TraceEngine::search`] executes, and the golden surface
 /// `tests/traces_search_sql.rs` byte-pins (via [`SearchPlan::generator_sqls`]
@@ -316,6 +382,11 @@ pub struct SearchPlan {
     pub(crate) group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     pub(crate) coalesce: bool,
+    /// The ordered spanset post-stages (issue #193): `by()`/`coalesce()`
+    /// in pipeline order, carrying the resolved group keys. Phase 2
+    /// reshapes the response from these; empty for a plain (flat) query,
+    /// keeping the default response byte-identical.
+    pub(crate) post_stages: Vec<SpansetStage>,
     /// The `with(most_recent=true)` search hint (issue #185): the response
     /// keeps its recency ordering (the default), most-recent first.
     pub(crate) most_recent: bool,
@@ -360,6 +431,12 @@ impl SearchPlan {
     /// #185); the response keeps its default recency ordering.
     pub fn most_recent(&self) -> bool {
         self.most_recent
+    }
+
+    /// The ordered spanset post-stages (issue #193) — `by()`/`coalesce()`
+    /// in pipeline order. Empty when the query is flat.
+    pub(crate) fn post_stages(&self) -> &[SpansetStage] {
+        &self.post_stages
     }
 
     /// The spanset `| by(...)` cardinality pre-flight probe SQL (issue
@@ -745,25 +822,54 @@ struct PlannedPipeline {
     group_by: Vec<Field>,
     /// Whether a `| coalesce()` stage is present (issue #185).
     coalesce: bool,
+    /// The ordered `by()`/`coalesce()` post-stages with resolved group
+    /// keys (issue #193).
+    post_stages: Vec<SpansetStage>,
 }
 
 fn plan_pipeline(
     query: &Query,
     agg_fields: &mut Vec<AttrFieldRef>,
     select_attrs: &mut Vec<AttrFieldRef>,
+    nested_set: &mut bool,
+    trace_ctx: &mut bool,
+    child_count: &mut bool,
 ) -> Result<PlannedPipeline, PlanError> {
     let mut aggregates = Vec::new();
     let mut select_fields = Vec::new();
     let mut group_by = Vec::new();
     let mut coalesce = false;
+    let mut post_stages: Vec<SpansetStage> = Vec::new();
     for stage in &query.pipeline {
         match stage {
-            // Spanset-level grouping / coalesce (issue #185): recognized
-            // search stages. `by(...)` grouping keys are carried to the
-            // executor, which enforces the shared `reader.traceql_max_series`
-            // cardinality cap (`422 query_too_broad`).
-            PipelineStage::By { fields } => group_by.extend(fields.iter().cloned()),
-            PipelineStage::Coalesce => coalesce = true,
+            // Spanset-level grouping / coalesce (issue #185 parse, #193
+            // response reshaping): `by(...)` grouping keys feed the #185
+            // pre-flight cardinality probe (`group_by`) AND the #193
+            // ordered `post_stages` that reshape the response. EVERY
+            // resolvable by-key produces a grouped `By` stage; a genuinely
+            // un-groupable key form (span-event / span-link intrinsic) is a
+            // clean `400` from `plan_group_key`, never a silent flat 200.
+            PipelineStage::By { fields } => {
+                group_by.extend(fields.iter().cloned());
+                let mut keys = Vec::with_capacity(fields.len());
+                for field in fields {
+                    keys.push(plan_group_key(
+                        field,
+                        agg_fields,
+                        select_attrs,
+                        nested_set,
+                        trace_ctx,
+                        child_count,
+                    )?);
+                }
+                if !keys.is_empty() {
+                    post_stages.push(SpansetStage::By(keys));
+                }
+            }
+            PipelineStage::Coalesce => {
+                coalesce = true;
+                post_stages.push(SpansetStage::Coalesce);
+            }
             PipelineStage::Aggregate {
                 op,
                 field,
@@ -922,7 +1028,102 @@ fn plan_pipeline(
         select_fields,
         group_by,
         coalesce,
+        post_stages,
     })
+}
+
+/// Resolves one `by()` key `Field` to a [`PlannedGroupKey`] (issue #193),
+/// interning any attribute value reads and forcing the trace-context /
+/// child-count / nested-set co-loads a key needs. EVERY by-key the
+/// read-path can resolve to a per-span scalar is grouped to parity — the
+/// physical columns, the #181 nested-set intrinsics, the #184 trace-level
+/// intrinsics, the #192 instrumentation intrinsics, and attributes. The
+/// ONLY excluded class is the multi-valued span-EVENT / span-LINK
+/// intrinsics (`event:name`/`event:timeSinceStart`/`link:spanID`/
+/// `link:traceID`): a span carries a COLLECTION of events/links, so there
+/// is no single scalar group value — grouping by them is a clean
+/// [`PlanError::UnsupportedField`] (`400`), never a silent flat 200.
+fn plan_group_key(
+    field: &Field,
+    agg_fields: &mut Vec<AttrFieldRef>,
+    select_attrs: &mut Vec<AttrFieldRef>,
+    nested_set: &mut bool,
+    trace_ctx: &mut bool,
+    child_count: &mut bool,
+) -> Result<PlannedGroupKey, PlanError> {
+    let display = field.to_string();
+    let resolver = match field {
+        Field::Intrinsic(Intrinsic::Name) => GroupKeyResolver::Physical(PhysicalSelect::Name),
+        Field::Intrinsic(Intrinsic::Duration) => {
+            GroupKeyResolver::Physical(PhysicalSelect::DurationNs)
+        }
+        Field::Intrinsic(Intrinsic::Status) => GroupKeyResolver::Physical(PhysicalSelect::Status),
+        Field::Intrinsic(Intrinsic::Kind) => GroupKeyResolver::Physical(PhysicalSelect::Kind),
+        Field::Intrinsic(Intrinsic::StatusMessage) => GroupKeyResolver::StatusMessage,
+        Field::Intrinsic(Intrinsic::SpanId) => GroupKeyResolver::SpanIdHex,
+        Field::Intrinsic(Intrinsic::ParentId) => GroupKeyResolver::ParentIdHex,
+        Field::Intrinsic(Intrinsic::TraceId) => GroupKeyResolver::TraceIdHex,
+        Field::Intrinsic(Intrinsic::InstrumentationName) => GroupKeyResolver::InstrumentationName,
+        Field::Intrinsic(Intrinsic::InstrumentationVersion) => {
+            GroupKeyResolver::InstrumentationVersion
+        }
+        Field::Intrinsic(Intrinsic::NestedSetParent) => {
+            *nested_set = true;
+            GroupKeyResolver::NestedSet(NestedSetField::Parent)
+        }
+        Field::Intrinsic(Intrinsic::NestedSetLeft) => {
+            *nested_set = true;
+            GroupKeyResolver::NestedSet(NestedSetField::Left)
+        }
+        Field::Intrinsic(Intrinsic::NestedSetRight) => {
+            *nested_set = true;
+            GroupKeyResolver::NestedSet(NestedSetField::Right)
+        }
+        Field::Intrinsic(Intrinsic::TraceDuration) => {
+            *trace_ctx = true;
+            GroupKeyResolver::TraceDuration
+        }
+        Field::Intrinsic(Intrinsic::RootName) => {
+            *trace_ctx = true;
+            GroupKeyResolver::RootName
+        }
+        Field::Intrinsic(Intrinsic::RootServiceName) => {
+            *trace_ctx = true;
+            GroupKeyResolver::RootServiceName
+        }
+        Field::Intrinsic(Intrinsic::ChildCount) => {
+            *child_count = true;
+            GroupKeyResolver::ChildCount
+        }
+        // Span-event / span-link intrinsics are collection-valued per span
+        // (a span has many events/links), so there is no single scalar
+        // group value — a clean 400, never a silent flat 200.
+        Field::Intrinsic(
+            Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart
+            | Intrinsic::LinkSpanId
+            | Intrinsic::LinkTraceId,
+        ) => {
+            return Err(PlanError::UnsupportedField(format!(
+                "by({field}): grouping by a span-event / span-link intrinsic is not supported \
+                 (a span carries a collection of events/links, so there is no single group value)"
+            )));
+        }
+        Field::Attribute { scope, key }
+            if *scope == pulsus_traceql::AttrScope::Resource && key == "service.name" =>
+        {
+            GroupKeyResolver::Physical(PhysicalSelect::Service)
+        }
+        attr @ Field::Attribute { .. } => {
+            let field_ref =
+                attr_field_ref(attr).expect("Field::Attribute always yields a field ref");
+            GroupKeyResolver::Attr {
+                str_idx: intern(select_attrs, &field_ref),
+                num_idx: intern(agg_fields, &field_ref),
+            }
+        }
+    };
+    Ok(PlannedGroupKey { display, resolver })
 }
 
 /// Plans one search request. Pure and deterministic — the same inputs
@@ -1010,7 +1211,17 @@ pub fn plan_search(
         }
     }
 
-    let pipeline = plan_pipeline(query, &mut agg_fields, &mut select_attrs)?;
+    // `plan_pipeline` may force additional co-loads (issue #193): a `by()`
+    // key over a nested-set / trace-level / child-count intrinsic needs the
+    // same co-load its filter form does, even with no such filter leaf.
+    let pipeline = plan_pipeline(
+        query,
+        &mut agg_fields,
+        &mut select_attrs,
+        &mut nested_set,
+        &mut trace_ctx,
+        &mut child_count,
+    )?;
     // A trailing `with(most_recent=true)` search hint (issue #185): keeps
     // the response's default recency ordering (most-recent first).
     let most_recent = query
@@ -1064,6 +1275,7 @@ pub fn plan_search(
         select_fields: pipeline.select_fields,
         group_by: pipeline.group_by,
         coalesce: pipeline.coalesce,
+        post_stages: pipeline.post_stages,
         most_recent,
         by_probe_sql,
     })

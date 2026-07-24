@@ -371,6 +371,30 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // Spanset `| by(span.foo)` (issue #193): grouping by an ATTRIBUTE
+        // key interns `span.foo` into the SAME `val`/`val_num` batch reads
+        // as a `select()`/field operand — the golden pins that grouping
+        // adds NO new scan shape (Phase-1 generators unchanged; the group
+        // value rides the existing index-served attr batch), and the
+        // attribute-key form has NO `by()` cardinality pre-flight probe
+        // (only `resource.service.name` admits one), so the backstop
+        // bounds it at runtime.
+        name: "spanset_by_attr",
+        q: r#"{ .a = "1" } | by(span.foo)"#,
+        distributed: false,
+    },
+    Case {
+        // Spanset `| by(rootServiceName)` (issue #193): a TRACE-LEVEL by-key
+        // resolves from the #184 trace-wide context co-load — so grouping by
+        // it FORCES that (window-free, PK-served) co-load even with no such
+        // filter leaf. The golden pins the co-load as the minimal scan the
+        // key needs (Phase-1 generators still unchanged), never a silent
+        // flat fallback.
+        name: "spanset_by_root_service",
+        q: r#"{ .a = "1" } | by(rootServiceName)"#,
+        distributed: false,
+    },
+    Case {
         // Spanset `| coalesce()` (issue #185): a Phase-2 spanset-merge
         // stage — the Phase-1 SQL is byte-identical to the plain filter
         // (regression guard; response reshaping is #193).

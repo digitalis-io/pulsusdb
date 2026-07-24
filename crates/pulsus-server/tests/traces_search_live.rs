@@ -911,6 +911,83 @@ async fn search_semantics_against_real_clickhouse() {
         "case k spss cap, body {json}"
     );
 
+    // -- (k2) issue #193: `| by(span.retries)` regroups a trace's matched
+    // spans into ONE spanSet per distinct key value, each carrying the
+    // typed group `attributes`. Trace 11's two "agg" spans differ in
+    // span.retries (3, 1) → two spanSets; the flat matched/spans view is
+    // replaced by the grouped array. -------------------------------------
+    let res = search(
+        port,
+        r#"{ name = "agg" } | by(span.retries)"#,
+        w0,
+        w1,
+        "",
+        "case k2 by",
+    );
+    let json = res.json("case k2 by");
+    let t11 = json["traces"]
+        .as_array()
+        .expect("traces")
+        .iter()
+        .find(|t| t["traceID"] == hex(&tid(11)))
+        .expect("trace 11 in the by() response");
+    let sets = t11["spanSets"].as_array().expect("spanSets array");
+    assert_eq!(
+        sets.len(),
+        2,
+        "one spanSet per distinct span.retries, body {json}"
+    );
+    let mut group_values: Vec<f64> = sets
+        .iter()
+        .map(|s| {
+            assert_eq!(s["matched"], 1, "each retries group has one matched span");
+            s["attributes"][0]["value"]["doubleValue"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("group attr doubleValue, body {json}"))
+        })
+        .collect();
+    group_values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(group_values, vec![1.0, 3.0], "the two group key values");
+    for set in sets {
+        assert_eq!(
+            set["attributes"][0]["key"], "span.retries",
+            "group attribute carries the by() key spelling"
+        );
+    }
+
+    // -- (k3) issue #193: `| by(span.retries) | coalesce()` collapses the
+    // groups back into the flat single spanSet (no per-spanSet
+    // attributes), in pipeline order. -----------------------------------
+    let res = search(
+        port,
+        r#"{ name = "agg" } | by(span.retries) | coalesce()"#,
+        w0,
+        w1,
+        "",
+        "case k3 coalesce",
+    );
+    let json = res.json("case k3 coalesce");
+    let t11 = json["traces"]
+        .as_array()
+        .expect("traces")
+        .iter()
+        .find(|t| t["traceID"] == hex(&tid(11)))
+        .expect("trace 11 in the coalesce response");
+    let sets = t11["spanSets"].as_array().expect("spanSets array");
+    assert_eq!(
+        sets.len(),
+        1,
+        "coalesce() collapses to one spanSet, body {json}"
+    );
+    assert_eq!(
+        sets[0]["matched"], 2,
+        "the collapsed spanSet unions both spans"
+    );
+    assert!(
+        sets[0].get("attributes").is_none(),
+        "the collapsed flat spanSet carries no group attributes, body {json}"
+    );
+
     // -- (l) legacy params equal their q= equivalent. ----------------------
     let legacy_path = format!(
         "/api/traces/v1/search?tags={}&minDuration=1ms&start={w0}&end={w1}",

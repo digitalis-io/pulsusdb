@@ -103,6 +103,17 @@ const ALLOWLIST: &[(&str, &str, &str, usize, &str)] = &[
      "matched_spans ref list covered by the transients envelope (ref width per matched id)"),
     ("search_eval.rs", "evaluate_batch", "Vec::with_capacity", 1,
      "summaries buffer: base charge (take x size_of<SpanSummary>) before the reservation"),
+    // ---- issue #193: by()/coalesce() response reshaping ------------------
+    ("search_eval.rs", "new", "HashSet::", 1,
+     "GroupCardinalityCounter::new: the empty distinct-group set (HashSet::new allocates nothing; each distinct tuple is charged group_tuple_bytes in observe() BEFORE insert, released on the success path)"),
+    ("search_eval.rs", "resolve_group_tuple", "Vec::with_capacity", 1,
+     "one span's group-key tuple: the Vec slot (keys.len x size_of<GroupValue>) charged into the transient partition total before the reservation; string values charge .len before each clone"),
+    ("search_eval.rs", "build_span_set_groups", "Vec::new", 2,
+     "the distinct-tuple order vec + the per-bucket members outer vec: both covered by the n x PER_SPAN_GROUP_TRANSIENT_BYTES envelope charged before the partition loop, released when the retained groups are built"),
+    ("search_eval.rs", "build_span_set_groups", "HashMap::", 1,
+     "the tuple->bucket index map: covered by the same PER_SPAN_GROUP_TRANSIENT_BYTES envelope (per-entry key header + value + overhead) + the map key's string payload charged before insert; released with the transient partition"),
+    ("search_eval.rs", "build_span_set_groups", "Vec::with_capacity", 3,
+     "retained groups vec (overhead + n x size_of<SpanSetGroup> charged before) + per-group attributes vec (overhead + keys.len slots charged before) + per-group spans vec (take x size_of<SpanSummary> charged before); together == groups_retained_bytes"),
     // ---- issue #172 + #183: structural relation intermediates -----------
     ("search_eval.rs", "rel_descendants", "HashMap::", 1,
      "parent->children adjacency map (incl. its per-entry child Vecs via or_default): spans x DESCENDANT_TRANSIENT_BYTES envelope (key + Vec header + child slot with doubling slack) charged before allocation, released after the walk"),
