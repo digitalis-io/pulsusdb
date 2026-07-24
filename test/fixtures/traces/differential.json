@@ -174,6 +174,20 @@
       "attr_type": "mixed",
       "mode": "gated",
       "q": "{ resource.run_id = \"{R}\" && (resource.env = \"prod\" || span.http.status_code = 200) && (kind = consumer || span.cache_hit = true) }"
+    },
+    {
+      "case_id": "by_name",
+      "construct": "by() spanset grouping (response reshaping; matched trace set unchanged)",
+      "attr_type": "intrinsic",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && name = \"charge-card\" } | by(name)"
+    },
+    {
+      "case_id": "by_name_coalesce",
+      "construct": "by() | coalesce() (spanSets collapse back to one; matched trace set unchanged)",
+      "attr_type": "intrinsic",
+      "mode": "gated",
+      "q": "{ resource.run_id = \"{R}\" && name = \"charge-card\" } | by(name) | coalesce()"
     }
   ],
   "informational": {

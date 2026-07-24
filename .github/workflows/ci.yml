@@ -247,6 +247,20 @@ jobs:
           PULSUSDB_COMPARE_OTLP_URL: "http://localhost:4318"
         run: cargo test -p pulsus-read --test compare_value_differential
 
+      # Issue #193: the by()/coalesce() grouped-response VALUE differential,
+      # ENFORCED (non-skipped). Reuses the SAME digest-pinned tempo v3.0.2
+      # oracle: pushes fixture spans to :4318, then asserts grouped /
+      # coalesced spanSet-array parity (per-trace group-tuple set + per-group
+      # span-id membership + attributes typing) against PulsusDB's real
+      # search executor over this job's ClickHouse 24.8 on 19123.
+      - name: TraceQL Tempo differential leg (by()/coalesce grouping)
+        env:
+          PULSUS_TEST_CLICKHOUSE: "1"
+          PULSUS_TEST_CH_HTTP_PORT: "19123"
+          PULSUSDB_GROUPING_DIFF_URL: "http://localhost:13200"
+          PULSUSDB_GROUPING_OTLP_URL: "http://localhost:4318"
+        run: cargo test -p pulsus-read --test traces_search_grouping_differential
+
       - name: Stop Tempo differential oracle
         if: always()
         run: docker rm -f pulsus-tempo-diff || true

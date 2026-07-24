@@ -2537,4 +2537,130 @@ async fn two_phase_search_explain_and_budget_gates() {
         vec![0x31],
         "an uppercase-hex link:traceID literal must resolve the lowercase-hex-stored span P"
     );
+
+    // ---- AC5 (issue #193): a `by()` query adds NO new scan --------------
+    // Grouping is a client-side post-pass over already-hydrated spans, so
+    // the Phase-1 generator SQL and its EXPLAIN granule selection are
+    // byte-identical to the equivalent ungrouped plan; the per-group
+    // retained-bytes accounting means the grouped search returns 200 with
+    // populated `groups` (never a budget breach on the healthy corpus).
+    let ungrouped = plan_for(&engine, r#"{ .env = "prod" }"#, base, now);
+    let grouped = plan_for(
+        &engine,
+        r#"{ .env = "prod" } | by(resource.service.name)"#,
+        base,
+        now,
+    );
+    assert_eq!(
+        grouped.generator_sqls, ungrouped.generator_sqls,
+        "by() must not change the Phase-1 generator SQL"
+    );
+    let raw_ungrouped = explain_raw(&client, &ungrouped.generator_sqls[0]).await;
+    let raw_grouped = explain_raw(&client, &grouped.generator_sqls[0]).await;
+    assert_eq!(
+        primary_key_granules(&raw_ungrouped),
+        primary_key_granules(&raw_grouped),
+        "by() reuses the SAME granules as the ungrouped plan — no new granule reads:\n\
+         ungrouped:\n{raw_ungrouped}\ngrouped:\n{raw_grouped}"
+    );
+    assert!(
+        grouped.by_probe_sql().is_some(),
+        "the resource.service.name by() form carries the cardinality pre-flight probe"
+    );
+    // Grouping is orthogonal to partiality: the grouped and ungrouped
+    // plans share the same top-K candidate stream, so their `partial`
+    // OUTCOME is identical — that identity, not an absolute value, is the
+    // grouping invariant (a match-all over the corpus is genuinely partial
+    // at limit 20 on BOTH). The new gate is that per-group spanSets come
+    // back (the per-group retained accounting succeeded).
+    let grouped_out = engine
+        .search(&grouped)
+        .await
+        .expect("grouped search executes");
+    let ungrouped_out = engine
+        .search(&ungrouped)
+        .await
+        .expect("ungrouped search executes");
+    assert_eq!(
+        grouped_out.partial, ungrouped_out.partial,
+        "by() must not change the partial outcome — it adds no scan"
+    );
+    assert!(
+        !grouped_out.traces.is_empty()
+            && grouped_out
+                .traces
+                .iter()
+                .all(|t| t.groups.as_ref().is_some_and(|gs| gs.iter().all(|g| g
+                    .attributes
+                    .first()
+                    .is_some_and(|(k, _)| k == "by(resource.service.name)")))),
+        "every by(resource.service.name) trace carries per-group spanSets keyed on the by-key"
+    );
+
+    // ---- AC9 (issue #193): cross-batch long-string group keys -----------
+    // N > BATCH_TRACES single-span traces, each with a UNIQUE multi-KB
+    // `name` (the group key), so `by(name)` produces N distinct groups
+    // spanning >= 2 Phase-2 batches — exercising the GroupCardinalityCounter's
+    // cross-batch accumulation and the per-group retained accounting LIVE
+    // (max_series stays far above N, so the cardinality cap never fires).
+    // The exact charge-before-allocate byte-budget TRIP is proven
+    // hermetically (search_eval::tests::multi_batch_long_string_group_keys_
+    // trip_the_cumulative_byte_budget): HYDRATION_BYTE_BUDGET is a
+    // non-configurable const, so a live "tight budget" is not expressible.
+    const AC9_TRACES: u64 = 40; // > BATCH_TRACES (32) => >= 2 phase-2 batches
+    const AC9_NAME_BYTES: u64 = 4_000; // multi-KB, under the 8192-byte hydration cap
+    let ac9_win = base + WINDOW_NS / 2;
+    exec(
+        &client,
+        &format!(
+            "INSERT INTO {DB}.trace_spans \
+             (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+              status_code, kind, payload_type, payload) \
+             SELECT \
+               toFixedString(unhex(leftPad(lower(hex(number + 8000000)), 32, '0')), 16), \
+               toFixedString(unhex(leftPad(lower(hex(number + 8000000)), 16, '0')), 8), \
+               toFixedString(unhex('0000000000000000'), 8), \
+               concat('ac9-', toString(number), '-', repeat('x', {AC9_NAME_BYTES})), \
+               'svc', {ac9_win} + toInt64(number) * 1000000, 1000, 0, 1, 1, 'p' \
+             FROM numbers({AC9_TRACES})"
+        ),
+    )
+    .await;
+    let ac9_plan = plan_for_with(
+        &engine,
+        r#"{ name =~ "ac9-.*" } | by(name)"#,
+        base,
+        now,
+        100,
+        10,
+    );
+    let ac9_out = engine
+        .search(&ac9_plan)
+        .await
+        .expect("ac9 grouped search executes");
+    assert!(
+        !ac9_out.partial,
+        "the cross-batch long-string grouped search is not partial"
+    );
+    assert_eq!(
+        ac9_out.traces.len() as u64,
+        AC9_TRACES,
+        "every long-name trace is returned across >= 2 phase-2 batches"
+    );
+    for t in &ac9_out.traces {
+        let groups = t
+            .groups
+            .as_ref()
+            .expect("by(name) produces grouped spanSets");
+        assert_eq!(groups.len(), 1, "each single-span trace has one name group");
+        let (key, value) = &groups[0].attributes[0];
+        assert_eq!(key, "by(name)");
+        match value {
+            pulsus_read::GroupValue::Str(v) => assert!(
+                v.starts_with("ac9-") && v.len() as u64 >= AC9_NAME_BYTES,
+                "the group key is the full multi-KB name"
+            ),
+            other => panic!("a name group value must be a string, got {other:?}"),
+        }
+    }
 }

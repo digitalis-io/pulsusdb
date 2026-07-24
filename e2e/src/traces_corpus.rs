@@ -64,6 +64,14 @@ pub const CASE_IDS: &[&str] = &[
     "avg_duration_gt",
     "select_status",
     "nested_bool",
+    // Issue #193: `by()` / `coalesce()` reshape the RESPONSE (grouped
+    // spanSet arrays), never the matched TRACE set — so both share
+    // name_eq's expectation. The grouped/coalesced spanSet-array VALUE
+    // parity is pinned by the dedicated schema-it grouping differential
+    // (traces_search_grouping_differential); here they gate that the
+    // reshaped response keeps trace-ID-set + validity parity end-to-end.
+    "by_name",
+    "by_name_coalesce",
 ];
 
 /// A typed OTLP attribute value (plan v2 delta 1): rendered to the
@@ -388,6 +396,10 @@ fn construction_matches(t: usize) -> BTreeSet<&'static str> {
     tag("avg_duration_gt", avg_duration_exceeds(t));
     tag("select_status", is_error(t));
     tag("nested_bool", t % 5 < 2); // prod traces (derivation: fixture doc)
+    // Issue #193: identical filter to name_eq — by()/coalesce() reshape
+    // the response, not the matched trace set.
+    tag("by_name", t % 4 == 1);
+    tag("by_name_coalesce", t % 4 == 1);
     m
 }
 
@@ -690,6 +702,8 @@ pub fn naive_matches(case_id: &str, t: &GeneratedTrace, run_id: &str) -> bool {
         // key entirely match, as do differing values.
         "neg_attr_missing_key" => spans().any(|s| res_str(s, "env") != Some("prod")),
         "name_eq" => spans().any(|s| s.name == "charge-card"),
+        // Issue #193: by()/coalesce() do not change the matched trace set.
+        "by_name" | "by_name_coalesce" => spans().any(|s| s.name == "charge-card"),
         "status_error" => spans().any(|s| s.status_code == 2),
         "kind_consumer" => spans().any(|s| s.kind == 5),
         "duration_gt" => spans().any(|s| s.duration_ns > 800 * MS),

@@ -65,10 +65,11 @@ use pulsus_traceql::{
 use super::exec::ByteBudget;
 use super::filter::NestedSetField;
 use super::search_plan::{
-    AggSource, PhysicalEval, PhysicalSelect, PlannedArith, PlannedFilter, PlannedLeafEval,
-    PlannedOperand, SearchPlan, SelectField, TraceCtxEval,
+    AggSource, GroupKeyResolver, PhysicalEval, PhysicalSelect, PlannedArith, PlannedFilter,
+    PlannedGroupKey, PlannedLeafEval, PlannedOperand, SearchPlan, SelectField, SpansetStage,
+    TraceCtxEval,
 };
-use crate::logql::error::ReadError;
+use crate::logql::error::{ReadError, TooBroadReason};
 
 /// One hydrated span (physical summary columns only — never payloads).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +195,105 @@ impl SpanSummary {
     }
 }
 
+/// The canonical NaN bit pattern all NaN group keys collapse onto (issue
+/// #193 R2-F2): grouping is value-parity-correct, not sensitive to NaN
+/// payloads or the sign of zero.
+const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
+/// Canonicalizes an `f64` to the bit pattern a [`GroupValue::Double`]
+/// stores (issue #193 R2-F2): every NaN collapses to one group, and
+/// `-0.0` folds to `+0.0`, so `Eq`/`Hash` grouping matches the reference's
+/// value semantics. The differential is the authority; this is the
+/// mechanism.
+pub fn canonical_double_bits(f: f64) -> u64 {
+    if f.is_nan() {
+        CANONICAL_NAN_BITS
+    } else if f == 0.0 {
+        // Folds -0.0 → +0.0 (0.0 == -0.0 is true).
+        0.0_f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
+/// One `by()` group-key value, typed to the reference's
+/// `value:{stringValue|intValue|doubleValue|boolValue}` rendering (issue
+/// #193). The float variant stores [`canonical_double_bits`] so the derived
+/// `Eq`/`Hash` hold and `-0.0`/NaN group as the reference groups them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GroupValue {
+    Str(String),
+    Int(i64),
+    /// A double group key as its [`canonical_double_bits`] pattern; render
+    /// via `f64::from_bits`.
+    Double(u64),
+    Bool(bool),
+    /// The span carried no value for this key (grouped into the nil bucket).
+    Nil,
+}
+
+impl GroupValue {
+    /// The owned heap payload beyond the enum's own `size_of` slot: only a
+    /// `Str` carries bytes (charged/released via `.len()`, the module-wide
+    /// payload convention). Numeric/bool/nil add nothing.
+    pub(crate) fn payload_bytes(&self) -> usize {
+        match self {
+            GroupValue::Str(s) => s.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// One response spanSet produced by a `by()` regroup (issue #193): the
+/// resolved group-key `attributes` (in `by()` order), the total matched
+/// span count IN THIS GROUP (pre-`spss`), and the `spss`-capped per-group
+/// summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanSetGroup {
+    pub attributes: Vec<(String, GroupValue)>,
+    pub matched: u32,
+    pub spans: Vec<SpanSummary>,
+}
+
+impl SpanSetGroup {
+    /// This group's retained heap — accounted the SAME way [`TraceMatch`]
+    /// accounts its own `spans`, plus the `attributes` (display + value
+    /// payload via `.len()`, `.capacity()` for the enclosing `Vec` slot).
+    /// [`build_span_set_groups`] charges exactly these amounts before each
+    /// allocation, so the heap-evict / coalesce-collapse release is exact.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        super::exec::RETAINED_ENTRY_OVERHEAD
+            + self.attributes.capacity() * std::mem::size_of::<(String, GroupValue)>()
+            + self
+                .attributes
+                .iter()
+                .map(|(display, value)| display.len() + value.payload_bytes())
+                .sum::<usize>()
+            + self.spans.capacity() * std::mem::size_of::<SpanSummary>()
+            + self
+                .spans
+                .iter()
+                .map(SpanSummary::heap_payload_bytes)
+                .sum::<usize>()
+    }
+}
+
+/// The retained heap of a `by()`-produced group vector (issue #193): the
+/// enclosing `Vec` slot + overhead plus each group's [`SpanSetGroup::retained_bytes`].
+/// This is the exact amount [`build_span_set_groups`] charges and the
+/// amount a trailing `coalesce()` collapse releases.
+pub(crate) fn groups_retained_bytes(groups: &[SpanSetGroup]) -> usize {
+    // `len()` == the enclosing `Vec`'s capacity by construction
+    // ([`build_span_set_groups`] reserves `Vec::with_capacity(n)` and pushes
+    // exactly `n`), so this matches the charge and the release exactly.
+    super::exec::RETAINED_ENTRY_OVERHEAD
+        + std::mem::size_of_val(groups)
+        + groups
+            .iter()
+            .map(SpanSetGroup::retained_bytes)
+            .sum::<usize>()
+}
+
 /// One exactly-matched trace, ready for the engine's result heap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceMatch {
@@ -205,13 +305,18 @@ pub struct TraceMatch {
     pub matched: u32,
     /// `spss`-capped summaries, ascending `(start_ns, span_id)`.
     pub spans: Vec<SpanSummary>,
+    /// The `by()`-regrouped spanSets (issue #193): `Some` iff a `by()`
+    /// stage is active and not collapsed by a trailing `coalesce()`; the
+    /// default (`None`) keeps the flat response byte-identical.
+    pub groups: Option<Vec<SpanSetGroup>>,
 }
 
 impl TraceMatch {
     /// Capacity-based retained cost — byte-for-byte equal to what
     /// [`evaluate_batch`] charged while building this match (asserted by
     /// the `charges_equal_retained_bytes_exactly` unit test), so the
-    /// engine's heap-evict release keeps the budget exact.
+    /// engine's heap-evict release keeps the budget exact. Includes the
+    /// `by()` groups (issue #193) via [`groups_retained_bytes`].
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<TraceMatch>()
             + super::exec::RETAINED_ENTRY_OVERHEAD
@@ -221,6 +326,89 @@ impl TraceMatch {
                 .iter()
                 .map(SpanSummary::heap_payload_bytes)
                 .sum::<usize>()
+            + self
+                .groups
+                .as_deref()
+                .map(groups_retained_bytes)
+                .unwrap_or(0)
+    }
+}
+
+/// A `by()` group-key value tuple (issue #193) — one [`GroupValue`] per
+/// `by()` key, in query order.
+pub(crate) type GroupTuple = Vec<GroupValue>;
+
+/// The fixed per-tuple overhead of the [`GroupCardinalityCounter`]'s
+/// `HashSet` — the set slot (the tuple `Vec` header) + the
+/// container-overhead envelope. The variable string payload is charged on
+/// top per tuple (issue #193 R4-F1: `.len()` for payload, `.capacity()`
+/// for slots).
+const GROUP_TUPLE_ENTRY_BYTES: usize =
+    std::mem::size_of::<GroupTuple>() + super::exec::RETAINED_ENTRY_OVERHEAD;
+
+/// The retained cost of one distinct group-key tuple in the cardinality
+/// counter (issue #193 R4-F1): the fixed `HashSet` slot / per-element
+/// overhead PLUS the owned `GroupValue::Str` payloads, via the SAME
+/// `.len()`-based method [`SpanSetGroup::retained_bytes`] uses for its
+/// value strings — so the two accounting sites provably cannot drift.
+pub(crate) fn group_tuple_bytes(tuple: &GroupTuple) -> usize {
+    GROUP_TUPLE_ENTRY_BYTES
+        + tuple.capacity() * std::mem::size_of::<GroupValue>()
+        + tuple.iter().map(GroupValue::payload_bytes).sum::<usize>()
+}
+
+/// The distinct-group cardinality cap (issue #193 R2-F1): a cross-batch,
+/// cross-trace running accumulator threaded into [`evaluate_batch`] and
+/// enforced INSIDE [`build_span_set_groups`] at grouping-PRODUCTION time —
+/// before any trailing `coalesce()` collapse and before winner eviction,
+/// so `by()|coalesce()` and fan-out concentrated in limit-evicted traces
+/// are bounded by the SAME static `422 TraceSearchSeriesCap` as bare
+/// `by()`. Each distinct tuple's ACTUAL heap ([`group_tuple_bytes`]) is
+/// charged BEFORE it is retained; a repeat tuple charges nothing (dedup).
+/// The counter persists for the whole request (it must, to keep enforcing
+/// across batches) and its charge is released on the success path by
+/// [`GroupCardinalityCounter::release`].
+pub(crate) struct GroupCardinalityCounter {
+    seen: HashSet<GroupTuple>,
+    cap: u64,
+    charged: usize,
+}
+
+impl GroupCardinalityCounter {
+    pub(crate) fn new(cap: u64) -> Self {
+        GroupCardinalityCounter {
+            seen: HashSet::new(),
+            cap,
+            charged: 0,
+        }
+    }
+
+    /// Observes one distinct group tuple: charges its actual retained
+    /// bytes BEFORE retaining it, then trips the `422` the moment the
+    /// distinct count exceeds `cap`. A tuple already seen charges nothing.
+    fn observe(&mut self, tuple: &GroupTuple, budget: &mut ByteBudget) -> Result<(), ReadError> {
+        if self.seen.contains(tuple) {
+            return Ok(());
+        }
+        let bytes = group_tuple_bytes(tuple);
+        budget.charge(bytes)?;
+        self.charged += bytes;
+        self.seen.insert(tuple.clone());
+        if self.seen.len() as u64 > self.cap {
+            return Err(ReadError::QueryTooBroad(
+                TooBroadReason::TraceSearchSeriesCap {
+                    count: self.seen.len() as u64,
+                    cap: self.cap,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Releases the counter's whole retained charge (success-path only;
+    /// on an error the request budget dies whole).
+    pub(crate) fn release(&self, budget: &mut ByteBudget) {
+        budget.release(self.charged);
     }
 }
 
@@ -1424,6 +1612,360 @@ fn build_summary(
     })
 }
 
+/// Per-span transient partition cost for [`build_span_set_groups`] (issue
+/// #193): the `tuple → bucket` map entry, its distinct-tuple `order` slot,
+/// the `members` outer `Vec` slot, and one member-index slot. An
+/// upper-bound (every span a distinct group) charged before the partition
+/// allocations; the variable string payloads are charged on top and the
+/// whole envelope is released when the retained groups are built.
+const PER_SPAN_GROUP_TRANSIENT_BYTES: usize = std::mem::size_of::<GroupTuple>()
+    + std::mem::size_of::<usize>()
+    + super::exec::RETAINED_ENTRY_OVERHEAD
+    + std::mem::size_of::<GroupTuple>()
+    + std::mem::size_of::<Vec<usize>>()
+    + std::mem::size_of::<usize>();
+
+/// Charges `bytes` against `budget` AND records them in the caller's
+/// running transient total, so the exact amount charged is released
+/// wholesale when the transient partition dies.
+fn charge_transient(
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+    bytes: usize,
+) -> Result<(), ReadError> {
+    budget.charge(bytes)?;
+    *transient += bytes;
+    Ok(())
+}
+
+/// The owned string payload of a group tuple (the `.len()`-based payload
+/// convention; numeric/bool/nil values add nothing).
+fn tuple_string_payload(tuple: &GroupTuple) -> usize {
+    tuple.iter().map(GroupValue::payload_bytes).sum()
+}
+
+/// Charges a string's `.len()` into the transient total (before the clone)
+/// and returns it as a [`GroupValue::Str`].
+fn charged_str(
+    s: &str,
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+) -> Result<GroupValue, ReadError> {
+    charge_transient(budget, transient, s.len())?;
+    Ok(GroupValue::Str(s.to_string()))
+}
+
+/// Go's `time.Duration.String()` fractional-part formatter: emits up to
+/// `prec` fractional digits (trailing zeros trimmed) as `".xxx"` (empty if
+/// all zero) and returns the integer part `u / 10^prec`.
+fn go_duration_frac(mut u: u128, prec: u32) -> (String, u128) {
+    let mut digits: Vec<u8> = Vec::new();
+    let mut printing = false;
+    for _ in 0..prec {
+        let digit = (u % 10) as u8;
+        printing = printing || digit != 0;
+        if printing {
+            digits.push(b'0' + digit);
+        }
+        u /= 10;
+    }
+    let frac = if digits.is_empty() {
+        String::new()
+    } else {
+        digits.reverse();
+        let mut s = String::from(".");
+        // Safety: `digits` holds only ASCII '0'..='9' by construction.
+        s.push_str(std::str::from_utf8(&digits).expect("ascii digits"));
+        s
+    };
+    (frac, u)
+}
+
+/// Renders a nanosecond duration as Go's `time.Duration.String()` — the
+/// form Tempo v3.0.2 uses for a TraceQL `duration`/`traceDuration` group
+/// value's `stringValue` (verified live via the grouping differential):
+/// sub-second uses `ns`/`µs`/`ms` with a trimmed fraction, `>= 1s` uses
+/// `[h][m]s` with a trimmed fractional-seconds part (`1.5s`, `1m30s`,
+/// `1h1m1s`, `500µs`, `0s`).
+fn go_duration_string(nanos: i64) -> String {
+    if nanos == 0 {
+        return "0s".to_string();
+    }
+    let neg = nanos < 0;
+    let u0: u128 = (nanos as i128).unsigned_abs();
+    const SECOND: u128 = 1_000_000_000;
+    let s = if u0 < SECOND {
+        let (unit, prec): (&str, u32) = if u0 < 1_000 {
+            ("ns", 0)
+        } else if u0 < 1_000_000 {
+            ("µs", 3)
+        } else {
+            ("ms", 6)
+        };
+        let (frac, int_part) = go_duration_frac(u0, prec);
+        format!("{int_part}{frac}{unit}")
+    } else {
+        let (frac, secs) = go_duration_frac(u0, 9);
+        let mut out = format!("{}{frac}s", secs % 60);
+        let mins = secs / 60;
+        if mins > 0 {
+            out = format!("{}m{out}", mins % 60);
+            let hours = mins / 60;
+            if hours > 0 {
+                out = format!("{hours}h{out}");
+            }
+        }
+        out
+    };
+    if neg { format!("-{s}") } else { s }
+}
+
+/// Resolves one `by()` key's typed value for a hydrated span (issue #193),
+/// covering EVERY resolvable key form — physical columns, the #181
+/// nested-set / #184 trace-level / #192 instrumentation intrinsics, and
+/// attributes — from the SAME per-trace evaluation environment the filters
+/// read (no new scan). String clones charge their `.len()` into the
+/// transient total BEFORE the clone; numeric / absent values allocate
+/// nothing.
+fn resolve_group_value(
+    resolver: &GroupKeyResolver,
+    env: &EvalEnv<'_>,
+    span: &HydratedSpan,
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+) -> Result<GroupValue, ReadError> {
+    let trace_id = env.ctx.trace_id;
+    Ok(match resolver {
+        GroupKeyResolver::Physical(PhysicalSelect::Service) => {
+            charged_str(&span.service, budget, transient)?
+        }
+        GroupKeyResolver::Physical(PhysicalSelect::Name) => {
+            charged_str(&span.name, budget, transient)?
+        }
+        // `duration`/`status`/`kind` render by their TraceQL TYPE, matching
+        // Tempo v3.0.2 (verified live via the grouping differential): a
+        // `duration` value is Go's `time.Duration.String()` form, and
+        // `status`/`kind` are their lowercase keyword enums — all
+        // `stringValue`, NOT numeric.
+        GroupKeyResolver::Physical(PhysicalSelect::DurationNs) => {
+            charged_str(&go_duration_string(span.duration_ns), budget, transient)?
+        }
+        GroupKeyResolver::Physical(PhysicalSelect::Status) => {
+            charged_str(status_keyword(span.status_code), budget, transient)?
+        }
+        GroupKeyResolver::Physical(PhysicalSelect::Kind) => {
+            charged_str(kind_keyword(span.kind), budget, transient)?
+        }
+        GroupKeyResolver::StatusMessage => charged_str(&span.status_message, budget, transient)?,
+        GroupKeyResolver::InstrumentationName => charged_str(&span.scope_name, budget, transient)?,
+        GroupKeyResolver::InstrumentationVersion => {
+            charged_str(&span.scope_version, budget, transient)?
+        }
+        GroupKeyResolver::SpanIdHex => {
+            let mut buf = [0u8; 16];
+            charged_str(hex_into(&span.span_id, &mut buf), budget, transient)?
+        }
+        GroupKeyResolver::ParentIdHex => {
+            let mut buf = [0u8; 16];
+            charged_str(hex_into(&span.parent_id, &mut buf), budget, transient)?
+        }
+        GroupKeyResolver::TraceIdHex => {
+            let mut buf = [0u8; 32];
+            charged_str(hex_into(&trace_id, &mut buf), budget, transient)?
+        }
+        // The numbering covers every hydrated span, so the lookup succeeds
+        // whenever the plan forced nested-set computation (index is `Some`);
+        // an absent index/entry is `Nil`.
+        GroupKeyResolver::NestedSet(field) => env
+            .nested_set
+            .and_then(|idx| idx.get(&span.span_id))
+            .map(|v| GroupValue::Int(v.value(*field)))
+            .unwrap_or(GroupValue::Nil),
+        // `traceDuration` is a duration type too → the same Go-duration
+        // `stringValue` form as `duration`.
+        GroupKeyResolver::TraceDuration => match env.ctx.info {
+            Some(i) => charged_str(
+                &go_duration_string(i.trace_end_ns.saturating_sub(i.trace_start_ns)),
+                budget,
+                transient,
+            )?,
+            None => GroupValue::Nil,
+        },
+        GroupKeyResolver::RootName => match env.ctx.info {
+            Some(i) => charged_str(&i.root_name, budget, transient)?,
+            None => GroupValue::Nil,
+        },
+        GroupKeyResolver::RootServiceName => match env.ctx.info {
+            Some(i) => charged_str(&i.root_service, budget, transient)?,
+            None => GroupValue::Nil,
+        },
+        GroupKeyResolver::ChildCount => GroupValue::Int(
+            env.ctx
+                .child_counts
+                .get(&(trace_id, span.span_id))
+                .copied()
+                .unwrap_or(0) as i64,
+        ),
+        GroupKeyResolver::Attr { str_idx, num_idx } => {
+            let key = (trace_id, span.span_id);
+            if let Some(v) = env.attrs.agg_values[*num_idx].get(&key) {
+                GroupValue::Double(canonical_double_bits(*v))
+            } else if let Some(s) = env.attrs.select_values[*str_idx].get(&key) {
+                charged_str(s, budget, transient)?
+            } else {
+                GroupValue::Nil
+            }
+        }
+    })
+}
+
+/// Resolves one span's full group-key tuple (issue #193). The tuple `Vec`
+/// slot is charged into the transient total before allocation.
+fn resolve_group_tuple(
+    keys: &[PlannedGroupKey],
+    env: &EvalEnv<'_>,
+    span: &HydratedSpan,
+    budget: &mut ByteBudget,
+    transient: &mut usize,
+) -> Result<GroupTuple, ReadError> {
+    charge_transient(
+        budget,
+        transient,
+        keys.len() * std::mem::size_of::<GroupValue>(),
+    )?;
+    let mut tuple = Vec::with_capacity(keys.len());
+    for key in keys {
+        tuple.push(resolve_group_value(
+            &key.resolver,
+            env,
+            span,
+            budget,
+            transient,
+        )?);
+    }
+    Ok(tuple)
+}
+
+/// Regroups one trace's FULL (pre-`spss`) matched span set into one
+/// [`SpanSetGroup`] per distinct `by()` key-tuple (issue #193), in
+/// first-appearance order, applying `spss` PER GROUP (matching the
+/// reference — regrouping the already-`spss`-capped flat spans would drop
+/// members). Enforces the distinct-group `422` via `counter` at
+/// production time (before any trailing `coalesce()` collapse). Every
+/// retained byte is charged BEFORE allocation so [`groups_retained_bytes`]
+/// releases exactly what was charged; the partition scaffolding is charged
+/// transiently and released here.
+fn build_span_set_groups(
+    plan: &SearchPlan,
+    keys: &[PlannedGroupKey],
+    env: &EvalEnv<'_>,
+    matched_spans: &[&HydratedSpan],
+    counter: &mut GroupCardinalityCounter,
+    budget: &mut ByteBudget,
+) -> Result<Vec<SpanSetGroup>, ReadError> {
+    let trace_id = env.ctx.trace_id;
+    let mut transient = 0usize;
+    charge_transient(
+        budget,
+        &mut transient,
+        matched_spans.len() * PER_SPAN_GROUP_TRANSIENT_BYTES,
+    )?;
+    // Distinct tuples in first-appearance order + their member indices.
+    let mut order: Vec<GroupTuple> = Vec::new();
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    let mut index: HashMap<GroupTuple, usize> = HashMap::new();
+    for (i, span) in matched_spans.iter().enumerate() {
+        let tuple = resolve_group_tuple(keys, env, span, budget, &mut transient)?;
+        if let Some(&bucket) = index.get(&tuple) {
+            members[bucket].push(i);
+        } else {
+            // Charge + cap-check the distinct tuple (persisted) BEFORE it is
+            // retained; then the map's owned key copy (transient).
+            counter.observe(&tuple, budget)?;
+            charge_transient(budget, &mut transient, tuple_string_payload(&tuple))?;
+            index.insert(tuple.clone(), order.len());
+            members.push(vec![i]);
+            order.push(tuple);
+        }
+    }
+    // Retained groups: charge the enclosing Vec slot before the reservation.
+    budget.charge(
+        super::exec::RETAINED_ENTRY_OVERHEAD + order.len() * std::mem::size_of::<SpanSetGroup>(),
+    )?;
+    let mut groups = Vec::with_capacity(order.len());
+    for (tuple, member_idxs) in order.iter().zip(members.iter()) {
+        let take = member_idxs.len().min(plan.spss as usize);
+        // Per-group container: overhead + attribute slots + span slots.
+        budget.charge(
+            super::exec::RETAINED_ENTRY_OVERHEAD
+                + keys.len() * std::mem::size_of::<(String, GroupValue)>()
+                + take * std::mem::size_of::<SpanSummary>(),
+        )?;
+        let mut attributes = Vec::with_capacity(keys.len());
+        for (key, value) in keys.iter().zip(tuple.iter()) {
+            budget.charge(key.display.len() + value.payload_bytes())?;
+            attributes.push((key.display.clone(), value.clone()));
+        }
+        let mut spans = Vec::with_capacity(take);
+        for &idx in member_idxs.iter().take(take) {
+            spans.push(build_summary(
+                plan,
+                trace_id,
+                matched_spans[idx],
+                env.attrs,
+                budget,
+            )?);
+        }
+        groups.push(SpanSetGroup {
+            attributes,
+            matched: member_idxs.len() as u32,
+            spans,
+        });
+    }
+    drop(index);
+    budget.release(transient);
+    Ok(groups)
+}
+
+/// Applies the ordered `by()`/`coalesce()` post-stages (issue #193) to one
+/// trace's flat matched set, returning the final `groups` layer. `By`
+/// regroups (enforcing the cardinality cap at production time); a trailing
+/// `Coalesce` collapses the groups back to the flat spanSet (releasing
+/// their retained charge — they are no longer retained); a `Coalesce`
+/// with no active grouping is a no-op.
+fn apply_post_stages(
+    plan: &SearchPlan,
+    env: &EvalEnv<'_>,
+    matched_spans: &[&HydratedSpan],
+    counter: &mut GroupCardinalityCounter,
+    budget: &mut ByteBudget,
+) -> Result<Option<Vec<SpanSetGroup>>, ReadError> {
+    let mut groups: Option<Vec<SpanSetGroup>> = None;
+    for stage in plan.post_stages() {
+        match stage {
+            SpansetStage::By(keys) => {
+                if let Some(previous) = groups.take() {
+                    budget.release(groups_retained_bytes(&previous));
+                }
+                groups = Some(build_span_set_groups(
+                    plan,
+                    keys,
+                    env,
+                    matched_spans,
+                    counter,
+                    budget,
+                )?);
+            }
+            SpansetStage::Coalesce => {
+                if let Some(collapsed) = groups.take() {
+                    budget.release(groups_retained_bytes(&collapsed));
+                }
+            }
+        }
+    }
+    Ok(groups)
+}
+
 /// Evaluates one hydrated batch → the exactly-matched traces, each as a
 /// response summary. Batch inputs are discarded by the caller afterwards
 /// (only these summaries survive into the result heap).
@@ -1442,6 +1984,7 @@ pub(crate) fn evaluate_batch(
     plan: &SearchPlan,
     traces: &[TraceSpans],
     attrs: &BatchAttrs,
+    counter: &mut GroupCardinalityCounter,
     budget: &mut ByteBudget,
 ) -> Result<Vec<TraceMatch>, ReadError> {
     let mut out = Vec::new();
@@ -1471,10 +2014,14 @@ pub(crate) fn evaluate_batch(
         };
         let mut filter_idx = 0;
         let spanset = eval_spanset(&plan.spanset, plan, &mut filter_idx, trace, &env, budget)?;
-        if let Some(charged) = nested_set {
-            release_nested_set(charged, budget);
-        }
+        // The nested-set numbering (issue #181) now also feeds `by()`
+        // grouping over the nested-set intrinsics (issue #193), so it is
+        // held until AFTER `apply_post_stages` and released on every exit
+        // path — never before grouping can read it.
         let Some(matched) = spanset else {
+            if let Some(charged) = nested_set {
+                release_nested_set(charged, budget);
+            }
             continue;
         };
         // Post-match transients (per-aggregate `Vec<f64>` buffers + the
@@ -1498,6 +2045,9 @@ pub(crate) fn evaluate_batch(
             if !pass {
                 budget.release(transients);
                 release_set(matched, budget);
+                if let Some(charged) = nested_set {
+                    release_nested_set(charged, budget);
+                }
                 continue 'traces;
             }
         }
@@ -1527,6 +2077,16 @@ pub(crate) fn evaluate_batch(
             summaries.push(build_summary(plan, trace.trace_id, span, attrs, budget)?);
         }
         let matched_total = matched_spans.len() as u32;
+        // Issue #193: reshape into `by()`/`coalesce()` spanSets from the
+        // FULL (pre-`spss`) matched set. `None` (no post-stages, or a
+        // trailing `coalesce()` collapse) keeps the flat response
+        // byte-identical.
+        let groups = apply_post_stages(plan, &env, &matched_spans, counter, budget)?;
+        // `env`'s borrow of `nested_set` has ended (its last use was
+        // `apply_post_stages`), so the numbering can now be released.
+        if let Some(charged) = nested_set {
+            release_nested_set(charged, budget);
+        }
         drop(matched_spans);
         budget.release(transients);
         release_set(matched, budget);
@@ -1535,6 +2095,7 @@ pub(crate) fn evaluate_batch(
             sort_key,
             matched: matched_total,
             spans: summaries,
+            groups,
         });
     }
     Ok(out)
@@ -1564,6 +2125,28 @@ mod tests {
                 },
                 max_candidates: 100,
                 max_series: 1_000,
+                distributed: false,
+            },
+        )
+        .expect("plan")
+    }
+
+    fn plan_cap(q: &str, max_series: u64) -> SearchPlan {
+        plan_search(
+            &parse(q).expect("parse"),
+            &SearchParams {
+                start_ns: 0,
+                end_ns: 1_000_000,
+                limit: 20,
+                spss: 3,
+            },
+            &SearchCtx {
+                filter: SpanFilterCtx {
+                    spans_table: "trace_spans",
+                    attrs_table: "trace_attrs_idx",
+                },
+                max_candidates: 100,
+                max_series,
                 distributed: false,
             },
         )
@@ -1602,8 +2185,14 @@ mod tests {
     /// there is deliberately NO uncharged evaluation path, so the pure
     /// semantic tests fund one instead of bypassing the accounting.
     fn eval(plan: &SearchPlan, traces: &[TraceSpans], attrs: &BatchAttrs) -> Vec<TraceMatch> {
-        evaluate_batch(plan, traces, attrs, &mut ByteBudget::new(usize::MAX))
-            .expect("within the test budget")
+        evaluate_batch(
+            plan,
+            traces,
+            attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect("within the test budget")
     }
 
     fn membership(plan: &SearchPlan, entries: &[(usize, [u8; 16], [u8; 8])]) -> BatchAttrs {
@@ -2064,8 +2653,14 @@ mod tests {
             let p = plan(q);
             let attrs = membership(&p, &[]);
             let mut budget = ByteBudget::new(usize::MAX);
-            let matches =
-                evaluate_batch(&p, &[family_trace()], &attrs, &mut budget).expect("in budget");
+            let matches = evaluate_batch(
+                &p,
+                &[family_trace()],
+                &attrs,
+                &mut GroupCardinalityCounter::new(u64::MAX),
+                &mut budget,
+            )
+            .expect("in budget");
             assert!(matches.is_empty(), "{q}");
             assert_eq!(budget.used(), 0, "{q}: all sets released on the miss path");
         }
@@ -2191,7 +2786,14 @@ mod tests {
             };
             let attrs = membership(&p, &[]);
             let mut budget = ByteBudget::new(usize::MAX);
-            let matches = evaluate_batch(&p, &[trace], &attrs, &mut budget).expect("in budget");
+            let matches = evaluate_batch(
+                &p,
+                &[trace],
+                &attrs,
+                &mut GroupCardinalityCounter::new(u64::MAX),
+                &mut budget,
+            )
+            .expect("in budget");
             assert_eq!(matches.len(), 1, "{q}");
             let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
             assert_eq!(
@@ -2220,8 +2822,14 @@ mod tests {
         let attrs = membership(&p, &[]);
         // Room for the two operand sets, not for the walk transients.
         let mut budget = ByteBudget::new(2 * 2_000 * SET_ENTRY_BYTES + 1);
-        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
-            .expect_err("the descendant envelope pre-charge must breach");
+        let err = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect_err("the descendant envelope pre-charge must breach");
         assert!(
             matches!(
                 err,
@@ -2364,8 +2972,14 @@ mod tests {
             let p = plan_wide(q);
             let attrs = ac6_membership(&p);
             let mut budget = ByteBudget::new(usize::MAX);
-            let matches =
-                evaluate_batch(&p, &[ac6_trace()], &attrs, &mut budget).expect("in budget");
+            let matches = evaluate_batch(
+                &p,
+                &[ac6_trace()],
+                &attrs,
+                &mut GroupCardinalityCounter::new(u64::MAX),
+                &mut budget,
+            )
+            .expect("in budget");
             let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
             assert_eq!(budget.used(), retained, "{q}: intermediates all released");
         }
@@ -2569,13 +3183,522 @@ mod tests {
         let mut attrs = membership(&p, &[]);
         attrs.select_values[0].insert((tid(1), sid(1)), "bar-value".to_string());
         let mut budget = ByteBudget::new(usize::MAX);
-        let matches = evaluate_batch(&p, &traces, &attrs, &mut budget).expect("in budget");
+        let matches = evaluate_batch(
+            &p,
+            &traces,
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect("in budget");
         assert_eq!(matches.len(), 2);
         let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
         assert_eq!(
             budget.used(),
             retained,
             "the budget must hold exactly the returned matches' retained bytes"
+        );
+    }
+
+    // -- issue #193: by()/coalesce() response reshaping ------------------
+
+    /// `by(resource.service.name)` regroups the FULL matched set into one
+    /// spanSet per distinct service (first-appearance order); the flat
+    /// `matched`/`spans` stay as the ungrouped view.
+    #[test]
+    fn by_service_groups_matched_spans_by_distinct_service() {
+        let p = plan(r#"{ } | by(resource.service.name)"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "checkout", "a", 10, 1),
+                span(2, "billing", "b", 20, 1),
+                span(3, "checkout", "c", 30, 1),
+            ],
+        };
+        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        assert_eq!(matches[0].matched, 3, "flat ungrouped view unchanged");
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].attributes,
+            vec![(
+                "by(resource.service.name)".to_string(),
+                GroupValue::Str("checkout".to_string())
+            )]
+        );
+        assert_eq!(groups[0].matched, 2);
+        let g0_ids: Vec<[u8; 8]> = groups[0].spans.iter().map(|s| s.span_id).collect();
+        assert_eq!(g0_ids, vec![sid(1), sid(3)]);
+        assert_eq!(groups[1].matched, 1);
+        assert_eq!(
+            groups[1].attributes[0].1,
+            GroupValue::Str("billing".to_string())
+        );
+    }
+
+    /// `spss` is applied PER GROUP on the pre-`spss` matched set — a group
+    /// with more members than `spss` reports the full `matched` but caps
+    /// its `spans`.
+    #[test]
+    fn by_service_applies_spss_per_group() {
+        let p = plan(r#"{ } | by(resource.service.name)"#); // spss = 3
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "checkout", "a", 10, 1),
+                span(2, "checkout", "b", 20, 1),
+                span(3, "checkout", "c", 30, 1),
+                span(4, "checkout", "d", 40, 1),
+            ],
+        };
+        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].matched, 4, "full pre-spss group membership");
+        assert_eq!(groups[0].spans.len(), 3, "spss cap PER group");
+    }
+
+    /// `by()|coalesce()` collapses the groups back to the flat spanSet
+    /// (`groups: None`), while `coalesce()|by()` stays grouped.
+    #[test]
+    fn coalesce_order_relative_to_by_is_honoured() {
+        let trace = || TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "checkout", "a", 10, 1),
+                span(2, "billing", "b", 20, 1),
+            ],
+        };
+        let by_then_coalesce = plan(r#"{ } | by(resource.service.name) | coalesce()"#);
+        let m = eval(
+            &by_then_coalesce,
+            &[trace()],
+            &membership(&by_then_coalesce, &[]),
+        );
+        assert!(
+            m[0].groups.is_none(),
+            "by()|coalesce() collapses to the flat spanSet"
+        );
+
+        let coalesce_then_by = plan(r#"{ } | coalesce() | by(resource.service.name)"#);
+        let m = eval(
+            &coalesce_then_by,
+            &[trace()],
+            &membership(&coalesce_then_by, &[]),
+        );
+        assert_eq!(
+            m[0].groups
+                .as_ref()
+                .expect("coalesce()|by() stays grouped")
+                .len(),
+            2
+        );
+    }
+
+    /// The distinct-group `422 TraceSearchSeriesCap` fires on the
+    /// by()-produced cardinality across the whole batch — BEFORE a trailing
+    /// `coalesce()` collapse (so `by()|coalesce()` cannot bypass it) and
+    /// counting groups concentrated in ANY trace, not just winners.
+    #[test]
+    fn distinct_group_cardinality_cap_fires_including_under_trailing_coalesce() {
+        let p = plan_cap(r#"{ } | by(resource.service.name) | coalesce()"#, 2);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "a", "s", 10, 1),
+                span(2, "b", "s", 20, 1),
+                span(3, "c", "s", 30, 1),
+            ],
+        };
+        let err = evaluate_batch(
+            &p,
+            &[trace],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(2),
+            &mut ByteBudget::new(usize::MAX),
+        )
+        .expect_err("3 distinct services over a cap of 2 must 422");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 3, cap: 2 })
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// The cap is a CROSS-BATCH running total: distinct tuples accumulate
+    /// across `evaluate_batch` calls on the same counter, so fan-out spread
+    /// over multiple batches still trips.
+    #[test]
+    fn distinct_group_cap_accumulates_across_batches() {
+        let p = plan_cap(r#"{ } | by(resource.service.name)"#, 2);
+        let mut counter = GroupCardinalityCounter::new(2);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let b1 = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "a", "s", 10, 1), span(2, "b", "s", 20, 1)],
+        };
+        evaluate_batch(&p, &[b1], &membership(&p, &[]), &mut counter, &mut budget)
+            .expect("two distinct groups fit a cap of 2");
+        let b2 = TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, "c", "s", 30, 1)],
+        };
+        let err = evaluate_batch(&p, &[b2], &membership(&p, &[]), &mut counter, &mut budget)
+            .expect_err("the third distinct group across batches trips the cap");
+        assert!(matches!(
+            err,
+            ReadError::QueryTooBroad(TooBroadReason::TraceSearchSeriesCap { count: 3, cap: 2 })
+        ));
+    }
+
+    /// Float `by()` grouping (issue #193 R2-F2): `+0.0` and `-0.0` collapse
+    /// into one group, and every NaN into one group — the
+    /// `canonical_double_bits` mechanism.
+    #[test]
+    fn float_by_key_collapses_signed_zero_and_all_nan() {
+        let p = plan(r#"{ } | by(span.ratio)"#);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![
+                span(1, "s", "a", 10, 1),
+                span(2, "s", "b", 20, 1),
+                span(3, "s", "c", 30, 1),
+                span(4, "s", "d", 40, 1),
+            ],
+        };
+        let mut attrs = membership(&p, &[]);
+        // span.ratio interns into agg_fields[0] (numeric) — resolved as a
+        // canonical Double.
+        attrs.agg_values[0].insert((tid(1), sid(1)), 0.0);
+        attrs.agg_values[0].insert((tid(1), sid(2)), -0.0);
+        attrs.agg_values[0].insert((tid(1), sid(3)), f64::NAN);
+        attrs.agg_values[0].insert((tid(1), sid(4)), f64::from_bits(0x7ff8_0000_0000_0001)); // another NaN payload
+        let matches = eval(&p, &[trace], &attrs);
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 2, "one zero group + one NaN group");
+        // The zero group holds spans 1 and 2 (+0.0 / -0.0 folded).
+        let zero_group = groups
+            .iter()
+            .find(|g| g.attributes[0].1 == GroupValue::Double(canonical_double_bits(0.0)))
+            .expect("zero group");
+        assert_eq!(zero_group.matched, 2);
+        let nan_group = groups
+            .iter()
+            .find(|g| g.attributes[0].1 == GroupValue::Double(CANONICAL_NAN_BITS))
+            .expect("nan group");
+        assert_eq!(nan_group.matched, 2);
+    }
+
+    /// Go `time.Duration.String()` parity (Tempo renders a `duration`
+    /// group value via this exact format).
+    #[test]
+    fn go_duration_string_matches_the_go_runtime_format() {
+        assert_eq!(go_duration_string(0), "0s");
+        assert_eq!(go_duration_string(500), "500ns");
+        assert_eq!(go_duration_string(1_500), "1.5µs");
+        assert_eq!(go_duration_string(1_000_000), "1ms");
+        assert_eq!(go_duration_string(1_500_000), "1.5ms");
+        assert_eq!(go_duration_string(1_000_000_000), "1s");
+        assert_eq!(go_duration_string(1_500_000_000), "1.5s");
+        assert_eq!(go_duration_string(90_000_000_000), "1m30s");
+        assert_eq!(go_duration_string(3_661_000_000_000), "1h1m1s");
+        assert_eq!(go_duration_string(-1_500_000_000), "-1.5s");
+    }
+
+    /// Finding (flag-5 answer): `by(status)`/`by(kind)`/`by(duration)`
+    /// render by their TraceQL TYPE as `stringValue` keyword / duration
+    /// forms — matching Tempo v3.0.2 (NOT numeric enums), under the
+    /// `by(<expr>)` group-key attribute NAME.
+    #[test]
+    fn enum_and_duration_by_keys_render_as_typed_keyword_strings() {
+        let p = plan("{} | by(kind)");
+        let mut s1 = span(1, "s", "a", 10, 1);
+        s1.kind = 2; // server
+        let mut s2 = span(2, "s", "b", 20, 1);
+        s2.kind = 2;
+        let mut s3 = span(3, "s", "c", 30, 1);
+        s3.kind = 5; // consumer
+        let matches = eval(
+            &p,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![s1, s2, s3],
+            }],
+            &membership(&p, &[]),
+        );
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].attributes[0],
+            (
+                "by(kind)".to_string(),
+                GroupValue::Str("server".to_string())
+            )
+        );
+        assert_eq!(groups[0].matched, 2);
+        assert_eq!(
+            groups[1].attributes[0].1,
+            GroupValue::Str("consumer".to_string())
+        );
+
+        let ps = plan("{} | by(status)");
+        let mut e1 = span(1, "s", "a", 10, 1);
+        e1.status_code = 2; // error
+        let mut e2 = span(2, "s", "b", 20, 1);
+        e2.status_code = 1; // ok
+        let ms = eval(
+            &ps,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![e1, e2],
+            }],
+            &membership(&ps, &[]),
+        );
+        let gs = ms[0].groups.as_ref().expect("by() active");
+        assert_eq!(
+            gs[0].attributes[0],
+            (
+                "by(status)".to_string(),
+                GroupValue::Str("error".to_string())
+            )
+        );
+        assert_eq!(gs[1].attributes[0].1, GroupValue::Str("ok".to_string()));
+
+        let pd = plan("{} | by(duration)");
+        let md = eval(
+            &pd,
+            &[TraceSpans {
+                trace_id: tid(1),
+                spans: vec![span(1, "s", "a", 10, 1_500_000_000)],
+            }],
+            &membership(&pd, &[]),
+        );
+        assert_eq!(
+            md[0].groups.as_ref().expect("by() active")[0].attributes[0],
+            (
+                "by(duration)".to_string(),
+                GroupValue::Str("1.5s".to_string())
+            )
+        );
+    }
+
+    /// Issue #193 (no silent subset): the nested-set intrinsics are
+    /// resolvable group keys — `by(nestedSetParent)` groups on the
+    /// per-trace numbering (an `intValue`), not a flat fallback.
+    #[test]
+    fn nested_set_by_key_groups_on_the_numbering() {
+        let p = plan("{} | by(nestedSetParent)");
+        assert!(p.nested_set, "the by-key must force nested-set numbering");
+        // Root span 1; children 2 and 3 both parented to 1 → same
+        // nestedSetParent (root's `left`); the root itself is -1.
+        let mut child2 = span(2, "s", "b", 20, 1);
+        child2.parent_id = sid(1);
+        let mut child3 = span(3, "s", "c", 30, 1);
+        child3.parent_id = sid(1);
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), child2, child3],
+        };
+        let matches = eval(&p, &[trace], &membership(&p, &[]));
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        // Two distinct nestedSetParent values: -1 (root) and the root's
+        // left (its two children share it), all rendered as intValue.
+        assert_eq!(groups.len(), 2);
+        for g in groups {
+            assert!(matches!(g.attributes[0].1, GroupValue::Int(_)));
+        }
+        let root_group = groups
+            .iter()
+            .find(|g| g.attributes[0].1 == GroupValue::Int(-1))
+            .expect("root has nestedSetParent = -1");
+        assert_eq!(root_group.matched, 1);
+    }
+
+    /// Issue #193 (no silent subset): a trace-level by-key
+    /// (`by(rootServiceName)`) forces its co-load and groups on the
+    /// trace-wide value (a `stringValue`).
+    #[test]
+    fn trace_level_by_key_groups_on_the_coload_value() {
+        let p = plan("{} | by(rootServiceName)");
+        assert!(
+            p.trace_ctx,
+            "the by-key must force the trace-context co-load"
+        );
+        let trace = TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, "s", "a", 10, 1), span(2, "s", "b", 20, 1)],
+        };
+        let mut attrs = membership(&p, &[]);
+        attrs.trace_ctx.insert(
+            tid(1),
+            TraceCtxInfo {
+                trace_start_ns: 0,
+                trace_end_ns: 100,
+                root_name: "GET /".to_string(),
+                root_service: "gateway".to_string(),
+            },
+        );
+        let matches = eval(&p, &[trace], &attrs);
+        let groups = matches[0].groups.as_ref().expect("by() active");
+        // Trace-constant → one group holding both spans.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].attributes[0],
+            (
+                "by(rootServiceName)".to_string(),
+                GroupValue::Str("gateway".to_string())
+            )
+        );
+        assert_eq!(groups[0].matched, 2);
+    }
+
+    /// Issue #193 (no silent subset): span-EVENT / span-LINK intrinsics are
+    /// collection-valued per span, so grouping by them is a clean plan
+    /// error (`400`), NEVER a silent flat 200.
+    #[test]
+    fn event_and_link_by_keys_are_a_clean_plan_error_not_a_flat_fallback() {
+        for q in [
+            "{} | by(event:name)",
+            "{} | by(link:spanID)",
+            "{} | by(link:traceID)",
+        ] {
+            let err = plan_search(
+                &parse(q).expect("parse"),
+                &SearchParams {
+                    start_ns: 0,
+                    end_ns: 1_000_000,
+                    limit: 20,
+                    spss: 3,
+                },
+                &SearchCtx {
+                    filter: SpanFilterCtx {
+                        spans_table: "trace_spans",
+                        attrs_table: "trace_attrs_idx",
+                    },
+                    max_candidates: 100,
+                    max_series: 1_000,
+                    distributed: false,
+                },
+            )
+            .expect_err(&format!("{q} must be an unsupported-field plan error"));
+            assert!(
+                matches!(err, super::super::filter::PlanError::UnsupportedField(_)),
+                "{q}: expected UnsupportedField (400), got {err:?}"
+            );
+        }
+    }
+
+    /// AC5/AC8: for a grouped query the budget holds EXACTLY the winners'
+    /// `retained_bytes` PLUS the counter's per-distinct-tuple
+    /// `group_tuple_bytes` — one shared accounting method, no drift.
+    #[test]
+    fn grouped_charges_equal_retained_plus_counter_exactly() {
+        let p = plan(r#"{ } | by(resource.service.name)"#);
+        let traces = vec![
+            TraceSpans {
+                trace_id: tid(1),
+                spans: vec![
+                    span(1, "checkout", "a", 10, 1),
+                    span(2, "billing", "b", 20, 1),
+                ],
+            },
+            TraceSpans {
+                trace_id: tid(2),
+                spans: vec![span(1, "checkout", "c", 30, 1)],
+            },
+        ];
+        let mut counter = GroupCardinalityCounter::new(u64::MAX);
+        let mut budget = ByteBudget::new(usize::MAX);
+        let matches = evaluate_batch(&p, &traces, &membership(&p, &[]), &mut counter, &mut budget)
+            .expect("in budget");
+        let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
+        // Distinct tuples across the batch: "checkout" and "billing".
+        let expected_counter: usize = [
+            vec![GroupValue::Str("checkout".to_string())],
+            vec![GroupValue::Str("billing".to_string())],
+        ]
+        .iter()
+        .map(group_tuple_bytes)
+        .sum();
+        assert_eq!(
+            budget.used(),
+            retained + expected_counter,
+            "budget == winners' retained_bytes + the counter's group_tuple_bytes"
+        );
+    }
+
+    /// AC9 (issue #193 R4-F2): the cumulative counter is charged BEFORE it
+    /// retains a long-string group-key tuple, ACROSS batches. With
+    /// `max_series` well above the distinct-tuple count (so the cardinality
+    /// `422` never fires), a `ByteBudget` too small for the second batch's
+    /// multi-KB long-string tuple returns the byte-budget error at charge
+    /// time — never after materialization. The `ByteBudget::charge`
+    /// atomicity (no phantom `used`) guarantees the trip precedes the
+    /// insert.
+    #[test]
+    fn multi_batch_long_string_group_keys_trip_the_cumulative_byte_budget() {
+        let p = plan(r#"{ } | by(resource.service.name)"#);
+        let big_a = "a".repeat(4096);
+        let big_b = "b".repeat(4096);
+        let batch1 = || TraceSpans {
+            trace_id: tid(1),
+            spans: vec![span(1, &big_a, "s", 10, 1)],
+        };
+        let batch2 = || TraceSpans {
+            trace_id: tid(2),
+            spans: vec![span(1, &big_b, "s", 20, 1)],
+        };
+        // Learn the exact total cost of both batches (max_series high — the
+        // byte budget, not the cap, is the sole trip condition).
+        let mut probe_counter = GroupCardinalityCounter::new(1_000);
+        let mut probe = ByteBudget::new(usize::MAX);
+        evaluate_batch(
+            &p,
+            &[batch1()],
+            &membership(&p, &[]),
+            &mut probe_counter,
+            &mut probe,
+        )
+        .expect("batch 1 fits an unbounded budget");
+        evaluate_batch(
+            &p,
+            &[batch2()],
+            &membership(&p, &[]),
+            &mut probe_counter,
+            &mut probe,
+        )
+        .expect("batch 2 fits an unbounded budget");
+        let full = probe.used();
+
+        // One byte short of the two-batch total: batch 1 fits, batch 2 —
+        // whose new long-string tuple pushes past the ceiling — trips.
+        let mut counter = GroupCardinalityCounter::new(1_000);
+        let mut tight = ByteBudget::new(full - 1);
+        evaluate_batch(
+            &p,
+            &[batch1()],
+            &membership(&p, &[]),
+            &mut counter,
+            &mut tight,
+        )
+        .expect("batch 1 fits the tight budget");
+        let err = evaluate_batch(
+            &p,
+            &[batch2()],
+            &membership(&p, &[]),
+            &mut counter,
+            &mut tight,
+        )
+        .expect_err("the second long-string tuple trips the cumulative byte budget");
+        assert!(
+            matches!(
+                err,
+                ReadError::QueryTooBroad(TooBroadReason::ScanBudgetBytes { .. })
+            ),
+            "the byte budget (not the cardinality cap) is the trip: got {err:?}"
         );
     }
 
@@ -2623,7 +3746,14 @@ mod tests {
         };
         let attrs = membership(&p, &[]); // no foo value anywhere
         let mut budget = ByteBudget::new(usize::MAX);
-        let matches = evaluate_batch(&p, &[trace], &attrs, &mut budget).expect("in budget");
+        let matches = evaluate_batch(
+            &p,
+            &[trace],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect("in budget");
         let summary = &matches[0].spans[0];
         assert!(summary.attributes.is_empty());
         assert_eq!(
@@ -2669,8 +3799,14 @@ mod tests {
         // Success probe: full cost measured; exactly ONE value clone.
         clone_probe::reset();
         let mut probe = ByteBudget::new(usize::MAX);
-        let built =
-            evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut probe).expect("fits");
+        let built = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut probe,
+        )
+        .expect("fits");
         assert_eq!(clone_probe::count(), 1, "the allowed path clones once");
         let full_cost = probe.used();
         assert_eq!(full_cost, built[0].retained_bytes());
@@ -2680,8 +3816,14 @@ mod tests {
         // The charge fails, so the clone site is never reached.
         clone_probe::reset();
         let mut budget = ByteBudget::new(full_cost - 1);
-        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
-            .expect_err("one byte short must fail at the value charge");
+        let err = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect_err("one byte short must fail at the value charge");
         assert!(
             matches!(
                 err,
@@ -2699,8 +3841,14 @@ mod tests {
         // Breach at the first fixed pre-charge: still zero clones.
         clone_probe::reset();
         let mut tiny = ByteBudget::new(16);
-        evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut tiny)
-            .expect_err("a near-zero budget fails before anything is built");
+        evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut tiny,
+        )
+        .expect_err("a near-zero budget fails before anything is built");
         assert_eq!(clone_probe::count(), 0);
     }
 
@@ -2724,8 +3872,14 @@ mod tests {
         // One filter set's upper-bound pre-charge is spans × entry cost;
         // allow half of it.
         let mut budget = ByteBudget::new(1_000 * SET_ENTRY_BYTES);
-        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
-            .expect_err("the first filter's set pre-charge must breach");
+        let err = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect_err("the first filter's set pre-charge must breach");
         assert!(
             matches!(
                 err,
@@ -2736,7 +3890,14 @@ mod tests {
         // And with room the query completes to its (empty) result with
         // every intermediate released.
         let mut roomy = ByteBudget::new(usize::MAX);
-        let matches = evaluate_batch(&p, &[trace], &attrs, &mut roomy).expect("in budget");
+        let matches = evaluate_batch(
+            &p,
+            &[trace],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut roomy,
+        )
+        .expect("in budget");
         assert!(matches.is_empty());
         assert_eq!(roomy.used(), 0, "all intermediate sets were released");
     }
@@ -2768,8 +3929,14 @@ mod tests {
         // 1,000-span upper bound; 2.5 sets of room means the union's
         // pre-charge is the one that breaches.
         let mut budget = ByteBudget::new(2_500 * SET_ENTRY_BYTES);
-        let err = evaluate_batch(&p, std::slice::from_ref(&trace), &attrs, &mut budget)
-            .expect_err("the union set's pre-charge must breach");
+        let err = evaluate_batch(
+            &p,
+            std::slice::from_ref(&trace),
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect_err("the union set's pre-charge must breach");
         assert!(
             matches!(
                 err,
@@ -2784,7 +3951,14 @@ mod tests {
         // With room: completes, and the budget holds exactly the
         // returned matches (all sets released after the merge).
         let mut roomy = ByteBudget::new(usize::MAX);
-        let matches = evaluate_batch(&p, &[trace], &attrs, &mut roomy).expect("in budget");
+        let matches = evaluate_batch(
+            &p,
+            &[trace],
+            &attrs,
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut roomy,
+        )
+        .expect("in budget");
         assert_eq!(matches.len(), 1);
         assert_eq!(
             roomy.used(),
@@ -3049,8 +4223,14 @@ mod tests {
         // transient are released.
         let p = plan("{ nestedSetParent < 0 }");
         let mut budget = ByteBudget::new(usize::MAX);
-        let matches = evaluate_batch(&p, &[nested_set_aa()], &membership(&p, &[]), &mut budget)
-            .expect("fits");
+        let matches = evaluate_batch(
+            &p,
+            &[nested_set_aa()],
+            &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(u64::MAX),
+            &mut budget,
+        )
+        .expect("fits");
         let retained: usize = matches.iter().map(TraceMatch::retained_bytes).sum();
         assert_eq!(
             budget.used(),
@@ -3362,6 +4542,7 @@ mod tests {
             &p,
             std::slice::from_ref(&trace),
             &membership(&p, &[]),
+            &mut GroupCardinalityCounter::new(u64::MAX),
             &mut budget,
         )
         .expect_err("the numbering pre-charge must breach");

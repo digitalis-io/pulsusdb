@@ -46,7 +46,7 @@
 //! fails the scenario.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -440,6 +440,71 @@ fn fetch_structural_tuples(body: &serde_json::Value) -> Result<BTreeSet<String>>
         let kind = normalize_kind(&span["kind"]);
         let start = span["startTimeUnixNano"].as_str().unwrap_or_default();
         out.insert(format!("{span_id}|{name}|{kind}|{parent}|{start}"));
+    }
+    Ok(out)
+}
+
+/// One search spanSet's canonical group signature (issue #193): its
+/// group-key `attributes` rendered `key=<typed value>` (sorted, joined),
+/// or the sentinel `<flat>` when the spanSet carries no `attributes` (a
+/// plain or `coalesce()`-collapsed spanSet). The typed-value prefix
+/// (`s:`/`i:`/`d:`/`b:`) makes the wire type part of the signature, so
+/// `intValue` vs `doubleValue` vs `stringValue` divergence is caught.
+fn span_set_signature(set: &serde_json::Value) -> String {
+    let Some(attrs) = set["attributes"].as_array() else {
+        return "<flat>".to_string();
+    };
+    if attrs.is_empty() {
+        return "<flat>".to_string();
+    }
+    let mut parts: Vec<String> = attrs
+        .iter()
+        .map(|a| {
+            let key = a["key"].as_str().unwrap_or_default();
+            let v = &a["value"];
+            let val = if let Some(s) = v["stringValue"].as_str() {
+                format!("s:{s}")
+            } else if let Some(s) = v["intValue"].as_str() {
+                format!("i:{s}")
+            } else if let Some(n) = v["intValue"].as_i64() {
+                format!("i:{n}")
+            } else if let Some(f) = v["doubleValue"].as_f64() {
+                format!("d:{f}")
+            } else if let Some(b) = v["boolValue"].as_bool() {
+                format!("b:{b}")
+            } else {
+                "null".to_string()
+            };
+            format!("{key}={val}")
+        })
+        .collect();
+    parts.sort();
+    parts.join(",")
+}
+
+/// Per-trace grouped-spanSet signature (issue #193): traceID → the sorted
+/// SET of group signatures. Reads BOTH stores' search shape (PulsusDB
+/// `spanSets[]`; Tempo `spanSets[]`, or the legacy singular `spanSet`).
+/// This is the grouped/coalesced spanSet-array response-shape gate — a
+/// `by()` response's group tuples + typed attributes must byte-match the
+/// reference oracle.
+fn grouped_signatures(body: &serde_json::Value) -> Result<BTreeMap<String, BTreeSet<String>>> {
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let Some(traces) = body["traces"].as_array() else {
+        return Ok(out);
+    };
+    for t in traces {
+        let tid = t["traceID"]
+            .as_str()
+            .map(normalize_trace_id_hex)
+            .with_context(|| format!("grouped search result missing a traceID: {t}"))?;
+        let sets: Vec<serde_json::Value> = match t["spanSets"].as_array() {
+            Some(arr) => arr.clone(),
+            None if t["spanSet"].is_object() => vec![t["spanSet"].clone()],
+            None => Vec::new(),
+        };
+        let sigs = sets.iter().map(span_set_signature).collect();
+        out.insert(tid, sigs);
     }
     Ok(out)
 }
@@ -1604,6 +1669,38 @@ async fn run_search_case(
             case.ledger.as_deref().unwrap_or(""),
             path.display()
         )));
+    }
+
+    // Issue #193 grouped/coalesced spanSet-array parity: for a `by()` case
+    // the trace-ID set is identical to the ungrouped query, so the NEW gate
+    // is the per-trace group-tuple / typed-attribute SHAPE. Assert
+    // PulsusDB's grouped spanSets byte-match the reference oracle's (a
+    // `by(name)` case → one `name=s:charge-card` group per trace; a
+    // `by(name)|coalesce()` case → one `<flat>` spanSet per trace on BOTH
+    // sides). This is the #182-class response-shape gate for #193.
+    if case.q.contains("by(") {
+        let pulsus_g = grouped_signatures(&pulsus_body)?;
+        let tempo_g = grouped_signatures(&tempo_body)?;
+        if pulsus_g != tempo_g {
+            let detail = format!(
+                "grouped spanSet-array signatures diverged: pulsusdb {pulsus_g:?} != tempo \
+                 {tempo_g:?}"
+            );
+            let path = dump("grouped_shape", &detail)?;
+            if gated {
+                bail!(
+                    "case {:?}: {detail} (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+            return informational_result(Some(&format!(
+                "case {:?} (ledger {:?}): {detail} (dumped to {})",
+                case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
