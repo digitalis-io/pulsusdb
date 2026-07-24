@@ -398,3 +398,131 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "$IDENTITY" \
             "$REF"
+
+  # Native OS packages — .deb + .rpm (issue #213). Mirrors the Docker `build`
+  # matrix: per-arch NATIVE runners (`amd64 -> ubuntu-latest`, `arm64 ->
+  # ubuntu-24.04-arm`), no QEMU. Each leg builds the release binary against a
+  # conservative glibc floor (Debian bullseye, glibc 2.31 — NOT the runtime
+  # image's bookworm), runs nfpm to emit both formats from one config, and (on a
+  # real tag) smoke-tests them in ubuntu:22.04 + rockylinux:9 containers whose
+  # glibc (2.35 / 2.34) exceeds the build floor — so the Rocky leg mechanically
+  # proves the floor is low enough. Assets are attached to the Release by the
+  # dependent `packages-release` fan-in job; nothing here touches GHCR/cosign.
+  packages:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, rpm_arch: x86_64,  runner: ubuntu-latest }
+          - { arch: arm64, rpm_arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+
+      # Byte-identical copy of the `build` job's ancestry gate (do not edit one
+      # without the other — a CI drift-guard could diff them).
+      - name: Enforce tag ancestry — publish only from merged main
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at $(git rev-parse HEAD), which is not an ancestor of origin/main — releases are published only from merged main commits"
+            exit 1
+          fi
+
+      # rpm-legal version: strip the leading `v`, rewrite `-` (illegal in an rpm
+      # Version) to `~`, which sorts BELOW the release in both deb and rpm so a
+      # prerelease orders correctly (v1.2.3-rc.1 -> 1.2.3~rc.1). PKG_ARCH is the
+      # nfpm arch (mapped to x86_64/aarch64 for rpm by nfpm itself).
+      - name: Compute package version (rpm-legal)
+        run: |
+          set -euo pipefail
+          V="${GITHUB_REF_NAME#v}"; V="${V//-/~}"
+          echo "PKG_VERSION=${V:-0.0.0}" >> "$GITHUB_ENV"
+          echo "PKG_ARCH=${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      # Build THIS arch's binary natively inside the glibc-2.31 floor image, with
+      # the same version/revision stamp the Docker release uses. Staged to the
+      # FIXED path dist/pulsusdb (nfpm does not env-expand contents[].src; each
+      # runner is single-arch so no ${arch} in the path is needed).
+      - name: Build release binary against glibc floor (bullseye)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm -v "$PWD":/src -w /src \
+            -e PULSUS_BUILD_VERSION="${GITHUB_REF_NAME}" \
+            -e PULSUS_BUILD_REVISION="${GITHUB_SHA}" \
+            docker.io/library/rust:1.93-bullseye \
+            cargo build --release -p pulsus-server --bin pulsusdb
+          cp target/release/pulsusdb dist/pulsusdb
+
+      # Emit the real .deb + .rpm (out/), then a synthetic lower-version base
+      # package with a DISTINCT payload (smoke-base/) so the smoke upgrade leg can
+      # prove the on-disk binary is actually replaced. Restore the real binary at
+      # dist/pulsusdb afterwards so smoke.sh's REAL_SHA is the real payload.
+      - name: Build packages (deb + rpm) + synthetic base
+        run: |
+          set -euo pipefail
+          mkdir -p out smoke-base
+          for pkgr in deb rpm; do
+            docker run --rm -e PKG_VERSION -e PKG_ARCH -v "$PWD":/w -w /w \
+              ghcr.io/goreleaser/nfpm:v2.43.1 package \
+              --config packaging/nfpm.yaml --packager "$pkgr" --target out/
+          done
+          cp dist/pulsusdb dist/pulsusdb.real
+          printf 'PULSUSDB_SMOKETEST_BASE' >> dist/pulsusdb
+          for pkgr in deb rpm; do
+            docker run --rm -e "PKG_VERSION=0.0.0~smoketest" -e PKG_ARCH -v "$PWD":/w -w /w \
+              ghcr.io/goreleaser/nfpm:v2.43.1 package \
+              --config packaging/nfpm.yaml --packager "$pkgr" --target smoke-base/
+          done
+          mv dist/pulsusdb.real dist/pulsusdb
+
+      - name: Smoke test deb+rpm (install/upgrade/scriptlets/uninstall)
+        if: github.event_name == 'push'
+        run: ./packaging/smoke.sh "${{ matrix.arch }}" "${{ env.PKG_VERSION }}"
+
+      - name: Upload package artifacts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Fan-in (mirrors `merge`): collect both arches' packages, checksum them, and
+  # attach them to the GitHub Release. This is the ONLY job that elevates to
+  # `contents: write` (job-level, so `build`/`merge`/the workflow default stay
+  # `contents: read`); it never touches GHCR/cosign. Push-gated at the job level,
+  # so the workflow_dispatch dry-run publishes nothing.
+  packages-release:
+    runs-on: ubuntu-latest
+    needs: packages
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - name: Download per-arch packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist-packages
+
+      # Create the Release if this tag has none yet (`|| true` tolerates a rerun
+      # or a pre-existing Release), then upload the four packages + SHA256SUMS,
+      # clobbering on re-run so the job is idempotent.
+      - name: Checksums and publish to the Release
+        working-directory: dist-packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha256sum ./*.deb ./*.rpm > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            ./*.deb ./*.rpm SHA256SUMS --clobber

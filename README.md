@@ -78,6 +78,26 @@ The default install is a self-contained single-node stack — bundled ClickHouse
 
 **The `pulsusdb` application image is not published to a registry yet** (tracked separately) — real installs need `--set image.tag=<a locally built or future released tag>` until that lands.
 
+## Installing native packages (.deb / .rpm)
+
+Each `v*` release attaches native `.deb` and `.rpm` packages (amd64 + arm64) plus a `SHA256SUMS` file to its [GitHub Release](https://github.com/digitalis-io/pulsusdb/releases):
+
+```sh
+# Debian / Ubuntu (20.04+)
+sudo apt install ./pulsusdb_<ver>_amd64.deb
+
+# RHEL / Rocky / AlmaLinux 9+ / Fedora
+sudo dnf install ./pulsusdb-<ver>-1.x86_64.rpm
+```
+
+A package installs the binary to `/usr/bin/pulsusdb`, a `pulsusdb.service` systemd unit, a commented `/etc/pulsusdb/config.yaml`, and a dedicated `pulsusdb` system user with its data dir at `/var/lib/pulsusdb`. It is **not** started automatically — edit `config.yaml` to point at your ClickHouse, then:
+
+```sh
+sudo systemctl enable --now pulsusdb
+```
+
+See [docs/releasing.md §7](docs/releasing.md) for the supported-distro (glibc) floor and upgrade behaviour.
+
 ## Contributing
 
 Contributions are welcome once the initial design documents land. Until then, feedback on the architecture and API documents via issues is the most useful way to help.
