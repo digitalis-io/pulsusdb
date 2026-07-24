@@ -188,12 +188,15 @@ M8-LQ1 (issue #200) — logfmt flags + unpack/decolorize/drop/keep
 ========================================================================
 
 Reference target: grafana/loki v3.7.3 (the pinned M8-LQ conformance
-target). NOT YET container-captured in this sandbox (the pinned image
-cannot run here); the (__error__, __error_details__) values and
-accept/reject verdicts below are the coder's reasoned, reference-correct
-expectations, pinned by the hermetic goldens in
-`logql_pipeline_golden.rs`. FLAGGED for branch-validation against the
-pinned v3.7.3 container — see "capture probes" at the end.
+target). CONTAINER-CAPTURED and reconciled: the branch-validation was
+performed against the pinned v3.7.3 container, and the values below were
+confirmed against it — lines tagged `[byte-exact, v3.7.3]` are verbatim
+from the container capture; the accept/reject verdicts (`| logfmt` lenient,
+`keep` stream-label dropping, `unpack` _entry promotion / non-string skip,
+`--strict` completed-prefix emission, `a="b"c=1` accepted, the
+`unexpected '<char>'` InvalidKey rendering) were all verified by direct
+capture. Pinned by the hermetic goldens in `logql_pipeline_golden.rs`.
+The "capture probes" at the end record the exact queries used.
 
 ------------------------------------------------------------------------
 [A] Default `| logfmt` is LENIENT (best-effort, NEVER sets __error__)
