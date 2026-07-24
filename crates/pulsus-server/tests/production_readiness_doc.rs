@@ -119,6 +119,41 @@ fn heading_matches_section(line: &str, sec: &str) -> bool {
     }
 }
 
+/// Integer of a `## N. Title` top-level numbered heading, or `None` if the line
+/// is not one. Uses the same heading grammar as `heading_matches_section`
+/// (top-level = exactly two `#`, then the number, then a `.`+whitespace/end
+/// boundary), restricted to top-level so nested `### N.M` headings are ignored.
+fn top_level_section_number(line: &str) -> Option<u32> {
+    let line = line.trim_end();
+    let t = line.trim_start();
+    let hashes = t.chars().take_while(|c| *c == '#').count();
+    if hashes != 2 {
+        return None;
+    }
+    let after_hash = &t[hashes..];
+    if !after_hash.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = after_hash.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let after = &rest[digits.len()..];
+    // Same boundary as `heading_matches_section`, minus the `.<digit>` nested case
+    // (which `take_while` already consumed): `.` then whitespace, or `.` at line end.
+    let mut chars = after.chars();
+    match chars.next() {
+        Some('.') => match chars.next() {
+            None => {}
+            Some(next) if next.is_whitespace() => {}
+            _ => return None,
+        },
+        _ => return None,
+    }
+    digits.parse().ok()
+}
+
 /// All `ci.yml: "<name>"` citations scanned from the raw doc text.
 fn ci_step_citations(text: &str) -> Vec<String> {
     let needle = "ci.yml: \"";
@@ -231,17 +266,25 @@ fn every_evidence_pointer_in_the_readiness_doc_resolves() {
 
 #[test]
 fn the_readiness_doc_has_all_nine_sections() {
+    use std::collections::BTreeSet;
+
     let text = doc_text();
-    for n in 1..=9 {
-        let sec = n.to_string();
-        assert!(
-            text.lines().any(|line| heading_matches_section(line, &sec)),
-            "section §{sec} heading missing from production-readiness.md"
-        );
-    }
-    assert!(
-        !text.lines().any(|line| heading_matches_section(line, "10")),
-        "production-readiness.md has an unexpected 10th top-level section"
+    // Collect every top-level numbered heading (`## N. Title`) as its integer.
+    let numbers: Vec<u32> = text.lines().filter_map(top_level_section_number).collect();
+    let sections: BTreeSet<u32> = numbers.iter().copied().collect();
+    let expected: BTreeSet<u32> = (1..=9).collect();
+    // Exact set-equality catches ANY spurious (§10, §11, …) or missing top-level
+    // section, not just a spurious §10.
+    assert_eq!(
+        sections, expected,
+        "production-readiness.md top-level numbered sections must be exactly {{1..=9}}, \
+         got {sections:?}"
+    );
+    // A set collapses duplicates; the length check reds on a repeated `## N.`.
+    assert_eq!(
+        numbers.len(),
+        sections.len(),
+        "production-readiness.md has a duplicate top-level section number: {numbers:?}"
     );
 }
 
