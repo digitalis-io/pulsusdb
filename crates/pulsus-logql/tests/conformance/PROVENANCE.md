@@ -64,9 +64,11 @@ published documentation and observed behaviour.
 **Docs-vs-binary conflict policy:** where the published docs disagree with
 observed v3.7.3 behaviour, observed behaviour wins; the divergence is
 recorded here and escalated to the owner if material. Two such observed
-verdicts are already recorded as `oracle: reject` (both-reject agreements):
-`stage.ip` (no standalone `ip` pipeline stage exists) and `stage.distinct`
-(no `distinct` pipeline stage exists in v3.7.3, in any argument form).
+verdicts are recorded as `oracle: reject` and dispositioned `reject-parity`
+(#203 closeout): `stage.ip` (no standalone `ip` pipeline stage exists) and
+`stage.distinct` (no `distinct` pipeline stage exists in v3.7.3, in any
+argument form). We reject both with a construct-named `NotYetSupported` and so
+does the reference — a terminal parity, not a tracked gap.
 
 ## Clean-room / licensing statement (grep-checkable)
 
@@ -104,6 +106,14 @@ Every construct has exactly one `status`:
   an `owning_issue`. When the owning issue lands and the construct starts
   parsing or names a boundary, this probe turns RED, forcing the disposition
   to be flipped deliberately.
+- `reject-parity` — the probe yields `LogQlError::NotYetSupported` naming its
+  `error_construct` (like `interim-named`) AND the pinned reference *also*
+  rejects it (`oracle: reject`): parity, not a compatibility gap. It is a
+  terminal state — **no `owning_issue`** and not counted by
+  `interim_count_pin`. The residual `stage.distinct`/`stage.ip` constructs
+  (no such pipeline stage exists in v3.7.3) are the two members. The live
+  differential separately confirms the reference still rejects; a flip to
+  Accept (either side) is RED.
 - `divergence` — an owner-escalated, intentional deviation. Requires a
   non-empty `justification`, an `oracle_citation` (a
   `https://grafana.com/docs/loki/` URL for the expected behaviour), an
@@ -125,21 +135,23 @@ live oracle still returns the recorded verdict, so there is no separate
 allowlist that could silently suppress a gap. Each construct is exactly one
 of:
 
-- **agreement** — `supported` ∧ `oracle=accept` (both accept), or interim ∧
-  `oracle=reject` (both reject the probe).
+- **agreement** — `supported` ∧ `oracle=accept` (both accept), or
+  `reject-parity` ∧ `oracle=reject` (both reject the probe).
 - **tracked interim gap** — interim ∧ `oracle=accept`: a real compatibility
   gap the reference supports and we do not yet. It is visible in the
   registry (with its public-doc citation) and carries an owning issue — a gap
-  is surfaced and tracked, never allowlisted away.
+  is surfaced and tracked, never allowlisted away. Empty after the #203
+  closeout (`interim_count_pin == 0`).
 - **unescalated divergence** — `supported` ∧ `oracle=reject` (we more
-  permissive than the oracle): disallowed at LQ0; the categories test fails
-  if one appears. A genuine, owner-ruled divergence goes through the
+  permissive than the oracle), or `reject-parity` ∧ `oracle=accept` (we
+  reject and the reference does not): both disallowed; the categories test
+  fails if one appears. A genuine, owner-ruled divergence goes through the
   `divergence` disposition status instead (pinned to 0 at LQ0).
 
 `differential_categories_are_pinned` pins the exact category counts
-(supported / tracked-interim / both-reject agreement) and asserts zero
-`supported ∧ reject`, so a status or oracle flip must be re-pinned
-deliberately.
+(supported / tracked-interim / reject-parity agreement) and asserts zero
+`supported ∧ reject` and zero `reject-parity ∧ accept`, so a status or oracle
+flip must be re-pinned deliberately.
 
 ## Revision workflow
 
