@@ -503,6 +503,8 @@ GET /config       → effective configuration, secrets redacted (rendered as YAM
 GET /buildinfo    → {"version","revision","builtAt","rustc"}
 ```
 
+`/metrics` exposes three implemented families (see `architecture.md §8` for the exact metric set): **ingest** (`pulsus_ingest_*`, `writer`/`all` roles only — absent on a reader-only process), **label cache** (`pulsus_label_cache_*`, reader/all), and **query eval gate** (`pulsus_query_eval_*`, reader/all). Ingest errors are attributed per signal + error-class, not per ingest protocol; on-disk spool size/file-count gauges, per-API/per-planner-stage query latencies, tier-router segment decisions, and tail-session counters are not yet exposed.
+
 When basic auth is enabled, `/ready` and `/metrics` remain **unauthenticated** (liveness probes and metric scrapers must work without credentials); `/config`, `/buildinfo`, and every data-plane route require auth.
 
 ---
