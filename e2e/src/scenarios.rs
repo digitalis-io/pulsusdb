@@ -126,13 +126,19 @@ pub const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "logs_pipeline_differential",
-        // Single-variant only (issue M6-09 plan v2 delta A: the
-        // differential rides e2e-single, like `traces_differential`; the
-        // cluster overlay ships no reference log store). Additionally
+        // Both variants (issue #204). On single the full disposition-driven
+        // differential runs against the pinned reference log store; on
+        // cluster it runs ORACLE-LESS (`logs::oracle_present`) — the cluster
+        // overlay ships no reference store, so every `PulsusDB(cluster) ==`
+        // by-construction corpus hard gate is kept (proving shard fan-out
+        // reassembles the full corpus with no lost/duplicated rows) and only
+        // the reference comparison is skipped (parity inherited transitively
+        // from the single leg, topology-invariant). Both variants stay
         // self-gated on PULSUS_E2E_LOGS_DIFFERENTIAL=1 — set only by the
-        // nightly/dispatch full-tier ci.yml job ("no per-PR gate, no new
-        // job"); a per-PR e2e-single run prints a skip and returns Ok.
-        variants: &[Variant::Single],
+        // nightly/dispatch `e2e-metrics-full` matrix job (already exported to
+        // BOTH matrix variants; "no per-PR gate, no new job"); a per-PR run
+        // prints a skip and returns Ok.
+        variants: &[Variant::Single, Variant::Cluster],
         run: |ctx| Box::pin(crate::logs::logs_pipeline_differential(ctx)),
     },
     Scenario {
@@ -1271,6 +1277,29 @@ mod tests {
                 "no scenarios registered for {variant:?}"
             );
         }
+    }
+
+    /// Issue #204: the LogQL pipeline differential is registered for BOTH
+    /// variants (single = full oracle differential; cluster = oracle-less).
+    #[test]
+    fn logs_pipeline_differential_runs_on_both_variants() {
+        let s = SCENARIOS
+            .iter()
+            .find(|s| s.name == "logs_pipeline_differential")
+            .unwrap();
+        assert!(s.variants.contains(&Variant::Single) && s.variants.contains(&Variant::Cluster));
+    }
+
+    /// Issue #204: the SM differential stays single-only — its direct
+    /// Loki-push producer needs the compat push endpoint mounted only on the
+    /// single overlay.
+    #[test]
+    fn logs_structured_metadata_differential_stays_single_only() {
+        let s = SCENARIOS
+            .iter()
+            .find(|s| s.name == "logs_structured_metadata_differential")
+            .unwrap();
+        assert_eq!(s.variants, &[Variant::Single]);
     }
 
     #[test]

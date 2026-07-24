@@ -26,6 +26,18 @@
 //! only — the scenario self-gates on `PULSUS_E2E_LOGS_DIFFERENTIAL=1`
 //! (set by ci.yml's existing nightly full-tier job; no per-PR gate, no
 //! new job).
+//!
+//! **Cluster variant (issue #204):** the reference log store ships only on
+//! the single overlay, so under `Variant::Cluster` the differential runs
+//! ORACLE-LESS (`oracle_present`) — every `PulsusDB(cluster) ==` the
+//! by-construction corpus hard gate stays (the completeness gate and every
+//! streams/metric/ordered/error case), only the reference-oracle comparison
+//! is skipped. This proves the shard fan-out reassembles the full corpus
+//! with no lost or duplicated rows; reference-semantics parity is
+//! topology-invariant and inherited transitively from the single leg
+//! (`single == corpus == oracle`). The same nightly `e2e-metrics-full`
+//! matrix leg already exports the differential flag to both variants, so no
+//! new job/leg is added.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -674,6 +686,55 @@ fn labeled_entries_json(entries: &[LabeledEntry]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Whether the live reference log store (oracle) is available for this run
+/// (issue #204). The reference store ships only on the single overlay
+/// (`deploy/e2e/compose.single.yaml`); the cluster overlay ships no
+/// reference store, so under `Variant::Cluster` the differential runs
+/// oracle-less: every `PulsusDB == corpus` hard gate is kept, only the
+/// reference-oracle comparison is skipped. Reference parity is inherited
+/// transitively from the single leg (`single == corpus == oracle`), which
+/// is topology-invariant.
+fn oracle_present(ctx: &Ctx) -> bool {
+    ctx.variant == crate::scenarios::Variant::Single
+}
+
+/// One completeness probe target. `Pulsus` is always present and always at
+/// index 0; `Oracle` is present only when [`oracle_present`] holds (issue
+/// #204).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CompletenessStore {
+    Pulsus,
+    Oracle,
+}
+
+impl CompletenessStore {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pulsus => "pulsusdb",
+            Self::Oracle => "oracle",
+        }
+    }
+}
+
+/// The completeness probe targets, in stable order (Pulsus always index 0).
+/// On cluster (`with_oracle == false`) the list is PulsusDB-only, so the
+/// oracle slot is never built, indexed, or queried — both `wait_for_completeness`
+/// and `completeness_timeout_diagnostic` iterate this one selector (issue
+/// #204).
+fn completeness_stores(with_oracle: bool) -> &'static [CompletenessStore] {
+    if with_oracle {
+        &[CompletenessStore::Pulsus, CompletenessStore::Oracle]
+    } else {
+        &[CompletenessStore::Pulsus]
+    }
+}
+
+/// Progress `reached` counter: the min of the stores actually queried —
+/// PulsusDB alone when oracle-less, else `min(pulsus, oracle)` (issue #204).
+fn completeness_reached(pulsus: usize, oracle: Option<usize>) -> usize {
+    oracle.map_or(pulsus, |o| pulsus.min(o))
+}
+
 /// Per-attempt progress line (issue #106), rate-limited to at most one
 /// unchanged line per [`COMPLETENESS_PROGRESS_LOG_INTERVAL`]: without it
 /// the "still filling / set mismatch" path was silent every poll, so CI
@@ -685,17 +746,25 @@ fn log_completeness_progress(
     label: &str,
     total: usize,
     pulsus: usize,
-    oracle: usize,
+    oracle: Option<usize>,
 ) {
     let now = Instant::now();
-    let changed = last.get() != (pulsus, oracle);
+    // Oracle-less (cluster) runs collapse the change-detection key to the
+    // pulsus count alone, so an unchanged PulsusDB count still rate-limits
+    // the line (issue #204).
+    let oracle_key = oracle.unwrap_or(pulsus);
+    let changed = last.get() != (pulsus, oracle_key);
     if changed || now.duration_since(last_log_at.get()) >= COMPLETENESS_PROGRESS_LOG_INTERVAL {
-        let reached = pulsus.min(oracle);
+        let reached = completeness_reached(pulsus, oracle);
+        let oracle_disp = match oracle {
+            Some(o) => format!("oracle={o}"),
+            None => "oracle=n/a (oracle-less)".to_string(),
+        };
         println!(
             "pulsus-e2e:   {label} completeness: reached {reached}/{total}: pulsusdb={pulsus} \
-             oracle={oracle}"
+             {oracle_disp}"
         );
-        last.set((pulsus, oracle));
+        last.set((pulsus, oracle_key));
         last_log_at.set(now);
     }
 }
@@ -730,17 +799,16 @@ async fn completeness_timeout_diagnostic(
         limit,
         query_timeout,
     } = *probe;
+    // Oracle-less on cluster (issue #204): iterate the same selector the
+    // poll uses, so `query_loki` is never invoked and no `"oracle"` key is
+    // emitted when the reference store is absent.
+    let with_oracle = oracle_present(ctx);
     let mut stores = serde_json::Map::new();
-    for (store, body) in [
-        (
-            "pulsusdb",
-            query_pulsus(ctx, q, window, limit, query_timeout).await,
-        ),
-        (
-            "oracle",
-            query_loki(ctx, q, window, limit, query_timeout).await,
-        ),
-    ] {
+    for store in completeness_stores(with_oracle) {
+        let body = match store {
+            CompletenessStore::Pulsus => query_pulsus(ctx, q, window, limit, query_timeout).await,
+            CompletenessStore::Oracle => query_loki(ctx, q, window, limit, query_timeout).await,
+        };
         let entry = match body {
             Ok(body) => {
                 let raw = raw_entry_count(&body);
@@ -766,7 +834,7 @@ async fn completeness_timeout_diagnostic(
             }
             Err(err) => serde_json::json!({ "error": format!("final query failed: {err:#}") }),
         };
-        stores.insert(store.to_string(), entry);
+        stores.insert(store.label().to_string(), entry);
     }
     let artifact = serde_json::json!({
         "surface": surface,
@@ -811,6 +879,10 @@ async fn wait_for_completeness(
     let expected = corpus.expected_all_records();
     let expected_total = set_entry_count(&expected);
     let query_timeout = query_request_timeout(corpus.scale);
+    // Oracle-less on cluster (issue #204): the reference store ships only on
+    // the single overlay, so the oracle probe/body/`sets[1]` is never built
+    // or queried when it is absent.
+    let with_oracle = oracle_present(ctx);
     // Rate-limit state for the per-attempt progress line (issue #106):
     // interior-mutability so the poll closure stays `Fn` (no `&mut`
     // capture across the awaited future).
@@ -824,20 +896,23 @@ async fn wait_for_completeness(
         completeness_poll_timeout(corpus.scale),
         COMPLETENESS_POLL_INTERVAL,
         || async {
-            // Pass 1 — validity gates on BOTH stores' responses, before
-            // ANY set comparison (round-2 finding 2: comparing one store
-            // first would keep retrying while the OTHER store's response
-            // is already permanently invalid).
-            let bodies = [
-                (
-                    "pulsusdb",
-                    query_pulsus(ctx, &q, window, limit, query_timeout).await?,
-                ),
-                (
-                    "oracle",
-                    query_loki(ctx, &q, window, limit, query_timeout).await?,
-                ),
-            ];
+            // Pass 1 — validity gates on every present store's response,
+            // before ANY set comparison (round-2 finding 2: comparing one
+            // store first would keep retrying while the OTHER store's
+            // response is already permanently invalid). The oracle body is
+            // NOT constructed/queried when absent (issue #204).
+            let mut bodies: Vec<(&str, serde_json::Value)> = Vec::new();
+            for store in completeness_stores(with_oracle) {
+                let body = match store {
+                    CompletenessStore::Pulsus => {
+                        query_pulsus(ctx, &q, window, limit, query_timeout).await?
+                    }
+                    CompletenessStore::Oracle => {
+                        query_loki(ctx, &q, window, limit, query_timeout).await?
+                    }
+                };
+                bodies.push((store.label(), body));
+            }
             let mut sets = Vec::with_capacity(bodies.len());
             for (store, body) in &bodies {
                 let raw = raw_entry_count(body);
@@ -886,7 +961,10 @@ async fn wait_for_completeness(
             // progress line so the "set mismatch" case is no longer silent
             // (issue #106).
             let pulsus_matched = completeness_set_diff(&sets[0], &expected).matched;
-            let oracle_matched = completeness_set_diff(&sets[1], &expected).matched;
+            // `sets[1]` is dereferenced only when the oracle is present, so
+            // an oracle-less (cluster) run indexes no oracle slot (issue #204).
+            let oracle_matched =
+                with_oracle.then(|| completeness_set_diff(&sets[1], &expected).matched);
             log_completeness_progress(
                 &progress,
                 &last_log_at,
@@ -918,9 +996,14 @@ async fn wait_for_completeness(
             },
             &expected,
             timeout_err.context(format!(
-                "run {:?} never reached completeness ({} records) on both stores",
+                "run {:?} never reached completeness ({} records) on {}",
                 corpus.run_id,
-                corpus.total_records()
+                corpus.total_records(),
+                if with_oracle {
+                    "both stores"
+                } else {
+                    "PulsusDB"
+                },
             )),
         )
         .await),
@@ -980,19 +1063,32 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
             Ok::<(u16, String), anyhow::Error>((status, body))
         }
     };
+    // Oracle-less on cluster (issue #204): the error witness is asserted on
+    // the reference store only on the single overlay.
+    let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let (pulsus_status, pulsus_body) = fetch(ctx.url("/api/logs/v1/query")).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
-    let oracle_started = std::time::Instant::now();
-    let (oracle_status, oracle_body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
-    let oracle_elapsed = oracle_started.elapsed();
-    // Per-case elapsed line (issue #92, see `run_streams_case`).
-    println!(
-        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
-        case.case_id,
-        pulsus_elapsed.as_millis(),
-        oracle_elapsed.as_millis(),
-    );
+    let (oracle_status, oracle_body) = if with_oracle {
+        let oracle_started = std::time::Instant::now();
+        let (status, body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+        let oracle_elapsed = oracle_started.elapsed();
+        // Per-case elapsed line (issue #92, see `run_streams_case`).
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+            oracle_elapsed.as_millis(),
+        );
+        (Some(status), body)
+    } else {
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle n/a (oracle-less cluster)",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+        );
+        (None, String::new())
+    };
 
     let dump = |detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1011,10 +1107,12 @@ async fn run_metric_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) ->
         write_artifact(ctx, ARTIFACT_AREA, "metric-error-witness", &artifact)
     };
 
-    for (store, status, body) in [
-        ("pulsusdb", pulsus_status, &pulsus_body),
-        ("oracle", oracle_status, &oracle_body),
-    ] {
+    let mut checks: Vec<(&str, u16, &str)> =
+        vec![("pulsusdb", pulsus_status, pulsus_body.as_str())];
+    if let Some(status) = oracle_status {
+        checks.push(("oracle", status, oracle_body.as_str()));
+    }
+    for (store, status, body) in checks {
         if status != 400 {
             let path = dump(&format!("{store} returned {status}, expected 400"))?;
             bail!(
@@ -1076,8 +1174,16 @@ async fn run_metric_match_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseR
             Ok::<(u16, String), anyhow::Error>((status, body))
         }
     };
+    // Oracle-less on cluster (issue #204): asserted on the reference store
+    // only on the single overlay.
+    let with_oracle = oracle_present(ctx);
     let (pulsus_status, pulsus_body) = fetch(ctx.url("/api/logs/v1/query")).await?;
-    let (oracle_status, oracle_body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+    let (oracle_status, oracle_body) = if with_oracle {
+        let (status, body) = fetch(format!("{}/loki/api/v1/query", ctx.loki_url)).await?;
+        (Some(status), body)
+    } else {
+        (None, String::new())
+    };
 
     let dump = |detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1102,10 +1208,12 @@ async fn run_metric_match_error_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseR
         )
     };
 
-    for (store, status, body) in [
-        ("pulsusdb", pulsus_status, &pulsus_body),
-        ("oracle", oracle_status, &oracle_body),
-    ] {
+    let mut checks: Vec<(&str, u16, &str)> =
+        vec![("pulsusdb", pulsus_status, pulsus_body.as_str())];
+    if let Some(status) = oracle_status {
+        checks.push(("oracle", status, oracle_body.as_str()));
+    }
+    for (store, status, body) in checks {
         if status < 400 {
             let path = dump(&format!(
                 "{store} returned {status}, expected an error (>= 400)"
@@ -1181,6 +1289,10 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
         expected.len(),
     );
 
+    // Oracle-less on cluster (issue #204): PulsusDB stays hard-gated against
+    // the corpus; the reference-vector comparison runs on the single overlay
+    // only.
+    let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_instant(
         ctx,
@@ -1191,28 +1303,38 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
     )
     .await?;
     let pulsus_elapsed = pulsus_started.elapsed();
-    let oracle_started = std::time::Instant::now();
-    let oracle_body = query_instant(
-        ctx,
-        &format!("{}/loki/api/v1/query", ctx.loki_url),
-        &q,
-        eval_ns,
-        query_timeout,
-    )
-    .await?;
-    let oracle_elapsed = oracle_started.elapsed();
-    // Per-case elapsed line (issue #92, see `run_streams_case`).
-    println!(
-        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
-        case.case_id,
-        pulsus_elapsed.as_millis(),
-        oracle_elapsed.as_millis(),
-    );
-    // `vector_result_set` hard-fails on duplicate label sets (validity
-    // gate; a truncation gate is not applicable — metric vectors carry
-    // no request limit).
+    let (oracle_body, oracle_set) = if with_oracle {
+        let oracle_started = std::time::Instant::now();
+        let oracle_body = query_instant(
+            ctx,
+            &format!("{}/loki/api/v1/query", ctx.loki_url),
+            &q,
+            eval_ns,
+            query_timeout,
+        )
+        .await?;
+        let oracle_elapsed = oracle_started.elapsed();
+        // Per-case elapsed line (issue #92, see `run_streams_case`).
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+            oracle_elapsed.as_millis(),
+        );
+        // `vector_result_set` hard-fails on duplicate label sets (validity
+        // gate; a truncation gate is not applicable — metric vectors carry
+        // no request limit).
+        let oracle_set = vector_result_set(&oracle_body)?;
+        (oracle_body, oracle_set)
+    } else {
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle n/a (oracle-less cluster)",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+        );
+        (serde_json::Value::Null, MetricVector::new())
+    };
     let pulsus_set = vector_result_set(&pulsus_body)?;
-    let oracle_set = vector_result_set(&oracle_body)?;
 
     let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1250,36 +1372,38 @@ async fn run_metric_instant_case(ctx: &Ctx, corpus: &LogCorpus, case: &CaseRaw) 
             path.display()
         );
     }
-    if !vectors_match(&oracle_set, &expected) {
-        let path = dump(
-            "oracle_vs_corpus",
-            &format!("oracle vector diverged: got {oracle_set:?}, expected {expected:?}"),
-        )?;
-        if gated {
-            bail!(
-                "case {:?}: oracle diverged from the corpus expectation (repro {})",
+    if with_oracle {
+        if !vectors_match(&oracle_set, &expected) {
+            let path = dump(
+                "oracle_vs_corpus",
+                &format!("oracle vector diverged: got {oracle_set:?}, expected {expected:?}"),
+            )?;
+            if gated {
+                bail!(
+                    "case {:?}: oracle diverged from the corpus expectation (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+            println!(
+                "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+                 (dumped to {})",
                 case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
+                path.display()
+            );
+        } else if !gated {
+            let path = dump(
+                "stale_exclusion",
+                "informational metric case matched the oracle",
+            )?;
+            bail!(
+                "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+                case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
                 path.display()
             );
         }
-        println!(
-            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
-             (dumped to {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
-    } else if !gated {
-        let path = dump(
-            "stale_exclusion",
-            "informational metric case matched the oracle",
-        )?;
-        bail!(
-            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
     }
     Ok(())
 }
@@ -1331,6 +1455,10 @@ async fn run_metric_instant_ordered_case(
         },
     );
 
+    // Oracle-less on cluster (issue #204): the PulsusDB value-order gate is
+    // unchanged; the cross-store label-sequence comparison runs on the
+    // single overlay only.
+    let with_oracle = oracle_present(ctx);
     let pulsus_body = query_instant(
         ctx,
         &ctx.url("/api/logs/v1/query"),
@@ -1339,20 +1467,25 @@ async fn run_metric_instant_ordered_case(
         query_timeout,
     )
     .await?;
-    let oracle_body = query_instant(
-        ctx,
-        &format!("{}/loki/api/v1/query", ctx.loki_url),
-        &q,
-        eval_ns,
-        query_timeout,
-    )
-    .await?;
+    let (oracle_body, oracle_ordered, oracle_set) = if with_oracle {
+        let oracle_body = query_instant(
+            ctx,
+            &format!("{}/loki/api/v1/query", ctx.loki_url),
+            &q,
+            eval_ns,
+            query_timeout,
+        )
+        .await?;
+        let oracle_ordered = ordered_vector(&oracle_body)?;
+        // Set-equal validity gate (dup-label hard-fail lives in vector_result_set).
+        let oracle_set = vector_result_set(&oracle_body)?;
+        (oracle_body, oracle_ordered, oracle_set)
+    } else {
+        (serde_json::Value::Null, Vec::new(), MetricVector::new())
+    };
 
     let pulsus_ordered = ordered_vector(&pulsus_body)?;
-    let oracle_ordered = ordered_vector(&oracle_body)?;
-    // Set-equal validity gate (dup-label hard-fail lives in vector_result_set).
     let pulsus_set = vector_result_set(&pulsus_body)?;
-    let oracle_set = vector_result_set(&oracle_body)?;
 
     let dump = |detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1381,7 +1514,7 @@ async fn run_metric_instant_ordered_case(
             path.display()
         );
     }
-    if !vectors_match(&oracle_set, &expected) {
+    if with_oracle && !vectors_match(&oracle_set, &expected) {
         let path = dump(&format!(
             "oracle vector diverged: got {oracle_set:?}, expected {expected:?}"
         ))?;
@@ -1416,19 +1549,22 @@ async fn run_metric_instant_ordered_case(
     }
     // (b) The ordered label-set sequences agree between the two stores
     // (the equal-value a/c tie-break is label-ascending on both — v3.7.3).
-    let pulsus_seq: Vec<&BTreeMap<String, String>> =
-        pulsus_ordered.iter().map(|(l, _)| l).collect();
-    let oracle_seq: Vec<&BTreeMap<String, String>> =
-        oracle_ordered.iter().map(|(l, _)| l).collect();
-    if pulsus_seq != oracle_seq {
-        let path = dump(&format!(
-            "ordered label sequence diverged: pulsusdb {pulsus_seq:?} vs oracle {oracle_seq:?}"
-        ))?;
-        bail!(
-            "case {:?}: the two stores disagree on value order (repro {})",
-            case.case_id,
-            path.display()
-        );
+    // Cross-store only, so skipped oracle-less on cluster (issue #204).
+    if with_oracle {
+        let pulsus_seq: Vec<&BTreeMap<String, String>> =
+            pulsus_ordered.iter().map(|(l, _)| l).collect();
+        let oracle_seq: Vec<&BTreeMap<String, String>> =
+            oracle_ordered.iter().map(|(l, _)| l).collect();
+        if pulsus_seq != oracle_seq {
+            let path = dump(&format!(
+                "ordered label sequence diverged: pulsusdb {pulsus_seq:?} vs oracle {oracle_seq:?}"
+            ))?;
+            bail!(
+                "case {:?}: the two stores disagree on value order (repro {})",
+                case.case_id,
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1488,21 +1624,35 @@ async fn run_metric_range_case(
                 .with_context(|| format!("{url} body was not JSON"))
         }
     };
+    // Oracle-less on cluster (issue #204): PulsusDB stays hard-gated against
+    // the tumbling corpus; the reference-matrix comparison runs on the
+    // single overlay only.
+    let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_range(ctx.url("/api/logs/v1/query_range")).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
-    let oracle_started = std::time::Instant::now();
-    let oracle_body = query_range(format!("{}/loki/api/v1/query_range", ctx.loki_url)).await?;
-    let oracle_elapsed = oracle_started.elapsed();
-    // Per-case elapsed line (issue #92, see `run_streams_case`).
-    println!(
-        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
-        case.case_id,
-        pulsus_elapsed.as_millis(),
-        oracle_elapsed.as_millis(),
-    );
+    let (oracle_body, oracle_set) = if with_oracle {
+        let oracle_started = std::time::Instant::now();
+        let oracle_body = query_range(format!("{}/loki/api/v1/query_range", ctx.loki_url)).await?;
+        let oracle_elapsed = oracle_started.elapsed();
+        // Per-case elapsed line (issue #92, see `run_streams_case`).
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+            oracle_elapsed.as_millis(),
+        );
+        let oracle_set = matrix_result_set(&oracle_body)?;
+        (oracle_body, oracle_set)
+    } else {
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle n/a (oracle-less cluster)",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+        );
+        (serde_json::Value::Null, MetricMatrix::new())
+    };
     let pulsus_set = matrix_result_set(&pulsus_body)?;
-    let oracle_set = matrix_result_set(&oracle_body)?;
 
     let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1540,33 +1690,35 @@ async fn run_metric_range_case(
             path.display()
         );
     }
-    if !matrices_match(&oracle_set, &expected) {
-        let path = dump("oracle_vs_corpus", "oracle sliding-window result diverged")?;
-        if gated {
-            bail!(
-                "case {:?}: oracle diverged from the corpus expectation (repro {})",
+    if with_oracle {
+        if !matrices_match(&oracle_set, &expected) {
+            let path = dump("oracle_vs_corpus", "oracle sliding-window result diverged")?;
+            if gated {
+                bail!(
+                    "case {:?}: oracle diverged from the corpus expectation (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+            println!(
+                "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+                 (dumped to {})",
                 case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
+                path.display()
+            );
+        } else if !gated {
+            let path = dump(
+                "stale_exclusion",
+                "informational metric case matched the oracle",
+            )?;
+            bail!(
+                "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+                case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
                 path.display()
             );
         }
-        println!(
-            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
-             (dumped to {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
-    } else if !gated {
-        let path = dump(
-            "stale_exclusion",
-            "informational metric case matched the oracle",
-        )?;
-        bail!(
-            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
     }
     Ok(())
 }
@@ -1599,20 +1751,35 @@ async fn run_streams_case(
     // precedent): budget breaches against the tier-aware query timeout
     // stay diagnosable from CI logs alone. Elapsed only — these helpers
     // return parsed JSON, so no raw byte count is in hand.
+    //
+    // Oracle-less on cluster (issue #204): the reference store is queried
+    // and compared only on the single overlay; on cluster `loki_body` stays
+    // null and `loki_set` empty (neither is consulted below the guard).
+    let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_pulsus(ctx, &q, window, fixture.limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
-    let loki_started = std::time::Instant::now();
-    let loki_body = query_loki(ctx, &q, window, fixture.limit, query_timeout).await?;
-    let loki_elapsed = loki_started.elapsed();
-    println!(
-        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
-        case.case_id,
-        pulsus_elapsed.as_millis(),
-        loki_elapsed.as_millis(),
-    );
+    let (loki_body, loki_set) = if with_oracle {
+        let loki_started = std::time::Instant::now();
+        let loki_body = query_loki(ctx, &q, window, fixture.limit, query_timeout).await?;
+        let loki_elapsed = loki_started.elapsed();
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+            loki_elapsed.as_millis(),
+        );
+        let loki_set = result_set(&loki_body)?;
+        (loki_body, loki_set)
+    } else {
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle n/a (oracle-less cluster)",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+        );
+        (serde_json::Value::Null, ExpectedResult::new())
+    };
     let pulsus_set = result_set(&pulsus_body)?;
-    let loki_set = result_set(&loki_body)?;
 
     let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1640,9 +1807,14 @@ async fn run_streams_case(
     };
 
     // Validity gate (b): a raw count at the limit means truncation — a
-    // top-K, not a set. Hard on both stores, even for informational
-    // cases (it invalidates the comparison, not the semantics).
-    for (store, body) in [("pulsusdb", &pulsus_body), ("oracle", &loki_body)] {
+    // top-K, not a set. Hard on every present store, even for informational
+    // cases (it invalidates the comparison, not the semantics). The oracle
+    // is skipped when absent (issue #204).
+    let mut truncation_bodies: Vec<(&str, &serde_json::Value)> = vec![("pulsusdb", &pulsus_body)];
+    if with_oracle {
+        truncation_bodies.push(("oracle", &loki_body));
+    }
+    for (store, body) in truncation_bodies {
         let raw = raw_entry_count(body);
         if raw as u32 >= fixture.limit {
             let path = dump(
@@ -1659,11 +1831,14 @@ async fn run_streams_case(
         }
     }
     // Validity gate (c): duplicate entries would collapse in the set
-    // comparison and mask a real response-shaping bug. Hard on both.
-    for (store, body, set) in [
-        ("pulsusdb", &pulsus_body, &pulsus_set),
-        ("oracle", &loki_body, &loki_set),
-    ] {
+    // comparison and mask a real response-shaping bug. Hard on every
+    // present store.
+    let mut dup_sets: Vec<(&str, &serde_json::Value, &ExpectedResult)> =
+        vec![("pulsusdb", &pulsus_body, &pulsus_set)];
+    if with_oracle {
+        dup_sets.push(("oracle", &loki_body, &loki_set));
+    }
+    for (store, body, set) in dup_sets {
         let raw = raw_entry_count(body);
         let distinct = set_entry_count(set);
         if raw != distinct {
@@ -1690,41 +1865,45 @@ async fn run_streams_case(
         );
     }
 
-    // Oracle vs the corpus expectation (== vs PulsusDB, transitively).
-    if loki_set != expected {
-        let detail = describe_diff("oracle", &loki_set, &expected);
-        let path = dump("oracle_vs_corpus", &detail)?;
-        if gated {
-            bail!(
-                "case {:?}: {detail} (repro {})",
+    // Oracle vs the corpus expectation (== vs PulsusDB, transitively) —
+    // skipped oracle-less on cluster (issue #204: reference parity is
+    // inherited transitively from the single leg).
+    if with_oracle {
+        if loki_set != expected {
+            let detail = describe_diff("oracle", &loki_set, &expected);
+            let path = dump("oracle_vs_corpus", &detail)?;
+            if gated {
+                bail!(
+                    "case {:?}: {detail} (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+            println!(
+                "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}): \
+                 {detail} (dumped to {})",
                 case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
+                path.display()
+            );
+        } else if !gated {
+            // Anti-rot (issue #72 review round 1, finding 5, mirroring the
+            // ledger discipline): a ledgered oracle divergence that has
+            // STARTED MATCHING again must fail the run — the stale exclusion
+            // has to be removed (case re-gated, ledger entry kept for
+            // history), never left silently passing.
+            let path = dump(
+                "stale_exclusion",
+                "informational case matched the oracle — the ledgered divergence no longer exists",
+            )?;
+            bail!(
+                "case {:?}: ledgered divergence ({:?}) is stale — the oracle now matches; re-gate \
+                 the case and drop its ledger reference (repro {})",
+                case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
                 path.display()
             );
         }
-        println!(
-            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}): \
-             {detail} (dumped to {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
-    } else if !gated {
-        // Anti-rot (issue #72 review round 1, finding 5, mirroring the
-        // ledger discipline): a ledgered oracle divergence that has
-        // STARTED MATCHING again must fail the run — the stale exclusion
-        // has to be removed (case re-gated, ledger entry kept for
-        // history), never left silently passing.
-        let path = dump(
-            "stale_exclusion",
-            "informational case matched the oracle — the ledgered divergence no longer exists",
-        )?;
-        bail!(
-            "case {:?}: ledgered divergence ({:?}) is stale — the oracle now matches; re-gate \
-             the case and drop its ledger reference (repro {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
     }
 
     // Placement discriminator (issue #109): scope is per-entry structured
@@ -1741,8 +1920,14 @@ async fn run_streams_case(
             corpus.run_id,
         );
         let pulsus_sel = query_pulsus(ctx, &selector, window, fixture.limit, query_timeout).await?;
-        let loki_sel = query_loki(ctx, &selector, window, fixture.limit, query_timeout).await?;
-        for (store, body) in [("pulsusdb", &pulsus_sel), ("oracle", &loki_sel)] {
+        // The reference-store placement check runs only on the single
+        // overlay; the PulsusDB placement gate is unchanged (issue #204).
+        let mut sel_bodies: Vec<(&str, serde_json::Value)> = vec![("pulsusdb", pulsus_sel)];
+        if with_oracle {
+            let loki_sel = query_loki(ctx, &selector, window, fixture.limit, query_timeout).await?;
+            sel_bodies.push(("oracle", loki_sel));
+        }
+        for (store, body) in &sel_bodies {
             let matched = raw_entry_count(body);
             if matched != 0 {
                 let path = dump(
@@ -1820,18 +2005,31 @@ async fn run_streams_limited_case(
         2, // >= 2 by construction (see AC3′); logged for CI diagnosis
     );
 
+    // Oracle-less on cluster (issue #204): the reference store is queried
+    // and compared only on the single overlay.
+    let with_oracle = oracle_present(ctx);
     let pulsus_started = std::time::Instant::now();
     let pulsus_body = query_pulsus(ctx, &q, window, limit, query_timeout).await?;
     let pulsus_elapsed = pulsus_started.elapsed();
-    let loki_started = std::time::Instant::now();
-    let loki_body = query_loki(ctx, &q, window, limit, query_timeout).await?;
-    let loki_elapsed = loki_started.elapsed();
-    println!(
-        "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
-        case.case_id,
-        pulsus_elapsed.as_millis(),
-        loki_elapsed.as_millis(),
-    );
+    let loki_body = if with_oracle {
+        let loki_started = std::time::Instant::now();
+        let loki_body = query_loki(ctx, &q, window, limit, query_timeout).await?;
+        let loki_elapsed = loki_started.elapsed();
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle {}ms",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+            loki_elapsed.as_millis(),
+        );
+        loki_body
+    } else {
+        println!(
+            "pulsus-e2e: query {q:?} (case {:?}) pulsusdb {}ms oracle n/a (oracle-less cluster)",
+            case.case_id,
+            pulsus_elapsed.as_millis(),
+        );
+        serde_json::Value::Null
+    };
 
     let dump = |kind: &str, detail: &str| -> Result<std::path::PathBuf> {
         let artifact = serde_json::json!({
@@ -1870,7 +2068,12 @@ async fn run_streams_limited_case(
     //   3. strictly distinct timestamps — the ordered comparison must not
     //      depend on tie-breaking (a duplicate ts signals ambiguity and
     //      invalidates the comparison rather than passing silently).
-    for (store, body) in [("pulsusdb", &pulsus_body), ("oracle", &loki_body)] {
+    // The oracle is skipped when absent (issue #204).
+    let mut validity_bodies: Vec<(&str, &serde_json::Value)> = vec![("pulsusdb", &pulsus_body)];
+    if with_oracle {
+        validity_bodies.push(("oracle", &loki_body));
+    }
+    for (store, body) in validity_bodies {
         let raw = raw_entry_count(body);
         if raw as u32 != limit {
             let path = dump(
@@ -1931,40 +2134,43 @@ async fn run_streams_limited_case(
         );
     }
 
-    // Oracle vs the corpus ordered prefix (== vs PulsusDB, transitively).
-    let loki_entries = ordered_entries_or_dump("oracle", &loki_body, &case.case_id, &dump)?;
-    if loki_entries != expected {
-        let path = dump(
-            "oracle_vs_corpus",
-            &format!("oracle ordered result {loki_entries:?} != expected {expected:?}"),
-        )?;
-        if gated {
-            bail!(
-                "case {:?}: oracle ordered result diverged from the corpus earliest-{limit} \
-                 prefix (repro {})",
+    // Oracle vs the corpus ordered prefix (== vs PulsusDB, transitively) —
+    // skipped oracle-less on cluster (issue #204).
+    if with_oracle {
+        let loki_entries = ordered_entries_or_dump("oracle", &loki_body, &case.case_id, &dump)?;
+        if loki_entries != expected {
+            let path = dump(
+                "oracle_vs_corpus",
+                &format!("oracle ordered result {loki_entries:?} != expected {expected:?}"),
+            )?;
+            if gated {
+                bail!(
+                    "case {:?}: oracle ordered result diverged from the corpus earliest-{limit} \
+                     prefix (repro {})",
+                    case.case_id,
+                    path.display()
+                );
+            }
+            println!(
+                "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
+                 (dumped to {})",
                 case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
+                path.display()
+            );
+        } else if !gated {
+            // Anti-rot, mirroring `run_streams_case`.
+            let path = dump(
+                "stale_exclusion",
+                "informational case matched the oracle — the ledgered divergence no longer exists",
+            )?;
+            bail!(
+                "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
+                case.case_id,
+                case.ledger.as_deref().unwrap_or(""),
                 path.display()
             );
         }
-        println!(
-            "pulsus-e2e:   logs informational delta (never gating): case {:?} (ledger {:?}) \
-             (dumped to {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
-    } else if !gated {
-        // Anti-rot, mirroring `run_streams_case`.
-        let path = dump(
-            "stale_exclusion",
-            "informational case matched the oracle — the ledgered divergence no longer exists",
-        )?;
-        bail!(
-            "case {:?}: ledgered divergence ({:?}) is stale — re-gate the case (repro {})",
-            case.case_id,
-            case.ledger.as_deref().unwrap_or(""),
-            path.display()
-        );
     }
     Ok(())
 }
@@ -2227,6 +2433,7 @@ async fn wait_for_sm_completeness(
                 sets.push(set);
             }
             let pulsus_matched = completeness_set_diff(&sets[0], &expected).matched;
+            // The SM lane is single-only, so the oracle is always present.
             let oracle_matched = completeness_set_diff(&sets[1], &expected).matched;
             log_completeness_progress(
                 &progress,
@@ -2234,7 +2441,7 @@ async fn wait_for_sm_completeness(
                 "sm logs",
                 expected_total,
                 pulsus_matched,
-                oracle_matched,
+                Some(oracle_matched),
             );
             if sets.iter().any(|set| *set != expected) {
                 return Ok(None); // still filling — keep polling
@@ -3786,5 +3993,242 @@ mod tests {
         );
 
         accept_task.abort();
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #204: the oracle-less cluster differential — the reference
+    // store's completeness probe is NEVER built/indexed/queried on the
+    // cluster leg (helper-level floors + the two dispatch-site floors).
+    // ---------------------------------------------------------------
+
+    /// AC2 (part): `oracle_present` is single-only.
+    #[test]
+    fn oracle_present_is_true_only_on_the_single_overlay() {
+        let single = probe_ctx(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            crate::scenarios::Variant::Single,
+        );
+        let cluster = probe_ctx(
+            "http://127.0.0.1:1".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            crate::scenarios::Variant::Cluster,
+        );
+        assert!(oracle_present(&single));
+        assert!(!oracle_present(&cluster));
+    }
+
+    /// AC7 (helper floor): the cluster store list excludes the oracle slot,
+    /// so `sets[1]`/`query_loki` are structurally unreachable; single still
+    /// fans to both, in stable order (Pulsus index 0).
+    #[test]
+    fn cluster_completeness_selects_pulsus_only() {
+        let stores = completeness_stores(false);
+        assert_eq!(stores, &[CompletenessStore::Pulsus]);
+        assert!(!stores.contains(&CompletenessStore::Oracle));
+        assert_eq!(
+            completeness_stores(true),
+            &[CompletenessStore::Pulsus, CompletenessStore::Oracle]
+        );
+    }
+
+    /// AC2b: the progress `reached` counter reads PulsusDB alone oracle-less,
+    /// else the min of both.
+    #[test]
+    fn oracle_less_progress_counts_pulsus_only() {
+        assert_eq!(completeness_reached(7, None), 7);
+        assert_eq!(completeness_reached(7, Some(4)), 4);
+        assert_eq!(completeness_reached(3, Some(9)), 3);
+    }
+
+    /// A [`Ctx`] with an explicit variant + PulsusDB/oracle URLs; the
+    /// collector/prometheus/tempo URLs are unroutable placeholders these
+    /// tests never touch, and `compose` is never invoked.
+    fn probe_ctx(base_url: String, loki_url: String, variant: crate::scenarios::Variant) -> Ctx {
+        Ctx {
+            http: reqwest::Client::new(),
+            base_url,
+            collector_url: "http://127.0.0.1:1".to_string(),
+            prometheus_url: "http://127.0.0.1:1".to_string(),
+            tempo_url: "http://127.0.0.1:1".to_string(),
+            loki_url,
+            variant,
+            fixtures_dir: crate::engine::workspace_root().join("test/fixtures"),
+            compose: crate::engine::Compose::new(
+                crate::engine::EngineKind::Docker,
+                vec![],
+                "logs-cluster-oracle-guard-test",
+            ),
+        }
+    }
+
+    /// Inverse of [`result_set`]: serializes a corpus expectation back into
+    /// the `query_range` streams wire shape the PulsusDB stub returns, so a
+    /// single poll of `wait_for_completeness` sees the full set and succeeds.
+    fn streams_response_json(expected: &ExpectedResult) -> serde_json::Value {
+        let result: Vec<serde_json::Value> = expected
+            .iter()
+            .map(|(labels, entries)| {
+                let values: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(ts, line)| serde_json::json!([ts.to_string(), line]))
+                    .collect();
+                serde_json::json!({ "stream": labels, "values": values })
+            })
+            .collect();
+        serde_json::json!({ "data": { "resultType": "streams", "result": result } })
+    }
+
+    /// Serves `body` as a well-formed HTTP/1.1 200 JSON response for every
+    /// connection on an ephemeral loopback port — the stand-in PulsusDB
+    /// query backend (mirrors `metrics::spawn_stub_backend`).
+    async fn spawn_json_stub(body: String) -> std::net::SocketAddr {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Counts inbound connections then drops them — the oracle endpoint that
+    /// must NEVER be contacted on the cluster leg. A single connection is the
+    /// regression signal (no body read needed).
+    async fn count_connections(
+        listener: tokio::net::TcpListener,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(socket);
+        }
+    }
+
+    /// Resolves the instant `hits` reaches 1 — never under correct code
+    /// (the oracle is off the cluster store list), so it only wins the
+    /// `select!` below when an unconditional oracle probe is re-introduced.
+    async fn oracle_hit_watchdog(hits: &std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        loop {
+            if hits.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn tiny_cluster_corpus(run_id: &str) -> LogCorpus {
+        logs_corpus::generate(&LogCorpusSpec {
+            scale: Scale::Ci,
+            record_count: 3,
+            step_ns: 1_000_000_000,
+            base_ns: 1_700_000_000_000_000_000,
+            run_id: run_id.to_string(),
+        })
+    }
+
+    /// AC7b (dispatch-site floor): driving the REAL `wait_for_completeness`
+    /// on a `Variant::Cluster` Ctx completes `Ok` using PulsusDB only and
+    /// leaves `oracle_hits == 0`. A regression re-adding an unconditional
+    /// oracle probe (`sets[1]`/`query_loki`) trips the `select!` watchdog.
+    #[tokio::test]
+    async fn cluster_wait_for_completeness_never_contacts_oracle() {
+        let corpus = tiny_cluster_corpus("e2e-logs-cluster-oracle-guard");
+        let window = query_window(&corpus);
+        let expected = corpus.expected_all_records();
+        let body = streams_response_json(&expected).to_string();
+        let pulsus_addr = spawn_json_stub(body).await;
+
+        let oracle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oracle_addr = oracle_listener.local_addr().unwrap();
+        let oracle_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let oracle_task = tokio::spawn(count_connections(oracle_listener, oracle_hits.clone()));
+
+        let ctx = probe_ctx(
+            format!("http://{pulsus_addr}"),
+            format!("http://{oracle_addr}"),
+            crate::scenarios::Variant::Cluster,
+        );
+
+        // limit well above the 3-record corpus (raw == distinct == 3 < limit),
+        // so the first poll's `sets[0] == expected` returns Ok immediately.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                r = wait_for_completeness(&ctx, &corpus, window, 1000) => r,
+                _ = oracle_hit_watchdog(&oracle_hits) => panic!(
+                    "oracle endpoint contacted on the cluster leg — an unconditional oracle probe \
+                     was re-introduced"
+                ),
+            }
+        })
+        .await
+        .expect("wait_for_completeness did not resolve within 30s");
+        result.expect("cluster completeness must succeed using PulsusDB only");
+        assert_eq!(
+            oracle_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "oracle must never be contacted on cluster"
+        );
+        oracle_task.abort();
+    }
+
+    /// AC7b (dispatch-site floor, second call site): the REAL
+    /// `completeness_timeout_diagnostic` on a cluster Ctx iterates the
+    /// PulsusDB-only store list, so it never fires `query_loki` and emits no
+    /// `"oracle"` key. The PulsusDB probe fails fast (unroutable base_url,
+    /// recorded as an error entry) — the point is `oracle_hits == 0`.
+    #[tokio::test]
+    async fn cluster_completeness_timeout_diagnostic_omits_oracle() {
+        let corpus = tiny_cluster_corpus("e2e-logs-cluster-oracle-diag");
+        let window = query_window(&corpus);
+        let expected = corpus.expected_all_records();
+
+        let oracle_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let oracle_addr = oracle_listener.local_addr().unwrap();
+        let oracle_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let oracle_task = tokio::spawn(count_connections(oracle_listener, oracle_hits.clone()));
+
+        let ctx = probe_ctx(
+            "http://127.0.0.1:1".to_string(),
+            format!("http://{oracle_addr}"),
+            crate::scenarios::Variant::Cluster,
+        );
+        let q = run_scope_query(&corpus.run_id);
+        let probe = CompletenessProbe {
+            q: &q,
+            window,
+            limit: 1000,
+            query_timeout: Duration::from_secs(2),
+        };
+
+        let _ = completeness_timeout_diagnostic(
+            &ctx,
+            "logs_pipeline_completeness",
+            "completeness-timeout-cluster-test",
+            &probe,
+            &expected,
+            anyhow::anyhow!("synthetic timeout for the cluster no-oracle diagnostic test"),
+        )
+        .await;
+
+        assert_eq!(
+            oracle_hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the timeout diagnostic must never contact the oracle on cluster"
+        );
+        oracle_task.abort();
     }
 }
