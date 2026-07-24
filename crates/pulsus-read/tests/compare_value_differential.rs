@@ -365,8 +365,25 @@ fn otlp_push(otlp_base: &str, nonce: &[u8; 16], spans: &[SpanDef]) {
     );
 }
 
+/// The Tempo metrics-query step. Small and FIXED (not the whole-window span):
+/// a single whole-window bucket is aligned to the step grid and can land its
+/// right edge in the future even for a past-anchored window, which reads back
+/// empty; a small fixed step keeps every bucket the query touches finely
+/// aligned and — because the corpus is anchored in the past (see
+/// [`compare_value_differential`]) — already finalised. `compare()` counts
+/// are additive across disjoint time buckets, so summing the per-step samples
+/// (see [`tempo_query_once`]) yields the same totals a single bucket would.
+const TEMPO_STEP_S: i64 = 60;
+
 /// Polls Tempo's metrics API until `compare()` returns the corpus's
 /// baseline/selection counts for the three keys.
+///
+/// Because the corpus is anchored in the PAST and `window` ends in the past,
+/// every bucket this query touches is already finalised, so the FIRST
+/// non-empty response carries the COMPLETE counts — the poll loop exists only
+/// to wait out Tempo's flush of the freshly-pushed spans (~seconds), not to
+/// wait for any future wall-clock boundary. The budget is a generous safety
+/// net.
 fn tempo_counts(api_base: &str, window: (i64, i64)) -> Counts {
     for _ in 0..60 {
         if let Some(map) = tempo_query_once(api_base, window)
@@ -380,14 +397,13 @@ fn tempo_counts(api_base: &str, window: (i64, i64)) -> Counts {
 }
 
 fn tempo_query_once(api_base: &str, window: (i64, i64)) -> Option<Counts> {
-    let window_s = (window.1 - window.0) / 1_000_000_000;
     let url = format!("{}/api/metrics/query_range", api_base.trim_end_matches('/'));
     let out = Command::new("curl")
         .args(["-s", "-G", "--max-time", "20"])
         .args(["--data-urlencode", "q={} | compare({ status = error })"])
         .args(["--data-urlencode", &format!("start={}", window.0)])
         .args(["--data-urlencode", &format!("end={}", window.1)])
-        .args(["--data-urlencode", &format!("step={window_s}s")])
+        .args(["--data-urlencode", &format!("step={TEMPO_STEP_S}s")])
         .arg(&url)
         .output()
         .expect("curl on PATH");
@@ -473,8 +489,24 @@ async fn compare_value_differential() {
     };
 
     let sec = 1_000_000_000i64;
-    let base = now_ns();
-    let window = (base - 60 * sec, base + 120 * sec);
+    // Anchor the corpus ~90s in the PAST (span timestamps `base .. base+3s`).
+    // This is the crux of the flake fix. Tempo v3.0.2's live_store only
+    // finalises a TraceQL-metrics time bucket once wall-clock passes that
+    // bucket's right edge, and it counts spans by their span time. The
+    // previous design anchored the corpus at "now" and queried a window
+    // ending 120s in the FUTURE, so the value-bearing bucket only finalised
+    // ~120s+ later — racing the poll budget and intermittently red-ing main.
+    // With `base` in the past, EVERY bucket covering the corpus is already
+    // finalised by the time the test queries, so the first non-empty poll
+    // returns COMPLETE counts within a few seconds of Tempo flushing the push
+    // (observed ~3s locally), deterministically. 90s stays well inside Tempo's
+    // ~15m `query_backend_after` live_store window, so live_store serves it.
+    let base = now_ns() - 90 * sec;
+    // Both reads use this window; it brackets the corpus and, crucially, ENDS
+    // in the past (`base+60s`) so every Tempo bucket it touches is complete.
+    // PulsusDB's side is a plain ClickHouse timestamp range and is unaffected
+    // by the anchor.
+    let window = (base - 60 * sec, base + 60 * sec);
     let nonce = *uuid::Uuid::new_v4().as_bytes();
     let spans = corpus(base);
 
@@ -496,7 +528,7 @@ async fn compare_value_differential() {
     );
     let pulsus = pulsus_counts(&engine, window).await;
 
-    // Tempo readback.
+    // Tempo readback (past-anchored, already-complete buckets; see tempo_counts).
     let tempo = tempo_counts(&api_base, window);
 
     eprintln!("pulsus compare() counts: {pulsus:#?}");

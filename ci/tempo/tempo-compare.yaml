@@ -27,13 +27,17 @@
 # live-store block within a few seconds; complete_block_timeout 30m then keeps
 # that completed block queryable for the whole test window.
 #
-# NOTE on visibility latency: the compare() leg queries a metrics window that
-# extends ~120 s INTO THE FUTURE (base-60s .. base+120s, one 180 s bucket), so
-# the value-bearing bucket is only finalised as wall-clock advances — observed
-# ~70-90 s from push to non-empty compare() output locally. That is well
-# inside the test's 60x2s = 120 s poll budget, but it is NOT the "few seconds"
-# an instant query would give; the latency is a property of the forward window,
-# not of these flush knobs.
+# NOTE on visibility latency: Tempo only finalises a TraceQL-metrics time
+# bucket once wall-clock passes that bucket's right edge, and it buckets spans
+# by their span time. The compare() leg therefore anchors its corpus ~90 s in
+# the PAST and queries a window that ends in the past too (base-60s .. base+60s
+# with a small fixed step), so every bucket the query touches is ALREADY
+# finalised. compare() counts then appear COMPLETE within a few seconds of the
+# push flushing (observed ~2-3 s locally) — no waiting on a future boundary.
+# (An earlier design used a forward window ending ~120 s in the FUTURE; that
+# forced the bucket to finalise as wall-clock advanced, ~70-190 s later, which
+# raced the poll budget and intermittently red-ed main. Fixed in the test, not
+# via these flush knobs.)
 # --------------------------------------------------------------------------
 
 # Required for TraceQL streaming/metrics responses over plain HTTP.
