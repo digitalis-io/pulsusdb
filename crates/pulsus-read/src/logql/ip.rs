@@ -177,56 +177,17 @@ fn ipv4_candidate_re() -> &'static Regex {
 /// then validated by `std::net`, so a non-IPv6 run like `12:34:56` simply
 /// fails to parse and is skipped.
 ///
-/// The greedy run is *not* a pure superset, though: an unbracketed
-/// `addr:port` such as `2001:db8::1:8080` is itself a valid but *different*
-/// 8-group address, so the run would parse and could produce a false in-range
-/// match. That ambiguous form is filtered out by [`is_ambiguous_v6_addr_port`]
-/// in [`line_has_ip_in`] (the bracketed `[addr]:port` form is unaffected —
-/// the regex stops at `]`, so the port never enters the candidate).
+/// Extraction is maximal to match the pinned reference: an unbracketed
+/// `addr:port` such as `2001:db8::1:8080` is itself a valid 8-group IPv6
+/// address, and the reference greedily consumes the whole token and matches it
+/// in-range. We do the same — the greedy run takes the entire token as one
+/// candidate. The bracketed `[addr]:port` form is unaffected: the regex stops
+/// at `]`, so the port never enters the candidate and only the host matches.
 fn ipv6_candidate_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"[A-Fa-f0-9]{0,4}(?::[A-Fa-f0-9]{0,4}){2,}").expect("static ipv6 regex")
     })
-}
-
-/// Detects the ambiguous *unbracketed* IPv6 `addr:port` candidate form.
-///
-/// A greedy candidate like `2001:db8::1:8080` is indistinguishable, from the
-/// candidate string alone, between the host `2001:db8::1` on port `8080` and
-/// the literal 8-group address `2001:db8:0:0:0:0:1:8080`. Because the `::`
-/// compression lets a trailing decimal group masquerade as a port (and vice
-/// versa), we cannot know which the log author meant. The reference disambiguates
-/// this in raw log text with the bracketed `[addr]:port` form, which the
-/// extractor already handles correctly (the regex terminates at `]`).
-///
-/// For the genuinely ambiguous unbracketed form we take the conservative
-/// choice mandated for this line filter: skip the candidate entirely rather
-/// than emit a false in-range match from the mis-extended address. The trade
-/// is that a real 8-group address whose last group happens to be a small
-/// decimal (e.g. `2001:db8::1:2`) is also skipped — but that string is itself
-/// ambiguous with a host+port, so declining to match it is the safe outcome.
-///
-/// The form is flagged only when the candidate's trailing `:group` is a decimal
-/// port (`1..=65535`, ≤4 chars per the group regex) *and* the address prefix
-/// with that group removed is *independently* a complete, valid IPv6 address —
-/// which is only possible when the prefix contains `::`. A full 8-group address
-/// (`2001:db8:0:0:0:0:1:2`) is never flagged: dropping its last group leaves 7
-/// uncompressed groups, which does not parse.
-fn is_ambiguous_v6_addr_port(candidate: &str) -> bool {
-    let Some((prefix, last)) = candidate.rsplit_once(':') else {
-        return false;
-    };
-    // Trailing group must look like a decimal port literal.
-    if last.is_empty() || !last.bytes().all(|b| b.is_ascii_digit()) {
-        return false;
-    }
-    if last.parse::<u16>().is_err() {
-        return false;
-    }
-    // Ambiguous only if the port-stripped prefix is itself a valid IPv6 address
-    // (implying a `::` absorbed the groups the trailing port would otherwise be).
-    prefix.parse::<Ipv6Addr>().is_ok()
 }
 
 /// Scans `line` for any address (of the matcher's family) that satisfies
@@ -241,14 +202,9 @@ pub(crate) fn line_has_ip_in(matcher: &IpMatcher, line: &str) -> bool {
                 .is_ok_and(|a| matcher.contains(&IpAddr::V4(a)))
         }),
         IpMatcher::V6 { .. } => ipv6_candidate_re().find_iter(line).any(|m| {
-            let candidate = m.as_str();
-            // Skip the ambiguous unbracketed `addr:port` form so a mis-extended
-            // address cannot produce a false in-range match (see
-            // `is_ambiguous_v6_addr_port`).
-            !is_ambiguous_v6_addr_port(candidate)
-                && candidate
-                    .parse::<Ipv6Addr>()
-                    .is_ok_and(|a| matcher.contains(&IpAddr::V6(a)))
+            m.as_str()
+                .parse::<Ipv6Addr>()
+                .is_ok_and(|a| matcher.contains(&IpAddr::V6(a)))
         }),
     }
 }
@@ -418,17 +374,22 @@ mod tests {
     }
 
     #[test]
-    fn line_scan_unbracketed_v6_addr_port_is_not_mis_extended() {
-        // `2001:db8::1:8080` (host `2001:db8::1` + port 8080, no brackets) is a
-        // *valid but different* 8-group address. A filter covering the
-        // mis-extended address but NOT the intended host must not produce a
-        // false in-range match — the ambiguous candidate is skipped instead.
+    fn line_scan_unbracketed_v6_addr_port_is_extracted_maximally() {
+        // Expected outcomes captured from the pinned reference (v3.7.3): the
+        // unbracketed token `2001:db8::1:8080` parses in full as the 8-group
+        // IPv6 address `2001:db8::1:8080`, and the reference greedily consumes
+        // and matches it. We extract maximally to match that parity.
         //
-        // Range endpoints: `2001:db8::1:8000`..=`2001:db8::1:9000` contain the
-        // mis-parsed `2001:db8::1:8080` (last group 0x8080) but exclude the
-        // host `2001:db8::1` (== `2001:db8::0:1`).
-        let range = m("2001:db8::1:8000-2001:db8::1:9000");
-        assert!(!line_has_ip_in(&range, "peer 2001:db8::1:8080 up"));
+        // The whole token is in `2001:db8::/32`, so the CIDR filter matches...
+        let cidr = m("2001:db8::/32");
+        assert!(line_has_ip_in(&cidr, "peer 2001:db8::1:8080 up"));
+        // ...and an exact filter on the full token matches...
+        let exact_token = m("2001:db8::1:8080");
+        assert!(line_has_ip_in(&exact_token, "peer 2001:db8::1:8080 up"));
+        // ...but an exact filter on the *host* `2001:db8::1` does NOT match,
+        // because the token is taken as the whole address, not host+port.
+        let exact_host = m("2001:db8::1");
+        assert!(!line_has_ip_in(&exact_host, "peer 2001:db8::1:8080 up"));
     }
 
     #[test]
