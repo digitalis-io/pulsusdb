@@ -1299,21 +1299,26 @@ enum LogfmtErrKind {
     /// An `=` where a key is expected — a token starting with `=`, or an
     /// `=` immediately after a completed bare value (`a=1=2`).
     UnexpectedEquals,
-    /// A key byte the decoder rejects (a `"` or a control byte `<0x20`).
-    InvalidKey,
+    /// A byte the decoder rejects where a key or unquoted value is
+    /// expected — a `"` opening a key, a control byte `<0x20` mid-key, or a
+    /// `"` following an unquoted value. Carries the offending byte so the
+    /// message can name it (`unexpected '<char>'`), matching the reference
+    /// (v3.7.3), which has no static "invalid key" text.
+    InvalidKey(char),
 }
 
 /// Streams-path `__error_details__` for a `--strict` `LogfmtParserErr`
 /// (issue #99 detail-string precedent, extended for #200). Byte-exact for
 /// the unterminated-quote class (`pos = runes+1`, oracle_probe.txt [2]);
 /// faithful-format (same structure, ledgered position) for the
-/// `unexpected '='` / `invalid key` classes — the `__error__` LABEL itself
-/// is always correct, only the detail STRING is faithful-format.
+/// `unexpected '='` class. The `InvalidKey` class renders
+/// `unexpected '<char>'` naming the offending byte, matching the reference
+/// (v3.7.3) — the `__error__` LABEL is always correct.
 fn logfmt_error_details(err: LogfmtErr) -> String {
     let reason = match err.kind {
-        LogfmtErrKind::UnterminatedQuote => "unterminated quoted value",
-        LogfmtErrKind::UnexpectedEquals => "unexpected '='",
-        LogfmtErrKind::InvalidKey => "invalid key",
+        LogfmtErrKind::UnterminatedQuote => "unterminated quoted value".to_string(),
+        LogfmtErrKind::UnexpectedEquals => "unexpected '='".to_string(),
+        LogfmtErrKind::InvalidKey(ch) => format!("unexpected '{ch}'"),
     };
     format!("logfmt syntax error at pos {} : {reason}", err.pos)
 }
@@ -1922,7 +1927,7 @@ fn walk_logfmt<'t>(
             if b == b'"' || b < 0x20 {
                 return Err(LogfmtErr {
                     pos: logfmt_rune_pos(text, i),
-                    kind: LogfmtErrKind::InvalidKey,
+                    kind: LogfmtErrKind::InvalidKey(b as char),
                 });
             }
             i += 1;
@@ -1984,7 +1989,12 @@ fn walk_logfmt<'t>(
                 let val_start = i;
                 while i < len {
                     let b = bytes[i];
-                    if b.is_ascii_whitespace() || b == b'=' {
+                    // A `"` terminates the unquoted value the same way an `=`
+                    // does: the completed pair is emitted, then the next
+                    // iteration's key walk reports the `"` as unexpected at
+                    // key position (reference v3.7.3: `a=1"b"` keeps `a="1"`
+                    // and errors `unexpected '"'` at the pos of the `"`).
+                    if b.is_ascii_whitespace() || b == b'=' || b == b'"' {
                         break;
                     }
                     i += 1;

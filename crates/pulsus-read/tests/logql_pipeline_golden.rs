@@ -336,7 +336,9 @@ fn logfmt_strict_errors_per_malformed_class() {
         ])
     );
 
-    // (3) Invalid key — a `"` opens a key at rune pos 1.
+    // (3) A `"` opening a key at rune pos 1 is unexpected. Expected values
+    // captured against the pinned reference (v3.7.3): the reference names
+    // the offending byte (`unexpected '"'`) and has no "invalid key" text.
     let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#""quoted=1"#).unwrap();
     assert_eq!(
         got,
@@ -346,9 +348,38 @@ fn logfmt_strict_errors_per_malformed_class() {
             ("__error__", "LogfmtParserErr"),
             (
                 "__error_details__",
-                "logfmt syntax error at pos 1 : invalid key",
+                r#"logfmt syntax error at pos 1 : unexpected '"'"#,
             ),
         ])
+    );
+
+    // (4) A `"` following an UNQUOTED value is unexpected. Reference
+    // (v3.7.3): `a=1"b"` → pos 4 `unexpected '"'`; the completed `a="1"`
+    // pair before the fault is kept.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a=1"b""#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("a", "1"),
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                r#"logfmt syntax error at pos 4 : unexpected '"'"#,
+            ),
+        ])
+    );
+
+    // (5) Parity lock: after a CLOSED quoted value the next token may start
+    // with no separating whitespace. Reference (v3.7.3): `a="b"c=1` is
+    // ACCEPTED as `{a="b", c="1"}` with NO `__error__` — the
+    // whitespace-after-close-quote strictness a code-review proposed would
+    // have wrongly diverged here.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a="b"c=1"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("a", "b"), ("app", "checkout"), ("c", "1"), ("env", "prod"),])
     );
 }
 
