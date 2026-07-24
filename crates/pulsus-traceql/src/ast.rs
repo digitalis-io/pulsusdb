@@ -400,6 +400,14 @@ pub enum Intrinsic {
     /// `rootServiceName` | `trace:rootService` — the trace root span's
     /// service name (string).
     RootServiceName,
+    // -- issue #192: the instrumentation-scope intrinsic namespace. Only a
+    // scoped spelling exists (`instrumentation:name`/`instrumentation:version`),
+    // resolved through the `instrumentation` scope keyword.
+    /// `instrumentation:name` — the OTLP instrumentation scope name (string).
+    InstrumentationName,
+    /// `instrumentation:version` — the OTLP instrumentation scope version
+    /// (string).
+    InstrumentationVersion,
 }
 
 impl Intrinsic {
@@ -444,6 +452,8 @@ impl Intrinsic {
             ("trace", "duration") => Some(Self::TraceDuration),
             ("trace", "rootName") => Some(Self::RootName),
             ("trace", "rootService") => Some(Self::RootServiceName),
+            ("instrumentation", "name") => Some(Self::InstrumentationName),
+            ("instrumentation", "version") => Some(Self::InstrumentationVersion),
             _ => None,
         }
     }
@@ -467,6 +477,8 @@ impl Intrinsic {
             Intrinsic::TraceDuration => "traceDuration",
             Intrinsic::RootName => "rootName",
             Intrinsic::RootServiceName => "rootServiceName",
+            Intrinsic::InstrumentationName => "instrumentation:name",
+            Intrinsic::InstrumentationVersion => "instrumentation:version",
         }
     }
 }
@@ -485,6 +497,9 @@ pub enum AttrScope {
     Span,
     Resource,
     Unscoped,
+    /// `instrumentation.` — the OTLP instrumentation-scope attribute
+    /// namespace (issue #192), index-served under `scope='instrumentation'`.
+    Instrumentation,
 }
 
 impl fmt::Display for AttrScope {
@@ -493,6 +508,7 @@ impl fmt::Display for AttrScope {
             AttrScope::Span => "span.",
             AttrScope::Resource => "resource.",
             AttrScope::Unscoped => ".",
+            AttrScope::Instrumentation => "instrumentation.",
         };
         write!(f, "{s}")
     }
@@ -1105,6 +1121,18 @@ mod tests {
                 Intrinsic::RootServiceName,
                 "rootServiceName",
             ),
+            (
+                "instrumentation",
+                "name",
+                Intrinsic::InstrumentationName,
+                "instrumentation:name",
+            ),
+            (
+                "instrumentation",
+                "version",
+                Intrinsic::InstrumentationVersion,
+                "instrumentation:version",
+            ),
         ] {
             assert_eq!(Intrinsic::from_scoped(scope, ident), Some(intrinsic));
             assert_eq!(intrinsic.to_string(), canonical);
@@ -1112,7 +1140,8 @@ mod tests {
         // Unknown colon scopes stay unresolved (generic error at parse).
         assert_eq!(Intrinsic::from_scoped("event", "name"), None);
         assert_eq!(Intrinsic::from_scoped("link", "spanID"), None);
-        assert_eq!(Intrinsic::from_scoped("instrumentation", "name"), None);
+        // instrumentation: now resolves (issue #192) — see the loop above.
+        assert_eq!(Intrinsic::from_scoped("instrumentation", "bogus"), None);
         assert_eq!(Intrinsic::from_scoped("span", "bogus"), None);
         assert_eq!(
             Intrinsic::from_scoped("trace", "rootName"),

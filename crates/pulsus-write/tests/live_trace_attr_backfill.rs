@@ -197,6 +197,8 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             status_message: String::new(),
             kind: 3,
             shared: 0,
+            scope_name: String::new(),
+            scope_version: String::new(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }],
         attrs: vec![AttrRecord {

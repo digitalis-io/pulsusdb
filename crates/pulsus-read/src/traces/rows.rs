@@ -65,6 +65,13 @@ pub struct HydrationRow {
     /// list (RowBinary is positional).
     pub status_message: String,
     pub kind: i8,
+    /// The OTLP `InstrumentationScope.name`/`version` (issue #192's
+    /// `instrumentation:name`/`instrumentation:version` intrinsics),
+    /// byte-capped like `service`/`name`. Appended after `kind` — in
+    /// lockstep with `search_sql::hydration_sql`'s SELECT list (RowBinary is
+    /// positional).
+    pub scope_name: String,
+    pub scope_version: String,
 }
 
 /// One attribute-membership row (`search_sql::membership_sql`).

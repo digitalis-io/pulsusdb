@@ -297,6 +297,8 @@ mod tests {
                 status_message: String::new(),
                 kind: 0,
                 shared: 0,
+                scope_name: String::new(),
+                scope_version: String::new(),
                 payload: vec![1],
             }],
             ..Default::default()

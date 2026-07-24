@@ -140,6 +140,10 @@ fn fixture_request_rebased_to_now() -> (ExportTraceServiceRequest, usize, usize)
             .map(|r| r.attributes.len())
             .unwrap_or(0);
         for ss in &mut rs.scope_spans {
+            // Issue #192: instrumentation-scope attributes are indexed under
+            // `scope='instrumentation'`, emitted once PER SPAN in this scope
+            // (exactly as resource attrs re-emit per span).
+            let scope_attrs = ss.scope.as_ref().map(|s| s.attributes.len()).unwrap_or(0);
             let base = ss
                 .spans
                 .iter()
@@ -152,7 +156,7 @@ fn fixture_request_rebased_to_now() -> (ExportTraceServiceRequest, usize, usize)
                 span.start_time_unix_nano = now_ns + offset;
                 span.end_time_unix_nano = now_ns + offset + duration;
                 span_count += 1;
-                attr_count += resource_attrs + span.attributes.len();
+                attr_count += resource_attrs + span.attributes.len() + scope_attrs;
             }
         }
     }
@@ -182,11 +186,12 @@ async fn sync_post_round_trips_exact_counts_on_both_trace_tables() {
 
     let (req, span_count, attr_count) = fixture_request_rebased_to_now();
     // The committed fixture's known shape: 2 spans; 2 resource attrs x 2
-    // spans + 3 span attrs on span A = 7 attr rows. Recounted from the
-    // decoded fixture above so a fixture edit fails here loudly rather
-    // than silently weakening the exact-count assertion.
+    // spans + 3 span attrs on span A + 1 instrumentation-scope attr x 2
+    // spans (issue #192) = 9 attr rows. Recounted from the decoded fixture
+    // above so a fixture edit fails here loudly rather than silently
+    // weakening the exact-count assertion.
     assert_eq!(span_count, 2);
-    assert_eq!(attr_count, 7);
+    assert_eq!(attr_count, 9);
 
     let writer = Arc::new(TraceWriter::new_with_tables(
         Arc::new(ChClient::new(db_config(db)).await.expect("connect writer")),

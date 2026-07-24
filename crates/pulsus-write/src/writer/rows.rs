@@ -671,6 +671,12 @@ pub struct TraceSpanRow {
     /// additive migration-31 `shared UInt8 DEFAULT 0` column absorbs it
     /// regardless of physical column order.
     pub shared: u8,
+    /// OTLP `InstrumentationScope.name`/`version` (issue #192), `""` when
+    /// absent. Inserted by column name (`Row` derive), so the additive
+    /// migration-37 `scope_name`/`scope_version LowCardinality(String)
+    /// DEFAULT ''` columns absorb them regardless of physical column order.
+    pub scope_name: String,
+    pub scope_version: String,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
@@ -690,6 +696,8 @@ impl From<&SpanRecord> for TraceSpanRow {
             kind: record.kind,
             payload_type: 1,
             shared: record.shared,
+            scope_name: record.scope_name.clone(),
+            scope_version: record.scope_version.clone(),
             payload: record.payload.clone(),
         }
     }
@@ -703,6 +711,7 @@ impl TraceSpanRow {
             &self.name,
             &self.service,
             self.status_message.len(),
+            self.scope_name.len() + self.scope_version.len(),
             self.payload.len(),
         )
     }
@@ -716,12 +725,19 @@ impl TraceSpanRow {
             &record.name,
             &record.service,
             record.status_message.len(),
+            record.scope_name.len() + record.scope_version.len(),
             record.payload.len(),
         )
     }
 
-    fn estimate(name: &str, service: &str, status_message_len: usize, payload_len: usize) -> u64 {
-        (name.len() + service.len() + status_message_len + payload_len
+    fn estimate(
+        name: &str,
+        service: &str,
+        status_message_len: usize,
+        scope_len: usize,
+        payload_len: usize,
+    ) -> u64 {
+        (name.len() + service.len() + status_message_len + scope_len + payload_len
             + 16 /* trace_id */ + 8 /* span_id */ + 8 /* parent_id */
             + 8 /* timestamp_ns */ + 8 /* duration_ns */
             + 1 /* status_code */ + 1 /* kind */ + 1 /* payload_type */
@@ -749,6 +765,8 @@ impl SpoolEncode for TraceSpanRow {
             "kind": self.kind,
             "payload_type": self.payload_type,
             "shared": self.shared,
+            "scope_name": self.scope_name,
+            "scope_version": self.scope_version,
             "payload_len": self.payload.len(),
         })
     }
@@ -1318,6 +1336,8 @@ mod tests {
             status_message: String::new(),
             kind: 3,
             shared: 1,
+            scope_name: "io.otel".to_string(),
+            scope_version: "2.1".to_string(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }
     }
@@ -1351,6 +1371,8 @@ mod tests {
         assert_eq!(mapped.kind, 3);
         assert_eq!(mapped.payload_type, 1, "OTLP protobuf payload type");
         assert_eq!(mapped.shared, 1, "the Zipkin shared flag is copied through");
+        assert_eq!(mapped.scope_name, "io.otel");
+        assert_eq!(mapped.scope_version, "2.1");
         assert_eq!(mapped.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -1382,6 +1404,8 @@ mod tests {
                 "kind": 3,
                 "payload_type": 1,
                 "shared": 1,
+                "scope_name": "io.otel",
+                "scope_version": "2.1",
                 "payload_len": 4,
             })
         );

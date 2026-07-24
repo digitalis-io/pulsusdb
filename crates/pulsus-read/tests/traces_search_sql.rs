@@ -253,6 +253,23 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // `instrumentation:name` (issue #192): a bounded-window span scan on
+        // the migration-37 `scope_name` hydrated byte-capped column — the
+        // `statusMessage` precedent (no index; the SpanScan prunes on
+        // `timestamp_ns`). Phase 2 compares the same capped rendering.
+        name: "instrumentation_name_eq",
+        q: r#"{ instrumentation:name = "io.opentelemetry.contrib.http" }"#,
+        distributed: false,
+    },
+    Case {
+        // `instrumentation.<key>` attribute (issue #192): index-served via
+        // the `(key, val, scope)` prefix with `scope = 'instrumentation'`,
+        // exactly like any `span.`/`resource.` attribute leaf.
+        name: "instrumentation_attr_eq",
+        q: r#"{ instrumentation.library.language = "rust" }"#,
+        distributed: false,
+    },
+    Case {
         // Attribute existence present (issue #185, `existence.neq_nil` /
         // bare-attr): an index-served key-only `(key)` scan with the no-op
         // `1` value predicate + a key-existence membership probe.

@@ -99,8 +99,9 @@ fn fixture_scope() -> InstrumentationScope {
     InstrumentationScope {
         name: "checkout-instrumentation".to_string(),
         version: "1.2.3".to_string(),
-        // Deliberately non-empty: scope attributes must NEVER reach the
-        // index (issue #54 adjudication #2) — only the payload keeps them.
+        // Deliberately non-empty: scope attributes are indexed under
+        // `scope='instrumentation'` (issue #192, superseding the #54
+        // adjudication #2 that dropped them) AND kept in the payload.
         attributes: vec![kv(
             "scope.only.attr",
             Value::StringValue("payload-only".to_string()),
@@ -217,6 +218,11 @@ fn parse_produces_the_hand_derived_golden_rows() {
     assert_eq!(a.duration_ns, 1_000_000_000);
     assert_eq!(a.status_code, 0, "unset status -> code 0");
     assert_eq!(a.kind, 2, "SPAN_KIND_SERVER = 2");
+    assert_eq!(
+        a.scope_name, "checkout-instrumentation",
+        "instrumentation scope name promoted (issue #192)"
+    );
+    assert_eq!(a.scope_version, "1.2.3", "instrumentation scope version");
 
     let b = &out.spans[1];
     assert_eq!(b.trace_id, TRACE_ID);
@@ -229,11 +235,14 @@ fn parse_produces_the_hand_derived_golden_rows() {
     assert_eq!(b.duration_ns, 250_000_000);
     assert_eq!(b.status_code, 2, "STATUS_CODE_ERROR = 2");
     assert_eq!(b.kind, 3, "SPAN_KIND_CLIENT = 3");
+    assert_eq!(b.scope_name, "checkout-instrumentation");
+    assert_eq!(b.scope_version, "1.2.3");
 
-    // --- attrs: keys verbatim (never normalized), resource-then-span
-    // order per span, scope discriminators, val_num only for the numeric
-    // parse, day-floored date; scope (InstrumentationScope) attributes
-    // never appear.
+    // --- attrs: keys verbatim (never normalized),
+    // resource-then-span-then-instrumentation order per span, scope
+    // discriminators, val_num only for the numeric parse, day-floored date;
+    // instrumentation-scope attributes are indexed under
+    // `scope='instrumentation'` (issue #192).
     /// One attr row's golden-comparable projection (`date`/`trace_id`/
     /// per-span carried columns are asserted separately below).
     type AttrGolden<'a> = (&'a str, &'a str, &'a str, Option<f64>, [u8; 8]);
@@ -269,12 +278,28 @@ fn parse_produces_the_hand_derived_golden_rows() {
             ("span", "http.status_code", "500", Some(500.0), SPAN_A_ID),
             ("span", "http.method", "GET", None, SPAN_A_ID),
             ("span", "deployment.environment", "prod", None, SPAN_A_ID),
-            // span B: resource attrs only (it has no span attrs).
+            // ...then span A's instrumentation-scope attr (issue #192),
+            // emitted last in the resource→span→instrumentation order.
+            (
+                "instrumentation",
+                "scope.only.attr",
+                "payload-only",
+                None,
+                SPAN_A_ID
+            ),
+            // span B: resource attrs (no span attrs) then the scope attr.
             ("resource", "service.name", "checkout", None, SPAN_B_ID),
             (
                 "resource",
                 "deployment.environment",
                 "prod",
+                None,
+                SPAN_B_ID
+            ),
+            (
+                "instrumentation",
+                "scope.only.attr",
+                "payload-only",
                 None,
                 SPAN_B_ID
             ),

@@ -113,6 +113,17 @@ pub(crate) enum PhysicalEval {
         op: StrOp,
         value: String,
     },
+    /// `instrumentation:name` (issue #192) — on the hydrated `scope_name`.
+    InstrumentationName {
+        op: StrOp,
+        value: String,
+    },
+    /// `instrumentation:version` (issue #192) — on the hydrated
+    /// `scope_version`.
+    InstrumentationVersion {
+        op: StrOp,
+        value: String,
+    },
 }
 
 /// One trace-level intrinsic leaf (issue #184), ready for Phase-2
@@ -530,6 +541,16 @@ fn plan_physical(p: &PhysicalPredicate) -> Result<PhysicalEval, PlanError> {
             op: planned_str_op(*op, value)?,
             value: value.clone(),
         },
+        PhysicalPredicate::InstrumentationName { op, value } => PhysicalEval::InstrumentationName {
+            op: planned_str_op(*op, value)?,
+            value: value.clone(),
+        },
+        PhysicalPredicate::InstrumentationVersion { op, value } => {
+            PhysicalEval::InstrumentationVersion {
+                op: planned_str_op(*op, value)?,
+                value: value.clone(),
+            }
+        }
     })
 }
 
@@ -622,6 +643,7 @@ fn attr_field_ref(field: &Field) -> Option<AttrFieldRef> {
                 pulsus_traceql::AttrScope::Span => Some("span"),
                 pulsus_traceql::AttrScope::Resource => Some("resource"),
                 pulsus_traceql::AttrScope::Unscoped => None,
+                pulsus_traceql::AttrScope::Instrumentation => Some("instrumentation"),
             },
         }),
         Field::Intrinsic(_) => None,
@@ -858,7 +880,9 @@ fn plan_pipeline(
                             | Intrinsic::TraceId
                             | Intrinsic::TraceDuration
                             | Intrinsic::RootName
-                            | Intrinsic::RootServiceName,
+                            | Intrinsic::RootServiceName
+                            | Intrinsic::InstrumentationName
+                            | Intrinsic::InstrumentationVersion,
                         ) => {
                             return Err(PlanError::TypeMismatch(
                                 "select() of this intrinsic is not supported".to_string(),

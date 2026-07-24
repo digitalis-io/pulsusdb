@@ -198,7 +198,7 @@ pub fn hydration_sql(
 ) -> String {
     format!(
         "SELECT trace_id, span_id, parent_id, {}, {}, timestamp_ns, duration_ns, \
-         status_code, {}, kind\n\
+         status_code, {}, kind, {}, {}\n\
          FROM {spans_table}\n\
          WHERE {}\n  AND {}\n\
          ORDER BY trace_id ASC, timestamp_ns ASC, span_id ASC\n\
@@ -206,6 +206,8 @@ pub fn hydration_sql(
         byte_capped("service"),
         byte_capped("name"),
         byte_capped("status_message"),
+        byte_capped("scope_name"),
+        byte_capped("scope_version"),
         trace_id_in(trace_ids),
         time_clause(window),
         max_spans_per_trace + 1
@@ -472,6 +474,15 @@ mod tests {
              substringUTF8(status_message, 1, {TRACE_STR_COL_CP_FALLBACK})) AS status_message"
         );
         assert!(hydration.contains(&status_needle), "{hydration}");
+        // Issue #192: the instrumentation-scope columns hydrate byte-capped
+        // exactly like `status_message`.
+        for col in ["scope_name", "scope_version"] {
+            let scope_needle = format!(
+                "if(length({col}) <= {TRACE_STR_COL_CAP}, {col}, \
+                 substringUTF8({col}, 1, {TRACE_STR_COL_CP_FALLBACK})) AS {col}"
+            );
+            assert!(hydration.contains(&scope_needle), "{hydration}");
+        }
         let root = root_sql("trace_spans", &[[7u8; 16]]);
         assert!(root.contains(&needle), "{root}");
 

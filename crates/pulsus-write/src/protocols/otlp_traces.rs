@@ -5,11 +5,14 @@
 //! span_id)`, distribution shards by the server-side `cityHash64(trace_id)`
 //! — docs/architecture.md §2.2), and attribute keys are stored **verbatim**
 //! in the index (docs/architecture.md §2.3), discriminated by a `scope`
-//! column (`'resource'` vs `'span'`) so scoped TraceQL selectors never
-//! collide across scopes. `InstrumentationScope` attributes are not
-//! indexed at all (M4 TraceQL exposes only `resource.`/`span.` selectors,
-//! issue #54 adjudication #2); they remain fully preserved in the span
-//! payload.
+//! column (`'resource'`, `'span'`, `'instrumentation'`) so scoped TraceQL
+//! selectors never collide across scopes. `InstrumentationScope` attributes
+//! are indexed under `scope='instrumentation'` (issue #192, superseding the
+//! #54 adjudication #2 that dropped them) so the `instrumentation.<key>`
+//! selector resolves; the scope's `name`/`version` are promoted onto the
+//! `SpanRecord`'s `scope_name`/`scope_version` columns for the
+//! `instrumentation:name`/`instrumentation:version` intrinsics. Everything
+//! remains fully preserved in the span payload as well.
 //!
 //! **Payload contract (pinned for T2/T3, issue #54 adjudication #3):**
 //! every [`SpanRecord::payload`] is a self-contained single-`ResourceSpans`
@@ -44,7 +47,7 @@ use std::borrow::Cow;
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, TracesData};
 use prost::Message;
@@ -57,6 +60,10 @@ use crate::ingest::traces::{AttrRecord, ParsedTraces, SpanRecord};
 const SCOPE_RESOURCE: &str = "resource";
 /// The `scope` discriminator value for a span attribute row.
 const SCOPE_SPAN: &str = "span";
+/// The `scope` discriminator value for an instrumentation-scope attribute
+/// row (issue #192) — `scope_spans.scope.attributes`, indexed verbatim so
+/// the `instrumentation.<key>` TraceQL selector resolves.
+const SCOPE_INSTRUMENTATION: &str = "instrumentation";
 
 /// The per-request cap on [`parse`]'s **estimated expanded output bytes**
 /// (see the module doc's "Expansion budget" section). Derivation: the
@@ -361,7 +368,28 @@ fn parse_span(
     let kind = span.kind as i8;
     let shared = shared_flag(span);
 
+    // OTLP `InstrumentationScope.name`/`version` verbatim (issue #192), `""`
+    // when the scope is absent — promoted onto the span row for the
+    // `instrumentation:name`/`instrumentation:version` intrinsics. Bytes
+    // charged in `span_expansion_charge`.
+    let (scope_name, scope_version) = ctx
+        .scope_spans
+        .scope
+        .as_ref()
+        .map(|s| (s.name.clone(), s.version.clone()))
+        .unwrap_or_default();
+
     let resource_attrs = ctx.resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+    // The instrumentation-scope attributes (issue #192): indexed per span in
+    // this scope under `scope='instrumentation'`, exactly as resource attrs
+    // re-emit per span — so `instrumentation.<key>` membership resolves
+    // against the owning span's rows.
+    let scope_attrs = ctx
+        .scope_spans
+        .scope
+        .as_ref()
+        .map(|s| s.attributes.as_slice())
+        .unwrap_or(&[]);
 
     // Expansion-budget reservation (module doc, issue #54 code-review
     // [high] fix): estimate this span's produced bytes from wire lengths
@@ -375,6 +403,7 @@ fn parse_span(
         span_expansion_charge(
             span,
             ctx.resource,
+            ctx.scope_spans.scope.as_ref(),
             ctx.service.len(),
             ctx.payload_base_estimate,
         ),
@@ -406,7 +435,8 @@ fn parse_span(
     };
     for (scope, attrs) in [
         (SCOPE_RESOURCE, resource_attrs),
-        (SCOPE_SPAN, &span.attributes),
+        (SCOPE_SPAN, span.attributes.as_slice()),
+        (SCOPE_INSTRUMENTATION, scope_attrs),
     ] {
         for kv in attrs {
             out.attrs.push(attr_record(
@@ -433,6 +463,8 @@ fn parse_span(
         status_message,
         kind,
         shared,
+        scope_name,
+        scope_version,
         payload: build_payload(span, ctx.resource, ctx.resource_spans, ctx.scope_spans),
     });
     Ok(())
@@ -544,20 +576,32 @@ fn find_service_kv(resource: Option<&Resource>) -> Option<&KeyValue> {
 fn span_expansion_charge(
     span: &Span,
     resource: Option<&Resource>,
+    scope: Option<&InstrumentationScope>,
     service_len: usize,
     payload_base: usize,
 ) -> usize {
     let resource_attrs = resource.map(|r| r.attributes.as_slice()).unwrap_or(&[]);
+    let scope_attrs = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
     // The promoted `status_message` (issue #184) is an extra materialized
-    // copy beyond the wire `span.encoded_len()`, like `name`/`service`.
+    // copy beyond the wire `span.encoded_len()`, like `name`/`service`. The
+    // promoted `scope_name`/`scope_version` (issue #192) are the same shape.
     let status_message_len = span.status.as_ref().map(|s| s.message.len()).unwrap_or(0);
+    let scope_name_len = scope.map(|s| s.name.len() + s.version.len()).unwrap_or(0);
     let mut charge = SPAN_ROW_OVERHEAD
         + span.name.len()
         + service_len
         + payload_base
         + span.encoded_len()
-        + status_message_len;
-    for kv in resource_attrs.iter().chain(&span.attributes) {
+        + status_message_len
+        + scope_name_len;
+    // Every resource ⊕ span ⊕ instrumentation-scope attribute becomes one
+    // indexed row per span (issue #192 adds the scope arm) — charged BEFORE
+    // materialization, in lockstep with the emission loop above.
+    for kv in resource_attrs
+        .iter()
+        .chain(&span.attributes)
+        .chain(scope_attrs)
+    {
         charge += ATTR_ROW_OVERHEAD + attr_budget_charge(kv);
     }
     charge
@@ -593,6 +637,7 @@ fn resource_spans_expansion_charge(rs: &ResourceSpans) -> usize {
             charge = charge.saturating_add(span_expansion_charge(
                 span,
                 resource,
+                scope_spans.scope.as_ref(),
                 service_len,
                 payload_base,
             ));
@@ -1182,19 +1227,61 @@ mod tests {
         assert_eq!(scopes, vec!["resource", "span"]);
     }
 
-    /// Issue #54 adjudication #2: `InstrumentationScope` attributes are
-    /// never indexed — they exist only inside the payload.
+    /// Issue #192 (supersedes the #54 adjudication #2 that dropped them):
+    /// `InstrumentationScope` attributes ARE indexed under
+    /// `scope='instrumentation'` with their key verbatim, in
+    /// resource→span→instrumentation emission order; the scope `name`/
+    /// `version` are promoted onto the `SpanRecord` columns.
     #[test]
-    fn parse_never_indexes_instrumentation_scope_attributes() {
+    fn parse_indexes_instrumentation_scope_attributes_and_promotes_name_version() {
+        let resource = Resource {
+            attributes: vec![kv("res.attr", Value::StringValue("r".to_string()))],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        };
+        let mut s = valid_span();
+        s.attributes = vec![kv("span.attr", Value::StringValue("s".to_string()))];
         let scope = InstrumentationScope {
             name: "my-scope".to_string(),
             version: "1.0.0".to_string(),
             attributes: vec![kv("scope.attr", Value::StringValue("x".to_string()))],
             dropped_attributes_count: 0,
         };
-        let out = parse(&request_with(None, Some(scope), vec![valid_span()]), 0)
+        let out = parse(&request_with(Some(resource), Some(scope), vec![s]), 0)
             .expect("within the expansion budget");
-        assert!(out.attrs.is_empty());
+
+        // The instrumentation attribute is indexed verbatim, last in the
+        // resource→span→instrumentation emission order.
+        let rows: Vec<(&str, &str, &str)> = out
+            .attrs
+            .iter()
+            .map(|a| (a.scope.as_str(), a.key.as_str(), a.val.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("resource", "res.attr", "r"),
+                ("span", "span.attr", "s"),
+                ("instrumentation", "scope.attr", "x"),
+            ]
+        );
+
+        // The scope name/version are promoted onto the span row.
+        assert_eq!(out.spans.len(), 1);
+        assert_eq!(out.spans[0].scope_name, "my-scope");
+        assert_eq!(out.spans[0].scope_version, "1.0.0");
+    }
+
+    /// A span whose `ScopeSpans` carries no `scope` yields no
+    /// instrumentation attr rows and empty `scope_name`/`scope_version`.
+    #[test]
+    fn parse_absent_instrumentation_scope_leaves_scope_columns_empty() {
+        let out = parse(&request_with(None, None, vec![valid_span()]), 0)
+            .expect("within the expansion budget");
+        assert!(out.attrs.iter().all(|a| a.scope != "instrumentation"));
+        assert_eq!(out.spans.len(), 1);
+        assert_eq!(out.spans[0].scope_name, "");
+        assert_eq!(out.spans[0].scope_version, "");
     }
 
     #[test]

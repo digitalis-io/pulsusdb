@@ -185,6 +185,16 @@ pub enum PhysicalPredicate {
     /// `span:parentID` (issue #184) — as [`PhysicalPredicate::SpanIdHex`]
     /// but over the `parent_id` column.
     ParentIdHex { op: ComparisonOp, value: String },
+    /// `instrumentation:name` (issue #192) — Eq/Neq/Re/Nre on the
+    /// `scope_name` `LowCardinality(String)` column. Phase-1 SQL compares the
+    /// byte-capped rendering (the shared `search_sql` cap helper), matching
+    /// the capped value Phase 2 hydrates and evaluates — the `statusMessage`
+    /// precedent.
+    InstrumentationName { op: ComparisonOp, value: String },
+    /// `instrumentation:version` (issue #192) — as
+    /// [`PhysicalPredicate::InstrumentationName`] but over the
+    /// `scope_version` column.
+    InstrumentationVersion { op: ComparisonOp, value: String },
 }
 
 /// Which nested-set structural intrinsic a leaf compares (issue #181).
@@ -412,6 +422,17 @@ pub(crate) fn physical_sql(p: &PhysicalPredicate) -> String {
         }
         PhysicalPredicate::SpanIdHex { op, value } => hex_column_sql("span_id", *op, value),
         PhysicalPredicate::ParentIdHex { op, value } => hex_column_sql("parent_id", *op, value),
+        PhysicalPredicate::InstrumentationName { op, value } => {
+            // Issue #192: compare the CAPPED column (the `statusMessage`
+            // precedent) so Phase-1 candidate selection agrees byte-for-byte
+            // with the capped `scope_name` Phase 2 hydrates and evaluates. No
+            // index is lost: `scope_name` has none (SpanScan class — the
+            // bounded time-window scan prunes on `timestamp_ns` alone).
+            string_column_sql(&byte_cap_expr("scope_name"), *op, value)
+        }
+        PhysicalPredicate::InstrumentationVersion { op, value } => {
+            string_column_sql(&byte_cap_expr("scope_version"), *op, value)
+        }
     }
 }
 
@@ -474,6 +495,9 @@ fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
         AttrScope::Span => Some("span"),
         AttrScope::Resource => Some("resource"),
         AttrScope::Unscoped => None,
+        // Issue #192: `instrumentation.<key>` attributes are index-served
+        // under the writer's `scope='instrumentation'` discriminator.
+        AttrScope::Instrumentation => Some("instrumentation"),
     }
 }
 
@@ -921,6 +945,24 @@ pub fn compile_leaf(
         Field::Intrinsic(Intrinsic::RootServiceName) => {
             compile_root_leaf(RootField::ServiceName, op, value)
         }
+        // -- issue #192: the instrumentation-scope intrinsics — hydrated
+        // physical columns, the `statusMessage` precedent -----------------
+        Field::Intrinsic(Intrinsic::InstrumentationName) => {
+            let (op, s) = string_op_leaf("instrumentation:name", op, value)?;
+            let physical = PhysicalPredicate::InstrumentationName { op, value: s };
+            Ok(CompiledLeaf {
+                generator: spans_generator_for(&physical),
+                eval: LeafEval::Physical(physical),
+            })
+        }
+        Field::Intrinsic(Intrinsic::InstrumentationVersion) => {
+            let (op, s) = string_op_leaf("instrumentation:version", op, value)?;
+            let physical = PhysicalPredicate::InstrumentationVersion { op, value: s };
+            Ok(CompiledLeaf {
+                generator: spans_generator_for(&physical),
+                eval: LeafEval::Physical(physical),
+            })
+        }
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {
                 compile_service_leaf(op, value)
@@ -986,7 +1028,9 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
             | Intrinsic::TraceId
             | Intrinsic::TraceDuration
             | Intrinsic::RootName
-            | Intrinsic::RootServiceName,
+            | Intrinsic::RootServiceName
+            | Intrinsic::InstrumentationName
+            | Intrinsic::InstrumentationVersion,
         ) => Err(PlanError::TypeMismatch(
             "this intrinsic is not supported in a field-vs-field comparison".to_string(),
         )),

@@ -2154,6 +2154,8 @@ fn group_hydrated_rows(
                 status_code: row.status_code,
                 status_message: row.status_message,
                 kind: row.kind,
+                scope_name: row.scope_name,
+                scope_version: row.scope_version,
             });
     }
     Ok((traces, overflowed))
@@ -2850,6 +2852,8 @@ mod tests {
             status_code: 0,
             status_message: String::new(),
             kind: 1,
+            scope_name: String::new(),
+            scope_version: String::new(),
         }
     }
 

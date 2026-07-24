@@ -39,6 +39,12 @@ pub struct SpanRecord {
     /// `span_id` rather than its inherited `parent_id` — the exact wire
     /// contract `zipkin.rs` emits, which an OTLP-native sender may also set.
     pub shared: u8,
+    /// OTLP `InstrumentationScope.name`/`version` verbatim, `""` when the
+    /// scope is absent (issue #192). Stored on `trace_spans` so the
+    /// `instrumentation:name`/`instrumentation:version` intrinsics are
+    /// queryable and `compare()` has a per-span source.
+    pub scope_name: String,
+    pub scope_version: String,
     /// Encoded single-`ResourceSpans` `TracesData` (see above).
     pub payload: Vec<u8>,
 }
@@ -56,10 +62,12 @@ pub struct AttrRecord {
     /// #131).
     pub date: u16,
     pub key: String,
-    /// `'resource'` or `'span'` — the index's scope discriminator, so
-    /// `resource.foo` and `span.foo` never collide (issue #54 plan v2
-    /// delta 1). Scope (`InstrumentationScope`) attributes are not indexed
-    /// at all; they stay in the span payload.
+    /// `'resource'`, `'span'`, or `'instrumentation'` — the index's scope
+    /// discriminator, so `resource.foo`/`span.foo`/`instrumentation.foo`
+    /// never collide (issue #54 plan v2 delta 1). Instrumentation-scope
+    /// (`InstrumentationScope`) attributes are indexed under
+    /// `scope='instrumentation'` (issue #192, superseding the #54 decision
+    /// that dropped them); they also stay in the span payload.
     pub scope: String,
     pub val: String,
     /// `val.parse::<f64>()` when finite, else `None` (`Nullable(Float64)`).
@@ -127,6 +135,8 @@ mod tests {
             status_message: String::new(),
             kind: 3,
             shared: 0,
+            scope_name: "io.otel.http".to_string(),
+            scope_version: "1.4.2".to_string(),
             payload: vec![0xDE, 0xAD],
         };
         assert_eq!(span.trace_id, [1; 16]);
@@ -139,6 +149,8 @@ mod tests {
         assert_eq!(span.status_code, 2);
         assert_eq!(span.kind, 3);
         assert_eq!(span.shared, 0);
+        assert_eq!(span.scope_name, "io.otel.http");
+        assert_eq!(span.scope_version, "1.4.2");
         assert_eq!(span.payload, vec![0xDE, 0xAD]);
     }
 

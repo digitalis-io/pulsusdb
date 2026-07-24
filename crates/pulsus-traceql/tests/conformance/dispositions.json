@@ -1,6 +1,6 @@
 {
-  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. The 9 residual interim constructs (event/link/instrumentation scope + intrinsics) are schema-blocked, owned by #192.",
-  "interim_count_pin": 9,
+  "comment": "M7-TQ6 closeout (#185): 'supported' is PARSE-level conformance. pipeline.by / pipeline.coalesce are parse-supported and plan+cap-enforce (reader.traceql_max_series, 422 query_too_broad); their value/response reshaping into per-group spanset arrays is a tracked follow-up in #193. #192 PR-A flips the 3 instrumentation-scope constructs (scope.instrumentation + the 2 intrinsics) to supported. The 6 residual interim constructs (event/link scope + intrinsics) remain schema-blocked, owned by #192.",
+  "interim_count_pin": 6,
   "entries": [
     {
       "construct": "intrinsic.name",
@@ -184,16 +184,18 @@
     },
     {
       "construct": "intrinsic.instrumentation.name",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_instrumentation_name"
+      ],
       "tempo": "accept"
     },
     {
       "construct": "intrinsic.instrumentation.version",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/intrinsic_instrumentation_version"
+      ],
       "tempo": "accept"
     },
     {
@@ -266,9 +268,10 @@
     },
     {
       "construct": "scope.instrumentation",
-      "status": "interim-generic",
-      "evidence": [],
-      "owning_issue": 192,
+      "status": "supported",
+      "evidence": [
+        "accept/scope_instrumentation"
+      ],
       "tempo": "accept"
     },
     {

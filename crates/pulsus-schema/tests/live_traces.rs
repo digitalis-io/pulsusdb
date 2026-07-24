@@ -1343,6 +1343,216 @@ async fn migration_status_message_add_column_survives_a_populated_projection_tab
     drop_database(&client, db).await;
 }
 
+/// Issue #192: migration 37 adds `trace_spans.scope_name`/`scope_version`
+/// `LowCardinality(String) DEFAULT ''` — `run_init` on a fresh database
+/// lands both columns (reconcile applies the additive ALTER after the frozen
+/// id-16 CREATE), a second run is a no-op (idempotent, no `MigrationDrift`),
+/// pre-existing rows read back `''`, and freshly inserted values round-trip.
+#[tokio::test]
+async fn migration_37_adds_scope_name_version_idempotently_and_round_trips() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_scope_name_ver";
+    drop_database(&client, db).await;
+    let ctx = test_ctx(db);
+    run_init(&client, &ctx).await.expect("run_init (first run)");
+
+    // Both columns exist, typed LowCardinality(String) with the '' default.
+    #[derive(Row, serde::Serialize, serde::Deserialize, Debug, Clone)]
+    struct ColumnRow {
+        name: String,
+        r#type: String,
+        default_expression: String,
+    }
+    let sql = format!(
+        "SELECT name, type, default_expression FROM system.columns \
+         WHERE database = '{db}' AND table = 'trace_spans' \
+           AND name IN ('scope_name', 'scope_version') ORDER BY name"
+    );
+    let mut stream = client
+        .query_stream::<ColumnRow>(&sql, &QuerySettings::new())
+        .await
+        .expect("query system.columns");
+    let mut cols = Vec::new();
+    while let Some(row) = stream.next().await {
+        cols.push(row.expect("decode column row"));
+    }
+    drop(stream);
+    assert_eq!(cols.len(), 2, "migration 37 must add both scope columns");
+    assert_eq!(cols[0].name, "scope_name");
+    assert_eq!(cols[0].r#type, "LowCardinality(String)");
+    assert_eq!(cols[0].default_expression, "''");
+    assert_eq!(cols[1].name, "scope_version");
+    assert_eq!(cols[1].r#type, "LowCardinality(String)");
+    assert_eq!(cols[1].default_expression, "''");
+
+    // Rows inserted WITHOUT the columns (the pre-#192 writer shape) read
+    // back '' — no data migration; rows inserted WITH them round-trip.
+    let ts = now_ns();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_spans \
+                     (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                      status_code, kind, payload_type, payload) \
+                 VALUES ('0123456789abcdef', 'span0001', '00000000', 'op-a', 'checkout', {ts}, \
+                         1000000, 2, 2, 1, 'payload-a')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert without scope columns");
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_spans \
+                     (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                      status_code, scope_name, scope_version, kind, payload_type, payload) \
+                 VALUES ('0123456789abcdef', 'span0002', 'span0001', 'op-b', 'billing', {ts}, \
+                         2000000, 2, 'io.opentelemetry.contrib.http', '1.4.2', 3, 1, 'payload-b')"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("insert with scope columns");
+    let empty = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.trace_spans \
+             WHERE span_id = 'span0001' AND scope_name = '' AND scope_version = ''"
+        ),
+    )
+    .await;
+    assert_eq!(empty, 1, "pre-#192-shaped rows read back ''");
+    let filled = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.trace_spans \
+             WHERE scope_name = 'io.opentelemetry.contrib.http' AND scope_version = '1.4.2'"
+        ),
+    )
+    .await;
+    assert_eq!(filled, 1, "stored scope name/version round-trip");
+
+    // Idempotence: the second run neither drifts nor duplicates.
+    run_init(&client, &ctx)
+        .await
+        .expect("run_init (second run, no-op)");
+
+    drop_database(&client, db).await;
+}
+
+/// Issue #192 (the id-31/35 precedent re-proven for migration 37): the
+/// `ADD COLUMN scope_name/scope_version` ALTER runs on a POPULATED
+/// `trace_spans` carrying the `SELECT *` `service_time` projection with
+/// existing parts — 24.8 accepts it, pre-existing rows read back the `''`
+/// default, and the projection survives with materialized parts.
+#[tokio::test]
+async fn migration_scope_name_version_add_column_survives_a_populated_projection_table() {
+    skip_unless_live!();
+    let client = ChClient::new(test_config()).await.expect("connect");
+    let db = "pulsus_schema_it_traces_scope_ver_alter";
+    drop_database(&client, db).await;
+    client
+        .execute(
+            &format!("CREATE DATABASE IF NOT EXISTS {db}"),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create db");
+
+    // The pre-#192 trace_spans shape (id-16 + migrations 31/35), projection
+    // and all, WITHOUT the scope columns — the state migration 37 alters.
+    client
+        .execute(
+            &format!(
+                "CREATE TABLE {db}.trace_spans (\
+                     trace_id FixedString(16), span_id FixedString(8), parent_id FixedString(8), \
+                     name LowCardinality(String), service LowCardinality(String), \
+                     timestamp_ns Int64 CODEC(DoubleDelta, ZSTD(1)), \
+                     duration_ns Int64 CODEC(T64, ZSTD(1)), status_code Int8, kind Int8, \
+                     payload_type Int8, payload String CODEC(ZSTD(3)), \
+                     shared UInt8 DEFAULT 0, status_message String DEFAULT '', \
+                     INDEX idx_duration duration_ns TYPE minmax GRANULARITY 4, \
+                     PROJECTION service_time (SELECT * ORDER BY (service, timestamp_ns)) \
+                 ) ENGINE = MergeTree \
+                 PARTITION BY toDate(fromUnixTimestamp64Nano(timestamp_ns)) \
+                 ORDER BY (trace_id, timestamp_ns)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("create pre-#192 trace_spans");
+
+    let base = now_ns();
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {db}.trace_spans \
+                     (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                      status_code, kind, payload_type, payload) \
+                 SELECT toFixedString(hex(cityHash64(number)), 16), \
+                        toFixedString(substring(hex(cityHash64(number, 1)), 1, 8), 8), \
+                        toFixedString('00000000', 8), 'op', concat('svc-', toString(number % 8)), \
+                        {base} + number * 1000000, 5000000, 0, 2, 1, 'p' \
+                 FROM numbers(5000)"
+            ),
+            &QuerySettings::new(),
+            Idempotency::NonIdempotent,
+        )
+        .await
+        .expect("seed populated trace_spans");
+
+    // The migration-37 ALTER over the populated projection-carrying table.
+    client
+        .execute(
+            &format!(
+                "ALTER TABLE {db}.trace_spans \
+                 ADD COLUMN IF NOT EXISTS scope_name LowCardinality(String) DEFAULT '', \
+                 ADD COLUMN IF NOT EXISTS scope_version LowCardinality(String) DEFAULT ''"
+            ),
+            &QuerySettings::new(),
+            Idempotency::Idempotent,
+        )
+        .await
+        .expect("ADD COLUMN scope_name/scope_version must be accepted on a projection table");
+
+    let nonempty = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM {db}.trace_spans \
+             WHERE scope_name != '' OR scope_version != ''"
+        ),
+    )
+    .await;
+    assert_eq!(nonempty, 0, "pre-existing rows read back ''");
+
+    let ddl = create_table_query(&client, db, "trace_spans").await;
+    assert!(
+        ddl.contains("PROJECTION service_time"),
+        "the projection definition must survive ADD COLUMN: {ddl}"
+    );
+    let projection_parts = count(
+        &client,
+        &format!(
+            "SELECT count() AS n FROM system.projection_parts \
+             WHERE database = '{db}' AND table = 'trace_spans' \
+               AND name = 'service_time' AND active"
+        ),
+    )
+    .await;
+    assert!(
+        projection_parts > 0,
+        "the service_time projection must retain materialized parts after ADD COLUMN"
+    );
+
+    drop_database(&client, db).await;
+}
+
 /// Issue #173 AC-new (projection ALTER): the migration-31 `ADD COLUMN
 /// shared` runs on a POPULATED `trace_spans` carrying a `SELECT *`
 /// (`service_time`) projection with existing parts — the prior ALTER

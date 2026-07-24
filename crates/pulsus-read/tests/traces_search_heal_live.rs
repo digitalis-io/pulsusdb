@@ -203,6 +203,8 @@ fn batch(ts_ns: i64, date: u16) -> ParsedTraces {
             status_message: String::new(),
             kind: 3,
             shared: 0,
+            scope_name: String::new(),
+            scope_version: String::new(),
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }],
         attrs: vec![AttrRecord {
@@ -420,6 +422,8 @@ fn two_service_batch(ts_ns: i64) -> ParsedTraces {
         status_message: String::new(),
         kind: 3,
         shared: 0,
+        scope_name: String::new(),
+        scope_version: String::new(),
         payload: vec![0x01],
     };
     ParsedTraces {
@@ -525,6 +529,137 @@ async fn spanset_by_service_cardinality_cap_rejects_over_max_series() {
         .await
         .expect("under cap the by() query succeeds");
     assert!(ok.returned >= 2, "both services returned under the cap");
+
+    writer.shutdown(Duration::from_secs(5)).await;
+    drop_database(&bootstrap, db).await;
+}
+
+/// One span carrying an instrumentation scope (`name`/`version` promoted to
+/// the physical `scope_name`/`scope_version` columns) plus one
+/// instrumentation-scope attribute indexed under `scope='instrumentation'`
+/// (issue #192). The trace/span ids are unique so a throwaway DB returns
+/// exactly this span.
+fn instrumentation_batch(ts_ns: i64, date: u16) -> ParsedTraces {
+    ParsedTraces {
+        spans: vec![SpanRecord {
+            trace_id: [0xC7; 16],
+            span_id: [0x11; 8],
+            parent_id: [0; 8],
+            name: "checkout".to_string(),
+            service: "gateway".to_string(),
+            timestamp_ns: ts_ns,
+            duration_ns: 1_000_000_000,
+            status_code: 1,
+            status_message: String::new(),
+            kind: 3,
+            shared: 0,
+            scope_name: "io.opentelemetry.contrib.http".to_string(),
+            scope_version: "1.4.2".to_string(),
+            payload: vec![0x01],
+        }],
+        attrs: vec![AttrRecord {
+            date,
+            key: "telemetry.sdk.language".to_string(),
+            scope: "instrumentation".to_string(),
+            val: "rust".to_string(),
+            val_num: None,
+            timestamp_ns: ts_ns,
+            trace_id: [0xC7; 16],
+            span_id: [0x11; 8],
+            duration_ns: 1_000_000_000,
+        }],
+        ..Default::default()
+    }
+}
+
+/// Issue #192 (the #184 search-intrinsic live-coverage bar, applied to the
+/// instrumentation constructs): a span carrying an instrumentation scope +
+/// scope attribute is written through the REAL trace writer, then the REAL
+/// `parse → plan_search → TraceEngine::search` pipeline RETURNS it for all
+/// three PR-A search constructs — the `instrumentation:name`/
+/// `instrumentation:version` intrinsics (hydrated `scope_name`/`scope_version`
+/// physical columns) AND the `instrumentation."<key>"` scoped attribute
+/// (index-served under `scope='instrumentation'`).
+///
+/// AC8's "live TraceQL differential" for the instrumentation search
+/// constructs is satisfied by this combined gating — parse-disposition
+/// conformance + hermetic search goldens + the `compare()` value differential
+/// (`compare_value_differential.rs`) + this live search-value test — NOT a
+/// new per-intrinsic reference-differential file (there is no such precedent:
+/// #184's `statusMessage`/`span:id` search intrinsics have none either).
+#[tokio::test]
+async fn instrumentation_search_constructs_return_the_seeded_span() {
+    skip_unless_live!();
+
+    let bootstrap = ChClient::new(test_config("default"))
+        .await
+        .expect("connect (bootstrap)");
+    let db = "pulsus_read_it_trace_search_instrumentation";
+    init_db(&bootstrap, db).await;
+
+    let client = Arc::new(
+        ChClient::new(test_config(db))
+            .await
+            .expect("connect (writer db)"),
+    );
+    let mut cfg = WriterConfig::default();
+    cfg.batch_bytes.0 = 1;
+    let writer = TraceWriter::with_inserters_with_tables(
+        Arc::new(ChBlockInserter::new(client.clone())),
+        Arc::new(ChBlockInserter::new(client.clone())),
+        &cfg,
+        TraceWriterTables::traces_default(),
+    );
+
+    let ts_ns = now_ns();
+    let date = (ts_ns / 86_400_000_000_000) as u16;
+    let wait = writer
+        .admit_flush(instrumentation_batch(ts_ns, date))
+        .expect("queue has room");
+    tokio::time::timeout(Duration::from_secs(10), wait)
+        .await
+        .expect("flush settles")
+        .expect("span commits");
+
+    let params = SearchParams {
+        start_ns: ts_ns - 3_600_000_000_000,
+        end_ns: ts_ns + 3_600_000_000_000,
+        limit: 20,
+        spss: 10,
+    };
+    let engine = TraceEngine::new(
+        ChClient::new(test_config(db)).await.expect("connect"),
+        engine_config(),
+    );
+
+    // Every construct must RETURN the one seeded span. The two intrinsics
+    // read the hydrated physical columns; the scoped attr is index-served.
+    let queries = [
+        r#"{ instrumentation:name = "io.opentelemetry.contrib.http" }"#,
+        r#"{ instrumentation:version = "1.4.2" }"#,
+        r#"{ instrumentation."telemetry.sdk.language" = "rust" }"#,
+    ];
+
+    for q in queries {
+        let query = pulsus_traceql::parse(q).unwrap_or_else(|e| panic!("{q}: parses ({e})"));
+        // Poll until the span is searchable (insert/merge visibility), then
+        // assert the construct returns exactly the seeded span.
+        let mut returned = 0;
+        for _ in 0..150 {
+            let plan = plan_search(&query, &params, &engine.search_ctx())
+                .unwrap_or_else(|e| panic!("{q}: plans ({e:?})"));
+            returned = engine
+                .search(&plan)
+                .await
+                .unwrap_or_else(|e| panic!("{q}: search executes ({e:?})"))
+                .returned;
+            if returned >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(returned, 1, "{q}: must return the one seeded span");
+    }
 
     writer.shutdown(Duration::from_secs(5)).await;
     drop_database(&bootstrap, db).await;
