@@ -53,7 +53,7 @@ use pulsus_logql::{
     CompareOp, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, NumericLiteral, ParserStage, Stage,
 };
 
-use super::ip::IpMatcher;
+use super::ip::{IpMatcher, line_has_ip_in};
 // Shared Go-stdlib string-quoting ports (issue #70): `go_quote` mirrors
 // Go stdlib `strconv.Quote` (number branch), `go_time_quote` mirrors Go
 // stdlib `time`'s internal `quote` (duration branch) — reused here so the
@@ -156,10 +156,18 @@ pub enum MetricRun<'a> {
     },
 }
 
+/// One alternative of a client-side line filter (M8-LQ2 `linefilter.or`).
+/// A filter's alternatives are an `or` disjunction: the stage matches iff
+/// ANY alternative matches the current line. An `ip("…")` head/alternative
+/// compiles to [`LineMatcher::Ip`] (a range test with no token prefilter,
+/// so [`super::plan::is_pushable_line_filter`] keeps it off the SQL push-
+/// down and it is evaluated here); a plain value compiles to `Literal`
+/// (`|=`/`!=`) or `Regex` (`|~`/`!~`).
 #[derive(Debug)]
 enum LineMatcher {
     Literal(String),
     Regex(regex::Regex),
+    Ip(IpMatcher),
 }
 
 #[derive(Debug)]
@@ -216,8 +224,10 @@ enum TmplPart {
 #[derive(Debug)]
 enum CompiledStage {
     LineFilter {
-        op: LineFilterOp,
-        matcher: LineMatcher,
+        /// `or`-disjunction alternatives; the stage matches iff ANY matches.
+        matchers: Vec<LineMatcher>,
+        /// `!=`/`!~` invert the disjunction (keep iff NONE match).
+        negated: bool,
     },
     Json {
         /// Empty = full flatten.
@@ -281,22 +291,42 @@ impl CompiledPipeline {
         for stage in stages {
             match stage {
                 Stage::LineFilter(lf) => {
-                    if !seen_line_format {
-                        // Pushed down to SQL by `plan::compile_line_filters`
-                        // — never re-evaluated here.
+                    // A line filter is pushed down to SQL (and skipped here to
+                    // avoid double evaluation) ONLY when it both precedes the
+                    // first `line_format` (it references the original `body`)
+                    // AND is pushable — i.e. no alternative is an `ip("…")`.
+                    // An `ip(…)`/mixed-`or` filter, or any filter following a
+                    // `line_format`, is served here client-side, matching
+                    // `plan::compile_line_filters`'s pushdown split exactly.
+                    if !seen_line_format && super::plan::is_pushable_line_filter(lf) {
                         continue;
                     }
-                    let matcher = match lf.op {
-                        LineFilterOp::Contains | LineFilterOp::NotContains => {
-                            LineMatcher::Literal(lf.value.clone())
-                        }
-                        LineFilterOp::Regex | LineFilterOp::NotRegex => {
-                            // Unanchored, like the SQL pushdown's
-                            // `match(body, ...)`.
-                            LineMatcher::Regex(compile_regex(&lf.value)?)
-                        }
-                    };
-                    compiled.push(CompiledStage::LineFilter { op: lf.op, matcher });
+                    let mut matchers = Vec::with_capacity(1 + lf.or_matches.len());
+                    for (value, is_ip) in lf.alternatives() {
+                        let matcher = if is_ip {
+                            // `ip("…")` compiles to a range matcher regardless
+                            // of the outer op (`ip(…)` is only ever `|=`/`!=`).
+                            LineMatcher::Ip(
+                                IpMatcher::parse(value)
+                                    .map_err(|e| PipelineError::BadIpFilter(e.to_string()))?,
+                            )
+                        } else {
+                            match lf.op {
+                                LineFilterOp::Contains | LineFilterOp::NotContains => {
+                                    LineMatcher::Literal(value.to_string())
+                                }
+                                LineFilterOp::Regex | LineFilterOp::NotRegex => {
+                                    // Unanchored, like the SQL pushdown's
+                                    // `match(body, ...)`.
+                                    LineMatcher::Regex(compile_regex(value)?)
+                                }
+                            }
+                        };
+                        matchers.push(matcher);
+                    }
+                    let negated =
+                        matches!(lf.op, LineFilterOp::NotContains | LineFilterOp::NotRegex);
+                    compiled.push(CompiledStage::LineFilter { matchers, negated });
                 }
                 Stage::Parser(p) => {
                     mutates_labels = true;
@@ -351,11 +381,19 @@ impl CompiledPipeline {
             }
         }
 
+        // Fast path only when the pipeline is line filters AND every one
+        // pushed down (nothing compiled to run). A non-pushable `ip(…)`/
+        // mixed-`or` filter compiles a run-stage, so `compiled` is non-empty
+        // and the fast path is (correctly) declined — otherwise exec would
+        // skip its client-side evaluation entirely.
+        let line_filter_only =
+            compiled.is_empty() && stages.iter().all(|s| matches!(s, Stage::LineFilter(_)));
+
         Ok(CompiledPipeline {
             stages: compiled,
             mutates_labels,
             rewrites_line,
-            line_filter_only: stages.iter().all(|s| matches!(s, Stage::LineFilter(_))),
+            line_filter_only,
             has_unwrap,
         })
     }
@@ -462,15 +500,19 @@ impl CompiledPipeline {
 
         for stage in &self.stages {
             match stage {
-                CompiledStage::LineFilter { op, matcher } => {
-                    let hit = match matcher {
+                CompiledStage::LineFilter { matchers, negated } => {
+                    // `or` disjunction: the line hits iff ANY alternative
+                    // matches the current (possibly `line_format`-rewritten)
+                    // line bytes. `ip("…")` alternatives scan the line for an
+                    // in-range address; literal/regex alternatives use the
+                    // substring/regex test.
+                    let hit = matchers.iter().any(|m| match m {
                         LineMatcher::Literal(lit) => line.contains(lit.as_str()),
                         LineMatcher::Regex(re) => re.is_match(&line),
-                    };
-                    let keep = match op {
-                        LineFilterOp::Contains | LineFilterOp::Regex => hit,
-                        LineFilterOp::NotContains | LineFilterOp::NotRegex => !hit,
-                    };
+                        LineMatcher::Ip(matcher) => line_has_ip_in(matcher, &line),
+                    });
+                    // `!=`/`!~` keep the line iff NONE of the alternatives match.
+                    let keep = if *negated { !hit } else { hit };
                     if !keep {
                         return MetricRun::Dropped;
                     }
