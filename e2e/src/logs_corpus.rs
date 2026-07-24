@@ -1169,8 +1169,10 @@ pub fn naive_matches(case_id: &str, r: &GeneratedRecord) -> bool {
                         |ip| matches!(ip, std::net::IpAddr::V4(v4) if v4.octets()[0] == 10),
                     )
         }
-        // Invalid-value arm: `addr` present but not parseable as an IP — the
-        // line is returned error-tagged, so it counts as a survivor.
+        // Invalid-value arm: `addr` present but not parseable as an IP ⇒
+        // `match=false` (no error labels, per the pinned reference). Under the
+        // `!=` filter that non-match is *returned*, carrying only the raw
+        // `addr` label, so it counts as a survivor.
         "ip_label_invalid" => {
             r.service == SVC_IP_INVALID
                 && body_logfmt(r)

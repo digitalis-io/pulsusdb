@@ -1858,6 +1858,29 @@ mod tests {
         }
     }
 
+    /// Issue #201 regression: an `ip(…)` line filter has no token/skip-index
+    /// prefilter, so it does NOT push down — it compiles a run-stage and must
+    /// therefore decline the `is_line_filter_only` fast path. If the gate
+    /// wrongly reported `true`, exec would skip the client-side IP scan and the
+    /// filter would silently no-op. A plain literal line filter still qualifies.
+    #[test]
+    fn an_ip_only_line_filter_is_not_line_filter_only() {
+        let ip_only =
+            CompiledPipeline::compile(&stages_of(r#"{a="b"} |= ip("10.0.0.0/8")"#)).unwrap();
+        assert!(
+            !ip_only.is_line_filter_only(),
+            "an ip() line filter must not take the pushdown-only fast path"
+        );
+
+        // Positive control: a pure literal line filter DOES push down fully and
+        // keeps the fast path.
+        let literal = CompiledPipeline::compile(&stages_of(r#"{a="b"} |= "boom""#)).unwrap();
+        assert!(
+            literal.is_line_filter_only(),
+            "a pure literal line filter should remain line-filter-only"
+        );
+    }
+
     /// Adjudication #2 regression: the STREAMS path is byte-identical
     /// with and without a trailing `| unwrap x` — no conversion, no
     /// `__error__`, no label removal.
