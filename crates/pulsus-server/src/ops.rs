@@ -560,309 +560,377 @@ mod tests {
         handle.render()
     }
 
-    /// AC-2 (logs): `record_log_ingest_snapshot` emits every per-table,
-    /// per-signal, registration-cache, and backfill `pulsus_ingest_*` series
-    /// with the seeded values, the right `# TYPE`, and the log table/signal
-    /// labels.
-    #[test]
-    fn log_ingest_snapshot_exports_named_series() {
-        let snap = WriterMetricsSnapshot {
-            samples: TableMetricsSnapshot {
-                rows_total: 7,
-                bytes_total: 512,
-                flushes_total: 2,
-                flush_latency_sum_ns: 999_999_999,
-                retries_total: 1,
-                inflight: 1,
-                spool_write_failures_total: 4,
-                ..Default::default()
-            },
-            streams: TableMetricsSnapshot {
-                rows_total: 3,
-                ..Default::default()
-            },
-            patterns: TableMetricsSnapshot {
-                rows_total: 9,
-                ..Default::default()
-            },
-            patterns_dropped_total: 6,
-            queue_bytes: 1024,
-            backpressure_total: 2,
-            spool_poison_total: 5,
-            spool_uncertain_total: 8,
-            stream_registrations_total: 11,
-            lru_hits_total: 13,
-            lru_misses_total: 17,
-            collisions_total: 19,
-            rejected_total: 23,
-            backfill_enqueued_total: 29,
-            backfill_dropped_total: 31,
-            backfill_retries_total: 37,
-            backfill_healed_total: 41,
-            backfill_abandoned_total: 43,
-            backfill_pending: 47,
-        };
-        let r = render_local(|| record_log_ingest_snapshot(&snap));
+    /// A `TableMetricsSnapshot` with every *exported* field set to a distinct
+    /// nonzero value derived from `base` (offsets 1..=7). Distinct-per-table
+    /// bases make a mis-wired `table` label (a value landing on the wrong
+    /// series) fail. `flush_latency_count` is intentionally left zero: it is
+    /// not exported, so it carries no series to assert.
+    fn table_snap(base: u64) -> TableMetricsSnapshot {
+        TableMetricsSnapshot {
+            rows_total: base + 1,
+            bytes_total: base + 2,
+            flushes_total: base + 3,
+            flush_latency_sum_ns: base + 4,
+            flush_latency_count: 0,
+            retries_total: base + 5,
+            inflight: base + 6,
+            spool_write_failures_total: base + 7,
+        }
+    }
 
-        assert_type(&r, "pulsus_ingest_rows_total", "counter");
-        assert_type(&r, "pulsus_ingest_inflight", "gauge");
-        assert_type(&r, "pulsus_ingest_queue_bytes", "gauge");
+    /// Asserts all seven `record_table_metrics` series for `table` carry their
+    /// exact `table_snap(base)` values.
+    fn assert_table_series(r: &str, table: &str, base: u64) {
+        for (name, off) in [
+            ("pulsus_ingest_rows_total", 1u64),
+            ("pulsus_ingest_bytes_total", 2),
+            ("pulsus_ingest_flushes_total", 3),
+            ("pulsus_ingest_flush_latency_nanoseconds_total", 4),
+            ("pulsus_ingest_retries_total", 5),
+            ("pulsus_ingest_inflight", 6),
+            ("pulsus_ingest_spool_write_failures_total", 7),
+        ] {
+            assert_sample(
+                r,
+                &format!(r#"{name}{{table="{table}"}}"#),
+                (base + off) as f64,
+            );
+        }
+    }
+
+    /// Asserts the `# TYPE` header for every per-table metric name (one line
+    /// per name regardless of the number of `table` label values).
+    fn assert_table_types(r: &str) {
+        assert_type(r, "pulsus_ingest_rows_total", "counter");
+        assert_type(r, "pulsus_ingest_bytes_total", "counter");
+        assert_type(r, "pulsus_ingest_flushes_total", "counter");
         assert_type(
-            &r,
+            r,
             "pulsus_ingest_flush_latency_nanoseconds_total",
             "counter",
         );
-        assert_type(&r, "pulsus_ingest_backfill_pending", "gauge");
+        assert_type(r, "pulsus_ingest_retries_total", "counter");
+        assert_type(r, "pulsus_ingest_inflight", "gauge");
+        assert_type(r, "pulsus_ingest_spool_write_failures_total", "counter");
+    }
 
-        assert_sample(&r, r#"pulsus_ingest_rows_total{table="log_samples"}"#, 7.0);
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_bytes_total{table="log_samples"}"#,
-            512.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_flushes_total{table="log_samples"}"#,
-            2.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_flush_latency_nanoseconds_total{table="log_samples"}"#,
-            999_999_999.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_retries_total{table="log_samples"}"#,
-            1.0,
-        );
-        assert_sample(&r, r#"pulsus_ingest_inflight{table="log_samples"}"#, 1.0);
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_spool_write_failures_total{table="log_samples"}"#,
-            4.0,
-        );
-        assert_sample(&r, r#"pulsus_ingest_rows_total{table="log_streams"}"#, 3.0);
-        assert_sample(&r, r#"pulsus_ingest_rows_total{table="log_patterns"}"#, 9.0);
+    /// A `BackfillMetricsSnapshot` with every field distinct-nonzero from
+    /// `base` (offsets 1..=6).
+    fn backfill_snap(base: u64) -> BackfillMetricsSnapshot {
+        BackfillMetricsSnapshot {
+            enqueued_total: base + 1,
+            dropped_total: base + 2,
+            retries_total: base + 3,
+            healed_total: base + 4,
+            abandoned_total: base + 5,
+            pending: base + 6,
+        }
+    }
 
-        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="logs"}"#, 1024.0);
+    /// Asserts all six `record_backfill_metrics` series for `backlog`.
+    fn assert_backfill_series(r: &str, backlog: &str, base: u64) {
+        for (name, off) in [
+            ("pulsus_ingest_backfill_enqueued_total", 1u64),
+            ("pulsus_ingest_backfill_dropped_total", 2),
+            ("pulsus_ingest_backfill_retries_total", 3),
+            ("pulsus_ingest_backfill_healed_total", 4),
+            ("pulsus_ingest_backfill_abandoned_total", 5),
+            ("pulsus_ingest_backfill_pending", 6),
+        ] {
+            assert_sample(
+                r,
+                &format!(r#"{name}{{backlog="{backlog}"}}"#),
+                (base + off) as f64,
+            );
+        }
+    }
+
+    /// Asserts the `# TYPE` header for every backfill metric name.
+    fn assert_backfill_types(r: &str) {
+        assert_type(r, "pulsus_ingest_backfill_enqueued_total", "counter");
+        assert_type(r, "pulsus_ingest_backfill_dropped_total", "counter");
+        assert_type(r, "pulsus_ingest_backfill_retries_total", "counter");
+        assert_type(r, "pulsus_ingest_backfill_healed_total", "counter");
+        assert_type(r, "pulsus_ingest_backfill_abandoned_total", "counter");
+        assert_type(r, "pulsus_ingest_backfill_pending", "gauge");
+    }
+
+    /// Asserts the `# TYPE` header for the five per-`signal` series shared by
+    /// all three writers.
+    fn assert_signal_types(r: &str) {
+        assert_type(r, "pulsus_ingest_queue_bytes", "gauge");
+        assert_type(r, "pulsus_ingest_backpressure_total", "counter");
+        assert_type(r, "pulsus_ingest_spool_poison_total", "counter");
+        assert_type(r, "pulsus_ingest_spool_uncertain_total", "counter");
+        assert_type(r, "pulsus_ingest_rejected_total", "counter");
+    }
+
+    /// AC-2 (logs): `record_log_ingest_snapshot` emits every per-table,
+    /// per-signal, registration-cache, and backfill `pulsus_ingest_*` series.
+    /// Exhaustive: EVERY emitted series is asserted for both its exact seeded
+    /// value AND its `# TYPE` header. The struct literal is fully spelled out
+    /// (no `..Default::default()`) so a newly added exported field breaks this
+    /// test's compile until it is seeded and asserted. Distinct-nonzero seeds
+    /// (per-table bases 10/20/30, backfill base 40, per-signal 51..=59) catch a
+    /// mis-wired name, `table`/`signal` label, or counter/gauge type.
+    #[test]
+    fn log_ingest_snapshot_exports_named_series() {
+        let snap = WriterMetricsSnapshot {
+            samples: table_snap(10),
+            streams: table_snap(20),
+            patterns: table_snap(30),
+            patterns_dropped_total: 51,
+            queue_bytes: 1000,
+            backpressure_total: 52,
+            spool_poison_total: 53,
+            spool_uncertain_total: 54,
+            stream_registrations_total: 55,
+            lru_hits_total: 56,
+            lru_misses_total: 57,
+            collisions_total: 58,
+            rejected_total: 59,
+            backfill_enqueued_total: 41,
+            backfill_dropped_total: 42,
+            backfill_retries_total: 43,
+            backfill_healed_total: 44,
+            backfill_abandoned_total: 45,
+            backfill_pending: 46,
+        };
+        let r = render_local(|| record_log_ingest_snapshot(&snap));
+
+        // # TYPE header for every emitted metric name.
+        assert_table_types(&r);
+        assert_signal_types(&r);
+        assert_backfill_types(&r);
+        assert_type(&r, "pulsus_ingest_registrations_total", "counter");
+        assert_type(&r, "pulsus_ingest_registration_cache_hits_total", "counter");
+        assert_type(
+            &r,
+            "pulsus_ingest_registration_cache_misses_total",
+            "counter",
+        );
+        assert_type(&r, "pulsus_ingest_collisions_total", "counter");
+        assert_type(&r, "pulsus_ingest_patterns_dropped_total", "counter");
+
+        // Per-table values (7 series each).
+        assert_table_series(&r, "log_samples", 10);
+        assert_table_series(&r, "log_streams", 20);
+        assert_table_series(&r, "log_patterns", 30);
+
+        // Per-signal values.
+        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="logs"}"#, 1000.0);
         assert_sample(
             &r,
             r#"pulsus_ingest_backpressure_total{signal="logs"}"#,
-            2.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_spool_poison_total{signal="logs"}"#,
-            5.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_spool_uncertain_total{signal="logs"}"#,
-            8.0,
-        );
-        assert_sample(&r, r#"pulsus_ingest_rejected_total{signal="logs"}"#, 23.0);
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_registrations_total{signal="logs"}"#,
-            11.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_registration_cache_hits_total{signal="logs"}"#,
-            13.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_registration_cache_misses_total{signal="logs"}"#,
-            17.0,
-        );
-        assert_sample(&r, r#"pulsus_ingest_collisions_total{signal="logs"}"#, 19.0);
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_patterns_dropped_total{signal="logs"}"#,
-            6.0,
-        );
-
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_enqueued_total{backlog="log_streams"}"#,
-            29.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_dropped_total{backlog="log_streams"}"#,
-            31.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_retries_total{backlog="log_streams"}"#,
-            37.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_healed_total{backlog="log_streams"}"#,
-            41.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_abandoned_total{backlog="log_streams"}"#,
-            43.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_pending{backlog="log_streams"}"#,
-            47.0,
-        );
-    }
-
-    /// AC-2 (metrics): the metric-writer snapshot emits its four tables, the
-    /// `signal="metrics"` series (incl. `metadata_upserts`), and both series/
-    /// metadata backfills.
-    #[test]
-    fn metric_ingest_snapshot_exports_named_series() {
-        let snap = MetricWriterMetricsSnapshot {
-            samples: TableMetricsSnapshot {
-                rows_total: 50,
-                ..Default::default()
-            },
-            series: TableMetricsSnapshot {
-                rows_total: 51,
-                ..Default::default()
-            },
-            metadata: TableMetricsSnapshot {
-                rows_total: 52,
-                ..Default::default()
-            },
-            hist_samples: TableMetricsSnapshot {
-                rows_total: 53,
-                ..Default::default()
-            },
-            queue_bytes: 2048,
-            backpressure_total: 3,
-            spool_poison_total: 4,
-            spool_uncertain_total: 5,
-            series_registrations_total: 6,
-            series_lru_hits_total: 7,
-            series_lru_misses_total: 8,
-            metadata_upserts_total: 9,
-            collisions_total: 10,
-            rejected_total: 11,
-            series_backfill: BackfillMetricsSnapshot {
-                enqueued_total: 12,
-                pending: 13,
-                ..Default::default()
-            },
-            metadata_backfill: BackfillMetricsSnapshot {
-                abandoned_total: 14,
-                ..Default::default()
-            },
-        };
-        let r = render_local(|| record_metric_ingest_snapshot(&snap));
-
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_rows_total{table="metric_samples"}"#,
-            50.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_rows_total{table="metric_series"}"#,
-            51.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_rows_total{table="metric_metadata"}"#,
             52.0,
         );
         assert_sample(
             &r,
-            r#"pulsus_ingest_rows_total{table="metric_hist_samples"}"#,
+            r#"pulsus_ingest_spool_poison_total{signal="logs"}"#,
             53.0,
         );
-        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="metrics"}"#, 2048.0);
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_spool_uncertain_total{signal="logs"}"#,
+            54.0,
+        );
+        assert_sample(&r, r#"pulsus_ingest_rejected_total{signal="logs"}"#, 59.0);
+
+        // Registration-cache values.
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_registrations_total{signal="logs"}"#,
+            55.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_registration_cache_hits_total{signal="logs"}"#,
+            56.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_registration_cache_misses_total{signal="logs"}"#,
+            57.0,
+        );
+        assert_sample(&r, r#"pulsus_ingest_collisions_total{signal="logs"}"#, 58.0);
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_patterns_dropped_total{signal="logs"}"#,
+            51.0,
+        );
+
+        // Backfill values (6 series).
+        assert_backfill_series(&r, "log_streams", 40);
+
+        // Logs have no per-metrics metadata-upsert series.
+        assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
+    }
+
+    /// AC-2 (metrics): the metric-writer snapshot emits its four tables, the
+    /// `signal="metrics"` series (incl. `metadata_upserts`), and both series/
+    /// metadata backfills. Exhaustive: EVERY emitted series is asserted for its
+    /// exact seeded value AND its `# TYPE`. Fully-spelled struct literal.
+    /// Distinct-nonzero seeds (per-table bases 100/110/120/130, backfill bases
+    /// 140/150, per-signal 61..=69) catch a mis-wired name/label/type.
+    #[test]
+    fn metric_ingest_snapshot_exports_named_series() {
+        let snap = MetricWriterMetricsSnapshot {
+            samples: table_snap(100),
+            series: table_snap(110),
+            metadata: table_snap(120),
+            hist_samples: table_snap(130),
+            queue_bytes: 2000,
+            backpressure_total: 61,
+            spool_poison_total: 62,
+            spool_uncertain_total: 63,
+            series_registrations_total: 64,
+            series_lru_hits_total: 65,
+            series_lru_misses_total: 66,
+            metadata_upserts_total: 67,
+            collisions_total: 68,
+            rejected_total: 69,
+            series_backfill: backfill_snap(140),
+            metadata_backfill: backfill_snap(150),
+        };
+        let r = render_local(|| record_metric_ingest_snapshot(&snap));
+
+        // # TYPE header for every emitted metric name.
+        assert_table_types(&r);
+        assert_signal_types(&r);
+        assert_backfill_types(&r);
+        assert_type(&r, "pulsus_ingest_registrations_total", "counter");
+        assert_type(&r, "pulsus_ingest_registration_cache_hits_total", "counter");
+        assert_type(
+            &r,
+            "pulsus_ingest_registration_cache_misses_total",
+            "counter",
+        );
+        assert_type(&r, "pulsus_ingest_collisions_total", "counter");
+        assert_type(&r, "pulsus_ingest_metadata_upserts_total", "counter");
+
+        // Per-table values (4 tables × 7 series).
+        assert_table_series(&r, "metric_samples", 100);
+        assert_table_series(&r, "metric_series", 110);
+        assert_table_series(&r, "metric_metadata", 120);
+        assert_table_series(&r, "metric_hist_samples", 130);
+
+        // Per-signal values.
+        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="metrics"}"#, 2000.0);
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_backpressure_total{signal="metrics"}"#,
+            61.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_spool_poison_total{signal="metrics"}"#,
+            62.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_spool_uncertain_total{signal="metrics"}"#,
+            63.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_rejected_total{signal="metrics"}"#,
+            69.0,
+        );
+
+        // Registration-cache + metadata-upsert values.
         assert_sample(
             &r,
             r#"pulsus_ingest_registrations_total{signal="metrics"}"#,
-            6.0,
+            64.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_registration_cache_hits_total{signal="metrics"}"#,
+            65.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_registration_cache_misses_total{signal="metrics"}"#,
+            66.0,
+        );
+        assert_sample(
+            &r,
+            r#"pulsus_ingest_collisions_total{signal="metrics"}"#,
+            68.0,
         );
         assert_sample(
             &r,
             r#"pulsus_ingest_metadata_upserts_total{signal="metrics"}"#,
-            9.0,
+            67.0,
         );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_enqueued_total{backlog="metric_series"}"#,
-            12.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_pending{backlog="metric_series"}"#,
-            13.0,
-        );
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_abandoned_total{backlog="metric_metadata"}"#,
-            14.0,
-        );
+
+        // Backfill values (2 backlogs × 6 series).
+        assert_backfill_series(&r, "metric_series", 140);
+        assert_backfill_series(&r, "metric_metadata", 150);
+
         // Metrics writer has no pattern-drop series.
         assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
     }
 
     /// AC-2 (traces): the trace-writer snapshot emits its two tables, the
     /// `signal="traces"` series, and the attrs backfill — and NO
-    /// registration-cache/collision/metadata series (traces track none).
+    /// registration-cache/collision/metadata/pattern series (traces track
+    /// none). Exhaustive: EVERY emitted series is asserted for its exact
+    /// seeded value AND its `# TYPE`. Fully-spelled struct literal.
+    /// Distinct-nonzero seeds (per-table bases 200/210, backfill base 220,
+    /// per-signal 71..=74) catch a mis-wired name/label/type.
     #[test]
     fn trace_ingest_snapshot_exports_named_series() {
         let snap = TraceWriterMetricsSnapshot {
-            spans: TableMetricsSnapshot {
-                rows_total: 60,
-                bytes_total: 4096,
-                ..Default::default()
-            },
-            attrs: TableMetricsSnapshot {
-                rows_total: 61,
-                ..Default::default()
-            },
-            queue_bytes: 512,
-            backpressure_total: 2,
-            spool_poison_total: 3,
-            spool_uncertain_total: 4,
-            rejected_total: 5,
-            attrs_backfill: BackfillMetricsSnapshot {
-                healed_total: 6,
-                pending: 7,
-                ..Default::default()
-            },
+            spans: table_snap(200),
+            attrs: table_snap(210),
+            queue_bytes: 500,
+            backpressure_total: 71,
+            spool_poison_total: 72,
+            spool_uncertain_total: 73,
+            rejected_total: 74,
+            attrs_backfill: backfill_snap(220),
         };
         let r = render_local(|| record_trace_ingest_snapshot(&snap));
 
-        assert_sample(&r, r#"pulsus_ingest_rows_total{table="trace_spans"}"#, 60.0);
+        // # TYPE header for every emitted metric name.
+        assert_table_types(&r);
+        assert_signal_types(&r);
+        assert_backfill_types(&r);
+
+        // Per-table values (2 tables × 7 series).
+        assert_table_series(&r, "trace_spans", 200);
+        assert_table_series(&r, "trace_attrs_idx", 210);
+
+        // Per-signal values.
+        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="traces"}"#, 500.0);
         assert_sample(
             &r,
-            r#"pulsus_ingest_bytes_total{table="trace_spans"}"#,
-            4096.0,
+            r#"pulsus_ingest_backpressure_total{signal="traces"}"#,
+            71.0,
         );
         assert_sample(
             &r,
-            r#"pulsus_ingest_rows_total{table="trace_attrs_idx"}"#,
-            61.0,
-        );
-        assert_sample(&r, r#"pulsus_ingest_queue_bytes{signal="traces"}"#, 512.0);
-        assert_sample(&r, r#"pulsus_ingest_rejected_total{signal="traces"}"#, 5.0);
-        assert_sample(
-            &r,
-            r#"pulsus_ingest_backfill_healed_total{backlog="trace_attrs_idx"}"#,
-            6.0,
+            r#"pulsus_ingest_spool_poison_total{signal="traces"}"#,
+            72.0,
         );
         assert_sample(
             &r,
-            r#"pulsus_ingest_backfill_pending{backlog="trace_attrs_idx"}"#,
-            7.0,
+            r#"pulsus_ingest_spool_uncertain_total{signal="traces"}"#,
+            73.0,
         );
+        assert_sample(&r, r#"pulsus_ingest_rejected_total{signal="traces"}"#, 74.0);
+
+        // Backfill values (6 series).
+        assert_backfill_series(&r, "trace_attrs_idx", 220);
+
+        // Traces track no registration-cache/collision/metadata/pattern series.
         assert!(!r.contains("pulsus_ingest_registrations_total"));
+        assert!(!r.contains("pulsus_ingest_registration_cache_hits_total"));
+        assert!(!r.contains("pulsus_ingest_registration_cache_misses_total"));
         assert!(!r.contains("pulsus_ingest_collisions_total"));
         assert!(!r.contains("pulsus_ingest_metadata_upserts_total"));
+        assert!(!r.contains("pulsus_ingest_patterns_dropped_total"));
     }
 
     /// AC-3 / reader-only guard: `metrics_handler` with empty writer slots
