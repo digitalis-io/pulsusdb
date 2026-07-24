@@ -128,6 +128,22 @@
       ]
     },
     {
+      "source": "ip_label_missing",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.ip"
+      ]
+    },
+    {
+      "source": "ip_label_invalid",
+      "kind": "e2e-differential",
+      "constructs": [
+        "parser.logfmt",
+        "labelfilter.ip"
+      ]
+    },
+    {
       "source": "metric_filtered_count",
       "kind": "e2e-differential",
       "constructs": [

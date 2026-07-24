@@ -26,8 +26,8 @@ mod token;
 
 pub use ast::{
     BINARY_OP_KEYWORDS, BinModifier, BinOp, CompareOp, Duration, Expr, Grouping, GroupingKind,
-    LabelExtraction, LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LogExpr, LogRange,
-    MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral, ParserStage,
+    LabelExtraction, LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LineMatch, LogExpr,
+    LogRange, MatchGroup, MatchOp, Matcher, MetricExpr, NumericLiteral, ParserStage,
     REMAINING_UNSUPPORTED_STAGES, RangeAggOp, Stage, StreamSelector, UNWRAP_CONVERSIONS, Unwrap,
     VectorAggOp, VectorMatching,
 };

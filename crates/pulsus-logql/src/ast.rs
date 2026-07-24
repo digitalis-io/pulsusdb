@@ -231,6 +231,15 @@ pub enum LabelFilterExpr {
         op: CompareOp,
         rhs: NumericLiteral,
     },
+    /// IP form (M8-LQ2 `labelfilter.ip`): `name = ip("…")` /
+    /// `name != ip("…")`. `value` is the raw CIDR/range/single-address
+    /// text (matching is a `pulsus-read` concern); `negated` is the `!=`
+    /// form.
+    Ip {
+        name: String,
+        value: String,
+        negated: bool,
+    },
     And(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
     Or(Box<LabelFilterExpr>, Box<LabelFilterExpr>),
 }
@@ -253,6 +262,14 @@ impl fmt::Display for LabelFilterExpr {
         match self {
             LabelFilterExpr::Match(m) => write!(f, "{m}"),
             LabelFilterExpr::Compare { name, op, rhs } => write!(f, "{name} {op} {rhs}"),
+            LabelFilterExpr::Ip {
+                name,
+                value,
+                negated,
+            } => {
+                let op = if *negated { "!=" } else { "=" };
+                write!(f, "{name} {op} ip({})", quote(value))
+            }
             LabelFilterExpr::And(a, b) => {
                 Self::fmt_child(a, f)?;
                 write!(f, " and ")?;
@@ -334,18 +351,60 @@ impl fmt::Display for LabelFmt {
     }
 }
 
-/// `("|=" | "!=" | "|~" | "!~") string` — chains with no separator
-/// (`{app="x"} |= "a" != "b" !~ "c"`); `!=`/`!~` carry no leading pipe.
+/// `("|=" | "!=" | "|~" | "!~") <line-match> (or <line-match>)*` — chains
+/// with no separator between filters (`{app="x"} |= "a" != "b" !~ "c"`);
+/// `!=`/`!~` carry no leading pipe. The head alternative is `value` +
+/// `value_is_ip` (an `ip("…")` head renders `ip("…")` instead of a quoted
+/// literal); each `or`-chained alternative is an [`LineMatch`]. `ip(…)` is
+/// only accepted with `|=`/`!=` (M8-LQ2 `linefilter.ip`); the `or` chain is
+/// M8-LQ2 `linefilter.or`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LineFilter {
     pub op: LineFilterOp,
     pub value: String,
+    /// `true` when the head alternative is an `ip("…")` CIDR/range spec
+    /// rather than a plain literal/regex value.
+    pub value_is_ip: bool,
+    /// Additional `or`-chained alternatives after the head (empty for a
+    /// plain single-value filter). Each carries its own `is_ip` flag.
+    pub or_matches: Vec<LineMatch>,
+}
+
+impl LineFilter {
+    /// Iterates every alternative of this filter (head first, then each
+    /// `or` alternative) as `(value, is_ip)`.
+    pub fn alternatives(&self) -> impl Iterator<Item = (&str, bool)> + '_ {
+        std::iter::once((self.value.as_str(), self.value_is_ip))
+            .chain(self.or_matches.iter().map(|m| (m.value.as_str(), m.is_ip)))
+    }
 }
 
 impl fmt::Display for LineFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.op, quote(&self.value))
+        write!(f, "{} ", self.op)?;
+        fn render(f: &mut fmt::Formatter<'_>, value: &str, is_ip: bool) -> fmt::Result {
+            if is_ip {
+                write!(f, "ip({})", quote(value))
+            } else {
+                write!(f, "{}", quote(value))
+            }
+        }
+        render(f, &self.value, self.value_is_ip)?;
+        for m in &self.or_matches {
+            write!(f, " or ")?;
+            render(f, &m.value, m.is_ip)?;
+        }
+        Ok(())
     }
+}
+
+/// One `or`-chained alternative of a [`LineFilter`] (`|= "a" or "b"` /
+/// `|= "a" or ip("…")`) — the head alternative lives on `LineFilter`
+/// itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LineMatch {
+    pub value: String,
+    pub is_ip: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

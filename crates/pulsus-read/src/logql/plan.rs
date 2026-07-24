@@ -460,6 +460,9 @@ fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
             Stage::LineFormat(_) => seen_line_format = true,
             Stage::LabelFilter(_) => return true,
             Stage::LineFilter(_) if seen_line_format => return true,
+            // A non-pushable line filter (`ip(…)`/mixed-`or`) drops lines
+            // in-engine (client pipeline), so it must oversample too.
+            Stage::LineFilter(lf) if !is_pushable_line_filter(lf) => return true,
             _ => {}
         }
     }
@@ -474,7 +477,11 @@ fn has_unpushed_dropping_stage(pipeline: &[Stage]) -> bool {
 fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     use pulsus_logql::ParserStage;
     pipeline.iter().find_map(|stage| match stage {
-        Stage::LineFilter(_) => None,
+        // A pushable line filter is served by the columnar `sp.line_filters`
+        // predicate; a non-pushable one (`ip(…)`/mixed-`or`) must force
+        // in-engine client aggregation over the raw scan.
+        Stage::LineFilter(lf) if is_pushable_line_filter(lf) => None,
+        Stage::LineFilter(_) => Some("ip line filter"),
         Stage::Parser(ParserStage::Json { .. }) => Some("json"),
         Stage::Parser(ParserStage::Logfmt { .. }) => Some("logfmt"),
         Stage::Parser(ParserStage::Regexp(_)) => Some("regexp"),
@@ -908,12 +915,35 @@ pub(crate) fn compile_line_filters(pipeline: &[Stage]) -> Vec<String> {
     let mut out = Vec::new();
     for stage in pipeline {
         match stage {
-            Stage::LineFilter(lf) => out.push(compile_line_filter(lf)),
+            // Non-pushable line filters (`ip(…)` / any `or` alternative that
+            // is an `ip`) have no literal/token prefilter and are evaluated
+            // in the client pipeline — never emit SQL for them here (doing so
+            // would drop lines the client scan must keep / re-test).
+            Stage::LineFilter(lf) if is_pushable_line_filter(lf) => {
+                out.push(compile_line_filter(lf))
+            }
+            Stage::LineFilter(_) => {}
             Stage::LineFormat(_) => break,
             _ => {}
         }
     }
     out
+}
+
+/// The single source of truth for "does this line filter push down to SQL,
+/// or must it run in the client pipeline?" Consulted at every site that
+/// decides SQL-vs-client for a `Stage::LineFilter` (this module's
+/// `compile_line_filters`, `has_unpushed_dropping_stage`,
+/// `metric_pipeline_construct`; `pipeline.rs`'s compile/`line_filter_only`;
+/// `exec.rs`'s `stats` gate) so the two paths never drift.
+///
+/// An `ip(…)` alternative is a range test over IP-shaped substrings — it has
+/// no `tokenbf_v1`/`hasToken` prefilter and cannot prune granules, so it (and
+/// any `or` group containing one) evaluates client-side. A pure literal/regex
+/// `or` group pushes down as a disjunction that preserves each disjunct's
+/// token prefilter.
+pub(crate) fn is_pushable_line_filter(lf: &LineFilter) -> bool {
+    !lf.value_is_ip && lf.or_matches.iter().all(|m| !m.is_ip)
 }
 
 /// ClickHouse's `tokenbf_v1` splits on non-alphanumeric ASCII; a `hasToken`
@@ -951,12 +981,44 @@ fn is_plain_literal(pattern: &str) -> bool {
 /// still surfacing the prefilter for ClickHouse's optimizer to exploit
 /// where it can (architect plan: "Prefilter is always paired with the
 /// exact predicate").
+///
+/// An `or` group (M8-LQ2 `linefilter.or`) is a disjunction of the same
+/// per-alternative compound predicate: `((a) OR (b) …)` for positive ops,
+/// `NOT ((a) OR (b) …)` for negative ops (each disjunct's `hasToken`
+/// prefilter is preserved, so the `tokenbf_v1` skip index still prunes). A
+/// single-value filter is left un-wrapped so its pushed-down SQL is
+/// byte-identical to the pre-`or` output. Callers must gate on
+/// [`is_pushable_line_filter`]: this only ever sees literal/regex
+/// alternatives (`ip(…)` is served client-side).
 pub(crate) fn compile_line_filter(lf: &LineFilter) -> String {
+    let disjuncts: Vec<String> = lf
+        .alternatives()
+        .map(|(value, _)| match lf.op {
+            LineFilterOp::Contains | LineFilterOp::NotContains => contains_predicate(value),
+            LineFilterOp::Regex | LineFilterOp::NotRegex => regex_predicate(value),
+        })
+        .collect();
+    let core = if lf.or_matches.is_empty() {
+        disjuncts
+            .into_iter()
+            .next()
+            .expect("a line filter always has a head alternative")
+    } else {
+        disjuncts
+            .iter()
+            .map(|p| format!("({p})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    };
     match lf.op {
-        LineFilterOp::Contains => contains_predicate(&lf.value),
-        LineFilterOp::NotContains => format!("NOT ({})", contains_predicate(&lf.value)),
-        LineFilterOp::Regex => regex_predicate(&lf.value),
-        LineFilterOp::NotRegex => format!("NOT ({})", regex_predicate(&lf.value)),
+        LineFilterOp::Contains | LineFilterOp::Regex => {
+            if lf.or_matches.is_empty() {
+                core
+            } else {
+                format!("({core})")
+            }
+        }
+        LineFilterOp::NotContains | LineFilterOp::NotRegex => format!("NOT ({core})"),
     }
 }
 
