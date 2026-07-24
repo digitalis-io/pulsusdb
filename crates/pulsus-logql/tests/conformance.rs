@@ -40,10 +40,19 @@ use pulsus_logql::{
     parse,
 };
 
-// Interim gaps route to the epic #191 owns (its parent #190) until the
-// LQ-1..n sub-issues are filed, then re-home. Every interim disposition must
-// name a valid owning issue.
-const VALID_ISSUES: [u64; 1] = [190];
+// The M8-LQ epic (#190) closed out its interim constructs: LQ1–LQ3 flipped
+// the 8 accept-side gaps to `supported` and this closeout (#203) moved the 2
+// both-reject residuals (`stage.distinct`/`stage.ip`) to `reject-parity`, so
+// the interim set is now EMPTY. `VALID_ISSUES` and `CLOSEOUT_INTERIM_ALLOWLIST`
+// are therefore empty: any newly-added interim disposition names an issue
+// absent from both lists and goes RED (`check_interim_issue` +
+// `interim_entries_are_allowlisted`). Re-populate both in lockstep if a future
+// issue reopens an interim gap.
+const VALID_ISSUES: [u64; 0] = [];
+// The committed open-issue allowlist the strict closeout gate enforces: every
+// interim entry's owning_issue must be in it. Empty now that #203 drove the
+// pin to 0 — the gate is a hard `interim == 0`.
+const CLOSEOUT_INTERIM_ALLOWLIST: &[u64] = &[];
 // The published LogQL query-docs root (functional citation literal, black-box
 // public-doc use — see PROVENANCE.md). Every registry `doc` must live under it.
 const DOCS_PREFIX: &str = "https://grafana.com/docs/loki/";
@@ -119,6 +128,11 @@ enum Status {
     Supported,
     InterimNamed,
     InterimGeneric,
+    /// We reject the construct (a construct-named `NotYetSupported` boundary)
+    /// AND the pinned reference rejects it — parity, not a compat gap.
+    /// Terminal: no `owning_issue`. The live differential separately confirms
+    /// the reference still rejects; an oracle flip to Accept is RED.
+    RejectParity,
     Divergence,
 }
 
@@ -812,6 +826,45 @@ fn check_status(d: &Disposition, probe: &str) -> Result<(), String> {
                 )),
             }
         }
+        // Reject-parity: we reject the probe AND the reference rejects it. It
+        // is NOT a compat gap, so it carries no owning issue and is not routed
+        // through `check_interim_issue`. The residual reject-parity stages both
+        // produce a `NotYetSupported` that names the stage, so the arm enforces
+        // the same construct-named-error contract as `interim-named` (a stage
+        // that now parses, or errors generically, or names a different
+        // construct, is RED). The live differential separately confirms the
+        // reference still rejects (an oracle flip to Accept is RED there).
+        Status::RejectParity => {
+            let want = d.error_construct.as_deref().ok_or_else(|| {
+                format!("{}: reject-parity requires `error_construct`", d.construct)
+            })?;
+            match &class {
+                ProbeClass::Named(got) if got == want => {
+                    let err = parse(probe).expect_err("reject-parity probe must error");
+                    if err.to_string().contains(want) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "{}: NotYetSupported Display {:?} does not name {want:?}",
+                            d.construct,
+                            err.to_string()
+                        ))
+                    }
+                }
+                ProbeClass::Named(got) => Err(format!(
+                    "{}: reject-parity error_construct {want:?} but probe named {got:?}",
+                    d.construct
+                )),
+                ProbeClass::Parses(_) => Err(format!(
+                    "{}: reject-parity but probe {probe:?} now parses (we no longer reject it)",
+                    d.construct
+                )),
+                ProbeClass::Generic => Err(format!(
+                    "{}: reject-parity but probe {probe:?} errored generically (expected a named boundary)",
+                    d.construct
+                )),
+            }
+        }
         Status::Divergence => check_divergence(d),
     }
 }
@@ -1016,11 +1069,17 @@ fn differential_categories_are_pinned() {
     let mut supported = 0usize;
     let mut tracked_interim = 0usize; // interim ∧ oracle accepts (a real gap)
     let mut both_reject = 0usize; // interim ∧ oracle rejects (agreement)
+    let mut reject_parity = 0usize; // reject-parity ∧ oracle rejects (agreement)
     let mut unescalated_divergence = Vec::new(); // supported ∧ oracle rejects
+    let mut oracle_flipped_reject_parity = Vec::new(); // reject-parity ∧ oracle accepts
     for d in &disp.entries {
         match (d.status, d.oracle) {
             (Status::Supported, Oracle::Accept) => supported += 1,
             (Status::Supported, Oracle::Reject) => unescalated_divergence.push(&d.construct),
+            (Status::RejectParity, Oracle::Reject) => reject_parity += 1,
+            (Status::RejectParity, Oracle::Accept) => {
+                oracle_flipped_reject_parity.push(&d.construct)
+            }
             (Status::Divergence, _) => {}
             (_, Oracle::Accept) => tracked_interim += 1,
             (_, Oracle::Reject) => both_reject += 1,
@@ -1033,14 +1092,29 @@ fn differential_categories_are_pinned() {
         unescalated_divergence.is_empty(),
         "supported constructs the reference rejects (unescalated divergences): {unescalated_divergence:?}"
     );
+    // A reject-parity construct the oracle now ACCEPTS is an unescalated
+    // divergence in the other direction (we reject, the reference does not).
+    assert!(
+        oracle_flipped_reject_parity.is_empty(),
+        "reject-parity constructs the reference now accepts (unescalated divergences): \
+         {oracle_flipped_reject_parity:?}"
+    );
+    // Closeout pins (#203): LQ1–LQ3 flipped the 8 accept-side gaps to
+    // `supported` and this closeout moved the 2 both-reject residuals
+    // (`stage.distinct`/`stage.ip`) into the new reject-parity bucket
+    // (both_reject 2 → 0, reject_parity = 2), driving tracked interim to 0.
     assert_eq!(supported, 97, "supported (both-accept agreement) count pin");
     assert_eq!(
         tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"
     );
     assert_eq!(
-        both_reject, 2,
-        "both-reject agreement count pin (interim ∧ oracle rejects: stage.ip, stage.distinct)"
+        both_reject, 0,
+        "both-reject agreement count pin (interim ∧ oracle rejects)"
+    );
+    assert_eq!(
+        reject_parity, 2,
+        "reject-parity count pin (reject-parity ∧ oracle rejects: stage.ip, stage.distinct)"
     );
 
     // Every tracked interim gap must name an owning issue.
@@ -1053,6 +1127,33 @@ fn differential_categories_are_pinned() {
             );
         }
     }
+}
+
+// #7b — the strict closeout gate (#203): every interim disposition must be
+// owned by an issue in the committed allowlist. The allowlist is now empty
+// (`CLOSEOUT_INTERIM_ALLOWLIST == []`), so this enforces a hard
+// `interim == 0`: any newly-added interim disposition names an issue absent
+// from the allowlist (or names none) and goes RED. Re-populate the allowlist
+// in lockstep with `VALID_ISSUES` if a future issue reopens an interim gap.
+#[test]
+fn interim_entries_are_allowlisted() {
+    let disp = load_dispositions();
+    let stray: Vec<String> = disp
+        .entries
+        .iter()
+        .filter(|d| matches!(d.status, Status::InterimNamed | Status::InterimGeneric))
+        .filter(|d| {
+            d.owning_issue
+                .map(|i| !CLOSEOUT_INTERIM_ALLOWLIST.contains(&i))
+                .unwrap_or(true)
+        })
+        .map(|d| format!("{} (owning_issue {:?})", d.construct, d.owning_issue))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "interim dispositions not owned by an allowlisted open issue \
+         {CLOSEOUT_INTERIM_ALLOWLIST:?}: {stray:?}"
+    );
 }
 
 // #8
@@ -1230,10 +1331,9 @@ fn registry_covers_the_recognized_parser_surface() {
         let d = by_construct
             .get(id.as_str())
             .unwrap_or_else(|| panic!("unsupported stage {kw:?} has no `{id}` disposition"));
-        assert_eq!(
-            d.status,
-            Status::InterimNamed,
-            "{id}: an unsupported stage must be interim-named"
+        assert!(
+            matches!(d.status, Status::InterimNamed | Status::RejectParity),
+            "{id}: an unsupported stage must be interim-named or reject-parity"
         );
         match classify(&format!("{{app=\"x\"}} | {kw}")) {
             ProbeClass::Named(got) => assert_eq!(&got, kw, "{id}: probe must name the stage"),
@@ -1415,6 +1515,52 @@ fn divergence_fixture() -> Disposition {
         oracle_citation: Some(format!("{DOCS_PREFIX}latest/query/log_queries/#x")),
         owner_escalation: Some(format!("{REPO_PREFIX}issues/191#issuecomment-1")),
     }
+}
+
+/// A reject-parity fixture: a residual stage the parser still rejects with a
+/// construct-named `NotYetSupported` and the reference also rejects (terminal,
+/// no owning issue). `distinct`/`ip` are the two live residuals.
+fn reject_parity_fixture() -> Disposition {
+    Disposition {
+        construct: "fixture.reject-parity".to_string(),
+        status: Status::RejectParity,
+        oracle: Oracle::Reject,
+        error_construct: Some("distinct".to_string()),
+        evidence: vec![],
+        owning_issue: None,
+        justification: None,
+        oracle_citation: None,
+        owner_escalation: None,
+    }
+}
+
+#[test]
+fn reject_parity_naming_its_construct_validates() {
+    // GREEN: the probe still reaches a NotYetSupported boundary naming its
+    // error_construct (`distinct`) — parity preserved.
+    check_status(&reject_parity_fixture(), r#"{app="x"} | distinct"#)
+        .expect("a named boundary naming `distinct` is a valid reject-parity");
+}
+
+#[test]
+fn reject_parity_probe_that_now_parses_is_red() {
+    // RED: a reject-parity construct whose probe now parses `Ok` means we
+    // stopped rejecting it — the disposition must be flipped deliberately.
+    assert!(check_status(&reject_parity_fixture(), r#"{app="x"}"#).is_err());
+}
+
+#[test]
+fn reject_parity_naming_a_different_construct_is_red() {
+    // RED: error_construct is `distinct` but the probe names `ip`.
+    assert!(check_status(&reject_parity_fixture(), r#"{app="x"} | ip"#).is_err());
+}
+
+#[test]
+fn reject_parity_without_error_construct_is_red() {
+    // RED: reject-parity requires a construct-named boundary.
+    let mut d = reject_parity_fixture();
+    d.error_construct = None;
+    assert!(check_status(&d, r#"{app="x"} | distinct"#).is_err());
 }
 
 #[test]

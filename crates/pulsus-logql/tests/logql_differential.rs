@@ -41,6 +41,36 @@ enum Verdict {
     Reject,
 }
 
+/// The disposition-driven classification of a construct whose live oracle
+/// verdict already matches its recorded `oracle` (the recorded-verdict guard
+/// runs first, in the loop). Factored out so the RED arms are provable by a
+/// hermetic unit test, not only by the live leg.
+#[derive(Debug)]
+enum Outcome {
+    Agreement,
+    TrackedInterim,
+    Mismatch(String),
+}
+
+fn classify_verdict(id: &str, status: &str, live: Verdict) -> Outcome {
+    match (status, live) {
+        ("supported", Verdict::Accept) => Outcome::Agreement,
+        ("supported", Verdict::Reject) => Outcome::Mismatch(format!(
+            "{id}: supported but the reference rejects — an unescalated divergence"
+        )),
+        // Reject-parity (#203): we reject AND the reference must reject. A live
+        // Accept is an unescalated divergence in the other direction (we
+        // reject, the reference does not) — a loud mismatch, never silently
+        // folded into the tracked-interim bucket by the wildcard below.
+        ("reject-parity", Verdict::Reject) => Outcome::Agreement,
+        ("reject-parity", Verdict::Accept) => Outcome::Mismatch(format!(
+            "{id}: reject-parity but the reference now accepts — an unescalated divergence"
+        )),
+        (_, Verdict::Reject) => Outcome::Agreement, // interim ∧ both reject
+        (_, Verdict::Accept) => Outcome::TrackedInterim, // interim ∧ reference accepts
+    }
+}
+
 fn conf_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -156,14 +186,10 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
             ));
             continue;
         }
-        match (*status, live) {
-            ("supported", Verdict::Accept) => agreements += 1,
-            ("supported", Verdict::Reject) => mismatches.push(format!(
-                "{}: supported but the reference rejects — an unescalated divergence",
-                c.id
-            )),
-            (_, Verdict::Reject) => agreements += 1, // interim ∧ both reject
-            (_, Verdict::Accept) => tracked_interim += 1, // interim ∧ reference accepts
+        match classify_verdict(c.id.as_str(), status, live) {
+            Outcome::Agreement => agreements += 1,
+            Outcome::TrackedInterim => tracked_interim += 1,
+            Outcome::Mismatch(m) => mismatches.push(m),
         }
     }
 
@@ -179,4 +205,25 @@ fn registry_probes_match_the_recorded_oracle_verdict() {
          interim gaps (all visible in the registry with an owning issue)",
         registry.constructs.len()
     );
+}
+
+// Hermetic RED-path proof (#203 plan-review TEST-GAP): the pinned v3.7.3
+// reference only exercises the reject-parity ∧ Reject agreement arm, so a
+// reference flip to Accept is never covered live. This proves the
+// `("reject-parity", Verdict::Accept)` arm records a loud mismatch rather than
+// silently folding it into the tracked-interim bucket via the wildcard.
+#[test]
+fn reject_parity_reference_accept_is_a_mismatch() {
+    match classify_verdict("stage.distinct", "reject-parity", Verdict::Accept) {
+        Outcome::Mismatch(m) => assert!(
+            m.contains("reject-parity") && m.contains("now accepts"),
+            "unexpected mismatch message: {m:?}"
+        ),
+        other => panic!("expected a mismatch for a reject-parity oracle flip, got {other:?}"),
+    }
+    // The both-reject agreement stays an agreement.
+    assert!(matches!(
+        classify_verdict("stage.distinct", "reject-parity", Verdict::Reject),
+        Outcome::Agreement
+    ));
 }
