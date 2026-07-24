@@ -3156,16 +3156,25 @@ pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 /// (review round 1, finding 1's quantile bound).
 pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 
-/// The `rate_counter` retention cap (M8-LQ3, code review round 2): like
-/// `quantile_over_time`, the reset walk is order-dependent, so every
+/// The `rate_counter` retention cap (M8-LQ3, code review rounds 2/3):
+/// like `quantile_over_time`, the reset walk is order-dependent, so every
 /// unwrapped `(ts, value)` sample is retained per bucket until `finish`.
-/// A dense range query overlapping many buckets could otherwise multiply
-/// retained points without bound. Past this many retained points the
-/// query aborts as `QueryTooBroad(CounterValues)` — complete-or-error,
-/// never OOM and never a silently truncated increase. Bounds only the
-/// retained points; the reset-aware rate value is unchanged below the
-/// cap. Same ceiling as [`MAX_QUANTILE_VALUES`] (the shared "reducer
-/// state grows with surviving rows" class).
+/// A dense range query retains one point per scanned sample, growing the
+/// combined per-bucket vectors without bound. Past this many retained
+/// points the query aborts as `QueryTooBroad(CounterValues)` —
+/// complete-or-error, never OOM and never a silently truncated increase.
+/// Bounds only the retained points; the reset-aware rate value is
+/// unchanged below the cap. Same ceiling as [`MAX_QUANTILE_VALUES`] (the
+/// shared "reducer state grows with surviving rows" class).
+///
+/// The `push_rows` charge (`counter_values += 1`) is a TRUE bound on the
+/// combined retention: [`bucket_of`] maps each scanned row to exactly one
+/// step bucket and `push_rows` performs exactly one `Counter` push per
+/// charged row — overlapping range windows (`step < range`) do NOT
+/// re-retain a sample, since the raw scan delivers each stored sample
+/// once and the buckets partition it. So `Σ retained points ==
+/// counter_values` (pinned by
+/// `rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets`).
 pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
 
 /// Derived-series cap for client-aggregated metric queries: the number
@@ -3300,6 +3309,14 @@ impl<'q> ClientAggState<'q> {
                 }
             }
             if matches!(op, RangeAggOp::RateCounter) {
+                // One charge per scanned row IS one charge per retained
+                // `Counter` point: `bucket_of` below yields exactly one
+                // bucket and the row is pushed into it exactly once, so
+                // `counter_values` equals the combined length of every
+                // `Counter` vector — a true bound even when `step < range`
+                // makes the reference's windows overlap (the raw scan
+                // delivers each stored sample once; buckets partition it,
+                // never re-retain). See `MAX_COUNTER_VALUES`.
                 self.counter_values += 1;
                 if self.counter_values > MAX_COUNTER_VALUES {
                     return Err(ReadError::QueryTooBroad(TooBroadReason::CounterValues {
@@ -7082,6 +7099,132 @@ mod tests {
         state.counter_values = MAX_COUNTER_VALUES - 1;
         let err = state.push_rows(&rows).unwrap_err();
         match err {
+            ReadError::QueryTooBroad(TooBroadReason::CounterValues { count, cap }) => {
+                assert_eq!(cap, MAX_COUNTER_VALUES);
+                assert_eq!(count, MAX_COUNTER_VALUES + 1);
+            }
+            other => panic!("expected QueryTooBroad(CounterValues), got {other:?}"),
+        }
+    }
+
+    /// Code review round 3 (M8-LQ3, finding 1 — settled EMPIRICALLY): the
+    /// concern was that `counter_values += 1` charges an INPUT ROW before
+    /// `buckets` is derived, so a row copied into MULTIPLE overlapping
+    /// `Counter` accumulators (a range query with `step < range`) would
+    /// consume one quota unit while retaining several points — leaving
+    /// bucket×row retention unbounded.
+    ///
+    /// This test drives the real `push_rows` fold for a RANGE
+    /// `rate_counter(...[1m])` at `step = 20s` (`step < range`, the
+    /// reference's overlapping-window shape) with samples spanning THREE
+    /// step buckets, and proves the premise is false: `bucket_of` maps
+    /// each row to exactly one bucket, so the COMBINED length of every
+    /// `Counter` vector equals both the input-row count AND the
+    /// `counter_values` charge. A per-row charge is therefore a true bound
+    /// on total retained points — no under-count is possible. The
+    /// reset-aware per-bucket values are unchanged below the cap, and the
+    /// named `CounterValues` error still trips exactly when the combined
+    /// retention crosses the ceiling.
+    #[test]
+    fn rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets() {
+        let (compiled, client, meta, _instant_window) = rate_counter_state_inputs();
+        // A RANGE query: 20s step, 60s (=1m) range — step < range, so the
+        // reference's per-output-point windows overlap. Six samples land
+        // in three distinct step buckets (0, 20s, 40s).
+        let step_ns = 20_000_000_000u64;
+        let range_ns = 60_000_000_000u64;
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: range_ns as i64,
+            step_ns: Some(step_ns),
+        };
+        let rows = [
+            (10_000_000_000i64, "c=10"), // bucket 0
+            (15_000_000_000, "c=30"),    // bucket 0
+            (25_000_000_000, "c=5"),     // bucket 20s
+            (35_000_000_000, "c=12"),    // bucket 20s
+            (45_000_000_000, "c=7"),     // bucket 40s
+            (55_000_000_000, "c=20"),    // bucket 40s
+        ]
+        .into_iter()
+        .map(|(timestamp_ns, body)| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns,
+            body: body.to_string(),
+        })
+        .collect::<Vec<_>>();
+
+        // Push through the real fold, then introspect the retained state
+        // BEFORE finishing (finish consumes it).
+        let mut state =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(range_ns)).unwrap();
+        state.push_rows(&rows).unwrap();
+
+        // `unwrap` sets the metric fan-out gate, so grouping is by final
+        // label set — one group here (the unwrapped `c` is removed, base
+        // labels are shared).
+        assert_eq!(state.label_groups.len(), 1, "one series expected");
+        let buckets = &state
+            .label_groups
+            .values()
+            .next()
+            .expect("the one label group's buckets")
+            .1;
+        assert!(
+            buckets.len() > 1,
+            "the case must genuinely span multiple buckets: {} bucket(s)",
+            buckets.len()
+        );
+        assert_eq!(buckets.len(), 3, "samples land in buckets 0, 20s, 40s");
+
+        // The crux: the COMBINED length of every retained `Counter` vector
+        // equals the input-row count AND the per-row charge. Each row is
+        // retained EXACTLY once — overlapping windows do not multiply it.
+        let total_retained: usize = state
+            .label_groups
+            .values()
+            .flat_map(|(_, b)| b.values())
+            .map(|acc| match acc {
+                BucketAcc::Counter(pts) => pts.len(),
+                other => panic!("expected a Counter accumulator, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(
+            total_retained,
+            rows.len(),
+            "every scanned row is retained exactly once across all buckets"
+        );
+        assert_eq!(
+            state.counter_values,
+            rows.len() as u64,
+            "the per-row charge equals total retained points (a true bound)"
+        );
+
+        // Values below the cap are unchanged: each bucket's reset-aware
+        // increase, divided by the 60s range. b0: 30-10=20; b20: 12-5=7;
+        // b40: 20-7=13.
+        let QueryResult::Matrix(series) = state.finish() else {
+            panic!("a range rate_counter query yields a matrix");
+        };
+        assert_eq!(series.len(), 1, "one series: {series:?}");
+        assert_eq!(
+            series[0].points,
+            vec![
+                (0, 20.0 / 60.0),
+                (step_ns as i64, 7.0 / 60.0),
+                (2 * step_ns as i64, 13.0 / 60.0),
+            ],
+            "per-bucket reset-aware rates are unaffected by the retention guard"
+        );
+
+        // The cap bounds the COMBINED retention, not source rows in some
+        // privileged bucket: pre-charged to `MAX - 1`, the second scanned
+        // row (regardless of which bucket it lands in) trips the named
+        // error at `count = MAX + 1`.
+        let mut capped =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(range_ns)).unwrap();
+        capped.counter_values = MAX_COUNTER_VALUES - 1;
+        match capped.push_rows(&rows).unwrap_err() {
             ReadError::QueryTooBroad(TooBroadReason::CounterValues { count, cap }) => {
                 assert_eq!(cap, MAX_COUNTER_VALUES);
                 assert_eq!(count, MAX_COUNTER_VALUES + 1);
