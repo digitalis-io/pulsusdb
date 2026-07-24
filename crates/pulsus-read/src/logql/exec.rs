@@ -3156,6 +3156,18 @@ pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 /// (review round 1, finding 1's quantile bound).
 pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 
+/// The `rate_counter` retention cap (M8-LQ3, code review round 2): like
+/// `quantile_over_time`, the reset walk is order-dependent, so every
+/// unwrapped `(ts, value)` sample is retained per bucket until `finish`.
+/// A dense range query overlapping many buckets could otherwise multiply
+/// retained points without bound. Past this many retained points the
+/// query aborts as `QueryTooBroad(CounterValues)` — complete-or-error,
+/// never OOM and never a silently truncated increase. Bounds only the
+/// retained points; the reset-aware rate value is unchanged below the
+/// cap. Same ceiling as [`MAX_QUANTILE_VALUES`] (the shared "reducer
+/// state grows with surviving rows" class).
+pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
+
 /// Derived-series cap for client-aggregated metric queries: the number
 /// of distinct output groups (final label sets, or fingerprints on the
 /// non-mutating path) a single query may materialize. Bounds the last
@@ -3196,6 +3208,9 @@ struct ClientAggState<'q> {
     /// Total values retained across every quantile accumulator, charged
     /// against [`MAX_QUANTILE_VALUES`].
     quantile_values: u64,
+    /// Total timestamped points retained across every `rate_counter`
+    /// accumulator, charged against [`MAX_COUNTER_VALUES`].
+    counter_values: u64,
 }
 
 impl<'q> ClientAggState<'q> {
@@ -3232,6 +3247,7 @@ impl<'q> ClientAggState<'q> {
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
             quantile_values: 0,
+            counter_values: 0,
         })
     }
 
@@ -3280,6 +3296,15 @@ impl<'q> ClientAggState<'q> {
                     return Err(ReadError::QueryTooBroad(TooBroadReason::QuantileValues {
                         count: self.quantile_values,
                         cap: MAX_QUANTILE_VALUES,
+                    }));
+                }
+            }
+            if matches!(op, RangeAggOp::RateCounter) {
+                self.counter_values += 1;
+                if self.counter_values > MAX_COUNTER_VALUES {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::CounterValues {
+                        count: self.counter_values,
+                        cap: MAX_COUNTER_VALUES,
                     }));
                 }
             }
@@ -6957,6 +6982,111 @@ mod tests {
                 assert_eq!(count, MAX_QUANTILE_VALUES + 1);
             }
             other => panic!("expected QueryTooBroad(QuantileValues), got {other:?}"),
+        }
+    }
+
+    /// The `rate_counter` retention state (`BucketAcc::Counter`, code
+    /// review round 2): builds a client-aggregated `rate_counter` instant
+    /// state and its shared inputs.
+    fn rate_counter_state_inputs() -> (
+        super::super::pipeline::CompiledPipeline,
+        plan::ClientAgg,
+        HashMap<u64, StreamMetaRow>,
+        ClientWindow,
+    ) {
+        let stages = match pulsus_logql::parse(r#"rate_counter({a="b"} | logfmt | unwrap c [1m])"#)
+            .expect("parse")
+        {
+            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => range.selector.pipeline,
+            other => panic!("unexpected expr: {other:?}"),
+        };
+        let compiled = super::super::pipeline::CompiledPipeline::compile(&stages).expect("compile");
+        let client = plan::ClientAgg {
+            pipeline: stages,
+            value: plan::ClientValue::Unwrap,
+            range_op: RangeAggOp::RateCounter,
+            param: None,
+            absent_labels: Vec::new(),
+        };
+        let meta = HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        )]);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: None,
+        };
+        (compiled, client, meta, window)
+    }
+
+    /// Code review round 2 (M8-LQ3, finding 1): the `rate_counter`
+    /// per-bucket point retention is bounded by [`MAX_COUNTER_VALUES`],
+    /// mirroring the quantile bound. Below the cap the reset-aware rate is
+    /// unaffected (four samples 10,30,5,12 by ts → increase 32 over the
+    /// 60s window = 32/60); charged to the boundary the next sample trips
+    /// the named `CounterValues` too-broad error — complete-or-error,
+    /// never a silently truncated increase.
+    #[test]
+    fn rate_counter_point_retention_is_capped_without_changing_values_below_it() {
+        let (compiled, client, meta, window) = rate_counter_state_inputs();
+        // Below the cap: the reset-aware value is exactly 32/60, unchanged
+        // by the retention guard.
+        let rows = [
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 10_000_000_000,
+                body: "c=10".to_string(),
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 20_000_000_000,
+                body: "c=30".to_string(),
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 30_000_000_000,
+                body: "c=5".to_string(), // reset: 5 < 30
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 40_000_000_000,
+                body: "c=12".to_string(),
+            },
+        ];
+        let result = run_client_agg_rows(
+            &rows,
+            &compiled,
+            &meta,
+            &client,
+            window,
+            Some(60_000_000_000),
+        )
+        .expect("below the cap the query succeeds");
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector, got {result:?}");
+        };
+        assert_eq!(items.len(), 1, "one series expected: {items:?}");
+        assert_eq!(items[0].value, 32.0 / 60.0);
+
+        // At the boundary: the next retained point trips the named error,
+        // exactly as the quantile bound does — driven through the real
+        // `push_rows` fold with the counter pre-charged (a 4M-row fixture
+        // would be pure waste).
+        let mut state =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(60_000_000_000)).unwrap();
+        state.counter_values = MAX_COUNTER_VALUES - 1;
+        let err = state.push_rows(&rows).unwrap_err();
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::CounterValues { count, cap }) => {
+                assert_eq!(cap, MAX_COUNTER_VALUES);
+                assert_eq!(count, MAX_COUNTER_VALUES + 1);
+            }
+            other => panic!("expected QueryTooBroad(CounterValues), got {other:?}"),
         }
     }
 

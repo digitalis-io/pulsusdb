@@ -272,6 +272,13 @@
       "mode": "gated",
       "kind": "metric_instant_ordered",
       "query": "sort(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m])))"
+    },
+    {
+      "case_id": "metric_sort_desc_order",
+      "construct": "M8-LQ3 sort_desc value-ordering: sort_desc(sum by (grp) (count_over_time(...))) over the SAME counts {a:5,b:1,c:5} returns the vector DESCENDING by value with the a/c tie broken by label ascending — order a,c,b (oracle-confirmed v3.7.3). Independent end-to-end coverage of the sort_desc handler/encoder path. Set-equal validity gate plus a store-vs-store ordered-sequence gate (metric_instant_ordered)",
+      "mode": "gated",
+      "kind": "metric_instant_ordered",
+      "query": "sort_desc(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m])))"
     }
   ]
 }

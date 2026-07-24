@@ -2760,13 +2760,47 @@ mod tests {
     /// reducer/encoder regression fails hermetically every PR.
     #[test]
     fn shipped_sort_case_evaluates_in_the_pinned_value_order() {
+        assert_eq!(
+            hermetic_ordered_grps("metric_sort_order"),
+            vec![
+                ("b".to_string(), 1.0),
+                ("a".to_string(), 5.0),
+                ("c".to_string(), 5.0),
+            ],
+            "sort must order ascending by value with the a/c tie broken by label ascending"
+        );
+    }
+
+    /// Issue M8-LQ3 (code review round 2, test gap): the `sort_desc` mirror
+    /// of the AC9 hermetic gate — the SHIPPED evaluator output is in the
+    /// pinned DESCENDING value order `a, c, b` (the equal-value `a`/`c` tie
+    /// still broken by label ascending). Covers the sort_desc handler/
+    /// encoder path independently every PR; the live lane asserts both
+    /// stores agree on this order.
+    #[test]
+    fn shipped_sort_desc_case_evaluates_in_the_pinned_value_order() {
+        assert_eq!(
+            hermetic_ordered_grps("metric_sort_desc_order"),
+            vec![
+                ("a".to_string(), 5.0),
+                ("c".to_string(), 5.0),
+                ("b".to_string(), 1.0),
+            ],
+            "sort_desc must order descending by value with the a/c tie broken by label ascending"
+        );
+    }
+
+    /// Shared driver for the sort/sort_desc hermetic order gates: evaluates
+    /// the committed ordered case `case_id` through the shipped engine and
+    /// returns the `(grp, value)` sequence in the engine's emitted order.
+    fn hermetic_ordered_grps(case_id: &str) -> Vec<(String, f64)> {
         let fixture = shipped_fixture();
         let corpus = shipped_corpus(&fixture, fixture.ci.record_count);
         let case = fixture
             .cases
             .iter()
-            .find(|c| c.kind() == "metric_instant_ordered")
-            .expect("the sort-order case is committed");
+            .find(|c| c.case_id == case_id)
+            .unwrap_or_else(|| panic!("the {case_id} case is committed"));
         let rendered = case.query.replace("{R}", &corpus.run_id);
         let expr = pulsus_logql::parse(&rendered).expect("parse");
         let service = first_selector_service(&expr);
@@ -2780,7 +2814,7 @@ mod tests {
         else {
             panic!("sort case did not evaluate to a vector");
         };
-        let order: Vec<(String, f64)> = samples
+        samples
             .into_iter()
             .map(|s| {
                 let grp = s
@@ -2791,16 +2825,7 @@ mod tests {
                     .expect("grp label");
                 (grp, s.value)
             })
-            .collect();
-        assert_eq!(
-            order,
-            vec![
-                ("b".to_string(), 1.0),
-                ("a".to_string(), 5.0),
-                ("c".to_string(), 5.0),
-            ],
-            "sort must order ascending by value with the a/c tie broken by label ascending"
-        );
+            .collect()
     }
 
     /// The D1 witness, hermetic half: the SHIPPED evaluator FAILS the

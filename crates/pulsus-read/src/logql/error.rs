@@ -136,6 +136,17 @@ pub enum TooBroadReason {
     /// query aborts with this named error, never an OOM and never a
     /// silently approximated quantile.
     QuantileValues { count: u64, cap: u64 },
+    /// Issue M8-LQ3 (code review round 2): a `rate_counter` evaluation
+    /// retained more timestamped counter samples than
+    /// [`crate::logql::exec::MAX_COUNTER_VALUES`] across its buckets — the
+    /// reset walk is order-dependent, so (like `quantile_over_time`) the
+    /// raw `(ts, value)` points are held until `finish`, making its state
+    /// grow with surviving rows rather than with `buckets × series`.
+    /// Complete-or-error: the query aborts with this named error, never an
+    /// OOM and never a silently truncated increase. Bounds only the
+    /// RETAINED points; the computed reset-aware rate is unaffected below
+    /// the cap.
+    CounterValues { count: u64, cap: u64 },
     /// Issue #73 (retroactive re-review): a client-aggregated LogQL
     /// metric query resolved more distinct output series (final label
     /// sets on the fan-out/label-mutating path, or fingerprints on the
@@ -247,6 +258,13 @@ impl fmt::Display for TooBroadReason {
                 write!(
                     f,
                     "quantile_over_time retained {count} sample values, exceeding the \
+                     {cap}-value cap — narrow the window or filter the pipeline"
+                )
+            }
+            TooBroadReason::CounterValues { count, cap } => {
+                write!(
+                    f,
+                    "rate_counter retained {count} counter samples, exceeding the \
                      {cap}-value cap — narrow the window or filter the pipeline"
                 )
             }
@@ -548,6 +566,20 @@ mod tests {
         .to_string();
         assert!(msg.contains("4000001"), "{msg}");
         assert!(msg.contains("4000000-value cap"), "{msg}");
+    }
+
+    /// Code review round 2 (M8-LQ3): the `rate_counter` retention cap
+    /// names the count and cap, mirroring the quantile bound.
+    #[test]
+    fn counter_values_display_names_count_and_cap() {
+        let msg = TooBroadReason::CounterValues {
+            count: 4_000_001,
+            cap: 4_000_000,
+        }
+        .to_string();
+        assert!(msg.contains("4000001"), "{msg}");
+        assert!(msg.contains("4000000-value cap"), "{msg}");
+        assert!(msg.contains("rate_counter"), "{msg}");
     }
 
     /// Issue #73 (retroactive re-review): the derived-series cap uses

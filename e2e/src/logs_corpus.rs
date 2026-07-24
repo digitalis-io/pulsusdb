@@ -119,6 +119,11 @@ pub const METRIC_CASE_IDS: &[&str] = &[
     // `metric_instant_ordered` kind whose ordered result sequence is
     // compared store-vs-store; branch-validated order `b, a, c`.
     "metric_sort_order",
+    // Issue M8-LQ3 `sort_desc` value-order vector (instant; gated) — the
+    // descending mirror over the SAME `svc-sort` counts {a:5,b:1,c:5}, so
+    // the sort_desc handler/encoder path is covered end-to-end
+    // independently; branch-validated order `a, c, b`.
+    "metric_sort_desc_order",
 ];
 
 pub const SVC_JSON: &str = "svc-json";
@@ -688,7 +693,10 @@ impl LogCorpus {
             // reduces to `{grp}` counts {a:5, b:1, c:5}. The set is the
             // order-neutral validity gate; the ordered sequence (b,a,c) is
             // checked store-vs-store in `run_metric_instant_ordered_case`.
-            "metric_sort_order" => {
+            // Same set as `metric_sort_order` (the order-neutral validity
+            // gate); `sort_desc`'s descending sequence (a,c,b) is checked
+            // store-vs-store in `run_metric_instant_ordered_case`.
+            "metric_sort_order" | "metric_sort_desc_order" => {
                 for (grp, count) in [("a", 5.0), ("b", 1.0), ("c", 5.0)] {
                     out.insert(
                         BTreeMap::from([("grp".to_string(), grp.to_string())]),

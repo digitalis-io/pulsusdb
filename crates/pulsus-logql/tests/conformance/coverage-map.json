@@ -345,6 +345,17 @@
         "range.count_over_time",
         "parser.logfmt"
       ]
+    },
+    {
+      "source": "metric_sort_desc_order",
+      "kind": "e2e-differential",
+      "constructs": [
+        "agg.sort_desc",
+        "agg.sum",
+        "grouping.by",
+        "range.count_over_time",
+        "parser.logfmt"
+      ]
     }
   ]
 }

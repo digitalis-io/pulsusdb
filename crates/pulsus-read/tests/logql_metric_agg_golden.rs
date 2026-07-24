@@ -2147,6 +2147,98 @@ fn rate_counter_sparse_window_divides_by_the_full_interval() {
     assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
 }
 
+/// Rule 2 (AC10) — the DISCRIMINATING lower-boundary test: the lookback is
+/// half-open `(t-range, t]`, so a sample sitting EXACTLY at `t-range` is
+/// EXCLUDED (branch-validated v3.7.3: a lone in-window point past such an
+/// excluded start sample yields increase 0). This is enforced by the raw
+/// scan's `timestamp_ns > {start_ns}` predicate (strict lower bound), NOT
+/// by the reducer — so the discriminator is the generated SQL plus the
+/// value the surviving rows reduce to. A closed `[t-range, t]`
+/// interpretation would (a) render `>=` here and (b) INCLUDE the `t-range`
+/// sample, changing the result — this test fails under that reading.
+///
+/// Instant `t = 90s`, `[1m]` ⇒ `start_ns = 30s` (`= t-range`),
+/// `end_ns = 90s` (`= t`). Samples at 30s (`c=100`, the excluded start),
+/// 60s (`c=140`, interior), 90s (`c=200`, the included end). Half-open:
+/// only 140→200 survive ⇒ increase 60 / 60s = 1.0. Closed: 100→140→200 ⇒
+/// increase 100 / 60s ≈ 1.667 — a DIFFERENT value, which the assertions
+/// below reject.
+#[test]
+fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
+    let at_ns = 90 * NS;
+    let params = instant_params(at_ns);
+    let mp = metric_plan_of(
+        r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+        &params,
+    );
+    // The plan's window is exactly `(t-range, t]`.
+    assert_eq!(mp.start_ns, 30 * NS, "start_ns must be t-range");
+    assert_eq!(mp.end_ns, at_ns, "end_ns must be t");
+
+    // The enforcing layer: the raw-scan predicate is STRICT on the lower
+    // bound (`>`), so the `t-range` sample is filtered out server-side. A
+    // closed interval would render `>=` and this assertion would fail.
+    let sql = pulsus_read::logql::sql::metric_raw_samples(
+        &mp.table,
+        &["checkout".to_string()],
+        &[1],
+        pulsus_read::logql::sql::TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        &mp.extra_predicates,
+    );
+    assert!(
+        sql.contains(&format!(
+            "timestamp_ns > {} AND timestamp_ns <= {}",
+            30 * NS,
+            at_ns
+        )),
+        "raw-scan window must be half-open `(t-range, t]` (strict `>`): {sql}"
+    );
+
+    // The result difference: only the survivors of the half-open window
+    // reduce; the `t-range=30s` sample is excluded, the `t=90s` end sample
+    // included.
+    let all = vec![
+        row(1, 30 * NS, "c=100"), // exactly t-range — excluded
+        row(1, 60 * NS, "c=140"), // interior
+        row(1, at_ns, "c=200"),   // exactly t — included
+    ];
+    let survivors: Vec<_> = all
+        .iter()
+        .filter(|r| r.timestamp_ns > mp.start_ns && r.timestamp_ns <= mp.end_ns)
+        .cloned()
+        .collect();
+    let half_open = single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            &survivors,
+            &meta_one(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(half_open, 60.0 / 60.0, "excludes the t-range sample");
+
+    // The closed-interval reading (all three rows) would give a DIFFERENT
+    // value — proving the boundary rule is load-bearing, not cosmetic.
+    let closed = single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            &all,
+            &meta_one(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(closed, 100.0 / 60.0);
+    assert_ne!(
+        half_open, closed,
+        "the t-range sample must change the result (half-open ≠ closed)"
+    );
+}
+
 /// `rate_counter` requires `unwrap` (it reduces unwrapped counter values);
 /// without it the planner rejects with the oracle-shaped arity message.
 #[test]
