@@ -34,6 +34,8 @@ accept/field_or
 accept/field_parens
 accept/field_precedence
 accept/hints_most_recent
+accept/intrinsic_event_name
+accept/intrinsic_event_time_since_start
 accept/intrinsic_instrumentation_name
 accept/intrinsic_instrumentation_version
 accept/intrinsic_kind_eq_server
@@ -88,6 +90,7 @@ accept/pipeline_max_duration
 accept/pipeline_min_attr
 accept/pipeline_sum_attr
 accept/rhs_attr_eq
+accept/scope_event
 accept/scope_instrumentation
 accept/scope_quoted
 accept/select_multi

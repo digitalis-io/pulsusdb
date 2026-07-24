@@ -408,6 +408,14 @@ pub enum Intrinsic {
     /// `instrumentation:version` — the OTLP instrumentation scope version
     /// (string).
     InstrumentationVersion,
+    // -- issue #192 (PR-B): the span-event intrinsic namespace. Only a
+    // scoped spelling exists (`event:name`/`event:timeSinceStart`), resolved
+    // through the `event` scope keyword.
+    /// `event:name` — a span event's name (string).
+    EventName,
+    /// `event:timeSinceStart` — a span event's timestamp relative to its
+    /// span's start, as a duration (`event.timeUnixNano − span.startTimeUnixNano`).
+    EventTimeSinceStart,
 }
 
 impl Intrinsic {
@@ -454,6 +462,8 @@ impl Intrinsic {
             ("trace", "rootService") => Some(Self::RootServiceName),
             ("instrumentation", "name") => Some(Self::InstrumentationName),
             ("instrumentation", "version") => Some(Self::InstrumentationVersion),
+            ("event", "name") => Some(Self::EventName),
+            ("event", "timeSinceStart") => Some(Self::EventTimeSinceStart),
             _ => None,
         }
     }
@@ -479,6 +489,8 @@ impl Intrinsic {
             Intrinsic::RootServiceName => "rootServiceName",
             Intrinsic::InstrumentationName => "instrumentation:name",
             Intrinsic::InstrumentationVersion => "instrumentation:version",
+            Intrinsic::EventName => "event:name",
+            Intrinsic::EventTimeSinceStart => "event:timeSinceStart",
         }
     }
 }
@@ -500,6 +512,9 @@ pub enum AttrScope {
     /// `instrumentation.` — the OTLP instrumentation-scope attribute
     /// namespace (issue #192), index-served under `scope='instrumentation'`.
     Instrumentation,
+    /// `event.` — the span-event attribute namespace (issue #192 PR-B),
+    /// index-served under `scope='event'`.
+    Event,
 }
 
 impl fmt::Display for AttrScope {
@@ -509,6 +524,7 @@ impl fmt::Display for AttrScope {
             AttrScope::Resource => "resource.",
             AttrScope::Unscoped => ".",
             AttrScope::Instrumentation => "instrumentation.",
+            AttrScope::Event => "event.",
         };
         write!(f, "{s}")
     }
@@ -1133,15 +1149,24 @@ mod tests {
                 Intrinsic::InstrumentationVersion,
                 "instrumentation:version",
             ),
+            ("event", "name", Intrinsic::EventName, "event:name"),
+            (
+                "event",
+                "timeSinceStart",
+                Intrinsic::EventTimeSinceStart,
+                "event:timeSinceStart",
+            ),
         ] {
             assert_eq!(Intrinsic::from_scoped(scope, ident), Some(intrinsic));
             assert_eq!(intrinsic.to_string(), canonical);
         }
         // Unknown colon scopes stay unresolved (generic error at parse).
-        assert_eq!(Intrinsic::from_scoped("event", "name"), None);
+        // event: now resolves (issue #192 PR-B) — see the loop above; link:
+        // stays interim (PR-C).
         assert_eq!(Intrinsic::from_scoped("link", "spanID"), None);
-        // instrumentation: now resolves (issue #192) — see the loop above.
+        // instrumentation:/event: resolve (issue #192) — see the loop above.
         assert_eq!(Intrinsic::from_scoped("instrumentation", "bogus"), None);
+        assert_eq!(Intrinsic::from_scoped("event", "bogus"), None);
         assert_eq!(Intrinsic::from_scoped("span", "bogus"), None);
         assert_eq!(
             Intrinsic::from_scoped("trace", "rootName"),

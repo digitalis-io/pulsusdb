@@ -498,8 +498,24 @@ fn attr_scope_literal(scope: AttrScope) -> Option<&'static str> {
         // Issue #192: `instrumentation.<key>` attributes are index-served
         // under the writer's `scope='instrumentation'` discriminator.
         AttrScope::Instrumentation => Some("instrumentation"),
+        // Issue #192 PR-B: `event.<key>` span-event attributes are
+        // index-served under the writer's `scope='event'` discriminator.
+        AttrScope::Event => Some(SCOPE_EVENT),
     }
 }
+
+/// The dedicated intrinsic-scope discriminator the writer emits span-event
+/// intrinsics under (issue #192 PR-B, `otlp_traces::SCOPE_EVENT_INTRINSIC`)
+/// — kept structurally disjoint from the sender-supplied [`SCOPE_EVENT`]
+/// attribute scope, so `event:name`/`event:timeSinceStart` resolve against
+/// intrinsic rows only, never a user attribute.
+const SCOPE_EVENT: &str = "event";
+const SCOPE_EVENT_INTRINSIC: &str = "event:intrinsic";
+/// The reserved intrinsic key for `event:name` under [`SCOPE_EVENT_INTRINSIC`].
+const EVENT_NAME_KEY: &str = "name";
+/// The reserved intrinsic key for `event:timeSinceStart` (numeric `val_num`,
+/// ns) under [`SCOPE_EVENT_INTRINSIC`].
+const EVENT_TIME_SINCE_START_KEY: &str = "timeSinceStart";
 
 /// Compiles one attribute leaf (anything but `resource.service.name`).
 fn compile_attr_leaf(
@@ -508,7 +524,22 @@ fn compile_attr_leaf(
     op: ComparisonOp,
     value: &Value,
 ) -> Result<CompiledLeaf, PlanError> {
-    let scope_lit = attr_scope_literal(scope);
+    compile_attr_probe_leaf(attr_scope_literal(scope), key, op, value)
+}
+
+/// The attribute-leaf core over an already-resolved `(scope_lit, key)` —
+/// shared by ordinary attribute leaves ([`compile_attr_leaf`]) and the
+/// span-event intrinsics (issue #192 PR-B), which lower to a reserved
+/// `(key, scope='event:intrinsic')` index probe rather than a physical
+/// column. The value classification (string/bool eq, regex, numeric,
+/// duration, and their `!=`/`!~` absent-key negations) is identical either
+/// way — a span-event intrinsic is just a reserved-key attribute.
+fn compile_attr_probe_leaf(
+    scope_lit: Option<&'static str>,
+    key: &str,
+    op: ComparisonOp,
+    value: &Value,
+) -> Result<CompiledLeaf, PlanError> {
     let (pred, negated, class) = match (op, value) {
         (ComparisonOp::Eq, Value::String(s)) => {
             (ValuePred::StringEq(s.clone()), false, GenClass::AttrEq)
@@ -963,6 +994,21 @@ pub fn compile_leaf(
                 eval: LeafEval::Physical(physical),
             })
         }
+        // -- issue #192 PR-B: the span-event intrinsics — reserved-key
+        // probes on the dedicated `event:intrinsic` index scope. `event:name`
+        // is a string leaf (AttrEq on `(key, val, scope)`); `event:timeSinceStart`
+        // is a numeric leaf (key-only `val_num` scan) — index-served exactly
+        // like any attribute, so the "span matches iff ≥1 event row satisfies
+        // the leaf" membership semantics come for free.
+        Field::Intrinsic(Intrinsic::EventName) => {
+            compile_attr_probe_leaf(Some(SCOPE_EVENT_INTRINSIC), EVENT_NAME_KEY, op, value)
+        }
+        Field::Intrinsic(Intrinsic::EventTimeSinceStart) => compile_attr_probe_leaf(
+            Some(SCOPE_EVENT_INTRINSIC),
+            EVENT_TIME_SINCE_START_KEY,
+            op,
+            value,
+        ),
         Field::Attribute { scope, key } => {
             if *scope == AttrScope::Resource && key == "service.name" {
                 compile_service_leaf(op, value)
@@ -1030,7 +1076,9 @@ fn compare_operand(field: &Field) -> Result<CompareOperand, PlanError> {
             | Intrinsic::RootName
             | Intrinsic::RootServiceName
             | Intrinsic::InstrumentationName
-            | Intrinsic::InstrumentationVersion,
+            | Intrinsic::InstrumentationVersion
+            | Intrinsic::EventName
+            | Intrinsic::EventTimeSinceStart,
         ) => Err(PlanError::TypeMismatch(
             "this intrinsic is not supported in a field-vs-field comparison".to_string(),
         )),
@@ -1865,6 +1913,47 @@ mod tests {
         assert_eq!(
             compiled.generators[0].predicate,
             "match(lower(hex(parent_id)), '^(?:0a.*)$')"
+        );
+    }
+
+    /// Issue #192 PR-B: the span-event intrinsics lower to reserved-key
+    /// probes on the dedicated `event:intrinsic` index scope, and the
+    /// `event.<key>` attribute to the disjoint `event` scope — the hard
+    /// namespace partition (plan v2 Δ1).
+    #[test]
+    fn event_intrinsics_and_attrs_lower_to_partitioned_index_scopes() {
+        // event:name -> AttrEq on (key='name', val, scope='event:intrinsic').
+        let f = first_filter(r#"{ event:name = "exception" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'name' AND val = 'exception' AND scope = 'event:intrinsic'"
+        );
+        match &compiled.leaves[0].eval {
+            LeafEval::Attr { probe, negated } => {
+                assert!(!negated);
+                assert_eq!(probe.key, "name");
+                assert_eq!(probe.scope, Some("event:intrinsic"));
+                assert_eq!(probe.pred, ValuePred::StringEq("exception".to_string()));
+            }
+            other => panic!("expected an attr membership eval, got {other:?}"),
+        }
+
+        // event:timeSinceStart > 1ms -> key-only `val_num` scan (ns) under
+        // the same intrinsic scope.
+        let f = first_filter(r#"{ event:timeSinceStart > 1ms }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'timeSinceStart' AND val_num > 1000000 AND scope = 'event:intrinsic'"
+        );
+
+        // event.<key> attribute -> AttrEq under the disjoint scope='event'.
+        let f = first_filter(r#"{ event.exception.type = "IOError" }"#);
+        let compiled = compile_span_filter(&f).unwrap();
+        assert_eq!(
+            compiled.generators[0].predicate,
+            "key = 'exception.type' AND val = 'IOError' AND scope = 'event'"
         );
     }
 

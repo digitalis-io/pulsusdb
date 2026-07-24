@@ -602,7 +602,8 @@ fn rhs_begins_field(cursor: &Cursor<'_>) -> bool {
             if (name == "span"
                 || name == "resource"
                 || name == "parent"
-                || name == "instrumentation")
+                || name == "instrumentation"
+                || name == "event")
                 && matches!(cursor.peek2().kind, TokenKind::Dot)
             {
                 true
@@ -857,13 +858,17 @@ fn parse_field(cursor: &mut Cursor<'_>) -> Result<(Field, Span), TraceQlError> {
                     span: tok.span,
                 });
             }
-            if (name == "span" || name == "resource" || name == "instrumentation")
+            if (name == "span"
+                || name == "resource"
+                || name == "instrumentation"
+                || name == "event")
                 && followed_by_dot
             {
                 let scope = match name.as_str() {
                     "span" => AttrScope::Span,
                     "resource" => AttrScope::Resource,
-                    _ => AttrScope::Instrumentation,
+                    "instrumentation" => AttrScope::Instrumentation,
+                    _ => AttrScope::Event,
                 };
                 cursor.advance(); // scope ident
                 cursor.advance(); // '.'
@@ -1017,7 +1022,9 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
         // `duration` and `traceDuration`/`trace:duration` require a
         // duration literal (issue #184: the trace-wide duration is the
         // same value type as the span duration).
-        Field::Intrinsic(Intrinsic::Duration | Intrinsic::TraceDuration) => {
+        Field::Intrinsic(
+            Intrinsic::Duration | Intrinsic::TraceDuration | Intrinsic::EventTimeSinceStart,
+        ) => {
             let tok = cursor.peek().clone();
             match &tok.kind {
                 TokenKind::Duration(raw) => {
@@ -1042,7 +1049,9 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
         }
         // String-valued intrinsics: `name` plus the issue #184 additions
         // `statusMessage`, `span:id`, `span:parentID`, `trace:id`,
-        // `rootName`, `rootServiceName`. The operator (`=`/`!=`/`=~`/`!~`)
+        // `rootName`, `rootServiceName`, and the issue #192 scoped intrinsics
+        // `instrumentation:name`/`instrumentation:version`/`event:name`. The
+        // operator (`=`/`!=`/`=~`/`!~`)
         // is validated downstream at leaf compilation; here the value must
         // be a string literal.
         Field::Intrinsic(
@@ -1054,7 +1063,8 @@ fn parse_value(cursor: &mut Cursor<'_>, field: &Field) -> Result<Value, TraceQlE
             | Intrinsic::RootName
             | Intrinsic::RootServiceName
             | Intrinsic::InstrumentationName
-            | Intrinsic::InstrumentationVersion,
+            | Intrinsic::InstrumentationVersion
+            | Intrinsic::EventName,
         ) => {
             let tok = cursor.peek().clone();
             match tok.kind {
@@ -1337,6 +1347,8 @@ fn parse_aggregate(
                         | Intrinsic::RootServiceName
                         | Intrinsic::InstrumentationName
                         | Intrinsic::InstrumentationVersion
+                        | Intrinsic::EventName
+                        | Intrinsic::EventTimeSinceStart
                 )
             ) {
                 return Err(TraceQlError::UnexpectedToken {
@@ -1772,14 +1784,11 @@ mod tests {
 
     #[test]
     fn unknown_colon_scopes_are_generic_errors_not_named_boundaries() {
-        // event:/link: must stay GENERIC (interim-generic disposition),
-        // never a NotYetSupported named boundary. (instrumentation: now
-        // resolves — see instrumentation_scope_constructs_parse.)
-        for q in [
-            r#"{ event:name = "exception" }"#,
-            r#"{ link:spanID = "0a1b" }"#,
-            "{ span:bogus > 1 }",
-        ] {
+        // link: must stay GENERIC (interim-generic disposition), never a
+        // NotYetSupported named boundary. (instrumentation: and event: now
+        // resolve — see instrumentation_scope_constructs_parse /
+        // event_scope_constructs_parse.)
+        for q in [r#"{ link:spanID = "0a1b" }"#, "{ span:bogus > 1 }"] {
             match parse(q) {
                 Err(TraceQlError::NotYetSupported { .. }) => {
                     panic!("{q}: must be a generic error, not a named boundary")
@@ -1809,6 +1818,28 @@ mod tests {
         assert_eq!(
             only_field(r#"{ instrumentation:version = "1.4.2" }"#),
             Field::Intrinsic(Intrinsic::InstrumentationVersion),
+        );
+    }
+
+    /// Issue #192 (PR-B): the three span-event constructs parse — the
+    /// `scope.event` attribute namespace plus the `event:name`/
+    /// `event:timeSinceStart` intrinsics (a string and a duration).
+    #[test]
+    fn event_scope_constructs_parse() {
+        assert_eq!(
+            only_field(r#"{ event.exception.type = "IOError" }"#),
+            Field::Attribute {
+                scope: AttrScope::Event,
+                key: "exception.type".to_string(),
+            },
+        );
+        assert_eq!(
+            only_field(r#"{ event:name = "exception" }"#),
+            Field::Intrinsic(Intrinsic::EventName),
+        );
+        assert_eq!(
+            only_field(r#"{ event:timeSinceStart > 1ms }"#),
+            Field::Intrinsic(Intrinsic::EventTimeSinceStart),
         );
     }
 

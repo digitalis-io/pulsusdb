@@ -30,7 +30,7 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use opentelemetry_proto::tonic::trace::v1::span::SpanKind;
+use opentelemetry_proto::tonic::trace::v1::span::{Event, SpanKind};
 use opentelemetry_proto::tonic::trace::v1::status::StatusCode;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, TracesData};
 use prost::Message;
@@ -57,6 +57,10 @@ fn read_fixture(name: &str) -> Vec<u8> {
 /// `date` every attr row must carry.
 const SPAN_A_START_NS: u64 = 1_700_000_000_000_000_000;
 const SPAN_A_END_NS: u64 = SPAN_A_START_NS + 1_000_000_000; // +1s
+/// Span A's single event fires 3 ms after the span starts (issue #192 PR-B):
+/// its `event:timeSinceStart` intrinsic is therefore exactly this many ns.
+const SPAN_A_EVENT_NS: u64 = SPAN_A_START_NS + 3_000_000; // +3ms
+const SPAN_A_EVENT_TIME_SINCE_START_NS: i64 = 3_000_000;
 const SPAN_B_START_NS: u64 = SPAN_A_START_NS + 5_000_000; // +5ms
 const SPAN_B_END_NS: u64 = SPAN_B_START_NS + 250_000_000; // +250ms
 const GOLDEN_DAY: u16 = 19_675;
@@ -114,7 +118,8 @@ fn fixture_scope() -> InstrumentationScope {
 /// attributes — `http.status_code` (Int 500, exercises `val_num`),
 /// `http.method` ("GET"), and `deployment.environment` ("prod") which
 /// ALSO exists at resource scope: the dual-scope same-key golden (issue
-/// #54 plan v2 test-gap fix).
+/// #54 plan v2 test-gap fix). It also carries one span **event** (issue
+/// #192 PR-B): `exception` at +3 ms with one attribute `exception.type`.
 fn span_a() -> Span {
     Span {
         trace_id: TRACE_ID.to_vec(),
@@ -132,6 +137,15 @@ fn span_a() -> Span {
                 Value::StringValue("prod".to_string()),
             ),
         ],
+        events: vec![Event {
+            time_unix_nano: SPAN_A_EVENT_NS,
+            name: "exception".to_string(),
+            attributes: vec![kv(
+                "exception.type",
+                Value::StringValue("IOError".to_string()),
+            )],
+            dropped_attributes_count: 0,
+        }],
         status: None,
         ..Default::default()
     }
@@ -287,6 +301,19 @@ fn parse_produces_the_hand_derived_golden_rows() {
                 None,
                 SPAN_A_ID
             ),
+            // ...then span A's event rows (issue #192 PR-B): the two
+            // intrinsics under the dedicated `event:intrinsic` scope (name,
+            // then timeSinceStart in ns via val_num) followed by the event's
+            // verbatim attribute under `scope='event'`.
+            ("event:intrinsic", "name", "exception", None, SPAN_A_ID),
+            (
+                "event:intrinsic",
+                "timeSinceStart",
+                "3000000",
+                Some(SPAN_A_EVENT_TIME_SINCE_START_NS as f64),
+                SPAN_A_ID
+            ),
+            ("event", "exception.type", "IOError", None, SPAN_A_ID),
             // span B: resource attrs (no span attrs) then the scope attr.
             ("resource", "service.name", "checkout", None, SPAN_B_ID),
             (

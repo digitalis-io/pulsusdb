@@ -270,6 +270,33 @@ const CASES: &[Case] = &[
         distributed: false,
     },
     Case {
+        // `event:name` (issue #192 PR-B): index-served via the `(key, val,
+        // scope)` prefix with the reserved key `name` under the dedicated
+        // `scope = 'event:intrinsic'` — an AttrEq generator, exactly like an
+        // attribute leaf. The intrinsic scope is a hard partition from the
+        // sender `event` attribute scope.
+        name: "event_name_eq",
+        q: r#"{ event:name = "exception" }"#,
+        distributed: false,
+    },
+    Case {
+        // `event:timeSinceStart > 1ms` (issue #192 PR-B): a key-only `(key)`
+        // prefix scan on the reserved `timeSinceStart` key under
+        // `scope = 'event:intrinsic'`, filtering `val_num` (ns) — index-served
+        // like any numeric attribute comparison.
+        name: "event_time_since_start_gt",
+        q: r#"{ event:timeSinceStart > 1ms }"#,
+        distributed: false,
+    },
+    Case {
+        // `event.<key>` attribute (issue #192 PR-B): index-served via the
+        // `(key, val, scope)` prefix with `scope = 'event'`, exactly like any
+        // `span.`/`resource.` attribute leaf.
+        name: "event_attr_eq",
+        q: r#"{ event.exception.type = "IOError" }"#,
+        distributed: false,
+    },
+    Case {
         // Attribute existence present (issue #185, `existence.neq_nil` /
         // bare-attr): an index-served key-only `(key)` scan with the no-op
         // `1` value predicate + a key-existence membership probe.

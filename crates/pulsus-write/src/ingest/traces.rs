@@ -62,12 +62,16 @@ pub struct AttrRecord {
     /// #131).
     pub date: u16,
     pub key: String,
-    /// `'resource'`, `'span'`, or `'instrumentation'` — the index's scope
-    /// discriminator, so `resource.foo`/`span.foo`/`instrumentation.foo`
-    /// never collide (issue #54 plan v2 delta 1). Instrumentation-scope
-    /// (`InstrumentationScope`) attributes are indexed under
-    /// `scope='instrumentation'` (issue #192, superseding the #54 decision
-    /// that dropped them); they also stay in the span payload.
+    /// The index's scope discriminator, so same-key attributes never collide
+    /// across scopes (issue #54 plan v2 delta 1): `'resource'`, `'span'`, or
+    /// `'instrumentation'` for the three attribute scopes; plus the span-event
+    /// scopes `'event'` (event attributes, verbatim keys) and the dedicated
+    /// `'event:intrinsic'` (reserved keys `name`/`timeSinceStart`) that the
+    /// writer emits ONLY from intrinsic code — a hard namespace partition
+    /// (issue #192 PR-B). Instrumentation-scope (`InstrumentationScope`)
+    /// attributes are indexed under `scope='instrumentation'` (issue #192,
+    /// superseding the #54 decision that dropped them). All of these also
+    /// stay in the span payload.
     pub scope: String,
     pub val: String,
     /// `val.parse::<f64>()` when finite, else `None` (`Nullable(Float64)`).
@@ -87,7 +91,10 @@ pub struct AttrRecord {
 pub struct ParsedTraces {
     /// One per accepted span.
     pub spans: Vec<SpanRecord>,
-    /// One per indexed (resource ⊕ span) attribute of every accepted span.
+    /// One per indexed row of every accepted span: its resource ⊕ span ⊕
+    /// instrumentation-scope attributes, plus each span event's intrinsic
+    /// rows (`event:intrinsic` name/timeSinceStart) and event attributes
+    /// (`event` scope) — issue #192.
     pub attrs: Vec<AttrRecord>,
     /// Count of individual spans dropped during parsing (not requests — a
     /// malformed/truncated payload is a whole-request error, never a

@@ -2213,4 +2213,160 @@ async fn two_phase_search_explain_and_budget_gates() {
         output.traces[0].matched, 2,
         "both direct children of the G1 root match"
     );
+
+    // (g) Issue #192 PR-B: span-event search-value coverage + the AC8 hard
+    // namespace partition, proven at the RESULT-SET level across TWO SEPARATE
+    // spans (plan v2 Δ1 — a sender attribute keyed `name` can NEVER satisfy
+    // the `event:name` intrinsic, and vice-versa):
+    //  - Span P: one event whose INTRINSIC `event:name` = "A" (under the
+    //    dedicated `scope='event:intrinsic'`), plus `timeSinceStart` = 3 ms
+    //    (via `val_num`) and a verbatim `exception.type` = "IOError" attribute
+    //    (`scope='event'`). P carries NO user attribute keyed `name`.
+    //  - Span Q (distinct trace): one event-scoped user attribute literally
+    //    keyed `name` = "B" (`event."name"`, `scope='event'`), and NO
+    //    intrinsic name "B".
+    const EP: &str = "000000000000000000000000000e1921"; // P: trace_id[15] = 0x21
+    const EP_SPAN: &str = "0000000000e19201";
+    const EQ: &str = "000000000000000000000000000e1922"; // Q: trace_id[15] = 0x22
+    const EQ_SPAN: &str = "0000000000e19202";
+    async fn insert_event_span(
+        client: &ChClient,
+        ts: i64,
+        trace_hex: &str,
+        span_hex: &str,
+        name: &str,
+    ) {
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_spans \
+                 (trace_id, span_id, parent_id, name, service, timestamp_ns, duration_ns, \
+                  status_code, kind, payload_type, payload) \
+                 SELECT toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), \
+                        toFixedString(unhex('0000000000000000'), 8), \
+                        '{name}', 'evt192', {ts}, 1000, 0, 1, 1, 'p'"
+            ),
+        )
+        .await;
+    }
+    async fn insert_event_attr(
+        client: &ChClient,
+        ts: i64,
+        ids: (&str, &str),
+        key: &str,
+        val: &str,
+        scope: &str,
+        val_num: &str,
+    ) {
+        let (trace_hex, span_hex) = ids;
+        exec(
+            client,
+            &format!(
+                "INSERT INTO {DB}.trace_attrs_idx \
+                 (date, key, val, scope, val_num, timestamp_ns, trace_id, span_id, duration_ns) \
+                 SELECT toDate(fromUnixTimestamp64Nano({ts})), '{key}', '{val}', '{scope}', \
+                        {val_num}, {ts}, toFixedString(unhex('{trace_hex}'), 16), \
+                        toFixedString(unhex('{span_hex}'), 8), 1000"
+            ),
+        )
+        .await;
+    }
+    insert_event_span(&client, g, EP, EP_SPAN, "event-span-p").await;
+    insert_event_attr(
+        &client,
+        g,
+        (EP, EP_SPAN),
+        "name",
+        "A",
+        "event:intrinsic",
+        "NULL",
+    )
+    .await;
+    insert_event_attr(
+        &client,
+        g,
+        (EP, EP_SPAN),
+        "timeSinceStart",
+        "3000000",
+        "event:intrinsic",
+        "3000000",
+    )
+    .await;
+    insert_event_attr(
+        &client,
+        g,
+        (EP, EP_SPAN),
+        "exception.type",
+        "IOError",
+        "event",
+        "NULL",
+    )
+    .await;
+    insert_event_span(&client, g, EQ, EQ_SPAN, "event-span-q").await;
+    insert_event_attr(&client, g, (EQ, EQ_SPAN), "name", "B", "event", "NULL").await;
+
+    // Each construct returns EXACTLY span P (index-served), never span Q.
+    for q in [
+        r#"{ event:name = "A" }"#,
+        r#"{ event:timeSinceStart > 1ms }"#,
+        r#"{ event.exception.type = "IOError" }"#,
+    ] {
+        let plan = plan_for(&engine, q, wide.0, wide.1);
+        let output = engine.search(&plan).await.expect("event search");
+        assert_eq!(output.returned, 1, "{q}");
+        assert_eq!(output.traces[0].trace_id[15], 0x21, "{q}");
+        assert_eq!(output.traces[0].matched, 1, "{q}");
+        assert_eq!(output.traces[0].spans[0].name, "event-span-p", "{q}");
+    }
+
+    // timeSinceStart is a real numeric comparison: 3 ms does NOT satisfy > 5 ms.
+    let plan = plan_for(&engine, r#"{ event:timeSinceStart > 5ms }"#, wide.0, wide.1);
+    let output = engine.search(&plan).await.expect("event tss negative");
+    assert!(
+        !output.traces.iter().any(|t| t.trace_id[15] == 0x21),
+        "3 ms timeSinceStart must not match > 5 ms"
+    );
+
+    // The AC8 hard partition, proven as DISJOINT RESULT SETS: the intrinsic
+    // namespace (`event:name`, `scope='event:intrinsic'`) and the user
+    // attribute namespace (`event."name"`, `scope='event'`) never cross.
+    async fn event_hits(engine: &TraceEngine, q: &str, start: i64, end: i64) -> Vec<u8> {
+        let plan = plan_for(engine, q, start, end);
+        let output = engine
+            .search(&plan)
+            .await
+            .unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut ids: Vec<u8> = output.traces.iter().map(|t| t.trace_id[15]).collect();
+        ids.sort_unstable();
+        ids
+    }
+    // The intrinsic query resolves EXACTLY P (the intrinsic name), never Q's
+    // same-keyed user attribute.
+    assert_eq!(
+        event_hits(&engine, r#"{ event:name = "A" }"#, wide.0, wide.1).await,
+        vec![0x21],
+        "event:name intrinsic returns ONLY span P"
+    );
+    // The quoted user attribute resolves EXACTLY Q, never P's intrinsic.
+    assert_eq!(
+        event_hits(&engine, r#"{ event."name" = "B" }"#, wide.0, wide.1).await,
+        vec![0x22],
+        r#"event."name" attribute returns ONLY span Q"#
+    );
+    // Cross-namespace value lookups match NOTHING: "B" is only a user
+    // attribute (never an intrinsic), "A" is only an intrinsic (never an
+    // attribute).
+    assert!(
+        event_hits(&engine, r#"{ event:name = "B" }"#, wide.0, wide.1)
+            .await
+            .is_empty(),
+        "the user-attribute value B never satisfies the event:name intrinsic"
+    );
+    assert!(
+        event_hits(&engine, r#"{ event."name" = "A" }"#, wide.0, wide.1)
+            .await
+            .is_empty(),
+        r#"the intrinsic value A never satisfies the event."name" attribute"#
+    );
 }
