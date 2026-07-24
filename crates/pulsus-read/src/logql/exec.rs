@@ -2985,20 +2985,23 @@ impl SimpleAcc {
     }
 }
 
-/// One bucket's state: streaming stats, or the full value set for
-/// `quantile_over_time`.
+/// One bucket's state: streaming stats, the full value set for
+/// `quantile_over_time`, or the timestamped counter samples for
+/// `rate_counter` (reset detection is order-dependent, so the raw
+/// `(ts, value)` points are retained and walked at `finish`).
 #[derive(Debug, Clone)]
 enum BucketAcc {
     Simple(SimpleAcc),
     Values(Vec<f64>),
+    Counter(Vec<(i64, f64)>),
 }
 
 impl BucketAcc {
     fn new(op: RangeAggOp, ts_ns: i64, v: f64) -> Self {
-        if matches!(op, RangeAggOp::QuantileOverTime) {
-            BucketAcc::Values(vec![v])
-        } else {
-            BucketAcc::Simple(SimpleAcc::new(ts_ns, v))
+        match op {
+            RangeAggOp::QuantileOverTime => BucketAcc::Values(vec![v]),
+            RangeAggOp::RateCounter => BucketAcc::Counter(vec![(ts_ns, v)]),
+            _ => BucketAcc::Simple(SimpleAcc::new(ts_ns, v)),
         }
     }
 
@@ -3006,6 +3009,7 @@ impl BucketAcc {
         match self {
             BucketAcc::Simple(acc) => acc.add(ts_ns, v),
             BucketAcc::Values(vals) => vals.push(v),
+            BucketAcc::Counter(pts) => pts.push((ts_ns, v)),
         }
     }
 
@@ -3013,6 +3017,7 @@ impl BucketAcc {
     fn finish(self, op: RangeAggOp, rate_window_ns: Option<u64>, quantile: Option<f64>) -> f64 {
         match self {
             BucketAcc::Values(mut vals) => quantile_of(&mut vals, quantile.unwrap_or(f64::NAN)),
+            BucketAcc::Counter(pts) => apply_rate(counter_increase(pts), rate_window_ns),
             BucketAcc::Simple(acc) => match op {
                 // Oracle-probed: `rate` over an unwrapped range is the
                 // per-second SUM of values (count-shaped inputs
@@ -3033,9 +3038,44 @@ impl BucketAcc {
                 RangeAggOp::QuantileOverTime | RangeAggOp::AbsentOverTime => {
                     unreachable!("dispatched before BucketAcc::finish")
                 }
+                // `rate_counter` is `Counter`-backed (reset detection is
+                // order-dependent), never `Simple`.
+                RangeAggOp::RateCounter => unreachable!("Counter-backed"),
             },
         }
     }
+}
+
+/// The reset-aware total counter increase over a bucket's unwrapped
+/// samples (issue M8-LQ3, AC4). Samples are ordered by timestamp with a
+/// STABLE sort (no value tie-break): duplicate-timestamp samples keep
+/// their delivered scan order — the deterministic SQL scan order
+/// `ORDER BY timestamp_ns, fingerprint, body` (`metric_raw_samples`) —
+/// matching the pinned reference (v3.7.3), which processes same-timestamp
+/// unwrapped samples in storage/scan order rather than re-sorting them by
+/// value (branch-validated: the sequence `5, 10, 3, 12` with `10`/`3`
+/// tied at one timestamp yields increase 17 / 0.2833, not the 12 / 0.2 an
+/// ascending-value sort would give). The walk then adds `next - prev` on
+/// a monotone step and the bare `next` on a drop (a counter reset counts
+/// from zero). Total increase `= last - first + Σ(resets)`; the caller
+/// divides by the window seconds (`apply_rate`). No PromQL-style boundary
+/// extrapolation.
+fn counter_increase(mut pts: Vec<(i64, f64)>) -> f64 {
+    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+    let mut iter = pts.into_iter().map(|(_, v)| v);
+    let Some(mut prev) = iter.next() else {
+        return 0.0;
+    };
+    let mut increase = 0.0;
+    for v in iter {
+        if v < prev {
+            increase += v;
+        } else {
+            increase += v - prev;
+        }
+        prev = v;
+    }
+    increase
 }
 
 /// The reference oracle's quantile semantics (live-probed: `q=0.9` over
@@ -3116,6 +3156,27 @@ pub const MAX_CLIENT_AGG_BUCKETS: u64 = 11_000;
 /// (review round 1, finding 1's quantile bound).
 pub const MAX_QUANTILE_VALUES: u64 = 4_000_000;
 
+/// The `rate_counter` retention cap (M8-LQ3, code review rounds 2/3):
+/// like `quantile_over_time`, the reset walk is order-dependent, so every
+/// unwrapped `(ts, value)` sample is retained per bucket until `finish`.
+/// A dense range query retains one point per scanned sample, growing the
+/// combined per-bucket vectors without bound. Past this many retained
+/// points the query aborts as `QueryTooBroad(CounterValues)` —
+/// complete-or-error, never OOM and never a silently truncated increase.
+/// Bounds only the retained points; the reset-aware rate value is
+/// unchanged below the cap. Same ceiling as [`MAX_QUANTILE_VALUES`] (the
+/// shared "reducer state grows with surviving rows" class).
+///
+/// The `push_rows` charge (`counter_values += 1`) is a TRUE bound on the
+/// combined retention: [`bucket_of`] maps each scanned row to exactly one
+/// step bucket and `push_rows` performs exactly one `Counter` push per
+/// charged row — overlapping range windows (`step < range`) do NOT
+/// re-retain a sample, since the raw scan delivers each stored sample
+/// once and the buckets partition it. So `Σ retained points ==
+/// counter_values` (pinned by
+/// `rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets`).
+pub const MAX_COUNTER_VALUES: u64 = 4_000_000;
+
 /// Derived-series cap for client-aggregated metric queries: the number
 /// of distinct output groups (final label sets, or fingerprints on the
 /// non-mutating path) a single query may materialize. Bounds the last
@@ -3156,6 +3217,9 @@ struct ClientAggState<'q> {
     /// Total values retained across every quantile accumulator, charged
     /// against [`MAX_QUANTILE_VALUES`].
     quantile_values: u64,
+    /// Total timestamped points retained across every `rate_counter`
+    /// accumulator, charged against [`MAX_COUNTER_VALUES`].
+    counter_values: u64,
 }
 
 impl<'q> ClientAggState<'q> {
@@ -3192,6 +3256,7 @@ impl<'q> ClientAggState<'q> {
             fp_groups: HashMap::new(),
             label_groups: HashMap::new(),
             quantile_values: 0,
+            counter_values: 0,
         })
     }
 
@@ -3240,6 +3305,23 @@ impl<'q> ClientAggState<'q> {
                     return Err(ReadError::QueryTooBroad(TooBroadReason::QuantileValues {
                         count: self.quantile_values,
                         cap: MAX_QUANTILE_VALUES,
+                    }));
+                }
+            }
+            if matches!(op, RangeAggOp::RateCounter) {
+                // One charge per scanned row IS one charge per retained
+                // `Counter` point: `bucket_of` below yields exactly one
+                // bucket and the row is pushed into it exactly once, so
+                // `counter_values` equals the combined length of every
+                // `Counter` vector — a true bound even when `step < range`
+                // makes the reference's windows overlap (the raw scan
+                // delivers each stored sample once; buckets partition it,
+                // never re-retain). See `MAX_COUNTER_VALUES`.
+                self.counter_values += 1;
+                if self.counter_values > MAX_COUNTER_VALUES {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::CounterValues {
+                        count: self.counter_values,
+                        cap: MAX_COUNTER_VALUES,
                     }));
                 }
             }
@@ -4673,7 +4755,37 @@ fn reduce(op: VectorAggOp, vals: &[f64]) -> f64 {
         VectorAggOp::Topk | VectorAggOp::Bottomk => {
             unreachable!("topk/bottomk are selections, dispatched before reduce")
         }
+        // sort/sort_desc reorder the result vector — `group_instant`
+        // (reorder) / `group_range` (passthrough) branch before `reduce`.
+        VectorAggOp::Sort | VectorAggOp::SortDesc => {
+            unreachable!("sort/sort_desc reorder, dispatched before reduce")
+        }
     }
+}
+
+/// `sort`/`sort_desc` order an instant result vector by value: ascending
+/// (`Sort`) / descending (`SortDesc`). A NaN value ranks LAST in BOTH
+/// directions (compared via `is_nan()`, so a NaN's sign never leaks into
+/// the order the way `f64::total_cmp` alone would); equal values break by
+/// label set ascending — deterministic and hermetically golden-able.
+fn sort_instant(mut series: Vec<InstantSeries>, op: VectorAggOp) -> Vec<InstantSeries> {
+    let desc = matches!(op, VectorAggOp::SortDesc);
+    series.sort_by(|a, b| {
+        a.value
+            .is_nan()
+            .cmp(&b.value.is_nan())
+            .then_with(|| {
+                if a.value.is_nan() {
+                    std::cmp::Ordering::Equal
+                } else if desc {
+                    b.value.total_cmp(&a.value)
+                } else {
+                    a.value.total_cmp(&b.value)
+                }
+            })
+            .then_with(|| a.labels.cmp(&b.labels))
+    });
+    series
 }
 
 /// The `topk`/`bottomk` `k`: the parameter floored to a count; a missing
@@ -4809,6 +4921,12 @@ fn group_range(
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         return select_k_range(series, op, grouping, param);
     }
+    // A range result (matrix) has no single sortable value per series;
+    // `sort`/`sort_desc` are passthrough here (the reference likewise does
+    // not value-order matrices — the wire stays label-canonical).
+    if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
+        return series;
+    }
     let mut groups: HashMap<LabelSet, Vec<BTreeMap<i64, f64>>> = HashMap::new();
     for s in series {
         groups
@@ -4847,6 +4965,11 @@ fn group_instant(
 ) -> Vec<InstantSeries> {
     if matches!(op, VectorAggOp::Topk | VectorAggOp::Bottomk) {
         return select_k_instant(series, op, grouping, param);
+    }
+    // `sort`/`sort_desc` reorder the vector by value (no grouping —
+    // rejected at plan time), preserving each series unchanged.
+    if matches!(op, VectorAggOp::Sort | VectorAggOp::SortDesc) {
+        return sort_instant(series, op);
     }
     let mut groups: HashMap<LabelSet, Vec<f64>> = HashMap::new();
     for s in series {
@@ -6876,6 +6999,237 @@ mod tests {
                 assert_eq!(count, MAX_QUANTILE_VALUES + 1);
             }
             other => panic!("expected QueryTooBroad(QuantileValues), got {other:?}"),
+        }
+    }
+
+    /// The `rate_counter` retention state (`BucketAcc::Counter`, code
+    /// review round 2): builds a client-aggregated `rate_counter` instant
+    /// state and its shared inputs.
+    fn rate_counter_state_inputs() -> (
+        super::super::pipeline::CompiledPipeline,
+        plan::ClientAgg,
+        HashMap<u64, StreamMetaRow>,
+        ClientWindow,
+    ) {
+        let stages = match pulsus_logql::parse(r#"rate_counter({a="b"} | logfmt | unwrap c [1m])"#)
+            .expect("parse")
+        {
+            Expr::Metric(pulsus_logql::MetricExpr::Range { range, .. }) => range.selector.pipeline,
+            other => panic!("unexpected expr: {other:?}"),
+        };
+        let compiled = super::super::pipeline::CompiledPipeline::compile(&stages).expect("compile");
+        let client = plan::ClientAgg {
+            pipeline: stages,
+            value: plan::ClientValue::Unwrap,
+            range_op: RangeAggOp::RateCounter,
+            param: None,
+            absent_labels: Vec::new(),
+        };
+        let meta = HashMap::from([(
+            1u64,
+            StreamMetaRow {
+                fingerprint: 1,
+                service: "checkout".to_string(),
+                labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
+            },
+        )]);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: None,
+        };
+        (compiled, client, meta, window)
+    }
+
+    /// Code review round 2 (M8-LQ3, finding 1): the `rate_counter`
+    /// per-bucket point retention is bounded by [`MAX_COUNTER_VALUES`],
+    /// mirroring the quantile bound. Below the cap the reset-aware rate is
+    /// unaffected (four samples 10,30,5,12 by ts → increase 32 over the
+    /// 60s window = 32/60); charged to the boundary the next sample trips
+    /// the named `CounterValues` too-broad error — complete-or-error,
+    /// never a silently truncated increase.
+    #[test]
+    fn rate_counter_point_retention_is_capped_without_changing_values_below_it() {
+        let (compiled, client, meta, window) = rate_counter_state_inputs();
+        // Below the cap: the reset-aware value is exactly 32/60, unchanged
+        // by the retention guard.
+        let rows = [
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 10_000_000_000,
+                body: "c=10".to_string(),
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 20_000_000_000,
+                body: "c=30".to_string(),
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 30_000_000_000,
+                body: "c=5".to_string(), // reset: 5 < 30
+            },
+            MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 40_000_000_000,
+                body: "c=12".to_string(),
+            },
+        ];
+        let result = run_client_agg_rows(
+            &rows,
+            &compiled,
+            &meta,
+            &client,
+            window,
+            Some(60_000_000_000),
+        )
+        .expect("below the cap the query succeeds");
+        let QueryResult::Vector(items) = result else {
+            panic!("expected a vector, got {result:?}");
+        };
+        assert_eq!(items.len(), 1, "one series expected: {items:?}");
+        assert_eq!(items[0].value, 32.0 / 60.0);
+
+        // At the boundary: the next retained point trips the named error,
+        // exactly as the quantile bound does — driven through the real
+        // `push_rows` fold with the counter pre-charged (a 4M-row fixture
+        // would be pure waste).
+        let mut state =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(60_000_000_000)).unwrap();
+        state.counter_values = MAX_COUNTER_VALUES - 1;
+        let err = state.push_rows(&rows).unwrap_err();
+        match err {
+            ReadError::QueryTooBroad(TooBroadReason::CounterValues { count, cap }) => {
+                assert_eq!(cap, MAX_COUNTER_VALUES);
+                assert_eq!(count, MAX_COUNTER_VALUES + 1);
+            }
+            other => panic!("expected QueryTooBroad(CounterValues), got {other:?}"),
+        }
+    }
+
+    /// Code review round 3 (M8-LQ3, finding 1 — settled EMPIRICALLY): the
+    /// concern was that `counter_values += 1` charges an INPUT ROW before
+    /// `buckets` is derived, so a row copied into MULTIPLE overlapping
+    /// `Counter` accumulators (a range query with `step < range`) would
+    /// consume one quota unit while retaining several points — leaving
+    /// bucket×row retention unbounded.
+    ///
+    /// This test drives the real `push_rows` fold for a RANGE
+    /// `rate_counter(...[1m])` at `step = 20s` (`step < range`, the
+    /// reference's overlapping-window shape) with samples spanning THREE
+    /// step buckets, and proves the premise is false: `bucket_of` maps
+    /// each row to exactly one bucket, so the COMBINED length of every
+    /// `Counter` vector equals both the input-row count AND the
+    /// `counter_values` charge. A per-row charge is therefore a true bound
+    /// on total retained points — no under-count is possible. The
+    /// reset-aware per-bucket values are unchanged below the cap, and the
+    /// named `CounterValues` error still trips exactly when the combined
+    /// retention crosses the ceiling.
+    #[test]
+    fn rate_counter_cap_bounds_total_retained_points_across_overlapping_buckets() {
+        let (compiled, client, meta, _instant_window) = rate_counter_state_inputs();
+        // A RANGE query: 20s step, 60s (=1m) range — step < range, so the
+        // reference's per-output-point windows overlap. Six samples land
+        // in three distinct step buckets (0, 20s, 40s).
+        let step_ns = 20_000_000_000u64;
+        let range_ns = 60_000_000_000u64;
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: range_ns as i64,
+            step_ns: Some(step_ns),
+        };
+        let rows = [
+            (10_000_000_000i64, "c=10"), // bucket 0
+            (15_000_000_000, "c=30"),    // bucket 0
+            (25_000_000_000, "c=5"),     // bucket 20s
+            (35_000_000_000, "c=12"),    // bucket 20s
+            (45_000_000_000, "c=7"),     // bucket 40s
+            (55_000_000_000, "c=20"),    // bucket 40s
+        ]
+        .into_iter()
+        .map(|(timestamp_ns, body)| MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns,
+            body: body.to_string(),
+        })
+        .collect::<Vec<_>>();
+
+        // Push through the real fold, then introspect the retained state
+        // BEFORE finishing (finish consumes it).
+        let mut state =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(range_ns)).unwrap();
+        state.push_rows(&rows).unwrap();
+
+        // `unwrap` sets the metric fan-out gate, so grouping is by final
+        // label set — one group here (the unwrapped `c` is removed, base
+        // labels are shared).
+        assert_eq!(state.label_groups.len(), 1, "one series expected");
+        let buckets = &state
+            .label_groups
+            .values()
+            .next()
+            .expect("the one label group's buckets")
+            .1;
+        assert!(
+            buckets.len() > 1,
+            "the case must genuinely span multiple buckets: {} bucket(s)",
+            buckets.len()
+        );
+        assert_eq!(buckets.len(), 3, "samples land in buckets 0, 20s, 40s");
+
+        // The crux: the COMBINED length of every retained `Counter` vector
+        // equals the input-row count AND the per-row charge. Each row is
+        // retained EXACTLY once — overlapping windows do not multiply it.
+        let total_retained: usize = state
+            .label_groups
+            .values()
+            .flat_map(|(_, b)| b.values())
+            .map(|acc| match acc {
+                BucketAcc::Counter(pts) => pts.len(),
+                other => panic!("expected a Counter accumulator, got {other:?}"),
+            })
+            .sum();
+        assert_eq!(
+            total_retained,
+            rows.len(),
+            "every scanned row is retained exactly once across all buckets"
+        );
+        assert_eq!(
+            state.counter_values,
+            rows.len() as u64,
+            "the per-row charge equals total retained points (a true bound)"
+        );
+
+        // Values below the cap are unchanged: each bucket's reset-aware
+        // increase, divided by the 60s range. b0: 30-10=20; b20: 12-5=7;
+        // b40: 20-7=13.
+        let QueryResult::Matrix(series) = state.finish() else {
+            panic!("a range rate_counter query yields a matrix");
+        };
+        assert_eq!(series.len(), 1, "one series: {series:?}");
+        assert_eq!(
+            series[0].points,
+            vec![
+                (0, 20.0 / 60.0),
+                (step_ns as i64, 7.0 / 60.0),
+                (2 * step_ns as i64, 13.0 / 60.0),
+            ],
+            "per-bucket reset-aware rates are unaffected by the retention guard"
+        );
+
+        // The cap bounds the COMBINED retention, not source rows in some
+        // privileged bucket: pre-charged to `MAX - 1`, the second scanned
+        // row (regardless of which bucket it lands in) trips the named
+        // error at `count = MAX + 1`.
+        let mut capped =
+            ClientAggState::new(&compiled, &meta, &client, window, Some(range_ns)).unwrap();
+        capped.counter_values = MAX_COUNTER_VALUES - 1;
+        match capped.push_rows(&rows).unwrap_err() {
+            ReadError::QueryTooBroad(TooBroadReason::CounterValues { count, cap }) => {
+                assert_eq!(cap, MAX_COUNTER_VALUES);
+                assert_eq!(count, MAX_COUNTER_VALUES + 1);
+            }
+            other => panic!("expected QueryTooBroad(CounterValues), got {other:?}"),
         }
     }
 

@@ -498,6 +498,7 @@ fn range_id(op: RangeAggOp) -> &'static str {
         RangeAggOp::FirstOverTime => "range.first_over_time",
         RangeAggOp::LastOverTime => "range.last_over_time",
         RangeAggOp::AbsentOverTime => "range.absent_over_time",
+        RangeAggOp::RateCounter => "range.rate_counter",
     }
 }
 
@@ -512,6 +513,8 @@ fn vector_id(op: VectorAggOp) -> &'static str {
         VectorAggOp::Stdvar => "agg.stdvar",
         VectorAggOp::Topk => "agg.topk",
         VectorAggOp::Bottomk => "agg.bottomk",
+        VectorAggOp::Sort => "agg.sort",
+        VectorAggOp::SortDesc => "agg.sort_desc",
     }
 }
 
@@ -635,6 +638,7 @@ const RANGE_ALL: &[RangeAggOp] = &[
     RangeAggOp::FirstOverTime,
     RangeAggOp::LastOverTime,
     RangeAggOp::AbsentOverTime,
+    RangeAggOp::RateCounter,
 ];
 const VECTOR_ALL: &[VectorAggOp] = &[
     VectorAggOp::Sum,
@@ -646,6 +650,8 @@ const VECTOR_ALL: &[VectorAggOp] = &[
     VectorAggOp::Stdvar,
     VectorAggOp::Topk,
     VectorAggOp::Bottomk,
+    VectorAggOp::Sort,
+    VectorAggOp::SortDesc,
 ];
 const BINOP_ALL: &[BinOp] = &[
     BinOp::Add,
@@ -1027,9 +1033,9 @@ fn differential_categories_are_pinned() {
         unescalated_divergence.is_empty(),
         "supported constructs the reference rejects (unescalated divergences): {unescalated_divergence:?}"
     );
-    assert_eq!(supported, 94, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 97, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 3,
+        tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"
     );
     assert_eq!(
@@ -1511,8 +1517,9 @@ fn interim_generic_without_owning_issue_is_red() {
         owner_escalation: None,
     };
     // A probe that genuinely produces a generic error, so only the missing
-    // owning_issue can fail it.
-    assert!(check_status(&d, r#"sort(rate({app="x"}[5m]))"#).is_err());
+    // owning_issue can fail it. (`sort(...)` now parses since M8-LQ3 flipped
+    // it to supported; an unknown aggregation function still errors generic.)
+    assert!(check_status(&d, r#"notafunc(rate({app="x"}[5m]))"#).is_err());
 }
 
 #[test]

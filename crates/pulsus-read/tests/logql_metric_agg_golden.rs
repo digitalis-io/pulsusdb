@@ -2050,3 +2050,306 @@ fn a_matching_modifier_on_a_scalar_operand_is_ignored_matching_the_loki_oracle()
     assert_eq!(out[0].value, 110.0);
     assert_eq!(out[1].value, 103.0);
 }
+
+// ---------------------------------------------------------------------
+// Issue M8-LQ3 (AC4/AC5): `rate_counter` reset-aware per-second increase
+// and `sort`/`sort_desc` value ordering.
+//
+// ORACLE NOTE: the exact `rate_counter` per-window VALUES (reset/dup-ts
+// tie-break/boundary/sparse) and the `sort`/`sort_desc` NaN+tie ORDER are
+// reference-dependent (pinned Loki v3.7.3). The expectations below are the
+// hand-derived values under plan v4's stated Rules 1-3; they are pinned
+// here for the reducer SHAPE every PR and cross-checked against the live
+// reference by the gated e2e vectors (`metric_rate_counter_*`). If the
+// reference diverges the e2e gate goes RED and these are corrected in place.
+// ---------------------------------------------------------------------
+
+/// Runs an instant `rate_counter` query over a single-series counter body
+/// (`c=<n>`, `logfmt | unwrap c`), returning the one per-second value. The
+/// `[1m]` window makes the divisor exactly 60s.
+fn rate_counter_instant(rows: &[MetricScanRow]) -> f64 {
+    let params = instant_params(60 * NS);
+    single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            rows,
+            &meta_one(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Rule 1 — a counter that RESETS mid-window. Values 10,30,5,12 by ts:
+/// +20 (10→30), reset +5 (drop to 5, counts from zero), +7 (5→12) = 32;
+/// divided by the 60s window = 32/60.
+#[test]
+fn rate_counter_reset_counts_the_post_reset_value_from_zero() {
+    let rows = vec![
+        row(1, 10 * NS, "c=10"),
+        row(1, 20 * NS, "c=30"),
+        row(1, 30 * NS, "c=5"), // reset: 5 < 30
+        row(1, 40 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 32.0 / 60.0);
+}
+
+/// Rule 3 — duplicate-timestamp samples are processed in DELIVERED scan
+/// order (the reducer's stable sort by timestamp preserves the SQL
+/// `ORDER BY timestamp_ns, fingerprint, body` order), NOT re-sorted by
+/// value. Branch-validated against the pinned reference (v3.7.3): values
+/// 5,{10,3}@20s,12 delivered as 5,10,3,12 → +5 (5→10), reset +3 (10→3),
+/// +9 (3→12) = 17; divided by the 60s window = 17/60 (0.2833). An
+/// ascending-value tie-sort would instead see 5,3,10,12 → 12/60 (0.2),
+/// which the reference does NOT produce — so the delivered order is
+/// load-bearing and this vector pins it.
+#[test]
+fn rate_counter_duplicate_timestamp_preserves_delivered_scan_order() {
+    // Delivered in the SQL scan order (ts asc, then fingerprint/body): the
+    // two ts=20s samples arrive as c=10 then c=3.
+    let rows = vec![
+        row(1, 10 * NS, "c=5"),
+        row(1, 20 * NS, "c=10"),
+        row(1, 20 * NS, "c=3"), // same ts as c=10, delivered after it
+        row(1, 30 * NS, "c=12"),
+    ];
+    assert_eq!(rate_counter_instant(&rows), 17.0 / 60.0);
+    // The stable sort keys only on timestamp, so distinct-ts samples are
+    // reordered into ascending time regardless of arrival, but the tied
+    // pair keeps whatever relative order it was delivered in.
+    let shuffled_distinct = vec![
+        row(1, 30 * NS, "c=12"),
+        row(1, 10 * NS, "c=5"),
+        row(1, 20 * NS, "c=10"),
+        row(1, 20 * NS, "c=3"),
+    ];
+    assert_eq!(rate_counter_instant(&shuffled_distinct), 17.0 / 60.0);
+}
+
+/// Rule 2 — samples ON the window boundaries both contribute. Monotone
+/// 100→160 with no reset ⇒ increase 60, divided by the 60s window = 1.0.
+/// (The SQL half-open `(t-range, t]` window inclusion itself is validated
+/// by the gated e2e `metric_rate_counter_boundary` vector; the hermetic
+/// reducer sees whatever rows it is handed.)
+#[test]
+fn rate_counter_boundary_samples_contribute() {
+    let rows = vec![row(1, 1, "c=100"), row(1, 60 * NS, "c=160")];
+    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+}
+
+/// Rule 1 divisor / no-extrapolation — sparse interior samples 200→260
+/// (span 10s) still divide by the FULL 60s window, not the sample span:
+/// increase 60 / 60s = 1.0 (a boundary-extrapolated reading would inflate
+/// to 6.0).
+#[test]
+fn rate_counter_sparse_window_divides_by_the_full_interval() {
+    let rows = vec![row(1, 25 * NS, "c=200"), row(1, 35 * NS, "c=260")];
+    assert_eq!(rate_counter_instant(&rows), 60.0 / 60.0);
+}
+
+/// Rule 2 (AC10) — the DISCRIMINATING lower-boundary test: the lookback is
+/// half-open `(t-range, t]`, so a sample sitting EXACTLY at `t-range` is
+/// EXCLUDED (branch-validated v3.7.3: a lone in-window point past such an
+/// excluded start sample yields increase 0). This is enforced by the raw
+/// scan's `timestamp_ns > {start_ns}` predicate (strict lower bound), NOT
+/// by the reducer — so the discriminator is the generated SQL plus the
+/// value the surviving rows reduce to. A closed `[t-range, t]`
+/// interpretation would (a) render `>=` here and (b) INCLUDE the `t-range`
+/// sample, changing the result — this test fails under that reading.
+///
+/// Instant `t = 90s`, `[1m]` ⇒ `start_ns = 30s` (`= t-range`),
+/// `end_ns = 90s` (`= t`). Samples at 30s (`c=100`, the excluded start),
+/// 60s (`c=140`, interior), 90s (`c=200`, the included end). Half-open:
+/// only 140→200 survive ⇒ increase 60 / 60s = 1.0. Closed: 100→140→200 ⇒
+/// increase 100 / 60s ≈ 1.667 — a DIFFERENT value, which the assertions
+/// below reject.
+#[test]
+fn rate_counter_excludes_a_sample_at_exactly_t_minus_range() {
+    let at_ns = 90 * NS;
+    let params = instant_params(at_ns);
+    let mp = metric_plan_of(
+        r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+        &params,
+    );
+    // The plan's window is exactly `(t-range, t]`.
+    assert_eq!(mp.start_ns, 30 * NS, "start_ns must be t-range");
+    assert_eq!(mp.end_ns, at_ns, "end_ns must be t");
+
+    // The enforcing layer: the raw-scan predicate is STRICT on the lower
+    // bound (`>`), so the `t-range` sample is filtered out server-side. A
+    // closed interval would render `>=` and this assertion would fail.
+    let sql = pulsus_read::logql::sql::metric_raw_samples(
+        &mp.table,
+        &["checkout".to_string()],
+        &[1],
+        pulsus_read::logql::sql::TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        &mp.extra_predicates,
+    );
+    assert!(
+        sql.contains(&format!(
+            "timestamp_ns > {} AND timestamp_ns <= {}",
+            30 * NS,
+            at_ns
+        )),
+        "raw-scan window must be half-open `(t-range, t]` (strict `>`): {sql}"
+    );
+
+    // The result difference: only the survivors of the half-open window
+    // reduce; the `t-range=30s` sample is excluded, the `t=90s` end sample
+    // included.
+    let all = vec![
+        row(1, 30 * NS, "c=100"), // exactly t-range — excluded
+        row(1, 60 * NS, "c=140"), // interior
+        row(1, at_ns, "c=200"),   // exactly t — included
+    ];
+    let survivors: Vec<_> = all
+        .iter()
+        .filter(|r| r.timestamp_ns > mp.start_ns && r.timestamp_ns <= mp.end_ns)
+        .cloned()
+        .collect();
+    let half_open = single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            &survivors,
+            &meta_one(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(half_open, 60.0 / 60.0, "excludes the t-range sample");
+
+    // The closed-interval reading (all three rows) would give a DIFFERENT
+    // value — proving the boundary rule is load-bearing, not cosmetic.
+    let closed = single_vector_value(
+        run_client(
+            r#"rate_counter({env="prod"} | logfmt | unwrap c [1m])"#,
+            &params,
+            &all,
+            &meta_one(),
+        )
+        .unwrap(),
+    );
+    assert_eq!(closed, 100.0 / 60.0);
+    assert_ne!(
+        half_open, closed,
+        "the t-range sample must change the result (half-open ≠ closed)"
+    );
+}
+
+/// `rate_counter` requires `unwrap` (it reduces unwrapped counter values);
+/// without it the planner rejects with the oracle-shaped arity message.
+#[test]
+fn rate_counter_without_unwrap_is_rejected() {
+    let params = instant_params(60 * NS);
+    let expr = parse(r#"rate_counter({env="prod"}[1m])"#).expect("parse");
+    match plan(&expr, &params, &ctx()) {
+        Err(ReadError::PipelineInvalid { reason }) => {
+            assert_eq!(reason, "invalid aggregation rate_counter without unwrap");
+        }
+        other => panic!("expected PipelineInvalid, got {other:?}"),
+    }
+}
+
+// --- sort / sort_desc value ordering ---------------------------------
+
+fn sort_vector_fixture() -> QueryResult {
+    QueryResult::Vector(vec![
+        VectorSample {
+            labels: vec![("app".to_string(), "a".to_string())],
+            value: 5.0,
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "b".to_string())],
+            value: 1.0,
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "c".to_string())],
+            value: 5.0, // ties app=a
+        },
+        VectorSample {
+            labels: vec![("app".to_string(), "d".to_string())],
+            value: f64::NAN,
+        },
+    ])
+}
+
+fn ordered_apps(result: QueryResult) -> Vec<String> {
+    let QueryResult::Vector(items) = result else {
+        panic!("expected a vector, got {result:?}");
+    };
+    items.into_iter().map(|s| s.labels[0].1.clone()).collect()
+}
+
+/// `sort` orders the returned vector ascending by value; equal values
+/// break by label set ascending (a before c); NaN ranks LAST.
+#[test]
+fn sort_orders_the_vector_ascending_with_nan_last() {
+    let aggs = vec![(pulsus_logql::VectorAggOp::Sort, None, None)];
+    assert_eq!(
+        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        vec!["b", "a", "c", "d"]
+    );
+}
+
+/// `sort_desc` orders descending; the 5.0 tie still breaks by label set
+/// ascending (a before c); NaN ranks LAST in BOTH directions.
+#[test]
+fn sort_desc_orders_the_vector_descending_with_nan_last() {
+    let aggs = vec![(pulsus_logql::VectorAggOp::SortDesc, None, None)];
+    assert_eq!(
+        ordered_apps(apply_vector_aggs(sort_vector_fixture(), &aggs)),
+        vec!["a", "c", "b", "d"]
+    );
+}
+
+/// A range `sort(...)` yields a matrix with no single sortable value per
+/// series, so it is a passthrough — the series set is unchanged.
+#[test]
+fn range_sort_is_a_passthrough_over_the_matrix() {
+    let matrix = QueryResult::Matrix(vec![
+        MatrixSeries {
+            labels: vec![("app".to_string(), "a".to_string())],
+            points: vec![(0, 5.0), (STEP, 1.0)],
+        },
+        MatrixSeries {
+            labels: vec![("app".to_string(), "b".to_string())],
+            points: vec![(0, 3.0)],
+        },
+    ]);
+    for op in [
+        pulsus_logql::VectorAggOp::Sort,
+        pulsus_logql::VectorAggOp::SortDesc,
+    ] {
+        let out = apply_vector_aggs(matrix.clone(), &[(op, None, None)]);
+        let QueryResult::Matrix(items) = out else {
+            panic!("expected a matrix");
+        };
+        let by_app: HashMap<String, Vec<(i64, f64)>> = items
+            .into_iter()
+            .map(|s| (s.labels[0].1.clone(), s.points))
+            .collect();
+        assert_eq!(by_app["a"], vec![(0, 5.0), (STEP, 1.0)]);
+        assert_eq!(by_app["b"], vec![(0, 3.0)]);
+    }
+}
+
+/// `sort`/`sort_desc` reject a grouping clause — the reference has no
+/// `sort by(x)(...)` form, so the planner 400s rather than silently
+/// ignoring it.
+#[test]
+fn sort_with_a_grouping_is_rejected() {
+    let params = instant_params(60 * NS);
+    for query in [
+        r#"sort by(app) (rate({env="prod"}[1m]))"#,
+        r#"sort_desc by(app) (rate({env="prod"}[1m]))"#,
+    ] {
+        let expr = parse(query).expect("parse");
+        match plan(&expr, &params, &ctx()) {
+            Err(ReadError::PipelineInvalid { .. }) => {}
+            other => panic!("expected {query:?} to be PipelineInvalid, got {other:?}"),
+        }
+    }
+}

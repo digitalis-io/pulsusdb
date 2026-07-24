@@ -210,12 +210,28 @@ async fn run_query(
     explain: bool,
     at_ns: i64,
 ) -> Result<Response, ApiError> {
+    // Preserve the engine's value order on the wire only for a terminal
+    // sort/sort_desc INSTANT query (mirrors the PromQL `step_ms == 0 &&
+    // expr_is_sort_root` gate). A range sort yields a matrix and keeps the
+    // deterministic label-sort.
+    let preserve_vector_order = matches!(query_params.spec, QuerySpec::Instant { .. })
+        && pulsus_read::logql::terminal_sort(expr);
     if explain {
         let (result, plan_explain) = engine.query_explained(expr, query_params).await?;
-        Ok(encode::query_response(result, Some(plan_explain), at_ns))
+        Ok(encode::query_response(
+            result,
+            Some(plan_explain),
+            at_ns,
+            preserve_vector_order,
+        ))
     } else {
         let result = engine.query(expr, query_params).await?;
-        Ok(encode::query_response(result, None, at_ns))
+        Ok(encode::query_response(
+            result,
+            None,
+            at_ns,
+            preserve_vector_order,
+        ))
     }
 }
 

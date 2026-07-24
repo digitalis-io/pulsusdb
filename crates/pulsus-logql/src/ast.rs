@@ -783,6 +783,10 @@ pub enum RangeAggOp {
     FirstOverTime,
     LastOverTime,
     AbsentOverTime,
+    /// `rate_counter({...} | unwrap x [5m])` — the reset-aware per-second
+    /// increase over unwrapped counter values (issue M8-LQ3). Requires
+    /// `unwrap`; client-aggregated like the other over-time reducers.
+    RateCounter,
 }
 
 impl RangeAggOp {
@@ -802,6 +806,7 @@ impl RangeAggOp {
             "first_over_time" => Some(Self::FirstOverTime),
             "last_over_time" => Some(Self::LastOverTime),
             "absent_over_time" => Some(Self::AbsentOverTime),
+            "rate_counter" => Some(Self::RateCounter),
             _ => None,
         }
     }
@@ -822,6 +827,7 @@ impl RangeAggOp {
             RangeAggOp::FirstOverTime => "first_over_time",
             RangeAggOp::LastOverTime => "last_over_time",
             RangeAggOp::AbsentOverTime => "absent_over_time",
+            RangeAggOp::RateCounter => "rate_counter",
         }
     }
 }
@@ -847,6 +853,12 @@ pub enum VectorAggOp {
     Stdvar,
     Topk,
     Bottomk,
+    /// `sort(...)` / `sort_desc(...)` — order the instant result vector by
+    /// value ascending/descending (issue M8-LQ3). A post-aggregation
+    /// in-memory reordering, not a reduction; carries no parameter and no
+    /// grouping.
+    Sort,
+    SortDesc,
 }
 
 impl VectorAggOp {
@@ -861,6 +873,8 @@ impl VectorAggOp {
             "stdvar" => Some(Self::Stdvar),
             "topk" => Some(Self::Topk),
             "bottomk" => Some(Self::Bottomk),
+            "sort" => Some(Self::Sort),
+            "sort_desc" => Some(Self::SortDesc),
             _ => None,
         }
     }
@@ -882,6 +896,8 @@ impl VectorAggOp {
             VectorAggOp::Stdvar => "stdvar",
             VectorAggOp::Topk => "topk",
             VectorAggOp::Bottomk => "bottomk",
+            VectorAggOp::Sort => "sort",
+            VectorAggOp::SortDesc => "sort_desc",
         }
     }
 }
@@ -1082,6 +1098,7 @@ mod tests {
             ("first_over_time", RangeAggOp::FirstOverTime),
             ("last_over_time", RangeAggOp::LastOverTime),
             ("absent_over_time", RangeAggOp::AbsentOverTime),
+            ("rate_counter", RangeAggOp::RateCounter),
         ] {
             assert_eq!(RangeAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
@@ -1100,6 +1117,8 @@ mod tests {
             ("stdvar", VectorAggOp::Stdvar),
             ("topk", VectorAggOp::Topk),
             ("bottomk", VectorAggOp::Bottomk),
+            ("sort", VectorAggOp::Sort),
+            ("sort_desc", VectorAggOp::SortDesc),
         ] {
             assert_eq!(VectorAggOp::from_ident(name), Some(op));
             assert_eq!(op.to_string(), name);
@@ -1108,8 +1127,11 @@ mod tests {
 
     #[test]
     fn unknown_identifiers_are_not_recognized_as_implemented_aggregations() {
-        assert_eq!(RangeAggOp::from_ident("rate_counter"), None);
-        assert_eq!(VectorAggOp::from_ident("sort"), None);
+        // `rate_counter`/`sort`/`sort_desc` now resolve (issue M8-LQ3);
+        // genuinely-unknown idents must still return `None`.
+        assert_eq!(RangeAggOp::from_ident("rate_bytes"), None);
+        assert_eq!(VectorAggOp::from_ident("sortk"), None);
+        assert_eq!(VectorAggOp::from_ident("sort_asc"), None);
     }
 
     #[test]
@@ -1122,6 +1144,8 @@ mod tests {
             VectorAggOp::Count,
             VectorAggOp::Stddev,
             VectorAggOp::Stdvar,
+            VectorAggOp::Sort,
+            VectorAggOp::SortDesc,
         ] {
             assert!(!op.takes_param());
         }

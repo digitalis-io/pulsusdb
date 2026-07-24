@@ -237,6 +237,48 @@
       "kind": "metric_match_error",
       "expect_error_substr": "many-to-many matching not allowed: matching labels must be unique on one side",
       "query": "sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m])) / on(status) group_left sum by (method, status) (count_over_time({run_id=\"{R}\", service_name=\"svc-json\"} | json [30m]))"
+    },
+    {
+      "case_id": "metric_rate_counter_reset",
+      "construct": "M8-LQ3 rate_counter over a resetting unwrapped counter (c=10,30,5,12 by ts): reset-aware increase 32 / 60s window = 0.5333 (oracle-confirmed v3.7.3). Instant [1m] lookback — semantically identical on both stores (no tumbling divergence)",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcreset\"} | logfmt | unwrap c [1m])"
+    },
+    {
+      "case_id": "metric_rate_counter_sparse",
+      "construct": "M8-LQ3 rate_counter over sparse interior samples (c=200,260, 10s apart): increase 60 divided by the FULL 60s window = 1.0, NOT boundary-extrapolated (which would inflate to 6.0). Oracle-confirmed v3.7.3",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcsparse\"} | logfmt | unwrap c [1m])"
+    },
+    {
+      "case_id": "metric_rate_counter_boundary",
+      "construct": "M8-LQ3 rate_counter over a monotone counter spanning the window (c=100,160): increase 60 / 60s = 1.0 (oracle-confirmed v3.7.3). The half-open (t-range, t] edge-inclusion rule is pinned in the hermetic reducer golden",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcbound\"} | logfmt | unwrap c [1m])"
+    },
+    {
+      "case_id": "metric_rate_counter_dup_ts",
+      "construct": "M8-LQ3 rate_counter duplicate-timestamp handling: samples 5,{10,3}@one-ts,12 processed in delivered scan order (ts asc, then body asc) as 5,10,3,12 — +5, reset +3, +9 = increase 17 / 60s = 0.2833 (oracle-confirmed v3.7.3; an ascending-VALUE tie-sort would wrongly give 0.2). Both stores order same-ts samples in storage order, not by value",
+      "mode": "gated",
+      "kind": "metric_instant",
+      "query": "rate_counter({run_id=\"{R}\", service_name=\"svc-rcdup\"} | logfmt | unwrap c [1m])"
+    },
+    {
+      "case_id": "metric_sort_order",
+      "construct": "M8-LQ3 sort value-ordering: sort(sum by (grp) (count_over_time(...))) over counts {a:5,b:1,c:5} returns the vector ascending by value with the a/c tie broken by label ascending — order b,a,c (oracle-confirmed v3.7.3). Set-equal validity gate plus a store-vs-store ordered-sequence gate (metric_instant_ordered)",
+      "mode": "gated",
+      "kind": "metric_instant_ordered",
+      "query": "sort(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m])))"
+    },
+    {
+      "case_id": "metric_sort_desc_order",
+      "construct": "M8-LQ3 sort_desc value-ordering: sort_desc(sum by (grp) (count_over_time(...))) over the SAME counts {a:5,b:1,c:5} returns the vector DESCENDING by value with the a/c tie broken by label ascending — order a,c,b (oracle-confirmed v3.7.3). Independent end-to-end coverage of the sort_desc handler/encoder path. Set-equal validity gate plus a store-vs-store ordered-sequence gate (metric_instant_ordered)",
+      "mode": "gated",
+      "kind": "metric_instant_ordered",
+      "query": "sort_desc(sum by (grp) (count_over_time({run_id=\"{R}\", service_name=\"svc-sort\"} | logfmt [30m])))"
     }
   ]
 }
