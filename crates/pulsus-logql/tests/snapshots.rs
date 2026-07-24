@@ -868,6 +868,8 @@ Log(
         pipeline: [
             Parser(
                 Logfmt {
+                    strict: false,
+                    keep_empty: false,
                     extractions: [],
                 },
             ),
@@ -1006,6 +1008,144 @@ fn an_eq_label_filter_with_a_numeric_rhs_canonicalizes_to_double_eq() {
     let expr = parse(r#"{a="b"} | status = 500"#).unwrap();
     assert_eq!(expr.to_string(), r#"{a="b"} | status == 500"#);
     assert_round_trip(r#"{a="b"} | status = 500"#);
+}
+
+// ---------------------------------------------------------------------
+// M8-LQ1 (issue #200): the unpack / decolorize / drop / keep stages and
+// the `logfmt` `--strict`/`--keep-empty` flags. Debug shape pins for the
+// data-carrying stages plus the round-trip oracle for every new form.
+// ---------------------------------------------------------------------
+
+#[test]
+fn an_unpack_stage_parses_to_its_argumentless_node() {
+    assert_snapshot(
+        r#"{app="x"} | unpack"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            Unpack,
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_drop_stage_with_bare_and_matcher_qualified_elements() {
+    assert_snapshot(
+        r#"{app="x"} | drop level, status=~"5..", host!="local""#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            Drop(
+                [
+                    DropKeepElem {
+                        label: "level",
+                        matcher: None,
+                    },
+                    DropKeepElem {
+                        label: "status",
+                        matcher: Some(
+                            LabelMatch {
+                                op: Re,
+                                value: "5..",
+                            },
+                        ),
+                    },
+                    DropKeepElem {
+                        label: "host",
+                        matcher: Some(
+                            LabelMatch {
+                                op: Neq,
+                                value: "local",
+                            },
+                        ),
+                    },
+                ],
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn a_logfmt_stage_with_both_flags_pins_its_debug_shape() {
+    assert_snapshot(
+        r#"{app="x"} | logfmt --strict --keep-empty"#,
+        r#"
+Log(
+    LogExpr {
+        selector: StreamSelector {
+            matchers: [
+                Matcher {
+                    name: "app",
+                    op: Eq,
+                    value: "x",
+                },
+            ],
+        },
+        pipeline: [
+            Parser(
+                Logfmt {
+                    strict: true,
+                    keep_empty: true,
+                    extractions: [],
+                },
+            ),
+        ],
+    },
+)
+"#,
+    );
+}
+
+#[test]
+fn every_new_m8_lq1_stage_round_trips() {
+    let queries = [
+        r#"{a="b"} | unpack"#,
+        r#"{a="b"} | decolorize"#,
+        r#"{a="b"} | drop level"#,
+        r#"{a="b"} | drop level, status"#,
+        r#"{a="b"} | drop level="info""#,
+        r#"{a="b"} | drop status=~"5..", host!~"db.*""#,
+        r#"{a="b"} | keep app"#,
+        r#"{a="b"} | keep app, env="prod""#,
+        // logfmt flags, singly and combined, bare and with extractions.
+        r#"{a="b"} | logfmt --strict"#,
+        r#"{a="b"} | logfmt --keep-empty"#,
+        r#"{a="b"} | logfmt --strict --keep-empty"#,
+        r#"{a="b"} | logfmt --strict host="hostname""#,
+        // Interleaved with other stages (unpack/decolorize rewrite the line).
+        r#"{a="b"} | unpack | status = "500""#,
+        r#"{a="b"} | decolorize |= "err""#,
+        r#"{a="b"} | logfmt | drop __error__ | keep level"#,
+    ];
+    for q in queries {
+        assert_round_trip(q);
+    }
 }
 
 // ---------------------------------------------------------------------

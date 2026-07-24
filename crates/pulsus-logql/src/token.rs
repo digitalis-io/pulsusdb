@@ -78,6 +78,10 @@ pub enum TokenKind {
     Pipe,
 
     Ident(String),
+    /// A `--flag` name (the body without the leading `--`, e.g. `"strict"`
+    /// or `"keep-empty"`). Only the `logfmt` parser stage consumes these;
+    /// everywhere else a `Flag` is a parse error (issue #200).
+    Flag(String),
     /// An unescaped string value (double-quoted Go-style escapes or a
     /// backtick raw string already decoded by the lexer).
     String(String),

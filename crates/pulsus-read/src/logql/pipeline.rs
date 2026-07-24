@@ -27,9 +27,16 @@
 //! - `json` flattens nested objects with `_` separators, stringifies
 //!   scalars, skips `null`s and arrays; a malformed line is **kept** with
 //!   `__error__="JSONParserErr"`.
-//! - `logfmt` splits `k=v` pairs (bare key ⇒ empty value, quoted values
-//!   unescaped); an unterminated quote keeps the line with
-//!   `__error__="LogfmtParserErr"`.
+//! - `logfmt` splits `k=v` pairs (quoted values unescaped); the default is
+//!   lenient best-effort — empty-value pairs are dropped and a malformed
+//!   line NEVER sets `__error__` (issue #200, reference-matching). The
+//!   `--strict` flag tags a malformed line with `__error__="LogfmtParserErr"`;
+//!   `--keep-empty` retains empty-value pairs.
+//! - `unpack` parses a packed JSON object, promoting a string `_entry` back
+//!   to the line and other string fields to labels; a non-object line is
+//!   kept with `__error__="JSONParserErr"`.
+//! - `decolorize` strips ANSI SGR color escapes; `drop`/`keep` remove/retain
+//!   labels (optionally value-matched).
 //! - `regexp` named groups become labels; a non-matching line adds no
 //!   labels and is kept.
 //! - `pattern` `<name>` captures between literal delimiters, `<_>`
@@ -50,7 +57,8 @@ use std::fmt;
 use std::net::IpAddr;
 
 use pulsus_logql::{
-    CompareOp, LabelFilterExpr, LabelFmt, LineFilterOp, MatchOp, NumericLiteral, ParserStage, Stage,
+    CompareOp, DropKeepElem, LabelFilterExpr, LabelFmt, LabelMatch, LineFilterOp, MatchOp,
+    NumericLiteral, ParserStage, Stage,
 };
 
 use super::ip::{IpMatcher, line_has_ip_in};
@@ -234,6 +242,12 @@ enum CompiledStage {
         extractions: Vec<(String, Vec<JsonPathSeg>)>,
     },
     Logfmt {
+        /// `--strict`: a malformed line sets `__error__="LogfmtParserErr"`
+        /// (default is lenient best-effort, no error — issue #200).
+        strict: bool,
+        /// `--keep-empty`: retain extracted pairs whose value is empty
+        /// (default drops them — issue #200).
+        keep_empty: bool,
         /// Empty = all pairs; else `(label, source_key)`.
         extractions: Vec<(String, String)>,
     },
@@ -251,6 +265,50 @@ enum CompiledStage {
         label: String,
         kind: UnitKind,
     },
+    /// `| unpack` — parse the line as a packed JSON object, promoting a
+    /// string `_entry` field back to the line and other string fields to
+    /// labels; a non-object/parse-failure keeps the line with
+    /// `__error__="JSONParserErr"` (issue #200). Rewrites the line.
+    Unpack,
+    /// `| decolorize` — strip ANSI SGR escapes (`\x1b[…m`) from the line
+    /// (issue #200); borrowed/zero-alloc when nothing matches. Rewrites
+    /// the line.
+    Decolorize(regex::Regex),
+    /// `| drop <elems>` — remove each listed label when it matches (issue
+    /// #200); dropping `__error__` also clears `__error_details__`.
+    Drop(Vec<CompiledDropKeep>),
+    /// `| keep <elems>` — retain only labels matched by the list (issue
+    /// #200).
+    Keep(Vec<CompiledDropKeep>),
+}
+
+/// One compiled `drop`/`keep` element: a label name plus an optional
+/// value matcher (regexes compiled once, fully anchored).
+#[derive(Debug)]
+struct CompiledDropKeep {
+    label: String,
+    matcher: Option<CompiledDropKeepMatch>,
+}
+
+#[derive(Debug)]
+struct CompiledDropKeepMatch {
+    op: MatchOp,
+    value: String,
+    /// Anchored regex for `Re`/`Nre`; `None` for `Eq`/`Neq`.
+    re: Option<regex::Regex>,
+}
+
+impl CompiledDropKeepMatch {
+    /// Whether this matcher matches the given label value (Prometheus
+    /// matcher semantics — the same anchoring the label-filter family uses).
+    fn matches(&self, value: &str) -> bool {
+        match self.op {
+            MatchOp::Eq => value == self.value,
+            MatchOp::Neq => value != self.value,
+            MatchOp::Re => self.re.as_ref().is_some_and(|re| re.is_match(value)),
+            MatchOp::Nre => !self.re.as_ref().is_some_and(|re| re.is_match(value)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -377,6 +435,34 @@ impl CompiledPipeline {
                         label: u.label.clone(),
                         kind,
                     });
+                }
+                Stage::Unpack => {
+                    // Unpack rewrites the line (`_entry` becomes the line) and
+                    // promotes fields to labels — a following line filter must
+                    // therefore evaluate in-engine, so it sets the line-rewrite
+                    // gate exactly like `line_format`.
+                    mutates_labels = true;
+                    rewrites_line = true;
+                    seen_line_format = true;
+                    compiled.push(CompiledStage::Unpack);
+                }
+                Stage::Decolorize => {
+                    // Decolorize rewrites the line; a following line filter must
+                    // evaluate in-engine (the raw body still carries the color
+                    // codes ClickHouse would match against).
+                    rewrites_line = true;
+                    seen_line_format = true;
+                    compiled.push(CompiledStage::Decolorize(compile_regex(
+                        DECOLORIZE_PATTERN,
+                    )?));
+                }
+                Stage::Drop(elems) => {
+                    mutates_labels = true;
+                    compiled.push(CompiledStage::Drop(compile_drop_keep(elems)?));
+                }
+                Stage::Keep(elems) => {
+                    mutates_labels = true;
+                    compiled.push(CompiledStage::Keep(compile_drop_keep(elems)?));
                 }
             }
         }
@@ -518,15 +604,23 @@ impl CompiledPipeline {
                     }
                 }
                 CompiledStage::Json { extractions } => run_json(&line, extractions, labels),
-                CompiledStage::Logfmt { extractions } => {
+                CompiledStage::Logfmt {
+                    strict,
+                    keep_empty,
+                    extractions,
+                } => {
                     // Borrow captures from the body slice when the line
                     // is still the original body; a rewritten
                     // (`line_format`-owned) line cannot be borrowed past
                     // its own reassignment, so its captures are copied.
                     match &line {
-                        Cow::Borrowed(text) => run_logfmt(text, extractions, labels, |c| c),
+                        Cow::Borrowed(text) => {
+                            run_logfmt(text, *strict, *keep_empty, extractions, labels, |c| c)
+                        }
                         Cow::Owned(text) => {
-                            run_logfmt(text, extractions, labels, |c| Cow::Owned(c.into_owned()))
+                            run_logfmt(text, *strict, *keep_empty, extractions, labels, |c| {
+                                Cow::Owned(c.into_owned())
+                            })
                         }
                     }
                 }
@@ -690,6 +784,61 @@ impl CompiledPipeline {
                         }
                     }
                 }
+                CompiledStage::Unpack => {
+                    // Reads the current line; returns the promoted `_entry`
+                    // (owned) when present. The immutable borrow of `line`
+                    // ends when `run_unpack` returns, so reassigning `line`
+                    // afterward is sound.
+                    if let Some(entry) = run_unpack(line.as_ref(), labels) {
+                        line = Cow::Owned(entry);
+                    }
+                }
+                CompiledStage::Decolorize(re) => {
+                    // Zero-alloc when nothing matches: `replace_all` returns
+                    // a borrow, which we resolve to `None` so no owned line is
+                    // built and the borrow of `line` ends before reassignment.
+                    let stripped = match re.replace_all(line.as_ref(), "") {
+                        Cow::Owned(s) => Some(s),
+                        Cow::Borrowed(_) => None,
+                    };
+                    if let Some(s) = stripped {
+                        line = Cow::Owned(s);
+                    }
+                }
+                CompiledStage::Drop(elems) => {
+                    for elem in elems {
+                        let drop = match &elem.matcher {
+                            // Bare label: drop unconditionally (a no-op when
+                            // the label is absent).
+                            None => true,
+                            // Matcher present: drop only when the current
+                            // value matches (a missing label is never a match).
+                            Some(m) => get_label(labels, &elem.label).is_some_and(|v| m.matches(v)),
+                        };
+                        if drop {
+                            remove_label(labels, &elem.label);
+                            // Dropping `__error__` clears its detail companion
+                            // too (they are one error record).
+                            if elem.label == ERROR_LABEL {
+                                remove_label(labels, ERROR_DETAILS_LABEL);
+                            }
+                        }
+                    }
+                }
+                CompiledStage::Keep(elems) => {
+                    // Retain only labels matched by some element (a bare
+                    // element retains its label; a matcher-qualified element
+                    // retains only on a value match).
+                    labels.retain(|(k, v)| {
+                        elems.iter().any(|elem| {
+                            elem.label == k.as_ref()
+                                && match &elem.matcher {
+                                    None => true,
+                                    Some(m) => m.matches(v),
+                                }
+                        })
+                    });
+                }
             }
         }
 
@@ -703,6 +852,38 @@ impl CompiledPipeline {
 
 fn compile_regex(pattern: &str) -> Result<regex::Regex, PipelineError> {
     regex::Regex::new(pattern).map_err(|e| PipelineError::BadRegex(e.to_string()))
+}
+
+/// The ANSI SGR (Select Graphic Rendition) color-escape pattern
+/// `decolorize` strips (issue #200): an ESC (`\x1b`) `[`, zero or more
+/// digits/`;`, terminated by `m`. Pinned to the documented color-code
+/// semantics — broader ANSI stripping is deliberately out of scope.
+const DECOLORIZE_PATTERN: &str = r"\x1b\[[0-9;]*m";
+
+/// Compiles a `drop`/`keep` element list once per query: each element's
+/// optional `Re`/`Nre` matcher is anchored-compiled here so the per-line
+/// path never touches the regex compiler (issue #200).
+fn compile_drop_keep(elems: &[DropKeepElem]) -> Result<Vec<CompiledDropKeep>, PipelineError> {
+    elems
+        .iter()
+        .map(|e| {
+            let matcher = match &e.matcher {
+                None => None,
+                Some(LabelMatch { op, value }) => Some(CompiledDropKeepMatch {
+                    op: *op,
+                    value: value.clone(),
+                    re: match op {
+                        MatchOp::Re | MatchOp::Nre => Some(compile_anchored_regex(value)?),
+                        MatchOp::Eq | MatchOp::Neq => None,
+                    },
+                }),
+            };
+            Ok(CompiledDropKeep {
+                label: e.label.clone(),
+                matcher,
+            })
+        })
+        .collect()
 }
 
 /// Fully-anchored matcher regex (Prometheus label-matcher semantics) —
@@ -724,7 +905,13 @@ fn compile_parser(p: &ParserStage) -> Result<CompiledStage, PipelineError> {
                 extractions: compiled,
             })
         }
-        ParserStage::Logfmt { extractions } => Ok(CompiledStage::Logfmt {
+        ParserStage::Logfmt {
+            strict,
+            keep_empty,
+            extractions,
+        } => Ok(CompiledStage::Logfmt {
+            strict: *strict,
+            keep_empty: *keep_empty,
             extractions: extractions
                 .iter()
                 .map(|e| (e.label.clone(), e.expression.clone()))
@@ -1093,15 +1280,53 @@ fn go_duration_parse_error(value: &str) -> String {
     )
 }
 
-/// Streams-path `__error_details__` for a `LogfmtParserErr` (issue #99,
-/// oracle_probe.txt [2]). Our only logfmt error site is an unterminated
-/// quoted value, which always runs to EOF, so Loki's 1-based position is
-/// one past the line's final rune. Loki sets `LogfmtParserErr` only under
-/// `| logfmt --strict` (we have no such flag; the trigger already diverges
-/// per #72) — this reproduces the detail string for that class.
-fn logfmt_error_details(text: &str) -> String {
-    let pos = text.chars().count() + 1;
-    format!("logfmt syntax error at pos {pos} : unterminated quoted value")
+/// A logfmt decoder error the walker reports (issue #200): the 1-based
+/// rune position plus the malformed class. Under `--strict` this becomes a
+/// `LogfmtParserErr`; the default (lenient) path swallows it after keeping
+/// the pairs decoded before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogfmtErr {
+    pos: usize,
+    kind: LogfmtErrKind,
+}
+
+/// The malformed-token classes `--strict` detects (clean-room from the
+/// logfmt grammar + observed reference behaviour; issue #200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogfmtErrKind {
+    /// A `"`-opened value with no closing quote before whitespace/EOF.
+    UnterminatedQuote,
+    /// An `=` where a key is expected — a token starting with `=`, or an
+    /// `=` immediately after a completed bare value (`a=1=2`).
+    UnexpectedEquals,
+    /// A byte the decoder rejects where a key or unquoted value is
+    /// expected — a `"` opening a key, a control byte `<0x20` mid-key, or a
+    /// `"` following an unquoted value. Carries the offending byte so the
+    /// message can name it (`unexpected '<char>'`), matching the reference
+    /// (v3.7.3), which has no static "invalid key" text.
+    InvalidKey(char),
+}
+
+/// Streams-path `__error_details__` for a `--strict` `LogfmtParserErr`
+/// (issue #99 detail-string precedent, extended for #200). Byte-exact for
+/// the unterminated-quote class (`pos = runes+1`, oracle_probe.txt [2]);
+/// faithful-format (same structure, ledgered position) for the
+/// `unexpected '='` class. The `InvalidKey` class renders
+/// `unexpected '<char>'` naming the offending byte, matching the reference
+/// (v3.7.3) — the `__error__` LABEL is always correct.
+fn logfmt_error_details(err: LogfmtErr) -> String {
+    let reason = match err.kind {
+        LogfmtErrKind::UnterminatedQuote => "unterminated quoted value".to_string(),
+        LogfmtErrKind::UnexpectedEquals => "unexpected '='".to_string(),
+        LogfmtErrKind::InvalidKey(ch) => format!("unexpected '{ch}'"),
+    };
+    format!("logfmt syntax error at pos {} : {reason}", err.pos)
+}
+
+/// The 1-based rune position of the byte at `byte_off` in `text` — Loki's
+/// `pos` numbering.
+fn logfmt_rune_pos(text: &str, byte_off: usize) -> usize {
+    text[..byte_off].chars().count() + 1
 }
 
 // ---------------------------------------------------------------------
@@ -1553,20 +1778,101 @@ fn json_scalar_to_string(v: &serde_json::Value) -> String {
 }
 
 // ---------------------------------------------------------------------
+// unpack
+// ---------------------------------------------------------------------
+
+/// `| unpack` (issue #200): parse the line as a packed JSON object,
+/// promoting a string `_entry` field back to the line (returned owned) and
+/// other string fields to labels via the shared `<key>_extracted`
+/// collision rule; non-string fields are skipped. A non-object line or a
+/// parse failure keeps the line and tags `__error__="JSONParserErr"` with
+/// the representative detail — the same malformed class `json` reports.
+/// Returns `Some(new_line)` only when a string `_entry` field was present.
+fn run_unpack<'a>(line: &str, labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>) -> Option<String> {
+    let map = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => {
+            set_label(
+                labels,
+                Cow::Borrowed(ERROR_LABEL),
+                Cow::Borrowed("JSONParserErr"),
+            );
+            set_label(
+                labels,
+                Cow::Borrowed(ERROR_DETAILS_LABEL),
+                Cow::Borrowed(JSON_ERROR_DETAILS),
+            );
+            return None;
+        }
+    };
+    let mut new_line = None;
+    for (k, v) in map {
+        // Only string fields participate; other JSON value types are skipped.
+        if let serde_json::Value::String(s) = v {
+            if k == "_entry" {
+                new_line = Some(s);
+            } else {
+                add_extracted(labels, Cow::Owned(k), Cow::Owned(s));
+            }
+        }
+    }
+    new_line
+}
+
+// ---------------------------------------------------------------------
 // logfmt
 // ---------------------------------------------------------------------
 
-/// Applies the logfmt stage: pass 1 validates the whole line (a
-/// malformed line contributes NO pairs, only the error label), pass 2
-/// commits pairs through `to_cow` — the identity for the original body
-/// (captures stay borrowed slices) or a copy for a rewritten line.
+/// Applies the logfmt stage in a single streaming pass (issue #200): each
+/// decoded pair is dropped when its value is empty unless `keep_empty`,
+/// else committed through `to_cow` — the identity for the original body
+/// (captures stay borrowed slices) or a copy for a rewritten line. On the
+/// first decoder error the walk stops; under `strict` it tags
+/// `__error__="LogfmtParserErr"` plus the per-class detail, otherwise (the
+/// lenient default) it swallows the error, keeping the pairs already
+/// emitted before it (matching the reference's default best-effort logfmt).
 fn run_logfmt<'a, 't>(
     text: &'t str,
+    strict: bool,
+    keep_empty: bool,
     extractions: &'a [(String, String)],
     labels: &mut Vec<(Cow<'a, str>, Cow<'a, str>)>,
     to_cow: impl Fn(Cow<'t, str>) -> Cow<'a, str>,
 ) {
-    if walk_logfmt(text, &mut |_, _| {}).is_err() {
+    let result = if extractions.is_empty() {
+        walk_logfmt(text, &mut |k, v| {
+            if !keep_empty && v.is_empty() {
+                return;
+            }
+            add_extracted(labels, to_cow(Cow::Borrowed(k)), to_cow(v));
+        })
+    } else {
+        // Targeted extraction: resolve each requested source key to its
+        // first occurrence. The error verdict is identical across the
+        // per-key walks, so it is captured once (the first).
+        let mut err = Ok(());
+        for (label, source_key) in extractions {
+            let mut found: Option<Cow<'t, str>> = None;
+            let res = walk_logfmt(text, &mut |k, v| {
+                if found.is_none() && k == source_key {
+                    found = Some(v);
+                }
+            });
+            if err.is_ok() {
+                err = res;
+            }
+            let value = found.map(&to_cow).unwrap_or(Cow::Borrowed(""));
+            // The same empty-drop rule applies to a targeted miss/empty.
+            if !keep_empty && value.is_empty() {
+                continue;
+            }
+            add_extracted(labels, Cow::Borrowed(label.as_str()), value);
+        }
+        err
+    };
+    if let Err(err) = result
+        && strict
+    {
         set_label(
             labels,
             Cow::Borrowed(ERROR_LABEL),
@@ -1575,65 +1881,88 @@ fn run_logfmt<'a, 't>(
         set_label(
             labels,
             Cow::Borrowed(ERROR_DETAILS_LABEL),
-            Cow::Owned(logfmt_error_details(text)),
+            Cow::Owned(logfmt_error_details(err)),
         );
-        return;
-    }
-    if extractions.is_empty() {
-        // Infallible: pass 1 above validated the line.
-        let _ = walk_logfmt(text, &mut |k, v| {
-            add_extracted(labels, to_cow(Cow::Borrowed(k)), to_cow(v));
-        });
-    } else {
-        for (label, source_key) in extractions {
-            let mut found: Option<Cow<'t, str>> = None;
-            let _ = walk_logfmt(text, &mut |k, v| {
-                if found.is_none() && k == source_key {
-                    found = Some(v);
-                }
-            });
-            let value = found.map(&to_cow).unwrap_or(Cow::Borrowed(""));
-            add_extracted(labels, Cow::Borrowed(label.as_str()), value);
-        }
     }
 }
 
-/// Minimal logfmt walk: space-separated `key=value` pairs, double-quoted
-/// values with `\"`/`\\` escapes, bare keys => empty value. Values are
-/// borrowed slices of `text` except quoted values containing an escape
-/// (unescaping forces the only owned path). The only malformed class is
-/// an unterminated quoted value (`Err`, sink output must be discarded).
-fn walk_logfmt<'t>(text: &'t str, sink: &mut impl FnMut(&'t str, Cow<'t, str>)) -> Result<(), ()> {
-    let mut rest = text.trim_start();
-    while !rest.is_empty() {
-        let key_end = rest
-            .find(|c: char| c == '=' || c.is_whitespace())
-            .unwrap_or(rest.len());
-        let key = &rest[..key_end];
-        rest = &rest[key_end..];
+/// Minimal logfmt walk (issue #200): whitespace-separated `key[=value]`
+/// tokens, double-quoted values with `\"`/`\\` escapes, bare keys emitting
+/// an empty value. Values are borrowed slices of `text` except quoted
+/// values containing an escape (the only owned path). Pairs are emitted to
+/// `sink` as they decode (including any preceding a later error). Returns
+/// `Err` on the first malformed token — an unterminated quote, an
+/// unexpected `=`, or an invalid key — carrying its 1-based rune position;
+/// the caller decides strict (error) vs lenient (swallow, keep the pairs).
+fn walk_logfmt<'t>(
+    text: &'t str,
+    sink: &mut impl FnMut(&'t str, Cow<'t, str>),
+) -> Result<(), LogfmtErr> {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Skip inter-token whitespace.
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        // A token opening with `=` has an empty key.
+        if bytes[i] == b'=' {
+            return Err(LogfmtErr {
+                pos: logfmt_rune_pos(text, i),
+                kind: LogfmtErrKind::UnexpectedEquals,
+            });
+        }
+        // Key: a maximal run of bytes that are not whitespace/`=`/`"`/control.
+        // A `"` or a control byte mid-key is an invalid key.
+        let key_start = i;
+        while i < len {
+            let b = bytes[i];
+            if b == b'=' || b.is_ascii_whitespace() {
+                break;
+            }
+            if b == b'"' || b < 0x20 {
+                return Err(LogfmtErr {
+                    pos: logfmt_rune_pos(text, i),
+                    kind: LogfmtErrKind::InvalidKey(b as char),
+                });
+            }
+            i += 1;
+        }
+        let key = &text[key_start..i];
         let mut value: Cow<'t, str> = Cow::Borrowed("");
-        if let Some(after_eq) = rest.strip_prefix('=') {
-            if let Some(after_quote) = after_eq.strip_prefix('"') {
+        if i < len && bytes[i] == b'=' {
+            i += 1; // consume '='
+            if i < len && bytes[i] == b'"' {
+                i += 1; // opening quote
+                let content_start = i;
                 let mut escaped = false;
-                let mut closed_at = None;
-                let mut chars = after_quote.char_indices();
-                while let Some((i, c)) = chars.next() {
+                let mut closed_at: Option<usize> = None;
+                let mut chars = text[content_start..].char_indices();
+                while let Some((off, c)) = chars.next() {
                     match c {
                         '\\' => {
                             escaped = true;
                             chars.next();
                         }
                         '"' => {
-                            closed_at = Some(i);
+                            closed_at = Some(content_start + off);
                             break;
                         }
                         _ => {}
                     }
                 }
-                let Some(end) = closed_at else {
-                    return Err(()); // unterminated quote
+                let Some(close) = closed_at else {
+                    // Unterminated quote at EOF: pos is one past the final rune.
+                    return Err(LogfmtErr {
+                        pos: logfmt_rune_pos(text, len),
+                        kind: LogfmtErrKind::UnterminatedQuote,
+                    });
                 };
-                let raw = &after_quote[..end];
+                let raw = &text[content_start..close];
                 value = if escaped {
                     let mut out = String::with_capacity(raw.len());
                     let mut cs = raw.chars();
@@ -1650,17 +1979,32 @@ fn walk_logfmt<'t>(text: &'t str, sink: &mut impl FnMut(&'t str, Cow<'t, str>)) 
                 } else {
                     Cow::Borrowed(raw)
                 };
-                rest = &after_quote[end + 1..];
+                i = close + 1; // past the closing quote
             } else {
-                let val_end = after_eq.find(char::is_whitespace).unwrap_or(after_eq.len());
-                value = Cow::Borrowed(&after_eq[..val_end]);
-                rest = &after_eq[val_end..];
+                // Bare value: a run of bytes up to the next whitespace or
+                // `=`. A value ending at `=` (a second `key=` with no
+                // separating whitespace) leaves the loop pointing at that
+                // `=`, which the next iteration reports as an unexpected `=`
+                // — the completed pair is emitted first (streaming decode).
+                let val_start = i;
+                while i < len {
+                    let b = bytes[i];
+                    // A `"` terminates the unquoted value the same way an `=`
+                    // does: the completed pair is emitted, then the next
+                    // iteration's key walk reports the `"` as unexpected at
+                    // key position (reference v3.7.3: `a=1"b"` keeps `a="1"`
+                    // and errors `unexpected '"'` at the pos of the `"`).
+                    if b.is_ascii_whitespace() || b == b'=' || b == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                value = Cow::Borrowed(&text[val_start..i]);
             }
         }
         if !key.is_empty() {
             sink(key, value);
         }
-        rest = rest.trim_start();
     }
     Ok(())
 }

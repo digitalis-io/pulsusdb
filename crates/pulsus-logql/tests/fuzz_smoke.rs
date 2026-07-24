@@ -158,6 +158,16 @@ fn parse_never_panics_on_fixed_adversarial_cases() {
         "\0\0\0\0",
         "日本語日本語日本語",
         r#"{app="日本語", env=~"テスト.*"}"#,
+        // Issue #200: the `--flag` lexer boundary and the new stages.
+        "--",
+        "--strict",
+        "a--b",
+        "{a=\"b\"} | logfmt --strict --keep-empty",
+        "{a=\"b\"} | logfmt --unknown",
+        "{a=\"b\"} | drop",
+        "{a=\"b\"} | drop level, status=~\"5..\"",
+        "{a=\"b\"} | keep",
+        "{a=\"b\"} | unpack | decolorize",
     ];
     for case in cases {
         let _ = parse(case);

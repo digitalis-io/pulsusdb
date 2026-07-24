@@ -333,8 +333,17 @@ fn walk_stage(stage: &Stage, out: &mut BTreeSet<String>) {
                 ParserStage::Json { extractions } if !extractions.is_empty() => {
                     out.insert("parser.json.expressions".to_string());
                 }
-                ParserStage::Logfmt { extractions } if !extractions.is_empty() => {
-                    out.insert("parser.logfmt.expressions".to_string());
+                ParserStage::Logfmt {
+                    strict,
+                    keep_empty,
+                    extractions,
+                } => {
+                    if !extractions.is_empty() {
+                        out.insert("parser.logfmt.expressions".to_string());
+                    }
+                    if *strict || *keep_empty {
+                        out.insert("parser.logfmt.flags".to_string());
+                    }
                 }
                 ParserStage::Regexp(_) | ParserStage::Pattern(_) => {
                     out.insert("statics.string".to_string());
@@ -374,6 +383,18 @@ fn walk_stage(stage: &Stage, out: &mut BTreeSet<String>) {
                 }
                 .to_string(),
             );
+        }
+        Stage::Unpack => {
+            out.insert("stage.unpack".to_string());
+        }
+        Stage::Decolorize => {
+            out.insert("stage.decolorize".to_string());
+        }
+        Stage::Drop(_) => {
+            out.insert("stage.drop".to_string());
+        }
+        Stage::Keep(_) => {
+            out.insert("stage.keep".to_string());
         }
     }
 }
@@ -652,6 +673,8 @@ fn parser_all() -> Vec<ParserStage> {
             extractions: vec![],
         },
         ParserStage::Logfmt {
+            strict: false,
+            keep_empty: false,
             extractions: vec![],
         },
         ParserStage::Regexp(String::new()),
@@ -1004,9 +1027,9 @@ fn differential_categories_are_pinned() {
         unescalated_divergence.is_empty(),
         "supported constructs the reference rejects (unescalated divergences): {unescalated_divergence:?}"
     );
-    assert_eq!(supported, 89, "supported (both-accept agreement) count pin");
+    assert_eq!(supported, 94, "supported (both-accept agreement) count pin");
     assert_eq!(
-        tracked_interim, 8,
+        tracked_interim, 3,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"
     );
     assert_eq!(

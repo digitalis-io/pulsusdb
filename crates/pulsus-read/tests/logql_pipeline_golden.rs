@@ -199,7 +199,10 @@ fn json_sanitizes_extracted_keys_and_prefixes_leading_digits() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn logfmt_splits_pairs_with_quoted_values_and_bare_keys() {
+fn logfmt_splits_pairs_with_quoted_values_and_drops_empty_bare_keys() {
+    // Default-behaviour correction (issue #200): the default `| logfmt` is
+    // reference-lenient and DROPS empty-value extractions — the bare key
+    // `retry` no longer appears (previously the pre-existing #72 over-keep).
     let (got, _) = run(
         r#"{a="b"} | logfmt"#,
         r#"level=error msg="conn \"lost\"" retry took=250ms"#,
@@ -212,37 +215,74 @@ fn logfmt_splits_pairs_with_quoted_values_and_bare_keys() {
             ("env", "prod"),
             ("level", "error"),
             ("msg", r#"conn "lost""#),
-            ("retry", ""), // bare key => empty value
             ("took", "250ms"),
+            // `retry` (bare key => empty value) is dropped by default.
         ])
     );
 }
 
 #[test]
-fn logfmt_unterminated_quote_is_kept_with_the_exact_error_label() {
-    let (got, line) = run(r#"{a="b"} | logfmt"#, r#"level="unterminated"#).unwrap();
+fn logfmt_default_is_lenient_on_malformed_lines() {
+    // Default `| logfmt` NEVER sets `__error__` (issue #200 — reference
+    // default is lenient best-effort, resolving the pre-existing #72
+    // over-eager trigger). Pairs decoded before the malformed token are
+    // kept; the error is swallowed.
+    //
+    // (a) An unterminated quote after a valid pair: `foo=bar` survives.
+    let (got, line) = run(r#"{a="b"} | logfmt"#, r#"foo="bar" baz="qux"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("foo", "bar")])
+    );
+    assert_eq!(
+        line, r#"foo="bar" baz="qux"#,
+        "parsers never rewrite the line"
+    );
+
+    // (b) An unterminated quote as the first token: no extracted label, no
+    // `__error__`.
+    let (got, _) = run(r#"{a="b"} | logfmt"#, r#"level="unterminated"#).unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+}
+
+#[test]
+fn logfmt_targeted_extraction_drops_a_missing_source_by_default() {
+    // The empty-drop rule applies uniformly to a targeted-extraction miss
+    // (issue #200): `missing` (no `nope` key in the line) is dropped by
+    // default, leaving only the renamed `lvl`.
+    let (got, _) = run(
+        r#"{a="b"} | logfmt lvl="level", missing="nope""#,
+        "level=warn other=x",
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("lvl", "warn")])
+    );
+}
+
+#[test]
+fn logfmt_keep_empty_retains_empty_value_keys() {
+    // `--keep-empty` retains empty-value extractions (issue #200): the bare
+    // key `retry` and the targeted miss `missing` come back as `""`.
+    let (got, _) = run(
+        r#"{a="b"} | logfmt --keep-empty"#,
+        "level=error retry took=250ms",
+    )
+    .unwrap();
     assert_eq!(
         got,
         labels(&[
             ("app", "checkout"),
             ("env", "prod"),
-            ("__error__", "LogfmtParserErr"),
-            // issue #99: `level="unterminated` is 19 runes; Loki's 1-based
-            // position for the unterminated quote at EOF is one past the
-            // final rune (oracle_probe.txt [2]).
-            (
-                "__error_details__",
-                "logfmt syntax error at pos 20 : unterminated quoted value",
-            ),
+            ("level", "error"),
+            ("retry", ""),
+            ("took", "250ms"),
         ])
     );
-    assert_eq!(line, r#"level="unterminated"#);
-}
 
-#[test]
-fn logfmt_targeted_extraction_renames_the_source_key() {
     let (got, _) = run(
-        r#"{a="b"} | logfmt lvl="level", missing="nope""#,
+        r#"{a="b"} | logfmt --keep-empty lvl="level", missing="nope""#,
         "level=warn other=x",
     )
     .unwrap();
@@ -255,6 +295,263 @@ fn logfmt_targeted_extraction_renames_the_source_key() {
             ("missing", ""),
         ])
     );
+}
+
+#[test]
+fn logfmt_strict_errors_per_malformed_class() {
+    // `--strict` sets `__error__="LogfmtParserErr"` for every malformed
+    // class (issue #200). Detail is byte-exact for the unterminated-quote
+    // class (oracle_probe.txt [2]) and faithful-format for the others (the
+    // LABEL is always correct; only the detail STRING is ledgered).
+
+    // (1) Unterminated quote — `level="unterminated` is 19 runes, pos 20.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"level="unterminated"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                "logfmt syntax error at pos 20 : unterminated quoted value",
+            ),
+        ])
+    );
+
+    // (2) Unexpected `=` — `a=1=2`: the completed `a="1"` pair is kept, the
+    // second `=` (rune pos 4) is unexpected.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, "a=1=2").unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("a", "1"),
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                "logfmt syntax error at pos 4 : unexpected '='",
+            ),
+        ])
+    );
+
+    // (3) A `"` opening a key at rune pos 1 is unexpected. Expected values
+    // captured against the pinned reference (v3.7.3): the reference names
+    // the offending byte (`unexpected '"'`) and has no "invalid key" text.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#""quoted=1"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                r#"logfmt syntax error at pos 1 : unexpected '"'"#,
+            ),
+        ])
+    );
+
+    // (4) A `"` following an UNQUOTED value is unexpected. Reference
+    // (v3.7.3): `a=1"b"` → pos 4 `unexpected '"'`; the completed `a="1"`
+    // pair before the fault is kept.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a=1"b""#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("a", "1"),
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "LogfmtParserErr"),
+            (
+                "__error_details__",
+                r#"logfmt syntax error at pos 4 : unexpected '"'"#,
+            ),
+        ])
+    );
+
+    // (5) Parity lock: after a CLOSED quoted value the next token may start
+    // with no separating whitespace. Reference (v3.7.3): `a="b"c=1` is
+    // ACCEPTED as `{a="b", c="1"}` with NO `__error__` — the
+    // whitespace-after-close-quote strictness a code-review proposed would
+    // have wrongly diverged here.
+    let (got, _) = run(r#"{a="b"} | logfmt --strict"#, r#"a="b"c=1"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[("a", "b"), ("app", "checkout"), ("c", "1"), ("env", "prod"),])
+    );
+}
+
+// ---------------------------------------------------------------------
+// unpack (issue #200)
+// ---------------------------------------------------------------------
+
+#[test]
+fn unpack_promotes_entry_to_the_line_and_string_fields_to_labels() {
+    let (got, line) = run(
+        r#"{a="b"} | unpack"#,
+        r#"{"_entry":"the real log line","level":"info","count":5,"nested":{"x":1}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("level", "info"),
+            // `count` (number) and `nested` (object) are skipped — only
+            // string fields become labels.
+        ])
+    );
+    assert_eq!(line, "the real log line");
+}
+
+#[test]
+fn unpack_without_an_entry_field_keeps_the_line_and_promotes_labels() {
+    let (got, line) = run(r#"{a="b"} | unpack"#, r#"{"level":"warn","svc":"api"}"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("level", "warn"),
+            ("svc", "api"),
+        ])
+    );
+    assert_eq!(line, r#"{"level":"warn","svc":"api"}"#);
+}
+
+#[test]
+fn unpack_malformed_line_is_kept_with_the_json_error_label() {
+    let (got, line) = run(r#"{a="b"} | unpack"#, "not a json object").unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("__error__", "JSONParserErr"),
+            (
+                "__error_details__",
+                "Value looks like object, but can't find closing '}' symbol",
+            ),
+        ])
+    );
+    assert_eq!(line, "not a json object");
+}
+
+#[test]
+fn unpack_collision_with_a_stream_label_lands_under_the_extracted_suffix() {
+    let (got, _) = run(r#"{a="b"} | unpack"#, r#"{"app":"other","x":"1"}"#).unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("app_extracted", "other"),
+            ("env", "prod"),
+            ("x", "1"),
+        ])
+    );
+}
+
+// ---------------------------------------------------------------------
+// decolorize (issue #200)
+// ---------------------------------------------------------------------
+
+#[test]
+fn decolorize_strips_ansi_color_escapes() {
+    let (got, line) = run(
+        r#"{a="b"} | decolorize"#,
+        "\u{1b}[31merror:\u{1b}[0m disk full",
+    )
+    .unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(line, "error: disk full");
+}
+
+#[test]
+fn decolorize_leaves_a_line_without_color_codes_unchanged() {
+    let (got, line) = run(r#"{a="b"} | decolorize"#, "plain message").unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+    assert_eq!(line, "plain message");
+}
+
+// ---------------------------------------------------------------------
+// drop / keep (issue #200)
+// ---------------------------------------------------------------------
+
+#[test]
+fn drop_removes_a_bare_label() {
+    let (got, _) = run(r#"{a="b"} | logfmt | drop level"#, "level=info msg=hi").unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("msg", "hi")])
+    );
+}
+
+#[test]
+fn drop_with_a_value_matcher_only_removes_on_a_match() {
+    let (got, _) = run(
+        r#"{a="b"} | logfmt | drop level="info""#,
+        "level=info msg=hi",
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[("app", "checkout"), ("env", "prod"), ("msg", "hi")])
+    );
+    // A non-matching value keeps the label.
+    let (got, _) = run(
+        r#"{a="b"} | logfmt | drop level="info""#,
+        "level=warn msg=hi",
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        labels(&[
+            ("app", "checkout"),
+            ("env", "prod"),
+            ("level", "warn"),
+            ("msg", "hi"),
+        ])
+    );
+}
+
+#[test]
+fn drop_error_clears_the_error_detail_companion() {
+    // A malformed json sets `__error__` + `__error_details__`; dropping
+    // `__error__` clears BOTH (they are one error record).
+    let (got, _) = run(r#"{a="b"} | json | drop __error__"#, "not json").unwrap();
+    assert_eq!(got, labels(&[("app", "checkout"), ("env", "prod")]));
+}
+
+#[test]
+fn keep_retains_only_the_listed_labels() {
+    let (got, _) = run(
+        r#"{a="b"} | logfmt | keep app, level"#,
+        "level=info msg=hi svc=api",
+    )
+    .unwrap();
+    // Only `app` and `level` survive — the `env` stream label, `msg`, and
+    // `svc` are all dropped.
+    assert_eq!(got, labels(&[("app", "checkout"), ("level", "info")]));
+}
+
+#[test]
+fn keep_with_a_value_matcher_retains_only_on_a_match() {
+    let (got, _) = run(
+        r#"{a="b"} | logfmt | keep level="info""#,
+        "level=info msg=hi",
+    )
+    .unwrap();
+    assert_eq!(got, labels(&[("level", "info")]));
+    // A non-matching value drops it too — nothing is kept.
+    let (got, _) = run(
+        r#"{a="b"} | logfmt | keep level="info""#,
+        "level=warn msg=hi",
+    )
+    .unwrap();
+    assert_eq!(got, labels(&[]));
 }
 
 // ---------------------------------------------------------------------

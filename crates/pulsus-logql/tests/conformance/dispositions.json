@@ -1,5 +1,5 @@
 {
-  "interim_count_pin": 10,
+  "interim_count_pin": 5,
   "entries": [
     {
       "construct": "matcher.eq",
@@ -73,9 +73,8 @@
     },
     {
       "construct": "parser.logfmt.flags",
-      "status": "interim-generic",
-      "oracle": "accept",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "parser.regexp",
@@ -462,31 +461,23 @@
     },
     {
       "construct": "stage.unpack",
-      "status": "interim-named",
-      "oracle": "accept",
-      "error_construct": "unpack",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "stage.drop",
-      "status": "interim-named",
-      "oracle": "accept",
-      "error_construct": "drop",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "stage.keep",
-      "status": "interim-named",
-      "oracle": "accept",
-      "error_construct": "keep",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "stage.decolorize",
-      "status": "interim-named",
-      "oracle": "accept",
-      "error_construct": "decolorize",
-      "owning_issue": 190
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "stage.distinct",

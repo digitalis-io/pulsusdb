@@ -12,10 +12,10 @@
 //! overlap in when they run (architect plan amendments 1-3).
 
 use crate::ast::{
-    self, BinModifier, BinOp, CompareOp, Expr, Grouping, GroupingKind, LabelExtraction,
-    LabelFilterExpr, LabelFmt, LineFilter, LineFilterOp, LogExpr, LogRange, MatchOp, Matcher,
-    MetricExpr, NumericLiteral, ParserStage, RangeAggOp, Stage, StreamSelector, Unwrap,
-    VectorAggOp,
+    self, BinModifier, BinOp, CompareOp, DropKeepElem, Expr, Grouping, GroupingKind,
+    LabelExtraction, LabelFilterExpr, LabelFmt, LabelMatch, LineFilter, LineFilterOp, LogExpr,
+    LogRange, MatchOp, Matcher, MetricExpr, NumericLiteral, ParserStage, RangeAggOp, Stage,
+    StreamSelector, Unwrap, VectorAggOp,
 };
 use crate::duration;
 use crate::error::{LogQlError, MAX_DEPTH};
@@ -214,6 +214,7 @@ fn describe(kind: &TokenKind) -> String {
         TokenKind::PipeMatch => "'|~'".to_string(),
         TokenKind::Pipe => "'|'".to_string(),
         TokenKind::Ident(s) => format!("identifier {s:?}"),
+        TokenKind::Flag(s) => format!("flag \"--{s}\""),
         TokenKind::String(s) => format!("string {s:?}"),
         TokenKind::Duration(s) => format!("duration {s:?}"),
         TokenKind::Number(s) => format!("number {s:?}"),
@@ -590,7 +591,10 @@ fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
             }
             "logfmt" => {
                 cursor.advance();
+                let (strict, keep_empty) = parse_logfmt_flags(cursor)?;
                 Ok(Stage::Parser(ParserStage::Logfmt {
+                    strict,
+                    keep_empty,
                     extractions: parse_extraction_list(cursor)?,
                 }))
             }
@@ -616,6 +620,22 @@ fn parse_pipe_stage(cursor: &mut Cursor<'_>) -> Result<Stage, LogQlError> {
             "unwrap" => {
                 cursor.advance();
                 Ok(Stage::Unwrap(parse_unwrap(cursor)?))
+            }
+            "unpack" => {
+                cursor.advance();
+                Ok(Stage::Unpack)
+            }
+            "decolorize" => {
+                cursor.advance();
+                Ok(Stage::Decolorize)
+            }
+            "drop" => {
+                cursor.advance();
+                Ok(Stage::Drop(parse_drop_keep_list(cursor)?))
+            }
+            "keep" => {
+                cursor.advance();
+                Ok(Stage::Keep(parse_drop_keep_list(cursor)?))
             }
             name if ast::REMAINING_UNSUPPORTED_STAGES.contains(&name) => {
                 Err(LogQlError::NotYetSupported {
@@ -656,6 +676,62 @@ fn parse_extraction_list(cursor: &mut Cursor<'_>) -> Result<Vec<LabelExtraction>
             label.clone()
         };
         out.push(LabelExtraction { label, expression });
+        if matches!(cursor.peek().kind, TokenKind::Comma) {
+            cursor.advance();
+            continue;
+        }
+        break;
+    }
+    Ok(out)
+}
+
+/// Consumes any leading `--strict` / `--keep-empty` flag tokens after the
+/// `logfmt` keyword (issue #200), returning `(strict, keep_empty)`. Flags
+/// may appear in any order; a repeated flag is idempotent; any other flag
+/// name is an `UnexpectedToken` (never a silent ignore).
+fn parse_logfmt_flags(cursor: &mut Cursor<'_>) -> Result<(bool, bool), LogQlError> {
+    let mut strict = false;
+    let mut keep_empty = false;
+    while let TokenKind::Flag(name) = &cursor.peek().kind {
+        match name.as_str() {
+            "strict" => strict = true,
+            "keep-empty" => keep_empty = true,
+            other => {
+                let tok = cursor.peek();
+                return Err(LogQlError::UnexpectedToken {
+                    found: format!("flag \"--{other}\""),
+                    expected: "'--strict' or '--keep-empty'".to_string(),
+                    span: tok.span,
+                });
+            }
+        }
+        cursor.advance();
+    }
+    Ok((strict, keep_empty))
+}
+
+/// `drop`/`keep` element list: one or more `ident [<op> "value"]` entries,
+/// comma-separated (issue #200). At least one element is required; the
+/// optional value matcher accepts `=`/`!=`/`=~`/`!~`.
+fn parse_drop_keep_list(cursor: &mut Cursor<'_>) -> Result<Vec<DropKeepElem>, LogQlError> {
+    let mut out = Vec::new();
+    loop {
+        let (label, _) = cursor.expect_ident()?;
+        let matcher = match cursor.peek().kind {
+            TokenKind::Eq => Some(MatchOp::Eq),
+            TokenKind::Neq => Some(MatchOp::Neq),
+            TokenKind::Re => Some(MatchOp::Re),
+            TokenKind::Nre => Some(MatchOp::Nre),
+            _ => None,
+        };
+        let matcher = if let Some(op) = matcher {
+            cursor.advance();
+            let (value, _) = cursor.expect_string()?;
+            Some(LabelMatch { op, value })
+        } else {
+            None
+        };
+        out.push(DropKeepElem { label, matcher });
         if matches!(cursor.peek().kind, TokenKind::Comma) {
             cursor.advance();
             continue;
