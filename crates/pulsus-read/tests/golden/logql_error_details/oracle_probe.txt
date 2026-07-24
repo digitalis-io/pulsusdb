@@ -71,7 +71,7 @@ STREAMS PATH — the three error classes (issue #99 scope)
 
   => pos = (rune length of the line) + 1 for the unterminated-quote-at-EOF
      class — reproduced byte-exact. LEDGERED: every other Loki logfmt
-     syntax-error class (unexpected '=', invalid key, ...) is not an error
+     syntax-error class (unexpected '=', unexpected '"', unterminated quoted value, ...) is not an error
      site in our parser.
 
 [3] LabelFilterErr (query: {probe="..."} | logfmt | <field> <op> <lit>)
@@ -238,7 +238,13 @@ faithful-format (same structure, ledgered position) for the others.
     __error_details__ = logfmt syntax error at pos 4 : unexpected '='             [faithful-format]
   INPUT `"quoted=1`  (a `"` opens the key)  =>
     __error__         = LogfmtParserErr
-    __error_details__ = logfmt syntax error at pos 1 : invalid key                [faithful-format]
+    __error_details__ = logfmt syntax error at pos 1 : unexpected '"'              [byte-exact, v3.7.3]
+  INPUT `a=1"b"`  (a `"` follows an unquoted value)  =>
+    a="1"  kept (pair completed before the error), then:
+    __error__         = LogfmtParserErr
+    __error_details__ = logfmt syntax error at pos 4 : unexpected '"'              [byte-exact, v3.7.3]
+  NOTE: the reference renders `unexpected '<char>'` naming the offending byte
+    for a stray char at key position; there is no distinct "invalid key" text.
 
 ------------------------------------------------------------------------
 [D] unpack / decolorize / drop / keep
