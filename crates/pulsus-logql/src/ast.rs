@@ -536,6 +536,11 @@ pub enum MetricExpr {
     /// A bare scalar number (`2`, `0.95`) as a metric-expression operand
     /// (issue M6-10), raw text — parsed to `f64` by the planner.
     Literal(String),
+    /// `vector(<scalar>)` (issue #221): promotes a scalar to a vector
+    /// result (`{} => n`). Raw number text, kept for the same `Eq`/`Hash`
+    /// reason as [`MetricExpr::Literal`]. Only a `NUMBER` arg (mirrors
+    /// Loki v3.7.4's `vectorExpr` grammar, which rejects inner expressions).
+    VectorFn(String),
     /// A binary operation between metric expressions (issue M6-10).
     /// `modifier` carries the `bool` comparison modifier and (issue #91)
     /// the `on()`/`ignoring()`/`group_left()`/`group_right()` vector-
@@ -584,6 +589,7 @@ impl fmt::Display for MetricExpr {
                 write!(f, "{inner})")
             }
             MetricExpr::Literal(raw) => write!(f, "{raw}"),
+            MetricExpr::VectorFn(raw) => write!(f, "vector({raw})"),
             MetricExpr::Binary {
                 op,
                 modifier,
@@ -1032,7 +1038,7 @@ fn quote(value: &str) -> String {
 /// Pipeline stage keywords still outside the implemented set (issue #200
 /// flipped `unpack`/`drop`/`keep`/`decolorize` to first-class stages):
 /// recognized after a bare `|` and named in `NotYetSupported`.
-pub const REMAINING_UNSUPPORTED_STAGES: &[&str] = &["distinct", "ip"];
+pub const REMAINING_UNSUPPORTED_STAGES: &[&str] = &["ip"];
 
 /// The conversion functions `unwrap` accepts in its wrapped form.
 pub const UNWRAP_CONVERSIONS: &[&str] = &["duration", "duration_seconds", "bytes"];

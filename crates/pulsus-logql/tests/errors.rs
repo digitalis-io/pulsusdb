@@ -100,10 +100,39 @@ fn a_parameter_on_a_parameterless_vector_aggregation_is_rejected() {
 #[test]
 fn every_remaining_unsupported_stage_keyword_is_named() {
     // Issue #200 flipped `unpack`/`drop`/`keep`/`decolorize` to first-class
-    // stages; only `distinct`/`ip` remain out-of-subset.
-    for keyword in ["distinct", "ip"] {
+    // stages; issue #221 removed `distinct` (not a Loki v3.7.4 construct —
+    // reject-parity means a plain bad-stage rejection, not a placeholder
+    // `NotYetSupported`), so only `ip` remains out-of-subset.
+    assert_eq!(pulsus_logql::REMAINING_UNSUPPORTED_STAGES, &["ip"]);
+    for &keyword in pulsus_logql::REMAINING_UNSUPPORTED_STAGES {
         let query = format!(r#"{{a="b"}} | {keyword}"#);
         assert_not_yet_supported(&query, keyword);
+    }
+}
+
+#[test]
+fn distinct_stage_is_a_generic_rejection_not_not_yet_supported() {
+    // `distinct` is not a Loki v3.7.4 pipeline stage (issue #221); parity
+    // means it rejects as an ordinary bad stage. `| distinct foo` falls
+    // through to the label-filter parser, which fails on the missing
+    // operator — a generic `UnexpectedToken`, never `NotYetSupported`.
+    match parse(r#"{a="b"} | distinct foo"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("label-filter operator"), "{expected}");
+        }
+        other => panic!("expected a generic bad-stage rejection for distinct, got {other:?}"),
+    }
+}
+
+#[test]
+fn scalar_function_is_rejected() {
+    // Loki v3.7.4 has no `scalar()` function (issue #221); it rejects as an
+    // unknown aggregation function — a generic `UnexpectedToken`.
+    match parse(r#"scalar(rate({a="b"}[1m]))"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("aggregation function"), "{expected}");
+        }
+        other => panic!("expected scalar() to be rejected, got {other:?}"),
     }
 }
 

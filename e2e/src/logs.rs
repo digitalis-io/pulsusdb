@@ -3122,6 +3122,7 @@ mod tests {
                     walk(lhs).or_else(|| walk(rhs))
                 }
                 pulsus_logql::MetricExpr::Literal(_) => None,
+                pulsus_logql::MetricExpr::VectorFn(_) => None,
             }
         }
         let pulsus_logql::Expr::Metric(me) = expr else {
@@ -3192,6 +3193,10 @@ mod tests {
             }
             pulsus_read::logql::MetricNode::Scalar(v) => {
                 pulsus_read::logql::QueryResult::Scalar(*v)
+            }
+            pulsus_read::logql::MetricNode::VectorLit { value, window } => {
+                pulsus_read::logql::materialize_vector_lit(*value, window)
+                    .expect("vector() grid within bucket cap")
             }
             pulsus_read::logql::MetricNode::VectorAgg { aggs, inner } => {
                 pulsus_read::logql::apply_vector_aggs(

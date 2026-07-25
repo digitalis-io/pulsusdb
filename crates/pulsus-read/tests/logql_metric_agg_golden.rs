@@ -13,8 +13,8 @@ use pulsus_logql::{BinOp, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
-    QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, VectorSample, apply_vector_aggs,
-    combine_binary, plan, run_client_agg_rows,
+    QueryParams, QueryResult, ReadError, SAMPLE_EXTRACTION_ERROR, TooBroadReason, VectorSample,
+    apply_vector_aggs, combine_binary, materialize_vector_lit, plan, run_client_agg_rows,
 };
 
 fn ctx() -> PlanCtx<'static> {
@@ -1185,6 +1185,7 @@ fn eval_scalar_query(query: &str) -> f64 {
     fn eval(node: &MetricNode) -> Result<QueryResult, ReadError> {
         match node {
             MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
+            MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
             MetricNode::Binary {
                 op,
                 return_bool,
@@ -2420,6 +2421,199 @@ fn range_sort_is_a_passthrough_over_the_matrix() {
         assert_eq!(by_app["a"], vec![(0, 5.0), (STEP, 1.0)]);
         assert_eq!(by_app["b"], vec![(0, 3.0)]);
     }
+}
+
+// ---------------------------------------------------------------------
+// Issue #221: `vector(<scalar>)`.
+// ---------------------------------------------------------------------
+
+/// Plans `query` into its `MetricBinary` node tree (the leafless/binary
+/// path `vector()` takes).
+fn metric_node_of(query: &str, params: &QueryParams) -> MetricNode {
+    let expr = parse(query).expect("parse");
+    match plan(&expr, params, &ctx()).expect("plan") {
+        Plan::MetricBinary(node) => node,
+        other => panic!("expected a MetricBinary plan for {query}, got {other:?}"),
+    }
+}
+
+/// Evaluates a full `MetricNode` tree the engine's way: leaves run the
+/// client-aggregation over `rows`, everything else combines in-Rust.
+fn eval_node(
+    node: &MetricNode,
+    rows: &[MetricScanRow],
+    meta: &HashMap<u64, StreamMetaRow>,
+) -> Result<QueryResult, ReadError> {
+    match node {
+        MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
+        MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
+        MetricNode::Leaf(mp) => {
+            let client = mp.client.as_ref().expect("client-aggregated plan");
+            let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
+            let result = run_client_agg_rows(
+                rows,
+                &compiled,
+                meta,
+                client,
+                ClientWindow {
+                    start_ns: mp.start_ns,
+                    end_ns: mp.end_ns,
+                    step_ns: mp.step_ns,
+                },
+                mp.rate_window_ns,
+            )?;
+            Ok(apply_vector_aggs(result, &mp.vector_aggs))
+        }
+        MetricNode::Binary {
+            op,
+            return_bool,
+            matching,
+            lhs,
+            rhs,
+        } => combine_binary(
+            *op,
+            *return_bool,
+            matching.as_ref(),
+            eval_node(lhs, rows, meta)?,
+            eval_node(rhs, rows, meta)?,
+        ),
+        MetricNode::VectorAgg { aggs, inner } => {
+            Ok(apply_vector_aggs(eval_node(inner, rows, meta)?, aggs))
+        }
+    }
+}
+
+#[test]
+fn instant_vector_lit_is_a_single_empty_label_sample() {
+    let node = metric_node_of("vector(5)", &instant_params(60 * NS));
+    let out = eval_node(&node, &[], &meta_one()).expect("eval");
+    let QueryResult::Vector(items) = out else {
+        panic!("expected a vector, got {out:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].labels, Vec::<(String, String)>::new());
+    assert_eq!(items[0].value, 5.0);
+}
+
+#[test]
+fn instant_vector_lit_binop_combines_as_vectors() {
+    // `vector(1) + vector(2)` => `{} 3`.
+    let node = metric_node_of("vector(1) + vector(2)", &instant_params(60 * NS));
+    assert_eq!(
+        single_vector_value(eval_node(&node, &[], &meta_one()).unwrap()),
+        3.0
+    );
+}
+
+#[test]
+fn sum_of_a_vector_lit_is_accepted_and_aggregates() {
+    // Unlike bare `sum(5)` (rejected), Loki accepts `sum(vector(5))` => `{} 5`.
+    let node = metric_node_of("sum(vector(5))", &instant_params(60 * NS));
+    assert_eq!(
+        single_vector_value(eval_node(&node, &[], &meta_one()).unwrap()),
+        5.0
+    );
+}
+
+#[test]
+fn or_vector_zero_fills_an_empty_selection() {
+    // The canonical use: `sum(rate({...}[1m])) or vector(0)` on an empty
+    // selection yields `{} 0`.
+    let node = metric_node_of(
+        r#"sum(rate({service_name="checkout"} | logfmt [1m])) or vector(0)"#,
+        &instant_params(60 * NS),
+    );
+    let out = eval_node(&node, &[], &meta_one()).expect("eval");
+    let QueryResult::Vector(items) = out else {
+        panic!("expected a vector, got {out:?}");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].labels, Vec::<(String, String)>::new());
+    assert_eq!(items[0].value, 0.0);
+}
+
+/// Over-cap range `vector(n)` rejects with the SAME `MetricBuckets` 422 a
+/// leaf over-cap range query trips — before allocating any grid (the
+/// `return` precedes the `Vec`, so a successful assertion proves no
+/// allocation). 11_001 buckets > the 11_000 cap.
+#[test]
+fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
+    let window = ClientWindow {
+        start_ns: 0,
+        end_ns: 11_000 * NS,
+        step_ns: Some(NS as u64),
+    };
+    match materialize_vector_lit(0.0, &window) {
+        Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
+            assert_eq!(buckets, 11_001);
+            assert_eq!(cap, 11_000);
+        }
+        other => panic!("expected a MetricBuckets too-broad error, got {other:?}"),
+    }
+}
+
+/// At exactly the cap the range `vector(n)` materializes a constant matrix
+/// with one empty-label series carrying the value at every grid step.
+#[test]
+fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
+    let window = ClientWindow {
+        start_ns: 0,
+        end_ns: 10_999 * NS,
+        step_ns: Some(NS as u64),
+    };
+    let out = materialize_vector_lit(7.0, &window).expect("at-cap must pass");
+    let points = single_series_points(out);
+    assert_eq!(points.len(), 11_000);
+    assert!(points.iter().all(|(_, v)| *v == 7.0));
+}
+
+/// The range grid is byte-identical to `bucket_grid`/`metric_range` even
+/// when `start_ns` is not a multiple of the step, and a `data + vector(0)`
+/// binop aligns on the data's populated steps.
+#[test]
+fn range_vector_lit_grid_aligns_under_an_unaligned_start() {
+    let step = 10 * NS;
+    let window = ClientWindow {
+        start_ns: 7 * NS,
+        end_ns: 37 * NS,
+        step_ns: Some(step as u64),
+    };
+    let vec_matrix = materialize_vector_lit(0.0, &window).expect("materialize");
+    assert_eq!(
+        single_series_points(vec_matrix.clone()),
+        vec![(0, 0.0), (step, 0.0), (2 * step, 0.0), (3 * step, 0.0)],
+    );
+
+    // A sparse data series populated only at two of the grid steps. Empty
+    // labels so it one-to-one matches vector(0)'s `{}` series — the test
+    // isolates GRID/step alignment, not label matching.
+    let data = QueryResult::Matrix(vec![MatrixSeries {
+        labels: vec![],
+        points: vec![(step, 4.0), (3 * step, 9.0)],
+    }]);
+    let combined = combine_binary(BinOp::Add, false, None, data, vec_matrix).expect("combine");
+    assert_eq!(
+        single_series_points(combined),
+        vec![(step, 4.0), (3 * step, 9.0)],
+    );
+}
+
+/// Round-4 regression: an `i64::MIN` range window must not panic/overflow —
+/// `vector(n)` inherits `bucket_grid`'s i128 math + `clamp_bucket`
+/// narrowing, so the extreme lower bucket is clamped, not wrapped.
+#[test]
+fn range_vector_lit_is_i64_min_safe() {
+    let window = ClientWindow {
+        start_ns: i64::MIN,
+        end_ns: i64::MIN + 3 * NS,
+        step_ns: Some(NS as u64),
+    };
+    let out = materialize_vector_lit(0.0, &window).expect("i64::MIN window must not panic");
+    let points = single_series_points(out);
+    assert!(!points.is_empty());
+    // The lowest grid bucket sits one step below `i64::MIN`; `clamp_bucket`
+    // narrows it to exactly `i64::MIN` (i128 math), never a wrapped value.
+    assert_eq!(points[0].0, i64::MIN);
 }
 
 /// `sort`/`sort_desc` reject a grouping clause — the reference has no

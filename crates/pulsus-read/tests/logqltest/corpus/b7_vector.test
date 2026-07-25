@@ -1,0 +1,45 @@
+# B7 — vector(<scalar>) value corpus (issue #221).
+#
+# `vector(n)` promotes a scalar to a vector result: one empty-label sample
+# `{} => n` at the eval ts (Loki `pkg/logql/syntax/ast.go` NewVectorExpr).
+# It is deterministic — the value is fixed by the literal, so these captures
+# are exact vs grafana/loki:3.7.4 (see PROVENANCE.md) with no data dependence
+# for the pure cases. Every eval is INSTANT (the runner is instant-only).
+#
+# A dataset backs the one data+vector combination case; the pure vector(n)
+# cases ignore it.
+
+load
+  {env="prod", service_name="vec-a"}
+  1s  x=1
+  2s  x=1
+  3s  x=1
+
+# --- pure vector(n): {} => n at the eval ts -------------------------------
+eval instant at 60s vector(0)
+  {} 0
+
+eval instant at 60s vector(5)
+  {} 5
+
+eval instant at 60s vector(0.95)
+  {} 0.95
+
+# --- vector(n) combines as a vector in binops -----------------------------
+eval instant at 60s vector(1) + vector(2)
+  {} 3
+
+eval instant at 60s vector(10) - vector(3)
+  {} 7
+
+eval instant at 60s vector(2) * vector(3)
+  {} 6
+
+# --- sum(vector(n)) is accepted (unlike bare sum(<scalar>)) => {} n --------
+eval instant at 60s sum(vector(5))
+  {} 5
+
+# --- vector(n) supplies the constant side of a data binop -----------------
+# sum(count_over_time(...)) over 3 in-window rows = {} 3; + vector(100) = 103.
+eval instant at 60s sum(count_over_time({service_name="vec-a"} | logfmt [1m])) + vector(100)
+  {} 103

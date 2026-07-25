@@ -1247,6 +1247,39 @@ fn scalar_literals_and_both_orientations_round_trip() {
     }
 }
 
+/// Issue #221: `vector(<NUMBER>)` parses to `MetricExpr::VectorFn` with
+/// the raw number text and round-trips through `Display`.
+#[test]
+fn vector_function_parses_and_round_trips() {
+    use pulsus_logql::MetricExpr;
+    let expr = parse("vector(0)").unwrap();
+    assert_eq!(
+        expr,
+        pulsus_logql::Expr::Metric(MetricExpr::VectorFn("0".to_string()))
+    );
+    for q in [
+        "vector(0)",
+        "vector(5)",
+        "vector(0.95)",
+        "vector(5) + vector(2)",
+    ] {
+        assert_round_trip(q);
+    }
+}
+
+/// Issue #221: `vector()` accepts only a `NUMBER` arg — an inner
+/// expression is rejected, mirroring Loki v3.7.4's grammar.
+#[test]
+fn vector_function_rejects_a_non_number_argument() {
+    use pulsus_logql::LogQlError;
+    match parse(r#"vector(rate({a="b"}[5m]))"#) {
+        Err(LogQlError::UnexpectedToken { expected, .. }) => {
+            assert!(expected.contains("vector value"), "{expected}");
+        }
+        other => panic!("expected vector() to reject a non-number arg, got {other:?}"),
+    }
+}
+
 /// AC4c (parser half): `^` is right-associative — `2 ^ 2 ^ 3` must parse
 /// as `2 ^ (2 ^ 3)`, never `(2 ^ 2) ^ 3`.
 #[test]

@@ -1038,6 +1038,16 @@ fn parse_metric_expr(cursor: &mut Cursor<'_>, depth: usize) -> Result<MetricExpr
         }
     };
 
+    // `vector(<NUMBER>)` (issue #221): promotes a scalar to a vector result
+    // (`{} => n`). Only a `NUMBER` arg — mirrors Loki v3.7.4's `vectorExpr`
+    // grammar (`vector "(" NUMBER ")"`), which rejects an inner expression.
+    if name == "vector" {
+        cursor.advance();
+        cursor.expect(&TokenKind::LParen, "'('")?;
+        let (raw, _) = cursor.expect_number("the vector value (e.g. vector(0))")?;
+        cursor.expect(&TokenKind::RParen, "')'")?;
+        return Ok(MetricExpr::VectorFn(raw));
+    }
     if let Some(op) = RangeAggOp::from_ident(&name) {
         cursor.advance();
         return parse_range_agg_call(cursor, op);
