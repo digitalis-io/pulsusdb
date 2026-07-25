@@ -3150,11 +3150,19 @@ fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u6
     }
 
     // `durationMilliseconds(selRange)`; window anchored on the first sample.
-    let sel_range_ms: i64 = (rng_ns / 1_000_000) as i64;
-    let range_start = first_t - sel_range_ms; // ns − ms: the reference's unit mix
-    let mut duration_to_start = (first_t - range_start) as f64 / 1000.0; // == sel_range_ms/1000
+    //
+    // Issue #227 review finding 2: every timestamp SPAN is computed in `i128`
+    // before the float conversion. `first_t - sel_range_ms` underflows i64 for
+    // a first sample near `i64::MIN`, and `last_t - first_t` overflows i64 for
+    // a window spanning near-`MIN` to near-`MAX` — both are valid extreme
+    // inputs that would panic in debug / wrap in release. The i128 widening
+    // changes no in-range value (the arithmetic is identical), it only removes
+    // the overflow; the reference's ns-vs-ms unit mix is preserved verbatim.
+    let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
+    let range_start = first_t as i128 - sel_range_ms; // ns − ms: the reference's unit mix
+    let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0; // == sel_range_ms/1000
     let duration_to_end = 0.0_f64; // rangeEnd == last.T ⇒ 0
-    let sampled_interval = (last_t - first_t) as f64 / 1000.0;
+    let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
     let average_duration = sampled_interval / (pts.len() - 1) as f64;
 
     if result_value > 0.0 && first_f >= 0.0 {
@@ -3236,7 +3244,10 @@ fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
     let step = step_ns as i128;
     let gs = grid_start as i128;
     let kmax = (end_ns as i128 - gs) / step;
-    (0..=kmax).map(|k| (gs + k * step) as i64).collect()
+    // Saturating narrowing, like the sliding evaluator's `grid_point` (issue
+    // #227 arithmetic sweep): every point is in `[grid_start, end]` by
+    // construction, so the clamp is defense-in-depth, never a wrap.
+    (0..=kmax).map(|k| clamp_bucket(gs + k * step)).collect()
 }
 
 /// The evaluation-bucket cap for client-aggregated range queries: a
@@ -3889,7 +3900,12 @@ struct FpSlide {
 
 impl FpSlide {
     fn grid_point(&self, k: i64) -> i64 {
-        (self.grid_start as i128 + k as i128 * self.step as i128) as i64
+        // i128 intermediate + a SATURATING narrowing (issue #227 arithmetic
+        // sweep): `k <= kmax` derives from `grid_point_count`, so every grid
+        // point is in `[grid_start, end]` and the clamp never fires on a
+        // real query — but a plain `as i64` would silently wrap rather than
+        // saturate if that invariant were ever broken.
+        clamp_bucket(self.grid_start as i128 + k as i128 * self.step as i128)
     }
 
     /// Emits every grid point `t` with `t < boundary` (all their samples are
@@ -3915,9 +3931,14 @@ impl FpSlide {
         while let Some(front) = self.win.front() {
             if front.ts <= lo {
                 let ev = self.win.pop_front().expect("front present");
-                *retained -= 1;
+                // Symmetric discharge (the concurrent-retention invariant):
+                // every evicted sample was charged on load, so this is exact;
+                // `saturating_sub` on both counters is panic-proofing, never
+                // a masked accounting path (class-A values are `1.0` or a
+                // non-negative `line.len()`, added and removed once each).
+                *retained = retained.saturating_sub(1);
                 if matches!(self.class, ReducerClass::InvertInteger) {
-                    self.run_int -= ev.value as u64;
+                    self.run_int = self.run_int.saturating_sub(ev.value as u64);
                 }
             } else {
                 break;
@@ -3999,7 +4020,8 @@ impl FpSlide {
             self.next_k += 1;
         }
         // Discharge whatever is still retained (the series is closed).
-        *retained -= self.win.len() as u64;
+        // Saturating for the same panic-proofing reason as `emit_at`.
+        *retained = retained.saturating_sub(self.win.len() as u64);
         if self.points.is_empty() {
             None
         } else {
@@ -4050,8 +4072,12 @@ struct RangeSlideState<'q> {
     series_out: Vec<MatrixSeries>,
     // Mutating.
     groups: HashMap<String, MutGroup>,
-    // Absent (selector-wide presence).
-    present_ts: Vec<i64>,
+    /// `absent_over_time`'s selector-wide presence, as a **grid-sized
+    /// difference array** (issue #227 review finding 1): index `k` holds the
+    /// coverage delta at grid point `k`, prefix-summed once at finish. Length
+    /// is `kmax + 2` — O(grid), capped by `MAX_CLIENT_AGG_BUCKETS`, and
+    /// completely independent of scan density (nothing per-sample is kept).
+    present_cover: Vec<i32>,
     // Distinct output-series count (the 500 cap, non-mutating path).
     series_count: u64,
     // Current collision run.
@@ -4116,7 +4142,10 @@ impl<'q> RangeSlideState<'q> {
             cur_fp: 0,
             series_out: Vec::new(),
             groups: HashMap::new(),
-            present_ts: Vec::new(),
+            // `kmax + 2` slots (`kmax + 1` grid points plus the exclusive
+            // upper delta index). `kmax` passed the 11k grid guard above, so
+            // this allocation is bounded before any row is read.
+            present_cover: vec![0; (kmax.max(-1) + 2) as usize],
             series_count: 0,
             coll_active: false,
             coll_fp: 0,
@@ -4228,8 +4257,20 @@ impl<'q> RangeSlideState<'q> {
         }
 
         if self.is_absent {
-            for _ in 0..self.coll.len() {
-                self.present_ts.push(ts);
+            // Issue #227 review finding 1: presence is recorded as O(GRID)
+            // COVERAGE, never an O(scan) timestamp vector. One surviving
+            // sample at `ts` makes every grid point in `[k_lo, k_hi]`
+            // non-empty; a difference array records that in O(1) per group
+            // and is prefix-summed once at finish. Memory is bounded by the
+            // grid (already capped at `MAX_CLIENT_AGG_BUCKETS`) regardless of
+            // scan density — nothing per-sample is retained, so no
+            // client-supplied range/step/cardinality can grow it.
+            if !self.coll.is_empty() {
+                let (k_lo, k_hi) = self.covering_k(ts);
+                if k_lo <= k_hi {
+                    self.present_cover[k_lo as usize] += 1;
+                    self.present_cover[k_hi as usize + 1] -= 1;
+                }
             }
             self.coll.clear();
             return Ok(());
@@ -4317,6 +4358,7 @@ impl<'q> RangeSlideState<'q> {
             }));
         }
         let integer = matches!(self.class, ReducerClass::InvertInteger);
+        let retained = &mut self.retained;
         let group = self.groups.entry(key).or_insert_with(|| MutGroup {
             labels,
             int_cells: HashMap::new(),
@@ -4324,7 +4366,29 @@ impl<'q> RangeSlideState<'q> {
         });
         for k in k_lo..=k_hi {
             if integer {
-                *group.int_cells.entry(k).or_insert(0) += value as u64;
+                // Review finding 3: a newly-CREATED integer cell is charged to
+                // the same concurrent-retention counter as a retained point,
+                // so the class-A fan-out obeys the documented invariant
+                // instead of relying on the implicit
+                // `MAX_CLIENT_AGG_SERIES × MAX_CLIENT_AGG_BUCKETS` product.
+                // Updating an existing cell is O(1) and charges nothing.
+                match group.int_cells.entry(k) {
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        *e.get_mut() += value as u64;
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(value as u64);
+                        *retained += 1;
+                        if *retained > MAX_RETAINED_WINDOW_POINTS {
+                            return Err(ReadError::QueryTooBroad(
+                                TooBroadReason::MetricRetention {
+                                    count: *retained,
+                                    cap: MAX_RETAINED_WINDOW_POINTS,
+                                },
+                            ));
+                        }
+                    }
+                }
             } else {
                 group.pt_cells.entry(k).or_default().push(WinSample {
                     ts,
@@ -4332,10 +4396,10 @@ impl<'q> RangeSlideState<'q> {
                     tie_rank,
                     value,
                 });
-                self.retained += 1;
-                if self.retained > MAX_RETAINED_WINDOW_POINTS {
+                *retained += 1;
+                if *retained > MAX_RETAINED_WINDOW_POINTS {
                     return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
-                        count: self.retained,
+                        count: *retained,
                         cap: MAX_RETAINED_WINDOW_POINTS,
                     }));
                 }
@@ -4366,7 +4430,12 @@ impl<'q> RangeSlideState<'q> {
     }
 
     fn grid_point(&self, k: i64) -> i64 {
-        (self.grid_start as i128 + k as i128 * self.step as i128) as i64
+        // i128 intermediate + a SATURATING narrowing (issue #227 arithmetic
+        // sweep): `k <= kmax` derives from `grid_point_count`, so every grid
+        // point is in `[grid_start, end]` and the clamp never fires on a
+        // real query — but a plain `as i64` would silently wrap rather than
+        // saturate if that invariant were ever broken.
+        clamp_bucket(self.grid_start as i128 + k as i128 * self.step as i128)
     }
 
     /// Finalizes into the query result.
@@ -4390,7 +4459,9 @@ impl<'q> RangeSlideState<'q> {
             let rate_window_ns = self.rate_window_ns;
             let grid_start = self.grid_start;
             let step = self.step;
-            let grid_point = |k: i64| (grid_start as i128 + k as i128 * step as i128) as i64;
+            // Saturating narrowing, like `FpSlide::grid_point` (issue #227
+            // arithmetic sweep) — never a silent wrap.
+            let grid_point = |k: i64| clamp_bucket(grid_start as i128 + k as i128 * step as i128);
             let groups = std::mem::take(&mut self.groups);
             let mut out: Vec<MatrixSeries> = Vec::new();
             for group in groups.into_values() {
@@ -4426,18 +4497,15 @@ impl<'q> RangeSlideState<'q> {
 
     /// `absent_over_time`: emit `1.0` at every grid point whose selector-wide
     /// window `(t-range, t]` is EMPTY (Loki's one emit-on-empty reducer).
-    fn finish_absent(mut self) -> QueryResult {
-        self.present_ts.sort_unstable();
-        let ts = &self.present_ts;
+    /// Prefix-sums the O(grid) coverage difference array (review finding 1):
+    /// a running sum > 0 means at least one sample covers that grid point.
+    fn finish_absent(self) -> QueryResult {
         let mut points: Vec<(i64, f64)> = Vec::new();
+        let mut running: i32 = 0;
         for k in 0..=self.kmax {
-            let t = self.grid_point(k);
-            let lo = t.saturating_sub(self.range);
-            // Any sample in (lo, t]? First ts > lo, then check ≤ t.
-            let idx = ts.partition_point(|&x| x <= lo);
-            let present = idx < ts.len() && ts[idx] <= t;
-            if !present {
-                points.push((t, 1.0));
+            running += self.present_cover[k as usize];
+            if running == 0 {
+                points.push((self.grid_point(k), 1.0));
             }
         }
         if points.is_empty() {
@@ -6102,6 +6170,14 @@ mod tests {
         m
     }
 
+    /// The pipeline stages of a log query (for building a `ClientAgg`).
+    fn parse_pipeline(query: &str) -> Vec<Stage> {
+        let pulsus_logql::Expr::Log(le) = pulsus_logql::parse(query).expect("parse") else {
+            panic!("expected a log expression");
+        };
+        le.pipeline
+    }
+
     fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
         samples
             .iter()
@@ -6274,23 +6350,342 @@ mod tests {
         }
     }
 
-    /// StableHash reproduces Loki `labels.StableHash`: `xxh64(seed 0)` over
-    /// sorted `name·0xFF·value·0xFF`. Pinned against the direct byte layout
-    /// (the live differential pins it against the container).
+    /// AC2: `stream_hash` == Loki's `labels.StableHash`, pinned against
+    /// GOLDEN VALUES CAPTURED FROM THE REFERENCE ITSELF — computed by calling
+    /// `labels.StableHash` in the pinned `grafana/loki` v3.7.4 checkout
+    /// (`vendor/github.com/prometheus/prometheus/model/labels/sharding.go`,
+    /// default build tags, the shape Loki release builds use). These are
+    /// external constants, NOT a recomputation of our own implementation, so
+    /// a change to our byte layout/seed reddens this test.
     #[test]
-    fn stream_hash_matches_the_stable_hash_byte_layout() {
-        let labels = vec![
-            ("app".to_string(), "a".to_string()),
-            ("env".to_string(), "prod".to_string()),
+    fn stream_hash_matches_loki_stable_hash_golden_values() {
+        let lbl = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // (sorted labels, Loki v3.7.4 `labels.StableHash` value)
+        let cases: &[(Vec<(String, String)>, u64)] = &[
+            (
+                lbl(&[("app", "a"), ("env", "prod")]),
+                8_934_535_624_278_967_805,
+            ),
+            (
+                lbl(&[("env", "prod"), ("service_name", "checkout")]),
+                3_591_138_641_183_557_463,
+            ),
+            (lbl(&[]), 17_241_709_254_077_376_921),
+            (lbl(&[("k", "v")]), 3_592_197_247_305_585_030),
+            (
+                lbl(&[("__name__", "x"), ("job", "j"), ("zz", "last")]),
+                12_310_789_843_392_592_049,
+            ),
         ];
-        let mut buf: Vec<u8> = Vec::new();
-        for (n, v) in &labels {
-            buf.extend_from_slice(n.as_bytes());
-            buf.push(0xFF);
-            buf.extend_from_slice(v.as_bytes());
-            buf.push(0xFF);
+        for (labels, want) in cases {
+            assert_eq!(
+                stream_hash(labels),
+                *want,
+                "StableHash mismatch for {labels:?}"
+            );
         }
-        assert_eq!(stream_hash(&labels), xxhash_rust::xxh64::xxh64(&buf, 0));
+    }
+
+    /// AC5(a): a DENSE but Loki-servable window (well within the caps and the
+    /// byte budget) streams to a correct result — the cap must not reject
+    /// density Loki serves. 50_000 samples in one `[range]`, well under the
+    /// 4M cap.
+    #[test]
+    fn sliding_dense_but_servable_window_streams_without_a_cap_error() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        const N: i64 = 50_000;
+        let rows: Vec<MetricScanRow> = (0..N)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: i + 1, // 1ns apart, all inside the window
+                body: "x".to_string(),
+            })
+            .collect();
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: N,
+            step_ns: Some(N as u64),
+            range_ns: N as u64,
+        };
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
+            .expect("a dense-but-servable window must stream, never 422");
+        assert_eq!(one_series_points(res).1, vec![(N, N as f64)]);
+    }
+
+    /// AC5(b) + AC8: the concurrent-retention cap trips DURING the scan (as
+    /// the first oversized window fills), not after it — the charge is
+    /// per-load, so a retaining reducer over more than `cap` in-window points
+    /// aborts with the named `MetricRetention` error. Uses a tiny synthetic
+    /// cap via the retaining (class-B `quantile`) path with a window wide
+    /// enough that nothing evicts.
+    #[test]
+    fn sliding_retention_cap_trips_during_the_scan_with_the_named_error() {
+        // A retaining reducer (quantile) whose window never evicts: every
+        // sample stays concurrently retained, so `retained` climbs to the cap.
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::QuantileOverTime,
+            param: Some(0.5),
+            absent_labels: vec![],
+        };
+        // Drive `FpSlide::load_group` directly with a TINY cap so the test is
+        // fast and the trip point is exact (the production cap is 4M).
+        let mut slide = FpSlide {
+            stream_hash: 7,
+            labels: vec![],
+            op: client.range_op,
+            class: reducer_class(client.range_op, client.value),
+            param: client.param,
+            rate_window_ns: None,
+            grid_start: 0,
+            step: 1_000_000,
+            range: 1_000_000_000,
+            kmax: 10,
+            next_k: 0,
+            win: VecDeque::new(),
+            run_int: 0,
+            reduce_buf: Vec::new(),
+            points: Vec::new(),
+        };
+        let mut retained = 0u64;
+        const TINY_CAP: u64 = 100;
+        let member = |v: f64| CollMember {
+            body: String::new(),
+            value: v,
+            out: None,
+        };
+        let mut err = None;
+        let mut loads = 0u64;
+        for i in 0..1_000i64 {
+            // All at ts=1 so nothing ever evicts (one collision-free load per
+            // call at increasing ts would evict; here the window only grows).
+            let group = [member(i as f64)];
+            loads += 1;
+            if let Err(e) = slide.load_group(1, &group, &mut retained, TINY_CAP) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(ReadError::QueryTooBroad(TooBroadReason::MetricRetention { count, cap })) => {
+                assert_eq!(cap, TINY_CAP);
+                assert_eq!(count, TINY_CAP + 1, "trips at the first over-cap load");
+            }
+            other => panic!("expected MetricRetention, got {other:?}"),
+        }
+        assert_eq!(
+            loads,
+            TINY_CAP + 1,
+            "the cap must trip DURING the scan (after ~cap loads), not after all 1000"
+        );
+    }
+
+    /// AC8: the concurrent-retention invariant is symmetric — every charged
+    /// point is discharged on eviction, so a long streaming slide over a
+    /// narrow window keeps `retained` bounded by the window's contents rather
+    /// than growing with the scan.
+    #[test]
+    fn sliding_retention_charge_and_discharge_are_symmetric() {
+        let mut slide = FpSlide {
+            stream_hash: 7,
+            labels: vec![],
+            op: RangeAggOp::QuantileOverTime,
+            class: ReducerClass::ReduceIndependent,
+            param: Some(0.5),
+            rate_window_ns: None,
+            grid_start: 0,
+            step: 10,
+            range: 10,
+            kmax: 100,
+            next_k: 0,
+            win: VecDeque::new(),
+            run_int: 0,
+            reduce_buf: Vec::new(),
+            points: Vec::new(),
+        };
+        let mut retained = 0u64;
+        // 100 samples 10ns apart over a 10ns window: at most a couple are
+        // ever concurrently retained, however long the scan runs.
+        for i in 1..=100i64 {
+            let group = [CollMember {
+                body: String::new(),
+                value: i as f64,
+                out: None,
+            }];
+            slide
+                .load_group(i * 10, &group, &mut retained, MAX_RETAINED_WINDOW_POINTS)
+                .expect("under cap");
+            assert!(
+                retained <= 3,
+                "retention must stay window-bounded, saw {retained} after {i} loads"
+            );
+        }
+        // Closing the series discharges everything left in the window.
+        slide.finish(&mut retained);
+        assert_eq!(retained, 0, "charge/discharge must be symmetric");
+    }
+
+    /// AC10: a forced same-`(fingerprint, timestamp_ns)` collision of ≥3 rows
+    /// with DISTINCT bodies resolves an ORDER-DEPENDENT reducer through the
+    /// full-body `tie_rank` order, byte-stable across shuffled input. Uses
+    /// `last_over_time` (positional in the canonical order) plus a class-C
+    /// `sum` — the two shapes the review called out as untested.
+    #[test]
+    fn sliding_same_stream_tie_rank_orders_class_c_and_first_last_deterministically() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 10,
+            step_ns: Some(10),
+            range_ns: 10,
+        };
+        // Three rows at the IDENTICAL `(fingerprint, timestamp_ns)` with
+        // DISTINCT bodies that all parse to the same label set (`a` is
+        // consumed by the unwrap), chosen so the full-BODY byte order is
+        // deliberately DIFFERENT from the value order:
+        //   `a="3"` (0x22 after `a=`) < `a=1` (0x31) < `a=2` (0x32)
+        //   ⇒ canonical values in order: 3, 1, 2
+        // So `first` = 3 and `last` = 2. A value-tiebreak (the old instant
+        // rule) would give first=1/last=3, and an arrival-order rule would
+        // flap under shuffling — this case discriminates all three.
+        let bodies = [r#"a="3""#, "a=1", "a=2"];
+        let run = |op: RangeAggOp, order: &[usize]| -> Vec<(i64, f64)> {
+            let client = ClientAgg {
+                pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+                value: ClientValue::Unwrap,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            let rows: Vec<MetricScanRow> = order
+                .iter()
+                .map(|&i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: 5,
+                    body: bodies[i].to_string(),
+                })
+                .collect();
+            let res =
+                run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).expect("eval");
+            one_series_points(res).1
+        };
+        // Every input permutation must give the SAME, body-order-determined
+        // answer (byte-stable across shuffled runs).
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [1, 2, 0], [2, 0, 1]] {
+            assert_eq!(
+                run(RangeAggOp::FirstOverTime, &order),
+                vec![(10, 3.0)],
+                "first = the min-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+            );
+            assert_eq!(
+                run(RangeAggOp::LastOverTime, &order),
+                vec![(10, 2.0)],
+                "last = the max-(ts,stream_hash,tie_rank) sample (body order), input {order:?}"
+            );
+            // Class C: the fold runs in the same canonical order.
+            assert_eq!(run(RangeAggOp::SumOverTime, &order), vec![(10, 6.0)]);
+        }
+    }
+
+    /// AC10: the retention cap's over-cap error is `MetricRetention` and the
+    /// collision-group cap's is `TsCollisionGroup` — two DISTINCT named 422
+    /// reasons, never conflated.
+    #[test]
+    fn sliding_over_cap_errors_are_distinct_named_reasons() {
+        let retention = ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+            count: MAX_RETAINED_WINDOW_POINTS + 1,
+            cap: MAX_RETAINED_WINDOW_POINTS,
+        })
+        .to_string();
+        let collision = ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+            count: MAX_TS_COLLISION_GROUP + 1,
+            cap: MAX_TS_COLLISION_GROUP,
+        })
+        .to_string();
+        assert!(retention.contains("concurrent sample"), "{retention}");
+        assert!(collision.contains("same-nanosecond"), "{collision}");
+        assert_ne!(retention, collision);
+    }
+
+    /// Issue #227 arithmetic sweep: `rate_counter` over EXTREME timestamps
+    /// (near `i64::MIN`/`i64::MAX`) must not panic in debug or wrap in
+    /// release — the spans are computed in i128 (review finding 2).
+    #[test]
+    fn rate_counter_extreme_timestamps_do_not_overflow() {
+        // A first sample near i64::MIN underflows `first_t - sel_range_ms`.
+        let v = rate_counter_extrapolated(
+            vec![(i64::MIN + 1, 1.0), (i64::MIN + 1_000, 2.0)],
+            Some(60_000_000_000),
+        );
+        assert!(v.is_finite(), "near-i64::MIN must not overflow, got {v}");
+        // A window spanning near-MIN to near-MAX overflows `last_t - first_t`.
+        let v = rate_counter_extrapolated(
+            vec![(i64::MIN + 1, 1.0), (i64::MAX - 1, 2.0)],
+            Some(60_000_000_000),
+        );
+        assert!(v.is_finite(), "full-i64-span must not overflow, got {v}");
+    }
+
+    /// Issue #227 review finding 1: `absent_over_time` retains NOTHING
+    /// per-sample — its presence state is the O(grid) coverage array, so a
+    /// dense selector cannot grow memory with the scan. Drives a dense scan
+    /// and asserts both the correct gaps and a bounded presence footprint.
+    #[test]
+    fn sliding_absent_presence_is_grid_bounded_not_scan_bounded() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::AbsentOverTime,
+            param: None,
+            absent_labels: vec![("app".to_string(), "a".to_string())],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 100,
+            step_ns: Some(10),
+            range_ns: 10,
+        };
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        // 20_000 dense samples covering only the second half of the grid.
+        let rows: Vec<MetricScanRow> = (0..20_000)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 51 + (i % 50),
+                body: "x".to_string(),
+            })
+            .collect();
+        state.push_rows(&rows).expect("dense absent scan");
+        // The presence state is exactly the grid-sized array — never 20_000.
+        assert_eq!(
+            state.present_cover.len(),
+            (window.end_ns / 10 + 2) as usize,
+            "presence state must be grid-sized, independent of scan density"
+        );
+        assert_eq!(state.retained, 0, "absent retains no per-sample points");
+        let QueryResult::Matrix(series) = state.finish().expect("finish") else {
+            panic!("expected a matrix");
+        };
+        // Grid {0,10,...,100}; samples occupy (50,100] ⇒ grid points 60..=100
+        // are covered, 0..=50 are absent.
+        let pts: Vec<i64> = series[0].points.iter().map(|(t, _)| *t).collect();
+        assert_eq!(pts, vec![0, 10, 20, 30, 40, 50]);
     }
 
     /// The `/stats` pushdown-only gate (M8-LQ2 Delta 1): a pushable literal
