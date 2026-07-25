@@ -13,12 +13,15 @@
 //! [`rows`] (`ChClient` result-row shapes), and [`exec`] (`LogQlEngine`,
 //! the only module here that talks to ClickHouse).
 //!
-//! **M1 rate semantic — documented divergence from Loki/Prometheus:**
-//! range-query rate/count bucketing is *fixed, step-aligned, non-overlapping*
-//! (`intDiv(ts, step) * step` tumbling windows), not a sliding `[range]`
-//! window re-evaluated at every step (task-manager resolution #4 on issue
-//! #11). See [`params::QuerySpec::Range`]'s doc comment for the precise
-//! contract. Sliding-window parity is an M6 concern.
+//! **Range-query semantics (issue #227): Loki-exact SLIDING windows.**
+//! A range metric query re-evaluates the `[range]` window `(t - range, t]` at
+//! every start-anchored grid point `{start + k·step ≤ end}`, streamed off raw
+//! `log_samples` — NOT the former fixed, step-aligned, non-overlapping
+//! `intDiv(ts, step) * step` tumbling buckets, and not the 5s rollup (which
+//! cannot reproduce Loki's per-event boundary). So `rate({}[1m])` and
+//! `rate({}[10m])` differ: the window width AND the rate divisor both track
+//! the `[range]`, never `step`. See [`params::QuerySpec::Range`]'s doc
+//! comment for the precise contract.
 //!
 //! **Scan budget applies to every stage.** `ClickHouse
 //! max_bytes_to_read` (from `reader.logql_scan_budget_bytes`) and the

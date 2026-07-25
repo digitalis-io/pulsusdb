@@ -127,7 +127,9 @@ Instant-eval values are stable 3.4.2 → 3.7.4 (verified: only cosmetic
 range-vector reducer changes), so no re-capture was needed for the seed.
 
 **Deferred to later batches / out of scope** (7 of 39): the 5 `metric_*range`
-tumbling cases (range/step, divergent by design); `scope_structured_metadata`
+cases (superseded by issue #227 — range queries are now Loki-exact sliding
+windows, covered by `b9_range_sliding.test` and the `eval range` directive);
+`scope_structured_metadata`
 (needs per-entry structured-metadata modelling, not yet in the DSL);
 `fetch_until_limit_paged` (keyset paging / result-limit — an exec/SQL concern,
 not the pure value path).

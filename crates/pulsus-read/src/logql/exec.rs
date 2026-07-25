@@ -1063,30 +1063,13 @@ impl LogQlEngine {
         // Issue #227: a range query reads in physical-key order
         // (`optimize_read_in_order`, no server sort) for the streaming slide;
         // an instant query keeps the total-timestamp order its reducers pin.
-        let (sql, settings) = if is_range {
-            (
-                super::sql::metric_raw_samples_sliding(
-                    &mp.table,
-                    &services,
-                    fingerprints,
-                    time_window,
-                    &mp.extra_predicates,
-                ),
-                self.budget_settings()
-                    .set("optimize_read_in_order", 1)
-                    .set("max_memory_usage", RANGE_READ_MAX_MEMORY_BYTES),
-            )
+        let sql = client_metric_read_sql(mp, &services, fingerprints, time_window);
+        let settings = if is_range {
+            self.budget_settings()
+                .set("optimize_read_in_order", 1)
+                .set("max_memory_usage", RANGE_READ_MAX_MEMORY_BYTES)
         } else {
-            (
-                super::sql::metric_raw_samples(
-                    &mp.table,
-                    &services,
-                    fingerprints,
-                    time_window,
-                    &mp.extra_predicates,
-                ),
-                self.budget_settings(),
-            )
+            self.budget_settings()
         };
         if let Some(e) = explain.as_mut() {
             e.push("metric_read", sql.clone(), Some(mp.routing.reason.clone()));
@@ -1254,14 +1237,12 @@ impl LogQlEngine {
         };
         let metric_sql = if mp.client.is_some() {
             // Client-aggregated (issue M6-10): the raw full-window fetch,
-            // not a SQL aggregate.
-            super::sql::metric_raw_samples(
-                &mp.table,
-                &services,
-                &fingerprints,
-                window,
-                &mp.extra_predicates,
-            )
+            // not a SQL aggregate. Issue #227 review round 5, finding 3:
+            // EXPLAIN must report the query that ACTUALLY executes — a range
+            // query runs the PK-ordered sliding scan (`run_metric_client`),
+            // so reporting `metric_raw_samples` here made the
+            // `explain_indexes` gates validate a query we never issue.
+            client_metric_read_sql(mp, &services, &fingerprints, window)
         } else {
             let source = super::sql::MetricSource {
                 table: &mp.table,
@@ -2975,6 +2956,37 @@ pub struct GridWindow {
     pub step_ns: Option<ValidatedDuration>,
 }
 
+/// The client-aggregated raw fetch SQL for a planned metric leaf — the ONE
+/// implementation shared by execution (`run_metric_client`) and EXPLAIN
+/// (`explain_metric`), so the reported query is by construction the query
+/// that runs (issue #227 review round 5, finding 3). A RANGE query reads in
+/// physical-key order for the streaming slide; an instant query keeps the
+/// total-timestamp order its reducers pin.
+fn client_metric_read_sql(
+    mp: &MetricPlan,
+    services: &[String],
+    fingerprints: &[u64],
+    window: super::sql::TimeWindow,
+) -> String {
+    if mp.step_ns.is_some() {
+        super::sql::metric_raw_samples_sliding(
+            &mp.table,
+            services,
+            fingerprints,
+            window,
+            &mp.extra_predicates,
+        )
+    } else {
+        super::sql::metric_raw_samples(
+            &mp.table,
+            services,
+            fingerprints,
+            window,
+            &mp.extra_predicates,
+        )
+    }
+}
+
 /// Builds the evaluation window for a planned metric leaf. The planner has
 /// already validated both durations, so a `Some(step)` plan yields the
 /// `Range` variant carrying two [`ValidatedDuration`]s and an instant plan
@@ -3991,9 +4003,6 @@ struct FpSlide {
     win: VecDeque<WinSample>,
     /// Class-A running integer (add-on-load / subtract-on-evict).
     run_int: u64,
-    /// Reused scratch for the class-B/C re-reduce slice (the `VecDeque` is not
-    /// contiguous) — cleared, never reallocated per emit.
-    reduce_buf: Vec<WinSample>,
     points: Vec<(i64, f64)>,
 }
 
@@ -4045,33 +4054,37 @@ impl FpSlide {
         }
         // Class A (integer invert) needs only the running value + emptiness —
         // no per-emit slice materialization. Class B/C re-reduce the window
-        // (reusing `reduce_buf`, since the deque is already canonically
-        // ordered for one fingerprint).
-        let v = if matches!(self.class, ReducerClass::InvertInteger) {
+        // over a BORROW: `make_contiguous` rotates the deque in place and
+        // hands back `&mut [T]`, so the re-reduction ALLOCATES NOTHING (issue
+        // #227 review round 5, finding 2). The previous `reduce_buf` copied
+        // the whole retained window every step, doubling peak memory for an
+        // uncharged duplicate; removing the copy is strictly better than
+        // charging it. Fields are copied out first so the `&mut self.win`
+        // borrow stays disjoint.
+        let (op, class, param, rate_window_ns, run_int) = (
+            self.op,
+            self.class,
+            self.param,
+            self.rate_window_ns,
+            self.run_int,
+        );
+        let v = if matches!(class, ReducerClass::InvertInteger) {
             if self.win.is_empty() {
                 None
             } else {
+                // A non-empty marker slice — class A ignores its contents.
                 reduce_window(
-                    self.op,
-                    self.class,
-                    self.param,
-                    self.rate_window_ns,
-                    self.run_int,
-                    // A non-empty marker slice — class A ignores its contents.
+                    op,
+                    class,
+                    param,
+                    rate_window_ns,
+                    run_int,
                     std::slice::from_ref(&WIN_SAMPLE_MARKER),
                 )
             }
         } else {
-            self.reduce_buf.clear();
-            self.reduce_buf.extend(self.win.iter().copied());
-            reduce_window(
-                self.op,
-                self.class,
-                self.param,
-                self.rate_window_ns,
-                self.run_int,
-                &self.reduce_buf,
-            )
+            let window = self.win.make_contiguous();
+            reduce_window(op, class, param, rate_window_ns, run_int, window)
         };
         if let Some(v) = v {
             self.points.push((t, v));
@@ -4091,6 +4104,17 @@ impl FpSlide {
         self.emit_until(ts, retained);
         for (rank, m) in members.iter().enumerate() {
             let value = m.value;
+            // Charge BEFORE the allocation (issue #227 review round 5,
+            // finding 2): `push_back` may grow the deque, so the cap must be
+            // checked first — uniform with `stage_member`'s discipline.
+            let next = *retained + 1;
+            if next > cap {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+                    count: next,
+                    cap,
+                }));
+            }
+            *retained = next;
             self.win.push_back(WinSample {
                 ts,
                 stream_hash: self.stream_hash,
@@ -4099,13 +4123,6 @@ impl FpSlide {
             });
             if matches!(self.class, ReducerClass::InvertInteger) {
                 self.run_int += value as u64;
-            }
-            *retained += 1;
-            if *retained > cap {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
-                    count: *retained,
-                    cap,
-                }));
             }
         }
         Ok(())
@@ -4406,42 +4423,85 @@ impl<'q> RangeSlideState<'q> {
         Ok(())
     }
 
-    /// An UPPER BOUND on the heap bytes [`Self::stage_member`] is about to
-    /// allocate for one member. Charging an over-estimate is what makes the
-    /// cap sound: `coll_bytes >= actual`, so bounding `coll_bytes` bounds the
-    /// real footprint.
+    /// A provable UPPER BOUND on the heap bytes [`Self::stage_member`] is
+    /// about to allocate for one member. Charging an over-estimate is what
+    /// makes the cap sound: `coll_bytes >= actual`, so bounding `coll_bytes`
+    /// bounds the real footprint.
     ///
-    /// Per reducer class, every per-member allocation is accounted:
-    /// - **body clone** — `row.body.len()`, only when `needs_body_order`
-    ///   (class C + first/last); zero for every other class.
-    /// - **rendered label JSON** (`key`) — at most `content + 6·pairs + 2`
-    ///   (`{`, `}`, and `"k":"v",` punctuation per pair), only when the
-    ///   pipeline mutates labels (`fan_out`) and the op is not `absent`.
-    /// - **cloned `LabelSet`** — `content` bytes of owned key/value data plus
-    ///   `2·String` headers per pair.
-    /// - fixed per-member overhead for the `CollMember`/`Vec` slots.
+    /// **Worst case per allocation** (issue #227 review round 5, finding 1 —
+    /// the round-4 version under-counted both of the first two):
+    /// - **rendered label JSON** — [`push_json_string`] expands a control
+    ///   byte (`< 0x20`) to `\u00XX`, **6 bytes**, so the rendered length is
+    ///   at most `6 × content`. Worst-case input: every byte a control
+    ///   character. Punctuation is at most 6 bytes per pair (`"":"",`) plus
+    ///   the two braces. The `String` is built with a capacity estimate that
+    ///   ASSUMES no escaping, so escaping-heavy input forces geometric
+    ///   growth whose final capacity can reach ~2× the length — hence the
+    ///   ×2. Charged: `2 × (6·content + 6·pairs + 2)`.
+    /// - **cloned `LabelSet`** — `content` bytes of owned key/value data
+    ///   (each `String::from(&str)` allocates exactly), plus the vector's
+    ///   element footprint `pairs × size_of::<(String, String)>()`. The
+    ///   `collect` is from an `ExactSizeIterator` so it reserves exactly, but
+    ///   ×2 is charged for allocator slack.
+    /// - **body clone** — exactly `row.body.len()` (`String::clone` reserves
+    ///   exactly), only when `needs_body_order`; plus the `String` header.
+    /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity,
+    ///   and during the realloc the old buffer is still live, so peak is up
+    ///   to ~3× the element count. Charged `4 × size_of::<CollMember>()` per
+    ///   member, which dominates `4n·size >= 3n·size` for every `n`.
+    ///
+    /// Saturating arithmetic throughout: a hostile label value cannot wrap
+    /// the charge to a small number (the multiplication is the only place
+    /// that could, and `content` is itself bounded by the byte-scan budget).
     fn member_stage_bytes(
         &self,
         row: &MetricScanRow,
         scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         stages_out: bool,
     ) -> u64 {
-        /// `String`/`Vec` header + allocator slack charged per owned piece.
-        const PER_ALLOC_OVERHEAD: u64 = 32;
-        let mut bytes = PER_ALLOC_OVERHEAD; // the `CollMember` slot itself
+        /// Worst-case expansion of one content byte by JSON escaping
+        /// (`\u00XX` for a control byte).
+        const MAX_JSON_ESCAPE_EXPANSION: u64 = 6;
+        /// A `Vec` push can double capacity while the old buffer is still
+        /// live; charging 4× per element dominates that peak.
+        const VEC_GROWTH_FACTOR: u64 = 4;
+
+        let member_slot = (std::mem::size_of::<CollMember>() as u64)
+            .saturating_mul(VEC_GROWTH_FACTOR);
+        let mut bytes = member_slot;
+
         if self.needs_body_order {
-            bytes += row.body.len() as u64 + PER_ALLOC_OVERHEAD;
+            bytes = bytes
+                .saturating_add(row.body.len() as u64)
+                .saturating_add(std::mem::size_of::<String>() as u64);
         }
+
         if stages_out {
             let pairs = scratch.len() as u64;
             let content: u64 = scratch
                 .iter()
                 .map(|(k, v)| (k.len() + v.len()) as u64)
-                .sum();
-            // `key` (JSON) + the owned `LabelSet` each hold the content once.
-            bytes += content + 6 * pairs + 2 + PER_ALLOC_OVERHEAD;
-            bytes += content + 2 * pairs * PER_ALLOC_OVERHEAD + PER_ALLOC_OVERHEAD;
+                .fold(0u64, u64::saturating_add);
+
+            // Rendered JSON: worst-case escaping, then geometric growth.
+            let json_len = content
+                .saturating_mul(MAX_JSON_ESCAPE_EXPANSION)
+                .saturating_add(pairs.saturating_mul(6))
+                .saturating_add(2);
+            bytes = bytes
+                .saturating_add(json_len.saturating_mul(2))
+                .saturating_add(std::mem::size_of::<String>() as u64);
+
+            // Cloned `LabelSet`: owned content + element footprint.
+            let elems = pairs
+                .saturating_mul(std::mem::size_of::<(String, String)>() as u64)
+                .saturating_mul(2);
+            bytes = bytes
+                .saturating_add(content)
+                .saturating_add(elems)
+                .saturating_add(std::mem::size_of::<LabelSet>() as u64);
         }
+
         bytes
     }
 
@@ -4530,7 +4590,6 @@ impl<'q> RangeSlideState<'q> {
                 next_k: 0,
                 win: VecDeque::new(),
                 run_int: 0,
-                reduce_buf: Vec::new(),
                 points: Vec::new(),
             });
             self.cur_fp = fp;
@@ -4590,32 +4649,38 @@ impl<'q> RangeSlideState<'q> {
                         *e.get_mut() += value as u64;
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(value as u64);
-                        *retained += 1;
-                        if *retained > MAX_RETAINED_WINDOW_POINTS {
+                        // Charge BEFORE inserting (issue #227 review round 5,
+                        // finding 2): the insert may grow the map.
+                        let next = *retained + 1;
+                        if next > MAX_RETAINED_WINDOW_POINTS {
                             return Err(ReadError::QueryTooBroad(
                                 TooBroadReason::MetricRetention {
-                                    count: *retained,
+                                    count: next,
                                     cap: MAX_RETAINED_WINDOW_POINTS,
                                 },
                             ));
                         }
+                        *retained = next;
+                        e.insert(value as u64);
                     }
                 }
             } else {
+                // Charge BEFORE the map/vector insertion (issue #227 review
+                // round 5, finding 2): both may allocate.
+                let next = *retained + 1;
+                if next > MAX_RETAINED_WINDOW_POINTS {
+                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+                        count: next,
+                        cap: MAX_RETAINED_WINDOW_POINTS,
+                    }));
+                }
+                *retained = next;
                 group.pt_cells.entry(k).or_default().push(WinSample {
                     ts,
                     stream_hash,
                     tie_rank,
                     value,
                 });
-                *retained += 1;
-                if *retained > MAX_RETAINED_WINDOW_POINTS {
-                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
-                        count: *retained,
-                        cap: MAX_RETAINED_WINDOW_POINTS,
-                    }));
-                }
             }
         }
         Ok(())
@@ -4799,8 +4864,8 @@ pub fn run_client_agg_rows(
 }
 
 /// The live engine's per-fold metric-aggregation state: the instant
-/// tumbling-into-one-window [`ClientAggState`] or the issue #227 range
-/// sliding evaluator, both driven chunk-wise off the raw scan stream.
+/// single-window [`ClientAggState`] or the issue #227 range sliding
+/// evaluator, both driven chunk-wise off the raw scan stream.
 enum MetricAggState<'q> {
     Instant(Box<ClientAggState<'q>>),
     Range(Box<RangeSlideState<'q>>),
@@ -6689,7 +6754,6 @@ mod tests {
             next_k: 0,
             win: VecDeque::new(),
             run_int: 0,
-            reduce_buf: Vec::new(),
             points: Vec::new(),
         };
         let mut retained = 0u64;
@@ -6745,7 +6809,6 @@ mod tests {
             next_k: 0,
             win: VecDeque::new(),
             run_int: 0,
-            reduce_buf: Vec::new(),
             points: Vec::new(),
         };
         let mut retained = 0u64;
@@ -7155,6 +7218,118 @@ mod tests {
         assert!(
             state.coll_bytes >= after_first,
             "charge accumulated, not reset"
+        );
+    }
+
+    /// Review round 5, finding 1: `member_stage_bytes` must be a true UPPER
+    /// BOUND on what `stage_member` actually allocates — including the
+    /// worst-case JSON escaping (a control byte renders as `\u00XX`, SIX
+    /// bytes) that the round-4 version counted only once.
+    #[test]
+    fn member_stage_bytes_is_an_upper_bound_under_worst_case_escaping() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+
+        // Every value byte is a control character — the maximum expansion
+        // the renderer can produce (1 byte in, 6 bytes out).
+        let worst: String = std::iter::repeat_n('\u{1}', 512).collect();
+        let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = vec![
+            (Cow::Borrowed("k"), Cow::Owned(worst.clone())),
+            (Cow::Borrowed("kk"), Cow::Owned(worst.clone())),
+        ];
+        let row = MetricScanRow {
+            fingerprint: 1,
+            timestamp_ns: 5,
+            body: "a=1".to_string(),
+        };
+        let charge = state.member_stage_bytes(&row, &pairs, true);
+
+        // What is ACTUALLY allocated for the JSON + the owned LabelSet.
+        let rendered = render_labels_json_sorted(&pairs);
+        let owned: LabelSet = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let actual_json = rendered.len() as u64;
+        let actual_labels: u64 = owned
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum::<u64>()
+            + owned.len() as u64 * std::mem::size_of::<(String, String)>() as u64;
+        assert!(
+            actual_json > pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum::<u64>(),
+            "the fixture must genuinely trigger escaping expansion"
+        );
+        assert!(
+            charge >= actual_json + actual_labels,
+            "charge {charge} must be >= actual {} (json {actual_json} + labels {actual_labels})",
+            actual_json + actual_labels
+        );
+    }
+
+    /// Review round 5, finding 3: EXPLAIN and execution share ONE SQL
+    /// builder, so the reported `metric_read` query IS the query that runs —
+    /// a range plan yields the PK-ordered sliding scan, an instant plan the
+    /// total-order scan. (Previously EXPLAIN reported `metric_raw_samples`
+    /// while a range query executed the sliding one, making the
+    /// `explain_indexes` gates validate a query we never issue.)
+    #[test]
+    fn explain_and_execution_share_one_client_read_sql() {
+        let ctx = PlanCtx {
+            db: "pulsus",
+            streams_idx: "log_streams_idx",
+            streams: "log_streams",
+            samples: "log_samples",
+            rollup_table: "log_metrics_5s",
+            rollup_res_ns: 5_000_000_000,
+            scan_budget_bytes: 1 << 40,
+            max_streams: 100_000,
+            pipeline_scan_factor: 10,
+        };
+        let window = super::super::sql::TimeWindow {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let svc = ["'checkout'".to_string()];
+        let mk = |spec| {
+            let expr = pulsus_logql::parse(r#"count_over_time({env="prod"} | logfmt [5m])"#)
+                .expect("parse");
+            let params = QueryParams {
+                spec,
+                limit: 100,
+                direction: Direction::Backward,
+            };
+            match plan::plan(&expr, &params, &ctx).expect("plan") {
+                plan::Plan::Metric(mp) => mp,
+                other => panic!("expected a metric plan, got {other:?}"),
+            }
+        };
+        // RANGE -> the PK-ordered sliding scan.
+        let range_mp = mk(QuerySpec::Range {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+            step_ns: 15_000_000_000,
+        });
+        let range_sql = client_metric_read_sql(&range_mp, &svc, &[1], window);
+        assert!(
+            range_sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
+            "range EXPLAIN/exec must report the sliding scan: {range_sql}"
+        );
+        // INSTANT -> the total-timestamp-order scan.
+        let instant_mp = mk(QuerySpec::Instant { at_ns: 60_000_000_000 });
+        let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window);
+        assert!(
+            instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
+            "instant must keep its total order: {instant_sql}"
         );
     }
 
