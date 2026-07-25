@@ -6,29 +6,20 @@
 //!
 //! Batch 0 seeds the corpus with the instant-eval subset of today's 39
 //! differential cases (`test/fixtures/logs/differential.json`) ported into
-//! the DSL; later batches (B1–B6) append `.test` files to `CORPUS_FILES`.
+//! the DSL; later batches (B1–B6) just drop new `.test` files into the
+//! corpus dir — they are discovered from disk, so batches never edit a
+//! shared list (parallel-safe) and a file cannot silently drop out.
 
 #[path = "logqltest/mod.rs"]
 mod driver;
 
 use driver::runner::{DirectiveCounts, EvalMode, run_file};
 
-/// Every `.test` file in `tests/logqltest/corpus`. A file on disk not
-/// listed here (or vice versa) fails `corpus_files_match_the_directory`,
-/// so a new batch cannot silently drop out of the replay.
-const CORPUS_FILES: &[&str] = &[
-    "differential_parsers_filters.test",
-    "differential_formatters.test",
-    "differential_errors.test",
-    "differential_ip_filters.test",
-    "differential_metric_reducers.test",
-    "differential_vector_matching.test",
-];
-
-/// The `.test` files on disk must exactly match `CORPUS_FILES` (the #29 F1
-/// pattern: filtering a test out cannot bypass the replay).
-#[test]
-fn corpus_files_match_the_directory() {
+/// Every `.test` file in `tests/logqltest/corpus`, discovered from disk (not
+/// a hardcoded list) so batches only ever ADD files with no shared edit point
+/// — parallel-safe. The #29 F1 anti-drop guarantee holds by construction: the
+/// replay runs whatever is on disk, so a file cannot silently drop out.
+fn corpus_files() -> Vec<String> {
     let mut on_disk: Vec<String> = std::fs::read_dir(driver::corpus_dir())
         .expect("corpus dir exists")
         .map(|e| e.expect("readable dir entry").file_name())
@@ -38,11 +29,29 @@ fn corpus_files_match_the_directory() {
         })
         .collect();
     on_disk.sort();
-    let mut listed: Vec<String> = CORPUS_FILES.iter().map(|s| s.to_string()).collect();
-    listed.sort();
-    assert_eq!(
-        on_disk, listed,
-        "corpus .test files on disk must exactly match CORPUS_FILES"
+    on_disk
+}
+
+/// Count `eval*` directives in a `.test` file's raw text, compared per-file
+/// against the cases the runner produced — so a parse bug that silently drops
+/// an `eval` is caught without needing a fragile global exact count.
+fn count_eval_directives(text: &str) -> usize {
+    text.lines()
+        .filter(|l| {
+            let tok = l.split_whitespace().next().unwrap_or("");
+            matches!(tok, "eval" | "eval_ordered" | "eval_fail")
+        })
+        .count()
+}
+
+/// The corpus directory is populated (a catastrophic dir/glob failure or an
+/// empty checkout is caught); at least the Batch 0 seed files are present.
+#[test]
+fn corpus_dir_is_populated() {
+    let files = corpus_files();
+    assert!(
+        files.len() >= 6,
+        "expected at least the 6 seed .test files, found {files:?}"
     );
 }
 
@@ -55,10 +64,19 @@ fn corpus_is_fully_green_and_exercises_every_directive() {
     let mut failures: Vec<String> = Vec::new();
     let mut case_count = 0usize;
 
-    for name in CORPUS_FILES {
+    for name in &corpus_files() {
         let path = driver::corpus_dir().join(name);
         let text = driver::read_file(&path);
         let run = run_file(name, &text).unwrap_or_else(|e| panic!("{e}"));
+        // Per-file no-drop guard: every `eval*` directive in the file must
+        // have produced a case (parallel-safe — no global exact count).
+        assert_eq!(
+            run.cases.len(),
+            count_eval_directives(&text),
+            "{name}: {} eval directives but {} cases — a parse bug dropped some",
+            count_eval_directives(&text),
+            run.cases.len()
+        );
         case_count += run.cases.len();
         for case in &run.cases {
             if !case.passed {
@@ -84,12 +102,12 @@ fn corpus_is_fully_green_and_exercises_every_directive() {
         failures.join("\n")
     );
 
-    // Every `eval*` directive in the seed files must have produced a case
-    // (a blank-line parse bug would silently drop some) — Batch 0 ports 32
-    // instant-eval differential cases.
-    assert_eq!(
-        case_count, 32,
-        "expected 32 seed cases from the instant-eval differential subset"
+    // A growing floor: Batch 0 seeds 32 instant-eval cases; later batches
+    // only add more. The per-file no-drop guard above is what catches
+    // silently-dropped cases — this is just a corpus-shrink backstop.
+    assert!(
+        case_count >= 32,
+        "expected at least the 32 seed cases, found {case_count}"
     );
     assert!(totals.clear > 0, "corpus never exercised `clear`");
     assert!(totals.load > 0, "corpus never exercised `load`");
