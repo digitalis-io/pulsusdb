@@ -739,35 +739,40 @@ async fn keyset_backward_page_keeps_the_primary_key_engaged_via_the_redundant_ti
 // Metric reads — rollup-served vs raw fallback, range vs instant.
 // ---------------------------------------------------------------------
 
+/// Issue #227 Tier-1 gate: a RANGE metric read slides raw off `log_samples`
+/// (the rollup fast-path is retired for range) and its PK-ordered sliding
+/// scan (`metric_raw_samples_sliding`) engages the `(service, fingerprint,
+/// timestamp_ns)` primary key — the same prune as every raw `log_samples`
+/// read (the `ORDER BY` change to `optimize_read_in_order` shape does not
+/// alter the index prune). Never a full scan (the query-performance mandate).
 #[tokio::test]
-async fn metric_rollup_range_read_uses_the_fingerprint_bucket_primary_key() {
+async fn metric_range_slides_raw_and_prunes_on_the_service_fingerprint_timestamp_primary_key() {
     skip_unless_live!();
-    let db = "pulsus_read_it_metric_rollup_range";
+    let db = "pulsus_read_it_metric_range_sliding";
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
     let mp = metric_plan(r#"rate({env="prod"}[5m])"#, &range_params(ts_ns), db);
-    assert!(mp.rollup, "fixture query must be rollup-eligible");
-    let table = format!("{db}.log_metrics_5s");
-    let sql = sql::metric_range(
-        sql::MetricSource {
-            table: &table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        },
-        &[],
+    assert!(!mp.rollup, "issue #227: a range query slides raw, never rollup");
+    assert!(mp.client.is_some());
+    assert_eq!(mp.table, "log_samples");
+    let table = format!("{db}.log_samples");
+    let sql = sql::metric_raw_samples_sliding(
+        &table,
+        &["'checkout'".to_string()],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
-        mp.step_ns.expect("range spec"),
         &mp.extra_predicates,
     );
-
+    assert!(
+        sql.contains("ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"),
+        "PK read order (optimize_read_in_order), no body/global-ts sort: {sql}"
+    );
     let usage = explain(&client, &sql).await;
-    assert_eq!(usage, expected_metric_rollup_usage());
-    assert!(!usage.iter().any(|l| l.contains("service")));
+    assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
 /// Issue #169 Tier-1 gate: the `/volume` rollup aggregation carries the
@@ -1445,10 +1450,13 @@ async fn discovery_fetch_by_names_prunes_on_the_metric_name_primary_key_componen
 // raw — two distinct table targets, both index-served.
 // ---------------------------------------------------------------------
 
+/// Issue #227: an un-piped range `count_over_time` slides raw (the rollup
+/// fast-path is retired for range reads) and prunes on the `log_samples`
+/// primary key.
 #[tokio::test]
-async fn m6_10_unpiped_count_over_time_is_still_rollup_served() {
+async fn m6_10_unpiped_count_over_time_range_slides_raw() {
     skip_unless_live!();
-    let db = "pulsus_read_it_m610_rollup";
+    let db = "pulsus_read_it_m610_range_raw";
     let ts_ns = now_ns();
     let client = setup(db, ts_ns).await;
 
@@ -1457,30 +1465,22 @@ async fn m6_10_unpiped_count_over_time_is_still_rollup_served() {
         &range_params(ts_ns),
         db,
     );
-    assert!(
-        mp.rollup,
-        "un-piped count_over_time must stay rollup-served"
-    );
-    assert!(mp.client.is_none(), "and must stay SQL-aggregated");
-    assert_eq!(mp.table, "log_metrics_5s");
-    let table = format!("{db}.log_metrics_5s");
-    let sql = sql::metric_range(
-        sql::MetricSource {
-            table: &table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        },
-        &[],
+    assert!(!mp.rollup, "issue #227: a range count slides raw");
+    assert!(mp.client.is_some());
+    assert_eq!(mp.table, "log_samples");
+    let table = format!("{db}.log_samples");
+    let sql = sql::metric_raw_samples_sliding(
+        &table,
+        &["'checkout'".to_string()],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
-        mp.step_ns.expect("range spec"),
         &mp.extra_predicates,
     );
     let usage = explain(&client, &sql).await;
-    assert_eq!(usage, expected_metric_rollup_usage());
+    assert_eq!(usage, expected_metric_instant_raw_usage());
 }
 
 #[tokio::test]
@@ -1537,19 +1537,16 @@ async fn metric_raw_fallback_uses_the_service_fingerprint_timestamp_primary_key(
     );
     assert!(!mp.rollup);
     let table = format!("{db}.log_samples");
-    let sql = sql::metric_range(
-        sql::MetricSource {
-            table: &table,
-            bucket_col: mp.bucket_col,
-            agg_expr: mp.agg_expr,
-        },
+    // Issue #227: a range read with a line filter slides raw
+    // (`metric_raw_samples_sliding`), the filter pushed down as a predicate.
+    let sql = sql::metric_raw_samples_sliding(
+        &table,
         &["'checkout'".to_string()],
         &[FP_PROD],
         TimeWindow {
             start_ns: mp.start_ns,
             end_ns: mp.end_ns,
         },
-        mp.step_ns.expect("range spec"),
         &mp.extra_predicates,
     );
 
