@@ -729,8 +729,18 @@ impl CompiledPipeline {
                     for f in fmts {
                         match f {
                             CompiledLabelFmt::Rename { dst, src } => {
-                                let value = remove_label(labels, src).unwrap_or_default();
-                                set_label(labels, Cow::Borrowed(dst), value);
+                                // Loki `LabelsFormatter.Process` (fmt.go:414-419):
+                                // the rename runs only when the source resolves
+                                // present; an absent source is a complete no-op and
+                                // dst is NOT created. A present (even empty) source
+                                // still renames — matches Loki's parsed-empty case
+                                // (`Set(dst,"")`+`Del(src)`). Empty *stream* labels
+                                // are non-ingestable (both engines drop them at
+                                // write), so this guard matches Loki for every
+                                // reachable input (#226).
+                                if let Some(value) = remove_label(labels, src) {
+                                    set_label(labels, Cow::Borrowed(dst), value);
+                                }
                             }
                             CompiledLabelFmt::Template { dst, tmpl } => {
                                 let rendered = render_template(tmpl, labels);
@@ -1133,21 +1143,44 @@ const DURATION_UNITS: &[(&str, f64)] = &[
     ("w", 604_800.0),
 ];
 
-/// Bytes units, decimal and binary, matched case-insensitively (`5KB`,
-/// `5kb`, `1MiB`, …).
+/// The full `dustin/go-humanize` byte-size table (`bytesSizeTable`),
+/// matched case-insensitively: bare units (`k`,`ki`,…), `b`-suffixed units
+/// (`kb`,`kib`,…), the empty suffix (a bare number is a byte count), and
+/// the exa tier (`e`/`eb`=1e18, `ei`/`eib`=2^60). Decimal factors are
+/// powers of 1000; binary factors powers of 1024.
 const BYTES_UNITS: &[(&str, f64)] = &[
-    ("kib", 1024.0),
-    ("mib", 1024.0 * 1024.0),
-    ("gib", 1024.0 * 1024.0 * 1024.0),
-    ("tib", 1024.0 * 1024.0 * 1024.0 * 1024.0),
-    ("pib", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
-    ("kb", 1e3),
-    ("mb", 1e6),
-    ("gb", 1e9),
-    ("tb", 1e12),
-    ("pb", 1e15),
+    ("", 1.0),
     ("b", 1.0),
+    ("k", 1e3),
+    ("kb", 1e3),
+    ("ki", 1024.0),
+    ("kib", 1024.0),
+    ("m", 1e6),
+    ("mb", 1e6),
+    ("mi", 1024.0 * 1024.0),
+    ("mib", 1024.0 * 1024.0),
+    ("g", 1e9),
+    ("gb", 1e9),
+    ("gi", 1024.0 * 1024.0 * 1024.0),
+    ("gib", 1024.0 * 1024.0 * 1024.0),
+    ("t", 1e12),
+    ("tb", 1e12),
+    ("ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ("tib", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ("p", 1e15),
+    ("pb", 1e15),
+    ("pi", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ("pib", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ("e", 1e18),
+    ("eb", 1e18),
+    ("ei", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ("eib", 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0),
 ];
+
+/// Go's `math.MaxUint64` (2^64-1) converted to f64 rounds up to 2^64 (a
+/// power of two, so exactly representable); go-humanize's overflow guard
+/// `f >= math.MaxUint64` is therefore `product >= 2^64` (#226).
+const BYTES_MAX_UINT64_F64: f64 = 18_446_744_073_709_551_616.0;
 
 /// Parses a (possibly compound, possibly fractional) duration to f64
 /// seconds: `250ms`, `1h30m`, `1.5s`. `None` when any component's unit is
@@ -1177,20 +1210,36 @@ pub(crate) fn parse_duration_seconds(raw: &str) -> Option<f64> {
     matched.then_some(total)
 }
 
-/// Parses a bytes quantity to f64 bytes: `512b`, `5KB`, `1MiB`
-/// (case-insensitive units, no compounding). `None` when the suffix is
-/// not a bytes unit.
+/// Parses a bytes quantity to f64 bytes — a faithful port of
+/// `dustin/go-humanize` `ParseBytes` (probed against grafana/loki:3.7.4):
+/// `512b`, `5KB`, `1MiB`, bare `1k`/`1ki`, `1,024`, `3 kB`, exa `1eb`. The
+/// leading `[0-9 . ,]` run is comma-stripped and `ParseFloat`d; the suffix
+/// is trimmed, Unicode-lowercased, and looked up in [`BYTES_UNITS`]; the
+/// product is truncated toward zero (Go's `uint64(f)`). `None` on a bad
+/// numeric prefix, an unknown suffix, or overflow (`f >= math.MaxUint64`) —
+/// the exact three cases [`bytes_parse_error`] renders a detail for.
+///
+/// The suffix uses Unicode-aware [`str::to_lowercase`] (not
+/// `to_ascii_lowercase`) to match Go's `strings.ToLower`: e.g. the Kelvin
+/// sign U+212A folds to `k`, so `1\u{212A}B`=1000 like Loki (#226 v5
+/// Finding A). The digit scan stays ASCII (`is_ascii_digit`) while Go uses
+/// `unicode.IsDigit`: go-humanize slices `s[:lastDigit]` by BYTE while
+/// `lastDigit` counts RUNES, so any non-ASCII digit yields a mangled prefix
+/// that Go's ASCII `strconv.ParseFloat` rejects — behaviorally identical to
+/// rejecting it here (both engines reject; #226 v5 Finding B).
 pub(crate) fn parse_bytes_value(raw: &str) -> Option<f64> {
     let num_end = raw
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
         .unwrap_or(raw.len());
-    if num_end == 0 {
+    let num = raw[..num_end].replace(',', "");
+    let n: f64 = num.parse().ok()?;
+    let unit = raw[num_end..].trim().to_lowercase();
+    let (_, factor) = BYTES_UNITS.iter().find(|(u, _)| *u == unit)?;
+    let product = n * factor;
+    if product >= BYTES_MAX_UINT64_F64 {
         return None;
     }
-    let n: f64 = raw[..num_end].parse().ok()?;
-    let unit = raw[num_end..].to_ascii_lowercase();
-    let (_, factor) = BYTES_UNITS.iter().find(|(u, _)| *u == unit)?;
-    Some(n * factor)
+    Some(product.trunc())
 }
 
 /// Converts a label value in `kind`'s unit family; `None` = conversion
@@ -1207,7 +1256,11 @@ fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
     match kind {
         UnitKind::Number => value.parse().ok(),
         UnitKind::Duration => parse_duration_seconds(value),
-        UnitKind::Bytes => value.parse().ok().or_else(|| parse_bytes_value(value)),
+        // Route entirely through the humanize port: a bare number is the
+        // empty-suffix table entry, so the old `value.parse` short-circuit
+        // (which bypassed uint64 truncation for e.g. `1.5`) is dropped
+        // (#226).
+        UnitKind::Bytes => parse_bytes_value(value),
     }
 }
 
@@ -1223,10 +1276,9 @@ fn convert_label_value(kind: UnitKind, value: &str) -> Option<f64> {
 ///   faithful-format (ledgered — Go consumes valid leading components
 ///   first, which we do not reproduce) but its interpolated value/unit
 ///   are quoted byte-exactly via [`go_time_quote`].
-/// - `Bytes`: LEDGERED — Loki's `humanize.ParseBytes` interpolates an
-///   internal numeric split; we emit the `ParseFloat` shape over the
-///   leading numeric run (byte-exact for a fully non-numeric value, which
-///   yields the empty prefix Loki reports).
+/// - `Bytes`: [`bytes_parse_error`] — byte-exact `humanize.ParseBytes`
+///   `.Error()` across all three branches (bad prefix / unknown suffix /
+///   overflow).
 fn label_filter_error_details(kind: UnitKind, value: &str) -> String {
     match kind {
         UnitKind::Number => {
@@ -1236,16 +1288,42 @@ fn label_filter_error_details(kind: UnitKind, value: &str) -> String {
             )
         }
         UnitKind::Duration => go_duration_parse_error(value),
-        UnitKind::Bytes => {
-            let prefix_end = value
-                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-                .unwrap_or(value.len());
-            // The prefix is a leading `[0-9.]*` run — no quote/control/
-            // non-ASCII byte is reachable, so no Go-quoting is needed
-            // here (out of finding-1 scope; Bytes stays ledgered).
-            let prefix = &value[..prefix_end];
-            format!("strconv.ParseFloat: parsing \"{prefix}\": invalid syntax")
-        }
+        UnitKind::Bytes => bytes_parse_error(value),
+    }
+}
+
+/// Byte-exact `dustin/go-humanize` `ParseBytes(value).Error()` for a failed
+/// byte conversion (#226). Mirrors humanize's control flow so the
+/// value-side per-line `__error_details__` matches Loki across all three
+/// branches:
+/// - bad numeric prefix → `strconv.ParseFloat: parsing "<prefix>": invalid syntax`
+///   (the comma-stripped prefix, quoted via the shared Go quoter; empty for
+///   a non-numeric value);
+/// - unknown suffix → `unhandled size name: <trimmed+lowercased suffix>`
+///   (same Unicode-lowered suffix [`parse_bytes_value`] looks up);
+/// - overflow → `too large: <ORIGINAL value>`.
+///
+/// [`parse_bytes_value`] returns `None` in exactly these three cases, so the
+/// two functions stay consistent.
+fn bytes_parse_error(value: &str) -> String {
+    let num_end = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == ','))
+        .unwrap_or(value.len());
+    let num = value[..num_end].replace(',', "");
+    if num.parse::<f64>().is_err() {
+        return format!(
+            "strconv.ParseFloat: parsing {}: invalid syntax",
+            go_quote(&num)
+        );
+    }
+    let unit = value[num_end..].trim().to_lowercase();
+    if BYTES_UNITS.iter().any(|(u, _)| *u == unit) {
+        // Prefix parsed and the suffix is a known unit — the only remaining
+        // failure `parse_bytes_value` reports is overflow; Go interpolates
+        // the ORIGINAL input string here.
+        format!("too large: {value}")
+    } else {
+        format!("unhandled size name: {unit}")
     }
 }
 
@@ -2083,6 +2161,78 @@ mod tests {
         assert_eq!(parse_bytes_value("1MiB"), Some(1_048_576.0));
         assert_eq!(parse_bytes_value("1h"), None);
         assert_eq!(parse_bytes_value("5xz"), None);
+    }
+
+    #[test]
+    fn bytes_value_matches_humanize_parse_bytes_table() {
+        // Probed exact against grafana/loki:3.7.4 `humanize.ParseBytes`.
+        // uint64 truncation toward zero.
+        assert_eq!(parse_bytes_value("1.5"), Some(1.0));
+        assert_eq!(parse_bytes_value("1.9KiB"), Some(1_945.0));
+        // Bare units (no `b` suffix).
+        assert_eq!(parse_bytes_value("1k"), Some(1_000.0));
+        assert_eq!(parse_bytes_value("1ki"), Some(1_024.0));
+        // Comma separators are stripped.
+        assert_eq!(parse_bytes_value("1,024"), Some(1_024.0));
+        assert_eq!(parse_bytes_value("1,024b"), Some(1_024.0));
+        // Space between number and unit is trimmed.
+        assert_eq!(parse_bytes_value("3 kB"), Some(3_000.0));
+        assert_eq!(parse_bytes_value("1.5 mib"), Some(1_572_864.0));
+        // Empty suffix = a bare byte count.
+        assert_eq!(parse_bytes_value("1000"), Some(1_000.0));
+        // Exa tier: `e`/`eb`=1e18, `ei`/`eib`=2^60.
+        assert_eq!(parse_bytes_value("1e"), Some(1e18));
+        assert_eq!(parse_bytes_value("1eb"), Some(1e18));
+        assert_eq!(parse_bytes_value("1ei"), Some(1_152_921_504_606_846_976.0));
+        assert_eq!(parse_bytes_value("1eib"), Some(1_152_921_504_606_846_976.0));
+        // Overflow: `f >= math.MaxUint64` (2^64) is rejected. 16*2^60 == 2^64.
+        assert_eq!(parse_bytes_value("16eib"), None);
+        // Just below the boundary is accepted (15*2^60 < 2^64).
+        assert_eq!(
+            parse_bytes_value("15eib"),
+            Some(15.0 * 1_152_921_504_606_846_976.0)
+        );
+    }
+
+    #[test]
+    fn bytes_value_folds_unicode_suffix_like_go_to_lower() {
+        // #226 v5 Finding A: Go `strings.ToLower` folds the Kelvin sign
+        // U+212A to `k`, so these are Loki-valid. Unicode-aware
+        // `to_lowercase` matches; an ASCII-only fold would reject them.
+        assert_eq!(parse_bytes_value("1\u{212A}B"), Some(1_000.0));
+        assert_eq!(parse_bytes_value("1\u{212A}"), Some(1_000.0));
+        assert_eq!(parse_bytes_value("1\u{212A}iB"), Some(1_024.0));
+    }
+
+    #[test]
+    fn bytes_value_rejects_unicode_digits_like_loki() {
+        // #226 v5 Finding B: go-humanize slices the numeric prefix by BYTE
+        // while counting runes, so a non-ASCII digit yields a mangled
+        // prefix that Go's ASCII ParseFloat rejects. An ASCII digit scan
+        // rejects the same inputs — accept/reject identical (both engines
+        // reject; only the garbage detail string would differ).
+        assert_eq!(parse_bytes_value("\u{FF11}\u{FF12}\u{FF13}KB"), None); // fullwidth 123
+        assert_eq!(parse_bytes_value("\u{0663}KB"), None); // Arabic-Indic 3
+    }
+
+    #[test]
+    fn bytes_parse_error_mirrors_humanize_three_branches() {
+        // Probed exact against grafana/loki:3.7.4.
+        assert_eq!(bytes_parse_error("5xb"), "unhandled size name: xb");
+        assert_eq!(bytes_parse_error("1Kx"), "unhandled size name: kx");
+        assert_eq!(bytes_parse_error("16eib"), "too large: 16eib");
+        assert_eq!(
+            bytes_parse_error("5.5.5b"),
+            "strconv.ParseFloat: parsing \"5.5.5\": invalid syntax"
+        );
+        assert_eq!(
+            bytes_parse_error("abc"),
+            "strconv.ParseFloat: parsing \"\": invalid syntax"
+        );
+        assert_eq!(
+            bytes_parse_error("-3b"),
+            "strconv.ParseFloat: parsing \"\": invalid syntax"
+        );
     }
 
     #[test]
