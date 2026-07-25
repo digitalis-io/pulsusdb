@@ -20,7 +20,7 @@ use pulsus_logql::{
 
 use super::error::ReadError;
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
-use super::exec::ClientWindow;
+use super::exec::GridWindow;
 use super::params::{
     Direction, PlanCtx, QueryParams, QuerySpec, ValidatedDuration, validate_duration_ns,
 };
@@ -224,7 +224,7 @@ pub enum MetricNode {
     /// constant `{}` matrix (reusing the shared bucket grid + cap).
     VectorLit {
         value: f64,
-        window: ClientWindow,
+        window: GridWindow,
     },
     Binary {
         op: BinOp,
@@ -417,28 +417,26 @@ fn build_metric_node(
 /// is `step_ns: None` (a single `{} => n` sample), range carries the
 /// spec's `start_ns`/`end_ns`/`step_ns` so exec materializes the constant
 /// `{}` matrix on the shared bucket grid.
-fn window_from(p: &QueryParams) -> Result<ClientWindow, ReadError> {
+fn window_from(p: &QueryParams) -> Result<GridWindow, ReadError> {
     // A `vector(n)` literal has no `[range]`; its constant `{}` series is
     // emitted at every start-anchored grid point regardless of window, so
     // `range_ns` is immaterial (0).
     match p.spec {
-        QuerySpec::Instant { at_ns } => Ok(ClientWindow {
+        QuerySpec::Instant { at_ns } => Ok(GridWindow {
             start_ns: at_ns,
             end_ns: at_ns,
             step_ns: None,
-            range_ns: ValidatedDuration::NONE,
         }),
         QuerySpec::Range {
             start_ns,
             end_ns,
             step_ns,
-        } => Ok(ClientWindow {
+        } => Ok(GridWindow {
             start_ns,
             end_ns,
             // The leafless `vector(n)` tree still routes its client `step`
             // through the boundary (issue #227 review round 3).
             step_ns: Some(validate_duration_ns(step_ns, "step")?),
-            range_ns: ValidatedDuration::NONE,
         }),
     }
 }

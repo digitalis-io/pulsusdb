@@ -91,11 +91,11 @@ pub fn terminal_sort(expr: &Expr) -> bool {
 pub use detected::{DetectedFieldOut, DetectedFields, DetectedLabelOut};
 pub use error::{ReadError, TooBroadReason};
 pub use exec::{
-    ClientWindow, EngineConfig, HistMatrixSeries, HistOrFloat, HistVectorSample, LogQlEngine,
-    LogStats, MatrixSeries, PatternSeries, QueryResult, StreamResult, TAIL_REGISTRATION_GRACE_NS,
-    TailCursor, TailLower, TailPage, TailSetup, VectorSample, VolumeAggregateBy, VolumeEntry,
-    VolumeQuery, apply_vector_aggs, combine_binary, materialize_vector_lit, read_query_settings,
-    run_client_agg_rows,
+    ClientWindow, EngineConfig, GridWindow, HistMatrixSeries, HistOrFloat, HistVectorSample,
+    LogQlEngine, LogStats, MatrixSeries, PatternSeries, QueryResult, StreamResult,
+    TAIL_REGISTRATION_GRACE_NS, TailCursor, TailLower, TailPage, TailSetup, VectorSample,
+    VolumeAggregateBy, VolumeEntry, VolumeQuery, apply_vector_aggs, combine_binary,
+    materialize_vector_lit, read_query_settings, run_client_agg_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
 pub use params::{

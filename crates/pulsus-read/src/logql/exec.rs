@@ -901,12 +901,7 @@ impl LogQlEngine {
                     compiled,
                     &HashMap::new(),
                     client,
-                    ClientWindow {
-                        start_ns: mp.grid_start_ns,
-                        end_ns: mp.end_ns,
-                        step_ns: mp.step_ns,
-                        range_ns: mp.range_ns,
-                    },
+                    metric_plan_window(mp),
                     mp.rate_window_ns,
                 );
             }
@@ -1104,12 +1099,7 @@ impl LogQlEngine {
         // side AS the scan streams and aborts mid-stream as
         // `QueryTooBroad(ScanBudgetBytes)` — complete-or-error holds
         // without buffering-driven OOM risk.
-        let window = ClientWindow {
-            start_ns: mp.grid_start_ns,
-            end_ns: mp.end_ns,
-            step_ns: mp.step_ns,
-            range_ns: mp.range_ns,
-        };
+        let window = metric_plan_window(mp);
         let mut state = if is_range {
             MetricAggState::Range(Box::new(RangeSlideState::new(
                 compiled,
@@ -2923,26 +2913,85 @@ impl<'m> StreamAccumulator<'m> {
 /// `step_ns` so `rate({}[1m])` and `rate({}[10m])` differ (the divisor and
 /// the window both track `range`, never `step`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClientWindow {
+pub enum ClientWindow {
+    /// A single window, already materialised into `[start_ns, end_ns]` by the
+    /// planner (`start = at - range`). An instant query has **no step grid
+    /// and no residual `[range]`** — both are structurally absent here, so
+    /// neither can be misread downstream.
+    Instant { start_ns: i64, end_ns: i64 },
+    /// Sliding range evaluation. BOTH durations are
+    /// [`ValidatedDuration`]s — boundary-validated and therefore non-zero,
+    /// **by type** (issue #227 review round 4, finding 2). There is no
+    /// "absent"/zero representation for a range window, so
+    /// [`RangeSlideState`] can only ever receive a real, validated range:
+    /// the previous `ValidatedDuration::NONE` sentinel (a public unvalidated
+    /// mint that could be placed in a range slot) is gone entirely.
+    Range {
+        /// The start-anchored emit grid's first point.
+        grid_start_ns: i64,
+        end_ns: i64,
+        step_ns: ValidatedDuration,
+        /// The `[range]` selector width — the sliding span `(t-range, t]`.
+        range_ns: ValidatedDuration,
+    },
+}
+
+impl ClientWindow {
+    /// The evaluation window's lower bound (the emit grid's first point for
+    /// a range query).
+    pub fn start_ns(&self) -> i64 {
+        match *self {
+            ClientWindow::Instant { start_ns, .. } => start_ns,
+            ClientWindow::Range { grid_start_ns, .. } => grid_start_ns,
+        }
+    }
+
+    pub fn end_ns(&self) -> i64 {
+        match *self {
+            ClientWindow::Instant { end_ns, .. } | ClientWindow::Range { end_ns, .. } => end_ns,
+        }
+    }
+
+    /// `Some` only for a range query — an instant window has no step grid.
+    pub fn step_ns(&self) -> Option<ValidatedDuration> {
+        match *self {
+            ClientWindow::Instant { .. } => None,
+            ClientWindow::Range { step_ns, .. } => Some(step_ns),
+        }
+    }
+}
+
+/// The evaluation grid for a leafless `vector(<scalar>)` node (issue #221):
+/// a constant series materialised at every step point. Deliberately a
+/// SEPARATE type from [`ClientWindow`] (issue #227 review round 4): a vector
+/// literal has no `[range]` selector at all, so it must not be able to
+/// occupy — or be built from — a range window's range slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridWindow {
     pub start_ns: i64,
     pub end_ns: i64,
-    /// `Some` = a range query's step grid; `None` = instant. Like
-    /// [`Self::range_ns`] this carries the unforgeable [`ValidatedDuration`]
-    /// (issue #227 review round 3), so a hostile `step` cannot reach the grid
-    /// arithmetic by constructing a window directly.
+    /// `Some` = the range grid (validated step); `None` = a single instant
+    /// sample.
     pub step_ns: Option<ValidatedDuration>,
-    /// The `[range]` selector width in nanoseconds — the sliding window's
-    /// span `(t-range, t]`. The scan itself is widened to `(start-range,
-    /// end]` so the first grid point `start` sees its full lookback.
-    ///
-    /// **Validated** into `1 ..= MAX_DURATION_NS` at the planner boundary
-    /// ([`super::params::validate_duration_ns`]). Carrying the unforgeable
-    /// [`ValidatedDuration`] rather than a raw integer makes it IMPOSSIBLE to
-    /// construct a `ClientWindow` — or to call the public
-    /// [`run_client_agg_rows`] entry — around the validation funnel (issue
-    /// #227 review round 3). [`ValidatedDuration::NONE`] is the leafless
-    /// `vector(<scalar>)` window, which has no `[range]` selector.
-    pub range_ns: ValidatedDuration,
+}
+
+/// Builds the evaluation window for a planned metric leaf. The planner has
+/// already validated both durations, so a `Some(step)` plan yields the
+/// `Range` variant carrying two [`ValidatedDuration`]s and an instant plan
+/// yields `Instant` — an inconsistent window is unrepresentable.
+fn metric_plan_window(mp: &MetricPlan) -> ClientWindow {
+    match mp.step_ns {
+        Some(step_ns) => ClientWindow::Range {
+            grid_start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+            step_ns,
+            range_ns: mp.range_ns,
+        },
+        None => ClientWindow::Instant {
+            start_ns: mp.grid_start_ns,
+            end_ns: mp.end_ns,
+        },
+    }
 }
 
 /// The instant-mode bucket key (any constant works — there is exactly
@@ -3356,8 +3405,8 @@ impl<'q> ClientAggState<'q> {
         window: ClientWindow,
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
-        if let Some(step) = window.step_ns.map(|d| d.as_u64()) {
-            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
+        if let Some(step) = window.step_ns().map(|d| d.as_u64()) {
+            let buckets = grid_bucket_count(window.start_ns(), window.end_ns(), step);
             if buckets > MAX_CLIENT_AGG_BUCKETS {
                 return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
                     buckets,
@@ -3403,7 +3452,7 @@ impl<'q> ClientAggState<'q> {
                 MetricRun::Kept { line, value } => (line, value),
             };
             check_surviving_error(&scratch)?;
-            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns.map(|d| d.as_u64()));
+            let bucket = bucket_of(row.timestamp_ns, self.window.step_ns().map(|d| d.as_u64()));
             if is_absent {
                 // Selector-wide presence (plan v2 D2): count surviving
                 // lines per bucket across ALL fingerprints/label sets.
@@ -3494,7 +3543,7 @@ impl<'q> ClientAggState<'q> {
     /// `absent_over_time` emits at most ONE series over the (pre-capped)
     /// bucket grid; the other reducers emit per surviving group.
     fn finish(self) -> QueryResult {
-        let is_instant = self.window.step_ns.is_none();
+        let is_instant = self.window.step_ns().is_none();
         if matches!(self.client.range_op, RangeAggOp::AbsentOverTime) {
             let labels: LabelSet = self.client.absent_labels.clone();
             return if is_instant {
@@ -3504,9 +3553,9 @@ impl<'q> ClientAggState<'q> {
                     QueryResult::Vector(Vec::new())
                 }
             } else {
-                let step = self.window.step_ns.map(|d| d.as_u64()).unwrap_or(0);
+                let step = self.window.step_ns().map(|d| d.as_u64()).unwrap_or(0);
                 let points: Vec<(i64, f64)> =
-                    bucket_grid(self.window.start_ns, self.window.end_ns, step)
+                    bucket_grid(self.window.start_ns(), self.window.end_ns(), step)
                         .into_iter()
                         .filter(|b| !self.present.contains(b))
                         .map(|b| (b, 1.0))
@@ -3607,7 +3656,7 @@ fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
 /// i128-safe, `clamp_bucket`-narrowed, `(start,end]`-aligned grid a leaf
 /// range query and `absent_over_time` use), so `points.len() == buckets`
 /// and a `data + vector(n)` binop aligns on the data's populated steps.
-pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<QueryResult, ReadError> {
+pub fn materialize_vector_lit(value: f64, window: &GridWindow) -> Result<QueryResult, ReadError> {
     match window.step_ns.map(|d| d.as_u64()) {
         None => Ok(QueryResult::Vector(vec![VectorSample {
             labels: vec![],
@@ -3686,26 +3735,41 @@ fn stream_hash(sorted_labels: &[(String, String)]) -> u64 {
 pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 
 /// Byte ceiling on the staged same-`(fingerprint, timestamp_ns)` collision
-/// group (issue #227 review round 3, finding 1).
+/// group (issue #227 review rounds 3 + 4, finding 1).
 ///
 /// The member-COUNT cap alone is not a memory bound: 10 000 multi-megabyte
-/// log lines are terabytes of RAM while staying comfortably inside the
-/// byte-scan budget. This cap is charged **before** each body is staged, so
-/// the staged buffer can never exceed it:
+/// members are terabytes of RAM while staying inside the byte-scan budget.
 ///
-/// > **Bound proof.** `flush_collision` empties `coll` at every
-/// > `(fingerprint, timestamp_ns)` boundary, so at most one group is staged
-/// > at a time. Within a group, a body is cloned only after
-/// > `staged_bytes + body.len() <= MAX_TS_COLLISION_GROUP_BYTES` has been
-/// > checked, and `staged_bytes` is incremented by exactly that `len()`.
-/// > Therefore `Σ staged body bytes <= MAX_TS_COLLISION_GROUP_BYTES` at all
-/// > times, **by construction**, for any body size and any density — the
-/// > breach returns a clean `TsCollisionGroup` error instead of allocating.
+/// > **Bound proof (re-derived for EVERY reducer class, round 4).**
+/// > 1. [`RangeSlideState::stage_member`] is the ONLY place a per-member
+/// >    allocation is pushed into `coll` — no reducer class has another
+/// >    path, and it is called exactly once per surviving row.
+/// > 2. It charges [`RangeSlideState::member_stage_bytes`] BEFORE allocating.
+/// >    That figure is an UPPER BOUND covering **every** per-member
+/// >    allocation: the body clone (class C + first/last), the rendered
+/// >    label JSON and the cloned `LabelSet` (any label-mutating pipeline —
+/// >    charged for ALL classes, including the integer class A that stages no
+/// >    body), plus fixed per-allocation overhead. Classes that allocate
+/// >    nothing extra charge only the constant.
+/// > 3. The staging is refused unless
+/// >    `coll_bytes + charge <= MAX_TS_COLLISION_GROUP_BYTES`, so the
+/// >    breaching allocation is never performed; on success `coll_bytes`
+/// >    grows by exactly the charge.
+/// > 4. `flush_collision` empties `coll` and resets `coll_bytes` together at
+/// >    every `(fingerprint, timestamp_ns)` boundary, so exactly one group is
+/// >    staged at a time and the counter can neither leak nor double-count
+/// >    across groups (including when a group straddles a fetch chunk: the
+/// >    straddling group is simply never flushed between chunks, so its
+/// >    charge accumulates continuously in the same counter).
+/// >
+/// > Therefore `actual staged heap bytes <= coll_bytes <=
+/// > MAX_TS_COLLISION_GROUP_BYTES` **at all times, for every reducer class,
+/// > any body/label size and any density**. A breach is a clean
+/// > `TsCollisionGroup` error — never a truncated group, so the `tie_rank`
+/// > order is never silently partial.
 ///
-/// 8 MiB of log lines sharing one nanosecond in one stream is already far
-/// beyond any real data (real groups are size 1), so nothing servable is
-/// rejected. Only the order-dependent reducers stage bodies at all
-/// (`needs_body_order`); every other reducer stages zero bytes.
+/// 8 MiB staged for one nanosecond in one stream is far beyond real data
+/// (real groups are size 1), so nothing servable is rejected.
 pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The sliding-window **concurrent** retained-point cap (issue #227):
@@ -4151,12 +4215,19 @@ impl<'q> RangeSlideState<'q> {
         window: ClientWindow,
         rate_window_ns: Option<u64>,
     ) -> Result<Self, ReadError> {
-        let step = window
-            .step_ns
-            .expect("RangeSlideState requires a range window")
-            .as_u64();
-        let grid_start = window.start_ns;
-        let end_ns = window.end_ns;
+        // Destructuring the `Range` variant is what makes the range
+        // GUARANTEED present and validated (issue #227 review round 4,
+        // finding 2): there is no zero/absent range to receive.
+        let ClientWindow::Range {
+            grid_start_ns: grid_start,
+            end_ns,
+            step_ns,
+            range_ns,
+        } = window
+        else {
+            unreachable!("RangeSlideState is constructed only for a Range window")
+        };
+        let step = step_ns.as_u64();
         let count = grid_point_count(grid_start, end_ns, step);
         if count > MAX_CLIENT_AGG_BUCKETS {
             return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
@@ -4188,7 +4259,7 @@ impl<'q> RangeSlideState<'q> {
             step,
             // No narrowing: `range_ns` is already a boundary-validated,
             // in-domain `i64` (issue #227 review round 2, finding 2).
-            range: window.range_ns.get(),
+            range: range_ns.get(),
             kmax,
             fan_out: compiled.metric_mutates_labels(),
             is_absent: matches!(op, RangeAggOp::AbsentOverTime),
@@ -4258,58 +4329,120 @@ impl<'q> RangeSlideState<'q> {
                     None => continue,
                 },
             };
-            let out = if self.fan_out && !self.is_absent {
-                scratch.sort_unstable();
-                let key = render_labels_json_sorted(&scratch);
-                let labels: LabelSet = scratch
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect();
-                Some((key, labels))
-            } else {
-                None
-            };
             self.coll_active = true;
             self.coll_fp = row.fingerprint;
             self.coll_ts = row.timestamp_ns;
-            // Member-COUNT cap, charged BEFORE staging this row.
-            if self.coll.len() as u64 + 1 > MAX_TS_COLLISION_GROUP {
-                result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
-                    count: self.coll.len() as u64 + 1,
-                    cap: MAX_TS_COLLISION_GROUP,
-                }));
+            // THE SINGLE STAGING FUNNEL (issue #227 review round 4, finding
+            // 1): every per-member allocation — body clone, rendered label
+            // JSON, cloned `LabelSet` — is sized, capped, THEN allocated in
+            // one place. No reducer class has a path that stages anything
+            // outside it.
+            if let Err(e) = self.stage_member(row, v, &mut scratch) {
+                result = Err(e);
                 break;
             }
-            // Only order-dependent reducers stage the body (for the collision
-            // `tie_rank` sort); count/bytes/rate/min/max/quantile stage zero
-            // bytes, so the common path never clones a body at all.
-            let body = if self.needs_body_order {
-                // BYTE cap charged BEFORE the clone (issue #227 review round
-                // 3, finding 1): 10 000 multi-megabyte bodies would be
-                // terabytes of RAM under a count-only cap. Checking first
-                // means the staged buffer provably never exceeds the cap —
-                // the allocation that would breach it is never made.
-                let len = row.body.len() as u64;
-                if self.coll_bytes + len > MAX_TS_COLLISION_GROUP_BYTES {
-                    result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
-                        count: self.coll.len() as u64 + 1,
-                        cap: MAX_TS_COLLISION_GROUP,
-                    }));
-                    break;
-                }
-                self.coll_bytes += len;
-                row.body.clone()
-            } else {
-                String::new()
-            };
-            self.coll.push(CollMember {
-                body,
-                value: v,
-                out,
-            });
         }
         self.base_labels = base_labels;
         result
+    }
+
+    /// **The single staging funnel** — the ONLY place a per-member
+    /// allocation enters `coll` (issue #227 review round 4, finding 1).
+    ///
+    /// Order is load-bearing: (i) size every allocation this member will
+    /// make, (ii) check BOTH caps, (iii) only then allocate. Because the
+    /// sizing happens first, the allocation that would breach a cap is never
+    /// performed, for **every** reducer class — the previous code sized only
+    /// the body (and only when `needs_body_order`), leaving the fan-out
+    /// `key`/`LabelSet` clones uncharged.
+    ///
+    /// The charge is an UPPER BOUND on the heap bytes about to be allocated
+    /// (see [`Self::member_stage_bytes`]), so `coll_bytes >= actual staged
+    /// heap bytes` always, and `coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES`
+    /// is enforced — hence actual staged bytes are capped too.
+    fn stage_member(
+        &mut self,
+        row: &MetricScanRow,
+        value: f64,
+        scratch: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>,
+    ) -> Result<(), ReadError> {
+        let stages_out = self.fan_out && !self.is_absent;
+        if stages_out {
+            // In-place sort, no allocation — safe to do before the caps.
+            scratch.sort_unstable();
+        }
+        // (i) size EVERY allocation this member will make.
+        let bytes = self.member_stage_bytes(row, scratch, stages_out);
+        // (ii) both caps, BEFORE any allocation.
+        let next_count = self.coll.len() as u64 + 1;
+        if next_count > MAX_TS_COLLISION_GROUP
+            || self.coll_bytes + bytes > MAX_TS_COLLISION_GROUP_BYTES
+        {
+            return Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count: next_count,
+                cap: MAX_TS_COLLISION_GROUP,
+                bytes: self.coll_bytes + bytes,
+                bytes_cap: MAX_TS_COLLISION_GROUP_BYTES,
+            }));
+        }
+        // (iii) now — and only now — allocate.
+        let body = if self.needs_body_order {
+            row.body.clone()
+        } else {
+            String::new()
+        };
+        let out = if stages_out {
+            let key = render_labels_json_sorted(scratch);
+            let labels: LabelSet = scratch
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            Some((key, labels))
+        } else {
+            None
+        };
+        self.coll_bytes += bytes;
+        self.coll.push(CollMember { body, value, out });
+        Ok(())
+    }
+
+    /// An UPPER BOUND on the heap bytes [`Self::stage_member`] is about to
+    /// allocate for one member. Charging an over-estimate is what makes the
+    /// cap sound: `coll_bytes >= actual`, so bounding `coll_bytes` bounds the
+    /// real footprint.
+    ///
+    /// Per reducer class, every per-member allocation is accounted:
+    /// - **body clone** — `row.body.len()`, only when `needs_body_order`
+    ///   (class C + first/last); zero for every other class.
+    /// - **rendered label JSON** (`key`) — at most `content + 6·pairs + 2`
+    ///   (`{`, `}`, and `"k":"v",` punctuation per pair), only when the
+    ///   pipeline mutates labels (`fan_out`) and the op is not `absent`.
+    /// - **cloned `LabelSet`** — `content` bytes of owned key/value data plus
+    ///   `2·String` headers per pair.
+    /// - fixed per-member overhead for the `CollMember`/`Vec` slots.
+    fn member_stage_bytes(
+        &self,
+        row: &MetricScanRow,
+        scratch: &[(Cow<'_, str>, Cow<'_, str>)],
+        stages_out: bool,
+    ) -> u64 {
+        /// `String`/`Vec` header + allocator slack charged per owned piece.
+        const PER_ALLOC_OVERHEAD: u64 = 32;
+        let mut bytes = PER_ALLOC_OVERHEAD; // the `CollMember` slot itself
+        if self.needs_body_order {
+            bytes += row.body.len() as u64 + PER_ALLOC_OVERHEAD;
+        }
+        if stages_out {
+            let pairs = scratch.len() as u64;
+            let content: u64 = scratch
+                .iter()
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum();
+            // `key` (JSON) + the owned `LabelSet` each hold the content once.
+            bytes += content + 6 * pairs + 2 + PER_ALLOC_OVERHEAD;
+            bytes += content + 2 * pairs * PER_ALLOC_OVERHEAD + PER_ALLOC_OVERHEAD;
+        }
+        bytes
     }
 
     /// Ranks and dispatches the buffered collision group (full-body order ⇒
@@ -4636,7 +4769,7 @@ pub fn run_client_agg_rows(
     window: ClientWindow,
     rate_window_ns: Option<u64>,
 ) -> Result<QueryResult, ReadError> {
-    if window.step_ns.is_some() {
+    if matches!(window, ClientWindow::Range { .. }) {
         // Issue #227: a range query evaluates Loki's sliding windows, which
         // assume fingerprint-contiguous, ascending-ts input (the live
         // engine's `metric_raw_samples_sliding` PK scan guarantees it). The
@@ -6284,12 +6417,11 @@ mod tests {
     /// tests cannot fabricate an unvalidated duration either (issue #227
     /// review round 3).
     fn slide_window(start_ns: i64, end_ns: i64, step_ns: u64, range_ns: u64) -> ClientWindow {
-        ClientWindow {
-            start_ns,
+        ClientWindow::Range {
+            grid_start_ns: start_ns,
             end_ns,
-            step_ns: Some(
-                super::super::params::validate_duration_ns(step_ns, "step").expect("valid step"),
-            ),
+            step_ns: super::super::params::validate_duration_ns(step_ns, "step")
+                .expect("valid step"),
             range_ns: super::super::params::validate_duration_ns(range_ns, "range selector")
                 .expect("valid range"),
         }
@@ -6805,6 +6937,35 @@ mod tests {
         }
     }
 
+    /// Review round 4, finding 2: the instant/range modelling. A `Range`
+    /// window structurally REQUIRES two `ValidatedDuration`s (no zero/absent
+    /// representation exists), and an `Instant` window structurally has no
+    /// step and no range — so `RangeSlideState` can only receive a real,
+    /// validated, non-zero range. `ValidatedDuration::NONE` is gone.
+    #[test]
+    fn a_range_window_cannot_carry_an_absent_or_zero_range() {
+        // The only way to obtain the durations a `Range` window needs.
+        let step = super::super::params::validate_duration_ns(10, "step").unwrap();
+        let range = super::super::params::validate_duration_ns(30, "range selector").unwrap();
+        let w = ClientWindow::Range {
+            grid_start_ns: 0,
+            end_ns: 100,
+            step_ns: step,
+            range_ns: range,
+        };
+        assert_eq!(w.step_ns(), Some(step));
+        assert!(range.get() > 0, "a validated range is never zero");
+        // And zero can never be minted: the validator rejects it, so no
+        // `ValidatedDuration` carrying 0 exists to place in the range slot.
+        assert!(super::super::params::validate_duration_ns(0, "range selector").is_err());
+        // An instant window has neither a step nor a range slot at all.
+        let i = ClientWindow::Instant {
+            start_ns: 0,
+            end_ns: 100,
+        };
+        assert_eq!(i.step_ns(), None);
+    }
+
     /// Review round 2 finding 1: the `absent_over_time` presence counters are
     /// `i64`, whose maximum magnitude is the number of surviving collision
     /// groups — itself bounded by the byte-scan budget ceiling (one byte per
@@ -6869,7 +7030,9 @@ mod tests {
             })
             .collect();
         match state.push_rows(&rows) {
-            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { count, cap })) => {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count, cap, ..
+            })) => {
                 assert_eq!(cap, MAX_TS_COLLISION_GROUP);
                 assert!(
                     count < MAX_TS_COLLISION_GROUP,
@@ -6883,6 +7046,115 @@ mod tests {
             state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
             "staged {} bytes exceeds the {MAX_TS_COLLISION_GROUP_BYTES}-byte cap",
             state.coll_bytes
+        );
+    }
+
+    /// Review round 4, finding 1: the byte cap covers the FAN-OUT staging
+    /// (rendered label JSON + cloned `LabelSet`) for a reducer that stages NO
+    /// body — the exact hole in the round-3 accounting. Class A
+    /// (`count_over_time`, `needs_body_order == false`) with a label-mutating
+    /// pipeline extracting huge label values must still trip the byte cap.
+    #[test]
+    fn collision_group_byte_cap_covers_fan_out_staging_without_bodies() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+        let state_class = reducer_class(client.range_op, client.value);
+        assert_eq!(
+            state_class,
+            ReducerClass::InvertInteger,
+            "this case must be the class that stages NO body"
+        );
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        assert!(
+            !state.needs_body_order,
+            "the hole was that no body ⇒ nothing was charged"
+        );
+        // Each line carries a ~1 MiB extracted label VALUE — no body is
+        // staged, but the rendered JSON + cloned LabelSet are.
+        let big = "v".repeat(1024 * 1024);
+        let rows: Vec<MetricScanRow> = (0..64)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("big={big}"),
+            })
+            .collect();
+        match state.push_rows(&rows) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                count,
+                bytes,
+                bytes_cap,
+                ..
+            })) => {
+                assert!(
+                    count < MAX_TS_COLLISION_GROUP,
+                    "the BYTE dimension must trip, not the member count ({count})"
+                );
+                assert!(bytes > bytes_cap, "the error reports the byte breach");
+            }
+            other => panic!("fan-out staging must be byte-capped, got {other:?}"),
+        }
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "staged {} bytes exceeds the cap",
+            state.coll_bytes
+        );
+    }
+
+    /// The byte/count caps must ERROR, never silently truncate a group into a
+    /// partial (and therefore wrong) `tie_rank` order — including when the
+    /// group STRADDLES a fetch-chunk boundary. Pushing the same group in two
+    /// batches must accumulate one continuous charge and fail cleanly.
+    #[test]
+    fn a_capped_collision_group_errors_rather_than_truncating_across_chunks() {
+        let client = ClientAgg {
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = slide_window(0, 10, 10, 10);
+        let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+        let big = "x".repeat(1024 * 1024);
+        let chunk: Vec<MetricScanRow> = (0..5)
+            .map(|_| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("a=1 {big}"),
+            })
+            .collect();
+        // First chunk: under the cap, group left OPEN (straddling).
+        state.push_rows(&chunk).expect("first chunk under the cap");
+        let after_first = state.coll_bytes;
+        assert!(after_first > 0, "the straddling group carried a charge");
+        assert_eq!(state.coll.len(), 5, "group stayed open across the chunk");
+        // Second chunk continues the SAME (fingerprint, ts) group — the charge
+        // must accumulate continuously (no reset, no double count) and trip.
+        match state.push_rows(&chunk) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { .. })) => {}
+            other => panic!("the straddling group must trip the cap cleanly, got {other:?}"),
+        }
+        assert!(
+            state.coll_bytes <= MAX_TS_COLLISION_GROUP_BYTES,
+            "the accumulated charge stayed inside the cap"
+        );
+        // The error is terminal for the query: nothing is emitted from a
+        // partially-staged group, so no truncated tie order can escape.
+        assert!(
+            state.coll_bytes >= after_first,
+            "charge accumulated, not reset"
         );
     }
 
@@ -6928,6 +7200,8 @@ mod tests {
         let collision = ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
             count: MAX_TS_COLLISION_GROUP + 1,
             cap: MAX_TS_COLLISION_GROUP,
+            bytes: 1,
+            bytes_cap: MAX_TS_COLLISION_GROUP_BYTES,
         })
         .to_string();
         assert!(retention.contains("concurrent sample"), "{retention}");
@@ -6983,7 +7257,7 @@ mod tests {
         // The presence state is exactly the grid-sized array — never 20_000.
         assert_eq!(
             state.present_cover.len(),
-            (window.end_ns / 10 + 2) as usize,
+            (window.end_ns() / 10 + 2) as usize,
             "presence state must be grid-sized, independent of scan density"
         );
         assert_eq!(state.retained, 0, "absent retains no per-sample points");
@@ -8921,11 +9195,9 @@ mod tests {
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
         )]);
-        let window = ClientWindow {
+        let window = ClientWindow::Instant {
             start_ns: 0,
             end_ns: 60_000_000_000,
-            step_ns: None,
-            range_ns: ValidatedDuration::NONE,
         };
         let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
@@ -8982,11 +9254,9 @@ mod tests {
                 labels: r#"{"env":"prod","service_name":"checkout"}"#.to_string(),
             },
         )]);
-        let window = ClientWindow {
+        let window = ClientWindow::Instant {
             start_ns: 0,
             end_ns: 60_000_000_000,
-            step_ns: None,
-            range_ns: ValidatedDuration::NONE,
         };
         (compiled, client, meta, window)
     }

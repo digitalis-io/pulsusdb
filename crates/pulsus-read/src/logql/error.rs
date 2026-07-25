@@ -205,7 +205,16 @@ pub enum TooBroadReason {
     /// data; the transient full-body buffer that ranks it is bounded by
     /// this clean error rather than growing without limit. A Rust-side
     /// structural limit, never from a ClickHouse error code.
-    TsCollisionGroup { count: u64, cap: u64 },
+    TsCollisionGroup {
+        count: u64,
+        cap: u64,
+        /// Bytes the group would have staged (bodies + rendered label JSON +
+        /// cloned label sets) — the second, independent dimension of the cap
+        /// (issue #227 review round 4): a handful of very large members trips
+        /// this long before the member count.
+        bytes: u64,
+        bytes_cap: u64,
+    },
     /// Issue #227: the sliding-window range evaluator's **concurrent**
     /// retained window (charge-on-load / discharge-on-evict) exceeded
     /// [`crate::logql::exec::MAX_RETAINED_WINDOW_POINTS`] — the single
@@ -353,11 +362,17 @@ impl fmt::Display for TooBroadReason {
                      the time range"
                 )
             }
-            TooBroadReason::TsCollisionGroup { count, cap } => {
+            TooBroadReason::TsCollisionGroup {
+                count,
+                cap,
+                bytes,
+                bytes_cap,
+            } => {
                 write!(
                     f,
-                    "a same-nanosecond, same-stream run retained {count} lines, exceeding the \
-                     {cap}-line collision-group cap — narrow the selector or the pipeline"
+                    "a same-nanosecond, same-stream run would stage {count} lines / {bytes} \
+                     bytes, exceeding the collision-group caps ({cap} lines, {bytes_cap} bytes) \
+                     — narrow the selector or the pipeline"
                 )
             }
             TooBroadReason::MetricRetention { count, cap } => {

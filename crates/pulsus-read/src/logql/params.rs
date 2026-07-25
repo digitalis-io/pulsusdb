@@ -129,13 +129,6 @@ pub const MAX_DURATION_NS: i64 = i64::MAX / 4;
 pub struct ValidatedDuration(i64);
 
 impl ValidatedDuration {
-    /// The "no `[range]` selector" value (`0`) — used only by the leafless
-    /// `vector(<scalar>)` window, which has no range-vector duration at all.
-    /// Zero is safe everywhere the evaluator uses it (an empty lookback), and
-    /// it is deliberately NOT reachable through [`validate_duration_ns`],
-    /// which rejects `0` as a client input.
-    pub const NONE: Self = ValidatedDuration(0);
-
     /// The validated nanosecond value, always in `0 ..= MAX_DURATION_NS`.
     #[inline]
     pub fn get(self) -> i64 {

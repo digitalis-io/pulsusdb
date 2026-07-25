@@ -462,13 +462,12 @@ mod tests {
     async fn over_cap_leafless_vector_range_maps_to_422_query_too_broad() {
         const S: i64 = 1_000_000_000; // 1s
         // 11_001 buckets over `(0, 11000s]` at a 1s step > the 11000 cap.
-        let window = pulsus_read::logql::ClientWindow {
+        let window = pulsus_read::logql::GridWindow {
             start_ns: 0,
             end_ns: 11_000 * S,
             step_ns: Some(
                 pulsus_read::logql::validate_duration_ns(S as u64, "step").expect("valid step"),
             ),
-            range_ns: pulsus_read::logql::ValidatedDuration::NONE,
         };
         let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
             .expect_err("an over-cap vector(n) range query must reject");

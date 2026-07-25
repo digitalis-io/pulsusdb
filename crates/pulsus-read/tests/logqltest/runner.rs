@@ -721,11 +721,17 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
         &compiled,
         &store.meta,
         client,
-        ClientWindow {
-            start_ns: mp.grid_start_ns,
-            end_ns: mp.end_ns,
-            step_ns: mp.step_ns,
-            range_ns: mp.range_ns,
+        match mp.step_ns {
+            Some(step_ns) => ClientWindow::Range {
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+                step_ns,
+                range_ns: mp.range_ns,
+            },
+            None => ClientWindow::Instant {
+                start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+            },
         },
         mp.rate_window_ns,
     )

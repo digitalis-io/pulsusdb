@@ -111,11 +111,17 @@ fn run_client(
         &compiled,
         meta,
         client,
-        ClientWindow {
-            start_ns: mp.grid_start_ns,
-            end_ns: mp.end_ns,
-            step_ns: mp.step_ns,
-            range_ns: mp.range_ns,
+        match mp.step_ns {
+            Some(step_ns) => ClientWindow::Range {
+                grid_start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+                step_ns,
+                range_ns: mp.range_ns,
+            },
+            None => ClientWindow::Instant {
+                start_ns: mp.grid_start_ns,
+                end_ns: mp.end_ns,
+            },
         },
         mp.rate_window_ns,
     )?;
@@ -2453,11 +2459,17 @@ fn eval_node(
                 &compiled,
                 meta,
                 client,
-                ClientWindow {
-                    start_ns: mp.grid_start_ns,
-                    end_ns: mp.end_ns,
-                    step_ns: mp.step_ns,
-                    range_ns: mp.range_ns,
+                match mp.step_ns {
+                    Some(step_ns) => ClientWindow::Range {
+                        grid_start_ns: mp.grid_start_ns,
+                        end_ns: mp.end_ns,
+                        step_ns,
+                        range_ns: mp.range_ns,
+                    },
+                    None => ClientWindow::Instant {
+                        start_ns: mp.grid_start_ns,
+                        end_ns: mp.end_ns,
+                    },
                 },
                 mp.rate_window_ns,
             )?;
@@ -2537,13 +2549,12 @@ fn or_vector_zero_fills_an_empty_selection() {
 /// allocation). 11_001 buckets > the 11_000 cap.
 #[test]
 fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
         end_ns: 11_000 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
         ),
-        range_ns: pulsus_read::logql::ValidatedDuration::NONE,
     };
     match materialize_vector_lit(0.0, &window) {
         Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
@@ -2558,13 +2569,12 @@ fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
 /// with one empty-label series carrying the value at every grid step.
 #[test]
 fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 0,
         end_ns: 10_999 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
         ),
-        range_ns: pulsus_read::logql::ValidatedDuration::NONE,
     };
     let out = materialize_vector_lit(7.0, &window).expect("at-cap must pass");
     let points = single_series_points(out);
@@ -2578,13 +2588,12 @@ fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
 #[test]
 fn range_vector_lit_grid_aligns_under_an_unaligned_start() {
     let step = 10 * NS;
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: 7 * NS,
         end_ns: 37 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(step as u64, "step").expect("valid step"),
         ),
-        range_ns: pulsus_read::logql::ValidatedDuration::NONE,
     };
     let vec_matrix = materialize_vector_lit(0.0, &window).expect("materialize");
     // Issue #227: the grid is START-anchored `{start + k·step ≤ end}`, so an
@@ -2620,13 +2629,12 @@ fn range_vector_lit_grid_aligns_under_an_unaligned_start() {
 /// begins exactly at `i64::MIN` (k=0) without wrapping.
 #[test]
 fn range_vector_lit_is_i64_min_safe() {
-    let window = ClientWindow {
+    let window = pulsus_read::logql::GridWindow {
         start_ns: i64::MIN,
         end_ns: i64::MIN + 3 * NS,
         step_ns: Some(
             pulsus_read::logql::validate_duration_ns(NS as u64, "step").expect("valid step"),
         ),
-        range_ns: pulsus_read::logql::ValidatedDuration::NONE,
     };
     let out = materialize_vector_lit(0.0, &window).expect("i64::MIN window must not panic");
     let points = single_series_points(out);
