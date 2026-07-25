@@ -1,0 +1,36 @@
+# Ported instant-eval subset of differential.json — __error__ /
+# __error_details__ propagation (issue #99) and the surviving-error metric
+# reject (issue M6-10 D1). __error_details__ strings are byte-exact vs the
+# reference (pinned by logql_pipeline_golden.rs + logql_metric_agg_golden.rs).
+
+# --- json over a non-object line: __error__ + byte-exact detail --------
+load
+  {env="prod", service_name="svc-badjson"} service=svc-badjson
+  0s  not json at all
+
+eval instant at 60s {service_name="svc-badjson"} | json
+  {env="prod", service_name="svc-badjson", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  not json at all
+
+# `| __error__ != ""` keeps the errored stream carrying BOTH labels.
+eval instant at 60s {service_name="svc-badjson"} | json | __error__ != ""
+  {env="prod", service_name="svc-badjson", __error__="JSONParserErr", __error_details__="Value looks like object, but can't find closing '}' symbol"}  0s  not json at all
+
+clear
+
+# --- numeric label filter conversion failure: LabelFilterErr + detail --
+load
+  {env="prod", service_name="svc-badnum"} service=svc-badnum
+  0s  n=abc
+
+eval instant at 60s {service_name="svc-badnum"} | logfmt | n > 5
+  {env="prod", service_name="svc-badnum", n="abc", __error__="LabelFilterErr", __error_details__="strconv.ParseFloat: parsing \"abc\": invalid syntax"}  0s  n=abc
+
+clear
+
+# --- a surviving unwrap conversion failure fails the metric query ------
+load
+  {env="prod", service_name="svc-badunit"} service=svc-badunit
+  0s  took=abc x=1
+
+eval_fail instant at 60s sum_over_time({service_name="svc-badunit"} | logfmt | unwrap duration(took) [30m])
+  msg: SampleExtractionErr

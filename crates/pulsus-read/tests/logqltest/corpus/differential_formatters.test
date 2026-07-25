@@ -1,0 +1,23 @@
+# Ported instant-eval subset of differential.json — formatting stages.
+# line_format rewrites the line body; label_format renames a label. Neither
+# touches values, so these are streams cases (deterministic pipeline output).
+
+# --- line_format {{.label}} substitution -----------------------------
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"status":500,"method":"GET","path":"/a"}
+  5s  {"status":200,"method":"POST","path":"/b"}
+
+eval instant at 60s {service_name="svc-json"} | json | status = "500" | line_format "{{.method}} {{.path}}"
+  {env="prod", service_name="svc-json", status="500", method="GET", path="/a"}  0s  GET /a
+
+clear
+
+# --- label_format rename (dst=src moves the value, removes the source) -
+load
+  {env="prod", service_name="svc-logfmt"} service=svc-logfmt
+  0s  level=error took=300ms
+  5s  level=info took=100ms
+
+eval instant at 60s {service_name="svc-logfmt"} | logfmt | level = "error" | label_format lvl=level
+  {env="prod", service_name="svc-logfmt", lvl="error", took="300ms"}  0s  level=error took=300ms

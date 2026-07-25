@@ -1,0 +1,152 @@
+//! Issue #220 (Batch 0): the hermetic `logqltest` corpus entry point — a
+//! promqltest-style replayer for LogQL value/streams `.test` files against
+//! the pure evaluator in `pulsus-read`. No ClickHouse; the pinned reference
+//! container (`grafana/loki:3.7.4`) is touched ONLY to capture a new case's
+//! expected value (see `tests/logqltest/PROVENANCE.md`), never at test time.
+//!
+//! Batch 0 seeds the corpus with the instant-eval subset of today's 39
+//! differential cases (`test/fixtures/logs/differential.json`) ported into
+//! the DSL; later batches (B1–B6) append `.test` files to `CORPUS_FILES`.
+
+#[path = "logqltest/mod.rs"]
+mod driver;
+
+use driver::runner::{DirectiveCounts, EvalMode, run_file};
+
+/// Every `.test` file in `tests/logqltest/corpus`. A file on disk not
+/// listed here (or vice versa) fails `corpus_files_match_the_directory`,
+/// so a new batch cannot silently drop out of the replay.
+const CORPUS_FILES: &[&str] = &[
+    "differential_parsers_filters.test",
+    "differential_formatters.test",
+    "differential_errors.test",
+    "differential_ip_filters.test",
+    "differential_metric_reducers.test",
+    "differential_vector_matching.test",
+];
+
+/// The `.test` files on disk must exactly match `CORPUS_FILES` (the #29 F1
+/// pattern: filtering a test out cannot bypass the replay).
+#[test]
+fn corpus_files_match_the_directory() {
+    let mut on_disk: Vec<String> = std::fs::read_dir(driver::corpus_dir())
+        .expect("corpus dir exists")
+        .map(|e| e.expect("readable dir entry").file_name())
+        .filter_map(|n| {
+            let n = n.to_string_lossy().to_string();
+            n.ends_with(".test").then_some(n)
+        })
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = CORPUS_FILES.iter().map(|s| s.to_string()).collect();
+    listed.sort();
+    assert_eq!(
+        on_disk, listed,
+        "corpus .test files on disk must exactly match CORPUS_FILES"
+    );
+}
+
+/// The whole corpus replays 100% green, and exercises every executed
+/// directive kind (`clear`, `load`, `eval`, `eval_ordered`, `eval_fail`)
+/// and every result kind (streams + instant vector).
+#[test]
+fn corpus_is_fully_green_and_exercises_every_directive() {
+    let mut totals = DirectiveCounts::default();
+    let mut failures: Vec<String> = Vec::new();
+    let mut case_count = 0usize;
+
+    for name in CORPUS_FILES {
+        let path = driver::corpus_dir().join(name);
+        let text = driver::read_file(&path);
+        let run = run_file(name, &text).unwrap_or_else(|e| panic!("{e}"));
+        case_count += run.cases.len();
+        for case in &run.cases {
+            if !case.passed {
+                failures.push(format!(
+                    "{name}:{} `{}` — {}",
+                    case.line, case.query, case.detail
+                ));
+            }
+        }
+        totals.clear += run.counts.clear;
+        totals.load += run.counts.load;
+        totals.eval_value += run.counts.eval_value;
+        totals.eval_ordered += run.counts.eval_ordered;
+        totals.eval_fail += run.counts.eval_fail;
+        totals.streams_cases += run.counts.streams_cases;
+        totals.vector_cases += run.counts.vector_cases;
+        totals.scalar_cases += run.counts.scalar_cases;
+    }
+
+    assert!(
+        failures.is_empty(),
+        "the logqltest corpus must be 100% green:\n{}",
+        failures.join("\n")
+    );
+
+    // Every `eval*` directive in the seed files must have produced a case
+    // (a blank-line parse bug would silently drop some) — Batch 0 ports 32
+    // instant-eval differential cases.
+    assert_eq!(
+        case_count, 32,
+        "expected 32 seed cases from the instant-eval differential subset"
+    );
+    assert!(totals.clear > 0, "corpus never exercised `clear`");
+    assert!(totals.load > 0, "corpus never exercised `load`");
+    assert!(totals.eval_value > 0, "corpus never exercised `eval`");
+    assert!(
+        totals.eval_ordered > 0,
+        "corpus never exercised `eval_ordered` (sort/sort_desc)"
+    );
+    assert!(
+        totals.eval_fail > 0,
+        "corpus never exercised `eval_fail` (error cases)"
+    );
+    assert!(
+        totals.streams_cases > 0,
+        "corpus never produced a streams result"
+    );
+    assert!(
+        totals.vector_cases > 0,
+        "corpus never produced a vector result"
+    );
+}
+
+/// The #218 guard, exercised for real: a deliberately-perturbed expected
+/// value must redden the runner (exact-f64, not tolerance). A one-ULP
+/// change to a captured `rate_counter` value is caught.
+#[test]
+fn a_perturbed_expected_value_reddens_the_runner() {
+    let dataset = "load\n  {env=\"prod\", service_name=\"checkout\"} service=checkout\n\
+                   \t10s  c=10\n\t20s  c=30\n\t30s  c=5\n\t40s  c=12\n\n";
+    // Correct capture passes.
+    let good = format!(
+        "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} 0.5333344\n"
+    );
+    let run = run_file("inline/rate_counter_good.test", &good).expect("parse");
+    assert!(
+        run.cases[0].passed,
+        "correct capture: {}",
+        run.cases[0].detail
+    );
+
+    // A one-ULP perturbation of the expected value must FAIL (exact bits).
+    let perturbed_bits = 0.5333344_f64.to_bits() + 1;
+    let perturbed = f64::from_bits(perturbed_bits);
+    let bad = format!(
+        "{dataset}eval instant at 60s rate_counter({{env=\"prod\"}} | logfmt | unwrap c [1m])\n\
+         \t{{env=\"prod\", service_name=\"checkout\"}} {perturbed}\n"
+    );
+    let run = run_file("inline/rate_counter_bad.test", &bad).expect("parse");
+    assert!(
+        !run.cases[0].passed,
+        "a one-ULP perturbation must redden the runner (exact-f64, no tolerance)"
+    );
+    assert!(
+        run.cases[0].detail.contains("value mismatch"),
+        "the failure must name a value mismatch: {}",
+        run.cases[0].detail
+    );
+    assert_eq!(run.cases[0].mode, EvalMode::Value);
+}

@@ -1,0 +1,62 @@
+# Ported instant-eval subset of test/fixtures/logs/differential.json —
+# parser + line/label-filter streams cases. Expected label sets and lines
+# are deterministic pipeline output (pinned by logql_pipeline_golden.rs and
+# the differential harness against grafana/loki:3.7.4). See PROVENANCE.md.
+#
+# Each service scope is isolated with `clear` — a streams eval replays every
+# loaded line through the query's pipeline, so the loaded set must equal the
+# scope the query selects.
+
+# --- json: string filter, anchored regex filter, numeric filter ------
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s   {"status":500,"method":"GET","path":"/a"}
+  5s   {"status":200,"method":"POST","path":"/b"}
+  10s  {"status":500,"method":"DELETE","path":"/c"}
+
+eval instant at 60s {service_name="svc-json"} | json | status = "500"
+  {env="prod", service_name="svc-json", status="500", method="GET", path="/a"}      0s   {"status":500,"method":"GET","path":"/a"}
+  {env="prod", service_name="svc-json", status="500", method="DELETE", path="/c"}   10s  {"status":500,"method":"DELETE","path":"/c"}
+
+eval instant at 60s {service_name="svc-json"} | json | method =~ "GET|DELETE"
+  {env="prod", service_name="svc-json", status="500", method="GET", path="/a"}      0s   {"status":500,"method":"GET","path":"/a"}
+  {env="prod", service_name="svc-json", status="500", method="DELETE", path="/c"}   10s  {"status":500,"method":"DELETE","path":"/c"}
+
+eval instant at 60s {service_name="svc-json"} | json | status >= 500
+  {env="prod", service_name="svc-json", status="500", method="GET", path="/a"}      0s   {"status":500,"method":"GET","path":"/a"}
+  {env="prod", service_name="svc-json", status="500", method="DELETE", path="/c"}   10s  {"status":500,"method":"DELETE","path":"/c"}
+
+clear
+
+# --- logfmt: string filter, duration filter, bytes filter ------------
+load
+  {env="prod", service_name="svc-logfmt"} service=svc-logfmt
+  0s   level=error took=300ms size=6000
+  5s   level=info took=100ms size=2000
+  10s  level=error took=500ms size=8000
+
+eval instant at 60s {service_name="svc-logfmt"} | logfmt | level = "error"
+  {env="prod", service_name="svc-logfmt", level="error", took="300ms", size="6000"}   0s   level=error took=300ms size=6000
+  {env="prod", service_name="svc-logfmt", level="error", took="500ms", size="8000"}   10s  level=error took=500ms size=8000
+
+eval instant at 60s {service_name="svc-logfmt"} | logfmt | took > 250ms
+  {env="prod", service_name="svc-logfmt", level="error", took="300ms", size="6000"}   0s   level=error took=300ms size=6000
+  {env="prod", service_name="svc-logfmt", level="error", took="500ms", size="8000"}   10s  level=error took=500ms size=8000
+
+eval instant at 60s {service_name="svc-logfmt"} | logfmt | size > 5KB
+  {env="prod", service_name="svc-logfmt", level="error", took="300ms", size="6000"}   0s   level=error took=300ms size=6000
+  {env="prod", service_name="svc-logfmt", level="error", took="500ms", size="8000"}   10s  level=error took=500ms size=8000
+
+clear
+
+# --- regexp (named captures) + pattern captures ----------------------
+load
+  {env="prod", service_name="svc-plain"} service=svc-plain
+  0s   PUT /api/users 503 12ms
+  5s   GET /api/orders 200 5ms
+
+eval instant at 60s {service_name="svc-plain"} | regexp `^(?P<method>\w+) (?P<path>\S+) (?P<status>\d+)` | status = "503"
+  {env="prod", service_name="svc-plain", method="PUT", path="/api/users", status="503"}   0s   PUT /api/users 503 12ms
+
+eval instant at 60s {service_name="svc-plain"} | pattern "<method> <path> <status> <took>" | method = "PUT"
+  {env="prod", service_name="svc-plain", method="PUT", path="/api/users", status="503", took="12ms"}   0s   PUT /api/users 503 12ms

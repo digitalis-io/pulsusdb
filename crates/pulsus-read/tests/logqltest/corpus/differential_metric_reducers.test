@@ -1,0 +1,125 @@
+# Ported instant-eval subset of differential.json — client-aggregated
+# metric reducers, vector aggregation, scalar binop, rate_counter, and
+# sort/sort_desc ordering. Every value is EXACT-f64: counts and clean
+# divisions are hand-derived; the rate_counter values are the bit-exact
+# reference captures pinned in logql_metric_agg_golden.rs (grafana/loki:3.7.4,
+# the #218 ns/ms extrapolation-factor semantics). See PROVENANCE.md.
+
+# --- count_over_time over a json+filter pipeline; * scalar ------------
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s   {"status":500,"method":"GET"}
+  5s   {"status":500,"method":"GET"}
+  10s  {"status":200,"method":"POST"}
+
+eval instant at 60s count_over_time({service_name="svc-json"} | json | status = "500" [30m])
+  {env="prod", service_name="svc-json", status="500", method="GET"} 2
+
+eval instant at 60s count_over_time({service_name="svc-json"} | json | status = "500" [30m]) * 2
+  {env="prod", service_name="svc-json", status="500", method="GET"} 4
+
+clear
+
+# --- sum_over_time over unwrap duration(took) (exact 0.25s samples) ---
+load
+  {env="prod", service_name="svc-logfmt"} service=svc-logfmt
+  0s  took=250ms
+  5s  took=250ms
+
+eval instant at 60s sum_over_time({service_name="svc-logfmt"} | logfmt took | unwrap duration(took) [30m])
+  {env="prod", service_name="svc-logfmt"} 0.5
+
+clear
+
+# --- sum by (level) over a client-aggregated count_over_time ----------
+load
+  {env="prod", service_name="svc-logfmt"} service=svc-logfmt
+  0s   level=error msg=a
+  5s   level=error msg=b
+  10s  level=info msg=c
+
+eval instant at 60s sum by (level) (count_over_time({service_name="svc-logfmt"} | logfmt [30m]))
+  {level="error"} 2
+  {level="info"} 1
+
+clear
+
+# --- rate_counter: reset-aware increase, ns/ms extrapolation factor ---
+# Each block is a single counter series `c=<n>` (logfmt | unwrap c). Values
+# are span-dependent bit-exact captures (see logql_metric_agg_golden.rs).
+
+# Reset mid-window (10,30,5,12 @ 10s..40s, span 30s): increase 32.
+load
+  {env="prod", service_name="checkout"} service=checkout
+  10s  c=10
+  20s  c=30
+  30s  c=5
+  40s  c=12
+
+eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="checkout"} 0.5333344
+
+clear
+
+# Duplicate-timestamp delivered-scan-order (5,{10,3}@20s,12, span 20s).
+load
+  {env="prod", service_name="checkout"} service=checkout
+  10s  c=5
+  20s  c=10
+  20s  c=3
+  30s  c=12
+
+eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="checkout"} 0.2833341833333333
+
+clear
+
+# Monotone spanning the window (100,160 @ 1ns,60s, span ~60s): increase 60.
+load
+  {env="prod", service_name="checkout"} service=checkout
+  1ns  c=100
+  60s  c=160
+
+eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="checkout"} 1.000001
+
+clear
+
+# Sparse interior samples (200,260 @ 25s,35s, span 10s): NOT full-range
+# extrapolated (stays ~1.0, never ~6.0).
+load
+  {env="prod", service_name="checkout"} service=checkout
+  25s  c=200
+  35s  c=260
+
+eval instant at 60s rate_counter({env="prod"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="checkout"} 1.000006
+
+clear
+
+# --- sort / sort_desc value ordering (counts a:5,b:1,c:5) -------------
+load
+  {env="prod", service_name="svc-sort"} service=svc-sort
+  0s   grp=a
+  1s   grp=a
+  2s   grp=a
+  3s   grp=a
+  4s   grp=a
+  5s   grp=b
+  6s   grp=c
+  7s   grp=c
+  8s   grp=c
+  9s   grp=c
+  10s  grp=c
+
+# sort: ascending by value; the a/c tie breaks by label ascending -> b,a,c.
+eval_ordered instant at 60s sort(sum by (grp) (count_over_time({service_name="svc-sort"} | logfmt [30m])))
+  {grp="b"} 1
+  {grp="a"} 5
+  {grp="c"} 5
+
+# sort_desc: descending by value; the a/c tie breaks by label ascending -> a,c,b.
+eval_ordered instant at 60s sort_desc(sum by (grp) (count_over_time({service_name="svc-sort"} | logfmt [30m])))
+  {grp="a"} 5
+  {grp="c"} 5
+  {grp="b"} 1
