@@ -21,7 +21,7 @@ use pulsus_logql::{
 use super::error::ReadError;
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
 use super::exec::ClientWindow;
-use super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
+use super::params::{Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec};
 
 /// A pure fetch plan for either query shape. See the module docs for why
 /// stage 2/3 aren't pre-rendered here. `MetricBinary` (issue M6-10) is
@@ -150,7 +150,11 @@ pub struct MetricPlan {
     pub grid_start_ns: i64,
     /// The `[range]` selector width in nanoseconds — the sliding window's
     /// span and (for `rate`/`bytes_rate`) the per-second divisor.
-    pub range_ns: u64,
+    ///
+    /// **Validated** at the planner boundary into `1 ..= MAX_DURATION_NS`
+    /// ([`validate_duration_ns`], issue #227 review round 2) and carried as a
+    /// plain `i64`, so the evaluator never narrows client-controlled input.
+    pub range_ns: i64,
     pub rate_window_ns: Option<u64>,
     pub op: RangeAggOp,
     /// Outer-to-inner vector-aggregation chain (`sum by (...) (avg(...))`
@@ -323,11 +327,18 @@ fn plan_metric_expr(
     match base {
         MetricExpr::Range { .. } => Ok(Plan::Metric(metric_plan(metric_expr, p, ctx)?)),
         _ => {
-            // The zero-step guard normally lives in `metric_plan` (run
-            // per leaf); a leaf-less tree (`2 + 2`) must still reject a
-            // zero step for request-shape consistency.
-            if let QuerySpec::Range { step_ns: 0, .. } = p.spec {
-                return Err(ReadError::InvalidStep);
+            // The step-domain guard normally lives in `metric_plan` (run per
+            // leaf); a leaf-LESS tree (`2 + 2`, `vector(1)`) has no leaf to
+            // run it, so the same boundary validation is applied here —
+            // otherwise a hostile `step` would reach `window_from` ->
+            // `materialize_vector_lit`'s grid math unvalidated (issue #227
+            // review round 2). A zero step keeps its dedicated `InvalidStep`
+            // error for request-shape consistency.
+            if let QuerySpec::Range { step_ns, .. } = p.spec {
+                if step_ns == 0 {
+                    return Err(ReadError::InvalidStep);
+                }
+                validate_duration_ns(step_ns, "step")?;
             }
             Ok(Plan::MetricBinary(build_metric_node(metric_expr, p, ctx)?))
         }
@@ -582,6 +593,25 @@ fn metric_pipeline_construct(pipeline: &[Stage]) -> Option<&'static str> {
     })
 }
 
+/// **The client-controlled duration boundary** (issue #227 review round 2).
+///
+/// Validates a raw `u64` duration (the `[range]` selector from the AST, or
+/// the request `step`) into the domain `1 ..= MAX_DURATION_NS` and returns it
+/// as a plain `i64`. Every duration the range/sliding evaluator sees passes
+/// through here exactly once, so downstream code carries validated `i64`s and
+/// contains NO `as i64` narrowing of client input — a hostile value is a
+/// clean 400 at the boundary instead of a wrapped window downstream.
+pub(super) fn validate_duration_ns(value: u64, what: &'static str) -> Result<i64, ReadError> {
+    if value == 0 || value > MAX_DURATION_NS as u64 {
+        return Err(ReadError::DurationOutOfRange {
+            what,
+            value,
+            max: MAX_DURATION_NS,
+        });
+    }
+    Ok(value as i64)
+}
+
 fn metric_plan(
     metric_expr: &MetricExpr,
     p: &QueryParams,
@@ -703,7 +733,10 @@ fn metric_plan(
         None
     };
 
-    let range_ns = range.range.as_nanos();
+    // Issue #227 review round 2: VALIDATE the client-controlled `[range]`
+    // duration at this boundary. Everything downstream carries the validated
+    // `i64` — no `as i64` narrowing of client input exists past this line.
+    let range_ns = validate_duration_ns(range.range.as_nanos(), "range selector")?;
 
     // Issue #227: `start_ns` is the (range-widened) SCAN lower bound;
     // `grid_start_ns` is the start-anchored emit grid's first point. Both
@@ -713,7 +746,9 @@ fn metric_plan(
     // is the `rate([1m]) ≠ rate([10m])` fix.
     let (start_ns, end_ns, step_ns, grid_start_ns, rate_window_ns) = match p.spec {
         QuerySpec::Instant { at_ns } => {
-            let start = at_ns.saturating_sub(range_ns as i64);
+            // `range_ns` is validated in-domain, so this is an ordinary i64
+            // subtraction (saturating only for a `start` near `i64::MIN`).
+            let start = at_ns.saturating_sub(range_ns);
             (start, at_ns, None, start, Some(range_ns))
         }
         QuerySpec::Range {
@@ -721,7 +756,12 @@ fn metric_plan(
             end_ns,
             step_ns,
         } => {
-            let scan_start = start_ns.saturating_sub(range_ns as i64);
+            // Validate the client `step` at the same boundary as `[range]`
+            // (issue #227 review round 2), so the whole evaluator works over
+            // in-domain durations only: every later `step as i128` /
+            // `step_ns > i64::MAX` guard is then provably never taken.
+            validate_duration_ns(step_ns, "step")?;
+            let scan_start = start_ns.saturating_sub(range_ns);
             (scan_start, end_ns, Some(step_ns), start_ns, Some(range_ns))
         }
     };
@@ -850,7 +890,13 @@ fn metric_plan(
         step_ns,
         grid_start_ns,
         range_ns,
-        rate_window_ns: if is_rate { rate_window_ns } else { None },
+        // Widening a boundary-validated positive `i64` to `u64` for
+        // `apply_rate`'s divisor — provably lossless (issue #227 round 2).
+        rate_window_ns: if is_rate {
+            rate_window_ns.map(|ns| ns as u64)
+        } else {
+            None
+        },
         op: *op,
         vector_aggs,
         client,
@@ -1277,6 +1323,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ReadError::InvalidStep));
+    }
+
+    /// Issue #227 (review round 2): a HOSTILE client `step` — one above the
+    /// validated duration domain, including values that would narrow to a
+    /// NEGATIVE `i64` — is rejected END-TO-END by the real planner with the
+    /// named 400, never narrowed into the window/covering arithmetic.
+    #[test]
+    fn a_hostile_step_is_rejected_end_to_end_by_the_planner() {
+        for hostile in [
+            MAX_DURATION_NS as u64 + 1,
+            i64::MAX as u64 + 1, // would narrow to i64::MIN
+            u64::MAX,
+        ] {
+            let err = metric_mp(
+                r#"rate({env="prod"}[5m])"#,
+                QuerySpec::Range {
+                    start_ns: 0,
+                    end_ns: 1_000_000_000,
+                    step_ns: hostile,
+                },
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ReadError::DurationOutOfRange { what: "step", value, .. } if value == hostile
+                ),
+                "hostile step {hostile} must be a named 400, got {err:?}"
+            );
+        }
+    }
+
+    /// The same boundary guards the LEAFLESS tree (`vector(1)`, `2 + 2`),
+    /// which has no metric leaf to run `metric_plan`'s validation — a hostile
+    /// step there must not reach `materialize_vector_lit`'s grid math.
+    #[test]
+    fn a_hostile_step_is_rejected_for_a_leafless_metric_tree() {
+        let expr = parse("vector(1)").expect("parse");
+        let params = QueryParams {
+            spec: QuerySpec::Range {
+                start_ns: 0,
+                end_ns: 1_000_000_000,
+                step_ns: u64::MAX,
+            },
+            limit: 100,
+            direction: Direction::Backward,
+        };
+        match plan(&expr, &params, &test_ctx()) {
+            Err(ReadError::DurationOutOfRange { what: "step", .. }) => {}
+            other => panic!("expected a named duration rejection, got {other:?}"),
+        }
     }
 
     /// Issue #227: a range query NO LONGER routes to the 5s rollup on a

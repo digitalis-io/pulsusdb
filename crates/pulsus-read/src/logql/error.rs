@@ -476,6 +476,20 @@ pub enum ReadError {
     #[error("range query step_ns must be greater than zero")]
     InvalidStep,
 
+    /// Issue #227 (review round 2): a client-controlled duration — the
+    /// `[range]` selector or the request `step` — fell outside the validated
+    /// domain `1 ..= MAX_DURATION_NS` (≈73 years of nanoseconds). Rejected at
+    /// the planner boundary BEFORE any narrowing, so no hostile `u64` can
+    /// wrap the window/covering arithmetic downstream. A clean 400 (`bad_data`),
+    /// like [`Self::InvalidStep`]; nothing the reference serves is in the
+    /// rejected region.
+    #[error("{what} of {value} ns is outside the supported range (1 to {max} ns)")]
+    DurationOutOfRange {
+        what: &'static str,
+        value: u64,
+        max: i64,
+    },
+
     /// M7-A5a: the metrics dual-read decoded a `metric_hist_samples` row
     /// whose value columns cannot rebuild a [`NativeHistogram`]
     /// (`from_columns` structural failure — parallel span arrays of

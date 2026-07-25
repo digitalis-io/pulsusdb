@@ -2930,7 +2930,13 @@ pub struct ClientWindow {
     /// The `[range]` selector width in nanoseconds — the sliding window's
     /// span `(t-range, t]`. The scan itself is widened to `(start-range,
     /// end]` so the first grid point `start` sees its full lookback.
-    pub range_ns: u64,
+    ///
+    /// **Validated** into `1 ..= MAX_DURATION_NS` at the planner boundary
+    /// ([`super::plan::validate_duration_ns`], issue #227 review round 2), so
+    /// this is a plain in-domain `i64` and the evaluator performs NO
+    /// narrowing of client-controlled input. (`0` for the leafless
+    /// `vector(<scalar>)` window, which has no `[range]`.)
+    pub range_ns: i64,
 }
 
 /// The instant-mode bucket key (any constant works — there is exactly
@@ -4073,11 +4079,27 @@ struct RangeSlideState<'q> {
     // Mutating.
     groups: HashMap<String, MutGroup>,
     /// `absent_over_time`'s selector-wide presence, as a **grid-sized
-    /// difference array** (issue #227 review finding 1): index `k` holds the
-    /// coverage delta at grid point `k`, prefix-summed once at finish. Length
-    /// is `kmax + 2` — O(grid), capped by `MAX_CLIENT_AGG_BUCKETS`, and
-    /// completely independent of scan density (nothing per-sample is kept).
-    present_cover: Vec<i32>,
+    /// difference array** (issue #227 review round 1 finding 1): index `k`
+    /// holds the coverage delta at grid point `k`, prefix-summed once at
+    /// finish. Length is `kmax + 2` — O(grid), capped by
+    /// `MAX_CLIENT_AGG_BUCKETS`, and completely independent of scan density
+    /// (nothing per-sample is kept).
+    ///
+    /// **Counter width proof (review round 2 finding 1).** Each surviving
+    /// collision GROUP contributes exactly `+1` at one index and `-1` at
+    /// another, so `|counter| <= number of surviving collision groups <=
+    /// number of scanned rows`. The scan is hard-bounded by
+    /// `reader.logql_scan_budget_bytes` (`max_bytes_to_read`, ceiling
+    /// `LOGQL_SCAN_BUDGET_BYTES_CEILING`), and every `log_samples` row costs
+    /// at least one byte, so
+    /// `rows <= LOGQL_SCAN_BUDGET_BYTES_CEILING < 2^63 = i64::MAX`.
+    /// An `i64` counter therefore **cannot** overflow for any query the
+    /// engine will run — whereas the previous `i32` (max 2.1e9) was genuinely
+    /// reachable under a multi-GiB budget. No cap or checked arithmetic is
+    /// needed; the bound is structural, and
+    /// `absent_presence_counter_cannot_overflow_under_the_scan_budget` pins
+    /// the arithmetic.
+    present_cover: Vec<i64>,
     // Distinct output-series count (the 500 cap, non-mutating path).
     series_count: u64,
     // Current collision run.
@@ -4129,7 +4151,9 @@ impl<'q> RangeSlideState<'q> {
             rate_window_ns,
             grid_start,
             step,
-            range: window.range_ns as i64,
+            // No narrowing: `range_ns` is already a boundary-validated,
+            // in-domain `i64` (issue #227 review round 2, finding 2).
+            range: window.range_ns,
             kmax,
             fan_out: compiled.metric_mutates_labels(),
             is_absent: matches!(op, RangeAggOp::AbsentOverTime),
@@ -4501,7 +4525,10 @@ impl<'q> RangeSlideState<'q> {
     /// a running sum > 0 means at least one sample covers that grid point.
     fn finish_absent(self) -> QueryResult {
         let mut points: Vec<(i64, f64)> = Vec::new();
-        let mut running: i32 = 0;
+        // Same width as the deltas (see `present_cover`'s proof): the running
+        // sum is bounded by the total collision-group count, itself bounded by
+        // the byte-scan budget — it cannot overflow `i64`.
+        let mut running: i64 = 0;
         for k in 0..=self.kmax {
             running += self.present_cover[k as usize];
             if running == 0 {
@@ -6248,19 +6275,26 @@ mod tests {
         // Two lines inside a 1m window ending at 60s.
         let rows = slide_rows(1, &[(31_000_000_000, "x"), (59_000_000_000, "x")]);
         let s = 1_000_000_000i64;
-        let run = |range_ns: u64| {
+        let run = |range_ns: i64| {
             let window = ClientWindow {
                 start_ns: 60 * s,
                 end_ns: 60 * s,
                 step_ns: Some((60 * s) as u64),
                 range_ns,
             };
-            let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range_ns))
-                .unwrap();
+            let res = run_client_agg_rows(
+                &rows,
+                &compiled,
+                &meta,
+                &client,
+                window,
+                Some(range_ns as u64),
+            )
+            .unwrap();
             one_series_points(res).1
         };
-        let r1m = run(60 * s as u64); // 2 lines / 60s = 0.0333…
-        let r10m = run(600 * s as u64); // 2 lines / 600s = 0.0033…
+        let r1m = run(60 * s); // 2 lines / 60s = 0.0333…
+        let r10m = run(600 * s); // 2 lines / 600s = 0.0033…
         assert_ne!(r1m, r10m, "the [range] divisor must be live");
         assert_eq!(r1m, vec![(60 * s, 2.0 / 60.0)]);
         assert_eq!(r10m, vec![(60 * s, 2.0 / 600.0)]);
@@ -6418,7 +6452,7 @@ mod tests {
             start_ns: 0,
             end_ns: N,
             step_ns: Some(N as u64),
-            range_ns: N as u64,
+            range_ns: N,
         };
         let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None)
             .expect("a dense-but-servable window must stream, never 422");
@@ -6600,6 +6634,143 @@ mod tests {
             // Class C: the fold runs in the same canonical order.
             assert_eq!(run(RangeAggOp::SumOverTime, &order), vec![(10, 6.0)]);
         }
+    }
+
+    /// AC8 (review round 2 gap): the concurrent-retention invariant on the
+    /// MUTATING path — both `MutGroup.int_cells` (class A) and
+    /// `MutGroup.pt_cells` (class B/C) charge `retained`, and the whole
+    /// charge is released when the state is finished/dropped.
+    #[test]
+    fn sliding_mutating_fan_out_charges_and_releases_retention_for_both_cell_kinds() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 100,
+            step_ns: Some(10),
+            range_ns: 30,
+        };
+        // A `label_format` makes the output set differ from the base ⇒ the
+        // mutating fan-out path (`fan_out == true`).
+        for (op, value, expect_int_cells) in [
+            // Class A -> `int_cells`.
+            (RangeAggOp::CountOverTime, ClientValue::Count, true),
+            // Class B -> `pt_cells` (retained points).
+            (RangeAggOp::MaxOverTime, ClientValue::Unwrap, false),
+        ] {
+            let pipeline = if matches!(value, ClientValue::Unwrap) {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#)
+            } else {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#)
+            };
+            let client = ClientAgg {
+                pipeline,
+                value,
+                range_op: op,
+                param: None,
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            assert!(compiled.metric_mutates_labels(), "must be the fan-out path");
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            let rows: Vec<MetricScanRow> = (1..=5)
+                .map(|i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: i * 10,
+                    body: "a=1".to_string(),
+                })
+                .collect();
+            state.push_rows(&rows).expect("fan-out fold");
+            assert!(
+                state.retained > 0,
+                "{op:?}: the mutating fan-out must CHARGE retention"
+            );
+            let group = state.groups.values().next().expect("one output group");
+            if expect_int_cells {
+                assert!(!group.int_cells.is_empty(), "{op:?}: int_cells populated");
+                assert!(group.pt_cells.is_empty());
+                assert_eq!(
+                    state.retained,
+                    group.int_cells.len() as u64,
+                    "{op:?}: every created int cell is charged exactly once"
+                );
+            } else {
+                assert!(!group.pt_cells.is_empty(), "{op:?}: pt_cells populated");
+                assert!(group.int_cells.is_empty());
+                assert_eq!(
+                    state.retained,
+                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>(),
+                    "{op:?}: every retained point is charged exactly once"
+                );
+            }
+            // Finishing consumes the state — the whole charge goes away with
+            // it (no leak into a subsequent query).
+            let out = state.finish().expect("finish");
+            assert!(matches!(out, QueryResult::Matrix(ref m) if !m.is_empty()));
+        }
+    }
+
+    /// Review round 2 finding 2: a HOSTILE client-controlled duration is
+    /// rejected cleanly at the planner boundary — never narrowed/wrapped.
+    #[test]
+    fn hostile_durations_are_rejected_at_the_planner_boundary() {
+        use super::super::params::MAX_DURATION_NS;
+        // In-domain values pass.
+        assert_eq!(
+            super::super::plan::validate_duration_ns(60_000_000_000, "step").unwrap(),
+            60_000_000_000
+        );
+        assert_eq!(
+            super::super::plan::validate_duration_ns(MAX_DURATION_NS as u64, "step").unwrap(),
+            MAX_DURATION_NS
+        );
+        // Zero and everything above the domain are named 400s, NOT wraps.
+        for hostile in [
+            0u64,
+            MAX_DURATION_NS as u64 + 1,
+            i64::MAX as u64 + 1, // would narrow to a NEGATIVE i64
+            u64::MAX,
+        ] {
+            match super::super::plan::validate_duration_ns(hostile, "range selector") {
+                Err(ReadError::DurationOutOfRange { value, max, .. }) => {
+                    assert_eq!(value, hostile);
+                    assert_eq!(max, MAX_DURATION_NS);
+                }
+                other => panic!("hostile duration {hostile} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    /// Review round 2 finding 1: the `absent_over_time` presence counters are
+    /// `i64`, whose maximum magnitude is the number of surviving collision
+    /// groups — itself bounded by the byte-scan budget ceiling (one byte per
+    /// row minimum). This test pins the arithmetic identity the proof rests
+    /// on: the counter stays exact well past the old `i32` ceiling.
+    #[test]
+    fn absent_presence_counter_cannot_overflow_under_the_scan_budget() {
+        // The structural bound: rows <= scan-budget bytes < i64::MAX.
+        let budget_ceiling: u64 = pulsus_config::LOGQL_SCAN_BUDGET_BYTES_CEILING;
+        assert!(
+            (budget_ceiling as u128) < i64::MAX as u128,
+            "the byte-scan budget ceiling must bound the group count inside i64"
+        );
+        // And the counter type genuinely holds a value the old `i32` could
+        // not: accumulate PAST the i32 ceiling one increment at a time (the
+        // exact `+= 1` shape `flush_collision` uses) and stay exact.
+        let mut cover: Vec<i64> = vec![0; 2];
+        let start = i32::MAX as i64 - 5;
+        cover[0] = start;
+        for _ in 0..10 {
+            cover[0] += 1;
+        }
+        assert_eq!(
+            cover[0],
+            start + 10,
+            "counter must stay exact past i32::MAX"
+        );
+        assert!(cover[0] > i32::MAX as i64, "exceeds the old i32 ceiling");
+        // The symmetric decrement is equally exact.
+        cover[1] -= cover[0];
+        assert_eq!(cover[0] + cover[1], 0, "difference array nets to zero");
     }
 
     /// AC10: the retention cap's over-cap error is `MetricRetention` and the
@@ -8780,7 +8951,7 @@ mod tests {
             start_ns: 0,
             end_ns: range_ns as i64,
             step_ns: Some(step_ns),
-            range_ns,
+            range_ns: range_ns as i64,
         };
         let rows = [
             (10_000_000_000i64, "c=10"), // bucket 0

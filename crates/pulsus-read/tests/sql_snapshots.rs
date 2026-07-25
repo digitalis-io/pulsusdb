@@ -553,7 +553,7 @@ fn expected_sliding_reason() -> String {
 
 /// The `[5m]` selector range in nanoseconds — issue #227 makes it the
 /// `rate`/`bytes_rate` divisor AND the sliding window width (never `step`).
-const RANGE_NS: u64 = 300_000_000_000;
+const RANGE_NS: i64 = 300_000_000_000;
 
 #[test]
 fn rate_range_slides_raw_and_divides_by_the_range() {
@@ -567,7 +567,7 @@ fn rate_range_slides_raw_and_divides_by_the_range() {
     assert_eq!(mp.table, "log_samples");
     // `rate` divides by the `[range]` (5m), NOT `step` — the
     // `rate([1m]) ≠ rate([10m])` fix.
-    assert_eq!(mp.rate_window_ns, Some(RANGE_NS));
+    assert_eq!(mp.rate_window_ns, Some(RANGE_NS as u64));
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
@@ -592,7 +592,7 @@ fn bytes_rate_range_slides_raw_and_divides_by_the_range() {
     );
     assert!(!mp.rollup);
     assert!(mp.client.is_some());
-    assert_eq!(mp.rate_window_ns, Some(RANGE_NS));
+    assert_eq!(mp.rate_window_ns, Some(RANGE_NS as u64));
     assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
@@ -882,7 +882,7 @@ fn range_metric_spec_carries_the_caller_supplied_step() {
     // Issue #227: the emit grid starts at the caller's `start`; the SCAN
     // lower bound is widened back by the `[5m]` range for the lookback.
     assert_eq!(mp.grid_start_ns, START_NS);
-    assert_eq!(mp.start_ns, START_NS - RANGE_NS as i64);
+    assert_eq!(mp.start_ns, START_NS - RANGE_NS);
     assert_eq!(mp.range_ns, RANGE_NS);
     assert_eq!(mp.end_ns, END_NS);
 }

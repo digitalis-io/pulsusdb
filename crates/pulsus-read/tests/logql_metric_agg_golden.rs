@@ -444,13 +444,16 @@ fn extreme_window_bounds_hit_the_bucket_cap_without_overflow() {
     )
     .unwrap();
     assert_eq!(result, QueryResult::Matrix(Vec::new()));
-    // A huge step over the extreme window is a handful of buckets:
-    // accepted (no false positive from the widened arithmetic).
+    // A large-but-IN-DOMAIN step over the extreme window is a handful of
+    // buckets: accepted (no false positive from the widened arithmetic).
+    // `MAX_DURATION_NS` is the validated ceiling (issue #227 review round 2);
+    // a step ABOVE it is now rejected at the planner boundary instead — see
+    // `a_hostile_step_is_rejected_end_to_end_by_the_planner`.
     let params = QueryParams {
         spec: pulsus_read::logql::QuerySpec::Range {
             start_ns: i64::MIN,
             end_ns: i64::MAX,
-            step_ns: (i64::MAX / 2) as u64,
+            step_ns: pulsus_read::logql::MAX_DURATION_NS as u64,
         },
         limit: 100,
         direction: Direction::Backward,

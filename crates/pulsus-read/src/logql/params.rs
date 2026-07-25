@@ -99,6 +99,22 @@ pub struct TimeBounds {
 /// `PULSUS_LOGQL_MAX_STREAMS` config field only when a deployment needs it.
 pub const DEFAULT_MAX_STREAMS: usize = 100_000;
 
+/// **The client-controlled duration domain** (issue #227 review round 2).
+///
+/// Every duration reaching the range/sliding evaluator — the `[range]`
+/// selector and the request `step` — is validated against this bound ONCE at
+/// the planner boundary ([`super::plan::validate_duration_ns`]) and carried
+/// as a plain `i64` thereafter, so no downstream `as i64` narrowing exists
+/// and no hostile `u64` can wrap the window/covering arithmetic.
+///
+/// `i64::MAX / 4` ≈ **73 years** of nanoseconds: four times any conceivable
+/// query window (Loki's own `max_query_length` defaults to 30 days), while
+/// leaving two bits of headroom so that even a plain `i64` sum of a few
+/// in-domain durations (`ts + range`, `t - range`, `start - range`) cannot
+/// overflow. Anything larger is rejected with a clean 400 rather than
+/// narrowed — nothing Loki serves is in the rejected region.
+pub const MAX_DURATION_NS: i64 = i64::MAX / 4;
+
 #[cfg(test)]
 mod tests {
     use super::*;

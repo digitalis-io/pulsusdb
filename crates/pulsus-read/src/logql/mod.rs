@@ -98,7 +98,9 @@ pub use exec::{
     run_client_agg_rows,
 };
 pub use explain::{ExplainStage, PlanExplain};
-pub use params::{DEFAULT_MAX_STREAMS, Direction, PlanCtx, QueryParams, QuerySpec, TimeBounds};
+pub use params::{
+    DEFAULT_MAX_STREAMS, Direction, MAX_DURATION_NS, PlanCtx, QueryParams, QuerySpec, TimeBounds,
+};
 pub use pipeline::{CompiledPipeline, EntryOut, MetricRun, PipelineError, SAMPLE_EXTRACTION_ERROR};
 pub use plan::{
     ClientAgg, ClientValue, MetricNode, MetricPlan, Plan, ProbePlan, RouteChoice, RoutingDecision,
