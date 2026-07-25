@@ -1,0 +1,501 @@
+# B3 — metric range-aggregation value corpus (issue #220, Lean plan).
+#
+# Every case is an instant metric eval. Instant metric queries are
+# semantically identical to the reference (docs/features.md:55), so each
+# expected value below is a BIT-EXACT capture from grafana/loki:3.7.4 (the
+# #218 discipline: rate/rate_counter extrapolation factors are captured
+# verbatim, never hand-computed as increase/60). See PROVENANCE.md for the
+# capture procedure.
+#
+# Datasets are authored so every loaded sample falls inside the query
+# window (t-range, t] and the pipeline (a `| logfmt` parser) forces the
+# raw-scan client-aggregation path. Covers rate/count_over_time/bytes_rate/
+# bytes_over_time over a log range; sum/avg/min/max/stddev/stdvar/quantile/
+# first/last/absent_over_time and rate/rate_counter over unwrapped values.
+
+
+# ===================================================================
+# LOG-RANGE
+# ===================================================================
+
+# dense: 3 lines over [1m] -> count 3
+load
+  {env="prod", service_name="count_dense"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s count_over_time({service_name="count_dense"} | logfmt [1m])
+  {env="prod", lvl="info", service_name="count_dense"} 3
+
+clear
+
+# single sample, wide [5m] window
+load
+  {env="prod", service_name="count_single"}
+  30s  lvl=info
+
+eval instant at 60s count_over_time({service_name="count_single"} | logfmt [5m])
+  {env="prod", lvl="info", service_name="count_single"} 1
+
+clear
+
+# label filter keeps 2 of 3 lines
+load
+  {env="prod", service_name="count_filter"}
+  5s  lvl=error
+  10s  lvl=error
+  15s  lvl=info
+
+eval instant at 60s count_over_time({service_name="count_filter"} | logfmt | lvl="error" [1m])
+  {env="prod", lvl="error", service_name="count_filter"} 2
+
+clear
+
+# two lines far apart inside a [5m] window
+load
+  {env="prod", service_name="count_sparse"}
+  2s  lvl=info
+  58s  lvl=info
+
+eval instant at 60s count_over_time({service_name="count_sparse"} | logfmt [5m])
+  {env="prod", lvl="info", service_name="count_sparse"} 2
+
+clear
+
+# rate over a log range = count / window: 3/60s
+load
+  {env="prod", service_name="rate_log_1m"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s rate({service_name="rate_log_1m"} | logfmt [1m])
+  {env="prod", lvl="info", service_name="rate_log_1m"} 0.05
+
+clear
+
+# same 3 lines, wider [2m] window: 3/120s
+load
+  {env="prod", service_name="rate_log_2m"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s rate({service_name="rate_log_2m"} | logfmt [2m])
+  {env="prod", lvl="info", service_name="rate_log_2m"} 0.025
+
+clear
+
+# narrow [30s] window, both samples inside (30s,60s]: 2/30s
+load
+  {env="prod", service_name="rate_log_30s"}
+  40s  lvl=info
+  50s  lvl=info
+
+eval instant at 60s rate({service_name="rate_log_30s"} | logfmt [30s])
+  {env="prod", lvl="info", service_name="rate_log_30s"} 0.06666666666666667
+
+clear
+
+# bytes_over_time = sum of line bytes (3 x 8)
+load
+  {env="prod", service_name="bytes_dense"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s bytes_over_time({service_name="bytes_dense"} | logfmt [1m])
+  {env="prod", lvl="info", service_name="bytes_dense"} 24
+
+clear
+
+# single line of 11 bytes
+load
+  {env="prod", service_name="bytes_single"}
+  30s  lvl=warning
+
+eval instant at 60s bytes_over_time({service_name="bytes_single"} | logfmt [5m])
+  {env="prod", lvl="warning", service_name="bytes_single"} 11
+
+clear
+
+# bytes_rate = bytes / window: 24/60s
+load
+  {env="prod", service_name="bytes_rate_1m"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s bytes_rate({service_name="bytes_rate_1m"} | logfmt [1m])
+  {env="prod", lvl="info", service_name="bytes_rate_1m"} 0.4
+
+clear
+
+# same bytes, [2m] window: 24/120s
+load
+  {env="prod", service_name="bytes_rate_2m"}
+  5s  lvl=info
+  10s  lvl=info
+  15s  lvl=info
+
+eval instant at 60s bytes_rate({service_name="bytes_rate_2m"} | logfmt [2m])
+  {env="prod", lvl="info", service_name="bytes_rate_2m"} 0.2
+
+clear
+
+# ===================================================================
+# UNWRAP
+# ===================================================================
+
+# sum of unwrapped values {2,4,8}
+load
+  {env="prod", service_name="sum_dense"}
+  5s  v=2
+  10s  v=4
+  15s  v=8
+
+eval instant at 60s sum_over_time({service_name="sum_dense"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="sum_dense"} 14
+
+clear
+
+# single unwrapped sample
+load
+  {env="prod", service_name="sum_single"}
+  5s  v=5
+
+eval instant at 60s sum_over_time({service_name="sum_single"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="sum_single"} 5
+
+clear
+
+# mean of {2,4}
+load
+  {env="prod", service_name="avg_pair"}
+  5s  v=2
+  10s  v=4
+
+eval instant at 60s avg_over_time({service_name="avg_pair"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="avg_pair"} 3
+
+clear
+
+# mean of {2,4,6,8}
+load
+  {env="prod", service_name="avg_quad"}
+  5s  v=2
+  10s  v=4
+  15s  v=6
+  20s  v=8
+
+eval instant at 60s avg_over_time({service_name="avg_quad"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="avg_quad"} 5
+
+clear
+
+# min of {2,4,8}
+load
+  {env="prod", service_name="min_tri"}
+  5s  v=2
+  10s  v=4
+  15s  v=8
+
+eval instant at 60s min_over_time({service_name="min_tri"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="min_tri"} 2
+
+clear
+
+# max of {2,4,8}
+load
+  {env="prod", service_name="max_tri"}
+  5s  v=2
+  10s  v=4
+  15s  v=8
+
+eval instant at 60s max_over_time({service_name="max_tri"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="max_tri"} 8
+
+clear
+
+# population stddev of {2,4}
+load
+  {env="prod", service_name="stddev_pair"}
+  5s  v=2
+  10s  v=4
+
+eval instant at 60s stddev_over_time({service_name="stddev_pair"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="stddev_pair"} 1
+
+clear
+
+# population stddev of {2,4,6,8} = sqrt(5)
+load
+  {env="prod", service_name="stddev_quad"}
+  5s  v=2
+  10s  v=4
+  15s  v=6
+  20s  v=8
+
+eval instant at 60s stddev_over_time({service_name="stddev_quad"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="stddev_quad"} 2.23606797749979
+
+clear
+
+# population variance of {2,4}
+load
+  {env="prod", service_name="stdvar_pair"}
+  5s  v=2
+  10s  v=4
+
+eval instant at 60s stdvar_over_time({service_name="stdvar_pair"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="stdvar_pair"} 1
+
+clear
+
+# population variance of {2,4,6,8} = 5
+load
+  {env="prod", service_name="stdvar_quad"}
+  5s  v=2
+  10s  v=4
+  15s  v=6
+  20s  v=8
+
+eval instant at 60s stdvar_over_time({service_name="stdvar_quad"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="stdvar_quad"} 5
+
+clear
+
+# first_over_time = value at earliest ts
+load
+  {env="prod", service_name="first_tri"}
+  10s  v=10
+  30s  v=20
+  50s  v=30
+
+eval instant at 60s first_over_time({service_name="first_tri"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="first_tri"} 10
+
+clear
+
+# last_over_time = value at latest ts
+load
+  {env="prod", service_name="last_tri"}
+  10s  v=10
+  30s  v=20
+  50s  v=30
+
+eval instant at 60s last_over_time({service_name="last_tri"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="last_tri"} 30
+
+clear
+
+# rate over unwrap = sum(values)/window: 14/60s
+load
+  {env="prod", service_name="rate_unwrap_1m"}
+  5s  v=2
+  10s  v=4
+  15s  v=8
+
+eval instant at 60s rate({service_name="rate_unwrap_1m"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="rate_unwrap_1m"} 0.23333333333333334
+
+clear
+
+# same values, [2m] window: 14/120s
+load
+  {env="prod", service_name="rate_unwrap_2m"}
+  5s  v=2
+  10s  v=4
+  15s  v=8
+
+eval instant at 60s rate({service_name="rate_unwrap_2m"} | logfmt | unwrap v [2m])
+  {env="prod", service_name="rate_unwrap_2m"} 0.11666666666666667
+
+clear
+
+# quantile 0.5 (median) of {1,2,3}
+load
+  {env="prod", service_name="q50"}
+  5s  v=1
+  10s  v=2
+  15s  v=3
+
+eval instant at 60s quantile_over_time(0.5, {service_name="q50"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="q50"} 2
+
+clear
+
+# quantile 0.9 of {1,2,3,4} (linear interpolation)
+load
+  {env="prod", service_name="q90"}
+  5s  v=1
+  10s  v=2
+  15s  v=3
+  20s  v=4
+
+eval instant at 60s quantile_over_time(0.9, {service_name="q90"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="q90"} 3.7
+
+clear
+
+# quantile 0.25 of {2,4,6,8}
+load
+  {env="prod", service_name="q25"}
+  5s  v=2
+  10s  v=4
+  15s  v=6
+  20s  v=8
+
+eval instant at 60s quantile_over_time(0.25, {service_name="q25"} | logfmt | unwrap v [1m])
+  {env="prod", service_name="q25"} 3.5
+
+clear
+
+# unwrap duration(): 3 x 500ms -> 1.5s
+load
+  {env="prod", service_name="dur_sum"}
+  5s  took=500ms
+  10s  took=500ms
+  15s  took=500ms
+
+eval instant at 60s sum_over_time({service_name="dur_sum"} | logfmt | unwrap duration(took) [1m])
+  {env="prod", service_name="dur_sum"} 1.5
+
+clear
+
+# unwrap duration() mean of {200ms,600ms}
+load
+  {env="prod", service_name="dur_avg"}
+  5s  took=200ms
+  10s  took=600ms
+
+eval instant at 60s avg_over_time({service_name="dur_avg"} | logfmt | unwrap duration(took) [1m])
+  {env="prod", service_name="dur_avg"} 0.4
+
+clear
+
+# ===================================================================
+# RATE-COUNTER
+# ===================================================================
+
+# monotone 5..20, no reset (extrapolated)
+load
+  {env="prod", service_name="rc_monotone"}
+  10s  c=5
+  20s  c=10
+  30s  c=15
+  40s  c=20
+
+eval instant at 60s rate_counter({service_name="rc_monotone"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_monotone"} 0.2500005
+
+clear
+
+# one reset mid-window (20 -> 3)
+load
+  {env="prod", service_name="rc_reset1"}
+  10s  c=10
+  20s  c=20
+  30s  c=3
+  40s  c=8
+
+eval instant at 60s rate_counter({service_name="rc_reset1"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_reset1"} 0.3000006
+
+clear
+
+# multiple resets across the window
+load
+  {env="prod", service_name="rc_multireset"}
+  10s  c=5
+  20s  c=2
+  30s  c=9
+  40s  c=1
+  50s  c=6
+
+eval instant at 60s rate_counter({service_name="rc_multireset"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_multireset"} 0.250000375
+
+clear
+
+# two sparse interior samples, [1m] divisor
+load
+  {env="prod", service_name="rc_sparse"}
+  25s  c=100
+  35s  c=160
+
+eval instant at 60s rate_counter({service_name="rc_sparse"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_sparse"} 1.000006
+
+clear
+
+# wider [2m] window divisor
+load
+  {env="prod", service_name="rc_2m"}
+  10s  c=5
+  40s  c=65
+
+eval instant at 60s rate_counter({service_name="rc_2m"} | logfmt | unwrap c [2m])
+  {env="prod", service_name="rc_2m"} 0.500002
+
+clear
+
+# samples on the window boundaries (1ns and T)
+load
+  {env="prod", service_name="rc_boundary"}
+  1ns  c=100
+  60s  c=200
+
+eval instant at 60s rate_counter({service_name="rc_boundary"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_boundary"} 1.6666683333333332
+
+clear
+
+# single sample -> reference emits 0
+load
+  {env="prod", service_name="rc_single"}
+  30s  c=5
+
+eval instant at 60s rate_counter({service_name="rc_single"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rc_single"} 0
+
+clear
+
+# plain rate over the same counter (NOT reset-aware): sum/window
+load
+  {env="prod", service_name="rate_over_counter"}
+  10s  c=5
+  20s  c=10
+  30s  c=15
+
+eval instant at 60s rate({service_name="rate_over_counter"} | logfmt | unwrap c [1m])
+  {env="prod", service_name="rate_over_counter"} 0.5
+
+clear
+
+# ===================================================================
+# ABSENT
+# ===================================================================
+
+# stream present -> empty result
+load
+  {env="prod", service_name="absent_present"}
+  10s  lvl=info
+  20s  lvl=info
+
+eval instant at 60s absent_over_time({service_name="absent_present"} | logfmt [1m])
+
+clear
+
+# label filter drops every line -> absent = 1
+load
+  {env="prod", service_name="absent_filtered"}
+  10s  lvl=info
+  20s  lvl=info
+
+eval instant at 60s absent_over_time({service_name="absent_filtered"} | logfmt | lvl="debug" [1m])
+  {service_name="absent_filtered"} 1
+
+clear
+
