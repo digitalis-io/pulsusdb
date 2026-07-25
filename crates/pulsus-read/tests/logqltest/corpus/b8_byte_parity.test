@@ -1,0 +1,130 @@
+# Batch B8 (issue #226): byte-unit + empty-label parity with Loki. Every
+# expected outcome is a byte-exact capture from grafana/loki:3.7.4 (the #218
+# exact-fixture discipline — see PROVENANCE.md). Instant-eval only. Each
+# `load`…`clear` section is scoped to exactly the streams its query selects.
+#
+# Two divergences from Loki are closed here:
+#   1. `label_format` rename from an ABSENT source is a no-op (dst NOT created),
+#      matching Loki (fmt.go:414-419) — see the rename section.
+#   2. The byte value/RHS parser is now a faithful `humanize.ParseBytes` port:
+#      bare units, uint64 truncation, exa tier, comma separators, space-trim,
+#      the `f >= math.MaxUint64` overflow rejection, and the two humanize error
+#      details (`too large: …`, `unhandled size name: …`).
+# The 1KiB=1024/1000-excluded case is a regression-lock: both engines agree
+# (the field report compared decimal `1KB` in-container vs binary `1KiB`).
+
+# =====================================================================
+# 1KiB boundary regression-lock: both engines parse 1KiB=1024, so a
+# `size` of 1000 is excluded and 1024 is included.
+# =====================================================================
+load
+  {env="prod", service_name="b8-kib"}
+  0s   size=1000
+  5s   size=1024
+
+eval instant at 60s {service_name="b8-kib"} | logfmt | size >= 1KiB
+  {env="prod", service_name="b8-kib", size="1024"}  5s  size=1024
+
+clear
+
+# =====================================================================
+# bare unit on the RHS literal: `1k` = 1000 (no `b` suffix required).
+# =====================================================================
+load
+  {env="prod", service_name="b8-bare"}
+  0s   size=1000
+
+eval instant at 60s {service_name="b8-bare"} | logfmt | size >= 1k
+  {env="prod", service_name="b8-bare", size="1000"}  0s  size=1000
+
+clear
+
+# =====================================================================
+# uint64 truncation: the value `1.5` truncates toward zero to 1, so it
+# equals the RHS `1b`.
+# =====================================================================
+load
+  {env="prod", service_name="b8-trunc"}
+  0s   size=1.5
+
+eval instant at 60s {service_name="b8-trunc"} | logfmt | size == 1b
+  {env="prod", service_name="b8-trunc", size="1.5"}  0s  size=1.5
+
+clear
+
+# =====================================================================
+# exa tier, value-side: `1eb` = 1e18 >= `1pb` = 1e15. Well-separated
+# magnitudes keep the f64-vs-uint64 exa residual immaterial (v3 note).
+# =====================================================================
+load
+  {env="prod", service_name="b8-exa"}
+  0s   size=1eb
+
+eval instant at 60s {service_name="b8-exa"} | logfmt | size >= 1pb
+  {env="prod", service_name="b8-exa", size="1eb"}  0s  size=1eb
+
+clear
+
+# =====================================================================
+# comma separator: `1,024` = 1024 (commas stripped before ParseFloat).
+# =====================================================================
+load
+  {env="prod", service_name="b8-comma"}
+  0s   size=1,024
+
+eval instant at 60s {service_name="b8-comma"} | logfmt | size >= 1024b
+  {env="prod", service_name="b8-comma", size="1,024"}  0s  size=1,024
+
+clear
+
+# =====================================================================
+# space-trim: `3 kB` = 3000 (whitespace between number and unit trimmed).
+# =====================================================================
+load
+  {env="prod", service_name="b8-space"}
+  0s   size="3 kB"
+
+eval instant at 60s {service_name="b8-space"} | logfmt | size >= 3000b
+  {env="prod", service_name="b8-space", size="3 kB"}  0s  size="3 kB"
+
+clear
+
+# =====================================================================
+# label_format rename from an ABSENT source is a no-op: `newk=missing`
+# does NOT create `newk` (Loki fmt.go:414-419). Divergence #1 fix.
+# =====================================================================
+load
+  {env="prod", service_name="b8-rename"}
+  0s   level=info code=200
+
+eval instant at 60s {service_name="b8-rename"} | logfmt | label_format newk=missing
+  {code="200", env="prod", level="info", service_name="b8-rename"}  0s  level=info code=200
+
+clear
+
+# =====================================================================
+# overflow: `16eib` = 16 * 2^60 == 2^64 hits `f >= math.MaxUint64`, so the
+# value fails to convert. Loki keeps the line and tags the per-line error
+# `LabelFilterErr` + `too large: 16eib` (label_filter.go:181-188).
+# =====================================================================
+load
+  {env="prod", service_name="b8-ovf"}
+  0s   size=16eib
+
+eval instant at 60s {service_name="b8-ovf"} | logfmt | size > 1b
+  {__error__="LabelFilterErr", __error_details__="too large: 16eib", env="prod", service_name="b8-ovf", size="16eib"}  0s  size=16eib
+
+clear
+
+# =====================================================================
+# unknown suffix: `5xb` fails to convert; Loki keeps the line and tags
+# `unhandled size name: xb` (the trimmed+lowercased suffix).
+# =====================================================================
+load
+  {env="prod", service_name="b8-bad"}
+  0s   size=5xb
+
+eval instant at 60s {service_name="b8-bad"} | logfmt | size > 1b
+  {__error__="LabelFilterErr", __error_details__="unhandled size name: xb", env="prod", service_name="b8-bad", size="5xb"}  0s  size=5xb
+
+clear
