@@ -547,62 +547,65 @@ fn a_zero_step_range_query_is_rejected_before_any_sql_is_generated() {
 /// positive-eligibility case below (rate/count_over_time/bytes_rate/
 /// bytes_over_time all share the same step/resolution shape, differing
 /// only in `agg_expr`/`rate_window_ns`).
-fn expected_rollup_reason() -> String {
-    "rollup: step 60000000000 ns divisible by resolution 5000000000 ns".to_string()
+fn expected_sliding_reason() -> String {
+    "raw: sliding-window range aggregation (issue #227)".to_string()
 }
 
+/// The `[5m]` selector range in nanoseconds — issue #227 makes it the
+/// `rate`/`bytes_rate` divisor AND the sliding window width (never `step`).
+const RANGE_NS: u64 = 300_000_000_000;
+
 #[test]
-fn rate_is_rollup_served_and_sums_count() {
+fn rate_range_slides_raw_and_divides_by_the_range() {
     let mp = metric_plan(
         r#"rate({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert!(mp.rollup);
-    assert_eq!(mp.table, "log_metrics_5s");
-    assert_eq!(mp.bucket_col, "bucket_ns");
-    assert_eq!(mp.agg_expr, "sum(count)");
-    assert_eq!(mp.rate_window_ns, Some(STEP_NS));
-    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Rollup);
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    // Issue #227: no rollup for range — the streaming raw slide.
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
+    assert_eq!(mp.table, "log_samples");
+    // `rate` divides by the `[range]` (5m), NOT `step` — the
+    // `rate([1m]) ≠ rate([10m])` fix.
+    assert_eq!(mp.rate_window_ns, Some(RANGE_NS));
+    assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 #[test]
-fn count_over_time_is_rollup_served_with_no_rate_division() {
+fn count_over_time_range_slides_raw_with_no_rate_division() {
     let mp = metric_plan(
         r#"count_over_time({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert!(mp.rollup);
-    assert_eq!(mp.agg_expr, "sum(count)");
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
     assert_eq!(mp.rate_window_ns, None);
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 #[test]
-fn bytes_rate_sums_bytes_and_divides_by_the_window() {
+fn bytes_rate_range_slides_raw_and_divides_by_the_range() {
     let mp = metric_plan(
         r#"bytes_rate({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    // bytes_* ops are rollup-eligible too: `log_metrics_5s` carries a
-    // `bytes SimpleAggregateFunction(sum, UInt64)` column (schemas.md
-    // §3.1), so there is no bytes-specific eligibility carve-out.
-    assert!(mp.rollup);
-    assert_eq!(mp.agg_expr, "sum(bytes)");
-    assert_eq!(mp.rate_window_ns, Some(STEP_NS));
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
+    assert_eq!(mp.rate_window_ns, Some(RANGE_NS));
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 #[test]
-fn bytes_over_time_sums_bytes_with_no_rate_division() {
+fn bytes_over_time_range_slides_raw_with_no_rate_division() {
     let mp = metric_plan(
         r#"bytes_over_time({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert!(mp.rollup);
-    assert_eq!(mp.agg_expr, "sum(bytes)");
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
     assert_eq!(mp.rate_window_ns, None);
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 /// Renders `mp`'s metric SQL the way `LogQlEngine` would once fingerprints
@@ -637,51 +640,70 @@ fn metric_sql(
     }
 }
 
+/// Renders the sliding raw scan (`metric_raw_samples_sliding`) the way
+/// `LogQlEngine` would for a range query, so the `PREWHERE service` contract
+/// (PK-prefix engagement) stays pinned.
+fn sliding_sql(
+    mp: &pulsus_read::logql::MetricPlan,
+    services: &[String],
+    fingerprints: &[u64],
+) -> String {
+    sql::metric_raw_samples_sliding(
+        &mp.table,
+        services,
+        fingerprints,
+        TimeWindow {
+            start_ns: mp.start_ns,
+            end_ns: mp.end_ns,
+        },
+        &mp.extra_predicates,
+    )
+}
+
 #[test]
-fn a_line_filter_forces_the_raw_fallback_even_for_count_over_time() {
+fn a_line_filter_range_slides_raw_and_pushes_the_filter_down() {
     let mp = metric_plan(
         r#"count_over_time({env="prod"} |= "err" [5m])"#,
         &range_params(100, Direction::Backward),
     );
     assert!(!mp.rollup);
+    assert!(mp.client.is_some());
     assert_eq!(mp.table, "log_samples");
-    assert_eq!(mp.bucket_col, "timestamp_ns");
-    assert_eq!(mp.agg_expr, "count()");
     assert_eq!(mp.extra_predicates.len(), 1);
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
-    assert_eq!(mp.routing.reason, "raw: line filter present");
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = metric_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
-        "raw metric fallback must carry PREWHERE service, got:\n{sql}"
+        "sliding raw scan must carry PREWHERE service, got:\n{sql}"
     );
 }
 
 #[test]
-fn bytes_raw_fallback_sums_the_body_length() {
+fn bytes_range_with_a_line_filter_slides_raw() {
     let mp = metric_plan(
         r#"bytes_over_time({env="prod"} |= "err" [5m])"#,
         &range_params(100, Direction::Backward),
     );
     assert!(!mp.rollup);
-    assert_eq!(mp.agg_expr, "sum(length(body))");
-    assert_eq!(mp.routing.reason, "raw: line filter present");
+    assert!(mp.client.is_some());
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = metric_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
     assert!(
         sql.contains("PREWHERE service = 'checkout'\n"),
-        "raw metric fallback must carry PREWHERE service, got:\n{sql}"
+        "sliding raw scan must carry PREWHERE service, got:\n{sql}"
     );
 }
 
 #[test]
-fn a_step_not_dividing_the_rollup_resolution_forces_the_raw_fallback() {
+fn a_non_dividing_step_still_slides_raw_for_range() {
     let params = QueryParams {
         spec: QuerySpec::Range {
             start_ns: START_NS,
             end_ns: END_NS,
-            step_ns: 3_000_000_000, // 3s: not a multiple of the 5s rollup resolution
+            step_ns: 3_000_000_000, // 3s — irrelevant to routing now
         },
         limit: 100,
         direction: Direction::Backward,
@@ -690,35 +712,35 @@ fn a_step_not_dividing_the_rollup_resolution_forces_the_raw_fallback() {
     assert!(!mp.rollup);
     assert_eq!(mp.table, "log_samples");
     assert_eq!(mp.routing.chosen, pulsus_read::logql::RouteChoice::Raw);
-    assert_eq!(
-        mp.routing.reason,
-        "raw: step 3000000000 ns not a multiple of resolution 5000000000 ns"
-    );
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 
-    let sql = metric_sql(
+    let sql = sliding_sql(
         &mp,
         &["'checkout'".to_string(), "'billing'".to_string()],
         &[101, 205],
     );
     assert!(
         sql.contains("PREWHERE service IN ('checkout', 'billing')\n"),
-        "raw metric fallback must carry PREWHERE service IN (...) for multiple services, got:\n{sql}"
+        "sliding raw scan must carry PREWHERE service IN (...) for multiple services, got:\n{sql}"
     );
 }
 
 #[test]
-fn rollup_served_metric_sql_never_carries_a_service_prewhere() {
+fn a_range_query_never_routes_to_the_rollup() {
+    // Issue #227: the rollup fast-path is retired for range reads — even a
+    // resolution-dividing step is the streaming raw slide.
     let mp = metric_plan(
         r#"rate({env="prod"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert!(mp.rollup);
-    // Even if a caller mistakenly passed a non-empty service set, exercise
-    // the documented rollup-path contract: `LogQlEngine` always passes
-    // `&[]` for the rollup path since `log_metrics_5s` has no `service`
-    // column to filter on.
-    let sql = metric_sql(&mp, &[], &[101, 205]);
-    assert!(!sql.contains("PREWHERE"));
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
+    assert_ne!(mp.table, "log_metrics_5s");
+    // The sliding raw scan DOES carry a service PREWHERE (unlike the old
+    // rollup path) to keep the `(service, fingerprint, timestamp_ns)` PK
+    // prefix engaged.
+    let sql = sliding_sql(&mp, &["'checkout'".to_string()], &[101, 205]);
+    assert!(sql.contains("PREWHERE service = 'checkout'\n"));
 }
 
 fn rollup_source() -> sql::MetricSource<'static> {
@@ -889,7 +911,11 @@ fn range_metric_spec_carries_the_caller_supplied_step() {
         &range_params(100, Direction::Backward),
     );
     assert_eq!(mp.step_ns, Some(STEP_NS));
-    assert_eq!(mp.start_ns, START_NS);
+    // Issue #227: the emit grid starts at the caller's `start`; the SCAN
+    // lower bound is widened back by the `[5m]` range for the lookback.
+    assert_eq!(mp.grid_start_ns, START_NS);
+    assert_eq!(mp.start_ns, START_NS - RANGE_NS as i64);
+    assert_eq!(mp.range_ns, RANGE_NS);
     assert_eq!(mp.end_ns, END_NS);
 }
 
@@ -907,11 +933,10 @@ fn vector_agg_sum_by_captures_the_grouping_labels() {
     assert_eq!(grouping.labels, vec!["service_name".to_string()]);
     // `unwrap_vector_aggs` strips the `sum by (...)` wrapper before the
     // routing decision is made, so a vector-agg-wrapped range agg routes
-    // identically to the bare `rate(...)` it wraps (the wrapper is
-    // finished in Rust over the routed result, never part of the SQL
-    // eligibility shape).
-    assert!(mp.rollup);
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    // identically to the bare `rate(...)` it wraps — issue #227: the
+    // streaming raw slide.
+    assert!(!mp.rollup);
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 #[test]
@@ -952,7 +977,8 @@ fn every_vector_agg_op_is_captured_in_the_plan() {
 
 fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
     assert!(mp.client.is_some(), "expected a client-aggregated plan");
-    pulsus_read::logql::sql::metric_raw_samples(
+    // Issue #227: a range client query reads via the PK-ordered sliding scan.
+    pulsus_read::logql::sql::metric_raw_samples_sliding(
         &mp.table,
         &["'checkout'".to_string()],
         &[18374, 99120],
@@ -965,7 +991,7 @@ fn client_metric_sql(mp: &pulsus_read::logql::MetricPlan) -> String {
 }
 
 #[test]
-fn an_unwrapped_sum_over_time_renders_a_raw_scan_with_no_aggregate_and_no_limit() {
+fn an_unwrapped_sum_over_time_renders_a_sliding_raw_scan_with_no_aggregate_and_no_limit() {
     let mp = metric_plan(
         r#"sum_over_time({service_name="checkout"} | logfmt | unwrap duration(took) [5m])"#,
         &range_params(100, Direction::Backward),
@@ -976,17 +1002,21 @@ fn an_unwrapped_sum_over_time_renders_a_raw_scan_with_no_aggregate_and_no_limit(
         "raw: client-side pipeline/unwrap aggregation"
     );
     let sql = client_metric_sql(&mp);
+    // Issue #227: PK read order `(service, fingerprint, timestamp_ns)` (no
+    // body sort, no global timestamp sort), scan widened by the `[5m]` range
+    // (start = START_NS - 300s = 1782906900000000000).
     assert_eq!(
         sql,
         "SELECT fingerprint, timestamp_ns, body\n\
          FROM log_samples\n\
          PREWHERE service = 'checkout'\n\
          WHERE fingerprint IN (18374, 99120)\n\
-         \x20 AND timestamp_ns > 1782907200000000000 AND timestamp_ns <= 1782928800000000000\n\
-         ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"
+         \x20 AND timestamp_ns > 1782906900000000000 AND timestamp_ns <= 1782928800000000000\n\
+         ORDER BY service ASC, fingerprint ASC, timestamp_ns ASC"
     );
     assert!(!sql.contains("sum(count)"), "{sql}");
     assert!(!sql.contains("LIMIT"), "aggregations never truncate: {sql}");
+    assert!(!sql.contains(" body ASC"), "no body in ORDER BY: {sql}");
 }
 
 #[test]
@@ -1027,22 +1057,19 @@ fn a_post_line_format_metric_line_filter_is_absent_from_the_raw_scan_sql() {
     );
 }
 
-/// The other half of the AC2 byte-identity gate: adding M6-10 must not
-/// have disturbed the un-piped rollup routing — a rollup-eligible
-/// count_over_time still targets the rollup table with `sum(count)`
-/// (asserted again here, adjacent to the client-mode cases, so a
-/// routing regression cannot hide behind the older tests moving).
+/// Issue #227: an un-piped range `count_over_time` NO LONGER routes to the
+/// rollup — it is the streaming raw client slide (the rollup cannot
+/// reproduce Loki's per-event sliding-window boundary).
 #[test]
-fn un_piped_count_over_time_still_routes_to_the_rollup_after_m6_10() {
+fn un_piped_count_over_time_range_slides_raw() {
     let mp = metric_plan(
         r#"count_over_time({service_name="checkout"}[5m])"#,
         &range_params(100, Direction::Backward),
     );
-    assert!(mp.rollup);
-    assert!(mp.client.is_none());
-    assert_eq!(mp.table, "log_metrics_5s");
-    assert_eq!(mp.agg_expr, "sum(count)");
-    assert_eq!(mp.routing.reason, expected_rollup_reason());
+    assert!(!mp.rollup);
+    assert!(mp.client.is_some());
+    assert_eq!(mp.table, "log_samples");
+    assert_eq!(mp.routing.reason, expected_sliding_reason());
 }
 
 // ---------------------------------------------------------------------

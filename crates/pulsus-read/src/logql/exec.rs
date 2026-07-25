@@ -3760,6 +3760,16 @@ struct WinSample {
     value: f64,
 }
 
+/// A non-empty marker slice element for the class-A (integer) emit path,
+/// whose reducer reads only the running integer and the window's
+/// emptiness — never the sample contents.
+const WIN_SAMPLE_MARKER: WinSample = WinSample {
+    ts: 0,
+    stream_hash: 0,
+    tie_rank: 0,
+    value: 0.0,
+};
+
 /// The total order for the class-C fold and first/last argmin/argmax:
 /// `(ts, stream_hash, tie_rank)` — different ts by ts; same ts different
 /// stream by `stream_hash` (Loki-exact cross-stream); same ts same stream
@@ -3874,6 +3884,9 @@ struct FpSlide {
     win: VecDeque<WinSample>,
     /// Class-A running integer (add-on-load / subtract-on-evict).
     run_int: u64,
+    /// Reused scratch for the class-B/C re-reduce slice (the `VecDeque` is not
+    /// contiguous) — cleared, never reallocated per emit.
+    reduce_buf: Vec<WinSample>,
     points: Vec<(i64, f64)>,
 }
 
@@ -3913,30 +3926,54 @@ impl FpSlide {
                 break;
             }
         }
-        let slice: Vec<WinSample> = self.win.iter().copied().collect();
-        if let Some(v) = reduce_window(
-            self.op,
-            self.class,
-            self.param,
-            self.rate_window_ns,
-            self.run_int,
-            &slice,
-        ) {
+        // Class A (integer invert) needs only the running value + emptiness —
+        // no per-emit slice materialization. Class B/C re-reduce the window
+        // (reusing `reduce_buf`, since the deque is already canonically
+        // ordered for one fingerprint).
+        let v = if matches!(self.class, ReducerClass::InvertInteger) {
+            if self.win.is_empty() {
+                None
+            } else {
+                reduce_window(
+                    self.op,
+                    self.class,
+                    self.param,
+                    self.rate_window_ns,
+                    self.run_int,
+                    // A non-empty marker slice — class A ignores its contents.
+                    std::slice::from_ref(&WIN_SAMPLE_MARKER),
+                )
+            }
+        } else {
+            self.reduce_buf.clear();
+            self.reduce_buf.extend(self.win.iter().copied());
+            reduce_window(
+                self.op,
+                self.class,
+                self.param,
+                self.rate_window_ns,
+                self.run_int,
+                &self.reduce_buf,
+            )
+        };
+        if let Some(v) = v {
             self.points.push((t, v));
         }
     }
 
-    /// Loads one collision group (already ranked) at `ts`: emits grid points
-    /// `< ts` first, then charges each member into the window.
+    /// Loads one collision group (already `tie_rank`-ranked in `members`) at
+    /// `ts`: emits grid points `< ts` first, then charges each member into the
+    /// window. Reads values straight from the buffer (no intermediate `Vec`).
     fn load_group(
         &mut self,
         ts: i64,
-        values: &[f64],
+        members: &[CollMember],
         retained: &mut u64,
         cap: u64,
     ) -> Result<(), ReadError> {
         self.emit_until(ts, retained);
-        for (rank, &value) in values.iter().enumerate() {
+        for (rank, m) in members.iter().enumerate() {
+            let value = m.value;
             self.win.push_back(WinSample {
                 ts,
                 stream_hash: self.stream_hash,
@@ -4000,6 +4037,11 @@ struct RangeSlideState<'q> {
     kmax: i64,
     fan_out: bool,
     is_absent: bool,
+    /// Whether the reducer is order-DEPENDENT (class C, or first/last) and so
+    /// needs the full-body `tie_rank` order within a collision group. When
+    /// false (count/bytes/rate-no-unwrap, min/max/quantile) the body is never
+    /// retained — no per-row clone, no per-group sort (the alloc-gate path).
+    needs_body_order: bool,
     absent_labels: LabelSet,
     base_labels: HashMap<u64, LabelSet>,
     hashes: HashMap<u64, u64>,
@@ -4051,6 +4093,8 @@ impl<'q> RangeSlideState<'q> {
         }
         let op = client.range_op;
         let class = reducer_class(op, client.value);
+        let needs_body_order = matches!(class, ReducerClass::CanonicalFold)
+            || matches!(op, RangeAggOp::FirstOverTime | RangeAggOp::LastOverTime);
         Ok(RangeSlideState {
             compiled,
             op,
@@ -4064,6 +4108,7 @@ impl<'q> RangeSlideState<'q> {
             kmax,
             fan_out: compiled.metric_mutates_labels(),
             is_absent: matches!(op, RangeAggOp::AbsentOverTime),
+            needs_body_order,
             absent_labels: client.absent_labels.clone(),
             base_labels,
             hashes,
@@ -4084,100 +4129,123 @@ impl<'q> RangeSlideState<'q> {
     /// Folds one batch of (physical-key-ordered) rows: runs the pipeline,
     /// fails on a surviving `__error__`, and buffers same-`(fingerprint,
     /// timestamp_ns)` runs for full-body ranking before loading them.
+    ///
+    /// `base_labels` is moved to a LOCAL for the duration so the batch-reused
+    /// `scratch` (whose `Cow`s borrow it) does not tie a `self` borrow across
+    /// the mid-loop `&mut self` `flush_collision` — that keeps the fold's
+    /// per-row allocation at ZERO (the alloc-gate discipline), one shared
+    /// scratch across the whole batch.
     fn push_rows(&mut self, rows: &[MetricScanRow]) -> Result<(), ReadError> {
+        let base_labels = std::mem::take(&mut self.base_labels);
+        let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
+        let mut result = Ok(());
         for row in rows {
-            // Close the previous collision group at a `(fingerprint,
-            // timestamp_ns)` boundary BEFORE borrowing `base` for this row —
-            // `flush_collision` takes `&mut self`, which cannot overlap the
-            // immutable `self.base_labels` borrow below.
+            // `base_labels` is a LOCAL, so the reused `scratch` (whose `Cow`s
+            // borrow it) does not tie a `self` borrow across this `&mut self`
+            // flush — the fold stays zero-alloc-per-row with one shared
+            // scratch across the batch.
             if self.coll_active
                 && (self.coll_fp != row.fingerprint || self.coll_ts != row.timestamp_ns)
             {
-                self.flush_collision()?;
-            }
-            // `scratch` is scoped per row: its `Cow`s borrow `base` (=
-            // `self.base_labels[fp]`), so a batch-reused buffer would tie that
-            // borrow across the next iteration's `&mut self` flush. The
-            // extracted `v`/`out` are fully owned, so the borrow ends at the
-            // block. (Reusing one buffer across rows on the range path is a
-            // perf follow-up — the per-row pipeline parse already allocates.)
-            let extracted: Option<(f64, Option<(String, LabelSet)>)> = {
-                let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::new();
-                match self.base_labels.get(&row.fingerprint) {
-                    None => None,
-                    Some(base) => match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
-                        MetricRun::Dropped => None,
-                        MetricRun::Kept { line, value } => {
-                            check_surviving_error(&scratch)?;
-                            let v = match self.value_kind {
-                                ClientValue::Count => Some(1.0),
-                                ClientValue::Bytes => Some(line.len() as f64),
-                                ClientValue::Unwrap => value,
-                            };
-                            v.map(|v| {
-                                let out = if self.fan_out && !self.is_absent {
-                                    scratch.sort_unstable();
-                                    let key = render_labels_json_sorted(&scratch);
-                                    let labels: LabelSet = scratch
-                                        .iter()
-                                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                                        .collect();
-                                    Some((key, labels))
-                                } else {
-                                    None
-                                };
-                                (v, out)
-                            })
-                        }
-                    },
+                if let Err(e) = self.flush_collision(&base_labels) {
+                    result = Err(e);
+                    break;
                 }
-            };
-            let Some((v, out)) = extracted else {
+            }
+            let Some(base) = base_labels.get(&row.fingerprint) else {
                 continue;
+            };
+            let (line, value) = match self.compiled.run_metric_into(&row.body, base, &mut scratch) {
+                MetricRun::Dropped => continue,
+                MetricRun::Kept { line, value } => (line, value),
+            };
+            if let Err(e) = check_surviving_error(&scratch) {
+                result = Err(e);
+                break;
+            }
+            let v = match self.value_kind {
+                ClientValue::Count => 1.0,
+                ClientValue::Bytes => line.len() as f64,
+                ClientValue::Unwrap => match value {
+                    Some(v) => v,
+                    None => continue,
+                },
+            };
+            let out = if self.fan_out && !self.is_absent {
+                scratch.sort_unstable();
+                let key = render_labels_json_sorted(&scratch);
+                let labels: LabelSet = scratch
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect();
+                Some((key, labels))
+            } else {
+                None
             };
             self.coll_active = true;
             self.coll_fp = row.fingerprint;
             self.coll_ts = row.timestamp_ns;
+            // Only order-dependent reducers retain the body (for the collision
+            // `tie_rank` sort); count/bytes/rate/min/max/quantile do not, so
+            // the common path never clones a body.
+            let body = if self.needs_body_order {
+                row.body.clone()
+            } else {
+                String::new()
+            };
             self.coll.push(CollMember {
-                body: row.body.clone(),
+                body,
                 value: v,
                 out,
             });
             if self.coll.len() as u64 > MAX_TS_COLLISION_GROUP {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
+                result = Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
                     count: self.coll.len() as u64,
                     cap: MAX_TS_COLLISION_GROUP,
                 }));
+                break;
             }
         }
-        Ok(())
+        self.base_labels = base_labels;
+        result
     }
 
     /// Ranks and dispatches the buffered collision group (full-body order ⇒
     /// deterministic `tie_rank`), then releases the bodies.
-    fn flush_collision(&mut self) -> Result<(), ReadError> {
+    fn flush_collision(
+        &mut self,
+        base_labels: &HashMap<u64, LabelSet>,
+    ) -> Result<(), ReadError> {
         if self.coll.is_empty() {
             self.coll_active = false;
             return Ok(());
         }
         let fp = self.coll_fp;
         let ts = self.coll_ts;
-        // A true total order over the group: distinct bodies always differ;
-        // byte-identical bodies are genuinely interchangeable.
-        self.coll
-            .sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
-        let members = std::mem::take(&mut self.coll);
         self.coll_active = false;
+        // A true total order over the group (order-dependent reducers only):
+        // distinct bodies always differ; byte-identical bodies are genuinely
+        // interchangeable. Skipped entirely for the common order-independent
+        // reducers (which never retained a body).
+        if self.needs_body_order {
+            self.coll
+                .sort_by(|a, b| a.body.as_bytes().cmp(b.body.as_bytes()));
+        }
 
         if self.is_absent {
-            for _ in &members {
+            for _ in 0..self.coll.len() {
                 self.present_ts.push(ts);
             }
+            self.coll.clear();
             return Ok(());
         }
 
         let stream_hash = self.hashes.get(&fp).copied().unwrap_or(0);
         if self.fan_out {
+            // The fan-out path moves `out` out of each member, so it consumes
+            // the buffer (the mutating path is the already-expensive class);
+            // `coll` re-grows on the next group.
+            let members = std::mem::take(&mut self.coll);
             for (rank, m) in members.into_iter().enumerate() {
                 let (key, labels) = m.out.expect("mutating member carries its output set");
                 self.fan_out_sample(key, labels, ts, stream_hash, rank as u32, m.value)?;
@@ -4198,7 +4266,7 @@ impl<'q> RangeSlideState<'q> {
                     cap: MAX_CLIENT_AGG_SERIES,
                 }));
             }
-            let labels = self.base_labels.get(&fp).cloned().unwrap_or_default();
+            let labels = base_labels.get(&fp).cloned().unwrap_or_default();
             self.cur = Some(FpSlide {
                 stream_hash,
                 labels,
@@ -4213,13 +4281,18 @@ impl<'q> RangeSlideState<'q> {
                 next_k: 0,
                 win: VecDeque::new(),
                 run_int: 0,
+                reduce_buf: Vec::new(),
                 points: Vec::new(),
             });
             self.cur_fp = fp;
         }
-        let values: Vec<f64> = members.iter().map(|m| m.value).collect();
+        // Disjoint field borrows (`cur`, `coll`, `retained`) — the slider
+        // reads values straight from the buffer, no intermediate `Vec`; the
+        // buffer's capacity is reused (cleared, never reallocated per group).
         let cur = self.cur.as_mut().expect("slider just set");
-        cur.load_group(ts, &values, &mut self.retained, MAX_RETAINED_WINDOW_POINTS)
+        cur.load_group(ts, &self.coll, &mut self.retained, MAX_RETAINED_WINDOW_POINTS)?;
+        self.coll.clear();
+        Ok(())
     }
 
     /// Fans one ranked sample into every grid cell whose window `(t-range,
@@ -4296,7 +4369,10 @@ impl<'q> RangeSlideState<'q> {
 
     /// Finalizes into the query result.
     fn finish(mut self) -> Result<QueryResult, ReadError> {
-        self.flush_collision()?;
+        // `base_labels` moved to a local (as in `push_rows`) so the final
+        // `&mut self` flush does not clash with a `self.base_labels` borrow.
+        let base_labels = std::mem::take(&mut self.base_labels);
+        self.flush_collision(&base_labels)?;
         if let Some(prev) = self.cur.take() {
             if let Some(series) = prev.finish(&mut self.retained) {
                 self.series_out.push(series);
@@ -4388,21 +4464,27 @@ pub fn run_client_agg_rows(
     rate_window_ns: Option<u64>,
 ) -> Result<QueryResult, ReadError> {
     if window.step_ns.is_some() {
-        // Issue #227: a range query evaluates Loki's sliding windows. The
-        // pure (slice) entry may receive rows in arbitrary order, so sort by
-        // the physical read order `(fingerprint, timestamp_ns)` the live
-        // engine's `metric_raw_samples_sliding` scan guarantees — the
-        // streaming slide assumes fingerprint-contiguous, ascending-ts input
-        // (same-`(fingerprint, ts)` collision groups then arrive
-        // consecutively and are body-ranked in Rust).
-        let mut ordered: Vec<MetricScanRow> = rows.to_vec();
-        ordered.sort_by(|a, b| {
-            a.fingerprint
-                .cmp(&b.fingerprint)
-                .then(a.timestamp_ns.cmp(&b.timestamp_ns))
-        });
+        // Issue #227: a range query evaluates Loki's sliding windows, which
+        // assume fingerprint-contiguous, ascending-ts input (the live
+        // engine's `metric_raw_samples_sliding` PK scan guarantees it). The
+        // live path already streams in that order; only re-sort (cloning) the
+        // pure-slice entry if it is NOT already ordered — so a pre-ordered
+        // scan folds with zero per-row allocation.
         let mut state = RangeSlideState::new(compiled, meta, client, window, rate_window_ns)?;
-        state.push_rows(&ordered)?;
+        let ordered = rows.windows(2).all(|w| {
+            (w[0].fingerprint, w[0].timestamp_ns) <= (w[1].fingerprint, w[1].timestamp_ns)
+        });
+        if ordered {
+            state.push_rows(rows)?;
+        } else {
+            let mut sorted: Vec<MetricScanRow> = rows.to_vec();
+            sorted.sort_by(|a, b| {
+                a.fingerprint
+                    .cmp(&b.fingerprint)
+                    .then(a.timestamp_ns.cmp(&b.timestamp_ns))
+            });
+            state.push_rows(&sorted)?;
+        }
         return state.finish();
     }
     let mut state = ClientAggState::new(compiled, meta, client, window, rate_window_ns)?;
