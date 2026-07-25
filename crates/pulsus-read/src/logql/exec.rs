@@ -3898,7 +3898,10 @@ impl FpSlide {
     /// Evicts `T ≤ t-range` from the window front (discharging retention),
     /// then reduces the window and records a point (empty ⇒ gap).
     fn emit_at(&mut self, t: i64, retained: &mut u64) {
-        let lo = t - self.range;
+        // `saturating_sub`: for `t` near `i64::MIN` (or a `range` ≫ the whole
+        // window) `t-range` underflows i64; saturating to `i64::MIN` is
+        // correct — no stored ts is below it, so the eviction bound is exact.
+        let lo = t.saturating_sub(self.range);
         while let Some(front) = self.win.front() {
             if front.ts <= lo {
                 let ev = self.win.pop_front().expect("front present");
@@ -4350,7 +4353,7 @@ impl<'q> RangeSlideState<'q> {
         let mut points: Vec<(i64, f64)> = Vec::new();
         for k in 0..=self.kmax {
             let t = self.grid_point(k);
-            let lo = t - self.range;
+            let lo = t.saturating_sub(self.range);
             // Any sample in (lo, t]? First ts > lo, then check ≤ t.
             let idx = ts.partition_point(|&x| x <= lo);
             let present = idx < ts.len() && ts[idx] <= t;
