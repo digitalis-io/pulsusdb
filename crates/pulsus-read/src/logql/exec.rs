@@ -3200,22 +3200,41 @@ impl BucketAcc {
 /// a lone sample returns value `"0"`), so we return `0.0` and let `finish`
 /// surface it as a 0-valued vector element; we do NOT drop the group.
 fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
-    if pts.len() < 2 {
+    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+    rate_counter_over_sorted(pts.len(), |i| pts[i], rate_window_ns)
+}
+
+/// [`rate_counter_extrapolated`]'s body over an ALREADY timestamp-sorted
+/// sequence addressed by index — `at(i)` yields the `i`-th `(ts, value)` in
+/// ascending-`ts` order.
+///
+/// Split out so the sliding evaluator can reduce **over a borrow of the
+/// live window**: the retained window is already in canonical `(ts,
+/// stream_hash, tie_rank)` order (whose leading key is `ts`), so the sort
+/// the owning form performs is a no-op on it, and copying it into a
+/// `Vec<(i64, f64)>` at every grid point — as the round-4 code did — was
+/// pure waste that also doubled peak memory for the copy (issue #227 review
+/// round 5, finding 2). Values are read straight out of the window instead.
+/// The arithmetic is byte-identical to the owning form; only the storage
+/// differs.
+fn rate_counter_over_sorted<F>(len: usize, at: F, rate_window_ns: Option<u64>) -> f64
+where
+    F: Fn(usize) -> (i64, f64),
+{
+    if len < 2 {
         return 0.0;
     }
     let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
         return 0.0;
     };
-    pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
-    let first_t = pts[0].0;
-    let last_t = pts[pts.len() - 1].0;
-    let first_f = pts[0].1;
-    let last_f = pts[pts.len() - 1].1;
+    let (first_t, first_f) = at(0);
+    let (last_t, last_f) = at(len - 1);
 
     // Reset-aware increase in the reference's accumulation order.
     let mut result_value = last_f - first_f;
     let mut last_value = 0.0_f64;
-    for &(_, f) in &pts {
+    for i in 0..len {
+        let f = at(i).1;
         if f < last_value {
             result_value += last_value;
         }
@@ -3236,7 +3255,7 @@ fn rate_counter_extrapolated(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u6
     let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0; // == sel_range_ms/1000
     let duration_to_end = 0.0_f64; // rangeEnd == last.T ⇒ 0
     let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
-    let average_duration = sampled_interval / (pts.len() - 1) as f64;
+    let average_duration = sampled_interval / (len - 1) as f64;
 
     if result_value > 0.0 && first_f >= 0.0 {
         let duration_to_zero = sampled_interval * (first_f / result_value);
@@ -3779,6 +3798,14 @@ pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 /// > any body/label size and any density**. A breach is a clean
 /// > `TsCollisionGroup` error — never a truncated group, so the `tie_rank`
 /// > order is never silently partial.
+/// >
+/// > **What survives a flush.** `Vec::clear` DROPS every element (bodies,
+/// > rendered JSON and cloned label sets are freed) but keeps `coll`'s own
+/// > element buffer. That spare capacity is bounded by the largest group
+/// > ever staged, whose slot charge (`VEC_GROWTH_FACTOR ×
+/// > size_of::<CollMember>()` per member) was itself inside the cap — so
+/// > the residual buffer is `<= MAX_TS_COLLISION_GROUP_BYTES` too, and no
+/// > content bytes survive.
 ///
 /// 8 MiB staged for one nanosecond in one stream is far beyond real data
 /// (real groups are size 1), so nothing servable is rejected.
@@ -3795,7 +3822,71 @@ pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
 /// into one concurrent invariant. Same 4M magnitude, set generously so
 /// nothing Loki reliably serves is rejected (see the cap-generosity corpus
 /// case).
+///
+/// **Unit and byte relationship.** One point is one [`WinSample`]. Actual
+/// process bytes are `retained × size_of::<WinSample>()` scaled by the
+/// container's allocator growth slack (a `VecDeque`/`Vec` holds up to ~2×
+/// its length, plus the old buffer during a realloc) — i.e. `O(cap)`, with
+/// no axis that scales with `[range]`, step, cardinality or density. Any
+/// per-emit scratch a reducer needs on top of the window is charged
+/// per-sample up front by [`retention_points_per_sample`], so it is inside
+/// the same bound.
 pub const MAX_RETAINED_WINDOW_POINTS: u64 = 4_000_000;
+
+/// **The one retention gate.** Every sliding-path allocation that scales
+/// with scanned data is sized in retention POINTS, checked against the cap,
+/// and accounted HERE — *before* the allocation is performed (issue #227
+/// review round 5, finding 2: the charge sites used to be scattered, and
+/// three of them charged AFTER inserting, so the breaching allocation was
+/// made before the cap could refuse it). Every caller on the sliding path
+/// funnels through this function and [`discharge_retention`], so the
+/// "size → check the cap → allocate" rule has exactly one implementation.
+///
+/// `saturating_add` cannot mask a breach: saturation only ever makes the
+/// sum LARGER, so the comparison still rejects.
+fn charge_retention(retained: &mut u64, points: u64, cap: u64) -> Result<(), ReadError> {
+    let next = retained.saturating_add(points);
+    if next > cap {
+        return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
+            count: next,
+            cap,
+        }));
+    }
+    *retained = next;
+    Ok(())
+}
+
+/// Releases a charge made by [`charge_retention`], called as the charged
+/// memory is freed (eviction, series close, cell consumption). Saturating
+/// for panic-proofing only — the charge/discharge pairing is exact, which
+/// `finish`'s `retained == 0` post-condition asserts.
+fn discharge_retention(retained: &mut u64, points: u64) {
+    *retained = retained.saturating_sub(points);
+}
+
+/// Retention points charged per retained sample, in [`WinSample`] units.
+///
+/// Most reducers re-reduce over a BORROW of the live window and allocate
+/// nothing per emit, so one retained sample costs exactly one point.
+/// `quantile_over_time` is the sole exception: its reduction must SORT the
+/// values, and it cannot sort the window itself (the deque's ascending-`ts`
+/// order is what eviction depends on), so it materializes a `Vec<f64>` copy
+/// of the LIVE window at every grid point.
+///
+/// That copy is charged up front, at load, rather than at the emit that
+/// makes it — which is what keeps the rule "the cap approves an allocation
+/// before it happens" true for a copy taken deep inside a non-fallible
+/// reduce. **Bound:** the copy is `8 × W` bytes for a live window of `W`
+/// samples (`collect` from a `TrustedLen` iterator reserves exactly `W`),
+/// while the extra point charges `size_of::<WinSample>()` = 32 bytes per
+/// sample — 4× headroom, so the charge dominates the copy for every window
+/// size and every allocator slack.
+fn retention_points_per_sample(op: RangeAggOp) -> u64 {
+    match op {
+        RangeAggOp::QuantileOverTime => 2,
+        _ => 1,
+    }
+}
 
 /// The three sliding-window reducer classes (issue #227 finding-4 table,
 /// cited to Loki v3.7.4 `range_vector.go` / `syntax/ast.go:1449-1458`).
@@ -3940,12 +4031,27 @@ fn reduce_window(
         RangeAggOp::FirstOverTime => Some(ordered[0].value),
         RangeAggOp::LastOverTime => Some(ordered[ordered.len() - 1].value),
         RangeAggOp::QuantileOverTime => {
+            // The ONE re-reduction that cannot run over a borrow: the
+            // quantile needs the values SORTED, and the window itself must
+            // stay in ascending-`ts` order for eviction. The copy is
+            // pre-charged per retained sample by
+            // [`retention_points_per_sample`] (issue #227 review round 5,
+            // finding 2), so the cap has already approved it — `collect`
+            // from a `TrustedLen` iterator reserves exactly `ordered.len()`
+            // `f64`s, four times inside the 32-byte-per-sample charge.
             let mut vals: Vec<f64> = ordered.iter().map(|s| s.value).collect();
             Some(quantile_of(&mut vals, param.unwrap_or(f64::NAN)))
         }
         RangeAggOp::RateCounter => {
-            let pts: Vec<(i64, f64)> = ordered.iter().map(|s| (s.ts, s.value)).collect();
-            Some(rate_counter_extrapolated(pts, rate_window_ns))
+            // Over a BORROW — `ordered` is already ascending by `ts` (the
+            // canonical order's leading key), which is all the reset walk
+            // needs. No `Vec<(i64, f64)>` copy of the whole window per grid
+            // point (issue #227 review round 5, finding 2).
+            Some(rate_counter_over_sorted(
+                ordered.len(),
+                |i| (ordered[i].ts, ordered[i].value),
+                rate_window_ns,
+            ))
         }
         // sum/avg/min/max/stddev/stdvar reuse the instant path's exact
         // arithmetic (`SimpleAcc`) folded in canonical order.
@@ -4003,6 +4109,11 @@ struct FpSlide {
     win: VecDeque<WinSample>,
     /// Class-A running integer (add-on-load / subtract-on-evict).
     run_int: u64,
+    /// Retention points one retained sample costs — the window entry plus
+    /// any per-emit re-reduce scratch the reducer needs
+    /// ([`retention_points_per_sample`]). Charged on load, discharged on
+    /// evict, so charge and discharge use the same unit.
+    per_sample: u64,
     points: Vec<(i64, f64)>,
 }
 
@@ -4040,11 +4151,12 @@ impl FpSlide {
             if front.ts <= lo {
                 let ev = self.win.pop_front().expect("front present");
                 // Symmetric discharge (the concurrent-retention invariant):
-                // every evicted sample was charged on load, so this is exact;
-                // `saturating_sub` on both counters is panic-proofing, never
-                // a masked accounting path (class-A values are `1.0` or a
-                // non-negative `line.len()`, added and removed once each).
-                *retained = retained.saturating_sub(1);
+                // every evicted sample was charged on load in the same
+                // `per_sample` unit, so this is exact; the saturating form is
+                // panic-proofing, never a masked accounting path (class-A
+                // values are `1.0` or a non-negative `line.len()`, added and
+                // removed once each).
+                discharge_retention(retained, self.per_sample);
                 if matches!(self.class, ReducerClass::InvertInteger) {
                     self.run_int = self.run_int.saturating_sub(ev.value as u64);
                 }
@@ -4104,17 +4216,10 @@ impl FpSlide {
         self.emit_until(ts, retained);
         for (rank, m) in members.iter().enumerate() {
             let value = m.value;
-            // Charge BEFORE the allocation (issue #227 review round 5,
-            // finding 2): `push_back` may grow the deque, so the cap must be
-            // checked first — uniform with `stage_member`'s discipline.
-            let next = *retained + 1;
-            if next > cap {
-                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
-                    count: next,
-                    cap,
-                }));
-            }
-            *retained = next;
+            // Size → check the cap → allocate, through the ONE gate (issue
+            // #227 review round 5, finding 2): `push_back` may grow the
+            // deque, so the cap must refuse before the push, not after it.
+            charge_retention(retained, self.per_sample, cap)?;
             self.win.push_back(WinSample {
                 ts,
                 stream_hash: self.stream_hash,
@@ -4135,9 +4240,9 @@ impl FpSlide {
             self.emit_at(t, retained);
             self.next_k += 1;
         }
-        // Discharge whatever is still retained (the series is closed).
-        // Saturating for the same panic-proofing reason as `emit_at`.
-        *retained = retained.saturating_sub(self.win.len() as u64);
+        // Discharge whatever is still retained (the series is closed), in
+        // the same `per_sample` unit it was charged in.
+        discharge_retention(retained, self.win.len() as u64 * self.per_sample);
         if self.points.is_empty() {
             None
         } else {
@@ -4180,8 +4285,13 @@ struct RangeSlideState<'q> {
     absent_labels: LabelSet,
     base_labels: HashMap<u64, LabelSet>,
     hashes: HashMap<u64, u64>,
-    /// Concurrent retained-point count (charge-on-load / discharge-on-evict).
+    /// Concurrent retained-point count (charge-on-load / discharge-on-evict),
+    /// gated by [`charge_retention`]/[`discharge_retention`].
     retained: u64,
+    /// Retention points one retained sample costs
+    /// ([`retention_points_per_sample`]) — shared by the streaming sliders
+    /// and the mutating fan-out cells so both charge in the same unit.
+    per_sample: u64,
     // Non-mutating.
     cur: Option<FpSlide>,
     cur_fp: u64,
@@ -4285,6 +4395,7 @@ impl<'q> RangeSlideState<'q> {
             base_labels,
             hashes,
             retained: 0,
+            per_sample: retention_points_per_sample(op),
             cur: None,
             cur_fp: 0,
             series_out: Vec::new(),
@@ -4390,15 +4501,16 @@ impl<'q> RangeSlideState<'q> {
         }
         // (i) size EVERY allocation this member will make.
         let bytes = self.member_stage_bytes(row, scratch, stages_out);
-        // (ii) both caps, BEFORE any allocation.
+        // (ii) both caps, BEFORE any allocation. `saturating_add` cannot mask
+        // a breach (saturation only grows the sum) but does keep a
+        // pathological charge from overflowing the comparison itself.
         let next_count = self.coll.len() as u64 + 1;
-        if next_count > MAX_TS_COLLISION_GROUP
-            || self.coll_bytes + bytes > MAX_TS_COLLISION_GROUP_BYTES
-        {
+        let next_bytes = self.coll_bytes.saturating_add(bytes);
+        if next_count > MAX_TS_COLLISION_GROUP || next_bytes > MAX_TS_COLLISION_GROUP_BYTES {
             return Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup {
                 count: next_count,
                 cap: MAX_TS_COLLISION_GROUP,
-                bytes: self.coll_bytes + bytes,
+                bytes: next_bytes,
                 bytes_cap: MAX_TS_COLLISION_GROUP_BYTES,
             }));
         }
@@ -4418,7 +4530,7 @@ impl<'q> RangeSlideState<'q> {
         } else {
             None
         };
-        self.coll_bytes += bytes;
+        self.coll_bytes = next_bytes;
         self.coll.push(CollMember { body, value, out });
         Ok(())
     }
@@ -4429,46 +4541,64 @@ impl<'q> RangeSlideState<'q> {
     /// bounds the real footprint.
     ///
     /// **Worst case per allocation** (issue #227 review round 5, finding 1 —
-    /// the round-4 version under-counted both of the first two):
-    /// - **rendered label JSON** — [`push_json_string`] expands a control
-    ///   byte (`< 0x20`) to `\u00XX`, **6 bytes**, so the rendered length is
-    ///   at most `6 × content`. Worst-case input: every byte a control
-    ///   character. Punctuation is at most 6 bytes per pair (`"":"",`) plus
-    ///   the two braces. The `String` is built with a capacity estimate that
-    ///   ASSUMES no escaping, so escaping-heavy input forces geometric
-    ///   growth whose final capacity can reach ~2× the length — hence the
-    ///   ×2. Charged: `2 × (6·content + 6·pairs + 2)`.
-    /// - **cloned `LabelSet`** — `content` bytes of owned key/value data
-    ///   (each `String::from(&str)` allocates exactly), plus the vector's
-    ///   element footprint `pairs × size_of::<(String, String)>()`. The
-    ///   `collect` is from an `ExactSizeIterator` so it reserves exactly, but
-    ///   ×2 is charged for allocator slack.
-    /// - **body clone** — exactly `row.body.len()` (`String::clone` reserves
-    ///   exactly), only when `needs_body_order`; plus the `String` header.
+    /// the round-4 version counted the JSON content ONCE and charged a flat
+    /// 32 bytes per container slot, both of which an adversarial input
+    /// beats):
+    /// - **rendered label JSON** ([`render_labels_json_sorted`]) —
+    ///   [`push_json_string`] expands a C0 control byte to `\u00xx`, **SIX
+    ///   bytes out for one byte in**, which is the maximum expansion any
+    ///   input can produce (`"`/`\`/`\n`/`\r`/`\t`/`\b`/`\f` are 2, every
+    ///   other scalar is copied verbatim at its own UTF-8 width). Worst-case
+    ///   input is an all-control-character label value, so the rendered
+    ///   length is at most `6·content`. Punctuation adds at most 6 bytes per
+    ///   pair (`"k":"v"` = 5, plus a separating `,`) and the 2 braces. The
+    ///   `String` is pre-sized with a capacity estimate that ASSUMES NO
+    ///   escaping, so escaping-heavy input forces geometric growth: the last
+    ///   growth leaves capacity ≤ `2 × final length`, and during the realloc
+    ///   the old buffer is still live (≤ another half). Charged
+    ///   `3 × (6·content + 6·pairs + 2)`.
+    /// - **cloned `LabelSet`** — each `to_string()` on a `&str` allocates
+    ///   exactly its length (`content` in total), and the `collect` runs
+    ///   from a `TrustedLen` iterator so the vector reserves exactly `pairs`
+    ///   elements (`pairs × size_of::<(String, String)>()`). Charged 2× both
+    ///   for allocator slack.
+    /// - **body clone** — `String::clone` reserves exactly `row.body.len()`;
+    ///   charged with a `String` header on top, only when
+    ///   `needs_body_order`.
     /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity,
-    ///   and during the realloc the old buffer is still live, so peak is up
-    ///   to ~3× the element count. Charged `4 × size_of::<CollMember>()` per
-    ///   member, which dominates `4n·size >= 3n·size` for every `n`.
+    ///   and the old buffer is live during the realloc, so the peak is up to
+    ///   ~3× the element footprint. Charged `4 × size_of::<CollMember>()`
+    ///   per member, which dominates `3n·size` for every `n`. (`String`/`Vec`
+    ///   headers inside `CollMember` live in that slot; charging their sizes
+    ///   again above is deliberate over-count, not double-accounting error.)
     ///
-    /// Saturating arithmetic throughout: a hostile label value cannot wrap
-    /// the charge to a small number (the multiplication is the only place
-    /// that could, and `content` is itself bounded by the byte-scan budget).
+    /// Saturating arithmetic throughout, so a hostile label value cannot
+    /// wrap the charge round to a small number — saturation can only make
+    /// the charge larger, which is the safe direction.
     fn member_stage_bytes(
         &self,
         row: &MetricScanRow,
         scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         stages_out: bool,
     ) -> u64 {
-        /// Worst-case expansion of one content byte by JSON escaping
-        /// (`\u00XX` for a control byte).
+        /// Worst-case expansion of one content byte by JSON escaping: a C0
+        /// control byte renders as `\u00xx` — six bytes.
         const MAX_JSON_ESCAPE_EXPANSION: u64 = 6;
-        /// A `Vec` push can double capacity while the old buffer is still
-        /// live; charging 4× per element dominates that peak.
+        /// Worst-case punctuation per rendered pair: `"k":"v"` is 5 bytes of
+        /// syntax, plus the `,` separating it from the previous pair.
+        const JSON_PUNCTUATION_PER_PAIR: u64 = 6;
+        /// A growing `String`/`Vec` can hold 2× its length, and the old
+        /// buffer is still mapped while a realloc copies out of it; 3×
+        /// dominates that peak.
+        const ALLOC_GROWTH_SLACK: u64 = 3;
+        /// A `Vec` push can double capacity with the old buffer still live
+        /// (~3× peak); 4× per element dominates it.
         const VEC_GROWTH_FACTOR: u64 = 4;
+        /// Allocator slack charged on exactly-reserved allocations.
+        const EXACT_ALLOC_SLACK: u64 = 2;
 
-        let member_slot = (std::mem::size_of::<CollMember>() as u64)
-            .saturating_mul(VEC_GROWTH_FACTOR);
-        let mut bytes = member_slot;
+        let mut bytes =
+            (std::mem::size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
 
         if self.needs_body_order {
             bytes = bytes
@@ -4486,19 +4616,16 @@ impl<'q> RangeSlideState<'q> {
             // Rendered JSON: worst-case escaping, then geometric growth.
             let json_len = content
                 .saturating_mul(MAX_JSON_ESCAPE_EXPANSION)
-                .saturating_add(pairs.saturating_mul(6))
+                .saturating_add(pairs.saturating_mul(JSON_PUNCTUATION_PER_PAIR))
                 .saturating_add(2);
             bytes = bytes
-                .saturating_add(json_len.saturating_mul(2))
+                .saturating_add(json_len.saturating_mul(ALLOC_GROWTH_SLACK))
                 .saturating_add(std::mem::size_of::<String>() as u64);
 
             // Cloned `LabelSet`: owned content + element footprint.
-            let elems = pairs
-                .saturating_mul(std::mem::size_of::<(String, String)>() as u64)
-                .saturating_mul(2);
+            let elems = pairs.saturating_mul(std::mem::size_of::<(String, String)>() as u64);
             bytes = bytes
-                .saturating_add(content)
-                .saturating_add(elems)
+                .saturating_add(content.saturating_add(elems).saturating_mul(EXACT_ALLOC_SLACK))
                 .saturating_add(std::mem::size_of::<LabelSet>() as u64);
         }
 
@@ -4590,6 +4717,7 @@ impl<'q> RangeSlideState<'q> {
                 next_k: 0,
                 win: VecDeque::new(),
                 run_int: 0,
+                per_sample: self.per_sample,
                 points: Vec::new(),
             });
             self.cur_fp = fp;
@@ -4630,6 +4758,7 @@ impl<'q> RangeSlideState<'q> {
             }));
         }
         let integer = matches!(self.class, ReducerClass::InvertInteger);
+        let per_sample = self.per_sample;
         let retained = &mut self.retained;
         let group = self.groups.entry(key).or_insert_with(|| MutGroup {
             labels,
@@ -4644,37 +4773,27 @@ impl<'q> RangeSlideState<'q> {
                 // instead of relying on the implicit
                 // `MAX_CLIENT_AGG_SERIES × MAX_CLIENT_AGG_BUCKETS` product.
                 // Updating an existing cell is O(1) and charges nothing.
+                //
+                // ONE point per cell: an `int_cells` entry is an `(i64, u64)`
+                // pair, narrower than the `WinSample` the unit is defined by,
+                // and class A never re-reduces over a scratch
+                // (`per_sample == 1` for every integer op anyway).
                 match group.int_cells.entry(k) {
                     std::collections::hash_map::Entry::Occupied(mut e) => {
                         *e.get_mut() += value as u64;
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        // Charge BEFORE inserting (issue #227 review round 5,
-                        // finding 2): the insert may grow the map.
-                        let next = *retained + 1;
-                        if next > MAX_RETAINED_WINDOW_POINTS {
-                            return Err(ReadError::QueryTooBroad(
-                                TooBroadReason::MetricRetention {
-                                    count: next,
-                                    cap: MAX_RETAINED_WINDOW_POINTS,
-                                },
-                            ));
-                        }
-                        *retained = next;
+                        // Size → check the cap → allocate, through the ONE
+                        // gate (issue #227 review round 5, finding 2): the
+                        // insert may grow the map, so the cap must refuse
+                        // before it, not after.
+                        charge_retention(retained, 1, MAX_RETAINED_WINDOW_POINTS)?;
                         e.insert(value as u64);
                     }
                 }
             } else {
-                // Charge BEFORE the map/vector insertion (issue #227 review
-                // round 5, finding 2): both may allocate.
-                let next = *retained + 1;
-                if next > MAX_RETAINED_WINDOW_POINTS {
-                    return Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention {
-                        count: next,
-                        cap: MAX_RETAINED_WINDOW_POINTS,
-                    }));
-                }
-                *retained = next;
+                // Same gate before the map/vector insertion — both allocate.
+                charge_retention(retained, per_sample, MAX_RETAINED_WINDOW_POINTS)?;
                 group.pt_cells.entry(k).or_default().push(WinSample {
                     ts,
                     stream_hash,
@@ -4757,21 +4876,27 @@ impl<'q> RangeSlideState<'q> {
             let mut out: Vec<MatrixSeries> = Vec::new();
             for group in groups.into_values() {
                 let mut points: Vec<(i64, f64)> = Vec::new();
+                // Both branches drain the group's cells into a `Vec` keyed by
+                // grid index so the points come out ordered. The drain is
+                // bounded by the cells' own charge (one point per created
+                // cell / retained sample) and each element is narrower than
+                // the `WinSample` that charge is denominated in — the `Vec`
+                // moves the inner point vectors, it does not copy them. The
+                // discharge happens AFTER the cells are consumed, so a charge
+                // is never released while the memory it paid for is still
+                // live (issue #227 review round 5, finding 2).
                 if matches!(class, ReducerClass::InvertInteger) {
                     let mut cells: Vec<(i64, u64)> = group.int_cells.into_iter().collect();
-                    // Symmetric discharge: each cell was charged once on
-                    // creation and is released as it is consumed here.
-                    self.retained = self.retained.saturating_sub(cells.len() as u64);
+                    let staged = cells.len() as u64;
                     cells.sort_by_key(|(k, _)| *k);
                     for (k, run_int) in cells {
                         points.push((grid_point(k), reduce_int_cell(op, rate_window_ns, run_int)));
                     }
+                    discharge_retention(&mut self.retained, staged);
                 } else {
                     let mut cells: Vec<(i64, Vec<WinSample>)> =
                         group.pt_cells.into_iter().collect();
-                    // Symmetric discharge: every retained point released.
                     let staged: u64 = cells.iter().map(|(_, v)| v.len() as u64).sum();
-                    self.retained = self.retained.saturating_sub(staged);
                     cells.sort_by_key(|(k, _)| *k);
                     for (k, mut pts) in cells {
                         pts.sort_by(win_order);
@@ -4779,6 +4904,7 @@ impl<'q> RangeSlideState<'q> {
                             points.push((grid_point(k), v));
                         }
                     }
+                    discharge_retention(&mut self.retained, staged * self.per_sample);
                 }
                 if !points.is_empty() {
                     out.push(MatrixSeries {
@@ -6726,7 +6852,9 @@ mod tests {
     /// per-load, so a retaining reducer over more than `cap` in-window points
     /// aborts with the named `MetricRetention` error. Uses a tiny synthetic
     /// cap via the retaining (class-B `quantile`) path with a window wide
-    /// enough that nothing evicts.
+    /// enough that nothing evicts. `quantile` charges TWO points per sample
+    /// (the window entry plus its pre-charged re-reduce copy — review round 5,
+    /// finding 2), which is what the trip arithmetic below is expressed in.
     #[test]
     fn sliding_retention_cap_trips_during_the_scan_with_the_named_error() {
         // A retaining reducer (quantile) whose window never evicts: every
@@ -6738,6 +6866,11 @@ mod tests {
             param: Some(0.5),
             absent_labels: vec![],
         };
+        let per_sample = retention_points_per_sample(client.range_op);
+        assert_eq!(
+            per_sample, 2,
+            "quantile pre-charges its per-emit value copy alongside the window entry"
+        );
         // Drive `FpSlide::load_group` directly with a TINY cap so the test is
         // fast and the trip point is exact (the production cap is 4M).
         let mut slide = FpSlide {
@@ -6754,6 +6887,7 @@ mod tests {
             next_k: 0,
             win: VecDeque::new(),
             run_int: 0,
+            per_sample,
             points: Vec::new(),
         };
         let mut retained = 0u64;
@@ -6778,14 +6912,18 @@ mod tests {
         match err {
             Some(ReadError::QueryTooBroad(TooBroadReason::MetricRetention { count, cap })) => {
                 assert_eq!(cap, TINY_CAP);
-                assert_eq!(count, TINY_CAP + 1, "trips at the first over-cap load");
+                assert_eq!(
+                    count,
+                    TINY_CAP + per_sample,
+                    "trips at the first over-cap load"
+                );
             }
             other => panic!("expected MetricRetention, got {other:?}"),
         }
         assert_eq!(
             loads,
-            TINY_CAP + 1,
-            "the cap must trip DURING the scan (after ~cap loads), not after all 1000"
+            TINY_CAP / per_sample + 1,
+            "the cap must trip DURING the scan (after ~cap/per-sample loads), not after all 1000"
         );
     }
 
@@ -6809,11 +6947,14 @@ mod tests {
             next_k: 0,
             win: VecDeque::new(),
             run_int: 0,
+            per_sample: retention_points_per_sample(RangeAggOp::QuantileOverTime),
             points: Vec::new(),
         };
         let mut retained = 0u64;
         // 100 samples 10ns apart over a 10ns window: at most a couple are
-        // ever concurrently retained, however long the scan runs.
+        // ever concurrently retained, however long the scan runs (times the
+        // per-sample charge — 2 for quantile).
+        let bound = 3 * retention_points_per_sample(RangeAggOp::QuantileOverTime);
         for i in 1..=100i64 {
             let group = [CollMember {
                 body: String::new(),
@@ -6824,7 +6965,7 @@ mod tests {
                 .load_group(i * 10, &group, &mut retained, MAX_RETAINED_WINDOW_POINTS)
                 .expect("under cap");
             assert!(
-                retained <= 3,
+                retained <= bound,
                 "retention must stay window-bounded, saw {retained} after {i} loads"
             );
         }
