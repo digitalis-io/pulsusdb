@@ -1,0 +1,235 @@
+# B2 — LogQL formatter + stage constructs (issue #220).
+#
+# line_format / label_format (rename + template) / decolorize / drop /
+# keep, each over a minimal json|logfmt|regexp|pattern parser so there are
+# labels to format, drop, or keep. Every case is streams-result: the
+# pipeline rewrites line bodies and/or relabels streams.
+#
+# Captured byte-for-byte from grafana/loki:3.7.4 (query_range; Loki rejects
+# log queries as instant, but the per-entry rewrite is time-independent, so
+# the DSL eval stays `instant`). See PROVENANCE.md for the capture procedure.
+# Loki drops empty-valued labels; PulsusDB keeps them — cases are authored to
+# never emit an empty label (except keep-with-matcher, where BOTH agree the
+# stream survives with an empty label set).
+
+# === line_format: {{.label}} substitution over a json pipeline ===
+# json parser promotes status/method/path/region; line_format rewrites only the line body
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# single field + literal
+eval instant at 120s {service_name="svc-json"} | json | line_format "{{.method}} {{.status}}"
+  {env="prod", method="GET", path="/a", region="us", service_name="svc-json", status="500"}  0s  GET 500
+  {env="prod", method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  POST 200
+
+# multiple fields + literal arrows
+eval instant at 120s {service_name="svc-json"} | json | line_format "{{.method}} {{.path}} -> {{.status}}"
+  {env="prod", method="GET", path="/a", region="us", service_name="svc-json", status="500"}  0s  GET /a -> 500
+  {env="prod", method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  POST /b -> 200
+
+# base label + missing field renders empty
+eval instant at 120s {service_name="svc-json"} | json | line_format "[{{.env}}] {{.method}}-{{.nope}}"
+  {env="prod", method="GET", path="/a", region="us", service_name="svc-json", status="500"}  0s  [prod] GET-
+  {env="prod", method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  [prod] POST-
+
+# literal-only template (no fields)
+eval instant at 120s {service_name="svc-json"} | json | line_format "static line"
+  {env="prod", method="GET", path="/a", region="us", service_name="svc-json", status="500"}  0s  static line
+  {env="prod", method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  static line
+
+# line_format then keep the named label
+eval instant at 120s {service_name="svc-json"} | json | line_format "{{.method}}={{.status}}" | keep method
+  {method="GET"}  0s  GET=500
+  {method="POST"}  5s  POST=200
+
+clear
+
+# === drop / keep over a json pipeline ===
+# drop removes listed labels; keep retains only listed labels
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# drop two extracted labels
+eval instant at 120s {service_name="svc-json"} | json | drop path, region
+  {env="prod", method="GET", service_name="svc-json", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {env="prod", method="POST", service_name="svc-json", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# drop a base label
+eval instant at 120s {service_name="svc-json"} | json | drop env
+  {method="GET", path="/a", region="us", service_name="svc-json", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# drop base + extracted labels
+eval instant at 120s {service_name="svc-json"} | json | drop env, service_name
+  {method="GET", path="/a", region="us", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {method="POST", path="/b", region="eu", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# drop with a value matcher (only us row loses region)
+eval instant at 120s {service_name="svc-json"} | json | drop region="us"
+  {env="prod", method="GET", path="/a", service_name="svc-json", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {env="prod", method="POST", path="/b", region="eu", service_name="svc-json", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# drop bare + matcher mix
+eval instant at 120s {service_name="svc-json"} | json | drop path, region="eu"
+  {env="prod", method="GET", region="us", service_name="svc-json", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {env="prod", method="POST", service_name="svc-json", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# keep two labels
+eval instant at 120s {service_name="svc-json"} | json | keep method, status
+  {method="GET", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {method="POST", status="200"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# keep a single label
+eval instant at 120s {service_name="svc-json"} | json | keep path
+  {path="/a"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {path="/b"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# keep with a value matcher empties the non-match
+eval instant at 120s {service_name="svc-json"} | json | keep status="500"
+  {status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# keep with an anchored regex matcher
+eval instant at 120s {service_name="svc-json"} | json | keep method=~"P.*"
+  {}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {method="POST"}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# keep with two value matchers
+eval instant at 120s {service_name="svc-json"} | json | keep method="GET", status="500"
+  {method="GET", status="500"}  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  {}  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+clear
+
+# === label_format over a logfmt pipeline ===
+# logfmt promotes level/msg/code; label_format renames or templates labels
+load
+  {env="prod", service_name="svc-logfmt"} service=svc-logfmt
+  0s  level=error msg=boom code=42
+  5s  level=info msg=ok code=7
+
+# rename dst=src moves value and drops src
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format lvl=level
+  {code="42", env="prod", lvl="error", msg="boom", service_name="svc-logfmt"}  0s  level=error msg=boom code=42
+  {code="7", env="prod", lvl="info", msg="ok", service_name="svc-logfmt"}  5s  level=info msg=ok code=7
+
+# rename onto an existing label overwrites it
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format level=msg
+  {code="42", env="prod", level="boom", service_name="svc-logfmt"}  0s  level=error msg=boom code=42
+  {code="7", env="prod", level="ok", service_name="svc-logfmt"}  5s  level=info msg=ok code=7
+
+# template dst combining two labels
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format combo="{{.level}}-{{.code}}"
+  {code="42", combo="error-42", env="prod", level="error", msg="boom", service_name="svc-logfmt"}  0s  level=error msg=boom code=42
+  {code="7", combo="info-7", env="prod", level="info", msg="ok", service_name="svc-logfmt"}  5s  level=info msg=ok code=7
+
+# template with literal + missing field
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format tag="x-{{.nope}}"
+  {code="42", env="prod", level="error", msg="boom", service_name="svc-logfmt", tag="x-"}  0s  level=error msg=boom code=42
+  {code="7", env="prod", level="info", msg="ok", service_name="svc-logfmt", tag="x-"}  5s  level=info msg=ok code=7
+
+# rename + template in one stage
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format lvl=level, tag="v-{{.code}}"
+  {code="42", env="prod", lvl="error", msg="boom", service_name="svc-logfmt", tag="v-42"}  0s  level=error msg=boom code=42
+  {code="7", env="prod", lvl="info", msg="ok", service_name="svc-logfmt", tag="v-7"}  5s  level=info msg=ok code=7
+
+# rename then line_format uses the renamed label
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format lvl=level | line_format "{{.lvl}}/{{.msg}}"
+  {code="42", env="prod", lvl="error", msg="boom", service_name="svc-logfmt"}  0s  error/boom
+  {code="7", env="prod", lvl="info", msg="ok", service_name="svc-logfmt"}  5s  info/ok
+
+# label_format then keep the new labels
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | label_format lvl=level | keep lvl, code
+  {code="42", lvl="error"}  0s  level=error msg=boom code=42
+  {code="7", lvl="info"}  5s  level=info msg=ok code=7
+
+# line_format over a logfmt pipeline
+eval instant at 120s {service_name="svc-logfmt"} | logfmt | line_format "{{.level}} {{.msg}} #{{.code}}"
+  {code="42", env="prod", level="error", msg="boom", service_name="svc-logfmt"}  0s  error boom #42
+  {code="7", env="prod", level="info", msg="ok", service_name="svc-logfmt"}  5s  info ok #7
+
+clear
+
+# === decolorize strips ANSI color codes ===
+# one colored line + one plain line; decolorize strips SGR escapes, plain line is a no-op
+load
+  {env="prod", service_name="svc-color"} service=svc-color
+  0s  [31mERROR[0m disk full [33mwarn[0m
+  5s  plain line no color
+
+# decolorize strips color, plain line unchanged
+eval instant at 120s {service_name="svc-color"} | decolorize
+  {env="prod", service_name="svc-color"}  0s  ERROR disk full warn
+  {env="prod", service_name="svc-color"}  5s  plain line no color
+
+# decolorize then line_format on the base label
+eval instant at 120s {service_name="svc-color"} | decolorize | line_format "[{{.env}}] cleaned"
+  {env="prod", service_name="svc-color"}  0s  [prod] cleaned
+  {env="prod", service_name="svc-color"}  5s  [prod] cleaned
+
+# decolorize then keep the base label
+eval instant at 120s {service_name="svc-color"} | decolorize | keep env
+  {env="prod"}  0s  ERROR disk full warn
+  {env="prod"}  5s  plain line no color
+
+# decolorize then drop a base label
+eval instant at 120s {service_name="svc-color"} | decolorize | drop service_name
+  {env="prod"}  0s  ERROR disk full warn
+  {env="prod"}  5s  plain line no color
+
+clear
+
+# === pattern parser + line_format ===
+# pattern extracts method/path/status; line_format re-renders
+load
+  {env="prod", service_name="svc-pattern"} service=svc-pattern
+  0s  GET /api/users 200
+  5s  POST /api/orders 201
+
+# pattern captures then line_format
+eval instant at 120s {service_name="svc-pattern"} | pattern "<method> <path> <status>" | line_format "{{.status}} {{.method}}"
+  {env="prod", method="GET", path="/api/users", service_name="svc-pattern", status="200"}  0s  200 GET
+  {env="prod", method="POST", path="/api/orders", service_name="svc-pattern", status="201"}  5s  201 POST
+
+clear
+
+# === regexp parser + keep ===
+# regexp named captures then keep the user label only
+load
+  {env="prod", service_name="svc-regexp"} service=svc-regexp
+  0s  user=alice action=login ok
+  5s  user=bob action=logout ok
+
+# regexp captures then keep one label
+eval instant at 120s {service_name="svc-regexp"} | regexp `user=(?P<user>\w+) action=(?P<action>\w+)` | keep user
+  {user="alice"}  0s  user=alice action=login ok
+  {user="bob"}  5s  user=bob action=logout ok
+
+# regexp captures then drop one label
+eval instant at 120s {service_name="svc-regexp"} | regexp `user=(?P<user>\w+) action=(?P<action>\w+)` | drop action
+  {env="prod", service_name="svc-regexp", user="alice"}  0s  user=alice action=login ok
+  {env="prod", service_name="svc-regexp", user="bob"}  5s  user=bob action=logout ok
+
+clear
+
+# === malformed templates rejected by both engines ===
+# grafana/loki:3.7.4 returns HTTP 400 'unclosed action'; PulsusDB rejects the
+# template at compile time. eval_fail matches a substring of the PulsusDB error.
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"status": 500, "method": "GET", "path": "/a", "region": "us"}
+  5s  {"status": 200, "method": "POST", "path": "/b", "region": "eu"}
+
+# line_format with an unclosed template action
+eval_fail instant at 120s {service_name="svc-json"} | line_format "{{.method"
+  msg: unclosed
+
+# label_format template with an unclosed action
+eval_fail instant at 120s {service_name="svc-json"} | label_format x="{{.method"
+  msg: unclosed
+
+clear

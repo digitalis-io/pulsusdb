@@ -1,0 +1,436 @@
+# Batch B1 (issue #220): parser + filter value corpus. Every expected label
+# set / line / count is a byte-exact capture from grafana/loki:3.7.4 (WAL-
+# disabled, container `loki-b1` on :3101; the #218 exact-fixture discipline —
+# see PROVENANCE.md). Instant-eval only. Each `load`…`clear` section is scoped
+# to exactly the streams its query selects (a streams eval replays every loaded
+# line through the pipeline). service_name supplies the stream's service.
+
+# =====================================================================
+# json parser
+# =====================================================================
+
+# --- full flatten: nested objects join with `_`; scalars stringify -----
+load
+  {env="prod", service_name="j-nest"}
+  0s  {"level":"error","req":{"method":"GET","path":"/a"},"code":500}
+
+eval instant at 60s {service_name="j-nest"} | json
+  {env="prod", service_name="j-nest", level="error", req_method="GET", req_path="/a", code="500"}  0s  {"level":"error","req":{"method":"GET","path":"/a"},"code":500}
+
+clear
+
+# --- flatten then filter on a flattened nested key ---------------------
+load
+  {env="prod", service_name="j-nestf"}
+  0s  {"req":{"method":"GET"},"code":500}
+  5s  {"req":{"method":"POST"},"code":200}
+
+eval instant at 60s {service_name="j-nestf"} | json | req_method = "GET"
+  {env="prod", service_name="j-nestf", req_method="GET", code="500"}  0s  {"req":{"method":"GET"},"code":500}
+
+clear
+
+# --- targeted json path extraction (only `field` is extracted) ---------
+load
+  {env="prod", service_name="j-path"}
+  0s  {"a":{"b":"deep"},"x":1}
+
+eval instant at 60s {service_name="j-path"} | json field="a.b"
+  {env="prod", service_name="j-path", field="deep"}  0s  {"a":{"b":"deep"},"x":1}
+
+clear
+
+# --- bool + number scalars stringify -----------------------------------
+load
+  {env="prod", service_name="j-scalar"}
+  0s  {"ok":true,"n":3.5,"s":"hi"}
+
+eval instant at 60s {service_name="j-scalar"} | json
+  {env="prod", service_name="j-scalar", ok="true", n="3.5", s="hi"}  0s  {"ok":true,"n":3.5,"s":"hi"}
+
+clear
+
+# --- arrays and nulls are skipped --------------------------------------
+load
+  {env="prod", service_name="j-skip"}
+  0s  {"arr":[1,2],"nul":null,"keep":"y"}
+
+eval instant at 60s {service_name="j-skip"} | json
+  {env="prod", service_name="j-skip", keep="y"}  0s  {"arr":[1,2],"nul":null,"keep":"y"}
+
+clear
+
+# --- json | != (string inequality) ------------------------------------
+load
+  {env="prod", service_name="j-neq"}
+  0s  {"status":"200"}
+  5s  {"status":"500"}
+
+eval instant at 60s {service_name="j-neq"} | json | status != "200"
+  {env="prod", service_name="j-neq", status="500"}  5s  {"status":"500"}
+
+clear
+
+# --- json | =~ (anchored regex: `GE.*` matches GET and GETX) -----------
+load
+  {env="prod", service_name="j-re"}
+  0s   {"method":"GET"}
+  5s   {"method":"GETX"}
+  10s  {"method":"POST"}
+
+eval instant at 60s {service_name="j-re"} | json | method =~ "GE.*"
+  {env="prod", service_name="j-re", method="GET"}   0s  {"method":"GET"}
+  {env="prod", service_name="j-re", method="GETX"}  5s  {"method":"GETX"}
+
+clear
+
+# --- json | !~ (anchored negated regex) -------------------------------
+load
+  {env="prod", service_name="j-nre"}
+  0s  {"method":"GET"}
+  5s  {"method":"POST"}
+
+eval instant at 60s {service_name="j-nre"} | json | method !~ "PO.*"
+  {env="prod", service_name="j-nre", method="GET"}  0s  {"method":"GET"}
+
+clear
+
+# =====================================================================
+# logfmt parser
+# =====================================================================
+
+# --- basic decode incl. a quoted multi-word value ----------------------
+load
+  {env="prod", service_name="lf-basic"}
+  0s  level=info msg="hello world" dur=5ms
+
+eval instant at 60s {service_name="lf-basic"} | logfmt
+  {env="prod", service_name="lf-basic", level="info", msg="hello world", dur="5ms"}  0s  level=info msg="hello world" dur=5ms
+
+clear
+
+# --- --keep-empty retains an empty-value pair --------------------------
+load
+  {env="prod", service_name="lf-keep"}
+  0s  a=1 b= c=3
+
+eval instant at 60s {service_name="lf-keep"} | logfmt --keep-empty
+  {env="prod", service_name="lf-keep", a="1", b="", c="3"}  0s  a=1 b= c=3
+
+clear
+
+# --- default drops the empty-value pair (contrast to --keep-empty) -----
+load
+  {env="prod", service_name="lf-drop"}
+  0s  a=1 b= c=3
+
+eval instant at 60s {service_name="lf-drop"} | logfmt
+  {env="prod", service_name="lf-drop", a="1", c="3"}  0s  a=1 b= c=3
+
+clear
+
+# --- targeted rename extraction (lvl from source key `level`) ----------
+load
+  {env="prod", service_name="lf-ren"}
+  0s  level=error took=300ms
+
+eval instant at 60s {service_name="lf-ren"} | logfmt lvl="level"
+  {env="prod", service_name="lf-ren", lvl="error"}  0s  level=error took=300ms
+
+clear
+
+# --- numeric label filter: `<` over a plain number ---------------------
+load
+  {env="prod", service_name="lf-lt"}
+  0s   count=3
+  5s   count=10
+  10s  count=25
+
+eval instant at 60s {service_name="lf-lt"} | logfmt | count < 10
+  {env="prod", service_name="lf-lt", count="3"}  0s  count=3
+
+clear
+
+# --- numeric label filter: `<=` (boundary is inclusive) ----------------
+load
+  {env="prod", service_name="lf-le"}
+  0s   count=3
+  5s   count=10
+  10s  count=25
+
+eval instant at 60s {service_name="lf-le"} | logfmt | count <= 10
+  {env="prod", service_name="lf-le", count="3"}   0s  count=3
+  {env="prod", service_name="lf-le", count="10"}  5s  count=10
+
+clear
+
+# --- duration label filter: `<` over a duration literal ----------------
+load
+  {env="prod", service_name="lf-dlt"}
+  0s   took=100ms
+  5s   took=250ms
+  10s  took=500ms
+
+eval instant at 60s {service_name="lf-dlt"} | logfmt | took < 250ms
+  {env="prod", service_name="lf-dlt", took="100ms"}  0s  took=100ms
+
+clear
+
+# --- duration label filter: `>=` (boundary is inclusive) ---------------
+load
+  {env="prod", service_name="lf-dge"}
+  0s   took=100ms
+  5s   took=250ms
+  10s  took=500ms
+
+eval instant at 60s {service_name="lf-dge"} | logfmt | took >= 250ms
+  {env="prod", service_name="lf-dge", took="250ms"}  5s   took=250ms
+  {env="prod", service_name="lf-dge", took="500ms"}  10s  took=500ms
+
+clear
+
+# --- bytes label filter: `<=` over `5KB` (decimal: 5KB = 5000) ---------
+load
+  {env="prod", service_name="lf-ble"}
+  0s   size=2000
+  5s   size=6000
+  10s  size=8000
+
+eval instant at 60s {service_name="lf-ble"} | logfmt | size <= 5KB
+  {env="prod", service_name="lf-ble", size="2000"}  0s  size=2000
+
+clear
+
+# --- bytes label filter: `>=` over `1MB` (decimal: 1MB = 1000000) ------
+load
+  {env="prod", service_name="lf-mbge"}
+  0s  size=500000
+  5s  size=2000000
+
+eval instant at 60s {service_name="lf-mbge"} | logfmt | size >= 1MB
+  {env="prod", service_name="lf-mbge", size="2000000"}  5s  size=2000000
+
+clear
+
+# =====================================================================
+# regexp parser (named captures)
+# =====================================================================
+
+# --- multiple named captures become labels -----------------------------
+load
+  {env="prod", service_name="re-named"}
+  0s  GET /api/users 200 5ms
+
+eval instant at 60s {service_name="re-named"} | regexp `^(?P<method>\w+) (?P<path>\S+) (?P<status>\d+)`
+  {env="prod", service_name="re-named", method="GET", path="/api/users", status="200"}  0s  GET /api/users 200 5ms
+
+clear
+
+# --- regexp captures then filter on a capture --------------------------
+load
+  {env="prod", service_name="re-filt"}
+  0s  GET /api/users 200
+  5s  POST /api/orders 503
+
+eval instant at 60s {service_name="re-filt"} | regexp `^(?P<method>\w+) (?P<path>\S+) (?P<status>\d+)` | status = "503"
+  {env="prod", service_name="re-filt", method="POST", path="/api/orders", status="503"}  5s  POST /api/orders 503
+
+clear
+
+# =====================================================================
+# pattern parser (<name> captures, <_> discard)
+# =====================================================================
+
+# --- <_> discards the leading date token -------------------------------
+load
+  {env="prod", service_name="pat-disc"}
+  0s  2024-01-01 GET /x 200
+
+eval instant at 60s {service_name="pat-disc"} | pattern `<_> <method> <path> <status>`
+  {env="prod", service_name="pat-disc", method="GET", path="/x", status="200"}  0s  2024-01-01 GET /x 200
+
+clear
+
+# --- pattern captures then filter --------------------------------------
+load
+  {env="prod", service_name="pat-filt"}
+  0s  INFO cache hit
+  5s  WARN cache miss
+
+eval instant at 60s {service_name="pat-filt"} | pattern `<level> <subsys> <event>` | level = "WARN"
+  {env="prod", service_name="pat-filt", level="WARN", subsys="cache", event="miss"}  5s  WARN cache miss
+
+clear
+
+# =====================================================================
+# unpack parser (promotes `_entry` to the line, fields to labels)
+# =====================================================================
+
+# --- unpack rewrites the line and promotes string fields ---------------
+load
+  {env="prod", service_name="up-basic"}
+  0s  {"_entry":"real log line","level":"info","app":"api"}
+
+eval instant at 60s {service_name="up-basic"} | unpack
+  {env="prod", service_name="up-basic", level="info", app="api"}  0s  real log line
+
+clear
+
+# --- unpack then filter on a promoted label ----------------------------
+load
+  {env="prod", service_name="up-filt"}
+  0s  {"_entry":"a happened","level":"info"}
+  5s  {"_entry":"b happened","level":"error"}
+
+eval instant at 60s {service_name="up-filt"} | unpack | level = "error"
+  {env="prod", service_name="up-filt", level="error"}  5s  b happened
+
+clear
+
+# =====================================================================
+# line filters (|=, !=, |~, !~, ip())
+#
+# A bare leading line filter is pushed down to ClickHouse (`hasToken`/
+# `match`), so the hermetic runner (which replays only the client pipeline)
+# would not re-apply it. A leading `| decolorize` (identity on an ANSI-free
+# line) forces the following filter to evaluate client-side — the same
+# split the engine uses for a post-`line_format` filter — so these exercise
+# the client-side `LineMatcher` path. Values are still captured from Loki.
+# =====================================================================
+
+# --- |= contains -------------------------------------------------------
+load
+  {env="prod", service_name="lfc"}
+  0s   GET /a 200
+  5s   POST /b 500
+  10s  GET /c 404
+
+eval instant at 60s {service_name="lfc"} | decolorize |= "GET"
+  {env="prod", service_name="lfc"}  0s   GET /a 200
+  {env="prod", service_name="lfc"}  10s  GET /c 404
+
+clear
+
+# --- != does-not-contain ----------------------------------------------
+load
+  {env="prod", service_name="lfn"}
+  0s  GET /a 200
+  5s  POST /b 500
+
+eval instant at 60s {service_name="lfn"} | decolorize != "POST"
+  {env="prod", service_name="lfn"}  0s  GET /a 200
+
+clear
+
+# --- |~ regex match ----------------------------------------------------
+load
+  {env="prod", service_name="lfr"}
+  0s   status=200
+  5s   status=404
+  10s  status=503
+
+eval instant at 60s {service_name="lfr"} | decolorize |~ `status=5\d\d`
+  {env="prod", service_name="lfr"}  10s  status=503
+
+clear
+
+# --- !~ negated regex match -------------------------------------------
+load
+  {env="prod", service_name="lfnr"}
+  0s  status=200
+  5s  status=503
+
+eval instant at 60s {service_name="lfnr"} | decolorize !~ `status=5\d\d`
+  {env="prod", service_name="lfnr"}  0s  status=200
+
+clear
+
+# --- |= ip(...) line ip filter (CIDR membership over the raw line) ------
+load
+  {env="prod", service_name="lip"}
+  0s   client=10.1.2.3 ok
+  5s   client=192.168.0.9 ok
+  10s  client=10.9.9.9 ok
+
+eval instant at 60s {service_name="lip"} |= ip("10.0.0.0/8")
+  {env="prod", service_name="lip"}  0s   client=10.1.2.3 ok
+  {env="prod", service_name="lip"}  10s  client=10.9.9.9 ok
+
+clear
+
+# --- chained line filters (AND) ---------------------------------------
+load
+  {env="prod", service_name="lch"}
+  0s   GET /a 200 fast
+  5s   GET /b 500 slow
+  10s  POST /c 200 fast
+
+eval instant at 60s {service_name="lch"} | decolorize |= "GET" |~ `20\d`
+  {env="prod", service_name="lch"}  0s  GET /a 200 fast
+
+clear
+
+# --- addr = ip(CIDR) label filter after logfmt -------------------------
+load
+  {env="prod", service_name="labip"}
+  0s  addr=10.1.2.3 msg=x
+  5s  addr=192.168.0.1 msg=y
+
+eval instant at 60s {service_name="labip"} | logfmt | addr = ip("10.0.0.0/8")
+  {env="prod", service_name="labip", addr="10.1.2.3", msg="x"}  0s  addr=10.1.2.3 msg=x
+
+clear
+
+# =====================================================================
+# metric-wrapped parser+filter pipelines (instant vector results)
+# =====================================================================
+
+# --- count_over_time over json + numeric filter ------------------------
+load
+  {env="prod", service_name="m-json"}
+  0s   {"status":500}
+  5s   {"status":500}
+  10s  {"status":200}
+  15s  {"status":500}
+
+eval instant at 60s count_over_time({service_name="m-json"} | json | status >= 500 [30m])
+  {env="prod", service_name="m-json", status="500"} 3
+
+clear
+
+# --- count_over_time over logfmt + label filter (per-series counts) -----
+load
+  {env="prod", service_name="m-lf2"}
+  0s   level=error msg=a
+  5s   level=error msg=b
+  10s  level=info msg=c
+
+eval instant at 60s count_over_time({service_name="m-lf2"} | logfmt | level = "error" [30m])
+  {env="prod", service_name="m-lf2", level="error", msg="a"} 1
+  {env="prod", service_name="m-lf2", level="error", msg="b"} 1
+
+clear
+
+# =====================================================================
+# eval_fail: constructs the pipeline compiler rejects (Loki rejects too)
+# =====================================================================
+
+# --- regexp with no named capture group --------------------------------
+load
+  {env="prod", service_name="ef-re"}
+  0s  abc 123
+
+eval_fail instant at 60s {service_name="ef-re"} | regexp `\d+`
+  msg: at least one named capture
+
+clear
+
+# --- pattern with adjacent captures and no literal separator -----------
+load
+  {env="prod", service_name="ef-pat"}
+  0s  abc
+
+eval_fail instant at 60s {service_name="ef-pat"} | pattern `<a><b>`
+  msg: consecutive capture
+
+clear
