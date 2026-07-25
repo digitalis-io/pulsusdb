@@ -3778,10 +3778,14 @@ pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 /// > 2. It charges [`RangeSlideState::member_stage_bytes`] BEFORE allocating.
 /// >    That figure is an UPPER BOUND covering **every** per-member
 /// >    allocation: the body clone (class C + first/last), the rendered
-/// >    label JSON and the cloned `LabelSet` (any label-mutating pipeline —
-/// >    charged for ALL classes, including the integer class A that stages no
-/// >    body), plus fixed per-allocation overhead. Classes that allocate
-/// >    nothing extra charge only the constant.
+/// >    label JSON — sized EXACTLY by [`rendered_labels_json_len`], so the
+/// >    `\u00xx` six-for-one escape expansion is charged — and the cloned
+/// >    `LabelSet` with each of its owned strings (any label-mutating
+/// >    pipeline; charged for ALL classes, including the integer class A that
+/// >    stages no body), each through [`exact_alloc_bytes`] /
+/// >    [`grown_alloc_bytes`] so container growth and the allocator's minimum
+/// >    block are covered. Classes that allocate nothing extra charge only
+/// >    the `CollMember` slot.
 /// > 3. The staging is refused unless
 /// >    `coll_bytes + charge <= MAX_TS_COLLISION_GROUP_BYTES`, so the
 /// >    breaching allocation is never performed; on success `coll_bytes`
@@ -3810,6 +3814,72 @@ pub const MAX_TS_COLLISION_GROUP: u64 = 10_000;
 /// 8 MiB staged for one nanosecond in one stream is far beyond real data
 /// (real groups are size 1), so nothing servable is rejected.
 pub const MAX_TS_COLLISION_GROUP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The floor one owned heap allocation costs however short its payload is:
+/// `RawVec`'s `min_non_zero_cap` is 8 for byte-sized elements, and a real
+/// allocator rounds a small request up to its smallest size class. Flooring
+/// here also keeps [`exact_alloc_bytes`] a bound independent of whichever
+/// `ToString`/`clone` capacity specialization the standard library happens
+/// to use (issue #227 review round 5, finding 1).
+///
+/// This one is a deliberate MARGIN, not a tested factor: `String::capacity`
+/// reports the requested capacity, so no capacity-measuring test can observe
+/// the allocator's rounding it covers. Over-charging is the safe direction.
+const MIN_ALLOC_BYTES: u64 = 32;
+
+/// An upper bound on the heap bytes an **exactly reserved** allocation of
+/// `content` payload bytes occupies — `String::clone`, `str::to_owned` and
+/// `collect` from a `TrustedLen` iterator all reserve exactly the final
+/// length in ONE allocation, so there is no growth slack to charge, only the
+/// allocator's minimum block ([`MIN_ALLOC_BYTES`]).
+fn exact_alloc_bytes(content: u64) -> u64 {
+    content.max(MIN_ALLOC_BYTES)
+}
+
+/// An upper bound on the heap bytes a **geometrically grown** buffer of
+/// `content` final payload bytes occupies at its peak. `RawVec::grow_amortized`
+/// sets `cap = max(2·cap_old, required)`, and `cap_old < required <= content`
+/// at the last growth, so the final capacity is at most `2·content` while the
+/// old buffer (`< content`) is still mapped during the realloc — `3×`
+/// dominates that peak for every input.
+fn grown_alloc_bytes(content: u64) -> u64 {
+    exact_alloc_bytes(content).saturating_mul(3)
+}
+
+/// The exact number of bytes [`push_json_string`] appends for `s` — the two
+/// quotes plus the escaped body — computed WITHOUT allocating so the
+/// collision-group charge can size the rendered JSON *before* it is built
+/// (issue #227 review round 5, finding 1: charging the content once
+/// under-counted the `\u00xx` six-for-one expansion of a C0 control byte).
+/// [`rendered_labels_json_len_matches_the_renderer_byte_for_byte`] pins this
+/// against the renderer itself, so the two cannot drift.
+fn json_string_len(s: &str) -> u64 {
+    let mut n: u64 = 2; // the enclosing quotes
+    for c in s.chars() {
+        n = n.saturating_add(match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}' => 2,
+            c if (c as u32) < 0x20 => 6, // `\u00xx`
+            c => c.len_utf8() as u64,
+        });
+    }
+    n
+}
+
+/// The exact byte length [`render_labels_json_sorted`] will produce for
+/// `sorted_labels` (`{"k":"v",...}`), computed without allocating.
+fn rendered_labels_json_len(sorted_labels: &[(Cow<'_, str>, Cow<'_, str>)]) -> u64 {
+    let mut n: u64 = 2; // `{` and `}`
+    for (i, (k, v)) in sorted_labels.iter().enumerate() {
+        if i > 0 {
+            n = n.saturating_add(1); // `,`
+        }
+        n = n
+            .saturating_add(json_string_len(k))
+            .saturating_add(1) // `:`
+            .saturating_add(json_string_len(v));
+    }
+    n
+}
 
 /// The sliding-window **concurrent** retained-point cap (issue #227):
 /// charge-on-load / discharge-on-evict across every retained window entry
@@ -4292,6 +4362,12 @@ struct RangeSlideState<'q> {
     /// ([`retention_points_per_sample`]) — shared by the streaming sliders
     /// and the mutating fan-out cells so both charge in the same unit.
     per_sample: u64,
+    /// The concurrent-retention cap both paths check against — always
+    /// [`MAX_RETAINED_WINDOW_POINTS`] in production. Carried as a field (not
+    /// read from the constant at each site) so the cap has ONE source per
+    /// state and the tests can drive the trip with a tiny value instead of
+    /// materializing four million cells.
+    retention_cap: u64,
     // Non-mutating.
     cur: Option<FpSlide>,
     cur_fp: u64,
@@ -4396,6 +4472,7 @@ impl<'q> RangeSlideState<'q> {
             hashes,
             retained: 0,
             per_sample: retention_points_per_sample(op),
+            retention_cap: MAX_RETAINED_WINDOW_POINTS,
             cur: None,
             cur_fp: 0,
             series_out: Vec::new(),
@@ -4540,37 +4617,35 @@ impl<'q> RangeSlideState<'q> {
     /// makes the cap sound: `coll_bytes >= actual`, so bounding `coll_bytes`
     /// bounds the real footprint.
     ///
-    /// **Worst case per allocation** (issue #227 review round 5, finding 1 —
-    /// the round-4 version counted the JSON content ONCE and charged a flat
-    /// 32 bytes per container slot, both of which an adversarial input
-    /// beats):
-    /// - **rendered label JSON** ([`render_labels_json_sorted`]) —
-    ///   [`push_json_string`] expands a C0 control byte to `\u00xx`, **SIX
-    ///   bytes out for one byte in**, which is the maximum expansion any
-    ///   input can produce (`"`/`\`/`\n`/`\r`/`\t`/`\b`/`\f` are 2, every
-    ///   other scalar is copied verbatim at its own UTF-8 width). Worst-case
-    ///   input is an all-control-character label value, so the rendered
-    ///   length is at most `6·content`. Punctuation adds at most 6 bytes per
-    ///   pair (`"k":"v"` = 5, plus a separating `,`) and the 2 braces. The
-    ///   `String` is pre-sized with a capacity estimate that ASSUMES NO
-    ///   escaping, so escaping-heavy input forces geometric growth: the last
-    ///   growth leaves capacity ≤ `2 × final length`, and during the realloc
-    ///   the old buffer is still live (≤ another half). Charged
-    ///   `3 × (6·content + 6·pairs + 2)`.
-    /// - **cloned `LabelSet`** — each `to_string()` on a `&str` allocates
-    ///   exactly its length (`content` in total), and the `collect` runs
-    ///   from a `TrustedLen` iterator so the vector reserves exactly `pairs`
-    ///   elements (`pairs × size_of::<(String, String)>()`). Charged 2× both
-    ///   for allocator slack.
-    /// - **body clone** — `String::clone` reserves exactly `row.body.len()`;
-    ///   charged with a `String` header on top, only when
+    /// **Per allocation** (issue #227 review round 5, finding 1 — the
+    /// round-4 version counted the JSON content ONCE and charged a flat 32
+    /// bytes per container slot, both of which an adversarial input beats):
+    /// - **rendered label JSON** ([`render_labels_json_sorted`]) — sized by
+    ///   [`rendered_labels_json_len`], which walks the SAME escape arms as
+    ///   [`push_json_string`] and so yields the rendered length EXACTLY,
+    ///   including the `\u00xx` six-bytes-for-one expansion of a C0 control
+    ///   byte that the previous charge missed. Sizing (rather than assuming a
+    ///   6× worst case) also means an ordinary multi-hundred-KiB label value
+    ///   is not rejected six times too early. The `String` is pre-sized with
+    ///   an estimate that assumes no escaping, so escaping-heavy input forces
+    ///   geometric growth — charged through [`grown_alloc_bytes`].
+    /// - **cloned `LabelSet`** — one exactly-reserved `String` per key and
+    ///   per value, plus one exactly-reserved element buffer of `pairs ×
+    ///   size_of::<(String, String)>()` (the `collect` runs from a
+    ///   `TrustedLen` iterator). Each is charged through
+    ///   [`exact_alloc_bytes`], i.e. floored at the allocator's minimum
+    ///   block, so a label set of many one-byte values cannot cost more than
+    ///   its charge.
+    /// - **body clone** — `String::clone` reserves exactly `row.body.len()`
+    ///   in one allocation; charged through [`exact_alloc_bytes`], only when
     ///   `needs_body_order`.
-    /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity,
-    ///   and the old buffer is live during the realloc, so the peak is up to
-    ///   ~3× the element footprint. Charged `4 × size_of::<CollMember>()`
-    ///   per member, which dominates `3n·size` for every `n`. (`String`/`Vec`
-    ///   headers inside `CollMember` live in that slot; charging their sizes
-    ///   again above is deliberate over-count, not double-accounting error.)
+    /// - **`CollMember` slot in `coll`** — a `Vec` push can DOUBLE capacity
+    ///   with the old buffer still live during the realloc, so the peak for
+    ///   `n` members is `≤ 3n × size_of::<CollMember>()`. Charging
+    ///   `4 × size_of::<CollMember>()` per member dominates that for every
+    ///   `n` (and covers the initial `min_non_zero_cap` of 4 elements). The
+    ///   `String`/`Vec` headers of the pieces above live INSIDE that slot, so
+    ///   they are already covered.
     ///
     /// Saturating arithmetic throughout, so a hostile label value cannot
     /// wrap the charge round to a small number — saturation can only make
@@ -4581,52 +4656,29 @@ impl<'q> RangeSlideState<'q> {
         scratch: &[(Cow<'_, str>, Cow<'_, str>)],
         stages_out: bool,
     ) -> u64 {
-        /// Worst-case expansion of one content byte by JSON escaping: a C0
-        /// control byte renders as `\u00xx` — six bytes.
-        const MAX_JSON_ESCAPE_EXPANSION: u64 = 6;
-        /// Worst-case punctuation per rendered pair: `"k":"v"` is 5 bytes of
-        /// syntax, plus the `,` separating it from the previous pair.
-        const JSON_PUNCTUATION_PER_PAIR: u64 = 6;
-        /// A growing `String`/`Vec` can hold 2× its length, and the old
-        /// buffer is still mapped while a realloc copies out of it; 3×
-        /// dominates that peak.
-        const ALLOC_GROWTH_SLACK: u64 = 3;
         /// A `Vec` push can double capacity with the old buffer still live
-        /// (~3× peak); 4× per element dominates it.
+        /// (~3× peak); 4× per element dominates it for every length.
         const VEC_GROWTH_FACTOR: u64 = 4;
-        /// Allocator slack charged on exactly-reserved allocations.
-        const EXACT_ALLOC_SLACK: u64 = 2;
 
-        let mut bytes =
-            (std::mem::size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
+        let mut bytes = (size_of::<CollMember>() as u64).saturating_mul(VEC_GROWTH_FACTOR);
 
         if self.needs_body_order {
-            bytes = bytes
-                .saturating_add(row.body.len() as u64)
-                .saturating_add(std::mem::size_of::<String>() as u64);
+            bytes = bytes.saturating_add(exact_alloc_bytes(row.body.len() as u64));
         }
 
         if stages_out {
-            let pairs = scratch.len() as u64;
-            let content: u64 = scratch
-                .iter()
-                .map(|(k, v)| (k.len() + v.len()) as u64)
-                .fold(0u64, u64::saturating_add);
-
-            // Rendered JSON: worst-case escaping, then geometric growth.
-            let json_len = content
-                .saturating_mul(MAX_JSON_ESCAPE_EXPANSION)
-                .saturating_add(pairs.saturating_mul(JSON_PUNCTUATION_PER_PAIR))
-                .saturating_add(2);
-            bytes = bytes
-                .saturating_add(json_len.saturating_mul(ALLOC_GROWTH_SLACK))
-                .saturating_add(std::mem::size_of::<String>() as u64);
-
-            // Cloned `LabelSet`: owned content + element footprint.
-            let elems = pairs.saturating_mul(std::mem::size_of::<(String, String)>() as u64);
-            bytes = bytes
-                .saturating_add(content.saturating_add(elems).saturating_mul(EXACT_ALLOC_SLACK))
-                .saturating_add(std::mem::size_of::<LabelSet>() as u64);
+            // The rendered JSON, sized exactly, then grown.
+            bytes = bytes.saturating_add(grown_alloc_bytes(rendered_labels_json_len(scratch)));
+            // The cloned `LabelSet`: one owned `String` per key and per
+            // value, each floored at the allocator's minimum block.
+            for (k, v) in scratch {
+                bytes = bytes
+                    .saturating_add(exact_alloc_bytes(k.len() as u64))
+                    .saturating_add(exact_alloc_bytes(v.len() as u64));
+            }
+            // ...plus its exactly-reserved element buffer.
+            let elems = (scratch.len() as u64).saturating_mul(size_of::<(String, String)>() as u64);
+            bytes = bytes.saturating_add(exact_alloc_bytes(elems));
         }
 
         bytes
@@ -4726,12 +4778,7 @@ impl<'q> RangeSlideState<'q> {
         // reads values straight from the buffer, no intermediate `Vec`; the
         // buffer's capacity is reused (cleared, never reallocated per group).
         let cur = self.cur.as_mut().expect("slider just set");
-        cur.load_group(
-            ts,
-            &self.coll,
-            &mut self.retained,
-            MAX_RETAINED_WINDOW_POINTS,
-        )?;
+        cur.load_group(ts, &self.coll, &mut self.retained, self.retention_cap)?;
         self.coll.clear();
         Ok(())
     }
@@ -4759,6 +4806,7 @@ impl<'q> RangeSlideState<'q> {
         }
         let integer = matches!(self.class, ReducerClass::InvertInteger);
         let per_sample = self.per_sample;
+        let cap = self.retention_cap;
         let retained = &mut self.retained;
         let group = self.groups.entry(key).or_insert_with(|| MutGroup {
             labels,
@@ -4787,13 +4835,13 @@ impl<'q> RangeSlideState<'q> {
                         // gate (issue #227 review round 5, finding 2): the
                         // insert may grow the map, so the cap must refuse
                         // before it, not after.
-                        charge_retention(retained, 1, MAX_RETAINED_WINDOW_POINTS)?;
+                        charge_retention(retained, 1, cap)?;
                         e.insert(value as u64);
                     }
                 }
             } else {
                 // Same gate before the map/vector insertion — both allocate.
-                charge_retention(retained, per_sample, MAX_RETAINED_WINDOW_POINTS)?;
+                charge_retention(retained, per_sample, cap)?;
                 group.pt_cells.entry(k).or_default().push(WinSample {
                     ts,
                     stream_hash,
@@ -6925,6 +6973,16 @@ mod tests {
             TINY_CAP / per_sample + 1,
             "the cap must trip DURING the scan (after ~cap/per-sample loads), not after all 1000"
         );
+        // CHARGE BEFORE ALLOCATE (review round 5, finding 2): the breaching
+        // sample must never reach the deque. If the charge were applied AFTER
+        // `push_back` — as it was before — the window would hold one more
+        // sample than the cap allows, i.e. the allocation the cap exists to
+        // refuse would already have happened.
+        assert_eq!(
+            slide.win.len() as u64,
+            TINY_CAP / per_sample,
+            "the refused sample must not have been pushed"
+        );
     }
 
     /// AC8: the concurrent-retention invariant is symmetric — every charged
@@ -7047,6 +7105,10 @@ mod tests {
             (RangeAggOp::CountOverTime, ClientValue::Count, true),
             // Class B -> `pt_cells` (retained points).
             (RangeAggOp::MaxOverTime, ClientValue::Unwrap, false),
+            // Class B with a per-emit scratch charge (`per_sample == 2`):
+            // the fan-out cells must charge in the SAME unit the streaming
+            // slider does, or the discharge at finish cannot balance.
+            (RangeAggOp::QuantileOverTime, ClientValue::Unwrap, false),
         ] {
             let pipeline = if matches!(value, ClientValue::Unwrap) {
                 parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#)
@@ -7057,7 +7119,7 @@ mod tests {
                 pipeline,
                 value,
                 range_op: op,
-                param: None,
+                param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
                 absent_labels: vec![],
             };
             let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
@@ -7089,8 +7151,9 @@ mod tests {
                 assert!(group.int_cells.is_empty());
                 assert_eq!(
                     state.retained,
-                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>(),
-                    "{op:?}: every retained point is charged exactly once"
+                    group.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
+                        * retention_points_per_sample(op),
+                    "{op:?}: every retained point is charged exactly once, in `per_sample` units"
                 );
             }
             // RELEASE leg (review round 3, finding 3): drive the in-place
@@ -7102,6 +7165,185 @@ mod tests {
             assert_eq!(
                 state.retained, 0,
                 "{op:?}: every mutating-path charge must be discharged at finish"
+            );
+        }
+    }
+
+    /// Review round 5, finding 2: `rate_counter` re-reduces over a BORROW of
+    /// the live window instead of copying the whole window into an owned
+    /// `Vec<(i64, f64)>` at every grid point. The refactor must be
+    /// arithmetically INERT — pinned bit-for-bit (`to_bits`, so a low-bit
+    /// float drift or a reordered reset walk reddens) against an INDEPENDENT
+    /// transcription of the owned-`Vec` form below. Deliberately NOT compared
+    /// against `rate_counter_extrapolated`: that now delegates to the very
+    /// function under test, so such a comparison would move with the code and
+    /// prove nothing.
+    #[test]
+    fn rate_counter_over_a_borrowed_window_is_bit_identical_to_the_owning_form() {
+        /// The pre-refactor owned-`Vec` implementation, transcribed verbatim
+        /// and kept independent of the production code path.
+        fn reference(mut pts: Vec<(i64, f64)>, rate_window_ns: Option<u64>) -> f64 {
+            if pts.len() < 2 {
+                return 0.0;
+            }
+            let Some(rng_ns) = rate_window_ns.filter(|w| *w > 0) else {
+                return 0.0;
+            };
+            pts.sort_by(|(at, _), (bt, _)| at.cmp(bt));
+            let first_t = pts[0].0;
+            let last_t = pts[pts.len() - 1].0;
+            let first_f = pts[0].1;
+            let last_f = pts[pts.len() - 1].1;
+            let mut result_value = last_f - first_f;
+            let mut last_value = 0.0_f64;
+            for &(_, f) in &pts {
+                if f < last_value {
+                    result_value += last_value;
+                }
+                last_value = f;
+            }
+            let sel_range_ms: i128 = (rng_ns / 1_000_000) as i128;
+            let range_start = first_t as i128 - sel_range_ms;
+            let mut duration_to_start = (first_t as i128 - range_start) as f64 / 1000.0;
+            let duration_to_end = 0.0_f64;
+            let sampled_interval = (last_t as i128 - first_t as i128) as f64 / 1000.0;
+            let average_duration = sampled_interval / (pts.len() - 1) as f64;
+            if result_value > 0.0 && first_f >= 0.0 {
+                let duration_to_zero = sampled_interval * (first_f / result_value);
+                if duration_to_zero < duration_to_start {
+                    duration_to_start = duration_to_zero;
+                }
+            }
+            let threshold = average_duration * 1.1;
+            let mut extrapolate_to = sampled_interval;
+            extrapolate_to += if duration_to_start < threshold {
+                duration_to_start
+            } else {
+                average_duration / 2.0
+            };
+            extrapolate_to += if duration_to_end < threshold {
+                duration_to_end
+            } else {
+                average_duration / 2.0
+            };
+            result_value *= extrapolate_to / sampled_interval;
+            result_value / (rng_ns as f64 / 1_000_000_000.0)
+        }
+
+        let windows: Vec<Vec<(i64, f64)>> = vec![
+            vec![],
+            vec![(10, 5.0)],
+            vec![(10, 1.0), (20, 2.0), (30, 4.5)],
+            // Counter resets (the reset-aware accumulation order matters).
+            vec![(10, 9.0), (20, 3.0), (30, 11.25), (40, 2.5), (50, 7.125)],
+            // Same-timestamp neighbours (canonical order keeps them adjacent).
+            vec![(10, 1.5), (10, 2.5), (10, 0.25), (25, 9.75)],
+            // Values that exercise the extrapolation-to-zero branch.
+            vec![(0, 0.0), (1_000_000, 3.3), (5_000_000, 3.3000000000000003)],
+        ];
+        for pts in &windows {
+            let ordered: Vec<WinSample> = pts
+                .iter()
+                .enumerate()
+                .map(|(i, &(ts, value))| WinSample {
+                    ts,
+                    stream_hash: 7,
+                    tie_rank: i as u32,
+                    value,
+                })
+                .collect();
+            for rate_window_ns in [None, Some(0u64), Some(30_000_000_000)] {
+                let borrowed = reduce_window(
+                    RangeAggOp::RateCounter,
+                    ReducerClass::CanonicalFold,
+                    None,
+                    rate_window_ns,
+                    0,
+                    &ordered,
+                );
+                let owned = if ordered.is_empty() {
+                    None
+                } else {
+                    Some(reference(pts.clone(), rate_window_ns))
+                };
+                match (borrowed, owned) {
+                    (None, None) => {}
+                    (Some(b), Some(o)) => assert_eq!(
+                        b.to_bits(),
+                        o.to_bits(),
+                        "borrowed {b} != owned {o} for {pts:?} / {rate_window_ns:?}"
+                    ),
+                    (b, o) => panic!("presence differs: {b:?} vs {o:?} for {pts:?}"),
+                }
+            }
+        }
+    }
+
+    /// Review round 5, finding 2: on the MUTATING fan-out path the cap gate
+    /// runs BEFORE the cell/point insertion, for both cell kinds — the
+    /// allocation the cap exists to refuse is never made. Driven through a
+    /// tiny `retention_cap` (materializing four million cells would not be a
+    /// test); if the charge were applied after the insert, `retained` would
+    /// settle at `cap + 1` and the container would hold the refused entry.
+    #[test]
+    fn fan_out_retention_cap_refuses_the_breaching_cell_before_inserting_it() {
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // range 30 / step 10 ⇒ each sample fans into up to 3 grid cells.
+        let window = slide_window(0, 100, 10, 30);
+        const TINY_CAP: u64 = 4;
+        for (op, value, integer) in [
+            (RangeAggOp::CountOverTime, ClientValue::Count, true),
+            (RangeAggOp::QuantileOverTime, ClientValue::Unwrap, false),
+        ] {
+            let pipeline = if matches!(value, ClientValue::Unwrap) {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#)
+            } else {
+                parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#)
+            };
+            let client = ClientAgg {
+                pipeline,
+                value,
+                range_op: op,
+                param: matches!(op, RangeAggOp::QuantileOverTime).then_some(0.5),
+                absent_labels: vec![],
+            };
+            let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            state.retention_cap = TINY_CAP;
+            let rows: Vec<MetricScanRow> = (1..=20)
+                .map(|i| MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: i * 10,
+                    body: "a=1".to_string(),
+                })
+                .collect();
+            match state.push_rows(&rows) {
+                Err(ReadError::QueryTooBroad(TooBroadReason::MetricRetention { cap, count })) => {
+                    assert_eq!(cap, TINY_CAP);
+                    assert!(count > TINY_CAP, "{op:?}: the error names the breach");
+                }
+                other => panic!("{op:?}: expected MetricRetention, got {other:?}"),
+            }
+            // What the containers ACTUALLY hold, in charge units.
+            let held: u64 = state
+                .groups
+                .values()
+                .map(|g| {
+                    if integer {
+                        g.int_cells.len() as u64
+                    } else {
+                        g.pt_cells.values().map(|v| v.len() as u64).sum::<u64>()
+                            * retention_points_per_sample(op)
+                    }
+                })
+                .sum();
+            assert_eq!(
+                state.retained, held,
+                "{op:?}: the counter must match what is actually held"
+            );
+            assert!(
+                held <= TINY_CAP,
+                "{op:?}: the breaching cell was inserted anyway ({held} held vs cap {TINY_CAP})"
             );
         }
     }
@@ -7362,59 +7604,163 @@ mod tests {
         );
     }
 
-    /// Review round 5, finding 1: `member_stage_bytes` must be a true UPPER
-    /// BOUND on what `stage_member` actually allocates — including the
-    /// worst-case JSON escaping (a control byte renders as `\u00XX`, SIX
-    /// bytes) that the round-4 version counted only once.
+    /// Review round 5, finding 1: the charge sizes the rendered JSON by
+    /// walking the SAME escape arms the renderer uses, so the two cannot
+    /// drift. Covers every arm: the two-byte escapes, the `\u00xx` six-byte
+    /// C0 expansion (the one the round-4 charge counted as ONE byte),
+    /// verbatim ASCII, multi-byte UTF-8, empty strings and the empty set.
     #[test]
-    fn member_stage_bytes_is_an_upper_bound_under_worst_case_escaping() {
+    fn rendered_labels_json_len_matches_the_renderer_byte_for_byte() {
+        let cases: Vec<Vec<(Cow<'_, str>, Cow<'_, str>)>> = vec![
+            vec![],
+            vec![(Cow::Borrowed(""), Cow::Borrowed(""))],
+            vec![(Cow::Borrowed("app"), Cow::Borrowed("checkout"))],
+            // Every short escape.
+            vec![(Cow::Borrowed("q"), Cow::Borrowed("\"\\\n\r\t\u{08}\u{0C}"))],
+            // Every C0 byte that has no short escape ⇒ six bytes each.
+            vec![(
+                Cow::Borrowed("c0"),
+                Cow::Owned((0u8..0x20).map(|b| b as char).collect::<String>()),
+            )],
+            // Multi-byte UTF-8 is copied verbatim at its own width.
+            vec![
+                (Cow::Borrowed("é"), Cow::Borrowed("日本語")),
+                (Cow::Borrowed("emoji"), Cow::Borrowed("🚀🚀")),
+            ],
+            // A dense mixture across several pairs (comma punctuation).
+            vec![
+                (Cow::Borrowed("a"), Cow::Borrowed("1")),
+                (Cow::Borrowed("b"), Cow::Owned("\u{1}x\"y".repeat(7))),
+                (Cow::Borrowed("c"), Cow::Borrowed("plain")),
+            ],
+        ];
+        for pairs in &cases {
+            assert_eq!(
+                rendered_labels_json_len(pairs),
+                render_labels_json_sorted(pairs).len() as u64,
+                "sized length must equal the rendered length for {pairs:?}"
+            );
+        }
+    }
+
+    /// Review round 5, finding 1: `member_stage_bytes` must be a true UPPER
+    /// BOUND on what `stage_member` ACTUALLY allocates. Non-tautological by
+    /// construction — the fixtures drive the real `stage_member` and the
+    /// assertion measures the live `capacity()` of every buffer it created
+    /// (`coll`'s element buffer, the body clone, the rendered JSON, the
+    /// cloned `LabelSet` and each of its owned strings), then compares that
+    /// to the charge the caps were checked against.
+    ///
+    /// The fixtures are the inputs that beat the round-4 accounting: an
+    /// all-control-character label value (six rendered bytes per input byte,
+    /// counted once before), many one-byte labels (whose real allocations
+    /// cannot go below the allocator's minimum block), and enough members to
+    /// force `coll`'s capacity to double repeatedly.
+    #[test]
+    fn member_stage_bytes_upper_bounds_every_allocation_stage_member_makes() {
+        /// The live heap footprint of everything currently staged in `coll`.
+        fn staged_capacity(state: &RangeSlideState<'_>) -> u64 {
+            let mut n = (state.coll.capacity() * size_of::<CollMember>()) as u64;
+            for m in &state.coll {
+                n += m.body.capacity() as u64;
+                if let Some((key, labels)) = &m.out {
+                    n += key.capacity() as u64;
+                    n += (labels.capacity() * size_of::<(String, String)>()) as u64;
+                    for (k, v) in labels {
+                        n += (k.capacity() + v.capacity()) as u64;
+                    }
+                }
+            }
+            n
+        }
+
+        // Class C (`sum_over_time` over `unwrap`) ⇒ bodies staged for
+        // `tie_rank`; `label_format` ⇒ the fan-out `key`/`LabelSet` staged
+        // too. Both legs of the charge are exercised at once.
         let client = ClientAgg {
-            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu""#),
-            value: ClientValue::Count,
-            range_op: RangeAggOp::CountOverTime,
+            pipeline: parse_pipeline(r#"{x="y"} | logfmt | label_format region="eu" | unwrap a"#),
+            value: ClientValue::Unwrap,
+            range_op: RangeAggOp::SumOverTime,
             param: None,
             absent_labels: vec![],
         };
         let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
         let meta = slide_meta(1, r#"{"app":"a"}"#);
         let window = slide_window(0, 10, 10, 10);
-        let state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
 
-        // Every value byte is a control character — the maximum expansion
-        // the renderer can produce (1 byte in, 6 bytes out).
-        let worst: String = std::iter::repeat_n('\u{1}', 512).collect();
-        let pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = vec![
-            (Cow::Borrowed("k"), Cow::Owned(worst.clone())),
-            (Cow::Borrowed("kk"), Cow::Owned(worst.clone())),
+        let control: String = std::iter::repeat_n('\u{1}', 512).collect();
+        struct Fixture {
+            name: &'static str,
+            body: String,
+            labels: Vec<(String, String)>,
+        }
+        let fixtures = vec![
+            // Worst-case escaping: every value byte renders as six.
+            Fixture {
+                name: "all-control-character values",
+                body: "a=1".to_string(),
+                labels: vec![
+                    ("k".to_string(), control.clone()),
+                    ("kk".to_string(), control.clone()),
+                ],
+            },
+            // Minimum-block worst case: 64 one-byte keys and values.
+            Fixture {
+                name: "many one-byte labels",
+                body: "a=1".to_string(),
+                labels: (0..64u32)
+                    .map(|i| {
+                        (
+                            char::from(b'a' + (i % 26) as u8).to_string(),
+                            "x".to_string(),
+                        )
+                    })
+                    .collect(),
+            },
+            // No labels at all (charge must still cover the slot + body).
+            Fixture {
+                name: "no labels",
+                body: "a=1 ".repeat(300),
+                labels: Vec::new(),
+            },
+            // Mixed escapes and multi-byte UTF-8.
+            Fixture {
+                name: "mixed escapes and multi-byte",
+                body: "a=1".to_string(),
+                labels: vec![
+                    ("q\"k".to_string(), "v\\\n\t\u{7}".to_string()),
+                    ("日本".to_string(), "🚀".repeat(40)),
+                ],
+            },
         ];
-        let row = MetricScanRow {
-            fingerprint: 1,
-            timestamp_ns: 5,
-            body: "a=1".to_string(),
-        };
-        let charge = state.member_stage_bytes(&row, &pairs, true);
 
-        // What is ACTUALLY allocated for the JSON + the owned LabelSet.
-        let rendered = render_labels_json_sorted(&pairs);
-        let owned: LabelSet = pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        let actual_json = rendered.len() as u64;
-        let actual_labels: u64 = owned
-            .iter()
-            .map(|(k, v)| (k.len() + v.len()) as u64)
-            .sum::<u64>()
-            + owned.len() as u64 * std::mem::size_of::<(String, String)>() as u64;
-        assert!(
-            actual_json > pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum::<u64>(),
-            "the fixture must genuinely trigger escaping expansion"
-        );
-        assert!(
-            charge >= actual_json + actual_labels,
-            "charge {charge} must be >= actual {} (json {actual_json} + labels {actual_labels})",
-            actual_json + actual_labels
-        );
+        for Fixture { name, body, labels } in &fixtures {
+            let mut state = RangeSlideState::new(&compiled, &meta, &client, window, None).unwrap();
+            assert!(state.needs_body_order, "{name}: bodies must be staged");
+            assert!(state.fan_out, "{name}: label output must be staged");
+            // Enough members to force `coll` to grow through several
+            // capacity doublings (4 → 8 → 16 → 32).
+            for _ in 0..20 {
+                let row = MetricScanRow {
+                    fingerprint: 1,
+                    timestamp_ns: 5,
+                    body: body.clone(),
+                };
+                let mut scratch: Vec<(Cow<'_, str>, Cow<'_, str>)> = labels
+                    .iter()
+                    .map(|(k, v)| (Cow::Borrowed(k.as_str()), Cow::Borrowed(v.as_str())))
+                    .collect();
+                state.stage_member(&row, 1.0, &mut scratch).expect("staged");
+                assert!(
+                    state.coll_bytes >= staged_capacity(&state),
+                    "{name}: charge {} under-counts the {} bytes actually allocated \
+                     after {} members",
+                    state.coll_bytes,
+                    staged_capacity(&state),
+                    state.coll.len()
+                );
+            }
+        }
     }
 
     /// Review round 5, finding 3: EXPLAIN and execution share ONE SQL
@@ -7466,7 +7812,9 @@ mod tests {
             "range EXPLAIN/exec must report the sliding scan: {range_sql}"
         );
         // INSTANT -> the total-timestamp-order scan.
-        let instant_mp = mk(QuerySpec::Instant { at_ns: 60_000_000_000 });
+        let instant_mp = mk(QuerySpec::Instant {
+            at_ns: 60_000_000_000,
+        });
         let instant_sql = client_metric_read_sql(&instant_mp, &svc, &[1], window);
         assert!(
             instant_sql.contains("ORDER BY timestamp_ns ASC, fingerprint ASC, body ASC"),
