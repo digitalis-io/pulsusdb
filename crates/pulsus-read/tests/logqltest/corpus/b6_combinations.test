@@ -1,0 +1,538 @@
+# Batch B6 (issue #220): realistic MULTI-STAGE combination corpus — the
+# combinatorial surface where #218 hid. Every case chains several stages a
+# real user would write: parser × line/label filter × formatter × unwrap ×
+# range-reducer × vector-agg × grouping, plus binops between two multi-stage
+# metric exprs. Instant-eval only; each expected value is a BIT-EXACT capture
+# from grafana/loki:3.7.4 (container `loki-b6` on :3106, WAL + auto-discovery
+# disabled — the #218 exact-fixture discipline; see PROVENANCE.md).
+#
+# These are COMBINATIONS, not single-construct cases (those live in B1–B5).
+# Every metric query carries a parser stage (the raw-scan client-aggregation
+# path) and every loaded sample falls inside the query window (t-range, t].
+
+# =====================================================================
+# parser × label/line filter × count/rate × aggregation-by
+# =====================================================================
+
+# --- logfmt → status regex filter → count_over_time → sum by(method) ---
+load
+  {service_name="api-a", app="api"}
+  5s   method=GET status=200
+  10s  method=GET status=204
+  15s  method=POST status=201
+  20s  method=POST status=500
+  25s  method=DELETE status=200
+
+eval instant at 60s sum by (method) (count_over_time({service_name="api-a"} | logfmt | status=~"2.." [1m]))
+  {method="DELETE"} 1
+  {method="GET"} 2
+  {method="POST"} 1
+
+clear
+
+# --- logfmt → msg regex label filter → count_over_time → sum by(lvl) ---
+# (line filters are pushed to SQL, so metric combos use client-side
+#  label filters here; the line-filter construct is covered in B1 streams.)
+load
+  {service_name="api-b", app="api"}
+  5s   lvl=error msg=diskfull
+  10s  lvl=warn msg=diskslow
+  15s  lvl=info msg=timeout
+
+eval instant at 60s sum by (lvl) (count_over_time({service_name="api-b"} | logfmt | msg=~"disk.*" [1m]))
+  {lvl="error"} 1
+  {lvl="warn"} 1
+
+clear
+
+# --- logfmt → msg neq label filter → lvl regex → count_over_time → count by(lvl) ---
+load
+  {service_name="web", app="web", pod="a"}
+  5s   lvl=error msg=boom
+  10s  lvl=error msg=health
+  {service_name="web", app="web", pod="b"}
+  5s   lvl=error msg=crash
+  {service_name="web", app="web", pod="c"}
+  5s   lvl=warn msg=slow
+  8s   lvl=info msg=ok
+
+eval instant at 60s count by (lvl) (count_over_time({service_name="web"} | logfmt | msg!="health" | lvl=~"error|warn" [2m]))
+  {lvl="error"} 2
+  {lvl="warn"} 1
+
+clear
+
+# --- bytes_over_time over a logfmt+present-label filter → sum by(method) ---
+load
+  {service_name="api-c", app="api", method="GET"}
+  5s   msg=ok
+  10s  msg=ok
+  {service_name="api-c", app="api", method="POST"}
+  5s   msg=ok
+
+eval instant at 60s sum by (method) (bytes_over_time({service_name="api-c"} | logfmt | method!="" [1m]))
+  {method="GET"} 12
+  {method="POST"} 6
+
+clear
+
+# --- logfmt → method regex label filter → count_over_time → sum() -----
+load
+  {service_name="api-d", app="api"}
+  5s   method=GET path=/a
+  10s  method=POST path=/b
+  15s  method=DELETE path=/c
+
+eval instant at 60s sum(count_over_time({service_name="api-d"} | logfmt | method=~"GET|POST" [1m]))
+  {} 2
+
+clear
+
+# --- json → line_format (value-inert) → count → sum by(status) --------
+load
+  {service_name="api-e", app="api"}
+  5s   {"method":"GET","status":"200"}
+  10s  {"method":"GET","status":"500"}
+  15s  {"method":"POST","status":"200"}
+
+eval instant at 60s sum by (status) (count_over_time({service_name="api-e"} | json | line_format "{{.method}}-{{.status}}" [1m]))
+  {status="200"} 2
+  {status="500"} 1
+
+clear
+
+# =====================================================================
+# parser × unwrap × range-reducer × vector-agg (topk / bottomk / min / max / sum)
+# =====================================================================
+
+# --- logfmt unwrap → sum_over_time → sum by(pod) → topk(2) -------------
+load
+  {service_name="cache-a", app="cache", pod="p1"}
+  5s   hits=2
+  10s  hits=4
+  {service_name="cache-a", app="cache", pod="p2"}
+  5s   hits=10
+  {service_name="cache-a", app="cache", pod="p3"}
+  5s   hits=1
+  15s  hits=1
+  {service_name="cache-a", app="cache", pod="p4"}
+  5s   hits=8
+
+eval instant at 60s topk(2, sum by (pod) (sum_over_time({service_name="cache-a"} | logfmt | unwrap hits [2m])))
+  {pod="p2"} 10
+  {pod="p4"} 8
+
+clear
+
+# --- logfmt unwrap → avg_over_time → avg by(pod) → bottomk(1) ----------
+load
+  {service_name="cache-b", app="cache", pod="p1"}
+  5s   latency_ms=10
+  10s  latency_ms=30
+  {service_name="cache-b", app="cache", pod="p2"}
+  5s   latency_ms=4
+  10s  latency_ms=8
+  {service_name="cache-b", app="cache", pod="p3"}
+  5s   latency_ms=100
+
+eval instant at 60s bottomk(1, avg by (pod) (avg_over_time({service_name="cache-b"} | logfmt | unwrap latency_ms [2m])))
+  {pod="p2"} 6
+
+clear
+
+# --- json unwrap → avg_over_time → avg by(pod) → topk(2) ---------------
+load
+  {service_name="db-a", app="db", pod="d1"}
+  5s   {"latency_ms":8}
+  10s  {"latency_ms":16}
+  {service_name="db-a", app="db", pod="d2"}
+  5s   {"latency_ms":2}
+  {service_name="db-a", app="db", pod="d3"}
+  5s   {"latency_ms":20}
+  10s  {"latency_ms":40}
+
+eval instant at 60s topk(2, avg by (pod) (avg_over_time({service_name="db-a"} | json | unwrap latency_ms [2m])))
+  {pod="d1"} 12
+  {pod="d3"} 30
+
+clear
+
+# --- logfmt unwrap → max_over_time → max by(region) -------------------
+load
+  {service_name="edge-a", app="edge", region="us", pod="a"}
+  5s   qps=100
+  10s  qps=150
+  {service_name="edge-a", app="edge", region="us", pod="b"}
+  5s   qps=200
+  {service_name="edge-a", app="edge", region="eu", pod="c"}
+  5s   qps=90
+  20s  qps=80
+
+eval instant at 60s max by (region) (max_over_time({service_name="edge-a"} | logfmt | unwrap qps [1m]))
+  {region="eu"} 90
+  {region="us"} 200
+
+clear
+
+# --- logfmt unwrap → sum_over_time → sum() (no grouping) --------------
+load
+  {service_name="cache-c", app="cache"}
+  5s   bytes=100
+  10s  bytes=200
+  15s  bytes=300
+
+eval instant at 60s sum(sum_over_time({service_name="cache-c"} | logfmt | unwrap bytes [1m]))
+  {} 600
+
+clear
+
+# --- json unwrap → min_over_time → min() (no grouping) ---------------
+load
+  {service_name="db-b", app="db", pod="d1"}
+  5s   {"conns":30}
+  10s  {"conns":10}
+  {service_name="db-b", app="db", pod="d2"}
+  5s   {"conns":5}
+  {service_name="db-b", app="db", pod="d3"}
+  5s   {"conns":50}
+
+eval instant at 60s min(min_over_time({service_name="db-b"} | json | unwrap conns [1m]))
+  {} 5
+
+clear
+
+# =====================================================================
+# multi-stage: parser → label_format / label filter → unwrap → quantile / reducer → agg-by
+# =====================================================================
+
+# --- json unwrap → quantile_over_time(0.9) → sum by(svc) --------------
+load
+  {service_name="api-f", app="api", svc="checkout"}
+  5s   {"latency":1}
+  10s  {"latency":2}
+  15s  {"latency":3}
+  20s  {"latency":4}
+  {service_name="api-f", app="api", svc="cart"}
+  5s   {"latency":10}
+  10s  {"latency":20}
+  15s  {"latency":30}
+
+eval instant at 60s sum by (svc) (quantile_over_time(0.9, {service_name="api-f"} | json | unwrap latency [2m]))
+  {svc="cart"} 28
+  {svc="checkout"} 3.7
+
+clear
+
+# --- logfmt unwrap duration() → quantile_over_time(0.95) → avg by(method) ---
+load
+  {service_name="api-g", app="api", method="GET"}
+  5s   took=100ms
+  10s  took=200ms
+  15s  took=300ms
+  {service_name="api-g", app="api", method="POST"}
+  5s   took=400ms
+
+eval instant at 60s avg by (method) (quantile_over_time(0.95, {service_name="api-g"} | logfmt | unwrap duration(took) [2m]))
+  {method="GET"} 0.29
+  {method="POST"} 0.4
+
+clear
+
+# --- logfmt → label_format tier=level → unwrap bytes → sum_over_time → sum by(tier) ---
+load
+  {service_name="api-h", app="api", pod="a"}
+  5s   level=hot bytes=100
+  10s  level=hot bytes=100
+  {service_name="api-h", app="api", pod="b"}
+  5s   level=cold bytes=50
+
+eval instant at 60s sum by (tier) (sum_over_time({service_name="api-h"} | logfmt | label_format tier=level | unwrap bytes [1m]))
+  {tier="cold"} 50
+  {tier="hot"} 200
+
+clear
+
+# --- json → status regex filter → unwrap bytes → avg_over_time → avg by(method) ---
+load
+  {service_name="api-i", app="api", method="GET"}
+  5s   {"status":200,"bytes":10}
+  10s  {"status":204,"bytes":30}
+  15s  {"status":500,"bytes":999}
+  {service_name="api-i", app="api", method="POST"}
+  5s   {"status":201,"bytes":4}
+
+eval instant at 60s avg by (method) (avg_over_time({service_name="api-i"} | json | status=~"2.." | unwrap bytes [2m]))
+  {method="GET"} 20
+  {method="POST"} 4
+
+clear
+
+# --- logfmt unwrap → stddev_over_time → max by(host) ------------------
+load
+  {service_name="node-a", app="node", host="h1"}
+  5s   temp=2
+  10s  temp=4
+  {service_name="node-a", app="node", host="h2"}
+  5s   temp=2
+  10s  temp=4
+  15s  temp=6
+  20s  temp=8
+
+eval instant at 60s max by (host) (stddev_over_time({service_name="node-a"} | logfmt | unwrap temp [2m]))
+  {host="h1"} 1
+  {host="h2"} 2.23606797749979
+
+clear
+
+# --- logfmt unwrap → stdvar_over_time → sum by(dc) -------------------
+load
+  {service_name="node-b", app="node", dc="east", host="h1"}
+  5s   temp=2
+  10s  temp=4
+  {service_name="node-b", app="node", dc="east", host="h2"}
+  5s   temp=10
+  12s  temp=20
+  {service_name="node-b", app="node", dc="west", host="h3"}
+  5s   temp=2
+  10s  temp=4
+  15s  temp=6
+  20s  temp=8
+
+eval instant at 60s sum by (dc) (stdvar_over_time({service_name="node-b"} | logfmt | unwrap temp [2m]))
+  {dc="east"} 26
+  {dc="west"} 5
+
+clear
+
+# --- logfmt unwrap → first_over_time → min by(region) ----------------
+load
+  {service_name="edge-b", app="edge", region="us", pod="a"}
+  10s  gauge=5
+  30s  gauge=99
+  {service_name="edge-b", app="edge", region="us", pod="b"}
+  15s  gauge=3
+  {service_name="edge-b", app="edge", region="eu", pod="c"}
+  12s  gauge=7
+
+eval instant at 60s min by (region) (first_over_time({service_name="edge-b"} | logfmt | unwrap gauge [2m]))
+  {region="eu"} 7
+  {region="us"} 3
+
+clear
+
+# --- logfmt unwrap → last_over_time → max by(region) -----------------
+load
+  {service_name="edge-c", app="edge", region="us", pod="a"}
+  10s  gauge=5
+  30s  gauge=99
+  {service_name="edge-c", app="edge", region="us", pod="b"}
+  15s  gauge=3
+  {service_name="edge-c", app="edge", region="eu", pod="c"}
+  12s  gauge=7
+  40s  gauge=8
+
+eval instant at 60s max by (region) (last_over_time({service_name="edge-c"} | logfmt | unwrap gauge [2m]))
+  {region="eu"} 8
+  {region="us"} 99
+
+clear
+
+# --- logfmt unwrap duration() → quantile_over_time(0.99) → sum by(method) ---
+load
+  {service_name="api-j", app="api", method="GET"}
+  5s   took=100ms
+  10s  took=200ms
+  15s  took=300ms
+  20s  took=400ms
+  25s  took=500ms
+  {service_name="api-j", app="api", method="POST"}
+  5s   took=1s
+
+eval instant at 60s sum by (method) (quantile_over_time(0.99, {service_name="api-j"} | logfmt | unwrap duration(took) [2m]))
+  {method="GET"} 0.496
+  {method="POST"} 1
+
+clear
+
+# =====================================================================
+# vector-agg over unwrapped grouping — WITHOUT
+# =====================================================================
+
+# --- logfmt unwrap → avg_over_time → avg without(pod) ----------------
+load
+  {service_name="cache-d", app="cache", region="us", pod="p1"}
+  5s   latency_ms=10
+  {service_name="cache-d", app="cache", region="us", pod="p2"}
+  5s   latency_ms=20
+  {service_name="cache-d", app="cache", region="eu", pod="p3"}
+  5s   latency_ms=8
+
+eval instant at 60s avg without (pod) (avg_over_time({service_name="cache-d"} | logfmt | unwrap latency_ms [2m]))
+  {app="cache", region="eu", service_name="cache-d"} 8
+  {app="cache", region="us", service_name="cache-d"} 15
+
+clear
+
+# --- logfmt → lvl regex → count_over_time → sum by(pod) → bottomk(2) ---
+load
+  {service_name="cache-e", app="cache", pod="p1"}
+  5s   lvl=error
+  10s  lvl=error
+  15s  lvl=error
+  {service_name="cache-e", app="cache", pod="p2"}
+  5s   lvl=warn
+  {service_name="cache-e", app="cache", pod="p3"}
+  5s   lvl=error
+  10s  lvl=warn
+  {service_name="cache-e", app="cache", pod="p4"}
+  5s   lvl=info
+
+eval instant at 60s bottomk(2, sum by (pod) (count_over_time({service_name="cache-e"} | logfmt | lvl=~"error|warn" [2m])))
+  {pod="p2"} 1
+  {pod="p3"} 2
+
+clear
+
+# =====================================================================
+# binops between two multi-stage metric exprs
+# =====================================================================
+
+# --- error ratio: sum by(method) rate(5xx) / sum by(method) rate(all) ---
+load
+  {service_name="api-k", app="api", method="GET"}
+  5s   status=500
+  10s  status=200
+  15s  status=500
+  20s  status=200
+  {service_name="api-k", app="api", method="POST"}
+  5s   status=200
+  10s  status=201
+
+eval instant at 60s sum by (method) (rate({service_name="api-k"} | logfmt | status=~"5.." [1m])) / sum by (method) (rate({service_name="api-k"} | logfmt [1m]))
+  {method="GET"} 0.5
+
+clear
+
+# --- scalar ratio: sum count(status=500) / sum count(all) → {} --------
+load
+  {service_name="api-l", app="api"}
+  5s   {"status":500}
+  10s  {"status":200}
+  15s  {"status":500}
+  20s  {"status":404}
+
+eval instant at 60s sum(count_over_time({service_name="api-l"} | json | status="500" [1m])) / sum(count_over_time({service_name="api-l"} | json [1m]))
+  {} 0.5
+
+clear
+
+# --- avg bytes per line: bytes_over_time / count_over_time by(pod) ----
+load
+  {service_name="cache-f", app="cache", pod="p1"}
+  5s   msg=aa
+  10s  msg=aa
+  {service_name="cache-f", app="cache", pod="p2"}
+  5s   msg=aaaa
+
+eval instant at 60s sum by (pod) (bytes_over_time({service_name="cache-f"} | logfmt [1m])) / sum by (pod) (count_over_time({service_name="cache-f"} | logfmt [1m]))
+  {pod="p1"} 6
+  {pod="p2"} 8
+
+clear
+
+# --- comparison bool: sum by(method) count(GET) > bool 5 -------------
+load
+  {service_name="api-m", app="api"}
+  5s   method=GET
+  10s  method=GET
+  15s  method=GET
+  20s  method=GET
+  25s  method=GET
+  30s  method=GET
+  35s  method=POST
+  40s  method=POST
+
+eval instant at 60s sum by (method) (count_over_time({service_name="api-m"} | logfmt | method="GET" [1m])) > bool 5
+  {method="GET"} 1
+
+clear
+
+# --- threshold filter (no bool): sum by(pod) sum_over_time > 100 -----
+load
+  {service_name="cache-g", app="cache", pod="p1"}
+  5s   hits=60
+  10s  hits=60
+  {service_name="cache-g", app="cache", pod="p2"}
+  5s   hits=50
+  {service_name="cache-g", app="cache", pod="p3"}
+  5s   hits=200
+
+eval instant at 60s sum by (pod) (sum_over_time({service_name="cache-g"} | logfmt | unwrap hits [1m])) > 100
+  {pod="p1"} 120
+  {pod="p3"} 200
+
+clear
+
+# --- sum of two filtered counts: error-count + warn-count by(pod) ----
+load
+  {service_name="cache-h", app="cache", pod="p1"}
+  5s   lvl=error
+  10s  lvl=error
+  15s  lvl=warn
+  {service_name="cache-h", app="cache", pod="p2"}
+  5s   lvl=error
+  10s  lvl=warn
+  15s  lvl=warn
+
+eval instant at 60s sum by (pod) (count_over_time({service_name="cache-h"} | logfmt | lvl="error" [1m])) + sum by (pod) (count_over_time({service_name="cache-h"} | logfmt | lvl="warn" [1m]))
+  {pod="p1"} 3
+  {pod="p2"} 3
+
+clear
+
+# --- sum of two rates: 2xx-rate + 5xx-rate by(method) ----------------
+load
+  {service_name="api-n", app="api", method="GET"}
+  5s   status=200
+  10s  status=500
+  15s  status=204
+  {service_name="api-n", app="api", method="POST"}
+  5s   status=500
+  10s  status=502
+  15s  status=200
+
+eval instant at 60s sum by (method) (rate({service_name="api-n"} | logfmt | status=~"2.." [1m])) + sum by (method) (rate({service_name="api-n"} | logfmt | status=~"5.." [1m]))
+  {method="GET"} 0.05
+  {method="POST"} 0.05
+
+clear
+
+# --- rate_counter under sum by(pod) → topk(1) (extrapolation capture) --
+load
+  {service_name="cache-i", app="cache", pod="p1"}
+  10s  requests=5
+  20s  requests=10
+  30s  requests=15
+  40s  requests=20
+  {service_name="cache-i", app="cache", pod="p2"}
+  10s  requests=1
+  40s  requests=100
+
+eval instant at 60s topk(1, sum by (pod) (rate_counter({service_name="cache-i"} | logfmt | unwrap requests [1m])))
+  {pod="p2"} 1.6500033000000003
+
+clear
+
+# --- bytes_rate over a method regex filter → sum by(method) ----------
+load
+  {service_name="api-o", app="api", method="GET"}
+  5s   msg=aa
+  10s  msg=aa
+  {service_name="api-o", app="api", method="POST"}
+  5s   msg=aa
+  {service_name="api-o", app="api", method="DELETE"}
+  5s   msg=aa
+
+eval instant at 60s sum by (method) (bytes_rate({service_name="api-o"} | logfmt | method=~"GET|POST" [1m]))
+  {method="GET"} 0.2
+  {method="POST"} 0.1
