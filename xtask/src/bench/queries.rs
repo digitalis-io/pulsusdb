@@ -1461,7 +1461,12 @@ async fn run_metric_shape(
                 start_ns: mp.start_ns,
                 end_ns: mp.end_ns,
             },
-            mp.step_ns.unwrap_or(300_000_000_000),
+            // Issue #227 made `MetricPlan::step_ns` a `ValidatedDuration`.
+            // This bench stage still measures the step-bucketed rollup SQL
+            // shape directly (the committed evidence JSON is byte-frozen);
+            // the LogQL RANGE read path itself no longer emits it — see the
+            // note on this scenario.
+            mp.step_ns.map(|d| d.as_u64()).unwrap_or(300_000_000_000),
             &mp.extra_predicates,
         );
         let returned = execute_discard::<MetricRow>(client, &sql3, &s3_id, dist).await?;

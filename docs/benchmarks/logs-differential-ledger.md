@@ -196,6 +196,20 @@ Out of this ledger's scope by design:
   grid (env-gated), plus the hermetic `logqltest` `eval range` corpus.
   INSTANT metric queries were already identical (`(t - range, t]` at one
   evaluation instant) and are unchanged.
+- **e2e cases re-gated (issue #227).** The five cases this entry covered
+  are no longer informational — the divergence they recorded is gone, so
+  `test/fixtures/logs/differential.json` carries them at `mode: "gated"`
+  and the e2e exclusion list (`e2e/src/logs.rs`
+  `INFORMATIONAL_CASE_IDS`) is EMPTY again: `metric_rate_tumbling`,
+  **renamed `metric_rate_sliding`** (the id named the retired semantics),
+  and the four issue-#91 range vector-matching cases
+  `metric_match_on_range`, `metric_match_ignoring_range`,
+  `metric_match_group_left_range`, `metric_match_group_right_range`.
+  The e2e by-construction expectation (`expected_metric_matrix`) now
+  computes the sliding contract itself — start-anchored grid, half-open
+  `(t - range, t]`, gaps for empty windows, `rate` over the `[range]` —
+  and a hermetic test evaluates every committed range case through the
+  shipped sliding evaluator and requires the two to agree.
 
 ### matching-error-status-divergence (informational note, not a gate downgrade)
 
