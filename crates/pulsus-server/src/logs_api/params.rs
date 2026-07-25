@@ -131,6 +131,38 @@ pub(crate) enum ParamError {
     /// rejected.
     #[error("'query' must be a bare stream selector on the patterns endpoint (no pipeline stages)")]
     PatternsPipelineUnsupported,
+    /// Issue #227: `query_range`'s `(end - start) / step > 11000` — Loki's own
+    /// resolution limit (`loghttp/query.go` `errStepTooSmall`), enforced at
+    /// request parsing and surfaced with Loki's EXACT 400 message (replacing
+    /// the engine's `MetricBuckets` 422 at the request boundary).
+    #[error(
+        "exceeded maximum resolution of 11,000 points per time series. Try increasing the value \
+         of the step parameter"
+    )]
+    MaxResolutionExceeded,
+}
+
+/// Loki's `query_range` points-per-series ceiling (`loghttp/query.go:29`):
+/// `(end - start) / step > 11000` is a hard 400.
+pub(crate) const MAX_RANGE_QUERY_POINTS: u64 = 11_000;
+
+/// Enforces Loki's `(end - start) / step > 11000` resolution limit (issue
+/// #227). i128 arithmetic — the full `i64` span at a 1ns step overflows a
+/// plain `i64` count. A non-positive span never trips (mirrors Loki's
+/// integer `Duration/Duration`).
+pub(crate) fn ensure_range_resolution(
+    start_ns: i64,
+    end_ns: i64,
+    step_ns: u64,
+) -> Result<(), ParamError> {
+    if step_ns == 0 {
+        return Ok(()); // a zero step is already a 400 from `parse_step`.
+    }
+    let span = end_ns as i128 - start_ns as i128;
+    if span > 0 && span / step_ns as i128 > MAX_RANGE_QUERY_POINTS as i128 {
+        return Err(ParamError::MaxResolutionExceeded);
+    }
+    Ok(())
 }
 
 /// Nanoseconds since the Unix epoch, right now. Matches the rest of the
@@ -814,6 +846,42 @@ mod tests {
     fn parse_step_rejects_garbage() {
         let err = parse_step(Some("banana"), 0, 0).unwrap_err();
         assert!(matches!(err, ParamError::InvalidStep { .. }));
+    }
+
+    // -- Issue #227: Loki's (end-start)/step > 11000 resolution limit ----
+
+    #[test]
+    fn resolution_at_the_11000_point_limit_is_accepted() {
+        let s = 1_000_000_000i64;
+        // 11000 intervals exactly (Loki trips only on `> 11000`).
+        assert!(ensure_range_resolution(0, 11_000 * s, s as u64).is_ok());
+    }
+
+    #[test]
+    fn resolution_over_the_11000_point_limit_is_the_loki_400_message() {
+        let s = 1_000_000_000i64;
+        let err = ensure_range_resolution(0, 11_001 * s, s as u64).unwrap_err();
+        assert!(matches!(err, ParamError::MaxResolutionExceeded));
+        assert_eq!(
+            err.to_string(),
+            "exceeded maximum resolution of 11,000 points per time series. Try increasing the \
+             value of the step parameter"
+        );
+    }
+
+    #[test]
+    fn resolution_check_does_not_overflow_at_the_full_i64_span() {
+        // i64::MIN..i64::MAX at a 1ns step is ~2^64 intervals — must reject
+        // via i128, never panic/wrap.
+        assert!(matches!(
+            ensure_range_resolution(i64::MIN, i64::MAX, 1).unwrap_err(),
+            ParamError::MaxResolutionExceeded
+        ));
+    }
+
+    #[test]
+    fn resolution_check_ignores_a_non_positive_span() {
+        assert!(ensure_range_resolution(100, 50, 1).is_ok());
     }
 
     // -- Issue #171: /patterns step floor + grid ------------------------

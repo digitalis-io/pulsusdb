@@ -122,6 +122,10 @@ async fn query_range_impl(
     let expr = pulsus_logql::parse(query)?;
     let (start_ns, end_ns) = parse_bounds(&pairs)?;
     let step_ns = params::parse_step(params::get(&pairs, "step"), start_ns, end_ns)?;
+    // Issue #227: Loki's `(end-start)/step > 11000` resolution limit — a hard
+    // 400 at request parsing with Loki's exact message (the engine keeps its
+    // `MetricBuckets` guard as a defense-in-depth backstop).
+    params::ensure_range_resolution(start_ns, end_ns, step_ns)?;
     let limit = params::parse_limit(params::get(&pairs, "limit"))?;
     let direction = params::parse_direction(params::get(&pairs, "direction"))?;
     let query_params = QueryParams {
@@ -462,6 +466,7 @@ mod tests {
             start_ns: 0,
             end_ns: 11_000 * S,
             step_ns: Some(S as u64),
+            range_ns: 0,
         };
         let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
             .expect_err("an over-cap vector(n) range query must reject");
@@ -471,6 +476,30 @@ mod tests {
         assert!(
             json["error"].as_str().unwrap_or_default().contains("11000"),
             "over-cap message must name the 11000-bucket cap: {json:?}"
+        );
+    }
+
+    /// Issue #227: at the REQUEST boundary, `(end-start)/step > 11000` is
+    /// Loki's HTTP **400** with its exact message (the engine's
+    /// `MetricBuckets` 422 above is now only a defense-in-depth backstop).
+    #[tokio::test]
+    async fn query_range_over_the_11000_resolution_is_400_with_lokis_message() {
+        // (0, 11001s] at a 1s step = 11001 intervals > 11000.
+        let q = "query=count_over_time(%7Bapp%3D%22a%22%7D%5B5m%5D)\
+                 &start=0&end=11001000000000&step=1s";
+        let res = query_range(
+            State(test_state()),
+            HeaderMap::new(),
+            RawQuery(Some(q.to_string())),
+        )
+        .await;
+        let (status, json) = status_and_body(res).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["errorType"], "bad_data");
+        assert_eq!(
+            json["error"],
+            "exceeded maximum resolution of 11,000 points per time series. Try increasing the \
+             value of the step parameter"
         );
     }
 
