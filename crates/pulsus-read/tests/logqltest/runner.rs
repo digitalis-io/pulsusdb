@@ -20,11 +20,12 @@
 //!
 //! Directives (column 0, blank-line separated): `clear`, `load`,
 //! `eval instant at <T> <query>`, `eval_ordered instant at <T> <query>`,
-//! `eval_fail instant at <T> <query>`. Every eval is INSTANT — the value
-//! surface where PulsusDB is semantically identical to the reference
-//! (`docs/features.md:55`), so the goldens are bit-exact against
-//! `grafana/loki:3.7.4`. Range/step queries (tumbling≠sliding by design)
-//! are out of scope.
+//! `eval_fail instant at <T> <query>`, and — issue #227 — `eval range from
+//! <T0> to <T1> step <S> <query>` (the Loki sliding-window range evaluator;
+//! a matrix result compared point-by-point at EXACT-f64). Instant and range
+//! goldens are bit-exact against `grafana/loki:3.7.4` (range values captured
+//! from the container, or hand-derived for integer-exact reducers verified
+//! against `pkg/logql/range_vector.go` — see `PROVENANCE.md`).
 //!
 //! Evaluation drives the SAME pure functions the engine executes — for a
 //! log query `CompiledPipeline::run` per loaded line; for a metric query
@@ -42,9 +43,9 @@ use std::collections::HashMap;
 use pulsus_logql::{Expr, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
-    ClientWindow, CompiledPipeline, Direction, MetricNode, MetricPlan, Plan, PlanCtx, QueryParams,
-    QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit, plan,
-    run_client_agg_rows,
+    ClientWindow, CompiledPipeline, Direction, MatrixSeries, MetricNode, MetricPlan, Plan, PlanCtx,
+    QueryParams, QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit,
+    plan, run_client_agg_rows,
 };
 
 /// A sorted label set.
@@ -301,10 +302,22 @@ pub enum EvalMode {
     Fail,
 }
 
+/// A range eval's grid: `range from <T0> to <T1> step <S>` (issue #227).
+#[derive(Debug, Clone, Copy)]
+pub struct RangeEval {
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub step_ns: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalCmd {
     pub line: usize,
     pub at_ns: i64,
+    /// `Some` for a `range from <T0> to <T1> step <S>` eval (issue #227); the
+    /// matrix result's `(ts, value)` points are compared exactly. `None` =
+    /// the instant eval (uses `at_ns`).
+    pub range: Option<RangeEval>,
     pub mode: EvalMode,
     pub query: String,
     /// Raw expected result lines (interpreted at compare time by result
@@ -333,6 +346,8 @@ pub struct DirectiveCounts {
     pub streams_cases: usize,
     pub vector_cases: usize,
     pub scalar_cases: usize,
+    /// Range (`eval range`) matrix results (issue #227).
+    pub matrix_cases: usize,
 }
 
 /// One executed case's outcome.
@@ -487,18 +502,50 @@ fn parse_eval(
     lines: &[&str],
     directive_idx: usize,
 ) -> Result<(EvalCmd, usize), String> {
-    let rest = rest.strip_prefix("instant at ").ok_or_else(|| {
-        fmt_err(
+    let (at_ns, range, query) = if let Some(rest) = rest.strip_prefix("instant at ") {
+        let (at_tok, query) = rest
+            .split_once(char::is_whitespace)
+            .ok_or_else(|| fmt_err(file, directive_idx, "eval needs `<T> <query>`".into()))?;
+        let at_ns = parse_duration_ns(at_tok).map_err(|e| fmt_err(file, directive_idx, e))?;
+        (at_ns, None, query.trim().to_string())
+    } else if let Some(rest) = rest.strip_prefix("range from ") {
+        // `<T0> to <T1> step <S> <query>` (issue #227). The query may contain
+        // spaces, so split off exactly the 5 fixed grid tokens first.
+        let parts: Vec<&str> = rest.splitn(6, ' ').collect();
+        if parts.len() != 6 || parts[1] != "to" || parts[3] != "step" {
+            return Err(fmt_err(
+                file,
+                directive_idx,
+                "eval range needs `from <T0> to <T1> step <S> <query>`".into(),
+            ));
+        }
+        let start_ns = parse_duration_ns(parts[0]).map_err(|e| fmt_err(file, directive_idx, e))?;
+        let end_ns = parse_duration_ns(parts[2]).map_err(|e| fmt_err(file, directive_idx, e))?;
+        let step_i = parse_duration_ns(parts[4]).map_err(|e| fmt_err(file, directive_idx, e))?;
+        if step_i <= 0 {
+            return Err(fmt_err(
+                file,
+                directive_idx,
+                "eval range step must be > 0".into(),
+            ));
+        }
+        (
+            0,
+            Some(RangeEval {
+                start_ns,
+                end_ns,
+                step_ns: step_i as u64,
+            }),
+            parts[5].trim().to_string(),
+        )
+    } else {
+        return Err(fmt_err(
             file,
             directive_idx,
-            "only `instant at <T>` evals are supported".into(),
-        )
-    })?;
-    let (at_tok, query) = rest
-        .split_once(char::is_whitespace)
-        .ok_or_else(|| fmt_err(file, directive_idx, "eval needs `<T> <query>`".into()))?;
-    let at_ns = parse_duration_ns(at_tok).map_err(|e| fmt_err(file, directive_idx, e))?;
-    let query = query.trim().to_string();
+            "only `instant at <T>` and `range from <T0> to <T1> step <S>` evals are supported"
+                .into(),
+        ));
+    };
 
     let mut expected = Vec::new();
     let mut fail_msg = None;
@@ -537,6 +584,7 @@ fn parse_eval(
         EvalCmd {
             line: directive_idx + 1,
             at_ns,
+            range,
             mode,
             query,
             expected,
@@ -619,10 +667,13 @@ enum Outcome {
     Metric(QueryResult),
 }
 
-fn evaluate(store: &Store, query: &str, at_ns: i64) -> Result<Outcome, String> {
+fn evaluate(store: &Store, query: &str, spec: QuerySpec) -> Result<Outcome, String> {
     let expr = parse(query).map_err(|e| e.to_string())?;
     match &expr {
         Expr::Log(log) => {
+            if matches!(spec, QuerySpec::Range { .. }) {
+                return Err("a `range` eval requires a metric query".to_string());
+            }
             let compiled = CompiledPipeline::compile(&log.pipeline).map_err(|e| e.to_string())?;
             let mut out = Vec::new();
             for stream in &store.streams {
@@ -642,7 +693,7 @@ fn evaluate(store: &Store, query: &str, at_ns: i64) -> Result<Outcome, String> {
         }
         Expr::Metric(_) => {
             let params = QueryParams {
-                spec: QuerySpec::Instant { at_ns },
+                spec,
                 limit: 100,
                 direction: Direction::Backward,
             };
@@ -824,11 +875,105 @@ fn compare_metric(cmd: &EvalCmd, result: QueryResult) -> (bool, String) {
                 ),
             }
         }
+        QueryResult::Matrix(series) => compare_matrix(&cmd.expected, series),
         other => (
             false,
             format!("unexpected result kind for an instant eval: {other:?}"),
         ),
     }
+}
+
+/// Compares a range (`eval range`) matrix result (issue #227): each expected
+/// line is `{labels} <offset1> <value1> <offset2> <value2> ...` — the series'
+/// sorted `(timestamp_ns, value)` points, compared with EXACT-f64 equality.
+/// An empty window emits no point, so the offsets are explicit (gaps show as
+/// missing offsets, never as zeros).
+fn compare_matrix(expected: &[String], series: Vec<MatrixSeries>) -> (bool, String) {
+    let mut want: Vec<(Labels, Vec<(i64, f64)>)> = Vec::new();
+    for line in expected {
+        match parse_expected_matrix(line) {
+            Ok(e) => want.push(e),
+            Err(e) => return (false, format!("bad expected matrix line: {e}")),
+        }
+    }
+    let mut got: Vec<(Labels, Vec<(i64, f64)>)> = series
+        .into_iter()
+        .map(|s| {
+            let mut labels = s.labels;
+            labels.sort();
+            let mut points = s.points;
+            points.sort_by_key(|(t, _)| *t);
+            (labels, points)
+        })
+        .collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    if want.len() != got.len() {
+        return (
+            false,
+            format!(
+                "series count mismatch: got {}, want {}",
+                got.len(),
+                want.len()
+            ),
+        );
+    }
+    for (w, g) in want.iter().zip(&got) {
+        if w.0 != g.0 {
+            return (
+                false,
+                format!(
+                    "series label mismatch: got {}, want {}",
+                    fmt_labels(&g.0),
+                    fmt_labels(&w.0)
+                ),
+            );
+        }
+        if w.1.len() != g.1.len() {
+            return (
+                false,
+                format!(
+                    "point count mismatch for {}: got {:?}, want {:?}",
+                    fmt_labels(&w.0),
+                    g.1,
+                    w.1
+                ),
+            );
+        }
+        for ((wt, wv), (gt, gv)) in w.1.iter().zip(&g.1) {
+            if wt != gt || wv.to_bits() != gv.to_bits() {
+                return (
+                    false,
+                    format!(
+                        "point mismatch for {}: got ({gt}, {gv}), want ({wt}, {wv})",
+                        fmt_labels(&w.0),
+                    ),
+                );
+            }
+        }
+    }
+    (true, String::new())
+}
+
+fn parse_expected_matrix(line: &str) -> Result<(Labels, Vec<(i64, f64)>), String> {
+    let (mut labels, consumed) = parse_labelset(line)?;
+    labels.sort();
+    let rest = line[consumed..].trim();
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    if !toks.len().is_multiple_of(2) {
+        return Err(format!(
+            "matrix line needs `<offset> <value>` pairs after the labels: {line:?}"
+        ));
+    }
+    let mut points = Vec::new();
+    for pair in toks.chunks(2) {
+        let ts = parse_duration_ns(pair[0])?;
+        let v = pair[1]
+            .parse::<f64>()
+            .map_err(|e| format!("bad value {:?}: {e}", pair[1]))?;
+        points.push((ts, v));
+    }
+    Ok((labels, points))
 }
 
 fn compare_vector_ordered(want: &[VectorEntry], actual: &[VectorEntry]) -> (bool, String) {
@@ -930,10 +1075,19 @@ pub fn run_file(file: &str, text: &str) -> Result<FileRun, String> {
                     EvalMode::Ordered => counts.eval_ordered += 1,
                     EvalMode::Fail => counts.eval_fail += 1,
                 }
-                let outcome = evaluate(&store, &cmd.query, cmd.at_ns);
+                let spec = match cmd.range {
+                    Some(r) => QuerySpec::Range {
+                        start_ns: r.start_ns,
+                        end_ns: r.end_ns,
+                        step_ns: r.step_ns,
+                    },
+                    None => QuerySpec::Instant { at_ns: cmd.at_ns },
+                };
+                let outcome = evaluate(&store, &cmd.query, spec);
                 match &outcome {
                     Ok(Outcome::Streams(_)) => counts.streams_cases += 1,
                     Ok(Outcome::Metric(QueryResult::Scalar(_))) => counts.scalar_cases += 1,
+                    Ok(Outcome::Metric(QueryResult::Matrix(_))) => counts.matrix_cases += 1,
                     Ok(Outcome::Metric(_)) => counts.vector_cases += 1,
                     Err(_) => {}
                 }

@@ -1,0 +1,98 @@
+# b9_range_sliding.test — issue #227: Loki sliding-window RANGE queries.
+#
+# `eval range from <T0> to <T1> step <S>` replays the streaming sliding
+# evaluator (RangeSlideState) — the window `(t-range, t]` re-evaluated at
+# every start-anchored grid point `{T0 + k·S ≤ T1}`.
+#
+# Every case here uses an INTEGER-valued reducer (count / bytes /
+# sum-of-small-ints / min / max / first / last / a clean-division rate /
+# absent): the sliding-window result is integer-exact in f64 and matches
+# grafana/loki:3.7.4 BY CONSTRUCTION (hand-derived against
+# pkg/logql/range_vector.go's batchRangeVectorIterator — half-open
+# `(t-range, t]`, popBack/load, empty-window gap). Float-drift-sensitive
+# class-C folds and cross-stream StableHash same-ns tie cases are covered by
+# the env-gated live schema-it differential (they need the container oracle
+# to capture, per PROVENANCE.md), not this hermetic file.
+
+load
+  {env="prod", service_name="checkout"} service=checkout
+  10s  v=4
+  25s  v=1
+  40s  v=7
+  55s  v=2
+
+# --- class A: count_over_time, overlap (range > step) -----------------
+# grid {0,15s,30s,45s,60s}, window (t-30s, t]:
+#   t=0 empty (gap); 15s→{10s}=1; 30s→{10,25}=2; 45s→{25,40}=2; 60s→{40,55}=2
+eval range from 0s to 60s step 15s count_over_time({service_name="checkout"}[30s])
+  {env="prod", service_name="checkout"} 15s 1 30s 2 45s 2 60s 2
+
+# --- class A: count, degenerate tumbling (range == step) --------------
+# window (t-15s, t]: each grid point sees exactly one sample.
+eval range from 0s to 60s step 15s count_over_time({service_name="checkout"}[15s])
+  {env="prod", service_name="checkout"} 15s 1 30s 1 45s 1 60s 1
+
+# --- class A: count, undersample (range < step) — samples fall in gaps -
+# grid {0,20s,40s,60s}, window (t-10s, t]: 10s and 25s land in NO window
+# (Loki undersampling), only 40s and 55s are counted.
+eval range from 0s to 60s step 20s count_over_time({service_name="checkout"}[10s])
+  {env="prod", service_name="checkout"} 40s 1 60s 1
+
+# --- start-anchored grid under an UNALIGNED T0 ------------------------
+# grid {7s,17s,27s,37s} (NOT epoch multiples), window (t-10s, t]:
+#   7s empty; 17s→{10s}=1; 27s→{25s}=1; 37s empty (25s≤27s excluded, 40s>37s)
+eval range from 7s to 37s step 10s count_over_time({service_name="checkout"}[10s])
+  {env="prod", service_name="checkout"} 17s 1 27s 1
+
+# --- class A: bytes_over_time (Σ length(body)) — bodies are 3 bytes ----
+eval range from 0s to 60s step 15s bytes_over_time({service_name="checkout"}[30s])
+  {env="prod", service_name="checkout"} 15s 3 30s 6 45s 6 60s 6
+
+# --- class A: rate (no unwrap) = count / range_seconds ----------------
+# grid {0,20s,40s,60s}, window (t-20s, t]:
+#   20s→{10s}=1/20=0.05; 40s→{25,40}=2/20=0.1; 60s→{55s}=1/20=0.05
+eval range from 0s to 60s step 20s rate({service_name="checkout"}[20s])
+  {env="prod", service_name="checkout"} 20s 0.05 40s 0.1 60s 0.05
+
+# --- rate is LIVE on [range]: a wider window over the same grid differs -
+# window (t-60s, t]: every grid point sees the whole set so far.
+#   20s→{10}=1/60; 40s→{10,25,40}=3/60=0.05; 60s→{10,25,40,55}=4/60
+# (0.05 is the only clean point — assert JUST it to prove range≠20s above.)
+eval range from 40s to 40s step 20s rate({service_name="checkout"}[60s])
+  {env="prod", service_name="checkout"} 40s 0.05
+
+# --- class C: sum_over_time (unwrap) — small integers fold exactly -----
+# v = 4,1,7,2 at 10,25,40,55; window (t-30s, t]:
+#   15s→4; 30s→4+1=5; 45s→1+7=8; 60s→7+2=9
+eval range from 0s to 60s step 15s sum_over_time({service_name="checkout"} | logfmt | unwrap v [30s])
+  {env="prod", service_name="checkout"} 15s 4 30s 5 45s 8 60s 9
+
+# --- class B: min_over_time / max_over_time (order-independent) --------
+eval range from 0s to 60s step 15s min_over_time({service_name="checkout"} | logfmt | unwrap v [30s])
+  {env="prod", service_name="checkout"} 15s 4 30s 1 45s 1 60s 2
+
+eval range from 0s to 60s step 15s max_over_time({service_name="checkout"} | logfmt | unwrap v [30s])
+  {env="prod", service_name="checkout"} 15s 4 30s 4 45s 7 60s 7
+
+# --- class B: first/last as canonical-order endpoints -----------------
+# first = value at min (ts, stream_hash, tie_rank); last = at max.
+#   15s→{10s:4}; 30s→{10:4,25:1}; 45s→{25:1,40:7}; 60s→{40:7,55:2}
+eval range from 0s to 60s step 15s first_over_time({service_name="checkout"} | logfmt | unwrap v [30s])
+  {env="prod", service_name="checkout"} 15s 4 30s 4 45s 1 60s 7
+
+eval range from 0s to 60s step 15s last_over_time({service_name="checkout"} | logfmt | unwrap v [30s])
+  {env="prod", service_name="checkout"} 15s 4 30s 1 45s 7 60s 2
+
+# --- mutating pipeline (label_format) drives the fan-out cell path -----
+# region="eu" makes the output set differ from the base ⇒ fan_out=true;
+# one stream ⇒ one merged series. Same sum values as above.
+eval range from 0s to 60s step 15s sum_over_time({service_name="checkout"} | logfmt | label_format region="eu" | unwrap v [30s])
+  {env="prod", region="eu", service_name="checkout"} 15s 4 30s 5 45s 8 60s 9
+
+# --- absent_over_time: emit 1 for EMPTY sliding windows only ----------
+# grid {0,15s,30s,45s,60s}, window (t-15s, t]: only t=0 has no lookback.
+# Series labels = the selector's Eq matchers.
+eval range from 0s to 60s step 15s absent_over_time({service_name="checkout"}[15s])
+  {service_name="checkout"} 0s 1
+
+clear

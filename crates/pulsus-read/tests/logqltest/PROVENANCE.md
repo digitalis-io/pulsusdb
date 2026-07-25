@@ -13,10 +13,22 @@ the #218 lesson): a one-ULP perturbation reddens the runner
 - **Semantics of record:** the Go checkout at `/home/hayato/git/loki @ v3.7.4`
   (`pkg/logql/`).
 - Instant metric queries are **semantically identical** to the reference
-  (`docs/features.md:55`), so their goldens are bit-exact against the
-  container. Range/step queries hit PulsusDB's deliberate tumbling-vs-sliding
-  divergence and are **not** bit-exact by design — they are out of scope for
-  this corpus (every eval is `instant`).
+  (`docs/features.md`), so their goldens are bit-exact against the container.
+- **Range queries (issue #227)** now evaluate Loki's **sliding** windows
+  bit-exactly, so `eval range from <T0> to <T1> step <S>` is in scope. Two
+  capture disciplines:
+  - **Integer-exact reducers** (count / bytes / sum-of-small-ints / min /
+    max / first / last / clean-division rate / absent): the sliding-window
+    result is integer-exact in f64 and **hand-derived** against
+    `pkg/logql/range_vector.go`'s `batchRangeVectorIterator` (half-open
+    `(t-range, t]`, popBack/load, start-anchored grid, empty-window gap) —
+    Loki-exact by construction, no container needed. `b9_range_sliding.test`.
+  - **Float-drift-sensitive class-C folds** and **cross-stream StableHash
+    same-nanosecond tie** cases MUST be captured from the container (their
+    bit pattern depends on Loki's exact fold/heap order) — these live in the
+    env-gated live `schema-it` differential, NOT this hermetic file. The one
+    ratified divergence (same-ns SAME-stream `tie_rank` order) is documented
+    in `docs/features.md` / the differential ledger.
 
 ## `.test` DSL
 
