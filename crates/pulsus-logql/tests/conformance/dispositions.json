@@ -479,14 +479,18 @@
     {
       "construct": "stage.distinct",
       "status": "reject-parity",
-      "oracle": "reject",
-      "error_construct": "distinct"
+      "oracle": "reject"
     },
     {
       "construct": "stage.ip",
       "status": "reject-parity",
       "oracle": "reject",
       "error_construct": "ip"
+    },
+    {
+      "construct": "func.vector",
+      "status": "supported",
+      "oracle": "accept"
     },
     {
       "construct": "statics.string",

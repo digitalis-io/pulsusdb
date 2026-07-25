@@ -472,6 +472,9 @@ fn walk_metric(me: &MetricExpr, out: &mut BTreeSet<String>) {
         MetricExpr::Literal(_) => {
             out.insert("statics.number".to_string());
         }
+        MetricExpr::VectorFn(_) => {
+            out.insert("func.vector".to_string());
+        }
         MetricExpr::Binary {
             op,
             modifier,
@@ -828,43 +831,20 @@ fn check_status(d: &Disposition, probe: &str) -> Result<(), String> {
         }
         // Reject-parity: we reject the probe AND the reference rejects it. It
         // is NOT a compat gap, so it carries no owning issue and is not routed
-        // through `check_interim_issue`. The residual reject-parity stages both
-        // produce a `NotYetSupported` that names the stage, so the arm enforces
-        // the same construct-named-error contract as `interim-named` (a stage
-        // that now parses, or errors generically, or names a different
-        // construct, is RED). The live differential separately confirms the
-        // reference still rejects (an oracle flip to Accept is RED there).
-        Status::RejectParity => {
-            let want = d.error_construct.as_deref().ok_or_else(|| {
-                format!("{}: reject-parity requires `error_construct`", d.construct)
-            })?;
-            match &class {
-                ProbeClass::Named(got) if got == want => {
-                    let err = parse(probe).expect_err("reject-parity probe must error");
-                    if err.to_string().contains(want) {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "{}: NotYetSupported Display {:?} does not name {want:?}",
-                            d.construct,
-                            err.to_string()
-                        ))
-                    }
-                }
-                ProbeClass::Named(got) => Err(format!(
-                    "{}: reject-parity error_construct {want:?} but probe named {got:?}",
-                    d.construct
-                )),
-                ProbeClass::Parses(_) => Err(format!(
-                    "{}: reject-parity but probe {probe:?} now parses (we no longer reject it)",
-                    d.construct
-                )),
-                ProbeClass::Generic => Err(format!(
-                    "{}: reject-parity but probe {probe:?} errored generically (expected a named boundary)",
-                    d.construct
-                )),
-            }
-        }
+        // through `check_interim_issue`. Loki rejects these constructs with a
+        // *generic* syntax error (they are absent from its grammar), so the
+        // only contract is that BOTH engines reject — whether PulsusDB names
+        // the construct (`| ip` → `Named`) or rejects generically
+        // (`| distinct` → `Generic`, issue #221) is irrelevant. Only a probe
+        // that now PARSES is RED. The live differential separately confirms
+        // the reference still rejects (an oracle flip to Accept is RED there).
+        Status::RejectParity => match &class {
+            ProbeClass::Parses(_) => Err(format!(
+                "{}: reject-parity but probe {probe:?} now parses (we no longer reject it)",
+                d.construct
+            )),
+            _ => Ok(()),
+        },
         Status::Divergence => check_divergence(d),
     }
 }
@@ -1103,7 +1083,8 @@ fn differential_categories_are_pinned() {
     // `supported` and this closeout moved the 2 both-reject residuals
     // (`stage.distinct`/`stage.ip`) into the new reject-parity bucket
     // (both_reject 2 → 0, reject_parity = 2), driving tracked interim to 0.
-    assert_eq!(supported, 97, "supported (both-accept agreement) count pin");
+    // #221 added `func.vector` (supported) → 98.
+    assert_eq!(supported, 98, "supported (both-accept agreement) count pin");
     assert_eq!(
         tracked_interim, 0,
         "tracked interim gap count pin (interim ∧ oracle accepts, each with an owning issue)"
@@ -1517,15 +1498,17 @@ fn divergence_fixture() -> Disposition {
     }
 }
 
-/// A reject-parity fixture: a residual stage the parser still rejects with a
-/// construct-named `NotYetSupported` and the reference also rejects (terminal,
-/// no owning issue). `distinct`/`ip` are the two live residuals.
+/// A reject-parity fixture: a residual construct both engines reject
+/// (terminal, no owning issue). Loki rejects generically, so the harness
+/// only requires that PulsusDB rejects too — `error_construct` is inert
+/// (issue #221). `distinct` (generic) and `ip` (named) are the two live
+/// residuals.
 fn reject_parity_fixture() -> Disposition {
     Disposition {
         construct: "fixture.reject-parity".to_string(),
         status: Status::RejectParity,
         oracle: Oracle::Reject,
-        error_construct: Some("distinct".to_string()),
+        error_construct: None,
         evidence: vec![],
         owning_issue: None,
         justification: None,
@@ -1535,11 +1518,20 @@ fn reject_parity_fixture() -> Disposition {
 }
 
 #[test]
-fn reject_parity_naming_its_construct_validates() {
-    // GREEN: the probe still reaches a NotYetSupported boundary naming its
-    // error_construct (`distinct`) — parity preserved.
+fn reject_parity_generic_rejection_validates() {
+    // GREEN: `| distinct` now rejects with a generic syntax error (not a
+    // named boundary) — a valid reject-parity, since Loki also rejects it
+    // generically (issue #221).
     check_status(&reject_parity_fixture(), r#"{app="x"} | distinct"#)
-        .expect("a named boundary naming `distinct` is a valid reject-parity");
+        .expect("a generic rejection is a valid reject-parity");
+}
+
+#[test]
+fn reject_parity_named_rejection_also_validates() {
+    // GREEN: `| ip` still rejects with a construct-named `NotYetSupported`
+    // boundary — also a valid reject-parity (rejection kind is irrelevant).
+    check_status(&reject_parity_fixture(), r#"{app="x"} | ip"#)
+        .expect("a named rejection is a valid reject-parity");
 }
 
 #[test]
@@ -1547,20 +1539,6 @@ fn reject_parity_probe_that_now_parses_is_red() {
     // RED: a reject-parity construct whose probe now parses `Ok` means we
     // stopped rejecting it — the disposition must be flipped deliberately.
     assert!(check_status(&reject_parity_fixture(), r#"{app="x"}"#).is_err());
-}
-
-#[test]
-fn reject_parity_naming_a_different_construct_is_red() {
-    // RED: error_construct is `distinct` but the probe names `ip`.
-    assert!(check_status(&reject_parity_fixture(), r#"{app="x"} | ip"#).is_err());
-}
-
-#[test]
-fn reject_parity_without_error_construct_is_red() {
-    // RED: reject-parity requires a construct-named boundary.
-    let mut d = reject_parity_fixture();
-    d.error_construct = None;
-    assert!(check_status(&d, r#"{app="x"} | distinct"#).is_err());
 }
 
 #[test]

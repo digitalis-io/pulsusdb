@@ -43,7 +43,8 @@ use pulsus_logql::{Expr, parse};
 use pulsus_read::logql::rows::{MetricScanRow, StreamMetaRow};
 use pulsus_read::logql::{
     ClientWindow, CompiledPipeline, Direction, MetricNode, MetricPlan, Plan, PlanCtx, QueryParams,
-    QueryResult, QuerySpec, apply_vector_aggs, combine_binary, plan, run_client_agg_rows,
+    QueryResult, QuerySpec, apply_vector_aggs, combine_binary, materialize_vector_lit, plan,
+    run_client_agg_rows,
 };
 
 /// A sorted label set.
@@ -683,6 +684,9 @@ fn eval_leaf(mp: &MetricPlan, store: &Store) -> Result<QueryResult, String> {
 fn eval_node(node: &MetricNode, store: &Store) -> Result<QueryResult, String> {
     match node {
         MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
+        MetricNode::VectorLit { value, window } => {
+            materialize_vector_lit(*value, window).map_err(|e| e.to_string())
+        }
         MetricNode::Leaf(mp) => eval_leaf(mp, store),
         MetricNode::Binary {
             op,

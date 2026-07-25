@@ -694,6 +694,13 @@
       "syntax": "bare scalar number",
       "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#binary-operators",
       "probe": "count_over_time({app=\"x\"}[5m]) * 2"
+    },
+    {
+      "id": "func.vector",
+      "category": "functions",
+      "syntax": "vector(<scalar>)",
+      "doc": "https://grafana.com/docs/loki/latest/query/metric_queries/#vector",
+      "probe": "vector(1)"
     }
   ]
 }

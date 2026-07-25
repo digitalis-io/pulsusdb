@@ -20,6 +20,7 @@ use pulsus_logql::{
 
 use super::error::ReadError;
 use super::escape::{ch_regex_anchored, ch_regex_unanchored, ch_string};
+use super::exec::ClientWindow;
 use super::params::{Direction, PlanCtx, QueryParams, QuerySpec};
 
 /// A pure fetch plan for either query shape. See the module docs for why
@@ -197,6 +198,14 @@ pub enum ClientValue {
 pub enum MetricNode {
     Leaf(Box<MetricPlan>),
     Scalar(f64),
+    /// `vector(<scalar>)` (issue #221): a constant promoted to a vector
+    /// result (`{} => value`). Carries the resolved evaluation `window` so
+    /// exec materializes an instant single-sample vector or a range
+    /// constant `{}` matrix (reusing the shared bucket grid + cap).
+    VectorLit {
+        value: f64,
+        window: ClientWindow,
+    },
     Binary {
         op: BinOp,
         /// The `bool` comparison modifier (0/1 instead of filtering).
@@ -227,11 +236,30 @@ impl MetricNode {
         match self {
             MetricNode::Leaf(mp) => out.push(mp),
             MetricNode::Scalar(_) => {}
+            // A `vector(n)` literal is series-producing but reads no DB
+            // leaf (mirrors `Scalar` for leaf collection — see
+            // `produces_series`).
+            MetricNode::VectorLit { .. } => {}
             MetricNode::Binary { lhs, rhs, .. } => {
                 lhs.collect_leaves(out);
                 rhs.collect_leaves(out);
             }
             MetricNode::VectorAgg { inner, .. } => inner.collect_leaves(out),
+        }
+    }
+
+    /// Whether the tree produces a series result (vector/matrix) rather
+    /// than a pure scalar. True for any [`MetricNode::Leaf`] (a DB-read
+    /// range aggregation) or any [`MetricNode::VectorLit`] (`vector(n)`,
+    /// which yields `{} => n`); false for a pure-literal tree (`5`,
+    /// `5+3`). Drives `binary_result_type`'s scalar-vs-vector/matrix
+    /// classification (issue #221).
+    pub fn produces_series(&self) -> bool {
+        match self {
+            MetricNode::Leaf(_) | MetricNode::VectorLit { .. } => true,
+            MetricNode::Scalar(_) => false,
+            MetricNode::Binary { lhs, rhs, .. } => lhs.produces_series() || rhs.produces_series(),
+            MetricNode::VectorAgg { inner, .. } => inner.produces_series(),
         }
     }
 }
@@ -309,6 +337,10 @@ fn build_metric_node(
             raw,
             "scalar literal",
         )?)),
+        MetricExpr::VectorFn(raw) => Ok(MetricNode::VectorLit {
+            value: parse_plan_number(raw, "vector() value")?,
+            window: window_from(p),
+        }),
         MetricExpr::Binary {
             op,
             modifier,
@@ -350,6 +382,30 @@ fn build_metric_node(
                 }),
             }
         }
+    }
+}
+
+/// The evaluation window for a leafless `vector(n)` node (issue #221),
+/// taken from the same [`QuerySpec`] source `metric_plan` reads: instant
+/// is `step_ns: None` (a single `{} => n` sample), range carries the
+/// spec's `start_ns`/`end_ns`/`step_ns` so exec materializes the constant
+/// `{}` matrix on the shared bucket grid.
+fn window_from(p: &QueryParams) -> ClientWindow {
+    match p.spec {
+        QuerySpec::Instant { at_ns } => ClientWindow {
+            start_ns: at_ns,
+            end_ns: at_ns,
+            step_ns: None,
+        },
+        QuerySpec::Range {
+            start_ns,
+            end_ns,
+            step_ns,
+        } => ClientWindow {
+            start_ns,
+            end_ns,
+            step_ns: Some(step_ns),
+        },
     }
 }
 

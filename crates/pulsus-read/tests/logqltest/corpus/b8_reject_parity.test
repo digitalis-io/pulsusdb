@@ -1,0 +1,23 @@
+# B8 — reject-parity eval_fail corpus (issue #221).
+#
+# `distinct` (a pipeline stage) and `scalar()` (a function) are NOT Loki
+# v3.7.4 constructs — both are absent from its grammar and Loki rejects each
+# with an HTTP 400. Parity therefore means PulsusDB rejects them too; these
+# `eval_fail` cases pin that rejection (the `msg:` substring is a stable
+# fragment of PulsusDB's parse-error Display). The reference-rejects side is
+# additionally pinned by the reject-parity registry disposition + the live
+# differential leg (see the conformance harness).
+
+load
+  {env="prod", service_name="rp"}
+  0s  x=1
+
+# `| distinct` falls through to the label-filter parser (no such stage in the
+# grammar), which fails on the missing operator — a generic syntax error,
+# never a misleading `NotYetSupported` placeholder.
+eval_fail instant at 60s {service_name="rp"} | distinct foo
+  msg: label-filter operator
+
+# `scalar()` is not a recognized aggregation function — a generic rejection.
+eval_fail instant at 60s scalar(rate({service_name="rp"}[1m]))
+  msg: aggregation function

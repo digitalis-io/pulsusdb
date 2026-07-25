@@ -431,6 +431,49 @@ mod tests {
         assert_eq!(json["errorType"], "unavailable");
     }
 
+    /// Issue #221: an over-cap **leafless** `vector(n)` range query is guarded
+    /// at the engine's materialization boundary (no leaf ever runs, so it
+    /// bypasses `ClientAggState::new`'s cap) and returns the same
+    /// `QueryTooBroad(MetricBuckets)` a leaf over-cap range query trips —
+    /// cap-checked BEFORE allocating any grid, with no DB round-trip. This
+    /// drives the REAL over-cap-vector error (`materialize_vector_lit`, the
+    /// exact function `run_metric_node` calls for a `VectorLit`) through the
+    /// handler's `ReadError` → response conversion (the same
+    /// `From<ReadError> for ApiError` + `IntoResponse` path `query_range` uses
+    /// via `?`), asserting it surfaces end-to-end as **422 query_too_broad**
+    /// with the 11000-bucket-cap message — identical to any other over-cap
+    /// LogQL range query.
+    ///
+    /// Driving the `query_range` HTTP entrypoint itself to the engine requires
+    /// a live `ChPool` (there is no hermetic `ChPool`/`ChClient`/`LogQlEngine`
+    /// constructor — every path pings a real endpoint), and the LogQL handler
+    /// deliberately has NO param-layer cap pre-check (plan v4/v5: it would
+    /// diverge the leaf error semantics 422→400). So the hermetic ceiling is
+    /// this composed proof: the real leafless-vector error + the handler's
+    /// real error-mapping. The window matches the `QuerySpec::Range` →
+    /// evaluation-window mapping `query_range_impl` builds (`start_ns`/
+    /// `end_ns`/`step_ns`), so it is the exact error an over-cap
+    /// `query_range` would carry.
+    #[tokio::test]
+    async fn over_cap_leafless_vector_range_maps_to_422_query_too_broad() {
+        const S: i64 = 1_000_000_000; // 1s
+        // 11_001 buckets over `(0, 11000s]` at a 1s step > the 11000 cap.
+        let window = pulsus_read::logql::ClientWindow {
+            start_ns: 0,
+            end_ns: 11_000 * S,
+            step_ns: Some(S as u64),
+        };
+        let err = pulsus_read::logql::materialize_vector_lit(0.0, &window)
+            .expect_err("an over-cap vector(n) range query must reject");
+        let (status, json) = status_and_body(ApiError::Read(err).into_response()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json["errorType"], "query_too_broad");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains("11000"),
+            "over-cap message must name the 11000-bucket cap: {json:?}"
+        );
+    }
+
     #[tokio::test]
     async fn query_range_missing_query_param_is_400_bad_data() {
         let res = query_range(State(test_state()), HeaderMap::new(), RawQuery(None)).await;

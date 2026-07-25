@@ -1126,6 +1126,7 @@ impl LogQlEngine {
             match node {
                 MetricNode::Leaf(mp) => self.run_metric_inner(mp, explain.as_deref_mut()).await,
                 MetricNode::Scalar(v) => Ok(QueryResult::Scalar(*v)),
+                MetricNode::VectorLit { value, window } => materialize_vector_lit(*value, window),
                 MetricNode::VectorAgg { aggs, inner } => {
                     let result = self.run_metric_node(inner, explain.as_deref_mut()).await?;
                     Ok(apply_vector_aggs(result, aggs))
@@ -2615,11 +2616,14 @@ fn advance_tail_cursor(prev: Option<TailCursor>, rows: &[TailSampleRow]) -> Opti
     })
 }
 
-/// The `resultType` a binary metric plan produces: `scalar` for a
-/// leaf-less (pure-literal) tree, otherwise vector/matrix per the query
-/// spec — the same rule the encoder applies to the evaluated result.
+/// The `resultType` a binary metric plan produces: `scalar` for a tree
+/// that produces no series (pure-literal, e.g. `5`/`5+3`), otherwise
+/// vector/matrix per the query spec — the same rule the encoder applies to
+/// the evaluated result. A `vector(n)` leaf (issue #221) produces a series
+/// (`{} => n`), so `produces_series()` classifies a vector-lit-bearing tree
+/// as vector/matrix even though it has no [`MetricNode::Leaf`].
 fn binary_result_type(node: &MetricNode, params: &QueryParams) -> &'static str {
-    if node.leaves().is_empty() {
+    if !node.produces_series() {
         "scalar"
     } else if matches!(params.spec, QuerySpec::Instant { .. }) {
         "vector"
@@ -2880,7 +2884,7 @@ impl<'m> StreamAccumulator<'m> {
 /// `step_ns: None` = instant (one bucket over the whole window);
 /// `Some(step)` = the M1 tumbling bucket contract (`floor(ts/step) *
 /// step`, matching the SQL path's `intDiv` bucketing byte-for-byte).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClientWindow {
     pub start_ns: i64,
     pub end_ns: i64,
@@ -3522,6 +3526,46 @@ fn grid_bucket_count(start_ns: i64, end_ns: i64, step_ns: u64) -> u64 {
         Some(count) if count <= 0 => 0,
         Some(count) => u64::try_from(count).unwrap_or(u64::MAX),
         None => u64::MAX,
+    }
+}
+
+/// Materializes `vector(<scalar>)` (issue #221): promotes a constant to a
+/// vector/matrix result with an empty label set. Instant queries yield a
+/// single `{} => value` sample; range queries yield one constant `{}`
+/// series populated at every evaluation-grid step.
+///
+/// A leafless `vector(n)` bypasses [`ClientAggState::new`]'s
+/// `MAX_CLIENT_AGG_BUCKETS` guard (no leaf ever runs), so this checks the
+/// same cap via [`grid_bucket_count`] BEFORE materializing any grid — an
+/// over-cap `vector(n)` returns the identical `QueryTooBroad(MetricBuckets)`
+/// 422 as every other over-cap LogQL range query, with zero allocation and
+/// no DB round-trip. The grid itself REUSES [`bucket_grid`] (the same
+/// i128-safe, `clamp_bucket`-narrowed, `(start,end]`-aligned grid a leaf
+/// range query and `absent_over_time` use), so `points.len() == buckets`
+/// and a `data + vector(n)` binop aligns on the data's populated steps.
+pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<QueryResult, ReadError> {
+    match window.step_ns {
+        None => Ok(QueryResult::Vector(vec![VectorSample {
+            labels: vec![],
+            value,
+        }])),
+        Some(step) => {
+            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
+            if buckets > MAX_CLIENT_AGG_BUCKETS {
+                return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
+                    buckets,
+                    cap: MAX_CLIENT_AGG_BUCKETS,
+                }));
+            }
+            let points = bucket_grid(window.start_ns, window.end_ns, step)
+                .into_iter()
+                .map(|ts| (ts, value))
+                .collect();
+            Ok(QueryResult::Matrix(vec![MatrixSeries {
+                labels: vec![],
+                points,
+            }]))
+        }
     }
 }
 
