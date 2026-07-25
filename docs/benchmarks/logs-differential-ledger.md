@@ -169,36 +169,33 @@ Out of this ledger's scope by design:
 
 ## Entries
 
-### tumbling-vs-sliding-rate
+### tumbling-vs-sliding-rate — RESOLVED (issue #227)
 
-- **Case:** `metric_rate_tumbling` (issue M6-10 — the range-window
-  divergence deliberately left for the metric differential by the M6-09
-  ledger), and the issue #91 RANGE vector-matching cases
-  `metric_match_on_range`, `metric_match_ignoring_range`,
-  `metric_match_group_left_range`, `metric_match_group_right_range` (the
-  per-step instant join over `count_over_time` inherits the SAME
-  tumbling-vs-sliding bucket-alignment divergence — the join is applied
-  identically per step on both stores, so the only delta is the
-  underlying range-window alignment already ratified here).
-- **Exact accepted delta:** for RANGE metric queries, PulsusDB evaluates
-  fixed, epoch-aligned, non-overlapping tumbling buckets
-  (`intDiv(timestamp_ns, step) * step`; `rate` = bucket count / step
-  seconds, point stamped at the bucket start), while the oracle
-  re-evaluates a sliding `[range]` window at every request-aligned step
-  timestamp. Point timestamps therefore differ by alignment (bucket
-  start, epoch-aligned vs evaluation instant, request-`start`-aligned)
-  and window membership differs at the edges — the two point sets are
-  disjoint-by-construction for an unaligned request `start`. This is the
-  documented M1 tumbling contract (docs/architecture.md §5.3 /
-  `logql::params::QuerySpec::Range`), not a bug; sliding-window parity
-  is a scheduled later milestone.
-- **Gating:** the oracle comparison is informational for this case ONLY;
-  PulsusDB remains hard-gated against the tumbling by-construction
-  corpus expectation, and anti-rot applies (if the oracle ever matches
-  exactly, the run fails so the case is re-gated). INSTANT metric
-  queries have identical window semantics on both stores (`(t - range,
-  t]` at one evaluation instant) — every other M6-10 metric case is
-  instant-shaped and stays fully gated.
+- **Status:** RESOLVED. The former tumbling divergence is fixed — RANGE
+  metric queries now evaluate Loki's **sliding** `[range]` windows
+  bit-exactly (issue #227). The window `(t-range, t]` is re-evaluated at
+  every start-anchored grid point `{start + k·step ≤ end}`, streamed off
+  raw `log_samples` (the 5s rollup fast-path is retired for range reads —
+  it cannot reproduce Loki's per-event boundary). `rate({}[1m])` and
+  `rate({}[10m])` now differ, and point timestamps + window membership
+  match Loki. Reducer classes A (invert-integer) / B (re-reduce
+  order-independent) / C (canonical-fold) mirror Loki's
+  `batchRangeVectorIterator`.
+- **One ratified residual divergence:** same-nanosecond, **same-stream**
+  samples are ordered deterministically by full body bytes (a group-local
+  `tie_rank`) rather than Loki's unstored chunk-insertion order (PulsusDB
+  stores no ingestion ordinal). Cross-stream same-ts ties ARE Loki-exact
+  via `StableHash` (`xxhash64`, seed 0, sorted `name·0xFF·value·0xFF`).
+  The residual is measure-rare (two samples at the identical nanosecond in
+  one stream), byte-stable across runs, and bounded by a
+  `MAX_TS_COLLISION_GROUP` clean 422 — it affects only class-C float
+  low-bits and `first`/`last` value at an identical-ns same-stream
+  boundary.
+- **Gating:** the live `schema-it` differential now asserts the raw
+  sliding path is bit-exact to `grafana/loki:3.7.4` on an off-5s-boundary
+  grid (env-gated), plus the hermetic `logqltest` `eval range` corpus.
+  INSTANT metric queries were already identical (`(t - range, t]` at one
+  evaluation instant) and are unchanged.
 
 ### matching-error-status-divergence (informational note, not a gate downgrade)
 

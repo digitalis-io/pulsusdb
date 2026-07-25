@@ -20,18 +20,20 @@ pub enum Direction {
 /// range, at]` (the `range` comes from the query's own range-vector
 /// duration, e.g. `[5m]`, for metric queries; stream queries have no
 /// window narrower than the caller-supplied bound) and produces a single
-/// aggregate per series, never an `intDiv` bucket expression. `Range`
-/// produces the step-aligned bucketed shape (docs/schemas.md §3.2).
+/// aggregate per series.
 ///
-/// **M1 rate semantic (task-manager resolution #4):** `Range` bucketing is
-/// *fixed, step-aligned, non-overlapping* — `intDiv(ts, step) * step` tumbling
-/// windows — not Prometheus/Loki's sliding `[range]` window re-evaluated at
-/// every step. A query whose step does not divide evenly into whole
-/// buckets, or whose declared range differs from its step, still buckets by
-/// `step` alone; the range-vector duration only bounds which raw samples
-/// are considered eligible for rollup routing. This is a documented M1
-/// simplification, not sliding-window parity — full parity is an M6
-/// concern.
+/// **`Range` = Loki sliding windows (issue #227).** A range metric query
+/// re-evaluates the `[range]` window `(t - range, t]` at every
+/// **start-anchored** grid point `t ∈ {start + k·step ≤ end}` (Loki's
+/// `batchRangeVectorIterator`), streamed off raw `log_samples` — NOT the
+/// former fixed, epoch-aligned, non-overlapping `intDiv(ts, step) * step`
+/// tumbling buckets, and NOT the 5s rollup (which cannot reproduce Loki's
+/// per-event boundary). So `rate({}[1m]) ≠ rate({}[10m])`: the window width
+/// AND the `rate`/`bytes_rate` divisor both track the `[range]`, never
+/// `step`. The scan is widened to `(start - range, end]` so the first grid
+/// point sees its full lookback. The `[range]` itself is carried on
+/// [`super::plan::MetricPlan::range_ns`], not this spec (no type-shape
+/// churn). See docs/features.md and docs/benchmarks/logs-differential-ledger.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuerySpec {
     Instant {
