@@ -1,0 +1,167 @@
+# Batch B5 — binary operations value corpus (issue #220 lean plan).
+#
+# Every metric operand is client-path (`| json` parser stage); every eval is
+# `instant at 60s`; the dataset is exactly the query scope (the stream
+# selector is not re-applied by the hermetic runner). Values captured
+# bit-exact from grafana/loki:3.7.4 (container loki-b5, host :3105, WAL +
+# service/level auto-discovery disabled).
+#
+# Dataset A (one stream, service svc-json): method/status/tier counts over a
+# [30m] window at t=60s:
+#   sum by(method):        GET 4 (=3x200 + 1x500), POST 2
+#   sum by(method,status): {GET,200} 3, {GET,500} 1, {POST,200} 2
+#   sum by(status):        200 -> 5, 500 -> 1  ; every entry tier="web".
+# Legend used below:
+#   ALL  = count_over_time({service_name="svc-json"} | json [30m])
+#   S200 = count_over_time({service_name="svc-json"} | json | status="200" [30m])
+#   S500 = count_over_time({service_name="svc-json"} | json | status="500" [30m])
+
+load
+  {env="prod", service_name="svc-json"} service=svc-json
+  0s  {"method":"GET","status":"200","tier":"web"}
+  1s  {"method":"GET","status":"200","tier":"web"}
+  2s  {"method":"GET","status":"200","tier":"web"}
+  3s  {"method":"GET","status":"500","tier":"web"}
+  4s  {"method":"POST","status":"200","tier":"web"}
+  5s  {"method":"POST","status":"200","tier":"web"}
+
+# --- Arithmetic vector<->vector (matched signature {method}) ------------
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) + sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 7
+  {method="POST"} 4
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) - sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 1
+  {method="POST"} 0
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) * sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 12
+  {method="POST"} 4
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) / sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 1.3333333333333333
+  {method="POST"} 1
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) % sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 1
+  {method="POST"} 0
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) ^ sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 64
+  {method="POST"} 4
+
+# --- Arithmetic vector<->scalar (both orientations) --------------------
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) / 2
+  {method="GET"} 2
+  {method="POST"} 1
+
+eval instant at 60s 2 * sum by(method)(count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET"} 8
+  {method="POST"} 4
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) + 1
+  {method="GET"} 5
+  {method="POST"} 3
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) * 60
+  {method="GET"} 240
+  {method="POST"} 120
+
+# --- Scalar<->scalar (bare literals; result is a single scalar) --------
+eval instant at 60s 2 + 3
+  5
+
+eval instant at 60s 10 % 3
+  1
+
+# --- Comparison filter (returns matching series, keeps LHS value) ------
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) > 3
+  {method="GET"} 4
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) >= 2
+  {method="GET"} 4
+  {method="POST"} 2
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) == 2
+  {method="POST"} 2
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) != 5
+  {method="GET"} 4
+  {method="POST"} 2
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) < 5
+  {method="GET"} 4
+  {method="POST"} 2
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) <= 5
+  {method="GET"} 4
+  {method="POST"} 2
+
+# --- Comparison with `bool` (every series kept, value 0/1) -------------
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) > bool 3
+  {method="GET"} 1
+  {method="POST"} 0
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) == bool 2
+  {method="GET"} 0
+  {method="POST"} 1
+
+# --- Comparison vector<->vector ---------------------------------------
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) > sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 4
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) >= sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 4
+  {method="POST"} 2
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) > bool sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 1
+  {method="POST"} 0
+
+# --- Logical / set operations (sig {method,status}) -------------------
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) and sum by(method,status)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET", status="200"} 3
+  {method="POST", status="200"} 2
+
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) unless sum by(method,status)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET", status="500"} 1
+
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) or sum by(method,status)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET", status="200"} 3
+  {method="GET", status="500"} 1
+  {method="POST", status="200"} 2
+
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) unless on(status) sum by(status)(count_over_time({service_name="svc-json"} | json | status="500" [30m]))
+  {method="GET", status="200"} 3
+  {method="POST", status="200"} 2
+
+# --- on() / ignoring() one-to-one -------------------------------------
+eval instant at 60s sum by(status)(count_over_time({service_name="svc-json"} | json [30m])) / on(status) sum by(status)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {status="200"} 1
+
+eval instant at 60s sum by(method)(count_over_time({service_name="svc-json"} | json [30m])) - ignoring(status) sum by(method)(count_over_time({service_name="svc-json"} | json | status="200" [30m]))
+  {method="GET"} 1
+  {method="POST"} 0
+
+# --- group_left / group_right (many-to-one) ---------------------------
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) / on(status) group_left sum by(status)(count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200"} 0.6
+  {method="GET", status="500"} 1
+  {method="POST", status="200"} 0.4
+
+eval instant at 60s sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m])) * on(status) group_left(tier) sum by(status,tier)(count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200", tier="web"} 15
+  {method="GET", status="500", tier="web"} 1
+  {method="POST", status="200", tier="web"} 10
+
+eval instant at 60s sum by(status)(count_over_time({service_name="svc-json"} | json [30m])) * on(status) group_right sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200"} 15
+  {method="GET", status="500"} 1
+  {method="POST", status="200"} 10
+
+eval instant at 60s sum by(status,tier)(count_over_time({service_name="svc-json"} | json [30m])) * on(status) group_right(tier) sum by(method,status)(count_over_time({service_name="svc-json"} | json [30m]))
+  {method="GET", status="200", tier="web"} 15
+  {method="GET", status="500", tier="web"} 1
+  {method="POST", status="200", tier="web"} 10
+
+clear

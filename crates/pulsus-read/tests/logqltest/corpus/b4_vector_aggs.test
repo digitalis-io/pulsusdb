@@ -1,0 +1,323 @@
+# B4 — vector-aggregation value corpus (issue #220, Lean plan).
+#
+# Every case is an instant metric eval: an OUTER vector aggregation
+# (sum/avg/max/min/count/stddev/stdvar/topk/bottomk/sort/sort_desc, bare
+# and with by/without grouping) over an INNER metric range expression
+# (count_over_time / rate through a `| logfmt` parser, the raw-scan
+# client-aggregation path). Instant metric queries are semantically
+# identical to the reference (docs/features.md:55), so every expected value
+# below is a BIT-EXACT capture from grafana/loki:3.7.4 (see PROVENANCE.md
+# for the capture procedure — the #218 discipline, never hand-computed).
+#
+# Datasets are multi-series (several logfmt-extracted label values) so the
+# grouping actually partitions; every loaded sample falls inside the query
+# window (t-range, t].
+
+# ===================================================================
+# DATASET A — region x host, per-series counts {us/a=2, us/b=4,
+# eu/a=6, eu/b=8}; count_over_time gives 4 series over 2 region groups.
+# Reducers bare / by(region) / without(host).
+# ===================================================================
+load
+  {env="prod", service_name="metrics-a"}
+  1s  region=us host=a
+  2s  region=us host=a
+  3s  region=us host=b
+  4s  region=us host=b
+  5s  region=us host=b
+  6s  region=us host=b
+  7s  region=eu host=a
+  8s  region=eu host=a
+  9s  region=eu host=a
+  10s  region=eu host=a
+  11s  region=eu host=a
+  12s  region=eu host=a
+  13s  region=eu host=b
+  14s  region=eu host=b
+  15s  region=eu host=b
+  16s  region=eu host=b
+  17s  region=eu host=b
+  18s  region=eu host=b
+  19s  region=eu host=b
+  20s  region=eu host=b
+
+# sum, bare -> single {} series = 20
+eval instant at 60s sum(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 20
+
+# sum by(region): us=6, eu=14
+eval instant at 60s sum by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 14
+  {region="us"} 6
+
+# sum without(host): keeps env/region/service_name
+eval instant at 60s sum without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 14
+  {env="prod", region="us", service_name="metrics-a"} 6
+
+# avg, bare = 20/4 = 5
+eval instant at 60s avg(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 5
+
+# avg by(region): us=3, eu=7
+eval instant at 60s avg by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 7
+  {region="us"} 3
+
+# avg without(host)
+eval instant at 60s avg without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 7
+  {env="prod", region="us", service_name="metrics-a"} 3
+
+# max, bare = 8
+eval instant at 60s max(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 8
+
+# max by(region): us=4, eu=8
+eval instant at 60s max by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 8
+  {region="us"} 4
+
+# max without(host)
+eval instant at 60s max without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 8
+  {env="prod", region="us", service_name="metrics-a"} 4
+
+# min, bare = 2
+eval instant at 60s min(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 2
+
+# min by(region): us=2, eu=6
+eval instant at 60s min by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 6
+  {region="us"} 2
+
+# min without(host)
+eval instant at 60s min without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 6
+  {env="prod", region="us", service_name="metrics-a"} 2
+
+# count, bare = 4 series
+eval instant at 60s count(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 4
+
+# count by(region): 2 per region
+eval instant at 60s count by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 2
+  {region="us"} 2
+
+# count without(host)
+eval instant at 60s count without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 2
+  {env="prod", region="us", service_name="metrics-a"} 2
+
+# stddev, bare: population stddev of {2,4,6,8}
+eval instant at 60s stddev(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 2.23606797749979
+
+# stddev by(region): each {..} pair -> 1
+eval instant at 60s stddev by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 1
+  {region="us"} 1
+
+# stddev without(host)
+eval instant at 60s stddev without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 1
+  {env="prod", region="us", service_name="metrics-a"} 1
+
+# stdvar, bare: population variance of {2,4,6,8} = 5
+eval instant at 60s stdvar(count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {} 5
+
+# stdvar by(region)
+eval instant at 60s stdvar by (region) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 1
+  {region="us"} 1
+
+# stdvar without(host)
+eval instant at 60s stdvar without (host) (count_over_time({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", region="eu", service_name="metrics-a"} 1
+  {env="prod", region="us", service_name="metrics-a"} 1
+
+# topk(2) over leaf rate -> eu/a, eu/b (set compare)
+eval instant at 60s topk(2, rate({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", host="a", region="eu", service_name="metrics-a"} 0.1
+  {env="prod", host="b", region="eu", service_name="metrics-a"} 0.13333333333333333
+
+# bottomk(2) over leaf rate -> us/a, us/b
+eval instant at 60s bottomk(2, rate({service_name="metrics-a"} | logfmt [1m]))
+  {env="prod", host="a", region="us", service_name="metrics-a"} 0.03333333333333333
+  {env="prod", host="b", region="us", service_name="metrics-a"} 0.06666666666666667
+
+# sum by(region) over rate (float sum)
+eval instant at 60s sum by (region) (rate({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 0.23333333333333334
+  {region="us"} 0.1
+
+# avg by(region) over rate
+eval instant at 60s avg by (region) (rate({service_name="metrics-a"} | logfmt [1m]))
+  {region="eu"} 0.11666666666666667
+  {region="us"} 0.05
+
+clear
+
+# ===================================================================
+# DATASET B — 5 distinct series by host, counts {h1=1, h2=3, h3=5,
+# h4=7, h5=9}; unambiguous topk/bottomk selection (set compare).
+# ===================================================================
+load
+  {env="prod", service_name="metrics-b"}
+  1s  host=h1
+  2s  host=h2
+  3s  host=h2
+  4s  host=h2
+  5s  host=h3
+  6s  host=h3
+  7s  host=h3
+  8s  host=h3
+  9s  host=h3
+  10s  host=h4
+  11s  host=h4
+  12s  host=h4
+  13s  host=h4
+  14s  host=h4
+  15s  host=h4
+  16s  host=h4
+  17s  host=h5
+  18s  host=h5
+  19s  host=h5
+  20s  host=h5
+  21s  host=h5
+  22s  host=h5
+  23s  host=h5
+  24s  host=h5
+  25s  host=h5
+
+# topk(2): h5=9, h4=7
+eval instant at 60s topk(2, count_over_time({service_name="metrics-b"} | logfmt [1m]))
+  {env="prod", host="h4", service_name="metrics-b"} 7
+  {env="prod", host="h5", service_name="metrics-b"} 9
+
+# bottomk(2): h1=1, h2=3
+eval instant at 60s bottomk(2, count_over_time({service_name="metrics-b"} | logfmt [1m]))
+  {env="prod", host="h1", service_name="metrics-b"} 1
+  {env="prod", host="h2", service_name="metrics-b"} 3
+
+# topk(1): h5=9
+eval instant at 60s topk(1, count_over_time({service_name="metrics-b"} | logfmt [1m]))
+  {env="prod", host="h5", service_name="metrics-b"} 9
+
+# bottomk(3): h1,h2,h3
+eval instant at 60s bottomk(3, count_over_time({service_name="metrics-b"} | logfmt [1m]))
+  {env="prod", host="h1", service_name="metrics-b"} 1
+  {env="prod", host="h2", service_name="metrics-b"} 3
+  {env="prod", host="h3", service_name="metrics-b"} 5
+
+clear
+
+# ===================================================================
+# DATASET C — 3 regions x 2 hosts (us=2+4, eu=6+8, ap=1+3); an inner
+# `sum by(region)` wrapped by topk/bottomk (nested composition).
+# ===================================================================
+load
+  {env="prod", service_name="metrics-c"}
+  1s  region=us host=a
+  2s  region=us host=a
+  3s  region=us host=b
+  4s  region=us host=b
+  5s  region=us host=b
+  6s  region=us host=b
+  7s  region=eu host=a
+  8s  region=eu host=a
+  9s  region=eu host=a
+  10s  region=eu host=a
+  11s  region=eu host=a
+  12s  region=eu host=a
+  13s  region=eu host=b
+  14s  region=eu host=b
+  15s  region=eu host=b
+  16s  region=eu host=b
+  17s  region=eu host=b
+  18s  region=eu host=b
+  19s  region=eu host=b
+  20s  region=eu host=b
+  21s  region=ap host=a
+  22s  region=ap host=b
+  23s  region=ap host=b
+  24s  region=ap host=b
+
+# sum by(region) over rate: us,eu,ap
+eval instant at 60s sum by (region) (rate({service_name="metrics-c"} | logfmt [1m]))
+  {region="ap"} 0.06666666666666667
+  {region="eu"} 0.23333333333333334
+  {region="us"} 0.1
+
+# topk(2, sum by(region)(count_over_time)): eu=14, us=6
+eval instant at 60s topk(2, sum by (region) (count_over_time({service_name="metrics-c"} | logfmt [1m])))
+  {region="eu"} 14
+  {region="us"} 6
+
+# bottomk(2, sum by(region)(count_over_time)): ap=4, us=6
+eval instant at 60s bottomk(2, sum by (region) (count_over_time({service_name="metrics-c"} | logfmt [1m])))
+  {region="ap"} 4
+  {region="us"} 6
+
+# topk(2, sum by(region)(rate)): eu, us
+eval instant at 60s topk(2, sum by (region) (rate({service_name="metrics-c"} | logfmt [1m])))
+  {region="eu"} 0.23333333333333334
+  {region="us"} 0.1
+
+clear
+
+# ===================================================================
+# DATASET D — 4 distinct series by svc, counts {a=2,b=4,c=6,d=8};
+# nested topk/bottomk over `sum by(svc)`, and ordered sort/sort_desc.
+# ===================================================================
+load
+  {env="prod", service_name="metrics-d"}
+  1s  svc=a
+  2s  svc=a
+  3s  svc=b
+  4s  svc=b
+  5s  svc=b
+  6s  svc=b
+  7s  svc=c
+  8s  svc=c
+  9s  svc=c
+  10s  svc=c
+  11s  svc=c
+  12s  svc=c
+  13s  svc=d
+  14s  svc=d
+  15s  svc=d
+  16s  svc=d
+  17s  svc=d
+  18s  svc=d
+  19s  svc=d
+  20s  svc=d
+
+# topk(2, sum by(svc)(count_over_time)): d=8, c=6
+eval instant at 60s topk(2, sum by (svc) (count_over_time({service_name="metrics-d"} | logfmt [1m])))
+  {svc="c"} 6
+  {svc="d"} 8
+
+# bottomk(2, sum by(svc)(count_over_time)): a=2, b=4
+eval instant at 60s bottomk(2, sum by (svc) (count_over_time({service_name="metrics-d"} | logfmt [1m])))
+  {svc="a"} 2
+  {svc="b"} 4
+
+# sort ascending by value (ORDERED compare)
+eval_ordered instant at 60s sort(count_over_time({service_name="metrics-d"} | logfmt [1m]))
+  {env="prod", service_name="metrics-d", svc="a"} 2
+  {env="prod", service_name="metrics-d", svc="b"} 4
+  {env="prod", service_name="metrics-d", svc="c"} 6
+  {env="prod", service_name="metrics-d", svc="d"} 8
+
+# sort_desc descending by value (ORDERED compare)
+eval_ordered instant at 60s sort_desc(count_over_time({service_name="metrics-d"} | logfmt [1m]))
+  {env="prod", service_name="metrics-d", svc="d"} 8
+  {env="prod", service_name="metrics-d", svc="c"} 6
+  {env="prod", service_name="metrics-d", svc="b"} 4
+  {env="prod", service_name="metrics-d", svc="a"} 2
+
+clear
