@@ -112,9 +112,10 @@ fn run_client(
         meta,
         client,
         ClientWindow {
-            start_ns: mp.start_ns,
+            start_ns: mp.grid_start_ns,
             end_ns: mp.end_ns,
             step_ns: mp.step_ns,
+            range_ns: mp.range_ns,
         },
         mp.rate_window_ns,
     )?;
@@ -2456,9 +2457,10 @@ fn eval_node(
                 meta,
                 client,
                 ClientWindow {
-                    start_ns: mp.start_ns,
+                    start_ns: mp.grid_start_ns,
                     end_ns: mp.end_ns,
                     step_ns: mp.step_ns,
+                    range_ns: mp.range_ns,
                 },
                 mp.rate_window_ns,
             )?;
@@ -2542,6 +2544,7 @@ fn range_vector_lit_over_the_bucket_cap_rejects_without_allocating() {
         start_ns: 0,
         end_ns: 11_000 * NS,
         step_ns: Some(NS as u64),
+        range_ns: 0,
     };
     match materialize_vector_lit(0.0, &window) {
         Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets { buckets, cap })) => {
@@ -2560,6 +2563,7 @@ fn range_vector_lit_at_the_bucket_cap_passes_with_exact_point_count() {
         start_ns: 0,
         end_ns: 10_999 * NS,
         step_ns: Some(NS as u64),
+        range_ns: 0,
     };
     let out = materialize_vector_lit(7.0, &window).expect("at-cap must pass");
     let points = single_series_points(out);
@@ -2577,42 +2581,53 @@ fn range_vector_lit_grid_aligns_under_an_unaligned_start() {
         start_ns: 7 * NS,
         end_ns: 37 * NS,
         step_ns: Some(step as u64),
+        range_ns: 0,
     };
     let vec_matrix = materialize_vector_lit(0.0, &window).expect("materialize");
+    // Issue #227: the grid is START-anchored `{start + k·step ≤ end}`, so an
+    // unaligned `start=7NS` yields `7NS, 17NS, 27NS, 37NS` (NOT epoch
+    // multiples) — matching the sliding data leaves' grid.
+    let start = 7 * NS;
     assert_eq!(
         single_series_points(vec_matrix.clone()),
-        vec![(0, 0.0), (step, 0.0), (2 * step, 0.0), (3 * step, 0.0)],
+        vec![
+            (start, 0.0),
+            (start + step, 0.0),
+            (start + 2 * step, 0.0),
+            (start + 3 * step, 0.0),
+        ],
     );
 
-    // A sparse data series populated only at two of the grid steps. Empty
-    // labels so it one-to-one matches vector(0)'s `{}` series — the test
-    // isolates GRID/step alignment, not label matching.
+    // A sparse data series populated only at two of the (start-anchored) grid
+    // steps. Empty labels so it one-to-one matches vector(0)'s `{}` series —
+    // the test isolates GRID/step alignment, not label matching.
     let data = QueryResult::Matrix(vec![MatrixSeries {
         labels: vec![],
-        points: vec![(step, 4.0), (3 * step, 9.0)],
+        points: vec![(start + step, 4.0), (start + 3 * step, 9.0)],
     }]);
     let combined = combine_binary(BinOp::Add, false, None, data, vec_matrix).expect("combine");
     assert_eq!(
         single_series_points(combined),
-        vec![(step, 4.0), (3 * step, 9.0)],
+        vec![(start + step, 4.0), (start + 3 * step, 9.0)],
     );
 }
 
 /// Round-4 regression: an `i64::MIN` range window must not panic/overflow —
-/// `vector(n)` inherits `bucket_grid`'s i128 math + `clamp_bucket`
-/// narrowing, so the extreme lower bucket is clamped, not wrapped.
+/// `vector(n)` inherits `bucket_grid`'s i128 math, so the start-anchored grid
+/// begins exactly at `i64::MIN` (k=0) without wrapping.
 #[test]
 fn range_vector_lit_is_i64_min_safe() {
     let window = ClientWindow {
         start_ns: i64::MIN,
         end_ns: i64::MIN + 3 * NS,
         step_ns: Some(NS as u64),
+        range_ns: 0,
     };
     let out = materialize_vector_lit(0.0, &window).expect("i64::MIN window must not panic");
     let points = single_series_points(out);
     assert!(!points.is_empty());
-    // The lowest grid bucket sits one step below `i64::MIN`; `clamp_bucket`
-    // narrows it to exactly `i64::MIN` (i128 math), never a wrapped value.
+    // Start-anchored: the first grid point is `grid_start` = `i64::MIN` (k=0),
+    // computed in i128 and cast back without wrapping.
     assert_eq!(points[0].0, i64::MIN);
 }
 

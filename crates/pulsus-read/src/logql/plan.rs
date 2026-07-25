@@ -1279,8 +1279,12 @@ mod tests {
         assert!(matches!(err, ReadError::InvalidStep));
     }
 
+    /// Issue #227: a range query NO LONGER routes to the 5s rollup on a
+    /// resolution-dividing step — the rollup cannot reproduce Loki's
+    /// per-event sliding-window boundary, so every range read is the
+    /// streaming raw path.
     #[test]
-    fn a_step_dividing_the_resolution_routes_to_rollup_with_a_named_reason() {
+    fn a_range_query_routes_to_the_sliding_raw_path_regardless_of_step() {
         let mp = metric_mp(
             r#"rate({env="prod"}[5m])"#,
             QuerySpec::Range {
@@ -1290,16 +1294,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(mp.routing.chosen, RouteChoice::Rollup);
-        assert!(mp.rollup);
+        assert_eq!(mp.routing.chosen, RouteChoice::Raw);
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some(), "range routes to the client slide");
         assert_eq!(
             mp.routing.reason,
-            "rollup: step 60000000000 ns divisible by resolution 5000000000 ns"
+            "raw: sliding-window range aggregation (issue #227)"
         );
     }
 
+    /// Issue #227: a non-dividing step is also the sliding raw path (there is
+    /// no longer a rollup-vs-raw distinction for range reads).
     #[test]
-    fn a_step_not_dividing_the_resolution_routes_to_raw_with_a_named_reason() {
+    fn a_range_query_with_a_non_dividing_step_still_slides_raw() {
         let mp = metric_mp(
             r#"rate({env="prod"}[5m])"#,
             QuerySpec::Range {
@@ -1313,12 +1320,14 @@ mod tests {
         assert!(!mp.rollup);
         assert_eq!(
             mp.routing.reason,
-            "raw: step 3000000000 ns not a multiple of resolution 5000000000 ns"
+            "raw: sliding-window range aggregation (issue #227)"
         );
     }
 
+    /// Issue #227: a range query WITH a line filter is the pipeline/unwrap
+    /// client path (a beyond-plain aggregation), still raw and sliding.
     #[test]
-    fn a_line_filter_routes_to_raw_with_a_named_reason_even_on_an_eligible_step() {
+    fn a_range_line_filter_query_routes_to_raw_client_aggregation() {
         let mp = metric_mp(
             r#"count_over_time({env="prod"} |= "err" [5m])"#,
             QuerySpec::Range {
@@ -1329,7 +1338,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
-        assert_eq!(mp.routing.reason, "raw: line filter present");
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some());
+        // A plain line filter is pushed as a predicate, not a beyond-line
+        // stage, so the reason is the sliding-range reason.
+        assert_eq!(
+            mp.routing.reason,
+            "raw: sliding-window range aggregation (issue #227)"
+        );
+        assert_eq!(mp.extra_predicates.len(), 1, "the line filter is pushed");
     }
 
     #[test]
@@ -1346,8 +1363,10 @@ mod tests {
         assert_eq!(mp.routing.reason, "raw: instant query");
     }
 
+    /// Issue #227: rollup resolution is irrelevant to a range read now (it
+    /// always slides raw) — an unconfigured resolution changes nothing.
     #[test]
-    fn an_unconfigured_rollup_resolution_routes_to_raw_with_a_named_reason() {
+    fn an_unconfigured_rollup_resolution_still_slides_raw_for_range() {
         let params = QueryParams {
             spec: QuerySpec::Range {
                 start_ns: 0,
@@ -1365,7 +1384,10 @@ mod tests {
             Plan::Streams(_) | Plan::MetricBinary(_) => panic!("expected a Metric plan"),
         };
         assert_eq!(mp.routing.chosen, RouteChoice::Raw);
-        assert_eq!(mp.routing.reason, "raw: rollup resolution not configured");
+        assert_eq!(
+            mp.routing.reason,
+            "raw: sliding-window range aggregation (issue #227)"
+        );
     }
 
     /// Precedence lock (code review fix, issue #12): `Instant` must win
@@ -1816,10 +1838,11 @@ mod tests {
         assert!(!return_bool);
         let leaves = node.leaves();
         assert_eq!(leaves.len(), 2);
-        // Each leaf routes exactly as it would standalone (rollup here).
+        // Each leaf routes exactly as it would standalone — issue #227: a
+        // range leaf slides raw (client-aggregated), never rollup.
         for leaf in leaves {
-            assert!(leaf.rollup);
-            assert!(leaf.client.is_none());
+            assert!(!leaf.rollup);
+            assert!(leaf.client.is_some());
         }
     }
 
@@ -1876,8 +1899,10 @@ mod tests {
         assert_eq!(mp.vector_aggs.len(), 1);
         assert_eq!(mp.vector_aggs[0].0, VectorAggOp::Topk);
         assert_eq!(mp.vector_aggs[0].2, Some(5.0));
-        // topk/bottomk never disturb the inner query's routing.
-        assert!(mp.rollup);
+        // topk/bottomk never disturb the inner query's routing — issue #227:
+        // a range leaf slides raw (client-aggregated), never rollup.
+        assert!(!mp.rollup);
+        assert!(mp.client.is_some());
     }
 
     #[test]

@@ -395,9 +395,10 @@ fn per_row_allocation_bounds_hold() {
     let client = mp.client.as_ref().expect("client-aggregated");
     let compiled = CompiledPipeline::compile(&client.pipeline).expect("compile");
     let window = ClientWindow {
-        start_ns: mp.start_ns,
+        start_ns: mp.grid_start_ns,
         end_ns: mp.end_ns,
         step_ns: mp.step_ns,
+        range_ns: mp.range_ns,
     };
     // Warm-up run (also proves survivors exist).
     let warm = run_client_agg_rows(

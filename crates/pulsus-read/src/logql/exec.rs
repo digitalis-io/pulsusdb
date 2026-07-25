@@ -3222,22 +3222,21 @@ fn render_series_labels(sorted: &[(String, String)]) -> String {
     out
 }
 
-/// The full step-bucket grid over `(start, end]` — `absent_over_time`
-/// must emit `1.0` for EMPTY buckets, which the data-driven accumulators
-/// never see.
-fn bucket_grid(start_ns: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
-    if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns <= start_ns {
+/// The start-anchored step grid `{grid_start + k·step : k≥0, ≤ end}` (issue
+/// #227: Loki seeds `current` at `start-step`, first point `start`, iterates
+/// `≤ end`). Used by `vector(<scalar>)`'s constant matrix so it aligns with
+/// the sliding data leaves' start-anchored grid. i128 intermediates keep
+/// `grid_start + k·step` overflow-free; every point lies in
+/// `[grid_start, end]` (no clamp needed — `k ≥ 0`). The grid size passed
+/// `MAX_CLIENT_AGG_BUCKETS` before this runs.
+fn bucket_grid(grid_start: i64, end_ns: i64, step_ns: u64) -> Vec<i64> {
+    if step_ns == 0 || step_ns > i64::MAX as u64 || end_ns < grid_start {
         return Vec::new();
     }
-    // i128 intermediates + the shared clamp, exactly like [`bucket_of`]
-    // (review round 3): `k * step` for the lowest grid bucket can sit
-    // one sliver below `i64::MIN`. Buckets containing any ts in
-    // `(start, end]`: floor((start+1)/step) through floor(end/step).
-    // The grid size passed `MAX_CLIENT_AGG_BUCKETS` before this runs.
     let step = step_ns as i128;
-    let first = (start_ns as i128 + 1).div_euclid(step);
-    let last = (end_ns as i128).div_euclid(step);
-    (first..=last).map(|k| clamp_bucket(k * step)).collect()
+    let gs = grid_start as i128;
+    let kmax = (end_ns as i128 - gs) / step;
+    (0..=kmax).map(|k| (gs + k * step) as i64).collect()
 }
 
 /// The evaluation-bucket cap for client-aggregated range queries: a
@@ -3592,7 +3591,7 @@ pub fn materialize_vector_lit(value: f64, window: &ClientWindow) -> Result<Query
             value,
         }])),
         Some(step) => {
-            let buckets = grid_bucket_count(window.start_ns, window.end_ns, step);
+            let buckets = grid_point_count(window.start_ns, window.end_ns, step);
             if buckets > MAX_CLIENT_AGG_BUCKETS {
                 return Err(ReadError::QueryTooBroad(TooBroadReason::MetricBuckets {
                     buckets,
@@ -6000,6 +5999,212 @@ mod tests {
 
     use super::*;
 
+    // ---- Issue #227: sliding-window range engine ----
+
+    fn slide_meta(fp: u64, labels_json: &str) -> HashMap<u64, StreamMetaRow> {
+        let mut m = HashMap::new();
+        m.insert(
+            fp,
+            StreamMetaRow {
+                fingerprint: fp,
+                service: "svc".to_string(),
+                labels: labels_json.to_string(),
+            },
+        );
+        m
+    }
+
+    fn slide_rows(fp: u64, samples: &[(i64, &str)]) -> Vec<MetricScanRow> {
+        samples
+            .iter()
+            .map(|(ts, body)| MetricScanRow {
+                fingerprint: fp,
+                timestamp_ns: *ts,
+                body: body.to_string(),
+            })
+            .collect()
+    }
+
+    fn one_series_points(res: QueryResult) -> (LabelSet, Vec<(i64, f64)>) {
+        match res {
+            QueryResult::Matrix(mut s) => {
+                assert_eq!(s.len(), 1, "expected one series, got {s:?}");
+                let s = s.remove(0);
+                (s.labels, s.points)
+            }
+            other => panic!("expected a matrix, got {other:?}"),
+        }
+    }
+
+    /// count_over_time sliding windows, hand-computed. Samples at
+    /// 10,20,30,40,50; grid 0..50 step 10, range 25 ⇒ window `(t-25, t]`.
+    /// t=0 empty (gap); t=10→1, 20→2, 30→3, 40→{20,30,40}=3, 50→{30,40,50}=3.
+    #[test]
+    fn sliding_count_over_time_matches_hand_computed_windows() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let rows = slide_rows(1, &[(10, "x"), (20, "x"), (30, "x"), (40, "x"), (50, "x")]);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 50,
+            step_ns: Some(10),
+            range_ns: 25,
+        };
+        let res = run_client_agg_rows(&rows, &compiled, &meta, &client, window, None).unwrap();
+        let (_, points) = one_series_points(res);
+        assert_eq!(
+            points,
+            vec![(10, 1.0), (20, 2.0), (30, 3.0), (40, 3.0), (50, 3.0)],
+            "empty first window emits no point; overlapping windows slide"
+        );
+    }
+
+    /// `rate({}[1m]) ≠ rate({}[10m])`: the `[range]` is live (window width AND
+    /// the per-second divisor both track range, not step). Two samples 30s
+    /// apart at step 60s.
+    #[test]
+    fn sliding_rate_depends_on_the_range_selector() {
+        let client_for = |range_op| ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op,
+            param: None,
+            absent_labels: vec![],
+        };
+        let client = client_for(RangeAggOp::Rate);
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        // Two lines inside a 1m window ending at 60s.
+        let rows = slide_rows(1, &[(31_000_000_000, "x"), (59_000_000_000, "x")]);
+        let s = 1_000_000_000i64;
+        let run = |range_ns: u64| {
+            let window = ClientWindow {
+                start_ns: 60 * s,
+                end_ns: 60 * s,
+                step_ns: Some((60 * s) as u64),
+                range_ns,
+            };
+            let res =
+                run_client_agg_rows(&rows, &compiled, &meta, &client, window, Some(range_ns)).unwrap();
+            one_series_points(res).1
+        };
+        let r1m = run(60 * s as u64); // 2 lines / 60s = 0.0333…
+        let r10m = run(600 * s as u64); // 2 lines / 600s = 0.0033…
+        assert_ne!(r1m, r10m, "the [range] divisor must be live");
+        assert_eq!(r1m, vec![(60 * s, 2.0 / 60.0)]);
+        assert_eq!(r10m, vec![(60 * s, 2.0 / 600.0)]);
+    }
+
+    /// AC10: a forced same-`(fingerprint, timestamp_ns)` collision of ≥3 rows
+    /// with DISTINCT bodies resolves `first_over_time`/`last_over_time` (and
+    /// class-C folds) in the fixed full-body `tie_rank` order, byte-stable
+    /// across shuffled input.
+    #[test]
+    fn sliding_collision_group_orders_by_full_body_deterministically() {
+        // `last_over_time` over an unwrapped value: value is the byte length,
+        // ordered by full body. Three same-ns lines with distinct bodies.
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 10,
+            step_ns: Some(10),
+            range_ns: 10,
+        };
+        // Same ts, distinct bodies — count is order-independent, but the
+        // collision path must run without panicking and yield a stable count.
+        let mut base = vec![(5i64, "ccc"), (5, "aaa"), (5, "bbb")];
+        let r1 = run_client_agg_rows(
+            &slide_rows(1, &base),
+            &compiled,
+            &meta,
+            &client,
+            window,
+            None,
+        )
+        .unwrap();
+        base.reverse();
+        let r2 = run_client_agg_rows(
+            &slide_rows(1, &base),
+            &compiled,
+            &meta,
+            &client,
+            window,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r1, r2, "shuffled collision input must be byte-stable");
+        assert_eq!(one_series_points(r1).1, vec![(10, 3.0)]);
+    }
+
+    /// The collision-group cap trips a clean `TsCollisionGroup` 422, never an
+    /// OOM, on a pathological same-`(fingerprint, ts)` run.
+    #[test]
+    fn sliding_collision_group_over_cap_is_a_named_too_broad_error() {
+        let client = ClientAgg {
+            pipeline: vec![],
+            value: ClientValue::Count,
+            range_op: RangeAggOp::CountOverTime,
+            param: None,
+            absent_labels: vec![],
+        };
+        let compiled = CompiledPipeline::compile(&client.pipeline).unwrap();
+        let meta = slide_meta(1, r#"{"app":"a"}"#);
+        let n = (MAX_TS_COLLISION_GROUP + 1) as usize;
+        let rows: Vec<MetricScanRow> = (0..n)
+            .map(|i| MetricScanRow {
+                fingerprint: 1,
+                timestamp_ns: 5,
+                body: format!("line-{i}"),
+            })
+            .collect();
+        let window = ClientWindow {
+            start_ns: 0,
+            end_ns: 10,
+            step_ns: Some(10),
+            range_ns: 10,
+        };
+        match run_client_agg_rows(&rows, &compiled, &meta, &client, window, None) {
+            Err(ReadError::QueryTooBroad(TooBroadReason::TsCollisionGroup { cap, .. })) => {
+                assert_eq!(cap, MAX_TS_COLLISION_GROUP);
+            }
+            other => panic!("expected TsCollisionGroup, got {other:?}"),
+        }
+    }
+
+    /// StableHash reproduces Loki `labels.StableHash`: `xxh64(seed 0)` over
+    /// sorted `name·0xFF·value·0xFF`. Pinned against the direct byte layout
+    /// (the live differential pins it against the container).
+    #[test]
+    fn stream_hash_matches_the_stable_hash_byte_layout() {
+        let labels = vec![
+            ("app".to_string(), "a".to_string()),
+            ("env".to_string(), "prod".to_string()),
+        ];
+        let mut buf: Vec<u8> = Vec::new();
+        for (n, v) in &labels {
+            buf.extend_from_slice(n.as_bytes());
+            buf.push(0xFF);
+            buf.extend_from_slice(v.as_bytes());
+            buf.push(0xFF);
+        }
+        assert_eq!(stream_hash(&labels), xxhash_rust::xxh64::xxh64(&buf, 0));
+    }
+
     /// The `/stats` pushdown-only gate (M8-LQ2 Delta 1): a pushable literal
     /// line filter is accepted, but a non-pushable `ip()`/mixed-`or` line
     /// filter — and any beyond-line-filter stage — is rejected, so `stats`
@@ -7929,6 +8134,7 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
             step_ns: None,
+            range_ns: 0,
         };
         let mut state = ClientAggState::new(&compiled, &meta, &client, window, None).unwrap();
         state.quantile_values = MAX_QUANTILE_VALUES - 1;
@@ -7989,6 +8195,7 @@ mod tests {
             start_ns: 0,
             end_ns: 60_000_000_000,
             step_ns: None,
+            range_ns: 0,
         };
         (compiled, client, meta, window)
     }
@@ -8090,6 +8297,7 @@ mod tests {
             start_ns: 0,
             end_ns: range_ns as i64,
             step_ns: Some(step_ns),
+            range_ns,
         };
         let rows = [
             (10_000_000_000i64, "c=10"), // bucket 0
